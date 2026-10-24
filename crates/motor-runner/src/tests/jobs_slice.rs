@@ -54,6 +54,9 @@ fn jobs_slice_below_the_job_floor_refuses_admission_before_start() {
     let f = Fixture::new();
     let mut config = f.config();
     config.isolate_jobs = true;
+    // A portable test has no sandbox account, and with no global run there is
+    // no shared toolchain tree to prepare, so admission reads the slice alone.
+    config.development_allow_host_backend = true;
     config.memory_floor_gib = Some(16);
     config.systemd_command = Some(engine_replies((16 << 30) - 1));
     let runner = Runner::open(config).unwrap();
@@ -73,13 +76,11 @@ fn jobs_slice_at_the_job_floor_admits_and_clamps_instead_of_refusing() {
     let f = Fixture::new();
     let mut config = f.config();
     config.isolate_jobs = true;
+    // A portable test has no sandbox account, and with no global run there is
+    // no shared toolchain tree to prepare, so admission reads the slice alone.
+    config.development_allow_host_backend = true;
     config.memory_floor_gib = Some(16);
     config.systemd_command = Some(engine_replies(16 << 30));
-    // Standing in for the host's library trees keeps this test from granting
-    // access to them; admission itself never reads them.
-    let shared = config.state_dir().join("shared");
-    fs::create_dir_all(&shared).unwrap();
-    config.shared_read_roots = Some((shared.clone(), shared, None));
     let floor = config.memory_floor_gib;
     let runner = Runner::open(config).unwrap();
     let (request, _) = f.run("true");

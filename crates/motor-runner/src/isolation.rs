@@ -311,6 +311,16 @@ fn prepare_shared_read_access_from_as(
     bun_bin: Option<&Path>,
     user: &str,
 ) -> io::Result<()> {
+    // A portable test has no sandbox account and no job unit, so the grant
+    // that makes the host's toolchain trees readable to the job account has
+    // nothing to apply to. The activation fixture is the one that runs the
+    // same grants on a real host.
+    #[cfg(test)]
+    {
+        let _ = (cargo_home, rustup_home, bun_bin, user);
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
     for name in ["registry", "git"] {
         let path = cargo_home.join(name);
         fs::create_dir_all(&path)?;
