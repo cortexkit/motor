@@ -38,6 +38,8 @@ mod disk;
 mod health;
 #[path = "migration.rs"]
 mod migration;
+#[path = "remote_cache_engine.rs"]
+mod remote_cache_engine;
 #[path = "retirement.rs"]
 mod retirement;
 #[path = "sibling_eviction.rs"]
@@ -187,6 +189,13 @@ pub struct Config {
     /// Linux production uses systemd services under motor-job. The portable
     /// in-process test backend deliberately leaves this disabled.
     pub isolate_jobs: bool,
+    /// Opt in to the runner-owned remote cache. Ignored without job isolation.
+    pub remote_cache: bool,
+    /// Distinct loopback ports inside each unit's private network namespace.
+    pub remote_cache_forwarder_ports: BTreeMap<String, u16>,
+    #[cfg(unix)]
+    pub(crate) remote_cache_runtime: Option<Arc<crate::remote_cache::runtime::Runtime>>,
+    pub(crate) remote_cache_error: Option<String>,
     /// Outbound networking is opt-in and requires a probed isolated host backend.
     pub job_network: Option<crate::network::JobNetwork>,
     pub(crate) job_network_unavailable: String,
@@ -451,6 +460,14 @@ impl Config {
             sibling_snapshot_idle: DEFAULT_SIBLING_SNAPSHOT_IDLE,
             free_space_probe: Arc::new(|path| fs2::available_space(path)),
             isolate_jobs: false,
+            remote_cache: false,
+            remote_cache_forwarder_ports: BTreeMap::from([
+                ("sccache".into(), 3893),
+                ("ccache".into(), 3894),
+            ]),
+            #[cfg(unix)]
+            remote_cache_runtime: None,
+            remote_cache_error: None,
             job_network: None,
             job_network_unavailable: "--job-network veth is not enabled".into(),
             #[cfg(test)]
@@ -563,11 +580,9 @@ impl Config {
         std::sync::Arc<crate::remote_cache::provisioning::ActiveGeneration>,
         Vec<crate::remote_cache::transport::Forwarder>,
     )> {
-        // Nothing starts the gateway yet, so no generation is ever served and
-        // no unit gets a socket or a forwarder. Wiring the gateway into
-        // startup supplies the generation and the unit's forwarders here.
-        let _ = (fill, self.remote_cache_available(fill));
-        None
+        self.remote_cache_available(fill)?;
+        let runtime = self.remote_cache_runtime.as_ref()?;
+        Some((runtime.watch.admit()?, runtime.forwarders()))
     }
     /// Whether the remote compile cache can be on for a job or a fill of this
     /// runner at all, before provisioning is read: the runner switch must be
@@ -580,10 +595,10 @@ impl Config {
     /// environment, and a missing account fails the fill itself later.
     #[cfg(unix)]
     pub(crate) fn remote_cache_available(&self, fill: bool) -> Option<()> {
-        if !self.isolate_jobs || self.boat_profile || self.tenant_vm {
+        if !self.remote_cache || !self.isolate_jobs || self.vm_instance() {
             return None;
         }
-        if fill && self.vm_instance() {
+        if fill && (self.boat_profile || self.tenant_vm) {
             return None;
         }
         Some(())
@@ -1547,6 +1562,14 @@ impl Runner {
     /// The publication policy every fill, reuse decision and record reads, as
     /// the latest re-read of the provisioning files left it.
     pub(crate) fn publishing_policy(&self) -> crate::remote_cache::publication::PublishPolicy {
+        #[cfg(unix)]
+        if let Some(runtime) = &self.core.config.remote_cache_runtime {
+            self.core
+                .publishing
+                .lock()
+                .unwrap()
+                .write_breaker_open_until = runtime.gateway.write_breaker_open_until();
+        }
         self.core
             .publishing
             .lock()
@@ -1561,8 +1584,6 @@ impl Runner {
     /// Applies one re-read of the provisioning files: stores the new state,
     /// forgets invalidated records, saves the catalog without engine locks and
     /// queues any newly unpublished desired tips immediately.
-    // Production startup does not yet run the provisioning watcher.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn observe_publishing(
         &self,
         reread: crate::remote_cache::provisioning::Reread,
@@ -2162,7 +2183,8 @@ impl Runner {
         let sibling_fences = config.sibling_fences();
         // The switch is honoured only with job isolation, and only the build
         // server ever writes the cache.
-        let publishing_switch = config.isolate_jobs
+        let publishing_switch = config.remote_cache
+            && config.isolate_jobs
             && !config.boat_profile
             && !config.tenant_vm
             && !config.vm_instance();
@@ -2176,6 +2198,24 @@ impl Runner {
             catalog.publishing_seen.clone(),
         );
         let publishing_seen = catalog.publishing_seen.clone();
+        if config.remote_cache && !config.isolate_jobs {
+            config.remote_cache_error = Some("isolate_jobs is off; runner switch ignored".into());
+            tracing::warn!("remote cache switch ignored: isolate_jobs is off");
+        }
+        #[cfg(unix)]
+        if config.remote_cache_available(false).is_none() {
+            config.remote_cache_runtime = None;
+        }
+        #[cfg(unix)]
+        if config.remote_cache_available(false).is_some() && config.remote_cache_runtime.is_none() {
+            match crate::remote_cache::runtime::Runtime::start(&config) {
+                Ok(runtime) => config.remote_cache_runtime = Some(runtime),
+                Err(reason) => {
+                    tracing::warn!(%reason, "remote cache startup failed; serving uncached");
+                    config.remote_cache_error = Some(reason);
+                }
+            }
+        }
         let runner = Self {
             core: Arc::new(Core {
                 reserve_restore: Mutex::new(()),
@@ -2256,6 +2296,21 @@ impl Runner {
         };
         #[cfg(test)]
         tests::register_runner(&runner);
+        if !publishing_switch {
+            let snapshot = {
+                let mut inner = runner.core.inner.lock().unwrap();
+                if inner.publishing_seen.switch {
+                    inner.publishing_seen = crate::remote_cache::publishing::Seen::default();
+                    inner.catalog.publishing_seen = inner.publishing_seen.clone();
+                    Some(runner.catalog_snapshot(&inner)?)
+                } else {
+                    None
+                }
+            };
+            if let Some(snapshot) = snapshot {
+                runner.write_catalog(snapshot)?;
+            }
+        }
         // Deletions a previous run moved aside but did not finish.
         if runner.core.quarantined.is_empty() {
             if let Ok(entries) = fs::read_dir(runner.trash()) {
@@ -2300,6 +2355,8 @@ impl Runner {
                 runner.monitor_unit(id);
             });
         }
+        #[cfg(unix)]
+        runner.start_remote_cache();
         #[cfg(test)]
         if runner.core.config.manual_tick {
             return Ok(runner);
@@ -8478,6 +8535,11 @@ impl Runner {
         ledgers: &[Arc<crate::remote_cache::gateway::WriteLedger>],
     ) -> publication::Outcome {
         self.long_work("publication_drain");
+        if ledgers.is_empty() {
+            return publication::Outcome::Failed {
+                reason: "no cache write sockets".into(),
+            };
+        }
         let (mut keys, mut reason): (Vec<PublishedKey>, Option<String>) = (Vec::new(), None);
         for ledger in ledgers {
             if let Err(error) = ledger.drained() {

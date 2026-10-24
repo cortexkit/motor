@@ -315,6 +315,9 @@ impl Runner {
             })
             .collect();
         let health = {
+            // VM backends do not participate in the Linux compile cache.
+            let remote_cache =
+                (!self.core.config.vm_instance()).then(|| self.remote_cache_health(now));
             let mut counters = self.core.health.lock().unwrap();
             RunnerHealth {
                 runner_version: env!("CARGO_PKG_VERSION").into(),
@@ -340,6 +343,7 @@ impl Runner {
                 permits_held: Some(permits_held),
                 permits_cap: Some(self.core.config.max_weight),
                 queue_wait_1h: Some(counters.queue_wait(now)),
+                remote_cache,
             }
         };
         RunnerStatusReply {

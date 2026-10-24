@@ -750,6 +750,9 @@ impl Watch {
     pub(crate) fn enabled(&self) -> bool {
         self.inner.lock().unwrap().enabled()
     }
+    pub(crate) fn enabled_setting(&self) -> Option<bool> {
+        self.inner.lock().unwrap().enabled
+    }
 
     /// Re-reads the files whenever their metadata changes (checked every
     /// `poll`) and at least every `full`, handing each outcome to `report` in
