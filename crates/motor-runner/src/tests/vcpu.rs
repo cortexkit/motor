@@ -349,6 +349,143 @@ fn windows_avoidance_options_require_a_valid_pair() {
     assert_eq!(Runner::open(config).unwrap().core.cpus.capacity(), 30);
 }
 
+const LINUX_CPUS: [u32; 8] = [12, 13, 14, 15, 28, 29, 30, 31];
+
+fn linux_cpus_config(f: &Fixture) -> Config {
+    let mut config = f.config();
+    config.linux_cpus = Some("12-15,28-31".into());
+    config.max_weight = 16;
+    config
+}
+
+#[test]
+fn linux_cpu_list_must_name_online_cpus() {
+    let f = Fixture::new();
+    for list in ["", "32", "15-12", "twelve"] {
+        let mut config = linux_cpus_config(&f);
+        config.linux_cpus = Some(list.into());
+        assert!(Runner::open(config).is_err(), "{list:?}");
+    }
+}
+
+#[tokio::test]
+async fn linux_cpu_list_runs_a_long_twelve_vcpu_job_on_the_eight_listed_cpus() {
+    let f = Fixture::new();
+    let runner = Runner::open(linux_cpus_config(&f)).unwrap();
+    assert_eq!(runner.core.cpus.capacity(), 8);
+    assert_eq!(runner.core.cpus.claim_limit(), 16);
+    // Longer than the hosted lease limit of 7,200 s: only the direct runner
+    // serves it, and the runner itself puts no bound on the timeout.
+    let (mut request, bytes) = f.run("true");
+    request.weight_hint = Some(12);
+    request.timeout = Some(7_201);
+    f.submit(&runner, &request, &bytes);
+    assert_eq!(
+        terminal(&runner, request.job_id).await.outcome,
+        Outcome::Exit { code: 0 }
+    );
+    base_done(&runner).await;
+    let inner = runner.core.inner.lock().unwrap();
+    let job = &inner.jobs[&request.job_id];
+    assert_eq!(job.weight, 12);
+    assert_eq!(job.cpus, LINUX_CPUS);
+    for job in inner.jobs.values() {
+        assert!(
+            job.cpus.iter().all(|cpu| LINUX_CPUS.contains(cpu)),
+            "{:?} ran outside the list: {:?}",
+            job.id,
+            job.cpus
+        );
+    }
+}
+
+#[test]
+fn linux_cpu_list_refuses_claims_above_max_weight_before_start_without_waiting() {
+    let f = Fixture::new();
+    let runner = Runner::open(linux_cpus_config(&f)).unwrap();
+    assert!(runner.cpu_refusal(16).is_none());
+    for claim in [17, 32] {
+        let (mut request, _) = f.run("touch must-not-start");
+        request.weight_hint = Some(claim);
+        request.timeout = Some(7_201);
+        assert!(matches!(
+            runner.accept(request.clone()).unwrap(),
+            Admission::Refused(RefusalReason::RunnerFull)
+        ));
+        let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
+        let terminal = job.terminal.unwrap();
+        assert_eq!(
+            terminal.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::RunnerFull
+            }
+        );
+        assert_eq!(terminal.ran, Some(Ran::None));
+        let detail = terminal.refusal_detail().unwrap();
+        assert!(
+            detail.contains(&format!(
+                "vcpu request {claim} is outside the supported range 1..=16"
+            )) && detail.contains("max_weight limit")
+                && detail.contains("12-15,28-31"),
+            "{detail}"
+        );
+        assert!(job.cpus.is_empty() && job.setup_ms.is_none());
+    }
+    assert_eq!(runner.status().queue_depth, 0);
+    assert!(!Path::new(&f.key).join("must-not-start").exists());
+}
+
+/// Without a CPU list the allocatable CPUs stay the claim limit, so a claim
+/// above max_weight that fits the host is still accepted and waits.
+#[test]
+fn without_a_linux_cpu_list_claims_above_max_weight_still_wait() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.max_weight = 16;
+    let runner = Runner::open(config).unwrap();
+    assert_eq!(runner.core.cpus.capacity(), 30);
+    assert_eq!(runner.core.cpus.claim_limit(), 30);
+    let (mut request, _) = f.run("true");
+    request.weight_hint = Some(17);
+    assert!(matches!(
+        runner.accept(request.clone()).unwrap(),
+        Admission::Accepted(_)
+    ));
+    runner.tick().unwrap();
+    let inner = runner.core.inner.lock().unwrap();
+    let job = &inner.jobs[&request.job_id];
+    assert!(job.terminal.is_none() && job.cpus.is_empty() && job.setup_ms.is_none());
+}
+
+#[tokio::test]
+async fn linux_cpu_list_shares_the_windows_threads_while_the_slot_is_active() {
+    let f = Fixture::new();
+    let mut config = linux_cpus_config(&f);
+    let mut cpus = config
+        .cpu_topology
+        .take()
+        .unwrap()
+        .avoid_windows(&[12, 13, 14, 15], PathBuf::from("/windows/slot.lock"))
+        .unwrap();
+    cpus.set_windows_probe(Arc::new(|| Ok(true)));
+    config.cpu_topology = Some(cpus);
+    let runner = Runner::open(config).unwrap();
+    assert!(!runner.core.cpus.windows_fail_open_warned());
+    let (mut request, bytes) = f.run("true");
+    request.weight_hint = Some(4);
+    f.submit(&runner, &request, &bytes);
+    assert_eq!(
+        terminal(&runner, request.job_id).await.outcome,
+        Outcome::Exit { code: 0 }
+    );
+    let cpus = runner.core.inner.lock().unwrap().jobs[&request.job_id]
+        .cpus
+        .clone();
+    assert_eq!(cpus.len(), 4);
+    assert!(cpus.iter().all(|cpu| LINUX_CPUS.contains(cpu)), "{cpus:?}");
+    assert!(runner.core.cpus.windows_fail_open_warned());
+}
+
 #[tokio::test]
 async fn windows_start_does_not_move_existing_job_or_exempt_cache_fills() {
     let f = Fixture::new();

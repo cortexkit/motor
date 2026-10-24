@@ -13,6 +13,10 @@ pub(crate) struct CpuTopology {
     cores: Vec<Vec<u32>>,
     reserved: usize,
     windows: Option<Arc<WindowsReservation>>,
+    /// The largest vCPU claim admitted when it differs from the allocatable
+    /// CPU count: set only when Linux jobs are confined to an explicit CPU
+    /// list (see `confine`).
+    claim_limit: Option<u32>,
 }
 
 type ActivityProbe = Arc<dyn Fn() -> io::Result<bool> + Send + Sync>;
@@ -205,7 +209,49 @@ impl CpuTopology {
             cores,
             reserved,
             windows: None,
+            claim_limit: None,
         })
+    }
+
+    /// Places Linux jobs only on `cpus`, an explicit list of online CPUs, with
+    /// no daemon-only core. Claims up to `claim_limit` (the runner's
+    /// `max_weight`) are admitted even when they exceed the list's length: a
+    /// larger claim shares the listed CPUs, as an oversized claim already does
+    /// when CPUs overlap. A sibling outside the list is never used, so a
+    /// partially listed core contributes only its listed threads. Windows
+    /// avoidance set up before confinement keeps working on the listed CPUs:
+    /// when the Windows CPUs cover the whole list, placement fails open with
+    /// its usual warning instead of leaving Linux jobs no CPU.
+    pub(crate) fn confine(mut self, cpus: &[u32], claim_limit: u32) -> io::Result<Self> {
+        if cpus.is_empty()
+            || claim_limit == 0
+            || cpus
+                .iter()
+                .any(|cpu| !self.cores.iter().any(|core| core.contains(cpu)))
+        {
+            return Err(io::Error::other(
+                "--linux-cpus requires a non-empty list of online CPUs and a nonzero --max-weight",
+            ));
+        }
+        self.cores = self
+            .cores
+            .into_iter()
+            .map(|core| {
+                core.into_iter()
+                    .filter(|cpu| cpus.contains(cpu))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|core| !core.is_empty())
+            .collect();
+        self.reserved = 0;
+        self.claim_limit = Some(claim_limit);
+        Ok(self)
+    }
+
+    /// The largest vCPU claim this runner admits: the configured limit when
+    /// Linux jobs are confined to a CPU list, otherwise every allocatable CPU.
+    pub(crate) fn claim_limit(&self) -> u32 {
+        self.claim_limit.unwrap_or_else(|| self.capacity())
     }
 
     pub(crate) fn avoid_windows(mut self, cpus: &[u32], slot_lock: PathBuf) -> io::Result<Self> {
@@ -241,6 +287,14 @@ impl CpuTopology {
         Arc::get_mut(self.windows.as_mut().unwrap()).unwrap().probe = probe;
     }
 
+    /// Whether Windows avoidance has logged a fail-open warning.
+    #[cfg(test)]
+    pub(crate) fn windows_fail_open_warned(&self) -> bool {
+        self.windows
+            .as_ref()
+            .is_some_and(|windows| windows.last_warning.lock().unwrap().is_some())
+    }
+
     pub(crate) fn capacity(&self) -> u32 {
         self.cores
             .iter()
@@ -256,7 +310,7 @@ impl CpuTopology {
         count: u32,
         claims: impl Iterator<Item = &'a [u32]>,
     ) -> CpuPlacement {
-        assert!(count > 0 && count <= self.capacity());
+        assert!(count > 0 && count <= self.claim_limit());
         let windows_active = self
             .windows
             .as_ref()

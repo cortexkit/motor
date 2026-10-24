@@ -197,6 +197,84 @@ fn windows_covering_all_allocatable_cpus_fails_open() {
         .is_some());
 }
 
+const LINUX_CPUS: [u32; 8] = [12, 13, 14, 15, 28, 29, 30, 31];
+
+fn build_server() -> CpuTopology {
+    CpuTopology::new((0..16).map(|cpu| vec![cpu, cpu + 16]).collect()).unwrap()
+}
+
+#[test]
+fn unconfined_claim_limit_is_the_allocatable_cpu_count() {
+    let topology = build_server();
+    assert_eq!(topology.capacity(), 30);
+    assert_eq!(topology.claim_limit(), 30);
+}
+
+#[test]
+fn linux_cpu_list_confines_placement_and_admits_claims_up_to_max_weight() {
+    let topology = build_server().confine(&LINUX_CPUS, 16).unwrap();
+    // The listed threads are all allocatable: no daemon core is kept back.
+    assert_eq!(topology.capacity(), 8);
+    assert_eq!(topology.claim_limit(), 16);
+    for claim in [12, 16] {
+        assert_eq!(topology.place(claim, std::iter::empty()), LINUX_CPUS);
+    }
+    let four = topology.place(4, std::iter::empty());
+    assert_eq!(four, [12, 13, 28, 29]);
+    assert_eq!(
+        topology.place(4, std::iter::once(four.as_slice())),
+        [14, 15, 30, 31]
+    );
+    // A partially listed core contributes only its listed thread.
+    let partial = build_server().confine(&[0, 12], 4).unwrap();
+    assert_eq!(partial.capacity(), 2);
+    assert_eq!(partial.place(4, std::iter::empty()), [0, 12]);
+    for (cpus, limit) in [(&[][..], 16), (&[12, 32][..], 16), (&LINUX_CPUS[..], 0)] {
+        assert!(
+            build_server().confine(cpus, limit).is_err(),
+            "{cpus:?} {limit}"
+        );
+    }
+}
+
+#[derive(Clone, Default)]
+struct LogBytes(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for LogBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn confined_linux_cpus_share_windows_threads_while_the_slot_is_active() {
+    // The listed threads are exactly the Windows cores and their siblings, so
+    // an active Windows slot would leave Linux jobs nothing: avoidance fails
+    // open with a warning and the job still runs on the listed threads.
+    let topology = windows_topology(Arc::new(|| Ok(true)))
+        .confine(&LINUX_CPUS, 16)
+        .unwrap();
+    let logs = LogBytes::default();
+    let placement = tracing::subscriber::with_default(
+        motor_protocol::logging::LineSubscriber::new("[runner]", logs.clone()),
+        || topology.place_with_status(4, std::iter::empty()),
+    );
+    assert_eq!(placement.windows_active, Some(true));
+    assert!(placement.avoided_cpus.is_empty());
+    assert_eq!(placement.cpus, [12, 13, 28, 29]);
+    assert!(topology.windows_fail_open_warned());
+    let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("Windows CPU avoidance unavailable")
+            && logs.contains("Windows CPUs cover every allocatable CPU"),
+        "{logs}"
+    );
+}
+
 #[test]
 fn lock_table_matches_device_inode_and_only_granted_exclusive_flocks() {
     let entry = "1: FLOCK ADVISORY WRITE 101 08:1a:1234 0 EOF\n";
