@@ -36,7 +36,7 @@ class QualificationTests(unittest.TestCase):
             repo = root / 'repo'
             (repo / 'script/runner').mkdir(parents=True)
             hashes = {}
-            for name in ('toolchain-parity.py', 'toolchain.json', 'cargo-seed.py', 'syscall-surface.py'):
+            for name in q.PARITY_FILES:
                 relative = 'script/runner/' + name
                 (repo / relative).write_text(name)
                 hashes[relative] = hashlib.sha256(name.encode()).hexdigest()

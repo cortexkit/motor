@@ -35,11 +35,9 @@ if provider_spec is None or provider_spec.loader is None:
 provider = importlib.util.module_from_spec(provider_spec)
 provider_spec.loader.exec_module(provider)
 PORT = 19443
-PARITY_SCRIPT = ROOT / "script/runner/toolchain-parity.py"
-PARITY_MANIFEST = ROOT / "script/runner/toolchain.json"
-CARGO_SEED_SCRIPT = ROOT / 'script/runner/cargo-seed.py'
-SYSCALL_SURFACE_SCRIPT = ROOT / 'script/runner/syscall-surface.py'
-REMOTE_CACHE_ENVIRONMENT_SCRIPT = ROOT / 'script/runner/remote-cache-environment.py'
+PARITY_DIR = ROOT / "script/runner"
+PARITY_FILES = tuple((PARITY_DIR / "parity-files.txt").read_text().splitlines())
+PARITY_MANIFEST = PARITY_DIR / "toolchain.json"
 CARGO_OFFLINE_PROBE = ROOT / 'script/runner/cargo-offline-probe.py'
 GIT_PUSHURL_PROBE = ROOT / 'script/runner/git-pushurl-probe.py'
 WASM_OPT_PROBE = ROOT / 'script/runner/wasm-opt-probe.py'
@@ -880,21 +878,19 @@ def prepared_image_digest(revision, inventory):
 def parity_source(job=False, gnu_test_sha256=None, cargo_seed_sha256=None):
     # Run the operator checkout's checker, not an image's possibly stale checker
     # or its build-time inventory. Every phase measures the current filesystem.
-    return ("import json, types\n"
-            "seed_scope = {'__name__': 'cargo_seed'}\n"
-            f"exec({CARGO_SEED_SCRIPT.read_text()!r}, seed_scope)\n"
-            "syscall_scope = {'__name__': 'syscall_surface'}\n"
-            f"exec({SYSCALL_SURFACE_SCRIPT.read_text()!r}, syscall_scope)\n"
-            # The checker loads its sibling modules from its own folder unless
-            # they're already in scope, and here it runs from a string with no
-            # folder, so every sibling is passed in.
-            "remote_cache_scope = {'__name__': 'remote_cache_environment'}\n"
-            f"exec({REMOTE_CACHE_ENVIRONMENT_SCRIPT.read_text()!r}, remote_cache_scope)\n"
-            "scope = {'__name__': 'toolchain_parity', '__file__': '/toolchain-parity.py', 'seed': types.SimpleNamespace(**seed_scope), 'syscall_surface': types.SimpleNamespace(**syscall_scope), 'remote_cache_environment': types.SimpleNamespace(**remote_cache_scope)}\n"
-            f"exec({PARITY_SCRIPT.read_text()!r}, scope)\n"
-            f"registry = seed_scope['verified_manifest']({'cargo-seed-expected.json' if job else '/home/user/cargo-seed-expected.json'!r}, {cargo_seed_sha256!r}) if {cargo_seed_sha256!r} else None\n"
-            f"result = scope['check'](json.loads({PARITY_MANIFEST.read_text()!r}), role='boat', job={job!r}, gnu_test_sha256={gnu_test_sha256!r}, cargo_registry=registry)\n"
-            "print(json.dumps(result))\n")
+    files = {name: (PARITY_DIR / name).read_text() for name in PARITY_FILES}
+    return ("import importlib.util, json, tempfile\n"
+            "from pathlib import Path\n"
+            "with tempfile.TemporaryDirectory() as directory:\n"
+            "    root = Path(directory)\n"
+            f"    for name, content in {files!r}.items():\n"
+            "        (root / name).write_text(content)\n"
+            "    spec = importlib.util.spec_from_file_location('toolchain_parity', root / 'toolchain-parity.py')\n"
+            "    parity = importlib.util.module_from_spec(spec)\n"
+            "    spec.loader.exec_module(parity)\n"
+            f"    registry = parity.seed.verified_manifest({'cargo-seed-expected.json' if job else '/home/user/cargo-seed-expected.json'!r}, {cargo_seed_sha256!r}) if {cargo_seed_sha256!r} else None\n"
+            f"    result = parity.check(json.loads(parity.MANIFEST.read_text()), role='boat', job={job!r}, gnu_test_sha256={gnu_test_sha256!r}, cargo_registry=registry)\n"
+            "    print(json.dumps(result))\n")
 
 
 def parity_passed(report):
