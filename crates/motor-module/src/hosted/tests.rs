@@ -233,6 +233,7 @@ fn hosted_billing_seconds_keep_three_decimals() {
 }
 
 mod account;
+pub(crate) mod capacity;
 pub(crate) mod harness;
 mod settled_reattach;
 use harness::*;

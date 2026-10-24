@@ -822,7 +822,8 @@ impl Motor {
                         // so there is no lease to release or finish.
                         let spent_ms =
                             u64::try_from(spill_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        self.storage.routed_direct_no_host_fits(id, spent_ms)?;
+                        self.storage
+                            .routed_direct_no_host_fits(id, spent_ms, max_vcpus)?;
                         tracing::info!(job_id = %id, vcpus = request.weight_hint.unwrap_or(2),
                             max_vcpus = %max_vcpus.map_or_else(|| "unknown".to_owned(), |n| n.to_string()),
                             "hosted no_host_fits; routing to build server");
@@ -1292,6 +1293,11 @@ impl Motor {
                         .await
                         .map(|_| false);
                 }
+                let detail = if reason == RefusalReason::RunnerFull {
+                    self.with_hosted_max_vcpus(id, detail)
+                } else {
+                    detail
+                };
                 let mut terminal =
                     TerminalRecord::new(id, Outcome::RefusedBeforeStart { reason }, 0, 0, 0)
                         .with_ran(Ran::None)
@@ -1458,6 +1464,36 @@ impl Motor {
         if self.hosted_state(id).is_some() {
             tracing::warn!(job_id = %id, step, cause = %cause, "hosted job stopped");
         }
+    }
+    /// A build-server `runner_full` refusal of a job that went there because
+    /// the broker answered `no_host_fits` names the largest size each route
+    /// serves: the build server's own detail, which names its limit, then
+    /// `hosted max_vcpus <n>` from the broker's answer, or `unknown` when the
+    /// answer named no number. The build server's part is shortened if the
+    /// whole would pass the detail size limit, so the hosted figure is kept.
+    /// Other jobs, including ones sent direct before any lease request, keep
+    /// the build server's detail unchanged.
+    fn with_hosted_max_vcpus(&self, id: Uuid, detail: Option<String>) -> Option<String> {
+        let Some(max_vcpus) = self
+            .storage
+            .job(id)
+            .and_then(|job| job.no_host_fits_max_vcpus())
+        else {
+            return detail;
+        };
+        let hosted = format!(
+            "; hosted max_vcpus {}",
+            max_vcpus.map_or_else(|| "unknown".to_owned(), |n| n.to_string())
+        );
+        let mut runner = detail.unwrap_or_else(|| "runner_full".into());
+        let mut end = runner
+            .len()
+            .min(REFUSAL_DETAIL_MAX_BYTES.saturating_sub(hosted.len()));
+        while !runner.is_char_boundary(end) {
+            end -= 1;
+        }
+        runner.truncate(end);
+        Some(runner + &hosted)
     }
     /// The ID the build server knows this job by. It differs from the caller's
     /// job ID only after a spilled job whose hosted route failed before any Run
@@ -2625,6 +2661,8 @@ async fn emit(tx: &mpsc::Sender<io::Result<StreamRecord>>, record: StreamRecord)
 #[path = "queue_tests.rs"]
 mod queue_tests;
 
+#[cfg(test)]
+mod fleet_capacity_tests;
 #[cfg(test)]
 mod fleet_routing_tests;
 #[cfg(test)]

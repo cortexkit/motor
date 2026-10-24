@@ -1,4 +1,5 @@
 use super::super::*;
+use super::capacity::TenantCapacity;
 use crate::{Connector, Duplex};
 use motor_lease::{
     fake::{BrokerRequest, FakeBroker, FakeConfig},
@@ -100,6 +101,14 @@ pub struct Harness {
     /// Refusal reasons the host sends, one per run connection and in order,
     /// before it falls back to its behavior.
     pub host_refusals: Arc<Mutex<VecDeque<&'static str>>>,
+    /// When set, the broker selects the host only from the tenant's last
+    /// heartbeat and the host admits run tokens only within the tenant's
+    /// permits; see [`TenantCapacity`]. Queued `lease_replies` and
+    /// `host_refusals` still come first.
+    pub capacity: Arc<Mutex<Option<TenantCapacity>>>,
+    /// While false, a `CompleteRun` host holds each admitted job after
+    /// `Accepted`, so it keeps its claim on the tenant, until set true.
+    pub run_gate: Arc<tokio::sync::watch::Sender<bool>>,
     /// The 1-based number of the `/v1/leases` request the broker reads and
     /// records but never answers, holding its connection open as a broker
     /// that stopped responding would; 0 answers every request.
@@ -180,9 +189,13 @@ impl Harness {
         let runs = Arc::new(AtomicUsize::new(0));
         let frames = Arc::new(Mutex::new(Vec::new()));
         let host_refusals = Arc::new(Mutex::new(VecDeque::<&'static str>::new()));
+        let capacity = Arc::new(Mutex::new(None::<TenantCapacity>));
+        let run_gate = Arc::new(tokio::sync::watch::Sender::new(true));
         let host_task = tokio::spawn({
             let broker = broker.clone();
             let host_refusals = host_refusals.clone();
+            let capacity = capacity.clone();
+            let run_gate = run_gate.clone();
             let tokens = tokens.clone();
             let iats = iats.clone();
             let runs = runs.clone();
@@ -196,6 +209,8 @@ impl Harness {
                     let runs = runs.clone();
                     let frames = frames.clone();
                     let host_refusals = host_refusals.clone();
+                    let capacity = capacity.clone();
+                    let run_gate = run_gate.clone();
                     let broker = broker.clone();
                     tokio::spawn(async move {
                         let Ok(mut tls) = acceptor.accept(socket).await else {
@@ -271,6 +286,29 @@ impl Harness {
                                 return;
                             }
                         }
+                        // The tenant's admission gate. An admitted job's claim
+                        // is held until this connection ends, however it ends.
+                        let _claim = if purpose == Purpose::Run {
+                            let admitted = capacity
+                                .lock()
+                                .unwrap()
+                                .as_mut()
+                                .map(|tenant| tenant.admit(&claims.jti, claims.vcpus));
+                            if admitted == Some(false) {
+                                super::super::tls::write(
+                                    &mut tls,
+                                    &Prelude::LeaseRefused {
+                                        reason: "host_full".into(),
+                                    },
+                                )
+                                .await
+                                .unwrap();
+                                return;
+                            }
+                            admitted.map(|_| HeldClaim(capacity.clone(), claims.jti.clone()))
+                        } else {
+                            None
+                        };
                         super::super::tls::write(&mut tls, &Prelude::LeaseOk {})
                             .await
                             .unwrap();
@@ -375,7 +413,7 @@ impl Harness {
                                                     0,
                                                 )
                                             };
-                                        for frame in [
+                                        for (index, frame) in [
                                             Frame::Accepted(accepted),
                                             Frame::Terminal(terminal),
                                             Frame::HostedTerminal(HostedTerminal {
@@ -384,7 +422,14 @@ impl Harness {
                                                 billed_vcpu_ms: 6001,
                                                 max_runtime_s: claims.max_s,
                                             }),
-                                        ] {
+                                        ]
+                                        .into_iter()
+                                        .enumerate()
+                                        {
+                                            if index == 1 {
+                                                let mut gate = run_gate.subscribe();
+                                                let _ = gate.wait_for(|open| *open).await;
+                                            }
                                             motor_protocol::write_frame_async(&mut tls, &frame)
                                                 .await
                                                 .unwrap();
@@ -475,6 +520,7 @@ impl Harness {
         let unanswered_lease = Arc::new(AtomicUsize::new(0));
         let http_task = tokio::spawn({
             let broker = broker.clone();
+            let capacity = capacity.clone();
             let requests = requests.clone();
             let lease_bodies = lease_bodies.clone();
             let lease_replies = lease_replies.clone();
@@ -541,7 +587,26 @@ impl Harness {
                             unanswered.push(socket);
                             continue;
                         }
-                        lease_replies.lock().unwrap().pop_front()
+                        lease_replies.lock().unwrap().pop_front().or_else(|| {
+                            // CLOUD's per-host ceilings answer no_host_fits
+                            // before the broker looks at any heartbeat.
+                            let lease: serde_json::Value = serde_json::from_slice(&body).ok()?;
+                            let vcpus = u32::try_from(lease["vcpus"].as_u64()?).ok()?;
+                            if broker
+                                .lock()
+                                .unwrap()
+                                .knobs
+                                .max_vcpus
+                                .is_some_and(|max| vcpus > max)
+                            {
+                                return None;
+                            }
+                            capacity
+                                .lock()
+                                .unwrap()
+                                .as_mut()?
+                                .broker_answer(lease["job_id"].as_str()?, vcpus)
+                        })
                     } else {
                         None
                     };
@@ -595,6 +660,8 @@ impl Harness {
             drop_lease,
             release_admitted,
             host_refusals,
+            capacity,
+            run_gate,
             unanswered_lease,
             tasks: vec![host_task, http_task],
         }
@@ -624,6 +691,16 @@ impl Harness {
 /// broker settles `vcpus * SETTLED_RUNTIME_MS` and the replayed
 /// `HostedTerminal` bills the same amount.
 pub const SETTLED_RUNTIME_MS: u64 = 3000;
+
+/// A job's claim on the harness tenant, released when its run connection ends.
+struct HeldClaim(Arc<Mutex<Option<TenantCapacity>>>, String);
+impl Drop for HeldClaim {
+    fn drop(&mut self) {
+        if let Some(tenant) = self.0.lock().unwrap().as_mut() {
+            tenant.end(&self.1);
+        }
+    }
+}
 
 /// The `SettleThenDrop` job's sequenced records: `Started`, then one output
 /// record per `SETTLED_OUTPUT` entry.
