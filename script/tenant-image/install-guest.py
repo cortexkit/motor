@@ -273,7 +273,7 @@ def configure(pins):
         raise ImportError("cannot load the shared job identity installer")
     account = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(account)
-    account.ensure(json.loads((BUILD / "script/runner/toolchain.json").read_text())['job_identity'], run)
+    account.ensure(json.loads((BUILD / "script/runner/toolchain.json").read_text())['job_identity_by_role']['tenant'], run)
     for account in ("motor-cache",):
         run("useradd", "--system", "--user-group", "--home-dir", "/nonexistent",
             "--shell", "/usr/sbin/nologin", account)

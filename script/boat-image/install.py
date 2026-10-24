@@ -648,7 +648,7 @@ def install_units(systemd=Path("/etc/systemd/system")):
 
 
 def accounts():
-    job_account.ensure(json.loads(PARITY_PATH.read_text())['job_identity'], run)
+    job_account.ensure(json.loads(PARITY_PATH.read_text())['job_identity_by_role']['boat'], run)
     for account in ("motor-cache",):
         if subprocess.run(["id", "-u", account], capture_output=True).returncode:
             run("useradd", "--system", "--user-group", "--home-dir", "/nonexistent",

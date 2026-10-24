@@ -453,9 +453,16 @@
       "SCCACHE_DIR": null
     }
   },
-  "job_identity": {
-    "gid": 986,
-    "uid": 999
+  "job_identity_by_role": {
+    "boat": "system-assigned",
+    "build-server": {
+      "gid": 986,
+      "uid": 999
+    },
+    "tenant": {
+      "gid": 986,
+      "uid": 999
+    }
   },
   "layout_by_role": {
     "tenant": {

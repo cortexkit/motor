@@ -52,6 +52,12 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(set(manifest["rust_toolchains"]), {
             name + "-x86_64-unknown-linux-gnu" for name in ("1.91.0", "1.96.0", "1.99.0", "stable")})
 
+    def test_accounts_use_boats_system_assigned_rule(self):
+        with patch.object(install.job_account, 'ensure') as ensure, \
+             patch.object(install.subprocess, 'run', return_value=Mock(returncode=0)):
+            install.accounts()
+        ensure.assert_called_once_with('system-assigned', install.run)
+
     def test_wrong_input_hash_is_refused(self):
         pins = copy.deepcopy(self.pins)
         pins["runner_inputs_sha256"]["script/runner/tools.txt"] = "0" * 64

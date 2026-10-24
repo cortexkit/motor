@@ -220,9 +220,11 @@ these hold, and callers may rely on them:
   owned by root, so the job cannot change its own limits.
 - PID 1 in the job's PID namespace (4.1) is the bash wrapper, running as the job
   account.
-- The job account is `motor-job` (2.1). The Boat and tenant image recipes pin
-  it to the build server's uid and gid (999 and 986), but an image built before
-  that pin may differ, so prefer the properties above to the number.
+- The job account is `motor-job` (2.1). The tenant image recipe pins it to the
+  build server's uid and gid (999 and 986). Boat lets the system choose a free
+  system uid and a dedicated primary group when building each image, and records
+  the actual identity in the image inventory. Callers should check the sandbox
+  properties above, not a particular account number.
 
 A caller that checks these should check the full shape (slice, prefix, UUID
 and suffix), not a prefix, and refuse when any of them differs. The live Boat
