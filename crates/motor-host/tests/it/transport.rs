@@ -276,6 +276,34 @@ async fn helper_start_refusal_is_host_full_before_run_and_holds_the_tenant_until
             .all(|call| call != "relay:52"));
     }
 }
+#[tokio::test]
+async fn lease_admitted_before_a_start_refusal_is_refused_at_delivery_without_a_helper_call() {
+    let (runtime, fake, broker, requester, claims) = fixture();
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut client, &broker, &requester, &claims).await;
+    assert_eq!(
+        respond(&mut client, &requester, &claims, challenge).await,
+        json!({"type":"lease_ok"})
+    );
+    // Another lease's start was refused after this one was admitted: its
+    // delivery must not ask the helper again before the retry time.
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .start_refused("tenant", "fit", unix_ms());
+    write_frame(&mut client, &json!({"type":"hello","protocol_version":1}))
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(5), read_frame(&mut client))
+        .await
+        .expect("delivery answered without waking the tenant")
+        .unwrap();
+    assert_eq!(reply, json!({"type":"lease_refused","reason":"host_full"}));
+    assert!(task.await.unwrap().is_err());
+    assert!(fake.calls.lock().unwrap().is_empty());
+}
 async fn hello(
     client: &mut (impl AsyncRead + AsyncWrite + Unpin),
     broker: &SigningKey,
