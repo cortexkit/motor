@@ -1010,5 +1010,70 @@ class VerifyPhaseVerdictTests(unittest.TestCase):
         self.assertIn('| disk-quota/disk_quota/lane home | running | 2026-01-01T20:41:01+00:00 | "unmeasured" |', text)
 
 
+class FileSetattrToleranceTests(unittest.TestCase):
+    """A file_setattr INCONCLUSIVE passes only when its own control proves the kernel lacks the syscall."""
+
+    def control(self, **change):
+        control = dict(request=0x401c5820, clear_succeeded=True, before_flags=0x200, after_flags=0,
+                       before_project=0, after_project=0, file_setattr_supported=False,
+                       file_setattr_errno=38, kernel_release='6.8.0-1009-boat')
+        control.update(change)
+        return control
+
+    def data(self, evidence):
+        data = RunnerHostRenderTests().runner_data()
+        data['runner_host']['all_passed'] = False
+        data['runner_host']['checks'].append({'name': 'disk_quota.tmp.file_setattr_refusal', 'status': 'INCONCLUSIVE',
+                                              'evidence': evidence})
+        return data
+
+    def test_tolerated_when_the_control_shows_enosys(self):
+        data = self.data({'control': self.control(), 'job': {}, 'observation_gap': 'root got ENOSYS'})
+        outcome = probe.verdict(data)
+        self.assertTrue(outcome['passed'])
+        self.assertEqual(outcome['tolerated_inconclusive'], [
+            {'name': 'runner_host.disk_quota.tmp.file_setattr_refusal',
+             'reason': 'file_setattr absent on kernel 6.8.0-1009-boat (ENOSYS); not applicable'}])
+        self.assertEqual(probe.exit_status(data), 0)
+        self.assertIn('Tolerated inconclusive: `runner_host.disk_quota.tmp.file_setattr_refusal`: '
+                      'file_setattr absent on kernel 6.8.0-1009-boat (ENOSYS); not applicable.',
+                      RunnerHostRenderTests().rendered(data))
+        row = data['runner_host']['checks'][-1]
+        self.assertEqual(probe.verify_phase_status({'ran': True, 'completed': True}, [row]), 'passed')
+
+    def test_not_tolerated_when_the_control_says_the_syscall_exists(self):
+        for change in ({'file_setattr_supported': True}, {'file_setattr_supported': True, 'file_setattr_errno': 0}):
+            with self.subTest(change=change):
+                data = self.data({'control': self.control(**change), 'job': {}})
+                outcome = probe.verdict(data)
+                self.assertFalse(outcome['passed'])
+                self.assertNotIn('tolerated_inconclusive', outcome)
+                self.assertEqual(probe.exit_status(data), 1)
+
+    def test_not_tolerated_when_the_control_is_missing_or_malformed(self):
+        for evidence in ({'job': {}}, {'control': None}, {'control': {}}, None, 'control',
+                         {'control': self.control(file_setattr_supported=None)},
+                         {'control': self.control(file_setattr_errno='38')},
+                         {'control': self.control(file_setattr_errno=True)},
+                         {'control': self.control(file_setattr_errno=78)}):
+            with self.subTest(evidence=evidence):
+                data = self.data(evidence)
+                self.assertFalse(probe.verdict(data)['passed'])
+                self.assertEqual(probe.exit_status(data), 1)
+        data = self.data({'control': self.control()})
+        del data['runner_host']['checks'][-1]['evidence']
+        self.assertFalse(probe.verdict(data)['passed'])
+
+    def test_only_file_setattr_checks_use_the_enosys_control(self):
+        evidence = {'control': self.control()}
+        for name in ('disk_quota.reflink_baseline_headroom', 'disk_quota.tmp.file_setattr_refusal.extra',
+                     'prepared_clone.file_setattr_refusal'):
+            with self.subTest(name=name):
+                self.assertIsNone(probe.tolerated_inconclusive({'name': name, 'status': 'INCONCLUSIVE', 'evidence': evidence}))
+        # A FAIL is never tolerated, whatever its evidence says.
+        self.assertIsNone(probe.tolerated_inconclusive(
+            {'name': 'disk_quota.tmp.file_setattr_refusal', 'status': 'FAIL', 'evidence': evidence}))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

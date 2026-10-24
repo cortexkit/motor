@@ -292,11 +292,14 @@ The exit status reports the measurement verdict, and cleanup separately:
 accepted deletes never fails a run: nothing is left running and retrying cannot
 speed it up.
 
-`verdict.inconclusive` lists provider idle-reclaim checks marked `INCONCLUSIVE`. They
-remain `INCONCLUSIVE` in the check list rather than counting as passes, but do
-not block the runner-host verdict. Every parity, storage and other required check
-still needs `PASS`; a failed required check cannot be hidden by an inconclusive
-reclaim observation.
+`verdict.inconclusive` lists every check marked `INCONCLUSIVE`. They remain
+`INCONCLUSIVE` in the check list rather than counting as passes. Only two kinds
+do not block the runner-host verdict, each listed with its reason in
+`verdict.tolerated_inconclusive` and the findings: provider idle-reclaim checks,
+and a file_setattr refusal on a kernel its own control proves lacks the syscall
+(see Disk-quota qualification). Every parity, storage and other required check
+still needs `PASS`; a failed required check cannot be hidden by a tolerated
+inconclusive check.
 
 `Error: none recorded` in rendered findings means no measurement exception was
 caught. It does not override `cleanup_complete: false` or a failed network probe.
@@ -391,9 +394,13 @@ job refusal is a positive PASS. If root gets ENOSYS (for example on a pre-6.17
 kernel), that case is explicitly **INCONCLUSIVE**, not PASS: because root also
 returned ENOSYS, the case cannot establish that the job's ENOSYS came from its
 syscall filter. The result records the
-root control, errno and kernel release. The probe still collects quota and
-stop/resume evidence, but does not claim every required check passed when the
-path-setter case is inconclusive.
+root control, errno and kernel release. That INCONCLUSIVE does not block the
+verdict only when the check's own control shows the kernel lacks the syscall
+(`file_setattr_supported` false and errno 38, Linux ENOSYS): no job can call it
+there either, and the seccomp rule that denies it on newer kernels is covered by
+the runner's own tests. Findings print it as, for example, "file_setattr absent on
+kernel 6.8.0 (ENOSYS); not applicable". A file_setattr INCONCLUSIVE whose control
+is missing, malformed or reports the syscall present still fails the verdict.
 
 Run on the largest deployed size (`xlarge`) against a **newly rebuilt** prepared
 image. Use the existing credential reader and seed arguments. The quota lanes run

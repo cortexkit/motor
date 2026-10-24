@@ -554,12 +554,47 @@ def cleanup_state(data):
     return "purge_pending" if pending else "complete"
 
 
+# Linux's ENOSYS. The evidence comes from a Linux guest, so this is compared as
+# a number rather than with the operator machine's errno module (78 on macOS).
+LINUX_ENOSYS = 38
+FILE_SETATTR_CHECK = re.compile(r'disk_quota\.[^.]+\.file_setattr_refusal')
+
+
+def tolerated_inconclusive(row):
+    """Why an INCONCLUSIVE check does not block the verdict, or None when it does.
+
+    Two cases only. An unproven provider idle reclaim is an observation gap,
+    not a Motor failure. On a kernel without file_setattr the job's ENOSYS
+    cannot show that the seccomp filter refused the call, so that check is
+    INCONCLUSIVE; it is tolerated only when the check's own root control
+    proves the kernel lacks the syscall (not supported, errno ENOSYS): then no
+    job can call it either, and the seccomp rule that denies it on newer
+    kernels is covered by the runner's own tests. A missing or different
+    control keeps the check blocking."""
+    if row.get('status') != 'INCONCLUSIVE':
+        return None
+    name = row.get('name', '')
+    if not isinstance(name, str):
+        return None
+    if name.endswith('.idle_reclaim_observed'):
+        return 'idle reclaim not observed during the wait; provider observation gap'
+    if FILE_SETATTR_CHECK.fullmatch(name):
+        evidence = row.get('evidence')
+        control = evidence.get('control') if isinstance(evidence, dict) else None
+        if (isinstance(control, dict) and control.get('file_setattr_supported') is False
+                and type(control.get('file_setattr_errno')) is int
+                and control['file_setattr_errno'] == LINUX_ENOSYS):
+            release = control.get('kernel_release')
+            kernel = release if isinstance(release, str) and release else 'unknown'
+            return f'file_setattr absent on kernel {kernel} (ENOSYS); not applicable'
+    return None
+
+
 def required_checks_passed(checks):
-    # An unproven provider reclaim is an observation gap, not a Motor failure.
-    # Parity, storage and every other check still require a positive PASS.
+    # Every check needs a positive PASS, except an INCONCLUSIVE that
+    # tolerated_inconclusive explains.
     return bool(checks) and all(
-        row.get('status') == 'PASS' or (row.get('status') == 'INCONCLUSIVE'
-                                      and row.get('name', '').endswith('.idle_reclaim_observed'))
+        row.get('status') == 'PASS' or tolerated_inconclusive(row) is not None
         for row in checks)
 
 
@@ -587,8 +622,8 @@ def verify_phase_status(record, checks):
     """'not_run', 'passed', 'inconclusive', 'failed' or 'snapshot_size_bound' for one verify phase.
 
     Only a phase that started, finished without an error and recorded checks can
-    pass; 'inconclusive' means no check failed but one other than idle reclaim
-    could not decide, so the phase did not pass."""
+    pass; 'inconclusive' means no check failed but one that tolerated_inconclusive
+    does not explain could not decide, so the phase did not pass."""
     if record.get('ran') is not True:
         return 'not_run'
     if record.get('snapshot_size_bound'):
@@ -624,6 +659,7 @@ def verdict(data):
                             f"HTTP {bound.get('http_status')} {bound.get('boat_error')}"]}
     reasons = []
     inconclusive = []
+    tolerated = []
     if not data.get("measurements_complete"):
         reasons.append("measurements incomplete")
     if data.get("error"):
@@ -634,6 +670,9 @@ def verdict(data):
         if mode in data:
             checks = data[mode].get('checks', [])
             inconclusive.extend(mode + '.' + row['name'] for row in checks if row.get('status') == 'INCONCLUSIVE')
+            if mode == 'runner_host':
+                tolerated.extend({'name': mode + '.' + row['name'], 'reason': tolerated_inconclusive(row)}
+                                 for row in checks if tolerated_inconclusive(row) is not None)
             if data[mode].get("all_passed") is not True:
                 if mode != 'runner_host' or not required_checks_passed(checks):
                     reasons.append(mode + " checks did not all pass")
@@ -653,6 +692,9 @@ def verdict(data):
         result['image_qualified'] = not reasons and all(status == 'passed' for status in phases.values())
     if inconclusive:
         result['inconclusive'] = inconclusive
+    if tolerated:
+        # INCONCLUSIVE checks that did not block the verdict, with the reason.
+        result['tolerated_inconclusive'] = tolerated
     return result
 
 
@@ -922,6 +964,8 @@ def render_runner_host(data):
               f"Sandbox size: {display(data.get('size', 'large'))}.",
               f"Failing checks: {display(failing) if failing else 'none'}.",
               f"Inconclusive preconditions: {display(outcome.get('inconclusive')) if outcome.get('inconclusive') else 'none'}.",
+              *[f"Tolerated inconclusive: `{row.get('name')}`: {row.get('reason')}."
+                for row in outcome.get('tolerated_inconclusive', [])],
              f"Reasons: {display(outcome['reasons']) if outcome['reasons'] else 'none'}.",
              f"Measurement completion: {display(data.get('measurements_complete', False))}. Error: {error}.",
              f"Cleanup state (reported separately from the verdict): {display(cleanup_state(data))}. "

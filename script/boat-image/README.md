@@ -800,7 +800,9 @@ refusals are proved by the operator probe with successful unfiltered root
 FSSETXATTR controls;
 the job then fills the same directory whose inheritance it could not clear.
 When job-side refusal checks pass but the unfiltered root control reports
-ENOSYS for file_setattr, that live case is INCONCLUSIVE rather than PASS.
+ENOSYS for file_setattr, that live case is INCONCLUSIVE rather than PASS. It does
+not block the probe verdict only when that control shows the syscall unsupported
+with errno 38 (Linux ENOSYS); see the boat-probe README.
 
 ## Fast startup checks and failure evidence
 
