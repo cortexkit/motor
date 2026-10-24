@@ -356,8 +356,9 @@ impl Host {
             free_vcpus: self
                 .tenants
                 .values()
-                .map(|t| u64::from(t.vcpu_ceiling.saturating_sub(self.share(&t.tenant, now_ms))))
-                .sum(),
+                .map(|t| u64::from(t.budget().saturating_sub(self.share(&t.tenant, now_ms))))
+                .max()
+                .unwrap_or(0),
             free_mem_mib,
             queued: self
                 .snapshot

@@ -11,9 +11,16 @@ pub struct Tenant {
     pub tenant: String,
     pub sub: String,
     pub vcpu_ceiling: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_weight: Option<u32>,
     pub guest_ram_mib: u64,
     pub idle_suspend_s: u64,
     pub host_floor_bytes: u64,
+}
+impl Tenant {
+    pub fn budget(&self) -> u32 {
+        self.max_weight.unwrap_or(self.vcpu_ceiling)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -228,6 +235,7 @@ impl Host {
                     tenant: "sandbox".into(),
                     sub: String::new(),
                     vcpu_ceiling: ceiling,
+                    max_weight: None,
                     guest_ram_mib: 0,
                     idle_suspend_s: u64::MAX,
                     host_floor_bytes: 0,
@@ -338,18 +346,26 @@ impl Host {
         self.save(next)
     }
     pub fn share(&self, tenant: &str, now_ms: u64) -> u32 {
+        self.checked_share(tenant, now_ms).unwrap_or(u32::MAX)
+    }
+    fn checked_share(&self, tenant: &str, now_ms: u64) -> Option<u32> {
         self.snapshot
             .leases
             .values()
             .filter(|l| l.tenant == tenant && counted(l, now_ms))
             .map(|l| l.claims.vcpus)
-            .sum()
+            .try_fold(0u32, u32::checked_add)
     }
     pub fn quota(&self, tenant: &str, now_ms: u64) -> u32 {
         if !self.live.get(tenant).is_some_and(|v| v.ready) {
             1
         } else {
-            self.share(tenant, now_ms).max(1)
+            let ceiling = self
+                .tenants
+                .values()
+                .find(|t| t.tenant == tenant)
+                .map_or(1, |t| t.vcpu_ceiling);
+            self.share(tenant, now_ms).min(ceiling).max(1)
         }
     }
     pub fn is_ready(&self, tenant: &str) -> bool {
@@ -442,6 +458,22 @@ impl Host {
                 return refuse(Refusal::Auth);
             }
         } else {
+            if claims.vcpus > tenant.vcpu_ceiling {
+                return refuse(Refusal::HostFull);
+            }
+            // Released leases still appear in heartbeats, even though they no
+            // longer consume weight. Reusing a job id needs no additional entry.
+            if old.is_none()
+                && self
+                    .snapshot
+                    .leases
+                    .values()
+                    .filter(|l| l.state != LeaseState::Ended)
+                    .count()
+                    >= crate::wire::MAX_ENTRIES
+            {
+                return refuse(Refusal::HostFull);
+            }
             if next.vms.get(&tenant.tenant).is_some_and(|v| v.stop_pending) {
                 return refuse(Refusal::Capacity);
             }
@@ -469,10 +501,11 @@ impl Host {
                 .as_ref()
                 .filter(|l| counted(l, now_ms))
                 .map_or(0, |l| l.claims.vcpus);
-            if u64::from(self.share(&tenant.tenant, now_ms)) - u64::from(previous_share)
-                + u64::from(claims.vcpus)
-                > u64::from(tenant.vcpu_ceiling)
-            {
+            let share = self
+                .checked_share(&tenant.tenant, now_ms)
+                .and_then(|share| share.checked_sub(previous_share))
+                .and_then(|share| share.checked_add(claims.vcpus));
+            if share.is_none_or(|share| share > tenant.budget()) {
                 return refuse(Refusal::HostFull);
             }
             if replacing {
@@ -547,7 +580,11 @@ impl Host {
         {
             return refuse(Refusal::Capacity);
         }
-        if self.share(&lease.tenant, self.observed_at_ms) > tenant.vcpu_ceiling {
+        if lease.claims.vcpus > tenant.vcpu_ceiling
+            || self
+                .checked_share(&lease.tenant, self.observed_at_ms)
+                .is_none_or(|share| share > tenant.budget())
+        {
             return refuse(Refusal::HostFull);
         }
         Ok(if lease.replacing {
