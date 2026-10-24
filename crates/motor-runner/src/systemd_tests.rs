@@ -66,6 +66,17 @@ fn missing_or_unbounded_job_slice_refuses_execution() {
     }
 }
 
+/// Admission keeps only the remembered ceiling, and the placeholder for "no
+/// reading" must never look like a real one.
+#[test]
+fn a_remembered_slice_ceiling_reads_back_as_a_budget() {
+    assert_eq!(
+        JobMemoryBudget::from_max(25_769_803_776).map(|budget| budget.max),
+        Some(25_769_803_776)
+    );
+    assert_eq!(JobMemoryBudget::from_max(NO_JOB_MEMORY_BUDGET), None);
+}
+
 #[test]
 fn dead_launcher_never_counts_as_a_started_job_even_if_unit_is_active() {
     with_process_hook(Box::new(|_| Ok(output(""))), || {
