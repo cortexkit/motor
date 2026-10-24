@@ -44,7 +44,7 @@ SUB = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV"
 def config():
     return p.checked(dict(tenant="a", sub="acct:01ARZ3NDEKTSV4RRFFQ69G5FAV", vm="vm-a", image_version="v1", vcpu_ceiling=2,
                           guest_ram_mib=18432, disk_quota_bytes=21474836480, cpuset="0-1", tap_index=1, idle_suspend_s=60,
-                          host_floor_bytes=2147483648, resolvers=["1.1.1.1"]))
+                          host_floor_bytes=p.RUNNER_DEFAULT_FLOOR, resolvers=["1.1.1.1"]))
 
 
 class ProvisionTests(unittest.TestCase):
@@ -58,7 +58,10 @@ class ProvisionTests(unittest.TestCase):
                                           JOBS_DROP_IN=self.root / "jobs.conf",
                                           read_capacity=lambda: {"windows_vm_bytes": 16 * 1024**3,
                                                                  "host_reserve_bytes": 6 * 1024**3,
-                                                                 "jobs_min_bytes": 24 * 1024**3},
+                                                                 "jobs_min_bytes": 24 * 1024**3,
+                                                                 "storage_margin_bytes": 8 * 1024**3,
+                                                                 "growth_allowance_bytes": 64 * 1024**3,
+                                                                 "tenant_memory_reserve_bytes": 2 * 1024**3},
                                           memtotal_bytes=lambda: 128 * 1024**3,
                                           slice_properties=lambda _names: {"LoadState": "loaded", "MemoryMax": "42949672960"},
                                           runner_processes=lambda: [])
@@ -551,7 +554,6 @@ class ProvisionTests(unittest.TestCase):
         (p.base_path(c, self.image)).mkdir(parents=True)
         for name in ("base.vmstate", "base.memory"):
             (p.base_path(c, self.image) / name).write_bytes(b"x")
-        consumed = c["disk_quota_bytes"] + c["guest_ram_mib"] * 1048576
         state = self.root / "runner-state"
         floor = 128 * 1024**3
         # The lower-floor runner does not decide; the highest floor on the
@@ -562,21 +564,135 @@ class ProvisionTests(unittest.TestCase):
             if args[0] == "fallocate":
                 args[-1].write_bytes(b"allocated")
         execute = mock.Mock(side_effect=allocate)
-        free = type("Usage", (), {"free": consumed + floor - 1})
-        with mock.patch.object(p.shutil, "disk_usage", return_value=free), \
-                self.assertRaisesRegex(ValueError, r"would leave 127\.9 GiB free .* below motor-runner pid 4242's refusal floor 128\.0 GiB"):
+        needed = p.pre_operation_free_bytes(c, p.read_capacity(), True)
+        # One byte short of the host requirement is refused before the runner
+        # is consulted at all.
+        with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": needed - 1})), \
+                self.assertRaisesRegex(ValueError, f"provisioning needs {needed} free bytes"):
             p.provision(c, execute=execute, runners=runner)
         execute.assert_not_called()
         self.assertFalse((p.ROOT / "tenants" / c["tenant"]).exists())
-        # A runner whose state is on another filesystem does not count.
-        with mock.patch.object(p.shutil, "disk_usage", return_value=free), \
+        # With the runner's state outside the tenant's filesystem, the same
+        # host passes.
+        ample = needed + floor
+        with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": ample})), \
                 mock.patch.object(p, "device", side_effect=lambda path: 1 if path == state else 2):
             p.provision(c, execute=execute, runners=runner)
         execute.reset_mock()
         c2 = dict(c, tenant="b", vm="vm-b", tap_index=2)
-        with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": consumed + floor})):
+        # Sharing the filesystem admits the tenant too, with room for its
+        # requirement and the runner's floor on top.
+        with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": ample + floor})):
             p.provision(c2, execute=execute, runners=runner)
         execute.assert_called()
+
+    def test_pre_operation_requirement_passes_at_exact_and_refuses_one_byte_short(self):
+        index = [0]
+        for base, idle in ((False, 60), (True, 60), (False, 0), (True, 0)):
+            with self.subTest(base=base, idle=idle):
+                number = index[0]
+                index[0] += 1
+                c = p.checked({**config(), "tenant": f"exact{number}", "vm": f"vm-exact{number}",
+                               "tap_index": 20 + number, "idle_suspend_s": idle})
+                base_dir = p.base_path(c, self.image)
+                if base:
+                    base_dir.mkdir(parents=True, exist_ok=True)
+                    for name in ("base.vmstate", "base.memory"):
+                        (base_dir / name).write_bytes(b"base")
+                else:
+                    for name in ("base.vmstate", "base.memory"):
+                        (base_dir / name).unlink(missing_ok=True)
+                    if base_dir.exists():
+                        base_dir.rmdir()
+                self.assertEqual(p.base_present(c, self.image), base)
+                needed = p.pre_operation_free_bytes(c, p.read_capacity(), base)
+                def allocate(*args):
+                    if args[0] == "fallocate":
+                        with args[-1].open("wb") as file:
+                            file.truncate(args[2])
+                execute = mock.Mock(side_effect=allocate)
+                with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": needed - 1})), \
+                        self.assertRaisesRegex(ValueError, f"provisioning needs {needed} free bytes"):
+                    p.provision(c, execute=execute)
+                execute.assert_not_called()
+                self.assertFalse((p.ROOT / "tenants" / c["tenant"]).exists())
+                make_base = mock.Mock(side_effect=self.fake_base)
+                with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": needed})):
+                    p.provision(c, execute=execute, make_base=make_base)
+                execute.assert_called()
+                self.assertEqual(make_base.call_count, 0 if base else 1)
+
+    def test_permits_come_from_max_weight_and_are_never_injected(self):
+        keyless = config()
+        self.assertNotIn("max_weight", keyless)
+        self.assertIn("--max-weight 2 --rustc-slots 2", p.runner_args(keyless))
+        record = {name: value for name, value in keyless.items() if name not in p.PROVISION_ONLY}
+        self.assertNotIn("max_weight", record)
+        # The operator's budget reaches both runner arguments and the helper
+        # registry, and the two arguments stay equal for the guest's check.
+        c = p.checked({**config(), "max_weight": 64, "vcpu_ceiling": 24})
+        self.assertIn("--max-weight 64 --rustc-slots 64", p.runner_args(c))
+        self.assertEqual(c["max_weight"], 64)
+        # A value the guest's u32 parser cannot read, one below the ceiling and
+        # a non-integer are all refused.
+        for value in (2**32, 2**32 - 1 + 1, 23, 0, -1, True, "64", 1.5):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                p.checked({**config(), "max_weight": value, "vcpu_ceiling": 24})
+        # The largest u32 is accepted, and idle 0 provisions.
+        self.assertEqual(p.checked({**config(), "max_weight": 2**32 - 1, "vcpu_ceiling": 24})["max_weight"], 2**32 - 1)
+        self.assertEqual(p.checked({**config(), "idle_suspend_s": 0})["idle_suspend_s"], 0)
+        with self.assertRaisesRegex(ValueError, "idle_suspend_s"):
+            p.checked({**config(), "idle_suspend_s": -1})
+
+    def test_a_sparse_v1_image_truncates_and_other_images_fallocate(self):
+        for index, (capabilities, allocated) in enumerate([(["sparse-v1"], False), ([], True), (None, True)]):
+            with self.subTest(capabilities=capabilities):
+                manifest = dict(version="v1", kernel_sha256=hashlib.sha256(b"kernel").hexdigest(),
+                                rootfs_sha256=hashlib.sha256(b"root").hexdigest())
+                if capabilities is not None:
+                    manifest["capabilities"] = capabilities
+                (self.image / "manifest.json").write_text(json.dumps(manifest))
+                calls = []
+                def execute(*args):
+                    calls.append(args[0])
+                    if args[0] == "fallocate":
+                        # A real fallocate gives the file the quota's length.
+                        with args[-1].open("wb") as file:
+                            file.truncate(args[2])
+                c = p.checked({**config(), "tenant": f"sparse{index}", "vm": f"vm-sparse{index}", "tap_index": 10 + index})
+                base = p.base_path(c, self.image)
+                base.mkdir(parents=True, exist_ok=True)
+                for name in ("base.vmstate", "base.memory"):
+                    (base / name).write_bytes(b"base")
+                with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": p.pre_operation_free_bytes(c, p.read_capacity(), True)})):
+                    p.provision(c, execute=execute)
+                disk = p.ROOT / "tenants" / c["tenant"] / "disk.img"
+                self.assertEqual(disk.stat().st_size, c["disk_quota_bytes"])
+                self.assertEqual("fallocate" in calls, allocated)
+                self.assertEqual(calls[:2] if allocated else calls[:1], ["fallocate", "mkfs.xfs"] if allocated else ["mkfs.xfs"])
+
+    def test_base_drive_carries_discard_and_a_protected_vmm(self):
+        requests = dict(p.base_requests(config(), "console=ttyS0"))
+        self.assertEqual(requests["/drives/tenant"]["discard"], True)
+        self.assertEqual(requests["/drives/tenant"]["io_engine"], "Sync")
+        p.SCHEMA.validate("PUT", "/drives/tenant", requests["/drives/tenant"])
+        scratch = self.root / "proc"
+        scratch.mkdir()
+        (scratch / "comm").write_text("firecracker\n")
+        value = self.root / "oom_score_adj"
+        self.assertEqual(p.protect_vmm(123, proc=scratch, oom=scratch)["oom_score_adj"], -500)
+        self.assertEqual((scratch / "oom_score_adj").read_text(), "-500")
+        # A wrong process, a failed write and a wrong read-back all refuse the
+        # boot instead of leaving an unprotected VMM running.
+        (scratch / "comm").write_text("bash\n")
+        with self.assertRaisesRegex(RuntimeError, "expected firecracker"):
+            p.protect_vmm(123, proc=scratch, oom=scratch)
+        (scratch / "comm").write_text("firecracker\n")
+        with mock.patch.object(Path, "write_text", side_effect=OSError("injected")), \
+                self.assertRaisesRegex(RuntimeError, "cannot set the VMM oom_score_adj"):
+            p.protect_vmm(123, proc=scratch, oom=scratch)
+        with self.assertRaisesRegex(RuntimeError, "oom readback"):
+            p.protect_vmm(123, proc=scratch, oom=scratch, reread=lambda: "0\n")
 
     def test_existing_disk_is_never_overwritten(self):
         home = self.root / "tenants/a"

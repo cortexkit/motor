@@ -31,6 +31,17 @@ JOBS_DROP_IN = Path("/etc/systemd/system/motor-jobs.slice.d/50-capacity.conf")
 U64_MAX = 2**64 - 1
 CAPACITY_KEYS = {"windows_vm_bytes", "host_reserve_bytes", "jobs_min_bytes", "storage_margin_bytes",
                  "growth_allowance_bytes", "tenant_memory_reserve_bytes"}
+U32_MAX = 2**32 - 1
+# motor-runner's default free-space floor (crates/motor-runner/src/engine.rs,
+# DEFAULT_FREE_SPACE_FLOOR_BYTES): below it the runner refuses jobs.
+# Between it and the runner's higher eviction threshold the runner deletes idle
+# workspaces and caches by design; nothing fails there.
+RUNNER_DEFAULT_FLOOR = 128 * 1024**3
+# The VMM ranks below jobs (+900) and above runners (-900) with the kernel's
+# OOM killer, so a host OOM prefers a job over the tenant's VM.
+VMM_OOM_SCORE_ADJ = -500
+# Room mkfs needs beyond the operating requirement when it writes a filesystem.
+METADATA_ALLOWANCE_BYTES = 2 * 1024**3
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "tenant-vm-spike/api_schema.py"
 spec = importlib.util.spec_from_file_location("tenant_firecracker_schema", SCHEMA_PATH)
 assert spec is not None and spec.loader is not None
@@ -192,6 +203,50 @@ def apply_jobs_slice():
         verify_jobs_slice(capacity)
 
 
+def storage_threshold(c, capacity):
+    """Host free bytes below which motor-host refuses new leases.
+
+    motor-host mirrors this formula over every registered tenant; the reserve
+    keeps a suspend possible at the threshold, because a suspend needs room
+    for the guest's RAM plus the host floor.
+    """
+    reserve = c["guest_ram_mib"] * 1048576 if c["idle_suspend_s"] > 0 else 0
+    threshold = u64(c["host_floor_bytes"] + reserve, "host floor and suspend reserve")
+    return u64(threshold + capacity["storage_margin_bytes"], "storage threshold")
+
+
+def operating_requirement(c, capacity):
+    """Free bytes provisioning and resize must leave for motor-host."""
+    return u64(storage_threshold(c, capacity) + capacity["storage_margin_bytes"]
+               + capacity["growth_allowance_bytes"], "operating requirement")
+
+
+def pre_operation_free_bytes(c, capacity, base_present):
+    """Free host bytes the operation needs before it creates anything.
+
+    A resize of the size base itself must fit: an absent base needs the
+    guest's RAM plus the 512 MiB placeholder, and every operation needs 2 GiB
+    for the filesystem metadata mkfs writes.
+    """
+    needed = u64(operating_requirement(c, capacity) + METADATA_ALLOWANCE_BYTES, "metadata allowance")
+    if not base_present:
+        needed = u64(needed + c["guest_ram_mib"] * 1048576 + 512 * 1048576, "size base space")
+    return needed
+
+
+def base_present(c, image):
+    base = base_path(c, image)
+    return base.exists() and all((base / name).is_file() for name in ("base.vmstate", "base.memory"))
+
+
+def sparse_v1(manifest):
+    """Whether an image manifest lists the sparse-v1 capability."""
+    capabilities = manifest.get("capabilities", [])
+    if not isinstance(capabilities, list):
+        raise ValueError("image manifest capabilities must be a list")
+    return "sparse-v1" in capabilities
+
+
 def component(value):
     if not isinstance(value, str) or not value or value in (".", "..") or "/" in value or "\0" in value or len(value.encode()) > 128:
         raise ValueError("expected a single nonempty path component")
@@ -200,7 +255,8 @@ def component(value):
 
 def checked(config):
     allowed = {"tenant", "sub", "vm", "image_version", "vcpu_ceiling", "guest_ram_mib", "disk_quota_bytes", "cpuset", "tap_index",
-               "idle_suspend_s", "host_floor_bytes", "memory_headroom_mib", "snapshot_memory_high_mib", "io_weight", "resolvers", "capture_console"}
+               "idle_suspend_s", "host_floor_bytes", "memory_headroom_mib", "snapshot_memory_high_mib", "io_weight", "resolvers",
+               "capture_console", "max_weight"}
     if set(config) - allowed:
         raise ValueError("unknown provisioning key")
     c = dict(config)
@@ -213,11 +269,19 @@ def checked(config):
     for name, default in (("idle_suspend_s", 600), ("host_floor_bytes", 128 * 1024**3),
                           ("memory_headroom_mib", 512), ("snapshot_memory_high_mib", 16384), ("io_weight", 100)):
         c.setdefault(name, default)
-    for name in ("vcpu_ceiling", "guest_ram_mib", "disk_quota_bytes", "tap_index", "idle_suspend_s", "memory_headroom_mib", "snapshot_memory_high_mib", "io_weight"):
+    for name in ("vcpu_ceiling", "guest_ram_mib", "disk_quota_bytes", "tap_index", "memory_headroom_mib", "snapshot_memory_high_mib", "io_weight"):
         if type(c[name]) is not int or c[name] <= 0:
             raise ValueError(f"{name} must be a positive integer")
+    # Zero idle means the tenant never suspends; motor-host reads it that way.
+    if type(c["idle_suspend_s"]) is not int or c["idle_suspend_s"] < 0:
+        raise ValueError("idle_suspend_s must be a nonnegative integer")
     if type(c["host_floor_bytes"]) is not int or c["host_floor_bytes"] < 0:
         raise ValueError("host floor must be nonnegative bytes")
+    if c["host_floor_bytes"] < RUNNER_DEFAULT_FLOOR:
+        # The direct runner refuses jobs below its own free-space floor. A host
+        # floor under that lets the threshold sit below the point where the
+        # runner already stopped admitting.
+        raise ValueError(f"host_floor_bytes must be at least the direct runner floor {RUNNER_DEFAULT_FLOOR}")
     if c["vcpu_ceiling"] > 256 or c["tap_index"] > 254 or c["io_weight"] > 10000 or c["memory_headroom_mib"] < 512:
         raise ValueError("invalid tenant limits")
     if not re.fullmatch(r"[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*", c["cpuset"]):
@@ -233,12 +297,24 @@ def checked(config):
         raise ValueError("resolvers must be public IPv4 addresses")
     if c["disk_quota_bytes"] + c["guest_ram_mib"] * 1048576 + c["host_floor_bytes"] >= 2**64:
         raise ValueError("space requirement overflows u64")
+    if "max_weight" in c:
+        # The guest's own parser reads max_weight as a u32, so a larger value
+        # would boot a runner that refuses its arguments.
+        weight = c["max_weight"]
+        if type(weight) is not int or not 0 < weight <= U32_MAX:
+            raise ValueError("max_weight must be an integer between 1 and 4294967295")
+        if weight < c["vcpu_ceiling"]:
+            raise ValueError("max_weight must be at least vcpu_ceiling")
     return c
 
 
 def runner_args(c):
+    # The permit budget is max_weight when the operator set it, and the vCPU
+    # ceiling otherwise, so a record without the key produces the same bytes
+    # it always did. The guest requires the two values to be equal.
+    weight = c.get("max_weight", c["vcpu_ceiling"])
     return (f"--backend host --tenant-vm --job-network veth --state-root /tenant/state "
-            f"--max-weight {c['vcpu_ceiling']} --rustc-slots {c['vcpu_ceiling']} "
+            f"--max-weight {weight} --rustc-slots {weight} "
             f"--sccache-size-gib {min(200, c['disk_quota_bytes'] // (4 * 1024**3))} "
             f"--free-space-floor-bytes {c['disk_quota_bytes'] // 10} "
             "--workspace-root /Users --owned-workspace-root /Users "
@@ -691,11 +767,6 @@ def trusted(path):
             raise ValueError(f"path must be root-owned, non-writable and not a symlink: {p}")
 
 
-# motor-runner's default free-space floor (crates/motor-runner/src/engine.rs):
-# below it the runner refuses jobs. Between it and the runner's higher eviction
-# threshold the runner deletes idle workspaces and caches by design; nothing
-# fails there.
-RUNNER_DEFAULT_FLOOR = 128 * 1024**3
 # The runner's options that take no value; every other option takes one.
 RUNNER_FLAGS = {"--tenant-vm", "--boat-profile"}
 
@@ -871,6 +942,33 @@ def boot_args(image):
     return args
 
 
+def protect_vmm(pid, proc=Path("/proc"), oom=Path("/proc"), reread=None):
+    """Give the VMM an OOM score below jobs (+900) and above runners (-900).
+
+    The jailer execs Firecracker in place, so the jailer's pid is the VMM's.
+    A set or read-back failure is fatal: a VMM ranked like a job could be the
+    kernel's first victim on a host whose memory is already over-committed.
+    """
+    try:
+        comm = (proc / "comm").read_text().strip()
+    except OSError as error:
+        raise RuntimeError(f"cannot confirm the VMM process: {error}") from error
+    if comm != "firecracker":
+        raise RuntimeError(f"expected firecracker, comm={comm!r}")
+
+    def read_back():
+        return (oom / "oom_score_adj").read_text()
+
+    try:
+        (oom / "oom_score_adj").write_text(str(VMM_OOM_SCORE_ADJ))
+        actual = (reread or read_back)().strip()
+    except OSError as error:
+        raise RuntimeError(f"cannot set the VMM oom_score_adj: {error}") from error
+    if actual != str(VMM_OOM_SCORE_ADJ):
+        raise RuntimeError(f"oom readback: expected {VMM_OOM_SCORE_ADJ}, got {actual!r}")
+    return dict(pid=pid, comm=comm, oom_score_adj=int(actual))
+
+
 class BootEvidence:
     """Optional operator artifacts that survive removal of a failed base jail."""
     def __init__(self, directory):
@@ -934,7 +1032,8 @@ def base_requests(c, args):
     return [("/machine-config", {"vcpu_count": c["vcpu_ceiling"], "mem_size_mib": c["guest_ram_mib"], "smt": False}),
             ("/boot-source", {"kernel_image_path": "/kernel", "boot_args": args}),
             ("/drives/rootfs", {"drive_id": "rootfs", "path_on_host": "/rootfs.ext4", "is_root_device": True, "is_read_only": True}),
-            ("/drives/tenant", {"drive_id": "tenant", "path_on_host": "/tenant.img", "is_root_device": False, "is_read_only": False}),
+            ("/drives/tenant", {"drive_id": "tenant", "path_on_host": "/tenant.img", "is_root_device": False, "is_read_only": False,
+                                "discard": True, "io_engine": "Sync"}),
             ("/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": "base0", "guest_mac": "06:00:ac:10:00:02"}),
             ("/vsock", {"guest_cid": 3, "uds_path": "/vsock.sock"}),
             ("/actions", {"action_type": "InstanceStart"})]
@@ -1000,6 +1099,7 @@ def build_base(c, image, base, console=None, diagnostics=None):
         proc = subprocess.Popen([str(a) for a in args], stdin=subprocess.DEVNULL,
                                 stdout=console if console is not None else subprocess.DEVNULL,
                                 stderr=stderr if stderr is not None else (console if console is not None else None))
+        evidence.record("vmm_oom_protection", **protect_vmm(proc.pid))
         deadline = time.monotonic() + 10
         while True:
             try:
@@ -1100,14 +1200,15 @@ def provision(c, make_base=build_base, execute=run, stage=None, runners=None):
             digest = hasher.hexdigest()
         if digest != manifest[key]:
             raise ValueError(f"image digest mismatch: {name}")
-    # Byte accounting includes suspend room AND a new size base. Neither a disk
-    # nor a directory is created if the available byte count is one byte short.
-    needed = c["disk_quota_bytes"] + c["guest_ram_mib"] * 1048576 + c["host_floor_bytes"]
-    if not base.exists():
-        needed += c["guest_ram_mib"] * 1048576 + 512 * 1048576
+    # Byte accounting includes the size base, the filesystem metadata mkfs
+    # writes, and the space motor-host needs to stay admitting and to let the
+    # disk grow. Neither a disk nor a directory is created if the available byte
+    # count is one byte short.
+    needed = pre_operation_free_bytes(c, capacity, base_present(c, image))
     free = shutil.disk_usage(ROOT).free
     if free < needed:
-        raise ValueError("insufficient host free bytes")
+        raise ValueError(f"provisioning needs {needed} free bytes on {ROOT}; {free} are available")
+
     # On a host that also runs motor-runner, the bytes this tenant can consume
     # (its disk, a suspend snapshot and any new size base) must leave free space
     # at or above that runner's refusal floor. Between the floor and its
@@ -1125,7 +1226,13 @@ def provision(c, make_base=build_base, execute=run, stage=None, runners=None):
     home.mkdir(mode=0o700)
     (home / "suspend").mkdir(mode=0o700)
     disk = home / "disk.img"
-    execute("fallocate", "-l", c["disk_quota_bytes"], disk)
+    if sparse_v1(manifest):
+        # The guest sees the full quota, but only the blocks it writes occupy
+        # the host. Its trim support returns freed blocks to the host filesystem.
+        with disk.open("wb") as file:
+            file.truncate(c["disk_quota_bytes"])
+    else:
+        execute("fallocate", "-l", c["disk_quota_bytes"], disk)
     disk.chmod(0o600)
     execute("mkfs.xfs", "-m", "reflink=1", disk)
     # This is the only host mount of the tenant filesystem, before any VM can

@@ -18,14 +18,27 @@ The JSON configuration has these required fields:
 - `vcpu_ceiling`, `guest_ram_mib`, `disk_quota_bytes`, `cpuset`, `tap_index` (1–254);
 - `resolvers`: public IPv4 resolver addresses, also configured in the host agent.
 
-Optional fields are `idle_suspend_s` (600), `host_floor_bytes` (128 GiB),
+Optional fields are `idle_suspend_s` (600), `host_floor_bytes` (128 GiB,
+minimum: the direct runner's 128 GiB free-space floor),
 `memory_headroom_mib` (512, minimum 512), `snapshot_memory_high_mib` (16384,
-clamped to guest RAM), and `io_weight` (100, range 1–10000). The default memory
+clamped to guest RAM), `io_weight` (100, range 1–10000), and `max_weight` (the
+permit budget, described below). `idle_suspend_s` 0 means the tenant never
+suspends. The default memory
 limit is `(guest_ram_mib + 512) * 1048576`, with `memory.high` applied **only**
 while creating a snapshot. The fixed jail `pids.max` is `vcpu_ceiling + 64`.
 Snapshot creation has substantial writeback costs; tune the I/O weight and
 headroom on the target host before production use. Weight is proportional
 sharing, not an absolute bandwidth guarantee.
+
+`max_weight` is the tenant's budget of concurrent job permits, counted as
+summed vCPU claims. It is optional: without it the budget is `vcpu_ceiling`,
+which is exactly what the guest runner arguments and host admission used
+before, so a record without the key provisions byte for byte as before.
+`checked()` never adds the key, so `switch-image` and `repair-from-registry`
+compare old records unchanged. When set, it is a positive integer of at most
+4294967295 (the guest's `u32` parser), and at least `vcpu_ceiling`; anything else
+is refused before any write. Both runner arguments, `--max-weight` and
+`--rustc-slots`, carry the budget and stay equal for the guest's own check.
 
 Choose a cpuset excluding the host runner's reserved Windows CPUs. Each tap
 index must be unique and reserves a dedicated no-login uid `400000 + index`;
@@ -96,9 +109,22 @@ MemoryHigh=35791394134
 
 ## Tenant allocation
 
-Provisioning checks **bytes** before allocating anything for the tenant: disk
-quota + suspend RAM + host floor, plus RAM and the temporary placeholder when a
-new size base is needed. On a host that also runs `motor-runner serve`, it reads
+Provisioning checks **bytes** before allocating anything for the tenant, against
+the same storage rule motor-host applies on every admission and heartbeat:
+
+```text
+host_floor_bytes + (idle_suspend_s > 0 ? guest RAM : 0)   the suspend reserve
+  + storage_margin_bytes                                  the storage threshold
+  + storage_margin_bytes + growth_allowance_bytes         the operating requirement
+  + 2 GiB (mkfs metadata)
+  + guest RAM + 512 MiB, only while the size base is absent
+```
+
+An operator budget with these values is `/etc/motor-host/capacity.json`. Nothing
+is created when free space falls one byte short. The same rule is exposed as
+`storage_threshold`, `operating_requirement` and `pre_operation_free_bytes`, and
+motor-host keeps the same numbers (`test_storage_requirement_pinned_to_the_cutover_figures`,
+`test_pre_operation_requirement_passes_at_exact_and_refuses_one_byte_short`). On a host that also runs `motor-runner serve`, it reads
 each runner's live arguments (`--free-space-floor-bytes` and `--state-root`,
 defaulting as the runner does). For every runner whose state shares the
 filesystem of `/var/lib/motor-vm`, it refuses unless the free space left after
@@ -111,9 +137,15 @@ runner's arguments cannot be parsed, or if its state root comes from an
 environment it cannot read
 (`test_runner_on_the_same_filesystem_keeps_its_refusal_floor_before_any_mutation`).
 It builds `base/<ceiling>-<ram>/{base.vmstate,base.memory}`
-only if absent. It fully allocates a new disk (never reflinks it), formats XFS
-with reflink enabled, and mounts it only during initial creation of
-`/tenant/runner-args`. It writes generation zero, a root-only helper registry
+only if absent. An image whose manifest lists the capability `sparse-v1` gets a
+disk truncated to the quota, so the guest sees the whole size and only blocks it
+writes occupy the host; any other image gets a fully allocated disk as before
+and is never reflinked. An existing disk is never rewritten, whichever way it
+was created. The base boot asks Firecracker for `discard` on the tenant drive
+with the `Sync` IO engine, so the guest's freed blocks reach the host, and it
+sets the VMM's `oom_score_adj` to -500 and reads it back, refusing the boot when
+either step fails. The disk is formatted XFS with reflink enabled and mounted
+only during initial creation of `/tenant/runner-args`. It writes generation zero, a root-only helper registry
 entry under `/etc/motor-vm-helper/tenants`, and the host-readable
 `/etc/motor-host/tenants.json` binding map. Existing tenants, tap indices and VM
 bindings are refused. Failure intentionally retains partially created disk
