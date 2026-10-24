@@ -110,7 +110,35 @@ request bytes, not canonical JSON.
 ### Error catalog
 
 Every error body is exactly `{"error":"<code>"}`, with no other member, except `no_host_fits`,
-which is exactly `{"error":"no_host_fits","max_vcpus":<integer>}` in that member order.
+which is exactly `{"error":"no_host_fits","max_vcpus":<integer>}` in that member order, and
+`bad_request`, which may also carry `field` as described below.
+
+**The `bad_request` field.** A 400 `bad_request` raised while validating a request body carries an
+optional string member `field`, after `error`, naming what failed:
+`{"error":"bad_request","field":"timeout_s"}`. Its value is a member path from the broker's own
+schema or the fixed value `body`, and never echoes client-supplied names. It is derived as follows:
+
+- A documented member that is missing, of the wrong type, out of range or failing its grammar is
+  named by its path, with dots for nested members: `timeout_s`, `placement_hint.host`,
+  `requester_jwk.x`. A member of an array element is named without an index: `warm.vm`,
+  `running.state`.
+- A member the schema doesn't define, at any nesting level, is reported as `body`. The unexpected
+  member's own name is never returned.
+- A body that isn't JSON or isn't an object is `body`. So is a body the strict JSON rules above
+  refuse before any member is identified: invalid UTF-8, a duplicate key, a number with a fraction
+  or exponent or outside the safe-integer range, or more than 65536 bytes.
+- A rule between members names the member that makes the body invalid: `shadow: true` with
+  `allow_spill: false` names `shadow` (`allow_spill: false` is valid on its own), and a usage
+  `ended_at_ms` before its `started_at_ms` names `ended_at_ms`. A checked value that doesn't match
+  the job names that value's member: a finish `run_ms` above `max_s × 1000` names `run_ms`, and a
+  usage `vcpus` that differs from the lease names `vcpus`.
+
+When a body has several faults, `field` names one of them; which one is not part of the contract.
+A 400 `bad_request` that is not about the body has no `field`: a missing or different
+Content-Type, an invalid path `job_id` or path host, and a query string on a host route. `field` is
+diagnostic: the broker doesn't log it, and it never changes what the refusal means. Clients must
+accept a 400 `bad_request` without `field`. `test-vectors/runners/bad-request.json` records exact
+request and reply bytes.
 
 | Status | Code |
 | --- | --- |

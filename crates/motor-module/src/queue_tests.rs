@@ -1202,11 +1202,22 @@ async fn spilled_deliberate_refusals_stay_final() {
 /// body's non-secret members, never the requester key.
 #[tokio::test]
 async fn spilled_bad_request_returns_to_build_server_and_logs_the_body() {
-    let broker = crate::hosted::test_http::Http::new(|path, _| {
+    for (status, body) in crate::hosted::tests::cloud_bad_request_replies() {
+        spilled_bad_request_reply(status, body).await;
+    }
+}
+
+async fn spilled_bad_request_reply(status: u16, body: String) {
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let expected_field = parsed["field"].as_str().unwrap_or("unknown");
+    let broker = crate::hosted::test_http::Http::with_reply_bytes(move |path, _| {
         if path == "/v1/leases" {
-            (400, serde_json::json!({"error": "bad_request"}))
+            (status, body.as_bytes().to_owned())
         } else {
-            (404, serde_json::json!({"error": "job_unknown"}))
+            (
+                404,
+                serde_json::to_vec(&serde_json::json!({"error": "job_unknown"})).unwrap(),
+            )
         }
     })
     .await;
@@ -1249,6 +1260,7 @@ async fn spilled_bad_request_returns_to_build_server_and_logs_the_body() {
         "route=spill".into(),
         "http_status=400".into(),
         "broker_code=bad_request".into(),
+        format!("field={expected_field}"),
         "vcpus=2".into(),
         "timeout_s=30".into(),
         "platform=linux-x64".into(),
@@ -1259,7 +1271,7 @@ async fn spilled_bad_request_returns_to_build_server_and_logs_the_body() {
         assert!(refused[0].contains(&field), "{field}: {text}");
     }
     assert!(!text.contains(&x), "requester key logged: {text}");
-    assert!(!text.contains("requester_jwk"), "{text}");
+    assert!(!text.contains("requester_jwk="), "{text}");
     assert!(!text.contains("lease_mismatch"), "{text}");
     let returned: Vec<_> = text
         .lines()

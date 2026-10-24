@@ -341,6 +341,120 @@ async fn stage1_invalid_lease_bodies_are_typed_refusals_not_lease_mismatch() {
     }
 }
 
+async fn assert_stage1_bad_request(status: u16, body: String, expected_field: Option<&str>) {
+    let broker = crate::hosted::test_http::Http::with_reply_bytes(move |path, _| {
+        if path == "/v1/leases" {
+            (status, body.as_bytes().to_owned())
+        } else {
+            (
+                404,
+                serde_json::to_vec(&serde_json::json!({"error": "job_unknown"})).unwrap(),
+            )
+        }
+    })
+    .await;
+    let h = Harness::new(Behavior::CompleteRun).await;
+    let (scratch, repo) = committed_repo();
+    let mut cfg = config(&h, &repo);
+    cfg.broker_url = Some(broker.url.clone());
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let motor = Motor::with_connector(cfg, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let captured = crate::logging::Captured::default();
+    let _log = crate::logging::scoped(captured.clone());
+    let stream = motor.run(request(&repo)).unwrap();
+    let id = stream.job_id;
+    let (_, terminal) = records(stream).await;
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RequestRejected
+        }
+    );
+    let detail = expected_field.map_or_else(
+        || "hosted_request_invalid".to_owned(),
+        |field| format!("hosted_request_invalid: {field}"),
+    );
+    assert_eq!(
+        terminal.refusal_detail.as_deref(),
+        Some(format!("hosted stage-1 routing (hosted_repositories): {detail}").as_str())
+    );
+    let state = motor.hosted_state(id).unwrap();
+    assert_eq!(state.hosted_code.as_deref(), Some("hosted_request_invalid"));
+    assert!(state.hosted_no_fallback && !state.run_sent);
+    assert_eq!(
+        broker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path == "/v1/leases")
+            .count(),
+        1
+    );
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    let text = captured.text();
+    let warnings: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("hosted lease body refused by broker"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{text}");
+    for member in [
+        "WARN".to_owned(),
+        format!("job_id={id}"),
+        "route=repository_routed".into(),
+        "http_status=400".into(),
+        "broker_code=bad_request".into(),
+        format!("field={}", expected_field.unwrap_or("unknown")),
+    ] {
+        assert!(warnings[0].contains(&member), "{member}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn stage1_cloud_bad_request_fields_reach_warning_and_refusal() {
+    let replies = crate::hosted::tests::cloud_bad_request_replies();
+    assert_eq!(replies.len(), 10);
+    for (status, body) in replies {
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_stage1_bad_request(status, body, parsed["field"].as_str()).await;
+    }
+}
+
+#[tokio::test]
+async fn stage1_bad_request_omits_oversized_fields() {
+    let (status, body) = crate::hosted::tests::cloud_bad_request_replies().remove(0);
+    let mut parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    parsed["field"] = "f".repeat(65).into();
+    assert_stage1_bad_request(status, parsed.to_string(), None).await;
+}
+
+#[tokio::test]
+async fn stage1_bad_request_omits_nonprintable_fields() {
+    let (status, body) = crate::hosted::tests::cloud_bad_request_replies().remove(0);
+    for field in [
+        "timeout_s\n",
+        "timeout_s\r",
+        "timeout_s\t",
+        "timeout_s\0",
+        "timeout_s\u{7f}",
+        "timeout_é",
+    ] {
+        let mut parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        parsed["field"] = field.into();
+        assert_stage1_bad_request(status, parsed.to_string(), None).await;
+    }
+}
+
+#[tokio::test]
+async fn stage1_bad_request_accepts_64_printable_ascii_characters() {
+    let (status, body) = crate::hosted::tests::cloud_bad_request_replies().remove(0);
+    let mut parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let field = format!("{} ~", "f".repeat(62));
+    parsed["field"] = field.clone().into();
+    assert_stage1_bad_request(status, parsed.to_string(), Some(&field)).await;
+}
+
 #[tokio::test]
 async fn stage1_lost_run_ack_reattaches_without_direct_fallback() {
     let h = Harness::new(Behavior::DropRunAck).await;

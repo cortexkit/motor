@@ -1122,7 +1122,7 @@ async fn stored_allow_spill_presence_and_value_survive_lease_re_requests() {
                 // naming the member, instead of collecting the broker's 400.
                 assert_eq!(
                     result.err(),
-                    Some(Error::RequestInvalid(Some("allow_spill")))
+                    Some(Error::RequestInvalid(RequestField::new("allow_spill")))
                 );
             }
         }
@@ -1146,6 +1146,29 @@ async fn stored_allow_spill_presence_and_value_survive_lease_re_requests() {
         );
         assert_eq!(h.runs.load(Ordering::SeqCst), 0);
     }
+}
+
+/// Exact broker reply bytes for lease-creation bad requests, including a 400
+/// without a field so older brokers stay compatible.
+pub(crate) fn cloud_bad_request_replies() -> Vec<(u16, String)> {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/bad-request.json"
+    ))
+    .unwrap();
+    vector["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| case["request"]["pathname"] == "/v1/leases")
+        .map(|case| {
+            let status = case["reply"]["status"].as_u64().unwrap();
+            assert_eq!(status, 400);
+            (
+                status as u16,
+                case["reply"]["body"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
 }
 
 /// The broker's recorded refusal of a closed account's new lease.
@@ -1404,7 +1427,10 @@ fn validate_refuses_requests_no_valid_lease_body_can_carry() {
         (30, Some(65), "vcpus"),
     ] {
         let refused = validate(&request(Some(timeout), weight));
-        assert_eq!(refused, Err(Error::RequestInvalid(Some(field))));
+        assert_eq!(
+            refused,
+            Err(Error::RequestInvalid(RequestField::new(field)))
+        );
         assert_eq!(
             refused.unwrap_err().detail(),
             format!("hosted_request_invalid: {field}")

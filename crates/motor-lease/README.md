@@ -19,10 +19,10 @@ host can also call `Nonces::prune` explicitly.
 ## Contract fixtures
 
 The broker repository, `cortexkit-cloud`, owns `docs/runners-contract.md` and
-`test-vectors/runners/`. `contracts/cloud/` mirrors eleven canonical files
-verbatim: the contract at commit `5632339`, `account-closure.json` at
-`e961a71`, `lease.json`, `boat-lease.json`, `shadow-lease.json` and
-`settled-reattach.json` at `e483f20`, `no-host-fits-lease.json` at
+`test-vectors/runners/`. `contracts/cloud/` mirrors twelve canonical files
+verbatim: the contract and `bad-request.json` at commit `df12dca`,
+`account-closure.json` at `e961a71`, `lease.json`, `boat-lease.json`,
+`shadow-lease.json` and `settled-reattach.json` at `e483f20`, `no-host-fits-lease.json` at
 `916347e`, `no-spill-lease.json` at `95fd2d1`, and the other vectors at
 `00e688e`. `contracts/digest-manifest.json` records source paths,
 revision and SHA-256 values. The digest test checks every file and inventory
@@ -47,10 +47,15 @@ repeat the same `allow_spill` value.
 `no-host-fits-lease.json` records the broker's final refusal for a no-spill
 16-vCPU lease when the only registered host's per-job ceiling is 8 vCPUs: HTTP
 422 with exactly `{"error":"no_host_fits","max_vcpus":8}` and no `Retry-After`.
-It is the only error body with a member besides `error`. The refusal is final
-for that request body; with spill allowed and Boat on, a job that fits a Boat
-size still spills, and `max_vcpus` then counts Boat sizes too. A host with no
-recorded per-job ceiling never produces it.
+The refusal is final for that request body; with spill allowed and Boat on, a
+job that fits a Boat size still spills, and `max_vcpus` then counts Boat sizes
+too. A host with no recorded per-job ceiling never produces it.
+
+`bad-request.json` records exact request and reply bytes for 400 `bad_request`:
+body-validation replies optionally name the failing member in `field`, using
+`body` for unexpected members without echoing client input. Other 400 replies
+can omit `field`. ck-motor carries only fields of at most 64 printable ASCII
+characters into its lease warning and repository-routed refusal detail.
 
 `account-closure.json` records a closed account. Its new lease is refused with
 the final HTTP 403 `{"error":"account_closed"}` and no `Retry-After`; a
