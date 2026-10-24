@@ -6,6 +6,10 @@ use std::{
 
 pub(crate) use crate::JOB_MEMORY_PROPERTIES;
 
+/// Stands in for the slice's memory ceiling when no usable budget was read.
+/// No slice can have this `MemoryMax`, so it refuses nothing.
+pub(crate) const NO_JOB_MEMORY_BUDGET: u64 = u64::MAX;
+
 /// What the shared jobs slice allows a job unit to request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct JobMemoryBudget {
@@ -16,6 +20,14 @@ pub(crate) struct JobMemoryBudget {
     /// check requires it to sit strictly below `max`.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub(crate) high: u64,
+}
+
+impl JobMemoryBudget {
+    /// The budget with a remembered ceiling. Only the ceiling drives a
+    /// decision, so callers that cache it do not keep the whole reading.
+    pub(crate) fn from_max(max: u64) -> Option<Self> {
+        (max != NO_JOB_MEMORY_BUDGET).then_some(Self { max, high: 0 })
+    }
 }
 
 /// Read the shared jobs slice's limits. Refuses rather than letting systemd

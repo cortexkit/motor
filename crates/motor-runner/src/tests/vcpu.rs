@@ -36,6 +36,34 @@ fn oom_detail_keeps_per_job_limit_and_advice_without_claiming_which_budget_was_h
     );
 }
 
+/// A job limit the jobs slice clamps cannot be raised by asking for more
+/// vCPUs, so the OOM advice stops recommending that: the job is already at
+/// the ceiling the host allows. A slice above the job's request leaves the
+/// advice as it was.
+#[cfg(target_os = "linux")]
+#[test]
+fn oom_advice_stops_recommending_more_vcpus_when_the_slice_caps_the_limit() {
+    let mut config = Config::new("unused", "main");
+    // 24 GiB: below the 30 GiB a 8-vCPU request would ask for.
+    config.slice_budget_probe = Some(25_769_803_776);
+    let capped = crate::engine::oom_memory_limit_detail(&config, 8, 30);
+    assert!(
+        !capped.contains("Request more vCPUs"),
+        "a clamped job cannot buy memory with vCPUs: {capped}"
+    );
+    assert!(
+        capped.contains("already at the maximum of 8 vCPUs"),
+        "{capped}"
+    );
+    // A slice above every admissible request changes nothing.
+    config.slice_budget_probe = Some(112_742_891_520);
+    let raised = crate::engine::oom_memory_limit_detail(&config, 2, 8);
+    assert!(
+        raised.contains("Request more vCPUs, for example linux,8c"),
+        "{raised}"
+    );
+}
+
 #[test]
 fn claims_are_exact_and_unsized_jobs_always_claim_two() {
     let f = Fixture::new();

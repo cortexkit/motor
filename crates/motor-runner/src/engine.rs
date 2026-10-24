@@ -241,6 +241,10 @@ pub struct Config {
     pub(crate) before_replay_read: Option<JobWriteHook>,
     #[cfg(test)]
     pub(crate) systemd_command: Option<crate::systemd::CommandHook>,
+    /// Stands in for the jobs slice ceiling the runner records from systemd, so
+    /// portable fixtures need no manager of their own.
+    #[cfg(test)]
+    pub(crate) slice_budget_probe: Option<u64>,
     /// Replaces `sibling_snapshot_mode()`, so portable fixtures can run either
     /// sibling mode without the isolated host backend.
     #[cfg(test)]
@@ -491,6 +495,8 @@ impl Config {
             #[cfg(test)]
             systemd_command: None,
             #[cfg(test)]
+            slice_budget_probe: None,
+            #[cfg(test)]
             sibling_snapshot_mode_override: None,
             #[cfg(test)]
             in_place_siblings_override: None,
@@ -717,6 +723,19 @@ impl Config {
     }
 }
 
+/// The memory ceiling the jobs slice puts on a job unit, when there is one.
+/// The runner records it at startup and on every maintenance pass, outside the
+/// state lock; an empty record means no reading is kept, which leaves job
+/// limits as they were.
+fn slice_ceiling(_config: &Config) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(budget) = _config.slice_budget_probe {
+        return crate::systemd::JobMemoryBudget::from_max(budget).map(|budget| budget.max);
+    }
+    let _ = _config;
+    None
+}
+
 pub(crate) fn oom_memory_limit_detail(_config: &Config, weight: u32, capacity: u32) -> String {
     if let Some(bytes) = _config.boat_memory_max_bytes {
         return format!("the kernel OOM-killed a process and the job was stopped (Boat job memory budget {} bytes; the shared host memory budget also applies). More vCPUs do not increase this sandbox's usable memory.", bytes);
@@ -733,13 +752,13 @@ pub(crate) fn oom_memory_limit_detail(_config: &Config, weight: u32, capacity: u
     // largest job this host can admit. When the jobs slice caps job limits, a
     // larger vCPU count cannot buy more memory, so the advice names that cap.
     let mut more = (weight.max(4) * 2).min(capacity);
-    if let Ok(budget) = crate::systemd::read_job_memory_budget() {
+    if let Some(slice_max) = slice_ceiling(_config) {
         // The slice clamps this job's limit, so only a request that still
         // raises the limit below the clamp is worth recommending.
         #[cfg(test)]
-        let raised = |vcpus: u32| crate::backend::memory_max(vcpus, floor_gib).min(budget.max);
+        let raised = |vcpus: u32| crate::backend::memory_max(vcpus, floor_gib).min(slice_max);
         #[cfg(not(test))]
-        let raised = |vcpus: u32| crate::backend::memory_max(vcpus).min(budget.max);
+        let raised = |vcpus: u32| crate::backend::memory_max(vcpus).min(slice_max);
         if more > weight && raised(more) <= raised(weight) {
             more = weight;
         }
@@ -1309,6 +1328,10 @@ struct Core {
     catalog_written: Mutex<CatalogWritten>,
     health: Mutex<health::Health>,
     repository_usage: Mutex<health::RepositoryUsage>,
+    /// The jobs slice's limits, refreshed outside the state lock so admission
+    /// never runs systemctl while holding it. `None` means no usable budget was
+    /// read, which refuses nothing by itself.
+    slice_budget: std::sync::atomic::AtomicU64,
     background_deletes: Arc<std::sync::atomic::AtomicUsize>,
     _lock: File,
     rustc_version: String,
@@ -2265,6 +2288,9 @@ impl Runner {
                 catalog_written: Mutex::new(CatalogWritten::default()),
                 health,
                 repository_usage: Mutex::new(repository_usage),
+                slice_budget: std::sync::atomic::AtomicU64::new(
+                    crate::systemd::NO_JOB_MEMORY_BUDGET,
+                ),
                 _lock: lock,
                 rustc_version,
                 compilers: Compilers::probe(&["cc", "c++", "ccache"]),
@@ -2273,6 +2299,9 @@ impl Runner {
         };
         #[cfg(test)]
         tests::register_runner(&runner);
+        // The slice's memory ceiling decides admission, and admission runs
+        // under the state lock; read it here, once, before any job is served.
+        runner.refresh_slice_budget();
         // Deletions a previous run moved aside but did not finish.
         if runner.core.quarantined.is_empty() {
             if let Ok(entries) = fs::read_dir(runner.trash()) {
@@ -2995,6 +3024,10 @@ impl Runner {
         if self.core.config.windows_instance() {
             request.weight_hint = Some(4);
         }
+        // Read the jobs slice before taking the state lock: `run_refusal` asks
+        // about admission and runs under it, and spawning systemctl there would
+        // stall every other admission, status reply and cancel.
+        self.refresh_slice_budget();
         let (_admission, initial_refusal) = {
             let _restore = self.reserve_restore_barrier();
             let mut inner = self.core.inner.lock().unwrap();
@@ -3144,33 +3177,40 @@ impl Runner {
 
     /// A Linux job unit takes its memory limit from the shared jobs slice. A
     /// slice too small for the floor every job requests refuses the job before
-    /// it starts, instead of letting the slice OOM-kill it on arrival. An
-    /// unreadable slice is left to the start path's existing refusal.
-    #[cfg(target_os = "linux")]
-    fn slice_memory_refusal(&self) -> Option<String> {
+    /// it starts, instead of letting the slice OOM-kill it on arrival. A slice
+    /// that cannot be read refuses nothing: the start path already refuses
+    /// there, with the reason the slice gave.
+    ///
+    /// The refusal is a host setup fault that waiting cannot clear, so it is
+    /// not reported as a full or busy runner: callers treat that reason as a
+    /// capacity signal to retry, and would retry this until their queue budget
+    /// ran out.
+    fn slice_memory_refusal(&self) -> Option<(RefusalReason, String)> {
         if !self.core.config.isolate_jobs || self.core.config.windows_instance() {
             return None;
         }
+        let max = self
+            .core
+            .slice_budget
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let budget = crate::systemd::JobMemoryBudget::from_max(max)?;
         #[cfg(test)]
         let floor = crate::backend::memory_floor(self.core.config.memory_floor_gib);
         #[cfg(not(test))]
         let floor = crate::backend::memory_floor();
-        let budget = crate::backend::systemctl(
-            &self.core.config,
-            &[
-                "show",
-                "--property=MemoryHigh,MemoryMax",
-                "motor-jobs.slice",
-            ],
-        )
-        .ok()
-        .and_then(|output| crate::systemd::job_memory_budget(&output))?;
         crate::backend::slice_refusal(floor, budget)
+            .map(|detail| (RefusalReason::WorkspaceSetupFailed, detail))
     }
 
-    #[cfg(not(target_os = "linux"))]
-    fn slice_memory_refusal(&self) -> Option<String> {
-        None
+    /// Read the jobs slice's limits and remember the memory ceiling for
+    /// admission. Callers run this outside the state lock: it spawns
+    /// systemctl, and admission holds that lock.
+    fn refresh_slice_budget(&self) {
+        let max = crate::systemd::read_job_memory_budget()
+            .map_or(crate::systemd::NO_JOB_MEMORY_BUDGET, |budget| budget.max);
+        self.core
+            .slice_budget
+            .store(max, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn run_refusal(&self, inner: &Inner, request: &Run) -> Option<(RefusalReason, String)> {
@@ -3248,8 +3288,8 @@ impl Runner {
             request.weight_hint.unwrap_or(2)
         }) {
             Some(refusal)
-        } else if let Some(detail) = self.slice_memory_refusal() {
-            Some((RefusalReason::RunnerFull, detail))
+        } else if let Some(refusal) = self.slice_memory_refusal() {
+            Some(refusal)
         } else if inner.drain_deadline.is_some() {
             Some((RefusalReason::RunnerDraining, "runner is draining".into()))
         } else if (!self.core.config.windows_instance()
@@ -5356,6 +5396,8 @@ impl Runner {
     /// Also exposed to fake-clock tests; retention is relative to both terminal
     /// time and mint time, so recent unknown IDs can never rerun an expired job.
     pub fn maintenance(&self) -> io::Result<()> {
+        // Outside the state lock, which maintenance later takes.
+        self.refresh_slice_budget();
         #[cfg(unix)]
         if self.core.config.macos_instance() {
             self.core

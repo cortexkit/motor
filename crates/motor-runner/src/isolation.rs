@@ -52,7 +52,6 @@ pub(crate) fn job_identity() -> io::Result<pid_init::JobIdentity> {
     pid_init::JobIdentity::resolve(USER)
 }
 
-#[cfg(not(test))]
 pub(crate) fn validate_account() -> io::Result<()> {
     validate_identity(
         USER,
@@ -60,14 +59,6 @@ pub(crate) fn validate_account() -> io::Result<()> {
         &[],
         account_groups(USER)?.as_deref(),
     )
-}
-
-/// Tests run without the provisioned sandbox account. A test that does need
-/// the account rules calls `validate_identity` through the writer path, and
-/// no test starts a job unit under the account, so only this gate is skipped.
-#[cfg(test)]
-pub(crate) fn validate_account() -> io::Result<()> {
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -148,7 +139,6 @@ fn writer_cache_acl(directory: bool, runner_write: bool) -> String {
     }
 }
 
-#[cfg(not(test))]
 pub(crate) fn prepare_private_state(state: &Path) -> io::Result<()> {
     // chmod on an extended ACL only closes its mask. Remove latent group grants
     // before another named-user grant can recompute that mask and reopen them.
@@ -164,14 +154,6 @@ pub(crate) fn prepare_private_state(state: &Path) -> io::Result<()> {
             ])
             .arg(state),
     )
-}
-
-/// A portable test has no sandbox account, so the grant that lets the job
-/// account traverse the runner state has nothing to apply to; it would only
-/// need root. Only the root-only operator tests run the grant itself.
-#[cfg(test)]
-pub(crate) fn prepare_private_state(_state: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 pub(crate) fn prepare_writer_cache(fleet: &Path, account: WriterAccount) -> io::Result<()> {
@@ -320,15 +302,6 @@ fn prepare_shared_read_access_from_as(
     bun_bin: Option<&Path>,
     user: &str,
 ) -> io::Result<()> {
-    // A portable test has no sandbox account and no job unit, so the grant
-    // that makes the host's toolchain trees readable to the job account has
-    // nothing to apply to. Only a test on a real host runs these grants.
-    #[cfg(test)]
-    {
-        let _ = (cargo_home, rustup_home, bun_bin, user);
-        return Ok(());
-    }
-    #[allow(unreachable_code)]
     for name in ["registry", "git"] {
         let path = cargo_home.join(name);
         fs::create_dir_all(&path)?;
