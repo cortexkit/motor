@@ -350,7 +350,14 @@ fn refuse_before_start(
         tracing::warn!(job_id = %job.id, ?reason, error = %error, "job refused_before_start");
     }
     health.lock().unwrap().refusal(now, &reason);
-    job.terminal(Outcome::RefusedBeforeStart { reason }, now);
+    // Recovery reuses this helper for cache-building jobs interrupted by a
+    // daemon restart. Such a job may already have run: only missing start
+    // and process records prove here that no job process ever existed.
+    if job.started_ms.is_none() && job.process.is_none() {
+        job.terminal_ended(Outcome::RefusedBeforeStart { reason }, now);
+    } else {
+        job.terminal(Outcome::RefusedBeforeStart { reason }, now);
+    }
     if let Some(detail) = detail {
         job.terminal = job.terminal.take().map(|t| t.with_refusal_detail(detail));
     }
@@ -814,6 +821,10 @@ struct Inner {
     /// A real exit status delivered while the finalization owner is collecting
     /// changes or retrying persistence takes precedence over a monitoring error.
     exit_statuses: BTreeMap<Uuid, backend::ExecutionOutcome>,
+    /// A monitor or cancellation handler may prove the unit is inactive even
+    /// without its exit code. Retain that proof if another thread is already
+    /// collecting changes or persisting the terminal for the same job.
+    ended_executions: BTreeSet<Uuid>,
     cpu_times: BTreeMap<Uuid, u64>,
     pending_start_refusals: BTreeSet<Uuid>,
     /// The sibling fences scheduling applies; fixed by the configuration.
@@ -2056,6 +2067,7 @@ impl Runner {
                     kill_retries: BTreeMap::new(),
                     finalizing: BTreeSet::new(),
                     exit_statuses: BTreeMap::new(),
+                    ended_executions: BTreeSet::new(),
                     cpu_times: BTreeMap::new(),
                     pending_start_refusals: BTreeSet::new(),
                     sibling_fences,
@@ -4354,11 +4366,17 @@ impl Runner {
                 // meanwhile, so an exited job being finalized is never
                 // signalled.
                 drop(inner);
-                if job.process.is_none() || self.unit_alive(job.process)? == Some(false) {
+                let unit_exited =
+                    job.process.is_some() && self.unit_alive(job.process)? == Some(false);
+                if job.process.is_none() || unit_exited {
                     tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel found unit already exited");
                     drop(signalling);
                     drop(write);
-                    return self.finish_unobserved_unit(id, "cancel recorded after unit exited");
+                    return self.finish_unobserved_unit(
+                        id,
+                        "cancel recorded after unit exited",
+                        unit_exited,
+                    );
                 } else {
                     tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel checked unit is alive");
                     self.core.backend.cancel(&self.core.config, &job, false)?;
@@ -4368,7 +4386,7 @@ impl Runner {
                 tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel already recorded; stop retries belong to the scheduler");
             }
         } else {
-            job.terminal(Outcome::Cancelled, self.now());
+            job.terminal_ended(Outcome::Cancelled, self.now());
             job.state = JobState::Tombstone;
             self.save(job)?;
             tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel recorded before start");
@@ -4480,7 +4498,7 @@ impl Runner {
                 .lock()
                 .unwrap()
                 .record_spill_withdrawal(self.now());
-            job.terminal(
+            job.terminal_ended(
                 Outcome::RefusedBeforeStart {
                     reason: RefusalReason::QueueWaitExceeded,
                 },
@@ -5625,9 +5643,11 @@ impl Runner {
                 Ok(alive) if job.process.is_none() || alive == Some(false) => {
                     let runner = self.clone();
                     std::thread::spawn(move || {
-                        if let Err(error) =
-                            runner.finish_unobserved_unit(id, "cancelled unit already exited")
-                        {
+                        if let Err(error) = runner.finish_unobserved_unit(
+                            id,
+                            "cancelled unit already exited",
+                            alive == Some(false),
+                        ) {
                             tracing::error!(%id, %error, "terminal bookkeeping failed");
                         }
                     });
@@ -5952,23 +5972,7 @@ impl Runner {
                         inner.cache_fills.insert(id, fill);
                     }
                     Err(error) => {
-                        let mut failed = job.clone();
-                        failed.terminal(Outcome::OutcomeUnknown, self.now());
-                        failed.monitoring_error = Some(error.to_string());
-                        let evidence = self.execution_evidence(&failed);
-                        let detail = self.explained_terminal(
-                            &failed,
-                            "cache_fill_setup_failed",
-                            &error.to_string(),
-                            &evidence,
-                        );
-                        failed.terminal = failed
-                            .terminal
-                            .take()
-                            .map(|t| t.with_refusal_detail(detail));
-                        self.save(&failed)?;
-                        inner.jobs.insert(id, failed);
-                        return self.finish_base(inner, &r, false, None);
+                        return self.fail_cache_fill(inner, &job, error);
                     }
                 }
             }
@@ -6547,6 +6551,7 @@ impl Runner {
             let a = reader(stdout, OutputStream::Stdout, runner.clone());
             let b = reader(stderr, OutputStream::Stderr, runner.clone());
             let status = execution.wait();
+            let execution_ended = status.is_ok();
             let output_error = [a.join(), b.join()]
                 .into_iter()
                 .find_map(|result| match result {
@@ -6555,11 +6560,33 @@ impl Runner {
                     _ => None,
                 });
             execution.reap();
-            if let Err(error) = runner.finish_execution(id, output_error.map_or(status, Err)) {
+            if let Err(error) =
+                runner.finish_execution(id, output_error.map_or(status, Err), execution_ended)
+            {
                 tracing::error!(%error, "terminal persistence failed");
             }
         });
         Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn fail_cache_fill(&self, inner: &mut Inner, job: &Job, error: io::Error) -> io::Result<()> {
+        let mut failed = job.clone();
+        failed.terminal_ended(Outcome::OutcomeUnknown, self.now());
+        failed.monitoring_error = Some(error.to_string());
+        let evidence = self.execution_evidence(&failed);
+        let detail = self.explained_terminal(
+            &failed,
+            "cache_fill_setup_failed",
+            &error.to_string(),
+            &evidence,
+        );
+        failed.terminal = failed
+            .terminal
+            .take()
+            .map(|t| t.with_refusal_detail(detail));
+        self.save(&failed)?;
+        inner.jobs.insert(job.id, failed);
+        self.finish_base(inner, job.request.as_ref().unwrap(), false, None)
     }
     fn failed_launch(
         &self,
@@ -6682,15 +6709,15 @@ impl Runner {
             tracing::error!(%id, %error, "durable job monitoring failed");
             // Keep the live unit's workspace reserved even if its output cannot
             // be saved. Only release it after the unit has actually stopped.
-            loop {
+            let unit_exited = loop {
                 let process = self.core.inner.lock().unwrap().jobs[&id].process;
                 match self.unit_alive(process) {
                     Ok(Some(true)) | Err(_) => {
                         std::thread::park_timeout(Duration::from_millis(500))
                     }
-                    _ => break,
+                    Ok(alive) => break alive == Some(false),
                 }
-            }
+            };
             if disk::storage_full(&error) {
                 let mut inner = self.core.inner.lock().unwrap();
                 inner
@@ -6713,11 +6740,12 @@ impl Runner {
                     .join("sandboxes")
                     .join(id.to_string())
                     .join("output");
-                self.finish_ended_unit(id, job.process, &directory, Some(&error))
+                self.finish_ended_unit(id, job.process, &directory, Some(&error), unit_exited)
             } else {
-                self.finish(
+                self.finish_execution(
                     id,
                     Err(io::Error::other(format!("monitor_output: {error}"))),
+                    unit_exited,
                 )
             };
             if let Err(error) = result {
@@ -6758,6 +6786,7 @@ impl Runner {
                     process.and_then(|p| p.unit).map(|u| self.core.backend.unit_name(&self.core.config, u)).unwrap_or_default()).as_bytes())?;
         }
         let mut alive = true;
+        let mut unit_exited = false;
         let mut inspect_at = std::time::Instant::now();
         #[cfg(target_os = "linux")]
         let mut polling = crate::systemd::PollBackoff::monitoring();
@@ -6777,7 +6806,10 @@ impl Runner {
                     .execution_evidence = Some(evidence);
                 let was_alive = alive;
                 alive = match self.unit_alive(process) {
-                    Ok(alive) => alive == Some(true),
+                    Ok(alive) => {
+                        unit_exited = alive == Some(false);
+                        alive == Some(true)
+                    }
                     Err(error) => {
                         tracing::warn!(%id, %error, "cannot inspect reattached unit; retrying");
                         std::thread::park_timeout(Duration::from_millis(500));
@@ -6852,19 +6884,20 @@ impl Runner {
                     }
                 }
                 if durable {
-                    return self.finish_ended_unit(id, process, &directory, None);
+                    return self.finish_ended_unit(id, process, &directory, None, unit_exited);
                 }
-                return self.finish(
+                return self.finish_execution(
                     id,
                     Err(io::Error::other(
                         "legacy_unit_ended: no retained exit status",
                     )),
+                    unit_exited,
                 );
             }
             std::thread::park_timeout(Duration::from_millis(25));
         }
     }
-    fn finish_unobserved_unit(&self, id: Uuid, reason: &str) -> io::Result<()> {
+    fn finish_unobserved_unit(&self, id: Uuid, reason: &str, unit_exited: bool) -> io::Result<()> {
         let job = self.core.inner.lock().unwrap().jobs[&id].clone();
         if job.durable_output {
             let directory = self
@@ -6879,9 +6912,10 @@ impl Runner {
                 job.process,
                 &directory,
                 Some(&io::Error::other(reason.to_owned())),
+                unit_exited,
             )
         } else {
-            self.finish(id, Err(io::Error::other(reason.to_owned())))
+            self.finish_execution(id, Err(io::Error::other(reason.to_owned())), unit_exited)
         }
     }
     fn finish_ended_unit(
@@ -6890,6 +6924,7 @@ impl Runner {
         process: Option<platform::ProcessIdentity>,
         directory: &Path,
         monitor_error: Option<&io::Error>,
+        unit_exited: bool,
     ) -> io::Result<()> {
         let (status, exit_file) = self.durable_exit_status(process, &directory.join("exit"));
         #[cfg(target_os = "linux")]
@@ -6914,7 +6949,7 @@ impl Runner {
             Some(monitor) => io::Error::other(format!("monitor_output: {monitor}; {error}")),
             None => error,
         });
-        self.finish(id, status)
+        self.finish_execution(id, status.map(backend::ExecutionOutcome::Unix), unit_exited)
     }
     #[cfg(target_os = "linux")]
     fn unproven_pid_bootstrap_status(
@@ -7029,6 +7064,7 @@ impl Runner {
                     inner.finalizing.remove(&id);
                     inner.starting.remove(&id);
                     inner.exit_statuses.remove(&id);
+                    inner.ended_executions.remove(&id);
                     inner.kill_retries.remove(&id);
                     inner.cpu_times.remove(&id);
                     if finished.base {
@@ -7183,8 +7219,14 @@ impl Runner {
             self.save(&inner.jobs[id]).is_err()
         });
     }
+    #[cfg(test)]
     fn finish(&self, id: Uuid, status: io::Result<std::process::ExitStatus>) -> io::Result<()> {
-        self.finish_execution(id, status.map(backend::ExecutionOutcome::Unix))
+        let execution_ended = status.is_ok();
+        self.finish_execution(
+            id,
+            status.map(backend::ExecutionOutcome::Unix),
+            execution_ended,
+        )
     }
     fn collect_accounting(&self, id: Uuid, mut reader: impl Read) {
         let result = (|| -> io::Result<()> {
@@ -7240,6 +7282,7 @@ impl Runner {
         &self,
         id: Uuid,
         status: io::Result<backend::ExecutionOutcome>,
+        execution_ended: bool,
     ) -> io::Result<()> {
         // git status over a large workspace takes a while, so it runs before
         // terminal persistence without the state lock. Claim finalization under
@@ -7259,6 +7302,9 @@ impl Runner {
             }
             if let Ok(status) = &status {
                 inner.exit_statuses.entry(id).or_insert(*status);
+            }
+            if execution_ended || status.is_ok() {
+                inner.ended_executions.insert(id);
             }
             if !inner.finalizing.insert(id) {
                 return Ok(());
@@ -7491,7 +7537,11 @@ impl Runner {
             if let Some(cpu_time_ns) = inner.cpu_times.get(&id) {
                 finished.record_reservation_use(*cpu_time_ns, ended_ms);
             }
-            finished.terminal(outcome, self.now());
+            if inner.ended_executions.contains(&id) {
+                finished.terminal_ended(outcome, self.now());
+            } else {
+                finished.terminal(outcome, self.now());
+            }
             finished.monitoring_error = monitoring_error.clone();
             let explanation = if let Some(error) = &monitoring_error {
                 Some(self.explained_terminal(&job, "exit_evidence_unavailable", error, &evidence))
@@ -7571,11 +7621,13 @@ impl Runner {
                 .and_then(|()| self.save(&finished));
             self.finish_step(id, &job.kill, "terminal record written", finish_started);
             inner = self.core.inner.lock().unwrap();
+            let terminal = finished.terminal.as_ref().unwrap();
             if saved.is_ok()
-                && inner
+                && (inner
                     .exit_statuses
                     .get(&id)
-                    .is_some_and(|exit| exit.wire() != finished.terminal.as_ref().unwrap().outcome)
+                    .is_some_and(|exit| exit.wire() != terminal.outcome)
+                    || (inner.ended_executions.contains(&id) && !terminal.execution_ended()))
             {
                 continue;
             }
@@ -7594,6 +7646,7 @@ impl Runner {
                     inner.kill_retries.remove(&id);
                     inner.finalizing.remove(&id);
                     inner.exit_statuses.remove(&id);
+                    inner.ended_executions.remove(&id);
                     inner.cpu_times.remove(&id);
                     if failing.is_some() {
                         tracing::info!(%id, "terminal persisted after failed attempts");

@@ -79,6 +79,15 @@ mod writer_command_selection;
 #[path = "tests/writer_storage.rs"]
 mod writer_storage;
 
+fn assert_execution_ended_wire(terminal: &TerminalRecord, ended: bool) {
+    let wire = serde_json::to_value(terminal).unwrap();
+    if ended {
+        assert_eq!(wire.get("execution_ended"), Some(&serde_json::json!(true)));
+    } else {
+        assert!(wire.get("execution_ended").is_none(), "{wire}");
+    }
+}
+
 pub(super) fn register_runner(runner: &Runner) {
     let Some(processes) = runner
         .config()

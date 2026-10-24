@@ -1078,8 +1078,14 @@ async fn windows_backend_missing_exit_is_unknown_but_post_exit_failures_preserve
             .await
             .unwrap();
         }
+        let terminal = terminal(&runner, r.job_id).await;
+        if matches!(fault, Fault::RejectStart | Fault::Start) {
+            assert_execution_ended_wire(&terminal, false);
+        } else {
+            assert_execution_ended_wire(&terminal, true);
+        }
         assert_eq!(
-            terminal(&runner, r.job_id).await.outcome,
+            terminal.outcome,
             if matches!(fault, Fault::RejectStart | Fault::Start) {
                 Outcome::OutcomeUnknown
             } else {
