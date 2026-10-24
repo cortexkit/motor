@@ -39,7 +39,7 @@ struct FormatMount<'a, F: Formatter> {
 }
 impl<F: Formatter> FormatMount<'_, F> {
     fn unmount(&mut self) -> io::Result<()> {
-        self.reporter.cleanup(CacheStep::FormatUnmountPoint, || {
+        self.reporter.cleanup(CacheStep::MountPoint, || {
             self.formatter.unmount(crate::CACHE_MOUNT)?;
             self.active = false;
             Ok(())
@@ -73,7 +73,7 @@ pub fn run_mounted(
         reporter,
         active: false,
     };
-    reporter.step(CacheStep::FormatMountPoint, || {
+    reporter.step(CacheStep::MountPoint, || {
         mounted.formatter.mount(volume, mount)?;
         // Own the mount before reporting completion: the guard must detach it
         // even if the observer disconnects while the native call is running.
@@ -365,9 +365,11 @@ mod tests {
                 ..Default::default()
             };
             let error = exercise_mounted(&mut formatter, VOLUME, Instant::now()).unwrap_err();
-            assert!(error.to_string().contains(
-                "remove cache format mount point failed: FormatUnmountPoint: unmount failed"
-            ));
+            assert!(
+                error
+                    .to_string()
+                    .contains("remove cache format mount point failed: MountPoint: unmount failed")
+            );
             assert_eq!(formatter.calls, ["mount", "format", "unmount", "unmount"]);
             if let Some(kind) = format_error {
                 assert_eq!(error.kind(), kind);

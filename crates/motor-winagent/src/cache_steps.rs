@@ -39,8 +39,6 @@ pub enum CacheStep {
     NextVolume,
     VolumeInformation,
     InitializeRaw,
-    FormatMountPoint,
-    FormatUnmountPoint,
     VolumeDiscovery,
     MountDirectory,
     MountPoint,
@@ -269,7 +267,7 @@ mod tests {
             let reporter = CacheReporter::new(tx);
             drop(rx);
             let mut cleaned = false;
-            let result = reporter.cleanup(CacheStep::FormatUnmountPoint, || {
+            let result = reporter.cleanup(CacheStep::MountPoint, || {
                 cleaned = true;
                 if fail {
                     Err(io::Error::new(
@@ -284,7 +282,7 @@ mod tests {
             if fail {
                 let error = result.unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-                assert_eq!(error.to_string(), "FormatUnmountPoint: unmount denied");
+                assert_eq!(error.to_string(), "MountPoint: unmount denied");
             } else {
                 result.unwrap();
             }
