@@ -16,6 +16,8 @@ use tokio::net::{UnixListener, UnixStream};
 mod boat_disk;
 #[path = "tests/cancellation.rs"]
 mod cancellation;
+#[path = "tests/declared_fills.rs"]
+mod declared_fills;
 #[path = "tests/dependency_writer.rs"]
 mod dependency_writer;
 #[path = "tests/disk_pressure.rs"]

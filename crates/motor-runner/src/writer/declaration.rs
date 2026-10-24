@@ -179,8 +179,46 @@ fn check_pattern(pattern: &str) -> Result<(), String> {
             ));
         }
     }
-    const ANY_NAME: [&str; 4] = ["a", "a/b", ".a", "a/.b"];
-    if !ANY_NAME.iter().any(|name| path_matches(pattern, name)) {
+    // A sample path the pattern itself names, so a pattern that names no file
+    // at all is refused rather than accepted. Literal segments are used as
+    // written. A wildcard segment becomes an ordinary name, ending in the file
+    // extension the segment states when it states one (so `*.h` samples
+    // `plain.h`); a range becomes its first value, and `**` one directory.
+    let mut path: Vec<String> = Vec::new();
+    for segment in pattern.split('/') {
+        if segment == "**" {
+            path.push("plain".to_string());
+            continue;
+        }
+        if let Some((start, end)) = segment.split_once("..") {
+            if !end.contains("..") {
+                if let (Ok(start), Ok(end)) = (start.parse::<i64>(), end.parse::<i64>()) {
+                    path.push(start.min(end).to_string());
+                    continue;
+                }
+            }
+        }
+        let literal: String = segment
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+            .collect();
+        let extension = segment
+            .rsplit_once('.')
+            .map(|(_, extension)| extension)
+            .filter(|extension| !extension.is_empty())
+            .filter(|extension| {
+                extension
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            });
+        path.push(match extension {
+            Some(extension) if literal.starts_with('.') => format!("plain.{extension}"),
+            _ if !literal.is_empty() && !literal.starts_with('.') => literal,
+            _ => "plain".to_string(),
+        });
+    }
+    let sample = vec![path.join("/")];
+    if !sample.iter().any(|name| path_matches(pattern, name)) {
         return Err(format!(
             "descriptor-inputs pattern matches nothing: {pattern}"
         ));
@@ -227,19 +265,31 @@ pub(crate) fn step_hash(hash: &mut sha2::Sha256, step: &Step) {
     field(hash, "");
 }
 
-/// The files of `commit`'s tree the declaration depends on.
+/// The files of `commit`'s tree a declared fill depends on.
 ///
-/// Patterns follow Python's glob, because this rule replaces a check written
-/// in Python and must accept exactly the same files: `*`, `?`, `[abc]` and
-/// `[a-z]` within one path segment, `**` across segments, and the leading-dot
-/// rule (a name starting with `.` is matched only by a segment that itself
-/// starts with `.`). A trailing `/` adds nothing to a list of files. The
-/// matched paths come back sorted and without duplicates, so the order the
-/// tree lists them in cannot leak into the hash.
+/// A pattern is a repository-relative path with shell wildcards, and it matches
+/// whole paths, one segment at a time:
 ///
-/// None of that syntax can climb out of the repository: a matched name never
-/// becomes a path, and the tree has no `..` entry, so every file the hash
-/// reads came from the commit itself.
+/// - `*` matches any run of characters inside one name, `?` one character, and
+///   `[abc]`, `[a-z]` and `[!abc]` one character from a set;
+/// - a segment that is exactly `**` stands for any number of directories;
+/// - `**` at the end of a pattern names everything below its directory;
+/// - a pattern with a `/` names a path from the repository root, and one
+///   without names a file in the root only;
+/// - a name starting with `.` is reached only by a segment that also starts
+///   with `.`, and `**` on its own names no hidden name;
+/// - a trailing `/` names a directory, which no tracked file is.
+///
+/// These are the rules Python's glob applies to a tracked file list, which is
+/// what this replaces, minus two quirks that came from matching a list of
+/// strings rather than paths: a `*` crossing `/`, and `**/x` failing on a
+/// top-level `x`. A declaration is easier to trust when a pattern means what its
+/// path spelling says.
+///
+/// The matched paths come back sorted and without duplicates, so the order the
+/// tree lists them in cannot leak into the hash. Nothing here can climb out of
+/// the repository: a matched name never becomes a path, and a tree holds no
+/// `..` entry, so every file the hash reads came from the commit itself.
 pub(crate) fn matched<'a>(tree: &[&'a str], inputs: &[String]) -> Vec<&'a str> {
     let mut matched: Vec<&str> = tree
         .iter()
@@ -251,157 +301,151 @@ pub(crate) fn matched<'a>(tree: &[&'a str], inputs: &[String]) -> Vec<&'a str> {
     matched
 }
 
-/// Whether `path` matches `pattern` under the rules in [`matched`].
+/// Whether the declared `pattern` names the file at `path`.
 pub(crate) fn path_matches(pattern: &str, path: &str) -> bool {
+    // A directory pattern names no file.
+    if pattern.ends_with('/') {
+        return false;
+    }
     let segments: Vec<&str> = pattern.split('/').collect();
-    let segments = trim_empty_tail(&segments);
-    let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
-    let path: Vec<&str> = path.split('/').collect();
-    match_segments(&segments, &path, 0)
-}
-
-/// A name beginning with `.` is only visible to a pattern segment that also
-/// names one, so a leading `**` cannot step into it.
-fn hidden(segment: &str) -> bool {
-    segment.starts_with('.')
-}
-
-fn match_segments(segments: &[&str], path: &[&str], from: usize) -> bool {
-    let Some((segment, rest)) = segments.split_first() else {
-        return from == path.len();
-    };
-    // `**` stands for this directory and any number of directories below it.
-    if *segment == "**" {
-        if match_segments(rest, path, from) {
-            return true;
+    let names: Vec<&str> = path.split('/').collect();
+    // A bare pattern names a file in the root, never one found by searching.
+    if !pattern.contains('/') {
+        return names.len() == 1 && segment_matches(segments[0], names[0]);
+    }
+    if !walk(&segments, &names) {
+        return false;
+    }
+    // A hidden name is reached only by the pattern segment that names it; `**`
+    // names no name of its own, so it sees none of them.
+    let mut segment = 0;
+    for name in &names {
+        while segment < segments.len() && segments[segment] == "**" {
+            segment += 1;
         }
-        if from >= path.len() || rest.is_empty() || hidden(path[from]) {
+        if hidden(name) && !segments.get(segment).is_some_and(|s| s.starts_with('.')) {
             return false;
         }
-        return match_segments(segments, path, from + 1);
+        segment += 1;
     }
-    let Some(name) = path.get(from) else {
+    true
+}
+
+/// A name beginning with `.` is hidden from a pattern segment that does not
+/// name one; `.` and `..` are not hidden names but paths, and no tree holds
+/// them.
+fn hidden(name: &str) -> bool {
+    name.starts_with('.') && name.len() > 1
+}
+
+/// Match pattern segments against path names, in order.
+fn walk(segments: &[&str], names: &[&str]) -> bool {
+    let Some((segment, rest)) = segments.split_first() else {
+        return names.is_empty();
+    };
+    if *segment == "**" {
+        // At the end, `**` names everything below: at least one file.
+        if rest.is_empty() {
+            return !names.is_empty();
+        }
+        // Otherwise it stands for the directories between: one or more, so
+        // `src/**/*.c` means the files below `src`, not the ones directly in it.
+        return (1..=names.len()).any(|skip| walk(rest, &names[skip..]));
+    }
+    let Some((name, rest_names)) = names.split_first() else {
         return false;
     };
-    if hidden(name) && !hidden(segment) {
-        return false;
-    }
-    volume_matches(segment, name) && match_segments(rest, path, from + 1)
+    segment_matches(segment, name) && walk(rest, rest_names)
 }
 
-fn trim_empty_tail(segments: &[&str]) -> Vec<String> {
-    let mut end = segments.len();
-    while end > 1 && segments[end - 1].is_empty() {
-        end -= 1;
-    }
-    segments[..end].iter().map(|s| (*s).to_string()).collect()
-}
-
-/// One path segment: a comma-separated list of dot-split alternatives, each
-/// optionally a numeric range. This is the syntax Python's glob inherited from
-/// shell path expansion.
-fn volume_matches(segment: &str, name: &str) -> bool {
-    for choice in segment.split(',') {
-        let mut parts = choice.split("..");
-        let (start, end) = match (parts.next(), parts.next(), parts.next()) {
-            (Some(start), None, None) => (start, None),
-            (Some(start), Some(end), None) => (start, Some(end)),
-            _ => continue,
-        };
-        if let Some(end) = end {
-            let crossed = match (
-                start.parse::<i64>(),
-                end.parse::<i64>(),
-                name.parse::<i64>(),
-            ) {
-                (Ok(start), Ok(end), Ok(value)) if start <= end => (start..=end).contains(&value),
-                (Ok(start), Ok(end), Ok(value)) => (end..=start).contains(&value),
-                _ => false,
-            };
-            if crossed {
-                return true;
+/// One pattern segment against one name: comma-split alternatives, each a shell
+/// wildcard pattern, or a numeric range written `3..9`.
+fn segment_matches(segment: &str, name: &str) -> bool {
+    segment
+        .split(',')
+        .any(|choice| match choice.split_once("..") {
+            Some((start, end)) if !end.contains("..") => {
+                matches!(
+                    (start.parse::<i64>(), end.parse::<i64>(), name.parse::<i64>()),
+                    (Ok(start), Ok(end), Ok(value))
+                        if (start.min(end)..=start.max(end)).contains(&value)
+                )
             }
-            continue;
-        }
-        let parts: Vec<&str> = choice.split('.').collect();
-        // A lone number names that one value; anything else compares the
-        // dot-separated words of the name, each as a shell pattern.
-        if parts.len() == 1 {
-            if name == start {
-                return true;
-            }
-            continue;
-        }
-        if parts.len() == name.split('.').count()
-            && parts
-                .iter()
-                .zip(name.split('.'))
-                .all(|(part, word)| wildcard(part, word))
-        {
-            return true;
-        }
-    }
-    false
+            _ => wildcard(choice, name),
+        })
 }
 
-/// `*`, `?`, `[seq]` and `[!seq]` inside one dot-separated word.
-fn wildcard(pattern: &str, word: &str) -> bool {
-    let pattern: Vec<char> = pattern.chars().collect();
-    let word: Vec<char> = word.chars().collect();
-    wildcard_from(&pattern, &word)
+/// `*`, `?`, `[abc]`, `[a-z]` and `[!abc]` over a whole name.
+fn wildcard(pattern: &str, name: &str) -> bool {
+    wildcard_from(pattern, name)
 }
 
-fn wildcard_from(pattern: &[char], word: &[char]) -> bool {
-    let Some((&first, rest)) = pattern.split_first() else {
-        return word.is_empty();
+fn wildcard_from(pattern: &str, name: &str) -> bool {
+    let Some(first) = pattern.chars().next() else {
+        return name.is_empty();
     };
+    let rest = &pattern[first.len_utf8()..];
     match first {
-        '*' => (0..=word.len()).any(|skip| wildcard_from(rest, &word[skip..])),
-        '?' => !word.is_empty() && wildcard_from(rest, &word[1..]),
+        '*' => (0..=name.len())
+            .filter(|skip| name.is_char_boundary(*skip))
+            .any(|skip| wildcard_from(rest, &name[skip..])),
+        '?' => match name.chars().next() {
+            Some(character) => wildcard_from(rest, &name[character.len_utf8()..]),
+            None => false,
+        },
         '[' => {
-            let Some(close) = closing_bracket(rest) else {
-                // An unclosed bracket is a literal one, as in fnmatch.
-                return word.first() == Some(&'[') && wildcard_from(rest, &word[1..]);
+            let (set, rest) = match character_set(rest) {
+                Some(set) => set,
+                // An unclosed bracket is a literal one.
+                None => return name.starts_with('[') && wildcard_from(rest, &name[1..]),
             };
-            let Some(character) = word.first() else {
-                return false;
-            };
-            set_matches(&rest[..close], *character) && wildcard_from(&rest[close + 1..], &word[1..])
+            match name.chars().next() {
+                Some(character) => {
+                    set_matches(set, character)
+                        && wildcard_from(rest, &name[character.len_utf8()..])
+                }
+                None => false,
+            }
         }
-        literal => word.first() == Some(&literal) && wildcard_from(rest, &word[1..]),
+        literal => match name.chars().next() {
+            Some(character) => {
+                character == literal && wildcard_from(rest, &name[character.len_utf8()..])
+            }
+            None => false,
+        },
     }
 }
 
-/// The index of the `]` closing a character set, or `None` when it never
-/// closes; a `]` that opens the set is a literal member.
-fn closing_bracket(rest: &[char]) -> Option<usize> {
-    let start = usize::from(matches!(rest.first(), Some('!')));
-    rest.iter()
-        .enumerate()
-        .skip(start + 1)
-        .find(|(_, character)| **character == ']')
-        .map(|(index, _)| index)
+/// A `[...]` set at the start of `rest`, and what follows its closing `]`.
+fn character_set(rest: &str) -> Option<(&str, &str)> {
+    let negated = rest.starts_with('!');
+    let body = if negated { &rest[1..] } else { rest };
+    // A `]` that opens the set is a member, not the end.
+    let search_from = usize::from(body.starts_with(']'));
+    let close = body[search_from..].find(']')? + search_from;
+    Some((&rest[..close + usize::from(negated)], &body[close + 1..]))
 }
 
-fn set_matches(set: &[char], character: char) -> bool {
-    let negate = matches!(set.first(), Some('!'));
-    let set = if negate { &set[1..] } else { set };
+fn set_matches(set: &str, character: char) -> bool {
+    let negated = set.starts_with('!');
+    let body = if negated { &set[1..] } else { set };
+    let characters: Vec<char> = body.chars().collect();
     let mut matched = false;
     let mut index = 0;
-    while index < set.len() {
-        if index + 2 < set.len() && set[index + 1] == '-' {
-            if (set[index]..=set[index + 2]).contains(&character) {
+    while index < characters.len() {
+        if index + 2 < characters.len() && characters[index + 1] == '-' {
+            if (characters[index]..=characters[index + 2]).contains(&character) {
                 matched = true;
             }
             index += 3;
         } else {
-            if set[index] == character {
+            if characters[index] == character {
                 matched = true;
             }
             index += 1;
         }
     }
-    matched != negate
+    matched != negated
 }
 
 /// The toolchain a declared fill's descriptor extends: the build server's
@@ -445,3 +489,7 @@ impl Compilers {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "declaration_tests.rs"]
+mod tests;
