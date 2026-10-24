@@ -27,8 +27,8 @@ mod host;
 #[cfg(windows)]
 mod hvsock;
 pub(crate) mod prep;
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) mod prep_error;
-mod staging;
 #[cfg(windows)]
 mod trusted_prep;
 #[cfg(unix)]
@@ -41,7 +41,6 @@ pub(crate) use caches::CacheDisks;
 #[cfg(test)]
 pub(crate) use vm::VmHook;
 
-<<<<<<< HEAD
 #[cfg(windows)]
 static SERVICE_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[cfg(windows)]
@@ -54,7 +53,6 @@ pub(crate) fn service_stop_requested() -> bool {
 }
 
 #[cfg(unix)]
-=======
 /// Prepare a QEMU job's resources for `id` and drop them at once, as a setup
 /// attempt that fails right after `Resources::prepare` would.
 #[cfg(all(test, unix))]
@@ -73,13 +71,21 @@ pub(crate) fn prepare_and_drop_resources(
     vm::Resources::prepare(config, staging, id, workspace).map(drop)
 }
 
->>>>>>> origin/main
+#[cfg(unix)]
 pub(crate) fn prepare_entry(path: &Path) -> std::io::Result<()> {
     prep::execute(path).inspect_err(|error| eprintln!("{}", prep_error::error_line(error)))
 }
 #[cfg(windows)]
 pub(crate) fn probe_peers() -> io::Result<()> {
     hvsock::probe_peers()
+}
+#[cfg(windows)]
+pub(crate) fn prep_probe(arguments: &[String]) -> io::Result<()> {
+    trusted_prep::probe(arguments)
+}
+#[cfg(windows)]
+pub(crate) fn qualify_prep(config: &Config) -> io::Result<()> {
+    trusted_prep::qualify(config)
 }
 #[cfg(windows)]
 pub(crate) fn qualify_prep_offline_cargo(config: Config) -> io::Result<()> {
@@ -304,6 +310,7 @@ impl Backend for WindowsBackend {
             durable_output: false,
             execution,
             // A VM job never mounts a fill's write sockets.
+            #[cfg(unix)]
             cache_ledgers: Vec::new(),
         })
     }

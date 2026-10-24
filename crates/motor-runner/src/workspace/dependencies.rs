@@ -304,6 +304,7 @@ pub(crate) fn fetch_command(
     Ok(cmd)
 }
 
+#[cfg(any(unix, test))]
 pub(crate) fn configure_fetch_git(
     cmd: &mut Command,
     empty_home: &Path,

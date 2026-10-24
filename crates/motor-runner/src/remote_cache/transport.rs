@@ -58,6 +58,10 @@ pub(crate) enum Role<'a> {
 }
 
 impl Transport {
+    pub(crate) fn has_tool(&self, tool: Tool) -> bool {
+        self.tools.iter().any(|(active, _)| *active == tool)
+    }
+
     /// `tools` names each tool active in the unit with the loopback port its
     /// forwarder listens on. Tools and ports must be distinct, and port 0 is
     /// refused because the tool's URL must be known before the unit starts.

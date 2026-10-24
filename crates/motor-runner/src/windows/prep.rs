@@ -175,25 +175,9 @@ pub(super) fn prepare(
         super::vm::restore_staging_access(config, staging)?;
     }
     #[cfg(windows)]
-<<<<<<< HEAD
-    execute_with_registry(&plan_path, |job_staging, workspace, routes| {
-        let lockfile = fs::read_to_string(workspace.join("Cargo.lock"))?;
-        super::trusted_prep::prepare_local_registry(config, job_staging, &lockfile, routes)
+    execute_with_registry(&plan_path, |job_staging, _workspace, lockfile, routes| {
+        super::trusted_prep::prepare_local_registry(config, job_staging, lockfile, routes)
     })?;
-=======
-    {
-        let mut root_fetch = true;
-        execute_with_fetch_and_finish(
-            &plan_path,
-            |cmd| {
-                let timeout = std::time::Duration::from_secs(if root_fetch { 600 } else { 30 });
-                root_fetch = false;
-                super::trusted_prep::prepare_fetch(config, staging, cmd, timeout)
-            },
-            |staging| super::trusted_prep::stage_cache(config, staging),
-        )?;
-    }
->>>>>>> origin/main
     let tar = staging.join("tree.tar");
     let mut file = File::open(&tar)
         .map_err(|error| super::vm::path_error("open trusted preparation tree", &tar, error))?;
@@ -254,7 +238,6 @@ fn run_preparation(config: &Config, id: Uuid, args: &[String]) -> io::Result<Out
     }
     #[cfg(target_os = "linux")]
     {
-        crate::systemd::require_job_memory_budget()?;
         use std::{io::Read, process::Stdio, time::Duration};
         let mut child = Command::new("/usr/bin/sudo")
             .args(args)
@@ -408,7 +391,7 @@ fn git(snapshot: &Snapshot, args: &[&str]) -> io::Result<std::process::Output> {
     command.env("SYSTEMROOT", "C:\\Windows");
     let output = command.output()?;
     if !output.status.success() {
-        return Err(invalid(format!("git {}: {}", args[0], output.status)));
+        return Err(invalid(String::from_utf8_lossy(&output.stderr)));
     }
     Ok(output)
 }
@@ -420,7 +403,7 @@ pub(crate) fn execute(plan_path: &Path) -> io::Result<()> {
     execute_with_fetch(plan_path, |cmd| {
         let output = cmd.output()?;
         if !output.status.success() {
-            return Err(invalid(format!("cargo fetch: {}", output.status)));
+            return Err(invalid(String::from_utf8_lossy(&output.stderr)));
         }
         Ok(())
     })
@@ -445,8 +428,6 @@ fn cargo_command(plan: &Plan, manifest: &Path, args: &[&str]) -> Command {
         )
         .env("CARGO_HOME", plan.staging.join("cargo-home"))
         .env("RUSTUP_HOME", &plan.rustup)
-        .env("RUSTC_WRAPPER", "")
-        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
         .args(args)
         .arg("--manifest-path")
         .arg(manifest)
@@ -454,11 +435,11 @@ fn cargo_command(plan: &Plan, manifest: &Path, args: &[&str]) -> Command {
     cmd
 }
 
-<<<<<<< HEAD
-fn stage_snapshots(plan: &Plan) -> io::Result<PathBuf> {
+fn stage_snapshots(plan: &Plan) -> io::Result<(Vec<PathBuf>, BTreeSet<String>, BTreeSet<String>)> {
     let mut roots = Vec::new();
     let mut cases = BTreeMap::new();
     let mut members = BTreeSet::new();
+    let mut regular_files = BTreeSet::new();
     for (index, snapshot) in plan.snapshots.iter().enumerate() {
         let root = plan.staging.join(mapped(&snapshot.destination)?);
         if roots
@@ -529,159 +510,41 @@ fn stage_snapshots(plan: &Plan) -> io::Result<PathBuf> {
                 continue;
             }
             if !kind.is_file() && !kind.is_dir() {
-=======
-pub(crate) fn execute_with_fetch(
-    plan_path: &Path,
-    fetch: impl FnMut(&mut Command) -> io::Result<()>,
-) -> io::Result<()> {
-    execute_with_fetch_and_finish(plan_path, fetch, |_| Ok(()))
-}
-
-fn execute_with_fetch_and_finish(
-    plan_path: &Path,
-    mut fetch: impl FnMut(&mut Command) -> io::Result<()>,
-    finish: impl FnOnce(&Path) -> io::Result<()>,
-) -> io::Result<()> {
-    let plan: Plan = read_json(plan_path)?;
-    let mut roots = Vec::new();
-    let mut cases = BTreeMap::new();
-    let mut members = BTreeSet::new();
-    let mut regular_files = BTreeSet::new();
-    super::prep_error::step("extract snapshots", &plan.staging, || {
-        for (index, snapshot) in plan.snapshots.iter().enumerate() {
-            let root = plan.staging.join(mapped(&snapshot.destination)?);
-            if roots
-                .iter()
-                .any(|other: &PathBuf| root.starts_with(other) || other.starts_with(&root))
-            {
->>>>>>> origin/main
                 return Err(invalid(format!(
-                    "overlapping snapshot: {}",
+                    "snapshot special file: {}/{name}",
                     snapshot.destination
                 )));
             }
-            if index == 0 {
-                let tree = git(
-                    snapshot,
-                    &["rev-parse", &format!("{}^{{tree}}", snapshot.commit)],
-                )?;
-                let computed = String::from_utf8_lossy(&tree.stdout);
-                if computed.trim() != plan.tree_hash {
-                    return Err(Trees::tree_hash_mismatch(
-                        &snapshot.mirror,
-                        &plan.tree_hash,
-                        computed.trim(),
-                    ));
-                }
+            if kind.is_file() {
+                regular_files.insert(transferred);
             }
-            fs::create_dir_all(&root)?;
-            let archive = git(
-                snapshot,
-                &[
-                    "archive",
-                    "--format=tar",
-                    &format!("{}^{{tree}}", snapshot.commit),
-                ],
-            )?;
-            for entry in tar::Archive::new(io::Cursor::new(archive.stdout)).entries()? {
-                let mut entry = entry?;
-                let name = entry
-                    .path()?
-                    .to_str()
-                    .ok_or_else(|| invalid("non-UTF8 snapshot path"))?
-                    .trim_end_matches('/')
-                    .to_owned();
-                let transferred = format!("{}/{}", mapped(&snapshot.destination)?.display(), name);
-                #[cfg(windows)]
-                let transferred = transferred.replace('\\', "/");
-                motor_winagent::validate_archive_path(&transferred)?;
-                check_case(&transferred, &mut cases)?;
-                if !members.insert(transferred.clone()) {
-                    return Err(invalid(format!("duplicate snapshot path: {transferred}")));
-                }
-                let kind = entry.header().entry_type();
-                if kind.is_symlink() {
-                    // Stage a tracked symlink as a regular file holding its target
-                    // text, as Git for Windows checks it out by default
-                    // (core.symlinks=false). The staged tree then holds only files
-                    // and directories, so nothing in it can point outside the job.
-                    let target = entry
-                        .link_name_bytes()
-                        .ok_or_else(|| {
-                            invalid(format!("snapshot link without target: {transferred}"))
-                        })?
-                        .into_owned();
-                    let path = root.join(&name);
-                    if let Some(parent) = path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&path)?
-                        .write_all(&target)?;
-                    continue;
-                }
-                if !kind.is_file() && !kind.is_dir() {
-                    return Err(invalid(format!(
-                        "snapshot special file: {}/{name}",
-                        snapshot.destination
-                    )));
-                }
-                if kind.is_file() {
-                    regular_files.insert(transferred);
-                }
-                entry.unpack_in(&root)?;
-            }
-            roots.push(root);
+            entry.unpack_in(&root)?;
         }
-        Ok(())
-    })?;
-    let workspace = plan.staging.join(mapped(&plan.workspace)?);
-    super::prep_error::step("validate manifests", &plan.staging, || {
-        if !workspace.join("Cargo.lock").is_file() {
-            return Err(invalid(format!(
-                "snapshot has no Cargo.lock: {}",
-                mapped(&plan.workspace)?.display()
-            )));
-        }
-        for root in &roots {
-            validate_manifests(root, &roots, &plan.routes)?;
-        }
-        Ok(())
-    })?;
-    super::prep_error::step("fetch dependencies", &plan.staging, || {
-        fs::create_dir_all(plan.staging.join("cargo-home"))?;
-        fs::create_dir_all(plan.staging.join("home"))?;
-        fetch_manifest(&plan, &workspace.join("Cargo.toml"), &mut fetch)
-    })?;
-    // Archive members are tracked snapshot paths, not files introduced by Cargo
-    // or by a dependency checkout. Independent nested workspaces need their own
-    // fetch, but a stale optional lockfile must not prevent the root build.
-    for name in members.iter().filter(|name| name.ends_with("/Cargo.lock")) {
-        let lockfile = plan.staging.join(name);
-        if lockfile == workspace.join("Cargo.lock") {
-            continue;
-        }
-        let manifest = lockfile.with_file_name("Cargo.toml");
-        let manifest_name = format!("{}Cargo.toml", name.strip_suffix("Cargo.lock").unwrap());
-        let fetched = if !regular_files.contains(name) || !regular_files.contains(&manifest_name) {
-            Err(invalid(
-                "lockfile and manifest must both be tracked regular files",
-            ))
-        } else {
-            fetch_manifest(&plan, &manifest, &mut fetch)
-        };
-        if let Err(error) = fetched {
-            let warning = super::prep_error::nested_warning(&plan.staging, &lockfile, error);
-            eprintln!("{warning}");
-            #[cfg(windows)]
-            super::prep_error::log_warnings(warning.as_bytes());
-        }
+        roots.push(root);
     }
-<<<<<<< HEAD
-    for root in &roots {
-        validate_manifests(root, &roots, &plan.routes)?;
+    Ok((roots, members, regular_files))
+}
+
+#[cfg(any(unix, windows, test))]
+fn validate_staged_manifests(
+    plan: &Plan,
+    roots: &[PathBuf],
+    regular_files: &BTreeSet<String>,
+) -> io::Result<PathBuf> {
+    let workspace = plan.staging.join(mapped(&plan.workspace)?);
+    let root_lockfile = format!("{}/Cargo.lock", mapped(&plan.workspace)?.display());
+    #[cfg(windows)]
+    let root_lockfile = root_lockfile.replace('\\', "/");
+    if !workspace.join("Cargo.lock").is_file()
+        || (!plan.snapshots.is_empty() && !regular_files.contains(&root_lockfile))
+    {
+        return Err(invalid(format!(
+            "snapshot has no Cargo.lock: {}",
+            plan.workspace
+        )));
+    }
+    for root in roots {
+        validate_manifests(root, roots, &plan.routes)?;
     }
     fs::create_dir_all(plan.staging.join("cargo-home"))?;
     fs::create_dir_all(plan.staging.join("home"))?;
@@ -692,31 +555,62 @@ fn execute_with_fetch_and_finish(
 #[cfg(any(unix, test))]
 pub(crate) fn execute_with_fetch(
     plan_path: &Path,
-    fetch: impl FnOnce(&mut Command) -> io::Result<()>,
+    mut fetch: impl FnMut(&mut Command) -> io::Result<()>,
 ) -> io::Result<()> {
     let plan: Plan = read_json(plan_path)?;
-    let workspace = stage_snapshots(&plan)?;
-    let mut command = cargo_command(
-        &plan,
-        &workspace.join("Cargo.toml"),
-        &["fetch", "--locked", "--target", "x86_64-pc-windows-msvc"],
-=======
+    let (roots, members, regular_files) =
+        super::prep_error::step("extract snapshots", &plan.staging, || {
+            stage_snapshots(&plan)
+        })?;
+    let workspace = super::prep_error::step("validate manifests", &plan.staging, || {
+        validate_staged_manifests(&plan, &roots, &regular_files)
+    })?;
+    super::prep_error::step("fetch dependencies", &plan.staging, || {
+        fetch_manifest(&plan, &workspace.join("Cargo.toml"), &mut fetch)
+    })?;
+    let root_lockfile = format!("{}/Cargo.lock", mapped(&plan.workspace)?.display());
+    #[cfg(windows)]
+    let root_lockfile = root_lockfile.replace('\\', "/");
+    for lockfile_name in members
+        .iter()
+        .filter(|name| name.ends_with("/Cargo.lock") && *name != &root_lockfile)
+    {
+        let manifest_name = format!(
+            "{}Cargo.toml",
+            lockfile_name.strip_suffix("Cargo.lock").unwrap()
+        );
+        let lockfile = plan.staging.join(lockfile_name);
+        let result =
+            if !regular_files.contains(lockfile_name) || !regular_files.contains(&manifest_name) {
+                Err(invalid(
+                    "nested lockfile and manifest must both be tracked regular files",
+                ))
+            } else {
+                fetch_manifest(&plan, &plan.staging.join(manifest_name), &mut fetch)
+            };
+        if result.is_err() {
+            eprintln!(
+                "{}",
+                super::prep_error::nested_warning(
+                    &plan.staging,
+                    &lockfile,
+                    invalid("nested Cargo fetch failed"),
+                )
+            );
+        }
+    }
     super::prep_error::step("stage dependencies", &plan.staging, || {
-        finish(&plan.staging)?;
         build_tar(&plan.staging)
     })
 }
 
+#[cfg(any(unix, test))]
 fn fetch_manifest(
     plan: &Plan,
     manifest: &Path,
     fetch: &mut impl FnMut(&mut Command) -> io::Result<()>,
 ) -> io::Result<()> {
-    // The job VM is offline, so every crate a Windows build may need has to be
-    // fetched here. Both Windows targets are fetched: the image carries the
-    // ARM64 toolchain, and a job building with `--target
-    // aarch64-pc-windows-msvc` needs that target's platform crates too.
-    let mut cmd = cargo_command(
+    let mut command = cargo_command(
         plan,
         manifest,
         &[
@@ -727,7 +621,6 @@ fn fetch_manifest(
             "--target",
             "aarch64-pc-windows-msvc",
         ],
->>>>>>> origin/main
     );
     command.args(["--config", "net.git-fetch-with-cli=true"]);
     crate::workspace::dependencies::configure_fetch_git(
@@ -742,26 +635,88 @@ fn fetch_manifest(
             .env(format!("GIT_CONFIG_VALUE_{count}"), mirror);
         count += 1;
     }
-<<<<<<< HEAD
     command.env("GIT_CONFIG_COUNT", count.to_string());
-    fetch(&mut command)?;
-    build_tar(&plan.staging)
+    fetch(&mut command)
+}
+
+#[cfg(any(windows, test))]
+fn combined_registry_lockfile(
+    plan: &Plan,
+    members: &BTreeSet<String>,
+    regular_files: &BTreeSet<String>,
+) -> io::Result<String> {
+    let root_lockfile = format!("{}/Cargo.lock", mapped(&plan.workspace)?.display());
+    #[cfg(windows)]
+    let root_lockfile = root_lockfile.replace('\\', "/");
+    if !regular_files.contains(&root_lockfile) {
+        return Err(invalid("root Cargo.lock is not a tracked regular file"));
+    }
+
+    let mut packages = Vec::new();
+    for name in members.iter().filter(|name| name.ends_with("/Cargo.lock")) {
+        if name != &root_lockfile {
+            if !regular_files.contains(name) {
+                continue;
+            }
+            let manifest = format!("{}Cargo.toml", name.strip_suffix("Cargo.lock").unwrap());
+            if !regular_files.contains(&manifest) {
+                continue;
+            }
+        }
+        let contents = fs::read_to_string(plan.staging.join(name))?;
+        let parsed: toml::Value = match toml::from_str(&contents) {
+            Ok(value) => value,
+            Err(error) if name != &root_lockfile => {
+                tracing::warn!(lockfile = %name, %error, "skipping invalid nested Cargo.lock");
+                continue;
+            }
+            Err(error) => return Err(invalid(format!("root Cargo.lock: {error}"))),
+        };
+        let Some(entries) = parsed.get("package").and_then(toml::Value::as_array) else {
+            if name == &root_lockfile {
+                return Err(invalid("root Cargo.lock has no package entries"));
+            }
+            tracing::warn!(lockfile = %name, "skipping nested Cargo.lock without package entries");
+            continue;
+        };
+        packages.extend(entries.iter().cloned());
+    }
+
+    let mut merged = String::from("version = 4\n");
+    for package in packages {
+        merged.push_str("\n[[package]]\n");
+        for key in ["name", "version", "source", "checksum"] {
+            if let Some(value) = package.get(key).and_then(toml::Value::as_str) {
+                merged.push_str(key);
+                merged.push_str(" = ");
+                merged.push_str(&serde_json::to_string(value).map_err(invalid)?);
+                merged.push('\n');
+            }
+        }
+    }
+    Ok(merged)
 }
 
 #[cfg(any(windows, test))]
 pub(crate) fn execute_with_registry(
     plan_path: &Path,
-    prepare_registry: impl FnOnce(&Path, &Path, &BTreeMap<String, PathBuf>) -> io::Result<()>,
+    prepare_registry: impl FnOnce(&Path, &Path, &str, &BTreeMap<String, PathBuf>) -> io::Result<()>,
 ) -> io::Result<()> {
     let plan: Plan = read_json(plan_path)?;
-    let workspace = stage_snapshots(&plan)?;
-    validate_repository_cargo_sources(&plan.staging)?;
-    prepare_registry(&plan.staging, &workspace, &plan.routes)?;
-    build_tar(&plan.staging)
-=======
-    cmd.env("GIT_CONFIG_COUNT", n.to_string());
-    fetch(&mut cmd)
->>>>>>> origin/main
+    let (roots, members, regular_files) =
+        super::prep_error::step("extract snapshots", &plan.staging, || {
+            stage_snapshots(&plan)
+        })?;
+    let workspace = super::prep_error::step("validate manifests", &plan.staging, || {
+        let workspace = validate_staged_manifests(&plan, &roots, &regular_files)?;
+        validate_repository_cargo_sources(&plan.staging)?;
+        Ok(workspace)
+    })?;
+    super::prep_error::step("stage dependencies", &plan.staging, || {
+        let lockfile = combined_registry_lockfile(&plan, &members, &regular_files)?;
+        prepare_registry(&plan.staging, &workspace, &lockfile, &plan.routes)?;
+        build_tar(&plan.staging)
+    })
 }
 
 fn check_case(path: &str, cases: &mut BTreeMap<String, String>) -> io::Result<()> {
@@ -851,8 +806,8 @@ fn validate_manifests(
         if metadata.is_dir() {
             validate_manifests(&path, roots, routes)?;
         } else if path.file_name().is_some_and(|n| n == "Cargo.toml") {
-            let value: toml::Value = toml::from_str(&fs::read_to_string(&path)?)
-                .map_err(|_| invalid("invalid Cargo.toml"))?;
+            let value: toml::Value =
+                toml::from_str(&fs::read_to_string(&path)?).map_err(invalid)?;
             validate_dependencies(&value, path.parent().unwrap(), roots, routes)?;
         }
     }
@@ -966,18 +921,7 @@ fn append(
         return Err(invalid(format!("case collision: {name}")));
     }
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_symlink() {
-        crate::filesystem::identity(path)?;
-    }
-    if metadata.is_symlink() {
-        let text = super::staging::link_text(path)?;
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_mode(0o644);
-        header.set_size(text.len() as u64);
-        header.set_cksum();
-        builder.append_data(&mut header, relative, text.as_slice())?;
-    } else if metadata.is_dir() {
+    if metadata.is_dir() {
         builder.append_dir(relative, path)?;
         let mut entries = fs::read_dir(path)?
             .map(|e| e.map(|e| e.path()))
@@ -987,9 +931,9 @@ fn append(
             append(builder, staging, &entry, seen)?;
         }
     } else if metadata.is_file() {
-        builder.append_file(relative, &mut crate::filesystem::read_nofollow(path)?)?;
+        builder.append_file(relative, &mut File::open(path)?)?;
     } else {
-        return Err(invalid(format!("special file: {name}")));
+        return Err(invalid(format!("link or special file: {}", path.display())));
     }
     Ok(())
 }
@@ -1043,124 +987,6 @@ pub(crate) fn store_collection(
 
 #[cfg(test)]
 mod trusted_cargo_config_tests {
-    #[cfg(unix)]
-    #[test]
-    fn nested_workspace_prefetch_supplies_its_git_dependency_to_offline_cargo() {
-        let scratch = ScratchDir::new("windows-nested-offline");
-        let git = |root: &Path, args: &[&str]| {
-            let output = Command::new("git")
-                .current_dir(root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8(output.stdout).unwrap().trim().to_owned()
-        };
-        let dependency = scratch.path().join("dependency");
-        fs::create_dir_all(dependency.join("src")).unwrap();
-        fs::write(
-            dependency.join("Cargo.toml"),
-            "[package]\nname='nested-dependency'\nversion='0.1.0'\nedition='2021'\n",
-        )
-        .unwrap();
-        fs::write(dependency.join("src/lib.rs"), "").unwrap();
-        fs::write(dependency.join("README.md"), "dependency readme").unwrap();
-        std::os::unix::fs::symlink("README.md", dependency.join("AGENTS.md")).unwrap();
-        git(&dependency, &["init", "-q"]);
-        git(&dependency, &["add", "."]);
-        git(
-            &dependency,
-            &[
-                "-c",
-                "user.name=Fixture",
-                "-c",
-                "user.email=fixture@example.invalid",
-                "commit",
-                "-qm",
-                "git dependency",
-            ],
-        );
-        let rev = git(&dependency, &["rev-parse", "HEAD"]);
-        let repository = scratch.path().join("repository");
-        fs::create_dir_all(repository.join("src")).unwrap();
-        fs::create_dir_all(repository.join("playground/src")).unwrap();
-        fs::write(
-            repository.join("Cargo.toml"),
-            "[workspace]\n[package]\nname='root'\nversion='0.1.0'\nedition='2021'\n",
-        )
-        .unwrap();
-        fs::write(
-            repository.join("Cargo.lock"),
-            "version=4\n[[package]]\nname='root'\nversion='0.1.0'\n",
-        )
-        .unwrap();
-        fs::write(repository.join("src/lib.rs"), "").unwrap();
-        let url = "https://example.invalid/nested-dependency";
-        fs::write(repository.join("playground/Cargo.toml"), format!("[workspace]\n[package]\nname='playground'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nnested-dependency={{git='{url}',rev='{rev}'}}\n")).unwrap();
-        fs::write(repository.join("playground/Cargo.lock"), format!("version=4\n[[package]]\nname='playground'\nversion='0.1.0'\ndependencies=['nested-dependency']\n[[package]]\nname='nested-dependency'\nversion='0.1.0'\nsource='git+{url}?rev={rev}#{rev}'\n")).unwrap();
-        fs::write(repository.join("playground/src/lib.rs"), "").unwrap();
-        git(&repository, &["init", "-q"]);
-        git(&repository, &["add", "."]);
-        git(
-            &repository,
-            &[
-                "-c",
-                "user.name=Fixture",
-                "-c",
-                "user.email=fixture@example.invalid",
-                "commit",
-                "-qm",
-                "nested workspace",
-            ],
-        );
-        let cargo = PathBuf::from(env!("CARGO"));
-        let plan = Plan {
-            staging: scratch.path().join("staging"),
-            snapshots: vec![Snapshot {
-                mirror: repository.join(".git"),
-                commit: git(&repository, &["rev-parse", "HEAD"]),
-                destination: "/repository".into(),
-            }],
-            routes: BTreeMap::from([(url.into(), dependency.join(".git"))]),
-            workspace: "/repository".into(),
-            tree_hash: git(&repository, &["rev-parse", "HEAD^{tree}"]),
-            cargo: cargo.clone(),
-            rustup: std::env::var_os("RUSTUP_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    PathBuf::from(std::env::var_os("HOME").unwrap()).join(".rustup")
-                }),
-            toolchain_bin: cargo.parent().unwrap().to_path_buf(),
-            toolchain_source: PathBuf::new(),
-        };
-        fs::create_dir_all(&plan.staging).unwrap();
-        let path = plan.staging.join("prepare.json");
-        atomic_json(&path, &plan).unwrap();
-        execute(&path).unwrap();
-        let output = cargo_command(
-            &plan,
-            &plan.staging.join("m/repository/playground/Cargo.toml"),
-            &["metadata", "--locked", "--offline", "--format-version", "1"],
-        )
-        .output()
-        .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert!(metadata["packages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|p| p["name"] == "nested-dependency"));
-    }
-
     #[test]
     fn collected_links_are_only_inert_tar_bytes_on_the_host() {
         let root = ScratchDir::new("windows-collected-links");
@@ -1346,7 +1172,7 @@ mod repository_cargo_source_tests {
         let plan_path = staging.join("prepare.json");
         atomic_json(&plan_path, &plan).unwrap();
         let registry_called = Cell::new(false);
-        let error = execute_with_registry(&plan_path, |_, _, _| {
+        let error = execute_with_registry(&plan_path, |_, _, _, _| {
             registry_called.set(true);
             Ok(())
         })
@@ -1399,5 +1225,100 @@ mod local_registry_source_config_tests {
             .expect("local-registry source path");
         assert!(Path::new(written_path).is_absolute());
         assert_eq!(PathBuf::from(written_path), registry);
+    }
+}
+
+#[cfg(test)]
+mod nested_lockfile_tests {
+    use super::*;
+    use cortexkit_test_support::ScratchDir;
+
+    fn lockfile(root: &str, dependency: &str, checksum: &str) -> String {
+        format!(
+            "version = 4\n\n[[package]]\nname = \"{root}\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"{dependency}\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\"\n"
+        )
+    }
+
+    #[test]
+    fn local_registry_lockfile_includes_nested_workspaces_with_manifests() {
+        let scratch = ScratchDir::new("windows-prep-nested-lockfiles");
+        let staging = scratch.path().to_path_buf();
+        let root = staging.join(mapped("/repository").unwrap());
+        let nested = root.join("tools/nested");
+        let orphan = root.join("tools/orphan");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&orphan).unwrap();
+        let root_lock = root.join("Cargo.lock");
+        let root_manifest = root.join("Cargo.toml");
+        let nested_lock = nested.join("Cargo.lock");
+        let nested_manifest = nested.join("Cargo.toml");
+        let orphan_lock = orphan.join("Cargo.lock");
+        fs::write(
+            &root_lock,
+            lockfile("root", "root-dependency", &"a".repeat(64)),
+        )
+        .unwrap();
+        fs::write(&root_manifest, "[package]\nname = \"root\"\n").unwrap();
+        fs::write(
+            &nested_lock,
+            lockfile("nested", "nested-dependency", &"b".repeat(64)),
+        )
+        .unwrap();
+        fs::write(&nested_manifest, "[package]\nname = \"nested\"\n").unwrap();
+        fs::write(
+            &orphan_lock,
+            lockfile("orphan", "orphan-dependency", &"c".repeat(64)),
+        )
+        .unwrap();
+
+        let root_lock = root_lock.strip_prefix(&staging).unwrap();
+        let root_manifest = root_manifest.strip_prefix(&staging).unwrap();
+        let nested_lock = nested_lock.strip_prefix(&staging).unwrap();
+        let nested_manifest = nested_manifest.strip_prefix(&staging).unwrap();
+        let orphan_lock = orphan_lock.strip_prefix(&staging).unwrap();
+        let root_lock = root_lock.to_string_lossy().replace('\\', "/");
+        let root_manifest = root_manifest.to_string_lossy().replace('\\', "/");
+        let nested_lock = nested_lock.to_string_lossy().replace('\\', "/");
+        let nested_manifest = nested_manifest.to_string_lossy().replace('\\', "/");
+        let members = [
+            root_lock.clone(),
+            root_manifest.clone(),
+            nested_lock.clone(),
+            nested_manifest.clone(),
+            orphan_lock.to_string_lossy().replace('\\', "/"),
+        ]
+        .into_iter()
+        .collect();
+        let regular_files = [
+            root_lock,
+            root_manifest,
+            nested_lock,
+            nested_manifest,
+            orphan_lock.to_string_lossy().replace('\\', "/"),
+        ]
+        .into_iter()
+        .collect();
+        let plan = Plan {
+            staging,
+            snapshots: Vec::new(),
+            routes: BTreeMap::new(),
+            workspace: "/repository".into(),
+            tree_hash: String::new(),
+            cargo: PathBuf::new(),
+            rustup: PathBuf::new(),
+            toolchain_bin: PathBuf::new(),
+            toolchain_source: PathBuf::new(),
+        };
+
+        let merged = combined_registry_lockfile(&plan, &members, &regular_files).unwrap();
+        let parsed: toml::Value = toml::from_str(&merged).unwrap();
+        let packages = parsed["package"].as_array().unwrap();
+        let names: BTreeSet<_> = packages
+            .iter()
+            .filter_map(|package| package["name"].as_str())
+            .collect();
+        assert!(names.contains("root-dependency"));
+        assert!(names.contains("nested-dependency"));
+        assert!(!names.contains("orphan-dependency"));
     }
 }

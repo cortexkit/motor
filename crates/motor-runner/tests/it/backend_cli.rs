@@ -50,7 +50,7 @@ fn windows_prepare_process_emits_a_structured_step_failure() {
     assert_eq!(failure["step"], "validate manifests");
     assert_eq!(
         failure["reason"],
-        "snapshot has no Cargo.lock: m/repository"
+        "snapshot has no Cargo.lock: [redacted path or source]"
     );
     assert!(!line.contains(staging.to_str().unwrap()), "{line}");
 }

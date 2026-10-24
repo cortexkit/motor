@@ -363,7 +363,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn hyperv_inventory_parser_requires_a_json_array() {
         let os = r#"{"number":0,"lun":0,"boot":true,"system":true}"#;
         let cache = r#"{"number":1,"lun":1,"boot":false,"system":false}"#;
@@ -386,19 +385,6 @@ mod tests {
     }
 
     #[test]
-    fn hyperv_formatter_quotes_the_captured_serial_and_retains_raw_guard() {
-        let script = super::mount_script_with_serial(1, "serial'quoted");
-        assert!(script.contains("-cne 'serial''quoted'"));
-        assert!(script.contains("$d.IsBoot -or $d.IsSystem"));
-        assert!(script.contains("$d.PartitionStyle -ne 'RAW'"));
-        assert_eq!(
-            super::mount_script(1),
-            super::mount_script_with_serial(1, super::CACHE_DISK_SERIAL)
-        );
-    }
-    #[test]
-=======
->>>>>>> origin/main
     fn privileged_dismount_never_resolves_the_job_mount_folder() {
         // Dismount runs after the job can replace C:\t. Fence the actual
         // Windows implementation against reintroducing pathname-based cleanup.

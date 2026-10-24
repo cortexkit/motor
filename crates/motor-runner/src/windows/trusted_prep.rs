@@ -1,7 +1,22 @@
 //! Windows job preparation fetches lockfile-selected registry artifacts as SYSTEM.
 //! Cargo runs only in the offline guest or in explicitly selected diagnostics.
 use super::*;
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    mem::{size_of, zeroed},
+    ptr::{null, null_mut},
+    time::{Duration, Instant},
+};
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, LocalFree, HANDLE, WAIT_OBJECT_0},
+    Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB},
+    Security::{
+        CreateRestrictedToken, GetTokenInformation, LogonUserW, TokenUser, DISABLE_MAX_PRIVILEGE,
+        LOGON32_LOGON_BATCH, LOGON32_PROVIDER_DEFAULT, SID_AND_ATTRIBUTES, TOKEN_USER,
+        WRITE_RESTRICTED,
+    },
+    System::{JobObjects::*, Threading::*},
+};
 mod local_registry;
 mod system;
 
@@ -15,6 +30,188 @@ fn checked(ok: i32) -> io::Result<()> {
 }
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
+}
+
+struct BatchHandle(HANDLE);
+impl Drop for BatchHandle {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+fn batch_token(root: &Path, restrict: bool) -> io::Result<BatchHandle> {
+    let mut bytes = fs::read(root.join("prep-secret.dpapi"))?;
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: bytes.len() as u32,
+        pbData: bytes.as_mut_ptr(),
+    };
+    let mut output: CRYPT_INTEGER_BLOB = unsafe { zeroed() };
+    unsafe {
+        checked(CryptUnprotectData(
+            &input,
+            null_mut(),
+            null(),
+            null(),
+            null(),
+            0,
+            &mut output,
+        ))?;
+    }
+    let secret = unsafe { std::slice::from_raw_parts_mut(output.pbData, output.cbData as usize) };
+    let mut password: Vec<u16> = secret
+        .iter()
+        .map(|byte| u16::from(*byte))
+        .chain(Some(0))
+        .collect();
+    for byte in secret {
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    unsafe { LocalFree(output.pbData.cast()) };
+    let mut result = null_mut();
+    let success = unsafe {
+        LogonUserW(
+            wide("motor-prep").as_ptr(),
+            wide(".").as_ptr(),
+            password.as_ptr(),
+            LOGON32_LOGON_BATCH,
+            LOGON32_PROVIDER_DEFAULT,
+            &mut result,
+        )
+    };
+    for unit in &mut password {
+        unsafe { std::ptr::write_volatile(unit, 0) };
+    }
+    checked(success)?;
+    let base = BatchHandle(result);
+    if !restrict {
+        return Ok(base);
+    }
+    let mut required = 0;
+    unsafe { GetTokenInformation(base.0, TokenUser, null_mut(), 0, &mut required) };
+    let mut user = vec![0u64; (required as usize).div_ceil(8)];
+    unsafe {
+        checked(GetTokenInformation(
+            base.0,
+            TokenUser,
+            user.as_mut_ptr().cast(),
+            required,
+            &mut required,
+        ))?;
+        let sid = (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid;
+        let restriction = SID_AND_ATTRIBUTES {
+            Sid: sid,
+            Attributes: 0,
+        };
+        let mut restricted = null_mut();
+        // For each permitted write, the account's Windows security identifier
+        // must be allowed by both the file's normal access list and the restricted token.
+        checked(CreateRestrictedToken(
+            base.0,
+            DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,
+            0,
+            null(),
+            0,
+            null(),
+            1,
+            &restriction,
+            &mut restricted,
+        ))?;
+        Ok(BatchHandle(restricted))
+    }
+}
+
+/// Starts one isolated `motor-prep` batch process and waits for its exit.
+fn run_as_batch(
+    config: &Config,
+    command: &mut Command,
+    cwd: &Path,
+    restrict: bool,
+    timeout: Duration,
+) -> io::Result<()> {
+    let root = &config.windows.as_ref().unwrap().layout_root;
+    let token = batch_token(root, restrict)?;
+    let program = command
+        .get_program()
+        .to_str()
+        .ok_or_else(|| invalid("non-UTF8 prep program"))?;
+    let mut args = vec![motor_winagent::quote_windows_arg(program)];
+    for arg in command.get_args() {
+        args.push(motor_winagent::quote_windows_arg(
+            arg.to_str()
+                .ok_or_else(|| invalid("non-UTF8 prep argument"))?,
+        ));
+    }
+    let mut line = wide(&args.join(" "));
+    let mut env = BTreeMap::new();
+    for (key, value) in command.get_envs() {
+        if let Some(value) = value {
+            env.insert(
+                key.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            );
+        }
+    }
+    let environment = motor_winagent::environment::encode_block(&env)?;
+    unsafe {
+        let job = BatchHandle(CreateJobObjectW(null(), null()));
+        if job.0.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        limits.BasicLimitInformation.ActiveProcessLimit = 32;
+        checked(SetInformationJobObject(
+            job.0,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ))?;
+        let mut startup: STARTUPINFOW = zeroed();
+        startup.cb = size_of::<STARTUPINFOW>() as u32;
+        let mut info: PROCESS_INFORMATION = zeroed();
+        checked(CreateProcessAsUserW(
+            token.0,
+            wide(program).as_ptr(),
+            line.as_mut_ptr(),
+            null(),
+            null(),
+            0,
+            CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            environment.as_ptr().cast(),
+            wide(&cwd.to_string_lossy()).as_ptr(),
+            &startup,
+            &mut info,
+        ))?;
+        let process = BatchHandle(info.hProcess);
+        let thread = BatchHandle(info.hThread);
+        if AssignProcessToJobObject(job.0, process.0) == 0 {
+            let error = io::Error::last_os_error();
+            TerminateProcess(process.0, 1);
+            WaitForSingleObject(process.0, 5000);
+            return Err(error);
+        }
+        if ResumeThread(thread.0) == u32::MAX {
+            return Err(io::Error::last_os_error());
+        }
+        let deadline = Instant::now() + timeout;
+        while WaitForSingleObject(process.0, 50) != WAIT_OBJECT_0 {
+            if Instant::now() >= deadline {
+                return Err(invalid(format!(
+                    "Windows trusted preparation exceeded {} seconds",
+                    timeout.as_secs()
+                )));
+            }
+        }
+        let mut code = 0;
+        checked(GetExitCodeProcess(process.0, &mut code))?;
+        if code != 0 {
+            return Err(invalid(format!(
+                "Windows trusted preparation process exited {code}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn log_phase(progress_path: &Path, phase: &str) -> io::Result<()> {
@@ -65,106 +262,6 @@ fn lock_exclusive_bounded(lock: &fs::File, operation: &str) -> io::Result<()> {
     }
 }
 
-<<<<<<< HEAD
-=======
-/// No inherited handles, no profile, no repository working directory, no shell.
-/// Suspending before Job Object assignment closes the child escape race.
-fn fetch(config: &Config, command: &mut Command, cwd: &Path, timeout: Duration) -> io::Result<()> {
-    run_as_batch(config, command, cwd, true, timeout)
-}
-fn run_as_batch(
-    config: &Config,
-    command: &mut Command,
-    cwd: &Path,
-    restrict: bool,
-    timeout: Duration,
-) -> io::Result<()> {
-    let root = &config.windows.as_ref().unwrap().layout_root;
-    let token = token(root, restrict)?;
-    let program = command
-        .get_program()
-        .to_str()
-        .ok_or_else(|| invalid("non-UTF8 prep program"))?;
-    let mut args = vec![motor_winagent::quote_windows_arg(program)];
-    for arg in command.get_args() {
-        args.push(motor_winagent::quote_windows_arg(
-            arg.to_str()
-                .ok_or_else(|| invalid("non-UTF8 prep argument"))?,
-        ));
-    }
-    let mut line = wide(&args.join(" "));
-    let mut env = BTreeMap::new();
-    for (key, value) in command.get_envs() {
-        if let Some(value) = value {
-            env.insert(
-                key.to_string_lossy().into_owned(),
-                value.to_string_lossy().into_owned(),
-            );
-        }
-    }
-    let environment = motor_winagent::environment::encode_block(&env)?;
-    unsafe {
-        let job = Handle(CreateJobObjectW(null(), null()));
-        if job.0.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
-        limits.BasicLimitInformation.LimitFlags =
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        limits.BasicLimitInformation.ActiveProcessLimit = 32;
-        checked(SetInformationJobObject(
-            job.0,
-            JobObjectExtendedLimitInformation,
-            (&raw const limits).cast(),
-            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        ))?;
-        let mut startup: STARTUPINFOW = zeroed();
-        startup.cb = size_of::<STARTUPINFOW>() as u32;
-        let mut info: PROCESS_INFORMATION = zeroed();
-        checked(CreateProcessAsUserW(
-            token.0,
-            wide(program).as_ptr(),
-            line.as_mut_ptr(),
-            null(),
-            null(),
-            0,
-            CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-            environment.as_ptr().cast(),
-            wide(&cwd.to_string_lossy()).as_ptr(),
-            &startup,
-            &mut info,
-        ))?;
-        let process = Handle(info.hProcess);
-        let thread = Handle(info.hThread);
-        if AssignProcessToJobObject(job.0, process.0) == 0 {
-            let error = io::Error::last_os_error();
-            TerminateProcess(process.0, 1);
-            WaitForSingleObject(process.0, 5000);
-            return Err(error);
-        }
-        if ResumeThread(thread.0) == u32::MAX {
-            return Err(io::Error::last_os_error());
-        }
-        let deadline = Instant::now() + timeout;
-        while WaitForSingleObject(process.0, 50) != WAIT_OBJECT_0 {
-            if Instant::now() >= deadline {
-                return Err(invalid(format!(
-                    "Windows trusted preparation exceeded {} seconds",
-                    timeout.as_secs()
-                )));
-            }
-        }
-        let mut code = 0;
-        checked(GetExitCodeProcess(process.0, &mut code))?;
-        if code != 0 {
-            return Err(invalid(format!(
-                "Windows trusted cargo fetch exited {code}"
-            )));
-        }
-    }
-    Ok(())
-}
->>>>>>> origin/main
 pub(super) fn remove_staging(_config: &Config, path: &Path) -> io::Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
@@ -173,7 +270,6 @@ pub(super) fn remove_staging(_config: &Config, path: &Path) -> io::Result<()> {
     }
 }
 
-<<<<<<< HEAD
 fn copy_tree(source: &Path, target: &Path) -> io::Result<()> {
     use std::os::windows::fs::MetadataExt;
     let metadata = fs::symlink_metadata(source)?;
@@ -213,8 +309,6 @@ fn copy_tree(source: &Path, target: &Path) -> io::Result<()> {
     }
     Ok(())
 }
-=======
->>>>>>> origin/main
 pub(super) fn copy_routes(
     staging: &Path,
     routes: &BTreeMap<String, PathBuf>,
@@ -223,18 +317,12 @@ pub(super) fn copy_routes(
     let destination = staging.join("cargo-home/git-mirrors");
     fs::create_dir_all(&destination)?;
     for (index, (url, mirror)) in routes.iter().enumerate() {
-<<<<<<< HEAD
         let copy = destination.join(index.to_string());
         copy_tree(mirror, &copy)?;
-=======
-        let copy = staging.join("fetch-git-deps").join(index.to_string());
-        super::staging::copy_tree(mirror, &copy, staging)?;
->>>>>>> origin/main
         result.insert(url.clone(), copy);
     }
     Ok(result)
 }
-<<<<<<< HEAD
 
 const OFFLINE_CARGO_MANIFEST: &str = "[package]\nname = \"motor-runner-offline-cache\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ncfg-if = \"=1.0.4\"\n";
 const OFFLINE_CARGO_LOCK: &str = "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801\"\n\n[[package]]\nname = \"motor-runner-offline-cache\"\nversion = \"0.1.0\"\ndependencies = [\n \"cfg-if\",\n]\n";
@@ -432,34 +520,6 @@ fn copy_cargo_cache(
                 fs::create_dir_all(parent)?;
             }
             fs::copy(path, target)?;
-=======
-fn copy_manifests(source: &Path, target: &Path, staging: &Path) -> io::Result<()> {
-    fs::create_dir_all(target)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.is_symlink() {
-            fs::write(
-                target.join(entry.file_name()),
-                super::staging::link_text(&entry.path())?,
-            )?;
-            continue;
-        }
-        crate::filesystem::identity(&entry.path())?;
-        if metadata.is_dir() {
-            copy_manifests(&entry.path(), &target.join(entry.file_name()), staging)?;
-        } else if !metadata.is_file() {
-            return Err(invalid("special file in preparation manifests"));
-        } else if matches!(
-            entry.file_name().to_str(),
-            Some("Cargo.toml" | "Cargo.lock")
-        ) {
-            super::staging::copy_tree(&entry.path(), &target.join(entry.file_name()), staging)?;
-        } else if entry.path().extension().is_some_and(|s| s == "rs") {
-            // Cargo discovers targets while fetching; empty placeholders retain
-            // that layout without exposing source code to the prep account.
-            fs::write(target.join(entry.file_name()), b"")?;
->>>>>>> origin/main
         }
     }
     Ok(())
@@ -513,13 +573,8 @@ fn run_offline_cargo(
 pub(super) fn prepare_local_registry(
     config: &Config,
     staging: &Path,
-<<<<<<< HEAD
     lockfile: &str,
     routes: &BTreeMap<String, PathBuf>,
-=======
-    command: &mut Command,
-    timeout: Duration,
->>>>>>> origin/main
 ) -> io::Result<()> {
     system::require_system()?;
     let vm = config.windows.as_ref().unwrap();
@@ -529,7 +584,6 @@ pub(super) fn prepare_local_registry(
         .read(true)
         .write(true)
         .open(vm.layout_root.join("prep.lock"))?;
-<<<<<<< HEAD
     lock_exclusive_bounded(&lock, "Windows local-registry cache lock")?;
     let cache = config.state_dir().join(LOCAL_REGISTRY_CACHE_DIRECTORY);
     let cargo_home = staging.join("cargo-home");
@@ -550,160 +604,6 @@ pub(super) fn offline_cargo_entry(config: Config) -> io::Result<()> {
         service::{ServiceAccess, ServiceState},
         service_manager::{ServiceManager, ServiceManagerAccess},
     };
-=======
-    lock.lock_exclusive()?;
-    let cargo = vm.layout_root.join("prep-toolchain/bin/cargo.exe");
-    let hash = format!("{:x}", Sha256::digest(fs::read(&cargo)?));
-    if hash != vm.prep_cargo_sha256.to_ascii_lowercase() {
-        return Err(invalid("standalone prep cargo SHA-256 mismatch"));
-    }
-    let manifests = staging.join("fetch-manifests");
-    if !manifests.exists() {
-        copy_manifests(&staging.join("m"), &manifests.join("m"), staging)?;
-    }
-    let cache = config.state_dir().join("prep-cargo");
-    fs::create_dir_all(&cache)?;
-    let mut fetch_command = Command::new(&cargo);
-    fetch_command.env_clear();
-    for (key, value) in command.get_envs() {
-        if let Some(value) = value {
-            fetch_command.env(key, value);
-        }
-    }
-    let mut manifest_arg = false;
-    for arg in command.get_args() {
-        if manifest_arg {
-            let manifest = Path::new(arg).strip_prefix(staging).map_err(invalid)?;
-            fetch_command.arg(manifests.join(manifest));
-            manifest_arg = false;
-        } else {
-            fetch_command.arg(arg);
-            manifest_arg = arg == "--manifest-path";
-        }
-    }
-    fetch_command
-        .env("CARGO_HOME", &cache)
-        .env("SYSTEMROOT", r"C:\Windows")
-        .env("TEMP", staging.join("fetch-temp"))
-        .env("TMP", staging.join("fetch-temp"))
-        .env("RUSTC", vm.layout_root.join("prep-toolchain/bin/rustc.exe"))
-        .env("RUSTC_WRAPPER", "")
-        .env("CARGO_BUILD_RUSTC_WRAPPER", "");
-    fs::create_dir_all(staging.join("fetch-temp"))?;
-    super::vm::checked(super::vm::control(
-        config,
-        "GrantPrep",
-        None,
-        &["-Staging".into(), staging.to_string_lossy().into()],
-    )?)?;
-    let fetched = fetch(config, &mut fetch_command, staging, timeout);
-    super::vm::checked(super::vm::control(
-        config,
-        "RevokePrep",
-        None,
-        &["-Staging".into(), staging.to_string_lossy().into()],
-    )?)?;
-    fetched
-}
-
-pub(super) fn stage_cache(config: &Config, staging: &Path) -> io::Result<()> {
-    use fs2::FileExt;
-    // Copy once after all workspace fetches, with no batch process able to
-    // change the shared cache while it is being staged.
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(
-            config
-                .windows
-                .as_ref()
-                .unwrap()
-                .layout_root
-                .join("prep.lock"),
-        )?;
-    lock.lock_exclusive()?;
-    let cache = config.state_dir().join("prep-cargo");
-    for name in [
-        "registry/index",
-        "registry/cache",
-        "git/db",
-        "git/checkouts",
-    ] {
-        let source = cache.join(name);
-        if source.exists() {
-            super::staging::copy_tree(&source, &staging.join("cargo-home").join(name), staging)?;
-        }
-    }
-    Ok(())
-}
-
-/// Executes the same restricted batch launch used for Cargo. An unrestricted
-/// batch-token control must first prove that the outside test path is writable.
-pub(super) fn qualify(config: &Config) -> io::Result<()> {
-    let root = &config.windows.as_ref().unwrap().layout_root;
-    let stage = root.join("staging").join(Uuid::now_v7().to_string());
-    fs::create_dir_all(stage.join("fetch-manifests"))?;
-    fs::create_dir_all(stage.join("fetch-temp"))?;
-    fs::create_dir_all(config.state_dir().join("prep-cargo"))?;
-    let credential = root.join("prep-secret.dpapi");
-    // Open as SYSTEM without reading bytes: the real protected file must exist.
-    drop(fs::File::open(&credential)?);
-    let outside = PathBuf::from(r"C:\Windows\Temp")
-        .join(format!("motor-prep-outside-{}.txt", Uuid::now_v7()));
-    let probe = stage.join("fetch-manifests/probe.exe");
-    fs::copy(std::env::current_exe()?, &probe)?;
-    let result = (|| {
-        super::vm::checked(super::vm::control(
-            config,
-            "GrantPrep",
-            None,
-            &["-Staging".into(), stage.to_string_lossy().into()],
-        )?)?;
-        for (mode, restricted) in [("base-control", false), ("restricted", true)] {
-            let output = stage.join(format!("fetch-temp/{mode}.json"));
-            let mut command = Command::new(&probe);
-            command
-                .arg("prep-probe")
-                .arg(mode)
-                .arg(&credential)
-                .arg(&outside)
-                .arg(&output)
-                .env_clear()
-                .env("SYSTEMROOT", r"C:\Windows");
-            run_as_batch(
-                config,
-                &mut command,
-                &stage,
-                restricted,
-                Duration::from_secs(600),
-            )?;
-            let bytes = fs::read(&output)?;
-            fs::write(root.join(format!("evidence/prep-{mode}.json")), &bytes)?;
-            let proof: serde_json::Value = serde_json::from_slice(&bytes).map_err(invalid)?;
-            let expected = if restricted { "denied" } else { "allowed" };
-            if proof["outside_write"] != expected
-                || proof["allowed_write"] != "allowed"
-                || (restricted && proof["credential_read"] != "denied")
-            {
-                return Err(invalid(
-                    "prep qualification did not exercise the expected native access checks",
-                ));
-            }
-        }
-        if outside.exists() {
-            return Err(invalid("prep qualification left an outside file"));
-        }
-        Ok(())
-    })();
-    if outside.exists() {
-        fs::remove_file(&outside)?;
-    }
-    remove_staging(config, &stage)?;
-    result
-}
->>>>>>> origin/main
 
     system::require_system()?;
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
@@ -1009,4 +909,109 @@ pub(super) fn local_registry_entry(config: Config) -> io::Result<()> {
     );
     result?;
     cleanup
+}
+
+/// Tests normal batch file access and verifies the restricted token cannot
+/// read the credential or write outside staging.
+pub(super) fn qualify(config: &Config) -> io::Result<()> {
+    let root = &config.windows.as_ref().unwrap().layout_root;
+    let stage = root.join("staging").join(Uuid::now_v7().to_string());
+    fs::create_dir_all(stage.join("fetch-manifests"))?;
+    fs::create_dir_all(stage.join("fetch-temp"))?;
+    let credential = root.join("prep-secret.dpapi");
+    drop(fs::File::open(&credential)?);
+    let outside = PathBuf::from(r"C:\Windows\Temp")
+        .join(format!("motor-prep-outside-{}.txt", Uuid::now_v7()));
+    let probe = stage.join("fetch-manifests/probe.exe");
+    fs::copy(std::env::current_exe()?, &probe)?;
+    let result = (|| {
+        super::vm::checked(super::vm::control(
+            config,
+            "GrantPrep",
+            None,
+            &["-Staging".into(), stage.to_string_lossy().into()],
+        )?)?;
+        for (mode, restrict) in [("base-control", false), ("restricted", true)] {
+            let output = stage.join(format!("fetch-temp/{mode}.json"));
+            let mut command = Command::new(&probe);
+            command
+                .arg("prep-probe")
+                .arg(mode)
+                .arg(&credential)
+                .arg(&outside)
+                .arg(&output)
+                .env_clear()
+                .env("SYSTEMROOT", r"C:\Windows");
+            run_as_batch(
+                config,
+                &mut command,
+                &stage,
+                restrict,
+                Duration::from_secs(600),
+            )?;
+            let bytes = fs::read(&output)?;
+            fs::write(root.join(format!("evidence/prep-{mode}.json")), &bytes)?;
+            let proof: serde_json::Value = serde_json::from_slice(&bytes).map_err(invalid)?;
+            let expected = if restrict { "denied" } else { "allowed" };
+            if proof["outside_write"] != expected
+                || proof["allowed_write"] != "allowed"
+                || (restrict && proof["credential_read"] != "denied")
+            {
+                return Err(invalid(
+                    "prep qualification did not exercise the expected native access checks",
+                ));
+            }
+        }
+        if outside.exists() {
+            return Err(invalid("prep qualification left an outside file"));
+        }
+        Ok(())
+    })();
+    if outside.exists() {
+        fs::remove_file(&outside)?;
+    }
+    remove_staging(config, &stage)?;
+    result
+}
+
+/// The child uses direct file operations so shell redirection failures cannot
+/// be mistaken for denied credential reads or outside writes.
+pub(crate) fn probe(arguments: &[String]) -> io::Result<()> {
+    if arguments.len() != 4 {
+        return Err(invalid(
+            "prep-probe requires mode, credential, outside and result paths",
+        ));
+    }
+    let mode = arguments[0].as_str();
+    let credential = Path::new(&arguments[1]);
+    let outside = Path::new(&arguments[2]);
+    let output = Path::new(&arguments[3]);
+    let proof = match mode {
+        "base-control" => {
+            fs::write(outside, b"unrestricted batch write control")?;
+            fs::remove_file(outside)?;
+            serde_json::json!({"outside_write":"allowed","allowed_write":"allowed"})
+        }
+        "restricted" => {
+            match fs::File::open(credential) {
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+                _ => {
+                    return Err(invalid(
+                        "restricted batch token did not deny opening the real runner credential",
+                    ))
+                }
+            }
+            match fs::write(outside, b"must be denied") {
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+                _ => {
+                    return Err(invalid(
+                        "restricted batch token did not deny the controlled outside write",
+                    ))
+                }
+            }
+            serde_json::json!({"credential_read":"denied","outside_write":"denied","allowed_write":"allowed"})
+        }
+        _ => return Err(invalid("unknown prep-probe mode")),
+    };
+    fs::write(output, serde_json::to_vec(&proof).map_err(invalid)?)
 }

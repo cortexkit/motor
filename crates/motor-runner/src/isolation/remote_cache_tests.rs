@@ -142,8 +142,8 @@ fn rendered_argv(
 const REMOTE_PINNED_SHA256: &str =
     "c20b3f34052769f35470cd8a8fb6abf91ae9bfe48d65c2e8eebb8b17069f9991";
 
-/// Every unit kind, rendered with and without forwarders: the forwarder starts
-/// are the only difference, they come right after the gate, and with no
+/// Every unit kind, rendered with and without forwarders: only forwarder starts
+/// and active-tool statistics change. Forwarders start right after the gate; with no
 /// forwarders nothing changes at all (the argv pinned in `command_golden`
 /// covers the unchanged units byte for byte).
 #[test]
@@ -209,7 +209,23 @@ fn forwarders_start_right_after_the_gate_and_change_nothing_else() {
                     "{name}: {with}"
                 );
                 assert_eq!(with.matches(&starts).count(), 1, "{name}: {with}");
-                let stripped = with.replacen(&starts, "", 1);
+                let ccache_stats =
+                    "ccache --print-stats >/motor-output/ccache-stats 2>/dev/null || true; ";
+                // When the ccache forwarder is enabled, assert its added stats
+                // capture exactly once, then remove only that capture so the
+                // pinned digest and comparison with no-forwarder argv remain
+                // unchanged.
+                let normalized = if durable
+                    && tools
+                        .iter()
+                        .any(|forwarder| forwarder.tool() == Tool::Ccache)
+                {
+                    assert_eq!(with.matches(ccache_stats).count(), 1, "{name}: {with}");
+                    with.replacen(ccache_stats, "", 1)
+                } else {
+                    with.clone()
+                };
+                let stripped = normalized.replacen(&starts, "", 1);
                 let stats_command = " sccache --show-stats --stats-format=json >/motor-output/cache-stats 2>/dev/null || true;";
                 let expected = if durable && env.is_empty() && !fill {
                     assert_eq!(stripped.matches(stats_command).count(), 1, "{name}: {with}");
@@ -222,7 +238,7 @@ fn forwarders_start_right_after_the_gate_and_change_nothing_else() {
                     "== {name} durable={durable} cached={}\n",
                     !env.is_empty()
                 ));
-                pinned.push_str(&with);
+                pinned.push_str(&normalized);
             }
         }
     }
@@ -324,6 +340,126 @@ fn mounts(sandbox: &Sandbox) -> (Vec<String>, Vec<String>) {
 fn names(arguments: &[String], path: &Path) -> bool {
     let path = path.to_str().unwrap();
     arguments.iter().any(|argument| argument.starts_with(path))
+}
+
+#[test]
+fn ccache_outputs_are_preallocated_bound_and_granted_for_jobs_and_no_cargo_fills() {
+    let f = Fixture::new();
+    fs::write(
+        f.workspace.join("unit.c"),
+        "int answer(void) { return 42; }",
+    )
+    .unwrap();
+    workspace::git(&f.workspace, &["init", "-q"]).unwrap();
+    workspace::git(&f.workspace, &["add", "."]).unwrap();
+    let tree = workspace::git(&f.workspace, &["write-tree"]).unwrap();
+    let cache = FakeCache::new();
+    let remote = cache.transport(&[(Tool::Ccache, free_port())]);
+    let acls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let log = acls.clone();
+    crate::systemd::with_process_hook(
+        Box::new(move |command| {
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            log.lock().unwrap().push(args);
+            fake_privileged_output(command).unwrap_or_else(|| command.output())
+        }),
+        || {
+            for writer in [false, true] {
+                let target = f.scratch.join(if writer {
+                    "ccache-fill-target"
+                } else {
+                    "ccache-job-target"
+                });
+                fs::create_dir_all(&target).unwrap();
+                let sandbox = Sandbox::prepare_role(
+                    Uuid::now_v7(),
+                    &f.state,
+                    &f.workspace,
+                    &target,
+                    &[],
+                    None,
+                    &f.state.join("slots"),
+                    1,
+                    &BTreeMap::new(),
+                    &tree,
+                    f.workspace.to_str().unwrap(),
+                    writer,
+                    false,
+                    false,
+                    None,
+                    &JavascriptTools::for_role(ToolchainRole::BuildServer),
+                    Some(&remote),
+                )
+                .unwrap();
+                let stats = sandbox.runtime.0.join("output/ccache-stats");
+                assert!(fs::symlink_metadata(&stats).unwrap().is_file());
+                assert_eq!(fs::metadata(&stats).unwrap().len(), 0);
+                assert!(sandbox
+                    .read_write
+                    .contains(&bind(&stats, Path::new("/motor-output/ccache-stats")).unwrap()));
+                assert!(acls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|args| args.iter().any(|arg| arg == stats.to_str().unwrap())));
+                let command = sandbox
+                    .command("exit 7", &f.workspace, &[], true, &[], 0)
+                    .unwrap();
+                let args = command
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                let shell = &args[args.len() - 3];
+                assert!(shell.contains("ccache --print-stats >/motor-output/ccache-stats"));
+                assert!(
+                    shell.find("code=$?").unwrap() < shell.find("ccache --print-stats").unwrap()
+                );
+                if writer {
+                    assert_eq!(
+                        fs::read_to_string(sandbox.runtime.0.join("tools/writer-cargo-check.sh"))
+                            .unwrap(),
+                        crate::writer::fill::CARGO_CHECK
+                    );
+                    assert!(sandbox
+                        .runtime
+                        .0
+                        .join("tools/writer-preflight.py")
+                        .is_file());
+                }
+            }
+        },
+    );
+    assert!(!cache_output_names(false).contains(&"ccache-stats"));
+}
+
+#[test]
+fn ccache_stats_capture_preserves_the_build_exit_code_even_if_stats_fail() {
+    let f = Fixture::new();
+    let output = f.scratch.join("capture-output");
+    fs::create_dir_all(&output).unwrap();
+    fs::write(output.join("ccache-stats"), "").unwrap();
+    fs::write(output.join("exit"), [b' '; 32]).unwrap();
+    let shell = with_ccache_statistics(
+        "code=7; printf '%s\\n' \"$code\" 1<>/motor-output/exit; exit \"$code\"",
+        true,
+    )
+    .replace("/motor-output", output.to_str().unwrap());
+    let stub = "ccache() { printf 'remote_storage_hit 1\\nremote_storage_error 0\\nremote_storage_timeout 0\\n'; return 9; }; ";
+    let status = Command::new("/bin/bash")
+        .args(["-c", &format!("{stub}{shell}")])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(7));
+    let stats =
+        crate::remote_cache::ccache::statistics(&fs::read(output.join("ccache-stats")).unwrap())
+            .unwrap();
+    assert_eq!(stats[crate::remote_cache::ccache::REMOTE_HIT], 1);
+    assert!(fs::read_to_string(output.join("exit"))
+        .unwrap()
+        .starts_with("7\n"));
 }
 
 #[test]

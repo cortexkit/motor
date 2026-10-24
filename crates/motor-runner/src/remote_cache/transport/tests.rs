@@ -86,7 +86,7 @@ impl Drop for ProcessGroup {
 /// Starts a forwarder from `directory`, so `socket` may be a short relative
 /// path whatever the directory's length. Returns its exit status and the
 /// group its background copy serves from.
-fn start_forwarder(
+pub(crate) fn start_forwarder(
     binary: &Path,
     directory: &Path,
     port: u16,
@@ -134,7 +134,7 @@ pub(crate) fn http(port: u16, method: &str, path: &str, body: &[u8]) -> io::Resu
     Ok((status, reply[end + 4..].to_vec()))
 }
 
-fn forwarder_binary(state: &Path) -> PathBuf {
+pub(crate) fn forwarder_binary(state: &Path) -> PathBuf {
     crate::isolation::prepare_cache_forwarder(state).unwrap()
 }
 

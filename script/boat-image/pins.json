@@ -10,7 +10,7 @@
     "script/runner/units/system/motor-jobs.slice": "9ff0c0e449aa78f5b0c3ea6d1f0ea86e81983e2bf16569b6e52106777b1ade3d",
     "script/runner/tools.txt": "deeae6c16195cbdea75324bc293e48117944e09956eadaa8c4e456f3188d743d",
     "script/runner/install-tools.sh": "381d6d1e0b56690a34a2c6df40f86f90eb6574663e2f91e9d7b27120d752a9ea",
-    "script/runner/toolchain.json": "ca94d1bf281d0c6c4beab17510ccfea0fb4ce0f2d1ce77ca9b9c7be65f3728bf",
+    "script/runner/toolchain.json": "d6c62cf73de52a724f7c35d263ed718b4d3810347e688bcd13cc18cfb87889a1",
     "script/runner/toolchain-parity.py": "27cdc99849d3cb08fe0e24320713f8bc5c891cf166246a993ed62ea2e3677c2a",
     "script/runner/syscall-surface.py": "930fb7373920f92ae4b876b7635d586f9dabb4d44e26fc4c9db045b18cbe0368",
     "script/runner/cargo-seed.py": "6759e7b26778d7bb62a5c081bac8162e1ed1ee1b67eca28bec3927e9ee07f485",
@@ -18,15 +18,9 @@
     "script/runner/sysctl/60-motor-inotify.conf": "2ddb7e2127e6c2c04d2d4c96293e12b39f29a81e58adac0c1a3eb8d432b7b9f4",
     "script/runner/build-sccache.sh": "d8b6f7b01c68ef98e129621ef6c59cb919749bf7ce0dbfeb3c47f9a4267d5435",
     "script/runner/patches/sccache-0.18.0-read-only-hits.patch": "e37a753c4fb04a37b118b9f49431740cd82a6c5e2ef93d9d01838e11a3242870",
-<<<<<<< HEAD
-    "script/runner/toolchain-parity.py": "6583d1a7155dbbb5f9514b46422b1f0a1a5e2da46c46899534b82b410b64584b",
-    "script/runner/cargo-seed.py": "6759e7b26778d7bb62a5c081bac8162e1ed1ee1b67eca28bec3927e9ee07f485",
-    "script/runner/toolchain.json": "e1601063fbe22b212639c62fd35ca13ff667f792bf02a7cb5c74613ac48c9017"
-=======
     "script/runner/build-git.sh": "f6bcd8e8d3ec7681063a589b551ece670122f35f8955b315db62ad8079380940",
     "script/runner/install-binaryen.py": "dfd4a8741fe70f2334cfaf63681710f6271f15067a9f3b1012fd82d22416ab6d",
     "script/runner/parity-files.txt": "6d538bb26b061cec3bc7d676879510eb6946461ffbb2ef560e2ec9e0ed46a89b",
     "script/runner/remote-cache-environment.py": "08ab82222025a888a3a436435daf2520213d799d4cb944a90b2843a6a7f2b2d2"
->>>>>>> origin/main
   }
 }

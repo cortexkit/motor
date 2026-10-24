@@ -14,19 +14,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod diagnostics;
 pub(crate) mod dns;
-pub(crate) use dns::DIRECTORY as DNS_DIRECTORY;
 mod network;
 mod paths;
 mod runner_socket;
 mod snapshot;
 
 const ARGS: &str = "/tenant/runner-args";
-/// Written by tenant attachment once it has placed the daemon's private
-/// resolver file. The runner that attachment starts reads it to decide whether
-/// a snapshot helper unit binds that resolver; every runner is started before
-/// the file exists. It lives on `/run`, which a fresh boot of the VM clears,
-/// so no stale marker outlives the resolver it describes.
-pub(crate) const DNS_MARKER: &str = "/run/motor-tenant-dns";
+pub(crate) use crate::tenant::DNS_MARKER;
 /// The tenant's workspace roots, each bound from the tenant disk over the
 /// image's own directory before the runner starts. Nothing the runner runs
 /// may live beneath them in the image.
@@ -929,7 +923,7 @@ mod tests {
         // that survives its runner's restart and is gone after the VM boots
         // again, which is what tells a helper's unit whether to bind it.
         assert_eq!(DNS_MARKER, "/run/motor-tenant-dns");
-        assert!(Path::new(DNS_DIRECTORY).is_absolute());
+        assert!(Path::new(crate::tenant::DNS_DIRECTORY).is_absolute());
     }
 
     #[tokio::test]

@@ -49,6 +49,7 @@ mod systemd;
 /// OOMPolicy also stops surviving job descendants. Kept outside `systemd` so
 /// the argument builders of the Windows VM backend compile on every host,
 /// although only a Linux host runs them.
+#[cfg(unix)]
 pub(crate) const JOB_MEMORY_PROPERTIES: [&str; 3] = [
     "--property=Slice=motor-jobs.slice",
     "--property=OOMScoreAdjust=900",
@@ -164,6 +165,19 @@ pub fn request_windows_service_stop() {
 #[doc(hidden)]
 pub fn hyperv_probe_peers() -> std::io::Result<()> {
     windows::probe_peers()
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn hyperv_prep_probe(arguments: &[String]) -> std::io::Result<()> {
+    windows::prep_probe(arguments)
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn hyperv_qualify_prep(config: Config) -> std::io::Result<()> {
+    let runner = Runner::open_for_qualification(config)?;
+    windows::qualify_prep(runner.config())
 }
 
 #[cfg(windows)]

@@ -113,6 +113,7 @@ pub(crate) struct Setup {
 pub(crate) struct Prepared {
     pub cwd: PathBuf,
     pub target: PathBuf,
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub wrapper: Option<PathBuf>,
     pub sandbox: Option<Box<dyn IsolationLauncher>>,
     pub vm: Option<std::sync::Mutex<Option<Box<dyn Execution>>>>,
@@ -153,6 +154,7 @@ pub(crate) struct Launch {
     pub execution: Box<dyn Execution>,
     /// The write ledgers of the unit's cache sockets; empty for a unit that is
     /// not a fill or has no remote cache.
+    #[cfg(unix)]
     pub cache_ledgers: Vec<std::sync::Arc<crate::remote_cache::gateway::WriteLedger>>,
 }
 
@@ -900,12 +902,13 @@ impl Backend for HostBackend {
         }?;
         #[cfg(target_os = "linux")]
         let cache_ledgers = launch.cache_ledgers();
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(unix, not(target_os = "linux")))]
         let cache_ledgers = Vec::new();
         Ok(Launch {
             process: Some(launch.identity),
             durable_output: launch.durable_output,
             execution: Box::new(launch),
+            #[cfg(unix)]
             cache_ledgers,
         })
     }
@@ -1033,6 +1036,7 @@ impl Execution for platform::Launch {
     }
 }
 
+#[cfg(unix)]
 fn compile_cache_environment(
     config: &Config,
     setup: &Setup,
@@ -1088,6 +1092,16 @@ fn compile_cache_environment(
     remote_cache_environment(config, setup, env)
 }
 
+#[cfg(not(unix))]
+fn compile_cache_environment(
+    _config: &Config,
+    _setup: &Setup,
+    _prepared: &Prepared,
+    _env: &mut BTreeMap<String, String>,
+) -> io::Result<()> {
+    Ok(())
+}
+
 /// A cache fill, or a job whose workspace root is a Cargo workspace.
 #[cfg(target_os = "linux")]
 fn rust_job(setup: &Setup) -> bool {
@@ -1106,6 +1120,7 @@ fn rust_job(setup: &Setup) -> bool {
 /// exactly what it was before the cache existed, operator settings included;
 /// scrubbing always runs before anything is added, so it never removes a
 /// value the runner generated.
+#[cfg(unix)]
 pub(crate) fn scrub_inherited_cache_environment(
     config: &Config,
     setup: &Setup,
@@ -1117,6 +1132,8 @@ pub(crate) fn scrub_inherited_cache_environment(
     if config.remote_cache_available(setup.base).is_none() {
         return;
     }
+    // Declared C/C++ fills and jobs need not contain a Cargo manifest.
+    env.retain(|key, _| !key.starts_with("CCACHE_"));
     #[cfg(target_os = "linux")]
     if !(setup.base || rust_job(setup)) {
         return;
@@ -1141,6 +1158,7 @@ pub(crate) fn scrub_inherited_cache_environment(
 /// gateway yet, so no unit is switched on and every role keeps today's
 /// environment; `remote_cache_job_environment` is what a switched-on unit
 /// would add on top of that baseline.
+#[cfg(unix)]
 fn remote_cache_environment(
     config: &Config,
     setup: &Setup,
@@ -1154,6 +1172,7 @@ fn remote_cache_environment(
         &forwarders,
         &generation,
         setup.base,
+        &setup.request.workspace_key,
         env,
     );
     Ok(())
@@ -1162,11 +1181,13 @@ fn remote_cache_environment(
 /// Apply one host type's remote cache delta to `env`: exactly the difference
 /// between its switch-off job environment and its switch-on one. `env` must
 /// already hold the role's baseline.
+#[cfg(unix)]
 pub(crate) fn remote_cache_job_environment(
     role: crate::remote_cache::provisioning::HostRole,
     forwarders: &[crate::remote_cache::transport::Forwarder],
     generation: &crate::remote_cache::provisioning::ActiveGeneration,
     fill: bool,
+    workspace: &str,
     env: &mut BTreeMap<String, String>,
 ) {
     let mut delta = crate::remote_cache::environment::delta(
@@ -1175,12 +1196,25 @@ pub(crate) fn remote_cache_job_environment(
         &generation.bucket,
         &generation.region,
     );
-    if fill {
+    if fill
+        && forwarders
+            .iter()
+            .any(|f| f.tool() == crate::remote_cache::gateway::Tool::Sccache)
+    {
         delta.extend(crate::remote_cache::environment::fill_values());
         delta.insert(
             "SCCACHE_S3_RW_MODE".into(),
             crate::remote_cache::environment::READ_WRITE_MODE.into(),
         );
+    }
+    if let Some(forwarder) = forwarders
+        .iter()
+        .find(|f| f.tool() == crate::remote_cache::gateway::Tool::Ccache)
+        .filter(|_| crate::remote_cache::ccache::installed(role))
+    {
+        delta.extend(crate::remote_cache::ccache::environment(
+            forwarder, fill, workspace,
+        ));
     }
     env.extend(delta);
 }

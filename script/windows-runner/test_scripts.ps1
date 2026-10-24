@@ -20,6 +20,7 @@ foreach ($file in $files) {
     $count++
 }
 . "$PSScriptRoot\accounts.ps1"
+. "$PSScriptRoot\qualify-peer.ps1"
 $root = Join-Path ([IO.Path]::GetTempPath()) ('motor-runner-script-tests-' + [Guid]::NewGuid())
 New-Item $root -ItemType Directory | Out-Null
 $script:effective = @('[Unicode]','Unicode=yes','[Version]','signature="$CHICAGO$"','Revision=1','[Privilege Rights]','SeBatchLogonRight = motor-prep,*S-1-5-32-544','SeDenyInteractiveLogonRight = *S-1-5-32-546')
@@ -499,6 +500,168 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         [IO.File]::Delete($sharingFile)
         Write-Host 'PASS parent-guard-denies-write-and-delete-and-refuses-existing-writer'
         $count++
+
+        # Run the production peer evidence validators with synthetic VM logs.
+        $peerNonce = '0123456789abcdef0123456789abcdef'
+        $nonce = $peerNonce
+        $victimVm = [Guid]'11111111-2222-3333-4444-555555555555'
+        $attackerVm = [Guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        $frameText = ConvertTo-Json -InputObject ([ordered]@{kind='hello'; nonce=$nonce; version=4}) -Compress
+        $framePayload = [Text.UTF8Encoding]::new($false, $true).GetBytes($frameText)
+        $frameLength = $framePayload.Length
+        $frame = [byte[]]::new($frameLength + 4)
+        $frame[0] = [byte](($frameLength -shr 24) -band 0xff)
+        $frame[1] = [byte](($frameLength -shr 16) -band 0xff)
+        $frame[2] = [byte](($frameLength -shr 8) -band 0xff)
+        $frame[3] = [byte]($frameLength -band 0xff)
+        [Array]::Copy($framePayload, 0, $frame, 4, $frameLength)
+        $null = Convert-RunnerPeerHello $frame $nonce
+        $peerStart = [DateTimeOffset]::Parse('2026-10-22T10:00:00Z')
+        $peerTimeline = [ordered]@{
+            hello_validated=$true; victim_start_ms=1000; boot_observed_ms=2000
+            attacker_start_ms=22000; proof_observed_ms=23000; host_connect_ms=24000
+            hello_ms=25000; settled_ms=85000; victim_start_utc=$peerStart.ToString('o')
+            boot_utc=$peerStart.AddSeconds(1).ToString('o')
+            boot_observed_utc=$peerStart.AddSeconds(2).ToString('o')
+            attacker_start_utc=$peerStart.AddSeconds(22).ToString('o')
+            proof_observed_utc=$peerStart.AddSeconds(23).ToString('o')
+            host_connect_utc=$peerStart.AddSeconds(24).ToString('o')
+            hello_utc=$peerStart.AddSeconds(25).ToString('o')
+            boot_event_id=18601; boot_record_id=42; boot_vm_id=$victimVm.ToString('D')
+            victim_vm_id=$victimVm.ToString('D'); attacker_vm_id=$attackerVm.ToString('D')
+            hello_nonce=$peerNonce
+        }
+        $peerProof = @([pscustomobject]@{target=$victimVm.ToString('D'); transport_connected=$false})
+        $peerLog = "boot nonce=$peerNonce`nhvsock listening`nhvsock refused peer vm_id=e0e16197dd564a1091955ee7a155a838`nhvsock accepted peer vm_id=a42e7cdad03f480c9cc2a4de20abb878`n"
+        $peerResult = Assert-RunnerPeerEvidence $nonce $victimVm $attackerVm $peerProof $peerTimeline $peerLog
+        if ($peerResult -ne 'cross-vm-attempt-did-not-consume-single-listener') { throw 'FAIL peer-false-with-final-hello-and-single-parent-accept' }
+        Write-Host 'PASS peer-false-with-final-hello-and-single-parent-accept'
+        $count++
+        function Assert-PeerFixtureFailure([string]$Name, [scriptblock]$Action) {
+            $rejected = $false
+            try { & $Action | Out-Null } catch { $rejected = $true }
+            if (-not $rejected) { throw "FAIL $Name" }
+            Write-Host "PASS $Name"
+            $script:count++
+        }
+        function Copy-PeerTimeline($Timeline) {
+            $copy = [ordered]@{}
+            foreach ($key in $Timeline.Keys) { $copy[$key] = $Timeline[$key] }
+            return $copy
+        }
+        $badTimeline = Copy-PeerTimeline $peerTimeline
+        $badTimeline['hello_validated'] = $false
+        Assert-PeerFixtureFailure 'peer-host-hello-failure-is-unproven' {
+            Assert-RunnerPeerEvidence $peerNonce $victimVm $attackerVm $peerProof $badTimeline $peerLog
+        }
+        $badTimeline = Copy-PeerTimeline $peerTimeline
+        $badTimeline['attacker_start_ms'] = 21999
+        $badTimeline['attacker_start_utc'] = $peerStart.AddMilliseconds(21999).ToString('o')
+        Assert-PeerFixtureFailure 'peer-attacker-before-boot-margin-is-unproven' {
+            Assert-RunnerPeerEvidence $peerNonce $victimVm $attackerVm $peerProof $badTimeline $peerLog
+        }
+        $connectedProof = @([pscustomobject]@{target=$victimVm.ToString('D'); transport_connected=$true})
+        Assert-PeerFixtureFailure 'peer-connected-attacker-needs-native-refusal' {
+            Assert-RunnerPeerEvidence $peerNonce $victimVm $attackerVm $connectedProof $peerTimeline $peerLog
+        }
+        $noLoopback = $peerLog.Replace("hvsock refused peer vm_id=e0e16197dd564a1091955ee7a155a838`n", '')
+        Assert-PeerFixtureFailure 'peer-requires-native-loopback-refusal' {
+            Assert-RunnerPeerEvidence $peerNonce $victimVm $attackerVm $peerProof $peerTimeline $noLoopback
+        }
+        $nonParent = $peerLog.Replace('a42e7cdad03f480c9cc2a4de20abb878', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')
+        Assert-PeerFixtureFailure 'peer-rejects-non-parent-accept' {
+            Assert-RunnerPeerEvidence $peerNonce $victimVm $attackerVm $peerProof $peerTimeline $nonParent
+        }
+
+        function New-PeerBootXml([Guid]$VmId, [string]$SystemTime, [long]$RecordId) {
+            return "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><EventID>18601</EventID><Channel>Microsoft-Windows-Hyper-V-Worker-Admin</Channel><TimeCreated SystemTime='$SystemTime'/><EventRecordID>$RecordId</EventRecordID></System><UserData><VmlEventLog><VmId>$VmId</VmId></VmlEventLog></UserData></Event>"
+        }
+        function New-PeerEvent([long]$RecordId, [string]$Xml) {
+            $event = [pscustomobject]@{RecordId=$RecordId; Xml=$Xml}
+            $event | Add-Member -MemberType ScriptMethod -Name ToXml -Value { $this.Xml }
+            return $event
+        }
+        Initialize-RunnerPeerSocket
+        $upperXml = New-PeerBootXml $victimVm $peerStart.AddSeconds(1).ToString('o') 42
+        $upperXml = $upperXml.Replace($victimVm.ToString('D'), $victimVm.ToString('D').ToUpperInvariant())
+        $bootXml = $upperXml
+        $since = $peerStart.UtcDateTime
+        if (-not (Get-RunnerPeerBootMatch $bootXml $victimVm $since)) { throw 'FAIL peer-boot-uppercase-userdata-guid-matches' }
+        Write-Host 'PASS peer-boot-uppercase-userdata-guid-matches'
+        $count++
+        $otherXml = New-PeerBootXml $attackerVm $peerStart.AddSeconds(1).ToString('o') 43
+        if ($null -ne (Get-RunnerPeerBootMatch $otherXml $victimVm $peerStart.UtcDateTime)) { throw 'FAIL peer-boot-different-vm-is-rejected' }
+        Write-Host 'PASS peer-boot-different-vm-is-rejected'
+        $count++
+        $oldXml = New-PeerBootXml $victimVm $peerStart.AddSeconds(-5).ToString('o') 44
+        if ($null -ne (Get-RunnerPeerBootMatch $oldXml $victimVm $peerStart.UtcDateTime)) { throw 'FAIL peer-boot-event-before-start-is-rejected' }
+        Write-Host 'PASS peer-boot-event-before-start-is-rejected'
+        $count++
+        $script:peerBootPoll = 0
+        $script:peerBootUnrelated = New-PeerEvent 45 $otherXml
+        $script:peerBootCurrent = New-PeerEvent 46 $upperXml
+        function global:Get-WinEvent {
+            [CmdletBinding()]
+            param([hashtable]$FilterHashtable)
+            $script:peerBootPoll++
+            if ($script:peerBootPoll -eq 1) { return $script:peerBootUnrelated }
+            return $script:peerBootCurrent
+        }
+        $eventPath = Join-Path $nativeFixtureRoot 'peer-boot-fixture.xml'
+        $bootMatch = Wait-RunnerPeerBoot $victimVm $since $eventPath
+        $queryEvidence = Get-Content -LiteralPath ($eventPath + '.queries.json') -Raw | ConvertFrom-Json
+        if ($script:peerBootPoll -lt 2 -or $bootMatch.record_id -ne 46 -or $queryEvidence.queries.Count -lt 2) { throw 'FAIL peer-boot-polls-past-unrelated-event-and-retains-queries' }
+        Write-Host 'PASS peer-boot-polls-past-unrelated-event-and-retains-queries'
+        $count++
+        Remove-Item Function:\Get-WinEvent
+
+        function global:Complete-SpikeNativeProcess($Monitor, [string]$Stdout, [string]$Stderr) {
+            [IO.File]::WriteAllText($Stdout, '')
+            [IO.File]::WriteAllText($Stderr, '')
+            return [pscustomobject]@{exitCode=$script:peerMonitorExit; stdout=''; stderr=''}
+        }
+        function New-MonitorFixture([int]$ExitAfterWaits, [int]$ProcessId) {
+            $process = [pscustomobject]@{Id=$ProcessId; Waits=0; ExitAfterWaits=$ExitAfterWaits; Killed=$false}
+            $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+                param([int]$Milliseconds)
+                $this.Waits++
+                return $this.Waits -ge $this.ExitAfterWaits
+            }
+            $process | Add-Member -MemberType ScriptMethod -Name Kill -Value { $this.Killed = $true }
+            return [pscustomobject]@{job="fixture-$ProcessId"; process=$process}
+        }
+        $script:peerMonitorExit = 137
+        $monitorStatus = Stop-RunnerPeerMonitor (New-MonitorFixture 2 43210) $nativeFixtureRoot 'fixture boot-gate failure'
+        if (-not $monitorStatus.forced -or -not $monitorStatus.terminated -or $monitorStatus.reason -notmatch 'fixture boot-gate failure' -or -not (Test-Path (Join-Path $nativeFixtureRoot 'peer-monitor-43210.status.json'))) { throw 'FAIL peer-monitor-intentional-kill-retains-reason-with-empty-output' }
+        Write-Host 'PASS peer-monitor-intentional-kill-retains-reason-with-empty-output'
+        $count++
+        $script:peerMonitorExit = 7
+        $monitorStatus = Stop-RunnerPeerMonitor (New-MonitorFixture 1 43211) $nativeFixtureRoot $null
+        if (-not $monitorStatus.terminated -or $monitorStatus.failure -notmatch 'Run monitor exited nonzero') { throw 'FAIL peer-monitor-unexpected-nonzero-has-explicit-reason' }
+        Write-Host 'PASS peer-monitor-unexpected-nonzero-has-explicit-reason'
+        $count++
+        $monitorStatus = Stop-RunnerPeerMonitor (New-MonitorFixture 99 43212) $nativeFixtureRoot $null
+        $qualifySource = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'qualify.ps1'))
+        if ($monitorStatus.terminated -or $qualifySource -notmatch 'if \(-not \$status\.terminated\) \{ \$canRemove = \$false \}') { throw 'FAIL peer-monitor-unreaped-preserves-disks' }
+        Write-Host 'PASS peer-monitor-unreaped-preserves-disks'
+        $count++
+        $primaryMessage = 'primary boot-gate failure'
+        $observed = $null
+        try { Assert-RunnerPeerCleanup ([IO.InvalidDataException]::new($primaryMessage)) @('secondary cleanup failure') } catch { $observed = $_.Exception.Message }
+        if ($observed -cne $primaryMessage) { throw 'FAIL peer-cleanup-preserves-primary-boot-gate-error' }
+        Write-Host 'PASS peer-cleanup-preserves-primary-boot-gate-error'
+        $count++
+
+        $qualifySource = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'qualify.ps1'))
+        $helloCapture = $qualifySource.IndexOf('$timeline.hello_ms = $peerClock.ElapsedMilliseconds')
+        $settleWait = $qualifySource.IndexOf('Wait-RunnerQualificationWindow $peerClock $timeline.hello_ms 60000')
+        if ($helloCapture -lt 0 -or $settleWait -lt $helloCapture) { throw 'FAIL peer-settle-production-window-is-anchored-to-recorded-hello' }
+        Write-Host 'PASS peer-settle-production-window-is-anchored-to-recorded-hello'
+        $count++
+        if ($qualifySource.IndexOf('$peerError = $_') -lt 0 -or $qualifySource.IndexOf('phase=$peerPhase; message=[string]$_') -lt 0) { throw 'FAIL peer-run-monitor-catch-retains-original-error-and-writes-reason' }
+        Write-Host 'PASS peer-run-monitor-catch-retains-original-error-and-writes-reason'
+        $count++
+        Remove-Item Function:\Complete-SpikeNativeProcess,Function:\Get-WinEvent -ErrorAction SilentlyContinue
     } finally {
         if ($lifetimeGuard) { $lifetimeGuard.Dispose() }
         if ($parentGuard) { $parentGuard.Dispose() }

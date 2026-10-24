@@ -56,11 +56,10 @@ class TrustedPrepDiagnosticTests(unittest.TestCase):
         self.assertCodeIn('"fetch", "--locked", "--offline", "--manifest-path"', self.prep)
         self.assertCodeIn('"fetch", "--locked", "--manifest-path"', self.prep)
         self.assertNotIn("PrepLaunchMatrix", self.qualify)
-        self.assertNotIn("CreateRestrictedToken", self.prep)
 
     def test_production_preparation_downloads_without_starting_host_cargo(self):
         self.assertCodeIn("execute_with_registry(&plan_path", self.prepare)
-        self.assertCodeIn("prepare_local_registry(config, job_staging, &lockfile, routes)", self.prepare)
+        self.assertCodeIn("prepare_local_registry(config, job_staging, lockfile, routes)", self.prepare)
         prepare_body = self.registry.split("pub(super) fn prepare_for_job(", 1)[1].split("\npub(super) fn prove(", 1)[0]
         self.assertCodeIn('download_allowlisted("index.crates.io"', prepare_body)
         self.assertCodeIn('download_allowlisted("static.crates.io"', prepare_body)
@@ -113,14 +112,19 @@ class TrustedPrepDiagnosticTests(unittest.TestCase):
         self.assertCodeIn('let local_registry = cargo_home.join("local-registry")', self.agent)
         self.assertCodeIn("local_registry_config_is_rewritten_to_absolute_guest_cargo_home", self.agent)
 
-    def test_restricted_token_and_access_check_diagnostics_are_removed(self):
+    def test_batch_probe_is_limited_to_explicit_prep_qualification(self):
         self.assertFalse((WINDOWS / "trusted_prep/launch").exists())
         self.assertFalse((WINDOWS / "trusted_prep/lowbox.rs").exists())
         self.assertFalse((HERE / "test_prep_access_checks.py").exists())
-        for source in (self.prepare, self.prep, self.hyperv, self.qualify):
-            self.assertNotIn("PrepLaunchMatrix", source)
-            self.assertNotIn("AccessChecksOnly", source)
-            self.assertNotIn("CreateRestrictedToken", source)
+        self.assertIn("CreateRestrictedToken(", self.prep)
+        self.assertIn("run_as_batch(", self.prep)
+        self.assertCodeIn("pub fn hyperv_prep_probe(arguments: &[String])", self.library)
+        self.assertCodeIn("trusted_prep::probe(arguments)", self.windows)
+        self.assertCodeIn('arg == "prep-probe"', self.main)
+        self.assertCodeIn("hyperv_prep_probe(&args[1..])", self.main)
+        self.assertIn("Runner-Check 'qualify-prep'", self.qualify)
+        production = self.prep.split("pub(super) fn prepare_local_registry(", 1)[1].split("pub(super) fn offline_cargo_entry", 1)[0]
+        self.assertNotIn("run_as_batch", production)
 
     def test_local_registry_proof_logs_durable_phases_and_skips_extra_parent_validation(self):
         local_registry_entry = self.prep.split("pub(super) fn local_registry_entry", 1)[1]

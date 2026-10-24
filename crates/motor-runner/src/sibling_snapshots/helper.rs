@@ -307,8 +307,8 @@ impl TenantResolver {
         Self::under(
             config.tenant_vm,
             config.boat_profile,
-            Path::new(crate::tenant_agent::DNS_MARKER),
-            Path::new(crate::tenant_agent::DNS_DIRECTORY),
+            Path::new(crate::tenant::DNS_MARKER),
+            Path::new(crate::tenant::DNS_DIRECTORY),
         )
     }
 

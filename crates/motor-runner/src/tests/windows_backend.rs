@@ -1778,7 +1778,10 @@ async fn windows_backend_prep_step_failure_reaches_refusal_without_host_paths() 
     let t = terminal(&runner, r.job_id).await;
     assert!(matches!(t.outcome, Outcome::RefusedBeforeStart { .. }));
     let detail = t.refusal_detail.unwrap();
-    assert!(detail.contains("windows prep: stage dependencies: special file: cargo-home/git/checkouts/dependency/rev/fifo"), "{detail}");
+    assert!(
+        detail.contains("windows prep: stage dependencies: link or special file: cargo-home/git/checkouts/dependency/rev/fifo"),
+        "{detail}"
+    );
     assert!(detail.contains("exit status: 1"), "{detail}");
     assert!(
         !detail.contains(f.scratch.path().to_str().unwrap()),
@@ -1821,14 +1824,11 @@ async fn windows_backend_every_invalid_path_refuses_before_start_and_a_symlink_n
             matches!(t.outcome, Outcome::RefusedBeforeStart { .. }),
             "{name}"
         );
+        let detail = t.refusal_detail.unwrap();
         let quoted = format!("{name:?}");
         assert!(
-            t.refusal_detail
-                .as_ref()
-                .unwrap()
-                .contains(&quoted[1..quoted.len() - 1]),
-            "{name}: {:?}",
-            t.refusal_detail
+            detail.contains(&quoted[1..quoted.len() - 1]),
+            "{name}: {detail}"
         );
         assert_eq!(a.starts.load(Ordering::SeqCst), 0);
         assert!(a.units.lock().unwrap().is_empty());
@@ -1939,7 +1939,8 @@ async fn windows_backend_case_collisions_are_detected_before_case_insensitive_ex
     assert!(matches!(t.outcome, Outcome::RefusedBeforeStart { .. }));
     let detail = t.refusal_detail.unwrap();
     assert!(
-        detail.contains("case collision") && detail.contains("A.rs") && detail.contains("a.rs")
+        detail.contains("case collision") && detail.contains("A.rs") && detail.contains("a.rs"),
+        "unexpected refusal detail: {detail}"
     );
     assert_eq!(a.starts.load(Ordering::SeqCst), 0);
 }

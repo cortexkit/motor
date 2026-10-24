@@ -105,6 +105,7 @@ try {
     $stopInProgress = $true
     Stop-RunnerServiceBounded
     $stopInProgress = $false
+    $null = Runner-Check 'qualify-prep'
     $disconnect = Runner-Check 'qualify-disconnect'
     $match = [regex]::Match($disconnect, 'job=([0-9a-f-]{36}) announced=(\d+) written=(\d+)')
     if (-not $match.Success -or [int]$match.Groups[3].Value -ge [int]$match.Groups[2].Value) { throw 'Disconnect did not stop in the middle of an announced agent frame' }

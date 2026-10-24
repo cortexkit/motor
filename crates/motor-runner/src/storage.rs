@@ -196,9 +196,11 @@ pub(crate) struct Job {
     /// When this fill started, in runner-clock milliseconds. A publication
     /// record ages from here, and an operator reads it as the time the entries
     /// of that fill were written.
+    #[cfg(unix)]
     #[serde(default)]
     pub fill_started_ms: Option<u64>,
     /// Store active when fill setup began, updated when the command launches.
+    #[cfg(unix)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill_identity: Option<StoreIdentity>,
     pub kill: Option<(Killed, u64)>,
@@ -315,7 +317,9 @@ impl Job {
             order,
             base: false,
             writer_descriptor: None,
+            #[cfg(unix)]
             fill_started_ms: None,
+            #[cfg(unix)]
             fill_identity: None,
             kill: None,
             stdout_offset: 0,
@@ -476,8 +480,10 @@ pub(crate) struct StoreIdentity {
 
 /// The persisted form of a provisioning store identity. The gateway's identity
 /// type lives where it is used to sign; records and comparisons use this one.
+#[cfg(unix)]
 pub(crate) use crate::remote_cache::publishing::Seen;
 
+#[cfg(unix)]
 pub(crate) fn encode_identity(
     identity: &crate::remote_cache::provisioning::StoreIdentity,
 ) -> StoreIdentity {
@@ -490,7 +496,7 @@ pub(crate) fn encode_identity(
 
 impl StoreIdentity {
     /// The same identity in the form the gateway signs and tags requests with.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn provisioned(&self) -> crate::remote_cache::provisioning::StoreIdentity {
         crate::remote_cache::provisioning::StoreIdentity {
             endpoint: self.endpoint.clone(),
@@ -614,6 +620,7 @@ pub(crate) struct Catalog {
     pub compile_cache_used_ms: Option<u64>,
     /// The remote cache's switch state this runner last acted on, so a change
     /// made while it was stopped is still a transition at the first re-read.
+    #[cfg(unix)]
     #[serde(default, skip_serializing_if = "Seen::is_default")]
     pub publishing_seen: Seen,
 }
@@ -630,6 +637,7 @@ impl Default for Catalog {
             transferred: BTreeMap::new(),
             mirror_used_ms: BTreeMap::new(),
             compile_cache_used_ms: None,
+            #[cfg(unix)]
             publishing_seen: Seen::default(),
         }
     }
