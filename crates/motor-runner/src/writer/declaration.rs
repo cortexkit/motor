@@ -71,13 +71,16 @@ pub(crate) struct Declaration {
 
 impl Declaration {
     /// One command for the shell that runs the steps in order, or `None` when
-    /// no step is declared.
+    /// no step is declared. The fill runs the steps as one shell command, so a
+    /// failing step stops the ones after it.
+    #[cfg(test)]
     pub(crate) fn command(&self) -> Option<String> {
         let commands: Vec<String> = self.fills.iter().map(Step::command).collect();
         (!commands.is_empty()).then(|| commands.join(" && "))
     }
 
     /// The tool of every declared step, once each, in declaration order.
+    #[cfg(test)]
     pub(crate) fn tools(&self) -> Vec<Tool> {
         let mut tools = Vec::new();
         for step in &self.fills {
@@ -215,7 +218,7 @@ fn check_pattern(pattern: &str) -> Result<(), String> {
             _ => "plain".to_string(),
         });
     }
-    let sample = vec![path.join("/")];
+    let sample = [path.join("/")];
     if !sample.iter().any(|name| path_matches(pattern, name)) {
         return Err(format!(
             "descriptor-inputs pattern matches nothing: {pattern}"

@@ -615,6 +615,7 @@ pub(crate) fn record_siblings(catalog: &mut Catalog, siblings: &[SiblingSnapshot
 /// target of its whole workspace, and a tree with no root `Cargo.toml` has
 /// nothing to warm from Cargo. The runner never assumes a particular
 /// repository's package names.
+#[cfg(test)]
 pub(crate) fn warm_command(mirror: &Path, commit: &str) -> String {
     warm_plan(mirror, commit).0
 }
@@ -626,6 +627,10 @@ pub(crate) fn warm_command(mirror: &Path, commit: &str) -> String {
 /// `.motor/cache.toml` declares is the whole warm plan. Its steps are
 /// explicit for the same reason, and a tree that declares nothing still runs
 /// `true`.
+///
+/// The one command a fill runs is the plan's steps joined with `&&`, which is
+/// what [`warm_steps`] returns separately for a caller that keeps the steps.
+#[cfg(test)]
 pub(crate) fn warm_plan(mirror: &Path, commit: &str) -> (String, bool) {
     let (steps, explicit) = warm_steps(mirror, commit);
     (steps.join(" && "), explicit)

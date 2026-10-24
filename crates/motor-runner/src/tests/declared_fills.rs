@@ -26,7 +26,7 @@ fn commit_declaration(f: &Fixture, text: &str) -> String {
     git(&f.main, &["rev-parse", "HEAD"])
 }
 
-use crate::writer::declaration::{self, Compilers, Declaration, Step, Tool};
+use crate::writer::declaration::{self, Compilers};
 use crate::writer::fill::{dependency_free, descriptor};
 
 #[test]
@@ -36,9 +36,7 @@ fn a_descriptor_changes_with_its_declared_steps_and_matched_files() {
     fs::create_dir_all(f.main.join("src")).unwrap();
     fs::write(f.main.join("src/main.c"), "int main(void){return 0;}\n").unwrap();
     let declare = |stanza: &str| commit_declaration(&f, stanza);
-    let base = format!(
-        "[[fill]]\ntool = \"ccache\"\ncommands = [\"make\"]\n\"descriptor-inputs\" = [\"src/**\", \"Makefile\"]\n"
-    );
+    let base = "[[fill]]\ntool = \"ccache\"\ncommands = [\"make\"]\n\"descriptor-inputs\" = [\"src/**\", \"Makefile\"]\n";
     let compilers = Compilers::default();
     let of = |tip: &str| {
         let declaration = declaration::read(&f.main, tip).unwrap();
@@ -52,7 +50,7 @@ fn a_descriptor_changes_with_its_declared_steps_and_matched_files() {
         )
         .unwrap()
     };
-    let first_tip = declare(&base);
+    let first_tip = declare(base);
     let first = of(&first_tip);
     // Rewriting the same bytes would make an empty commit; a comment makes a
     // new commit of the same declaration.
