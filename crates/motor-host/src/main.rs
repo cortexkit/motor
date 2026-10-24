@@ -112,6 +112,7 @@ async fn main() -> Result<()> {
                 tenant: binding.tenant,
                 sub: binding.sub,
                 vcpu_ceiling: registry.vcpu_ceiling,
+                max_weight: registry.max_weight,
                 guest_ram_mib: registry.guest_ram_mib,
                 idle_suspend_s: registry.idle_suspend_s,
                 host_floor_bytes: registry.host_floor_bytes,

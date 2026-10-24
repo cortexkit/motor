@@ -11,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 #[derive(Default)]
 struct Fake {
     fail: Mutex<Option<&'static str>>,
+    quota_ceiling: Mutex<Option<u32>>,
     calls: Mutex<Vec<String>>,
     peers: Mutex<Vec<UnixStream>>,
 }
@@ -27,6 +28,9 @@ impl Control for Fake {
     }
     fn quota(&self, _: &str, vcpus: u32) -> Result<()> {
         self.calls.lock().unwrap().push(format!("quota:{vcpus}"));
+        if let Some(ceiling) = *self.quota_ceiling.lock().unwrap() {
+            anyhow::ensure!((1..=ceiling).contains(&vcpus), "helper refused CPU quota");
+        }
         if *self.fail.lock().unwrap() == Some("quota") {
             bail!("quota control I/O failure");
         }
@@ -470,6 +474,113 @@ async fn warm_admission_applies_share_before_relay_and_third_run_keeps_quota_unc
             .count(),
         2
     );
+    let guests: Vec<_> = clients
+        .into_iter()
+        .map(|(client, guest)| {
+            drop(client);
+            guest
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    drop(guests);
+    runtime.host.lock().unwrap().guest_unready("tenant");
+}
+
+#[tokio::test]
+async fn permit_quota_stays_within_vcpu_ceiling_across_wakes_and_last_claim_end() {
+    let (runtime, fake, broker, requester, c) = fixture();
+    *fake.quota_ceiling.lock().unwrap() = Some(24);
+    {
+        let mut h = runtime.host.lock().unwrap();
+        let tenant = h.tenants.get_mut("vm").unwrap();
+        tenant.vcpu_ceiling = 24;
+        tenant.max_weight = Some(64);
+        assert_eq!(tenant.budget(), 64);
+    }
+    let now = unix_ms();
+    let mut clients = Vec::new();
+    let mut tasks = Vec::new();
+    let mut seq = 0;
+    for (n, weight, total) in [(1, 1, 1), (2, 24, 24), (3, 6, 30), (4, 24, 54), (5, 10, 64)] {
+        if n == 4 {
+            // The next lease must re-enter the wake path with an oversubscribed
+            // share, as it would after a saved VM is restored.
+            runtime.host.lock().unwrap().guest_unready("tenant");
+        }
+        let mut c = c.clone();
+        c.jti = format!("00000000-0000-7000-8000-{n:012x}");
+        c.vcpus = weight;
+        c.mem_mib = 16_384.max(3584 * u64::from(weight));
+        let (mut client, server) = tokio::io::duplex(8192);
+        tasks.push(tokio::spawn(serve(runtime.clone(), server)));
+        let challenge = hello(&mut client, &broker, &requester, &c).await;
+        assert_eq!(
+            respond(&mut client, &requester, &c, challenge).await["type"],
+            "lease_ok"
+        );
+        write_frame(&mut client, &json!({"type":"hello"}))
+            .await
+            .unwrap();
+        let guest = peer(&fake).await;
+        guest.set_nonblocking(true).unwrap();
+        let mut guest = tokio::net::UnixStream::from_std(guest).unwrap();
+        assert_eq!(
+            read_frame(&mut guest).await.unwrap()["type"],
+            "verified_lease"
+        );
+        assert_eq!(read_frame(&mut guest).await.unwrap()["type"], "hello");
+        clients.push((client, guest));
+        {
+            let mut h = runtime.host.lock().unwrap();
+            assert_eq!(h.share("tenant", now), total);
+            assert_eq!(h.quota("tenant", now), total.clamp(1, 24));
+            if n == 1 {
+                seq += 1;
+                h.event(
+                    "tenant",
+                    &event(
+                        seq,
+                        TenantEventKind::Refused,
+                        Some(&c.jti),
+                        Some(RefusedCause::Disconnect),
+                    ),
+                    now,
+                )
+                .unwrap();
+                assert_eq!(h.share("tenant", now), 0);
+            }
+        }
+        runtime.tick(now).unwrap();
+    }
+    {
+        let mut h = runtime.host.lock().unwrap();
+        for n in 2..=5 {
+            let job = format!("00000000-0000-7000-8000-{n:012x}");
+            for kind in [
+                TenantEventKind::Admitted,
+                TenantEventKind::Started,
+                TenantEventKind::Terminal,
+            ] {
+                seq += 1;
+                h.event("tenant", &event(seq, kind, Some(&job), None), now)
+                    .unwrap();
+            }
+        }
+        assert_eq!(h.share("tenant", now), 0);
+    }
+    runtime.tick(now).unwrap();
+    let calls = fake.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|s| s.starts_with("quota:"))
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["quota:1", "quota:24", "quota:24", "quota:1"]
+    );
+    assert_eq!(calls.iter().filter(|s| s.as_str() == "wake").count(), 2);
     let guests: Vec<_> = clients
         .into_iter()
         .map(|(client, guest)| {

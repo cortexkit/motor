@@ -180,6 +180,7 @@ async fn a_slow_hosted_client_receives_every_frame_after_the_tenant_runner_close
                 tenant: "tenant".into(),
                 sub: sub.into(),
                 vcpu_ceiling: 2,
+                max_weight: None,
                 guest_ram_mib: 18432,
                 idle_suspend_s: 600,
                 host_floor_bytes: 0,
