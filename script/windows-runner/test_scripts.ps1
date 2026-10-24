@@ -607,7 +607,11 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
             if ($script:peerBootPoll -eq 1) { return $script:peerBootUnrelated }
             return $script:peerBootCurrent
         }
-        $eventPath = Join-Path $nativeFixtureRoot 'peer-boot-fixture.xml'
+        # The native fixture folder was removed when its block finished, so the
+        # peer-boot evidence gets its own folder.
+        $peerBootRoot = Join-Path ([IO.Path]::GetTempPath()) ('motor-runner-peer-boot-' + [Guid]::NewGuid())
+        New-Item -ItemType Directory -Path $peerBootRoot | Out-Null
+        $eventPath = Join-Path $peerBootRoot 'peer-boot-fixture.xml'
         $bootMatch = Wait-RunnerPeerBoot $victimVm $since $eventPath
         $queryEvidence = Get-Content -LiteralPath ($eventPath + '.queries.json') -Raw | ConvertFrom-Json
         if ($script:peerBootPoll -lt 2 -or $bootMatch.record_id -ne 46 -or $queryEvidence.queries.Count -lt 2) { throw 'FAIL peer-boot-polls-past-unrelated-event-and-retains-queries' }
