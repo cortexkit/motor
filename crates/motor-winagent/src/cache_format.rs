@@ -1,540 +1,574 @@
-//! The guest's bounded, non-console invocation of the Windows formatter.
+//! Format the identity-checked new cache volume through the Windows storage provider.
 
-use crate::cache_steps::{CacheReporter, CacheStep};
-use std::{
-    io::{self, Read, Write},
-    process::{Command, Stdio},
-    sync::{Arc, Mutex},
-    thread,
-    time::{Duration, Instant},
-};
+#![cfg(any(windows, test))]
 
-const FORMAT_PROGRAM: &str = "C:\\Windows\\System32\\format.com";
-const OUTPUT_LIMIT: usize = 4096;
-const DESCRIPTION_LIMIT: usize = 384;
-const CONFIRMATION: &[u8] = b"Y\r\n";
+use std::{io, time::Instant};
 
-fn format_command(mount: &str) -> io::Result<Command> {
-    let mut command = Command::new(FORMAT_PROGRAM);
-    command.args(crate::cache::format_arguments(mount)?);
-    Ok(command)
+#[cfg(windows)]
+mod wmi;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Volume {
+    path: String,
+    object_path: String,
 }
 
-/// Format through the mount folder attached to the newly selected cache volume.
-pub fn run(mount: &str, deadline: Instant) -> io::Result<()> {
-    run_command(&mut format_command(mount)?, deadline)
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FormatOptions {
+    filesystem: &'static str,
+    label: &'static str,
+    allocation_unit_size: u32,
+    full: bool,
+    force: bool,
 }
 
-/// Mount, format and unmount operations that portable tests can replace.
-pub trait Formatter {
-    fn mount(&mut self, volume: &str, path: &str) -> io::Result<()>;
-    fn format(&mut self, path: &str, deadline: Instant) -> io::Result<()>;
-    fn unmount(&mut self, path: &str) -> io::Result<()>;
-}
-
-struct FormatMount<'a, F: Formatter> {
-    formatter: &'a mut F,
-    reporter: &'a CacheReporter,
-    active: bool,
-}
-impl<F: Formatter> FormatMount<'_, F> {
-    fn unmount(&mut self) -> io::Result<()> {
-        self.reporter.cleanup(CacheStep::MountPoint, || {
-            self.formatter.unmount(crate::CACHE_MOUNT)?;
-            self.active = false;
-            Ok(())
-        })
-    }
-}
-impl<F: Formatter> Drop for FormatMount<'_, F> {
-    fn drop(&mut self) {
-        if self.active {
-            let _ = self.unmount();
+impl Default for FormatOptions {
+    fn default() -> Self {
+        Self {
+            filesystem: "NTFS",
+            label: crate::CACHE_LABEL,
+            allocation_unit_size: 0,
+            full: false,
+            force: true,
         }
     }
 }
 
-/// `format.com` requires a mount point even when given a volume GUID path.
-/// Detach the first-use mount on both success and failure, before the normal
-/// cache validation and mount. The caller's deadline still includes partition
-/// creation, discovery, mounting and formatting.
-pub fn run_mounted(
-    formatter: &mut impl Formatter,
-    reporter: &CacheReporter,
+#[derive(Debug, PartialEq, Eq)]
+enum FormatValue {
+    Text(&'static str),
+    Number(u32),
+    Boolean(bool),
+}
+
+impl FormatOptions {
+    fn parameters(&self) -> [(&'static str, FormatValue); 5] {
+        [
+            ("FileSystem", FormatValue::Text(self.filesystem)),
+            ("FileSystemLabel", FormatValue::Text(self.label)),
+            (
+                "AllocationUnitSize",
+                FormatValue::Number(self.allocation_unit_size),
+            ),
+            ("Full", FormatValue::Boolean(self.full)),
+            ("Force", FormatValue::Boolean(self.force)),
+        ]
+    }
+}
+
+struct FormatResult {
+    return_value: u32,
+    extended_status: String,
+}
+
+/// The provider operations are replaceable so selection, parameters and deadlines
+/// can be tested without access to Windows disks.
+trait StorageProvider {
+    fn volumes(&mut self, deadline: Instant) -> io::Result<Vec<Volume>>;
+    fn start(
+        &mut self,
+        object_path: &str,
+        options: &FormatOptions,
+        deadline: Instant,
+    ) -> io::Result<()>;
+    fn poll(&mut self, timeout_ms: i32) -> io::Result<Option<FormatResult>>;
+}
+
+fn remaining_ms(deadline: Instant) -> io::Result<i32> {
+    remaining_ms_at(deadline, Instant::now())
+}
+
+fn remaining_ms_at(deadline: Instant, now: Instant) -> io::Result<i32> {
+    let remaining = deadline
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "cache storage format timed out"))?;
+    Ok(remaining.as_millis().clamp(1, 100) as i32)
+}
+
+fn validate_volume(volume: &str) -> io::Result<()> {
+    if !crate::cache::is_volume_guid_path(volume) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid cache volume identity for format",
+        ));
+    }
+    Ok(())
+}
+
+fn format_with(
+    provider: &mut impl StorageProvider,
     volume: &str,
     deadline: Instant,
 ) -> io::Result<()> {
-    if !crate::cache::is_volume_guid_path(volume) {
-        return Err(io::Error::other("invalid cache volume path for format"));
+    format_with_clock(provider, volume, deadline, Instant::now)
+}
+
+fn format_with_clock(
+    provider: &mut impl StorageProvider,
+    volume: &str,
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+) -> io::Result<()> {
+    validate_volume(volume)?;
+    remaining_ms_at(deadline, now())?;
+    let volumes = provider.volumes(deadline)?;
+    let mut matching = volumes
+        .iter()
+        .filter(|candidate| candidate.path.eq_ignore_ascii_case(volume));
+    let selected = matching
+        .next()
+        .ok_or_else(|| io::Error::other("cache volume absent from MSFT_Volume"))?;
+    if selected.object_path.is_empty() || matching.next().is_some() {
+        return Err(io::Error::other(
+            "cache volume has no unique WMI object identity",
+        ));
     }
-    let mount = crate::CACHE_MOUNT;
-    let mut mounted = FormatMount {
-        formatter,
-        reporter,
-        active: false,
+    remaining_ms_at(deadline, now())?;
+    provider.start(&selected.object_path, &FormatOptions::default(), deadline)?;
+    loop {
+        let result = provider.poll(remaining_ms_at(deadline, now())?)?;
+        // A completion observed after the deadline is still ambiguous. The host
+        // must discard the disk, even if the provider eventually finishes it.
+        remaining_ms_at(deadline, now())?;
+        if let Some(result) = result {
+            return format_result(result);
+        }
+    }
+}
+
+fn format_result(result: FormatResult) -> io::Result<()> {
+    if result.return_value == 0 {
+        return Ok(());
+    }
+    let (kind, description) = match result.return_value {
+        1 | 7 => (io::ErrorKind::Unsupported, "not supported"),
+        2 => (io::ErrorKind::Other, "unspecified error"),
+        3 => (io::ErrorKind::TimedOut, "provider timeout"),
+        4 => (io::ErrorKind::Other, "failed"),
+        5 => (io::ErrorKind::InvalidInput, "invalid parameter"),
+        40001 => (io::ErrorKind::PermissionDenied, "access denied"),
+        40004 => (io::ErrorKind::Other, "unexpected I/O error"),
+        40018 => (io::ErrorKind::Other, "failover cluster management required"),
+        42010 => (io::ErrorKind::Other, "system or critical partition"),
+        43000 => (io::ErrorKind::Other, "invalid cluster size"),
+        43001 => (io::ErrorKind::Other, "unsupported filesystem"),
+        43002 => (io::ErrorKind::Other, "quick format unavailable"),
+        43003 => (io::ErrorKind::Other, "cluster count exceeds 32 bits"),
+        43004 => (io::ErrorKind::Other, "unsupported UDF version"),
+        43005 => (
+            io::ErrorKind::Other,
+            "cluster size is not a physical-sector multiple",
+        ),
+        43006 => (io::ErrorKind::Other, "read-only volume"),
+        _ => (io::ErrorKind::Other, "provider failure"),
     };
-    reporter.step(CacheStep::MountPoint, || {
-        mounted.formatter.mount(volume, mount)?;
-        // Own the mount before reporting completion: the guard must detach it
-        // even if the observer disconnects while the native call is running.
-        mounted.active = true;
-        Ok(())
-    })?;
-    let result = mounted.formatter.format(mount, deadline);
-    // Do not return the format error until the mount has been removed. In
-    // particular, process spawn failures and timeouts need the same cleanup.
-    let cleanup = mounted.unmount();
-    match (result, cleanup) {
-        (result, Ok(())) => result,
-        (result, Err(cleanup)) => {
-            let message = format!("remove cache format mount point failed: {cleanup}");
-            match result {
-                Ok(()) => Err(io::Error::new(cleanup.kind(), message)),
-                Err(error) => Err(io::Error::new(error.kind(), format!("{error}; {message}"))),
-            }
-        }
-    }
-}
-
-#[derive(Default)]
-struct Captured {
-    bytes: Vec<u8>,
-    truncated: bool,
-    complete: bool,
-    error: Option<io::Error>,
-}
-
-impl Captured {
-    fn description(&self) -> String {
-        let description = format!(
-            "{:?}{}{}",
-            String::from_utf8_lossy(&self.bytes),
-            if self.complete {
-                ""
-            } else {
-                " [capture incomplete]"
-            },
-            self.error
-                .as_ref()
-                .map(|error| format!(" [read error: {error}]"))
-                .unwrap_or_default(),
-        );
-        // Reserve space for both streams inside CacheFailure's 1024-byte wire
-        // budget. Keep the tail: format often prints its error after a banner.
-        if description.len() > DESCRIPTION_LIMIT {
-            let mut start = description.len() - DESCRIPTION_LIMIT;
-            while !description.is_char_boundary(start) {
-                start += 1;
-            }
-            format!("\"...{} [truncated]", &description[start..])
-        } else if self.truncated {
-            format!("{description} [truncated]")
-        } else {
-            description
-        }
-    }
-}
-
-fn capture(mut pipe: impl Read + Send + 'static) -> Arc<Mutex<Captured>> {
-    let output = Arc::new(Mutex::new(Captured::default()));
-    let shared = Arc::clone(&output);
-    thread::spawn(move || {
-        let mut buffer = [0; 1024];
-        loop {
-            let result = pipe.read(&mut buffer);
-            let mut output = shared.lock().unwrap();
-            match result {
-                Ok(0) => break,
-                Ok(count) => {
-                    let discard = (output.bytes.len() + count).saturating_sub(OUTPUT_LIMIT);
-                    output.bytes.drain(..discard);
-                    output.bytes.extend_from_slice(&buffer[..count]);
-                    output.truncated |= discard != 0;
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    output.error = Some(error);
-                    break;
-                }
-            }
-            // Keep draining after the buffer fills, or a full pipe could block format.
-        }
-        shared.lock().unwrap().complete = true;
-    });
-    output
-}
-
-fn failure(
-    kind: io::ErrorKind,
-    reason: impl std::fmt::Display,
-    stdout: &Captured,
-    stderr: &Captured,
-) -> io::Error {
-    io::Error::new(
+    // Keep the return code ahead of the provider diagnostic so it survives
+    // truncation to the cache error message's 1024-byte limit.
+    Err(io::Error::new(
         kind,
         format!(
-            "cache format {reason}; stdout={}; stderr={}",
-            stdout.description(),
-            stderr.description()
+            "MSFT_Volume.Format returned {} ({description}); ExtendedStatus={:?}",
+            result.return_value, result.extended_status,
         ),
-    )
+    ))
 }
 
-fn run_command(command: &mut Command, deadline: Instant) -> io::Result<()> {
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            io::Error::new(error.kind(), format!("cache format spawn failed: {error}"))
-        })?;
-    let stdout = capture(child.stdout.take().unwrap());
-    let stderr = capture(child.stderr.take().unwrap());
-    // SYSTEM in session 0 has no interactive console. Supply the documented
-    // hard-disk confirmation, then EOF; /V supplies the label separately.
-    if let Some(mut input) = child.stdin.take() {
-        let _ = input.write_all(CONFIRMATION);
+fn call_complete(hresult: i32, operation_status: i32) -> io::Result<bool> {
+    const WBEM_S_TIMEDOUT: i32 = 0x40004;
+    if hresult == WBEM_S_TIMEDOUT {
+        return Ok(false);
     }
-    let mut status = None;
-    loop {
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(result) => status = result,
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(failure(
-                        error.kind(),
-                        format!("wait failed: {error}"),
-                        &stdout.lock().unwrap(),
-                        &stderr.lock().unwrap(),
-                    ));
-                }
-            }
-        }
-        {
-            let stdout = stdout.lock().unwrap();
-            let stderr = stderr.lock().unwrap();
-            if let Some(status) = status
-                && stdout.complete
-                && stderr.complete
-            {
-                return if status.success() {
-                    Ok(())
-                } else {
-                    Err(failure(
-                        io::ErrorKind::Other,
-                        format!("failed: {status}"),
-                        &stdout,
-                        &stderr,
-                    ))
-                };
-            }
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            // Never join a pipe reader past the deadline, even if an inherited
-            // pipe handle remains open. Its bounded tail is still diagnostic.
-            return Err(failure(
-                io::ErrorKind::TimedOut,
-                "timed out",
-                &stdout.lock().unwrap(),
-                &stderr.lock().unwrap(),
-            ));
-        }
-        thread::sleep(Duration::from_millis(10));
+    if hresult != 0 || operation_status != 0 {
+        return Err(io::Error::other(format!(
+            "cache WMI wait failed: HRESULT 0x{:08x}; operation status 0x{:08x}",
+            hresult as u32, operation_status as u32,
+        )));
     }
+    Ok(true)
+}
+
+/// No shell, drive letter or mount folder is needed: WMI invokes Format on the
+/// volume instance whose Path matches the GUID already selected by disk extents.
+/// The deadline comes unchanged from WindowsStorage::initialize_raw and includes
+/// partition creation in its 30-second budget.
+#[cfg(windows)]
+pub fn run(volume: &str, deadline: Instant) -> io::Result<()> {
+    validate_volume(volume)?;
+    remaining_ms(deadline)?;
+    let mut provider = wmi::Provider::connect()?;
+    format_with(&mut provider, volume, deadline)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{collections::VecDeque, time::Duration};
 
     const VOLUME: &str = "\\\\?\\Volume{0123abcd-0000-4000-8000-00000000cafe}\\";
+    const OBJECT: &str = "MSFT_Volume.ObjectId=\"opaque-selected-object-key\"";
 
-    #[derive(Default)]
-    struct FakeFormatter {
+    struct FakeProvider {
+        volumes: Vec<Volume>,
+        results: VecDeque<io::Result<Option<FormatResult>>>,
         calls: Vec<&'static str>,
-        volume: String,
-        mount_path: String,
-        format_path: String,
-        unmount_path: String,
-        deadline: Option<Instant>,
-        mount_error: bool,
-        format_error: Option<io::ErrorKind>,
-        unmount_error: bool,
-        disconnect_on_mount: Option<std::sync::mpsc::Receiver<crate::cache_steps::StepEvent>>,
+        started: Option<(String, FormatOptions, Instant)>,
+        query_deadline: Option<Instant>,
+        poll_timeouts: Vec<i32>,
+        start_error: bool,
     }
-
-    impl Formatter for FakeFormatter {
-        fn mount(&mut self, volume: &str, path: &str) -> io::Result<()> {
-            self.calls.push("mount");
-            self.volume = volume.to_owned();
-            self.mount_path = path.to_owned();
-            drop(self.disconnect_on_mount.take());
-            if self.mount_error {
-                return Err(io::Error::other("mount failed"));
+    impl Default for FakeProvider {
+        fn default() -> Self {
+            Self {
+                volumes: vec![Volume {
+                    path: VOLUME.into(),
+                    object_path: OBJECT.into(),
+                }],
+                results: [Ok(Some(FormatResult {
+                    return_value: 0,
+                    extended_status: String::new(),
+                }))]
+                .into(),
+                calls: Vec::new(),
+                started: None,
+                query_deadline: None,
+                poll_timeouts: Vec::new(),
+                start_error: false,
             }
-            Ok(())
-        }
-        fn format(&mut self, path: &str, deadline: Instant) -> io::Result<()> {
-            self.calls.push("format");
-            self.format_path = path.to_owned();
-            self.deadline = Some(deadline);
-            if let Some(kind) = self.format_error {
-                return Err(io::Error::new(kind, "format failed"));
-            }
-            Ok(())
-        }
-        fn unmount(&mut self, path: &str) -> io::Result<()> {
-            self.calls.push("unmount");
-            self.unmount_path = path.to_owned();
-            if self.unmount_error {
-                return Err(io::Error::other("unmount failed"));
-            }
-            Ok(())
         }
     }
-
-    fn exercise_mounted(
-        formatter: &mut impl Formatter,
-        volume: &str,
-        deadline: Instant,
-    ) -> io::Result<()> {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        run_mounted(formatter, &CacheReporter::new(tx), volume, deadline)
+    impl StorageProvider for FakeProvider {
+        fn volumes(&mut self, deadline: Instant) -> io::Result<Vec<Volume>> {
+            self.calls.push("volumes");
+            self.query_deadline = Some(deadline);
+            Ok(self.volumes.clone())
+        }
+        fn start(
+            &mut self,
+            path: &str,
+            options: &FormatOptions,
+            deadline: Instant,
+        ) -> io::Result<()> {
+            self.calls.push("start");
+            self.started = Some((path.into(), options.clone(), deadline));
+            if self.start_error {
+                return Err(io::Error::other("HRESULT 0x80041003"));
+            }
+            Ok(())
+        }
+        fn poll(&mut self, timeout_ms: i32) -> io::Result<Option<FormatResult>> {
+            self.calls.push("poll");
+            self.poll_timeouts.push(timeout_ms);
+            self.results
+                .pop_front()
+                .expect("unexpected extra provider poll")
+        }
     }
 
     #[test]
-    fn mount_is_set_before_format_and_removed_after_success() {
-        let mut formatter = FakeFormatter::default();
+    fn formats_only_the_selected_volume_object_as_quick_ntfs() {
+        let mut provider = FakeProvider::default();
+        provider.volumes.insert(
+            0,
+            Volume {
+                path: "\\\\?\\Volume{aaaaaaaa-0000-4000-8000-00000000cafe}\\".into(),
+                object_path: "wrong-volume".into(),
+            },
+        );
+        provider.volumes[1].path.make_ascii_uppercase();
         let deadline = Instant::now() + Duration::from_secs(30);
-        exercise_mounted(&mut formatter, VOLUME, deadline).unwrap();
-        assert_eq!(formatter.calls, ["mount", "format", "unmount"]);
-        assert_eq!(formatter.volume, VOLUME);
-        assert_eq!(formatter.mount_path, "C:\\t\\");
-        assert_eq!(formatter.unmount_path, "C:\\t\\");
-        assert_eq!(formatter.deadline, Some(deadline));
+        format_with(&mut provider, VOLUME, deadline).unwrap();
+        assert_eq!(provider.calls, ["volumes", "start", "poll"]);
+        assert_eq!(provider.query_deadline, Some(deadline));
+        assert_eq!(
+            provider.started,
+            Some((
+                OBJECT.into(),
+                FormatOptions {
+                    filesystem: "NTFS",
+                    label: "motor-target",
+                    allocation_unit_size: 0,
+                    full: false,
+                    force: true,
+                },
+                deadline
+            ))
+        );
+        assert!(
+            provider
+                .poll_timeouts
+                .iter()
+                .all(|wait| (1..=100).contains(wait))
+        );
     }
 
     #[test]
-    fn format_receives_the_mount_path_not_the_volume_guid() {
-        let mut formatter = FakeFormatter::default();
-        exercise_mounted(&mut formatter, VOLUME, Instant::now()).unwrap();
-        assert_eq!(formatter.format_path, "C:\\t\\");
-    }
-
-    #[test]
-    fn mount_is_removed_on_every_format_error() {
-        for kind in [
-            io::ErrorKind::NotFound,
-            io::ErrorKind::Other,
-            io::ErrorKind::TimedOut,
-            io::ErrorKind::Interrupted,
+    fn missing_duplicate_or_empty_object_identity_never_starts_format() {
+        for volumes in [
+            vec![],
+            vec![Volume {
+                path: VOLUME.into(),
+                object_path: String::new(),
+            }],
+            vec![FakeProvider::default().volumes[0].clone(); 2],
         ] {
-            let mut formatter = FakeFormatter {
-                format_error: Some(kind),
+            let mut provider = FakeProvider {
+                volumes,
                 ..Default::default()
             };
-            let error = exercise_mounted(&mut formatter, VOLUME, Instant::now()).unwrap_err();
-            assert_eq!(error.kind(), kind);
-            assert_eq!(error.to_string(), "format failed");
-            assert_eq!(formatter.calls, ["mount", "format", "unmount"]);
-            assert_eq!(formatter.unmount_path, "C:\\t\\");
-        }
-    }
-
-    #[test]
-    fn mount_failure_never_formats_or_removes_an_unowned_mount() {
-        let mut formatter = FakeFormatter {
-            mount_error: true,
-            ..Default::default()
-        };
-        assert!(exercise_mounted(&mut formatter, VOLUME, Instant::now()).is_err());
-        assert_eq!(formatter.calls, ["mount"]);
-    }
-
-    #[test]
-    fn unmount_failure_is_reported_alongside_any_format_failure() {
-        for format_error in [None, Some(io::ErrorKind::TimedOut)] {
-            let mut formatter = FakeFormatter {
-                format_error,
-                unmount_error: true,
-                ..Default::default()
-            };
-            let error = exercise_mounted(&mut formatter, VOLUME, Instant::now()).unwrap_err();
             assert!(
-                error
-                    .to_string()
-                    .contains("remove cache format mount point failed: MountPoint: unmount failed")
+                format_with(
+                    &mut provider,
+                    VOLUME,
+                    Instant::now() + Duration::from_secs(30)
+                )
+                .is_err()
             );
-            assert_eq!(formatter.calls, ["mount", "format", "unmount", "unmount"]);
-            if let Some(kind) = format_error {
-                assert_eq!(error.kind(), kind);
-                assert!(error.to_string().contains("format failed"));
-            }
+            assert_eq!(provider.calls, ["volumes"]);
+            assert!(provider.started.is_none());
         }
+        let mut provider = FakeProvider::default();
+        provider.volumes[0].path = "\\\\?\\Volume{aaaaaaaa-0000-4000-8000-00000000cafe}\\".into();
+        assert!(
+            format_with(
+                &mut provider,
+                VOLUME,
+                Instant::now() + Duration::from_secs(30)
+            )
+            .is_err()
+        );
+        assert!(provider.started.is_none());
     }
 
     #[test]
-    fn invalid_volume_identity_is_rejected_before_mounting() {
-        for bad in [
+    fn malformed_volume_paths_fail_before_contacting_the_provider() {
+        for path in [
             "C:",
             "C:\\t\\",
             "\\\\.\\PhysicalDrive1",
             "\\\\?\\Volume{not-a-guid}\\",
+            "\\\\?\\Volume{0123abcd-0000-4000-8000-00000000cafe}",
         ] {
-            let mut formatter = FakeFormatter::default();
-            assert!(exercise_mounted(&mut formatter, bad, Instant::now()).is_err());
-            assert!(formatter.calls.is_empty(), "{bad}");
+            let mut provider = FakeProvider::default();
+            assert_eq!(
+                format_with(
+                    &mut provider,
+                    path,
+                    Instant::now() + Duration::from_secs(30)
+                )
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert!(provider.calls.is_empty());
         }
     }
 
     #[test]
-    fn observer_disconnect_before_mount_does_not_attach_or_format() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        drop(rx);
-        let mut formatter = FakeFormatter::default();
-        let error = run_mounted(
-            &mut formatter,
-            &CacheReporter::new(tx),
+    fn pending_calls_are_polled_until_the_method_result_arrives() {
+        let mut provider = FakeProvider::default();
+        provider.results.push_front(Ok(None));
+        format_with(
+            &mut provider,
             VOLUME,
-            Instant::now(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("cache observer stopped"));
-        assert!(formatter.calls.is_empty());
-    }
-
-    #[test]
-    fn observer_disconnect_after_mount_still_removes_the_mount() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut formatter = FakeFormatter {
-            disconnect_on_mount: Some(rx),
-            ..Default::default()
-        };
-        let error = run_mounted(
-            &mut formatter,
-            &CacheReporter::new(tx),
-            VOLUME,
-            Instant::now(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("cache observer stopped"));
-        assert_eq!(formatter.calls, ["mount", "unmount"]);
-        assert_eq!(formatter.unmount_path, "C:\\t\\");
-    }
-
-    #[test]
-    fn exact_guest_format_program_and_arguments() {
-        let command = format_command("C:\\t\\").unwrap();
-        assert_eq!(command.get_program(), "C:\\Windows\\System32\\format.com");
-        assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            ["C:\\t\\", "/FS:NTFS", "/V:motor-target", "/Q", "/Y",]
-        );
-        assert!(format_command("C:").is_err());
-    }
-
-    #[cfg(unix)]
-    fn shell(script: &str, timeout: Duration) -> io::Result<()> {
-        run_command(
-            Command::new("sh").args(["-c", script]),
-            Instant::now() + timeout,
-        )
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn formatter_receives_confirmation_and_eof_without_a_console() {
-        shell(
-            "IFS= read -r answer; [ \"$answer\" = \"$(printf 'Y\\r')\" ] && ! IFS= read -r extra",
-            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(30),
         )
         .unwrap();
+        assert_eq!(provider.calls, ["volumes", "start", "poll", "poll"]);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn format_failure_carries_exit_status_stdout_and_stderr() {
-        let error = shell(
-            "printf 'format prompt'; printf 'Invalid parameter' >&2; exit 1",
-            Duration::from_secs(5),
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-        let message = error.to_string();
-        assert!(message.contains("exit status: 1"), "{message}");
-        assert!(message.contains("stdout=\"format prompt\""), "{message}");
+    fn every_nonzero_format_return_fails_with_the_provider_diagnostic() {
+        for code in [
+            1,
+            2,
+            3,
+            4,
+            5,
+            7,
+            4096,
+            40001,
+            40004,
+            40018,
+            42010,
+            43000,
+            43001,
+            43002,
+            43003,
+            43004,
+            43005,
+            43006,
+            u32::MAX,
+        ] {
+            let mut provider = FakeProvider {
+                results: [Ok(Some(FormatResult {
+                    return_value: code,
+                    extended_status: "storage-detail".into(),
+                }))]
+                .into(),
+                ..Default::default()
+            };
+            let error = format_with(
+                &mut provider,
+                VOLUME,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("MSFT_Volume.Format returned {code}")),
+                "{error}"
+            );
+            assert!(error.to_string().contains("storage-detail"), "{error}");
+            if code == 3 {
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            }
+            if code == 40001 {
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            }
+        }
+    }
+
+    #[test]
+    fn transport_failure_never_becomes_a_successful_format() {
+        let mut provider = FakeProvider {
+            start_error: true,
+            ..Default::default()
+        };
         assert!(
-            message.contains("stderr=\"Invalid parameter\""),
-            "{message}"
+            format_with(
+                &mut provider,
+                VOLUME,
+                Instant::now() + Duration::from_secs(30)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("0x80041003")
+        );
+        assert_eq!(provider.calls, ["volumes", "start"]);
+        let mut provider = FakeProvider {
+            results: [Err(io::Error::other("HRESULT 0x80041001"))].into(),
+            ..Default::default()
+        };
+        assert!(
+            format_with(
+                &mut provider,
+                VOLUME,
+                Instant::now() + Duration::from_secs(30)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("0x80041001")
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn format_output_is_bounded_but_pipes_are_drained() {
-        let error = shell(
-            "head -c 131072 /dev/zero; head -c 131072 /dev/zero >&2; exit 1",
-            Duration::from_secs(5),
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-        let message = error.to_string();
-        assert_eq!(message.matches("[truncated]").count(), 2, "{message}");
-        assert!(message.len() <= 1024, "{} bytes", message.len());
+    fn expired_deadline_prevents_queries_and_formatting() {
+        let mut provider = FakeProvider::default();
+        assert_eq!(
+            format_with(&mut provider, VOLUME, Instant::now())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(provider.calls.is_empty());
+        assert!(remaining_ms(Instant::now()).is_err());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn format_output_tails_survive_the_cache_failure_wire_budget() {
+    fn discovery_cannot_restart_the_original_format_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(30);
+        let mut times = [now, deadline].into_iter();
+        let mut provider = FakeProvider::default();
+        assert_eq!(
+            format_with_clock(&mut provider, VOLUME, deadline, || times.next().unwrap())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(provider.calls, ["volumes"]);
+        assert!(provider.started.is_none());
+    }
+
+    #[test]
+    fn completion_at_the_deadline_is_ambiguous_even_if_the_provider_succeeded() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(30);
+        let mut times = [now, now, deadline - Duration::from_millis(7), deadline].into_iter();
+        let mut provider = FakeProvider::default();
+        assert_eq!(
+            format_with_clock(&mut provider, VOLUME, deadline, || times.next().unwrap())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(provider.poll_timeouts, [7]);
+        assert_eq!(provider.calls, ["volumes", "start", "poll"]);
+    }
+
+    #[test]
+    fn positive_wmi_timeout_hresult_is_pending_not_success() {
+        assert!(!call_complete(0x40004, 0).unwrap());
+        assert!(call_complete(0, 0).unwrap());
+        assert!(call_complete(0x80041001u32 as i32, 0).is_err());
+        assert!(call_complete(0, 0x80041003u32 as i32).is_err());
+        assert!(call_complete(1, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod provider_contract_tests {
+    use super::*;
+
+    #[test]
+    fn format_method_parameters_match_the_documented_storage_schema() {
+        assert_eq!(
+            FormatOptions::default().parameters(),
+            [
+                ("FileSystem", FormatValue::Text("NTFS")),
+                ("FileSystemLabel", FormatValue::Text("motor-target")),
+                ("AllocationUnitSize", FormatValue::Number(0)),
+                ("Full", FormatValue::Boolean(false)),
+                ("Force", FormatValue::Boolean(true)),
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_return_code_survives_the_cache_failure_wire_budget() {
         use crate::cache_steps::{CacheLimits, CacheReporter, CacheStep, watch_cache};
         use std::sync::mpsc;
-
-        let (events_tx, events_rx) = mpsc::channel();
-        let reporter = CacheReporter::new(events_tx);
+        let (tx, events) = mpsc::channel();
+        let reporter = CacheReporter::new(tx);
         let result = reporter.step(CacheStep::InitializeRaw, || {
-            shell(
-                "head -c 131072 /dev/zero; printf STDOUT_END; head -c 131072 /dev/zero >&2; printf STDERR_END >&2; exit 1",
-                Duration::from_secs(5),
-            )
+            format_result(FormatResult {
+                return_value: 43006,
+                extended_status: "provider-detail-🦀".repeat(1024),
+            })
         });
-        let (result_tx, result_rx) = mpsc::channel();
-        result_tx.send(result).unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(result).unwrap();
         let failure = watch_cache(
-            events_rx,
-            result_rx,
+            events,
+            rx,
             |_, _| Ok(()),
-            || panic!("completed format must not be cancelled"),
+            || panic!("format finished"),
             CacheLimits::default(),
         )
         .unwrap_err();
-        assert_eq!(failure.step, CacheStep::InitializeRaw);
         failure.validate().unwrap();
-        assert!(failure.message.contains("exit status: 1"), "{failure}");
-        assert!(failure.message.contains("STDOUT_END"), "{failure}");
-        assert!(failure.message.contains("STDERR_END"), "{failure}");
+        assert_eq!(failure.step, CacheStep::InitializeRaw);
+        assert!(
+            failure
+                .message
+                .contains("MSFT_Volume.Format returned 43006 (read-only volume)"),
+            "{failure}"
+        );
+        assert!(failure.message.contains("ExtendedStatus="), "{failure}");
         let decoded: crate::cache_steps::CacheFailure =
             serde_json::from_str(&serde_json::to_string(&failure).unwrap()).unwrap();
         assert_eq!(decoded, failure);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn format_deadline_kills_process_and_preserves_output() {
-        let started = Instant::now();
-        let error = shell(
-            "printf 'waiting'; printf 'busy' >&2; exec sleep 10",
-            Duration::from_millis(200),
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(started.elapsed() < Duration::from_secs(5));
-        let message = error.to_string();
-        assert!(message.contains("stdout=\"waiting\""), "{message}");
-        assert!(message.contains("stderr=\"busy\""), "{message}");
     }
 }

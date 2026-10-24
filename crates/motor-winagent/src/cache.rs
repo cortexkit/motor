@@ -176,23 +176,6 @@ pub fn is_volume_guid_path(path: &str) -> bool {
         })
 }
 
-/// Arguments for `format.com`, started directly (no shell) through the agent's
-/// cache mount folder: a quick NTFS format with an explicit cache label.
-/// The caller also supplies the hard-disk confirmation on stdin; /Y only
-/// suppresses dismount/empty-label prompts on Windows versions supporting it.
-pub fn format_arguments(mount: &str) -> io::Result<Vec<String>> {
-    if mount != crate::CACHE_MOUNT {
-        return Err(io::Error::other("invalid cache mount path for format"));
-    }
-    Ok(vec![
-        mount.to_owned(),
-        "/FS:NTFS".into(),
-        format!("/V:{}", crate::CACHE_LABEL),
-        "/Q".into(),
-        "/Y".into(),
-    ])
-}
-
 #[derive(Clone, Debug)]
 pub struct CacheVolume {
     pub path: String,
@@ -737,9 +720,6 @@ mod tests {
         let prepared = prepare_cache(&mut fake, 7).unwrap();
         assert!(!prepared.freshly_formatted);
         assert_eq!(fake.formats, 0);
-        let arguments = format_arguments(crate::CACHE_MOUNT).unwrap();
-        assert!(arguments.contains(&format!("/V:{}", crate::CACHE_LABEL)));
-        assert!(arguments.contains(&"/FS:NTFS".to_owned()));
     }
 
     #[test]
@@ -767,28 +747,6 @@ mod tests {
     }
 
     #[test]
-    fn format_runs_quick_ntfs_with_cache_label_only_on_the_cache_mount_path() {
-        let mount = "C:\\t\\";
-        assert_eq!(
-            format_arguments(mount).unwrap(),
-            [mount, "/FS:NTFS", "/V:motor-target", "/Q", "/Y"]
-        );
-        for bad in [
-            "C:",
-            "C:\\t",
-            "C:\\other\\",
-            "\\\\?\\Volume{0123abcd-0000-4000-8000-00000000cafe}\\",
-            "\\\\?\\Volume{0123abcd-0000-4000-8000-00000000cafe}",
-            "\\\\?\\Volume{0123abcd-0000-4000-8000-00000000caf}\\",
-            "\\\\?\\Volume{0123abcd 0000-4000-8000-00000000cafe}\\",
-            "\\\\?\\Volume{0123abcd-0000-4000-8000-00000000cafe} /FS:FAT}\\",
-            "\\\\.\\PhysicalDrive1",
-        ] {
-            assert!(format_arguments(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
     fn native_formatter_rechecks_identity_and_raw_before_its_first_write() {
         // initialize_raw runs only in the Windows guest. Fence its order: every
         // guard must run before the partition table changes.
@@ -812,7 +770,7 @@ mod tests {
             assert!(at < first_write, "{guard} runs after the first write");
         }
         assert!(body.find("IOCTL_DISK_SET_DRIVE_LAYOUT_EX").unwrap() > first_write);
-        assert!(body.contains("motor_winagent::cache_format::run_mounted("));
+        assert!(body.contains("motor_winagent::cache_format::run(&volume, deadline)"));
         assert!(!body.contains("powershell"));
     }
 }
