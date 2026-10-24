@@ -265,6 +265,21 @@ class ParityTests(unittest.TestCase):
             return parity.check(self.manifest, role=role, job=job, gnu_test_sha256='package-qualified-test',
                                 cargo_registry=self.registry(), remote_cache_on=remote_cache_on)
 
+    # Settings the machine running the tests may export are not part of any
+    # role's declared job environment, but the cache capture records them
+    # when it is run inside a real job. A test that reads them from the host
+    # would pass on one machine and fail on another, so every test that calls
+    # capture() itself clears them first.
+    AMBIENT_CACHE_SETTINGS = ('RUSTC_WRAPPER', 'SCCACHE_DIR', 'SCCACHE_BUCKET', 'SCCACHE_LOG',
+                              'SCCACHE_S3_RW_MODE', 'SCCACHE_MULTILEVEL_CHAIN',
+                              'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY')
+
+    def hermetic(self, environ):
+        """`environ` with the host's own cache settings removed."""
+        return {name: value for name, value in environ.items()
+                if name not in self.AMBIENT_CACHE_SETTINGS
+                and not name.startswith(('SCCACHE_', 'AWS_'))}
+
     def test_missing_registry_crate_fails_boat_qualification(self):
         actual = self.observed('boat')
         actual['cargo_registry']['crates'] = []
@@ -554,26 +569,28 @@ class ParityTests(unittest.TestCase):
 
     def test_switch_on_role_markers_are_checked(self):
         # The bucket and region come from the provisioning generation, so the
-        # comparison pins them to what the job reported rather than to a value.
+        # comparison pins them to the role's declared placeholder rather than
+        # to a value this repository could not know.
         for role in ('build-server', 'boat', 'tenant'):
-            with self.subTest(role=role, field='endpoint'):
-                actual = self.switched_on(role)
-                actual['job_environment']['SCCACHE_ENDPOINT'] = 'http://127.0.0.1:1'
-                report = self.report(actual, job=True, role=role, remote_cache_on=True)
-                self.assertIn('job SCCACHE_ENDPOINT: expected', '\n'.join(report['errors']))
+            for field, value in (('SCCACHE_ENDPOINT', 'http://127.0.0.1:1'),
+                                 ('SCCACHE_BUCKET', 'other-bucket'),
+                                 ('SCCACHE_S3_RW_MODE', 'READ_WRITE')):
+                with self.subTest(role=role, field=field):
+                    actual = self.switched_on(role)
+                    actual['job_environment'][field] = value
+                    report = self.report(actual, job=True, role=role, remote_cache_on=True)
+                    self.assertIn('job ' + field + ': expected', '\n'.join(report['errors']))
             if role == 'build-server':
                 actual = self.switched_on(role)
                 del actual['job_environment']['SCCACHE_MULTILEVEL_CHAIN']
                 report = self.report(actual, job=True, role=role, remote_cache_on=True)
                 self.assertIn('job SCCACHE_MULTILEVEL_CHAIN', '\n'.join(report['errors']))
             else:
-                # Without level 1 there is no chain at all, and the wrapper is
-                # the read-only /motor-tools copy.
-                actual = self.switched_on(role)
-                actual['job_environment']['SCCACHE_MULTILEVEL_CHAIN'] = 'disk,s3'
-                report = self.report(actual, job=True, role=role, remote_cache_on=True)
-                self.assertIn('job SCCACHE_MULTILEVEL_CHAIN: expected None',
-                              '\n'.join(report['errors']))
+                # Boat and tenant VMs have no local level, so their switch-on
+                # contract has no chain at all; a job that still carries one
+                # must fail that contract.
+                self.assertNotIn('SCCACHE_MULTILEVEL_CHAIN',
+                                 self.switched_on(role)['job_environment'])
                 actual = self.switched_on(role)
                 actual['compile_wrapper']['resolved'] = '/srv/build/cargo-home/bin/sccache'
                 report = self.report(actual, job=True, role=role, remote_cache_on=True)
@@ -585,10 +602,17 @@ class ParityTests(unittest.TestCase):
 
     def test_switch_on_capture_collects_the_remote_variables(self):
         def capture(remote_cache_on):
+            # The capture records the process environment of the job it runs
+            # in. This test gives it one it controls, so the host's own cache
+            # settings and wrapper never decide the result.
+            environment = self.hermetic({
+                'PATH': self.manifest['job_environment_by_role']['boat']['PATH'],
+            })
             with patch.object(parity, 'output', return_value='stub'), \
                  patch.object(parity.Path, 'iterdir', return_value=iter(())), \
                  patch.object(parity.Path, 'glob', return_value=iter(())), \
                  patch.object(parity.shutil, 'which', return_value=None), \
+                 patch.object(parity.os, 'environ', environment), \
                  patch.object(parity, 'runtime_capture', return_value={}), \
                  patch.object(parity.syscall_surface, 'capture', return_value={}):
                 return parity.capture(parity.role_manifest(self.manifest, 'boat', True),
@@ -597,19 +621,17 @@ class ParityTests(unittest.TestCase):
         on, off = capture(True), capture(False)
         translated = {name: parity.remote_cache_environment.expand(value)
                       for name, value in parity.remote_cache_environment.JOB_ENVIRONMENT_BY_ROLE['boat'].items()}
-        for name, value in translated.items():
-            # The capture reads os.environ, so a local shell may already export
-            # one of these names; what matters is that the name is collected.
+        for name in translated:
             self.assertIn(name, on['job_environment'])
         # RUSTC_WRAPPER is a Boat baseline name that is absent (None) with the
-        # switch off; every other remote name appears only when it is on.
+        # switch off; every other remote name does not appear at all until it
+        # is on.
         self.assertIsNone(off['job_environment']['RUSTC_WRAPPER'])
         declared = {**self.manifest['job_environment'],
                     **self.manifest['job_environment_by_role']['boat']}
         for name in set(translated) - set(declared):
             self.assertNotIn(name, off['job_environment'])
-        # A switch-on job resolves the runner's wrapper from PATH, so the
-        # capture has to record the wrapper contract either way.
+        # The capture resolves the wrapper the runner installs from PATH.
         self.assertIn('compile_wrapper', on)
 
     def test_boat_cache_artifact_hashes_bind_the_build_record_to_live_binaries(self):
