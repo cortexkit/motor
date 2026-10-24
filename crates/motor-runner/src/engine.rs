@@ -571,8 +571,8 @@ impl Config {
     /// The gateway serves a generation only when the runner switch, the cache
     /// tenant's `enabled` state and job isolation all hold. Without isolation a
     /// job runs as the runner's own account, which can open the cache keys, so
-    /// the switch is ignored there.
-    #[cfg(unix)]
+    /// the switch is ignored there. Only Linux units carry cache forwarders.
+    #[cfg(target_os = "linux")]
     pub(crate) fn unit_remote_cache(
         &self,
         fill: bool,
