@@ -654,7 +654,9 @@ fn switched_off_environments_match_the_base_runner_for_every_role_and_kind() {
         ("SCCACHE_DIR", "/operator/cache"),
         ("SCCACHE_BUCKET", "operator-bucket"),
     ];
-    let cases: [(&str, bool, bool, bool, &[(&str, &str)]); 6] = [
+    // (case, boat, tenant, fill, pinned environment)
+    type Case<'a> = (&'a str, bool, bool, bool, &'a [(&'a str, &'a str)]);
+    let cases: [Case; 6] = [
         ("build-server job", false, false, false, BUILD_SERVER_JOB),
         ("build-server fill", false, false, true, BUILD_SERVER_FILL),
         ("boat job", true, false, false, HOSTED_JOB),
