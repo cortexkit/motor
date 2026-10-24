@@ -9,6 +9,7 @@ import hashlib
 import importlib.util
 import os
 from pathlib import Path
+import re
 import selectors
 import shutil
 import subprocess
@@ -204,6 +205,51 @@ class BaselineInputsTests(unittest.TestCase):
                          "SetEnvironmentVariable('RUSTUP_HOME', $env:RUSTUP_HOME, 'Machine')",
                          "'C:\\rust' /inheritance:r", ':(OI)(CI)RX'):
             self.assertIn(expected, source)
+
+    def test_baseline_installs_and_verifies_rustfmt_and_clippy_for_all_images(self):
+        source = (HERE / "setup-job-baseline.ps1").read_text()
+        self.assertIn("\n& $rustup component add clippy rustfmt --toolchain $toolchain\n", source)
+        for expected in ("component list --installed --toolchain $toolchain",
+                         "@('clippy', 'rustfmt')",
+                         'if ($components -notcontains "$component-$hostTriple") { throw'):
+            self.assertIn(expected, source)
+        rust_setup = source.split("$rustup = ", 1)[1].split("$git = ", 1)[0]
+        self.assertNotIn("$HyperVSpike", rust_setup)
+        self.assertNotIn("hyperv-runner", rust_setup)
+
+    def test_baseline_installs_and_verifies_both_windows_rust_targets(self):
+        source = (HERE / "setup-job-baseline.ps1").read_text()
+        self.assertIn("\n& $rustup target add aarch64-pc-windows-msvc --toolchain $toolchain\n", source)
+        for expected in ("target list --installed --toolchain $toolchain",
+                         "@($hostTriple, 'aarch64-pc-windows-msvc')",
+                         'if ($targets -notcontains $target) { throw'):
+            self.assertIn(expected, source)
+
+    def test_guest_requests_arm64_msvc_on_every_install_path(self):
+        source = (HERE / "setup-guest.ps1").read_text()
+        winget = source.split("$vsArgs = @(", 1)[1].split(") -join", 1)[0]
+        self.assertIn('"Microsoft.VisualStudio.Component.VC.Tools.ARM64"', winget)
+        installs = re.findall(r'^\s*\$p = Start-Process .*vs_buildtools\.exe.*$', source, re.MULTILINE)
+        self.assertEqual(len(installs), 2, "expected fresh installation and existing-instance repair")
+        for install in installs:
+            self.assertIn("--add Microsoft.VisualStudio.Component.VC.Tools.ARM64", install)
+        self.assertIn('modify --quiet --wait', installs[0])
+        self.assertIn('-requires Microsoft.VisualStudio.Workload.VCTools Microsoft.VisualStudio.Component.VC.Tools.ARM64', source)
+
+    def test_baseline_checks_arm64_linker_and_builds_offline_executable(self):
+        source = (HERE / "setup-job-baseline.ps1").read_text()
+        for expected in ('-requires Microsoft.VisualStudio.Workload.VCTools Microsoft.VisualStudio.Component.VC.Tools.ARM64',
+                         r'VC\Tools\MSVC\*\bin\Hostx64\arm64\link.exe',
+                         "if (-not $arm64Linker) { throw",
+                         'fn main() { println!("ARM64 toolchain verified"); }',
+                         '[workspace]',
+                         '"+$toolchain" build --offline --target aarch64-pc-windows-msvc',
+                         'if ($LASTEXITCODE -ne 0) { throw "Offline ARM64 Cargo build failed:',
+                         r'target\aarch64-pc-windows-msvc\debug\motor-arm64-toolchain-probe.exe'):
+            self.assertIn(expected, source)
+        manifest = source.split('Set-Content "$arm64Probe\\Cargo.toml"', 1)[1].split("'@", 1)[0]
+        self.assertNotIn("[dependencies]", manifest)
+        self.assertLess(source.index('build --offline'), source.index('# Freeze toolchain files'))
 
     def test_baseline_installs_pinned_protected_powershell(self):
         source = (HERE / "install-powershell.ps1").read_text()
