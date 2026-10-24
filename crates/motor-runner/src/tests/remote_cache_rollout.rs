@@ -273,6 +273,7 @@ fn cache_startup_errors_and_bind_failure_are_uncached_not_job_refusals() {
         super::super::remote_cache_engine::snapshot(&config, &Catalog::default(), 0).state,
         RemoteCacheState::CacheUnavailable
     );
+    assert_uncached_job_starts(&f, &config, "missing provisioning");
     provision(&layout, true);
     runtime.watch.reread();
     let transport = runtime.transport(TENANT, &[Tool::Sccache]).unwrap();
@@ -285,6 +286,67 @@ fn cache_startup_errors_and_bind_failure_are_uncached_not_job_refusals() {
     let health = super::super::remote_cache_engine::snapshot(&config, &Catalog::default(), 0);
     assert_eq!(health.state, RemoteCacheState::CacheUnavailable);
     assert!(health.reason.unwrap().contains("AlreadyExists"));
+    assert_uncached_job_starts(&f, &config, "socket bind failure");
+}
+
+/// Substitute only the privileged systemd launch, after the real backend has
+/// decided whether a cache failure permits the job to start and built its env.
+struct UncachedIsolationLauncher;
+
+impl crate::backend::IsolationLauncher for UncachedIsolationLauncher {
+    fn launch(
+        &self,
+        command: &str,
+        cwd: &Path,
+        env: &[(String, String)],
+        _cpus: &[u32],
+        _requested_vcpus: u32,
+    ) -> io::Result<crate::platform::Launch> {
+        for key in [
+            "SCCACHE_ENDPOINT",
+            "SCCACHE_BUCKET",
+            "CCACHE_REMOTE_STORAGE",
+        ] {
+            assert!(env.iter().all(|(name, _)| name != key), "unexpected {key}");
+        }
+        crate::platform::launch(command, cwd, env)
+    }
+}
+
+fn assert_uncached_job_starts(f: &Fixture, config: &Config, phase: &str) {
+    let (mut request, _) = f.run("exit 23");
+    request.base_commit = Some("f".repeat(40));
+    let setup = Setup {
+        id: request.job_id,
+        request,
+        cpus: vec![1],
+        base: false,
+        recorded: BTreeMap::new(),
+        snapshots: None,
+    };
+    let prepared = Prepared {
+        cwd: f.main.clone(),
+        target: f.scratch.join("uncached-target"),
+        wrapper: None,
+        sandbox: Some(Box::new(UncachedIsolationLauncher)),
+        vm: None,
+    };
+    let trees = Trees {
+        dependency_locks: Mutex::new(BTreeMap::new()),
+        mirrors: config.state_dir().join("mirrors"),
+        state: config.state_dir(),
+        compacting: Arc::default(),
+    };
+    let mut launch = crate::backend::HostBackend
+        .launch(config, &trees, &setup, &prepared, 1)
+        .unwrap_or_else(|error| panic!("{phase} must not refuse an uncached job: {error}"));
+    if let Some(process) = launch.process {
+        f.cleanup.0.lock().unwrap().register(process);
+    }
+    launch.execution.release().unwrap();
+    let outcome = launch.execution.wait().unwrap().wire();
+    launch.execution.reap();
+    assert_eq!(outcome, Outcome::Exit { code: 23 }, "{phase}");
 }
 
 #[test]
