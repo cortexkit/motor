@@ -309,6 +309,32 @@ impl Drop for Flight {
     }
 }
 
+/// One PUT on a write socket may take this long, past the end of the unit's
+/// command, to be answered before the fill's decision gives up on it. The
+/// gateway's own deadline already bounds every request; this only stops a
+/// socket that stopped being served from holding the decision forever.
+const DRAIN_LIMIT: Duration = Duration::from_secs(30);
+
+impl WriteLedger {
+    /// Blocks until no request on the socket is in flight, so a fill's
+    /// publication is decided after its last PUT was answered. Returns an
+    /// error naming the tool when the socket stayed busy past [`DRAIN_LIMIT`];
+    /// the decision then fails rather than guesses.
+    pub(crate) fn drained(&self) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + DRAIN_LIMIT;
+        while self.state.lock().unwrap().in_flight > 0 {
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "{} write socket still had a request in flight after the fill",
+                    self.tool.id()
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(())
+    }
+}
+
 /// One PUT on a write socket; it is recorded as failed unless marked stored.
 struct PutRecord {
     ledger: Arc<WriteLedger>,

@@ -309,6 +309,15 @@ pub(crate) fn unit_alive(process: Option<ProcessIdentity>) -> io::Result<Option<
 }
 
 impl Launch {
+    /// The write ledgers of this launch's cache sockets, if it is a fill.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn cache_ledgers(
+        &self,
+    ) -> Vec<std::sync::Arc<crate::remote_cache::gateway::WriteLedger>> {
+        self.runtime
+            .as_ref()
+            .map_or_else(Vec::new, |runtime| runtime.cache_ledgers())
+    }
     pub fn release(&mut self) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         {

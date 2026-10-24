@@ -258,6 +258,7 @@ impl Backend for InProcessWindows {
             process: None,
             durable_output: false,
             execution: Box::new(FakeExecution),
+            cache_ledgers: Vec::new(),
         })
     }
     fn cancel(&self, config: &Config, job: &Job, hard: bool) -> io::Result<()> {

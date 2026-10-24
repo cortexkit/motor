@@ -84,6 +84,8 @@ impl Backend for MacosBackend {
             }),
             durable_output: false,
             execution,
+            // A VM job never mounts a fill's write sockets.
+            cache_ledgers: Vec::new(),
         })
     }
     fn cancel(&self, config: &Config, job: &Job, _hard: bool) -> io::Result<()> {

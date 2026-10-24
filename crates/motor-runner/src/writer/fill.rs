@@ -168,6 +168,97 @@ pub(crate) fn statistics(state: &Path, id: motor_protocol::Uuid) -> io::Result<s
     Ok(value)
 }
 
+/// The biggest output file the runner reads back from a sandbox.
+const MAX_STATISTICS_BYTES: u64 = 64 * 1024;
+
+fn read_output(state: &Path, id: motor_protocol::Uuid, name: &str) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let path = state
+        .join("sandboxes")
+        .join(id.to_string())
+        .join("output")
+        .join(name);
+    let file = crate::filesystem::read_nofollow(&path)
+        .map_err(|e| io::Error::other(format!("cannot read {}: {e}", path.display())))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_STATISTICS_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() {
+        return Err(io::Error::other(format!(
+            "empty statistics file: {}",
+            path.display()
+        )));
+    }
+    if bytes.len() as u64 > MAX_STATISTICS_BYTES {
+        return Err(io::Error::other("statistics exceed 64 KiB"));
+    }
+    Ok(bytes)
+}
+
+/// Whether sccache reported a failed remote write. `cache_write_errors` counts
+/// puts the store refused or the transport lost; a fill that sent `all` as its
+/// multi-level write error policy also fails its own command on one, so this
+/// normally agrees with the fill's exit status.
+pub(crate) fn sccache_write_failures(state: &Path, id: motor_protocol::Uuid) -> io::Result<u64> {
+    let value = statistics(state, id)?;
+    let stats = value.get("stats").unwrap_or(&value);
+    let errors = ["cache_write_errors", "cache_errors"]
+        .iter()
+        .filter_map(|counter| stats.get(*counter))
+        .try_fold(0u64, |total, value| -> io::Result<u64> {
+            let count = count_in(value).ok_or_else(|| {
+                io::Error::other("statistics report a write-error count that is not a number")
+            })?;
+            Ok(total.saturating_add(count))
+        })?;
+    Ok(errors)
+}
+
+/// A counter's value, whether it is a bare number or sccache's
+/// `{"counts": {...}, "adv_counts": {...}}` shape.
+fn count_in(value: &serde_json::Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .get("counts")
+            .and_then(|counts| counts.as_object())
+            .map(|counts| counts.values().filter_map(serde_json::Value::as_u64).sum())
+    })
+}
+
+/// Whether ccache's `--print-stats` output reports a remote-storage error or
+/// timeout. ccache prints one `key<TAB>value` line per counter, and the
+/// remote-storage counters are named `remote_storage_error` and
+/// `remote_storage_timeout`. A file that does not parse as that shape fails
+/// the publication: statistics that cannot be read say nothing about the
+/// writes that happened.
+pub(crate) fn ccache_write_failures(state: &Path, id: motor_protocol::Uuid) -> io::Result<u64> {
+    let bytes = read_output(state, id, "ccache-stats")?;
+    let text =
+        String::from_utf8(bytes).map_err(|_| io::Error::other("ccache statistics are not text"))?;
+    let mut total = 0u64;
+    let mut named = 0usize;
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(name), Some(value)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if !matches!(name, "remote_storage_error" | "remote_storage_timeout") {
+            continue;
+        }
+        let count = value
+            .parse::<u64>()
+            .map_err(|_| io::Error::other(format!("ccache counter {name} is not a number")))?;
+        total = total.saturating_add(count);
+        named += 1;
+    }
+    if named == 0 {
+        return Err(io::Error::other(
+            "ccache statistics carry no remote-storage counter",
+        ));
+    }
+    Ok(total)
+}
+
 /// The writer compiles repository-local packages incrementally, which sccache
 /// cannot store. Graphs containing only those packages need no cache writer.
 /// Registry/git sources and paths outside the repository still require the

@@ -2011,6 +2011,15 @@ pub(crate) fn recovered_runtime(state: &Path, id: Uuid) -> RuntimeDir {
     )
 }
 impl RuntimeDir {
+    /// The write ledgers of the unit's cache sockets, empty unless they are a
+    /// fill's write sockets.
+    pub(crate) fn cache_ledgers(
+        &self,
+    ) -> Vec<std::sync::Arc<crate::remote_cache::gateway::WriteLedger>> {
+        self.2
+            .get()
+            .map_or_else(Vec::new, |sockets| sockets.ledgers())
+    }
     pub(crate) fn tracking(self, count: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
         self.track(count);
         self
