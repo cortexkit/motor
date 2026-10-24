@@ -563,6 +563,52 @@ def required_checks_passed(checks):
         for row in checks)
 
 
+# --verify-prepared-image phases, in the order a run without --verify-phase
+# runs them. Each restores the image into its own sandbox, because Boat stops a
+# sandbox 30 minutes after it starts and the whole verify takes longer.
+VERIFY_PHASES = ('core', 'disk-quota', 'idle')
+
+
+def selected_verify_phases(phase):
+    """The phases a run executes: the one --verify-phase names, or all of them in order."""
+    if phase is None:
+        return VERIFY_PHASES
+    if phase not in VERIFY_PHASES:
+        raise ProbeError('unknown verify phase: ' + str(phase))
+    return (phase,)
+
+
+def verify_phase_records(requested):
+    """One record per verify phase, all not run yet; `requested` are the ones this run will try."""
+    return {name: {'requested': name in requested, 'ran': False, 'status': 'not_run'} for name in VERIFY_PHASES}
+
+
+def verify_phase_status(record, checks):
+    """'not_run', 'passed', 'inconclusive', 'failed' or 'snapshot_size_bound' for one verify phase.
+
+    Only a phase that started, finished without an error and recorded checks can
+    pass; 'inconclusive' means no check failed but one other than idle reclaim
+    could not decide, so the phase did not pass."""
+    if record.get('ran') is not True:
+        return 'not_run'
+    if record.get('snapshot_size_bound'):
+        return 'snapshot_size_bound'
+    if record.get('error') or record.get('completed') is not True or not checks:
+        return 'failed'
+    if any(row.get('status') not in ('PASS', 'INCONCLUSIVE') for row in checks):
+        return 'failed'
+    return 'passed' if required_checks_passed(checks) else 'inconclusive'
+
+
+def verify_phase_outcomes(records):
+    """Each verify phase's status, read so that a phase never reported as run is not run."""
+    outcomes = {}
+    for name in VERIFY_PHASES:
+        record = records.get(name) or {}
+        outcomes[name] = record.get('status', 'not_run') if record.get('ran') is True else 'not_run'
+    return outcomes
+
+
 def verdict(data):
     """Require all required checks to pass, listing unproven idle-reclaim checks separately.
 
@@ -591,7 +637,20 @@ def verdict(data):
             if data[mode].get("all_passed") is not True:
                 if mode != 'runner_host' or not required_checks_passed(checks):
                     reasons.append(mode + " checks did not all pass")
+    records = (data.get('runner_host') or {}).get('verify_phases')
+    phases = None
+    if records is not None:
+        phases = verify_phase_outcomes(records)
+        requested = [name for name in VERIFY_PHASES if (records.get(name) or {}).get('requested') is True]
+        if not requested:
+            reasons.append('no verify phase was requested')
+        reasons.extend(f'verify phase {name}: {phases[name]}' for name in requested if phases[name] != 'passed')
     result = {"passed": not reasons, "outcome": "failed" if reasons else "passed", "reasons": reasons}
+    if phases is not None:
+        result['verify_phases'] = phases
+        result['not_run'] = [name for name in VERIFY_PHASES if phases[name] == 'not_run']
+        # A run of one phase can pass; the image is qualified only by every phase.
+        result['image_qualified'] = not reasons and all(status == 'passed' for status in phases.values())
     if inconclusive:
         result['inconclusive'] = inconclusive
     return result
@@ -799,6 +858,40 @@ def sizing_section(data):
     return lines
 
 
+def verify_phase_section(runner, outcome):
+    """The --verify-prepared-image phase table; empty for other runner-host runs."""
+    records = runner.get('verify_phases')
+    if records is None:
+        return []
+    phases = verify_phase_outcomes(records)
+    qualified = all(status == 'passed' for status in phases.values()) and outcome.get('passed') is True
+    not_run = [name for name in VERIFY_PHASES if phases[name] == 'not_run']
+    lines = ["## Verify phases", "",
+             "Each phase restores the prepared image into its own sandbox. A phase not run is never a pass.", "",
+             f"Image qualified by this run: **{'yes' if qualified else 'no'}**"
+             + (f" (not run: {', '.join(not_run)})" if not_run else "") + ".", "",
+             "| Phase | Requested | Status | Sandbox | Seconds | Checks | Error |", "| --- | --- | --- | --- | --- | --- | --- |"]
+    for name in VERIFY_PHASES:
+        record = records.get(name) or {}
+        lines.append(f"| {name} | {display(record.get('requested', False))} | {phases[name].upper()} | "
+                     f"{display(record.get('sandbox', 'none'))} | {display(rounded(record.get('seconds'), 1))} | "
+                     f"{len(record.get('check_names', []))} | {display(record.get('error', 'none'))} |")
+    return lines + [""]
+
+
+def section_timing_lines(runner):
+    """Wall time of every recorded step, so an overrun shows where the time went."""
+    rows = runner.get('section_timings') or []
+    lines = ["## Section timings (wall seconds, operator machine)", "",
+             "A step still `running` was in progress when the run stopped.", "",
+             "| Section | Outcome | Started (UTC) | Seconds |", "| --- | --- | --- | --- |"]
+    lines += [f"| {row.get('name')} | {row.get('outcome')} | {row.get('started_at')} | {display(rounded(row.get('seconds'), 1))} |"
+              for row in rows]
+    if not rows:
+        lines.append("| unmeasured | | | |")
+    return lines + [""]
+
+
 def render_runner_host(data):
     """Findings for --runner-host: the verdict, per-phase jobs, timings and job memory budget."""
     runner = data["runner_host"]
@@ -808,6 +901,8 @@ def render_runner_host(data):
     bound = data.get("snapshot_size_bound")
     label = ("SNAPSHOT_SIZE_BOUND" if outcome.get("outcome") == "snapshot_size_bound" else
              "PASSED" if outcome["passed"] else "FAILED")
+    if outcome["passed"] and outcome.get("image_qualified") is False:
+        label += " for the phases run; the image is not qualified until every verify phase passes"
     error = display(data["error"]) if data.get("error") is not None else "none recorded"
     status = data.get("exit_status")
     status_text = (f"Exit status: {status}" if status is not None else
@@ -831,6 +926,7 @@ def render_runner_host(data):
              f"Measurement completion: {display(data.get('measurements_complete', False))}. Error: {error}.",
              f"Cleanup state (reported separately from the verdict): {display(cleanup_state(data))}. "
              f"{status_text} (0 passed, 1 failed, 3 resources need --cleanup, 4 snapshot_size_bound).", "",
+             *verify_phase_section(runner, outcome),
              "## Phases", "",
              "Every phase runs real jobs through the motor client over the pinned SSH forward.", "",
              "| Phase | Checks passed | Exit job code | Rust job code | Job seconds (exit / rust / isolation) | "
@@ -903,6 +999,7 @@ def render_runner_host(data):
                      f" | {mib(budget.get('memory_max_bytes'))} | {display(job.get('limits', {}).get('memory.max', 'unmeasured'))} |")
     lines += ["", f"Smallest job memory budget across phases: {mib(min(budgets)) if budgets else 'unmeasured'} MiB.", "",
               *sizing_section(data), "",
+              *section_timing_lines(runner),
               "## Snapshots", "",
               "| Role | Name | Snapshot id | Size bytes | Retained | Real jobs qualified |", "| --- | --- | --- | --- | --- | --- |"]
     for role, item in (("prepared source (borrowed, not deleted)", runner.get("prepared_source")),
@@ -959,6 +1056,9 @@ def main(report_stream=None):
     parser.add_argument('--prepared-image', action='store_true', help='explicitly retain a prepared named image for future retry reuse')
     parser.add_argument('--from-prepared-image', help='start from an operator-owned prepared image; reapply this recipe and run all checks')
     parser.add_argument('--verify-prepared-image', help='qualify an existing snapshot unchanged: hydrate, install broker identity, real jobs, resume; no recipe reapply or service restart')
+    parser.add_argument('--verify-phase', choices=VERIFY_PHASES,
+                        help='with --verify-prepared-image, run only this phase in its own sandbox '
+                             '(default: every phase, one sandbox each, one combined verdict)')
     parser.add_argument('--delete-retained-images', action='store_true', help='with --cleanup, also delete explicitly retained prepared images')
     parser.add_argument('--cargo-seed-manifest', type=Path, help='operator server capture, required for runner-host registry parity')
     parser.add_argument('--cargo-seed-sha256', help='independently recorded SHA-256 of the server seed manifest')
@@ -980,6 +1080,8 @@ def main(report_stream=None):
             parser.error('--verify-prepared-image cannot rebuild or retain an image')
         if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', args.verify_prepared_image):
             parser.error('invalid prepared named-snapshot handle')
+    if args.verify_phase and not args.verify_prepared_image:
+        parser.error('--verify-phase requires --verify-prepared-image')
     if args.delete_retained_images and not args.cleanup:
         parser.error('--delete-retained-images requires --cleanup')
     if args.runner_host and not args.cleanup and not args.render:
@@ -1019,6 +1121,7 @@ def main(report_stream=None):
             runner.retain_prepared_image = args.prepared_image
             runner.from_prepared_image = args.from_prepared_image
             runner.verify_prepared_image = args.verify_prepared_image
+            runner.verify_phases = selected_verify_phases(args.verify_phase)
             runner.cargo_seed_manifest = args.cargo_seed_manifest
             runner.cargo_seed_sha256 = args.cargo_seed_sha256
             runner.cargo_seed_archive = args.cargo_seed_archive

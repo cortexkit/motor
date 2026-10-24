@@ -848,6 +848,29 @@ checks readiness and disk identity/order, runs real jobs, and repeats after
 stop/resume. Only the probe-only bridge is explicitly started to transport real
 jobs. The source snapshot is borrowed and never deleted by cleanup.
 
+Boat stops a sandbox 30 minutes after it starts, and the whole qualification
+takes longer, so it is split into phases. Each phase restores the same image
+into its own fresh sandbox. The probe asks Boat to delete that sandbox before the
+next phase starts, and the run's final cleanup retries any deletion that did not finish:
+
+| `--verify-phase` | What it proves | Expected sandbox time |
+| --- | --- | --- |
+| `core` | prepared-clone identity and readiness, storage, host, parity and every real job | about 8 minutes |
+| `disk-quota` | quota lanes, stop with a quota-sized target, resume, readiness recovery, backing-file shrink, then every real job again after the resume | about 18–20 minutes |
+| `idle` | Boat's idle reclaim (up to 17 minutes idle), then a real job | about 20 minutes |
+
+These times are estimates from the phase contents. Each run measures its own
+steps in `runner_host.section_timings` and the findings' "Section timings" table.
+Without `--verify-phase`, one run executes all three in that order and writes one
+verdict that passes only when every phase ran and passed; only such a run sets
+`verdict.image_qualified` to true. A phase that fails is recorded and the next phase
+still runs, except after Boat refuses the size or the run is interrupted, which stops
+the sequence. With `--verify-phase`, only the named phase runs and the others are
+reported `not_run`, never passed. That run's verdict covers the named phase alone and
+`verdict.image_qualified` stays false; separate runs are not combined, so the operator
+qualifies the image from one passing run of each phase. `--max-minutes` applies to
+each phase's sandbox separately.
+
 Every real-job fixture includes an npm lockfile and a locally generated tarball
 dependency containing regular files. No registry or project-specific dependency
 is needed. The first and second Node jobs read `node_modules/boat-dep/index.js`;
