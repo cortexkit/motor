@@ -109,6 +109,12 @@ pub fn check_javascript_setup(
 ) -> std::io::Result<String> {
     isolation::check_javascript_setup(&isolation::JavascriptTools::for_config(config), scratch)
 }
+/// Runs a cold-cache online fetch in the tenant's trusted snapshot helper.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn check_tenant_cargo_fetch(scratch: &std::path::Path) -> std::io::Result<()> {
+    isolation::check_tenant_cargo_fetch(scratch)
+}
 /// PID 1 of a Boat job's PID namespace; the job unit
 /// execs the installed runner in this mode. Never returns.
 #[cfg(target_os = "linux")]

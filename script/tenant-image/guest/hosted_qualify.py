@@ -31,6 +31,8 @@ PARITY = "PASS guest toolchain parity: tenant host contract and package-qualifie
 JAVASCRIPT_SETUP = ("PASS guest runner JavaScript setup: bun.lock, package-lock.json and pnpm-lock.yaml "
                     "installed with the tenant runner's tools after attach")
 RUNNER_JAVASCRIPT_PASS = "PASS runner JavaScript setup: bun.lock, package-lock.json and pnpm-lock.yaml installs"
+CARGO_FETCH = "PASS guest trusted cargo prefetch: itoa 1.0.18 fetched online in a snapshot helper with a cold cache"
+RUNNER_CARGO_FETCH_PASS = "PASS runner trusted cargo prefetch: itoa 1.0.18 fetched online into a cold cache"
 SAMPLE_BYTES = 32 * 1024 * 1024
 
 
@@ -314,6 +316,20 @@ def javascript_setup_probe(scratch):
     print(JAVASCRIPT_SETUP, flush=True)
 
 
+def cargo_fetch_probe(scratch):
+    """Use a fresh cache and the production helper, whose mount namespace is
+    separate from both this qualifier and the daemon's private resolver view."""
+    target = scratch / "cargo-fetch"
+    if target.exists():
+        shutil.rmtree(target)
+    output = run("/usr/local/bin/motor-runner", "check-tenant-cargo-fetch",
+                 "--scratch", str(target))
+    if RUNNER_CARGO_FETCH_PASS not in output.splitlines():
+        raise RuntimeError("the runner's trusted online Cargo fetch check did not pass")
+    shutil.rmtree(target)
+    print(CARGO_FETCH, flush=True)
+
+
 def main():
     deadline = time.monotonic() + 120
     while subprocess.run(["systemctl", "is-active", "--quiet", "motor-tenant-runner.service"]).returncode:
@@ -329,6 +345,7 @@ def main():
     scratch = Path("/tenant/qualification-scratch")
     scratch.mkdir(exist_ok=True)
     javascript_setup_probe(scratch)
+    cargo_fetch_probe(scratch)
     env = dict(os.environ, TMPDIR=str(scratch), RUSTC_WRAPPER="", CARGO_BUILD_RUSTC_WRAPPER="")
     for key in list(env):
         if key.startswith("GIT_CONFIG_"):

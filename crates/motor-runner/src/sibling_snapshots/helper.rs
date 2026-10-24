@@ -218,10 +218,16 @@ impl View {
     }
 
     /// The `systemd-run` properties that build this view.
-    fn properties(&self) -> io::Result<Vec<String>> {
+    fn properties(&self, tenant_vm: bool) -> io::Result<Vec<String>> {
         let hidden = self.hidden();
         let mut read_only = Vec::new();
         let mut read_write = Vec::new();
+        if tenant_vm {
+            // systemd starts helpers outside the daemon's private mount namespace.
+            // The VM-global resolver is empty; only trusted preparation units get
+            // the daemon's resolver bind. Do not hide the rest of /etc as a checkout.
+            read_only.push("/run/motor-tenant-daemon/resolv.conf:/etc/resolv.conf".into());
+        }
         for (source, destination) in &self.read_only {
             read_only.push(bind(source, destination)?);
         }
@@ -649,7 +655,7 @@ fn arguments(
         "--property=UMask=0022".into(),
     ];
     arguments.extend(crate::systemd::JOB_MEMORY_PROPERTIES.map(str::to_owned));
-    arguments.extend(view.properties()?);
+    arguments.extend(view.properties(config.tenant_vm)?);
     arguments.push("--".into());
     arguments.push(
         program

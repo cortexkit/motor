@@ -47,6 +47,7 @@ ROOT_PATHS = "PASS guest root paths: everything root executes from is root-owned
 PARITY = "PASS guest toolchain parity: tenant host contract and package-qualified gnutest"
 JAVASCRIPT_SETUP = ("PASS guest runner JavaScript setup: bun.lock, package-lock.json and pnpm-lock.yaml "
                     "installed with the tenant runner's tools after attach")
+CARGO_FETCH = "PASS guest trusted cargo prefetch: itoa 1.0.18 fetched online in a snapshot helper with a cold cache"
 # Committed offline fixtures, one per lockfile kind the runner installs from.
 # Every qualification job's repository carries them, so each job's real
 # workspace setup runs Bun, npm and pnpm inside the booted image.
@@ -55,7 +56,7 @@ JAVASCRIPT_MANAGERS = ("bun", "npm", "pnpm")
 TEST = "isolation::tests::hosted_job_cannot_open_vsock"
 WORKSPACE = "/Users/qualification/probe"
 STEPS = ("preflight", "provision and boot", "live inventory", "tenant inventory", "name service",
-          "tool trees", "root paths", "toolchain parity", "javascript setup", "vsock isolation", "first job", "warm target reuse", "suspend", "restore", "post-restore job",
+          "tool trees", "root paths", "toolchain parity", "javascript setup", "trusted cargo fetch", "vsock isolation", "first job", "warm target reuse", "suspend", "restore", "post-restore job",
          "guest units", "teardown")
 
 
@@ -856,6 +857,7 @@ class Harness:
             self.step("root paths", lambda: self.expect_console(ROOT_PATHS))
             self.step("toolchain parity", lambda: self.expect_console(PARITY))
             self.step("javascript setup", lambda: self.expect_console(JAVASCRIPT_SETUP))
+            self.step("trusted cargo fetch", lambda: self.expect_console(CARGO_FETCH))
             self.step("vsock isolation", lambda: self.expect_console("PASS guest vsock isolation: 1 passed; 0 failed; 0 ignored"))
             def result(frames, number):
                 return assert_job(frames, 23 if number == 1 else 0,
