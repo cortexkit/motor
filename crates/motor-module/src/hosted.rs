@@ -74,6 +74,14 @@ pub struct HostedJobState {
     /// Persist the decision so retries and restarts cannot enable local fallback.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) repository_routed: bool,
+    /// Selected by the global fleet route. Persist alongside repository routing
+    /// so capacity waits and pre-Run correction survive configuration changes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) fleet_routed: bool,
+    /// Outbound-network fleet jobs cannot run on Boat. Store the restriction
+    /// before requesting a lease so retries and restarts keep the same policy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) fleet_no_spill: bool,
     /// Set durably just before ck-motor sends the Run frame to a hosted
     /// runner. Until then no runner holds the command, so whatever happened to
     /// the lease, the job provably never ran; afterwards it may have.
@@ -101,6 +109,9 @@ fn stored_lease_request<'de, D: serde::Deserializer<'de>>(
         .map_err(serde::de::Error::custom)
 }
 impl HostedJobState {
+    pub(crate) fn capacity_routed(&self) -> bool {
+        self.repository_routed || self.fleet_routed
+    }
     pub(crate) fn new(config: &Config) -> Self {
         Self {
             broker_url: config
@@ -776,7 +787,7 @@ impl Client {
                     Some("no_capacity")
                         if status == 503
                             && path == "/v1/leases"
-                            && self.route.repository_routed =>
+                            && self.route.capacity_routed() =>
                     {
                         Error::NoCapacity(bounded_provisioning_retry_ms(retry_after_ms))
                     }
@@ -897,12 +908,14 @@ impl Client {
         let allow_spill = !job
             .hosted
             .as_ref()
-            .is_some_and(|state| state.repository_routed);
+            .is_some_and(|state| state.repository_routed || state.fleet_no_spill);
         let route = job.hosted.as_ref().map_or("hosted", |state| {
             if state.spill_wait_ms.is_some() {
                 "spill"
             } else if state.repository_routed {
                 "repository_routed"
+            } else if state.fleet_routed {
+                "fleet_routed"
             } else if state.hosted_test {
                 "hosted_test"
             } else {
@@ -962,7 +975,7 @@ impl Client {
             let attempt = state.placement_attempts;
             let spilled = state.spill_wait_ms.is_some();
             let hosted_test = state.hosted_test;
-            let repository_routed = state.repository_routed;
+            let capacity_routed = state.capacity_routed();
             let key = requester()?;
             body.requester_jwk = RequesterJwk::from_key(&key.verifying_key());
             // Acquire credentials before recording this attempt: a vault refusal
@@ -1079,7 +1092,7 @@ impl Client {
                 // because its issue time is later. These waits are not failed
                 // placements, so they don't use up the three placement
                 // attempts.
-                Err(e @ (Error::HostFull | Error::Capacity)) if repository_routed => {
+                Err(e @ (Error::HostFull | Error::Capacity)) if capacity_routed => {
                     let retry_at =
                         tokio::time::Instant::now() + Duration::from_millis(HOST_FULL_RETRY_MS);
                     if retry_at >= provisioning_deadline {
