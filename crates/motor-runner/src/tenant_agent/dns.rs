@@ -6,11 +6,13 @@ use std::{
     path::Path,
 };
 
-pub(super) const DIRECTORY: &str = "/run/motor-tenant-daemon";
+/// The daemon's private resolver directory, as attachment installs it and as
+/// the runner's own files outside this module refer to it.
+pub(crate) const DIRECTORY: &str = "/run/motor-tenant-daemon";
 
 /// Root-only backing file for the daemon service's private resolver bind.
 /// Updating the same inode also preserves the binding across a future refresh.
-pub(super) fn install(directory: &Path, resolvers: &[String], owner: u32) -> io::Result<()> {
+pub(crate) fn install(directory: &Path, resolvers: &[String], owner: u32) -> io::Result<()> {
     if resolvers.is_empty() || resolvers.len() > 3 {
         return Err(io::Error::other(
             "daemon DNS needs one to three resolver addresses",
