@@ -176,16 +176,16 @@ pub fn is_volume_guid_path(path: &str) -> bool {
         })
 }
 
-/// Arguments for `format.com`, started directly (no shell) on the new cache
-/// partition's volume: a quick NTFS format with an explicit cache label.
+/// Arguments for `format.com`, started directly (no shell) through the agent's
+/// cache mount folder: a quick NTFS format with an explicit cache label.
 /// The caller also supplies the hard-disk confirmation on stdin; /Y only
 /// suppresses dismount/empty-label prompts on Windows versions supporting it.
-pub fn format_arguments(volume: &str) -> io::Result<Vec<String>> {
-    if !is_volume_guid_path(volume) {
-        return Err(io::Error::other("invalid cache volume path for format"));
+pub fn format_arguments(mount: &str) -> io::Result<Vec<String>> {
+    if mount != crate::CACHE_MOUNT {
+        return Err(io::Error::other("invalid cache mount path for format"));
     }
     Ok(vec![
-        volume.to_owned(),
+        mount.to_owned(),
         "/FS:NTFS".into(),
         format!("/V:{}", crate::CACHE_LABEL),
         "/Q".into(),
@@ -737,8 +737,7 @@ mod tests {
         let prepared = prepare_cache(&mut fake, 7).unwrap();
         assert!(!prepared.freshly_formatted);
         assert_eq!(fake.formats, 0);
-        let arguments =
-            format_arguments("\\\\?\\Volume{0123abcd-0000-4000-8000-00000000cafe}\\").unwrap();
+        let arguments = format_arguments(crate::CACHE_MOUNT).unwrap();
         assert!(arguments.contains(&format!("/V:{}", crate::CACHE_LABEL)));
         assert!(arguments.contains(&"/FS:NTFS".to_owned()));
     }
@@ -768,15 +767,17 @@ mod tests {
     }
 
     #[test]
-    fn format_runs_quick_ntfs_with_cache_label_only_on_a_volume_guid_path() {
-        let volume = "\\\\?\\Volume{0123abcd-0000-4000-8000-00000000cafe}\\";
+    fn format_runs_quick_ntfs_with_cache_label_only_on_the_cache_mount_path() {
+        let mount = "C:\\t\\";
         assert_eq!(
-            format_arguments(volume).unwrap(),
-            [volume, "/FS:NTFS", "/V:motor-target", "/Q", "/Y"]
+            format_arguments(mount).unwrap(),
+            [mount, "/FS:NTFS", "/V:motor-target", "/Q", "/Y"]
         );
         for bad in [
             "C:",
             "C:\\t",
+            "C:\\other\\",
+            "\\\\?\\Volume{0123abcd-0000-4000-8000-00000000cafe}\\",
             "\\\\?\\Volume{0123abcd-0000-4000-8000-00000000cafe}",
             "\\\\?\\Volume{0123abcd-0000-4000-8000-00000000caf}\\",
             "\\\\?\\Volume{0123abcd 0000-4000-8000-00000000cafe}\\",
@@ -811,7 +812,7 @@ mod tests {
             assert!(at < first_write, "{guard} runs after the first write");
         }
         assert!(body.find("IOCTL_DISK_SET_DRIVE_LAYOUT_EX").unwrap() > first_write);
-        assert!(body.contains("motor_winagent::cache_format::run(&volume, deadline)"));
+        assert!(body.contains("motor_winagent::cache_format::run_mounted("));
         assert!(!body.contains("powershell"));
     }
 }

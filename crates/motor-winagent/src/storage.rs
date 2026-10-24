@@ -40,6 +40,27 @@ fn win32(ok: i32) -> io::Result<()> {
         Ok(())
     }
 }
+
+struct CacheFormatter;
+impl motor_winagent::cache_format::Formatter for CacheFormatter {
+    fn mount(&mut self, volume: &str, path: &str) -> io::Result<()> {
+        unsafe {
+            win32(SetVolumeMountPointW(
+                wide(path).as_ptr(),
+                wide(volume).as_ptr(),
+            ))
+        }
+    }
+
+    fn format(&mut self, path: &str, deadline: Instant) -> io::Result<()> {
+        motor_winagent::cache_format::run(path, deadline)
+    }
+
+    fn unmount(&mut self, path: &str) -> io::Result<()> {
+        unsafe { win32(DeleteVolumeMountPointW(wide(path).as_ptr())) }
+    }
+}
+
 struct Handle(HANDLE);
 impl Handle {
     fn open(
@@ -619,7 +640,17 @@ impl CacheStorage for WindowsStorage {
             )?;
 
             let volume = self.new_volume()?;
-            motor_winagent::cache_format::run(&volume, deadline)
+            reporter.step(CacheStep::MountDirectory, || {
+                motor_winagent::cache::empty_mount_directory(std::path::Path::new(
+                    motor_winagent::CACHE_MOUNT,
+                ))
+            })?;
+            motor_winagent::cache_format::run_mounted(
+                &mut CacheFormatter,
+                &reporter,
+                &volume,
+                deadline,
+            )
         })
     }
 

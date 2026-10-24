@@ -39,6 +39,8 @@ pub enum CacheStep {
     NextVolume,
     VolumeInformation,
     InitializeRaw,
+    FormatMountPoint,
+    FormatUnmountPoint,
     VolumeDiscovery,
     MountDirectory,
     MountPoint,
@@ -117,6 +119,24 @@ impl CacheReporter {
                 result.is_err(),
             ))
             .map_err(|_| io::Error::other("cache observer stopped"))?;
+        result.map_err(|error| io::Error::new(error.kind(), format!("{step:?}: {error}")))
+    }
+
+    /// Cleanup must still run after a timeout disconnects the observer. Unlike
+    /// normal steps, losing the timing receiver cannot cancel the operation.
+    pub fn cleanup<T>(
+        &self,
+        step: CacheStep,
+        operation: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        let _ = self.0.send(StepEvent::Begin(step));
+        let started = Instant::now();
+        let result = operation();
+        let _ = self.0.send(StepEvent::End(
+            step,
+            started.elapsed().as_millis() as u64,
+            result.is_err(),
+        ));
         result.map_err(|error| io::Error::new(error.kind(), format!("{step:?}: {error}")))
     }
 }
@@ -241,6 +261,36 @@ pub fn watch_cache<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_runs_after_observer_disconnect_and_preserves_its_result() {
+        for fail in [false, true] {
+            let (tx, rx) = mpsc::channel();
+            let reporter = CacheReporter::new(tx);
+            drop(rx);
+            let mut cleaned = false;
+            let result = reporter.cleanup(CacheStep::FormatUnmountPoint, || {
+                cleaned = true;
+                if fail {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "unmount denied",
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(cleaned);
+            if fail {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert_eq!(error.to_string(), "FormatUnmountPoint: unmount denied");
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
     fn exercise(fail: bool) -> (Result<(), CacheFailure>, usize, usize) {
         let (events_tx, events_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
