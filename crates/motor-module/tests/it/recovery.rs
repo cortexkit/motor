@@ -310,10 +310,20 @@ impl Fixture {
         source: Option<&Path>,
         configure: impl FnOnce(&mut RunnerConfig),
     ) -> Self {
+        Self::with_local_root(cut, max_weight, source, None, configure).await
+    }
+    async fn with_local_root(
+        cut: Cut,
+        max_weight: u32,
+        source: Option<&Path>,
+        local_root: Option<&Path>,
+        configure: impl FnOnce(&mut RunnerConfig),
+    ) -> Self {
         let scratch = ScratchDir::new("motor-module");
-        fs::create_dir_all(scratch.join("local")).unwrap();
+        let local = local_root.map_or_else(|| scratch.join("local"), Path::to_path_buf);
+        fs::create_dir_all(&local).unwrap();
         fs::create_dir_all(scratch.join("remote")).unwrap();
-        let local = fs::canonicalize(scratch.join("local")).unwrap();
+        let local = fs::canonicalize(local).unwrap();
         let remote = fs::canonicalize(scratch.join("remote")).unwrap();
         let main = local.join("source/main");
         let sibling = local.join("source/commons");
@@ -1368,6 +1378,66 @@ async fn capped_unavailable_tips_do_not_resend_a_prepared_worktrees_history() {
         terminal(&records).bundle_bytes
     );
     assert!(terminal(&records).bundle_bytes > 0);
+}
+
+#[tokio::test]
+async fn fleet_invalid_vcpus_keep_the_claim_and_are_refused_by_direct_admission_once() {
+    // Keep every non-vCPU input hosted-valid so the route exclusion proves the
+    // claim was invalid, rather than merely rejecting a test scratch path.
+    let (hosted_scratch, _) = crate::hosted::boat_tests::committed_repo();
+    let mut f = Fixture::with_local_root(
+        Cut::None,
+        28,
+        None,
+        Some(&hosted_scratch.0.join("local")),
+        |_| {},
+    )
+    .await;
+    let broker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    f.config.hosted_runners = true;
+    f.config.hosted_fleet_routing = true;
+    f.config.broker_url = Some(format!("http://{}", broker.local_addr().unwrap()));
+    f.config.broker_token_source = crate::BrokerTokenSource::Fake;
+    std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
+    let motor = f.motor();
+    let marker = f.scratch.join("unexpected-start");
+    for claim in [0, 65] {
+        let mut request = f.request(&format!("touch '{}'", marker.display()));
+        request.timeout = Some(600);
+        request.queue_wait_limit_s = Some(1);
+        request.weight_hint = Some(2);
+        crate::hosted::validate(&request).expect("all other lease inputs must be valid");
+        request.weight_hint = Some(claim);
+        let stream = motor.run(request).unwrap();
+        let id = stream.job_id;
+        assert!(stream.hosted_state().is_none());
+        let records = collect(stream).await;
+        let terminal = terminal(&records);
+        assert_eq!(
+            terminal.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::RunnerFull
+            }
+        );
+        assert_eq!(terminal.ran, Some(Ran::None));
+        assert!(!marker.exists());
+        let frames = f.proxy.frames.lock().unwrap();
+        let runs: Vec<_> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::Run(run) if run.job_id == id => Some(run),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].weight_hint, Some(claim));
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), broker.accept())
+            .await
+            .is_err(),
+        "invalid claims must never request a lease"
+    );
 }
 
 #[tokio::test]

@@ -310,9 +310,12 @@ impl Motor {
                 "routed to hosted (hosted_repositories)");
         } else if self.config.hosted_runners
             && matches!(request.platform, None | Some(Platform::Linux))
+            && (!self.config.hosted_fleet_routing || crate::hosted::validate(&request).is_ok())
         {
-            self.storage
-                .hosted_route(id, crate::HostedJobState::new(&self.config))?;
+            let mut route = crate::HostedJobState::new(&self.config);
+            route.fleet_routed = self.config.hosted_fleet_routing;
+            route.hosted_no_fallback = route.fleet_routed;
+            self.storage.hosted_route(id, route)?;
         }
         self.storage
             .retain_job(id, Some(request.workspace_key.clone()))?;
@@ -501,7 +504,7 @@ impl Motor {
                     tracing::info!(job_id = %id, result = released.err().map_or("released", |e| e.code()),
                         run_sent = state.run_sent, "hosted release");
                     if released == Err(crate::hosted::Error::Admitted) {
-                        if state.run_sent || (!state.repository_routed && state.placement.is_some())
+                        if state.run_sent || (!state.capacity_routed() && state.placement.is_some())
                         {
                             let (_, wake) = watch::channel(false);
                             return self.follow(id, 0, None, tx, wake).await;
@@ -722,8 +725,8 @@ impl Motor {
         wake: watch::Receiver<bool>,
     ) -> io::Result<bool> {
         let (mut request, mut returns) = submission;
-        // A repository-routed job the broker could never place runs on the
-        // build server under the queue-wait limit it has left; see
+        // After a repository or fleet route gets no_host_fits, run on the build
+        // server with only the remaining queue-wait budget; see
         // `Storage::routed_direct_no_host_fits`.
         let wait = match self.storage.job(id) {
             Some(job) if job.routed_direct_reason.is_some() => job.queue_wait_limit_s,
@@ -808,7 +811,7 @@ impl Motor {
                     Err(crate::hosted::Error::NoHostFits(max_vcpus))
                         if self
                             .hosted_state(id)
-                            .is_some_and(|s| s.repository_routed && !s.run_sent) =>
+                            .is_some_and(|s| s.capacity_routed() && !s.run_sent) =>
                     {
                         // No hosted host can ever hold this job, so choosing
                         // hosted for it was wrong from the start. This undoes
@@ -850,14 +853,14 @@ impl Motor {
                             crate::hosted::Error::Admitted
                                 if !self
                                     .hosted_state(id)
-                                    .is_some_and(|s| s.repository_routed && !s.run_sent) =>
+                                    .is_some_and(|s| s.capacity_routed() && !s.run_sent) =>
                             {
                                 return self.follow_inner(id, 0, None, tx, wake, spill_after).await
                             }
                             crate::hosted::Error::SandboxLost
                                 if !self
                                     .hosted_state(id)
-                                    .is_some_and(|s| s.repository_routed && !s.run_sent) =>
+                                    .is_some_and(|s| s.capacity_routed() && !s.run_sent) =>
                             {
                                 return self.lost_sandbox(id, tx).await.map(|_| false)
                             }
@@ -2620,6 +2623,8 @@ async fn emit(tx: &mpsc::Sender<io::Result<StreamRecord>>, record: StreamRecord)
 #[path = "queue_tests.rs"]
 mod queue_tests;
 
+#[cfg(test)]
+mod fleet_routing_tests;
 #[cfg(test)]
 mod repository_routing_tests;
 

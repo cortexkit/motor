@@ -468,7 +468,7 @@ impl Storage {
                 .is_some_and(|route| route.repository_routed)
         })
     }
-    /// Jobs selected by `hosted_repositories` in the last hour that the broker
+    /// Repository- or fleet-routed jobs in the last hour that the broker
     /// answered `no_host_fits`, and that therefore ran on the build server.
     pub(crate) fn hosted_no_host_fits_1h(&self) -> usize {
         self.hosted_no_host_fits_1h_at(now_ms())
@@ -497,7 +497,7 @@ impl Storage {
             })
             .count()
     }
-    /// Durably send a repository-routed job to the build server because the
+    /// Durably send a repository- or fleet-routed job to the build server because the
     /// broker answered `no_host_fits` before any placement. The hosted route
     /// is removed, so nothing later releases or finishes a lease the broker
     /// never booked, and a restart attaches to the build server instead of

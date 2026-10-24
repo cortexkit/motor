@@ -9,6 +9,11 @@ use std::{
 pub struct Config {
     #[serde(skip_serializing_if = "is_false")]
     pub hosted_runners: bool,
+    /// Give the global hosted route capacity waits and pre-Run direct correction.
+    /// Requests outside hosted validation stay direct; hosted_runners still
+    /// controls whether the global hosted route is enabled at all.
+    #[serde(skip_serializing_if = "is_false")]
+    pub hosted_fleet_routing: bool,
     /// Main-checkout repository identities whose ordinary jobs use hosted leases.
     /// Workspace paths are deliberately not matched: linked worktrees share the
     /// resolved repository_root of their main checkout. Windows and macOS stay direct.
@@ -20,7 +25,10 @@ pub struct Config {
     pub spill_to_hosted: bool,
     /// Compare sampled build-server jobs against hosted runners without routing
     /// caller traffic there. Omit defaults for older closed config schemas.
-    #[serde(skip_serializing_if = "ShadowConfig::is_default")]
+    #[serde(
+        skip_serializing_if = "ShadowConfig::is_default",
+        deserialize_with = "disabled_or_shadow_config"
+    )]
     pub shadow_to_hosted: ShadowConfig,
     /// Capacity-permit wait before attempting spill, in seconds (default 45).
     #[serde(skip_serializing_if = "is_default_spill_after")]
@@ -102,6 +110,25 @@ impl Default for ShadowConfig {
 impl ShadowConfig {
     fn is_default(&self) -> bool {
         self == &Self::default()
+    }
+}
+// A direct-only rollback can switch shadowing off with the same false literal
+// as the routing flags. Enabling shadowing still requires its explicit config.
+fn disabled_or_shadow_config<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ShadowConfig, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Value {
+        Config(ShadowConfig),
+        Disabled(bool),
+    }
+    match Value::deserialize(deserializer)? {
+        Value::Config(config) => Ok(config),
+        Value::Disabled(false) => Ok(ShadowConfig::default()),
+        Value::Disabled(true) => Err(serde::de::Error::custom(
+            "enabling shadow_to_hosted requires an object with enabled: true",
+        )),
     }
 }
 impl BrokerTokenSource {
@@ -290,6 +317,7 @@ impl Default for Config {
             .unwrap_or_else(|| home.join(".local/share"));
         Self {
             hosted_runners: false,
+            hosted_fleet_routing: false,
             hosted_repositories: Vec::new(),
             spill_to_hosted: false,
             shadow_to_hosted: ShadowConfig::default(),

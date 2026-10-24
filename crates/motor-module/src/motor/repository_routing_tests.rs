@@ -17,7 +17,7 @@ fn config(h: &Harness, repo: &Path) -> Config {
     }
 }
 
-fn request(workspace: &Path) -> RunRequest {
+pub(super) fn request(workspace: &Path) -> RunRequest {
     let args = crate::cli::RunArgs {
         cwd: Some(workspace.into()),
         command: vec!["true".into()],
@@ -27,7 +27,7 @@ fn request(workspace: &Path) -> RunRequest {
     crate::cli::build_request(&args).unwrap()
 }
 
-fn lease_bodies(h: &Harness) -> Vec<serde_json::Value> {
+pub(super) fn lease_bodies(h: &Harness) -> Vec<serde_json::Value> {
     h.lease_bodies
         .lock()
         .unwrap()
@@ -135,7 +135,7 @@ async fn unlisted_and_windows_jobs_keep_the_direct_path() {
     assert_eq!(motor.hosted_health().unwrap()["hosted_routed_jobs_1h"], 0);
 }
 
-struct DirectPeer(AtomicUsize);
+pub(super) struct DirectPeer(pub(super) AtomicUsize);
 type Connection<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = io::Result<Box<dyn crate::Duplex>>> + Send + 'a>,
 >;
@@ -169,7 +169,7 @@ impl Connector for DirectPeer {
                         started: true,
                         default_branch_tip: false,
                         gate_jobs: true,
-                        platforms: vec!["linux".into(), "windows".into()],
+                        platforms: vec!["linux".into(), "windows".into(), "macos".into()],
                         return_paths: true,
                         return_chunked: false,
                         sibling_paths: false,
