@@ -1,3 +1,7 @@
 # path enclosing-function maximum-call-count
 # Motor tests use cortexkit_test_support::scratch_root(). Its root derivation
-# is in the published dependency, so no motor source needs an exemption.
+# is in the published dependency, so no motor test needs an exemption.
+# Production reads of the OS temp root that have nothing to do with test scratch:
+# ck-motor writes a per-connection, create_new 0600 known_hosts pin for the
+# Windows or macOS runner into the per-user temp directory and removes it on drop.
+crates/motor-module/src/transport.rs for_endpoint 1

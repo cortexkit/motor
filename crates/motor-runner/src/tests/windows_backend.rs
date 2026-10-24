@@ -56,6 +56,10 @@ enum Fault {
     DismountOnce,
     CacheGrantMissingOnce,
     CacheGrantMissingAlways,
+    // The guest's RAW-disk initialization fails part-way on the first boot
+    // only, leaving a disk that is no longer RAW but holds no NTFS volume.
+    CacheInitFailedOnce,
+    CacheInitFailed,
     UnitExit,
     Silent,
     FloodOutput,
@@ -197,16 +201,27 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
         }
         if args.iter().any(|s| s == "windows-prepare") {
             assert!(args.iter().any(|s| s == "--property=User=motor-prep"));
+            for property in [
+                "--property=Slice=motor-jobs.slice",
+                "--property=OOMScoreAdjust=900",
+                "--property=OOMPolicy=kill",
+            ] {
+                assert!(args.iter().any(|s| s == property), "missing {property}");
+            }
+            assert!(args.iter().any(|s| s == "--pipe"));
             assert!(!args.iter().any(|s| s.contains("PrivateNetwork")));
             let plan = Path::new(args.last().unwrap());
-            prep::execute_with_fetch(plan, |cmd| {
+            let prepared = prep::execute_with_fetch(plan, |cmd| {
                 let args = cmd
                     .get_args()
                     .map(|s| s.to_str().unwrap())
                     .collect::<Vec<_>>();
-                assert!(args
-                    .windows(2)
-                    .any(|a| a == ["--target", "x86_64-pc-windows-msvc"]));
+                for target in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
+                    assert!(
+                        args.windows(2).any(|a| a == ["--target", target]),
+                        "prep must fetch crates for {target}: {args:?}"
+                    );
+                }
                 assert!(args.contains(&"--locked"));
                 let home = cmd
                     .get_envs()
@@ -225,19 +240,29 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                     fs::write(home.join(name), data)?;
                 }
                 Ok(())
-            })?;
+            });
+            if let Err(error) = prepared {
+                return Ok(output(
+                    1,
+                    Vec::new(),
+                    format!("{}\n", crate::windows::prep_error::error_line(&error)).into_bytes(),
+                ));
+            }
         }
         Ok(output(0, Vec::new(), Vec::new()))
     }));
     let captured = agent.clone();
     c.windows_vm = Some(Arc::new(move |args, nonce, path| {
         captured.units.lock().unwrap().push(args.to_vec());
-        let fault = if matches!(fault, Fault::DismountOnce | Fault::CacheGrantMissingOnce) {
+        let fault = if matches!(
+            fault,
+            Fault::DismountOnce | Fault::CacheGrantMissingOnce | Fault::CacheInitFailedOnce
+        ) {
             if captured.units.lock().unwrap().len() == 1 {
-                if fault == Fault::DismountOnce {
-                    Fault::Dismount
-                } else {
-                    Fault::CacheGrantMissingAlways
+                match fault {
+                    Fault::DismountOnce => Fault::Dismount,
+                    Fault::CacheInitFailedOnce => Fault::CacheInitFailed,
+                    _ => Fault::CacheGrantMissingAlways,
                 }
             } else {
                 Fault::None
@@ -315,6 +340,21 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                                 step: motor_winagent::cache_steps::CacheStep::VolumeAcl,
                                 elapsed_ms: 1,
                                 message: "VolumeAcl: cache_grant_missing".into(),
+                                completed: Vec::new(),
+                            },
+                        },
+                    )?;
+                    stall(&a, &s, 2);
+                    return Ok(());
+                }
+                if fault == Fault::CacheInitFailed {
+                    session.send(
+                        &mut port,
+                        &AgentFrame::CacheFailed {
+                            failure: motor_winagent::cache_steps::CacheFailure {
+                                step: motor_winagent::cache_steps::CacheStep::InitializeRaw,
+                                elapsed_ms: 36_494,
+                                message: "native storage step timed out".into(),
                                 completed: Vec::new(),
                             },
                         },
@@ -548,6 +588,33 @@ fn cleaned(c: &Config, id: Uuid, agent: &Agent) {
     assert_eq!(agent.stops.load(Ordering::SeqCst), 1);
 }
 
+/// A setup attempt for a job whose earlier attempt is not cleaned up yet
+/// (its staging directory still exists) fails, and must not delete that
+/// earlier attempt's overlay, socket directory or staging: its VM may still
+/// be using them.
+#[test]
+fn windows_backend_failed_attempt_keeps_an_earlier_attempt_s_files() {
+    let f = Fixture::new();
+    let (c, _) = configure(&f, Fault::None, 0);
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let id = Uuid::now_v7();
+    let [overlay, sockets, staging] = job_artifacts(runner.config(), id);
+    fs::write(&overlay, b"earlier overlay").unwrap();
+    fs::create_dir_all(&sockets).unwrap();
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("tree"), b"earlier staging").unwrap();
+    let error =
+        crate::windows::prepare_and_drop_resources(runner.config(), id, "workspace").unwrap_err();
+    assert!(error.to_string().contains("staging"), "{error}");
+    for path in [&overlay, &sockets, &staging] {
+        assert!(
+            path.exists(),
+            "{} of the earlier attempt was deleted",
+            path.display()
+        );
+    }
+}
+
 #[test]
 fn windows_backend_recovery_notice_describes_only_automatic_retry_policy() {
     let f = Fixture::new();
@@ -604,11 +671,10 @@ async fn windows_backend_streams_collects_and_preserves_full_width_status_at_wir
             stored.started.as_ref().unwrap().path_mapping,
             Some(PathMapping::new("/", r"C:\m"))
         );
-        assert!(terminal
-            .workspace_changes
-            .unwrap()
-            .iter()
-            .any(|p| p.ends_with("changed.rs")));
+        assert_eq!(
+            terminal.workspace_changes.unwrap(),
+            ["changed.rs", "deleted.rs"]
+        );
         let replay = runner.replay(r.job_id, 0).unwrap();
         assert!(
             matches!(&replay[0], Frame::Started { path_mapping: Some(mapping), .. } if mapping == &PathMapping::new("/", r"C:\m"))
@@ -663,6 +729,75 @@ async fn windows_backend_streams_collects_and_preserves_full_width_status_at_wir
             .disk(&r.workspace_key)
             .exists());
         assert!(!Path::new(&r.workspace_key).exists());
+    }
+}
+
+#[test]
+fn windows_backend_reports_workspace_changes_relative_to_checkout_root() {
+    let f = Fixture::new();
+    let (c, _) = configure(&f, Fault::None, 0);
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    // Each key is paired with the collection prefix the guest uses for it. The
+    // trailing-slash key must not change the result, and the deeper key must
+    // not match its shallower neighbour.
+    for (key, member) in [
+        ("/Users/u/repo", "m/Users/u/repo"),
+        ("/Users/u/repo/", "m/Users/u/repo"),
+        ("/srv/work/a/b/c/repo", "m/srv/work/a/b/c/repo"),
+    ] {
+        let id = Uuid::now_v7();
+        let mut builder = tar::Builder::new(Vec::new());
+        for name in [
+            format!("{member}/a.txt"),
+            format!("{member}/sub/b.txt"),
+            // A sibling checkout beside the workspace, and one whose name
+            // only shares the workspace's text prefix.
+            format!("{member}-sibling/c.txt"),
+            "m/Users/u/sibling/d.txt".into(),
+            "m/srv/work/a/b/c/other/e.txt".into(),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(1);
+            header.set_cksum();
+            builder.append_data(&mut header, name, &b"x"[..]).unwrap();
+        }
+        let bytes = builder.into_inner().unwrap();
+        prep::store_collection(
+            runner.config(),
+            id,
+            &bytes,
+            &[
+                format!("{member}/gone.txt"),
+                "m/Users/u/sibling/gone.txt".into(),
+            ],
+        )
+        .unwrap();
+        let (mut r, _) = request(&f);
+        r.workspace_key = key.into();
+        let job = Job::new(id, Some(r), 0, 0, 4);
+        assert_eq!(
+            WindowsBackend
+                .collect_changes(&runner.core.trees, &job)
+                .unwrap()
+                .unwrap(),
+            ["a.txt", "gone.txt", "sub/b.txt"],
+            "{key}"
+        );
+        // The stored collection keeps its guest form for its other readers.
+        let stored: Vec<String> = read_json(
+            &runner
+                .config()
+                .state_dir()
+                .join("jobs")
+                .join(id.to_string())
+                .join("windows-changes.json"),
+        )
+        .unwrap();
+        assert!(
+            stored.contains(&format!("{member}/sub/b.txt")),
+            "{stored:?}"
+        );
     }
 }
 
@@ -750,6 +885,7 @@ async fn windows_backend_launch_transfers_ownership_without_io_and_wait_keeps_al
             request: r,
             base: false,
             recorded: BTreeMap::new(),
+            snapshots: None,
         };
         let prepared = WindowsBackend
             .materialize(runner.config(), &runner.core.trees, &setup)
@@ -784,7 +920,8 @@ async fn windows_backend_launch_transfers_ownership_without_io_and_wait_keeps_al
         cleaned(runner.config(), setup.id, &a);
         let config = runner.config().clone();
         drop(runner);
-        let reopened = Runner::open_with_backend(config, Box::new(FakeHost)).unwrap();
+        let reopened =
+            reopen_with(|| Runner::open_with_backend(config.clone(), Box::new(FakeHost)));
         assert!(
             reopened.core.quarantined.is_empty(),
             "direct backend collections must not become unreadable jobs on restart"
@@ -941,8 +1078,14 @@ async fn windows_backend_missing_exit_is_unknown_but_post_exit_failures_preserve
             .await
             .unwrap();
         }
+        let terminal = terminal(&runner, r.job_id).await;
+        if matches!(fault, Fault::RejectStart | Fault::Start) {
+            assert_execution_ended_wire(&terminal, false);
+        } else {
+            assert_execution_ended_wire(&terminal, true);
+        }
         assert_eq!(
-            terminal(&runner, r.job_id).await.outcome,
+            terminal.outcome,
             if matches!(fault, Fault::RejectStart | Fault::Start) {
                 Outcome::OutcomeUnknown
             } else {
@@ -1100,6 +1243,55 @@ async fn windows_backend_missing_cache_grant_on_retry_refuses_without_third_boot
         .caches()
         .disk(&request.workspace_key)
         .exists());
+}
+
+#[tokio::test]
+async fn windows_backend_interrupted_cache_initialization_discards_disk_and_next_job_recreates_it()
+{
+    // A guest can lose its 30 s initialization budget after the disk got a GPT
+    // but before the NTFS volume exists. The guest only initializes RAW disks,
+    // so such a disk can never be completed later; it must not stay at the
+    // workspace's cache path.
+    let f = Fixture::new();
+    source(&f);
+    let (c, a) = configure(&f, Fault::CacheInitFailedOnce, 0);
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let (first, bytes) = request(&f);
+    let disk = runner
+        .config()
+        .windows
+        .as_ref()
+        .unwrap()
+        .caches()
+        .disk(&first.workspace_key);
+    fs::write(&disk, b"GPT without an NTFS volume").unwrap();
+    f.submit(&runner, &first, &bytes);
+    assert!(matches!(
+        terminal(&runner, first.job_id).await.outcome,
+        Outcome::RefusedBeforeStart { .. }
+    ));
+    assert!(!disk.exists(), "interrupted cache disk was kept");
+    assert_eq!(
+        a.units.lock().unwrap().len(),
+        1,
+        "no retry for this failure"
+    );
+    assert_eq!(a.starts.load(Ordering::SeqCst), 0);
+    for path in job_artifacts(runner.config(), first.job_id) {
+        assert!(!path.exists(), "{} remains", path.display());
+    }
+
+    let (second, bytes) = request(&f);
+    assert_eq!(first.workspace_key, second.workspace_key);
+    f.submit(&runner, &second, &bytes);
+    assert_eq!(
+        terminal(&runner, second.job_id).await.outcome,
+        Outcome::WindowsExit { code: 0 }
+    );
+    // The fake qemu-img writes this content only when it creates a new disk.
+    assert_eq!(fs::read(&disk).unwrap(), b"fake qcow2");
+    assert_eq!(a.units.lock().unwrap().len(), 2);
+    assert_eq!(a.starts.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -1347,6 +1539,9 @@ async fn windows_backend_qemu_unit_has_confined_account_fixed_paths_limits_and_o
         "--wait",
         "--collect",
         "--property=User=motor-qemu",
+        "--property=Slice=motor-jobs.slice",
+        "--property=OOMScoreAdjust=900",
+        "--property=OOMPolicy=kill",
         "--property=SupplementaryGroups=kvm",
         "--property=ProtectSystem=strict",
         "--property=ProtectHome=yes",
@@ -1443,6 +1638,154 @@ async fn windows_backend_tar_contains_only_m_and_selected_cargo_home_members() {
     assert!(names
         .iter()
         .all(|name| !name.contains("/.git/") && !name.ends_with(".json")));
+}
+
+#[tokio::test]
+async fn windows_backend_fetches_tracked_nested_workspaces_and_tolerates_a_failed_nested_fetch() {
+    let f = Fixture::new();
+    source(&f);
+    for name in ["broken", "playground"] {
+        fs::create_dir_all(f.main.join(name).join("src")).unwrap();
+        fs::write(
+            f.main.join(name).join("Cargo.toml"),
+            format!("[workspace]\n[package]\nname='{name}'\nversion='0.1.0'\nedition='2021'\n"),
+        )
+        .unwrap();
+        fs::write(f.main.join(name).join("Cargo.lock"), "version = 3\n").unwrap();
+        fs::write(f.main.join(name).join("src/lib.rs"), "").unwrap();
+    }
+    fs::create_dir_all(f.main.join("malformed")).unwrap();
+    fs::write(f.main.join("malformed/Cargo.lock"), "version = 3\n").unwrap();
+    git(&f.main, &["add", "."]);
+    git(&f.main, &["commit", "-m", "nested workspaces"]);
+    fs::create_dir_all(f.main.join("untracked")).unwrap();
+    fs::write(f.main.join("untracked/Cargo.lock"), "version = 3\n").unwrap();
+    let (mut c, a) = configure(&f, Fault::None, 0);
+    let fetched = Arc::new(Mutex::new(Vec::new()));
+    let observed = fetched.clone();
+    let original = c.windows_command.take().unwrap();
+    c.windows_command = Some(Arc::new(move |program, args| {
+        if args.iter().any(|arg| arg == "windows-prepare") {
+            prep::execute_with_fetch(Path::new(args.last().unwrap()), |cmd| {
+                let args: Vec<_> = cmd.get_args().collect();
+                let manifest = Path::new(
+                    args[args
+                        .iter()
+                        .position(|arg| *arg == "--manifest-path")
+                        .unwrap()
+                        + 1],
+                );
+                let name = manifest
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                observed.lock().unwrap().push(name.clone());
+                if name == "broken" {
+                    return Err(io::Error::other("stale optional lockfile"));
+                }
+                let home = cmd
+                    .get_envs()
+                    .find(|(key, _)| *key == "CARGO_HOME")
+                    .unwrap()
+                    .1
+                    .unwrap();
+                let path = Path::new(home).join(format!("registry/cache/fixture/{name}.crate"));
+                fs::create_dir_all(path.parent().unwrap())?;
+                fs::write(path, b"fetched dependency")?;
+                Ok(())
+            })?;
+            return Ok(output(0, Vec::new(), Vec::new()));
+        }
+        original(program, args)
+    }));
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let (r, bytes) = request(&f);
+    f.submit(&runner, &r, &bytes);
+    let t = terminal(&runner, r.job_id).await;
+    assert_eq!(
+        t.outcome,
+        Outcome::WindowsExit { code: 0 },
+        "{:?}",
+        t.refusal_detail
+    );
+    assert_eq!(*fetched.lock().unwrap(), ["a", "broken", "playground"]);
+    let tree = a.tree.lock().unwrap();
+    let names: Vec<_> = tar::Archive::new(io::Cursor::new(&*tree))
+        .entries()
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert!(
+        names.contains(&"cargo-home/registry/cache/fixture/playground.crate".into()),
+        "{names:?}"
+    );
+    assert!(
+        names.contains(&"cargo-home/registry/cache/fixture/a.crate".into()),
+        "{names:?}"
+    );
+}
+
+#[tokio::test]
+async fn windows_backend_prep_step_failure_reaches_refusal_without_host_paths() {
+    let f = Fixture::new();
+    source(&f);
+    let (mut c, a) = configure(&f, Fault::None, 0);
+    let original = c.windows_command.take().unwrap();
+    c.windows_command = Some(Arc::new(move |program, args| {
+        if args.iter().any(|arg| arg == "windows-prepare") {
+            assert!(args.iter().any(|arg| arg == "--pipe"));
+            let error = prep::execute_with_fetch(Path::new(args.last().unwrap()), |cmd| {
+                let home = cmd
+                    .get_envs()
+                    .find(|(key, _)| *key == "CARGO_HOME")
+                    .unwrap()
+                    .1
+                    .unwrap();
+                let checkout = Path::new(home).join("git/checkouts/dependency/rev");
+                fs::create_dir_all(&checkout)?;
+                let path =
+                    std::ffi::CString::new(checkout.join("fifo").as_os_str().as_encoded_bytes())
+                        .unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                Ok(())
+            })
+            .unwrap_err();
+            return Ok(output(
+                1,
+                Vec::new(),
+                format!(
+                    "Running as unit: motor-prep.service\n{}\nFinished with result: exit-code\n",
+                    crate::windows::prep_error::error_line(&error)
+                )
+                .into_bytes(),
+            ));
+        }
+        original(program, args)
+    }));
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let (r, bytes) = request(&f);
+    f.submit(&runner, &r, &bytes);
+    let t = terminal(&runner, r.job_id).await;
+    assert!(matches!(t.outcome, Outcome::RefusedBeforeStart { .. }));
+    let detail = t.refusal_detail.unwrap();
+    assert!(detail.contains("windows prep: stage dependencies: special file: cargo-home/git/checkouts/dependency/rev/fifo"), "{detail}");
+    assert!(detail.contains("exit status: 1"), "{detail}");
+    assert!(
+        !detail.contains(f.scratch.path().to_str().unwrap()),
+        "{detail}"
+    );
+    assert_eq!(a.starts.load(Ordering::SeqCst), 0);
+    assert!(a.units.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1697,6 +2040,7 @@ async fn windows_backend_unreleased_prepared_and_execution_drop_each_clean_once(
             cpus: vec![12, 13, 14, 15],
             base: false,
             recorded: BTreeMap::new(),
+            snapshots: None,
         };
         let prepared = WindowsBackend
             .materialize(runner.config(), &runner.core.trees, &setup)

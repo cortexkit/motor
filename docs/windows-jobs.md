@@ -203,6 +203,10 @@ becomes `C:\m\Users\me\project`. The workspace, siblings and `cwd` are
 mapped the same way. Test: `every_invalid_windows_path_rule_is_refused`
 (`crates/motor-winagent/src/lib.rs`).
 
+Windows does not advertise `hello.sibling_paths`: its staging-export backend
+retains the rule that siblings share the repository root's parent directory.
+Test: `in_place_and_windows_siblings_still_require_neighbours`.
+
 4.2. The `started` record carries `path_mapping: {host_prefix: "/",
 guest_prefix: "C:\\m"}` so the caller can translate paths in output back.
 `ck-motor` forwards it unchanged. Linux jobs omit the field. Tests:
@@ -346,6 +350,19 @@ value or Cargo's `--target-dir` selects a different path. Tests:
 
 A disk is keyed by the workspace, the baseline name
 and the toolchain version, so a new baseline or toolchain starts cold.
+
+The host creates a new disk empty. On its first use the guest agent rechecks
+the disk's serial, that Windows does not run from it, and that it is RAW, then
+writes a GPT with one Basic Data partition through native disk IOCTLs and
+quick-formats it NTFS with `format.com`, all within the 30-second
+`InitializeRaw` step. It never initializes a disk that already has a partition
+table. A disk whose initialization stopped part-way therefore fails the job's
+preparation, and like any failed preparation the host discards it, so the
+workspace's next job starts on a new disk. Tests:
+`formatter_refuses_every_initialized_layout_including_interrupted_ones`,
+`stranded_partition_without_ntfs_volume_is_refused_not_reformatted`,
+`natively_initialized_layout_passes_the_reuse_checks`,
+`windows_backend_interrupted_cache_initialization_discards_disk_and_next_job_recreates_it`.
 
 A disk is kept for the next job only when the command reached a known outcome
 (any exit code counts), the guest dismounted the disk cleanly, and the VM unit

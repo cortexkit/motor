@@ -19,13 +19,61 @@ host can also call `Nonces::prune` explicitly.
 ## Contract fixtures
 
 The broker repository, `cortexkit-cloud`, owns `docs/runners-contract.md` and
-`test-vectors/runners/`. `contracts/cloud/` mirrors all six canonical files
-verbatim: the contract, `lease.json` and `boat-lease.json` at commit `3d70bcf`,
-the other vectors at `00e688e`. `contracts/digest-manifest.json` records source paths,
+`test-vectors/runners/`. `contracts/cloud/` mirrors twelve canonical files
+verbatim: the contract and `bad-request.json` at commit `df12dca`,
+`account-closure.json` at `e961a71`, `lease.json`, `boat-lease.json`,
+`shadow-lease.json` and `settled-reattach.json` at `e483f20`, `no-host-fits-lease.json` at
+`916347e`, `no-spill-lease.json` at `95fd2d1`, and the other vectors at
+`00e688e`. `contracts/digest-manifest.json` records source paths,
 revision and SHA-256 values. The digest test checks every file and inventory
 completeness. The conformance tests compare tokens, signing bytes, request bodies
 and settlement replies directly to these external vectors; they never regenerate
 or rewrite the canonical bytes.
+
+`no-spill-lease.json` pins the ordinary lease-hash projection, excluding
+`requester_jwk` and including an explicitly false `allow_spill` after `timeout_s`.
+It also records the real broker's `503 no_capacity` and `Retry-After` when only a
+full registered host is selectable, even with Boat enabled.
+
+Since `e483f20` the broker requires `allow_spill` on every lease body and
+answers a body without it 400 `bad_request` before claiming the job; the fake
+broker does the same. `lease.json`, `boat-lease.json` and
+`settled-reattach.json` now send `"allow_spill": true`. `shadow-lease.json`
+records a Boat shadow lease (`allow_spill: true`, then `shadow: true`) and its
+`lease_hash`: the ordinary projection without `requester_jwk`, with
+`"shadow":true` as the last member after `allow_spill`. A re-request must
+repeat the same `allow_spill` value.
+
+`no-host-fits-lease.json` records the broker's final refusal for a no-spill
+16-vCPU lease when the only registered host's per-job ceiling is 8 vCPUs: HTTP
+422 with exactly `{"error":"no_host_fits","max_vcpus":8}` and no `Retry-After`.
+The refusal is final for that request body; with spill allowed and Boat on, a
+job that fits a Boat size still spills, and `max_vcpus` then counts Boat sizes
+too. A host with no recorded per-job ceiling never produces it.
+
+`bad-request.json` records exact request and reply bytes for 400 `bad_request`:
+body-validation replies optionally name the failing member in `field`, using
+`body` for unexpected members without echoing client input. Other 400 replies
+can omit `field`. ck-motor carries only fields of at most 64 printable ASCII
+characters into its lease warning and repository-routed refusal detail.
+
+`account-closure.json` records a closed account. Its new lease is refused with
+the final HTTP 403 `{"error":"account_closed"}` and no `Retry-After`; a
+re-request of a job already placed or provisioning keeps its normal answer, and
+reattach, release, finish and host reports still work. A signed heartbeat whose
+snapshot has warm entries for the closed account and an open one gets exactly
+`{"ignored":[],"closed_subjects":["acct:<closed account>"]}`. Since `e961a71`
+`closed_subjects` is always present in a heartbeat reply: sorted `acct:<ULID>`
+subjects, empty when none of the host's reported tenants is closed. Closure is
+permanent.
+
+`settled-reattach.json` records a reattach for a registered-host job that its
+host already settled by usage report: HTTP 200 with a `purpose: "attach"` token
+and the lease's unchanged id, placement, endpoint, SPKI hash, `max_s` and
+`reserved_vcpu_ms`, and identical tenant totals before and after it. The broker
+answers this way for 24 hours after such a settlement so a client that lost the
+end of a job's output can reconnect and have the host replay it. Boat jobs and
+jobs settled any other way still get 409 `job_finished`.
 
 ## Fake broker test executable
 
@@ -33,7 +81,9 @@ or rewrite the canonical bytes.
 refused for the `main` instance (also enforced by the pure `FakeBroker` model).
 It serves the lease, reattach, release, heartbeat, usage and public JWKS routes. Reservations
 and counters are in memory; restart is a test reset. It settles expired unreported
-jobs as `host_lost`. No job bytes are transported. Machine-worker authentication
+jobs as `host_lost`. A job settled by its host's usage report still gets an
+attach token on reattach for 86400 s (`SETTLED_REATTACH_WINDOW_MS`) after the
+report; `host_lost` and released jobs keep their 409. No job bytes are transported. Machine-worker authentication
 is an exact configured test bearer mapped to a subject, not CK account acquisition.
 
 ```sh
@@ -53,6 +103,9 @@ The first stdout line gives its bound address; credentials are never printed.
 
 `--refuse CODE` refuses leases with HTTP 403 before creating a reservation.
 `--max-s SECONDS` simulates a budget-shortened runtime (including below 10 s).
+`--max-vcpus N` simulates a fleet whose largest host holds N vCPUs: a new lease
+asking for more is answered HTTP 422 `{"error":"no_host_fits","max_vcpus":N}`
+before any reservation is made.
 The reservation is `vcpus * granted max_s * 1000`. Model tests can set a finite
 allowance to exercise budget shortening and the below-10 refusal; `--max-s` can
 also deliberately issue a below-10 cap as a hostile-client test control.

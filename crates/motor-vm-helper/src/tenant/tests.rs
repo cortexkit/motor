@@ -47,6 +47,13 @@ struct Fake {
     fail: &'static str,
     space: u64,
     unclean: bool,
+    marker: bool,
+    present: bool,
+    frozen: bool,
+    partial_snapshot: bool,
+    snapshot_uncertain: bool,
+    stop_failures: u32,
+    record_failures: u32,
 }
 impl Default for Fake {
     fn default() -> Self {
@@ -58,6 +65,13 @@ impl Default for Fake {
             fail: "",
             space: u64::MAX,
             unclean: false,
+            marker: false,
+            present: false,
+            frozen: false,
+            partial_snapshot: false,
+            snapshot_uncertain: false,
+            stop_failures: 0,
+            record_failures: 0,
         }
     }
 }
@@ -85,6 +99,10 @@ impl Backend for Fake {
     }
     fn mark_unclean(&mut self, _: &Registry, _: &str) -> Result<()> {
         self.call("unclean-fsync")?;
+        if self.record_failures > 0 {
+            self.record_failures -= 1;
+            return Err(Error("unclean record I/O failure".into()));
+        }
         self.unclean = true;
         Ok(())
     }
@@ -93,6 +111,21 @@ impl Backend for Fake {
         self.unclean = false;
         Ok(())
     }
+    fn was_running(&mut self, _: &Registry) -> Result<bool> {
+        Ok(self.marker)
+    }
+    fn clear_running(&mut self, _: &Registry) -> Result<()> {
+        self.call("clear-running-marker")?;
+        self.marker = false;
+        Ok(())
+    }
+    fn running_tenants(&mut self) -> Vec<String> {
+        if self.running {
+            vec!["a".into()]
+        } else {
+            vec![]
+        }
+    }
     fn metrics(&mut self, _: &str, _: &Registry) -> Result<(u64, u64)> {
         self.call("metrics")?;
         Ok((1048576, 123))
@@ -100,6 +133,15 @@ impl Backend for Fake {
     fn registry(&mut self, _: &str) -> Result<Registry> {
         self.call("registry")?;
         Ok(registry("a"))
+    }
+    fn vm_present(&mut self, _: &str) -> Result<bool> {
+        Ok(self.present)
+    }
+    fn remove(&mut self, tenant: &str, _: &Registry) -> Result<PathBuf> {
+        self.call("remove")?;
+        Ok(PathBuf::from(format!(
+            "/var/lib/motor-vm/removed/{tenant}-1"
+        )))
     }
     fn key(&mut self, _: &Registry) -> Result<SnapshotKey> {
         Ok(key(self.generation))
@@ -110,8 +152,13 @@ impl Backend for Fake {
     fn running(&mut self, _: &str) -> bool {
         self.running
     }
+    fn snapshot_uncertain(&self, _: &str) -> bool {
+        self.snapshot_uncertain
+    }
     fn load(&mut self, _: &str, _: &Registry, saved: bool) -> Result<()> {
         self.running = true;
+        // The real backend writes the marker just before the VMM spawns.
+        self.marker = true;
         self.call(if saved {
             "load-saved-tap"
         } else {
@@ -178,19 +225,38 @@ impl Backend for Fake {
         if matches!(self.fail, "agent-refused" | "agent-timeout") {
             return Err(Error(self.fail.into()));
         }
+        self.frozen = true;
         Ok(())
     }
     fn thaw(&mut self, _: &str) -> Result<()> {
-        self.call("thaw")
+        self.call("thaw")?;
+        self.frozen = false;
+        Ok(())
     }
     fn snapshot(&mut self, _: &str, _: &Registry, k: &SnapshotKey) -> Result<()> {
         self.call("snapshot-create")?;
+        if self.fail == "create-timeout" {
+            assert!(
+                self.frozen,
+                "only a drained and frozen VM may be snapshotted"
+            );
+            self.partial_snapshot = true;
+            self.snapshot_uncertain = true;
+            return Err(Error(format!("{SNAPSHOT_CREATE_UNCERTAIN}: Firecracker PUT /snapshot/create step=read_status api_timeout elapsed_ms=480000")));
+        }
         self.saved = Some(k.clone());
         Ok(())
     }
     fn stop(&mut self, _: &str) -> Result<()> {
         self.call("stop")?;
+        if self.stop_failures > 0 {
+            self.stop_failures -= 1;
+            return Err(Error("cgroup.kill I/O failure".into()));
+        }
         self.running = false;
+        self.snapshot_uncertain = false;
+        self.partial_snapshot = false;
+        self.frozen = false;
         Ok(())
     }
     fn available(&mut self, _: &Registry) -> Result<u64> {
@@ -331,13 +397,22 @@ fn hosted_suspend_keys_then_stops_and_stop_never_snapshots() {
     c.handle("a", Operation::Suspend).unwrap();
     assert_eq!(
         c.0.calls,
-        ["registry", "prepare", "snapshot-create", "stop"]
+        [
+            "registry",
+            "prepare",
+            "snapshot-create",
+            "stop",
+            "clear-running-marker"
+        ]
     );
     assert_eq!(c.0.saved, Some(key(4)));
     c.0.running = true;
     c.0.calls.clear();
     c.handle("a", Operation::Stop).unwrap();
-    assert_eq!(c.0.calls, ["registry", "prepare", "stop"]);
+    assert_eq!(
+        c.0.calls,
+        ["registry", "prepare", "stop", "clear-running-marker"]
+    );
 }
 #[test]
 fn hosted_prepare_refusal_or_timeout_never_creates_snapshot() {
@@ -347,9 +422,11 @@ fn hosted_prepare_refusal_or_timeout_never_creates_snapshot() {
             fail: reason,
             ..Fake::default()
         });
-        assert!(c.handle("a", Operation::Suspend).is_err(), "{reason}");
+        let error = c.handle("a", Operation::Suspend).err().unwrap();
+        assert!(error.0.starts_with("suspend_prepare_refused:"), "{error}");
         assert_eq!(c.0.calls, ["registry", "prepare", "thaw"]);
         assert!(c.0.running);
+        assert!(!c.0.frozen && !c.0.partial_snapshot && c.0.saved.is_none());
     }
 }
 #[test]
@@ -372,6 +449,98 @@ fn hosted_failed_snapshot_thaws_and_keeps_vm_running() {
     );
     assert!(c.0.running);
 }
+
+#[test]
+fn hosted_create_timeout_reaps_writer_cleans_partial_snapshot_and_cold_boots_with_recovery() {
+    let mut c = Controller(Fake {
+        running: true,
+        marker: true,
+        fail: "create-timeout",
+        ..Fake::default()
+    });
+    let error = c.handle("a", Operation::Suspend).err().unwrap();
+    assert!(
+        error.0.starts_with("suspend_create_failed_vm_stopped"),
+        "{error}"
+    );
+    assert_eq!(
+        c.0.calls,
+        [
+            "registry",
+            "prepare",
+            "snapshot-create",
+            "stop",
+            "unclean-fsync",
+            "unlink-fsync"
+        ]
+    );
+    assert!(!c.0.running && !c.0.partial_snapshot && !c.0.frozen);
+    assert!(c.0.saved.is_none() && c.0.marker && c.0.unclean);
+    c.0.fail = "";
+    c.0.calls.clear();
+    let reply = c.handle("a", Operation::Ensure).unwrap().reply;
+    assert!(matches!(
+        reply,
+        Reply::Tenant {
+            running: true,
+            restored: false,
+            recovery_required: true,
+            ..
+        }
+    ));
+    assert!(c.0.calls.contains(&"load-base-size-tap".into()));
+    assert!(!c.0.calls.contains(&"load-saved-tap".into()));
+    assert!(!c.0.frozen);
+    c.handle("a", Operation::RecoveryComplete).unwrap();
+    assert!(!c.0.unclean);
+    c.handle("a", Operation::Relay(52)).unwrap();
+}
+#[test]
+fn hosted_uncertain_create_retries_stop_before_record_or_adoption() {
+    let mut c = Controller(Fake {
+        running: true,
+        marker: true,
+        fail: "create-timeout",
+        stop_failures: 2,
+        record_failures: 1,
+        ..Fake::default()
+    });
+    let error = c.handle("a", Operation::Suspend).err().unwrap();
+    assert!(error.0.starts_with("suspend_create_stop_failed"), "{error}");
+    assert_eq!(
+        c.0.calls,
+        ["registry", "prepare", "snapshot-create", "stop"]
+    );
+    assert!(c.0.running && c.0.snapshot_uncertain && c.0.partial_snapshot);
+    assert!(!c.0.unclean);
+
+    c.0.calls.clear();
+    assert!(c.handle("a", Operation::Ensure).is_err());
+    assert_eq!(c.0.calls, ["registry", "stop"]);
+    assert!(c.0.running && c.0.snapshot_uncertain && c.0.partial_snapshot);
+
+    c.0.calls.clear();
+    assert!(c.handle("a", Operation::Ensure).is_err());
+    assert_eq!(c.0.calls, ["registry", "stop", "unclean-fsync"]);
+    assert!(!c.0.running && !c.0.snapshot_uncertain && !c.0.partial_snapshot);
+    assert!(c.0.marker && !c.0.unclean);
+
+    c.0.calls.clear();
+    let reply = c.handle("a", Operation::Ensure).unwrap().reply;
+    assert!(matches!(
+        reply,
+        Reply::Tenant {
+            running: true,
+            restored: false,
+            recovery_required: true,
+            ..
+        }
+    ));
+    assert!(c.0.unclean && c.0.marker);
+    assert!(c.0.calls.contains(&"load-base-size-tap".into()));
+    assert!(!c.0.calls.contains(&"load-saved-tap".into()));
+}
+
 #[test]
 fn hosted_suspend_space_check_is_bytes_and_precedes_prepare() {
     let mut c = Controller(Fake {
@@ -423,6 +592,7 @@ fn hosted_tenant_wire_rejects_extra_arguments_without_changing_job_ops() {
         "adopt",
         "set_cpu_max",
         "open_relay",
+        "remove_tenant",
     ] {
         let mut value = json!({"op":op,"tenant":"a"});
         if op == "set_cpu_max" {
@@ -460,35 +630,44 @@ fn hosted_caps_and_bases_are_per_guest_size() {
     assert_ne!(r.tap(), small.tap());
 }
 
-#[test]
-fn hosted_reconnect_adopts_without_waking_or_stopping_the_tenant() {
-    struct Machine(Controller<Fake>);
-    impl crate::Machine for Machine {
-        fn reconcile(&mut self) -> Result<()> {
-            Ok(())
-        }
-        fn start(&mut self, _: usize, _: &crate::Lease, _: crate::Kind) -> Result<Vec<OwnedFd>> {
-            unreachable!()
-        }
-        fn stop(&mut self, _: usize, _: &crate::Lease, _: bool) -> Result<()> {
-            unreachable!()
-        }
-        fn cleanup(&mut self, _: usize) -> Result<()> {
-            unreachable!()
-        }
-        fn alive(&mut self, _: usize) -> bool {
-            unreachable!()
-        }
-        fn tenant(&mut self, tenant: &str, op: Operation) -> Result<Response> {
-            self.0.handle(tenant, op)
+/// A helper machine with only tenant VMs, as on a hosted host.
+struct TenantMachine(Controller<Fake>);
+impl crate::Machine for TenantMachine {
+    fn reconcile(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn start(&mut self, _: usize, _: &crate::Lease, _: crate::Kind) -> Result<Vec<OwnedFd>> {
+        unreachable!()
+    }
+    fn stop(&mut self, _: usize, _: &crate::Lease, _: bool) -> Result<()> {
+        unreachable!()
+    }
+    fn cleanup(&mut self, _: usize) -> Result<()> {
+        unreachable!()
+    }
+    fn alive(&mut self, _: usize) -> bool {
+        unreachable!()
+    }
+    fn tenant(&mut self, tenant: &str, op: Operation) -> Result<Response> {
+        self.0.handle(tenant, op)
+    }
+    fn shutdown(&mut self) -> Result<()> {
+        match self.0.stop_all().as_slice() {
+            [] => Ok(()),
+            failures => Err(Error(format!("{failures:?}"))),
         }
     }
+}
+const PEER: crate::Peer = crate::Peer {
+    uid: 1000,
+    gid: 1000,
+};
+
+#[test]
+fn hosted_reconnect_adopts_without_waking_or_stopping_the_tenant() {
     let mut helper =
-        crate::Helper::new(Machine(Controller(Fake::default())), 1, vec![1000]).unwrap();
-    let peer = crate::Peer {
-        uid: 1000,
-        gid: 1000,
-    };
+        crate::Helper::new(TenantMachine(Controller(Fake::default())), 1, vec![1000]).unwrap();
+    let peer = PEER;
     let first = helper.connect(peer).unwrap();
     helper
         .handle(first, crate::Request::Ensure { tenant: "a".into() })
@@ -553,4 +732,217 @@ fn hosted_unclean_disk_never_restores_snapshot_and_flag_waits_for_guest_recovery
     c.0.fail = "";
     c.handle("a", Operation::RecoveryComplete).unwrap();
     assert!(!c.0.unclean);
+}
+
+/// Runs `stop_on_signal` on its own thread, as the service does, and returns
+/// the thread with its id. The signal is sent to that thread only, and only it
+/// has SIGTERM blocked, so no other test thread can take the default action.
+fn signal_waiter(
+    helper: &std::sync::Arc<std::sync::Mutex<crate::Helper<TenantMachine>>>,
+) -> (std::thread::JoinHandle<Result<i32>>, usize) {
+    let helper = helper.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let signals = crate::signals::StopSignals::block()?;
+        sender
+            .send(unsafe { libc::pthread_self() } as usize)
+            .unwrap();
+        crate::signals::stop_on_signal(&helper, &signals)
+    });
+    (waiter, receiver.recv().unwrap())
+}
+
+#[test]
+fn service_stop_signal_runs_the_clean_tenant_stop_before_the_helper_exits() {
+    let helper = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::Helper::new(TenantMachine(Controller(Fake::default())), 1, vec![1000]).unwrap(),
+    ));
+    let connection = helper.lock().unwrap().connect(PEER).unwrap();
+    helper
+        .lock()
+        .unwrap()
+        .handle(connection, crate::Request::Ensure { tenant: "a".into() })
+        .unwrap();
+    helper.lock().unwrap().machine.0 .0.calls.clear();
+    let (waiter, thread) = signal_waiter(&helper);
+    assert!(helper.lock().unwrap().machine.0 .0.running);
+    assert_eq!(
+        unsafe { libc::pthread_kill(thread as libc::pthread_t, libc::SIGTERM) },
+        0
+    );
+    assert_eq!(waiter.join().unwrap().unwrap(), libc::SIGTERM);
+
+    let mut helper = helper.lock().unwrap();
+    let fake = &helper.machine.0 .0;
+    assert_eq!(
+        fake.calls,
+        [
+            "registry",
+            "prepare",
+            "stop",
+            "clear-running-marker",
+            "registry"
+        ]
+    );
+    assert!(!fake.running);
+    assert!(!fake.unclean);
+    assert!(!fake.marker);
+    // Nothing can start the VM again between the clean stop and the exit.
+    let refused = helper
+        .handle(connection, crate::Request::Ensure { tenant: "a".into() })
+        .err()
+        .unwrap();
+    assert_eq!(refused.0, "helper is stopping");
+    assert!(!helper.machine.0 .0.running);
+}
+
+#[test]
+fn service_stop_signal_records_a_tenant_whose_guest_flush_fails_as_unclean() {
+    let helper = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::Helper::new(TenantMachine(Controller(Fake::default())), 1, vec![1000]).unwrap(),
+    ));
+    let connection = helper.lock().unwrap().connect(PEER).unwrap();
+    helper
+        .lock()
+        .unwrap()
+        .handle(connection, crate::Request::Ensure { tenant: "a".into() })
+        .unwrap();
+    {
+        let fake = &mut helper.lock().unwrap().machine.0 .0;
+        fake.calls.clear();
+        fake.fail = "agent-timeout";
+    }
+    let (waiter, thread) = signal_waiter(&helper);
+    unsafe { libc::pthread_kill(thread as libc::pthread_t, libc::SIGTERM) };
+    let error = waiter.join().unwrap().unwrap_err();
+    assert!(error.0.contains("guest flush failed"), "{error}");
+
+    let fake = &helper.lock().unwrap().machine.0 .0;
+    assert!(!fake.running);
+    assert!(fake.unclean);
+    assert!(fake.marker);
+    let flag = fake
+        .calls
+        .iter()
+        .position(|c| c == "unclean-fsync")
+        .unwrap();
+    let stop = fake.calls.iter().position(|c| c == "stop").unwrap();
+    assert!(flag < stop, "{:?}", fake.calls);
+}
+
+/// What survives a SIGKILL or a power loss: the tenant home on disk. The VMs
+/// and the helper's memory of them do not.
+fn after_kill(previous: &Fake) -> Fake {
+    Fake {
+        generation: previous.generation,
+        saved: Some(key(previous.generation)),
+        unclean: previous.unclean,
+        marker: previous.marker,
+        ..Fake::default()
+    }
+}
+
+#[test]
+fn killed_helper_leaves_the_running_marker_so_the_next_start_runs_recovery() {
+    let mut first = Controller(Fake::default());
+    first.handle("a", Operation::Ensure).unwrap();
+    assert!(first.0.marker);
+    // Killed with no clean stop. A suspend snapshot that matches the image
+    // must still not be restored over a disk the guest never flushed.
+    let mut next = Controller(after_kill(&first.0));
+    let reply = next.handle("a", Operation::Ensure).unwrap().reply;
+    assert!(matches!(
+        reply,
+        Reply::Tenant {
+            running: true,
+            restored: false,
+            recovery_required: true,
+            ..
+        }
+    ));
+    let calls = &next.0.calls;
+    let flag = calls.iter().position(|c| c == "unclean-fsync").unwrap();
+    let load = calls
+        .iter()
+        .position(|c| c == "load-base-size-tap")
+        .unwrap();
+    assert!(flag < load, "{calls:?}");
+    assert!(!calls.iter().any(|c| c == "load-saved-tap"));
+
+    // A clean stop removes the marker, so the next start needs no recovery.
+    let mut clean = Controller(Fake::default());
+    clean.handle("a", Operation::Ensure).unwrap();
+    clean.handle("a", Operation::Stop).unwrap();
+    assert!(!clean.0.marker);
+    let mut next = Controller(after_kill(&clean.0));
+    let reply = next.handle("a", Operation::Ensure).unwrap().reply;
+    assert!(matches!(
+        reply,
+        Reply::Tenant {
+            restored: true,
+            recovery_required: false,
+            ..
+        }
+    ));
+    assert!(!next.0.calls.iter().any(|c| c == "unclean-fsync"));
+}
+
+#[test]
+fn a_vm_that_died_on_its_own_is_recorded_unclean_before_it_is_started_again() {
+    let mut c = Controller(Fake::default());
+    c.handle("a", Operation::Ensure).unwrap();
+    c.0.running = false;
+    c.0.calls.clear();
+    let reply = c.handle("a", Operation::Ensure).unwrap().reply;
+    assert!(matches!(
+        reply,
+        Reply::Tenant {
+            recovery_required: true,
+            ..
+        }
+    ));
+    assert_eq!(c.0.calls[..2], ["registry", "unclean-fsync"]);
+}
+
+#[test]
+fn removal_refuses_an_unknown_tenant_and_a_running_vm_before_touching_anything() {
+    // An unknown name: no registry entry, and no interrupted removal to finish.
+    let mut c = Controller(Fake {
+        fail: "registry",
+        ..Fake::default()
+    });
+    assert!(c.handle("a", Operation::Remove).is_err());
+    assert_eq!(c.0.calls, ["registry"]);
+    // A registry entry that belongs to another tenant name.
+    let mut c = Controller(Fake::default());
+    assert!(c.handle("b", Operation::Remove).is_err());
+    assert_eq!(c.0.calls, ["registry"]);
+    for (running, present) in [(true, false), (false, true)] {
+        let mut c = Controller(Fake {
+            running,
+            present,
+            ..Fake::default()
+        });
+        let error = c.handle("a", Operation::Remove).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "tenant VM is running; stop it before removing the tenant"
+        );
+        assert_eq!(
+            c.0.calls,
+            ["registry"],
+            "running={running} present={present}"
+        );
+    }
+    let mut c = Controller(Fake::default());
+    assert!(matches!(
+        c.handle("a", Operation::Remove).unwrap().reply,
+        Reply::Removed { ref quarantine } if quarantine == "/var/lib/motor-vm/removed/a-1"
+    ));
+    assert_eq!(c.0.calls, ["registry", "remove"]);
+    // The wire names a tenant and nothing else.
+    assert!(serde_json::from_value::<crate::Request>(
+        json!({"op":"remove_tenant","tenant":"a","quarantine":"/tmp"})
+    )
+    .is_err());
 }

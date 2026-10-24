@@ -4,6 +4,8 @@ After=local-fs.target motor-net-rules.service
 Requires=motor-net-rules.service
 
 [Service]
+OOMScoreAdjust=-900
+OOMPolicy=continue
 User=root
 Environment=HOME=/tenant
 Environment=CARGO_HOME=/usr/local/lib/motor/cargo

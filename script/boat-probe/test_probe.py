@@ -474,6 +474,7 @@ class SSHTests(unittest.TestCase):
     def test_resume_refresh_does_not_reauthorize_tested_key_before_persistence_checks(self):
         runner = MagicMock()
         runner.data = {"run_id": "unit"}
+        runner.size = "large"
         runner.create.return_value = ({"id": "bx_23456789", "vcpu": 8, "memoryGB": 16}, {})
         measurement = ssh_reach.SSHReach(runner)
         public = "ssh-ed25519 dGVzdA== tested"
@@ -622,7 +623,7 @@ class ExitStatusTests(unittest.TestCase):
             findings = (Path(tmp) / "run" / "results.md").read_text()
         self.assertFalse(result["cleanup_complete"])
         self.assertEqual(result["cleanup_state"], "purge_pending")
-        self.assertEqual(result["verdict"], {"passed": True, "reasons": []})
+        self.assertEqual(result["verdict"], {"passed": True, "outcome": "passed", "reasons": []})
         self.assertEqual(result["exit_status"], 0)
         self.assertIn("Runner-host verdict: **PASSED**", findings)
         self.assertIn('Cleanup state (reported separately from the verdict): "purge_pending"', findings)
@@ -688,6 +689,16 @@ class RunnerHostRenderTests(unittest.TestCase):
         self.assertIn('Reasons: ["runner_host checks did not all pass"].', text)
         self.assertIn("Exit status: 1", text)
 
+    def test_failed_check_reason_is_rendered_without_reclassifying_old_evidence(self):
+        data = self.runner_data(status='FAIL')
+        data['runner_host']['checks'][1]['reason'] = 'expected Linux ENOSYS=38; observed errno=78'
+        text = self.rendered(data)
+        self.assertIn('## Failed check reasons', text)
+        self.assertIn('expected Linux ENOSYS=38; observed errno=78', text)
+        self.assertIn('**FAILED**', text)
+        del data['runner_host']['checks'][1]['reason']
+        self.assertIn('not recorded in this report', self.rendered(data))
+
     def test_inconclusive_reclaim_is_visible_and_does_not_mask_required_failures(self):
         data = self.runner_data()
         data['runner_host']['all_passed'] = False
@@ -716,6 +727,172 @@ class RunnerHostRenderTests(unittest.TestCase):
         self.assertIn("| Create from measurement snapshot to first finished job | \"unmeasured\" |", text)
         self.assertIn("Smallest job memory budget across phases: unmeasured MiB.", text)
         self.assertNotIn("{{", text)
+
+
+def load_runner_host():
+    module = sys.modules.get("runner_host")
+    if module is None:
+        sys.path.insert(0, str(HERE))
+        try:
+            import runner_host as module
+        finally:
+            sys.path.pop(0)
+    return module
+
+
+SIZE_REFUSAL = json.dumps({"ok": False, "code": "type_too_small",
+                           "message": "snapshot holds more data than a default sandbox can take"})
+
+
+class SizeOptionTests(unittest.TestCase):
+    def created_size(self, argv):
+        observed = {}
+        def run(runner):
+            observed["size"] = runner.size
+            runner.create()
+        item = {"id": "bx_23456789", "state": "ready", "vcpu": 4, "memoryGB": 8}
+        client = FakeClient({("POST", "/sandboxes"): {"sandbox": item}, ("GET", "/sandboxes/bx_23456789"): {"sandbox": item},
+                             ("GET", "/sandboxes/bx_23456789/usage"): {}, ("DELETE", "/sandboxes/bx_23456789"): deleting(),
+                             ("GET", "/deletion-operations/bdop_test"): deleting()})
+        with tempfile.TemporaryDirectory() as tmp:
+            output = io.StringIO()
+            with patch("sys.argv", ["probe.py", "--output", str(Path(tmp) / "run"), *argv]), \
+                 patch.object(probe, "read_key", return_value="fake-key"), patch.object(probe, "Client", return_value=client), \
+                 patch.object(probe.Probe, "run", run), patch.object(probe.signal, "signal"), contextlib.redirect_stdout(output):
+                probe.main()
+            result = json.loads(output.getvalue())
+        return observed["size"], client.calls[0][2]["type"], result
+
+    def test_size_defaults_to_large_and_is_used_for_the_created_sandbox(self):
+        size, created, result = self.created_size([])
+        self.assertEqual((size, created, result["size"]), ("large", "large", "large"))
+        size, created, result = self.created_size(["--size", "default"])
+        self.assertEqual((size, created, result["size"]), ("default", "default", "default"))
+        self.assertEqual(result["sizing"]["default"]["provider_reported"]["vcpu"], 4)
+        size, created, _ = self.created_size(["--size", "small"])
+        self.assertEqual((size, created), ("small", "small"))
+
+    def test_size_choices_are_boat_sizes_the_probe_knows(self):
+        errors = io.StringIO()
+        with patch("sys.argv", ["probe.py", "--output", "unused", "--size", "xxlarge"]), \
+             contextlib.redirect_stderr(errors), self.assertRaises(SystemExit):
+            probe.main()
+        self.assertIn("invalid choice", errors.getvalue())
+        with self.assertRaises(probe.ProbeError):
+            probe.Probe(FakeClient({}), evidence(), lambda: None, size="xxlarge")
+        self.assertTrue(probe.provider_sizing_matches({"vcpu": 16, "memoryGB": 32}, "xlarge"))
+
+    def test_provider_sizing_follows_the_requested_size(self):
+        self.assertTrue(probe.provider_sizing_matches({"vcpu": 4, "memoryGB": 8}, "default"))
+        self.assertFalse(probe.provider_sizing_matches({"vcpu": 8, "memoryGB": 16}, "default"))
+        self.assertTrue(probe.provider_sizing_matches({"vcpu": 2, "memoryGB": 4}, "small"))
+        self.assertIn("default sizing (4 vCPU, 8 GB)", probe.sizing_error("default"))
+
+    def test_verify_prepared_image_creates_the_requested_size(self):
+        runner_host = load_runner_host()
+        def run(host):
+            host.probe.create(host.probe.verify_prepared_image)
+        item = {"id": "bx_23456789", "state": "ready", "vcpu": 4, "memoryGB": 8}
+        client = FakeClient({("POST", "/sandboxes"): {"sandbox": item}, ("GET", "/sandboxes/bx_23456789"): {"sandbox": item},
+                             ("GET", "/sandboxes/bx_23456789/usage"): {}, ("DELETE", "/sandboxes/bx_23456789"): deleting(),
+                             ("GET", "/deletion-operations/bdop_test"): deleting()})
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("sys.argv", ["probe.py", "--runner-host", "--verify-prepared-image", "motor-boat-prepared-09f9365aa9a8",
+                                "--size", "default", "--output", str(Path(tmp) / "run"), "--cargo-seed-manifest", "seed.json",
+                                "--cargo-seed-sha256", "a" * 64, "--acknowledge-tenant-one-private-cache"]), \
+             patch.object(probe, "read_key", return_value="fake-key"), patch.object(probe, "Client", return_value=client), \
+             patch.object(runner_host.RunnerHost, "run", run), patch.object(probe.signal, "signal"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            probe.main()
+        self.assertEqual(client.calls[0][2], {"type": "default", "ttlSeconds": 1800, "noEnv": True,
+                                              "from": "motor-boat-prepared-09f9365aa9a8"})
+
+
+class SnapshotSizeBoundTests(unittest.TestCase):
+    def test_refusal_classification_needs_a_size_specific_refusal(self):
+        for status, body, expected in ((400, SIZE_REFUSAL, True), (422, "{}", True), (409, "{}", True),
+                                       (403, SIZE_REFUSAL, True), (403, '{"code":"forbidden"}', False),
+                                       (401, SIZE_REFUSAL, False), (404, "{}", False), (429, "{}", False),
+                                       (500, SIZE_REFUSAL, False)):
+            with self.subTest(status=status, body=body):
+                self.assertEqual(probe.size_refusal(probe.ApiError(status, body)), expected)
+        self.assertTrue(probe.size_refusal(probe.ProbeError('sandbox entered failure state: {"error":"type_too_small"}')))
+        self.assertFalse(probe.size_refusal(probe.ProbeError("sandbox entered failure state: {}")))
+
+    def test_smaller_create_refused_from_a_large_snapshot_is_its_own_verdict(self):
+        runner_host = load_runner_host()
+        def run(host):
+            host.probe.create(host.probe.verify_prepared_image)
+        client = FakeClient({("POST", "/sandboxes"): probe.ApiError(400, SIZE_REFUSAL)})
+        with tempfile.TemporaryDirectory() as tmp:
+            output = io.StringIO()
+            with patch("sys.argv", ["probe.py", "--runner-host", "--verify-prepared-image", "motor-boat-prepared-09f9365aa9a8",
+                                    "--size", "default", "--output", str(Path(tmp) / "run"), "--cargo-seed-manifest", "seed.json",
+                                    "--cargo-seed-sha256", "a" * 64, "--acknowledge-tenant-one-private-cache"]), \
+                 patch.object(probe, "read_key", return_value="fake-key"), patch.object(probe, "Client", return_value=client), \
+                 patch.object(runner_host.RunnerHost, "run", run), patch.object(probe.signal, "signal"), \
+                 contextlib.redirect_stdout(output):
+                self.assertEqual(probe.main(), probe.EXIT_SNAPSHOT_SIZE_BOUND)
+            result = json.loads(output.getvalue())
+            findings = (Path(tmp) / "run" / "results.md").read_text()
+        self.assertEqual(result["verdict"]["outcome"], "snapshot_size_bound")
+        self.assertFalse(result["verdict"]["passed"])
+        self.assertIn("type_too_small", result["verdict"]["reasons"][0])
+        self.assertEqual(result["snapshot_size_bound"]["http_status"], 400)
+        self.assertEqual(result["snapshot_size_bound"]["boat_error"], SIZE_REFUSAL)
+        self.assertEqual(result["snapshot_size_bound"]["snapshot_source_size"], "large")
+        self.assertNotIn("error", result)
+        self.assertEqual((result["pending_creates"], result["cleanup_state"]), ([], "complete"))
+        self.assertEqual(result["exit_status"], 4)
+        self.assertIn("Runner-host verdict: **SNAPSHOT_SIZE_BOUND**", findings)
+        self.assertIn("type_too_small", findings)
+        self.assertIn("This image cannot serve that size", findings)
+
+    def test_large_refusal_and_unrelated_refusals_stay_generic_failures(self):
+        for size, error in (("large", probe.ApiError(400, SIZE_REFUSAL)), ("default", probe.ApiError(401, SIZE_REFUSAL))):
+            with self.subTest(size=size):
+                data = evidence()
+                runner = probe.Probe(FakeClient({("POST", "/sandboxes"): error}), data, lambda: None, size=size)
+                with self.assertRaises(probe.ApiError):
+                    runner.create("motor-boat-prepared-09f9365aa9a8")
+                self.assertNotIn("snapshot_size_bound", data)
+        # The run's own snapshot, saved on the same size it is cloned to, is not size-bound.
+        data = evidence()
+        runner = probe.Probe(FakeClient({("POST", "/sandboxes"): probe.ApiError(400, SIZE_REFUSAL)}), data, lambda: None, size="default")
+        with self.assertRaises(probe.ApiError):
+            runner.create("motor-probe-run", source_size="default")
+        self.assertNotIn("snapshot_size_bound", data)
+        self.assertEqual(probe.verdict(dict(data, measurements_complete=True, error="x"))["outcome"], "failed")
+
+    def test_restore_failure_naming_the_size_is_also_size_bound(self):
+        failed = {"id": "bx_23456789", "state": "error", "error": {"code": "type_too_small"}}
+        client = FakeClient({("POST", "/sandboxes"): {"sandbox": {"id": "bx_23456789"}},
+                             ("GET", "/sandboxes/bx_23456789"): {"sandbox": failed}})
+        data = evidence()
+        with self.assertRaises(probe.SnapshotSizeBound) as raised:
+            probe.Probe(client, data, lambda: None, size="small").create("motor-boat-prepared-09f9365aa9a8")
+        self.assertIn("type_too_small", raised.exception.evidence["boat_error"])
+        self.assertEqual(data["resources"][0]["id"], "bx_23456789")
+
+
+class SizingRenderTests(unittest.TestCase):
+    def test_sizing_is_recorded_per_size_and_rendered_with_skipped_jobs(self):
+        data = RunnerHostRenderTests().runner_data()
+        data["size"] = "default"
+        data["sizing"] = {"default": {"provider_reported": {"vcpu": 4, "memoryGB": 8},
+                                      "phases": {"prepared_clone": {"usable_vcpus": 4, "runner_max_weight": 4,
+                                                                    "runner_rustc_slots": 4, "endpoint_vcpu_ceiling": 4,
+                                                                    "job_vcpus": 4, "mem_total_bytes": 8323002368,
+                                                                    "mem_available_before_runner_bytes": 7612203008,
+                                                                    "runner_memory_max_bytes": 6979321856}}}}
+        data["runner_host"]["phases"][0]["skipped_jobs"] = [
+            {"name": "rust", "reason": "skipped: the job asks for 8 vCPUs and this default sandbox has 4 usable vCPUs"}]
+        text = RunnerHostRenderTests().rendered(data)
+        self.assertIn("## Sandbox sizing", text)
+        self.assertIn("| default | [4, 8] | prepared_clone | 4 | 4 | 4 | 4 | 4 | 8323002368 | 7612203008 | 6979321856 |", text)
+        self.assertIn("Sandbox size: \"default\".", text)
+        self.assertIn("initial rust: skipped: the job asks for 8 vCPUs and this default sandbox has 4 usable vCPUs", text)
+        self.assertNotIn("SNAPSHOT_SIZE_BOUND", text)
 
 
 if __name__ == "__main__":

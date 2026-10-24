@@ -270,6 +270,9 @@ pub(crate) fn run(args: &[String]) -> io::Result<()> {
             "physical-chmod requires -- before tree paths",
         ));
     }
+    // This short-lived root helper inherits the runner's protected score, but
+    // permission walks are expendable setup work, not the daemon itself.
+    fs::write("/proc/self/oom_score_adj", "900")?;
     apply(policy, &args[2..].iter().map(Path::new).collect::<Vec<_>>())
 }
 

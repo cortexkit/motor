@@ -9,6 +9,11 @@ use std::{
 pub struct Config {
     #[serde(skip_serializing_if = "is_false")]
     pub hosted_runners: bool,
+    /// Main-checkout repository identities whose ordinary jobs use hosted leases.
+    /// Workspace paths are deliberately not matched: linked worktrees share the
+    /// resolved repository_root of their main checkout. Windows and macOS stay direct.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosted_repositories: Vec<String>,
     /// Move only proven capacity-permit waits to hosted runners. Defaults are
     /// omitted so older clients with a closed Config schema can still load it.
     #[serde(skip_serializing_if = "is_false")]
@@ -40,6 +45,8 @@ pub struct Config {
     /// Ordered Windows endpoints. An empty list keeps the legacy instance pair.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub windows_runners: Vec<WindowsRunner>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub macos_runner: Option<MacosRunner>,
     pub worktree_roots: Vec<PathBuf>,
     pub queue_wait_limit_s: u64,
     pub ssh_config_override: Option<PathBuf>,
@@ -168,6 +175,7 @@ impl WindowsRunner {
             instance: self.instance.clone(),
             state_root: Some(self.state_root.clone()),
             windows: Some(self.clone()),
+            macos: None,
         }
     }
     fn validate(&self) -> io::Result<()> {
@@ -205,6 +213,73 @@ impl WindowsRunner {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MacosRunner {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub host: String,
+    #[serde(skip_serializing_if = "is_ssh_port")]
+    pub port: u16,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub user: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub host_key: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub instance: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub state_root: String,
+}
+impl Default for MacosRunner {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: 22,
+            user: String::new(),
+            host_key: String::new(),
+            instance: String::new(),
+            state_root: String::new(),
+        }
+    }
+}
+impl MacosRunner {
+    fn target(&self) -> RunnerTarget {
+        RunnerTarget {
+            instance: self.instance.clone(),
+            state_root: Some(self.state_root.clone()),
+            windows: None,
+            macos: Some(self.clone()),
+        }
+    }
+    fn validate(&self) -> io::Result<()> {
+        if self.host.is_empty()
+            || self.host.starts_with('-')
+            || !self
+                .host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            || self.port == 0
+            || self.user != "motor"
+            || self.instance.is_empty()
+            || !self
+                .instance
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+            || !self.state_root.starts_with('/')
+            || !self
+                .state_root
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
+            || self.host_key.contains(['\r', '\n'])
+            || ssh_key::PublicKey::from_openssh(&self.host_key).is_err()
+        {
+            return Err(io::Error::other(
+                "invalid macOS runner endpoint, motor user, instance, state root or host key",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let home = std::env::var_os("HOME")
@@ -215,6 +290,7 @@ impl Default for Config {
             .unwrap_or_else(|| home.join(".local/share"));
         Self {
             hosted_runners: false,
+            hosted_repositories: Vec::new(),
             spill_to_hosted: false,
             shadow_to_hosted: ShadowConfig::default(),
             spill_after_s: 45,
@@ -226,6 +302,7 @@ impl Default for Config {
             windows_runner_instance: None,
             windows_runner_state_root: None,
             windows_runners: Vec::new(),
+            macos_runner: None,
             worktree_roots: vec![data.join("cortexkit/alfonso/worktrees")],
             queue_wait_limit_s: 300,
             ssh_config_override: None,
@@ -261,6 +338,20 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> io::Result<()> {
+        if let Some(runner) = &self.macos_runner {
+            runner.validate()?;
+            if runner.instance == self.runner_instance
+                || Some(&runner.instance) == self.windows_runner_instance.as_ref()
+                || self
+                    .windows_runners
+                    .iter()
+                    .any(|windows| windows.instance == runner.instance)
+            {
+                return Err(io::Error::other(
+                    "macos_runner instance must differ from Linux and Windows instances",
+                ));
+            }
+        }
         let mut names = std::collections::HashSet::new();
         for runner in &self.windows_runners {
             runner.validate()?;
@@ -356,6 +447,15 @@ impl Config {
             return Err(io::Error::other("worktree_roots must be absolute"));
         }
         if self
+            .hosted_repositories
+            .iter()
+            .any(|p| !Path::new(p).is_absolute())
+        {
+            return Err(io::Error::other(
+                "hosted_repositories must be absolute repository roots",
+            ));
+        }
+        if self
             .spill_avoid_host
             .as_deref()
             .is_some_and(|host| !motor_lease::valid_name(host))
@@ -377,6 +477,7 @@ impl Config {
                 instance: self.runner_instance.clone(),
                 state_root: None,
                 windows: None,
+                macos: None,
             }),
             Some(Platform::Windows) if !self.windows_runners.is_empty() => {
                 Ok(self.windows_runners[0].target())
@@ -389,11 +490,17 @@ impl Config {
                     instance: instance.clone(),
                     state_root: Some(root.clone()),
                     windows: None,
+                    macos: None,
                 }),
                 _ => Err(io::Error::other(
                     "requested platform windows is not configured",
                 )),
             },
+            Some(Platform::Macos) => self
+                .macos_runner
+                .as_ref()
+                .map(MacosRunner::target)
+                .ok_or_else(|| io::Error::other("requested platform macos is not configured")),
             Some(platform) => Err(io::Error::other(format!(
                 "requested platform {platform:?} is unsupported"
             ))),
@@ -401,6 +508,11 @@ impl Config {
     }
 
     pub(crate) fn stored_target(&self, instance: Option<&str>) -> io::Result<RunnerTarget> {
+        if let Some(runner) = &self.macos_runner {
+            if instance == Some(runner.instance.as_str()) {
+                return Ok(runner.target());
+            }
+        }
         if instance.is_none() || instance == Some(self.runner_instance.as_str()) {
             return self.target(None);
         }
@@ -409,6 +521,7 @@ impl Config {
                 instance: instance.unwrap().into(),
                 state_root: self.windows_runner_state_root.clone(),
                 windows: None,
+                macos: None,
             });
         }
         Err(io::Error::other(format!(
@@ -423,4 +536,5 @@ pub(crate) struct RunnerTarget {
     pub instance: String,
     pub state_root: Option<String>,
     pub windows: Option<WindowsRunner>,
+    pub macos: Option<MacosRunner>,
 }

@@ -1,5 +1,5 @@
 //! In-memory broker state machine for tests. HTTP transport lives in the binary.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde_json::{json, Value};
@@ -25,6 +25,15 @@ pub struct Knobs {
     pub refusal: Option<(u16, String)>,
     /// Shorten the granted runtime; the reservation follows the granted cap.
     pub max_s: Option<u64>,
+    /// The most vCPUs any host behind this broker could ever hold. A new
+    /// lease asking for more is answered 422 `no_host_fits` with this number
+    /// as `max_vcpus`, before any reservation is made.
+    pub max_vcpus: Option<u32>,
+    /// Account subjects (`acct:<ULID>`) whose accounts are closed. A new lease
+    /// for the configured subject is then refused 403 `account_closed`, while
+    /// jobs it already holds keep their normal answers; heartbeat replies list
+    /// the closed subjects among the tenants the host reports.
+    pub closed_subjects: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,10 +76,19 @@ struct Reservation {
 }
 
 enum Settlement {
-    Usage { body: Vec<u8>, reply: UsageReply },
+    /// Settled by the placement host's usage report at `settled_at_ms`.
+    Usage {
+        body: Vec<u8>,
+        reply: UsageReply,
+        settled_at_ms: u64,
+    },
     HostLost(UsageReply),
     Released(UsageReply),
 }
+
+/// How long after a usage-report settlement a reattach still gets an `attach`
+/// token instead of 409 `job_finished`: 86400 s, as the runners contract states.
+pub const SETTLED_REATTACH_WINDOW_MS: u64 = 86_400_000;
 
 pub struct FakeBroker {
     config: FakeConfig,
@@ -155,7 +173,7 @@ impl FakeBroker {
                 .and_then(|p| p.strip_suffix("/reattach"))
             {
                 return match serde_json::from_slice::<ReattachRequest>(request.body) {
-                    Ok(body) => self.reattach(job_id, body, now_ms / 1000),
+                    Ok(body) => self.reattach(job_id, body, now_ms),
                     Err(_) => BrokerReply::error(400, "bad_request"),
                 };
             }
@@ -190,7 +208,7 @@ impl FakeBroker {
                     Err(_) => BrokerReply::error(400, "bad_request"),
                 },
                 "usage" => match serde_json::from_slice(request.body) {
-                    Ok(body) => self.usage(host_id, body, request.body),
+                    Ok(body) => self.usage(host_id, body, now_ms),
                     Err(_) => BrokerReply::error(400, "bad_request"),
                 },
                 _ => BrokerReply::error(404, "not_found"),
@@ -200,7 +218,10 @@ impl FakeBroker {
     }
 
     fn lease(&mut self, request: LeaseRequest, now_s: u64) -> BrokerReply {
-        if request.requester_jwk.verifying_key().is_err()
+        // The broker requires an explicit spill policy on every lease body and
+        // refuses one without it before looking up or claiming the job.
+        if request.allow_spill.is_none()
+            || request.requester_jwk.verifying_key().is_err()
             || !valid_job_id(&request.job_id)
             || !(1..=64).contains(&request.vcpus)
             || !(10..=7200).contains(&request.timeout_s)
@@ -230,14 +251,23 @@ impl FakeBroker {
             if job.release.is_some() {
                 return BrokerReply::error(409, "job_released");
             }
-            let mut comparable = request.clone();
-            comparable.requester_jwk = job.request.requester_jwk.clone();
-            if comparable != job.request {
+            if lease_identity(&request) != lease_identity(&job.request) {
                 return BrokerReply::error(409, "job_conflict");
             }
         } else {
+            // A closed account gets no new job; one it already holds (the
+            // branch above) keeps its answer so it can run to its end.
+            if self.knobs.closed_subjects.contains(&self.config.subject) {
+                return BrokerReply::error(403, "account_closed");
+            }
             if let Some((status, code)) = &self.knobs.refusal {
                 return BrokerReply::error(*status, code);
+            }
+            if let Some(max_vcpus) = self.knobs.max_vcpus.filter(|max| request.vcpus > *max) {
+                return BrokerReply::json(
+                    422,
+                    json!({"error": "no_host_fits", "max_vcpus": max_vcpus}),
+                );
             }
             // The fake serves a single host. When the lease avoids it, nothing
             // else is selectable, which the contract answers as no capacity.
@@ -303,7 +333,7 @@ impl FakeBroker {
         )
     }
 
-    fn reattach(&mut self, job_id: &str, request: ReattachRequest, now_s: u64) -> BrokerReply {
+    fn reattach(&mut self, job_id: &str, request: ReattachRequest, now_ms: u64) -> BrokerReply {
         if request.requester_jwk.verifying_key().is_err() {
             return BrokerReply::error(400, "bad_request");
         }
@@ -313,10 +343,24 @@ impl FakeBroker {
         if job.release.is_some() {
             return BrokerReply::error(409, "job_released");
         }
-        if job.settlement.is_some() {
-            return BrokerReply::error(409, "job_finished");
+        match &job.settlement {
+            None => {}
+            // The host keeps a job it settled by usage report, with its output
+            // and terminal record, for a day, so a client that lost the end of
+            // the stream can attach and have it replayed. This fake serves one
+            // registered host and no Boat sandboxes, so every usage-report
+            // settlement here is a registered host's.
+            Some(Settlement::Usage { settled_at_ms, .. })
+                if settled_at_ms.saturating_add(SETTLED_REATTACH_WINDOW_MS) > now_ms => {}
+            Some(_) => return BrokerReply::error(409, "job_finished"),
         }
-        self.issue(job_id, &request.requester_jwk, Purpose::Attach, now_s, 200)
+        self.issue(
+            job_id,
+            &request.requester_jwk,
+            Purpose::Attach,
+            now_ms / 1000,
+            200,
+        )
     }
 
     fn release(&mut self, job_id: &str) -> BrokerReply {
@@ -415,6 +459,24 @@ impl FakeBroker {
         {
             return BrokerReply::error(400, "bad_request");
         }
+        // The closed accounts among the tenants this heartbeat reports: each
+        // warm entry's tenant, and the owner of each running job the broker
+        // knows, whether or not that job is ignored. Sorted and unique.
+        let mut closed: BTreeSet<&String> = heartbeat
+            .warm
+            .iter()
+            .map(|vm| &vm.tenant)
+            .filter(|tenant| self.knobs.closed_subjects.contains(*tenant))
+            .collect();
+        if self.knobs.closed_subjects.contains(&self.config.subject)
+            && heartbeat
+                .running
+                .iter()
+                .any(|job| self.jobs.contains_key(&job.job_id))
+        {
+            closed.insert(&self.config.subject);
+        }
+        let closed_subjects: Vec<String> = closed.into_iter().cloned().collect();
         let mut ignored = Vec::new();
         for running in heartbeat.running {
             if host != self.config.placement.host {
@@ -437,10 +499,13 @@ impl FakeBroker {
                 None => ignored.push(running.job_id),
             }
         }
-        BrokerReply::json(200, json!({"ignored": ignored}))
+        BrokerReply::json(
+            200,
+            json!({"ignored": ignored, "closed_subjects": closed_subjects}),
+        )
     }
 
-    fn usage(&mut self, host: &str, usage: Usage, _body: &[u8]) -> BrokerReply {
+    fn usage(&mut self, host: &str, usage: Usage, now_ms: u64) -> BrokerReply {
         if !valid_job_id(&usage.job_id)
             || !(1..=64).contains(&usage.vcpus)
             || usage.started_at_ms > MAX_SAFE_INTEGER
@@ -466,6 +531,7 @@ impl FakeBroker {
             Some(Settlement::Usage {
                 body: original,
                 reply,
+                ..
             }) => {
                 return if original == &body {
                     BrokerReply::json(200, reply)
@@ -489,6 +555,7 @@ impl FakeBroker {
         job.settlement = Some(Settlement::Usage {
             body,
             reply: reply.clone(),
+            settled_at_ms: now_ms,
         });
         BrokerReply::json(200, reply)
     }
@@ -553,4 +620,27 @@ fn valid_keyed_hash(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+/// The ordinary lease-hash projection: requester keys can rotate on a re-request,
+/// but placement and resource choices (including the allow_spill value) cannot.
+/// `lease` refuses a body without allow_spill before this is used, so the member
+/// is always present here. The fake serves registered hosts only and does not
+/// accept shadow leases.
+fn lease_identity(request: &LeaseRequest) -> Value {
+    let mut identity = json!({
+        "job_id": request.job_id,
+        "vcpus": request.vcpus,
+        "platform": request.platform,
+        "net": request.net,
+        "workspace_key_hash": request.workspace_key_hash,
+        "repo_hash": request.repo_hash,
+        "placement_hint": request.placement_hint,
+        "avoid_host": request.avoid_host,
+        "timeout_s": request.timeout_s,
+    });
+    if let Some(allow_spill) = request.allow_spill {
+        identity["allow_spill"] = json!(allow_spill);
+    }
+    identity
 }

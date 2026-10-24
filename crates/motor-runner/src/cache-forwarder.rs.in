@@ -1,0 +1,113 @@
+//! Standalone, dependency-free forwarder from a job's loopback TCP port to the
+//! runner's remote cache gateway. Built only from this embedded trusted source,
+//! never a submitted workspace.
+//!
+//! Jobs and fills run without a network of their own, and some build tools can
+//! only reach their cache through an `http://host:port` URL. The runner serves
+//! each tool on a Unix socket bound into the unit's sandbox; this program
+//! exposes that socket as `127.0.0.1:<port>` inside the unit's own network
+//! namespace. It holds no key: the gateway signs every request outside the
+//! sandbox.
+//!
+//! `cache-forwarder <127.0.0.1:port> <socket>` binds the address, hands the
+//! bound listener to a background copy of itself and exits 0, so the port
+//! already accepts connections when the command returns. When the address
+//! cannot be bound (another process of the same unit holds it) it exits 1 and
+//! the unit carries on without a cache.
+use std::{
+    env, io,
+    net::{Shutdown, TcpListener, TcpStream},
+    os::{
+        fd::{FromRawFd, OwnedFd},
+        unix::net::UnixStream,
+    },
+    process::{Command, Stdio},
+    thread,
+    time::Duration,
+};
+
+/// The argument the background copy is started with, followed by the socket.
+const SERVE: &str = "--serve";
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let code = match args.as_slice() {
+        [_, flag, socket] if flag == SERVE => serve(socket),
+        [_, address, socket] => start(address, socket),
+        _ => {
+            eprintln!("usage: cache-forwarder <127.0.0.1:port> <socket>");
+            2
+        }
+    };
+    std::process::exit(code);
+}
+
+fn start(address: &str, socket: &str) -> i32 {
+    let listener = match TcpListener::bind(address) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("cache-forwarder: cannot listen on {address}: {error}");
+            return 1;
+        }
+    };
+    let program = match env::current_exe() {
+        Ok(program) => program,
+        Err(error) => {
+            eprintln!("cache-forwarder: cannot find itself: {error}");
+            return 1;
+        }
+    };
+    // The listener becomes the copy's standard input; nothing else of this
+    // process is inherited, because Rust opens every descriptor close-on-exec.
+    match Command::new(program)
+        .arg(SERVE)
+        .arg(socket)
+        .stdin(Stdio::from(OwnedFd::from(listener)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(_) => 0,
+        Err(error) => {
+            eprintln!("cache-forwarder: cannot start: {error}");
+            1
+        }
+    }
+}
+
+fn serve(socket: &str) -> i32 {
+    // Standard input is the listener `start` bound.
+    let listener = TcpListener::from(unsafe { OwnedFd::from_raw_fd(0) });
+    loop {
+        match listener.accept() {
+            Ok((client, _)) => {
+                let socket = socket.to_owned();
+                thread::spawn(move || relay(client, &socket));
+            }
+            // Out of descriptors or threads: retrying at once would only spin.
+            Err(_) => thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+/// Copies one tool connection to a new gateway connection and back. When the
+/// gateway connection cannot be made the tool's connection is closed, which
+/// the tool treats as an unreachable cache.
+fn relay(client: TcpStream, socket: &str) {
+    let Ok(gateway) = UnixStream::connect(socket) else {
+        return;
+    };
+    let (Ok(client_reader), Ok(gateway_writer)) = (client.try_clone(), gateway.try_clone()) else {
+        return;
+    };
+    let upload = thread::spawn(move || {
+        let _ = io::copy(&mut &client_reader, &mut &gateway_writer);
+        // The tool finished sending; the gateway may still be answering.
+        let _ = gateway_writer.shutdown(Shutdown::Write);
+    });
+    let _ = io::copy(&mut &gateway, &mut &client);
+    // The gateway closed the connection, so nothing the tool still sends can
+    // be answered: closing both directions also ends the upload copy.
+    let _ = client.shutdown(Shutdown::Both);
+    let _ = upload.join();
+}

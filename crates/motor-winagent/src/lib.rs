@@ -1,8 +1,12 @@
-//! The shared host/guest protocol for a single disposable Windows job VM.
+//! The shared host/guest protocol for a single disposable job VM.
 //!
 //! Frames are JSON preceded by a four-byte big-endian payload length. Both peers
 //! must validate each incoming and outgoing frame with the same state machine.
 //! Transport deadlines, persistence of Started, and VM cleanup belong to the host.
+//!
+//! One `Frame` type and one framing serve two guest operating systems. The
+//! [`Profile`] chosen when a [`Protocol`] or [`Session`] is constructed decides
+//! which frames and which order that conversation accepts.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
@@ -10,11 +14,15 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize};
 
 pub mod cache;
+pub mod cache_format;
 pub mod cache_steps;
 pub mod environment;
 pub mod transport;
 
+/// Version of the Windows profile; the Windows agent sends it in its Hello.
 pub const PROTOCOL_VERSION: u32 = 4;
+/// Version of the macOS profile, versioned independently of the Windows one.
+pub const MACOS_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_COLLECT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -46,6 +54,9 @@ pub enum Stream {
 pub struct CacheTimings {
     pub elapsed_ms: u64,
     pub disk_selection_ms: u64,
+    /// Time spent initializing a RAW cache disk (native GPT layout plus
+    /// format.com). The name is kept from the PowerShell formatter it replaced
+    /// because it is part of the wire format.
     pub powershell_ms: u64,
     /// PowerShell Set-Disk time, zero when the native path is used.
     pub set_disk_ms: u64,
@@ -94,6 +105,11 @@ pub enum Frame {
     },
     Exit {
         code: u32,
+    },
+    /// The command was terminated by this signal number. Only the macOS profile
+    /// accepts it; Windows reports every termination through `Exit`.
+    Signal {
+        signal: i32,
     },
     Cancel {},
     Collect {},
@@ -170,10 +186,37 @@ pub enum Peer {
     Agent,
 }
 
+/// Which guest operating system a conversation serves. The profile is fixed when
+/// the conversation is constructed and selects the accepted frames and order;
+/// the frame type and framing are the same for both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Profile {
+    /// The Hyper-V/QEMU Windows agent: tree upload, cache mount, collection
+    /// and dismount around the command.
+    Windows,
+    /// The macOS VM agent. The host shares the workspace into the guest, so the
+    /// conversation carries the command, its output and its termination
+    /// without the Windows tree-upload, cache, collection or dismount frames.
+    Macos,
+}
+
+impl Profile {
+    /// The Hello version an agent speaking this profile must send.
+    pub fn version(self) -> u32 {
+        match self {
+            Profile::Windows => PROTOCOL_VERSION,
+            Profile::Macos => MACOS_PROTOCOL_VERSION,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     AwaitHello,
     ReceivingTree,
+    /// macOS only: Hello accepted, waiting for the host's TreeEnd, which carries
+    /// the command and no tree chunks.
+    AwaitCommand,
     AwaitTreeReceived,
     Ready,
     AwaitStarted,
@@ -190,6 +233,7 @@ pub enum State {
 /// poisons the conversation: neither peer may resume or start a second command.
 #[derive(Debug)]
 pub struct Protocol {
+    profile: Profile,
     nonce: String,
     state: State,
     collected_bytes: usize,
@@ -198,18 +242,28 @@ pub struct Protocol {
 }
 
 impl Protocol {
+    /// A Windows-profile conversation.
     pub fn new(nonce: impl Into<String>) -> io::Result<Self> {
+        Self::with_profile(Profile::Windows, nonce)
+    }
+
+    pub fn with_profile(profile: Profile, nonce: impl Into<String>) -> io::Result<Self> {
         let nonce = nonce.into();
         if nonce.is_empty() {
             return Err(invalid("boot nonce must not be empty"));
         }
         Ok(Self {
+            profile,
             nonce,
             state: State::AwaitHello,
             collected_bytes: 0,
             cache_reported: false,
             cache_progress_frames: 0,
         })
+    }
+
+    pub fn profile(&self) -> Profile {
+        self.profile
     }
 
     pub fn state(&self) -> State {
@@ -223,7 +277,11 @@ impl Protocol {
     /// `sender` identifies the actual transport direction, not a field provided
     /// by the untrusted peer. Call before acting on a received message.
     pub fn accept(&mut self, sender: Peer, frame: &Frame) -> io::Result<()> {
-        match self.transition(sender, frame) {
+        let next = match self.profile {
+            Profile::Windows => self.transition(sender, frame),
+            Profile::Macos => self.macos_transition(sender, frame),
+        };
+        match next {
             Ok(state) => {
                 self.state = state;
                 Ok(())
@@ -235,6 +293,56 @@ impl Protocol {
         }
     }
 
+    fn check_hello(&self, version: u32, nonce: &str) -> io::Result<()> {
+        if version != self.profile.version() {
+            return Err(invalid(format!(
+                "unsupported agent protocol version {version}"
+            )));
+        }
+        if nonce != self.nonce {
+            return Err(invalid("agent hello boot nonce mismatch"));
+        }
+        Ok(())
+    }
+
+    /// The macOS sequence: Hello, TreeEnd, Started, any
+    /// number of Output, then Exit or Signal. Cancel is allowed while the
+    /// command is starting or running. Every other frame, including the Windows
+    /// cache, tree-chunk, collect and dismount frames, poisons the conversation.
+    fn macos_transition(&mut self, sender: Peer, frame: &Frame) -> io::Result<State> {
+        use Frame::*;
+        use Peer::{Agent, Host};
+        use State::*;
+
+        let next = match (self.state, sender, frame) {
+            (AwaitHello, Agent, Hello { version, nonce }) => {
+                self.check_hello(*version, nonce)?;
+                AwaitCommand
+            }
+            (AwaitCommand, Host, TreeEnd { command }) => {
+                command.validate_posix()?;
+                AwaitStarted
+            }
+            (AwaitStarted, Agent, Started {}) => Running,
+            (AwaitStarted | Running, Host, Cancel {}) => self.state,
+            (Running, Agent, Output { .. }) => Running,
+            (Running, Agent, Exit { .. }) => Complete,
+            (Running, Agent, Signal { signal }) => {
+                if *signal <= 0 {
+                    return Err(invalid(format!("invalid termination signal {signal}")));
+                }
+                Complete
+            }
+            _ => {
+                return Err(invalid(format!(
+                    "out-of-order agent frame from {sender:?} in {:?}",
+                    self.state
+                )));
+            }
+        };
+        Ok(next)
+    }
+
     fn transition(&mut self, sender: Peer, frame: &Frame) -> io::Result<State> {
         use Frame::*;
         use Peer::{Agent, Host};
@@ -242,14 +350,7 @@ impl Protocol {
 
         let next = match (self.state, sender, frame) {
             (AwaitHello, Agent, Hello { version, nonce }) => {
-                if *version != PROTOCOL_VERSION {
-                    return Err(invalid(format!(
-                        "unsupported agent protocol version {version}"
-                    )));
-                }
-                if nonce != &self.nonce {
-                    return Err(invalid("agent hello boot nonce mismatch"));
-                }
+                self.check_hello(*version, nonce)?;
                 ReceivingTree
             }
             (ReceivingTree, Host, ReceiveTree { .. }) => ReceivingTree,
@@ -327,11 +428,24 @@ pub struct Session {
 }
 
 impl Session {
+    /// A Windows-profile session.
     pub fn new(peer: Peer, nonce: impl Into<String>) -> io::Result<Self> {
+        Self::with_profile(peer, Profile::Windows, nonce)
+    }
+
+    pub fn with_profile(
+        peer: Peer,
+        profile: Profile,
+        nonce: impl Into<String>,
+    ) -> io::Result<Self> {
         Ok(Self {
             peer,
-            protocol: Protocol::new(nonce)?,
+            protocol: Protocol::with_profile(profile, nonce)?,
         })
+    }
+
+    pub fn profile(&self) -> Profile {
+        self.protocol.profile()
     }
 
     pub fn state(&self) -> State {
@@ -357,7 +471,10 @@ impl Session {
             Ok(None) if self.state() == State::Complete => Ok(None),
             Ok(None) => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "agent session closed before dismount",
+                match self.profile() {
+                    Profile::Windows => "agent session closed before dismount",
+                    Profile::Macos => "agent session closed before exit or signal",
+                },
             )),
             Err(error) => Err(error),
         };
@@ -475,6 +592,30 @@ impl Command {
     pub fn validate(&self) -> io::Result<()> {
         mapped_cwd(&self.cwd)?;
         mapped_cwd(&self.workspace)?;
+        self.validate_text()
+    }
+
+    /// The macOS guest uses caller paths as they are, so Windows name rules do
+    /// not apply. Paths must still be absolute and normalized: no empty, `.` or
+    /// `..` components and no NUL.
+    pub fn validate_posix(&self) -> io::Result<()> {
+        for path in [&self.cwd, &self.workspace] {
+            let relative = path
+                .strip_prefix('/')
+                .ok_or_else(|| invalid(format!("path is not an absolute POSIX path: {path:?}")))?;
+            if relative.contains('\0')
+                || (!relative.is_empty()
+                    && relative
+                        .split('/')
+                        .any(|component| matches!(component, "" | "." | "..")))
+            {
+                return Err(invalid(format!("path is not normalized: {path:?}")));
+            }
+        }
+        self.validate_text()
+    }
+
+    fn validate_text(&self) -> io::Result<()> {
         if self.command.contains('\0')
             || self.source_commit.contains('\0')
             || self.env.iter().any(|(key, value)| {
@@ -1044,6 +1185,9 @@ fn append_source_link(
     }
     builder.append_data(&mut header, path, io::empty())
 }
+
+#[cfg(test)]
+mod macos_profile_tests;
 
 #[cfg(test)]
 mod tests {

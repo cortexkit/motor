@@ -125,6 +125,9 @@ pub fn describe_close(error: &anyhow::Error) -> CloseReport {
             if let Some(Error::Refused(reason)) = layer.downcast_ref::<Error>() {
                 return Some(format!("refused {}", reason.wire()));
             }
+            if let Some(Error::Journal(io)) = layer.downcast_ref::<Error>() {
+                return Some(format!("journal {:?}: {io}", io.kind()));
+            }
             None
         })
         .or_else(|| {
@@ -177,6 +180,8 @@ pub struct Runtime {
     event_workers: Mutex<BTreeSet<String>>,
     terminal_workers: Mutex<BTreeSet<String>>,
     tenant_operations: BTreeMap<String, Arc<Mutex<()>>>,
+    /// Closed tenants whose removal is running on its own thread.
+    removal_workers: Mutex<BTreeSet<String>>,
     pub(crate) sandbox_identity: Option<crate::sandbox::IdentityFile>,
 }
 impl Runtime {
@@ -241,6 +246,7 @@ impl Runtime {
             event_workers: Mutex::new(BTreeSet::new()),
             terminal_workers: Mutex::new(BTreeSet::new()),
             tenant_operations,
+            removal_workers: Mutex::new(BTreeSet::new()),
             last_key_refresh: Mutex::new(0),
             fetch_keys: AtomicBool::new(false),
             sandbox_identity,
@@ -293,8 +299,8 @@ impl Runtime {
             .collect();
         for tenant in tenants {
             if self.control.adopt(&tenant)? {
-                if self.ensure(&tenant).is_err() {
-                    tracing::error!(tenant, "tenant_recovery_pending");
+                if let Err(error) = self.ensure(&tenant) {
+                    tracing::error!(tenant, detail = %format!("{error:#}"), "tenant_recovery_pending");
                 }
             } else {
                 self.host
@@ -378,6 +384,29 @@ impl Runtime {
         self.ensure_locked(tenant)?;
         self.start_events(tenant.to_owned());
         Ok(())
+    }
+    /// Tenants that are neither ready nor removed. In a sandbox, where the
+    /// broker owns the VM and nothing suspends it, such a tenant is one whose
+    /// recovery failed: until it is ready, no job can be admitted.
+    pub(crate) fn recovery_pending(&self) -> Vec<String> {
+        let host = self.host.lock().expect("host lock");
+        self.tenant_operations
+            .keys()
+            .filter(|tenant| !host.is_removed(tenant) && !host.is_ready(tenant))
+            .cloned()
+            .collect()
+    }
+    /// Repeats startup recovery for every tenant [`Self::recovery_pending`]
+    /// names, returning the first failure. Startup recovers only once, and in
+    /// a sandbox whose readiness is withdrawn no admission arrives to retry.
+    pub(crate) fn retry_recovery(self: &Arc<Self>) -> Result<()> {
+        let mut failure = None;
+        for tenant in self.recovery_pending() {
+            if let Err(error) = self.ensure(&tenant) {
+                failure.get_or_insert(error.context(format!("recover tenant {tenant}")));
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
     pub(crate) fn tenant_operations(&self, tenant: &str) -> Result<Arc<Mutex<()>>> {
         self.tenant_operations
@@ -566,9 +595,13 @@ impl Runtime {
             let mut host = self.host.lock().expect("host lock");
             host.billing_tick(now_ms)?;
             let cancels = host.expire(now_ms)?;
+            host.retention_tick(now_ms)?;
             let mut quotas = Vec::new();
             let mut candidates = Vec::new();
             for tenant in self.tenant_operations.keys() {
+                if host.is_removed(tenant) {
+                    continue;
+                }
                 if let Some(update) = host.quota_update(tenant, now_ms)? {
                     quotas.push(update);
                 }
@@ -613,6 +646,28 @@ impl Runtime {
                 self.host.lock().expect("host lock").stopped(&tenant)?;
             }
         }
+        // A removal stops the VM and waits on the helper, so it runs on its
+        // own thread rather than holding up this tick's cancels and expiry.
+        let due = self.host.lock().expect("host lock").removals_due(now_ms)?;
+        for tenant in due {
+            if !self
+                .removal_workers
+                .lock()
+                .expect("removal workers")
+                .insert(tenant.clone())
+            {
+                continue;
+            }
+            let runtime = self.clone();
+            std::thread::spawn(move || {
+                runtime.remove_closed(&tenant, now_ms);
+                runtime
+                    .removal_workers
+                    .lock()
+                    .expect("removal workers")
+                    .remove(&tenant);
+            });
+        }
         if !candidates.is_empty() {
             match self.control.available_bytes() {
                 Ok(available) => {
@@ -630,6 +685,37 @@ impl Runtime {
         match failure {
             Some(error) => Err(error),
             None => Ok(()),
+        }
+    }
+    /// Removes a closed tenant once it is ready: under the tenant's operation
+    /// lock (so no wake, suspend or relay setup runs meanwhile) it rechecks
+    /// that no lease or connection is open, stops the VM cleanly, and has the
+    /// helper quarantine its data and drop its records and network setup.
+    /// A failure is recorded with a retry time; see `Host::removal_failed`.
+    pub fn remove_closed(&self, tenant: &str, now_ms: u64) {
+        let result = (|| -> Result<Option<String>> {
+            let operations = self.tenant_operations(tenant)?;
+            let _operation = operations.lock().expect("tenant operations lock");
+            if !self
+                .host
+                .lock()
+                .expect("host lock")
+                .removal_ready(tenant, now_ms)
+            {
+                return Ok(None);
+            }
+            self.control.stop(tenant)?;
+            self.host.lock().expect("host lock").stopped(tenant)?;
+            Ok(Some(self.control.remove(tenant)?))
+        })();
+        let mut host = self.host.lock().expect("host lock");
+        let recorded = match result {
+            Ok(Some(quarantine)) => host.tenant_removed(tenant, &quarantine, now_ms),
+            Ok(None) => Ok(()),
+            Err(error) => host.removal_failed(tenant, now_ms, &format!("{error:#}")),
+        };
+        if let Err(error) = recorded {
+            tracing::error!(tenant, %error, "tenant_removal_record_failed");
         }
     }
     fn fetch_detached_terminals(self: &Arc<Self>) {
@@ -723,11 +809,16 @@ impl Runtime {
             }
         }
         let result = self.control.suspend(tenant);
-        let still_idle = self
-            .host
-            .lock()
-            .expect("host lock")
-            .finish_suspend(tenant, result.is_ok());
+        let mut host = self.host.lock().expect("host lock");
+        let still_idle = host.finish_suspend(tenant, result.is_ok());
+        if let Err(error) = &result {
+            // A failed create may have required killing the VMM. Reconcile via
+            // the helper on the next lease instead of trusting stale readiness.
+            host.guest_unready(tenant);
+            host.suspend_failed(tenant, unix_ms());
+            tracing::warn!(tenant, detail = %format!("{error:#}"), "tenant_suspend_failed");
+        }
+        drop(host);
         if result.is_ok() && !still_idle {
             tracing::info!(tenant, "suspended_with_new_activity");
         }
@@ -866,6 +957,17 @@ pub async fn serve<S>(runtime: Arc<Runtime>, mut client: S) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    serve_with_slot(runtime, &mut client, None).await
+}
+
+pub async fn serve_with_slot<S>(
+    runtime: Arc<Runtime>,
+    mut client: S,
+    slot: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let first = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut client))
         .await
         .at(Side::Client, "lease_hello")?
@@ -993,8 +1095,22 @@ where
             .at(Side::Client, "lease_refused")?;
             return Ok(());
         }
-        Err((e, _)) => return Err(e).at(Side::Host, "admission"),
+        Err((e, _)) => {
+            // A journal failure (a full disk, most often) is still answered,
+            // so the requester logs why instead of seeing a closed connection.
+            let reason = e.refusal();
+            log_refusal("challenge", reason, "admission", Some(&claims.jti));
+            write_frame(
+                &mut client,
+                &json!({"type":"lease_refused", "reason":reason.wire()}),
+            )
+            .await
+            .at(Side::Client, "lease_refused")?;
+            return Err(e).at(Side::Host, "admission");
+        }
     };
+    // Only a verified challenge releases the pre-authentication connection budget.
+    drop(slot);
     tracing::info!(jti = %claims.jti, "lease_connected");
     let alive = Arc::new(AtomicBool::new(true));
     let connection = ConnectionGuard {
@@ -1006,6 +1122,12 @@ where
         armed: true,
     };
     drop(prelude_guard);
+    // Set once the connection enters the relay or a stored replay; from then
+    // on it ends with a graceful drain.
+    let streamed = AtomicBool::new(false);
+    // Set once this connection has written the job's final frames to the
+    // client. Delivery is only recorded after the client then closes cleanly.
+    let terminal_written = AtomicBool::new(false);
     let outcome = async {
     let deadline = tokio::time::Instant::now()
         + Duration::from_millis(claims.exp.saturating_mul(1000).saturating_sub(unix_ms()));
@@ -1034,7 +1156,8 @@ where
             .at(Side::Client, "first_frame")?;
         let stored = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, 0).is_some();
         if stored {
-            return serve_stored(&runtime, &claims.jti, &first, &mut client).await;
+            streamed.store(true, Ordering::Release);
+            return serve_stored(&runtime, &claims.jti, &first, &mut client, &terminal_written).await;
         }
         let delivery_runtime = runtime.clone();
         let delivery_claims = claims.clone();
@@ -1073,11 +1196,19 @@ where
         let mut guest = tokio::net::UnixStream::from_std(stream).at(Side::Host, "relay_start")?;
         write_frame(&mut guest, &first).await.at(Side::Guest, "relay_start")?;
         guest.write_all(&buffered).await.at(Side::Guest, "relay_start")?;
-        let (mut cr, mut cw) = tokio::io::split(client);
+        streamed.store(true, Ordering::Release);
+        // Split a borrow, not the stream itself: once the relay ends, `serve`
+        // still needs the client stream to close it gracefully.
+        let (mut cr, mut cw) = tokio::io::split(&mut client);
         let (mut gr, mut gw) = guest.split();
         // This connection owns the reverse drain after decoding Terminal or
         // selecting host-settled final frames; ownership is not client delivery.
         let draining_terminal = AtomicBool::new(false);
+        let relay_trace = crate::relay::RelayTrace::new(&claims.jti);
+        // Set once writing to the guest has failed because the guest closed
+        // its end. Client input is then read and discarded, and the guest's
+        // output keeps flowing to the client until the guest's stream ends.
+        let guest_input_closed = AtomicBool::new(false);
         // Copy by hand rather than with tokio::io::copy, so a failure says
         // whether reading the client or writing the guest failed.
         let to_guest = async {
@@ -1088,16 +1219,29 @@ where
                     tracing::info!(jti = claims.jti, side = "client", step = "relay", cause = "eof", "connection_closed");
                     return Ok::<(), anyhow::Error>(());
                 }
-                if draining_terminal.load(Ordering::Acquire) {
+                if draining_terminal.load(Ordering::Acquire) || guest_input_closed.load(Ordering::Acquire) {
                     continue;
                 }
-                if let Err(error) = gw.write_all(&buffer[..n]).await {
+                if let Err(error) = relay_trace.guest_input(&mut gw, &buffer[..n]).await {
                     if draining_terminal.load(Ordering::Acquire)
                         && matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::NotConnected)
                     {
                         tracing::debug!(jti = claims.jti, side = "guest", step = "relay", cause = %error, "guest_input_closed_during_terminal_drain");
                         continue;
                     }
+                    if matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::NotConnected) {
+                        // The tenant runner closes a job stream as soon as it
+                        // has written the terminal, without reading what the
+                        // client sent since (its one-per-second heartbeats).
+                        // Frames it wrote before closing are still queued for
+                        // this relay, so a failed write here must not end the
+                        // relay: the guest's output side decides when it ends.
+                        tracing::warn!(jti = claims.jti, operation = "write_guest_uds", cause = %error, "guest_input_closed");
+                        relay_trace.guest_input_closed();
+                        guest_input_closed.store(true, Ordering::Release);
+                        continue;
+                    }
+                    tracing::warn!(jti = claims.jti, operation = "write_guest_uds", cause = %error, "relay_io_failed");
                     return Err(error).at(Side::Guest, "relay");
                 }
             }
@@ -1114,8 +1258,8 @@ where
                             let frames = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, cursor.saturating_add(1));
                             if let Some(frames) = frames {
                                 draining_terminal.store(true, Ordering::Release);
-                                for frame in frames { write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?; }
-                                runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms()).at(Side::Host, "relay")?;
+                                for frame in frames { relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?; }
+                                terminal_written.store(true, Ordering::Release);
                                 break None;
                             }
                         }
@@ -1126,8 +1270,8 @@ where
                 if let Some(frames) = settled {
                     draining_terminal.store(true, Ordering::Release);
                     tracing::warn!(jti=claims.jti, "host_settled_runner_frame_ignored");
-                    for frame in frames { write_frame(&mut cw,&frame).await.at(Side::Client, "relay")?; }
-                    runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms()).at(Side::Host, "relay")?;
+                    for frame in frames { relay_trace.client_frame(&mut cw,&frame).await.at(Side::Client, "relay")?; }
+                    terminal_written.store(true, Ordering::Release);
                     return Ok::<(),anyhow::Error>(());
                 }
                 let frame = frame.at(Side::Guest, "relay")?;
@@ -1145,7 +1289,8 @@ where
                     // forwarding while this connection waits for billing.
                     draining_terminal.store(true, Ordering::Release);
                     if runtime.sandbox_identity.is_some() {
-                        write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
+                        relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
+                        terminal_written.store(true, Ordering::Release);
                         return Ok::<(),anyhow::Error>(());
                     }
                     let control = runtime.control.clone();
@@ -1161,13 +1306,13 @@ where
                         if let Some(value) = value { break value; }
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     };
-                    write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
-                    write_frame(&mut cw, &hosted).await.at(Side::Client, "relay")?;
-                    runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms()).at(Side::Host, "relay")?;
-                    tracing::debug!(jti = claims.jti, "connection_terminal_delivered");
+                    relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
+                    relay_trace.client_frame(&mut cw, &hosted).await.at(Side::Client, "relay")?;
+                    terminal_written.store(true, Ordering::Release);
+                    tracing::debug!(jti = claims.jti, "connection_terminal_written");
                     return Ok::<(),anyhow::Error>(());
                 }
-                write_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
+                relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
             }
             #[allow(unreachable_code)]
             Ok::<(), anyhow::Error>(())
@@ -1175,7 +1320,17 @@ where
         tokio::select! { result = to_guest => { result?; }, result = to_client => { result?; } }
         Ok(())
     };
-    tokio::select! { result = connected => result, _ = connection_ended(&mut updates, (claims.purpose == Purpose::Run).then_some(deadline)) => Ok(()) }
+    let result = tokio::select! { result = connected => result, _ = connection_ended(&mut updates, (claims.purpose == Purpose::Run).then_some(deadline)) => Ok(()) };
+    if streamed.load(Ordering::Acquire) {
+        // The connection record, and with it the lease's hold on the tenant,
+        // stays in place until this drain ends; `connection.finish()` runs after.
+        let clean = close_client(&mut client, &claims.jti).await;
+        if clean && terminal_written.load(Ordering::Acquire) {
+            runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms()).at(Side::Host, "terminal_delivered")?;
+            tracing::debug!(jti = claims.jti, "connection_terminal_delivered");
+        }
+    }
+    result
     }.await
     .map_err(|error| error.context(ConnectionJob(claims.jti.clone())));
     connection.finish().await;
@@ -1187,6 +1342,7 @@ async fn serve_stored(
     job: &str,
     first: &Value,
     client: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    terminal_written: &AtomicBool,
 ) -> Result<()> {
     if first["type"] != "hello" {
         return Err(closed(Side::Client, "stored_hello", "expected hello"));
@@ -1222,12 +1378,7 @@ async fn serve_stored(
                         .await
                         .at(Side::Client, "stored_terminal")?;
                 }
-                runtime
-                    .host
-                    .lock()
-                    .expect("host lock")
-                    .terminal_delivered(job, unix_ms())
-                    .at(Side::Host, "stored_terminal")?;
+                terminal_written.store(true, Ordering::Release);
                 return Ok(());
             }
             Some("job_status") => {
@@ -1247,6 +1398,79 @@ async fn serve_stored(
                 .await
                 .at(Side::Client, "stored_cancel")?,
             _ => return Err(closed(Side::Client, "stored_request", "operation_refused")),
+        }
+    }
+}
+
+/// How long a connection that has finished sending waits for its client to
+/// read the rest and close. Everything still in flight at that point fits in
+/// the two ends' socket buffers: Linux and macOS autotune each to a few MiB at
+/// most, so under 16 MiB in all. Two minutes covers that at about 140 KiB/s,
+/// well below the slowest rate seen from a real client (about 320 KiB/s). A
+/// client that has everything closes at once; this bound only limits how long
+/// a stalled one holds the connection open.
+pub const CLIENT_DRAIN_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Ends a client connection that carried job frames so that frames already
+/// written still reach the client.
+///
+/// Dropping a TCP socket while the client's heartbeats sit unread in its
+/// receive queue, or arrive after the drop, makes the kernel answer with a
+/// reset. A reset discards whatever the host had not yet sent, and can make the
+/// client discard what it had not yet read, so a slow client lost the end of
+/// its output and the terminal record. Instead, finish the write side (TLS
+/// close_notify, then FIN after all queued data), then read and discard client
+/// input until the client closes, bounded by [`CLIENT_DRAIN_DEADLINE`]. Returns
+/// true when the client closed its side within the deadline, and false when
+/// shutdown or a read failed or the deadline passed. The caller uses true as
+/// its delivery signal: a client that closes with frames still unread in its
+/// socket resets the connection rather than closing it, though the host cannot
+/// see whether the client program itself handled them.
+async fn close_client(client: &mut (impl AsyncRead + AsyncWrite + Unpin), jti: &str) -> bool {
+    let started = tokio::time::Instant::now();
+    let deadline = started + CLIENT_DRAIN_DEADLINE;
+    let shutdown = match tokio::time::timeout_at(deadline, client.shutdown()).await {
+        Ok(result) => result.map_err(|error| format!("{:?}: {error}", error.kind())),
+        Err(_) => Err("timed out".to_owned()),
+    };
+    if let Err(cause) = shutdown {
+        tracing::info!(
+            jti,
+            side = "client",
+            step = "drain",
+            cause,
+            "client_drain_ended"
+        );
+        return false;
+    }
+    let mut buffer = [0; 4096];
+    let cause = loop {
+        match tokio::time::timeout_at(deadline, client.read(&mut buffer)).await {
+            Ok(Ok(0)) => break None,
+            Ok(Ok(_)) => {}
+            // A TLS client that closes its socket without sending close_notify
+            // shows up as UnexpectedEof; count it as a close, like a plain EOF.
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => break None,
+            Ok(Err(error)) => break Some(format!("{:?}: {error}", error.kind())),
+            Err(_) => break Some("timed out".to_owned()),
+        }
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match cause {
+        None => {
+            tracing::debug!(jti, elapsed_ms, "client_drain_closed");
+            true
+        }
+        Some(cause) => {
+            tracing::info!(
+                jti,
+                side = "client",
+                step = "drain",
+                cause,
+                elapsed_ms,
+                "client_drain_ended"
+            );
+            false
         }
     }
 }

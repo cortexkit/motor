@@ -1,7 +1,7 @@
 # Installing the runner
 
 This guide sets up a dedicated Linux build server to run `motor-runner`, and a
-Mac to reach it with `ck-motor`. It covers the host, the sandbox accounts, the
+client machine to reach it with `ck-motor`. It covers the host, the sandbox accounts, the
 tools jobs use, the compile cache, the systemd units, optional job networking,
 and the first start. Later upgrades go through
 [drain-and-rollback.md](drain-and-rollback.md); the Windows instance has its own
@@ -9,9 +9,10 @@ guide, [windows-image.md](windows-image.md).
 
 The scripts under `script/runner/` encode one host layout: shared state under
 `/srv/build`, a single operator account that owns the runner's systemd user
-units, and Mac paths under `/Users`. Read each script's first lines before
-running it; paths such as the operator's home and the network interface name
-are fixed in the scripts and the unit files, and must match your host.
+units, and caller paths under `/Users`, where macOS clients keep their
+checkouts. Read each script's first lines before running it; paths such as the
+operator's home and the network interface name are fixed in the scripts and the
+unit files, and must match your host.
 
 ## Host requirements
 
@@ -19,9 +20,9 @@ are fixed in the scripts and the unit files, and must match your host.
   system services; do not share the machine with unrelated workloads.
 - An XFS filesystem with reflink support mounted at `/srv/build`. The runner
   clones workspaces and targets with reflinks, which work only within one
-  filesystem, so caller paths (`/Users`) must live on the same filesystem.
-  `setup.sh` bind-mounts `/srv/build/Users` at `/Users` and probes a reflink
-  copy across them.
+  filesystem, so caller paths must live on the same filesystem. `setup.sh`
+  prepares only `/Users`, the macOS client location: it bind-mounts
+  `/srv/build/Users` at `/Users` and probes a reflink copy across them.
 - systemd with `PrivatePIDs=` support (systemd 257 or newer; the runner does
   not check the version). The CPU
   accounting parser is tested against output captured from systemd 259. Also
@@ -115,8 +116,8 @@ Do not remove or downgrade a helper still needed by another running instance.
 
 ## 1. Bootstrap the server
 
-From a Mac with an SSH alias for the server (the scripts use `alfonso-runner`
-unless `RUNNER_HOST` names another):
+From the operator machine, with an SSH alias for the server (the scripts use
+`alfonso-runner` unless `RUNNER_HOST` names another):
 
 ```sh
 script/runner/setup.sh
@@ -125,7 +126,8 @@ script/runner/setup.sh
 `setup.sh` refuses to run unless `/srv/build` is a mounted XFS filesystem. It:
 
 - installs the build packages (C toolchain, clang, lld, Git, Node, npm and
-  others), and Rust, cargo-nextest and Bun at the versions the Mac has;
+  others), and Rust, cargo-nextest and Bun at the versions the operator machine
+  has;
 - creates `/srv/build/{src,target,cargo-home,tools-target,mirrors,bundles}`;
 - bind-mounts `/srv/build/Users` at `/Users` through `/etc/fstab` and proves a
   reflink copy between them; it refuses if `/Users` already holds data;
@@ -244,7 +246,7 @@ stay up (`loginctl enable-linger <operator>`).
 | `--windows-cpus LIST` | absent | Linux placement avoidance: Windows VM host CPUs in CPU-list syntax; their online SMT siblings are included. Requires `--windows-slot-lock`. |
 | `--windows-slot-lock PATH` | absent | Absolute path to the shared Windows QEMU slot lock; requires `--windows-cpus`. Read-only observation, never acquires the lock. |
 | `--job-network veth` | absent | Allow outbound networking for jobs that request it. |
-| `--reserve-daemon-core false` | true | Explicitly let a dedicated single-job sandbox use all online CPUs. The fleet default keeps its existing daemon-core reservation policy. |
+| `--reserve-daemon-core false` | true | Explicitly let a dedicated single-job sandbox use all online CPUs. The fleet default keeps its existing daemon-core reservation policy. `--tenant-vm` implies `false`: a tenant VM is sized for its tenant's jobs, so it never keeps a core back (`tenant_mode_never_reserves_a_daemon_core`). |
 | `--boat-profile` | absent | Explicit single-tenant Boat compatibility for systemd 255: omit unsupported PrivatePIDs, retain other isolation and add CPU/PID ceilings. Do not enable it to bypass missing PID isolation on an ordinary build server; the default profile refuses unsupported systemd. See `script/boat-image/README.md`. |
 | `--drain-timeout-s N` | 1800 | Deadline for a SIGUSR1-initiated drain. |
 
@@ -331,7 +333,7 @@ It installs a root-owned timer that deletes checkouts under
 `/etc/systemd/system/motor-review-reaper.service` and
 `/etc/systemd/system/motor-review-reaper.timer`.
 
-## 8. Connect the Mac
+## 8. Connect the client machine
 
 Install `ck-motor` as described in [module.md](module.md): build it, place it
 as a reserved module, enroll its signing key in the vault, add the public key
@@ -345,7 +347,7 @@ systemctl --user is-active motor-runner.service
 journalctl --user -u motor-runner.service -n 50   # "motor-runner serving" with its version
 ```
 
-Then run a job from the Mac, for example `ck motor run -- uname -a` (with
+Then run a job from the client machine, for example `ck motor run -- uname -a` (with
 `admit_direct_exec` enabled; save its one-time secret for
 [`ck motor attach JOB_ID`](module.md#reattaching-after-a-disconnect)), and the [server gate](server-gate.md) from a
 checkout on the server.

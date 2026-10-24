@@ -3,14 +3,19 @@
 import contextlib
 import copy
 import importlib.util
+import inspect
 import io
 from importlib.machinery import SourceFileLoader
 import json
+import os
+import pwd
+import stat
+import subprocess
 import sys
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch, Mock
+from unittest.mock import patch, Mock, MagicMock
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("boat_image_install", HERE / "install.py")
@@ -48,6 +53,12 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(set(manifest["rust_toolchains"]), {
             name + "-x86_64-unknown-linux-gnu" for name in ("1.91.0", "1.96.0", "1.99.0", "stable")})
 
+    def test_accounts_use_boats_system_assigned_rule(self):
+        with patch.object(install.job_account, 'ensure') as ensure, \
+             patch.object(install.subprocess, 'run', return_value=Mock(returncode=0)):
+            install.accounts()
+        ensure.assert_called_once_with('system-assigned', install.run)
+
     def test_wrong_input_hash_is_refused(self):
         pins = copy.deepcopy(self.pins)
         pins["runner_inputs_sha256"]["script/runner/tools.txt"] = "0" * 64
@@ -73,10 +84,48 @@ class RecipeTests(unittest.TestCase):
                 self.assertIn('x86_64-unknown-linux-musl', targets)
             self.assertIn('clippy', components)
 
+    def test_recipe_disables_rustup_self_update_before_installing_toolchains(self):
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        with patch.object(install, 'run', return_value='') as run:
+            install.install_rust(manifest, '/rustup-init')
+        calls = [call.args for call in run.call_args_list]
+        disable = calls.index(('rustup', 'set', 'auto-self-update', 'disable'))
+        installs = [i for i, args in enumerate(calls) if args[:3] == ('rustup', 'toolchain', 'install')]
+        self.assertTrue(installs and disable < min(installs))
+        self.assertEqual(calls[0][0], '/rustup-init')
+        self.assertLess(0, disable)
+
     def test_recipe_uses_server_bun_home_and_preserves_job_path_order(self):
         unit = (HERE / 'motor-boat.service').read_text()
         self.assertIn('Environment=HOME=/home/ubuntu\n', unit)
         self.assertIn('Environment=PATH=/home/ubuntu/.bun/bin:/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin:', unit)
+
+    def test_pinned_git_is_built_and_precedes_ubuntu_git_for_runner_and_jobs(self):
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        link_dir = manifest['tools']['git']['path_by_role']['boat'].rsplit('/', 1)[0]
+        unit = (HERE / 'motor-boat.service').read_text()
+        runner_path = next(line.split('=', 2)[2] for line in unit.splitlines() if line.startswith('Environment=PATH='))
+        job_path = manifest['job_environment_by_role']['boat']['PATH']
+        for path in (runner_path, job_path):
+            entries = path.split(':')
+            self.assertLess(entries.index(link_dir), entries.index('/usr/bin'), path)
+        source = (HERE / 'install.py').read_text()
+        self.assertIn('run("bash", str(ROOT / "script/runner/build-git.sh"))', source)
+        self.assertIn('manifest["tools"]["git"]["source"]["build_packages"]', source)
+
+    def test_binaryen_120_replaces_the_distro_tool_and_is_pinned(self):
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        spec = manifest['tools']['wasm-opt']
+        self.assertEqual('wasm-opt version 120', spec['version'])
+        self.assertEqual('/usr/local/bin/wasm-opt', spec['path_by_role']['boat'])
+        self.assertEqual('ddb097af51d1bdb17300d986b0de7d97422f1933dedb4c9eda3510e0bf4076cc',
+                         spec['source']['sha256'])
+        self.assertNotIn('binaryen', manifest['apt_packages']['required'])
+        self.assertIn('binaryen', install.BOAT_BASE_PURGE)
+        self.assertIn('script/runner/install-binaryen.py', install.RUNNER_INPUTS)
+        self.assertIn("run('/usr/bin/python3', str(ROOT / 'script/runner/install-binaryen.py')",
+                      (HERE / 'install.py').read_text())
+        self.assertIn('"wasm-opt": ["wasm-opt", "--version"]', (HERE / 'install.py').read_text())
 
     def test_recipe_passes_exact_rustup_component_and_target_argv(self):
         manifest = json.loads(install.PARITY_PATH.read_text())
@@ -181,13 +230,16 @@ class RecipeTests(unittest.TestCase):
     def test_host_unit_has_explicit_boat_profile_and_no_enabled_bridge(self):
         unit = (HERE / "motor-boat.service").read_text()
         self.assertIn("--boat-profile", unit)
-        self.assertIn("--max-weight @VCPUS@", unit)
+        # The runner's CPU counts are set at start (sandbox_cpus feeds sized_runner_args), not in the unit.
+        self.assertNotIn("--max-weight", unit)
+        self.assertNotIn("--rustc-slots", unit)
+        self.assertNotIn("@VCPUS@", unit)
         self.assertIn("--job-network veth", unit)
         self.assertIn("User=root", unit)
         self.assertIn('--tenant-vm --tenant-socket-dir /run/motor-tenant', unit)
         self.assertIn('--reserve-daemon-core false', unit)
-        self.assertIn('--free-space-floor-bytes 25769803776', unit)
-        self.assertIn('--free-space-eviction-bytes 34359738368', unit)
+        self.assertIn('--free-space-floor-bytes 34426847232', unit)
+        self.assertIn('--free-space-eviction-bytes 42949672960', unit)
         self.assertIn('RuntimeDirectoryMode=0700', unit)
         self.assertNotIn("[Install]", (HERE / "motor-boat-bridge.service").read_text())
         self.assertEqual(self.pins["probe_port"], 19443)
@@ -197,6 +249,72 @@ class RecipeTests(unittest.TestCase):
             install.target_directories()
         self.assertEqual(run.call_args.args[:8], ('install','-d','-o','root','-g','root','-m','0755'))
         self.assertTrue({'/usr/local/bin','/usr/local/libexec','/etc/systemd/system','/etc/ssh/sshd_config.d','/etc/motor','/etc/motor/tenant'} <= set(run.call_args.args[8:]))
+
+    def test_jobs_memory_policy_is_installed_from_shared_runner_source(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(install, 'run'):
+            systemd = Path(directory)
+            install.install_units(systemd)
+            source = install.ROOT / 'script/runner/units/system/motor-jobs.slice'
+            self.assertEqual((systemd / 'motor-jobs.slice').read_bytes(), source.read_bytes())
+            self.assertIn('script/runner/units/system/motor-jobs.slice', install.RUNNER_INPUTS)
+
+    def test_absent_tool_home_is_created_root_owned_before_tools_install(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(install, 'run') as run:
+            home = Path(tmp, 'ubuntu')
+            self.assertEqual(install.tool_home(home), {'path': str(home), 'created': True})
+        run.assert_called_once_with('install', '-d', '-o', 'root', '-g', 'root', '-m', '0755', str(home))
+        main = (HERE / 'install.py').read_text().split('def main():', 1)[1]
+        self.assertLess(main.index('tool_home()'), main.index('tools(manifest)'))
+
+    def test_tool_home_owned_by_another_account_is_refused_with_its_identity(self):
+        if os.geteuid() == 0:
+            self.skipTest('needs a directory a non-root account owns')
+        uid = os.getuid()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(install, 'run') as run:
+            home, proc = Path(tmp, 'ubuntu'), Path(tmp, 'proc')
+            home.mkdir(mode=0o755)
+            for pid, owner in (('123', uid), ('456', uid + 1)):
+                (proc / pid).mkdir(parents=True)
+                (proc / pid / 'status').write_text(f'Name:\tfixture\nUid:\t{owner}\t{owner}\t{owner}\t{owner}\n')
+            (proc / 'self').mkdir()
+            with self.assertRaises(ValueError) as refused:
+                install.tool_home(home, proc)
+        run.assert_not_called()
+        message = str(refused.exception)
+        self.assertIn(f'is owned by uid {uid} (', message)
+        try:
+            self.assertIn(pwd.getpwuid(uid).pw_name + ':x:' + str(uid), message)
+        except KeyError:
+            self.assertIn('no passwd entry', message)
+        self.assertIn('running processes: [123]', message)
+
+    def test_tool_home_must_be_a_root_directory_without_group_or_other_write(self):
+        for mode, expected in ((0o040755, None), (0o040775, 'mode 0775'), (0o040757, 'mode 0757'),
+                               (0o120777, 'physical directory')):
+            home = Mock()
+            home.lstat.return_value = Mock(st_uid=0, st_mode=mode)
+            home.__str__ = lambda _self: '/home/ubuntu'
+            with self.subTest(mode=oct(mode)), patch.object(install, 'run') as run:
+                if expected is None:
+                    self.assertEqual(install.tool_home(home), {'path': '/home/ubuntu', 'created': False})
+                else:
+                    with self.assertRaisesRegex(ValueError, expected):
+                        install.tool_home(home)
+                run.assert_not_called()
+
+    def test_archives_are_extracted_without_recorded_owners_under_a_fixed_umask(self):
+        seen = []
+        def record(*args, **_kwargs):
+            seen.append((args, os.umask(0o022)))
+        previous = os.umask(0o077)
+        try:
+            with patch.object(install, 'run', side_effect=record):
+                install.extract('/srv/build/downloads/node.tar.xz', '/usr/local', '-J', '--strip-components=1')
+            self.assertEqual(os.umask(previous), 0o077)
+        finally:
+            os.umask(previous)
+        self.assertEqual(seen, [(('tar', '--no-same-owner', '--no-same-permissions', '-J', '--strip-components=1',
+                                  '-xf', '/srv/build/downloads/node.tar.xz', '-C', '/usr/local'), 0o022)])
 
     def test_rendered_helper_install_normalizes_every_parent_and_fixed_binary(self):
         calls = []
@@ -242,6 +360,8 @@ class RecipeTests(unittest.TestCase):
         mount = writes['/etc/systemd/system/var-lib-motor\\x2dboat.mount']
         self.assertIn('Requires=motor-boat-restored.service', mount)
         self.assertIn('After=motor-boat-restored.service', mount)
+        self.assertIn('Options=loop,noatime,prjquota\n', mount)
+        self.assertNotIn(',discard', mount)
         for name in ('/etc/systemd/system/var-lib-motor\\x2dboat.mount', '/etc/systemd/system/Users.mount'):
             for directive in ('Requires', 'After'):
                 values = next(line.split('=', 1)[1].split() for line in writes[name].splitlines() if line.startswith(directive + '='))
@@ -295,15 +415,46 @@ class RecipeTests(unittest.TestCase):
 
     def test_storage_rejects_non_reflink_xfs_and_failed_clone(self):
         with patch.object(start, 'mounts', return_value=[]), patch.object(start, 'state_mount'), \
-             patch.object(start, 'users_mount'), patch.object(start.subprocess, 'check_output', return_value='reflink=0'), \
+             patch.object(start, 'users_mount'), patch.object(start.subprocess, 'check_output', side_effect=['rw,prjquota', 'reflink=0']), \
              self.assertRaisesRegex(RuntimeError, 'reflink enabled'):
             start.check_storage()
         with tempfile.TemporaryDirectory() as tmp, patch.object(start, 'STATE', Path(tmp)), \
              patch.object(start, 'USERS', Path(tmp)), patch.object(start, 'mounts', return_value=[]), \
              patch.object(start, 'state_mount'), patch.object(start, 'users_mount'), \
-             patch.object(start.subprocess, 'check_output', return_value='reflink=1'), \
+             patch.object(start.subprocess, 'check_output', side_effect=['rw,prjquota', 'reflink=1']), \
              patch.object(start.fcntl, 'ioctl', side_effect=OSError(95, 'unsupported')), self.assertRaises(OSError):
+             start.check_storage()
+
+    def test_storage_requires_enforced_project_quota(self):
+        with patch.object(start, 'mounts', return_value=[]), patch.object(start, 'state_mount'), \
+             patch.object(start, 'users_mount'), patch.object(start.subprocess, 'check_output', return_value='rw,noquota'), \
+             self.assertRaisesRegex(RuntimeError, 'requires enforced XFS project quotas'):
             start.check_storage()
+
+    def test_trim_storage_invokes_bounded_fstrim_on_verified_mount(self):
+        with self.storage_watch_paths(), patch.object(start, 'mounts', return_value=['verified']), \
+             patch.object(start, 'state_mount') as mount, patch.object(start.subprocess, 'run') as run:
+            start.trim_storage()
+        mount.assert_called_once_with(['verified'])
+        run.assert_called_once_with(['/usr/sbin/fstrim', '--verbose', str(start.STATE)], check=True, timeout=30)
+
+    def test_trim_storage_refuses_changed_identity_or_mount(self):
+        with self.storage_watch_paths(), patch.object(start, 'storage_identity', return_value=(1792, 128, 999)), \
+             patch.object(start.subprocess, 'run') as run, self.assertRaisesRegex(RuntimeError, 'changed Boat storage'):
+            start.trim_storage()
+        run.assert_not_called()
+        with self.storage_watch_paths(), patch.object(start, 'mounts', return_value=[]), \
+             patch.object(start, 'state_mount', side_effect=RuntimeError('not XFS')), \
+             patch.object(start.subprocess, 'run') as run, self.assertRaisesRegex(RuntimeError, 'not XFS'):
+            start.trim_storage()
+        run.assert_not_called()
+
+    def test_trim_storage_propagates_failure_and_timeout(self):
+        for error in (subprocess.CalledProcessError(1, 'fstrim'), subprocess.TimeoutExpired('fstrim', 30)):
+            with self.subTest(error=error), self.storage_watch_paths(), patch.object(start, 'mounts', return_value=[]), \
+                 patch.object(start, 'state_mount'), patch.object(start.subprocess, 'run', side_effect=error), \
+                 self.assertRaises(type(error)):
+                start.trim_storage()
 
     def test_prepare_storage_never_mounts_over_nonempty_views(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -372,22 +523,381 @@ class RecipeTests(unittest.TestCase):
             start.wait_restored(clock=lambda: now[0], pause=pause)
         self.assertEqual(now[0], 3 + start.RESTORE_STABLE_S)
 
-    def test_storage_watch_withdraws_readiness_and_stays_failed_closed(self):
+    def test_storage_identity_rejects_users_reverting_to_root_disk(self):
+        root_device = Path('/').stat().st_dev
+        state, users = Mock(), Mock()
+        state.stat.return_value = Mock(st_dev=root_device + 1, st_ino=128)
+        users.stat.return_value = Mock(st_dev=root_device, st_ino=131)
+        with patch.object(start, 'STATE', state), patch.object(start, 'USERS', users), \
+             self.assertRaisesRegex(RuntimeError, 'Boat storage view changed'):
+            start.storage_identity()
+        users.samefile.assert_not_called()
+
+    def test_storage_identity_requires_same_workspace_directory_not_just_device(self):
+        root_device = Path('/').stat().st_dev
+        state, users = MagicMock(), Mock()
+        state.stat.return_value = Mock(st_dev=root_device + 1, st_ino=128)
+        users.stat.return_value = Mock(st_dev=root_device + 1, st_ino=131)
+        users.samefile.return_value = False
+        with patch.object(start, 'STATE', state), patch.object(start, 'USERS', users), \
+             self.assertRaisesRegex(RuntimeError, 'Boat storage view changed'):
+            start.storage_identity()
+        users.samefile.assert_called_once_with(state / 'state/workspaces')
+
+    @contextlib.contextmanager
+    def storage_watch_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
-            evidence, marker = Path(tmp, 'evidence'), Path(tmp, 'ready')
+            evidence, marker, health, lock = (Path(tmp, name) for name in ('evidence', 'ready', 'health.json', 'lock'))
             evidence.write_text(json.dumps({'identity': [1792, 128, 131]}))
             marker.touch()
-            observations = []
-            def pause(_):
-                observations.append(marker.exists())
-                marker.touch()  # A restarting endpoint cannot restore admission.
-                if len(observations) == 3:
-                    raise InterruptedError('stop watcher')
             with patch.object(start, 'STORAGE_EVIDENCE', evidence), patch.object(start, 'ENDPOINT_READY', marker), \
-                 patch.object(start, 'storage_identity', side_effect=[(1792, 128, 131), RuntimeError('view lost'), (1792, 128, 131)]), \
-                 self.assertRaises(InterruptedError):
+                 patch.object(start, 'STORAGE_HEALTH', health), patch.object(start, 'STORAGE_LOCK', lock), \
+                 patch.object(start, 'storage_identity', return_value=(1792, 128, 131)), \
+                 patch.object(start, 'notify_systemd'), \
+                 patch.object(start.os, 'statvfs', return_value=Mock(f_bavail=64 << 30, f_frsize=1, f_favail=10000)):
+                yield evidence, marker, health
+
+    def test_cold_quota_shortage_withdraws_until_both_filesystems_recover(self):
+        required = (32 << 30) + (64 << 20)
+        available = {'root': required - 4096, 'xfs': 64 << 30}
+        def stats(path):
+            return Mock(f_bavail=available['root' if str(path) == '/' else 'xfs'], f_frsize=1, f_favail=10000)
+        with self.storage_watch_paths() as (_, marker, health):
+            polls = []
+            def pause(_):
+                polls.append(json.loads(health.read_text())['status'])
+                self.assertFalse(marker.exists())
+                if len(polls) == 1:
+                    available['root'] = 64 << 30
+                    available['xfs'] = required - 1
+                elif len(polls) == 2:
+                    available['xfs'] = required
+                else:
+                    raise InterruptedError('stop after recovery')
+            with patch.object(start.os, 'statvfs', side_effect=stats), self.assertRaises(InterruptedError):
                 start.watch_storage(pause=pause)
-            self.assertEqual(observations, [True, False, False])
+            self.assertEqual(polls, ['unhealthy', 'unhealthy', 'healthy'])
+
+    def test_root_shortage_without_capacity_recovery_stays_withdrawn(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            def stats(path):
+                return Mock(f_bavail=(10 if str(path) == '/' else 60) << 30, f_frsize=1, f_favail=10000)
+            polls = []
+            def pause(_):
+                polls.append(json.loads(health.read_text())['status'])
+                self.assertFalse(marker.exists())
+                if len(polls) == 3:
+                    raise InterruptedError('no evictable capacity')
+            with patch.object(start.os, 'statvfs', side_effect=stats), self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause)
+            self.assertEqual(polls, ['unhealthy'] * 3)
+
+    def test_idle_25gb_workspace_reclamation_restores_watcher_health(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            xfs_free = 33_494_822_912
+            polls = []
+            def stats(path):
+                return Mock(f_bavail=(60 << 30) if str(path) == '/' else xfs_free,
+                            f_frsize=1, f_favail=10000)
+            def pause(_):
+                nonlocal xfs_free
+                polls.append(json.loads(health.read_text())['status'])
+                self.assertFalse(marker.exists())
+                if len(polls) == 1:
+                    # Runner eviction and FITRIM recover the retained workspace;
+                    # only the watcher may turn the new sample into healthy state.
+                    xfs_free += 25_501_368_320
+                else:
+                    raise InterruptedError('observed healthy recovery')
+            with patch.object(start.os, 'statvfs', side_effect=stats), self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause)
+            self.assertEqual(polls, ['unhealthy', 'healthy'])
+
+    def test_capacity_sample_cannot_overwrite_a_newer_locked_withdrawal(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            available = {'root': 64 << 30}
+            locks = []
+            @contextlib.contextmanager
+            def ordered_lock():
+                locks.append(True)
+                if len(locks) == 2:
+                    # A setup acquired the lock after an old healthy sample,
+                    # withdrew readiness, and released it before publication.
+                    available['root'] = (32 << 30) - 1
+                    marker.unlink(missing_ok=True)
+                    start.write_storage_health('unhealthy', reason='newer setup withdrawal')
+                yield
+            def stats(path):
+                return Mock(f_bavail=available['root'] if str(path) == '/' else 64 << 30, f_frsize=1, f_favail=10000)
+            def pause(_):
+                self.assertFalse(marker.exists())
+                self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy', 'stale healthy sample replaced the newer withdrawal')
+                raise InterruptedError('publication observed')
+            with patch.object(start, 'storage_lock', ordered_lock), patch.object(start.os, 'statvfs', side_effect=stats), self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause)
+
+    def test_healthy_publication_rechecks_capacity_under_a_nonrecursive_lock(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            held = False
+            samples = []
+            @contextlib.contextmanager
+            def lock():
+                nonlocal held
+                self.assertFalse(held, 'storage lock was acquired recursively')
+                held = True
+                try:
+                    yield
+                finally:
+                    held = False
+            def capacity():
+                samples.append(held)
+                return True
+            def pause(_):
+                self.assertEqual(samples, [False, True])
+                self.assertEqual(json.loads(health.read_text())['status'], 'healthy')
+                raise InterruptedError('publication checked')
+            with patch.object(start, 'storage_lock', lock), patch.object(start, 'quota_capacity_ready', capacity), self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause)
+
+    def test_capacity_check_is_lock_free_and_samples_only_two_filesystems(self):
+        stats = Mock(f_bavail=64 << 30, f_frsize=1)
+        with patch.object(start, 'storage_lock', side_effect=AssertionError('caller already holds this lock')), patch.object(start.os, 'statvfs', return_value=stats) as probe:
+            self.assertTrue(start.quota_capacity_ready())
+        self.assertEqual(probe.call_args_list, [unittest.mock.call(start.STATE), unittest.mock.call('/')])
+
+    def test_storage_withdrawal_records_root_capacity_and_inodes(self):
+        with self.storage_watch_paths() as (_, marker, _):
+            def stats(path):
+                return Mock(f_bavail=123 if str(path) == '/' else 456, f_frsize=4096,
+                            f_favail=789 if str(path) == '/' else 987)
+            with patch.object(start.os, 'statvfs', side_effect=stats):
+                start.withdraw_storage('cold_quota_capacity_below_floor')
+            volumes = json.loads(marker.with_name('endpoint-withdrawal.json').read_text())['volumes']
+            self.assertEqual(volumes['root'], {'volume': '/', 'free_bytes': 123 * 4096, 'free_inodes': 789})
+            self.assertEqual(set(volumes), {'root', 'runner_state', 'workspace'})
+
+    def test_storage_withdrawal_records_root_probe_failure(self):
+        with self.storage_watch_paths() as (_, marker, _):
+            def stats(path):
+                if str(path) == '/':
+                    raise OSError('root unavailable')
+                return Mock(f_bavail=456, f_frsize=4096, f_favail=987)
+            with patch.object(start.os, 'statvfs', side_effect=stats):
+                start.withdraw_storage()
+            root = json.loads(marker.with_name('endpoint-withdrawal.json').read_text())['volumes']['root']
+            self.assertEqual(root, {'volume': '/', 'probe_error': 'root unavailable'})
+
+    def test_storage_watch_starts_withdrawn_before_reading_evidence(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            def read_evidence():
+                self.assertFalse(marker.exists())
+                self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+                raise ValueError('bad evidence')
+            with patch.object(start, 'STORAGE_EVIDENCE', Mock(read_text=read_evidence)), \
+                 self.assertRaisesRegex(ValueError, 'bad evidence'):
+                start.watch_storage()
+            self.assertFalse(marker.exists())
+
+    def test_storage_watch_starts_before_endpoint_runtime_directory_exists(self):
+        with self.storage_watch_paths() as (_, old_marker, health):
+            marker = old_marker.parent / 'motor' / 'endpoint-ready'
+            self.assertFalse(marker.parent.exists())
+            notifications = []
+            def notify(message):
+                notifications.append(message)
+                self.assertFalse(marker.exists())
+                self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+            def pause(_):
+                self.assertEqual(json.loads(health.read_text())['status'], 'healthy')
+                self.assertFalse(marker.exists())
+                raise InterruptedError('first healthy poll completed')
+            with patch.object(start, 'ENDPOINT_READY', marker), self.assertRaisesRegex(InterruptedError, 'first healthy poll'):
+                start.watch_storage(pause=pause, notify=notify)
+            self.assertEqual(notifications, ['READY=1'])
+            self.assertEqual(marker.parent.stat().st_mode & 0o777, 0o755)
+            withdrawal = json.loads(marker.with_name('endpoint-withdrawal.json').read_text())
+            self.assertEqual(withdrawal['rule'], 'storage_watch_failed: first healthy poll completed')
+            self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+
+    def test_storage_watch_withdraws_before_logging_even_when_logging_fails(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            def pause(_):
+                marker.touch()
+            def log(*args, **kwargs):
+                self.assertFalse(marker.exists())
+                self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+                raise BrokenPipeError('journal unavailable')
+            with patch.object(start, 'storage_identity', side_effect=[(1792, 128, 131), RuntimeError('view lost')]), \
+                 patch('builtins.print', side_effect=log), self.assertRaises(BrokenPipeError):
+                start.watch_storage(pause=pause)
+            self.assertFalse(marker.exists())
+
+    def test_storage_watch_all_loop_exceptions_withdraw_and_escape(self):
+        for source in ('evidence_json', 'evidence_missing', 'identity', 'pause', 'notify', 'health_write'):
+            with self.subTest(source=source), self.storage_watch_paths() as (evidence, marker, health), contextlib.ExitStack() as stack:
+                if source == 'evidence_json':
+                    evidence.write_text('{')
+                elif source == 'evidence_missing':
+                    evidence.unlink()
+                elif source == 'identity':
+                    stack.enter_context(patch.object(start, 'storage_identity', side_effect=ValueError('stat failed')))
+                elif source == 'notify':
+                    stack.enter_context(patch.object(start, 'notify_systemd', side_effect=OSError('notify failed')))
+                elif source == 'health_write':
+                    original = start.write_storage_health
+                    def write(status, identity=None, reason=None):
+                        if status == 'healthy':
+                            raise OSError('health write failed')
+                        original(status, identity, reason)
+                    stack.enter_context(patch.object(start, 'write_storage_health', side_effect=write))
+                def pause(_):
+                    marker.touch()
+                    raise InterruptedError('pause failed')
+                with self.assertRaises((OSError, ValueError)):
+                    start.watch_storage(pause=pause)
+                self.assertFalse(marker.exists())
+                self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+
+    def test_storage_watch_unlink_failure_is_fatal_and_cleanup_retries(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            unlink, attempts = Path.unlink, []
+            def remove(path, **kwargs):
+                if path == marker:
+                    attempts.append(path)
+                    if len(attempts) == 1:
+                        raise PermissionError('unlink failed')
+                return unlink(path, **kwargs)
+            with patch.object(Path, 'unlink', remove), self.assertRaises(PermissionError):
+                start.watch_storage()
+            self.assertGreaterEqual(len(attempts), 2)
+            self.assertFalse(marker.exists())
+            self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+
+    def test_storage_watch_failed_revocation_write_cannot_leave_healthy_lease(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            original, revocations = start.write_storage_health, []
+            def write(status, identity=None, reason=None):
+                if status == 'unhealthy':
+                    revocations.append(status)
+                    if len(revocations) > 1:
+                        raise OSError('cannot write unhealthy state')
+                original(status, identity, reason)
+            def pause(_):
+                self.assertEqual(json.loads(health.read_text())['status'], 'healthy')
+                marker.touch()
+                raise InterruptedError('stop watcher')
+            with patch.object(start, 'write_storage_health', side_effect=write), self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause)
+            self.assertFalse(marker.exists())
+            self.assertFalse(health.exists(), 'failed revocation must invalidate the old healthy lease')
+
+    def test_storage_watch_heartbeats_only_after_completed_polls_and_never_publishes(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            notifications, pauses = [], []
+            def notify(message):
+                notifications.append(message)
+                self.assertFalse(marker.exists())
+                status = 'unhealthy' if message == 'READY=1' else 'healthy'
+                self.assertEqual(json.loads(health.read_text())['status'], status)
+            def pause(seconds):
+                pauses.append(seconds)
+                self.assertFalse(marker.exists())
+                state = json.loads(health.read_text())
+                self.assertEqual(state['status'], 'healthy')
+                self.assertEqual(state['identity'], [1792, 128, 131])
+                self.assertGreater(state['expires_monotonic_ns'], start.time.monotonic_ns())
+                self.assertLessEqual(state['expires_monotonic_ns'], start.time.monotonic_ns() + 5_000_000_000)
+                self.assertEqual(health.stat().st_mode & 0o777, 0o600)
+                if len(pauses) == 2:
+                    raise InterruptedError('stop watcher')
+            with self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause, notify=notify)
+            self.assertEqual(notifications, ['READY=1', 'WATCHDOG=1'])
+            self.assertEqual(pauses, [1, 1])
+            self.assertFalse(marker.exists())
+            self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+
+    def test_storage_watch_restart_requires_matching_identity_before_healthy(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            for identity in ((1792, 128, 999), (1792, 128, 999)):
+                marker.touch()
+                with patch.object(start, 'storage_identity', return_value=identity), self.assertRaises(RuntimeError):
+                    start.watch_storage()
+                self.assertFalse(marker.exists())
+                self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+            def pause(_):
+                self.assertEqual(json.loads(health.read_text())['status'], 'healthy')
+                self.assertFalse(marker.exists())
+                raise InterruptedError('stop recovered watcher')
+            with self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause)
+
+    def test_storage_watch_clean_exit_in_poll_is_still_a_failure(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            def pause(_):
+                marker.touch()
+                raise SystemExit(0)
+            with self.assertRaisesRegex(RuntimeError, 'exited during a poll'):
+                start.watch_storage(pause=pause)
+            self.assertFalse(marker.exists())
+            self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
+
+    def test_storage_watch_health_lease_expires_without_further_polls(self):
+        with self.storage_watch_paths() as (_, marker, health), patch.object(start.time, 'monotonic_ns', return_value=100):
+            start.write_storage_health('healthy', (1792, 128, 131))
+            self.assertEqual(json.loads(health.read_text())['expires_monotonic_ns'], 5_000_000_100)
+            start.withdraw_storage('storage_identity_changed')
+            withdrawal = json.loads(marker.with_name('endpoint-withdrawal.json').read_text())
+            self.assertEqual(withdrawal['rule'], 'storage_identity_changed')
+            self.assertIn('runner_state', withdrawal['volumes'])
+            self.assertIn('workspace', withdrawal['volumes'])
+            self.assertEqual(json.loads(health.read_text())['expires_monotonic_ns'], 0)
+
+    def test_storage_watch_unit_has_watchdog_cleanup_and_explicit_crash_limit(self):
+        unit = (HERE / 'motor-boat-storage-watch.service').read_text()
+        for setting in ('Type=notify', 'NotifyAccess=main', 'WatchdogSec=5', 'Restart=on-failure',
+                        'RestartSec=1', 'StartLimitIntervalSec=60', 'StartLimitBurst=5',
+                        'RuntimeDirectory=motor-boat-storage', 'RuntimeDirectoryMode=0700',
+                        'RuntimeDirectoryPreserve=yes',
+                        'ExecStopPost=/usr/bin/python3 /usr/local/libexec/motor-boat-start.py --withdraw-storage'):
+            self.assertIn(setting, unit)
+
+    def test_image_config_gates_the_endpoint_marker_writer_on_watcher_health(self):
+        writes = {}
+        with patch.object(install, 'target_directories'), patch.object(install, 'accounts'), \
+             patch.object(install, 'install_units'), patch.object(install, 'state'), \
+             patch.object(install, 'run', return_value='8') as run, patch.object(install.shutil, 'copy2') as copy, \
+             patch.object(Path, 'mkdir'), patch.object(Path, 'unlink'), \
+             patch.object(Path, 'read_text', return_value='Include /etc/ssh/sshd_config.d/*.conf\n'), \
+             patch.object(Path, 'write_text', lambda path, text: writes.__setitem__(str(path), text)):
+            install.configure(self.pins, 'revision')
+        copy.assert_called_once_with(install.ROOT / 'script/runner/sysctl/60-motor-inotify.conf', '/etc/sysctl.d/60-motor-inotify.conf')
+        run.assert_any_call('sysctl', '-p', '/etc/sysctl.d/60-motor-inotify.conf')
+        config = json.loads(writes['/etc/motor/sandbox.json'])
+        self.assertEqual(config['ready_marker'], str(start.ENDPOINT_READY))
+        self.assertEqual(config['storage_health'], {'state_file': str(start.STORAGE_HEALTH),
+            'lock_file': str(start.STORAGE_LOCK), 'identity_paths': [str(start.STATE), str(start.USERS)]})
+        # The endpoint's readiness floor is the runner's admission floor on the
+        # runner's state disk, the one the unit passes the runner.
+        unit = (HERE / 'motor-boat.service').read_text()
+        self.assertIn(f"--free-space-floor-bytes {config['disk_floor']['floor_bytes']} ", unit)
+        self.assertIn(f"--state-root {config['disk_floor']['path']} ", unit)
+
+    def test_storage_watch_notify_uses_systemd_datagram_socket(self):
+        with tempfile.TemporaryDirectory() as tmp, start.socket.socket(start.socket.AF_UNIX, start.socket.SOCK_DGRAM) as receiver:
+            address = str(Path(tmp, 'notify'))
+            receiver.bind(address)
+            receiver.settimeout(1)
+            with patch.dict(start.os.environ, {'NOTIFY_SOCKET': address}):
+                start.notify_systemd('WATCHDOG=1')
+            self.assertEqual(receiver.recv(128), b'WATCHDOG=1')
+
+    def test_storage_withdraw_entry_point_only_revokes(self):
+        with self.storage_watch_paths() as (_, marker, health), \
+             patch.object(sys, 'argv', ['start', '--withdraw-storage']):
+            start.main()
+            self.assertFalse(marker.exists())
+            self.assertEqual(json.loads(health.read_text())['status'], 'unhealthy')
 
     def test_runner_refuses_unmounted_storage_before_spawning(self):
         with patch.object(sys, 'argv', ['start', 'serve']), \
@@ -484,16 +994,51 @@ class RecipeTests(unittest.TestCase):
     def test_bootstrap_and_host_exec_clear_every_provider_prefix(self):
         class ExecObserved(Exception):
             pass
-        def execv(program, args):
-            self.assertEqual(program, '/usr/local/bin/motor-host')
-            self.assertEqual(args, [program, '--sandbox', '/etc/motor/sandbox.json'])
-            self.assertEqual(dict(start.os.environ), {'PATH':'kept'})
-            raise ExecObserved()
-        with patch.dict(start.os.environ, {'ASCII_TOKEN':'secret','BOAT_FUTURE':'secret','BOAT_ID':'id','PATH':'kept'}, clear=True), \
-             patch.object(start, 'check_storage'), \
-             patch.object(sys, 'argv', ['start','--host-exec','--sandbox','/etc/motor/sandbox.json']), patch.object(start.os, 'execv', execv):
-            with self.assertRaises(ExecObserved):
-                start.main()
+        with tempfile.TemporaryDirectory() as tmp:
+            source, sized = Path(tmp, 'sandbox.json'), Path(tmp, 'run-sandbox.json')
+            source.write_text(json.dumps({'vcpu_ceiling': 8, 'job_socket': '/run/motor-tenant/jobs.sock'}))
+            def execv(program, args):
+                self.assertEqual(program, '/usr/local/bin/motor-host')
+                self.assertEqual(args, [program, '--sandbox', str(sized)])
+                self.assertEqual(dict(start.os.environ), {'PATH':'kept'})
+                raise ExecObserved()
+            with patch.dict(start.os.environ, {'ASCII_TOKEN':'secret','BOAT_FUTURE':'secret','BOAT_ID':'id','PATH':'kept'}, clear=True), \
+                 patch.object(start, 'check_storage'), patch.object(start, 'SIZED_SANDBOX', sized), \
+                 patch.object(start, 'sandbox_cpus', return_value=4), \
+                 patch.object(sys, 'argv', ['start','--host-exec','--sandbox',str(source)]), patch.object(start.os, 'execv', execv):
+                with self.assertRaises(ExecObserved):
+                    start.main()
+            self.assertEqual(json.loads(sized.read_text()), {'vcpu_ceiling': 4, 'job_socket': '/run/motor-tenant/jobs.sock'})
+
+    def test_runner_and_endpoint_cpu_counts_follow_the_running_sandbox(self):
+        # An image built on an 8-vCPU large and cloned onto a 4-vCPU default must
+        # admit 4, whatever count an older unit file still carries.
+        self.assertEqual(start.sized_runner_args(['serve', '--max-weight', '8', '--rustc-slots', '8', '--job-network', 'veth'], 4),
+                         ['serve', '--job-network', 'veth', '--max-weight', '4', '--rustc-slots', '4'])
+        self.assertEqual(start.sized_runner_args(['serve'], 2), ['serve', '--max-weight', '2', '--rustc-slots', '2'])
+        with tempfile.TemporaryDirectory() as tmp:
+            source, sized = Path(tmp, 'sandbox.json'), Path(tmp, 'sized.json')
+            source.write_text(json.dumps({'vcpu_ceiling': 8, 'ready_marker': '/run/motor/endpoint-ready'}))
+            self.assertEqual(start.sized_host_args(['--sandbox', str(source)], 4, sized), ['--sandbox', str(sized)])
+            self.assertEqual(json.loads(sized.read_text()), {'vcpu_ceiling': 4, 'ready_marker': '/run/motor/endpoint-ready'})
+            self.assertEqual(sized.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(source.read_text())['vcpu_ceiling'], 8)
+
+    def test_runner_is_started_with_the_measured_cpu_count(self):
+        launched = []
+        class Stop(Exception):
+            pass
+        def popen(argv):
+            launched.append(argv)
+            raise Stop()
+        with patch.object(sys, 'argv', ['start', 'serve', '--boat-profile']), patch.object(start, 'check_storage'), \
+             patch.object(start.Path, 'read_text', return_value=json.dumps({'mem_available_bytes': 8 << 30})), \
+             patch.object(start, 'sandbox_cpus', return_value=4), patch.object(start.subprocess, 'Popen', popen), \
+             self.assertRaises(Stop):
+            start.main()
+        self.assertEqual(launched[0][:6], ['/usr/local/bin/motor-runner', 'serve', '--boat-profile',
+                                           '--max-weight', '4', '--rustc-slots'])
+        self.assertEqual(launched[0][6], '4')
 
     def test_network_preflight_uses_absolute_admin_paths_and_never_applies_rules(self):
         calls = []
@@ -577,6 +1122,338 @@ class RecipeTests(unittest.TestCase):
             (root / 'noble_InRelease').write_text('Date: Wed, 01 Jan 2025 12:00:00 UTC\n')
             with self.assertRaises(ValueError):
                 install.release_manifest(root)
+
+
+class AptInstallTests(unittest.TestCase):
+    def test_held_installed_packages_are_skipped_and_recorded(self):
+        def execute(*args, **kwargs):
+            if args == ('apt-mark', 'showhold'):
+                self.assertTrue(kwargs['capture'])
+                return 'openssh-server\nsystemd'
+            if args == ('dpkg-query', '-W', '-f=${db:Status-Status}\t${Version}', 'openssh-server'):
+                self.assertTrue(kwargs['capture'])
+                return 'installed\t1:9.6p1-3ubuntu13.8'
+            if args[:2] == ('apt-get', 'install'):
+                return ''
+            self.fail(f'unexpected command: {args}')
+        with patch.object(install, 'run', side_effect=execute) as run:
+            record = install.apt_install(['python3', 'openssh-server', 'git'])
+        self.assertEqual(record, {'openssh-server': '1:9.6p1-3ubuntu13.8'})
+        self.assertEqual(run.call_args.args[-2:], ('python3', 'git'))
+        self.assertNotIn('openssh-server', run.call_args.args)
+        self.assertEqual(run.call_args.args[:2], ('apt-get', 'install'))
+
+    def test_held_missing_package_fails_before_install(self):
+        missing = install.subprocess.CalledProcessError(1, 'dpkg-query')
+        for status in (missing, 'config-files\t1:9.6p1', 'unpacked\t1:9.6p1', 'not-installed\t', 'installed\t'):
+            def execute(*args, **kwargs):
+                if args == ('apt-mark', 'showhold'):
+                    return 'openssh-server'
+                if args[:2] == ('dpkg-query', '-W'):
+                    if isinstance(status, Exception):
+                        raise status
+                    return status
+                self.fail(f'package installation must not run: {args}')
+            with self.subTest(status=status), patch.object(install, 'run', side_effect=execute):
+                with self.assertRaisesRegex(RuntimeError, 'required held package openssh-server is not installed'):
+                    install.apt_install(['python3', 'openssh-server'])
+
+    def test_unheld_packages_keep_normal_install_arguments(self):
+        with patch.object(install, 'run', return_value='') as run:
+            self.assertEqual(install.apt_install(['python3', 'git']), {})
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[0].args, ('apt-mark', 'showhold'))
+        self.assertEqual(run.call_args.args,
+                         ('apt-get', 'install', *install.APT_OPTIONS, '-y', '--no-install-recommends', 'python3', 'git'))
+
+    def test_all_held_packages_need_no_install(self):
+        with patch.object(install, 'run', side_effect=['python3', 'installed\t3.12.3']) as run:
+            self.assertEqual(install.apt_install(['python3']), {'python3': '3.12.3'})
+        self.assertEqual(run.call_count, 2)
+        self.assertFalse(any(call.args[:2] == ('apt-get', 'install') for call in run.call_args_list))
+
+    def test_recipe_never_overrides_or_removes_holds(self):
+        source = (HERE / 'install.py').read_text()
+        self.assertNotIn('--allow-change-held-packages', source)
+        self.assertNotIn('unhold', source)
+
+    def test_image_inventory_records_held_packages(self):
+        manifest = json.loads(install.PARITY_PATH.read_text())
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
+            root = Path(tmp)
+            for directory in ('etc/apt', 'srv/build', 'var/lib/motor-boat'):
+                (root / directory).mkdir(parents=True)
+            (root / 'etc/os-release').write_text('VERSION_ID="24.04"\n')
+            (root / 'srv/build/boat-provider-audit.json').write_text('{}')
+            args = Mock(revision='abc', apt_preflight_only=False, cargo_seed_manifest=Path('seed.json'),
+                        cargo_seed_archive=Path('seed.tar'), cargo_seed_sha256='a' * 64,
+                        acknowledge_tenant_one_private_cache=True)
+            stack.enter_context(patch.object(install.argparse.ArgumentParser, 'parse_args', return_value=args))
+            stack.enter_context(patch.object(install.os, 'geteuid', return_value=0))
+            stack.enter_context(patch.object(install.os, 'chdir'))
+            stack.enter_context(patch.dict(install.os.environ))
+            stack.enter_context(patch.object(install, 'Path', side_effect=lambda path: root / str(path).lstrip('/')))
+            for name, value in (('BUILD', root / 'srv/build'), ('STATE', root / 'var/lib/motor-boat'),
+                                ('APT_LISTS', root / 'var/lib/apt/lists/motor-boat')):
+                stack.enter_context(patch.object(install, name, value))
+            for name in ('validate', 'apt_update', 'target_directories', 'accounts', 'tools', 'configure',
+                         'service_preflight', 'install_permission_helper'):
+                stack.enter_context(patch.object(install, name))
+            for name in ('release_manifest', 'boat_base_layout', 'tool_home'):
+                stack.enter_context(patch.object(install, name, return_value={}))
+            stack.enter_context(patch.object(install, 'digest', return_value='a' * 64))
+            stack.enter_context(patch.object(install.parity.seed, 'verified_manifest', return_value={}))
+            stack.enter_context(patch.object(install.parity.seed, 'install', return_value={}))
+            stack.enter_context(patch.object(install.parity, 'check', return_value={'passed': True}))
+            stack.enter_context(patch.object(install.root_paths, 'require', return_value={}))
+            def execute(*command, **kwargs):
+                if command[:3] == ('git', '-C', str(install.ROOT)):
+                    return 'abc' if command[3] == 'rev-parse' else ''
+                if command[:2] == ('systemctl', 'show'):
+                    return '255.4'
+                if command == ('apt-mark', 'showhold'):
+                    return 'openssh-server'
+                if command == ('dpkg-query', '-W', '-f=${db:Status-Status}\t${Version}', 'openssh-server'):
+                    return 'installed\t1:9.6p1-3ubuntu13.8'
+                return ''
+            run = stack.enter_context(patch.object(install, 'run', side_effect=execute))
+            with contextlib.redirect_stdout(io.StringIO()):
+                install.main()
+            inventory = json.loads((root / 'var/lib/motor-boat/inventory.json').read_text())
+        self.assertEqual(inventory['apt_held_packages'], {'openssh-server': '1:9.6p1-3ubuntu13.8'})
+        command = next(call.args for call in run.call_args_list if call.args[:2] == ('apt-get', 'install'))
+        self.assertNotIn('openssh-server', command)
+        for package in manifest['apt_packages']['required']:
+            if package != 'openssh-server':
+                self.assertIn(package, command)
+
+
+class BoatBaseLayoutTests(unittest.TestCase):
+    """Boat's base image ships /usr/local owned by its sandbox account, with
+    the provider's Go, rustup, Cargo and Ruby installs inside Ubuntu's skeleton
+    directories. The fixture reproduces that layout; ownership is simulated
+    through a table that Path.lstat reports and the injected chown updates, so
+    the tests need not run as root and every re-own call is observable."""
+    # A stand-in for Boat's uid 1000; any non-root uid shows the same.
+    PROVIDER = install.BOAT_BASE_UID
+    SKELETON = ("usr/local", "usr/local/bin", "usr/local/etc", "usr/local/games", "usr/local/include",
+                "usr/local/lib", "usr/local/sbin", "usr/local/share", "usr/local/share/man", "usr/local/src",
+                "usr/local/share/ca-certificates")
+    # Every entry at or beneath these belongs to the provider unless ROOT_INSIDE names it.
+    PROVIDER_TREES = ("usr/local/go", "usr/local/rustup", "usr/local/cargo", "usr/local/include/ruby-4.0.0",
+                      "usr/local/lib/ruby", "usr/local/share/doc/ruby", "opt/provider")
+    PROVIDER_ENTRIES = ("usr/local/man", "usr/local/bin/go", "usr/local/bin/cargo", "usr/local/bin/ruby",
+                        "usr/local/lib/libruby.so.4.0", "usr/local/lib/provider-opt",
+                        "usr/local/share/ca-certificates/provider.crt")
+    # A root-owned file inside a provider tree goes with the tree.
+    ROOT_INSIDE = ("usr/local/include/ruby-4.0.0/ruby/config.h",)
+    # What the layout step removes, grouped as the inventory records it.
+    REMOVED = {
+        "/usr/local/bin/cargo": 1, "/usr/local/bin/go": 1, "/usr/local/bin/ruby": 1,
+        "/usr/local/cargo": 3, "/usr/local/go": 5,
+        "/usr/local/include/ruby-4.0.0": 5,
+        "/usr/local/lib/libruby.so.4.0": 1, "/usr/local/lib/provider-opt": 1, "/usr/local/lib/ruby": 7,
+        "/usr/local/rustup": 5,
+        "/usr/local/share/ca-certificates": 1, "/usr/local/share/doc": 2,
+    }
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.image = Path(os.path.realpath(temp.name), "image")
+        directories = ("usr/local/go/bin", "usr/local/go/src", "usr/local/rustup/toolchains/stable/bin",
+                       "usr/local/cargo/bin", "usr/local/include/ruby-4.0.0/ruby",
+                       "usr/local/lib/ruby/4.0.0/x86_64-linux", "usr/local/share/doc/ruby", "opt/provider",
+                       # Ours, root-owned, already present before the step.
+                       "usr/bin", "usr/local/lib/git/2.53.0/bin", "home/ubuntu/.bun/bin", "home/ubuntu/.rustup",
+                       "srv/build/cargo-home/bin")
+        for relative in self.SKELETON + directories:
+            (self.image / relative).mkdir(parents=True, exist_ok=True)
+        for relative in ("usr/local/go/bin/go", "usr/local/go/src/main.go", "usr/local/cargo/bin/cargo",
+                         "usr/local/rustup/toolchains/stable/bin/rustc", "usr/local/include/ruby-4.0.0/ruby.h",
+                         "usr/local/include/ruby-4.0.0/ruby/version.h", "usr/local/include/ruby-4.0.0/ruby/config.h",
+                         "usr/local/lib/ruby/4.0.0/set.rb", "usr/local/lib/ruby/4.0.0/x86_64-linux/rbconfig.rb",
+                         "usr/local/lib/ruby/4.0.0/ruby", "usr/local/lib/ruby/4.0.0/gem",
+                         "usr/local/lib/libruby.so.4.0", "usr/local/share/ca-certificates/provider.crt",
+                         "usr/local/share/doc/ruby/README", "opt/provider/tool",
+                         "usr/local/bin/motor-runner", "usr/local/lib/git/2.53.0/bin/git", "usr/bin/python3"):
+            (self.image / relative).write_text("#!/bin/sh\n")
+            (self.image / relative).chmod(0o755)
+        (self.image / "usr/local/man").symlink_to("share/man")
+        (self.image / "usr/local/bin/git").symlink_to("../lib/git/2.53.0/bin/git")
+        # Provider command links into its trees, absolute and relative.
+        (self.image / "usr/local/bin/go").symlink_to("/usr/local/go/bin/go")
+        (self.image / "usr/local/bin/cargo").symlink_to("../cargo/bin/cargo")
+        (self.image / "usr/local/bin/ruby").symlink_to("../lib/ruby/4.0.0/ruby")
+        # Root-owned links into provider trees, in and outside /usr/local.
+        (self.image / "usr/local/bin/gem").symlink_to("../lib/ruby/4.0.0/gem")
+        (self.image / "usr/bin/go").symlink_to("/usr/local/go/bin/go")
+        # Links out of /usr/local to a provider directory elsewhere: the
+        # provider's own link is removed as a link, root's stays, and neither
+        # leads the walk to opt/provider.
+        (self.image / "usr/local/lib/provider-opt").symlink_to("../../../opt/provider")
+        (self.image / "usr/local/share/opt-view").symlink_to("../../../opt/provider")
+        (self.image / "bin").symlink_to("usr/bin")
+        # Boat's /usr/local/share is also group-writable in this fixture.
+        (self.image / "usr/local/share").chmod(0o775)
+        self.owners = {}
+        for path in self.entries():
+            relative = str(path.relative_to(self.image))
+            provider = (relative in self.SKELETON + self.PROVIDER_ENTRIES or any(
+                relative == tree or relative.startswith(tree + "/") for tree in self.PROVIDER_TREES))
+            self.owners[path] = (self.PROVIDER, self.PROVIDER) if provider and relative not in self.ROOT_INSIDE else (0, 0)
+        self.chowned = []
+
+    def entries(self):
+        """Every path in the fixture, without following symlinks."""
+        for directory, directories, files in os.walk(self.image):
+            for name in ["", *directories, *files]:
+                yield Path(directory, name) if name else Path(directory)
+
+    def snapshot(self):
+        return {path: path.lstat().st_mode for path in self.entries()}
+
+    @staticmethod
+    def inode(path):
+        """The key lstat and lchown act on: every directory above the last
+        component resolved, the last component itself not, so a path reached
+        through a symlinked directory reports the owner of what it reaches."""
+        path = Path(path)
+        return Path(os.path.realpath(path.parent), path.name)
+
+    def chown(self, path, uid, gid):
+        self.chowned.append(Path(path))
+        self.owners[self.inode(path)] = (uid, gid)
+
+    def simulated(self):
+        real = Path.lstat
+
+        def lstat(path):
+            metadata = real(path)
+            uid, gid = self.owners.get(self.inode(path), (0, 0))
+            return Mock(st_uid=uid, st_gid=gid, st_mode=metadata.st_mode)
+
+        return patch.object(Path, "lstat", lstat)
+
+    def check(self):
+        # The report keeps only the first few offenders, in directory walk
+        # order, which differs between filesystems; ask for all of them so a
+        # named offender is found wherever the walk meets it.
+        with self.simulated():
+            return install.root_paths.check(install.root_paths.BOAT_ROOTS, self.image, 0,
+                                            limit=None)
+
+    def apply(self, **options):
+        with self.simulated():
+            return install.boat_base_layout(self.image, chown=self.chown, **options)
+
+    def test_build_refuses_before_the_layout_step_and_passes_after_it(self):
+        before = self.check()
+        self.assertGreater(before["offender_count"], 0)
+        for offender in ("usr/local/go", "usr/local/include/ruby-4.0.0", "usr/local/bin/ruby"):
+            self.assertIn(f"{self.image}/{offender}: uid={self.PROVIDER} gid={self.PROVIDER}", before["offenders"])
+        with self.simulated(), self.assertRaisesRegex(ValueError, "root executes from are not owned by uid 0"):
+            install.root_paths.require(install.root_paths.BOAT_ROOTS, self.image, 0)
+        report = self.apply()
+        after = self.check()
+        self.assertEqual((after["offender_count"], after["offenders"]), (0, []))
+        with self.simulated():
+            install.root_paths.require(install.root_paths.BOAT_ROOTS, self.image, 0)
+        self.assertEqual(report["removed"], self.REMOVED)
+        self.assertEqual(report["removed_entries"], sum(self.REMOVED.values()))
+        for tree in self.PROVIDER_TREES[:-1] + self.PROVIDER_ENTRIES[1:]:
+            self.assertFalse(os.path.lexists(self.image / tree), tree)
+        self.assertFalse(os.path.lexists(self.image / self.ROOT_INSIDE[0]))
+        # Root's links into removed entries go too; the provider's own links
+        # were removed as entries and are not listed twice.
+        self.assertEqual([(row["path"], row["uid"]) for row in report["unlinked"]],
+                         [("/usr/local/bin/gem", 0), ("/usr/bin/go", 0)])
+        # Our own installs beside the provider's survive untouched.
+        for kept in ("usr/local/bin/motor-runner", "usr/local/bin/git", "usr/local/lib/git/2.53.0/bin/git",
+                     "usr/local/share/doc", "usr/local/man", "usr/bin/python3"):
+            self.assertTrue(os.path.lexists(self.image / kept), kept)
+        self.assertEqual(stat.S_IMODE((self.image / "usr/local/share").lstat().st_mode), 0o755)
+
+    def test_only_the_skeleton_is_re_owned(self):
+        report = self.apply()
+        named = {self.image / name.lstrip("/") for name in install.BOAT_BASE_USR_LOCAL["skeleton"]}
+        self.assertTrue(set(self.chowned) <= named)
+        self.assertEqual(len(self.chowned), len(set(self.chowned)))
+        present = {path for path in named if os.path.lexists(path)}
+        self.assertEqual(set(self.chowned), present)
+        self.assertEqual({self.image / row["path"].lstrip("/") for row in report["reowned"]}, present)
+        self.assertEqual(sorted(report["absent"]), ["/usr/local/lib/python3.12", "/usr/local/lib/python3.12/dist-packages"])
+
+    def test_provider_entries_go_at_any_depth_while_unsafe_root_entries_still_fail_the_check(self):
+        # The layout step removes what the sandbox account owns, wherever it is
+        # under /usr/local. This root-owned directory is not a skeleton path,
+        # so the step leaves its group-write bit set and the root-owned path
+        # check must still report it by name.
+        deep = self.image / "usr/local/lib/git/2.53.0/bin/provider-extra"
+        deep.write_text("")
+        self.owners[deep] = (self.PROVIDER, self.PROVIDER)
+        writable = self.image / "usr/local/share/root-writable"
+        writable.mkdir()
+        writable.chmod(0o777)
+        report = self.apply()
+        self.assertFalse(os.path.lexists(deep))
+        self.assertEqual(report["removed"]["/usr/local/lib/git"], 1)
+        self.assertNotIn(writable, self.chowned)
+        self.assertEqual(self.check()["offenders"], [f"{writable}: mode=0777 (group or other may write)"])
+
+    def test_the_walk_never_follows_symlinks(self):
+        self.apply()
+        # Both links lead to a provider directory outside /usr/local; the
+        # provider's link is removed as a link and root's stays, while the
+        # directory they point at, and the provider file in it, are untouched.
+        self.assertFalse(os.path.lexists(self.image / "usr/local/lib/provider-opt"))
+        self.assertTrue((self.image / "usr/local/share/opt-view").is_symlink())
+        self.assertTrue((self.image / "opt/provider/tool").is_file())
+
+    def test_an_unexpected_owner_refuses_before_anything_changes(self):
+        cases = (("usr/local/lib", "refusing to re-own /usr/local/lib: owned by uid 4321", 4321),
+                 ("usr/local/lib/ruby/4.0.0/set.rb", "refusing to remove /usr/local/lib/ruby/4.0.0/set.rb: "
+                  "owned by uid 1001", 1001),
+                 ("usr/local/lib/git/2.53.0/bin/git", "refusing to leave in place "
+                  "/usr/local/lib/git/2.53.0/bin/git: owned by uid 1001", 1001))
+        for relative, message, uid in cases:
+            with self.subTest(relative):
+                before = self.snapshot()
+                saved = self.owners[self.image / relative]
+                self.owners[self.image / relative] = (uid, uid)
+                with self.assertRaisesRegex(ValueError, message):
+                    self.apply()
+                self.assertEqual(self.chowned, [])
+                self.assertEqual(self.snapshot(), before)
+                self.owners[self.image / relative] = saved
+
+    def test_a_removal_that_would_take_the_running_recipe_refuses_first(self):
+        # As if the recipe ran on the provider's interpreter, whose standard
+        # library sits in a tree the step would remove.
+        stdlib = self.image / "usr/local/lib/ruby/4.0.0"
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, f"{stdlib} is among them and this recipe runs from it"):
+            self.apply(protected={stdlib})
+        self.assertEqual((self.chowned, self.snapshot()), ([], before))
+        running = install.running_paths()
+        self.assertIn(Path(os.path.realpath(sys.executable)), running)
+        self.assertIn(install.ROOT, running)
+
+    def test_reapplying_changes_nothing(self):
+        self.apply()
+        self.chowned.clear()
+        again = self.apply()
+        self.assertEqual((again["removed"], again["removed_entries"], again["unlinked"], again["reowned"],
+                          self.chowned), ({}, 0, [], [], []))
+
+    def test_the_recipe_settles_the_layout_before_installing_and_checks_after(self):
+        main = inspect.getsource(install.main)
+        step = main.index("boat_base_layout()")
+        self.assertLess(main.index("target_directories()"), step)
+        for later in ("tool_home()", "tools(manifest)", "service_preflight()",
+                      "root_paths.require(root_paths.BOAT_ROOTS)"):
+            self.assertLess(step, main.index(later), later)
+        self.assertIn("boat_base_layout=base_layout", main)
 
 
 if __name__ == "__main__":

@@ -114,7 +114,25 @@ pub struct LeaseRequest {
     #[serde(deserialize_with = "required_nullable")]
     pub avoid_host: Option<String>,
     pub timeout_s: u64,
+    /// False restricts placement to registered hosts; true lets the broker
+    /// spill the lease to Boat. The broker refuses a lease body without it
+    /// (400 `bad_request`), so every newly built request must set it. It stays
+    /// optional in this type so lease requests that ck-motor stored before it
+    /// always sent the member still deserialize; re-sent unchanged, the broker
+    /// refuses them.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_boolean"
+    )]
+    pub allow_spill: Option<bool>,
     pub requester_jwk: RequesterJwk,
+}
+
+fn optional_boolean<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error> {
+    bool::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -19,6 +19,37 @@ foreach ($name in @('bootstrap.ps1', 'setup-guest.ps1', 'setup-job-baseline.ps1'
 # These assertions defend the provisioning inputs, not Windows installer behavior.
 $baseline = Get-Content (Join-Path $Scripts 'setup-job-baseline.ps1') -Raw
 $ast = [Management.Automation.Language.Parser]::ParseInput($baseline, [ref]$null, [ref]$null)
+foreach ($commandText in @('& $rustup component add clippy rustfmt --toolchain $toolchain', '& $rustup target add aarch64-pc-windows-msvc --toolchain $toolchain')) {
+    $commands = @($ast.FindAll({param($node) $node -is [Management.Automation.Language.CommandAst] -and $node.Extent.Text -eq $commandText}, $true))
+    Assert ($commands.Count -eq 1) "expected one unconditional $commandText"
+    $parent = $commands[0].Parent
+    while ($parent -ne $ast) {
+        Assert ($parent -is [Management.Automation.Language.PipelineAst] -or $parent -is [Management.Automation.Language.NamedBlockAst]) "conditional Rust installation: $commandText"
+        $parent = $parent.Parent
+    }
+}
+$checks++
+Write-Host 'PASS rust_components_and_arm64_target_unconditional'
+
+# Execute the real inventory guards with complete and incomplete rustup output.
+$hostTriple = 'x86_64-pc-windows-msvc'
+foreach ($inventory in @('components', 'targets')) {
+    $variable = if ($inventory -eq 'components') { 'component' } else { 'target' }
+    $guard = $ast.Find({param($node) $node -is [Management.Automation.Language.ForEachStatementAst] -and $node.Variable.VariablePath.UserPath -eq $variable}, $true)
+    Assert ($null -ne $guard) "missing $inventory inventory guard"
+    $complete = if ($inventory -eq 'components') { @("clippy-$hostTriple", "rustfmt-$hostTriple") } else { @($hostTriple, 'aarch64-pc-windows-msvc') }
+    foreach ($missing in @('', $complete[0], $complete[1])) {
+        Set-Variable -Name $inventory -Value @($complete | Where-Object { $_ -ne $missing })
+        $threw = $false
+        try { Invoke-Expression $guard.Extent.Text } catch {
+            Assert ($_.ToString().Contains('Missing Rust')) "unexpected inventory-check error: $_"
+            $threw = $true
+        }
+        Assert ($threw -eq ($missing -ne '')) "$inventory guard accepted missing '$missing' or rejected complete output"
+    }
+    $checks++
+    Write-Host "PASS rust_${inventory}_inventory_rejects_missing_entries"
+}
 $definition = $ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Resolve-MotorTrusteeSid'}, $true)
 Invoke-Expression $definition.Extent.Text
 $resolver = {param($name) if ($name -in @('motor-job','HOST\motor-job')) { 'S-1-5-21-123-1001' } else { throw 'unknown account' }}

@@ -3,7 +3,7 @@
 # server, as the operator (ubuntu). The repository copy is the source of truth:
 # capacity flags such as --max-weight live in units/motor-runner.service.
 #
-# This only writes the unit files and reloads systemd. It never restarts a
+# This writes user units and privileged memory-policy units and reloads systemd. It never restarts a
 # runner: a changed ExecStart takes effect at the next deploy.sh swap, which
 # drains first. Shows a diff and asks before overwriting a file that differs.
 set -euo pipefail
@@ -14,7 +14,16 @@ changed=0
 # own stdin instead of consuming the next file name.
 while IFS= read -r -d '' -u 3 file; do
   rel=${file#"$here/units/"}
-  target=$dest/$rel
+  privileged=0
+  case "$rel" in
+    system/motor-jobs.slice)
+      target=/etc/systemd/system/motor-jobs.slice
+      privileged=1 ;;
+    system/runner-user-manager.conf)
+      target=/etc/systemd/system/user@$(id -u).service.d/motor-oom.conf
+      privileged=1 ;;
+    *) target=$dest/$rel ;;
+  esac
   if [ -f "$target" ] && cmp -s "$file" "$target"; then
     continue
   fi
@@ -30,14 +39,22 @@ while IFS= read -r -d '' -u 3 file; do
   answer=
   read -r -p "Install $rel? [y/N] " answer || true
   [ "$answer" = y ] || { echo "skipped $rel"; continue; }
-  mkdir -p "$(dirname "$target")"
-  [ -f "$target" ] && cp -p "$target" "$target.bak-$(date -u +%Y%m%dT%H%M%SZ)"
-  install -m 0644 "$file" "$target"
+  if [ "$privileged" = 1 ]; then
+    sudo install -d -o root -g root -m 0755 "$(dirname "$target")"
+    [ ! -f "$target" ] || sudo cp -p "$target" "$target.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+    sudo install -o root -g root -m 0644 "$file" "$target"
+  else
+    mkdir -p "$(dirname "$target")"
+    [ ! -f "$target" ] || cp -p "$target" "$target.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+    install -m 0644 "$file" "$target"
+  fi
   changed=1
 done 3< <(find "$here/units" -type f -print0 | sort -z)
 if [ "$changed" = 1 ]; then
+  sudo systemctl daemon-reload
   systemctl --user daemon-reload
-  echo "Units installed. Restart a runner only through deploy.sh."
+  echo "Units installed. Drain all runner instances before rebooting to apply the user-manager OOM score."
+  echo "Do not restart user@$(id -u).service with live jobs. Afterwards restart runners only through deploy.sh."
 else
   echo "Installed units already match the repository."
 fi

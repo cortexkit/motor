@@ -41,6 +41,15 @@ pub trait Connector: Send + Sync {
     fn windows_refusal(&self) -> Option<&'static str> {
         self.refusal()
     }
+    fn macos_refusal(&self) -> Option<&'static str> {
+        self.refusal()
+    }
+    /// The `retry_after_ms` hint for a job this connector refused with
+    /// `code`: how long until the refusal may clear without an operator.
+    /// `None` unless the refusal is transient.
+    fn retry_after_ms(&self, _code: &str) -> Option<u64> {
+        None
+    }
     fn connect(&self, id: Uuid) -> ConnectFuture<'_>;
     fn connect_to<'a>(
         &'a self,
@@ -64,6 +73,9 @@ pub trait Connector: Send + Sync {
     ) -> ConnectFuture<'a> {
         self.connect_to(id, &runner.instance, Some(&runner.state_root))
     }
+    fn connect_macos<'a>(&'a self, id: Uuid, runner: &'a crate::MacosRunner) -> ConnectFuture<'a> {
+        self.connect_to(id, &runner.instance, Some(&runner.state_root))
+    }
 }
 
 pub(crate) struct InstanceConnector {
@@ -74,9 +86,14 @@ impl Connector for InstanceConnector {
     fn refusal(&self) -> Option<&'static str> {
         if self.target.windows.is_some() {
             self.connector.windows_refusal()
+        } else if self.target.macos.is_some() {
+            self.connector.macos_refusal()
         } else {
             self.connector.refusal()
         }
+    }
+    fn retry_after_ms(&self, code: &str) -> Option<u64> {
+        self.connector.retry_after_ms(code)
     }
     fn connect(
         &self,
@@ -84,6 +101,8 @@ impl Connector for InstanceConnector {
     ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + '_>> {
         if let Some(runner) = &self.target.windows {
             self.connector.connect_windows(id, runner)
+        } else if let Some(runner) = &self.target.macos {
+            self.connector.connect_macos(id, runner)
         } else {
             self.connector
                 .connect_to(id, &self.target.instance, self.target.state_root.as_deref())
@@ -414,6 +433,28 @@ impl SshConnector {
         *owned = Some(master);
         Ok(())
     }
+    /// The code health reports. Unlike `refusal`, which lets a job try again
+    /// once a sign failure's backoff has passed, this keeps showing the sign
+    /// failure until a sign succeeds.
+    pub(crate) fn health_refusal(&self) -> Option<&'static str> {
+        self.refusal_from(VaultAgent::health_refusal)
+    }
+    fn refusal_from(
+        &self,
+        agent_refusal: fn(&VaultAgent) -> Option<&'static str>,
+    ) -> Option<&'static str> {
+        if self.credentials.stopped.load(Ordering::Acquire) {
+            return Some("runner_agent_stopped");
+        }
+        let current = self.credentials.current.lock().unwrap();
+        current
+            .failure
+            .or_else(|| current.agent.as_deref().and_then(agent_refusal))
+    }
+    #[cfg(test)]
+    pub(crate) fn agent(&self) -> Option<Arc<VaultAgent>> {
+        self.credentials.current.lock().unwrap().agent.clone()
+    }
 }
 
 impl Drop for SshConnector {
@@ -429,7 +470,7 @@ struct SshPipe {
     read: tokio::process::ChildStdout,
     write: tokio::process::ChildStdin,
     _child: Child,
-    _pin: Option<WindowsPin>,
+    _pin: Option<EndpointPin>,
 }
 impl AsyncRead for SshPipe {
     fn poll_read(
@@ -462,6 +503,9 @@ impl AsyncWrite for SshPipe {
     }
 }
 impl Connector for SshConnector {
+    fn macos_refusal(&self) -> Option<&'static str> {
+        self.windows_refusal()
+    }
     fn windows_refusal(&self) -> Option<&'static str> {
         match self.refusal() {
             Some("runner_ssh_config_invalid") => self
@@ -476,13 +520,13 @@ impl Connector for SshConnector {
         }
     }
     fn refusal(&self) -> Option<&'static str> {
-        if self.credentials.stopped.load(Ordering::Acquire) {
-            return Some("runner_agent_stopped");
-        }
-        let current = self.credentials.current.lock().unwrap();
-        current
-            .failure
-            .or_else(|| current.agent.as_ref().and_then(|agent| agent.refusal()))
+        self.refusal_from(VaultAgent::refusal)
+    }
+    /// Only the signing agent's transient failures carry a hint. Credential,
+    /// agent and SSH configuration refusals need an operator.
+    fn retry_after_ms(&self, code: &str) -> Option<u64> {
+        let agent = self.credentials.current.lock().unwrap().agent.clone()?;
+        agent.retry_after_ms(code)
     }
     fn connect(
         &self,
@@ -547,26 +591,56 @@ impl Connector for SshConnector {
             }) as Box<dyn Duplex>)
         })
     }
+    fn connect_macos<'a>(&'a self, id: Uuid, runner: &'a crate::MacosRunner) -> ConnectFuture<'a> {
+        Box::pin(async move {
+            if self.credentials.unresolved() {
+                self.credentials.refresh().await;
+            }
+            if let Some(reason) = self.macos_refusal() {
+                return Err(io::Error::other(reason));
+            }
+            let agent = self
+                .credentials
+                .current
+                .lock()
+                .unwrap()
+                .agent
+                .clone()
+                .ok_or_else(|| io::Error::other("runner_credential_unavailable"))?;
+            let pin = EndpointPin::for_endpoint("motor-macos", &runner.host_key)?;
+            let mut child =
+                macos_command(id, runner, &agent.socket, &agent.identity, &pin.0).spawn()?;
+            Ok(Box::new(SshPipe {
+                read: child.stdout.take().unwrap(),
+                write: child.stdin.take().unwrap(),
+                _child: child,
+                _pin: Some(pin),
+            }) as Box<dyn Duplex>)
+        })
+    }
 }
 
-struct WindowsPin(std::path::PathBuf);
-impl WindowsPin {
+struct EndpointPin(std::path::PathBuf);
+type WindowsPin = EndpointPin;
+impl EndpointPin {
     fn new(runner: &crate::WindowsRunner) -> io::Result<Self> {
+        Self::for_endpoint("motor-windows", &runner.host_key)
+    }
+    fn for_endpoint(alias: &str, host_key: &str) -> io::Result<Self> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let path =
-            std::env::temp_dir().join(format!("motor-windows-{}.known_hosts", Uuid::now_v7()));
+        let path = std::env::temp_dir().join(format!("{alias}-{}.known_hosts", Uuid::now_v7()));
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&path)?;
         let pin = Self(path);
-        writeln!(file, "motor-windows {}", runner.host_key)?;
+        writeln!(file, "{alias} {host_key}")?;
         Ok(pin)
     }
 }
-impl Drop for WindowsPin {
+impl Drop for EndpointPin {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
@@ -593,6 +667,60 @@ fn windows_ssh_command(
     identity: &Path,
     known_hosts: &Path,
 ) -> Command {
+    endpoint_ssh_command(
+        ExplicitEndpoint {
+            host: &runner.host,
+            port: runner.port,
+            user: &runner.user,
+            alias: "motor-windows",
+            timeout: 3,
+        },
+        socket,
+        identity,
+        known_hosts,
+    )
+}
+
+fn macos_command(
+    id: Uuid,
+    runner: &crate::MacosRunner,
+    socket: &Path,
+    identity: &Path,
+    known_hosts: &Path,
+) -> Command {
+    let mut command = endpoint_ssh_command(
+        ExplicitEndpoint {
+            host: &runner.host,
+            port: runner.port,
+            user: &runner.user,
+            alias: "motor-macos",
+            timeout: 10,
+        },
+        socket,
+        identity,
+        known_hosts,
+    );
+    command.arg(format!(
+        "~/.cargo/bin/motor-runner connect --instance {} --state-root {} --job {id}",
+        runner.instance, runner.state_root
+    ));
+    command
+}
+
+struct ExplicitEndpoint<'a> {
+    host: &'a str,
+    port: u16,
+    user: &'a str,
+    alias: &'a str,
+    timeout: u64,
+}
+
+fn endpoint_ssh_command(
+    endpoint: ExplicitEndpoint<'_>,
+    socket: &Path,
+    identity: &Path,
+    known_hosts: &Path,
+) -> Command {
     let mut command = Command::new("ssh");
     // Each explicit endpoint has its own pin and no shared master. In particular,
     // the legacy build-server master must never carry an explicit endpoint's connection.
@@ -611,18 +739,18 @@ fn windows_ssh_command(
             "-o",
             "GlobalKnownHostsFile=/dev/null",
             "-o",
-            "HostKeyAlias=motor-windows",
-            "-o",
             "ControlMaster=no",
             "-o",
             "ControlPath=none",
-            "-o",
-            "ConnectTimeout=3",
             "-o",
             "PasswordAuthentication=no",
             "-o",
             "KbdInteractiveAuthentication=no",
         ])
+        .arg("-o")
+        .arg(format!("HostKeyAlias={}", endpoint.alias))
+        .arg("-o")
+        .arg(format!("ConnectTimeout={}", endpoint.timeout))
         .arg("-o")
         .arg(format!("IdentityAgent={}", socket.display()))
         .arg("-o")
@@ -630,10 +758,10 @@ fn windows_ssh_command(
         .arg("-i")
         .arg(identity)
         .arg("-p")
-        .arg(runner.port.to_string())
+        .arg(endpoint.port.to_string())
         .arg("-l")
-        .arg(&runner.user)
-        .arg(&runner.host)
+        .arg(endpoint.user)
+        .arg(endpoint.host)
         .env_remove("SSH_AUTH_SOCK")
         .env_remove("SSH_AGENT_PID")
         .env_remove("SUBC_LAUNCH_NONCE")
@@ -708,9 +836,89 @@ mod windows_command_tests {
     }
 }
 
+#[cfg(test)]
+mod macos_command_tests {
+    use super::*;
+
+    #[test]
+    fn macos_endpoint_uses_its_own_pin_vault_identity_and_ten_second_timeout() {
+        let runner = crate::MacosRunner {
+            host: "macos.example.invalid".into(),
+            port: 25578,
+            user: "motor".into(),
+            instance: "macos".into(),
+            state_root: "/Users/motor/state".into(),
+            host_key: "ssh-ed25519 test-pin".into(),
+        };
+        let pin = EndpointPin::for_endpoint("motor-macos", &runner.host_key).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&pin.0).unwrap(),
+            "motor-macos ssh-ed25519 test-pin\n"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&pin.0).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let path = pin.0.clone();
+        let command = macos_command(
+            Uuid::nil(),
+            &runner,
+            Path::new("/vault/s"),
+            Path::new("/vault/identity.pub"),
+            &pin.0,
+        );
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_str().unwrap())
+            .collect();
+        for required in [
+            "BatchMode=yes",
+            "ForwardAgent=no",
+            "IdentitiesOnly=yes",
+            "StrictHostKeyChecking=yes",
+            "GlobalKnownHostsFile=/dev/null",
+            "HostKeyAlias=motor-macos",
+            "ControlMaster=no",
+            "ControlPath=none",
+            "ConnectTimeout=10",
+            "PasswordAuthentication=no",
+            "KbdInteractiveAuthentication=no",
+            "IdentityAgent=/vault/s",
+            "motor",
+            "25578",
+            "macos.example.invalid",
+        ] {
+            assert!(args.contains(&required), "missing {required}: {args:?}");
+        }
+        assert_eq!(args.iter().filter(|a| **a == "-F").count(), 1);
+        assert!(args.windows(2).any(|a| a == ["-F", "/dev/null"]));
+        assert_eq!(args.iter().filter(|a| **a == "-i").count(), 1);
+        assert!(args.windows(2).any(|a| a == ["-i", "/vault/identity.pub"]));
+        assert!(args.contains(&format!("UserKnownHostsFile={}", path.display()).as_str()));
+        assert!(!args.contains(&"alfonso-runner"));
+        assert!(args
+            .last()
+            .unwrap()
+            .contains("--instance macos --state-root /Users/motor/state"));
+        for name in ["SSH_AUTH_SOCK", "SSH_AGENT_PID", "SUBC_LAUNCH_NONCE"] {
+            assert!(command
+                .as_std()
+                .get_envs()
+                .any(|(n, v)| n == name && v.is_none()));
+        }
+        drop(pin);
+        assert!(!path.exists());
+    }
+}
+
 pub(crate) struct Channel {
     pub return_paths: bool,
+    /// The runner's Hello advertised chunked returned files.
+    pub return_chunked: bool,
     pub gate_jobs: bool,
+    pub sibling_paths: bool,
     pub platforms: Vec<String>,
     tx: mpsc::Sender<WriteRequest>,
     rx: mpsc::Receiver<io::Result<Incoming>>,
@@ -734,6 +942,8 @@ impl Channel {
             &mut pipe,
             &Frame::Hello {
                 return_paths: false,
+                return_chunked: false,
+                sibling_paths: false,
                 protocol_version: PROTOCOL_VERSION,
                 started: true,
                 default_branch_tip: false,
@@ -768,12 +978,16 @@ impl Channel {
                     platforms,
                     gate_jobs,
                     return_paths,
+                    return_chunked,
+                    sibling_paths,
                     ..
                 } => {
                     let mut channel = Self::new(pipe);
                     channel.platforms = platforms;
                     channel.gate_jobs = gate_jobs;
                     channel.return_paths = return_paths;
+                    channel.return_chunked = return_chunked;
+                    channel.sibling_paths = sibling_paths;
                     channel.enable_heartbeats();
                     return Ok(channel);
                 }
@@ -840,7 +1054,7 @@ impl Channel {
                     advance(UnreachableStep::HelloSend);
                     let mut channel = Self::new(pipe);
                     channel
-                        .send(Frame::Hello { return_paths: false, protocol_version: PROTOCOL_VERSION,
+                        .send(Frame::Hello { return_paths: false, return_chunked: false, sibling_paths: false, protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: true,
                         gate_jobs: true,
@@ -853,12 +1067,14 @@ impl Channel {
                     match channel.next().await.map_err(|error| {
                         AttemptFailure::Step(UnreachableStep::HelloRecv, error.to_string())
                     })? {
-                        Incoming::Frame(Frame::Hello { protocol_version, platforms, gate_jobs, return_paths, .. })
+                        Incoming::Frame(Frame::Hello { protocol_version, platforms, gate_jobs, return_paths, return_chunked, sibling_paths, .. })
                             if protocol_version == PROTOCOL_VERSION =>
                         {
                             channel.platforms = platforms;
                             channel.gate_jobs = gate_jobs;
                             channel.return_paths = return_paths;
+                            channel.return_chunked = return_chunked;
+                            channel.sibling_paths = sibling_paths;
                             channel.enable_heartbeats();
                             tracing::info!(job_or_workspace_id = %id, elapsed_ms = started.elapsed().as_millis() as u64, "runner handshake complete");
                             Ok(channel)
@@ -1008,6 +1224,8 @@ impl Channel {
         Self {
             gate_jobs: false,
             return_paths: false,
+            return_chunked: false,
+            sibling_paths: false,
             platforms: Vec::new(),
             tx,
             rx,
@@ -1087,6 +1305,8 @@ mod hello_tests {
                     default_branch_tip: true,
                     gate_jobs: true,
                     return_paths: false,
+                    return_chunked: false,
+                    sibling_paths: true,
                     platforms: vec!["linux".into()],
                 },
             )
@@ -1094,7 +1314,7 @@ mod hello_tests {
             .unwrap();
         };
         let (channel, ()) = tokio::join!(Channel::from_hosted(Box::new(client)), server);
-        assert!(channel.is_ok());
+        assert!(channel.unwrap().sibling_paths);
     }
 
     #[tokio::test]
@@ -1118,6 +1338,8 @@ mod hello_tests {
                 &mut peer,
                 &Frame::Hello {
                     return_paths: false,
+                    return_chunked: false,
+                    sibling_paths: false,
                     protocol_version: PROTOCOL_VERSION,
                     started: true,
                     default_branch_tip: false,
@@ -1149,6 +1371,8 @@ mod hello_tests {
                     &mut peer,
                     &Frame::Hello {
                         return_paths: false,
+                        return_chunked: false,
+                        sibling_paths: capable,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,
@@ -1160,7 +1384,9 @@ mod hello_tests {
                 .unwrap();
             };
             let (channel, ()) = tokio::join!(Channel::open(&connector, Uuid::now_v7()), server);
-            assert_eq!(channel.unwrap().gate_jobs, capable);
+            let channel = channel.unwrap();
+            assert_eq!(channel.gate_jobs, capable);
+            assert_eq!(channel.sibling_paths, capable);
         }
     }
 }
@@ -1168,6 +1394,27 @@ mod hello_tests {
 #[cfg(test)]
 mod disconnect_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn boundary_eof_is_not_reported_as_a_truncated_frame() {
+        let (client, server) = tokio::io::duplex(64);
+        drop(server);
+        let mut channel = Channel::new(Box::new(client));
+        let error = channel.next().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "EOF at frame boundary");
+    }
+
+    #[tokio::test]
+    async fn partial_body_eof_still_reports_truncation() {
+        let (client, mut server) = tokio::io::duplex(64);
+        server.write_all(&[0, 0, 0, 12, b'{']).await.unwrap();
+        drop(server);
+        let mut channel = Channel::new(Box::new(client));
+        let error = channel.next().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "truncated JSON frame");
+    }
     use std::task::{Context, Poll};
     struct FailedWriter;
     impl AsyncRead for FailedWriter {
@@ -1331,7 +1578,7 @@ async fn read_exact_active<R: AsyncRead + Unpin>(
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "truncated frame",
+                "EOF at frame boundary",
             ));
         }
         bytes = &mut bytes[n..];

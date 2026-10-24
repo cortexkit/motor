@@ -69,6 +69,8 @@ impl TenantConnection {
     /// Logs why this tenant connection is being closed. `frame` names the
     /// refused frame's type (or why no frame could be decoded), never its
     /// contents, so a refusal names itself without copying peer data.
+    /// `reason` is a snake_case label, so the tenant diagnostics journal
+    /// filter can pass it through.
     fn operation_refused(&self, frame: &str, reason: &'static str) {
         tracing::warn!(jti = %self.lease.jti, frame, reason, "operation_refused");
     }
@@ -172,6 +174,7 @@ async fn reader<R: AsyncRead + Unpin>(
     activity: watch::Sender<Activity>,
     tenant: Option<Arc<TenantConnection>>,
 ) {
+    let mut trace = ChannelTrace::new(tenant.as_deref(), "read");
     let mut read = ActivityRead {
         read,
         activity,
@@ -185,16 +188,18 @@ async fn reader<R: AsyncRead + Unpin>(
                 result = read_record_async(&mut read) => match result {
                     Ok(Some(DecodedFrame::Frame(frame))) => Ok(Some(frame)),
                     Ok(None) => Ok(None),
-                    Ok(Some(DecodedFrame::Unknown(_))) => { ctx.operation_refused("unknown", "unknown frame type"); break; }
+                    Ok(Some(DecodedFrame::Unknown(_))) => { trace.reason = "unknown_frame"; ctx.operation_refused("unknown", "unknown_frame_type"); break; }
                     Err(error) => {
                         // The decode error text can quote peer bytes; log its kind only.
                         tracing::warn!(jti = %ctx.lease.jti, kind = ?error.kind(), "tenant frame read failed");
-                        ctx.operation_refused("undecodable", "frame read failed");
+                        ctx.operation_refused("undecodable", "frame_read_failed");
+                        trace.reason = "read_error";
+                        trace.error_kind = Some(error.kind());
                         break;
                     }
                 },
                 _ = tokio::time::sleep_until(ctx.deadline()), if ctx.lease.purpose == LeasePurpose::Run && !ctx.admitted().await => {
-                    if ctx.expire().await { break; }
+                    if ctx.expire().await { trace.reason = "lease_expired"; break; }
                     continue;
                 }
             }
@@ -203,15 +208,22 @@ async fn reader<R: AsyncRead + Unpin>(
         };
         let frame = match result {
             Ok(Some(frame)) => frame,
-            Ok(None) => break,
+            Ok(None) => {
+                trace.reason = "eof";
+                break;
+            }
             Err(error) => {
                 tracing::warn!(%error, "runner frame read/decode failed");
+                trace.reason = "read_error";
+                trace.error_kind = Some(error.kind());
                 break;
             }
         };
+        trace.frame(&frame);
         if let Some(ctx) = &tenant {
             if !ctx.allowed(&frame, &mut hello, &mut ran) {
-                ctx.operation_refused(&frame_type(&frame), "not allowed on this tenant connection");
+                ctx.operation_refused(&frame_type(&frame), "not_allowed_on_tenant_connection");
+                trace.reason = "operation_refused";
                 break;
             }
         }
@@ -222,6 +234,7 @@ async fn reader<R: AsyncRead + Unpin>(
             }
         });
         if tx.send(frame).await.is_err() {
+            trace.reason = "session_input_closed";
             break;
         }
     }
@@ -239,16 +252,19 @@ async fn writer<W: AsyncWrite + Unpin>(
     job: watch::Receiver<Option<QueueProgress>>,
     tenant: Option<Arc<TenantConnection>>,
 ) {
+    let mut trace = ChannelTrace::new(tenant.as_deref(), "write");
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     loop {
         let frame = tokio::select! {
-            frame = rx.recv() => match frame { Some(f) => f, None => break },
+            frame = rx.recv() => match frame { Some(f) => f, None => { trace.reason = "session_output_closed"; break; } },
             _ = heartbeat.tick() => Frame::Heartbeat {
                 queue_wait_ms: job.borrow().as_ref().and_then(QueueProgress::elapsed_ms),
             },
         };
+        trace.frame(&frame);
         if let Some(ctx) = &tenant {
             if ctx.state.lock().await.closed {
+                trace.reason = "reader_closed";
                 break;
             }
         }
@@ -258,6 +274,7 @@ async fn writer<W: AsyncWrite + Unpin>(
                 state.cause = RefusedCause::Expired;
                 state.closed = true;
                 ctx.changed.notify_one();
+                trace.reason = "lease_expired";
                 break;
             }
             let result = match tokio::time::timeout_at(
@@ -293,7 +310,7 @@ async fn writer<W: AsyncWrite + Unpin>(
         } else if let Some(ctx) = &tenant {
             tokio::select! {
                 result = write_frame_async(&mut write, &frame) => result,
-                _ = ctx.stop_write.notified() => break,
+                _ = ctx.stop_write.notified() => { trace.reason = "reader_closed"; break; },
             }
         } else {
             write_frame_async(&mut write, &frame).await
@@ -307,6 +324,8 @@ async fn writer<W: AsyncWrite + Unpin>(
                 _ => "control",
             };
             tracing::warn!(%error, frame_type, "runner frame write failed");
+            trace.reason = "write_error";
+            trace.error_kind = Some(error.kind());
             break;
         }
         if matches!(frame, Frame::Hello { .. }) {
@@ -315,6 +334,69 @@ async fn writer<W: AsyncWrite + Unpin>(
                 "runner hello written"
             );
         }
+        // Record when these frames are written to the connection, to help
+        // diagnose slow cancels.
+        match &frame {
+            Frame::Terminal(terminal) => {
+                tracing::info!(job_id = %terminal.job_id, outcome = ?terminal.outcome, "runner terminal written to client")
+            }
+            Frame::CancelReply(reply) => {
+                tracing::info!(job_id = %reply.job_id, "runner cancel reply written to client")
+            }
+            _ => {}
+        }
+    }
+}
+
+struct ChannelTrace {
+    jti: Option<Uuid>,
+    direction: &'static str,
+    reason: &'static str,
+    error_kind: Option<io::ErrorKind>,
+    frames: u64,
+    frame_type: &'static str,
+    seq: Option<u64>,
+    started: std::time::Instant,
+}
+impl ChannelTrace {
+    fn new(tenant: Option<&TenantConnection>, direction: &'static str) -> Self {
+        Self {
+            jti: tenant.map(|ctx| ctx.lease.jti),
+            direction,
+            reason: "cancelled",
+            error_kind: None,
+            frames: 0,
+            frame_type: "none",
+            seq: None,
+            started: std::time::Instant::now(),
+        }
+    }
+    fn frame(&mut self, frame: &Frame) {
+        self.frames += 1;
+        self.seq = match frame {
+            Frame::Output(output) => Some(output.seq),
+            Frame::Started { seq, .. } => Some(*seq),
+            _ => None,
+        };
+        self.frame_type = match frame {
+            Frame::Hello { .. } => "hello",
+            Frame::Run(_) => "run",
+            Frame::Attach(_) => "attach",
+            Frame::Heartbeat { .. } => "heartbeat",
+            Frame::BundleChunk { .. } => "bundle_chunk",
+            Frame::Accepted(_) => "accepted",
+            Frame::Started { .. } => "started",
+            Frame::Output(_) => "output",
+            Frame::Terminal(_) => "terminal",
+            _ => "control",
+        };
+    }
+}
+impl Drop for ChannelTrace {
+    fn drop(&mut self) {
+        tracing::info!(jti = ?self.jti, direction = self.direction, reason = self.reason,
+            error_kind = ?self.error_kind, frames = self.frames, frame_type = self.frame_type,
+            seq = self.seq, elapsed_ms = self.started.elapsed().as_millis() as u64, "runner_channel_closed");
     }
 }
 
@@ -382,6 +464,17 @@ async fn channel_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         tenant.as_ref(),
     )
     .await;
+    if let Some(ctx) = &tenant {
+        // The session's own end, beside the reader's and writer's
+        // runner_channel_closed: "returned" covers a delivered terminal, a
+        // refusal and the reader closing first. The error text can quote peer
+        // data, so only its kind is logged.
+        let (reason, error_kind) = match &result {
+            Ok(()) => ("returned", None),
+            Err(error) => ("error", Some(error.kind())),
+        };
+        tracing::info!(jti = %ctx.lease.jti, reason, error_kind = ?error_kind, "tenant_job_stream_ended");
+    }
     reading.abort();
     drop(tx);
     while tasks.join_next().await.is_some() {}
@@ -429,13 +522,16 @@ async fn session(
     send(
         tx,
         Frame::Hello {
-            return_paths: !runner.config().windows_instance(),
+            return_paths: !runner.config().vm_instance(),
+            return_chunked: !runner.config().vm_instance(),
+            sibling_paths: runner.config().sibling_snapshot_mode(),
             protocol_version: PROTOCOL_VERSION,
             started: supports_started,
             default_branch_tip: supports_default_branch_tip,
             gate_jobs: supports_gate_jobs,
             platforms: match runner.config().served_platform() {
                 Platform::Windows => vec!["windows".into()],
+                Platform::Macos => vec!["macos".into()],
                 _ => Vec::new(),
             },
         },
@@ -497,7 +593,7 @@ async fn session(
                 match locked(&runner, move |r| r.accept(admitted)).await? {
                     Admission::Duplicate => {
                         if let Some(ctx) = tenant {
-                            ctx.operation_refused("run", "job already has a record");
+                            ctx.operation_refused("run", "job_already_has_record");
                         }
                         return Ok(());
                     }
@@ -753,7 +849,10 @@ async fn session(
             }
             Frame::Cancel(request) => {
                 let id = request.job_id;
+                let received = std::time::Instant::now();
+                tracing::info!(job_id = %id, "runner cancel frame received");
                 locked(&runner, move |r| r.cancel(id)).await?;
+                tracing::info!(job_id = %id, elapsed_ms = received.elapsed().as_millis() as u64, "runner cancel handled");
                 send(tx, Frame::CancelReply(CancelReply::new(request.job_id))).await?;
                 if tenant.is_some() {
                     continue;
@@ -921,6 +1020,8 @@ async fn attach(
                 Frame::Output(output) => from = output.seq + 1,
                 Frame::Started { seq, .. } => from = seq + 1,
                 Frame::ReturnResult(result) => from = result.seq + 1,
+                Frame::ReturnChunk(chunk) => from = chunk.seq + 1,
+                Frame::ReturnManifest(manifest) => from = manifest.seq + 1,
                 _ => {}
             }
             let terminal = matches!(frame, Frame::Terminal(_));
@@ -934,7 +1035,10 @@ async fn attach(
             frame = next(rx) => match frame {
                 None => return Ok(()),
                 Some(Frame::Cancel(_)) => {
+                    let received = std::time::Instant::now();
+                    tracing::info!(job_id = %id, "runner cancel frame received on job stream");
                     locked(runner, move |r| r.cancel(id)).await?;
+                    tracing::info!(job_id = %id, elapsed_ms = received.elapsed().as_millis() as u64, "runner cancel handled");
                     if tenant { send(tx, Frame::CancelReply(CancelReply::new(id))).await?; }
                 },
                 Some(Frame::Attach(request)) if tenant => from = request.from_seq,
@@ -946,7 +1050,12 @@ async fn attach(
                     let outcome = locked(runner, move |r| r.withdraw_for(id, reason, spill)).await?;
                     send(tx, Frame::WithdrawReply { outcome }).await?;
                 },
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected attach frame")),
+                Some(other) => {
+                    // Name the frame's type, never its contents, so the
+                    // tenant's journal says which frame ended the stream.
+                    tracing::warn!(job_id = %id, frame = %frame_type(&other), "runner job stream refused frame");
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected attach frame"));
+                }
             }
         }
     }

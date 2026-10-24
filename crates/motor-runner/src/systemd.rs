@@ -4,6 +4,36 @@ use std::{
     time::Duration,
 };
 
+pub(crate) use crate::JOB_MEMORY_PROPERTIES;
+
+/// Refuse execution rather than let systemd synthesize an uncapped implicit slice
+/// when an operator has not yet installed the shared memory policy.
+pub(crate) fn require_job_memory_budget() -> io::Result<()> {
+    let output = systemctl(
+        &[
+            "show",
+            "--property=MemoryHigh,MemoryMax",
+            "motor-jobs.slice",
+        ],
+        false,
+    )?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let number = |key| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(key))
+            .and_then(|n| n.parse::<u64>().ok())
+    };
+    if output.status.success()
+        && number("MemoryHigh=")
+            .zip(number("MemoryMax="))
+            .is_some_and(|(high, max)| high > 0 && high < max && max < u64::MAX)
+    {
+        Ok(())
+    } else {
+        Err(io::Error::other("motor-jobs.slice has no finite shared memory budget; install the runner system units before admitting jobs"))
+    }
+}
+
 #[cfg(test)]
 pub(crate) type CommandHook = std::sync::Arc<dyn Fn(&[&str]) -> io::Result<Output> + Send + Sync>;
 
@@ -79,7 +109,9 @@ pub(crate) fn private_pids_capability(version: &str, boat_profile: bool) -> io::
     if major < 257 && !boat_profile {
         return Err(io::Error::other("systemd >=257 is required for PrivatePIDs; only an explicitly configured single-tenant --boat-profile may run without it"));
     }
-    Ok(major >= 257)
+    // Boat always uses the runner init, including on newer managers, so its
+    // namespace and project-quota ioctl filter runs before any job code.
+    Ok(major >= 257 && !boat_profile)
 }
 
 #[cfg(target_os = "linux")]
@@ -92,7 +124,7 @@ pub(crate) fn job_private_pids(boat_profile: bool) -> io::Result<bool> {
     }
     let enabled = private_pids_capability(&String::from_utf8_lossy(&output.stdout), boat_profile)?;
     if !enabled {
-        tracing::warn!("Boat single-tenant profile: systemd lacks PrivatePIDs; jobs share the host PID namespace");
+        tracing::info!("Boat profile: jobs use the runner's PID namespace bootstrap and quota-attribute filter");
     }
     Ok(enabled)
 }
@@ -163,7 +195,7 @@ fn boat_provider_environment_names_include_unknown_prefixes_without_values() {
 fn boat_pid_compatibility_is_explicit_and_version_checked() {
     assert!(private_pids_capability("255.4-1ubuntu8.16", false).is_err());
     assert!(!private_pids_capability("255.4-1ubuntu8.16", true).unwrap());
-    assert!(private_pids_capability("257.9", true).unwrap());
+    assert!(!private_pids_capability("257.9", true).unwrap());
     assert!(private_pids_capability("259.5", false).unwrap());
     assert!(private_pids_capability("unknown", true).is_err());
 }
@@ -211,14 +243,16 @@ pub(crate) fn wait_until_active(
 ) -> io::Result<bool> {
     let mut polling = PollBackoff::activation();
     loop {
+        if expired()? {
+            return Ok(false);
+        }
         if systemctl(&["is-active", "--quiet", unit], true)?
             .status
             .success()
         {
-            return Ok(true);
-        }
-        if expired()? {
-            return Ok(false);
+            // The launcher may have died while systemctl was running. The
+            // service is still behind its stdin gate and must be discarded.
+            return Ok(!expired()?);
         }
         wait(polling.next_delay());
     }

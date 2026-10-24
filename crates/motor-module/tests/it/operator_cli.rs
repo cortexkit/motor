@@ -1454,6 +1454,62 @@ async fn direct_runs_need_a_timeout_within_the_cap_and_aft_runs_do_not() {
 }
 
 #[tokio::test]
+async fn cli_net_run_is_admitted_on_direct_route_and_relays_outbound() {
+    let mut f = Fixture::new(Cut::None, 28).await;
+    f.config.network_routing = true;
+    // Simulate the grant at the proxy so the portable runner remains offline.
+    f.proxy.strip_run_network.store(true, Ordering::SeqCst);
+    *f.proxy.accepted_network.lock().unwrap() = Some(Some(motor_protocol::Network::Outbound));
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    assert_eq!(
+        daemon.bind(DIRECT_CHANNEL, direct()).await.header.ty,
+        FrameType::Response
+    );
+    let cli::Invocation::Run(args) = cli::parse_args(&[
+        "--net".into(),
+        "--cwd".into(),
+        f.main.display().to_string(),
+        "--".into(),
+        "true".into(),
+    ])
+    .unwrap() else {
+        panic!("expected a run")
+    };
+    let request = cli::build_request(&args).unwrap();
+    let records = run_records(&daemon, DIRECT_CHANNEL, request).await;
+    let StreamRecord::Accepted(accepted) = &records[0] else {
+        panic!("accepted must be the first stream record: {records:?}")
+    };
+    assert_eq!(accepted.network, Some(motor_protocol::Network::Outbound));
+    assert_eq!(
+        f.recorded_run().network,
+        Some(motor_protocol::Network::Outbound)
+    );
+    assert_eq!(last_terminal(&records).outcome, Outcome::Exit { code: 0 });
+}
+
+#[tokio::test]
+async fn direct_net_runs_still_require_network_routing() {
+    let f = Fixture::new(Cut::None, 28).await;
+    assert!(!f.config.network_routing);
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    assert_eq!(
+        daemon.bind(DIRECT_CHANNEL, direct()).await.header.ty,
+        FrameType::Response
+    );
+    let request = timed(&f, "true", 60).with_network(motor_protocol::Network::Outbound);
+    let records = run_records(&daemon, DIRECT_CHANNEL, request).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        last_terminal(&records).outcome,
+        Outcome::RefusedBeforeStart {
+            reason: motor_protocol::RefusalReason::NetworkUnsupported,
+        }
+    );
+    assert!(f.proxy.frames.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn only_direct_routes_mark_gates_and_extend_the_queue_wait() {
     let f = Fixture::new(Cut::None, 28).await;
     let daemon = Daemon::start(&f, direct_config(&f)).await;
@@ -1519,7 +1575,8 @@ async fn cli_streams_both_outputs_in_order_and_exits_with_the_commands_code() {
     let mut lines = err.lines();
     let credential = lines.next().unwrap();
     assert!(credential.starts_with("ck motor run: job_id="));
-    assert!(credential.contains(" secret="));
+    assert!(credential.contains(" secret-file="));
+    assert!(!credential.contains(" secret="));
     assert_eq!(lines.collect::<Vec<_>>(), ["err1", "err2"]);
     let log = captured.text();
     let submitted = log
@@ -1538,6 +1595,131 @@ async fn cli_streams_both_outputs_in_order_and_exits_with_the_commands_code() {
                 && line.contains(job)),
             "no {event:?} line for {job} in {log}"
         );
+    }
+}
+
+struct ReturnClient {
+    wire: WireClient,
+    workspace: std::path::PathBuf,
+}
+
+#[subc_client_rs::async_trait]
+impl ExecClient for ReturnClient {
+    fn local_workspace(&self) -> Option<&std::path::Path> {
+        Some(&self.workspace)
+    }
+    async fn run(&self, request: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError> {
+        self.wire.run(request).await
+    }
+    async fn attach(&self, id: Uuid, secret: &str) -> Result<Box<dyn RecordStream>, SubmitError> {
+        self.wire.attach(id, secret).await
+    }
+    async fn status(
+        &self,
+        id: Uuid,
+        secret: &str,
+    ) -> Result<motor_protocol::JobStatusReply, SubmitError> {
+        self.wire.status(id, secret).await
+    }
+    async fn cancel(&self, id: Uuid, secret: Option<&str>) -> Result<(), String> {
+        self.wire.cancel(id, secret).await
+    }
+}
+
+#[tokio::test]
+async fn cli_returns_absolute_git_ignored_job_created_file_and_reattaches_with_v1_fallback() {
+    for legacy in [false, true] {
+        let f = Fixture::new(Cut::None, 28).await;
+        f.proxy.strip_return_chunked.store(legacy, Ordering::SeqCst);
+        fs::write(f.key.join(".gitignore"), ".cortexkit/\n").unwrap();
+        let path = f.key.join(".cortexkit/gate/return-probe.txt");
+        let ignored =
+            crate::snapshot::git(&f.key, &["check-ignore", path.to_str().unwrap()]).unwrap();
+        assert_eq!(ignored, path.to_str().unwrap());
+        assert!(!path.exists());
+        let daemon = Daemon::start(&f, direct_config(&f)).await;
+        assert_eq!(
+            daemon.bind(DIRECT_CHANNEL, direct()).await.header.ty,
+            FrameType::Response
+        );
+        let mut client = ReturnClient {
+            wire: WireClient {
+                daemon,
+                channel: DIRECT_CHANNEL,
+                hosted: false,
+            },
+            workspace: f.key.clone(),
+        };
+        let request = timed(
+            &f,
+            "mkdir -p .cortexkit/gate; echo returned > .cortexkit/gate/return-probe.txt; exit 23",
+            300,
+        )
+        .with_return_paths(vec![path.to_str().unwrap().into()])
+        .with_return_chunked(true)
+        .with_return_max_bytes(cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP);
+        let secret_path = f.scratch.join("return-secret");
+        let secret_file = cli::SecretFile::create(&secret_path).unwrap();
+        let (_tx, mut interrupts) = mpsc::channel(1);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = cli::drive_run(
+            &client,
+            &request,
+            Some(secret_file),
+            &mut out,
+            &mut err,
+            &mut interrupts,
+        )
+        .await;
+        assert_eq!(code, 23, "{}", String::from_utf8_lossy(&err));
+        assert_eq!(fs::read(&path).unwrap(), b"returned\n");
+        let line = format!("ck motor run: returned {} (9 bytes)", path.display());
+        assert_eq!(String::from_utf8_lossy(&err).matches(&line).count(), 1);
+        let run = f
+            .proxy
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|frame| match frame {
+                motor_protocol::Frame::Run(run) => Some(run.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(run.return_chunked, !legacy);
+        assert_eq!(
+            run.return_max_bytes,
+            if legacy {
+                motor_protocol::RETURN_MAX_BYTES
+            } else {
+                cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP
+            }
+        );
+        fs::remove_file(&path).unwrap();
+        err.clear();
+        let args = cli::AttachArgs {
+            job_id: run.job_id,
+            secret_file: Some(secret_path.clone()),
+            status: false,
+        };
+        let secret = fs::read_to_string(&secret_path).unwrap();
+        client.workspace = f.scratch.join("different-attach-directory");
+        fs::create_dir(&client.workspace).unwrap();
+        assert_eq!(
+            cli::drive_attach(
+                &client,
+                &args,
+                secret.trim(),
+                &mut out,
+                &mut err,
+                &mut interrupts
+            )
+            .await,
+            23
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"returned\n");
+        assert_eq!(String::from_utf8_lossy(&err).matches(&line).count(), 1);
     }
 }
 
@@ -1692,4 +1874,167 @@ async fn hosted_runs_are_direct_only_and_need_a_configured_broker() {
             .any(|frame| matches!(frame,
             motor_protocol::Frame::Run(run) if run.job_id == terminal.job_id)));
     }
+}
+
+/// Every record an agent `exec.attach` from `from_seq` receives, through its terminal.
+async fn attach_records(daemon: &Daemon, id: Uuid, from_seq: u64) -> Vec<StreamRecord> {
+    let mut frames = daemon
+        .send(
+            AFT_CHANNEL,
+            json!({"op":"exec.attach", "params":AttachRequest::new(id, from_seq)}),
+        )
+        .await;
+    let mut records = Vec::new();
+    loop {
+        let frame = next(&mut frames).await;
+        assert_eq!(frame.header.ty, FrameType::StreamData, "{}", body(&frame));
+        let record: StreamRecord = serde_json::from_slice(&frame.body).unwrap();
+        let terminal = matches!(record, StreamRecord::Terminal(_));
+        records.push(record);
+        if terminal {
+            return records;
+        }
+    }
+}
+
+fn return_results(records: &[StreamRecord]) -> Vec<&cortexkit_exec_remote_types::ReturnResult> {
+    records
+        .iter()
+        .filter_map(|record| match record {
+            StreamRecord::ReturnResult(result) => Some(result),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn agent_return_paths_send_return_result_immediately_before_the_terminal() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, f.config.clone()).await;
+    assert_eq!(
+        daemon.bind(AFT_CHANNEL, aft()).await.header.ty,
+        FrameType::Response
+    );
+    let request = f
+        .request("mkdir -p out; printf x > out/file; exit 23")
+        .with_return_paths(vec!["out/file".into()]);
+    let records = run_records(&daemon, AFT_CHANNEL, request).await;
+    let terminal = last_terminal(&records);
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+    // A build-server job reports no hosted placement.
+    assert_eq!(terminal.hosted(), None);
+    let results = return_results(&records);
+    assert_eq!(results.len(), 1, "{records:?}");
+    assert!(
+        matches!(&records[records.len() - 2], StreamRecord::ReturnResult(_)),
+        "{records:?}"
+    );
+    let result = results[0];
+    assert_eq!(result.job_id(), terminal.job_id);
+    let files = result.returned_files().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path(), "out/file");
+    assert_eq!(files[0].data(), b"x");
+    // The runner was asked for the absolute path under the request's cwd.
+    let run = f
+        .proxy
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|frame| match frame {
+            motor_protocol::Frame::Run(run) if run.job_id == terminal.job_id => Some(run.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        run.return_paths,
+        [f.key.join("out/file").to_str().unwrap().to_owned()]
+    );
+    // A reattach from the start replays it before the terminal; one past its
+    // sequence number does not repeat it.
+    let replay = attach_records(&daemon, terminal.job_id, 0).await;
+    assert_eq!(return_results(&replay), results, "{replay:?}");
+    let after = attach_records(&daemon, terminal.job_id, result.seq() + 1).await;
+    assert!(return_results(&after).is_empty(), "{after:?}");
+    assert_eq!(last_terminal(&after).outcome, Outcome::Exit { code: 23 });
+}
+
+#[tokio::test]
+async fn agent_without_return_paths_never_receives_a_return_result() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, f.config.clone()).await;
+    assert_eq!(
+        daemon.bind(AFT_CHANNEL, aft()).await.header.ty,
+        FrameType::Response
+    );
+    // A cap alone asks for nothing; only non-empty return_paths opts in.
+    let request = f
+        .request("mkdir -p out; printf x > out/file; exit 0")
+        .with_return_max_bytes(1);
+    let records = run_records(&daemon, AFT_CHANNEL, request).await;
+    let terminal = last_terminal(&records);
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 0 });
+    assert!(return_results(&records).is_empty(), "{records:?}");
+    assert!(
+        records
+            .iter()
+            .all(|record| !matches!(record, StreamRecord::Unknown { .. })),
+        "{records:?}"
+    );
+    let replay = attach_records(&daemon, terminal.job_id, 0).await;
+    assert!(return_results(&replay).is_empty(), "{replay:?}");
+    assert!(f.proxy.frames.lock().unwrap().iter().any(|frame| matches!(frame,
+        motor_protocol::Frame::Run(run) if run.job_id == terminal.job_id && run.return_paths.is_empty())));
+}
+
+#[tokio::test]
+async fn agent_over_cap_return_max_bytes_is_invalid_params_and_never_runs() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, f.config.clone()).await;
+    assert_eq!(
+        daemon.bind(AFT_CHANNEL, aft()).await.header.ty,
+        FrameType::Response
+    );
+    let request = f
+        .request("true")
+        .with_return_paths(vec!["out".into()])
+        .with_return_max_bytes(cortexkit_exec_remote_types::RETURN_MAX_BYTES_CAP + 1);
+    let refused = error(
+        &daemon
+            .request(AFT_CHANNEL, "exec.run", json!(request))
+            .await,
+    );
+    assert_eq!(refused["code"], "invalid_params", "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("return_max_bytes"),
+        "{refused}"
+    );
+    assert!(
+        f.proxy.frames.lock().unwrap().is_empty(),
+        "a refused request must not reach the runner"
+    );
+    // An absolute path is not relative to cwd: refused before start.
+    let records = run_records(
+        &daemon,
+        AFT_CHANNEL,
+        f.request("true")
+            .with_return_paths(vec![f.key.join("out").to_str().unwrap().into()]),
+    )
+    .await;
+    let terminal = last_terminal(&records);
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: motor_protocol::RefusalReason::RequestRejected
+        }
+    );
+    assert_eq!(
+        terminal.refusal_detail.as_deref(),
+        Some("return_paths_exceeded")
+    );
+    assert!(f.proxy.frames.lock().unwrap().is_empty());
 }

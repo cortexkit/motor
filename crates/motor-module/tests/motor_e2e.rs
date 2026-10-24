@@ -1,4 +1,5 @@
-//! Real Mac/Linux acceptance. Invoke directly, never through remote bash routing:
+//! Real acceptance of a macOS client against the Linux runner; this file builds
+//! only on a macOS client. Invoke directly, never through remote bash routing:
 //! cargo nextest run -p motor-module --test motor_e2e --run-ignored all --test-threads 1 --no-capture
 //!
 //! The second invocation runs a test consumer registered as the scratch daemon's
@@ -667,7 +668,7 @@ impl Rig {
         let (code, output) = if side == "mac" {
             let local = shell(cwd, command);
             (
-                local.status.code().expect("Mac gate exit code"),
+                local.status.code().expect("local macOS gate exit code"),
                 text(&local),
             )
         } else {
@@ -765,7 +766,7 @@ impl Rig {
         let mut linux = self
             .normalized_gate("linux", key, cwd, selection, roots, false)
             .await;
-        eprintln!("motor-e2e step 1: remote gate normalized; running Mac baseline");
+        eprintln!("motor-e2e step 1: remote gate normalized; running local macOS baseline");
         let mut mac = self
             .normalized_gate("mac", key, cwd, selection, roots, false)
             .await;
@@ -1043,13 +1044,13 @@ fn platform_exclusions(mac: &mut Vec<(String, String)>, linux: &mut Vec<(String,
                 .filter(|(_, n)| n.split_whitespace().last() == Some(name))
                 .count(),
             1,
-            "listed Mac-only test missing: {name}"
+            "listed macOS-only test missing: {name}"
         );
         assert!(
             !linux
                 .iter()
                 .any(|(_, n)| n.split_whitespace().last() == Some(name)),
-            "Mac-only test ran on Linux: {name}"
+            "macOS-only test ran on Linux: {name}"
         );
         mac.retain(|(_, n)| n.split_whitespace().last() != Some(name));
     }
@@ -1069,7 +1070,7 @@ fn platform_exclusions(mac: &mut Vec<(String, String)>, linux: &mut Vec<(String,
         assert!(
             !mac.iter()
                 .any(|(_, n)| n.split_whitespace().last() == Some(name)),
-            "Linux-only test ran on Mac: {name}"
+            "Linux-only test ran on the macOS client: {name}"
         );
         linux.retain(|(_, n)| n.split_whitespace().last() != Some(name));
     }
@@ -1697,7 +1698,10 @@ async fn disruptions(rig: &Rig) {
 }
 
 async fn marker_absent(rig: &Rig, key: &Path, marker: &str) {
-    assert!(!key.join(marker).exists(), "submitted command ran on Mac");
+    assert!(
+        !key.join(marker).exists(),
+        "submitted command ran on the client machine"
+    );
     ssh(&format!(
         "test ! -e {}",
         quote(key.join(marker).to_str().unwrap())
@@ -1922,7 +1926,7 @@ async fn snapshots_and_env(rig: &Rig) {
             };
             resolved == sibling_file && resolved.is_file()
         }),
-        "compiler diagnostic must resolve to the same existing Mac sibling source: {}",
+        "compiler diagnostic must resolve to the same existing client-side sibling source: {}",
         failed.output()
     );
     assert!(
@@ -2105,6 +2109,8 @@ async fn runner_rpc(frame: Frame) -> Frame {
         &mut stdin,
         &Frame::Hello {
             return_paths: false,
+            return_chunked: false,
+            sibling_paths: false,
             protocol_version: motor_protocol::PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
@@ -2418,7 +2424,7 @@ fn ssh_configs(parent: &Path, home: &Path) {
 }
 
 #[tokio::test]
-#[ignore = "requires an explicitly configured operator e2e instance on the Mac"]
+#[ignore = "requires an explicitly configured operator e2e instance on a macOS client"]
 async fn motor_e2e() {
     assert_eq!(status_lines("PASS [ 0.01s] (   1/20) package tests::one\nSLOW [ 1s] package tests::one\nPASS [ 2s] (2/20) package tests::two"),
         vec![("PASS".into(), "package tests::one".into()), ("PASS".into(), "package tests::two".into())]);

@@ -50,6 +50,7 @@ pub(super) struct Proxy {
     pub pause_on_cut: AtomicBool,
     pub legacy_have: AtomicBool,
     pub strip_return_paths: AtomicBool,
+    pub strip_return_chunked: AtomicBool,
     pub strip_run_network: AtomicBool,
     // None leaves the runner's grant unchanged; Some sets or removes it.
     pub accepted_network: Mutex<Option<Option<Network>>>,
@@ -160,7 +161,7 @@ impl Connector for Arc<Proxy> {
                             _ => false,
                         };
                         let mut value = serde_json::to_value(frame).unwrap();
-                        // In one process the Mac and server cannot own the same
+                        // In one process the client and server cannot own the same
                         // absolute directory. Only the fixture remaps roots;
                         // production transports send the original paths intact.
                         proxy.rewrite(&mut value, false);
@@ -221,6 +222,11 @@ impl Connector for Arc<Proxy> {
                             && value["type"] == "hello"
                         {
                             value.as_object_mut().unwrap().remove("return_paths");
+                        }
+                        if proxy.strip_return_chunked.load(Ordering::SeqCst)
+                            && value["type"] == "hello"
+                        {
+                            value.as_object_mut().unwrap().remove("return_chunked");
                         }
                         if proxy.legacy_have.load(Ordering::SeqCst) && value["type"] == "have_reply"
                         {
@@ -386,6 +392,7 @@ impl Fixture {
             pause_on_cut: AtomicBool::new(false),
             legacy_have: AtomicBool::new(false),
             strip_return_paths: AtomicBool::new(false),
+            strip_return_chunked: AtomicBool::new(false),
             strip_run_network: AtomicBool::new(false),
             accepted_network: Mutex::new(None),
             frames: Arc::new(Mutex::new(Vec::new())),
@@ -1592,4 +1599,67 @@ async fn authentication_fault_after_connect_keeps_safe_code_in_run_refusal() {
     assert_eq!(t.refusal_detail(), Some("runner_sign_unavailable"));
     assert_eq!(t.ran, Some(Ran::None));
     assert_eq!(t.retry_after_ms(), None);
+}
+
+// The connector decides which of its refusals are transient; the motor copies
+// that hint onto the refusal unchanged, both when the connector refuses before
+// the job opens a channel and when the refusal appears while it does, for a
+// run's terminal record and for a Prepare reply alike.
+#[tokio::test]
+async fn connector_retry_hint_reaches_run_and_prepare_refusals() {
+    struct HintedFault {
+        /// Refuse only once a connect has been tried, as when SSH reaches the
+        /// signing agent and the vault fails to sign.
+        late: bool,
+        connected: AtomicBool,
+    }
+    impl Connector for HintedFault {
+        fn refusal(&self) -> Option<&'static str> {
+            (!self.late || self.connected.load(Ordering::SeqCst))
+                .then_some("runner_sign_unavailable")
+        }
+        fn retry_after_ms(&self, code: &str) -> Option<u64> {
+            (code == "runner_sign_unavailable").then_some(1234)
+        }
+        fn connect(
+            &self,
+            _: Uuid,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + '_>> {
+            self.connected.store(true, Ordering::SeqCst);
+            Box::pin(async { Err(io::Error::other("private handshake error canary")) })
+        }
+    }
+    let f = Fixture::new(Cut::None, 28).await;
+    for late in [false, true] {
+        let motor = Motor::with_connector(
+            f.config.clone(),
+            &f.scratch.join(format!("hinted-fault-{late}")),
+            Arc::new(HintedFault {
+                late,
+                connected: AtomicBool::new(false),
+            }),
+        )
+        .unwrap();
+        let records = collect(motor.run(f.request("true")).unwrap()).await;
+        let t = terminal(&records);
+        assert_eq!(
+            t.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::RunnerAuthenticationFailed
+            },
+            "late={late}"
+        );
+        assert_eq!(t.refusal_detail(), Some("runner_sign_unavailable"));
+        assert_eq!(t.retry_after_ms(), Some(1234), "late={late}");
+        let reply = motor
+            .prepare(PrepareRequest::new(
+                text(&f.key),
+                text(&f.main),
+                git(&f.main, &["rev-parse", "HEAD"]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reply.refusal_detail(), Some("runner_sign_unavailable"));
+        assert_eq!(reply.retry_after_ms(), Some(1234), "late={late}");
+    }
 }

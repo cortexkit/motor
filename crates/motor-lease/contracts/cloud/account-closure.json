@@ -1,0 +1,91 @@
+{
+  "note": "TEST-ONLY bytes produced by the broker: a closed account's lease refused with 403 account_closed, and a heartbeat reply naming the closed tenant the host reports in closed_subjects; seeds reproduce the keys.",
+  "test_only_host_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "clock_ms": 1792195200123,
+  "closed_account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "open_account": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+  "unreported_closed_account": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+  "host": {
+    "host_id": "host-a",
+    "public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+    "endpoint": "runner.example:7443",
+    "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "platform": "linux-x64"
+  },
+  "lease": {
+    "request": {
+      "method": "POST",
+      "pathname": "/v1/leases",
+      "body": {
+        "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+        "vcpus": 2,
+        "platform": "linux-x64",
+        "net": true,
+        "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4",
+        "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+        "placement_hint": {
+          "host": "host-a",
+          "vm": "warm-vm-1"
+        },
+        "avoid_host": null,
+        "timeout_s": 100,
+        "requester_jwk": {
+          "kty": "OKP",
+          "crv": "Ed25519",
+          "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+        },
+        "allow_spill": true
+      }
+    },
+    "reply": {
+      "status": 403,
+      "retry_after": null,
+      "body": {
+        "error": "account_closed"
+      }
+    }
+  },
+  "heartbeat": {
+    "request": {
+      "method": "POST",
+      "pathname": "/v1/hosts/host-a/heartbeat",
+      "body": {
+        "free_vcpus": 60,
+        "free_mem_mib": 245760,
+        "queued": 0,
+        "warm": [
+          {
+            "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4",
+            "vm": "warm-vm-2"
+          },
+          {
+            "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4",
+            "vm": "warm-vm-1"
+          }
+        ],
+        "running": [],
+        "healthy": true
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "CK-Host": "host-a",
+        "CK-Timestamp": "1792195200123",
+        "CK-Counter": "1",
+        "CK-Signature": "b95bdd1c9d519fb19e02364e81c3f66ffdfb73fe7e386b5d55f25b78decef1ad676cdd5a1db4fe42966fcdd461db025cac7a57aa581a0cf7bf7a445a0477a309"
+      }
+    },
+    "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-a/heartbeat\n09b98181cdfc4151a9c68e93c44318beecb3daf35af91112a4c579d575637b3e\n1792195200123\n1",
+    "reply": {
+      "status": 200,
+      "retry_after": null,
+      "body": {
+        "ignored": [],
+        "closed_subjects": [
+          "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        ]
+      }
+    }
+  }
+}

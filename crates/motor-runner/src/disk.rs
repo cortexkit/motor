@@ -1,6 +1,9 @@
 use super::*;
 
-fn javascript_entry_lock(state: &Path, path: &Path) -> io::Result<Option<File>> {
+pub(super) fn javascript_entry_lock(
+    state: &Path,
+    path: &Path,
+) -> io::Result<Option<platform::JavascriptCacheLock>> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let key = name.split('.').next().unwrap_or_default();
     if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -19,6 +22,9 @@ struct Candidate {
     workspace: Option<String>,
     last_used_ms: u64,
     cache_disk: bool,
+    /// An unreferenced sibling snapshot, deleted by the snapshot deletion
+    /// protocol rather than removed in place.
+    snapshot: bool,
 }
 
 // Caches used in the last half hour are likely to be reused; deleting them costs a cold rebuild.
@@ -61,7 +67,9 @@ impl Drop for TransferGuard {
         inner.preparing.remove(&self.id);
         if let Some(transfer) = inner.catalog.transferred.get_mut(&self.id) {
             transfer.finished_ms = self.runner.now();
-            if let Err(error) = self.runner.catalog(&inner) {
+            let catalog = self.runner.catalog_snapshot(&inner);
+            drop(inner);
+            if let Err(error) = catalog.and_then(|catalog| self.runner.write_catalog(catalog)) {
                 tracing::error!(%error, "cannot persist completed transfer retention");
             }
         }
@@ -70,6 +78,18 @@ impl Drop for TransferGuard {
 
 fn overlaps(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
+}
+
+impl Config {
+    pub(crate) fn boat_workspace_trash_roots(&self) -> Vec<PathBuf> {
+        if !self.boat_profile {
+            return Vec::new();
+        }
+        self.owned_workspace_roots
+            .iter()
+            .map(|root| root.join(format!(".motor-boat-trash-{}", self.instance)))
+            .collect()
+    }
 }
 
 /// Count allocated inode blocks physically, without following symlinks or
@@ -98,6 +118,13 @@ fn allocated_bytes(path: &Path, device: u64) -> io::Result<u64> {
 }
 
 impl Runner {
+    // Only profiles with a disk reserve need this barrier. It is taken before
+    // inner so waiting for allocation never prevents status or cancel reads.
+    pub(super) fn reserve_restore_barrier(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        (self.core.config.disk_reserve_bytes != 0)
+            .then(|| self.core.reserve_restore.lock().unwrap())
+    }
+
     pub(super) fn protect_admission(&self, inner: &mut Inner, request: &Run) -> AdmissionGuard {
         let token = Uuid::now_v7();
         inner.admitting.insert(token, request.clone());
@@ -108,6 +135,7 @@ impl Runner {
     }
 
     pub(crate) fn transfer(&self, id: Uuid) -> TransferGuard {
+        let _restore = self.reserve_restore_barrier();
         self.core.inner.lock().unwrap().transfers.insert(id);
         TransferGuard {
             runner: self.clone(),
@@ -131,7 +159,12 @@ impl Runner {
                 )),
             }));
         }
-        workspace::validate(&r.workspace_key, &r.repository_root, &r.siblings)?;
+        workspace::validate(
+            &r.workspace_key,
+            &r.repository_root,
+            &r.siblings,
+            self.core.config.sibling_snapshot_mode(),
+        )?;
         let refusal = |reason: RefusalReason, disk_full, detail: String| Refusal {
             retry_after_ms: if reason == RefusalReason::RunnerDraining {
                 self.drain_retry_after_ms()
@@ -177,6 +210,7 @@ impl Runner {
                 "runner_draining".into(),
             )));
         }
+        let _restore = self.reserve_restore_barrier();
         if let Some(full) = self.ensure_disk_space()? {
             return Ok(Err(refusal(
                 RefusalReason::RunnerDiskFull,
@@ -290,6 +324,13 @@ impl Runner {
                 queue_depth,
                 running,
                 failed_job_units,
+                cleanup_blocked_by_quarantine: self
+                    .core
+                    .quarantine_cleanup
+                    .lock()
+                    .unwrap()
+                    .blocked
+                    .clone(),
                 counts: counters.counts(now),
                 underused_reservations,
                 repository_usage,
@@ -384,6 +425,8 @@ impl Runner {
                 .iter()
                 .filter_map(|p| p.canonicalize().ok()),
         );
+        let active_protected = protected.clone();
+        protected.extend(self.core.config.boat_workspace_trash_roots());
         let roots: Vec<_> = self
             .core
             .config
@@ -421,25 +464,45 @@ impl Runner {
                 workspace: Some(key.clone()),
                 last_used_ms: workspace.used_ms,
                 cache_disk: false,
+                snapshot: false,
             });
         }
         // These are the runner's actual upload, deletion and launch staging
         // roots. Never scan /srv/build or infer ownership from directory names.
-        for kind in [
+        let state_roots = [
             "spools",
             "trash",
             "sandboxes",
+            "boat-quarantine",
             "git-deps",
             "js-installs",
             "js-manager-caches",
-        ] {
-            let root = self.core.trees.state.join(kind);
+        ]
+        .into_iter()
+        .map(|kind| (kind, self.core.trees.state.join(kind)));
+        let workspace_trash = self
+            .core
+            .config
+            .boat_workspace_trash_roots()
+            .into_iter()
+            .map(|root| ("boat-workspace-trash", root));
+        for (kind, root) in state_roots.chain(workspace_trash) {
+            if kind == "boat-quarantine" && !self.core.config.boat_profile {
+                continue;
+            }
             let Ok(entries) = fs::read_dir(&root) else {
                 continue;
             };
+            #[cfg(target_os = "linux")]
+            if kind == "boat-workspace-trash" {
+                Self::validate_boat_workspace_trash(&root)?;
+            }
+            if fs::symlink_metadata(&root)?.file_type().is_symlink() {
+                continue;
+            }
             let canonical_root = root.canonicalize()?;
             let canonical_state = self.core.trees.state.canonicalize()?;
-            if !canonical_root.starts_with(&canonical_state) {
+            if kind != "boat-workspace-trash" && !canonical_root.starts_with(&canonical_state) {
                 continue;
             }
             for entry in entries {
@@ -462,7 +525,9 @@ impl Runner {
                     javascript_entry_lock(&self.core.trees.state, &path)?.is_none()
                 } else if kind == "git-deps" {
                     dependency_roots.contains(&path) || inner.evicting_dependencies.contains(&path)
-                } else if kind == "trash" {
+                } else if kind == "boat-workspace-trash" {
+                    active_protected.iter().any(|owned| overlaps(&path, owned))
+                } else if matches!(kind, "trash" | "boat-quarantine") {
                     false
                 } else {
                     name.parse::<Uuid>().ok().is_some_and(|id| {
@@ -482,6 +547,7 @@ impl Runner {
                         workspace: None,
                         last_used_ms,
                         cache_disk: false,
+                        snapshot: false,
                     });
                 }
             }
@@ -490,21 +556,183 @@ impl Runner {
         if inner.writer.is_none() && !inner.evicting_caches.contains(&fleet) {
             if let Ok(metadata) = fs::symlink_metadata(&fleet) {
                 if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    // Jobs read the cache through a read-only mount, so the
+                    // directory's own time shows only when the writer last
+                    // added a top-level entry. Its last use is the latest of
+                    // that, the last job to finish, and now while any job is
+                    // admitted, queued or running: each of those reads it.
+                    let modified_ms = metadata
+                        .modified()?
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let in_flight = !inner.admitting.is_empty()
+                        || inner.jobs.values().any(|job| job.terminal.is_none());
+                    let last_used_ms = if in_flight {
+                        self.now()
+                    } else {
+                        modified_ms.max(inner.catalog.compile_cache_used_ms.unwrap_or(0))
+                    };
                     candidates.push(Candidate {
                         path: fleet,
                         workspace: None,
                         cache_disk: false,
-                        last_used_ms: metadata
-                            .modified()?
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64,
+                        snapshot: false,
+                        last_used_ms,
                     });
                 }
             }
         }
         candidates.sort_by(|a, b| (a.last_used_ms, &a.path).cmp(&(b.last_used_ms, &b.path)));
-        Ok(candidates)
+        // Unreferenced sibling snapshots go first, least recently used
+        // first: a snapshot is rebuilt from the mirror in one setup, while a
+        // workspace loses its build target.
+        let mut snapshots = self.snapshot_disk_candidates(inner);
+        snapshots.extend(candidates);
+        Ok(snapshots)
+    }
+
+    /// Every sibling snapshot that nothing references, least recently used
+    /// first. A listing failure leaves snapshots out rather than stopping
+    /// the rest of the pass.
+    fn snapshot_disk_candidates(&self, inner: &Inner) -> Vec<Candidate> {
+        let references = super::sibling_eviction::SnapshotReferences::of(inner);
+        let root = self.core.config.sibling_snapshots_dir();
+        let listed =
+            crate::sibling_snapshots::store::repositories(&root).and_then(|repositories| {
+                let mut listed = Vec::new();
+                for repository in repositories {
+                    listed.extend(crate::sibling_snapshots::store::list(&repository)?);
+                }
+                Ok(listed)
+            });
+        let listed = listed.unwrap_or_else(|error| {
+            tracing::warn!(%error, "cannot list sibling snapshots for disk eviction");
+            Vec::new()
+        });
+        let mut candidates: Vec<_> = listed
+            .into_iter()
+            .filter(|snapshot| !references.covers(&snapshot.directory))
+            .map(|snapshot| Candidate {
+                last_used_ms: snapshot
+                    .used
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                path: snapshot.directory,
+                workspace: None,
+                cache_disk: false,
+                snapshot: true,
+            })
+            .collect();
+        candidates.sort_by(|a, b| (a.last_used_ms, &a.path).cmp(&(b.last_used_ms, &b.path)));
+        candidates
+    }
+
+    /// Deletes an unreferenced sibling snapshot for pressure eviction, by the
+    /// snapshot deletion protocol, and frees its space before returning, so
+    /// the next free-space probe sees it. Returns the bytes it held, or
+    /// `None` when the recheck found it referenced or being copied.
+    fn evict_sibling_snapshot(&self, directory: &Path, device: u64) -> io::Result<Option<u64>> {
+        let Some(aside) = self.delete_sibling_snapshot(directory)? else {
+            return Ok(None);
+        };
+        self.long_work("disk_remove");
+        let bytes = allocated_bytes(&aside, device);
+        #[cfg(target_os = "linux")]
+        if self.core.config.isolate_jobs {
+            crate::isolation::restore_runner_access(&aside)?;
+        }
+        fs::remove_dir_all(&aside)?;
+        bytes.map(Some)
+    }
+
+    /// Records the outcome of one pressure deletion: the eviction and its
+    /// catalog changes, or a failure, which holds the path back from
+    /// eviction for a while. A failed deletion of a path that no longer
+    /// exists is not a failure. `cache_cleared` says the shared compiler
+    /// cache was moved away from its path, which empties it even when a
+    /// later step of its deletion failed.
+    fn record_disk_removal(
+        &self,
+        candidate: &Candidate,
+        deleted: io::Result<u64>,
+        cache_cleared: bool,
+    ) {
+        let disappeared = deleted.is_err()
+            && matches!(
+                fs::symlink_metadata(&candidate.path),
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            );
+        let mut inner = self.core.inner.lock().unwrap();
+        let mut catalog = None;
+        inner.evicting_dependencies.remove(&candidate.path);
+        inner.evicting_caches.remove(&candidate.path);
+        if let Some(key) = &candidate.workspace {
+            inner.dropping.remove(key);
+        }
+        // The fill records describe the cache's contents, so they go with
+        // them, also when the deletion failed after the cache had left.
+        if cache_cleared || (deleted.is_ok() && candidate.path == self.core.config.sccache_dir()) {
+            inner.catalog.forget_compiler_cache_fills();
+            if deleted.is_err() {
+                catalog = Some(self.catalog_snapshot(&inner));
+            }
+        }
+        match deleted {
+            Ok(bytes) => {
+                if let Some(key) = &candidate.workspace {
+                    inner.catalog.workspaces.remove(key);
+                }
+                let eviction = DiskEviction {
+                    path: candidate.path.to_string_lossy().into_owned(),
+                    bytes,
+                    last_used_ms: candidate.last_used_ms,
+                    evicted_ms: self.now(),
+                };
+                tracing::info!(path = %eviction.path, bytes, last_used_ms = eviction.last_used_ms, evicted_ms = eviction.evicted_ms, "runner disk eviction");
+                self.core
+                    .health
+                    .lock()
+                    .unwrap()
+                    .record(eviction.evicted_ms, |c| {
+                        c.evictions += 1;
+                        c.eviction_bytes += bytes;
+                    });
+                inner.last_eviction = Some(eviction);
+                // Saved after the state lock is released, below.
+                catalog = Some(self.catalog_snapshot(&inner));
+            }
+            Err(_) if disappeared => {}
+            Err(error) => {
+                // Permission and filesystem failures rarely change between
+                // admissions. Retry later rather than hammering the same tree.
+                let delay =
+                    if self.core.config.boat_profile && error.kind() == io::ErrorKind::TimedOut {
+                        10_000
+                    } else {
+                        5 * 60 * 1000
+                    };
+                let retry_after_ms = self.now().saturating_add(delay);
+                self.core
+                    .health
+                    .lock()
+                    .unwrap()
+                    .record(self.now(), |c| c.eviction_failures += 1);
+                inner
+                    .eviction_retry_after
+                    .insert(candidate.path.clone(), retry_after_ms);
+                tracing::warn!(path = %candidate.path.display(), %error, retry_after_ms, "runner disk eviction failed")
+            }
+        }
+        drop(inner);
+        if let Some(catalog) = catalog {
+            if let Err(error) = catalog.and_then(|catalog| self.write_catalog(catalog)) {
+                // Metadata writes can still fail when deleting reflinks
+                // freed no blocks. Preserve the typed admission refusal.
+                tracing::error!(%error, "cannot persist pressure cleanup catalog");
+            }
+        }
     }
 
     fn live_cache_disks(&self, inner: &Inner) -> BTreeSet<PathBuf> {
@@ -537,6 +765,7 @@ impl Runner {
                 workspace: None,
                 last_used_ms: c.last_used_ms,
                 cache_disk: true,
+                snapshot: false,
             })
             .collect();
         // On the Windows instance every deletable tree lives under these fixed
@@ -582,6 +811,7 @@ impl Runner {
                         .unwrap_or_default()
                         .as_millis() as u64,
                     cache_disk: false,
+                    snapshot: false,
                 });
             }
         }
@@ -592,10 +822,201 @@ impl Runner {
     /// Delete synchronously off the state lock and probe after each tree. Rename
     /// to trash is not enough: on XFS shared extents may reclaim no free space.
     pub(super) fn ensure_disk_space(&self) -> io::Result<Option<RunnerDiskFull>> {
-        self.ensure_admission_ownership()?;
+        self.reclaim_disk_space(false)
+    }
+
+    /// The disk pass for admitting a Run request. A Boat sandbox serves one job
+    /// at a time for one tenant, so a workspace that the next job does not
+    /// reuse is unlikely to be used again, while keeping it can leave the next
+    /// build too little room: with jobs back to back every workspace counts as
+    /// recently used and the ordinary pass keeps it as long as the floor holds.
+    /// There every idle workspace is evicted before admission, whatever the
+    /// free space. The request's own workspace and siblings stay, because the
+    /// caller registered them as admitting before this pass.
+    pub(super) fn ensure_admission_disk_space(&self) -> io::Result<Option<RunnerDiskFull>> {
+        self.reclaim_disk_space(self.core.config.boat_profile)
+    }
+
+    fn quarantine_cleanup_blockers(&self) -> Vec<Uuid> {
+        let all = || self.core.quarantined.keys().copied().collect();
+        if self.core.quarantined.is_empty() {
+            return Vec::new();
+        }
+        // A cached admission decision is not proof for a destructive pass.
+        // Do not race another inventory or accept an incomplete backend list.
+        let Ok(_probe) = self.core.quarantine_probe.try_lock() else {
+            return all();
+        };
+        let Ok(Some(units)) = self.core.backend.live_units(&self.core.config) else {
+            return all();
+        };
+        {
+            let inner = self.core.inner.lock().unwrap();
+            if !inner.launching.is_empty() || !inner.starting.is_empty() {
+                return all();
+            }
+            let accounted: BTreeSet<_> = inner
+                .jobs
+                .values()
+                .filter(|job| job.terminal.is_none())
+                .filter_map(|job| job.process.and_then(|process| process.unit))
+                .map(|unit| self.core.backend.unit_name(&self.core.config, unit))
+                .collect();
+            if !units.is_subset(&accounted) {
+                return all();
+            }
+        }
+        self.core
+            .quarantined
+            .iter()
+            .filter_map(|(id, job)| {
+                let sandbox = self.core.trees.state.join("sandboxes").join(id.to_string());
+                let absent = matches!(fs::symlink_metadata(sandbox), Err(error) if error.kind() == io::ErrorKind::NotFound);
+                (job.request.is_some() || job.process.is_some() || !absent).then_some(*id)
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn boat_private_candidate(&self, candidate: &Candidate) -> bool {
+        self.core.config.boat_profile
+            && (candidate.workspace.is_some()
+                || candidate.path.parent() == Some(self.trash().as_path())
+                || self.boat_workspace_garbage(&candidate.path)
+                || candidate.path.parent()
+                    == Some(self.core.trees.state.join("boat-quarantine").as_path()))
+    }
+
+    fn boat_workspace_garbage(&self, path: &Path) -> bool {
+        self.core
+            .config
+            .boat_workspace_trash_roots()
+            .iter()
+            .any(|root| path.parent() == Some(root.as_path()))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn boat_workspace_trash(&self, path: &Path) -> io::Result<PathBuf> {
+        // /Users is a bind mount. Even on the same XFS device, renaming from
+        // that mount into runner-state trash fails with EXDEV. Retire under
+        // the workspace root instead, keeping atomic detachment before the
+        // bounded, no-follow deletion (and retry inventory) runs.
+        self.core
+            .config
+            .owned_workspace_roots
+            .iter()
+            .zip(self.core.config.boat_workspace_trash_roots())
+            .filter(|(root, _)| path != *root && path.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
+            .map(|(_, trash)| trash)
+            .ok_or_else(|| io::Error::other("Boat workspace has no eviction root"))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn validate_boat_workspace_trash(trash: &Path) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(trash)?;
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(io::Error::other(
+                "Boat workspace trash must be runner-private",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn remove_boat_candidate(&self, candidate: &Candidate) -> io::Result<u64> {
+        if let Some(key) = &candidate.workspace {
+            self.validate_destinations(key, None, &[])?;
+        }
+        let bytes = crate::boat_quota::cached_bytes(&candidate.path).unwrap_or_else(|error| {
+            tracing::warn!(path = %candidate.path.display(), %error, "Boat eviction size unknown; deletion must not depend on a complete walk");
+            0
+        });
+        let retired = if candidate.workspace.is_some() {
+            use std::os::unix::fs::DirBuilderExt;
+            let trash = self.boat_workspace_trash(&candidate.path)?;
+            match fs::DirBuilder::new().mode(0o700).create(&trash) {
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                result => result?,
+            }
+            Self::validate_boat_workspace_trash(&trash)?;
+            let retired = trash.join(format!("boat-cache-{}", Uuid::now_v7()));
+            fs::rename(&candidate.path, &retired)?;
+            File::open(&trash)?.sync_all()?;
+            File::open(candidate.path.parent().unwrap())?.sync_all()?;
+            retired
+        } else {
+            candidate.path.clone()
+        };
+        if let Err(error) = crate::boat_quota::remove_retired_tree(&retired) {
+            if candidate.workspace.is_none() {
+                return Err(error);
+            }
+            tracing::warn!(path = %retired.display(), %error, "Boat cache detached; bounded private garbage collection will continue later");
+        }
+        Ok(bytes)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn evict_boat_setup_workspace(&self, setup: &Setup) -> io::Result<()> {
+        let key = &setup.request.workspace_key;
         let _pressure = self.core.disk.lock().unwrap();
+        let used = {
+            let mut inner = self.core.inner.lock().unwrap();
+            if !self.core.config.boat_profile
+                || setup.base
+                || !inner.starting.contains(&setup.id)
+                || !inner.reserved.contains_key(key)
+                || inner.jobs[&setup.id].key() != key.as_str()
+            {
+                return Err(io::Error::other(
+                    "cold eviction does not own the active Boat setup reservation",
+                ));
+            }
+            inner.dropping.insert(key.clone());
+            inner
+                .catalog
+                .workspaces
+                .get(key)
+                .map_or(self.now(), |workspace| workspace.used_ms)
+        };
+        let candidate = Candidate {
+            path: PathBuf::from(key),
+            workspace: Some(key.clone()),
+            last_used_ms: used,
+            cache_disk: false,
+            snapshot: false,
+        };
+        let _tree = crate::tree_access::lock(&candidate.path);
+        let deleted = self.remove_boat_candidate(&candidate);
+        let result = deleted
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| io::Error::new(error.kind(), error.to_string()));
+        self.record_disk_removal(&candidate, deleted, false);
+        result?;
+        (self.core.config.boat_storage_trim)()
+    }
+
+    /// With `sweep_idle_workspaces`, every evictable catalogued workspace is
+    /// deleted regardless of age or free space before the ordinary rules apply
+    /// to everything else.
+    fn reclaim_disk_space(
+        &self,
+        sweep_idle_workspaces: bool,
+    ) -> io::Result<Option<RunnerDiskFull>> {
+        let _pressure = self.core.disk.lock().unwrap();
+        #[cfg(unix)]
+        if self.core.config.macos_instance() {
+            return crate::macos::evict(&self.core.config, self.core.trees.mirrors.clone());
+        }
         let floor = self.core.config.free_space_floor_bytes;
         if floor == 0 {
+            self.ensure_admission_ownership()?;
             return Ok(None);
         }
         // Reclaim cache before admission becomes unsafe. Missing the soft goal
@@ -607,16 +1028,35 @@ impl Runner {
             .unwrap_or_else(|| floor.saturating_mul(2));
         let probe = || (self.core.config.free_space_probe)(&self.core.trees.state);
         let mut free = probe()?;
-        if !self.core.quarantined.is_empty() {
-            // Admission can proceed after every live unit is accounted for, but
-            // damaged historical records still cannot authorize destructive GC.
+        if free >= soft && !sweep_idle_workspaces {
+            self.ensure_admission_ownership()?;
+            return Ok(None);
+        }
+        let blocked = self.quarantine_cleanup_blockers();
+        {
+            let mut cleanup = self.core.quarantine_cleanup.lock().unwrap();
+            cleanup.blocked = blocked.clone();
+            let now = self.now();
+            if !blocked.is_empty()
+                && cleanup
+                    .last_error_ms
+                    .is_none_or(|last| now.saturating_sub(last) >= 300_000)
+            {
+                tracing::error!(quarantined_ids = ?blocked, "runner disk cleanup blocked by quarantine");
+                cleanup.last_error_ms = Some(now);
+            }
+        }
+        if !blocked.is_empty() {
+            self.ensure_admission_ownership()?;
             return Ok((free < floor).then_some(RunnerDiskFull {
                 free_bytes: free,
                 floor_bytes: floor,
             }));
         }
-        if free >= soft {
-            return Ok(None);
+        for id in self.core.quarantined.keys() {
+            // Null sidecar fields do not prove that a job never ran. The fresh
+            // inventory and absent sandbox only authorize GC, not replay/retry.
+            tracing::warn!(quarantined_id = %id, "disk cleanup proceeding past ownerless quarantine; duplicate fence retained");
         }
         let device = crate::filesystem::device(&self.core.trees.state)?;
         let mut attempted = BTreeSet::new();
@@ -647,11 +1087,28 @@ impl Runner {
                     {
                         return false;
                     }
+                    if sweep_idle_workspaces && c.workspace.is_some() {
+                        return true;
+                    }
+                    // Only a sweep continues past the soft goal, and only for
+                    // workspaces.
+                    if free >= soft {
+                        return false;
+                    }
+                    // Nothing uses an unreferenced snapshot; the next setup
+                    // that needs it builds it again.
+                    if c.snapshot {
+                        return true;
+                    }
                     // Only caches are worth keeping for reuse. A dead job's private
                     // tree and pending deletions are garbage at any age.
                     let garbage = c.path.parent().is_some_and(|parent| {
-                        parent == sandboxes || parent == trash || staging.as_deref() == Some(parent)
-                    });
+                        parent == sandboxes
+                            || parent == trash
+                            || (self.core.config.boat_profile
+                                && parent == self.core.trees.state.join("boat-quarantine"))
+                            || staging.as_deref() == Some(parent)
+                    }) || self.boat_workspace_garbage(&c.path);
                     if (c.cache_disk
                         && now.saturating_sub(c.last_used_ms) <= SOFT_PRESSURE_MIN_AGE_MS)
                         || (!garbage
@@ -679,6 +1136,23 @@ impl Runner {
                 next
             };
             let Some(candidate) = candidate else { break };
+            if candidate.snapshot {
+                attempted.insert(candidate.path.clone());
+                let deleted = match self.evict_sibling_snapshot(&candidate.path, device) {
+                    Ok(None) => continue,
+                    Ok(Some(bytes)) => Ok(bytes),
+                    Err(error) => Err(error),
+                };
+                self.record_disk_removal(&candidate, deleted, false);
+                free = probe()?;
+                if free >= soft && !sweep_idle_workspaces && !self.core.config.boat_profile {
+                    self.core.health.lock().unwrap().record(self.now(), |c| {
+                        c.skipped_recent += skipped_recent.len() as u64;
+                    });
+                    return Ok(None);
+                }
+                continue;
+            }
             let caches = self.core.config.windows.as_ref().map(|vm| vm.caches());
             let _cache_lock = if candidate.cache_disk {
                 let caches = caches.as_ref().unwrap();
@@ -758,6 +1232,9 @@ impl Runner {
                 .map_or(Ok(()), |key| self.validate_destinations(key, None, &[]));
             #[cfg(target_os = "linux")]
             let access = authorization.and_then(|()| {
+                if self.boat_private_candidate(&candidate) {
+                    return Ok(());
+                }
                 if self.core.config.isolate_jobs {
                     if candidate.path.parent()
                         == Some(self.core.trees.state.join("sandboxes").as_path())
@@ -772,14 +1249,28 @@ impl Runner {
             });
             #[cfg(not(target_os = "linux"))]
             let access: io::Result<()> = authorization;
+            let mut cache_cleared = false;
             let deleted = access.and_then(|()| {
+                #[cfg(target_os = "linux")]
+                if self.boat_private_candidate(&candidate) {
+                    return self.remove_boat_candidate(&candidate);
+                }
                 let bytes = allocated_bytes(&candidate.path, device)?;
                 if candidate.cache_disk {
                     caches.as_ref().unwrap().remove(&candidate.path)?;
                 } else if candidate.path == self.core.config.sccache_dir() {
                     let trash = self.trash().join(format!("sccache-{}", Uuid::now_v7()));
                     fs::create_dir_all(self.trash())?;
+                    #[cfg(target_os = "linux")]
+                    if self.core.config.writer_account.is_some() {
+                        crate::isolation::retire_writer_cache(&candidate.path, &trash)?;
+                    } else {
+                        fs::rename(&candidate.path, &trash)?;
+                    }
+                    #[cfg(not(target_os = "linux"))]
                     fs::rename(&candidate.path, &trash)?;
+                    // From here on jobs see an empty cache, whatever fails next.
+                    cache_cleared = true;
                     #[cfg(target_os = "linux")]
                     if let Some(account) = self.core.config.writer_account {
                         crate::isolation::prepare_writer_cache(&candidate.path, account)?;
@@ -794,76 +1285,27 @@ impl Runner {
                 }
                 Ok(bytes)
             });
-            let disappeared = deleted.is_err()
-                && matches!(
-                    fs::symlink_metadata(&candidate.path),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound
-                );
-            let mut inner = self.core.inner.lock().unwrap();
-            inner.evicting_dependencies.remove(&candidate.path);
-            inner.evicting_caches.remove(&candidate.path);
-            if let Some(key) = &candidate.workspace {
-                inner.dropping.remove(key);
-            }
-            match deleted {
-                Ok(bytes) => {
-                    if candidate.path == self.core.config.sccache_dir() {
-                        for repository in inner.catalog.repositories.values_mut() {
-                            repository.filled_descriptor = None;
-                            repository.filled_descriptors.clear();
-                            repository.recorded_without_writer.clear();
-                            repository.miss_refills.clear();
-                        }
-                    }
-                    if let Some(key) = &candidate.workspace {
-                        inner.catalog.workspaces.remove(key);
-                    }
-                    let eviction = DiskEviction {
-                        path: candidate.path.to_string_lossy().into_owned(),
-                        bytes,
-                        last_used_ms: candidate.last_used_ms,
-                        evicted_ms: self.now(),
-                    };
-                    tracing::info!(path = %eviction.path, bytes, last_used_ms = eviction.last_used_ms, evicted_ms = eviction.evicted_ms, "runner disk eviction");
-                    self.core
-                        .health
-                        .lock()
-                        .unwrap()
-                        .record(eviction.evicted_ms, |c| {
-                            c.evictions += 1;
-                            c.eviction_bytes += bytes;
-                        });
-                    inner.last_eviction = Some(eviction);
-                    if let Err(error) = self.catalog(&inner) {
-                        // Metadata writes can still fail when deleting reflinks
-                        // freed no blocks. Preserve the typed admission refusal.
-                        tracing::error!(%error, "cannot persist pressure cleanup catalog");
-                    }
-                }
-                Err(_) if disappeared => {}
-                Err(error) => {
-                    // Permission and filesystem failures rarely change between
-                    // admissions. Retry later rather than hammering the same tree.
-                    let retry_after_ms = self.now().saturating_add(5 * 60 * 1000);
-                    self.core
-                        .health
-                        .lock()
-                        .unwrap()
-                        .record(self.now(), |c| c.eviction_failures += 1);
-                    inner
-                        .eviction_retry_after
-                        .insert(candidate.path.clone(), retry_after_ms);
-                    tracing::warn!(path = %candidate.path.display(), %error, retry_after_ms, "runner disk eviction failed")
-                }
-            }
-            drop(inner);
+            self.record_disk_removal(&candidate, deleted, cache_cleared);
             free = probe()?;
-            if free >= soft {
+            if free >= soft && !sweep_idle_workspaces && !self.core.config.boat_profile {
                 self.core.health.lock().unwrap().record(self.now(), |c| {
                     c.skipped_recent += skipped_recent.len() as u64;
                 });
                 return Ok(None);
             }
+        }
+        #[cfg(target_os = "linux")]
+        if self.core.config.boat_profile && (!attempted.is_empty() || free < floor) {
+            // Batch discard after eviction: XFS free space alone does not mean
+            // the sparse loop image returned its blocks to the root disk.
+            (self.core.config.boat_storage_trim)()?;
+            free = probe()?;
+        }
+        if free >= soft {
+            self.core.health.lock().unwrap().record(self.now(), |c| {
+                c.skipped_recent += skipped_recent.len() as u64;
+            });
+            return Ok(None);
         }
         if free >= floor {
             self.core.health.lock().unwrap().record(self.now(), |c| {
@@ -888,5 +1330,139 @@ impl Runner {
             free_bytes: free,
             floor_bytes: floor,
         }))
+    }
+}
+
+/// How often an idle runner with a disk reserve checks whether its disk has
+/// dropped under the admission floor.
+pub(super) const DISK_UPKEEP_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Whether a failed write ran out of space (ENOSPC).
+pub(super) fn storage_full(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::StorageFull
+}
+
+impl Runner {
+    fn disk_reserve_path(&self) -> PathBuf {
+        self.core.trees.state.join("disk-reserve")
+    }
+
+    /// Keeps a runner that reserves disk (the Boat profile) able to admit a job
+    /// without waiting for one to arrive. Admission is the only other place
+    /// that evicts, and in a Boat sandbox nothing reaches admission while the
+    /// disk is full: the endpoint's journal shares this disk and the endpoint
+    /// withdraws its readiness below the floor. So when no job is live and free
+    /// space is under the floor, this runs the ordinary pressure pass, which
+    /// below the floor may evict any idle workspace, including the one the last
+    /// job used. Once free space is back above the floor, it recreates the disk
+    /// reserve if a full disk used it up.
+    pub(crate) fn disk_upkeep(&self) -> io::Result<()> {
+        let floor = self.core.config.free_space_floor_bytes;
+        if self.core.config.disk_reserve_bytes == 0 || floor == 0 {
+            return Ok(());
+        }
+        let Ok(_restore) = self.core.reserve_restore.try_lock() else {
+            return Ok(());
+        };
+        let idle = |inner: &Inner| {
+            !inner.restoring_reserve
+                && inner.jobs.values().all(|job| job.terminal.is_some())
+                && inner.starting.is_empty()
+                && inner.admitting.is_empty()
+                && inner.preparing.is_empty()
+                && inner.transfers.is_empty()
+                && inner.reserved.is_empty()
+        };
+        if !idle(&self.core.inner.lock().unwrap()) {
+            return Ok(());
+        }
+        let probe = || (self.core.config.free_space_probe)(&self.core.trees.state);
+        if probe()? < floor {
+            self.ensure_disk_space()?;
+            if probe()? < floor {
+                return Ok(());
+            }
+        }
+        // Claim the idle interval, not the global lock: writing the reserve can
+        // stall on a stressed disk, but status/cancel/record work must proceed.
+        let mut inner = self.core.inner.lock().unwrap();
+        if !idle(&inner) {
+            return Ok(());
+        }
+        inner.restoring_reserve = true;
+        drop(inner);
+        let claim = Marker::new(self, |inner: &mut Inner| inner.restoring_reserve = false);
+        let temporary = self.write_disk_reserve()?;
+        let mut inner = self.core.inner.lock().unwrap();
+        let published = temporary.map_or(Ok(()), |temporary| {
+            fs::rename(&temporary, self.disk_reserve_path()).inspect_err(|_| {
+                let _ = fs::remove_file(temporary);
+            })
+        });
+        claim.clear(&mut inner);
+        published
+    }
+
+    /// Returns a fully allocated, synced temporary file. The caller publishes it
+    /// under the idle claim without keeping the state lock across this I/O.
+    fn write_disk_reserve(&self) -> io::Result<Option<PathBuf>> {
+        let bytes = self.core.config.disk_reserve_bytes;
+        let path = self.disk_reserve_path();
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(invalid("runner disk reserve is not a regular file"))
+            }
+            Ok(metadata) if metadata.len() == bytes => return Ok(None),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let temporary = path.with_extension("tmp");
+        let written = (|| -> io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temporary)?;
+            self.long_work("disk_reserve_write");
+            let chunk = vec![0; 1 << 20];
+            let mut left = bytes;
+            while left > 0 {
+                let n = left.min(chunk.len() as u64) as usize;
+                file.write_all(&chunk[..n])?;
+                left -= n as u64;
+            }
+            file.sync_all()
+        })();
+        if written.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        written?;
+        tracing::info!(bytes, "runner disk reserve allocated");
+        Ok(Some(temporary))
+    }
+
+    /// Frees the reserve after a write ran out of space, so the records that
+    /// let a finished job end (its terminal record, the catalog, the
+    /// endpoint's journal) can still be written. Returns whether a reserve was
+    /// removed.
+    pub(super) fn release_disk_reserve(&self) -> bool {
+        if self.core.config.disk_reserve_bytes == 0 {
+            return false;
+        }
+        match fs::remove_file(self.disk_reserve_path()) {
+            Ok(()) => {
+                tracing::warn!(
+                    bytes = self.core.config.disk_reserve_bytes,
+                    "runner disk reserve released after the disk filled"
+                );
+                true
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                tracing::error!(%error, "cannot release runner disk reserve");
+                false
+            }
+        }
     }
 }

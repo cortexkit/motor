@@ -4,7 +4,9 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import socket
+import stat
 import struct
 import tempfile
 import threading
@@ -17,6 +19,20 @@ p = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(p)
 # Kept before setUp replaces it, for the one test that reads a fake /proc.
 REAL_RUNNER_PROCESSES = p.runner_processes
+# The real host paths, kept before setUp points them into a scratch directory.
+LIVE_PATHS = dict(ROOT=p.ROOT, REGISTRY=p.REGISTRY, PROVISION=p.PROVISION, BINDINGS=p.BINDINGS)
+# The hosted-host renderer whose output install.sh requires the installed
+# provisioning record to match byte for byte.
+hosted_spec = importlib.util.spec_from_file_location(
+    "hosted_host", Path(__file__).resolve().parents[1] / "hosted-host" / "hosted_host.py")
+assert hosted_spec is not None and hosted_spec.loader is not None
+hosted = importlib.util.module_from_spec(hosted_spec)
+hosted_spec.loader.exec_module(hosted)
+# The host's two records as found: the provisioning record still names the
+# image from before a hand swap; the helper registry names the image running.
+RECORD_IMAGE = "tenant-20261020-main-806a6d3-20261020T021255Z"
+REGISTRY_IMAGE = "tenant-20261020-net-bb3e7fd-20261020T163144Z"
+SUB = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV"
 
 
 def config():
@@ -72,6 +88,112 @@ class ProvisionTests(unittest.TestCase):
         self.patch.stop()
         self.tmp.cleanup()
 
+    def removal_records(self):
+        """Two provisioned tenants, a (tap 1) and b (tap 2), with disks,
+        suspend snapshots, a set-aside stale snapshot and bindings."""
+        bindings = {}
+        for tenant, tap in (("a", 1), ("b", 2)):
+            c = p.checked({**config(), "tenant": tenant, "vm": f"vm-{tenant}", "tap_index": tap})
+            (p.PROVISION / f"{tenant}.json").write_text(json.dumps(c, indent=2) + "\n")
+            home = p.ROOT / "tenants" / tenant
+            record = {key: value for key, value in c.items() if key not in p.PROVISION_ONLY}
+            record.update({name: str(home / leaf) for name, leaf in p.REGISTRY_PATHS.items()})
+            (p.REGISTRY / f"{tenant}.json").write_text(json.dumps(record, indent=2) + "\n")
+            (home / "suspend").mkdir(parents=True)
+            (home / "suspend.stale-v0-1").mkdir()
+            (home / "disk.img").write_bytes(tenant.encode())
+            (home / "generation").write_text("3\n")
+            (home / "suspend/suspend.memory").write_bytes(b"memory")
+            (home / "suspend/key.json").write_text("{}")
+            bindings[f"vm-{tenant}"] = {"tenant": tenant, "sub": c["sub"]}
+        p.BINDINGS.write_text(json.dumps(bindings, indent=2) + "\n")
+        p.BINDINGS.chmod(0o644)
+
+    def snapshot_tree(self):
+        return {str(path.relative_to(self.root)): path.read_bytes() if path.is_file() else None
+                for path in sorted(self.root.rglob("*")) if path.name != "provision.lock"}
+
+    def test_removal_layout_is_the_one_the_helper_removes(self):
+        pinned = json.loads(Path(__file__).with_name("removal-layout.json").read_text())
+        with mock.patch.multiple(p, **LIVE_PATHS):
+            self.assertEqual(p.removal_layout(), pinned)
+
+    def test_remove_tenant_refuses_while_either_service_is_running(self):
+        self.removal_records()
+        before = self.snapshot_tree()
+        for active in ("motor-host.service", "motor-vm-helper.service"):
+            with self.subTest(active=active):
+                states = {"motor-host.service": "inactive", "motor-vm-helper.service": "inactive", active: "active"}
+                execute = mock.Mock()
+                with self.assertRaisesRegex(ValueError, "must be stopped") as refused:
+                    p.remove_tenant("a", check_service=states.get, execute=execute, has_tap=lambda _tap: True,
+                                    output=lambda _line: None)
+                self.assertIn(p.STOP_COMMAND, str(refused.exception))
+                execute.assert_not_called()
+                self.assertEqual(self.snapshot_tree(), before)
+
+    def test_remove_tenant_dry_run_lists_everything_and_deletes_nothing(self):
+        self.removal_records()
+        before = self.snapshot_tree()
+        lines = []
+        execute = mock.Mock()
+        p.remove_tenant("a", dry_run=True, check_service=lambda _unit: "inactive", execute=execute,
+                        has_tap=lambda tap: tap == "mtap1", now=lambda: 1000, output=lines.append)
+        execute.assert_not_called()
+        self.assertEqual(self.snapshot_tree(), before)
+        listed = "\n".join(lines)
+        home = p.ROOT / "tenants/a"
+        for path in (home / "disk.img", home / "generation", home / "suspend/suspend.memory",
+                     home / "suspend/key.json", home / "suspend.stale-v0-1", p.REGISTRY / "a.json", p.PROVISION / "a.json"):
+            self.assertIn(f"{path}\n", listed + "\n")
+        self.assertIn(f"binding vm-a in {p.BINDINGS}", listed)
+        self.assertIn("delete: tap mtap1", listed)
+        self.assertIn("ufw route motor-tenant-mtap1", listed)
+        self.assertTrue(all(line.startswith("would ") for line in lines), lines)
+        self.assertNotIn("tenants/b", listed)
+        self.assertNotIn("mtap2", listed)
+
+    def test_remove_tenant_quarantines_one_tenant_and_the_second_survives(self):
+        self.removal_records()
+        b_before = {path: data for path, data in self.snapshot_tree().items()
+                    if path.startswith("tenants/b") or path.endswith("b.json")}
+        execute = mock.Mock()
+        messages = []
+        p.remove_tenant("a", check_service=lambda _unit: "inactive", execute=execute,
+                        has_tap=lambda tap: tap in ("mtap1", "mtap2"), now=lambda: 1000, output=messages.append)
+        execute.assert_called_once_with("ip", "link", "delete", "dev", "mtap1")
+        quarantine = p.ROOT / "removed/a-1000"
+        self.assertFalse((p.ROOT / "tenants/a").exists())
+        self.assertFalse((p.REGISTRY / "a.json").exists())
+        self.assertFalse((p.PROVISION / "a.json").exists())
+        self.assertEqual((quarantine / "home/disk.img").read_bytes(), b"a")
+        self.assertTrue((quarantine / "home/suspend/suspend.memory").exists())
+        self.assertTrue((quarantine / "home/suspend.stale-v0-1").is_dir())
+        self.assertEqual(json.loads((quarantine / "records/registry.json").read_text())["tap_index"], 1)
+        self.assertEqual(json.loads((quarantine / "records/provision.json").read_text())["tenant"], "a")
+        self.assertEqual(json.loads((quarantine / "records/binding.json").read_text()),
+                         {"vm-a": {"tenant": "a", "sub": SUB}})
+        self.assertEqual(stat.S_IMODE(quarantine.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((p.ROOT / "removed").stat().st_mode), 0o700)
+        self.assertEqual(json.loads(p.BINDINGS.read_text()), {"vm-b": {"tenant": "b", "sub": SUB}})
+        self.assertEqual(stat.S_IMODE(p.BINDINGS.stat().st_mode), 0o644)
+        b_after = {path: data for path, data in self.snapshot_tree().items()
+                   if path.startswith("tenants/b") or path.endswith("b.json")}
+        self.assertEqual(b_after, b_before)
+        self.assertTrue(any("quarantined" in line for line in messages), messages)
+        # The tenant is gone: a second removal finds nothing to remove.
+        with self.assertRaisesRegex(ValueError, "no helper registry entry"):
+            p.remove_tenant("a", check_service=lambda _unit: "inactive", execute=execute,
+                            has_tap=lambda _tap: False, output=lambda _line: None)
+
+    def test_remove_tenant_purge_now_deletes_instead_of_quarantining(self):
+        self.removal_records()
+        p.remove_tenant("a", purge_now=True, check_service=lambda _unit: "inactive", execute=mock.Mock(),
+                        has_tap=lambda _tap: False, now=lambda: 1000, output=lambda _line: None)
+        self.assertFalse((p.ROOT / "tenants/a").exists())
+        self.assertEqual(list((p.ROOT / "removed").iterdir()), [])
+        self.assertEqual((p.ROOT / "tenants/b/disk.img").read_bytes(), b"b")
+
     def test_switch_image_refuses_when_either_service_is_running(self):
         _c, provision_path, registry_path, _suspend, _manifest = self.switch_records()
         old_config = provision_path.read_bytes()
@@ -82,13 +204,37 @@ class ProvisionTests(unittest.TestCase):
                 states[active] = "active"
                 make_base = mock.Mock(side_effect=self.fake_base)
                 validate = mock.Mock()
-                with self.assertRaisesRegex(ValueError, "must be stopped"):
+                with self.assertRaisesRegex(ValueError, "must be stopped") as refused:
                     p.switch_image("a", "v2", make_base=make_base, check_service=states.get,
                                    validate_image=validate, output=lambda _line: None)
+                # The refusal names the exact command that stops the tenant
+                # cleanly, not a bare kill of the VM.
+                self.assertIn("sudo systemctl stop motor-host.service motor-vm-helper.service", str(refused.exception))
+                self.assertIn("cleanly", str(refused.exception))
                 validate.assert_not_called()
                 make_base.assert_not_called()
                 self.assertEqual(provision_path.read_bytes(), old_config)
                 self.assertEqual(registry_path.read_bytes(), old_record)
+
+    def test_switch_image_warns_when_the_last_vm_stop_was_unclean(self):
+        self.switch_records()
+        home = p.ROOT / "tenants/a"
+        messages = []
+        switch = lambda: p.switch_image("a", "v2", make_base=self.fake_base, check_service=lambda _unit: "inactive",
+                                        validate_image=lambda _image: None, output=messages.append)
+        switch()
+        self.assertFalse(any("did not stop cleanly" in line for line in messages), messages)
+        # The helper's running marker outlived the stop: the guest's power was
+        # cut, and the operator is told that its next start runs recovery.
+        (home / "running.json").write_text("{}")
+        messages.clear()
+        switch()
+        warning = [line for line in messages if "did not stop cleanly" in line]
+        self.assertEqual(len(warning), 1, messages)
+        self.assertIn("recovery", warning[0])
+        # The switch itself does not touch the marker; the helper turns it into
+        # the unclean-stop record when the tenant next starts.
+        self.assertTrue((home / "running.json").exists())
 
     def test_switch_image_runs_the_hosted_image_inventory_command(self):
         with mock.patch.object(p.subprocess, "run") as execute:
@@ -171,6 +317,122 @@ class ProvisionTests(unittest.TestCase):
         self.assertEqual((suspend / "suspend.vmstate").read_bytes(), b"old-state")
         self.assertEqual(len(list(suspend.parent.glob("suspend.stale-*"))), 0)
         self.assertEqual(list(p.PROVISION.glob("*.pending")), [])
+
+    def installer_render(self, image_version):
+        """The bytes install.sh installs, and compares, for tenant-1's record."""
+        return json.dumps(hosted.tenant_config(SUB, 100, image_version), indent=2) + "\n"
+
+    def add_image(self, version):
+        image = self.root / "tenant-images" / version
+        image.mkdir(parents=True)
+        (image / "vmlinux").write_bytes(b"kernel-" + version.encode())
+        (image / "rootfs").write_bytes(b"root-" + version.encode())
+        (image / "manifest.json").write_text(json.dumps(dict(
+            version=version, kernel_sha256=hashlib.sha256(b"kernel-" + version.encode()).hexdigest(),
+            rootfs_sha256=hashlib.sha256(b"root-" + version.encode()).hexdigest())))
+        return image
+
+    def mismatched_tenant_1(self):
+        """Records of the live mismatch, each written the way its writer writes it."""
+        provision_path = p.PROVISION / "tenant-1.json"
+        provision_path.write_text(self.installer_render(RECORD_IMAGE))
+        provision_path.chmod(0o644)
+        c = p.checked(json.loads(provision_path.read_text()))
+        record = {key: value for key, value in c.items() if key not in {"tenant", "sub", "vm", "resolvers"}}
+        home = p.ROOT / "tenants/tenant-1"
+        record.update(disk=str(home / "disk.img"), generation=str(home / "generation"), suspend=str(home / "suspend"),
+                      image_version=REGISTRY_IMAGE)
+        registry_path = p.REGISTRY / "tenant-1.json"
+        registry_path.write_text(json.dumps(record, indent=2) + "\n")
+        (home / "suspend").mkdir(parents=True)
+        self.add_image(RECORD_IMAGE)
+        self.add_image(REGISTRY_IMAGE)
+        return provision_path, registry_path
+
+    def repair(self, validate_image=lambda _image: None, output=None):
+        return p.repair_from_registry("tenant-1", validate_image=validate_image, check_trusted=lambda _path: None,
+                                      output=(lambda _line: None) if output is None else output)
+
+    def test_switch_image_refuses_the_live_mismatch_until_it_is_repaired(self):
+        provision_path, registry_path = self.mismatched_tenant_1()
+        target = "tenant-20261021-main-0000000-20261021T120000Z"
+        self.add_image(target)
+        switch = lambda: p.switch_image("tenant-1", target, make_base=self.fake_base, check_service=lambda _unit: "inactive",
+                                        validate_image=lambda _image: None, output=lambda _line: None)
+        with self.assertRaisesRegex(ValueError, "image versions differ"):
+            switch()
+        registry_before = registry_path.read_bytes()
+        validated = []
+        messages = []
+        self.assertTrue(self.repair(validate_image=validated.append, output=messages.append))
+
+        # Exactly image_version changed, to the registry's, and nothing else.
+        self.assertEqual(validated, [self.root / "tenant-images" / REGISTRY_IMAGE])
+        self.assertEqual(registry_path.read_bytes(), registry_before)
+        self.assertEqual(json.loads(provision_path.read_text()),
+                         {**json.loads(self.installer_render(RECORD_IMAGE)), "image_version": REGISTRY_IMAGE})
+        self.assertEqual(messages, [f"{provision_path}: image_version {RECORD_IMAGE} -> {REGISTRY_IMAGE} "
+                                    f"(from {registry_path}); no other field changed"])
+        # install.sh --check accepts it: the bytes equal its render for the
+        # installed image, the mode is unchanged and the images now agree.
+        self.assertEqual(provision_path.read_text(), self.installer_render(REGISTRY_IMAGE))
+        self.assertEqual(provision_path.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(json.loads(registry_path.read_text())["image_version"],
+                         json.loads(provision_path.read_text())["image_version"])
+        self.assertEqual(list(p.PROVISION.glob("*.pending")), [])
+
+        # Repairing again changes nothing; the switch now proceeds.
+        messages.clear()
+        self.assertFalse(self.repair(output=messages.append))
+        self.assertIn("nothing changed", messages[0])
+        switch()
+        self.assertEqual(json.loads(provision_path.read_text())["image_version"], target)
+        self.assertEqual(json.loads(registry_path.read_text())["image_version"], target)
+
+    def test_repair_refuses_without_changing_anything_unless_only_the_image_differs(self):
+        def drop(record, name):
+            del record[name]
+        cases = {
+            "registry image missing": (None, "registry image does not exist"),
+            "registry image fails validation": (None, "inventory failed"),
+            "registry manifest names another version": (None, "manifest version mismatch"),
+            "other field differs": (lambda record: record.update(vcpu_ceiling=7), "differ at vcpu_ceiling"),
+            "disk path differs": (lambda record: record.update(disk="/elsewhere/disk.img"), "differ at disk"),
+            "registry field missing": (lambda record: drop(record, "io_weight"), "differ at io_weight"),
+            "registry field extra": (lambda record: record.update(capture_console=True), "differ at capture_console"),
+            "registry image not a name": (lambda record: record.update(image_version="../x"), "path component"),
+        }
+        for case, (edit, message) in cases.items():
+            with self.subTest(case=case):
+                self.tearDown()
+                self.setUp()
+                provision_path, registry_path = self.mismatched_tenant_1()
+                if edit is not None:
+                    record = json.loads(registry_path.read_text())
+                    edit(record)
+                    registry_path.write_text(json.dumps(record, indent=2) + "\n")
+                validate = lambda _image: None
+                if case == "registry image missing":
+                    shutil.rmtree(self.root / "tenant-images" / REGISTRY_IMAGE)
+                elif case == "registry image fails validation":
+                    def validate(_image):
+                        raise ValueError("inventory failed")
+                elif case == "registry manifest names another version":
+                    (self.root / "tenant-images" / REGISTRY_IMAGE / "manifest.json").write_text(json.dumps(dict(version=RECORD_IMAGE)))
+                provision_before, registry_before = provision_path.read_bytes(), registry_path.read_bytes()
+                with self.assertRaisesRegex(ValueError, message):
+                    self.repair(validate_image=validate)
+                self.assertEqual(provision_path.read_bytes(), provision_before)
+                self.assertEqual(registry_path.read_bytes(), registry_before)
+
+    def test_repair_keeps_the_old_record_if_the_replace_fails(self):
+        provision_path, _registry_path = self.mismatched_tenant_1()
+        before = provision_path.read_bytes()
+        with mock.patch.object(p.os, "replace", side_effect=OSError("injected replace failure")), \
+                self.assertRaisesRegex(OSError, "injected"):
+            self.repair()
+        self.assertEqual(provision_path.read_bytes(), before)
+        self.assertEqual(list(p.PROVISION.glob("*.pending")) + list(p.PROVISION.glob(".*.pending")), [])
 
     def test_invalid_names_and_unknown_options(self):
         for name in ["", ".", "..", "foo/bar", "a\0b"]:

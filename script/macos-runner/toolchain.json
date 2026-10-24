@@ -1,0 +1,433 @@
+{
+  "schema": 1,
+  "platform": "macos",
+  "release_status": "pending review",
+  "ipsw": {
+    "version": "27.0.1",
+    "build": "26A434",
+    "file": "macos-27.0.1-26A434.ipsw",
+    "size": 26637307067,
+    "sha256": "2f016638293c3e641b8b25391a76fbc16563b3711915a5551cf8aa0f5598a5c1"
+  },
+  "observed_host": {
+    "version": "27.0",
+    "build": "26A425"
+  },
+  "clt": {
+    "package_id": "com.apple.pkg.CLTools_Executables",
+    "version": "pending measurement",
+    "softwareupdate_label": "pending measurement"
+  },
+  "rustup": "1.29.1",
+  "rust_profile": "minimal",
+  "rust_default": "1.99.0-aarch64-apple-darwin",
+  "rust_toolchains": {
+    "1.91.0-aarch64-apple-darwin": {
+      "rustc": "rustc 1.91.0 (f8297e351 2025-10-28)",
+      "targets": [
+        "aarch64-apple-darwin"
+      ],
+      "components": [
+        "cargo-aarch64-apple-darwin",
+        "clippy-aarch64-apple-darwin",
+        "rust-std-aarch64-apple-darwin",
+        "rustc-aarch64-apple-darwin",
+        "rustfmt-aarch64-apple-darwin"
+      ],
+      "rustc_verbose": "pending measurement",
+      "sha256": "pending measurement"
+    },
+    "1.96.0-aarch64-apple-darwin": {
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+      "targets": [
+        "aarch64-apple-darwin"
+      ],
+      "components": [
+        "cargo-aarch64-apple-darwin",
+        "clippy-aarch64-apple-darwin",
+        "rust-std-aarch64-apple-darwin",
+        "rustc-aarch64-apple-darwin",
+        "rustfmt-aarch64-apple-darwin"
+      ],
+      "rustc_verbose": "pending measurement",
+      "sha256": "pending measurement"
+    },
+    "1.99.0-aarch64-apple-darwin": {
+      "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+      "targets": [
+        "aarch64-apple-darwin"
+      ],
+      "components": [
+        "cargo-aarch64-apple-darwin",
+        "clippy-aarch64-apple-darwin",
+        "rust-std-aarch64-apple-darwin",
+        "rustc-aarch64-apple-darwin",
+        "rustfmt-aarch64-apple-darwin"
+      ],
+      "rustc_verbose": "pending measurement",
+      "sha256": "pending measurement"
+    },
+    "stable-aarch64-apple-darwin": {
+      "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+      "targets": [
+        "aarch64-apple-darwin"
+      ],
+      "components": [
+        "cargo-aarch64-apple-darwin",
+        "rust-std-aarch64-apple-darwin",
+        "rustc-aarch64-apple-darwin"
+      ],
+      "rustc_verbose": "pending measurement",
+      "sha256": "pending measurement"
+    }
+  },
+  "stable_copy_from": "1.99.0-aarch64-apple-darwin",
+  "cargo_home": "/opt/motor/cargo",
+  "rustup_home": "/opt/motor/rustup",
+  "cargo_binaries": {
+    "cargo": {
+      "proxy": true
+    },
+    "cargo-clippy": {
+      "proxy": true
+    },
+    "cargo-fmt": {
+      "proxy": true
+    },
+    "cargo-miri": {
+      "proxy": true
+    },
+    "cargo-nextest": {
+      "version": "cargo-nextest 0.9.138 (fc97e97bb 2026-06-21)",
+      "sha256": "pending measurement"
+    },
+    "ckdev-mutate": {
+      "matches": "ckdev-mutate-5d005f45",
+      "version": "ckdev-mutate 0.12.7",
+      "sha256": "pending measurement"
+    },
+    "ckdev-mutate-0097d269": {
+      "version": "ckdev-mutate 0.9.1",
+      "sha256": "pending measurement"
+    },
+    "ckdev-mutate-0b3bc096": {
+      "version": "ckdev-mutate 0.12.6",
+      "sha256": "pending measurement"
+    },
+    "ckdev-mutate-0c99c7e1": {
+      "version": "ckdev-mutate 0.9.8",
+      "sha256": "pending measurement"
+    },
+    "ckdev-mutate-46cc166b": {
+      "version": "ckdev-mutate 0.8.0",
+      "sha256": "pending measurement"
+    },
+    "ckdev-mutate-5d005f45": {
+      "version": "ckdev-mutate 0.12.7",
+      "sha256": "pending measurement"
+    },
+    "ckdev-mutate-73c7e661": {
+      "version": "ckdev-mutate 0.9.5",
+      "sha256": "pending measurement"
+    },
+    "ckdev-mutate-85c8b577": {
+      "version": "ckdev-mutate 0.12.4",
+      "sha256": "pending measurement"
+    },
+    "ckdev-mutate-9d6b663d": {
+      "version": "ckdev-mutate 0.12.1",
+      "sha256": "pending measurement"
+    },
+    "ckdev-mutate-be120e92": {
+      "version": "ckdev-mutate 0.12.0",
+      "sha256": "pending measurement"
+    },
+    "ckdev-mutate-c1591d4a": {
+      "version": "ckdev-mutate 0.9.3",
+      "sha256": "pending measurement"
+    },
+    "ckdev-mutate-dfdb1129": {
+      "version": "ckdev-mutate 0.9.0",
+      "sha256": "pending measurement"
+    },
+    "clippy-driver": {
+      "proxy": true
+    },
+    "rls": {
+      "proxy": true
+    },
+    "rust-analyzer": {
+      "proxy": true
+    },
+    "rust-gdb": {
+      "proxy": true
+    },
+    "rust-gdbgui": {
+      "proxy": true
+    },
+    "rust-lldb": {
+      "proxy": true
+    },
+    "rustc": {
+      "proxy": true
+    },
+    "rustdoc": {
+      "proxy": true
+    },
+    "rustfmt": {
+      "proxy": true
+    },
+    "rustup": {
+      "sha256": "pending measurement"
+    },
+    "wasm-bindgen": {
+      "version": "wasm-bindgen 0.2.126",
+      "sha256": "pending measurement"
+    },
+    "wasm-bindgen-test-runner": {
+      "version": "wasm-bindgen-test-runner 0.2.126",
+      "sha256": "pending measurement"
+    },
+    "wasm2es6js": {
+      "version": "wasm2es6js 0.2.126",
+      "sha256": "pending measurement"
+    },
+    "worker-build": {
+      "version": "0.8.7",
+      "sha256": "pending measurement"
+    },
+    "worker-codegen": {
+      "version": "worker-build 0.8.7",
+      "sha256": "pending measurement"
+    }
+  },
+  "cargo_installs": [
+    {
+      "bins": [
+        "cargo-nextest"
+      ],
+      "crate": "cargo-nextest",
+      "version": "0.9.138"
+    },
+    {
+      "bins": [
+        "wasm-bindgen",
+        "wasm-bindgen-test-runner",
+        "wasm2es6js"
+      ],
+      "crate": "wasm-bindgen-cli",
+      "version": "0.2.126"
+    },
+    {
+      "bins": [
+        "worker-build",
+        "worker-codegen"
+      ],
+      "crate": "worker-build",
+      "version": "0.8.7"
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "46cc166b0df2edcfd14b3eb54ed6eeac588fed69",
+      "source": {
+        "url": "https://github.com/cortexkit/commons/archive/46cc166b0df2edcfd14b3eb54ed6eeac588fed69.tar.gz",
+        "sha256": "pending measurement"
+      }
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "dfdb11293eba0e5f03bd5d8e73c7c4b64dae1f73",
+      "source": {
+        "url": "https://github.com/cortexkit/commons/archive/dfdb11293eba0e5f03bd5d8e73c7c4b64dae1f73.tar.gz",
+        "sha256": "pending measurement"
+      }
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "0097d269a4c409db13306a11fc2c504057629791",
+      "source": {
+        "url": "https://github.com/cortexkit/commons/archive/0097d269a4c409db13306a11fc2c504057629791.tar.gz",
+        "sha256": "pending measurement"
+      }
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "c1591d4a76fa3d3a7367237922b0bca5214dbf11",
+      "source": {
+        "url": "https://github.com/cortexkit/commons/archive/c1591d4a76fa3d3a7367237922b0bca5214dbf11.tar.gz",
+        "sha256": "pending measurement"
+      }
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "73c7e66145e131eadffdd874c82d93548868b668",
+      "source": {
+        "url": "https://github.com/cortexkit/commons/archive/73c7e66145e131eadffdd874c82d93548868b668.tar.gz",
+        "sha256": "pending measurement"
+      }
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "0c99c7e16d8ae22b6e114136b6b7b68be6f1394e",
+      "source": {
+        "url": "https://github.com/cortexkit/commons/archive/0c99c7e16d8ae22b6e114136b6b7b68be6f1394e.tar.gz",
+        "sha256": "pending measurement"
+      }
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "be120e9254c4972191b39b2e6814987918206afc",
+      "source": {
+        "url": "https://github.com/cortexkit/commons/archive/be120e9254c4972191b39b2e6814987918206afc.tar.gz",
+        "sha256": "pending measurement"
+      }
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "9d6b663dac487bb982c7bfd18a96eee2292164ad",
+      "source": {
+        "url": "https://github.com/cortexkit/commons/archive/9d6b663dac487bb982c7bfd18a96eee2292164ad.tar.gz",
+        "sha256": "pending measurement"
+      }
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "85c8b577795d556fb27e54b548f06ea913d8b337",
+      "source": {
+        "url": "https://github.com/cortexkit/commons/archive/85c8b577795d556fb27e54b548f06ea913d8b337.tar.gz",
+        "sha256": "pending measurement"
+      }
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "0b3bc096880e22ab43bec18eb6719a50fc59c270",
+      "source": {
+        "url": "https://github.com/cortexkit/commons/archive/0b3bc096880e22ab43bec18eb6719a50fc59c270.tar.gz",
+        "sha256": "pending measurement"
+      }
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "default": true,
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "5d005f453c892a09147ffb5e991c06966ff9b4a2",
+      "source": {
+        "url": "https://github.com/cortexkit/commons/archive/5d005f453c892a09147ffb5e991c06966ff9b4a2.tar.gz",
+        "sha256": "pending measurement"
+      }
+    }
+  ],
+  "sources": {
+    "rustup": {
+      "url": "https://static.rust-lang.org/rustup/archive/1.29.1/aarch64-apple-darwin/rustup-init",
+      "sha256": "pending measurement"
+    },
+    "bun": {
+      "url": "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-darwin-aarch64.zip",
+      "sha256": "pending measurement"
+    },
+    "git": {
+      "url": "https://www.kernel.org/pub/software/scm/git/git-2.53.0.tar.xz",
+      "sha256": "5818bd7d80b061bbbdfec8a433d609dc8818a05991f731ffc4a561e2ca18c653"
+    },
+    "bash": {
+      "version": "5.2.37",
+      "url": "https://ftp.gnu.org/gnu/bash/bash-5.2.37.tar.gz",
+      "sha256": "9599b22ecd1d5787ad7d3b7bf0c59f312b3396d1e281175dd1f8a4014da621ff"
+    }
+  },
+  "tools": {
+    "bun": {
+      "path": "/opt/motor/bun/bin/bun",
+      "version": "1.4.2",
+      "sha256": "pending measurement"
+    },
+    "git": {
+      "path": "/opt/motor/bin/git",
+      "version": "git version 2.53.0",
+      "sha256": "pending measurement"
+    },
+    "bash": {
+      "path": "/opt/motor/bin/bash",
+      "version": "pending measurement",
+      "sha256": "pending measurement"
+    }
+  },
+  "agent": {
+    "commit": "311f411cc2f12baba058dd356be80c066f0b0aba",
+    "sha256": "pending measurement"
+  },
+  "prep_tools": {
+    "cargo": {
+      "path": "bin/cargo",
+      "sha256": "pending measurement"
+    },
+    "rustc": {
+      "path": "bin/rustc",
+      "sha256": "pending measurement"
+    },
+    "bun": {
+      "path": "bin/bun",
+      "sha256": "pending measurement"
+    },
+    "git": {
+      "path": "bin/git",
+      "sha256": "pending measurement"
+    }
+  },
+  "job_environment_by_role": {
+    "macos": {
+      "HOME": "/Users/motorjob",
+      "TMPDIR": {
+        "per_job_directory": true
+      },
+      "PATH": "/opt/motor/cargo/bin:/opt/motor/bun/bin:/opt/motor/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+      "RUSTUP_HOME": "/opt/motor/rustup",
+      "CARGO_HOME": "/opt/motor/job/cargo-home",
+      "CARGO_TARGET_DIR": null
+    }
+  }
+}

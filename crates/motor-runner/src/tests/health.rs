@@ -197,6 +197,7 @@ fn recorded_job(
     let request = Run {
         return_paths: Vec::new(),
         return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
+        return_chunked: false,
         job_id: id,
         gate_job: false,
         network: None,
@@ -343,7 +344,7 @@ fn repository_usage_rebuilds_from_retained_records_after_restart() {
     atomic_json(&record, &job).unwrap();
     drop(runner);
 
-    let runner = Runner::open(config).unwrap();
+    let runner = reopen(config);
     let usage = runner.runner_status().health.unwrap().repository_usage;
     assert_eq!(
         usage["prefrontal"],

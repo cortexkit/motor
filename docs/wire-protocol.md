@@ -77,12 +77,18 @@ is omitted on the wire. The withdrawal eligibility and no-start proof are
 unchanged: the terminal retains `queue_wait_exceeded` with `ran: none`, and its
 detail begins `spill_withdrawal: `. The runner counts these jobs separately as
 `health.queue_wait_1h.spill_withdrawals`, not in hourly or per-repository queue-wait
-refusals. The new count defaults to zero and is omitted at zero. Older runners
+refusals. A spill withdrawal never carries `retry_after_ms` (5.6). The new count defaults to zero and is omitted at zero. Older runners
 ignore the spill flag and continue counting it as a refusal; older clients
 remain compatible but cannot identify their spills. Tests:
 `spill_withdrawal_fields_are_additive_and_omitted_at_default`,
 `spill_withdrawal_is_not_a_queue_wait_refusal`, and
 `spill_withdrawals_are_exposed_but_not_reported_as_refusals`.
+A client that sent `spill: true` moves the job to a hosted runner when the
+terminal carries that detail prefix, even if a heartbeat without
+`queue_wait_ms` (the runner has already withdrawn the job) arrived before the
+terminal. Test:
+`spill_request_survives_a_heartbeat_without_queue_wait_before_the_terminal`
+(`crates/motor-module/src/spill.rs`).
 
 ## 3. Hello and capabilities
 
@@ -101,6 +107,7 @@ the original bytes. Test: `hello_without_started_capability_keeps_legacy_wire_by
 | `started: true` | The client accepts `started` records (section 6). |
 | `default_branch_tip: true` | The client distinguishes the default-branch fill tip from the submitted snapshot. The runner may use a nonempty integration tip for cache fills. Test: `hello_default_branch_tip_capability_is_additive`. |
 | `gate_jobs: true` | The peer understands `run.gate_job`; see [scheduling.md](scheduling.md#queue-order). Test: `gate_capability_and_mark_are_additive_motor_only_fields`. |
+| `sibling_paths: true` | The runner mounts sibling snapshots at any authorized workspace path, not only beside the repository root. Only snapshot-mode Linux runners advertise it; absence retains the neighbour rule for Run and Prepare. Tests: `hello_sibling_paths_capability_is_additive_and_defaults_false`, `sibling_paths_capability_tracks_snapshot_mode`. |
 | `platforms: ["windows"]` | The runner serves Windows jobs; see [windows-jobs.md](windows-jobs.md). Test: `windows_hello_advertises_explicit_platforms`. |
 
 Current `ck-motor` clients report a nonempty `run.integration_tip` or
@@ -151,6 +158,15 @@ The record also carries:
   (an array only when `ran` is `"remote"`; an empty array means no changes).
   Both are always present, explicitly null when unavailable. Test:
   `outcome_vectors_pin_before_start_proofs_and_nullability`.
+  On both Linux and Windows, each `workspace_changes` entry is a path relative
+  to the job's checkout root (the workspace key), with `/` separators and no
+  leading `/`, for example `sub/b.txt`. Paths outside the checkout root, such
+  as files in sibling checkouts, are not listed. Linux reports `git status`
+  entries (a rename lists only its destination; untracked files are
+  included). Windows reports files the job added, changed or deleted in the
+  guest; the runner converts the guest's `C:\m` paths to this form. Test:
+  `windows_backend_reports_workspace_changes_relative_to_checkout_root`
+  (`crates/motor-runner/src/tests/windows_backend.rs`).
 - Optional `pipestatus`, `refusal_detail` (at most 1024 bytes, for display,
   never for parsing), and `retry_after_ms`.
 
@@ -259,11 +275,74 @@ rather than rejecting them. Do not match their human-text prefixes for execution
 or retry decisions. Test:
 `unknown_refusal_retains_the_before_start_arm`.
 
-5.5. `retry_after_ms` is a hint that a refusal is transient (draining sends the
-time left to the drain deadline). Disk-full refusals carry no hint, because
-nothing re-probes on a schedule. A started job's terminal never carries one.
-Tests: `drain_retry_hint_is_bounded_by_the_deadline_on_the_private_frame`,
-`retry_hint_is_removed_from_started_job_terminal`.
+`execution_ended`, when present and `true`, proves that no process of the job
+remains. The runner sets it after reading a real exit status, confirming the
+unit is inactive, or proving the job never started (including before-start
+cancellation and refusal). It does not imply success or a known exit code:
+an `outcome_unknown` terminal can carry it. Absent or `false` means execution
+has not been proven ended and the job may still be running. Restart loss,
+uncertain monitoring or VM state, and execution-gate release failures do not
+by themselves establish this proof. False is omitted for older clients.
+Tests: `execution_ended_wire_real_status`,
+`execution_ended_wire_before_start`, `execution_ended_wire_unknown_monitor`,
+`cancelled_exited_unit_without_real_status_still_finalizes`.
+
+5.5. `retry_after_ms` is a hint that a refusal is transient: how long a caller
+should wait before asking again, never shorter than the caller's own remaining
+budget allows. A started job's terminal never carries one. Three refusals carry
+it:
+
+- `runner_draining`, on the private `refusal` frame: the time left to the drain
+  deadline. Test: `drain_retry_hint_is_bounded_by_the_deadline_on_the_private_frame`.
+- `runner_authentication_failed` with a transient signing detail
+  (`runner_sign_unavailable`, `runner_sign_invalid_response`): the time left in
+  the signing agent's backoff. The other signing details carry no hint, because
+  they need an operator. See [module.md](module.md#retry-hints-on-credential-refusals).
+- `queue_wait_exceeded`, on the job's terminal record: the recent build-server
+  queue wait, in the rules 5.6 gives.
+
+Disk-full refusals carry no hint, because nothing re-probes on a schedule.
+Test: `retry_hint_is_removed_from_started_job_terminal`.
+
+5.6. A queue-wait refusal (`refused_before_start`, reason
+`queue_wait_exceeded`) carries `retry_after_ms` when — and only when — the job
+was waiting for something another job's completion frees: enough free permits
+(`waiting_on=permits`), a running job's workspace (`workspace owner`), a queued
+job ahead of it in a workspace whose files overlap (`queued workspace job`), or
+the job that checks this directory out as a sibling instead (`sibling user of
+this checkout`). The value is the median of the queue waits of the jobs the
+runner started in the last hour (`health.queue_wait_1h.p50_ms`), clamped to
+1000–60000 ms. The floor keeps a caller from retrying before even a job whose
+start failed once would be retried; the ceiling is the runner's own longest
+start backoff, so a caller's deadline is never spent on a hint longer than the
+runner's experience of the queue.
+
+The runner sets this hint, because only it knows the phase a job was waiting
+in; `ck-motor` passes the terminal record through unchanged. A deployment that
+wants existing jobs to start carrying it therefore ships a new runner, not a
+new `ck-motor`: until the runner is upgraded, capacity refusals keep arriving
+without a hint.
+
+No hint accompanies a refusal that waiting cannot clear:
+
+| Refusal | Hint |
+| --- | --- |
+| `queue_wait_exceeded` with `waiting_on=demand exceeds capacity` (the job asks for more permits than the runner can ever grant) | Absent. |
+| Any other `queue_wait_exceeded` phase (behind a gate job, a cache fill, an older job, an upload, workspace setup) | Absent: no wait is known to end it. |
+| `queue_wait_exceeded` when no job started in the last hour | Absent: there is no recent wait to report, and zero would read as "retry at once". |
+| A spill withdrawal (`withdraw {spill: true}` handed to hosted capacity, detail `spill_withdrawal: `) | Absent: the caller is never refused, so it never sees the record. |
+| Every other reason (disk full, draining's queued-job refusal, lost to restart, request rejected, platform or network unsupported) | Absent. |
+
+Older clients already know the field (it has carried signing and drain hints),
+so they read it as written and ignore it for reasons they do not act on. Tests:
+`capacity_refusal_carries_the_recent_median_queue_wait_as_its_retry_hint`,
+`capacity_retry_hint_is_clamped_to_its_bounds`,
+`impossible_demand_refusal_carries_no_retry_hint`,
+`capacity_refusal_without_recent_starts_carries_no_retry_hint`,
+`spill_withdrawal_carries_no_retry_hint`
+(`crates/motor-runner/src/tests.rs`), and the old-client check
+`oldest_production_client_keeps_typed_queue_and_setup_refusal_details`
+(`python3 scripts/mixed-version.py`).
 
 ## 6. Sequence numbers, started and output
 
@@ -323,18 +402,60 @@ replayed `run` returns the same terminal), `lost_upload_e_after_last_byte_runs_o
 stays retrievable for 24 hours. Test: `cancelled_request_detaches_and_the_job_keeps_running`
 (`crates/motor-module/tests/it/detach.rs`).
 
+7.6. On the hosted path, `motor-host` keeps a job connection open after the
+job ends until it has relayed every record through `terminal` and
+`hosted_terminal`, however slowly the client reads. It then ends its side
+gracefully (TLS close_notify, then TCP FIN after the queued data) and keeps
+reading and discarding the client's heartbeats until the client closes, for at
+most two minutes (`CLIENT_DRAIN_DEADLINE`). Dropping the socket instead, with a
+heartbeat unread or arriving after the drop, made the kernel reset the
+connection and discard the frames still in flight. The host records the terminal
+as delivered, which queues its usage report at once, only when the client closes
+its side within that bound (a TLS close without close_notify counts); otherwise
+the report is queued when the 60-second delivery grace after the job's end
+expires. Billed
+time is measured from the runner's start and end events, so the drain never
+changes it. Tests:
+`slow_client_heartbeating_past_job_end_receives_every_frame_through_the_terminal`,
+`host_never_resets_a_client_with_unread_data_at_lease_end`,
+`a_client_that_never_closes_is_released_at_the_drain_deadline_without_delivery`
+(`crates/motor-host/tests/it/transport.rs`).
+
+7.7. The tenant runner closes a job stream as soon as it has written the
+terminal, without reading the client's later heartbeats. A slow client can
+still be far behind at that point, with the job's last output and the terminal
+queued between the runner and `motor-host`. When forwarding client bytes to the
+runner fails because the runner closed its end (broken pipe, reset or not
+connected), `motor-host` logs `guest_input_closed`, stops forwarding and
+discards further client input, and keeps relaying the runner's frames until
+the runner's stream ends. The relay ends there, not at the failed write, so
+the client still receives everything the runner wrote. Tests:
+`slow_client_receives_every_frame_after_the_runner_closes_its_job_stream`
+(`crates/motor-host/tests/it/transport.rs`) and, end to end through ck-motor's
+hosted channel and the real tenant runner,
+`a_slow_hosted_client_receives_every_frame_after_the_tenant_runner_closes_its_job_stream`
+(`crates/motor-module/src/hosted/relay_close_tests.rs`).
+
 ## 8. Queue wait and withdrawal
 
 8.1. `heartbeat.queue_wait_ms` is present only while the job is queued,
 measured from when its bundles were verified and pinned. It counts time waiting
-for capacity or another shared scheduler blocker, but excludes time when an
-earlier job owning the same workspace is the only blocker. The runner resumes
+for capacity or another shared scheduler blocker, but excludes time when the
+only blocker is a running or setting-up job that holds the job's own checkout
+(an earlier job owning the same workspace, or a job in another workspace that
+checks this directory out in place as a sibling), and time when the
+job is held back only for an earlier queued job whose main workspace overlaps
+one of this job's sibling checkout paths (both use the same host directory). The runner resumes
 the clock if another blocker appears. Upload, fetch, setup and execution are
 excluded. Cancellation still removes a queued job, and the request's execution
 timeout starts when its command starts. The `queue_wait_ms` in `started` and in
 the terminal record is this same counted wait, so a job that waited only behind
 its own workspace reports 0. `job_status_reply.waiting_on` reports the
-current blocker, such as `workspace owner` or `permits`. A plain heartbeat never
+current blocker, such as `workspace owner` (a job in this same workspace),
+`sibling user of this checkout` (a job in another workspace that uses this
+directory as a sibling; the refusal detail then names those jobs and their
+workspaces in `sibling_users=[...]`), `queued workspace job` or `permits`;
+it is free text, so clients show an unknown value as is. A plain heartbeat never
 authorizes withdrawal. Tests: `queue_heartbeats_are_additive_in_both_upgrade_orders`,
 `only_observed_permit_wait_can_withdraw_not_elapsed_acceptance`
 (`crates/motor-module/src/queue_tests.rs`).
@@ -355,6 +476,23 @@ seen the job survives a `ck-motor` restart. Tests:
 `zero_queue_wait_withdraws_and_cancel_is_idempotent`,
 `cancel_before_seen_survives_module_restart_and_attach_cancel`,
 `cancel_while_second_bundle_is_held_preserves_cancelled_tombstone`.
+
+9.2. The runner's cancel takes the job's output log ahead of output commits
+that have not started, so a job printing faster than the runner can commit
+its output does not hold back the unit stop. Test:
+`cancel_takes_the_job_log_ahead_of_the_next_output_commit`.
+
+9.3. While `exec.cancel` delivers a build-server cancel on its own
+connection, the job's stream keeps its connection: it sends no second cancel
+and does not reattach, so the terminal arrives without a reconnect. Test:
+`job_stream_keeps_its_connection_while_cancel_is_delivered`.
+
+9.4. Both sides log each cancel step at INFO with the job ID. `ck-motor` logs
+the elapsed milliseconds from the caller's request to the runner's
+acknowledgement. The runner logs the elapsed milliseconds from the cancel
+frame to the unit stop; for a killed job it then logs each step from the
+unit's exit to the terminal, with the time since finishing began and since
+the kill was recorded, and when the terminal frame is written to the client.
 
 ## 10. Compatibility
 

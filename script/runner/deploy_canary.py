@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 from pathlib import Path
+import select
 import signal
 import socket
 import struct
@@ -36,15 +37,50 @@ class Progress:
         self.state = 'initial'
 
 
+class Heartbeats:
+    def __init__(self, sock):
+        self.sock = sock
+        self.next_send = time.monotonic() + 1
+        self.queue_deadline = None
+        self.withdraw_job = None
+        self.withdraw_sent = False
+
+    def observe_queue_wait(self, job, limit, elapsed):
+        self.withdraw_job = job
+        self.queue_deadline = (None if elapsed is None else
+                               time.monotonic() + max(0, limit - elapsed / 1000))
+
+    def wait_for_readable(self):
+        while True:
+            now = time.monotonic()
+            if now >= self.next_send:
+                send(self.sock, dict(type='heartbeat'))
+                self.next_send = now + 1
+            if (not self.withdraw_sent and self.queue_deadline is not None and
+                    now >= self.queue_deadline):
+                send(self.sock, dict(type='withdraw', job_id=self.withdraw_job))
+                self.withdraw_sent = True
+                self.queue_deadline = None
+            # Keep the cadence even when the runner sends frequent heartbeats
+            # or a response arrives in several partial reads.
+            wake = self.next_send
+            if not self.withdraw_sent and self.queue_deadline is not None:
+                wake = min(wake, self.queue_deadline)
+            if select.select([self.sock], [], [], max(0, wake - now))[0]:
+                return
+
+
 def send(sock, frame):
     body = json.dumps(frame).encode()
     sock.sendall(struct.pack('!I', len(body)) + body)
 
 
-def receive(sock):
+def receive(sock, heartbeats=None):
     def exact(size):
         data = bytearray()
         while len(data) < size:
+            if heartbeats is not None:
+                heartbeats.wait_for_readable()
             chunk = sock.recv(size - len(data))
             if not chunk:
                 raise CanaryError('runner closed the canary stream')
@@ -57,9 +93,9 @@ def receive(sock):
     return frame
 
 
-def next_record(sock):
+def next_record(sock, heartbeats=None):
     while True:
-        frame = receive(sock)
+        frame = receive(sock, heartbeats)
         if frame['type'] != 'heartbeat':
             return frame
 
@@ -92,11 +128,13 @@ def check_refusal(frame, job, started=False):
     raise CanaryError(f'canary refused: {frame}')
 
 
-def attempt(state_root, instance, workspace, repository, commit, tree, bundle, queue_wait):
+def attempt(state_root, instance, workspace, repository, commit, tree, bundle, queue_wait, progress):
     job = str(uuid.uuid4())
     with connect(state_root / instance / 'runner.sock') as sock:
-        send(sock, dict(type='hello', protocol_version=1, started=True))
-        if next_record(sock)['type'] != 'hello':
+        heartbeats = Heartbeats(sock)
+        send(sock, dict(type='hello', protocol_version=1, started=True, gate_jobs=True))
+        hello = next_record(sock, heartbeats)
+        if hello['type'] != 'hello':
             raise CanaryError('runner did not negotiate canary protocol')
         send(sock, dict(type='run', job_id=job, workspace_key=workspace,
                         repository_root=repository, cwd=workspace,
@@ -104,19 +142,29 @@ def attempt(state_root, instance, workspace, repository, commit, tree, bundle, q
                         weight_hint=1, timeout=5, queue_wait_limit_s=queue_wait,
                         snapshot_commit=commit, tree_hash=tree, integration_tip=commit,
                         siblings=[], bundles=[dict(index=0, repository=repository,
-                            length=len(bundle), sha256=hashlib.sha256(bundle).hexdigest())]))
-        accepted = next_record(sock)
+                            length=len(bundle), sha256=hashlib.sha256(bundle).hexdigest())],
+                        **({'gate_job': True} if hello.get('gate_jobs') else {})))
+        accepted = next_record(sock, heartbeats)
         check_refusal(accepted, job)
         if accepted['type'] != 'accepted' or accepted.get('job_id') != job:
             raise CanaryError(f'canary was not accepted: {accepted}')
         send(sock, dict(type='bundle_chunk', index=0, offset=0,
                         data=base64.b64encode(bundle).decode()))
+        progress.state = 'queued'
         started = False
         while True:
-            frame = next_record(sock)
+            frame = receive(sock, heartbeats)
+            if frame['type'] == 'heartbeat':
+                if not started:
+                    # Queue budgets are client-driven. When a heartbeat omits
+                    # queue-wait duration, clear the local withdrawal timer.
+                    heartbeats.observe_queue_wait(job, queue_wait, frame.get('queue_wait_ms'))
+                continue
             check_refusal(frame, job, started)
             if frame['type'] == 'started' and frame.get('job_id') == job:
                 started = True
+                progress.state = 'started'
+                heartbeats.queue_deadline = None
             if frame['type'] == 'terminal':
                 if (frame.get('job_id') != job or not started or
                         frame.get('outcome') != dict(type='exit', code=0)):
@@ -150,7 +198,7 @@ def run(state_root, instance, workspace_root, deadline, progress):
         try:
             # Leave time for a queue refusal to arrive before the overall alarm.
             queue_wait = max(1, min(10, int(remaining / 2)))
-            attempt(state_root, instance, workspace, repository, commit, tree, bundle, queue_wait)
+            attempt(state_root, instance, workspace, repository, commit, tree, bundle, queue_wait, progress)
             return 0
         except CapacityRefusal as error:
             progress.state = 'capacity'
@@ -177,9 +225,9 @@ def main():
         result = run(args.state_root, args.instance, args.workspace_root,
                      time.monotonic() + args.timeout_s, progress)
     except CanaryDeadline as error:
-        # A pending attempt without a terminal result is a failure, even after
-        # earlier capacity refusals. Only completed capacity-only probes qualify.
-        if progress.state != 'capacity':
+        # Only a queued job or a capacity refusal can excuse a deadline. A
+        # failed handshake, upload, or a started job without a result cannot.
+        if progress.state not in ('capacity', 'queued'):
             parser.exit(1, f'{error}\n')
         result = INCONCLUSIVE
     except (CanaryError, OSError, ValueError, subprocess.SubprocessError) as error:
@@ -187,7 +235,8 @@ def main():
     finally:
         signal.alarm(0)
     if result == INCONCLUSIVE:
-        print('canary inconclusive: no free permit; keeping the new runner', file=sys.stderr)
+        print('canary inconclusive: no free permit; keeping the new runner (isolation not verified)',
+              file=sys.stderr)
     return result
 
 

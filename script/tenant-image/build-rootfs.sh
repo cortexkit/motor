@@ -11,7 +11,14 @@ done
 suite=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["debian_suite"])' "$out/versions.json")
 snapshot=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["debian_snapshot"])' "$out/versions.json")
 size=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rootfs_gib"])' "$out/versions.json")
-packages=$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["packages"]))' "$out/versions.json")
+packages=$(python3 - "$out/versions.json" "$out/script/runner/toolchain.json" <<'PY'
+import json, sys
+base, manifest = (json.load(open(path)) for path in sys.argv[1:])
+print(",".join(sorted(set(base["packages"] + manifest["apt_packages"]["required"]
+                          + manifest["apt_packages"]["by_role"]["tenant"]
+                          + manifest["tools"]["git"]["source"]["build_packages"]))))
+PY
+)
 root="$out/root"
 mkdir "$root" "$out/scratch"
 cleanup() {

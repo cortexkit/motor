@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -21,6 +21,136 @@ use tokio::{
 const ALGORITHM: &[u8] = b"ssh-ed25519";
 const MAX_PACKET: usize = 256 * 1024;
 const FAILURE: u8 = 5;
+/// How long the agent waits before asking the vault again after any sign
+/// failure other than a missing credential or a refused grant: the vault was
+/// unavailable, busy, restarting or timed out, or sent a reply the agent could
+/// not use.
+pub(crate) const TRANSIENT_SIGN_BACKOFF: Duration = Duration::from_secs(2);
+/// How long the agent waits before asking the vault again after the signing
+/// credential was missing or its grant was refused. An operator fixes those by
+/// re-creating the credential or re-approving the grant, without restarting
+/// ck-motor, so they are retried too, just less often.
+pub(crate) const REPAIRABLE_SIGN_BACKOFF: Duration = Duration::from_secs(30);
+
+struct SignFault {
+    code: &'static str,
+    /// The vault is not asked to sign again before this instant.
+    retry_at: Instant,
+}
+
+/// The most recent vault signing failure, shared by every connection to one
+/// agent. A failure never latches: it is cleared by the next successful sign,
+/// and once its backoff has passed one sign request asks the vault again.
+pub(crate) struct SignState {
+    fault: Mutex<Option<SignFault>>,
+    /// A stopped clock that replaces the real one. Always `None` outside tests,
+    /// which stop it so that only `advance` moves this agent's time.
+    paused_at: Mutex<Option<Instant>>,
+}
+impl SignState {
+    fn new() -> Self {
+        Self {
+            fault: Mutex::new(None),
+            paused_at: Mutex::new(None),
+        }
+    }
+    fn now(&self) -> Instant {
+        self.paused_at.lock().unwrap().unwrap_or_else(Instant::now)
+    }
+    #[cfg(test)]
+    pub(crate) fn pause(&self) {
+        self.paused_at
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Instant::now);
+    }
+    #[cfg(test)]
+    pub(crate) fn advance(&self, by: Duration) {
+        let mut paused_at = self.paused_at.lock().unwrap();
+        *paused_at = Some(paused_at.expect("pause the sign clock before advancing it") + by);
+    }
+    fn backoff(code: &str) -> Duration {
+        match code {
+            "runner_sign_missing" | "runner_sign_grant_refused" => REPAIRABLE_SIGN_BACKOFF,
+            _ => TRANSIENT_SIGN_BACKOFF,
+        }
+    }
+    /// Whether a sign request may call the vault now. While failing, only the
+    /// first request after the backoff is admitted, and admitting it restarts
+    /// the backoff, so a burst of jobs against a dead vault makes one call.
+    fn admit(&self) -> bool {
+        let now = self.now();
+        match self.fault.lock().unwrap().as_mut() {
+            None => true,
+            Some(fault) if now >= fault.retry_at => {
+                fault.retry_at = now + Self::backoff(fault.code);
+                true
+            }
+            Some(_) => false,
+        }
+    }
+    fn succeeded(&self) {
+        if let Some(previous) = self.fault.lock().unwrap().take() {
+            tracing::info!(previous = previous.code, "runner signing recovered");
+        }
+    }
+    fn failed(&self, code: &'static str, class: CredentialErrorClass) {
+        let retry_at = self.now() + Self::backoff(code);
+        let previous = self
+            .fault
+            .lock()
+            .unwrap()
+            .replace(SignFault { code, retry_at })
+            .map(|fault| fault.code);
+        // Log state changes only, so a dead vault does not flood the log. The
+        // code and error class are safe; the vault's message is not logged.
+        if previous != Some(code) {
+            tracing::warn!(
+                code,
+                class = class.classifier_code(),
+                retry_after_ms = Self::backoff(code).as_millis() as u64,
+                "runner signing failed"
+            );
+        }
+    }
+    /// The failure that refuses new jobs: held only until its backoff passes,
+    /// so the next job reaches SSH and its sign request asks the vault again.
+    fn refusal(&self) -> Option<&'static str> {
+        let now = self.now();
+        self.fault
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|fault| now < fault.retry_at)
+            .map(|fault| fault.code)
+    }
+    /// How many milliseconds a caller refused with `code` should wait before
+    /// trying again: the time left until the current failure's backoff ends,
+    /// at least 1 and at most `TRANSIENT_SIGN_BACKOFF`. Only an unavailable
+    /// vault or an unusable vault reply clears on its own, so only those two
+    /// codes get a hint. A missing credential or a refused grant waits for an
+    /// operator, and a hint would invite a caller to retry it in a loop.
+    /// `None` too when `code` is no longer the current failure.
+    fn retry_after_ms(&self, code: &str) -> Option<u64> {
+        if !matches!(
+            code,
+            "runner_sign_unavailable" | "runner_sign_invalid_response"
+        ) {
+            return None;
+        }
+        let now = self.now();
+        let fault = self.fault.lock().unwrap();
+        let fault = fault.as_ref().filter(|fault| fault.code == code)?;
+        let left = fault.retry_at.saturating_duration_since(now);
+        // Round up, so a hint never ends before the backoff does.
+        let left_ms = u64::try_from(left.as_micros().div_ceil(1000)).unwrap_or(u64::MAX);
+        Some(left_ms.clamp(1, TRANSIENT_SIGN_BACKOFF.as_millis() as u64))
+    }
+    /// The failure health reports: held until a sign succeeds.
+    fn current(&self) -> Option<&'static str> {
+        self.fault.lock().unwrap().as_ref().map(|fault| fault.code)
+    }
+}
 
 struct RuntimeDir(PathBuf);
 impl Drop for RuntimeDir {
@@ -37,7 +167,7 @@ pub(crate) struct VaultAgent {
     pub identity: PathBuf,
     pub control_path: PathBuf,
     alive: Arc<AtomicBool>,
-    failure: Arc<Mutex<Option<&'static str>>>,
+    signing: Arc<SignState>,
     stop: Mutex<Option<oneshot::Sender<()>>>,
     task: AsyncMutex<Option<JoinHandle<()>>>,
 }
@@ -73,8 +203,8 @@ impl VaultAgent {
         )?;
         let alive = Arc::new(AtomicBool::new(true));
         let running = Arc::clone(&alive);
-        let failure = Arc::new(Mutex::new(None));
-        let fault = Arc::clone(&failure);
+        let signing = Arc::new(SignState::new());
+        let shared = Arc::clone(&signing);
         let (stop, mut stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
             let mut clients = JoinSet::new();
@@ -86,8 +216,8 @@ impl VaultAgent {
                             let key = key_blob.clone();
                             let key_id = public.key_id.clone();
                             let resolver = Arc::clone(&resolver);
-                            let fault = Arc::clone(&fault);
-                            clients.spawn(serve(stream, key, key_id, resolver, fault));
+                            let signing = Arc::clone(&shared);
+                            clients.spawn(serve(stream, key, key_id, resolver, signing));
                         }
                         Err(_) => break,
                     },
@@ -105,16 +235,32 @@ impl VaultAgent {
             identity,
             control_path,
             alive,
-            failure,
+            signing,
             stop: Mutex::new(Some(stop)),
             task: AsyncMutex::new(Some(task)),
         })
     }
+    /// The code that refuses new jobs before start. A sign failure refuses
+    /// only during its backoff; after it, jobs try again.
     pub fn refusal(&self) -> Option<&'static str> {
-        self.failure
-            .lock()
-            .unwrap()
-            .or_else(|| (!self.alive.load(Ordering::Acquire)).then_some("runner_agent_stopped"))
+        self.signing.refusal().or_else(|| self.stopped_refusal())
+    }
+    /// The code health reports: a sign failure stays visible until a sign
+    /// succeeds, even after its backoff has passed.
+    pub fn health_refusal(&self) -> Option<&'static str> {
+        self.signing.current().or_else(|| self.stopped_refusal())
+    }
+    /// The `retry_after_ms` hint for a job refused with `code`; see
+    /// `SignState::retry_after_ms`.
+    pub fn retry_after_ms(&self, code: &str) -> Option<u64> {
+        self.signing.retry_after_ms(code)
+    }
+    fn stopped_refusal(&self) -> Option<&'static str> {
+        (!self.alive.load(Ordering::Acquire)).then_some("runner_agent_stopped")
+    }
+    #[cfg(test)]
+    pub(crate) fn signing(&self) -> &SignState {
+        &self.signing
     }
     pub async fn shutdown(&self) {
         self.alive.store(false, Ordering::Release);
@@ -164,7 +310,7 @@ async fn serve(
     key: Vec<u8>,
     key_id: String,
     resolver: Arc<dyn CredentialResolver>,
-    fault: Arc<Mutex<Option<&'static str>>>,
+    signing: Arc<SignState>,
 ) {
     loop {
         let packet = tokio::time::timeout(Duration::from_secs(30), async {
@@ -188,7 +334,7 @@ async fn serve(
             }
             13 => {
                 if let Some(data) = sign_request(&packet, &key) {
-                    if fault.lock().unwrap().is_none() {
+                    if signing.admit() {
                         match resolver.sign(crate::RUNNER_CREDENTIAL_ID, data).await {
                             Ok(signed) => {
                                 if let Ok(signature) = decode_hex(&signed.signature_hex, 64)
@@ -205,19 +351,24 @@ async fn serve(
                                     string(&mut blob, &signature);
                                     response = vec![14]; // SSH2_AGENT_SIGN_RESPONSE
                                     string(&mut response, &blob);
+                                    signing.succeeded();
                                 } else {
-                                    *fault.lock().unwrap() = Some("runner_sign_invalid_response");
+                                    signing.failed(
+                                        "runner_sign_invalid_response",
+                                        CredentialErrorClass::InvalidResponse,
+                                    );
                                 }
                             }
                             Err(error) => {
-                                *fault.lock().unwrap() = Some(match error.class {
+                                let code = match error.class {
                                     CredentialErrorClass::CredentialAbsent => "runner_sign_missing",
                                     CredentialErrorClass::Unauthorized
                                     | CredentialErrorClass::AuthRequired => {
                                         "runner_sign_grant_refused"
                                     }
                                     _ => "runner_sign_unavailable",
-                                });
+                                };
+                                signing.failed(code, error.class);
                             }
                         }
                     }
@@ -234,6 +385,71 @@ async fn serve(
         .await;
         if !matches!(sent, Ok(Ok(()))) {
             break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod retry_hint_tests {
+    use super::*;
+
+    // The hint is the time left in the failure's own backoff, read from the
+    // sign clock, so it shrinks as the clock moves and never drops below 1 ms.
+    #[test]
+    fn transient_sign_failures_hint_the_time_left_in_their_backoff() {
+        for (code, class) in [
+            ("runner_sign_unavailable", CredentialErrorClass::Unavailable),
+            (
+                "runner_sign_invalid_response",
+                CredentialErrorClass::InvalidResponse,
+            ),
+        ] {
+            let state = SignState::new();
+            state.pause();
+            assert_eq!(state.retry_after_ms(code), None, "no failure yet");
+            state.failed(code, class);
+            assert_eq!(state.retry_after_ms(code), Some(2000), "{code}");
+            state.advance(Duration::from_millis(750));
+            assert_eq!(state.retry_after_ms(code), Some(1250), "{code}");
+            // A partial millisecond rounds up, so the hint never ends early.
+            state.advance(Duration::from_micros(1_249_500));
+            assert_eq!(state.retry_after_ms(code), Some(1), "{code}");
+            // Past the backoff the failure still holds until a sign succeeds,
+            // so the hint stays at its 1 ms floor rather than disappearing.
+            state.advance(TRANSIENT_SIGN_BACKOFF);
+            assert_eq!(state.retry_after_ms(code), Some(1), "{code}");
+            // A hint is only for the failure that is current.
+            let other = if code == "runner_sign_unavailable" {
+                "runner_sign_invalid_response"
+            } else {
+                "runner_sign_unavailable"
+            };
+            assert_eq!(state.retry_after_ms(other), None, "{code}");
+            state.succeeded();
+            assert_eq!(state.retry_after_ms(code), None, "{code}");
+        }
+    }
+
+    // A missing credential or a refused grant waits for an operator. A hint
+    // would tell a caller to retry in a loop, so neither carries one, even
+    // inside its backoff.
+    #[test]
+    fn repairable_sign_failures_carry_no_hint() {
+        for (code, class) in [
+            (
+                "runner_sign_missing",
+                CredentialErrorClass::CredentialAbsent,
+            ),
+            (
+                "runner_sign_grant_refused",
+                CredentialErrorClass::Unauthorized,
+            ),
+        ] {
+            let state = SignState::new();
+            state.pause();
+            state.failed(code, class);
+            assert_eq!(state.refusal(), Some(code));
+            assert_eq!(state.retry_after_ms(code), None, "{code}");
         }
     }
 }

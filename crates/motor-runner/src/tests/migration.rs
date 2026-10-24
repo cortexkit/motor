@@ -50,19 +50,48 @@ async fn seed_legacy(f: &Fixture, config: &Config) -> LegacyFixture {
     }
 }
 
+/// What the warm-build checkout migration must leave alone, on a runner
+/// with in-place siblings: the foreground workspace's target, the in-place
+/// sibling checkout and an unrecorded checkout beside the retired one.
 fn assert_retained(f: &Fixture, legacy: &LegacyFixture) {
+    assert_migration_retained(f, legacy);
+    assert_eq!(
+        fs::read(legacy.sibling.join("keep")).unwrap(),
+        b"sibling output"
+    );
+}
+
+/// The part of `assert_retained` that holds in either sibling mode.
+fn assert_migration_retained(f: &Fixture, legacy: &LegacyFixture) {
     assert_eq!(
         fs::read(Path::new(&f.key).join("target/keep")).unwrap(),
         b"foreground output"
     );
     assert_eq!(
-        fs::read(legacy.sibling.join("keep")).unwrap(),
-        b"sibling output"
-    );
-    assert_eq!(
         fs::read(legacy.unrecorded.join("target/keep")).unwrap(),
         b"legacy output"
     );
+}
+
+/// After a runner with in-place siblings is reopened in sibling snapshot
+/// mode, the in-place sibling checkout the warm-up job left at the sibling's
+/// path is retired at startup: nothing claims it (it is no catalogued
+/// workspace, and no job, reservation, admission or Prepare holds it), and
+/// snapshot-mode jobs never use it again. Its record goes with it.
+#[cfg(target_os = "linux")]
+fn assert_sibling_checkout_retired(runner: &Runner, legacy: &LegacyFixture) {
+    assert!(
+        !legacy.sibling.exists(),
+        "the unclaimed in-place sibling checkout is retired"
+    );
+    assert!(!runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .catalog
+        .sibling_commits
+        .contains_key(text(&legacy.sibling)));
 }
 
 async fn trash_empty(runner: &Runner) {
@@ -450,7 +479,10 @@ async fn isolated_legacy_checkout_migration_retires_source_and_first_fill_create
         .config()
         .writer_account
         .expect("validated writer account");
-    assert_retained(&f, &legacy);
+    // The reopened runner isolates jobs, so it runs in sibling snapshot mode.
+    assert!(runner.core.config.sibling_snapshot_mode());
+    assert_migration_retained(&f, &legacy);
+    assert_sibling_checkout_retired(&runner, &legacy);
     drop(purge_hold);
     trash_empty(&runner).await;
     assert!(
@@ -523,10 +555,9 @@ async fn isolated_legacy_checkout_migration_retires_source_and_first_fill_create
         .unwrap(),
         "foreground output"
     );
-    assert_eq!(
-        fs::read(legacy.sibling.join("keep")).unwrap(),
-        b"sibling output"
-    );
+    // The post-migration warm-up job took its sibling from a snapshot and
+    // did not check it out at the sibling's path again.
+    assert!(!legacy.sibling.exists());
     assert_eq!(
         fs::read(legacy.unrecorded.join("target/keep")).unwrap(),
         b"legacy output"

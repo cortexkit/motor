@@ -3,26 +3,43 @@
   "debian_suite": "trixie",
   "debian_snapshot": "20261016T000000Z",
   "rootfs_gib": 32,
-  "kernel": "6.1.128",
+  "kernel": "6.18.58",
   "kernel_gcc": "13.4.0",
-  "kernel_sha256": "874d67d3181570e69ac6b33853f0448f05fc90d4cf3e4baaadc4a9cede7c50f3",
-  "rustup": "1.28.2",
+  "kernel_sha256": "069b19f9032c4dac8149ae4b6520c35debca0f42a9f6d52ee55ba6ca9b818013",
+  "rustup": "1.29.1",
   "packages": [
     "systemd-sysv", "dbus", "python3", "sudo", "acl", "xfsprogs",
     "iproute2", "iputils-ping", "nftables", "util-linux", "procps",
     "build-essential", "clang", "lld", "pkg-config", "libssl-dev",
     "sqlite3", "libsqlite3-dev", "git", "rsync", "curl", "jq",
     "ca-certificates", "unzip", "xz-utils", "unattended-upgrades", "ufw",
-    "binaryen", "gcc-mingw-w64-x86-64-win32", "g++-mingw-w64-x86-64-win32",
-    "libwin-hivex-perl", "nats-server", "flex", "bison", "libelf-dev", "patch"
+    "gcc-mingw-w64-x86-64-win32", "g++-mingw-w64-x86-64-win32",
+    "libwin-hivex-perl", "nats-server", "flex", "bison", "libelf-dev", "patch",
+    "gettext", "libcurl4-gnutls-dev", "libexpat1-dev", "libpcre2-dev", "zlib1g-dev"
   ],
   "runner_inputs_sha256": {
-    "script/runner/tools.txt": "971d6fc20abb8d76c5397803e90e7f58f0edb916c254a5b3ba4427dbc29213a1",
-    "script/runner/install-tools.sh": "3359904a3fd8984e665eaf5e4a44c60f7650e1adb1bee54e3a385a65487f0d98",
+    "script/runner/parity-files.txt": "6d538bb26b061cec3bc7d676879510eb6946461ffbb2ef560e2ec9e0ed46a89b",
+    "script/runner/remote-cache-environment.py": "08ab82222025a888a3a436435daf2520213d799d4cb944a90b2843a6a7f2b2d2",
+    "script/runner/units/system/motor-jobs.slice": "9ff0c0e449aa78f5b0c3ea6d1f0ea86e81983e2bf16569b6e52106777b1ade3d",
+    "script/runner/tools.txt": "deeae6c16195cbdea75324bc293e48117944e09956eadaa8c4e456f3188d743d",
+    "script/runner/install-tools.sh": "381d6d1e0b56690a34a2c6df40f86f90eb6574663e2f91e9d7b27120d752a9ea",
+    "script/runner/toolchain.json": "ca94d1bf281d0c6c4beab17510ccfea0fb4ce0f2d1ce77ca9b9c7be65f3728bf",
     "script/runner/build-sccache.sh": "d8b6f7b01c68ef98e129621ef6c59cb919749bf7ce0dbfeb3c47f9a4267d5435",
     "script/runner/motor-net.nft": "b0e1dddc368a7fca09b1c6df87b4c917319eebf75bd14be9ce9dc8193a1eb2bb",
     "script/runner/patches/sccache-0.18.0-read-only-hits.patch": "e37a753c4fb04a37b118b9f49431740cd82a6c5e2ef93d9d01838e11a3242870",
+<<<<<<< HEAD
     "script/runner/toolchain.json": "e1601063fbe22b212639c62fd35ca13ff667f792bf02a7cb5c74613ac48c9017"
+=======
+    "script/runner/build-git.sh": "f6bcd8e8d3ec7681063a589b551ece670122f35f8955b315db62ad8079380940",
+    "script/runner/install-binaryen.py": "dfd4a8741fe70f2334cfaf63681710f6271f15067a9f3b1012fd82d22416ab6d",
+    "script/runner/toolchain-parity.py": "27cdc99849d3cb08fe0e24320713f8bc5c891cf166246a993ed62ea2e3677c2a",
+    "script/runner/syscall-surface.py": "930fb7373920f92ae4b876b7635d586f9dabb4d44e26fc4c9db045b18cbe0368",
+    "script/runner/cargo-seed.py": "6759e7b26778d7bb62a5c081bac8162e1ed1ee1b67eca28bec3927e9ee07f485",
+    "script/runner/job-account.py": "21f185ddc868150a8bbfe94aa8eac18a50485b87bf8fa043944348dac77ef4ca",
+    "script/runner/sysctl/60-motor-inotify.conf": "2ddb7e2127e6c2c04d2d4c96293e12b39f29a81e58adac0c1a3eb8d432b7b9f4",
+    "script/boat-image/install.py": "253de50c33955cbbec4b696e6b13f998bc4f11ee061519dc08199b30e6df90fb",
+    "script/tenant-image/guest/root_paths.py": "2de3c028f009f8e77abe3524fcbbae589b47fd32d5a6af8ab1f55240d0a33c3d"
+>>>>>>> origin/main
   },
   "captured_at": "2026-10-17T08:17:09+00:00",
   "rust_default": "1.99.0",

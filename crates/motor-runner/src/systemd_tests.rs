@@ -13,6 +13,79 @@ fn output(text: &str) -> Output {
 }
 
 #[test]
+fn installed_units_reserve_host_memory_and_protect_user_runners() {
+    let setting = |unit: &str, section: &str, key: &str, expected: &str| {
+        let mut current = "";
+        let values: Vec<_> = unit
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.starts_with(['#', ';']) {
+                    return None;
+                }
+                if line.starts_with('[') {
+                    current = line;
+                }
+                let (name, value) = line.split_once('=')?;
+                (current == section && name == key).then_some(value)
+            })
+            .collect();
+        assert_eq!(values, [expected], "{section} {key} in {unit}");
+    };
+    let slice = include_str!("../../../script/runner/units/system/motor-jobs.slice");
+    setting(slice, "[Slice]", "MemoryHigh", "75%");
+    setting(slice, "[Slice]", "MemoryMax", "85%");
+    setting(slice, "[Slice]", "MemorySwapMax", "0");
+    for unit in [
+        include_str!("../../../script/runner/units/motor-runner.service"),
+        include_str!("../../../script/runner/units/motor-runner@.service"),
+        include_str!("../../../script/runner/units/system/runner-user-manager.conf"),
+        include_str!("../../../script/boat-image/motor-boat.service"),
+        include_str!("../../../script/tenant-image/guest/motor-tenant-agent.service"),
+    ] {
+        setting(unit, "[Service]", "OOMScoreAdjust", "-900");
+        setting(unit, "[Service]", "OOMPolicy", "continue");
+    }
+}
+
+#[test]
+fn missing_or_unbounded_job_slice_refuses_execution() {
+    for (text, valid) in [
+        ("", false),
+        ("MemoryHigh=infinity\nMemoryMax=infinity\n", false),
+        ("MemoryHigh=100\nMemoryMax=100\n", false),
+        ("MemoryHigh=0\nMemoryMax=100\n", false),
+        ("MemoryHigh=75\nMemoryMax=85\n", true),
+    ] {
+        with_process_hook(Box::new(move |_| Ok(output(text))), || {
+            assert_eq!(require_job_memory_budget().is_ok(), valid, "{text}");
+        });
+    }
+}
+
+#[test]
+fn dead_launcher_never_counts_as_a_started_job_even_if_unit_is_active() {
+    with_process_hook(Box::new(|_| Ok(output(""))), || {
+        assert!(!wait_until_active(
+            "motor-job-test.service",
+            || Ok(true),
+            |_| panic!("must not wait")
+        )
+        .unwrap());
+        let calls = std::cell::Cell::new(0);
+        assert!(!wait_until_active(
+            "motor-job-test.service",
+            || {
+                calls.set(calls.get() + 1);
+                Ok(calls.get() == 2)
+            },
+            |_| panic!("must not wait")
+        )
+        .unwrap());
+    });
+}
+
+#[test]
 fn retained_main_status_preserves_exit_signal_and_core_dump() {
     for (code, status, expected) in [
         (1, 0, Outcome::Exit { code: 0 }),

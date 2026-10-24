@@ -30,6 +30,8 @@ impl Connector for ClockPeer {
                     &mut peer,
                     &Frame::Hello {
                         return_paths: false,
+                        return_chunked: false,
+                        sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,
@@ -269,6 +271,8 @@ impl Connector for SpillPeer {
                         platforms: vec!["linux".into()],
                         default_branch_tip: false,
                         return_paths: false,
+                        return_chunked: false,
+                        sibling_paths: false,
                     },
                 )
                 .await
@@ -314,6 +318,18 @@ impl Connector for SpillPeer {
                             )
                             .await
                             .unwrap();
+                            // As the real runner can: once the job is
+                            // withdrawn its heartbeats carry no queue wait,
+                            // and one may go out before the terminal record,
+                            // which marks the withdrawal as a spill.
+                            write_frame_async(
+                                &mut peer,
+                                &Frame::Heartbeat {
+                                    queue_wait_ms: None,
+                                },
+                            )
+                            .await
+                            .unwrap();
                             write_frame_async(
                                 &mut peer,
                                 &Frame::Terminal(
@@ -326,7 +342,13 @@ impl Connector for SpillPeer {
                                         0,
                                         0,
                                     )
-                                    .with_ran(Ran::None),
+                                    .with_ran(Ran::None)
+                                    .with_refusal_detail(
+                                        format!(
+                                            "{}waiting_on=permits",
+                                            motor_protocol::SPILL_WITHDRAWAL_DETAIL_PREFIX
+                                        ),
+                                    ),
                                 ),
                             )
                             .await
@@ -646,6 +668,8 @@ impl Connector for ResubmitPeer {
                     platforms: vec!["linux".into()],
                     default_branch_tip: false,
                     return_paths: false,
+                    return_chunked: false,
+                    sibling_paths: false,
                 };
                 write_frame_async(&mut peer, &hello).await.unwrap();
                 while let Ok(Some(frame)) = read_frame_async(&mut peer).await {
@@ -859,12 +883,24 @@ pub(crate) async fn run_spilled(
     wait: u64,
     limit: Duration,
 ) -> Vec<StreamRecord> {
+    run_spilled_with_timeout(motor, id, repo, wait, limit, 30).await
+}
+
+/// [`run_spilled`] for a job with the given timeout in seconds.
+async fn run_spilled_with_timeout(
+    motor: &Motor,
+    id: Uuid,
+    repo: &Path,
+    wait: u64,
+    limit: Duration,
+    timeout: u64,
+) -> Vec<StreamRecord> {
     motor
         .storage
         .create(id, wait, None, Some("test".into()), false)
         .unwrap();
     let path = repo.to_str().unwrap();
-    let request = RunRequest::new(path, path, path, "true").with_timeout(30);
+    let request = RunRequest::new(path, path, path, "true").with_timeout(timeout);
     let (tx, mut rx) = mpsc::channel(32);
     let (_wake, wake) = watch::channel(false);
     let job = motor.clone();
@@ -1032,12 +1068,380 @@ async fn spilled_provisioning_budget_resubmits_to_build_server() {
     )
     .unwrap();
     let id = Uuid::now_v7();
+    let captured = crate::logging::Captured::default();
+    let _log = crate::logging::scoped(captured.clone());
     // A one-second queue-wait limit leaves the lease one second to provision.
     let records = run_spilled(&motor, id, &repo, 1, Duration::from_secs(30)).await;
     assert_one_build_server_job(id, &records);
     assert_resubmitted_once(id, &log.lock().unwrap(), 1);
     assert!(lease_requests(&broker.requests) >= 1);
     assert!(motor.hosted_state(id).is_none());
+    let text = captured.text();
+    let exhausted: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("spill provisioning budget exhausted"))
+        .collect();
+    assert_eq!(exhausted.len(), 1, "{text}");
+    assert!(exhausted[0].contains(&format!("job_id={id}")), "{text}");
+    let waited_ms: u64 = exhausted[0]
+        .split("waited_ms=")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // The one-second budget is counted from submission, while waited_ms is
+    // timed from the start of the spill path a moment later, so a full wait
+    // can log 999 ms. The bound still proves the lease used its whole budget
+    // rather than giving up early.
+    assert!(waited_ms >= 900, "{text}");
+    assert_eq!(
+        text.matches("outcome=returned_to_build_server").count(),
+        1,
+        "{text}"
+    );
+    assert!(text.contains("broker_code=hosted_provisioning"), "{text}");
+}
+
+#[tokio::test]
+async fn spilled_deliberate_refusals_stay_final() {
+    for (status, code, reason, detail) in [
+        (
+            403,
+            "account_closed",
+            RefusalReason::RequestRejected,
+            "hosted_account_closed",
+        ),
+        (
+            409,
+            "job_conflict",
+            RefusalReason::RequestRejected,
+            "lease_mismatch",
+        ),
+        (
+            422,
+            "platform_unsupported",
+            RefusalReason::PlatformUnsupported,
+            "hosted_platform_unsupported",
+        ),
+    ] {
+        let broker = crate::hosted::test_http::Http::new(move |path, _| {
+            if path == "/v1/leases" {
+                (status, serde_json::json!({"error": code}))
+            } else {
+                (404, serde_json::json!({"error": "job_unknown"}))
+            }
+        })
+        .await;
+        let scratch = ScratchDir::new("motor-spill-final-refusal");
+        let repo = fixture_repo(&scratch);
+        let peer = ResubmitPeer::new();
+        let log = peer.log.clone();
+        let motor = Motor::with_connector(
+            spill_config(&broker.url),
+            &scratch.join("state"),
+            Arc::new(peer),
+        )
+        .unwrap();
+        let id = Uuid::now_v7();
+        let captured = crate::logging::Captured::default();
+        let _log = crate::logging::scoped(captured.clone());
+        let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(30)).await;
+        let terminal = match records.last().unwrap() {
+            StreamRecord::Terminal(terminal) => terminal,
+            other => panic!("expected terminal, got {other:?}"),
+        };
+        assert_eq!(
+            terminal.outcome,
+            Outcome::RefusedBeforeStart { reason },
+            "{code}"
+        );
+        assert_eq!(terminal.ran, Some(Ran::None));
+        assert!(terminal.refusal_detail.as_deref().unwrap().contains(detail));
+        assert_eq!(
+            log.lock().unwrap().runs,
+            [(id, 0)],
+            "{code}: no resubmission"
+        );
+        assert_eq!(lease_requests(&broker.requests), 1);
+        assert!(!broker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path.ends_with("/reattach")));
+        let text = captured.text();
+        let outcomes: Vec<_> = text
+            .lines()
+            .filter(|line| line.contains("spill outcome"))
+            .collect();
+        assert_eq!(outcomes.len(), 1, "{text}");
+        assert!(
+            outcomes[0].contains("outcome=refused") && outcomes[0].contains(detail),
+            "{text}"
+        );
+        assert!(!text.contains("outcome=returned_to_build_server"), "{text}");
+        // Every lease 4xx is logged with the body's non-secret members.
+        assert!(
+            text.lines()
+                .any(|line| line.contains("hosted lease body refused by broker")
+                    && line.contains(&format!("http_status={status}"))
+                    && line.contains("timeout_s=30")
+                    && line.contains("vcpus=2")),
+            "{text}"
+        );
+        assert!(!text.contains("requester_jwk"), "{text}");
+    }
+}
+
+/// A broker that cannot parse a spilled job's lease body (400 `bad_request`)
+/// booked nothing, so the job goes back to the build-server queue the way a
+/// spill the broker could not place does. A warning names the job and the
+/// body's non-secret members, never the requester key.
+#[tokio::test]
+async fn spilled_bad_request_returns_to_build_server_and_logs_the_body() {
+    for (status, body) in crate::hosted::tests::cloud_bad_request_replies() {
+        spilled_bad_request_reply(status, body).await;
+    }
+}
+
+async fn spilled_bad_request_reply(status: u16, body: String) {
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let expected_field = parsed["field"].as_str().unwrap_or("unknown");
+    let broker = crate::hosted::test_http::Http::with_reply_bytes(move |path, _| {
+        if path == "/v1/leases" {
+            (status, body.as_bytes().to_owned())
+        } else {
+            (
+                404,
+                serde_json::to_vec(&serde_json::json!({"error": "job_unknown"})).unwrap(),
+            )
+        }
+    })
+    .await;
+    let scratch = ScratchDir::new("motor-spill-bad-request");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        spill_config(&broker.url),
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let captured = crate::logging::Captured::default();
+    let _log = crate::logging::scoped(captured.clone());
+    let id = Uuid::now_v7();
+    let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(30)).await;
+    assert_one_build_server_job(id, &records);
+    assert_resubmitted_once(id, &log.lock().unwrap(), 30);
+    // A 400 is not retried: the same body would be refused again.
+    assert_eq!(lease_requests(&broker.requests), 1);
+    assert!(motor.hosted_state(id).is_none());
+    let x = broker
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(path, _)| path == "/v1/leases")
+        .map(|(_, body)| body["requester_jwk"]["x"].as_str().unwrap().to_owned())
+        .unwrap();
+    let text = captured.text();
+    let refused: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("hosted lease body refused by broker"))
+        .collect();
+    assert_eq!(refused.len(), 1, "{text}");
+    for field in [
+        "WARN".to_owned(),
+        format!("job_id={id}"),
+        "route=spill".into(),
+        "http_status=400".into(),
+        "broker_code=bad_request".into(),
+        format!("field={expected_field}"),
+        "vcpus=2".into(),
+        "timeout_s=30".into(),
+        "platform=linux-x64".into(),
+        "net=false".into(),
+        "allow_spill=true".into(),
+        "placement_hint=none".into(),
+    ] {
+        assert!(refused[0].contains(&field), "{field}: {text}");
+    }
+    assert!(!text.contains(&x), "requester key logged: {text}");
+    assert!(!text.contains("requester_jwk="), "{text}");
+    assert!(!text.contains("lease_mismatch"), "{text}");
+    let returned: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("outcome=returned_to_build_server"))
+        .collect();
+    assert_eq!(returned.len(), 1, "{text}");
+    assert!(
+        returned[0].contains("broker_code=hosted_request_invalid"),
+        "{text}"
+    );
+}
+
+/// A spilled job whose timeout no lease body can carry (CLOUD takes 10 to
+/// 7200 seconds) is never sent to the broker: it goes straight back to the
+/// build-server queue, and a warning names the job, the member and the
+/// body's non-secret members.
+#[tokio::test]
+async fn spilled_job_with_an_unsendable_timeout_returns_without_a_lease_request() {
+    let broker = crate::hosted::test_http::Http::new(|path, _| {
+        assert_ne!(path, "/v1/leases", "an invalid lease body was sent");
+        (404, serde_json::json!({"error": "job_unknown"}))
+    })
+    .await;
+    let scratch = ScratchDir::new("motor-spill-unsendable-timeout");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        spill_config(&broker.url),
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let captured = crate::logging::Captured::default();
+    let _log = crate::logging::scoped(captured.clone());
+    let id = Uuid::now_v7();
+    let records =
+        run_spilled_with_timeout(&motor, id, &repo, 30, Duration::from_secs(30), 10_800).await;
+    assert_one_build_server_job(id, &records);
+    assert_resubmitted_once(id, &log.lock().unwrap(), 30);
+    assert!(broker.requests.lock().unwrap().is_empty());
+    assert!(motor.hosted_state(id).is_none());
+    let text = captured.text();
+    let invalid: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("hosted lease body invalid; not sent"))
+        .collect();
+    assert_eq!(invalid.len(), 1, "{text}");
+    for field in [
+        "WARN".to_owned(),
+        format!("job_id={id}"),
+        "field=timeout_s".into(),
+        "timeout_s=10800".into(),
+        "vcpus=2".into(),
+        "allow_spill=true".into(),
+    ] {
+        assert!(invalid[0].contains(&field), "{field}: {text}");
+    }
+    assert!(!text.contains("requester_jwk"), "{text}");
+    assert!(
+        text.contains("broker_code=hosted_request_invalid"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn spilled_sandbox_lost_before_run_returns_to_build_server() {
+    let broker = crate::hosted::test_http::Http::new(|path, _| {
+        if path == "/v1/leases" {
+            (409, serde_json::json!({"error": "sandbox_lost"}))
+        } else {
+            (404, serde_json::json!({"error": "job_unknown"}))
+        }
+    })
+    .await;
+    let scratch = ScratchDir::new("motor-spill-sandbox-lost");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        spill_config(&broker.url),
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let id = Uuid::now_v7();
+    let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(30)).await;
+    assert_one_build_server_job(id, &records);
+    assert_resubmitted_once(id, &log.lock().unwrap(), 30);
+    assert!(motor.hosted_state(id).is_none());
+}
+
+#[tokio::test]
+async fn spilled_lost_run_ack_reattaches_without_resubmitting() {
+    use crate::hosted::tests::harness::{Behavior, Harness};
+    let hosted = Harness::new(Behavior::DropRunAck).await;
+    let scratch = ScratchDir::new("motor-spill-lost-run-ack");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        Config {
+            spill_after_s: 0,
+            ..hosted.config()
+        },
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let captured = crate::logging::Captured::default();
+    let _log = crate::logging::scoped(captured.clone());
+    let id = Uuid::now_v7();
+    let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(30)).await;
+    let terminal = match records.last().unwrap() {
+        StreamRecord::Terminal(terminal) => terminal,
+        other => panic!("expected terminal, got {other:?}"),
+    };
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+    assert!(motor.hosted_state(id).unwrap().run_sent);
+    assert_eq!(log.lock().unwrap().runs, [(id, 0)]);
+    assert_eq!(hosted.runs.load(Ordering::SeqCst), 1);
+    assert!(hosted
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame, Frame::Attach(_))));
+    assert!(!hosted
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|path| path.ends_with("/release")));
+    let text = captured.text();
+    assert_eq!(text.matches("outcome=reattaching").count(), 1, "{text}");
+    assert!(!text.contains("outcome=returned_to_build_server"), "{text}");
+}
+
+#[tokio::test]
+async fn spilled_success_logs_placed_once() {
+    use crate::hosted::tests::harness::{Behavior, Harness};
+    let hosted = Harness::new(Behavior::CompleteRun).await;
+    let scratch = ScratchDir::new("motor-spill-placed");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        Config {
+            spill_after_s: 0,
+            ..hosted.config()
+        },
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let captured = crate::logging::Captured::default();
+    let _log = crate::logging::scoped(captured.clone());
+    let id = Uuid::now_v7();
+    let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(30)).await;
+    assert!(
+        matches!(records.last(), Some(StreamRecord::Terminal(terminal)) if terminal.outcome == Outcome::Exit { code: 23 })
+    );
+    assert_eq!(log.lock().unwrap().runs, [(id, 0)]);
+    let text = captured.text();
+    let placed: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("outcome=placed"))
+        .collect();
+    assert_eq!(placed.len(), 1, "{text}");
+    assert!(placed[0].contains(&format!("job_id={id}")), "{text}");
 }
 
 fn boat_paths(boat: &crate::hosted::boat_tests::Boat) -> Vec<String> {

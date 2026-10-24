@@ -67,24 +67,13 @@ impl HealthCache {
     fn report_at(&self, now: Instant, unix_ms: u64) -> HealthReport {
         let age = now.saturating_duration_since(self.last_success.unwrap_or(self.created));
         let degraded = age >= STALE_AFTER || self.failures >= FAILURE_LIMIT;
-        let newest_minute = minute_start_ms(unix_ms);
-        let oldest_minute = newest_minute.saturating_sub((HISTORY_LIMIT as u64 - 1) * MINUTE_MS);
         let mut metrics = json!({
             "build_server": null,
             "queue_wait_1h": null,
             "top_repos": null,
             "sample_age_ms": self.last_success.map(|_| age.as_millis() as u64),
             "headline": ["build_server", "queue_wait_1h"],
-            "history": self.history.iter()
-                .filter(|point| point.minute_ms >= oldest_minute && point.minute_ms <= newest_minute)
-                .map(|point| json!({
-                    "minute_ms": point.minute_ms,
-                    "permits_held": point.permits_held,
-                    "permits_cap": point.permits_cap,
-                    "queue_depth": point.queue_depth,
-                    "queue_p90_ms": point.queue_p90_ms,
-                }))
-                .collect::<Vec<_>>(),
+            "history": self.history_json(minute_start_ms(unix_ms)),
         });
         if !self.windows.is_empty() {
             metrics["windows_runners"] = json!(self.windows);
@@ -159,6 +148,52 @@ impl HealthCache {
             detail: Some(detail),
             metrics: Some(metrics),
         }
+    }
+
+    /// The history as parallel per-minute columns from the oldest retained
+    /// minute up to `newest_minute`, with `null` for a minute that has no
+    /// sample so gaps stay visible. The subc daemon caches at most 16 KiB of a
+    /// module's health metrics, and one object per minute for three hours
+    /// exceeded that; columns keep it to a few kilobytes. `permits_cap` is a
+    /// single number when it never changed in the window.
+    fn history_json(&self, newest_minute: u64) -> Value {
+        let oldest_minute = newest_minute.saturating_sub((HISTORY_LIMIT as u64 - 1) * MINUTE_MS);
+        let points: Vec<_> = self
+            .history
+            .iter()
+            .filter(|point| point.minute_ms >= oldest_minute && point.minute_ms <= newest_minute)
+            .collect();
+        let start = points
+            .first()
+            .map_or(newest_minute, |point| point.minute_ms);
+        let slots = if points.is_empty() {
+            0
+        } else {
+            ((newest_minute - start) / MINUTE_MS) as usize + 1
+        };
+        let mut held = vec![Value::Null; slots];
+        let mut cap = vec![Value::Null; slots];
+        let mut depth = vec![Value::Null; slots];
+        let mut p90 = vec![Value::Null; slots];
+        for point in &points {
+            let slot = ((point.minute_ms - start) / MINUTE_MS) as usize;
+            held[slot] = json!(point.permits_held);
+            cap[slot] = json!(point.permits_cap);
+            depth[slot] = json!(point.queue_depth);
+            p90[slot] = json!(point.queue_p90_ms);
+        }
+        let constant_cap = points
+            .first()
+            .map(|first| first.permits_cap)
+            .filter(|first| points.iter().all(|point| point.permits_cap == *first));
+        json!({
+            "start_minute_ms": start,
+            "step_ms": MINUTE_MS,
+            "permits_held": held,
+            "permits_cap": constant_cap.map_or(Value::Array(cap), |cap| json!(cap)),
+            "queue_depth": depth,
+            "queue_p90_ms": p90,
+        })
     }
 
     fn record_history(&mut self, sample: &RunnerHealth, unix_ms: u64) {
@@ -282,8 +317,9 @@ mod tests {
                     {"name": "repo-4", "vcpu_hours": 4.0}, {"name": "repo-3", "vcpu_hours": 3.0},
                     {"name": "repo-2", "vcpu_hours": 2.0}],
                 "sample_age_ms": 1500, "headline": ["build_server", "queue_wait_1h"],
-                "history": [{"minute_ms": 1_200_000, "permits_held": 12, "permits_cap": 80,
-                    "queue_depth": 4, "queue_p90_ms": 190000}]
+                "history": {"start_minute_ms": 1_200_000, "step_ms": 60_000,
+                    "permits_held": [12], "permits_cap": 80, "queue_depth": [4],
+                    "queue_p90_ms": [190000]}
             })
         );
     }
@@ -318,12 +354,9 @@ mod tests {
             .clone();
         assert_eq!(
             history,
-            json!([
-                {"minute_ms": 60_000, "permits_held": 5, "permits_cap": 80,
-                    "queue_depth": 7, "queue_p90_ms": 250},
-                {"minute_ms": 120_000, "permits_held": 12, "permits_cap": 80,
-                    "queue_depth": 4, "queue_p90_ms": 190_000}
-            ])
+            json!({"start_minute_ms": 60_000, "step_ms": 60_000,
+                "permits_held": [5, 12, null], "permits_cap": 80,
+                "queue_depth": [7, 4, null], "queue_p90_ms": [250, 190_000, null]})
         );
     }
 
@@ -340,19 +373,33 @@ mod tests {
         }
         assert_eq!(cache.history.len(), HISTORY_LIMIT);
         assert_eq!(cache.history.front().unwrap().minute_ms, MINUTE_MS);
-        let history = cache
+        let metrics = cache
             .report_at(now, HISTORY_LIMIT as u64 * MINUTE_MS)
             .metrics
-            .unwrap()["history"]
-            .as_array()
-            .unwrap()
-            .clone();
-        assert_eq!(history.len(), HISTORY_LIMIT);
-        assert_eq!(history.first().unwrap()["minute_ms"], MINUTE_MS);
-        assert_eq!(
-            history.last().unwrap()["minute_ms"],
-            json!(HISTORY_LIMIT as u64 * MINUTE_MS)
-        );
+            .unwrap();
+        let history = &metrics["history"];
+        assert_eq!(history["start_minute_ms"], MINUTE_MS);
+        for column in ["permits_held", "queue_depth", "queue_p90_ms"] {
+            let values = history[column].as_array().unwrap();
+            assert_eq!(values.len(), HISTORY_LIMIT, "{column}");
+            assert!(values.iter().all(|value| !value.is_null()), "{column}");
+        }
+        // The subc daemon drops a module's cached metrics above 16 KiB, so
+        // a full three-hour history with realistic values must stay well under.
+        let size = serde_json::to_vec(&metrics).unwrap().len();
+        assert!(size < 8 * 1024, "metrics are {size} bytes");
+    }
+
+    #[test]
+    fn history_reports_a_changing_cap_per_minute() {
+        let now = Instant::now();
+        let mut cache = HealthCache::default();
+        cache.update_at(Some(sample()), now, 0);
+        let mut raised = sample();
+        raised.permits_cap = Some(96);
+        cache.update_at(Some(raised), now, MINUTE_MS);
+        let history = cache.report_at(now, MINUTE_MS).metrics.unwrap()["history"].clone();
+        assert_eq!(history["permits_cap"], json!([80, 96]));
     }
 
     #[test]
@@ -373,12 +420,10 @@ mod tests {
             .clone();
         assert_eq!(
             history,
-            json!([
-                {"minute_ms": 0, "permits_held": 12, "permits_cap": 80,
-                    "queue_depth": 4, "queue_p90_ms": 190_000},
-                {"minute_ms": 2 * MINUTE_MS, "permits_held": 12, "permits_cap": 80,
-                    "queue_depth": 4, "queue_p90_ms": 190_000}
-            ])
+            json!({"start_minute_ms": 0, "step_ms": 60_000,
+                "permits_held": [12, null, 12, null], "permits_cap": 80,
+                "queue_depth": [4, null, 4, null],
+                "queue_p90_ms": [190_000, null, 190_000, null]})
         );
     }
 

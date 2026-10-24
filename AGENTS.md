@@ -49,7 +49,7 @@ revision pinned in `scripts/compat-client-revision`; run it on Linux.
 ## Release builds
 
 ```sh
-# macOS module
+# Client module
 env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo build --release -p motor-module --bin ck-motor --locked
 target/release/ck-motor --version
 # Linux runner

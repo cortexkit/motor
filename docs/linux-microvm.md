@@ -62,7 +62,9 @@ cargo build -p motor-vm-helper --release --locked
 sudo install -m 0755 target/release/motor-vm-helper /usr/local/libexec/motor-vm-helper
 sudo install -m 0644 crates/motor-vm-helper/systemd/motor-vm-helper.service /etc/systemd/system/
 sudo install -d -o root -g root -m 0755 /srv/build/vm /var/lib/motor-vm
-sudo install -m 0644 'crates/motor-vm-helper/systemd/var-lib-motor\x2dvm.mount' /etc/systemd/system/
+# The unit's name must be the systemd escape of /var/lib/motor-vm; the checkout
+# keeps it as motor-vm-storage.mount because Windows file names can't hold \.
+sudo install -m 0644 crates/motor-vm-helper/systemd/motor-vm-storage.mount '/etc/systemd/system/var-lib-motor\x2dvm.mount'
 sudo install -m 0644 crates/motor-vm-helper/systemd/motor-vm-storage-private.service /etc/systemd/system/
 # Write /etc/motor-vm-helper.json, using crates/motor-vm-helper/fixtures/helper.json
 # as the shape: allowed uid, socket group, CPU topology and job-account range.

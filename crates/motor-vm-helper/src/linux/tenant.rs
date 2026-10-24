@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufReader, Read, Write},
     os::{
         fd::{AsRawFd, OwnedFd},
         unix::{
@@ -31,6 +31,7 @@ struct Running {
     paused: bool,
     attached: bool,
     restored: bool,
+    snapshot_uncertain: bool,
 }
 pub struct LinuxTenants {
     config: Config,
@@ -230,6 +231,15 @@ impl Backend for LinuxTenants {
         File::open(path.parent().unwrap())?.sync_all()?;
         Ok(())
     }
+    fn was_running(&mut self, registry: &Registry) -> Result<bool> {
+        running_marker_present(&running_marker(registry))
+    }
+    fn clear_running(&mut self, registry: &Registry) -> Result<()> {
+        remove_running_marker(&running_marker(registry))
+    }
+    fn running_tenants(&mut self) -> Vec<String> {
+        self.running.keys().cloned().collect()
+    }
     fn metrics(&mut self, tenant: &str, registry: &Registry) -> Result<(u64, u64)> {
         let memory = std::fs::read_to_string(self.vm(tenant)?.group.join("memory.current"))?
             .trim()
@@ -282,6 +292,11 @@ impl Backend for LinuxTenants {
             .get_mut(tenant)
             .is_some_and(|v| matches!(v.child.try_wait(), Ok(None)))
     }
+    fn snapshot_uncertain(&self, tenant: &str) -> bool {
+        self.running
+            .get(tenant)
+            .is_some_and(|vm| vm.snapshot_uncertain)
+    }
     fn was_restored(&self, tenant: &str) -> bool {
         self.running.get(tenant).is_some_and(|vm| vm.restored)
     }
@@ -309,6 +324,8 @@ impl Backend for LinuxTenants {
         let prefix = if saved { "suspend" } else { "base" };
         let mut boundary_created = false;
         let mut group_created = false;
+        let marker = running_marker(r);
+        let mut marker_written = false;
         let setup = (|| {
             std::fs::create_dir_all(boundary.parent().unwrap())?;
             super::create_boundary(&boundary)?;
@@ -419,6 +436,10 @@ impl Backend for LinuxTenants {
             unsafe {
                 cmd.pre_exec(move || super::raw_place(procs.as_raw_fd()));
             }
+            // Durable before the VMM can touch the disk, so a helper killed
+            // at any later point leaves evidence of an unclean stop.
+            write_running_marker(&marker)?;
+            marker_written = true;
             Ok(cmd.spawn()?)
         })();
         let child = match setup {
@@ -435,7 +456,13 @@ impl Backend for LinuxTenants {
                 } else {
                     Ok(())
                 };
-                for cleanup in [ownership, mounts, cgroup] {
+                // Only a failed spawn follows the marker write: no VM ran.
+                let marker = if marker_written {
+                    remove_running_marker(&marker)
+                } else {
+                    Ok(())
+                };
+                for cleanup in [ownership, mounts, cgroup, marker] {
                     if let Err(error) = cleanup {
                         return Err(Error(format!("{e}; tenant cleanup failed: {error}")));
                     }
@@ -453,6 +480,7 @@ impl Backend for LinuxTenants {
                 paused: true,
                 attached: false,
                 restored: saved,
+                snapshot_uncertain: false,
             },
         );
         // A successful connection is required, not merely a leftover socket inode.
@@ -511,8 +539,17 @@ impl Backend for LinuxTenants {
     }
     fn snapshot(&mut self, tenant: &str, r: &Registry, key: &SnapshotKey) -> Result<()> {
         let vm = self.vm(tenant)?;
-        api(&vm.root, "PATCH", "/vm", &json!({"state":"Paused"}))?;
+        // A lost pause reply may still have paused the VM. Compensation must
+        // issue Resume even when the API call itself fails.
         vm.paused = true;
+        api_with_timeout(
+            &vm.root,
+            "PATCH",
+            "/vm",
+            &json!({"state":"Paused"}),
+            Duration::from_secs(10),
+        )
+        .map_err(|e| Error(e.to_string()))?;
         let high = vm.group.join("memory.high");
         let previous = std::fs::read_to_string(&high)?;
         std::fs::write(
@@ -520,7 +557,13 @@ impl Backend for LinuxTenants {
             (r.snapshot_memory_high_mib.min(r.guest_ram_mib) * 1048576).to_string(),
         )?;
         let result = (|| {
-            api(&vm.root, "PUT", "/snapshot/create", &snapshot_body())?;
+            let timeout = snapshot_create_timeout(r.guest_ram_mib);
+            eprintln!(
+                "tenant {tenant}: suspend_snapshot_create ram_mib={} timeout_ms={}",
+                r.guest_ram_mib,
+                timeout.as_millis()
+            );
+            create_snapshot(&vm.root, timeout, &mut vm.snapshot_uncertain)?;
             for (src, dst) in [
                 ("new.vmstate", "suspend.vmstate"),
                 ("new.memory", "suspend.memory"),
@@ -536,7 +579,14 @@ impl Backend for LinuxTenants {
                 &serde_json::to_vec(key).map_err(|e| Error(e.to_string()))?,
             )
         })();
-        std::fs::write(high, previous)?;
+        let restored = std::fs::write(high, previous);
+        if result.is_err() {
+            if let Err(error) = restored {
+                eprintln!("tenant {tenant}: suspend_restore_memory_high_failed: {error}");
+            }
+            return result;
+        }
+        restored?;
         result
     }
     fn stop(&mut self, tenant: &str) -> Result<()> {
@@ -577,6 +627,44 @@ impl Backend for LinuxTenants {
         crate::tenant::validate_port(port)?;
         let root = self.vm(tenant)?.root.clone();
         connect_relay(&root, port)
+    }
+    fn vm_present(&mut self, tenant: &str) -> Result<bool> {
+        crate::tenant::validate_name(tenant)?;
+        let jail = Path::new(super::BUILD_ROOT).join(format!("jail/tenants/{tenant}"));
+        Ok(self.groups.join(tenant).exists() || jail.exists())
+    }
+    fn remove(&mut self, tenant: &str, r: &Registry) -> Result<PathBuf> {
+        let paths = crate::removal::Paths::live();
+        let _lock = crate::removal::lock(&paths)?;
+        let unix_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let quarantine = crate::removal::begin(&paths, tenant, unix_s)?;
+        // Reconcile the firewall over every other tenant: that drops this
+        // tenant's chains, counter and UFW route grant and leaves the rest.
+        let remaining = tenant_network::without(self.registries()?, r);
+        tenant_network::install(&remaining)?;
+        tenant_network::remove_tap(r)?;
+        crate::removal::finish(&paths, tenant, &quarantine)?;
+        eprintln!(
+            "tenant {tenant}: removed records and network; data quarantined at {} until purge",
+            quarantine.display()
+        );
+        Ok(quarantine)
+    }
+    fn resume_removal(&mut self, tenant: &str) -> Result<Option<PathBuf>> {
+        let paths = crate::removal::Paths::live();
+        let _lock = crate::removal::lock(&paths)?;
+        let Some(quarantine) = crate::removal::pending(&paths, tenant)? else {
+            return Ok(None);
+        };
+        crate::removal::finish(&paths, tenant, &quarantine)?;
+        eprintln!(
+            "tenant {tenant}: completed an interrupted removal; data quarantined at {}",
+            quarantine.display()
+        );
+        Ok(Some(quarantine))
     }
 }
 
@@ -632,23 +720,144 @@ fn relay_handshake(stream: &mut (impl Read + Write), port: u32) -> Result<()> {
     Ok(())
 }
 
+/// Budget for 64 MiB/s plus 30 s of overhead. Reserve two minutes of the host's
+/// 600 s helper deadline for guest preparation, pause and failure compensation.
+fn snapshot_create_timeout(ram_mib: u64) -> Duration {
+    Duration::from_secs(ram_mib.div_ceil(64).saturating_add(30).clamp(60, 480))
+}
+
+pub(crate) fn create_snapshot(root: &Path, timeout: Duration, uncertain: &mut bool) -> Result<()> {
+    *uncertain = true;
+    let result = api_with_timeout(root, "PUT", "/snapshot/create", &snapshot_body(), timeout)
+        .map_err(|error| {
+            let prefix = if error.request_started {
+                crate::tenant::SNAPSHOT_CREATE_UNCERTAIN
+            } else {
+                "suspend_create_not_sent"
+            };
+            Error(format!("{prefix}: {error}"))
+        });
+    if !result.as_ref().is_err_and(|error| {
+        error
+            .0
+            .starts_with(crate::tenant::SNAPSHOT_CREATE_UNCERTAIN)
+    }) {
+        *uncertain = false;
+    }
+    result
+}
+
+struct ApiFailure {
+    method: String,
+    path: String,
+    step: &'static str,
+    request_started: bool,
+    elapsed_ms: u128,
+    timeout_ms: u128,
+    detail: String,
+}
+impl std::fmt::Display for ApiFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Firecracker {} {} step={} request_started={} elapsed_ms={} timeout_ms={}: {}",
+            self.method,
+            self.path,
+            self.step,
+            self.request_started,
+            self.elapsed_ms,
+            self.timeout_ms,
+            self.detail
+        )
+    }
+}
+
 pub fn api(root: &Path, method: &str, path: &str, body: &Value) -> Result<()> {
-    let root_fd = File::open(root)?;
-    let mut socket =
-        UnixStream::connect(format!("/proc/self/fd/{}/api.sock", root_fd.as_raw_fd()))?;
-    socket.set_read_timeout(Some(Duration::from_secs(300)))?;
-    socket.set_write_timeout(Some(Duration::from_secs(30)))?;
+    api_with_timeout(root, method, path, body, Duration::from_secs(300))
+        .map_err(|error| Error(error.to_string()))
+}
+
+fn api_with_timeout(
+    root: &Path,
+    method: &str,
+    path: &str,
+    body: &Value,
+    timeout: Duration,
+) -> std::result::Result<(), Box<ApiFailure>> {
+    let started = std::time::Instant::now();
+    let failure = |step, request_started, error: std::io::Error| {
+        Box::new(ApiFailure {
+            method: method.into(),
+            path: path.into(),
+            step,
+            request_started,
+            elapsed_ms: started.elapsed().as_millis(),
+            timeout_ms: timeout.as_millis(),
+            detail: if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) {
+                format!("api_timeout: {error}")
+            } else {
+                format!("{:?}: {error}", error.kind())
+            },
+        })
+    };
+    let root_fd = File::open(root).map_err(|e| failure("open_jail_root", false, e))?;
+    let mut socket = UnixStream::connect(format!("/proc/self/fd/{}/api.sock", root_fd.as_raw_fd()))
+        .map_err(|e| failure("connect", false, e))?;
+    socket
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| failure("set_read_timeout", false, e))?;
+    socket
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| failure("set_write_timeout", false, e))?;
     let data = body.to_string();
-    write!(socket, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}", data.len())?;
+    write!(socket, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}", data.len())
+        .map_err(|e| failure("write_request", true, e))?;
     let mut reader = BufReader::new(socket);
     let mut status = String::new();
-    reader.read_line(&mut status)?;
-    if status.split_whitespace().nth(1) != Some("204") {
-        return Err(Error(format!(
-            "Firecracker {method} {path}: {}",
-            status.trim()
-        )));
+    // Read one byte at a time with an absolute deadline; a trickled HTTP status
+    // must not extend the helper's reply budget indefinitely.
+    let end = started + timeout;
+    while !status.ends_with('\n') {
+        let remaining = end.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(failure(
+                "read_status",
+                true,
+                std::io::ErrorKind::TimedOut.into(),
+            ));
+        }
+        reader
+            .get_ref()
+            .set_read_timeout(Some(remaining))
+            .map_err(|e| failure("set_read_timeout", true, e))?;
+        let mut byte = [0];
+        reader
+            .read_exact(&mut byte)
+            .map_err(|e| failure("read_status", true, e))?;
+        status.push(byte[0] as char);
+        if status.len() > 1024 {
+            return Err(failure(
+                "read_status",
+                true,
+                std::io::Error::other("status line too long"),
+            ));
+        }
     }
+    if status.split_whitespace().nth(1) != Some("204") {
+        return Err(failure(
+            "response_status",
+            true,
+            std::io::Error::other(status.trim()),
+        ));
+    }
+    eprintln!(
+        "Firecracker {method} {path} completed elapsed_ms={} timeout_ms={}",
+        started.elapsed().as_millis(),
+        timeout.as_millis()
+    );
     Ok(())
 }
 fn load_body(prefix: &str, tap: &str) -> Value {
@@ -731,6 +940,38 @@ fn wait_empty(group: &Path) -> Result<()> {
         }
         std::thread::park_timeout(Duration::from_millis(10));
     }
+    Ok(())
+}
+/// Present from just before a tenant's VMM starts until a clean stop or a
+/// completed suspend, so it survives SIGKILL and power loss. It sits beside
+/// `unclean-stop.json` in the root-owned tenant home.
+fn running_marker(r: &Registry) -> PathBuf {
+    r.generation.with_file_name("running.json")
+}
+fn write_running_marker(path: &Path) -> Result<()> {
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    durable_write(path, json!({ "at_ms": at_ms }).to_string().as_bytes())
+}
+/// Any trusted regular file counts, whatever it holds: a damaged marker is
+/// still evidence. An operator can create one by hand (root-owned) to make the
+/// next start treat the tenant as stopped uncleanly.
+fn running_marker_present(path: &Path) -> Result<bool> {
+    match fs::trusted_file(path) {
+        Ok(_) => Ok(true),
+        Err(_) if !path.exists() => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+fn remove_running_marker(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
+    File::open(path.parent().unwrap())?.sync_all()?;
     Ok(())
 }
 fn durable_write(path: &Path, bytes: &[u8]) -> Result<()> {

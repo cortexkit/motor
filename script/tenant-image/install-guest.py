@@ -3,6 +3,7 @@
 
 import hashlib
 import errno
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -22,7 +23,24 @@ AGENT_VALIDATED_PATHS = (Path("/tenant"), Path("/Users"), Path("/home"), PREFIX 
 # they ship root-owned and readable by every account. The tenant runner then
 # finds them readable and skips its startup ACL grant, which on the VM's RAM
 # overlay would copy the whole toolchain up into memory on every boot.
-TOOL_TREES = (PREFIX / "rustup", PREFIX / "cargo")
+TOOL_TREES = (PREFIX / "rustup", PREFIX / "cargo", PREFIX / "bun")
+# The tenant agent binds the tenant's own directories over these before the
+# runner starts, so anything the image put beneath them would vanish at boot.
+TENANT_WORKSPACE_ROOTS = (Path("/home"), Path("/Users"))
+JAVASCRIPT_SETUP_PASS = "PASS runner JavaScript setup: bun.lock, package-lock.json and pnpm-lock.yaml installs"
+
+
+def load_root_paths():
+    # The chroot stages guest/ beside this script, as the source tree does.
+    spec = importlib.util.spec_from_file_location("root_paths", Path(__file__).resolve().parent / "guest/root_paths.py")
+    if spec is None or spec.loader is None:
+        raise ImportError("cannot load the root-owned path check")
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    return loaded
+
+
+root_paths = load_root_paths()
 
 
 def run(*args, capture=False) -> str:
@@ -34,6 +52,19 @@ def refuse_probe(args, expected):
     result = subprocess.run(["motor-runner", *args], text=True, capture_output=True)
     if result.returncode == 0 or expected not in result.stderr:
         raise ValueError(f"runner capability probe failed: {args}: {result.stderr}")
+
+
+def extract(archive, destination, *options):
+    # Release archives record their creator's owner (Node's stores uid 1001)
+    # and modes, and tar run as root restores both. Extract as root-owned files
+    # instead, with modes masked by a fixed 022 umask, so no other account can
+    # write where root later executes from.
+    previous = os.umask(0o022)
+    try:
+        run("tar", "--no-same-owner", "--no-same-permissions", *options, "-xf", str(archive),
+            "-C", str(destination))
+    finally:
+        os.umask(previous)
 
 
 def download(url, destination, expected):
@@ -55,51 +86,70 @@ def published_hash(url, filename):
 
 
 def install_tools(pins):
-    os.environ.update(
-        CARGO_HOME="/srv/build/cargo-home", RUSTUP_HOME="/home/ubuntu/.rustup",
-        CARGO_TARGET_DIR="/srv/build/target", TMPDIR="/srv/build/tmp",
-        RUSTC_WRAPPER="", CARGO_BUILD_RUSTC_WRAPPER="", GIT_TERMINAL_PROMPT="0",
-        HOME="/root", PATH="/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-    )
-    (BUILD / "tmp").mkdir()
-    rustup_url = (f"https://static.rust-lang.org/rustup/archive/{pins['rustup']}/"
-                  "x86_64-unknown-linux-gnu/rustup-init")
-    rustup_sha = urllib.request.urlopen(rustup_url + ".sha256").read().decode().split()[0]
-    download(rustup_url, BUILD / "rustup-init", rustup_sha)
-    (BUILD / "rustup-init").chmod(0o755)
-    run(str(BUILD / "rustup-init"), "-y", "--no-modify-path", "--profile", "minimal",
-        "--default-toolchain", pins["rust_default"])
-    for toolchain, targets in pins["rust_toolchains"].items():
-        run("rustup", "toolchain", "install", toolchain, "--profile", "minimal",
-            "--component", "clippy", "--component", "rustfmt")
-        run("rustup", "target", "add", "--toolchain", toolchain, *targets)
-    run("rustup", "default", pins["rust_default"])
+    # Use the same measured releases, target/component sets and installers as
+    # Boat; tenant-only pins describe the OS and kernel, never a second toolchain.
+    spec = importlib.util.spec_from_file_location("boat_tools", BUILD / "script/boat-image/install.py")
+    if spec is None or spec.loader is None:
+        raise ImportError("cannot load the shared image tool installer")
+    shared = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shared)
+    manifest = json.loads((BUILD / "script/runner/toolchain.json").read_text())
+    shared.parity.validate(manifest)
+    run("apt-get", "purge", "-y", "binaryen")
+    shared.tools(manifest, role="tenant")
 
-    node_file = f"node-v{pins['node']}-linux-x64.tar.xz"
-    node_url = f"https://nodejs.org/dist/v{pins['node']}/"
-    download(node_url + node_file, BUILD / node_file,
-             published_hash(node_url + "SHASUMS256.txt", node_file))
-    run("tar", "-xJf", str(BUILD / node_file), "--strip-components=1", "-C", "/usr/local")
-    bun_file = "bun-linux-x64.zip"
-    bun_url = f"https://github.com/oven-sh/bun/releases/download/bun-v{pins['bun']}/"
-    download(bun_url + bun_file, BUILD / bun_file,
-             published_hash(bun_url + "SHASUMS256.txt", bun_file))
-    run("unzip", "-q", str(BUILD / bun_file), "-d", str(BUILD / "bun"))
-    shutil.copy2(BUILD / "bun/bun-linux-x64/bun", "/usr/local/bin/bun")
-    Path("/usr/local/bin/bun").chmod(0o755)
-    run("npm", "install", "--global", "--prefix", "/usr/local", "--ignore-scripts",
-        f"npm@{pins['npm']}", f"pnpm@{pins['pnpm']}")
-    run("bash", str(BUILD / "script/runner/install-tools.sh"))
-    run("sh", str(BUILD / "script/runner/build-sccache.sh"))
-
-    PREFIX.mkdir(parents=True)
+    # The shared installer has already put Bun under PREFIX (toolchain.json's
+    # tenant path), outside /home.
+    PREFIX.mkdir(parents=True, exist_ok=True)
     (PREFIX / "cargo").mkdir()
     shutil.copytree(BUILD / "cargo-home/bin", PREFIX / "cargo/bin", symlinks=True)
     shutil.move("/home/ubuntu/.rustup", PREFIX / "rustup")
-    Path("/home/ubuntu").rmdir()
+    retire_tool_home()
+    # Root runs these files, so they get a fixed root-only-writable mode rather
+    # than whatever mode the build checkout's umask left on the source copy.
+    def install_file(source, destination):
+        shutil.copyfile(source, destination)
+        os.chmod(destination, 0o644)
+
+    for name in ("sccache-inputs.sha256", "sccache-artifacts.json"):
+        install_file(BUILD / name, PREFIX / name)
+    parity_dir = PREFIX / "parity"
+    parity_dir.mkdir(mode=0o755)
+    for name in shared.parity.PARITY_FILES:
+        install_file(BUILD / "script/runner" / name, parity_dir / name)
     # Only immutable binaries and toolchains enter the image, not install caches.
     os.environ.update(CARGO_HOME=str(PREFIX / "cargo"), RUSTUP_HOME=str(PREFIX / "rustup"),
-                      PATH=f"{PREFIX}/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+                      PATH=f"{PREFIX}/bun/bin:{PREFIX}/cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+
+
+def retire_tool_home(home=Path("/home/ubuntu")):
+    """The shared installer builds the Rust toolchain under /home/ubuntu, as on
+    Boat. In a tenant VM /home is the tenant's own directory, bound over the
+    image's, so nothing may stay there; refuse, naming it, if anything did."""
+    left = sorted(str(path) for path in home.iterdir())
+    if left:
+        raise ValueError(f"image tools left under {home}, which a tenant's /home hides at boot: {left}")
+    home.rmdir()
+
+
+def verify_workspace_roots_empty(roots=TENANT_WORKSPACE_ROOTS):
+    for root in roots:
+        left = sorted(str(path) for path in root.iterdir())
+        if left:
+            raise ValueError(f"image files under {root}, which the tenant agent binds over at attach: {left}")
+    return [str(root) for root in roots]
+
+
+def verify_javascript_setup(scratch=BUILD / "javascript-setup-check", runner="motor-runner"):
+    """Run the tenant runner's own trusted JavaScript dependency setup, with
+    the tool locations its --tenant-vm role uses, on bun.lock,
+    package-lock.json and pnpm-lock.yaml fixtures, so a setup tool missing from
+    where the runner looks fails the image build rather than every job."""
+    output = run(runner, "check-javascript-setup", "--tenant-vm", "--scratch", str(scratch), capture=True)
+    shutil.rmtree(scratch)
+    if output.splitlines()[-1:] != [JAVASCRIPT_SETUP_PASS]:
+        raise ValueError(f"runner JavaScript setup check did not pass: {output}")
+    return output.splitlines()
 
 
 def install_services(source, destination):
@@ -171,12 +221,7 @@ def verify_agent_paths(root, owner=0):
     return [str(path) for path in AGENT_VALIDATED_PATHS]
 
 
-def tool_tree_entries(root):
-    """Every path under root, including root, without following symlinks."""
-    yield root
-    for directory, directories, files in os.walk(root):
-        for name in directories + files:
-            yield Path(directory, name)
+tool_tree_entries = root_paths.tree_entries
 
 
 def publish_tool_trees(roots=TOOL_TREES, own=os.lchown):
@@ -223,7 +268,13 @@ def verify_tool_trees(roots=TOOL_TREES, acl=has_access_acl, owner=0, group=0):
 
 
 def configure(pins):
-    for account in ("motor-job", "motor-cache"):
+    spec = importlib.util.spec_from_file_location("job_account", BUILD / "script/runner/job-account.py")
+    if spec is None or spec.loader is None:
+        raise ImportError("cannot load the shared job identity installer")
+    account = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(account)
+    account.ensure(json.loads((BUILD / "script/runner/toolchain.json").read_text())['job_identity_by_role']['tenant'], run)
+    for account in ("motor-cache",):
         run("useradd", "--system", "--user-group", "--home-dir", "/nonexistent",
             "--shell", "/usr/sbin/nologin", account)
     for directory in ("tenant", "Users", "home", "overlay", ".lower", "usr/local/libexec", "etc/nftables.d"):
@@ -237,12 +288,16 @@ def configure(pins):
     shutil.copy2(BUILD / "guest/hosted_image_check.py", "/usr/local/libexec/hosted_image_check.py")
     Path("/usr/local/libexec/hosted_image_check.py").chmod(0o755)
     install_services(BUILD / "guest", Path("/etc/systemd/system"))
+    run("install", "-o", "root", "-g", "root", "-m", "0644",
+        str(BUILD / "script/runner/units/system/motor-jobs.slice"),
+        "/etc/systemd/system/motor-jobs.slice")
     clear_module_load_requests(Path("/"))
     rules = (BUILD / "script/runner/motor-net.nft").read_text()
     if rules.count("enp6s0") != 3:
         raise ValueError("unexpected runner network interface template")
     Path("/etc/nftables.d/motor-net.nft").write_text(rules.replace("enp6s0", "eth0"))
     Path("/etc/sysctl.d/90-motor.conf").write_text("net.ipv4.ip_forward=1\nkernel.modules_disabled=1\n")
+    shutil.copy2(BUILD / "script/runner/sysctl/60-motor-inotify.conf", "/etc/sysctl.d/60-motor-inotify.conf")
     Path("/etc/hostname").write_text("motor-tenant\n")
     Path("/etc/hosts").write_text("127.0.0.1 localhost\n127.0.1.1 motor-tenant\n")
     Path("/etc/resolv.conf").unlink(missing_ok=True)
@@ -261,8 +316,41 @@ def configure(pins):
     run("systemctl", "mask", "systemd-networkd.service", "systemd-resolved.service",
         "systemd-remount-fs.service",
         "apt-daily.timer", "apt-daily-upgrade.timer", "unattended-upgrades.service",
-        "ufw.service", "nftables.service", "nats-server.service", "serial-getty@ttyS0.service")
+        "ufw.service", "nftables.service", "nats-server.service", "ssh.service", "ssh.socket",
+        "serial-getty@ttyS0.service")
+    for key in Path("/etc/ssh").glob("ssh_host_*"):
+        key.unlink()
     run("systemctl", "set-default", "multi-user.target")
+
+
+def verify_git(manifest, unit=BUILD / "guest/motor-tenant-agent.service", which=shutil.which):
+    """The git that the guest runner and its jobs find first on the agent
+    unit's PATH is the build server's release, not Debian's older package."""
+    spec = manifest["tools"]["git"]
+    search = next(line.removeprefix("Environment=PATH=") for line in Path(unit).read_text().splitlines()
+                  if line.startswith("Environment=PATH="))
+    path = which("git", path=search)
+    if path != spec["path_by_role"]["tenant"]:
+        raise ValueError(f"git resolves to {path}, not the pinned build")
+    actual = run(path, "--version", capture=True)
+    if actual != spec["version"]:
+        raise ValueError(f"git version differs: {actual}")
+    return actual
+
+
+def verify_wasm_opt(manifest, unit=BUILD / "guest/motor-tenant-agent.service", which=shutil.which):
+    spec = manifest["tools"]["wasm-opt"]
+    search = next(line.removeprefix("Environment=PATH=") for line in Path(unit).read_text().splitlines()
+                  if line.startswith("Environment=PATH="))
+    path = which("wasm-opt", path=search)
+    if path != spec["path_by_role"]["tenant"]:
+        raise ValueError(f"wasm-opt resolves to {path}, not the pinned Binaryen release")
+    actual = run(path, "--version", capture=True)
+    expected_major = re.fullmatch(r"wasm-opt version (\d+)", spec["version"])
+    actual_major = re.match(r"wasm-opt version (\d+)(?:\s|$)", actual)
+    if not expected_major or not actual_major or expected_major.group(1) != actual_major.group(1):
+        raise ValueError(f"wasm-opt major version differs: {actual}")
+    return actual
 
 
 def verify(pins):
@@ -272,17 +360,16 @@ def verify(pins):
     inventory = {"systemd": systemd, "rust_toolchains": {}}
     inventory["agent_validated_paths"] = verify_agent_paths(Path("/"))
     inventory["static_module_load_requests"] = verify_no_module_load_requests(Path("/"))
-    for name, command in (("node", "node"), ("npm", "npm"), ("bun", "bun"), ("pnpm", "pnpm")):
-        actual = run(command, "--version", capture=True).removeprefix("v")
-        if actual != pins[name]:
-            raise ValueError(f"{name} version differs: {actual}")
-        inventory[name] = actual
-    for toolchain, expected in pins["rust_toolchains"].items():
-        actual = run("rustup", "target", "list", "--installed", "--toolchain", toolchain, capture=True).splitlines()
-        if sorted(actual) != sorted(expected):
-            raise ValueError(f"Rust targets differ: {toolchain}")
-        inventory["rust_toolchains"][toolchain] = actual
+    parity = json.loads(run("python3", str(PREFIX / "parity/toolchain-parity.py"),
+                            "--check", "--role", "tenant", capture=True))
+    inventory["parity"] = parity
+    inventory["rust_toolchains"] = parity["observed"]["rust_toolchains"]
     inventory["runner"] = run("motor-runner", "--version", capture=True)
+    manifest = json.loads((BUILD / "script/runner/toolchain.json").read_text())
+    inventory["git"] = verify_git(manifest)
+    inventory["wasm_opt"] = verify_wasm_opt(manifest)
+    inventory["empty_workspace_roots"] = verify_workspace_roots_empty()
+    inventory["javascript_setup"] = verify_javascript_setup()
     # Both errors occur during parsing, before a listener or runner can be opened.
     refuse_probe(["tenant-agent", "image-capability-probe"], "tenant-agent takes no arguments")
     refuse_probe(["image-capability-probe", "--tenant-vm", "--backend", "vm"],
@@ -296,13 +383,15 @@ def verify(pins):
     inventory["python"] = run("python3", "--version", capture=True)
     inventory["nextest"] = run("cargo", "nextest", "--version", capture=True)
     run("systemd-analyze", "verify", "/etc/systemd/system/motor-tenant-agent.service",
-        "/etc/systemd/system/motor-net-rules.service", "/etc/systemd/system/motor-image-check.service")
+        "/etc/systemd/system/motor-net-rules.service", "/etc/systemd/system/motor-image-check.service",
+        "/etc/systemd/system/motor-jobs.slice")
     # Last, after every tool above has run and could have added files.
     inventory["world_readable_tool_trees"] = verify_tool_trees()
+    inventory["root_owned_paths"] = root_paths.require(root_paths.TENANT_ROOTS)
     (BUILD / "tools.json").write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n")
     (BUILD / "packages.txt").write_text(run("dpkg-query", "-W", "-f=${Package}\t${Version}\n", capture=True) + "\n")
-    print(f"guest inventory: {len(pins['packages'])} packages; {len(pins['rust_toolchains'])} Rust toolchains; "
-          "4 JS tools; runner tenant-agent, sccache, nextest and Python executed")
+    print(f"guest inventory: {len(pins['packages'])} base packages; {len(inventory['rust_toolchains'])} Rust toolchains; "
+          "4 JS tools; runner tenant-agent and JavaScript setup, git, sccache, nextest and Python executed")
 
 
 def main():

@@ -2,8 +2,8 @@ use motor_protocol::{default_return_max_bytes, RunRequest, RETURN_MAX_BYTES};
 use serde::{Deserialize, Serialize};
 
 /// File-return options for the direct command interface's exec.run operation.
-/// The shared RunRequest does not yet carry these fields, so they are merged
-/// into its JSON object rather than nested on the wire.
+/// Unlike agent requests, direct requests name absolute workspace paths. The
+/// options share the RunRequest JSON object rather than nesting on the wire.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReturnOptions {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -13,6 +13,12 @@ pub struct ReturnOptions {
         skip_serializing_if = "is_default_cap"
     )]
     pub return_max_bytes: u64,
+    /// Prefer chunked returned files on the direct interface. The module
+    /// negotiates with the runner and caps legacy returns at 256 KiB.
+    /// Agent requests are refused if the runner lacks chunked-return support;
+    /// they are not downgraded to legacy returns.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub return_chunked: bool,
 }
 
 fn is_default_cap(cap: &u64) -> bool {
@@ -24,6 +30,7 @@ impl Default for ReturnOptions {
         Self {
             return_paths: Vec::new(),
             return_max_bytes: RETURN_MAX_BYTES,
+            return_chunked: false,
         }
     }
 }

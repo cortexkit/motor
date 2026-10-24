@@ -1,6 +1,8 @@
 #!/usr/bin/python3
 """Root qualification payload, staged only on a disposable tenant disk."""
 import os
+import importlib.util
+import shutil
 import json
 from pathlib import Path
 import socket
@@ -24,6 +26,13 @@ READY_S = 10.0
 ATTACH_WAIT_S = 90.0
 TOOL_ROOTS = (Path("/usr/local/lib/motor/rustup"), Path("/usr/local/lib/motor/cargo"))
 TOOL_TREES = "PASS guest tool trees: root-owned and world-readable without ACLs; no copy-up at runner start"
+ROOT_PATHS = "PASS guest root paths: everything root executes from is root-owned without group or other write"
+PARITY = "PASS guest toolchain parity: tenant host contract and package-qualified gnutest"
+JAVASCRIPT_SETUP = ("PASS guest runner JavaScript setup: bun.lock, package-lock.json and pnpm-lock.yaml "
+                    "installed with the tenant runner's tools after attach")
+RUNNER_JAVASCRIPT_PASS = "PASS runner JavaScript setup: bun.lock, package-lock.json and pnpm-lock.yaml installs"
+CARGO_FETCH = "PASS guest trusted cargo prefetch: itoa 1.0.18 fetched online in a snapshot helper with a cold cache"
+RUNNER_CARGO_FETCH_PASS = "PASS runner trusted cargo prefetch: itoa 1.0.18 fetched online into a cold cache"
 SAMPLE_BYTES = 32 * 1024 * 1024
 
 
@@ -153,6 +162,22 @@ def tool_tree_probe():
     print(TOOL_TREES, flush=True)
 
 
+def root_path_probe(image=Path("/"), owner=0):
+    # The host stages root_paths.py beside this file from its own checkout, so
+    # a booted image that drifted from the build-time rule is caught here.
+    spec = importlib.util.spec_from_file_location("root_paths", Path(__file__).with_name("root_paths.py"))
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load the staged root-owned path check")
+    rule = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rule)
+    report = rule.check(rule.TENANT_ROOTS, image, owner)
+    print("GUEST_ROOT_PATHS " + json.dumps(report, sort_keys=True), flush=True)
+    if report["offender_count"]:
+        raise RuntimeError(f"{report['offender_count']} path(s) root executes from are not root-owned "
+                           f"without group/other write: {report['offenders']}")
+    print(ROOT_PATHS, flush=True)
+
+
 def runner_diagnostics():
     state: dict[str, Any] = {}
     for name, args in (
@@ -265,6 +290,46 @@ def run(*args, **kwargs):
     return result.stdout
 
 
+def toolchain_probe(root):
+    report = json.loads(run("python3", str(root / "toolchain-parity.py"),
+                            "--check", "--role", "tenant"))
+    (root / "parity-host.json").write_text(json.dumps(report, indent=2) + "\n")
+    expected = (root / "gnutest.sha256").read_text().strip()
+    if not report['passed'] or report["observed"]["tools"]["gnutest"]["sha256"] != expected:
+        raise RuntimeError("booted package-qualified gnutest differs from the image inventory or parity failed")
+    print(PARITY, flush=True)
+
+
+def javascript_setup_probe(scratch):
+    """The runner's own trusted JavaScript dependency setup, with the tool
+    locations of its --tenant-vm role, run after attach: the tenant's /home and
+    /Users are bound over the image's by now, so a setup tool the image left
+    beneath them is missing here exactly as it would be for a job."""
+    target = scratch / "javascript-setup"
+    if target.exists():
+        shutil.rmtree(target)
+    output = run("/usr/local/bin/motor-runner", "check-javascript-setup", "--tenant-vm",
+                 "--scratch", str(target))
+    if RUNNER_JAVASCRIPT_PASS not in output.splitlines():
+        raise RuntimeError("the runner's JavaScript setup check did not pass")
+    shutil.rmtree(target)
+    print(JAVASCRIPT_SETUP, flush=True)
+
+
+def cargo_fetch_probe(scratch):
+    """Use a fresh cache and the production helper, whose mount namespace is
+    separate from both this qualifier and the daemon's private resolver view."""
+    target = scratch / "cargo-fetch"
+    if target.exists():
+        shutil.rmtree(target)
+    output = run("/usr/local/bin/motor-runner", "check-tenant-cargo-fetch",
+                 "--scratch", str(target))
+    if RUNNER_CARGO_FETCH_PASS not in output.splitlines():
+        raise RuntimeError("the runner's trusted online Cargo fetch check did not pass")
+    shutil.rmtree(target)
+    print(CARGO_FETCH, flush=True)
+
+
 def main():
     deadline = time.monotonic() + 120
     while subprocess.run(["systemctl", "is-active", "--quiet", "motor-tenant-runner.service"]).returncode:
@@ -274,9 +339,13 @@ def main():
     run("/usr/local/libexec/hosted_image_check.py", "--tenant")
     name_service_probe()
     tool_tree_probe()
+    root_path_probe()
     root = Path("/tenant/qualification")
+    toolchain_probe(root)
     scratch = Path("/tenant/qualification-scratch")
     scratch.mkdir(exist_ok=True)
+    javascript_setup_probe(scratch)
+    cargo_fetch_probe(scratch)
     env = dict(os.environ, TMPDIR=str(scratch), RUSTC_WRAPPER="", CARGO_BUILD_RUSTC_WRAPPER="")
     for key in list(env):
         if key.startswith("GIT_CONFIG_"):

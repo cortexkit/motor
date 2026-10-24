@@ -1,4 +1,5 @@
 {
+<<<<<<< HEAD
   "windows_cross": {
     "cargo_xwin": "0.23.1",
     "vs_manifest": "17",
@@ -35,16 +36,18 @@
     "tools": "target/windows-cross/tools",
     "license_note": "xwin downloads Microsoft MSVC CRT and Windows SDK headers and libraries under the same Microsoft Build Tools/SDK terms accepted by the Windows job image's unattended installation. They are used privately to build our own software, never redistributed. Only our binaries ship; cargo-xwin's MIT licence does not relicense the Microsoft SDK. No latest-version fallback or host-global installation."
   },
+=======
+>>>>>>> origin/main
   "accepted_os_differences": [
-    "The measured build server is Ubuntu 26.04; Boat remains Ubuntu 24.04. Kernels, glibc, systemd, Python, native compilers/linkers, SQLite/OpenSSL and distro package versions are not byte-for-byte equivalent. Required package presence and compiler thread model are checked; observed versions are recorded, not pinned across distributions.",
+    "The measured build server is Ubuntu 26.04; Boat remains Ubuntu 24.04 and tenant uses Debian trixie. Kernels, glibc, systemd, Python, native compilers/linkers, SQLite/OpenSSL and distro package versions are not byte-for-byte equivalent. Required package presence and compiler thread model are checked; observed versions are recorded, not pinned across distributions. Git is not among these differences: both images build the server's git release from the pinned kernel.org source into /usr/local/lib/git, ahead of the distro git on PATH, and git --version is checked exactly.",
     "The build server defaults to uutils coreutils and exposes GNU coreutils 9.7 under gnu-prefixed names. Boat defaults to GNU coreutils from Ubuntu 24.04 and supplies the same gnu-prefixed executable names. GNU versions are distro-provided.",
-    "wasm-opt is supplied by apt binaryen (/usr/bin/wasm-opt), version 120 on the captured build server. Boat's distro version is recorded in fresh qualification evidence, not forced to 120; WebAssembly optimizer output may differ.",
-    "Node's resolved installation directory may differ; its job-visible /usr/local/bin paths and Node/npm versions are exact. Bun is installed and mounted at /home/ubuntu/.bun/bin on both hosts.",
+    "wasm-opt uses apt binaryen (/usr/bin/wasm-opt) on the build server, where its major version is 120. Boat and tenant install the official Binaryen 120 x86_64 Linux release archive pinned by SHA-256 and remove the distro package. Parity checks the same major version and each role's executable path.",
+    "Node's resolved installation directory may differ; its job-visible /usr/local/bin paths and Node/npm versions are exact. Bun is installed at /home/ubuntu/.bun/bin on the build server and Boat. The tenant image installs it at /usr/local/lib/motor/bun/bin, because a tenant VM's /home is the tenant's own workspace root, bound over the image's /home before the runner starts. The runner takes Bun, Node, npm and pnpm only from these per-role paths, never from HOME or PATH, and every role's jobs see Bun mounted at /home/ubuntu/.bun/bin (tools.bun.job_path).",
     "No global esbuild exists on the build server. ENGRAM provides ESBUILD_BIN from engram-worker/node_modules/.bin/esbuild using its repository lockfile install, and sets WASM_BINDGEN_BIN=wasm-bindgen and WASM_OPT_BIN=wasm-opt itself.",
     "rust-analyzer, rls and cargo-miri are rustup proxies only in the measured state, not installed components. Jobs cannot install their missing components.",
     "1.89.0 was present only in the old Boat pins, not on the measured build server; it is deliberately excluded. stable is a separate installed toolchain without clippy/rustfmt. Boat copies its matching pinned numbered release and removes unlisted components from that independent copy; it never installs the moving stable channel. No component superset exception is used, and the captured rustc version is exact.",
     "Cargo executable hashes vary with native build inputs. Cargo binary versions and default pinned-variant identity are exact. Boat's patched sccache is identified by the build-input marker, recorded output hashes and a distinct stock binary, without starting a cache process; the build server's two sccache hashes are checked directly.",
-    "The shared build server uses the host-wide prefrontal-build-slot compiler supervisor; its .cache file must point to the trusted /motor-tools/sccache wrapper, which reads the read-only shared compile cache. Boat jobs get no compile cache: no fill runs there, and an empty read-only cache breaks C builds that cc-rs routes through sccache. So Boat jobs have no RUSTC_WRAPPER, SCCACHE_DIR or /motor-tools on PATH. All other job environment values remain exact."
+    "The shared build server uses the host-wide prefrontal-build-slot compiler supervisor; its .cache file must point to the trusted /motor-tools/sccache wrapper, which reads the read-only shared compile cache. Boat and tenant jobs get no compile cache: no fill runs there, and an empty read-only cache breaks C builds that cc-rs routes through sccache. Neither image's jobs have RUSTC_WRAPPER, SCCACHE_DIR or /motor-tools on PATH. Tenant's immutable Rustup home is /usr/local/lib/motor/rustup and its mounted Cargo bin is /tenant/cargo-home/bin. Bun precedes Cargo on every role's job PATH. Inotify instance capacity must be at least 8192; watch/event limits are recorded because kernel RAM-based defaults differ."
   ],
   "apt_packages": {
     "by_role": {
@@ -52,14 +55,19 @@
         "coreutils"
       ],
       "build-server": [
-        "gnu-coreutils"
+        "binaryen",
+        "gnu-coreutils",
+        "musl-tools"
+      ],
+      "tenant": [
+        "coreutils"
       ]
     },
     "observed_build_server_versions": {
       "acl": "2.3.2-2",
       "binaryen": "120-4build1",
       "build-essential": "12.12ubuntu2.26.04.2",
-      "ca-certificates": "20260601~26.04.1",
+      "ca-certificates": "20260816ubuntu0.26.04.1",
       "clang": "1:21.1.6-71",
       "curl": "8.18.0-1ubuntu2.8",
       "g++-mingw-w64-x86-64": "13.2.0-6ubuntu1+26.1",
@@ -67,10 +75,18 @@
       "git": "1:2.53.0-1ubuntu1.1",
       "gnu-coreutils": "9.7-3ubuntu2.1",
       "iproute2": "6.19.0-1ubuntu1.1",
+      "libfontconfig-dev": "2.17.1-3ubuntu1",
       "libsqlite3-dev": "3.46.1-9ubuntu0.3",
       "libssl-dev": "3.5.5-1ubuntu3.7",
+      "libvulkan1": "1.4.341.0-1",
+      "libwayland-dev": "1.24.0-2",
+      "libx11-xcb-dev": "2:1.8.13-1ubuntu0.1",
+      "libxkbcommon-x11-dev": "1.13.1-1",
       "lld": "1:21.1.6-71",
+      "mesa-vulkan-drivers": "26.0.8-1ubuntu0.3",
+      "musl-tools": "1.2.5-3build1",
       "nftables": "1.1.6-1",
+      "openssh-server": "1:10.2p1-2ubuntu3.8",
       "patch": "2.8-2build1",
       "pkg-config": "2.5.1-4",
       "procps": "2:4.0.4-9ubuntu1",
@@ -81,8 +97,10 @@
       "ufw": "0.36.2-9build1",
       "unzip": "6.0-29ubuntu1",
       "util-linux": "2.41.3-3ubuntu2.2",
+      "x11-apps": "7.7+11build4",
       "xfsprogs": "6.18.0-3",
-      "xz-utils": "5.8.3-1"
+      "xvfb": "2:21.1.22-1ubuntu1.3",
+      "xz-utils": "5.8.3-1ubuntu0.1"
     },
     "required": [
       "python3",
@@ -107,13 +125,21 @@
       "unzip",
       "xz-utils",
       "patch",
+      "openssh-server",
       "ufw",
-      "binaryen",
       "gcc-mingw-w64-x86-64",
-      "g++-mingw-w64-x86-64"
+      "g++-mingw-w64-x86-64",
+      "xvfb",
+      "x11-apps",
+      "mesa-vulkan-drivers",
+      "libvulkan1",
+      "libfontconfig-dev",
+      "libwayland-dev",
+      "libx11-xcb-dev",
+      "libxkbcommon-x11-dev"
     ]
   },
-  "capture_sha256": "844f7432dfa9b83888e8fe36af2e20467f77b7189c96bc24d4419b9d4f1e6467",
+  "capture_sha256": "ccee06b54c9e75f1462c00a546c929a798e14293fc60b177263e8d17b72b50b3",
   "cargo_binaries": {
     "cargo": {
       "proxy": true
@@ -131,8 +157,8 @@
       "version": "cargo-nextest 0.9.138 (fc97e97bb 2026-06-21)"
     },
     "ckdev-mutate": {
-      "matches": "ckdev-mutate-9d6b663d",
-      "version": "ckdev-mutate 0.12.1"
+      "matches": "ckdev-mutate-5d005f45",
+      "version": "ckdev-mutate 0.12.7"
     },
     "ckdev-mutate-0097d269": {
       "version": "ckdev-mutate 0.9.1"
@@ -145,6 +171,12 @@
     },
     "ckdev-mutate-46cc166b": {
       "version": "ckdev-mutate 0.8.0"
+    },
+    "ckdev-mutate-5d005f45": {
+      "version": "ckdev-mutate 0.12.7"
+    },
+    "ckdev-mutate-73af60d1": {
+      "version": "ckdev-mutate 0.12.10"
     },
     "ckdev-mutate-73c7e661": {
       "version": "ckdev-mutate 0.9.5"
@@ -297,7 +329,6 @@
         "ckdev-mutate"
       ],
       "crate": "cortexkit-mutate",
-      "default": true,
       "git": "https://github.com/cortexkit/commons",
       "rev": "9d6b663dac487bb982c7bfd18a96eee2292164ad"
     },
@@ -316,6 +347,23 @@
       "crate": "cortexkit-mutate",
       "git": "https://github.com/cortexkit/commons",
       "rev": "0b3bc096880e22ab43bec18eb6719a50fc59c270"
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "default": true,
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "5d005f453c892a09147ffb5e991c06966ff9b4a2"
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "73af60d143d64fe874606ce73f22e02cb356a4bb"
     }
   ],
   "compile_wrapper": {
@@ -431,10 +479,16 @@
     "gnuwhoami": "/usr/bin/gnuwhoami",
     "gnuyes": "/usr/bin/gnuyes"
   },
+  "inotify_minimum": {
+    "max_user_instances": 8192
+  },
   "job_environment": {
     "CARGO_HOME": "/motor-home/cargo",
     "ESBUILD_BIN": null,
     "RUSTUP_HOME": "/home/ubuntu/.rustup",
+    "TEMP": "/motor-home/tmp",
+    "TMP": "/motor-home/tmp",
+    "TMPDIR": "/motor-home/tmp",
     "WASM_BINDGEN_BIN": null,
     "WASM_OPT_BIN": null
   },
@@ -448,6 +502,35 @@
       "PATH": "/motor-tools:/home/ubuntu/.bun/bin:/srv/build/cargo-home/bin:/usr/local/bin:/usr/bin:/bin",
       "RUSTC_WRAPPER": "/motor-tools/prefrontal-build-slot",
       "SCCACHE_DIR": "/motor-cache"
+    },
+    "tenant": {
+      "PATH": "/home/ubuntu/.bun/bin:/tenant/cargo-home/bin:/usr/local/bin:/usr/bin:/bin",
+      "RUSTC_WRAPPER": null,
+      "RUSTUP_HOME": "/usr/local/lib/motor/rustup",
+      "SCCACHE_DIR": null
+    }
+  },
+  "job_identity_by_role": {
+    "boat": "system-assigned",
+    "build-server": {
+      "gid": 986,
+      "uid": 999
+    },
+    "tenant": {
+      "gid": 986,
+      "uid": 999
+    }
+  },
+  "layout_by_role": {
+    "tenant": {
+      "host": {
+        "cargo_home": "/usr/local/lib/motor/cargo",
+        "rustup_home": "/usr/local/lib/motor/rustup"
+      },
+      "job": {
+        "cargo_home": "/tenant/cargo-home",
+        "rustup_home": "/usr/local/lib/motor/rustup"
+      }
     }
   },
   "rust_default": "1.99.0-x86_64-unknown-linux-gnu",
@@ -542,8 +625,55 @@
   "source": "Read-only build-server capture; refresh with toolchain-parity.py --capture and --from-capture",
   "tools": {
     "bun": {
+      "job_path": "/home/ubuntu/.bun/bin/bun",
       "path": "/home/ubuntu/.bun/bin/bun",
+      "path_by_role": {
+        "tenant": "/usr/local/lib/motor/bun/bin/bun"
+      },
       "version": "1.4.2"
+    },
+    "bun-1.3.14": {
+      "archive": {
+        "archive_path": "bun-linux-x64/bun",
+        "format": "zip",
+        "install_dir": "/usr/local/lib/bun/1.3.14",
+        "install_path": "bin/bun",
+        "sha256": "951ee2aee855f08595aeec6225226a298d3fea83a3dcd6465c09cbccdf7e848f",
+        "url": "https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-x64.zip"
+      },
+      "path": "/usr/local/bin/bun-1.3.14",
+      "realpath_suffix": "/lib/bun/1.3.14/bin/bun",
+      "version": "1.3.14"
+    },
+    "corepack": {
+      "path": "/usr/local/bin/corepack",
+      "realpath_suffix": "/lib/node_modules/corepack/dist/corepack.js",
+      "version": "0.36.0"
+    },
+    "git": {
+      "path": "/usr/bin/git",
+      "path_by_role": {
+        "boat": "/usr/local/bin/git",
+        "tenant": "/usr/local/bin/git"
+      },
+      "realpath_suffix_by_role": {
+        "boat": "/usr/local/lib/git/2.53.0/bin/git",
+        "build-server": "/usr/bin/git",
+        "tenant": "/usr/local/lib/git/2.53.0/bin/git"
+      },
+      "source": {
+        "build_packages": [
+          "gettext",
+          "libcurl4-gnutls-dev",
+          "libexpat1-dev",
+          "libpcre2-dev",
+          "zlib1g-dev"
+        ],
+        "install_dir": "/usr/local/lib/git/2.53.0",
+        "sha256": "5818bd7d80b061bbbdfec8a433d609dc8818a05991f731ffc4a561e2ca18c653",
+        "url": "https://www.kernel.org/pub/software/scm/git/git-2.53.0.tar.xz"
+      },
+      "version": "git version 2.53.0"
     },
     "nats-server": {
       "path": "/usr/local/bin/nats-server",
@@ -553,18 +683,70 @@
       "path": "/usr/local/bin/node",
       "version": "v24.21.0"
     },
+    "node22": {
+      "archive": {
+        "format": "tar.xz",
+        "install_dir": "/usr/local/lib/nodejs/22.22.1",
+        "install_path": "bin/node",
+        "sha256": "9a6bc82f9b491279147219f6a18add1e18424dce90d41d2a5fcd69d4924ba3aa",
+        "strip_components": 1,
+        "url": "https://nodejs.org/dist/v22.22.1/node-v22.22.1-linux-x64.tar.xz"
+      },
+      "path": "/usr/local/bin/node22",
+      "realpath_suffix_by_role": {
+        "boat": "/lib/nodejs/22.22.1/bin/node",
+        "build-server": "/usr/bin/node"
+      },
+      "version": "v22.22.1"
+    },
     "npm": {
       "path": "/usr/local/bin/npm",
       "version": "11.19.0"
+    },
+    "npx": {
+      "path": "/usr/local/bin/npx",
+      "realpath_suffix": "/lib/node_modules/npm/bin/npx-cli.js",
+      "version": "11.19.0"
+    },
+    "pn": {
+      "path": "/usr/local/bin/pn",
+      "realpath_suffix": "/lib/node_modules/pnpm/bin/pnpm.mjs",
+      "version": "11.1.2",
+      "version_from": "pnpm"
     },
     "pnpm": {
       "path": "/usr/local/bin/pnpm",
       "version": "11.1.2"
     },
+    "pnpx": {
+      "path": "/usr/local/bin/pnpx",
+      "realpath_suffix": "/lib/node_modules/pnpm/bin/pnpx.mjs",
+      "version": "11.1.2",
+      "version_from": "pnpm"
+    },
+    "pnx": {
+      "path": "/usr/local/bin/pnx",
+      "realpath_suffix": "/lib/node_modules/pnpm/bin/pnpx.mjs",
+      "version": "11.1.2",
+      "version_from": "pnpm"
+    },
     "wasm-opt": {
-      "observed_build_server_version": "wasm-opt version 120",
       "path": "/usr/bin/wasm-opt",
-      "version_pattern": "wasm-opt version [0-9]+"
+      "path_by_role": {
+        "boat": "/usr/local/bin/wasm-opt",
+        "tenant": "/usr/local/bin/wasm-opt"
+      },
+      "realpath_suffix_by_role": {
+        "boat": "/usr/local/lib/binaryen/120/bin/wasm-opt",
+        "tenant": "/usr/local/lib/binaryen/120/bin/wasm-opt"
+      },
+      "source": {
+        "archive_root": "binaryen-version_120",
+        "install_dir": "/usr/local/lib/binaryen/120",
+        "sha256": "ddb097af51d1bdb17300d986b0de7d97422f1933dedb4c9eda3510e0bf4076cc",
+        "url": "https://github.com/WebAssembly/binaryen/releases/download/version_120/binaryen-version_120-x86_64-linux.tar.gz"
+      },
+      "version": "wasm-opt version 120"
     },
     "x86_64-w64-mingw32-g++": {
       "observed_build_server_version": "x86_64-w64-mingw32-g++ (GCC) 13-win32",
@@ -578,5 +760,41 @@
       "realpath_suffix": "-gcc-win32",
       "version_pattern": "x86_64-w64-mingw32-gcc \\(GCC\\) [0-9.]+-win32"
     }
+  },
+  "windows_cross": {
+    "arch": "x86_64",
+    "cache": "target/windows-cross/cache",
+    "cache_scope_note": "The tree hash covers the xwin/ subtree with relative paths and explicit file/symlink types. Only generated xwin/DONE hashes sorted LF-separated lines; content and multiplicity remain significant. Every other file byte and symlink target is exact. cargo-xwin creates host clang-cl and cmake/ wrappers outside this subtree; those are generated tool configuration, not SDK/CRT inputs.",
+    "cache_tree_sha256": "7463ca5bdb3be96b45a3a4a4ee5304d9b92d19e72930acc1d806e1eb3e8bf7cb",
+    "cargo_xwin": "0.23.1",
+    "crt": "14.44.17.14",
+    "license_note": "xwin downloads Microsoft MSVC CRT and Windows SDK headers and libraries under the same Microsoft Build Tools/SDK terms accepted by the Windows job image's unattended installation. They are used privately to build our own software, never redistributed. Only our binaries ship; cargo-xwin's MIT licence does not relicense the Microsoft SDK. No latest-version fallback or host-global installation.",
+    "manifest_note": "cargo-xwin 0.23.1 rejects minor 17.14 in --xwin-version despite its help text; component versions remain exact and the resolved manifest/cache content hashes are recorded.",
+    "package_manifest_sha256": "99dda859c4ae3c446eb25620d1a6237bb135d95d14d55cd1d30a15340bb39d80",
+    "prep_toolchain": {
+      "cargo_exe_sha256": "c9b44417dc8228b81923a1068a3c09e32d2793f2cced2a816789cf433c1f0d46",
+      "components": {
+        "cargo": "6201b8dcea8cc55ccfa12e842adf1b2c2aa96490a6cb4f129bf03f2df08c80c9",
+        "rust-std": "adadeafff137a7610884696912b853d4de259c4299ab035b66661e2e0f923ff0",
+        "rustc": "20fed82e629c1ed145f9e9bdee9aad65e790d4237a49bcfc61221eda69e35b14"
+      },
+      "rustc_exe_sha256": "fc40f1c8b65095a22a48c111aadc279c26a049b7e4161e8b99ffe3eb23873e86",
+      "target": "x86_64-pc-windows-msvc",
+      "version": "1.99.0"
+    },
+    "resolved_components": {
+      "Microsoft.VC.14.44.17.14.CRT.Headers": "14.44.35220",
+      "Microsoft.VC.14.44.17.14.CRT.Headers.Resources": "14.44.35220",
+      "Microsoft.VC.14.44.17.14.CRT.Headers.base": "14.44.35220",
+      "Microsoft.VC.14.44.17.14.CRT.x64.Desktop": "14.44.35226",
+      "Microsoft.VC.14.44.17.14.CRT.x64.Desktop.base": "14.44.35226",
+      "Win11SDK_10.0.26100": "10.0.26100.15"
+    },
+    "sdk": "10.0.26100",
+    "sdk_subdir": "xwin",
+    "tools": "target/windows-cross/tools",
+    "variant": "desktop",
+    "vs_channel_build": "17.14.37806.7",
+    "vs_manifest": "17"
   }
 }

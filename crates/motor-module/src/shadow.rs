@@ -452,6 +452,30 @@ mod tests {
         config.spill_avoid_host = None;
         assert!(!eligible(&config, &request, false, false));
     }
+    /// A job whose lease the broker would refuse with 400 `bad_request` is
+    /// never shadowed: CLOUD takes `timeout_s` only in 10..=7200 and `vcpus`
+    /// only in 1..=64.
+    #[test]
+    fn shadow_skips_jobs_whose_lease_body_the_broker_would_refuse() {
+        let config = config();
+        for (timeout, weight, ok) in [
+            (10, None, true),
+            (7200, None, true),
+            (9, None, false),
+            (7201, None, false),
+            (10_800, None, false),
+            (30, Some(0), false),
+            (30, Some(1), true),
+        ] {
+            let mut request = request().with_timeout(timeout);
+            request.weight_hint = weight;
+            assert_eq!(
+                eligible(&config, &request, false, false),
+                ok,
+                "timeout {timeout}, weight {weight:?}"
+            );
+        }
+    }
     #[tokio::test]
     async fn shadow_concurrency_cap_and_zero_sampling_are_nonblocking() {
         let dir = ScratchDir::new("shadow-cap");

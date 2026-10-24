@@ -1,6 +1,10 @@
 //! Durable, instance-scoped remote execution. The Unix transport is also usable
 //! in-process: bind a scratch socket and pass a cloned [`Runner`] to [`serve`].
 mod backend;
+#[cfg(target_os = "linux")]
+mod boat_quota;
+#[cfg(target_os = "linux")]
+mod boat_quota_events;
 mod cleanup;
 #[cfg(any(target_os = "linux", test))]
 mod compile_cache;
@@ -10,6 +14,8 @@ mod filesystem;
 #[cfg(target_os = "linux")]
 mod isolation;
 pub mod local_transport;
+#[cfg(unix)]
+pub mod macos;
 #[cfg(windows)]
 mod native_process;
 pub mod network;
@@ -20,12 +26,34 @@ mod platform;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod privilege;
 mod return_paths;
+// Nothing in a production build starts the remote cache yet, and its gateway
+// and sandbox transport only ever run on Linux job hosts, so outside Linux
+// tests some of it is unreachable.
+#[cfg(unix)]
+#[cfg_attr(any(not(test), not(target_os = "linux")), allow(dead_code))]
+mod remote_cache;
 mod server;
 mod setup_log;
+// Nothing in a production build uses sibling snapshots yet: production builds
+// keep sibling snapshot mode off, so only tests reach this module.
+#[cfg_attr(not(test), allow(dead_code))]
+mod sibling_snapshots;
 mod spool;
+mod state_lock;
 mod storage;
 #[cfg(any(target_os = "linux", test))]
 mod systemd;
+
+/// systemd-run properties for every job unit. PID 1 starts these system
+/// services, independently of the user manager's protected runner processes.
+/// OOMPolicy also stops surviving job descendants. Kept outside `systemd` so
+/// the argument builders of the Windows VM backend compile on every host,
+/// although only a Linux host runs them.
+pub(crate) const JOB_MEMORY_PROPERTIES: [&str; 3] = [
+    "--property=Slice=motor-jobs.slice",
+    "--property=OOMScoreAdjust=900",
+    "--property=OOMPolicy=kill",
+];
 mod tenant;
 #[cfg(target_os = "linux")]
 mod tenant_agent;
@@ -33,6 +61,8 @@ mod tenant_agent;
 mod tenant_local;
 #[cfg(test)]
 mod test_cleanup;
+#[cfg(all(test, unix))]
+mod test_helpers;
 #[cfg(test)]
 #[path = "../tests/support/process.rs"]
 mod test_process;
@@ -46,7 +76,7 @@ mod writer;
 pub use writer::CacheFill;
 
 pub use backend::BackendKind;
-pub use engine::{Config, Runner, DEFAULT_FREE_SPACE_FLOOR_BYTES};
+pub use engine::{Config, Runner, BOAT_DISK_RESERVE_BYTES, DEFAULT_FREE_SPACE_FLOOR_BYTES};
 #[cfg(target_os = "linux")]
 pub use privilege::run_helpers_directly_as_root;
 pub use server::serve;
@@ -65,6 +95,35 @@ pub fn permission_helper_digest() -> String {
 #[doc(hidden)]
 pub fn check_permissions_helper() -> std::io::Result<()> {
     permissions::check_install()
+}
+/// Runs the trusted JavaScript dependency setup with the tools of the role
+/// `config` selects (`--tenant-vm`, `--boat-profile`) on an embedded fixture
+/// locked with bun.lock, package-lock.json and pnpm-lock.yaml, in the new
+/// directory `scratch`. Image builds and qualification run it so that a setup
+/// tool missing from where the runner looks fails there, not in a job.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn check_javascript_setup(
+    config: &Config,
+    scratch: &std::path::Path,
+) -> std::io::Result<String> {
+    isolation::check_javascript_setup(&isolation::JavascriptTools::for_config(config), scratch)
+}
+/// Runs a cold-cache online fetch in the tenant's trusted snapshot helper.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn check_tenant_cargo_fetch(scratch: &std::path::Path) -> std::io::Result<()> {
+    isolation::check_tenant_cargo_fetch(scratch)
+}
+/// PID 1 of a Boat job's PID namespace; the job unit
+/// execs the installed runner in this mode. Never returns.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub const JOB_PID_INIT_MODE: &str = isolation::pid_init::MODE;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn job_pid_init(args: Vec<std::ffi::OsString>) -> ! {
+    isolation::pid_init::run(args)
 }
 #[cfg(target_os = "linux")]
 pub use tenant::serve_tenant;

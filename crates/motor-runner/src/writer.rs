@@ -10,6 +10,7 @@ use std::{
 
 #[cfg(target_os = "linux")]
 mod cache;
+pub(crate) mod declaration;
 pub(crate) mod fill;
 #[cfg(target_os = "linux")]
 pub use cache::CacheFill;
@@ -25,6 +26,7 @@ pub(crate) fn canonical_future(path: &Path) -> io::Result<PathBuf> {
     }
     let mut existing = path;
     let mut tail = Vec::new();
+    let mut looked_again = false;
     loop {
         match fs::canonicalize(existing) {
             Ok(mut canonical) => {
@@ -35,6 +37,13 @@ pub(crate) fn canonical_future(path: &Path) -> io::Result<PathBuf> {
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 match fs::symlink_metadata(existing) {
+                    // Created after canonicalize looked, by a setup running
+                    // alongside (a first workspace and a cache fill both
+                    // create the shared parent folder): look once more.
+                    Ok(metadata) if !metadata.file_type().is_symlink() && !looked_again => {
+                        looked_again = true;
+                        continue;
+                    }
                     Ok(_) => return Err(error),
                     Err(missing) if missing.kind() == io::ErrorKind::NotFound => {}
                     Err(other) => return Err(other),
@@ -91,22 +100,50 @@ pub(crate) fn validate_paths(
     siblings: &[SiblingSnapshot],
     known_checkouts: &[PathBuf],
 ) -> io::Result<()> {
+    validate_resolved_paths(
+        config,
+        known_checkouts,
+        std::iter::once(workspace)
+            .chain(cwd)
+            .chain(siblings.iter().map(|s| s.canonical_path.as_str()))
+            .map(|path| Ok((PathBuf::from(path), canonical_future(Path::new(path))?))),
+    )
+}
+
+pub(crate) fn validate_alias_paths(
+    config: &Config,
+    aliases: &[workspace::SiblingAlias],
+    known_checkouts: &[PathBuf],
+) -> io::Result<()> {
+    validate_resolved_paths(
+        config,
+        known_checkouts,
+        aliases
+            .iter()
+            .map(|alias| Ok((alias.path.clone(), alias.canonical.clone()))),
+    )
+}
+
+fn validate_resolved_paths(
+    config: &Config,
+    known_checkouts: &[PathBuf],
+    paths: impl IntoIterator<Item = io::Result<(PathBuf, PathBuf)>>,
+) -> io::Result<()> {
     let mut protected = vec![
         canonical_runner_path(&config.state_dir().join("sccache"))?,
         canonical_runner_path(&config.writer_scratch_dir())?,
     ];
+    for trash in config.boat_workspace_trash_roots() {
+        protected.push(canonical_runner_path(&trash)?);
+    }
     for checkout in known_checkouts {
         protected.push(canonical_future(checkout)?);
     }
     let prefix = format!(".motor-base-{}-", config.instance);
-    for path in std::iter::once(workspace)
-        .chain(cwd)
-        .chain(siblings.iter().map(|s| s.canonical_path.as_str()))
-    {
-        let supplied = Path::new(path);
-        let canonical = canonical_future(supplied)?;
+    for path in paths {
+        let (supplied, canonical) = path?;
         if protected.iter().any(|owned| overlaps(&canonical, owned))
-            || has_base_component(supplied, &prefix)
+            || has_base_component(&supplied, &prefix)
             || has_base_component(&canonical, &prefix)
             || contains_base_checkout(&canonical, &prefix)?
         {

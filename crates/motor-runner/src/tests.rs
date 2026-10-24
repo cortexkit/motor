@@ -2,6 +2,7 @@ use super::*;
 #[path = "tests/tenant.rs"]
 mod tenant;
 use crate::spool::Upload;
+use crate::writer::declaration::Compilers;
 use cortexkit_test_support::ScratchDir;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use sha2::{Digest, Sha256};
@@ -11,8 +12,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::net::{UnixListener, UnixStream};
 
+#[path = "tests/boat_disk.rs"]
+mod boat_disk;
 #[path = "tests/cancellation.rs"]
 mod cancellation;
+#[path = "tests/declared_fills.rs"]
+mod declared_fills;
 #[path = "tests/dependency_writer.rs"]
 mod dependency_writer;
 #[path = "tests/disk_pressure.rs"]
@@ -25,6 +30,8 @@ mod gate_priority;
 mod git_dependencies;
 #[path = "tests/health.rs"]
 mod health;
+#[path = "tests/held_prerequisites.rs"]
+mod held_prerequisites;
 #[path = "tests/migration.rs"]
 mod migration;
 #[path = "tests/monitoring.rs"]
@@ -33,12 +40,23 @@ mod monitoring;
 mod nested_workspaces;
 #[path = "tests/platform.rs"]
 mod platform_refusal;
+#[path = "tests/publication.rs"]
+mod publication;
 #[path = "tests/refusals.rs"]
 mod refusals;
+#[path = "tests/repository_retirement.rs"]
+mod repository_retirement;
 #[path = "tests/return_paths.rs"]
 mod return_paths;
+#[cfg(unix)]
+#[path = "tests/sibling_eviction.rs"]
+mod sibling_eviction;
+#[path = "tests/sibling_snapshots.rs"]
+mod sibling_snapshots;
 #[path = "tests/started.rs"]
 mod started;
+#[path = "tests/state_lock.rs"]
+mod state_lock;
 #[path = "tests/status_transitions.rs"]
 mod status_transitions;
 #[path = "tests/tip_capability.rs"]
@@ -62,6 +80,15 @@ mod workspace_snapshots;
 mod writer_command_selection;
 #[path = "tests/writer_storage.rs"]
 mod writer_storage;
+
+fn assert_execution_ended_wire(terminal: &TerminalRecord, ended: bool) {
+    let wire = serde_json::to_value(terminal).unwrap();
+    if ended {
+        assert_eq!(wire.get("execution_ended"), Some(&serde_json::json!(true)));
+    } else {
+        assert!(wire.get("execution_ended").is_none(), "{wire}");
+    }
+}
 
 pub(super) fn register_runner(runner: &Runner) {
     let Some(processes) = runner
@@ -269,6 +296,7 @@ impl Fixture {
             Run {
                 return_paths: Vec::new(),
                 return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
+                return_chunked: false,
                 gate_job: false,
                 network: None,
                 platform: None,
@@ -389,6 +417,7 @@ impl Fixture {
             Run {
                 return_paths: Vec::new(),
                 return_max_bytes: motor_protocol::RETURN_MAX_BYTES,
+                return_chunked: false,
                 gate_job: false,
                 network: None,
                 platform: None,
@@ -788,17 +817,61 @@ fn runner_full_counts_64_awaiting_uploads_and_tombstone_is_durable() {
     assert_eq!(runner.status().queue_depth, 0);
 }
 
-fn reopen(config: Config) -> Runner {
+fn reopen_with(open: impl FnMut() -> io::Result<Runner>) -> Runner {
+    reopen_with_message(open, "reopen")
+}
+
+fn reopen_with_message(mut open: impl FnMut() -> io::Result<Runner>, context: &str) -> Runner {
     let end = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        match Runner::open(config.clone()) {
+        match open() {
             Ok(r) => return r,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock && std::time::Instant::now() < end => {
                 std::thread::park_timeout(Duration::from_millis(5))
             }
-            Err(e) => panic!("reopen: {e}"),
+            Err(e) => panic!("{context}: {e}"),
         }
     }
+}
+
+fn reopen(config: Config) -> Runner {
+    reopen_with(|| Runner::open(config.clone()))
+}
+
+#[test]
+fn reopening_waits_for_the_previous_daemon_lock_owner() {
+    use fs2::FileExt;
+
+    let f = Fixture::new();
+    let config = f.config();
+    fs::create_dir_all(config.state_dir()).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(config.state_dir().join("daemon.lock"))
+        .unwrap();
+    lock.try_lock_exclusive().unwrap();
+
+    let (contended, observed) = std::sync::mpsc::channel();
+    let unlocker = std::thread::spawn(move || {
+        observed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reopen must observe the held daemon lock");
+        FileExt::unlock(&lock).unwrap();
+    });
+    let runner = reopen_with(|| {
+        let result = Runner::open(config.clone());
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+        {
+            let _ = contended.send(());
+        }
+        result
+    });
+    unlocker.join().unwrap();
+    drop(runner);
 }
 
 #[test]
@@ -973,13 +1046,19 @@ async fn drain_completes_promptly_with_a_started_unit_backed_job() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drain_waits_for_a_job_still_preparing() {
     let f = Fixture::new();
-    let (runner, hold, _release) = held_runner(&f);
+    let hold = Hold::new("materialize");
+    let mut config = f.config();
+    // A cache fill can start before the foreground job and consume this
+    // one-shot hold. Only the job whose drain behavior we assert may reach it.
+    config.disable_warm_builds = true;
+    config.long_work = Some(hold.hook());
+    let runner = Runner::open(config).unwrap();
+    let _release = Release(hold.clone());
     hold.arm();
     let (request, bytes) = f.run("true");
     f.submit(&runner, &request, &bytes);
     reached(&hold).await;
     runner.begin_drain(Duration::from_secs(30), false);
-    settle().await;
     assert_eq!(
         runner.drain_result(),
         None,
@@ -1673,11 +1752,17 @@ async fn hash_mismatch_and_materialization_failure_never_start() {
 }
 
 async fn connect(socket: &Path) -> UnixStream {
+    connect_with_sibling_paths(socket, false).await
+}
+
+async fn connect_with_sibling_paths(socket: &Path, sibling_paths: bool) -> UnixStream {
     let mut stream = UnixStream::connect(socket).await.unwrap();
     write_frame_async(
         &mut stream,
         &Frame::Hello {
             return_paths: false,
+            return_chunked: false,
+            sibling_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
@@ -1691,6 +1776,8 @@ async fn connect(socket: &Path) -> UnixStream {
         read_next(&mut stream).await,
         Frame::Hello {
             return_paths: true,
+            return_chunked: true,
+            sibling_paths,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
@@ -1878,6 +1965,8 @@ fn blocking_hello(socket: &Path) -> io::Result<std::os::unix::net::UnixStream> {
         &mut stream,
         &Frame::Hello {
             return_paths: false,
+            return_chunked: false,
+            sibling_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
@@ -2485,7 +2574,6 @@ async fn queue_wait_refusal_names_permit_holders_and_their_start_time() {
     );
     let detail = record.refusal_detail().expect("missing queue diagnostic");
     assert_eq!(record.ran, Some(Ran::None));
-    assert_eq!(record.retry_after_ms(), None);
     assert!(detail.starts_with("waiting_on=permits"), "{detail}");
     assert!(
         detail.contains("requested_permits=16; held_permits=20/28"),
@@ -2514,6 +2602,317 @@ async fn queue_wait_refusal_names_permit_holders_and_their_start_time() {
     assert!(!Path::new(&waiting.workspace_key)
         .join("must-not-run")
         .exists());
+}
+
+/// The queue wait that ended `id`, as a withdrawal would report it: the
+/// side-effect-free `job_status` reports the same `waiting_on` phase that the
+/// refusal detail starts with, and it does not dispatch the job.
+fn waiting_phase(runner: &Runner, id: Uuid) -> Option<String> {
+    runner.job_status(id).unwrap().waiting_on
+}
+
+/// Replaces the recent queue waits in the runner's health window with
+/// `waits_ms`, so the median a refusal reports is the one the test names. A
+/// job that waited no time at all records a zero wait of its own, and those
+/// would otherwise decide a median of one or two samples.
+fn record_queue_waits(runner: &Runner, waits_ms: &[u64]) {
+    let mut health = runner.core.health.lock().unwrap();
+    let now = runner.now();
+    health.reset_queue_waits();
+    for &wait_ms in waits_ms {
+        health.record_queue_wait(now, wait_ms);
+    }
+}
+
+/// Holds a job in its running phase until released, and releases it when the
+/// test unwinds, so a failing assertion cannot leave a holder running.
+struct ReleaseWriter(Option<PathBuf>);
+impl ReleaseWriter {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+    fn release(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::write(path, "");
+        }
+    }
+}
+impl std::ops::Drop for ReleaseWriter {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Withdraws a job that has waited `waited_ms` past its queue-wait limit, so
+/// the runner refuses it with `queue_wait_exceeded`, and returns its record.
+/// `recent` replaces the queue waits in the health window first, so the median
+/// a refusal reports is the one the test names.
+fn capacity_refusal(
+    runner: &Runner,
+    f: &Fixture,
+    name: &str,
+    weight_hint: u32,
+    recent: &[u64],
+    waited_ms: u64,
+) -> TerminalRecord {
+    let (mut waiting, bytes) = job_at(f, name, "true");
+    waiting.weight_hint = Some(weight_hint);
+    waiting.queue_wait_limit_s = 1;
+    f.submit(runner, &waiting, &bytes);
+    // The clock says this job has waited past its limit, so no dispatch pass
+    // can start it: the next withdrawal refuses it.
+    f.clock.fetch_add(waited_ms, Ordering::SeqCst);
+    let waiting_on = waiting_phase(runner, waiting.job_id);
+    record_queue_waits(runner, recent);
+    let outcome = runner
+        .withdraw(waiting.job_id)
+        .unwrap_or_else(|error| panic!("withdrawing {} failed: {error}", waiting.job_id));
+    assert_eq!(
+        outcome,
+        WithdrawOutcome::Withdrawn,
+        "job {} was not queued, waiting_on={waiting_on:?}; {}",
+        waiting.job_id,
+        runner_diagnostics(runner)
+    );
+    let record = runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .get(&waiting.job_id)
+        .and_then(|job| job.terminal.clone())
+        .expect("a withdrawn job has a terminal record");
+    assert_eq!(
+        record.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::QueueWaitExceeded
+        },
+        "record: {record:?}"
+    );
+    assert_eq!(record.ran, Some(Ran::None));
+    record
+}
+
+/// Starts a holder that occupies every permit of the runner's capacity, and
+/// returns the guard that releases it, also when the test unwinds.
+async fn full_permit_holder(f: &Fixture, runner: &Runner, name: &str) -> ReleaseWriter {
+    let release = f.scratch.join(name);
+    let release_writer = ReleaseWriter::new(release.clone());
+    let (mut holder, bytes) = f.run(&format!(
+        "while test ! -e '{}'; do sleep .02; done",
+        release.display()
+    ));
+    holder.weight_hint = Some(4);
+    f.submit(runner, &holder, &bytes);
+    until(|| runner.job_status(holder.job_id).unwrap().state == "running").await;
+    release_writer
+}
+
+#[tokio::test]
+async fn capacity_refusal_carries_the_recent_median_queue_wait_as_its_retry_hint() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.max_weight = 4;
+    let runner = Runner::open(config).unwrap();
+    warm(&f, &runner).await;
+    let holder = full_permit_holder(&f, &runner, "release-retry-hint-holder").await;
+    // The holder started without waiting and recorded a zero wait of its own;
+    // these samples replace it, so the hint has a known median to report.
+    let record = capacity_refusal(&runner, &f, "retry-hint-ok", 2, &[30_000], 1_000);
+    drop(holder);
+    assert_eq!(record.retry_after_ms(), Some(30_000));
+}
+
+/// The hint is the measured median clamped to the bounds the constants
+/// document, not the raw measurement.
+#[tokio::test]
+async fn capacity_retry_hint_is_clamped_to_its_bounds() {
+    // One sample per case, so the holder's own zero wait cannot pull the
+    // median down. 500 ms is under the floor and 500 s over the ceiling.
+    for (sample_ms, expected) in [
+        (500, CAPACITY_RETRY_MIN_MS),
+        (500_000, CAPACITY_RETRY_MAX_MS),
+    ] {
+        let f = Fixture::new();
+        let mut config = f.config();
+        config.max_weight = 4;
+        let runner = Runner::open(config).unwrap();
+        warm(&f, &runner).await;
+        let holder = full_permit_holder(&f, &runner, "release-clamped-hint-holder").await;
+        let record = capacity_refusal(&runner, &f, "retry-hint-clamped", 2, &[sample_ms], 10_000);
+        drop(holder);
+        assert_eq!(
+            record.retry_after_ms(),
+            Some(expected),
+            "median {sample_ms} must clamp to {expected}"
+        );
+    }
+}
+
+/// A job too heavy for the runner can never start, so a recent median queue
+/// wait is no reason to send the caller back.
+#[tokio::test]
+async fn impossible_demand_refusal_carries_no_retry_hint() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    warm(&f, &runner).await;
+    let record = capacity_refusal(&runner, &f, "retry-hint-impossible", 30, &[30_000], 1_000);
+    let detail = record
+        .refusal_detail()
+        .expect("missing capacity diagnostic");
+    assert!(
+        detail.starts_with("waiting_on=demand exceeds capacity"),
+        "{detail}"
+    );
+    assert_eq!(record.retry_after_ms(), None);
+}
+
+/// A runner that has started no job in the last hour has no median to report;
+/// zero samples is not a very short wait.
+#[tokio::test]
+async fn capacity_refusal_without_recent_starts_carries_no_retry_hint() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.max_weight = 4;
+    let runner = Runner::open(config).unwrap();
+    warm(&f, &runner).await;
+    let holder = full_permit_holder(&f, &runner, "release-hintless-holder").await;
+    record_queue_waits(&runner, &[]);
+    let measured = runner
+        .core
+        .health
+        .lock()
+        .unwrap()
+        .recent_queue_wait_p50(runner.now());
+    assert_eq!(
+        measured, None,
+        "this test needs a window with no started job, or it proves nothing"
+    );
+    let record = capacity_refusal(&runner, &f, "retry-hint-absent", 2, &[], 300_000);
+    drop(holder);
+    assert_eq!(record.retry_after_ms(), None);
+}
+
+/// The withdrawal that refuses a job refreshes its queue-wait clock first, so
+/// the record reports the wait up to the withdrawal, not up to the pass before.
+#[tokio::test]
+async fn withdrawal_refusal_reports_the_wait_up_to_the_withdrawal() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.max_weight = 4;
+    let runner = Runner::open(config).unwrap();
+    warm(&f, &runner).await;
+    let holder = full_permit_holder(&f, &runner, "release-clock-holder").await;
+    let (mut waiting, bytes) = job_at(&f, "clock-withdraw", "true");
+    waiting.weight_hint = Some(2);
+    waiting.queue_wait_limit_s = 0;
+    f.submit(&runner, &waiting, &bytes);
+    until(|| {
+        runner
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .jobs
+            .get(&waiting.job_id)
+            .is_some_and(|job| job.state == JobState::Queued)
+    })
+    .await;
+    // A pass starts the queue-wait clock. It cannot refuse or start the job
+    // here: a limit of zero only stops what has already been measured.
+    runner.tick().unwrap();
+    runner.maintenance().unwrap();
+    let started = runner
+        .job_status(waiting.job_id)
+        .unwrap()
+        .queue_wait_ms
+        .unwrap_or_else(|| {
+            panic!(
+                "the clock must be counting: {}",
+                runner_diagnostics(&runner)
+            )
+        });
+    f.clock.fetch_add(300_000, Ordering::SeqCst);
+    assert_eq!(
+        runner.job_status(waiting.job_id).unwrap().queue_wait_ms,
+        Some(started + 300_000),
+        "time since the last pass must count toward the job: {}",
+        runner_diagnostics(&runner)
+    );
+    let outcome = runner
+        .withdraw(waiting.job_id)
+        .unwrap_or_else(|error| panic!("withdrawing failed: {error}"));
+    assert_eq!(
+        outcome,
+        WithdrawOutcome::Withdrawn,
+        "{}",
+        runner_diagnostics(&runner)
+    );
+    let record = runner.core.inner.lock().unwrap().jobs[&waiting.job_id]
+        .terminal
+        .clone()
+        .unwrap();
+    drop(holder);
+    assert_eq!(
+        record.queue_wait_ms, 300_000,
+        "the withdrawal must count the wait up to itself, not up to the pass before; record: {record:?}"
+    );
+}
+
+/// A spill withdrawal becomes a hosted job: its caller is never refused, so it
+/// is not sent a hint either, even for a wait that would clear on its own.
+#[tokio::test]
+async fn spill_withdrawal_carries_no_retry_hint() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.max_weight = 4;
+    let runner = Runner::open(config).unwrap();
+    warm(&f, &runner).await;
+    let holder = full_permit_holder(&f, &runner, "release-spill-hint-holder").await;
+    // A spill withdrawal needs the job still queued when the client asks. This
+    // one is queued by hand with its limit already spent, which is what the
+    // frame path refuses; nothing runs a dispatch pass here to start it.
+    let (mut waiting, _) = job_at(&f, "spill-hintless", "true");
+    waiting.queue_wait_limit_s = 0;
+    runner.accept(waiting.clone()).unwrap();
+    let waiting_on = {
+        let mut inner = runner.core.inner.lock().unwrap();
+        {
+            let now = runner.now();
+            let job = inner.jobs.get_mut(&waiting.job_id).unwrap();
+            job.state = JobState::Queued;
+            job.queued_ms = Some(now);
+            runner.save(job).unwrap();
+        }
+        runner
+            .queue_wait_phase(&inner, &DispatchIndex::build(&inner), waiting.job_id)
+            .map(str::to_owned)
+    };
+    record_queue_waits(&runner, &[30_000]);
+    let outcome = runner
+        .withdraw_for(waiting.job_id, None, true)
+        .unwrap_or_else(|error| panic!("withdrawing failed: {error}"));
+    assert_eq!(
+        outcome,
+        WithdrawOutcome::Withdrawn,
+        "job was not queued, waiting_on={waiting_on:?}; {}",
+        runner_diagnostics(&runner)
+    );
+    let record = runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .get(&waiting.job_id)
+        .and_then(|job| job.terminal.clone())
+        .expect("a withdrawn job has a terminal record");
+    drop(holder);
+    assert!(record
+        .refusal_detail()
+        .is_some_and(|d| d.starts_with(motor_protocol::SPILL_WITHDRAWAL_DETAIL_PREFIX)));
+    assert_eq!(record.retry_after_ms(), None);
 }
 
 /// A job that would fit, held behind an older head that is past its backfill
@@ -2729,6 +3128,9 @@ fn launch_gate_child() {
     c.owned_workspace_roots = vec![path.clone()];
     c.free_space_floor_bytes = 0;
     c.base_commands = vec!["true".into()];
+    // The crash must come at this job's gate. A cache fill queued with it
+    // would start first and reach the gate hook instead.
+    c.disable_warm_builds = true;
     c.before_gate = Some(Arc::new(|| unsafe { libc::_exit(86) }));
     let runner = Runner::open(c).unwrap();
     runner.accept(r.clone()).unwrap();
@@ -2857,7 +3259,7 @@ cat "$TMPDIR/serve-write-probe"
     for key in ["TMPDIR", "TMP", "TEMP", "HOME"] {
         request.env.insert(key.into(), "/tmp/caller-shared".into());
     }
-    let mut stream = connect(&socket).await;
+    let mut stream = connect_with_sibling_paths(&socket, true).await;
     write_frame_async(&mut stream, &Frame::Run(request.clone()))
         .await
         .unwrap();
@@ -3901,8 +4303,8 @@ async fn cache_fence_protects_writer_setup_and_queues_writers_during_eviction() 
     assert!(!entry.exists());
 }
 
-/// Exercises the real daemon over its wire protocol without modifying the Mac
-/// client or using an in-process Runner. The operator supplies the daemon socket
+/// Exercises the real daemon over its wire protocol, with no change to the
+/// ck-motor client and no in-process Runner. The operator supplies the daemon socket
 /// and an existing host-only file whose absence inside the job proves isolation.
 #[cfg(target_os = "linux")]
 #[tokio::test]
@@ -4320,6 +4722,155 @@ fn queue_wait_clock_resumes_for_capacity_after_workspace_owner_finishes() {
         .refusal_detail()
         .unwrap()
         .starts_with("waiting_on=permits"));
+}
+
+/// Jobs for `sibling_user_wait_*` tests: a running job in another workspace
+/// that declares the fixture sibling, and a queued job whose main workspace is
+/// that sibling's canonical path, the same host directory. The queued job gets
+/// a one second queue budget.
+fn sibling_user_and_waiter(
+    f: &Fixture,
+    runner: &Runner,
+    waiter_weight: u32,
+    waiter_siblings: Vec<SiblingSnapshot>,
+) -> (Run, Run) {
+    let now = runner.now();
+    let (user, _) = job_at(f, "sibling-user", "true");
+    let (mut waiting, _) = f.run("true");
+    waiting.workspace_key = f.canonical.clone();
+    waiting.cwd = f.canonical.clone();
+    waiting.siblings = waiter_siblings;
+    waiting.queue_wait_limit_s = 1;
+    let mut inner = runner.core.inner.lock().unwrap();
+    let mut user_job = Job::new(user.job_id, Some(user.clone()), now, 1, 2);
+    user_job.state = JobState::Running;
+    user_job.started_ms = Some(now);
+    inner.jobs.insert(user.job_id, user_job);
+    let mut waiting_job = Job::new(waiting.job_id, Some(waiting.clone()), now, 2, waiter_weight);
+    waiting_job.state = JobState::Queued;
+    waiting_job.queued_ms = Some(now);
+    waiting_job.start_queue_wait(now);
+    inner.jobs.insert(waiting.job_id, waiting_job);
+    (user, waiting)
+}
+
+fn manual_tick_runner(f: &Fixture, max_weight: u32) -> Runner {
+    let mut config = f.config();
+    config.max_weight = max_weight;
+    config.manual_tick = true;
+    Runner::open(config).unwrap()
+}
+
+#[test]
+fn sibling_user_wait_is_named_with_its_holder_and_does_not_spend_queue_wait_budget() {
+    let f = Fixture::new();
+    let runner = manual_tick_runner(&f, 8);
+    let (user, waiting) = sibling_user_and_waiter(&f, &runner, 2, Vec::new());
+
+    let status = runner.job_status(waiting.job_id).unwrap();
+    assert_eq!(
+        status.waiting_on.as_deref(),
+        Some("sibling user of this checkout"),
+        "another workspace's sibling checkout is not this workspace's owner"
+    );
+    f.clock.fetch_add(5_000, Ordering::SeqCst);
+    assert_eq!(
+        runner.job_status(waiting.job_id).unwrap().queue_wait_ms,
+        Some(0),
+        "time behind a sibling user of this checkout is not queue wait"
+    );
+    let detail = {
+        let inner = runner.core.inner.lock().unwrap();
+        runner.queue_wait_detail(&inner, waiting.job_id)
+    };
+    assert!(
+        detail.starts_with(&format!(
+            "waiting_on=sibling user of this checkout; sibling_users=[job={} workspace={} permits=2]; requested_permits=2;",
+            user.job_id, user.workspace_key
+        )),
+        "{detail}"
+    );
+    assert_eq!(
+        runner.withdraw(waiting.job_id).unwrap(),
+        WithdrawOutcome::Started,
+        "a checkout conflict must not spend the budget a spill withdrawal checks"
+    );
+}
+
+#[test]
+fn sibling_user_wait_also_blocking_the_waiters_sibling_does_not_spend_queue_wait_budget() {
+    // The two repositories name each other as siblings: the running job's own
+    // workspace is also the waiting job's sibling checkout. That one job is
+    // still the only blocker.
+    let f = Fixture::new();
+    let runner = manual_tick_runner(&f, 8);
+    let sibling = SiblingSnapshot {
+        canonical_path: f
+            .scratch
+            .join("remote/worktrees/sibling-user")
+            .to_string_lossy()
+            .to_string(),
+        commit: "other".into(),
+        tree_hash: String::new(),
+        base_commit: None,
+    };
+    let (_, waiting) = sibling_user_and_waiter(&f, &runner, 2, vec![sibling]);
+
+    let status = runner.job_status(waiting.job_id).unwrap();
+    assert_eq!(
+        status.waiting_on.as_deref(),
+        Some("sibling user of this checkout")
+    );
+    f.clock.fetch_add(5_000, Ordering::SeqCst);
+    assert_eq!(
+        runner.job_status(waiting.job_id).unwrap().queue_wait_ms,
+        Some(0)
+    );
+    assert_eq!(
+        runner.withdraw(waiting.job_id).unwrap(),
+        WithdrawOutcome::Started
+    );
+}
+
+#[test]
+fn sibling_user_wait_still_spends_budget_when_capacity_would_also_block() {
+    // As behind a workspace owner, the clock keeps running when the job would
+    // not fit even after the sibling user frees its permits.
+    let f = Fixture::new();
+    let runner = manual_tick_runner(&f, 4);
+    let (mut capacity, _) = job_at(&f, "capacity", "true");
+    capacity.siblings.clear();
+    let (_, waiting) = sibling_user_and_waiter(&f, &runner, 4, Vec::new());
+    {
+        let now = runner.now();
+        let mut inner = runner.core.inner.lock().unwrap();
+        let mut capacity_job = Job::new(capacity.job_id, Some(capacity.clone()), now, 0, 2);
+        capacity_job.state = JobState::Running;
+        capacity_job.started_ms = Some(now);
+        inner.jobs.insert(capacity.job_id, capacity_job);
+    }
+
+    assert_eq!(
+        runner.job_status(waiting.job_id).unwrap().queue_wait_ms,
+        Some(0)
+    );
+    f.clock.fetch_add(1_000, Ordering::SeqCst);
+    assert_eq!(
+        runner.job_status(waiting.job_id).unwrap().queue_wait_ms,
+        Some(1_000)
+    );
+    assert_eq!(
+        runner.withdraw(waiting.job_id).unwrap(),
+        WithdrawOutcome::Withdrawn
+    );
+    let terminal = runner.core.inner.lock().unwrap().jobs[&waiting.job_id]
+        .terminal
+        .clone()
+        .unwrap();
+    assert!(terminal
+        .refusal_detail()
+        .unwrap()
+        .starts_with("waiting_on=sibling user of this checkout; sibling_users=[job="));
 }
 
 #[test]
@@ -4851,13 +5402,14 @@ fn setup_refusal_detail_is_bounded_redacted_and_not_part_of_the_reason() {
         .state = JobState::Queued;
     let error = io::Error::other(format!("{secret}: {}", "é".repeat(1024)));
     runner
-        .launch(
+        .launch_without_dispatch(
             Setup {
                 id: request.job_id,
                 cpus: vec![1, 17],
                 request: request.clone(),
                 base: false,
                 recorded: BTreeMap::new(),
+                snapshots: None,
             },
             Err(error),
         )

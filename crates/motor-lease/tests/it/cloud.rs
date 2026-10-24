@@ -319,3 +319,325 @@ fn cloud_lease_reattach_release_and_nullable_usage_settlement_match_fake() {
     unexpected["mem_mib"] = json!(16384);
     assert!(serde_json::from_value::<LeaseRequest>(unexpected).is_err());
 }
+
+/// CLOUD's `settled-reattach.json`: a registered host settles a job by usage
+/// report, and a later reattach still gets 200 with an `attach` token and the
+/// lease's unchanged fields. Seeded with the vector's keys and clocks, the fake
+/// returns the same statuses and JSON bodies for the lease, the settlement and
+/// the reattach, and the reattach leaves the settlement as it was.
+#[test]
+fn cloud_settled_reattach_reply_matches_fake() {
+    let v = vector("settled-reattach.json");
+    let lease_reply = &v["lease"]["reply"]["body"];
+    let mut broker = FakeBroker::new(
+        "cloud-vector",
+        FakeConfig {
+            worker_bearer: BEARER.into(),
+            subject: format!("acct:{}", v["account"].as_str().unwrap()),
+            placement: serde_json::from_value(lease_reply["placement"].clone()).unwrap(),
+            endpoint: v["host"]["endpoint"].as_str().unwrap().into(),
+            endpoint_spki_sha256: v["host"]["endpoint_spki_sha256"].as_str().unwrap().into(),
+            kid: v["key_id"].as_str().unwrap().into(),
+            signing_key: seed(v["test_only_job_seed_hex"].as_str().unwrap()),
+            announced_keys: vec![],
+        },
+    )
+    .unwrap();
+    broker.knobs.allowance_vcpu_ms = v["tenant_before"]["body"]["allowance"].as_u64();
+    broker.knobs.lease_id = Some(v["lease_id"].as_str().unwrap().into());
+    let machine = seed(v["test_only_machine_seed_hex"].as_str().unwrap());
+    let host_id = v["host"]["host_id"].as_str().unwrap();
+    assert_eq!(
+        machine.verifying_key().to_bytes().to_vec(),
+        (0..32)
+            .map(|i| u8::from_str_radix(
+                &v["host"]["public_key_hex"].as_str().unwrap()[i * 2..i * 2 + 2],
+                16
+            )
+            .unwrap())
+            .collect::<Vec<_>>()
+    );
+    broker.register_host(host_id.into(), machine.verifying_key());
+    let requester = seed(v["test_only_requester_seed_hex"].as_str().unwrap());
+
+    let request: LeaseRequest =
+        serde_json::from_value(v["lease"]["request"]["body"].clone()).unwrap();
+    assert_eq!(
+        request.requester_jwk,
+        RequesterJwk::from_key(&requester.verifying_key())
+    );
+    let leased = post(
+        &mut broker,
+        v["lease"]["request"]["pathname"].as_str().unwrap(),
+        &request,
+        v["lease_clock_ms"].as_u64().unwrap(),
+    );
+    assert_eq!(
+        (leased.status, &leased.body),
+        (
+            v["lease"]["reply"]["status"].as_u64().unwrap() as u16,
+            lease_reply
+        )
+    );
+
+    let u = &v["usage"]["request"];
+    let usage: Usage = serde_json::from_value(u["body"].clone()).unwrap();
+    let body = serde_json::to_vec(&usage).unwrap();
+    let path = u["pathname"].as_str().unwrap();
+    let timestamp = u["headers"]["CK-Timestamp"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let counter = u["headers"]["CK-Counter"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let signed =
+        HostHeaders::sign(host_id, "POST", path, &body, timestamp, counter, &machine).unwrap();
+    assert_eq!(signed.signature, u["headers"]["CK-Signature"]);
+    let settled = broker.handle(
+        BrokerRequest {
+            content_type: Some("application/json"),
+            method: "POST",
+            path,
+            bearer: None,
+            host_headers: Some(&signed),
+            body: &body,
+        },
+        v["usage_clock_ms"].as_u64().unwrap(),
+    );
+    assert_eq!(
+        (settled.status, &settled.body),
+        (
+            v["usage"]["reply"]["status"].as_u64().unwrap() as u16,
+            &v["usage"]["reply"]["body"]
+        )
+    );
+    let settlement = |broker: &FakeBroker| {
+        broker
+            .settlement(&request.job_id)
+            .map(|(reply, reason)| (serde_json::to_value(reply).unwrap(), reason))
+    };
+    let before = settlement(&broker);
+    assert_eq!(before, Some((v["usage"]["reply"]["body"].clone(), "usage")));
+    // The tenant read before and after the reattach is identical in CLOUD, and
+    // its settled total is this job's settlement.
+    assert_eq!(v["tenant_before"], v["tenant_after"]);
+    assert_eq!(
+        v["tenant_before"]["body"]["settled_vcpu_ms"],
+        v["usage"]["reply"]["body"]["settled_vcpu_ms"]
+    );
+
+    let attach: ReattachRequest =
+        serde_json::from_value(v["reattach"]["request"]["body"].clone()).unwrap();
+    let reattached = post(
+        &mut broker,
+        v["reattach"]["request"]["pathname"].as_str().unwrap(),
+        &attach,
+        v["clock_ms"].as_u64().unwrap(),
+    );
+    let expected = &v["reattach"]["reply"]["body"];
+    assert_eq!(
+        (reattached.status, &reattached.body),
+        (
+            v["reattach"]["reply"]["status"].as_u64().unwrap() as u16,
+            expected
+        )
+    );
+    for field in [
+        "lease_id",
+        "job_id",
+        "placement",
+        "endpoint",
+        "endpoint_spki_sha256",
+        "max_s",
+        "reserved_vcpu_ms",
+    ] {
+        assert_eq!(expected[field], lease_reply[field], "{field}");
+    }
+    let mut keys = KeySet::default();
+    keys.refresh(Ok(broker.jwks())).unwrap();
+    let claims = verify_token(
+        expected["job_token"].as_str().unwrap(),
+        &keys,
+        host_id,
+        Some(&request.job_id),
+        Purpose::Attach,
+        v["clock_ms"].as_u64().unwrap() / 1000,
+    )
+    .unwrap();
+    assert_eq!(claims.purpose, Purpose::Attach);
+    assert_eq!(settlement(&broker), before);
+}
+
+/// CLOUD's `no-host-fits-lease.json` is a no-spill 16-vCPU lease against a
+/// single registered host whose per-job ceiling is 8 vCPUs. The fake broker,
+/// limited to that ceiling, answers the same request with the same status and
+/// the same reply bytes, and books nothing.
+#[test]
+fn cloud_no_host_fits_reply_bytes_match_fake() {
+    let v = vector("no-host-fits-lease.json");
+    let tokens = vector("job-tokens.json");
+    let host = &v["host_registry"];
+    let mut broker = FakeBroker::new(
+        "cloud-vector",
+        FakeConfig {
+            worker_bearer: BEARER.into(),
+            subject: format!("acct:{}", v["account"].as_str().unwrap()),
+            placement: serde_json::from_value(json!({"host": host["host_id"], "vm": null}))
+                .unwrap(),
+            endpoint: "127.0.0.1:4443".into(),
+            endpoint_spki_sha256: base64url(&[8; 32]),
+            kid: v["key_id"].as_str().unwrap().into(),
+            signing_key: seed(tokens["seed_hex"].as_str().unwrap()),
+            announced_keys: vec![],
+        },
+    )
+    .unwrap();
+    broker.knobs.max_vcpus = Some(host["max_job_vcpus"].as_u64().unwrap() as u32);
+    let request: LeaseRequest = serde_json::from_value(v["request"]["body"].clone()).unwrap();
+    assert_eq!(request.allow_spill, Some(false));
+    // Send CLOUD's recorded request bytes, not a re-serialization of them.
+    let reply = broker.handle(
+        BrokerRequest {
+            content_type: Some("application/json"),
+            method: v["request"]["method"].as_str().unwrap(),
+            path: v["request"]["pathname"].as_str().unwrap(),
+            bearer: Some(BEARER),
+            host_headers: None,
+            body: v["request"]["body_bytes"].as_str().unwrap().as_bytes(),
+        },
+        v["clock_ms"].as_u64().unwrap(),
+    );
+    assert_eq!(reply.status, v["reply"]["status"].as_u64().unwrap() as u16);
+    assert_eq!(
+        serde_json::to_string(&reply.body).unwrap(),
+        v["reply"]["body_bytes"].as_str().unwrap()
+    );
+    assert_eq!(v["reply"]["headers"]["Retry-After"], Value::Null);
+    assert!(broker.settlement(&request.job_id).is_none());
+}
+
+/// CLOUD's `account-closure.json`: a closed account's new lease is refused
+/// with the final 403 `account_closed`, and a signed heartbeat whose warm
+/// entries name that closed account and an open one is answered with exactly
+/// the closed one in `closed_subjects`. A third closed account the host does
+/// not report stays out of the reply. The host's own `Heartbeat` encoding of
+/// the snapshot signs to CLOUD's recorded signature, and the fake broker,
+/// seeded with the same closures, gives the same statuses and bodies.
+#[test]
+fn cloud_account_closure_refusal_and_heartbeat_reply_match_fake() {
+    let v = vector("account-closure.json");
+    let tokens = vector("job-tokens.json");
+    let acct = |field: &str| format!("acct:{}", v[field].as_str().unwrap());
+    let host_id = v["host"]["host_id"].as_str().unwrap();
+    let broker_for = |closed: &[String]| {
+        let mut broker = FakeBroker::new(
+            "cloud-vector",
+            FakeConfig {
+                worker_bearer: BEARER.into(),
+                subject: acct("closed_account"),
+                placement: serde_json::from_value(json!({"host": host_id, "vm": "warm-vm-1"}))
+                    .unwrap(),
+                endpoint: v["host"]["endpoint"].as_str().unwrap().into(),
+                endpoint_spki_sha256: v["host"]["endpoint_spki_sha256"].as_str().unwrap().into(),
+                kid: tokens["key_id"].as_str().unwrap().into(),
+                signing_key: seed(tokens["seed_hex"].as_str().unwrap()),
+                announced_keys: vec![],
+            },
+        )
+        .unwrap();
+        broker.knobs.closed_subjects = closed.iter().cloned().collect();
+        broker
+    };
+    let closed = [acct("closed_account"), acct("unreported_closed_account")];
+    let clock = v["clock_ms"].as_u64().unwrap();
+
+    // The lease: refused for good, with no reservation behind it.
+    let lease = &v["lease"];
+    let request: LeaseRequest = serde_json::from_value(lease["request"]["body"].clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&request).unwrap(),
+        lease["request"]["body"]
+    );
+    let mut broker = broker_for(&closed);
+    let refused = post(
+        &mut broker,
+        lease["request"]["pathname"].as_str().unwrap(),
+        &request,
+        clock,
+    );
+    assert_eq!(
+        refused.status,
+        lease["reply"]["status"].as_u64().unwrap() as u16
+    );
+    assert_eq!(refused.body, lease["reply"]["body"]);
+    assert_eq!(
+        serde_json::to_string(&refused.body).unwrap(),
+        r#"{"error":"account_closed"}"#
+    );
+    assert_eq!(lease["reply"]["retry_after"], Value::Null);
+    assert!(broker.settlement(&request.job_id).is_none());
+
+    // A job placed before the closure keeps its normal answer on re-request;
+    // only a new job is refused.
+    let mut open_then_closed = broker_for(&[]);
+    let path = lease["request"]["pathname"].as_str().unwrap();
+    assert_eq!(
+        post(&mut open_then_closed, path, &request, clock).status,
+        201
+    );
+    open_then_closed.knobs.closed_subjects = closed.iter().cloned().collect();
+    assert_eq!(
+        post(&mut open_then_closed, path, &request, clock).status,
+        201
+    );
+    let mut fresh = request.clone();
+    fresh.job_id = "019e4567-89ab-7cde-8012-3456789abcdf".into();
+    assert_eq!(
+        post(&mut open_then_closed, path, &fresh, clock).body,
+        lease["reply"]["body"]
+    );
+
+    // The heartbeat: the host's encoding signs to CLOUD's bytes.
+    let hb = &v["heartbeat"];
+    let heartbeat: Heartbeat = serde_json::from_value(hb["request"]["body"].clone()).unwrap();
+    let body = serde_json::to_vec(&heartbeat).unwrap();
+    let path = hb["request"]["pathname"].as_str().unwrap();
+    let headers = &hb["request"]["headers"];
+    let timestamp = headers["CK-Timestamp"].as_str().unwrap().parse().unwrap();
+    let counter = headers["CK-Counter"].as_str().unwrap().parse().unwrap();
+    assert_eq!(
+        host_message_bytes("POST", path, &body, timestamp, counter),
+        hb["signed_string"].as_str().unwrap().as_bytes()
+    );
+    let key = seed(v["test_only_host_seed_hex"].as_str().unwrap());
+    let signed = HostHeaders::sign(host_id, "POST", path, &body, timestamp, counter, &key).unwrap();
+    assert_eq!(signed.signature, headers["CK-Signature"]);
+    assert_eq!(signed.host, headers["CK-Host"]);
+    broker.register_host(host_id.into(), key.verifying_key());
+    let reply = broker.handle(
+        BrokerRequest {
+            content_type: Some("application/json"),
+            method: "POST",
+            path,
+            bearer: None,
+            host_headers: Some(&signed),
+            body: &body,
+        },
+        clock,
+    );
+    assert_eq!(reply.status, hb["reply"]["status"].as_u64().unwrap() as u16);
+    assert_eq!(reply.body, hb["reply"]["body"]);
+    assert_eq!(
+        hb["reply"]["body"]["closed_subjects"],
+        json!([acct("closed_account")])
+    );
+    assert!(!hb["request"]["body"]["warm"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warm| warm["tenant"] == acct("unreported_closed_account")));
+}

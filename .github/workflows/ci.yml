@@ -8,8 +8,8 @@ permissions:
   contents: read
 
 # Host-isolation and root-helper lanes need dedicated trusted infrastructure
-# and privileges; Mac tests need a real Mac. They are not hosted CI lanes.
-# See AGENTS.md for operator build-server and local Mac instructions.
+# and privileges; macOS tests need a real macOS host. They are not hosted CI lanes.
+# See AGENTS.md for operator build-server and local macOS instructions.
 jobs:
   linux-ordinary:
     name: Linux ordinary
@@ -42,6 +42,22 @@ jobs:
       - uses: pnpm/action-setup@v4
         with:
           version: 11.1.2
+      # The runner starts node, npm and pnpm from the fixed paths in
+      # script/runner/toolchain.json, not from PATH. The setup actions install
+      # them under the tool cache, so put the pinned ones where the build
+      # server keeps them. npm and pnpm are launcher scripts that find their
+      # own files relative to the path they were started from, so they get a
+      # small exec wrapper rather than a symlink.
+      - name: Build-server JavaScript tool layout
+        run: |
+          sudo ln -sf "$(readlink -f "$(command -v node)")" /usr/local/bin/node
+          for tool in npm pnpm; do
+            printf '#!/bin/sh\nexec "%s" "$@"\n' "$(command -v "$tool")" | sudo tee "/usr/local/bin/$tool" >/dev/null
+            sudo chmod 0755 "/usr/local/bin/$tool"
+          done
+          /usr/local/bin/node --version
+          /usr/local/bin/npm --version
+          /usr/local/bin/pnpm --version
       - name: Tool versions
         run: |
           node --version
@@ -84,6 +100,49 @@ jobs:
         run: python3 scripts/mixed-version.py
       - name: Protocol vectors
         run: python3 crates/motor-protocol/tests/generate_vectors.py --check
+
+  linux-musl-runner:
+    name: Linux musl runner
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: never
+      CC_x86_64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+      - name: Install musl C compiler and Rust target
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q musl-tools
+          rustup target add x86_64-unknown-linux-musl
+      - name: Build static tenant runner
+        run: |
+          command -v musl-gcc >/dev/null || { echo 'musl-gcc is required; install musl-tools' >&2; exit 1; }
+          env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo build --locked --target x86_64-unknown-linux-musl -p motor-runner
+
+  python-safety:
+    name: Python safety
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - name: Motor safety gates and self-tests
         run: |
           python3 scripts/test-binary-fold.py
@@ -92,3 +151,15 @@ jobs:
           python3 scripts/test-scratch.py
           python3 scripts/subc-daemon-env.py
           python3 scripts/run-script-tests.py
+
+  ci-success:
+    name: CI success
+    runs-on: ubuntu-24.04
+    needs: [linux-ordinary, linux-musl-runner, python-safety]
+    if: ${{ always() }}
+    steps:
+      - name: All jobs succeeded
+        run: |
+          test "${{ needs.linux-ordinary.result }}" = success
+          test "${{ needs.linux-musl-runner.result }}" = success
+          test "${{ needs.python-safety.result }}" = success

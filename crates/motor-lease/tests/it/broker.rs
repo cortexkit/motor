@@ -1,6 +1,6 @@
 use super::common::*;
 use ed25519_dalek::SigningKey;
-use motor_lease::fake::{BrokerRequest, FakeBroker};
+use motor_lease::fake::{BrokerReply, BrokerRequest, FakeBroker};
 use motor_lease::*;
 use serde_json::json;
 
@@ -408,7 +408,7 @@ fn release_is_not_cancelled_by_another_job_or_another_hosts_heartbeat() {
     other_job.running[0].job_id = "019e4567-89ab-7cde-8012-3456789abcdf".into();
     assert_eq!(
         host_post(&mut b, "heartbeat", &other_job, 1, NOW).body,
-        json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcdf"]})
+        json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcdf"],"closed_subjects":[]})
     );
     let key = SigningKey::from_bytes(&[9; 32]);
     b.register_host("other-host".into(), key.verifying_key());
@@ -428,7 +428,7 @@ fn release_is_not_cancelled_by_another_job_or_another_hosts_heartbeat() {
     );
     assert_eq!(
         reply.body,
-        json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcde"]})
+        json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcde"],"closed_subjects":[]})
     );
     b.settle_due(lease.token_expires_at_ms + 60000);
     assert_eq!(
@@ -539,21 +539,121 @@ fn admitted_and_started_require_reattach_and_settled_jobs_are_finished() {
         assert_eq!(c.purpose, Purpose::Attach);
         assert_eq!(c.cnf.jkt, reattach.requester_jwk.thumbprint().unwrap());
         host_post(&mut b, "usage", &usage(), 2, NOW + 3000);
-        for path in [
-            "/v1/leases",
-            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
-        ] {
-            let reply = if path == "/v1/leases" {
-                post(&mut b, path, &lease_request(), NOW + 3000)
-            } else {
-                post(&mut b, path, &reattach, NOW + 3000)
-            };
-            assert_eq!(
-                (reply.status, reply.body),
-                (409, json!({"error":"job_finished"}))
-            );
-        }
+        // A settled job never gets another run token.
+        let retry = post(&mut b, "/v1/leases", &lease_request(), NOW + 3000);
+        assert_eq!(
+            (retry.status, retry.body),
+            (409, json!({"error":"job_finished"}))
+        );
     }
+}
+
+/// A job its host settled by usage report can be reattached for 86400 s after
+/// the settlement, so the host can replay output the client lost. The attach
+/// reply repeats the lease unchanged and settles nothing; at the end of the
+/// window the reply is 409 `job_finished` again.
+#[test]
+fn usage_settled_job_reattaches_for_a_day_without_changing_its_settlement() {
+    let mut b = broker();
+    let lease = issued(&mut b, &lease_request(), NOW);
+    host_post(
+        &mut b,
+        "heartbeat",
+        &heartbeat(JobState::Started, 1000),
+        1,
+        NOW,
+    );
+    let settled_at = NOW + 3000;
+    let settled = host_post(&mut b, "usage", &usage(), 2, settled_at);
+    assert_eq!(settled.status, 200);
+    let reattach = ReattachRequest {
+        requester_jwk: RequesterJwk::from_key(&SigningKey::from_bytes(&[9; 32]).verifying_key()),
+    };
+    let path = "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach";
+    let last = settled_at + motor_lease::fake::SETTLED_REATTACH_WINDOW_MS - 1;
+    for now in [settled_at, settled_at + 600_000, last] {
+        let reply = post(&mut b, path, &reattach, now);
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let attach: LeaseResponse = serde_json::from_value(reply.body).unwrap();
+        assert_eq!(
+            (
+                &attach.lease_id,
+                &attach.placement,
+                &attach.endpoint,
+                &attach.endpoint_spki_sha256,
+                attach.max_s,
+                attach.reserved_vcpu_ms,
+            ),
+            (
+                &lease.lease_id,
+                &lease.placement,
+                &lease.endpoint,
+                &lease.endpoint_spki_sha256,
+                lease.max_s,
+                lease.reserved_vcpu_ms,
+            )
+        );
+        let claims = verified(&b, &attach, Purpose::Attach, now);
+        assert_eq!(claims.iat, now / 1000);
+        assert_eq!(claims.cnf.jkt, reattach.requester_jwk.thumbprint().unwrap());
+        let (reply, reason) = b
+            .settlement("019e4567-89ab-7cde-8012-3456789abcde")
+            .unwrap();
+        assert_eq!(
+            (reply, reason),
+            (
+                &serde_json::from_value(settled.body.clone()).unwrap(),
+                "usage"
+            )
+        );
+    }
+    // The host's resent report still answers with the original settlement.
+    assert_eq!(host_post(&mut b, "usage", &usage(), 3, last), settled);
+    let expired = post(&mut b, path, &reattach, last + 1);
+    assert_eq!(
+        (expired.status, expired.body),
+        (409, json!({"error":"job_finished"}))
+    );
+}
+
+/// Only a usage-report settlement opens the reattach window: a job settled
+/// because its host was lost, or a released one, keeps its refusal.
+#[test]
+fn reattach_window_excludes_host_lost_and_released_jobs() {
+    let reattach = ReattachRequest {
+        requester_jwk: RequesterJwk::from_key(&SigningKey::from_bytes(&[9; 32]).verifying_key()),
+    };
+    let path = "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach";
+    let mut lost = broker();
+    let lease = issued(&mut lost, &lease_request(), NOW);
+    let deadline = NOW + (lease.max_s + 600) * 1000;
+    lost.settle_due(deadline);
+    assert_eq!(
+        lost.settlement("019e4567-89ab-7cde-8012-3456789abcde")
+            .unwrap()
+            .1,
+        "host_lost"
+    );
+    let reply = post(&mut lost, path, &reattach, deadline);
+    assert_eq!(
+        (reply.status, reply.body),
+        (409, json!({"error":"job_finished"}))
+    );
+    let mut released = broker();
+    issued(&mut released, &lease_request(), NOW);
+    let release = post(
+        &mut released,
+        "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
+        &ReleaseRequest {},
+        NOW,
+    );
+    let release_at = release.body["release_at_ms"].as_u64().unwrap();
+    released.settle_due(release_at);
+    let reply = post(&mut released, path, &reattach, release_at);
+    assert_eq!(
+        (reply.status, reply.body),
+        (409, json!({"error":"job_released"}))
+    );
 }
 
 #[test]
@@ -701,7 +801,7 @@ fn usage_from_another_host_is_unknown_and_heartbeat_jobs_are_ignored() {
         (
             "heartbeat",
             serde_json::to_vec(&heartbeat(JobState::Started, 999)).unwrap(),
-            json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcde"]}),
+            json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcde"],"closed_subjects":[]}),
         ),
     ] {
         let path = format!("/v1/hosts/other-host/{route}");
@@ -732,7 +832,7 @@ fn usage_from_another_host_is_unknown_and_heartbeat_jobs_are_ignored() {
     hb.running[0].job_id = "019e4567-89ab-7cde-8012-3456789abcd0".into();
     assert_eq!(
         host_post(&mut b, "heartbeat", &hb, 1, NOW).body,
-        json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcd0"]})
+        json!({"ignored":["019e4567-89ab-7cde-8012-3456789abcd0"],"closed_subjects":[]})
     );
 }
 
@@ -799,6 +899,35 @@ fn refusal_and_budget_shortening_knobs_leave_reservations_correct() {
         b.settle_due(NOW + (max_s + 600) * 1000);
         assert_eq!(b.settlement(&req.job_id).unwrap().0.settled_vcpu_ms, 0);
     }
+}
+
+/// A lease for more vCPUs than any host holds is refused with 422
+/// `no_host_fits` naming the largest count, and books nothing: once the limit
+/// allows it, the same job ID gets a fresh lease rather than a conflict.
+#[test]
+fn max_vcpus_knob_answers_no_host_fits_without_reserving() {
+    let mut b = broker();
+    b.knobs.max_vcpus = Some(8);
+    let mut req = lease_request();
+    req.vcpus = 16;
+    let refusal = post(&mut b, "/v1/leases", &req, NOW);
+    assert_eq!(
+        (refusal.status, refusal.body),
+        (422, json!({"error":"no_host_fits","max_vcpus":8}))
+    );
+    assert!(b.settlement(&req.job_id).is_none());
+    let mut fitting = lease_request();
+    fitting.job_id = "019e4567-89ab-7cde-8012-000000000008".into();
+    fitting.vcpus = 8;
+    assert_eq!(
+        issued(&mut b, &fitting, NOW).reserved_vcpu_ms,
+        8 * fitting.timeout_s * 1000
+    );
+    b.knobs.max_vcpus = None;
+    assert_eq!(
+        issued(&mut b, &req, NOW).reserved_vcpu_ms,
+        16 * req.timeout_s * 1000
+    );
 }
 
 #[test]
@@ -873,7 +1002,7 @@ fn heartbeat_elapsed_is_monotonic_capped_and_refreshes_do_not_move_loss_deadline
             deadline
         )
         .body,
-        json!({"ignored":[]})
+        json!({"ignored":[],"closed_subjects":[]})
     );
     let mut b = broker();
     issued(&mut b, &request, NOW);
@@ -1028,4 +1157,71 @@ fn routing_authentication_and_media_type_checks_have_contract_precedence() {
         .body,
         json!({"error":"bad_request"})
     );
+}
+
+#[test]
+fn allow_spill_projection_distinguishes_false_and_true_but_not_requester_rotation() {
+    for initial in [false, true] {
+        let mut b = broker();
+        let mut request = lease_request();
+        request.allow_spill = Some(initial);
+        issued(&mut b, &request, NOW);
+        request.requester_jwk =
+            RequesterJwk::from_key(&SigningKey::from_bytes(&[9; 32]).verifying_key());
+        issued(&mut b, &request, NOW + 1000);
+        request.allow_spill = Some(!initial);
+        assert_eq!(
+            post(&mut b, "/v1/leases", &request, NOW + 2000).body,
+            json!({"error":"job_conflict"}),
+            "{initial} -> {}",
+            !initial
+        );
+        // Dropping the member on a re-request is a malformed body, refused
+        // before the existing job is consulted.
+        request.allow_spill = None;
+        assert_eq!(
+            post(&mut b, "/v1/leases", &request, NOW + 2000),
+            BrokerReply::error(400, "bad_request"),
+            "{initial} -> absent"
+        );
+    }
+}
+
+/// The broker requires `allow_spill` on every lease body. `LeaseRequest` still
+/// deserializes a body without it, so lease requests ck-motor stored before it
+/// always sent the member still load, but the fake answers such a body 400
+/// `bad_request` and books nothing, as it does for any non-boolean value.
+#[test]
+fn allow_spill_is_required_and_must_be_boolean() {
+    let mut body = serde_json::to_value(lease_request()).unwrap();
+    body.as_object_mut().unwrap().remove("allow_spill");
+    let parsed: LeaseRequest = serde_json::from_value(body.clone()).unwrap();
+    assert_eq!(parsed.allow_spill, None);
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), body);
+    let mut b = broker();
+    assert_eq!(
+        post(&mut b, "/v1/leases", &body, NOW),
+        BrokerReply::error(400, "bad_request")
+    );
+    // Nothing was claimed: the job is unknown to reattach.
+    assert_eq!(
+        post(
+            &mut b,
+            &format!("/v1/leases/{}/reattach", parsed.job_id),
+            &ReattachRequest {
+                requester_jwk: parsed.requester_jwk.clone(),
+            },
+            NOW,
+        ),
+        BrokerReply::error(404, "job_unknown")
+    );
+    body["allow_spill"] = json!(true);
+    assert_eq!(post(&mut b, "/v1/leases", &body, NOW).status, 201);
+    for bad in [serde_json::Value::Null, json!(0), json!("false")] {
+        body["allow_spill"] = bad;
+        assert_eq!(
+            post(&mut broker(), "/v1/leases", &body, NOW).body,
+            json!({"error":"bad_request"})
+        );
+    }
 }

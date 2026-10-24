@@ -99,6 +99,87 @@ pub enum PartitionKind {
     Other,
 }
 
+/// GPT partition type GUIDs, written as one integer in their textual order
+/// (the layout `GUID::from_u128` expects).
+pub const BASIC_DATA_PARTITION: u128 = 0xebd0a0a2_b9e5_4433_87c0_68b6b72699c7;
+pub const RESERVED_PARTITION: u128 = 0xe3c9e316_0b5c_4db8_817d_f92df00215ae;
+
+/// Classify a GPT partition type. The native formatter writes
+/// `BASIC_DATA_PARTITION`, and the layout reader uses this same mapping, so a
+/// freshly initialized disk is read back as exactly one `BasicData` partition.
+pub fn partition_kind(partition_type: u128) -> PartitionKind {
+    match partition_type {
+        BASIC_DATA_PARTITION => PartitionKind::BasicData,
+        RESERVED_PARTITION => PartitionKind::Reserved,
+        _ => PartitionKind::Other,
+    }
+}
+
+/// Windows can describe a virgin disk as MBR with neither partitions nor a
+/// disk signature. Only that exact empty shape is equivalent to RAW.
+fn normalize(layout: DiskLayout) -> DiskLayout {
+    match layout {
+        DiskLayout::Mbr {
+            partition_count: 0,
+            signature: 0,
+        } => DiskLayout::Raw,
+        layout => layout,
+    }
+}
+
+/// The formatter's own guard, rechecked on the held disk handle immediately
+/// before the first write. A disk that already has any partition table,
+/// including one left by an interrupted initialization, is never rewritten.
+pub fn require_uninitialized(layout: DiskLayout) -> io::Result<()> {
+    match normalize(layout) {
+        DiskLayout::Raw => Ok(()),
+        _ => Err(io::Error::other("only a RAW cache disk may be initialized")),
+    }
+}
+
+/// GPT data partitions start and end on 1 MiB boundaries, as Windows' own
+/// disk tools place them.
+pub const PARTITION_ALIGNMENT: i64 = 1 << 20;
+const MIN_CACHE_PARTITION: i64 = 1 << 30;
+
+/// Place the single cache partition inside the usable range Windows reports
+/// for a newly created GPT. Returns (starting offset, length) in bytes.
+pub fn cache_partition(starting_usable: i64, usable_length: i64) -> io::Result<(i64, i64)> {
+    let invalid = || io::Error::other("cache disk has no usable GPT range");
+    if starting_usable <= 0 || usable_length <= 0 {
+        return Err(invalid());
+    }
+    let end = starting_usable
+        .checked_add(usable_length)
+        .ok_or_else(invalid)?;
+    let start = starting_usable
+        .checked_add(PARTITION_ALIGNMENT - 1)
+        .ok_or_else(invalid)?
+        / PARTITION_ALIGNMENT
+        * PARTITION_ALIGNMENT;
+    let length = (end - start) / PARTITION_ALIGNMENT * PARTITION_ALIGNMENT;
+    if length < MIN_CACHE_PARTITION {
+        return Err(invalid());
+    }
+    Ok((start, length))
+}
+
+/// Volume GUID paths have exactly this shape: `\\?\Volume{` + 36-character
+/// GUID + `}\`. Anything else is refused before it reaches a format command.
+pub fn is_volume_guid_path(path: &str) -> bool {
+    let Some(guid) = path
+        .strip_prefix("\\\\?\\Volume{")
+        .and_then(|rest| rest.strip_suffix("}\\"))
+    else {
+        return false;
+    };
+    guid.len() == 36
+        && guid.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
 #[derive(Clone, Debug)]
 pub struct CacheVolume {
     pub path: String,
@@ -107,8 +188,10 @@ pub struct CacheVolume {
     pub label: String,
 }
 
-/// Physical-disk queries and attribute updates use one held handle. A formatter
-/// using the disk number must recheck identity before changing the layout.
+/// Physical-disk queries and attribute updates use one held handle. Before
+/// changing the layout, the formatter must recheck the serial and the RAW
+/// layout through that handle, and confirm the disks running Windows exclude
+/// this disk.
 pub trait CacheStorage {
     fn serial(&mut self) -> io::Result<String>;
     fn windows_disks(&mut self) -> io::Result<Vec<u32>>;
@@ -122,6 +205,8 @@ pub struct PreparedCache {
     pub volume: String,
     pub freshly_formatted: bool,
     pub native_attributes_ms: u64,
+    /// Time spent initializing a RAW disk. The name is kept from the
+    /// PowerShell formatter it replaced because it is part of the wire format.
     pub powershell_ms: u64,
     pub volume_ms: u64,
 }
@@ -138,15 +223,7 @@ fn check_disk(
     if windows.is_empty() || windows.contains(&number) {
         return Err(io::Error::other("cache disk may hold running Windows"));
     }
-    // Windows can describe a virgin disk as MBR with neither partitions nor a
-    // disk signature. Only that exact empty shape is equivalent to RAW.
-    let layout = match storage.layout()? {
-        DiskLayout::Mbr {
-            partition_count: 0,
-            signature: 0,
-        } => DiskLayout::Raw,
-        layout => layout,
-    };
+    let layout = normalize(storage.layout()?);
     // Windows BIOS system disks are MBR; UEFI system disks contain an EFI
     // partition. Accept only the GPT data/MSR layout created for our caches.
     let allowed = match &layout {
@@ -253,24 +330,6 @@ pub fn empty_mount_directory(path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
-pub fn mount_script(number: u32) -> String {
-    mount_script_with_serial(number, CACHE_DISK_SERIAL)
-}
-
-pub fn mount_script_with_serial(number: u32, serial: &str) -> String {
-    let serial = serial.replace('\'', "''");
-    format!(
-        r#"$ErrorActionPreference='Stop';
-$d=Get-Disk -Number {number};
-if($d.IsBoot -or $d.IsSystem) {{ throw 'cache disk is a boot or system disk' }};
-if($d.SerialNumber.Trim() -cne '{serial}') {{ throw 'cache disk serial changed' }};
-if($d.IsOffline -or $d.IsReadOnly) {{ throw 'cache disk is not online and writable' }};
-if($d.PartitionStyle -ne 'RAW') {{ throw 'only a RAW cache disk may be initialized' }};
-$d | Initialize-Disk -PartitionStyle GPT -PassThru | New-Partition -UseMaximumSize | Format-Volume -FileSystem NTFS -NewFileSystemLabel '{label}' -Confirm:$false | Out-Null"#,
-        label = crate::CACHE_LABEL,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -304,6 +363,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn hyperv_inventory_parser_requires_a_json_array() {
         let os = r#"{"number":0,"lun":0,"boot":true,"system":true}"#;
         let cache = r#"{"number":1,"lun":1,"boot":false,"system":false}"#;
@@ -337,6 +397,8 @@ mod tests {
         );
     }
     #[test]
+=======
+>>>>>>> origin/main
     fn privileged_dismount_never_resolves_the_job_mount_folder() {
         // Dismount runs after the job can replace C:\t. Fence the actual
         // Windows implementation against reintroducing pathname-based cleanup.
@@ -440,8 +502,9 @@ mod tests {
             Ok(())
         }
         fn initialize_raw(&mut self) -> io::Result<()> {
+            require_uninitialized(self.layout.clone())?;
             self.formats += 1;
-            self.layout = DiskLayout::Gpt(vec![PartitionKind::Reserved, PartitionKind::BasicData]);
+            self.layout = DiskLayout::Gpt(vec![partition_kind(BASIC_DATA_PARTITION)]);
             Ok(())
         }
         fn volumes(&mut self) -> io::Result<Vec<CacheVolume>> {
@@ -616,34 +679,138 @@ mod tests {
     }
 
     #[test]
-    fn cache_powershell_is_only_a_serial_guarded_raw_formatter() {
-        let script = mount_script(7);
-        assert!(!script.contains("Set-Disk"));
-        assert!(script.contains("$d.SerialNumber.Trim() -cne 'motor-cache'"));
-        assert!(script.contains("if($d.PartitionStyle -ne 'RAW')"));
-        assert!(script.find("$d.SerialNumber").unwrap() < script.find("Initialize-Disk").unwrap());
+    fn formatter_refuses_every_initialized_layout_including_interrupted_ones() {
+        for layout in [
+            DiskLayout::Raw,
+            DiskLayout::Mbr {
+                partition_count: 0,
+                signature: 0,
+            },
+        ] {
+            require_uninitialized(layout).unwrap();
+        }
+        // An initialization stopped after the GPT was written (no partition),
+        // after the partition was added (no NTFS yet), or any foreign layout.
+        for layout in [
+            DiskLayout::Gpt(vec![]),
+            DiskLayout::Gpt(vec![PartitionKind::Reserved]),
+            DiskLayout::Gpt(vec![PartitionKind::BasicData]),
+            DiskLayout::Mbr {
+                partition_count: 1,
+                signature: 0,
+            },
+            DiskLayout::Mbr {
+                partition_count: 0,
+                signature: 0x1234,
+            },
+        ] {
+            let error = require_uninitialized(layout.clone()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "only a RAW cache disk may be initialized",
+                "{layout:?}"
+            );
+        }
     }
 
     #[test]
-    fn cache_mount_powershell_has_balanced_braces_and_preserves_disk_guards() {
-        let script = mount_script(7);
-        let mut depth = 0;
-        for c in script.chars() {
-            if c == '{' {
-                depth += 1;
-            }
-            if c == '}' {
-                depth -= 1;
-            }
-            assert!(depth >= 0, "unmatched closing brace");
+    fn stranded_partition_without_ntfs_volume_is_refused_not_reformatted() {
+        // GPT plus the data partition, but the format never ran: the guest
+        // must fail (so the host discards the disk), never format it again.
+        let mut fake = FakeStorage {
+            layout: DiskLayout::Gpt(vec![partition_kind(BASIC_DATA_PARTITION)]),
+            volumes: vec![],
+            ..Default::default()
+        };
+        assert_eq!(
+            prepare_cache(&mut fake, 7).err().unwrap().to_string(),
+            "cache volume not found"
+        );
+        assert_eq!(fake.formats, 0);
+        // A RAW (unformatted) volume on that partition is refused the same way.
+        let mut fake = FakeStorage {
+            layout: DiskLayout::Gpt(vec![partition_kind(BASIC_DATA_PARTITION)]),
+            ..Default::default()
+        };
+        fake.volumes[0].filesystem = "RAW".into();
+        fake.volumes[0].label = String::new();
+        assert!(prepare_cache(&mut fake, 7).is_err());
+        assert_eq!(fake.formats, 0);
+    }
+
+    #[test]
+    fn natively_initialized_layout_passes_the_reuse_checks() {
+        assert_eq!(
+            partition_kind(BASIC_DATA_PARTITION),
+            PartitionKind::BasicData
+        );
+        assert_eq!(partition_kind(RESERVED_PARTITION), PartitionKind::Reserved);
+        // The EFI system partition type must never be accepted as a cache.
+        assert_eq!(
+            partition_kind(0xc12a7328_f81f_11d2_ba4b_00a0c93ec93b),
+            PartitionKind::Other
+        );
+        // The native formatter writes one partition of BASIC_DATA_PARTITION
+        // and formats it NTFS with CACHE_LABEL. The next job must reuse that
+        // disk as-is, without initializing it again.
+        let mut fake = FakeStorage {
+            layout: DiskLayout::Gpt(vec![partition_kind(BASIC_DATA_PARTITION)]),
+            ..Default::default()
+        };
+        let prepared = prepare_cache(&mut fake, 7).unwrap();
+        assert!(!prepared.freshly_formatted);
+        assert_eq!(fake.formats, 0);
+    }
+
+    #[test]
+    fn cache_partition_is_aligned_inside_the_usable_gpt_range() {
+        // A 40 GiB disk: Windows reports usable space after the 34-sector
+        // primary GPT and before the 33-sector backup.
+        let disk: i64 = 40 << 30;
+        let (start, length) = cache_partition(17_408, disk - 17_408 - 16_896).unwrap();
+        assert_eq!(start, 1 << 20);
+        assert_eq!(start % PARTITION_ALIGNMENT, 0);
+        assert_eq!(length % PARTITION_ALIGNMENT, 0);
+        assert!(start + length <= disk - 16_896);
+        assert_eq!(length, disk - (2 << 20));
+        // Already aligned input keeps its start.
+        assert_eq!(
+            cache_partition(1 << 20, 4 << 30).unwrap(),
+            (1 << 20, 4 << 30)
+        );
+        for (offset, length) in [(0, 4 << 30), (17_408, 0), (17_408, 1 << 20), (i64::MAX, 1)] {
+            assert!(
+                cache_partition(offset, length).is_err(),
+                "{offset} {length}"
+            );
         }
-        assert_eq!(depth, 0);
-        assert!(script.contains("$d=Get-Disk -Number 7;"));
-        assert!(!script.contains("Get-Disk |"));
-        assert!(script.contains("if($d.IsBoot -or $d.IsSystem)"));
-        assert!(script.contains("if($d.PartitionStyle -ne 'RAW')"));
-        assert!(script.contains("Format-Volume -FileSystem NTFS"));
-        assert!(script.contains(crate::CACHE_LABEL));
-        assert!(script.find("$d.IsSystem").unwrap() < script.find("Initialize-Disk").unwrap());
+    }
+
+    #[test]
+    fn native_formatter_rechecks_identity_and_raw_before_its_first_write() {
+        // initialize_raw runs only in the Windows guest. Fence its order: every
+        // guard must run before the partition table changes.
+        let source = include_str!("storage.rs");
+        let body = source
+            .split_once("fn initialize_raw(&mut self)")
+            .unwrap()
+            .1
+            .split_once("fn volumes(&mut self)")
+            .unwrap()
+            .0;
+        let first_write = body.find("IOCTL_DISK_CREATE_DISK").unwrap();
+        for guard in [
+            "disk_serial(&self.disk",
+            "self.windows_disks()?",
+            "require_uninitialized(self.layout()?)",
+        ] {
+            let at = body
+                .find(guard)
+                .unwrap_or_else(|| panic!("missing {guard}"));
+            assert!(at < first_write, "{guard} runs after the first write");
+        }
+        assert!(body.find("IOCTL_DISK_SET_DRIVE_LAYOUT_EX").unwrap() > first_write);
+        assert!(body.contains("motor_winagent::cache_format::run(&volume, deadline)"));
+        assert!(!body.contains("powershell"));
     }
 }

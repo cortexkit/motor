@@ -134,6 +134,8 @@ async fn connected_channel() -> (Channel, tokio::io::DuplexStream) {
                 protocol_version: PROTOCOL_VERSION,
                 started: true,
                 return_paths: false,
+                return_chunked: false,
+                sibling_paths: false,
                 default_branch_tip: false,
                 gate_jobs: false,
                 platforms: Vec::new(),

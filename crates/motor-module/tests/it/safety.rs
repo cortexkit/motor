@@ -325,6 +325,8 @@ fn transport_spy_bundle_base64_name_collision_is_not_environment_metadata() {
     assert!(metadata.contains(r#""offset":42"#));
     let structured = [Frame::Hello {
         return_paths: false,
+        return_chunked: false,
+        sibling_paths: false,
         protocol_version: PROTOCOL_VERSION,
         started: true,
         default_branch_tip: false,
@@ -566,6 +568,8 @@ impl Connector for DisconnectDuringHave {
                     &mut runner,
                     &Frame::Hello {
                         return_paths: false,
+                        return_chunked: false,
+                        sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,
@@ -898,6 +902,8 @@ impl Connector for FutureRecords {
                     &mut b,
                     &Frame::Hello {
                         return_paths: false,
+                        return_chunked: false,
+                        sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,
@@ -1010,6 +1016,8 @@ impl Connector for UnknownCursorRecovery {
                     &mut b,
                     &Frame::Hello {
                         return_paths: false,
+                        return_chunked: false,
+                        sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,
@@ -1168,6 +1176,8 @@ impl Connector for WireRecords {
                     &mut b,
                     &Frame::Hello {
                         return_paths: false,
+                        return_chunked: false,
+                        sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,
@@ -1235,7 +1245,12 @@ fn manifest_advertises_exact_capability_and_all_operations() {
     let value = serde_json::to_value(crate::module::manifest("ck-motor")).unwrap();
     assert_eq!(
         value["capabilities"]["provides"],
-        serde_json::json!(["exec-remote/v1", "flow-scopes/v1"])
+        serde_json::json!([
+            "exec-remote/v1",
+            "flow-scopes/v1",
+            "exec-remote-return/v1",
+            "exec-remote-return/v2"
+        ])
     );
     let bytes = serde_json::to_string(&value).unwrap();
     for name in crate::module::OPERATIONS {

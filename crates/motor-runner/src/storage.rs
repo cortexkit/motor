@@ -13,6 +13,13 @@ use std::{
 
 pub const RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 pub const REPLAY_BYTES: u64 = 64 * 1024 * 1024;
+/// How long chunked returned files stay available for replay after the job
+/// ends. They can be 10 MiB per job, so they are not kept for the whole job
+/// history; a later replay sends the manifest with `expired` entries instead.
+pub const RETURN_RETENTION_MS: u64 = 60 * 60 * 1000;
+/// Prefix of the job-directory subdirectory that holds one collection's
+/// returned-file chunks.
+pub(crate) const RETURNED_DIRECTORY_PREFIX: &str = "returned-";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum JobState {
@@ -56,6 +63,62 @@ impl Serialize for Chunks {
 impl<'de> Deserialize<'de> for Chunks {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         VecDeque::<Chunk>::deserialize(deserializer).map(|chunks| Self(Arc::new(chunks)))
+    }
+}
+
+/// One chunk of a returned file. Its bytes are the file
+/// `<job directory>/<ReturnedFiles::directory>/chunk-<position>`, where
+/// position is the chunk's index in `ReturnedFiles::chunks`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ReturnedChunk {
+    pub seq: u64,
+    pub path_index: u32,
+    pub offset: u64,
+    pub length: u64,
+}
+
+/// The chunked returned files of a job that set `Run.return_chunked`.
+///
+/// The chunk bytes live in their own directory rather than in this record,
+/// and are written and synced before the record that names them is saved,
+/// as output chunks are. They are deleted `RETURN_RETENTION_MS` after the job
+/// ends, while the record, with this index and the manifest, stays for the
+/// job's whole history.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ReturnedFiles {
+    /// Name of the job-directory subdirectory holding the chunk bytes.
+    pub directory: String,
+    pub chunks: Vec<ReturnedChunk>,
+    /// Lists the Run's absolute paths; ck-motor maps them to the caller's.
+    pub manifest: ReturnManifest,
+    /// Set, and the directory deleted, once the retention window has passed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expired: bool,
+}
+
+impl ReturnedFiles {
+    pub fn chunk_path(&self, job_directory: &Path, position: usize) -> std::path::PathBuf {
+        job_directory
+            .join(&self.directory)
+            .join(format!("chunk-{position}"))
+    }
+
+    /// The manifest a replay sends once the bytes are gone: at its original
+    /// seq, each returned entry failed as `expired` with its size, other
+    /// failures unchanged, and no returned bytes. Original chunk counts remain
+    /// available to check the replay's sequence gap; legacy entries keep none.
+    pub fn expired_manifest(&self) -> ReturnManifest {
+        let mut manifest = self.manifest.clone();
+        for entry in &mut manifest.files {
+            if let ReturnManifestOutcome::Returned { size, .. } = entry.outcome {
+                entry.outcome = ReturnManifestOutcome::Failed {
+                    cause: ReturnPathsFailureCause::Expired,
+                    size: Some(size),
+                };
+            }
+        }
+        manifest.total_bytes = 0;
+        manifest
     }
 }
 
@@ -117,6 +180,8 @@ pub(crate) struct Job {
     pub terminal: Option<TerminalRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_result: Option<ReturnResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returned: Option<ReturnedFiles>,
     pub chunks: Chunks,
     pub next_seq: u64,
     pub output_bytes: u64,
@@ -128,6 +193,14 @@ pub(crate) struct Job {
     pub base: bool,
     #[serde(default)]
     pub writer_descriptor: Option<String>,
+    /// When this fill started, in runner-clock milliseconds. A publication
+    /// record ages from here, and an operator reads it as the time the entries
+    /// of that fill were written.
+    #[serde(default)]
+    pub fill_started_ms: Option<u64>,
+    /// Store active when fill setup began, updated when the command launches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_identity: Option<StoreIdentity>,
     pub kill: Option<(Killed, u64)>,
     /// Durable isolated stream positions, advanced atomically with replay chunks.
     #[serde(default)]
@@ -139,10 +212,11 @@ pub(crate) struct Job {
     /// Retained in the record even when replay storage cannot accept a diagnostic.
     #[serde(default)]
     pub monitoring_error: Option<String>,
-    /// Why the job was stopped by its memory limit, when it was. The terminal
-    /// record sent to callers (`TerminalRecord` in cortexkit-exec-remote-types)
-    /// has no free-form detail field outside refusals, so the text is kept here
-    /// and also written to the job's stderr.
+    /// Last live cgroup sample; systemd can remove the cgroup before finalization.
+    #[serde(skip)]
+    pub(crate) execution_evidence: Option<crate::engine::terminal_evidence::ExecutionEvidence>,
+    /// Memory-limit advice retained for inspection and stderr. The terminal's
+    /// existing detail field separately carries bounded resource evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_limit_detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,6 +224,14 @@ pub(crate) struct Job {
     /// Fixed execution end, independent of delayed launcher-accounting delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_ended_ms: Option<u64>,
+    /// The sibling snapshot directories this job's unit binds at its
+    /// siblings' paths, set in the save that records its process and start.
+    /// A running job without it was started with each sibling bound from its
+    /// host path, by an older runner or in in-place mode, so a main-workspace
+    /// job must not check that path out until it ends. Older runners ignore
+    /// the field, and a record they rewrite loses it, which only fences more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sibling_sources: Option<Vec<String>>,
 }
 
 /// A sidecar preserves damaged records and any independently readable ownership.
@@ -224,6 +306,7 @@ impl Job {
             process: None,
             terminal: None,
             return_result: None,
+            returned: None,
             chunks: Chunks::default(),
             next_seq: 0,
             output_bytes: 0,
@@ -232,14 +315,18 @@ impl Job {
             order,
             base: false,
             writer_descriptor: None,
+            fill_started_ms: None,
+            fill_identity: None,
             kill: None,
             stdout_offset: 0,
             stderr_offset: 0,
             durable_output: false,
             monitoring_error: None,
+            execution_evidence: None,
             memory_limit_detail: None,
             reservation_use: None,
             execution_ended_ms: None,
+            sibling_sources: None,
         }
     }
     pub fn pending(&self) -> bool {
@@ -287,12 +374,21 @@ impl Job {
         if let Some(tree_hash) = self.request.as_ref().map(|r| &r.tree_hash) {
             terminal = terminal.with_tree_hash(tree_hash.clone());
         }
-        if remote {
+        if remote
+            && self.request.as_ref().and_then(|r| r.platform.as_ref()) != Some(&Platform::Macos)
+        {
             terminal = terminal.with_workspace_changes(Vec::new());
         }
         self.terminal = Some(terminal);
         self.finished_ms = Some(now);
         self.state = JobState::Terminal;
+    }
+
+    /// Finish with proof that no process of the job remains, independently of
+    /// whether its exit status is known.
+    pub fn terminal_ended(&mut self, outcome: Outcome, now: u64) {
+        self.terminal(outcome, now);
+        self.terminal = self.terminal.take().map(|t| t.with_execution_ended());
     }
 
     pub fn queue_wait_ms(&self, now: u64) -> u64 {
@@ -362,6 +458,80 @@ pub(crate) struct Workspace {
     pub snapshot: String,
     pub siblings: Vec<SiblingSnapshot>,
     pub used_ms: u64,
+    /// Per sibling path, the trees whose artifacts may still be in this
+    /// workspace's `target/`, used to keep Cargo from reusing them after a
+    /// switch to another sibling snapshot; see `sibling_snapshots::freshness`.
+    /// Only setups that mounted siblings from snapshots write it. It goes away
+    /// with the entry, which is removed when the workspace is deleted.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sibling_freshness: BTreeMap<String, crate::sibling_snapshots::freshness::Record>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StoreIdentity {
+    pub endpoint: String,
+    pub bucket: String,
+    pub prefix: String,
+}
+
+/// The persisted form of a provisioning store identity. The gateway's identity
+/// type lives where it is used to sign; records and comparisons use this one.
+pub(crate) use crate::remote_cache::publishing::Seen;
+
+pub(crate) fn encode_identity(
+    identity: &crate::remote_cache::provisioning::StoreIdentity,
+) -> StoreIdentity {
+    StoreIdentity {
+        endpoint: identity.endpoint.clone(),
+        bucket: identity.bucket.clone(),
+        prefix: identity.prefix.clone(),
+    }
+}
+
+impl StoreIdentity {
+    /// The same identity in the form the gateway signs and tags requests with.
+    #[cfg(test)]
+    pub(crate) fn provisioned(&self) -> crate::remote_cache::provisioning::StoreIdentity {
+        crate::remote_cache::provisioning::StoreIdentity {
+            endpoint: self.endpoint.clone(),
+            bucket: self.bucket.clone(),
+            prefix: self.prefix.clone(),
+        }
+    }
+}
+
+/// A key a fill's PUTs stored in the remote store, with the tool whose socket
+/// wrote it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PublishedKey {
+    pub tool: String,
+    pub key: String,
+}
+
+/// A fill of one descriptor that published every entry it wrote to the remote
+/// store. The operator reads it to check that a repository's cache is fresh.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PublicationRecord {
+    /// The store the fill published into. A record belongs to one identity; a
+    /// key rotation keeps it, a prefix or bucket change forgets it.
+    pub identity: StoreIdentity,
+    /// When the published fill started. Age is measured from here, so a fill
+    /// that ran for hours still counts as fresh when it started.
+    pub started_ms: u64,
+    /// Bare keys (no tenant prefix and no credentials) that the fill's PUTs
+    /// stored, in the order they were first stored, up to the gateway's
+    /// sample size. Operators read this record, so it must stay free of
+    /// anything secret.
+    #[serde(default)]
+    pub keys: Vec<PublishedKey>,
+}
+
+/// The last fill of one descriptor that failed to publish, with the number of
+/// consecutive attempts that failed as builds (not merely remote writes).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PublishFailure {
+    pub started_ms: u64,
+    pub attempts: u32,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -378,6 +548,11 @@ pub(crate) struct Repository {
     pub finished_ms: Option<u64>,
     pub result: Option<RebuildResult>,
     pub desired: Option<BaseRequest>,
+    /// Per descriptor, the last fill that published it.
+    pub publications: BTreeMap<String, PublicationRecord>,
+    /// Per descriptor, the last fill that failed to publish, while no later
+    /// fill has published.
+    pub publish_failures: BTreeMap<String, PublishFailure>,
 }
 
 /// Exact catalog-owned checkout paths awaiting cheap retirement into trash.
@@ -426,6 +601,21 @@ pub(crate) struct Catalog {
     pub sibling_commits: BTreeMap<String, String>,
     #[serde(default)]
     pub transferred: BTreeMap<Uuid, RetainedTransfer>,
+    /// When each repository mirror was last used, by mirror directory name
+    /// (the hash of its repository root). Unused mirrors are retired; see
+    /// the runner's `retire_unused_repositories`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mirror_used_ms: BTreeMap<String, u64>,
+    /// When a job last finished, for the shared compiler cache's last use.
+    /// Jobs mount that cache read-only, so its own timestamps never show
+    /// reads; disk eviction ages the cache by this instead. A job still in
+    /// flight counts as use at the current time without being recorded here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_cache_used_ms: Option<u64>,
+    /// The remote cache's switch state this runner last acted on, so a change
+    /// made while it was stopped is still a transition at the first re-read.
+    #[serde(default, skip_serializing_if = "Seen::is_default")]
+    pub publishing_seen: Seen,
 }
 
 impl Default for Catalog {
@@ -438,6 +628,24 @@ impl Default for Catalog {
             generation_migration_complete: false,
             sibling_commits: BTreeMap::new(),
             transferred: BTreeMap::new(),
+            mirror_used_ms: BTreeMap::new(),
+            compile_cache_used_ms: None,
+            publishing_seen: Seen::default(),
+        }
+    }
+}
+
+impl Catalog {
+    /// Forget every repository's record of what the shared compiler cache
+    /// holds. Call whenever the cache's contents go, however that happens:
+    /// a repository whose fill is still recorded is never filled again until
+    /// its dependencies change, and every job compiles uncached meanwhile.
+    pub(crate) fn forget_compiler_cache_fills(&mut self) {
+        for repository in self.repositories.values_mut() {
+            repository.filled_descriptor = None;
+            repository.filled_descriptors.clear();
+            repository.recorded_without_writer.clear();
+            repository.miss_refills.clear();
         }
     }
 }
@@ -452,11 +660,67 @@ pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()>
     atomic_json_mode(path, value, false)
 }
 
+pub(crate) fn atomic_job_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
+    atomic_job_json_and(path, value, |_| Ok(()))
+}
+
+fn atomic_job_json_and(
+    path: &Path,
+    value: &impl Serialize,
+    before_publish: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| invalid("job has no directory"))?;
+    if directory.try_exists()? {
+        return atomic_json(path, value);
+    }
+    let jobs = directory
+        .parent()
+        .ok_or_else(|| invalid("job has no root"))?;
+    // Keep incomplete first records outside jobs: rollback binaries scan every
+    // directory there, even entries whose names are not UUIDs.
+    let staging = jobs
+        .with_file_name("job-staging")
+        .join(Uuid::now_v7().to_string());
+    let result = (|| {
+        atomic_json(&staging.join("record.json"), value)?;
+        before_publish(&staging)?;
+        crate::filesystem::rename(&staging, directory)?;
+        crate::filesystem::sync_directory(jobs)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+
 pub(crate) fn atomic_json_private(path: &Path, value: &impl Serialize) -> io::Result<()> {
     atomic_json_mode(path, value, true)
 }
 
 fn atomic_json_mode(path: &Path, value: &impl Serialize, private: bool) -> io::Result<()> {
+    let mut bytes = Vec::new();
+    write_json(&mut bytes, value)?;
+    atomic_bytes(path, &bytes, private)
+}
+
+/// `atomic_json` for a value already serialized, so a caller can serialize
+/// under a lock and write after releasing it. `private` writes it as
+/// `atomic_json_private` does (on Unix, readable by its owner only).
+pub(crate) fn atomic_bytes(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
+    atomic_bytes_and(path, bytes, private, || Ok(()))
+}
+
+/// `atomic_bytes`, calling `renamed` as soon as the new file has replaced
+/// the old one, before the directory is synced. From then on a reader of
+/// `path` sees the new bytes, even when this returns an error.
+pub(crate) fn atomic_bytes_and(
+    path: &Path,
+    bytes: &[u8],
+    private: bool,
+    renamed: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| invalid("record has no parent"))?;
@@ -483,11 +747,12 @@ fn atomic_json_mode(path: &Path, value: &impl Serialize, private: bool) -> io::R
         // This directory inherits the installer's SYSTEM/Administrators DACL.
         File::create(&tmp)?
     };
-    write_json(&mut file, value)?;
+    file.write_all(bytes)?;
     file.flush()?;
     file.sync_all()?;
     drop(file);
     crate::filesystem::rename(&tmp, path)?;
+    renamed()?;
     crate::filesystem::sync_directory(parent)
 }
 
@@ -518,6 +783,32 @@ pub(crate) fn recover_output_tail(directory: &Path, job: &Job) {
             }
         }
     }
+    remove_unreferenced_returned(directory, job);
+}
+
+/// Remove returned-file directories the record does not reference: a
+/// collection interrupted before its record was saved, or bytes whose expiry
+/// was saved before their deletion finished.
+pub(crate) fn remove_unreferenced_returned(directory: &Path, job: &Job) {
+    let kept = job
+        .returned
+        .as_ref()
+        .filter(|returned| !returned.expired)
+        .map(|returned| returned.directory.as_str());
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(RETURNED_DIRECTORY_PREFIX) && Some(name) != kept {
+            if let Err(error) = fs::remove_dir_all(entry.path()) {
+                tracing::warn!(job_id = %job.id, %error, "cannot remove unreferenced returned files");
+            }
+        }
+    }
 }
 
 fn write_json(writer: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
@@ -538,6 +829,51 @@ pub(crate) fn mint_ms(id: Uuid) -> u64 {
 mod tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
+
+    #[test]
+    fn first_job_record_is_complete_before_uuid_directory_is_published() {
+        let scratch = ScratchDir::new("runner-first-record");
+        let jobs = scratch.join("jobs");
+        fs::create_dir_all(&jobs).unwrap();
+        let job = Job::new(Uuid::now_v7(), None, 123, 1, 2);
+        let path = jobs.join(job.id.to_string()).join("record.json");
+        let mut inspected = false;
+        atomic_job_json_and(&path, &job, |staging| {
+            inspected = true;
+            assert!(!path.parent().unwrap().exists());
+            assert_eq!(fs::read_dir(&jobs)?.count(), 0);
+            assert_eq!(read_json::<Job>(&staging.join("record.json"))?.id, job.id);
+            Ok(())
+        })
+        .unwrap();
+        assert!(inspected);
+        assert_eq!(read_json::<Job>(&path).unwrap().id, job.id);
+        let chunk = path.with_file_name("chunk-0");
+        fs::write(&chunk, b"retained").unwrap();
+        atomic_job_json(&path, &job).unwrap();
+        assert_eq!(fs::read(chunk).unwrap(), b"retained");
+    }
+
+    #[test]
+    fn interrupted_first_job_record_never_leaves_a_canonical_directory() {
+        let scratch = ScratchDir::new("runner-interrupted-record");
+        let jobs = scratch.join("jobs");
+        fs::create_dir_all(&jobs).unwrap();
+        let job = Job::new(Uuid::now_v7(), None, 123, 1, 2);
+        let path = jobs.join(job.id.to_string()).join("record.json");
+        let interrupted = std::panic::catch_unwind(|| {
+            let _ = atomic_job_json_and(&path, &job, |_| panic!("interrupted publication"));
+        });
+        assert!(interrupted.is_err());
+        assert!(!path.parent().unwrap().exists());
+        assert_eq!(fs::read_dir(&jobs).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(scratch.join("job-staging")).unwrap().count(),
+            1
+        );
+        atomic_job_json(&path, &job).unwrap();
+        assert_eq!(read_json::<Job>(&path).unwrap().id, job.id);
+    }
 
     #[test]
     fn chunk_metadata_clone_shares_until_mutation_and_keeps_legacy_array_format() {

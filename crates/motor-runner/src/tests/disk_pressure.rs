@@ -1042,6 +1042,10 @@ fn disk_guard_reclaims_interrupted_javascript_publications_after_lock_release() 
         pressure.store(true, Ordering::SeqCst);
         assert!(runner.ensure_disk_space().unwrap().is_some());
         assert!(temporary.exists(), "{root} must survive while locked");
+        // A process another thread forks while the lock is held shares the
+        // lock's open file until it execs. Releasing must not wait for it.
+        #[cfg(unix)]
+        let _forked = crate::test_helpers::fork_before_exec().unwrap();
         drop(lock);
         assert!(runner.ensure_disk_space().unwrap().is_none());
         assert!(!temporary.exists(), "{root} must be reclaimed after unlock");
@@ -1072,6 +1076,18 @@ fn disk_soft_pressure_evicts_old_javascript_entries_but_keeps_recent_ones() {
             entries.push(path);
         }
     }
+    // Eviction checks whether each entry is in use by taking and releasing its
+    // lock, as setup does. A process another thread forks while the lock is
+    // held shares the lock's open file until it execs; a release must not wait
+    // for that, or the entry would look busy and survive the pass.
+    #[cfg(unix)]
+    let _forked = {
+        let lock = platform::javascript_cache_lock(&state, &"a".repeat(64)).unwrap();
+        lock.lock_exclusive().unwrap();
+        let forked = crate::test_helpers::fork_before_exec().unwrap();
+        drop(lock);
+        forked
+    };
     assert!(runner.ensure_disk_space().unwrap().is_none());
     for path in old {
         assert!(
@@ -1087,4 +1103,78 @@ fn disk_soft_pressure_evicts_old_javascript_entries_but_keeps_recent_ones() {
             path.display()
         );
     }
+}
+
+/// Jobs mount the shared compiler cache read-only, so its directory time
+/// stays at the writer's last top-level change however many jobs read it.
+/// Sets that time to two hours ago on the runner clock, with one entry inside.
+fn stale_compiler_cache(runner: &Runner) -> PathBuf {
+    let fleet = runner.config().sccache_dir();
+    fs::create_dir_all(&fleet).unwrap();
+    fs::write(fleet.join("entry"), "cached").unwrap();
+    File::open(&fleet)
+        .unwrap()
+        .set_times(
+            fs::FileTimes::new().set_modified(
+                UNIX_EPOCH + Duration::from_millis(runner.now() - 2 * 60 * 60 * 1000),
+            ),
+        )
+        .unwrap();
+    fleet
+}
+
+#[tokio::test]
+async fn disk_soft_pressure_keeps_the_compiler_cache_a_job_finished_with_recently() {
+    let f = Fixture::new();
+    // Between the hard floor (100) and the soft goal (200).
+    let mut c = config(&f, |_| Ok(150));
+    c.disable_warm_builds = true;
+    let runner = Runner::open(c).unwrap();
+    let (request, bytes) = f.run("true");
+    f.submit(&runner, &request, &bytes);
+    assert_eq!(
+        terminal(&runner, request.job_id).await.outcome,
+        Outcome::Exit { code: 0 }
+    );
+    let fleet = stale_compiler_cache(&runner);
+    f.clock.fetch_add(5 * 60 * 1000, Ordering::SeqCst);
+    assert!(runner.ensure_disk_space().unwrap().is_none());
+    assert!(
+        fleet.join("entry").exists(),
+        "a cache read by a job five minutes ago was evicted as idle"
+    );
+    // Once no job has used it for over half an hour it is idle like any cache.
+    f.clock.fetch_add(30 * 60 * 1000, Ordering::SeqCst);
+    assert!(runner.ensure_disk_space().unwrap().is_none());
+    assert!(fleet.is_dir());
+    assert!(
+        !fleet.join("entry").exists(),
+        "an idle cache must still be reclaimed under soft pressure"
+    );
+}
+
+#[tokio::test]
+async fn disk_soft_pressure_keeps_the_compiler_cache_while_a_job_runs() {
+    let f = Fixture::new();
+    let mut c = config(&f, |_| Ok(150));
+    c.disable_warm_builds = true;
+    let runner = Runner::open(c).unwrap();
+    // No job has finished since the runner started, as after a restart.
+    let (request, bytes) = f.run("while [ ! -f release ]; do sleep 0.01; done");
+    f.submit(&runner, &request, &bytes);
+    wait_for(|| {
+        runner.core.inner.lock().unwrap().jobs[&request.job_id]
+            .started
+            .is_some()
+    })
+    .await;
+    let fleet = stale_compiler_cache(&runner);
+    assert!(runner.ensure_disk_space().unwrap().is_none());
+    let kept = fleet.join("entry").exists();
+    fs::write(Path::new(&request.workspace_key).join("release"), "").unwrap();
+    assert_eq!(
+        terminal(&runner, request.job_id).await.outcome,
+        Outcome::Exit { code: 0 }
+    );
+    assert!(kept, "a cache a running job reads was evicted as idle");
 }

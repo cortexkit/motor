@@ -243,7 +243,7 @@ fn real_http_serves_jwks_lease_reattach_heartbeat_usage_and_errors() {
     let hb = heartbeat(JobState::Started, 3000);
     assert_eq!(
         server.host_post("heartbeat", &hb, 1, now_ms()),
-        (200, json!({"ignored":[]}))
+        (200, json!({"ignored":[],"closed_subjects":[]}))
     );
     assert_eq!(
         server.host_post("heartbeat", &hb, 1, now_ms()),
@@ -265,13 +265,31 @@ fn real_http_serves_jwks_lease_reattach_heartbeat_usage_and_errors() {
         )
     );
     assert_eq!(server.host_post("usage", &u, 4, now_ms()), first);
+    // A job settled by its host's usage report can still be reattached, so the
+    // host can replay output the client lost; the lease comes back unchanged.
+    let (status, body) = server.post(
+        "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
+        &ReattachRequest {
+            requester_jwk: lease_request().requester_jwk,
+        },
+    );
+    assert_eq!(status, 200, "{body}");
+    let settled_attach: LeaseResponse = serde_json::from_value(body).unwrap();
     assert_eq!(
-        server.post(
-            "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
-            &ReattachRequest {
-                requester_jwk: lease_request().requester_jwk
-            }
-        ),
+        (settled_attach.lease_id, settled_attach.reserved_vcpu_ms),
+        (lease.lease_id.clone(), lease.reserved_vcpu_ms)
+    );
+    verify_token(
+        &settled_attach.job_token,
+        &keys,
+        HOST,
+        Some("019e4567-89ab-7cde-8012-3456789abcde"),
+        Purpose::Attach,
+        now_ms() / 1000,
+    )
+    .unwrap();
+    assert_eq!(
+        server.post("/v1/leases", &lease_request()),
         (409, json!({"error":"job_finished"}))
     );
     assert_eq!(
@@ -307,6 +325,35 @@ fn fake_binary_refusal_and_shortening_flags_work_over_http() {
     assert_eq!(status, 201);
     assert_eq!(body["max_s"], 5);
     assert_eq!(body["reserved_vcpu_ms"], 10000);
+}
+
+#[test]
+fn fake_binary_max_vcpus_flag_answers_no_host_fits_over_http() {
+    let server = Server::start(&["--max-vcpus", "8"]);
+    let mut request = lease_request();
+    request.vcpus = 16;
+    assert_eq!(
+        server.post("/v1/leases", &request),
+        (422, json!({"error":"no_host_fits","max_vcpus":8}))
+    );
+    request.vcpus = 8;
+    assert_eq!(server.post("/v1/leases", &request).0, 201);
+}
+
+/// Over real HTTP, the fake executable answers a lease body without
+/// `allow_spill` 400 `bad_request`, as the broker does, and still books the
+/// same lease once the member is present.
+#[test]
+fn fake_binary_refuses_a_lease_without_allow_spill_over_http() {
+    let server = Server::start(&[]);
+    let mut body = serde_json::to_value(lease_request()).unwrap();
+    body.as_object_mut().unwrap().remove("allow_spill");
+    assert_eq!(
+        server.post("/v1/leases", &body),
+        (400, json!({"error":"bad_request"}))
+    );
+    body["allow_spill"] = json!(false);
+    assert_eq!(server.post("/v1/leases", &body).0, 201);
 }
 
 #[test]

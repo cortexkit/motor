@@ -404,6 +404,8 @@ async fn launch_fault_inner(stage: &'static str, isolated: bool) {
     let _release = Release(hold.clone());
     hold.arm();
     let mut config = f.config();
+    // Dispatch explicitly so a scheduler tick cannot race the cleanup lock probe.
+    config.manual_tick = true;
     config.disable_warm_builds = true;
     config.isolate_jobs = isolated;
     config.long_work = Some(hold.hook());
@@ -430,6 +432,7 @@ async fn launch_fault_inner(stage: &'static str, isolated: bool) {
     .unwrap();
     let (request, bytes) = f.run("sleep 60");
     f.submit(&runner, &request, &bytes);
+    runner.tick().unwrap();
     reached(&hold).await;
     {
         let inner = runner
@@ -461,12 +464,14 @@ async fn launch_fault_inner(stage: &'static str, isolated: bool) {
         );
         assert_eq!(result.retry_after_ms(), None);
         assert_eq!(result.ran, Some(Ran::None));
+        assert_execution_ended_wire(&result, true);
         assert_eq!(
             runner.replay(request.job_id, 0).unwrap(),
             vec![Frame::Terminal(result)]
         );
     } else {
         assert_eq!(result.outcome, Outcome::OutcomeUnknown);
+        assert_execution_ended_wire(&result, false);
     }
     let inner = runner.core.inner.lock().unwrap();
     assert!(!Runner::occupied(&inner, &f.key));

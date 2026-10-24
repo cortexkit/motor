@@ -23,6 +23,8 @@ impl Connector for ReplayPeer {
                     &mut peer,
                     &Frame::Hello {
                         return_paths: false,
+                        return_chunked: false,
+                        sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,

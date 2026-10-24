@@ -19,6 +19,15 @@ impl Drop for Http {
 }
 impl Http {
     pub async fn new(reply: impl Fn(&str, &Value) -> (u16, Value) + Send + Sync + 'static) -> Self {
+        Self::with_reply_bytes(move |path, body| {
+            let (status, body) = reply(path, body);
+            (status, serde_json::to_vec(&body).unwrap())
+        })
+        .await
+    }
+    pub async fn with_reply_bytes(
+        reply: impl Fn(&str, &Value) -> (u16, Vec<u8>) + Send + Sync + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Requests::default();
@@ -61,7 +70,6 @@ impl Http {
                     .unwrap()
                     .push((path.to_owned(), body.clone()));
                 let (status, body) = reply(path, &body);
-                let body = serde_json::to_vec(&body).unwrap();
                 let head = format!("HTTP/1.1 {status} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
                 let _ = socket.write_all(head.as_bytes()).await;
                 let _ = socket.write_all(&body).await;

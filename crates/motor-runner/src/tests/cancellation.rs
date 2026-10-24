@@ -241,7 +241,9 @@ fn cancelled_exited_unit_without_real_status_still_finalizes() {
             .is_some()
     }));
     let persisted: Job = read_json(&f.runner.record_path(id)).unwrap();
-    assert_eq!(persisted.terminal.unwrap().outcome, Outcome::OutcomeUnknown);
+    let terminal = persisted.terminal.unwrap();
+    assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
+    assert_execution_ended_wire(&terminal, true);
     assert_eq!(
         persisted.monitoring_error.as_deref(),
         Some("cancelled unit already exited")
@@ -250,6 +252,33 @@ fn cancelled_exited_unit_without_real_status_still_finalizes() {
     let inner = f.runner.core.inner.lock().unwrap();
     assert!(!inner.finalizing.contains(&id));
     assert!(!inner.kill_retries.contains_key(&id));
+}
+
+#[test]
+fn execution_ended_wire_competing_proof() {
+    let f = CancellationFixture::new();
+    f.collect.arm();
+    let release = Release(f.collect.clone());
+    let runner = f.runner.clone();
+    let id = f.id;
+    let owner =
+        std::thread::spawn(move || runner.finish(id, Err(io::Error::other("monitor lost"))));
+    assert!(poll(Duration::from_secs(10), || f.collect.held()));
+    f.runner
+        .finish_execution(id, Err(io::Error::other("unit inactive")), true)
+        .unwrap();
+    drop(release);
+    owner.join().unwrap().unwrap();
+    let disk: Job = read_json(&f.runner.record_path(id)).unwrap();
+    assert_execution_ended_wire(disk.terminal.as_ref().unwrap(), true);
+    assert!(f
+        .runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .ended_executions
+        .is_empty());
 }
 
 #[test]
@@ -384,5 +413,47 @@ fn overdue_deadline_keeps_its_origin_when_an_output_writer_delays_enforcement() 
         events,
         ["kill"],
         "a deadline past its grace must hard-stop a TERM-ignoring group"
+    );
+}
+
+/// A job printing faster than its output can be committed keeps its monitor
+/// taking the job log lock back to back, one commit after another. A cancel
+/// waiting for that lock must get it before the next output commit;
+/// otherwise the unit stop waits until the job's output pauses.
+#[test]
+fn cancel_takes_the_job_log_ahead_of_the_next_output_commit() {
+    let f = CancellationFixture::new();
+    let id = f.id;
+    fs::create_dir_all(f.runner.record_path(id).parent().unwrap()).unwrap();
+    let log = f.runner.job_log(id);
+    // The test thread plays the output monitor, in the middle of one commit.
+    let commit = log.write_for_output();
+    let runner = f.runner.clone();
+    let cancel = std::thread::spawn(move || runner.cancel(id));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while *log.cancels_waiting.lock().unwrap() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the cancel never queued for the job log lock"
+        );
+        std::thread::yield_now();
+    }
+    // Finish that commit and start the next one straight away, as the
+    // monitor does while its output file has unread bytes.
+    drop(commit);
+    f.runner
+        .output(id, OutputStream::Stdout, b"more output")
+        .unwrap();
+    assert_eq!(
+        *f.events.lock().unwrap(),
+        ["cancel"],
+        "the unit stop must be issued before the next output commit"
+    );
+    cancel.join().unwrap().unwrap();
+    let job = &f.runner.core.inner.lock().unwrap().jobs[&id];
+    assert!(matches!(job.kill, Some((Killed::Cancel, _))));
+    assert_eq!(
+        job.next_seq, 1,
+        "the output commit still happens after the cancel"
     );
 }

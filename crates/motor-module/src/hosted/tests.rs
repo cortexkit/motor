@@ -6,6 +6,7 @@ fn hosted_config_defaults_omit_all_keys_and_fake_is_forbidden_on_main() {
     let json = serde_json::to_value(&config).unwrap();
     for key in [
         "hosted_runners",
+        "hosted_repositories",
         "broker_url",
         "broker_token_source",
         "spill_to_hosted",
@@ -233,6 +234,7 @@ fn hosted_billing_seconds_keep_three_decimals() {
 
 mod account;
 pub(crate) mod harness;
+mod settled_reattach;
 use harness::*;
 use motor_protocol::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -244,6 +246,31 @@ fn stored(scratch: &Scratch, id: Uuid, route: HostedJobState) -> Arc<Storage> {
         .unwrap();
     storage.hosted_route(id, route).unwrap();
     storage
+}
+
+#[test]
+fn spill_provisioning_budget_caps_only_spills_and_respects_remaining_wait() {
+    let scratch = Scratch::new();
+    let storage = Storage::open(&scratch.0.join("state")).unwrap();
+    for (limit_s, spill_wait_ms, expected_ms) in [
+        (300, Some(45_000), 180_000),
+        (120, Some(45_000), 75_000),
+        (30, Some(45_000), 0),
+        (300, None, 300_000),
+    ] {
+        let id = Uuid::now_v7();
+        storage.create(id, limit_s, None, None, false).unwrap();
+        storage
+            .hosted_route(
+                id,
+                HostedJobState {
+                    spill_wait_ms,
+                    ..HostedJobState::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(spill_wait_budget_ms(&storage.job(id).unwrap()), expected_ms);
+    }
 }
 
 #[tokio::test]
@@ -286,6 +313,7 @@ async fn hosted_wrong_spki_sends_no_token_and_does_not_replace() {
                 avoid_host: None,
                 timeout_s: 30,
                 requester_jwk: motor_lease::RequesterJwk::from_key(&key.verifying_key()),
+                allow_spill: Some(true),
             },
         )
         .await
@@ -600,18 +628,22 @@ async fn return_paths_hosted_limits_refuse_before_lease_and_keep_no_fallback() {
         crate::ReturnOptions {
             return_paths: vec!["/home/missing/out".into()],
             return_max_bytes: RETURN_MAX_BYTES + 1,
+            return_chunked: false,
         },
         crate::ReturnOptions {
             return_paths: vec!["/home/missing/out".into(); 65],
             return_max_bytes: 1,
+            return_chunked: false,
         },
         crate::ReturnOptions {
             return_paths: vec![format!("/home/missing/{}", "x".repeat(4096))],
             return_max_bytes: 1,
+            return_chunked: false,
         },
         crate::ReturnOptions {
             return_paths: vec!["/home/elsewhere/out".into()],
             return_max_bytes: 1,
+            return_chunked: false,
         },
     ] {
         let stream = motor
@@ -860,11 +892,16 @@ fn cloud_hmac_and_client_request_bodies_match_canonical_lease_vector() {
         Some(serde_json::from_value(v["request"]["body"]["placement_hint"].clone()).unwrap()),
         serde_json::from_value(v["request"]["body"]["avoid_host"].clone()).unwrap(),
         RequesterJwk::from_key(&key.verifying_key()),
+        // An ordinary spilled lease, as `Client::run` builds it for a job that
+        // was not routed to hosted runners by repository.
+        Some(true),
     )
     .unwrap();
     assert_eq!(serde_json::to_value(&body).unwrap(), v["request"]["body"]);
     // The broker's lease hash takes the fields in this order, and
-    // `avoid_host` comes right after `placement_hint`.
+    // `avoid_host` comes right after `placement_hint`. ck-motor sends
+    // `allow_spill` where the hash places it, before `requester_jwk`; the
+    // broker accepts members in any order.
     let text = serde_json::to_string(&body).unwrap();
     let positions: Vec<_> = [
         "job_id",
@@ -876,6 +913,7 @@ fn cloud_hmac_and_client_request_bodies_match_canonical_lease_vector() {
         "placement_hint",
         "avoid_host",
         "timeout_s",
+        "allow_spill",
         "requester_jwk",
     ]
     .iter()
@@ -919,4 +957,483 @@ async fn hosted_job_released_stops_reattaching_without_resubmitting() {
     );
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+}
+
+// The wire body places requester_jwk last. Remove exactly that member to
+// project its serialized fields into the broker's ordinary lease-hash input.
+// Hashing is a broker operation; this projection is only used by contract tests.
+pub(crate) fn canonical_lease_bytes(body: &motor_lease::LeaseRequest) -> String {
+    let wire = serde_json::to_string(body).unwrap();
+    let requester = format!(
+        ",\"requester_jwk\":{}}}",
+        serde_json::to_string(&body.requester_jwk).unwrap()
+    );
+    format!(
+        "{}}}",
+        wire.strip_suffix(&requester)
+            .expect("requester key is the final wire member")
+    )
+}
+
+#[test]
+fn cloud_no_spill_request_serializes_to_the_exact_canonical_bytes_and_hash() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/no-spill-lease.json"
+    ))
+    .unwrap();
+    let expected: motor_lease::LeaseRequest =
+        serde_json::from_str(vector["request"]["body_bytes"].as_str().unwrap()).unwrap();
+    let mut request = RunRequest::new(
+        "/home/test/repo",
+        "/home/test/repo",
+        "/home/test/repo",
+        "true",
+    )
+    .with_platform(Platform::Linux)
+    .with_timeout(expected.timeout_s)
+    .with_weight_hint(expected.vcpus);
+    if expected.net {
+        request.network = Some(Network::Outbound);
+    }
+    let body = lease_body(
+        Uuid::parse_str(&expected.job_id).unwrap(),
+        &request,
+        (
+            expected.workspace_key_hash.clone(),
+            expected.repo_hash.clone(),
+        ),
+        expected.placement_hint.clone(),
+        expected.avoid_host.clone(),
+        expected.requester_jwk.clone(),
+        Some(false),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&body).unwrap(),
+        vector["request"]["body"]
+    );
+    let canonical = canonical_lease_bytes(&body);
+    assert_eq!(canonical, vector["canonical_lease_bytes"].as_str().unwrap());
+    assert_eq!(
+        motor_lease::sha256_hex(canonical.as_bytes()),
+        vector["lease_hash"]
+    );
+    let mut changed = body.clone();
+    changed.requester_jwk =
+        motor_lease::RequesterJwk::from_key(&SigningKey::from_bytes(&[8; 32]).verifying_key());
+    assert_eq!(
+        canonical_lease_bytes(&changed),
+        canonical,
+        "Requester rotation is not part of the lease hash"
+    );
+    changed.allow_spill = None;
+    let absent = canonical_lease_bytes(&changed);
+    changed.allow_spill = Some(true);
+    let spill = canonical_lease_bytes(&changed);
+    assert_ne!(
+        absent, spill,
+        "An absent member and true project to different lease-hash inputs"
+    );
+    assert_ne!(absent, canonical);
+    assert_ne!(spill, canonical);
+}
+
+/// CLOUD's `no-host-fits-lease.json` records a 16-vCPU repository-routed lease
+/// (`allow_spill: false`) and its lease hash; ck-motor's body for the same job
+/// has the same members and the same hash.
+#[test]
+fn cloud_no_host_fits_request_matches_the_vector_body_and_hash() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/no-host-fits-lease.json"
+    ))
+    .unwrap();
+    let expected: motor_lease::LeaseRequest =
+        serde_json::from_str(vector["request"]["body_bytes"].as_str().unwrap()).unwrap();
+    assert_eq!(expected.allow_spill, Some(false));
+    let mut request = RunRequest::new(
+        "/home/test/repo",
+        "/home/test/repo",
+        "/home/test/repo",
+        "true",
+    )
+    .with_platform(Platform::Linux)
+    .with_timeout(expected.timeout_s)
+    .with_weight_hint(expected.vcpus);
+    if expected.net {
+        request.network = Some(Network::Outbound);
+    }
+    let body = lease_body(
+        Uuid::parse_str(&expected.job_id).unwrap(),
+        &request,
+        (
+            expected.workspace_key_hash.clone(),
+            expected.repo_hash.clone(),
+        ),
+        expected.placement_hint.clone(),
+        expected.avoid_host.clone(),
+        expected.requester_jwk.clone(),
+        Some(false),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&body).unwrap(),
+        vector["request"]["body"]
+    );
+    assert_eq!(
+        motor_lease::sha256_hex(canonical_lease_bytes(&body).as_bytes()),
+        vector["lease_hash"]
+    );
+}
+
+#[tokio::test]
+async fn stored_allow_spill_presence_and_value_survive_lease_re_requests() {
+    for allow_spill in [None, Some(false), Some(true)] {
+        let h = Harness::new(Behavior::Normal).await;
+        let scratch = Scratch::new();
+        let id = Uuid::now_v7();
+        let request = Harness::request(&scratch.0);
+        let body = lease_body(
+            id,
+            &request,
+            (
+                motor_lease::base64url(&[1; 32]),
+                motor_lease::base64url(&[2; 32]),
+            ),
+            None,
+            None,
+            motor_lease::RequesterJwk::from_key(&SigningKey::from_bytes(&[3; 32]).verifying_key()),
+            allow_spill,
+        )
+        .unwrap();
+        let expected = canonical_lease_bytes(&body);
+        let mut route = h.route.clone();
+        // Deliberately disagree with the saved request: a config change must
+        // not change either the presence or the value on a re-request.
+        route.repository_routed = allow_spill != Some(false);
+        route.lease_request = Some(body);
+        let storage = stored(&scratch, id, route.clone());
+        for _ in 0..2 {
+            let result = Client::new(route.clone()).run(id, &request, &storage).await;
+            if allow_spill.is_some() {
+                drop(result.unwrap().0);
+            } else {
+                // A stored request missing allow_spill, which the broker
+                // requires, is never sent: the client refuses it itself,
+                // naming the member, instead of collecting the broker's 400.
+                assert_eq!(
+                    result.err(),
+                    Some(Error::RequestInvalid(RequestField::new("allow_spill")))
+                );
+            }
+        }
+        let bodies = h.lease_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), if allow_spill.is_some() { 2 } else { 0 });
+        for bytes in bodies.iter() {
+            let sent: motor_lease::LeaseRequest = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(sent.allow_spill, allow_spill);
+            assert_eq!(canonical_lease_bytes(&sent), expected);
+        }
+        assert_eq!(
+            storage
+                .job(id)
+                .unwrap()
+                .hosted
+                .unwrap()
+                .lease_request
+                .unwrap()
+                .allow_spill,
+            allow_spill
+        );
+        assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    }
+}
+
+/// Exact broker reply bytes for lease-creation bad requests, including a 400
+/// without a field so older brokers stay compatible.
+pub(crate) fn cloud_bad_request_replies() -> Vec<(u16, String)> {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/bad-request.json"
+    ))
+    .unwrap();
+    vector["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| case["request"]["pathname"] == "/v1/leases")
+        .map(|case| {
+            let status = case["reply"]["status"].as_u64().unwrap();
+            assert_eq!(status, 400);
+            (
+                status as u16,
+                case["reply"]["body"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// The broker's recorded refusal of a closed account's new lease.
+pub(crate) fn cloud_account_closed_reply() -> (u16, serde_json::Value) {
+    let v: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/account-closure.json"
+    ))
+    .unwrap();
+    let reply = &v["lease"]["reply"];
+    assert_eq!(reply["retry_after"], serde_json::Value::Null);
+    assert_eq!(
+        serde_json::to_string(&reply["body"]).unwrap(),
+        r#"{"error":"account_closed"}"#
+    );
+    (
+        reply["status"].as_u64().unwrap() as u16,
+        reply["body"].clone(),
+    )
+}
+
+/// A 403 `account_closed` lease refusal is final whatever routed the job
+/// hosted (configuration, a spill, repository routing or a direct hosted
+/// test): one lease request, a typed refusal that tells the caller not to
+/// repeat the request, no retry delay. A 403 on any other broker route is
+/// still an authentication failure, since the contract sends `account_closed`
+/// only on lease creation.
+#[tokio::test]
+async fn cloud_account_closed_lease_is_one_final_request_on_every_route() {
+    let (status, body) = cloud_account_closed_reply();
+    let broker = super::test_http::Http::new(move |path, _| {
+        if path == "/v1/leases" || path.ends_with("/reattach") {
+            (status, body.clone())
+        } else {
+            (404, serde_json::json!({"error": "job_unknown"}))
+        }
+    })
+    .await;
+    let h = Harness::new(Behavior::Normal).await;
+    for kind in ["configured", "spilled", "repository_routed", "hosted_test"] {
+        let scratch = Scratch::new();
+        let id = Uuid::now_v7();
+        let mut route = h.route.clone();
+        route.broker_url = broker.url.clone();
+        match kind {
+            "spilled" => route.spill_wait_ms = Some(0),
+            "repository_routed" => route.repository_routed = true,
+            "hosted_test" => route.hosted_test = true,
+            _ => {}
+        }
+        let storage = stored(&scratch, id, route.clone());
+        let before = broker.requests.lock().unwrap().len();
+        let client = Client::new(route);
+        let error = client
+            .run(id, &Harness::request(&scratch.0), &storage)
+            .await
+            .err();
+        assert_eq!(error, Some(Error::AccountClosed), "{kind}");
+        let requests = broker.requests.lock().unwrap()[before..].to_vec();
+        assert_eq!(requests.len(), 1, "{kind}: {requests:?}");
+        assert_eq!(requests[0].0, "/v1/leases", "{kind}");
+        assert_eq!(client.broker_code().as_deref(), Some("account_closed"));
+        assert_eq!(
+            client
+                .post::<_, serde_json::Value>(
+                    &format!("/v1/leases/{id}/reattach"),
+                    &serde_json::json!({})
+                )
+                .await,
+            Err(Error::Auth),
+            "{kind}"
+        );
+    }
+    let error = Error::AccountClosed;
+    assert_eq!(error.reason(), RefusalReason::RequestRejected);
+    assert_eq!(error.code(), "hosted_account_closed");
+    assert_eq!(
+        error.detail(),
+        "hosted_account_closed: hosted account closed"
+    );
+    assert_eq!(error.retry_after_ms(), None);
+    assert!(!error.replaceable());
+    assert_eq!(h.tokens.load(Ordering::SeqCst), 0);
+}
+
+/// Closure refuses new jobs only. A job the broker placed before the account
+/// closed is asked for again with its stored lease body and runs, while a new
+/// job for the same account is refused `account_closed`.
+#[tokio::test]
+async fn closed_account_rerequest_of_a_placed_job_still_runs_but_a_new_job_is_refused() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = Scratch::new();
+    let request = Harness::request(&scratch.0);
+    let id = Uuid::now_v7();
+    let path = scratch.0.to_str().unwrap();
+    let salt = [9; 32];
+    let body = lease_body(
+        id,
+        &request,
+        (
+            keyed_hash(&salt, "ck-ws-v1", path).unwrap(),
+            keyed_hash(&salt, "ck-repo-v1", path).unwrap(),
+        ),
+        None,
+        None,
+        RequesterJwk::from_key(&requester().unwrap().verifying_key()),
+        Some(true),
+    )
+    .unwrap();
+    let placed: motor_lease::LeaseResponse = Client::new(h.route.clone())
+        .post("/v1/leases", &body)
+        .await
+        .unwrap();
+    h.broker
+        .lock()
+        .unwrap()
+        .knobs
+        .closed_subjects
+        .insert("acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into());
+    let mut route = h.route.clone();
+    route.lease_request = Some(body);
+    let storage = stored(&scratch, id, route);
+    let (channel, lease) = Client::new(h.route.clone())
+        .run(id, &request, &storage)
+        .await
+        .unwrap();
+    drop(channel);
+    assert_eq!(lease.lease_id, placed.lease_id);
+    assert_eq!(h.tokens.load(Ordering::SeqCst), 1);
+
+    let fresh = Uuid::now_v7();
+    storage
+        .create(fresh, 30, None, Some("test".into()), false)
+        .unwrap();
+    storage.hosted_route(fresh, h.route.clone()).unwrap();
+    assert_eq!(
+        Client::new(h.route.clone())
+            .run(fresh, &request, &storage)
+            .await
+            .err(),
+        Some(Error::AccountClosed)
+    );
+    assert_eq!(h.tokens.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| *p == "/v1/leases")
+            .count(),
+        3
+    );
+}
+
+/// `invalid_lease_field` names the member CLOUD's lease parser refuses with
+/// 400 `bad_request`, for each rule of the pinned runners contract, and
+/// accepts the bounds and the `boat:` placement hint the contract allows.
+#[test]
+fn invalid_lease_field_names_each_member_the_broker_refuses() {
+    let request =
+        RunRequest::new("/home/a/repo", "/home/a/repo", "/home/a/repo", "true").with_timeout(30);
+    let valid = lease_body(
+        Uuid::now_v7(),
+        &request,
+        ("A".repeat(43), "b-_9".repeat(10) + "abc"),
+        None,
+        Some("build-server-1".into()),
+        RequesterJwk::from_key(&SigningKey::from_bytes(&[7; 32]).verifying_key()),
+        Some(true),
+    )
+    .unwrap();
+    assert_eq!(invalid_lease_field(&valid, false), None);
+    assert_eq!(invalid_lease_field(&valid, true), None);
+    type Mutation = fn(&mut LeaseRequest);
+    let accepted: [(&str, Mutation); 6] = [
+        ("timeout_s 10", |b| b.timeout_s = 10),
+        ("timeout_s 7200", |b| b.timeout_s = 7200),
+        ("vcpus 1", |b| b.vcpus = 1),
+        ("vcpus 64", |b| b.vcpus = 64),
+        ("avoid_host null", |b| b.avoid_host = None),
+        ("boat hint", |b| {
+            b.placement_hint = Some(Placement {
+                host: "boat:bx_1".into(),
+                vm: Some("bx_1".into()),
+            })
+        }),
+    ];
+    for (name, mutate) in accepted {
+        let mut body = valid.clone();
+        mutate(&mut body);
+        assert_eq!(invalid_lease_field(&body, false), None, "{name}");
+    }
+    let refused: [(&str, Mutation); 17] = [
+        ("job_id", |b| b.job_id.replace_range(14..15, "4")),
+        ("job_id", |b| {
+            b.job_id = "0190f0e2-1b2c-7d3e-8f4a-5b6c7d8e9F0a".into()
+        }),
+        ("vcpus", |b| b.vcpus = 0),
+        ("vcpus", |b| b.vcpus = 65),
+        ("platform", |b| b.platform = "linux x64".into()),
+        ("workspace_key_hash", |b| {
+            b.workspace_key_hash = "A".repeat(42)
+        }),
+        ("repo_hash", |b| {
+            b.repo_hash = format!("{}=", "A".repeat(42))
+        }),
+        ("placement_hint", |b| {
+            b.placement_hint = Some(Placement {
+                host: "host-1".into(),
+                vm: None,
+            })
+        }),
+        ("placement_hint", |b| {
+            b.placement_hint = Some(Placement {
+                host: "host/1".into(),
+                vm: Some("vm".into()),
+            })
+        }),
+        ("avoid_host", |b| b.avoid_host = Some("boat:bx_1".into())),
+        ("timeout_s", |b| b.timeout_s = 9),
+        ("timeout_s", |b| b.timeout_s = 7201),
+        ("timeout_s", |b| b.timeout_s = 10_800),
+        ("requester_jwk", |b| b.requester_jwk.kty = "EC".into()),
+        ("requester_jwk", |b| b.requester_jwk.crv = "X25519".into()),
+        ("requester_jwk", |b| b.requester_jwk.x = "B".repeat(43)),
+        ("allow_spill", |b| b.allow_spill = None),
+    ];
+    for (field, mutate) in refused {
+        let mut body = valid.clone();
+        mutate(&mut body);
+        assert_eq!(invalid_lease_field(&body, false), Some(field), "{body:?}");
+    }
+    let mut no_spill = valid.clone();
+    no_spill.allow_spill = Some(false);
+    assert_eq!(invalid_lease_field(&no_spill, false), None);
+    assert_eq!(invalid_lease_field(&no_spill, true), Some("shadow"));
+}
+
+/// A run request whose timeout or vCPU count no lease body can carry is
+/// refused before any lease, naming the member; a missing timeout keeps its
+/// own refusal.
+#[test]
+fn validate_refuses_requests_no_valid_lease_body_can_carry() {
+    let request = |timeout: Option<u64>, weight: Option<u32>| {
+        let mut request = RunRequest::new("/home/a/repo", "/home/a/repo", "/home/a/repo", "true");
+        request.timeout = timeout;
+        request.weight_hint = weight;
+        request
+    };
+    assert_eq!(validate(&request(None, None)), Err(Error::NoTimeout));
+    assert_eq!(validate(&request(Some(10), None)), Ok(()));
+    assert_eq!(validate(&request(Some(7200), Some(64))), Ok(()));
+    for (timeout, weight, field) in [
+        (9, None, "timeout_s"),
+        (7201, None, "timeout_s"),
+        (30, Some(0), "vcpus"),
+        (30, Some(65), "vcpus"),
+    ] {
+        let refused = validate(&request(Some(timeout), weight));
+        assert_eq!(
+            refused,
+            Err(Error::RequestInvalid(RequestField::new(field)))
+        );
+        assert_eq!(
+            refused.unwrap_err().detail(),
+            format!("hosted_request_invalid: {field}")
+        );
+    }
 }

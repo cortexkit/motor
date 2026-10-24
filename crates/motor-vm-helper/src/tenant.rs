@@ -38,6 +38,7 @@ pub enum Operation {
     Adopt,
     Metrics,
     RecoveryComplete,
+    Remove,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -151,10 +152,30 @@ pub trait Backend {
     fn recovery_complete(&mut self, _tenant: &str, _registry: &Registry) -> Result<()> {
         Err(Error("recovery unavailable".into()))
     }
+    /// Whether the durable running marker is present. `load` writes it before
+    /// the VMM starts and only a clean stop or a completed suspend removes it,
+    /// so a marker on a tenant that is not running means its last VM ended
+    /// without the guest flushing its disk: the helper was killed, the host
+    /// lost power, or the VMM died.
+    fn was_running(&mut self, _registry: &Registry) -> Result<bool> {
+        Ok(false)
+    }
+    fn clear_running(&mut self, _registry: &Registry) -> Result<()> {
+        Ok(())
+    }
+    /// Tenants this helper process started and may still be running.
+    fn running_tenants(&mut self) -> Vec<String> {
+        Vec::new()
+    }
     fn registry(&mut self, tenant: &str) -> Result<Registry>;
     fn key(&mut self, registry: &Registry) -> Result<SnapshotKey>;
     fn saved_key(&mut self, registry: &Registry) -> Result<Option<SnapshotKey>>;
     fn running(&mut self, tenant: &str) -> bool;
+    /// A failed create request may still be writing. Only a completed stop may
+    /// clear its quarantine; child liveness alone cannot authorize adoption.
+    fn snapshot_uncertain(&self, _tenant: &str) -> bool {
+        false
+    }
     fn was_restored(&self, _tenant: &str) -> bool {
         false
     }
@@ -174,17 +195,44 @@ pub trait Backend {
     fn metrics(&mut self, _tenant: &str, _registry: &Registry) -> Result<(u64, u64)> {
         Err(Error("tenant metrics unavailable".into()))
     }
+    /// Whether anything of a VM is left for this tenant even when this helper
+    /// process did not start it: its cgroup or its jail.
+    fn vm_present(&mut self, _tenant: &str) -> Result<bool> {
+        Ok(false)
+    }
+    /// Quarantines the stopped tenant's data and removes its records and
+    /// network setup; returns the quarantine folder.
+    fn remove(&mut self, _tenant: &str, _registry: &Registry) -> Result<PathBuf> {
+        Err(Error("tenant removal unavailable".into()))
+    }
+    /// Completes a removal whose registry entry is already gone but whose
+    /// data was not yet moved; `None` when there is none.
+    fn resume_removal(&mut self, _tenant: &str) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
 }
 
 pub struct Controller<B: Backend>(pub B);
+
+// Backend errors use this prefix only when snapshot/create may still be writing.
+pub(crate) const SNAPSHOT_CREATE_UNCERTAIN: &str = "suspend_create_uncertain";
 impl<B: Backend> Controller<B> {
     pub fn handle(&mut self, tenant: &str, op: Operation) -> Result<Response> {
         validate_name(tenant)?;
         if let Operation::Relay(port) = op {
             validate_port(port)?;
         }
+        if let Operation::Remove = op {
+            return self.remove(tenant);
+        }
         let r = self.0.registry(tenant)?;
         r.validate(tenant)?;
+        // Stop before recording recovery or consuming files: recording can
+        // itself stall on the disk that made snapshot/create time out.
+        if self.0.snapshot_uncertain(tenant) {
+            self.0.stop(tenant)?;
+        }
+        self.record_lost_vm(tenant, &r)?;
         let mut restored = self.0.was_restored(tenant);
         match op {
             Operation::Ensure | Operation::Restore => {
@@ -199,6 +247,7 @@ impl<B: Backend> Controller<B> {
             Operation::Cpu(vcpus) => self.0.cpu(tenant, &r.cpu_max(vcpus)?)?,
             Operation::Egress => self.0.egress(tenant, &r)?,
             Operation::Adopt => {}
+            Operation::Remove => unreachable!("removal returns before the registry is read"),
             Operation::RecoveryComplete => self.0.recovery_complete(tenant, &r)?,
             Operation::Metrics => {
                 let (memory_bytes, egress_bytes) = self.0.metrics(tenant, &r)?;
@@ -219,15 +268,22 @@ impl<B: Backend> Controller<B> {
             }
             Operation::Stop => {
                 if self.0.running(tenant) {
-                    let record = match self.0.prepare_stop(tenant) {
+                    let prepared = self.0.prepare_stop(tenant);
+                    let record = match &prepared {
                         Ok(()) => Ok(()),
                         Err(error) => self.0.mark_unclean(&r, &error.to_string()),
                     };
+                    let prepared = prepared.is_ok();
                     if let Err(error) = self.0.stop(tenant) {
                         let _ = self.0.thaw(tenant);
                         return Err(error);
                     }
                     record?;
+                    // Only a stop whose guest flush succeeded is clean. After a
+                    // failed flush the marker stays as a second durable record.
+                    if prepared {
+                        self.0.clear_running(&r)?;
+                    }
                 }
             }
             Operation::Suspend => {
@@ -241,9 +297,26 @@ impl<B: Backend> Controller<B> {
                 // A refused or timed-out prepare must never reach snapshot/create.
                 if let Err(error) = self.0.prepare(tenant) {
                     let _ = self.0.thaw(tenant);
-                    return Err(error);
+                    return Err(Error(format!("suspend_prepare_refused: {error}")));
                 }
                 if let Err(error) = self.0.snapshot(tenant, &r, &key) {
+                    if error.0.starts_with(SNAPSHOT_CREATE_UNCERTAIN) {
+                        // Closing the API socket does not cancel Firecracker's
+                        // writer. Kill and reap it before deleting any output.
+                        // Prepare already drained jobs and froze the filesystem,
+                        // but the next boot must still perform unclean recovery.
+                        self.0.stop(tenant).map_err(|stop| Error(format!(
+                            "suspend_create_stop_failed: {error}; stop: {stop}"
+                        )))?;
+                        // The running marker already forces recovery if this
+                        // reason cannot be recorded after the writer is stopped.
+                        let record = self.0.mark_unclean(&r, &error.to_string());
+                        let cleanup = self.0.consume(&r);
+                        eprintln!("tenant {tenant}: suspend_create_failed_vm_stopped action=cold_boot_recovery cause={error}");
+                        record?;
+                        cleanup?;
+                        return Err(Error(format!("suspend_create_failed_vm_stopped: {error}")));
+                    }
                     let cleanup = self.0.consume(&r);
                     self.0.thaw(tenant)?;
                     cleanup?;
@@ -255,6 +328,9 @@ impl<B: Backend> Controller<B> {
                     cleanup?;
                     return Err(error);
                 }
+                // The guest froze its filesystems before the snapshot, so the
+                // disk is consistent whether the snapshot or a fresh boot runs next.
+                self.0.clear_running(&r)?;
             }
         }
         let generation = self.0.key(&r)?.generation;
@@ -264,6 +340,84 @@ impl<B: Backend> Controller<B> {
             generation,
             recovery_required: self.0.unclean(&r)?,
         }))
+    }
+    /// The caller names a tenant only. Its registry entry decides what goes,
+    /// so an unknown tenant is refused, and the VM must already be stopped:
+    /// the helper checks that itself rather than trusting the caller. Every
+    /// tenant operation runs under the helper's one lock, so no suspend or
+    /// snapshot can be in progress while this runs.
+    fn remove(&mut self, tenant: &str) -> Result<Response> {
+        let r = match self.0.registry(tenant) {
+            Ok(r) => r,
+            Err(error) => {
+                return match self.0.resume_removal(tenant)? {
+                    Some(quarantine) => Ok(removed(quarantine)),
+                    None => Err(error),
+                }
+            }
+        };
+        r.validate(tenant)?;
+        if self.0.running(tenant) || self.0.vm_present(tenant)? {
+            return Err(Error(
+                "tenant VM is running; stop it before removing the tenant".into(),
+            ));
+        }
+        let quarantine = self.0.remove(tenant, &r)?;
+        Ok(removed(quarantine))
+    }
+    /// Turns a running marker left by a VM that is no longer running into the
+    /// unclean-stop record, so the next start skips the suspend snapshot and
+    /// the guest runs its recovery check. This covers a helper killed by
+    /// SIGKILL, a host power loss and a VMM that died on its own: none of them
+    /// ran the clean stop that removes the marker.
+    fn record_lost_vm(&mut self, tenant: &str, r: &Registry) -> Result<()> {
+        if !self.0.running(tenant) && self.0.was_running(r)? && !self.0.unclean(r)? {
+            self.0.mark_unclean(r, "vm_stopped_without_clean_stop")?;
+        }
+        Ok(())
+    }
+    /// The service stop path: stops every running tenant the way
+    /// `Operation::Stop` does (guest drain, `sync -f /tenant` and freeze,
+    /// bounded at 15 s, then the VMM is killed). A tenant that cannot be
+    /// stopped cleanly is recorded as unclean before this returns, so the
+    /// caller may exit and let systemd kill whatever is left. Returns the
+    /// tenants that did not stop cleanly, with the reason.
+    pub fn stop_all(&mut self) -> Vec<(String, Error)> {
+        let mut failures = Vec::new();
+        for tenant in self.0.running_tenants() {
+            let started = std::time::Instant::now();
+            let failure = match self.handle(&tenant, Operation::Stop) {
+                // A refused or timed-out guest flush still stops the VM. Stop
+                // has then recorded the reason and left the running marker.
+                Ok(_) => {
+                    let flushed = self
+                        .0
+                        .registry(&tenant)
+                        .and_then(|r| self.0.was_running(&r))
+                        .is_ok_and(|marker| !marker);
+                    (!flushed).then(|| Error("guest flush failed; recorded as unclean".into()))
+                }
+                Err(error) => {
+                    // The VM may still be running and will be killed by
+                    // systemd. The marker is already durable; this adds the
+                    // reason when the registry is readable.
+                    if let Ok(r) = self.0.registry(&tenant) {
+                        let _ = self.0.mark_unclean(&r, &format!("service_stop: {error}"));
+                    }
+                    Some(error)
+                }
+            };
+            // The journal keeps these, the only measurements of the stop.
+            let ms = started.elapsed().as_millis();
+            match failure {
+                None => eprintln!("tenant {tenant}: clean stop took {ms} ms"),
+                Some(error) => {
+                    eprintln!("tenant {tenant}: unclean stop after {ms} ms: {error}");
+                    failures.push((tenant, error));
+                }
+            }
+        }
+        failures
     }
     fn wake(&mut self, tenant: &str, r: &Registry) -> Result<bool> {
         let key = self.0.key(r)?;
@@ -314,6 +468,12 @@ impl<B: Backend> Controller<B> {
         }
         result.map(|()| false)
     }
+}
+
+fn removed(quarantine: PathBuf) -> Response {
+    Response::new(Reply::Removed {
+        quarantine: quarantine.display().to_string(),
+    })
 }
 
 #[cfg(test)]

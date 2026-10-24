@@ -45,7 +45,7 @@ an SSH connection or executes a local command.
 
 | Hosted condition | Existing `RefusalReason` | Detail code |
 | --- | --- | --- |
-| Broker 401/403, host authentication refusal | `RunnerAuthenticationFailed` | `hosted_auth` |
+| Broker 401/403 (except a lease's 403 `account_closed`), host authentication refusal | `RunnerAuthenticationFailed` | `hosted_auth` |
 | Expired lease | `RunnerAuthenticationFailed` | `hosted_expired` |
 | TLS SPKI mismatch | `RunnerAuthenticationFailed` | `hosted_spki_mismatch` |
 | No account grant/machine token (`not_found`) | `RunnerAuthenticationFailed` | `hosted_account_not_found` |
@@ -58,11 +58,12 @@ an SSH connection or executes a local command.
 | Connection failure before Run | `Unreachable` | `hosted_connect_failed` |
 | Broker unavailable | `Unreachable` | `hosted_broker_unreachable` |
 | Budget exhausted | `RequestRejected` | `hosted_budget_exhausted` |
+| Account closed (lease 403 `account_closed`); final, never retried and never sent back to the build server, spilled jobs included | `RequestRejected` | `hosted_account_closed` |
 | Broker platform unavailable | `PlatformUnsupported` | `hosted_platform_unsupported` |
 | No timeout or runtime cap below minimum | `RequestRejected` | `hosted_no_timeout`, `hosted_max_s_too_short` |
 | Path outside supported roots | `RequestRejected` | `hosted_path_outside_roots` |
 | Hosted workspace prepare/drop | `RequestRejected` | `hosted_prepare_unsupported` |
-| Return path limits/capability missing | `RequestRejected` | `return_paths_exceeded`, `return_paths_unsupported` |
+| Return path limits/capability missing | `RequestRejected` | `return_paths_exceeded`, `return_paths_unsupported`, `return_chunked_unsupported` |
 | Runner lease mismatch | `RequestRejected` | `lease_mismatch` |
 | Generic pre-start request rejection | Existing validation reason | `hosted_request_rejected` |
 
@@ -81,6 +82,14 @@ Conditions without an exact 0.2.8 refusal variant, for the caller-types owner:
   terminal is already stored, keep that result even when billing is unavailable.
 - `hosted_job_admitted` is recovery via attach, not resubmission. Settled/released
   jobs (`hosted_job_finished`, `hosted_job_released`) do not authorize a fresh Run.
+- A job whose stream dropped after its own host ended and settled it by usage
+  report is still reattachable for 24 hours: the broker answers the reattach with
+  an attach token instead of `job_finished`, the host replays the remaining
+  output, terminal and billed usage from ck-motor's cursor, and the job ends with
+  its real exit code. ck-motor reports and settles nothing for it. Boat jobs and
+  jobs settled any other way keep `job_finished` (outcome unknown unless a real
+  terminal is already stored). Test:
+  `stream_lost_after_host_settled_reattaches_and_replays_the_real_terminal`.
 
 Tests: `hosted_config_defaults_omit_all_keys_and_fake_is_forbidden_on_main`,
 `hosted_refusals_use_legacy_reason_and_distinct_codes`, and the account-token
@@ -107,7 +116,7 @@ other job changes route.
 - The lease avoids no host (`avoid_host` is null) and is not retried for
   capacity: a `no_capacity` or `host_full` answer refuses at once.
 - The result returns as for any direct job: the command's exit code, with the
-  job ID and reattach secret on stderr. A lease that can't be granted or
+  job ID and secret-file path on stderr. A lease that can't be granted or
   connected is a before-start refusal, exit 200, whose detail is the hosted code
   followed by the broker's error code, for example
   `hosted_capacity: broker no_capacity`. It never falls back to the build

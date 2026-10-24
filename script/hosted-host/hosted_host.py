@@ -9,6 +9,13 @@ install.sh calls this to produce, on stdout, the exact bytes it installs:
                                     the provision.py operator JSON for tenant 1
   public-ip                         the one global IPv4 address of this machine
 
+and one operator query, which reads motor-host's admin socket as root:
+
+  runner-log --tenant T --since TIME [--until TIME] [--job UUID]
+                                    the tenant runner's journal for a window,
+                                    redacted in the guest to the runner's own
+                                    labels, counters and job ids
+
 The machine-specific facts (CPU layout, account ranges, install paths) are
 constants here, beside their reasons, so test_hosted_host.py can check them
 against each other, against install.sh and against the Rust config structs
@@ -17,11 +24,14 @@ that read the rendered files.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import importlib.util
 import ipaddress
 import json
 from pathlib import Path
 import re
+import socket
+import struct
 import subprocess
 import sys
 
@@ -162,6 +172,66 @@ def public_ipv4(ip_output: str) -> str:
     return found[0]
 
 
+def unix_seconds(text: str) -> int:
+    """A Unix time in seconds, or an ISO 8601 time; one without a zone is UTC."""
+    if re.fullmatch(r"\d+", text):
+        return int(text)
+    moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return int(moment.timestamp())
+
+
+def runner_log_request(tenant: str, since: int, until: int | None, job: str | None) -> dict:
+    """The admin-socket request for the tenant runner's journal in a window.
+    motor-host forwards it to the guest as the read-only diagnostics op."""
+    if until is not None and until < since:
+        raise ValueError("--until is before --since")
+    request = {"tenant": tenant, "op": "diagnostics", "since_unix_s": since}
+    if until is not None:
+        request["until_unix_s"] = until
+    if job is not None:
+        request["jti"] = job
+    return request
+
+
+def admin_exchange(request: dict, path: Path = ADMIN_SOCKET) -> dict:
+    """One length-prefixed JSON request and reply on motor-host's admin socket."""
+    body = json.dumps(request).encode()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(60)
+        connection.connect(str(path))
+        connection.sendall(struct.pack(">I", len(body)) + body)
+        header = connection.recv(4, socket.MSG_WAITALL)
+        if len(header) != 4:
+            raise ValueError("motor-host closed the admin socket without a reply")
+        (length,) = struct.unpack(">I", header)
+        reply = b""
+        while len(reply) < length:
+            chunk = connection.recv(length - len(reply))
+            if not chunk:
+                raise ValueError("motor-host closed the admin socket mid-reply")
+            reply += chunk
+    return json.loads(reply)
+
+
+def runner_log_lines(reply: dict) -> list[str]:
+    """One `<UTC time> <message>` line per journal entry, then a note when the
+    guest cut the window short."""
+    if reply.get("ok") is not True:
+        raise ValueError(f"diagnostics refused: {reply.get('error', 'no reason given')}")
+    journal = reply.get("journal", {})
+    if journal.get("unavailable"):
+        raise ValueError("the guest could not read the tenant runner's journal")
+    lines = []
+    for entry in journal.get("entries", []):
+        moment = datetime.fromtimestamp(entry["unix_us"] / 1_000_000, tz=timezone.utc)
+        lines.append(f"{moment.isoformat(timespec='microseconds')} {entry['message']}")
+    if journal.get("truncated"):
+        lines.append("# truncated: narrow --since/--until or add --job")
+    return lines
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -176,8 +246,19 @@ def main() -> int:
     tenant.add_argument("--disk-quota-gib", type=int)
     tenant.add_argument("--image-version")
     commands.add_parser("public-ip")
+    runner_log = commands.add_parser("runner-log")
+    runner_log.add_argument("--tenant", required=True)
+    runner_log.add_argument("--since", required=True, help="Unix seconds or ISO 8601 (UTC if no zone)")
+    runner_log.add_argument("--until", help="Unix seconds or ISO 8601 (UTC if no zone)")
+    runner_log.add_argument("--job", help="keep only entries naming this job id (jti)")
     args = parser.parse_args()
     try:
+        if args.command == "runner-log":
+            request = runner_log_request(args.tenant, unix_seconds(args.since),
+                                         None if args.until is None else unix_seconds(args.until), args.job)
+            for line in runner_log_lines(admin_exchange(request)):
+                print(line)
+            return 0
         if args.command == "public-ip":
             output = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
                                     check=True, capture_output=True, text=True).stdout

@@ -16,15 +16,20 @@ from build_storage import DiskMeter, FREE_FLOOR, GIB, assert_unmounted, choose_b
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
+PARITY_FILES = tuple((REPO / "script/runner/parity-files.txt").read_text().splitlines())
 BOOT_ARGS = ("console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro "
              "init=/sbin/motor-init net.ifnames=0 ipv6.disable=1 "
              "systemd.unified_cgroup_hierarchy=1")
 RUNNER_INPUTS = (
     "script/runner/tools.txt", "script/runner/install-tools.sh",
-    "script/runner/toolchain.json",
     "script/runner/build-sccache.sh", "script/runner/motor-net.nft",
     "script/runner/patches/sccache-0.18.0-read-only-hits.patch",
-)
+    "script/runner/build-git.sh", "script/runner/install-binaryen.py",
+    "script/runner/job-account.py",
+    "script/runner/units/system/motor-jobs.slice",
+    "script/runner/sysctl/60-motor-inotify.conf", "script/boat-image/install.py",
+    "script/tenant-image/guest/root_paths.py",
+) + tuple(f"script/runner/{name}" for name in PARITY_FILES)
 
 
 def digest(path):
@@ -50,6 +55,10 @@ def load_versions(path):
     for name in ("node", "npm", "bun", "pnpm", "rust_default", "kernel", "kernel_gcc", "rustup"):
         if not re.fullmatch(r"\d+\.\d+\.\d+", pins[name]):
             raise ValueError(f"invalid release pin: {name}")
+    # Cleanup needs fchmodat2 with AT_EMPTY_PATH (Linux 6.6+). Firecracker's
+    # supported guest series with that syscall starts at 6.18, not 6.12.
+    if tuple(map(int, pins['kernel'].split('.'))) < (6, 18, 0):
+        raise ValueError('kernel must be >=6.18.0 for a Firecracker-supported guest with fchmodat2(AT_EMPTY_PATH)')
     if pins["rust_default"] not in pins["rust_toolchains"]:
         raise ValueError("default Rust must be an installed pinned toolchain")
     for toolchain, targets in pins["rust_toolchains"].items():

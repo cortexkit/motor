@@ -57,7 +57,7 @@ paths below bound in. `ProtectSystem=strict`, `ProtectHome=tmpfs`,
 | --- | --- | --- |
 | The workspace, at the caller's absolute path | Read-write | The runner's checkout of the snapshot |
 | The workspace's `.git` | Read-only | Same checkout |
-| Each sibling, at its own absolute path (and next to the workspace under its directory name) | Read-only | The runner's sibling checkout |
+| Each sibling, at its own absolute path (and next to the workspace under its directory name) | Read-only | Its immutable per-commit sibling snapshot; the host checkout only in legacy in-place mode |
 | `/run/motor/target` and the per-workspace target path | Read-write | The workspace's private build output |
 | `/motor-home` (`HOME`), with a private `CARGO_HOME` at `/motor-home/cargo` | Read-write | Per-job directory |
 | `/motor-home/cargo/registry`, `/motor-home/cargo/git` | Read-only | The shared Cargo registry and Git sources |
@@ -72,6 +72,12 @@ paths below bound in. `ProtectSystem=strict`, `ProtectHome=tmpfs`,
 | `/etc/resolv.conf` | Read-only, outbound jobs only | Generated; see 6.3 |
 | `/motor-output/{stdout,stderr,exit,cache-stats}` | Write to existing files only | The job's durable output |
 
+Sibling snapshot paths may be in a different allowed workspace root. The
+runner authorizes their resolved destinations just as it does the workspace;
+neither nesting nor colliding worktree aliases are supported. The mount remains
+at exactly the supplied canonical path, with a read-only worktree alias.
+Operator test: `isolated_snapshot_sibling_in_another_allowed_root_is_read_only_at_its_path`.
+
 Source: `Sandbox` construction in `crates/motor-runner/src/isolation.rs`.
 Test for the command shape: `systemd_job_command_preserves_shell_source_and_forces_private_tmp`.
 The complete mount list is not covered by one test; the
@@ -79,6 +85,15 @@ The complete mount list is not covered by one test; the
 `/dev/shm` is sized to `MemoryMax`, and the rules below name tests for other
 properties. A Rust job also gets `CARGO_TARGET_DIR=/run/motor/target` and
 `SCCACHE_DIR=/motor-cache`.
+
+Boat sandboxes and tenant VMs have no shared compile cache: their jobs get
+no `/motor-cache` mount, no `RUSTC_WRAPPER` and no `SCCACHE_*` variables. A Rust
+job there still builds in the same fixed folder as on the build server:
+`CARGO_TARGET_DIR=/run/motor/target`, bound to the workspace's own `target/`, so
+build paths and `./target` behave identically everywhere. Tests:
+`hosted_jobs_bypass_shared_compile_cache_but_keep_the_fixed_target_folder`,
+`tenant_rust_launch_builds_in_fixed_target_without_compile_cache`
+(`crates/motor-runner/src/backend_tests.rs`).
 
 3.1. A job cannot read the runner's state, mirrors, other workspaces or other
 jobs' sandboxes. Tests: `isolated_job_cannot_access_runner_or_other_jobs` and
@@ -128,8 +143,34 @@ sources. Tests: `isolated_nested_javascript_jobs_resolve_offline_and_reuse_trust
 
 ## 4. Processes
 
-4.1. A job has a private PID namespace (`PrivatePIDs=yes`) and cannot see or
-signal other accounts' processes. Test: `isolated_job_cannot_see_another_accounts_process`.
+4.1. A job has a private PID namespace and cannot see or signal processes
+outside it. systemd >=257 uses `PrivatePIDs=yes`; the explicit Boat profile on
+older systemd uses the runner's `job-pid-init` bootstrap, then execs the same
+bash wrapper as PID 1 with the job beneath it. The bootstrap temporarily starts
+as root, mounts namespace-local proc while retaining systemd's protected proc
+submounts, and drops to `motor-job` with no capabilities, no-new-privileges,
+a fresh user-owned session keyring and namespace seccomp before job code runs.
+The trusted supervisor remains outside the namespace in the same cgroup. Tests:
+`isolated_job_cannot_see_another_accounts_process`,
+`boat_pid_init_unit_changes_only_what_the_init_needs`,
+`namespace_filter_refuses_new_pid_namespaces_and_clone3_on_every_path`.
+The live Boat probe checks PID 1, `/proc/1/cgroup`, outside-PID ESRCH, credentials,
+capabilities, keyring ownership, proc protections and setsid-child cleanup;
+portable tests do not establish those privileged transitions.
+
+4.1.1. What a job sees in `/proc`: its own processes only
+(`ProtectProc=invisible` hides other accounts'), plus the machine-wide entries
+such as `/proc/stat`, `/proc/meminfo`, `/proc/cpuinfo`, `/proc/loadavg` and
+`/proc/uptime`. `ps`, test harnesses and system-information libraries read
+those (`ps` needs the boot time in `/proc/stat`). `ProtectKernelTunables=yes`
+keeps `/proc/sys` and the other kernel-setting files read-only. Boat jobs see
+exactly the same: the Boat profile does not set `ProcSubset=pid`, which would
+hide every non-process entry and make `ps` fail. On Boat those entries describe
+only the sandbox VM, which admits one job; on the build server they describe the
+shared host, as they always have. Test:
+`boat_command_preserves_isolation_and_limits_without_private_pids`
+(`crates/motor-runner/src/isolation/tests.rs`); the live Boat probe checks the
+mount and the entries from inside a job (`script/boat-image/README.md`).
 
 4.2. The command starts only after the runner has written the job's durable
 record: the service waits on a one-byte gate on its stdin, and end-of-file runs
@@ -141,6 +182,91 @@ ignore `SIGTERM`. Test: `isolated_cancel_kills_entire_cgroup_including_term_igno
 
 4.4. A job starts with no ignored or blocked signals. Test:
 `isolated_job_starts_with_no_ignored_or_blocked_signals`.
+
+4.4.1. On Boat's older-systemd bootstrap path, the wrapper's exit file remains
+authoritative and the supervisor mirrors its exit or terminating signal for
+systemd's status fallback. Status 226 is a retry-safe refusal only with a
+complete failure line in the root-only setup file, no wrapper exit code and
+no job output. With neither a valid exit file nor that evidence, execution is
+unknown; a wrapper-recorded exit 226 remains an ordinary job exit. Tests:
+`supervisor_reproduces_real_exit_and_sigkill_wait_status`,
+`boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit`.
+
+The exit inode is opened no-follow and parsed with a 33-byte read (32 bytes
+maximum plus one overflow byte). That observation is carried into classification,
+never reread, including for oversized or sparse files. Supervisor wait failure
+uses status 227 and no retry-safe record; without a wrapper exit status the
+outcome remains unknown. The supervisor never duplicates a child's core dump;
+it mirrors the terminating signal with its own core-dumped bit clear.
+The fallback also starts its own session, re-arms parent-death SIGKILL after
+the credential drop, checks the supervisor pidfd to close the PPid-zero race,
+and validates moved proc protections against a live independent reference.
+Tests: `post_credential_drop_rearms_parent_death_signal`,
+`job_group_sigcont_does_not_reach_supervisor_session`,
+`supervisor_wait_failure_cannot_write_a_setup_record`,
+`proc_protections_must_equal_the_independent_reference_after_moves`.
+
+4.4.2. How a job can tell it is inside a motor job sandbox. On every Linux
+host that runs jobs (the build server, a Boat sandbox and a hosted tenant VM)
+these hold, and callers may rely on them:
+
+- The job's process runs in the cgroup of its own transient system service,
+  `/proc/self/cgroup` reads `0::/motor.slice/motor-jobs.slice/motor-job-<uuid>.service`, with a
+  UUID in lowercase hyphenated form. It is the id of the runner that started the
+  unit and need not equal the job id the caller sees: a hosted job runs under
+  the tenant runner's own id. The name comes from one function, `host_unit_name`
+  in `crates/motor-runner/src/backend.rs`.
+- That cgroup is not delegated to the job: its directory and control files are
+  owned by root, so the job cannot change its own limits.
+- PID 1 in the job's PID namespace (4.1) is the bash wrapper, running as the job
+  account.
+- The job account is `motor-job` (2.1). The tenant image recipe pins it to the
+  build server's uid and gid (999 and 986). Boat lets the system choose a free
+  system uid and a dedicated primary group when building each image, and records
+  the actual identity in the image inventory. Callers should check the sandbox
+  properties above, not a particular account number.
+
+A caller that checks these should check the full shape (slice, prefix, UUID
+and suffix), not a prefix, and refuse when any of them differs. The live Boat
+probe checks PID 1 and `/proc/1/cgroup` (4.1); the cgroup path shape and
+ownership are not covered by a test.
+
+4.4.3. All job and cache-writer services, snapshot dependency helpers, Windows
+preparation and QEMU services share `motor-jobs.slice`. Its `MemoryHigh=75%`
+throttles and reclaims before `MemoryMax=85%` invokes cgroup OOM; percentages
+refer to physical host RAM, so the same policy scales down on Boat and tenant
+VMs. Swap is disabled for this slice. The remaining 15% is headroom for the
+runner and system, not a reservation against unrelated host workloads. The
+per-job limits remain unchanged. A slice cap bounds actual aggregate use,
+unlike charging admission for each job's declared maximum, which would reject
+low-memory jobs unnecessarily. CPU admission is unchanged.
+
+Work services have `OOMScoreAdjust=900` and `OOMPolicy=kill`, so an OOM victim's
+remaining processes are stopped. Runners stay outside that slice at `-900`.
+Their `OOMPolicy=continue` keeps a killed launcher or permission-helper child
+from making systemd stop the control-plane service as well.
+The unprivileged build-server user manager cannot lower an inherited OOM score:
+`script/runner/install-units.sh` therefore installs a privileged
+`user@<operator-uid>.service` drop-in as well as the user runner units and the
+system slice. Drain every instance and reboot before using the new negative
+user-service score; reloading alone does not change the running user manager.
+Boat and tenant runners are system services, so PID 1 can set their score
+directly. The separate root permission-repair CLI raises its own score to 900;
+root runners' in-process permission walks are still part of the runner.
+
+Launch refuses a missing/unbounded slice rather than silently using systemd's
+implicit unlimited slice. A killed launcher before gate release is setup
+refusal, not an executed/lost job. A victim of an ancestor OOM still increments
+its own `oom_kill` counter even if its own `max` and `oom` counters stay zero;
+the existing OOM counts and per-job vCPU advice remain available. More vCPUs
+raise only the per-job limit, not the shared host budget.
+
+Tests: `installed_units_reserve_host_memory_and_protect_user_runners`,
+`missing_or_unbounded_job_slice_refuses_execution`,
+`dead_launcher_never_counts_as_a_started_job_even_if_unit_is_active`,
+`ancestor_slice_oom_keeps_victim_counters_and_vcpu_advice`, and the operator-only
+`isolated_job_memory_budget_and_oom_priority_protect_runner` (real cgroup limits,
+job membership and `/proc` OOM scores; it does not exhaust host RAM).
 
 4.5. The command runs as `bash -c <command>` with the request's working
 directory. Its environment is the request's filtered variables (5.1) with the
@@ -192,6 +318,12 @@ before upload with
 
 6.3. A job granted outbound access gets a veth pair into its namespace (its
 side is `eth0`, IPv4 only) and reaches the internet through NAT. The runner
+turns IPv6 off on `eth0`; on a kernel with no IPv6 at all (the tenant VM image
+boots with `ipv6.disable=1`, so its namespaces have no `/proc/sys/net/ipv6`)
+there is nothing to turn off and the step is skipped. Any other failure of that
+step, including a failed write while IPv6 exists, fails the attach. Test:
+`eth0_ipv6_disable_is_skipped_only_when_the_namespace_has_no_ipv6`
+(`crates/motor-runner/src/network_linux.rs`). The runner
 checks at startup that the `motor_net` nftables table is present; the operator
 installs it (see [runner-install.md](runner-install.md#6-optional-job-networking)). The table
 (`script/runner/motor-net.nft`) lets the job open connections only to public

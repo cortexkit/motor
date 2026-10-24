@@ -500,3 +500,111 @@ fn watchdog_runtime_stops_the_only_lease_once_and_clears_durable_stop_pending() 
     assert!(!h.snapshot.vms["tenant"].stop_pending);
     assert!(h.snapshot.vms["tenant"].initialized_generation.is_none());
 }
+
+#[test]
+fn retention_deletes_records_just_past_thirteen_months_and_keeps_unsettled_reports() {
+    use motor_host::billing::{BILLING_RETENTION_MS, RETENTION_INTERVAL_MS};
+    let dir = scratch();
+    let mut h = disk_host(dir.path());
+    h.consume_nonce("nonce".into(), NOW, NOW).unwrap();
+    // JOB ends one millisecond before JOB2. Its usage report is never
+    // confirmed, so after the 30-day retry window it is set aside.
+    started(&mut h, JOB, 1);
+    end(&mut h, JOB, 3, MS + 3000, terminal(JOB, "exit"));
+    h.terminal_delivered(JOB, MS + 3000).unwrap();
+    started(&mut h, JOB2, 4);
+    end(&mut h, JOB2, 6, MS + 3001, terminal(JOB2, "exit"));
+    h.terminal_delivered(JOB2, MS + 3001).unwrap();
+    let settled = h.snapshot.outbox[1].clone();
+    assert!(h
+        .finish_request(
+            &settled,
+            200,
+            &json!({"job_id":JOB2,"settled_vcpu_ms":3001,"released_vcpu_ms":0})
+        )
+        .unwrap());
+    h.expire_outbox(MS + 3000 + OUTBOX_MAX_AGE_MS).unwrap();
+    assert_eq!(h.snapshot.expired_outbox.len(), 1);
+    let archive = dir.path().join("outbox-expired");
+    assert_eq!(std::fs::read_dir(&archive).unwrap().count(), 1);
+    // JOB3 finished as long ago as JOB, but its report is still queued and
+    // inside its retry window (re-queued a day before the pass).
+    started(&mut h, JOB3, 7);
+    end(&mut h, JOB3, 9, MS + 3000, terminal(JOB3, "exit"));
+    h.terminal_delivered(JOB3, MS + 3000).unwrap();
+    let boundary = MS + 3001 + BILLING_RETENTION_MS;
+    h.snapshot.outbox[0].created_ms = boundary - 86_400_000;
+
+    // JOB2 finished exactly thirteen months ago: not more than, so it stays.
+    assert_eq!(h.prune_retention(boundary - 1).unwrap(), 0);
+    assert_eq!(h.retention_tick(boundary).unwrap(), 1);
+    assert!(h.snapshot.nonces.is_empty());
+    for (job, kept) in [(JOB, false), (JOB2, true), (JOB3, true)] {
+        assert_eq!(h.snapshot.leases.contains_key(job), kept, "{job} lease");
+        assert_eq!(h.snapshot.billing.contains_key(job), kept, "{job} billing");
+    }
+    assert!(h.snapshot.expired_outbox.is_empty());
+    assert_eq!(std::fs::read_dir(&archive).unwrap().count(), 0);
+    // The pruned state is what the journal holds after a restart.
+    drop(h);
+    let mut h = disk_host(dir.path());
+    assert!(!h.snapshot.leases.contains_key(JOB));
+    assert!(h.snapshot.leases.contains_key(JOB2));
+    // A pass is not repeated before its interval: the tick one millisecond
+    // later skips JOB2 even though it is then past thirteen months.
+    assert_eq!(h.retention_tick(boundary).unwrap(), 0);
+    assert_eq!(h.retention_tick(boundary + 1).unwrap(), 0);
+    assert!(h.snapshot.leases.contains_key(JOB2));
+    // A pass at that instant deletes JOB2. JOB3 is far older but still
+    // unsettled inside its retry window, so it survives.
+    assert_eq!(h.prune_retention(boundary + 1).unwrap(), 1);
+    assert!(!h.snapshot.leases.contains_key(JOB2));
+    assert!(h.snapshot.leases.contains_key(JOB3));
+    assert_eq!(
+        h.retention_tick(boundary + RETENTION_INTERVAL_MS).unwrap(),
+        0
+    );
+    assert!(h.snapshot.leases.contains_key(JOB3));
+    // Once the retry window lapses the report is set aside, and the next pass
+    // deletes it with the rest of JOB3's records.
+    let lapsed = boundary - 86_400_000 + OUTBOX_MAX_AGE_MS;
+    h.expire_outbox(lapsed).unwrap();
+    assert_eq!(std::fs::read_dir(&archive).unwrap().count(), 1);
+    assert_eq!(h.prune_retention(lapsed).unwrap(), 1);
+    assert!(h.snapshot.leases.is_empty() && h.snapshot.billing.is_empty());
+    assert!(h.snapshot.outbox.iter().all(|r| r.job.is_none()));
+    assert!(h.snapshot.expired_outbox.is_empty());
+    assert_eq!(std::fs::read_dir(&archive).unwrap().count(), 0);
+}
+
+#[test]
+fn retention_never_deletes_a_running_lease_and_drains_a_backlog_in_bounded_passes() {
+    use motor_host::billing::{BILLING_RETENTION_MS, RETENTION_BATCH};
+    let mut h = host();
+    started(&mut h, JOB, 1);
+    end(&mut h, JOB, 3, MS + 3000, terminal(JOB, "exit"));
+    h.billing_tick(MS + 63_000).unwrap();
+    let request = h.snapshot.outbox[0].clone();
+    h.finish_request(
+        &request,
+        200,
+        &json!({"job_id":JOB,"settled_vcpu_ms":3000,"released_vcpu_ms":0}),
+    )
+    .unwrap();
+    let finished = h.snapshot.leases[JOB].clone();
+    let total = RETENTION_BATCH + 10;
+    for n in 0..total {
+        h.snapshot
+            .leases
+            .insert(format!("old-{n:04}"), finished.clone());
+    }
+    started(&mut h, JOB2, 4);
+    let later = MS + 3000 + BILLING_RETENTION_MS + 1;
+    assert_eq!(h.retention_tick(later).unwrap(), RETENTION_BATCH);
+    // A full batch leaves the next pass due at once, on the next tick.
+    assert_eq!(
+        h.retention_tick(later).unwrap(),
+        total + 1 - RETENTION_BATCH
+    );
+    assert_eq!(h.snapshot.leases.keys().collect::<Vec<_>>(), vec![JOB2]);
+}

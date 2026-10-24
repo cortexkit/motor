@@ -1063,6 +1063,8 @@ fn hello_without_started_capability_keeps_legacy_wire_bytes() {
         Frame::Hello {
             protocol_version: 1,
             return_paths: false,
+            return_chunked: false,
+            sibling_paths: false,
             started: false,
             default_branch_tip: false,
             gate_jobs: false,
@@ -1076,6 +1078,8 @@ fn hello_without_started_capability_keeps_legacy_wire_bytes() {
         Frame::Hello {
             protocol_version: 1,
             return_paths: false,
+            return_chunked: false,
+            sibling_paths: false,
             started: true,
             default_branch_tip: false,
             gate_jobs: false,
@@ -1093,6 +1097,8 @@ fn hello_default_branch_tip_capability_is_additive() {
         Frame::Hello {
             protocol_version: 1,
             return_paths: false,
+            return_chunked: false,
+            sibling_paths: false,
             started: true,
             default_branch_tip: true,
             gate_jobs: false,
@@ -1118,6 +1124,22 @@ fn hello_default_branch_tip_capability_is_additive() {
     } = serde_json::from_slice(&serde_json::to_vec(&capable).unwrap()).unwrap();
     assert_eq!(protocol_version, 1);
     assert!(started);
+}
+
+#[test]
+fn hello_sibling_paths_capability_is_additive_and_defaults_false() {
+    for enabled in [false, true] {
+        let frame: Frame = serde_json::from_value(serde_json::json!({
+            "type": "hello", "protocol_version": 1, "sibling_paths": enabled
+        }))
+        .unwrap();
+        assert!(matches!(frame, Frame::Hello { sibling_paths, .. } if sibling_paths == enabled));
+        let wire = serde_json::to_value(frame).unwrap();
+        assert_eq!(
+            wire.get("sibling_paths"),
+            enabled.then_some(&serde_json::Value::Bool(true))
+        );
+    }
 }
 
 #[test]

@@ -46,6 +46,7 @@ pub fn lease_request() -> LeaseRequest {
         avoid_host: None,
         timeout_s: 10,
         requester_jwk: RequesterJwk::from_key(&SigningKey::from_bytes(&[3; 32]).verifying_key()),
+        allow_spill: Some(true),
     }
 }
 pub fn post(b: &mut FakeBroker, path: &str, body: &impl Serialize, now: u64) -> BrokerReply {

@@ -27,6 +27,8 @@ mod host;
 #[cfg(windows)]
 mod hvsock;
 pub(crate) mod prep;
+pub(crate) mod prep_error;
+mod staging;
 #[cfg(windows)]
 mod trusted_prep;
 #[cfg(unix)]
@@ -34,11 +36,12 @@ pub(crate) mod vm;
 #[cfg(windows)]
 #[path = "windows/hyperv.rs"]
 pub(crate) mod vm;
-pub(crate) use agent::{PreparedVm, Runtime};
+pub(crate) use agent::Runtime;
 pub(crate) use caches::CacheDisks;
 #[cfg(test)]
 pub(crate) use vm::VmHook;
 
+<<<<<<< HEAD
 #[cfg(windows)]
 static SERVICE_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[cfg(windows)]
@@ -51,8 +54,28 @@ pub(crate) fn service_stop_requested() -> bool {
 }
 
 #[cfg(unix)]
+=======
+/// Prepare a QEMU job's resources for `id` and drop them at once, as a setup
+/// attempt that fails right after `Resources::prepare` would.
+#[cfg(all(test, unix))]
+pub(crate) fn prepare_and_drop_resources(
+    config: &crate::engine::Config,
+    id: uuid::Uuid,
+    workspace: &str,
+) -> std::io::Result<()> {
+    let staging = config
+        .windows
+        .as_ref()
+        .expect("validated Windows config")
+        .layout_root
+        .join("staging")
+        .join(id.to_string());
+    vm::Resources::prepare(config, staging, id, workspace).map(drop)
+}
+
+>>>>>>> origin/main
 pub(crate) fn prepare_entry(path: &Path) -> std::io::Result<()> {
-    prep::execute(path)
+    prep::execute(path).inspect_err(|error| eprintln!("{}", prep_error::error_line(error)))
 }
 #[cfg(windows)]
 pub(crate) fn probe_peers() -> io::Result<()> {
@@ -222,6 +245,29 @@ pub(crate) fn command(config: &Config, program: &str, args: &[String]) -> io::Re
     Command::new(program).args(args).output()
 }
 
+/// Converts one member of the stored Windows collection to the form the Linux
+/// backend reports in `workspace_changes`: a '/'-separated path relative to the
+/// job's checkout root (the workspace key).
+///
+/// The guest sees host path P at `C:\m` + P, so a collection member is
+/// `m/` followed by the host path without its leading '/'. The guest collects
+/// everything under `C:\m`, which also holds sibling checkouts. The Linux
+/// backend runs `git status` in the checkout root, and sibling checkouts sit
+/// beside the checkout rather than inside it, so Linux never reports them.
+/// Members outside the checkout root are therefore left out here too.
+/// The stored collection keeps the `m/` form because other readers of the
+/// job directory depend on it; only the reported list is converted.
+fn checkout_relative(key: &str, member: &str) -> Option<String> {
+    let host = member.strip_prefix("m/")?;
+    let root = key.trim_matches('/');
+    let relative = if root.is_empty() {
+        host
+    } else {
+        host.strip_prefix(root)?.strip_prefix('/')?
+    };
+    (!relative.is_empty()).then(|| relative.to_owned())
+}
+
 pub(crate) struct WindowsBackend;
 impl Backend for WindowsBackend {
     fn validate(&self, config: &Config) -> io::Result<()> {
@@ -242,7 +288,7 @@ impl Backend for WindowsBackend {
         _weight: u32,
     ) -> io::Result<Launch> {
         let execution = prepared
-            .windows
+            .vm
             .as_ref()
             .ok_or_else(|| invalid("Windows VM was not prepared"))?
             .lock()
@@ -256,7 +302,9 @@ impl Backend for WindowsBackend {
                 unit: Some(setup.id),
             }),
             durable_output: false,
-            execution: Box::new(execution),
+            execution,
+            // A VM job never mounts a fill's write sockets.
+            cache_ledgers: Vec::new(),
         })
     }
     fn cancel(&self, config: &Config, job: &Job, hard: bool) -> io::Result<()> {
@@ -296,11 +344,16 @@ impl Backend for WindowsBackend {
             .join("jobs")
             .join(job.id.to_string())
             .join("windows-changes.json");
-        if path.exists() {
-            read_json(&path).map(Some)
-        } else {
-            Ok(None)
+        if !path.exists() {
+            return Ok(None);
         }
+        let collected: Vec<String> = read_json(&path)?;
+        Ok(Some(
+            collected
+                .iter()
+                .filter_map(|member| checkout_relative(job.key(), member))
+                .collect(),
+        ))
     }
     fn reconcile(&self, config: &Config, _interrupted: &[Job]) -> io::Result<Vec<Uuid>> {
         #[cfg(any(target_os = "linux", test))]

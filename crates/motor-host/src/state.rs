@@ -69,6 +69,9 @@ pub struct Snapshot {
     pub counter: u64,
     #[serde(default)]
     pub last_alive: u64,
+    /// Tenants whose accounts the broker reported closed, by tenant name.
+    #[serde(default)]
+    pub closed: BTreeMap<String, crate::closure::ClosedTenant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -79,6 +82,8 @@ pub enum Refusal {
     HostFull,
     Capacity,
     InternalFailure,
+    /// The host could not record the lease because its disk is full.
+    StorageFull,
 }
 impl Refusal {
     pub fn wire(self) -> &'static str {
@@ -88,6 +93,7 @@ impl Refusal {
             Self::HostFull => "host_full",
             Self::Capacity => "capacity",
             Self::InternalFailure => "internal_failure",
+            Self::StorageFull => "storage_full",
         }
     }
 }
@@ -111,6 +117,20 @@ impl std::fmt::Display for Error {
     }
 }
 impl std::error::Error for Error {}
+impl Error {
+    /// The refusal a requester receives when this error ends its admission.
+    /// A journal write that ran out of space is `storage_full`; any other
+    /// journal failure is `internal_failure`.
+    pub fn refusal(&self) -> Refusal {
+        match self {
+            Self::Refused(reason) => *reason,
+            Self::Journal(error) if error.kind() == io::ErrorKind::StorageFull => {
+                Refusal::StorageFull
+            }
+            Self::Journal(_) => Refusal::InternalFailure,
+        }
+    }
+}
 fn refuse<T>(r: Refusal) -> Result<T, Error> {
     Err(Error::Refused(r))
 }
@@ -146,6 +166,8 @@ struct LiveVm {
     runner_idle: bool,
     space_logged: bool,
     idle_since_ms: Option<u64>,
+    suspend_failures: u32,
+    suspend_retry_after_ms: u64,
     events_since_ms: Option<u64>,
 }
 
@@ -169,6 +191,8 @@ pub struct Host {
     pub(crate) restart_ms: u64,
     pub(crate) prior_alive_ms: u64,
     pub(crate) provider_managed: bool,
+    /// When the next billing-record retention pass is due; see `retention_tick`.
+    pub(crate) retention_due_ms: u64,
 }
 impl Host {
     pub fn new(
@@ -187,7 +211,14 @@ impl Host {
             restart_ms: 0,
             prior_alive_ms: 0,
             provider_managed: false,
+            retention_due_ms: 0,
         }
+    }
+    /// Replaces the journal, so tests can make writes fail the way a full
+    /// disk does. Production never swaps the journal of a running host.
+    #[doc(hidden)]
+    pub fn replace_journal(&mut self, journal: Box<dyn Journal>) {
+        self.journal = journal;
     }
     pub(crate) fn sandbox(ceiling: u32, snapshot: Snapshot, journal: Box<dyn Journal>) -> Self {
         let mut host = Self::new(
@@ -401,6 +432,11 @@ impl Host {
             .any(|c| c.job == claims.jti && c.purpose == claims.purpose);
         let mut next = self.snapshot.clone();
         let mut admission = Admission::Ready;
+        if claims.purpose == Purpose::Run && self.is_closed(&tenant.tenant) {
+            // A closed account starts no new job. Attach stays open so a
+            // client can still collect a result already running or finished.
+            return refuse(Refusal::Auth);
+        }
         if claims.purpose == Purpose::Attach {
             if live || old.is_none() {
                 return refuse(Refusal::Auth);
@@ -773,6 +809,16 @@ impl Host {
             live.preludes = live.preludes.saturating_sub(1);
         }
     }
+    /// A relay or a connection setup for one of the tenant's jobs is open.
+    pub(crate) fn tenant_busy(&self, tenant: &str) -> bool {
+        self.live.get(tenant).is_some_and(|v| v.preludes > 0)
+            || self.connections.iter().any(|connection| {
+                self.snapshot
+                    .leases
+                    .get(&connection.job)
+                    .is_some_and(|lease| lease.tenant == tenant)
+            })
+    }
     fn tenant_idle(&self, tenant: &str) -> bool {
         let Some(live) = self.live.get(tenant) else {
             return false;
@@ -803,6 +849,9 @@ impl Host {
         };
         let idle = self.is_ready(tenant) && !self.is_suspending(tenant) && self.tenant_idle(tenant);
         let live = self.live.entry(tenant.to_owned()).or_default();
+        if idle_suspend_s == 0 || now_ms < live.suspend_retry_after_ms {
+            return false;
+        }
         if !idle {
             live.idle_since_ms = None;
             live.space_logged = false;
@@ -857,10 +906,31 @@ impl Host {
             self.guest_unready(tenant);
         }
         let live = self.live.entry(tenant.to_owned()).or_default();
+        if succeeded {
+            live.suspend_failures = 0;
+            live.suspend_retry_after_ms = 0;
+        }
         live.suspending = false;
         live.idle_since_ms = None;
         self.publish_connections();
         still_idle
+    }
+    pub(crate) fn suspend_failed(&mut self, tenant: &str, now_ms: u64) {
+        let live = self.live.entry(tenant.to_owned()).or_default();
+        live.suspend_failures = live.suspend_failures.saturating_add(1);
+        // Snapshot failures can saturate shared storage. Activity does not erase
+        // this cooldown: a busy/idle cycle must not trigger another large write.
+        let delay_ms = (30 * 60 * 1000u64)
+            .saturating_mul(1 << live.suspend_failures.saturating_sub(1).min(4))
+            .min(6 * 60 * 60 * 1000);
+        live.suspend_retry_after_ms = now_ms.saturating_add(delay_ms);
+        tracing::info!(
+            tenant,
+            failures = live.suspend_failures,
+            retry_after_ms = live.suspend_retry_after_ms,
+            delay_ms,
+            "suspend_backoff"
+        );
     }
 }
 fn counted(l: &Lease, now_ms: u64) -> bool {

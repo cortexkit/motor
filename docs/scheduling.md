@@ -80,7 +80,20 @@ When a head does not fit the free capacity, smaller heads behind it may run in
 its place (backfill) for its first 60 seconds. After that, or when the blocked
 head is a gate job, backfill stops until it fits. A head blocked by its own
 workspace (a checkout in use, a deletion, a sibling conflict) does not stop
-others. Running jobs are never stopped or moved to other CPUs, and no capacity
+others. A head whose last start attempt failed (its setup record or the
+catalog could not be saved, say) is queued again and not started before a
+retry delay, 1 second doubling to at most 60 seconds per consecutive failure.
+During that delay it keeps its place and its claim on capacity, exactly as a
+head waiting for permits: a gate or aged head still stops backfill, and when
+nothing else (a workspace owner, a sibling checkout) holds it, its
+`waiting_on` is `permits`. A head whose earlier start attempt is still being
+cleaned up (a Windows VM not yet confirmed stopped) waits like a head blocked
+by its own workspace, with `waiting_on` = `workspace setup`, and stops no one:
+that cleanup has no upper bound. Tests:
+`a_gate_in_its_start_retry_delay_still_fences_capacity`,
+`a_gate_with_cleanup_pending_fences_nothing`
+(`crates/motor-runner/src/tests/gate_priority.rs`). Running jobs are never
+stopped or moved to other CPUs, and no capacity
 is permanently reserved. Tests: `capped_head_allows_backfill_only_until_its_grace_expires`
 (`crates/motor-runner/src/tests.rs`), `capacity_blocked_gate_still_fences_smaller_workers`,
 `workspace_conflicted_gate_does_not_block_independent_workers`,
@@ -91,9 +104,18 @@ is permanently reserved. Tests: `capped_head_allows_backfill_only_until_its_grac
 - A job's queue-wait clock starts when its bundles are verified and pinned, not
   at acceptance; upload, fetch and setup do not count. Test:
   `upload_fetch_and_setup_do_not_spend_queue_wait_budget`.
+  A job that is queued behind a running owner of its workspace starts with its
+  clock paused. A job queued again after a failed start resumes its clock at
+  that moment, so the failed attempt's setup does not count either. Tests:
+  `a_fetched_job_behind_its_workspace_owner_starts_paused`,
+  `a_requeued_job_is_not_charged_for_its_failed_setup`
+  (`crates/motor-runner/src/tests/state_lock.rs`).
 - While the job is queued, its heartbeats carry `queue_wait_ms`. The clock
   advances for capacity and other shared scheduler blockers, but pauses while
-  the only blocker is an earlier job that owns the same workspace. If another
+  the only blocker is an earlier job that owns the same workspace, or a job in
+  another workspace that checks this workspace's directory out as a sibling
+  (`waiting_on` = `sibling user of this checkout`). It still advances if the
+  job would not fit even once that holder frees its permits. If another
   blocker appears, queue time resumes from its accumulated value. Cancellation
   still removes a queued job; the request's execution timeout still starts when
   its command starts. Job status reports the current scheduler blocker in
@@ -107,6 +129,8 @@ is permanently reserved. Tests: `capped_head_allows_backfill_only_until_its_grac
   `only_observed_permit_wait_can_withdraw_not_elapsed_acceptance`,
   `workspace_owner_wait_does_not_spend_queue_wait_budget`,
   `queue_wait_clock_resumes_for_capacity_after_workspace_owner_finishes`,
+  `sibling_user_wait_is_named_with_its_holder_and_does_not_spend_queue_wait_budget`,
+  `sibling_user_wait_still_spends_budget_when_capacity_would_also_block`,
   `cancelled_workspace_waiter_is_removed_from_the_queue`,
   `jobs_waiting_on_a_workspace_keep_fifo_order`
   (`crates/motor-runner/src/tests.rs`),

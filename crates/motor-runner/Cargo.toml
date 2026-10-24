@@ -28,6 +28,14 @@ uuid = { version = "1", features = ["serde", "v7"] }
 
 [target.'cfg(unix)'.dependencies]
 cortexkit-cow = "=0.1.1"
+# The remote compile cache gateway: HTTP/1.1 parsing, SigV4 signing and TLS to
+# the object store.
+hmac = "0.12"
+httparse = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+motor-macvm = { path = "../motor-macvm" }
 
 [target.'cfg(windows)'.dependencies]
 tokio = { workspace = true, features = ["io-std"] }

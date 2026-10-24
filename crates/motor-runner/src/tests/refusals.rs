@@ -131,13 +131,14 @@ fn refusal_logs_preserve_errors_from_transfer_fetch_setup_restart_and_attach() {
         .state = JobState::Queued;
     let log = logs(|| {
         runner
-            .launch(
+            .launch_without_dispatch(
                 Setup {
                     id: setup.job_id,
                     cpus: vec![1, 17],
                     request: setup.clone(),
                     base: false,
                     recorded: BTreeMap::new(),
+                    snapshots: None,
                 },
                 Err(io::Error::other("sandbox ownership denied")),
             )
@@ -230,4 +231,66 @@ fn policy_and_withdrawal_refusals_log_their_diagnostics() {
         "RunnerDiskFull",
         "free_bytes=7 floor_bytes=100",
     );
+}
+
+/// A terminal that cannot be persisted is retried with the job still being
+/// finalized. The failure is logged at WARN once, not once per retry, and
+/// its recovery once.
+#[test]
+fn repeated_terminal_persistence_failures_warn_once() {
+    use std::os::unix::process::ExitStatusExt;
+    let f = Fixture::new();
+    let failures_left = Arc::new(Mutex::new(0usize));
+    let mut c = f.config();
+    c.manual_tick = true;
+    c.disable_warm_builds = true;
+    c.catalog_write = Some({
+        let failures_left = failures_left.clone();
+        Arc::new(move |step| {
+            let mut left = failures_left.lock().unwrap();
+            if step == CatalogWrite::Starting && *left > 0 {
+                *left -= 1;
+                return Err(io::Error::other("injected catalog write failure"));
+            }
+            Ok(())
+        })
+    });
+    let runner = Runner::open(c).unwrap();
+    // Armed after startup, whose maintenance also writes the catalog.
+    *failures_left.lock().unwrap() = 3;
+    let (request, _) = f.run("true");
+    let id = request.job_id;
+    let now = runner.now();
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        inner
+            .catalog
+            .workspaces
+            .insert(request.workspace_key.clone(), Workspace::default());
+        let mut job = Job::new(id, Some(request), now, 1, 2);
+        job.state = JobState::Running;
+        job.started_ms = Some(now);
+        inner.jobs.insert(id, job);
+    }
+    let log = logs(|| {
+        runner
+            .finish(id, Ok(std::process::ExitStatus::from_raw(0)))
+            .unwrap()
+    });
+    assert_eq!(*failures_left.lock().unwrap(), 0, "{log}");
+    let warnings = log
+        .lines()
+        .filter(|line| line.contains("terminal persistence failed"))
+        .count();
+    assert_eq!(warnings, 1, "{log}");
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("terminal persisted after failed attempts"))
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(runner.core.inner.lock().unwrap().jobs[&id]
+        .terminal
+        .is_some());
 }

@@ -29,6 +29,34 @@ workspace nested inside a known one, is refused before setup. Tests:
 `nested_workspace_is_refused_before_any_workspace_is_created`
 (`crates/motor-runner/src/tests/nested_workspaces.rs`).
 
+1.3. Isolated Linux runners advertising `hello.sibling_paths` accept siblings
+in any of their allowed workspace roots, not only beside the repository root.
+Existing path components are resolved before authorization and overlap checks;
+a symlink cannot escape an allowed root or hide nesting. A disallowed path's
+refusal names `allowed_roots`. Siblings, their worktree aliases and workspaces
+must not overlap, including siblings with colliding directory names. Tests:
+`snapshot_sibling_in_another_allowed_root_is_prepared`,
+`snapshot_sibling_path_authorization_refuses_roots_nesting_and_symlink_escape`,
+`snapshot_sibling_refuses_nesting_in_known_workspace_or_sibling_by_canonical_path`.
+
+After an in-place sibling checkout is retired, its worktree alias can remain a
+dangling host symlink. Snapshot mounts do not need that host checkout. A dangling
+alias is accepted only when its target resolves to the declared sibling path;
+the virtual alias mount node still receives root, overlap and writer-storage
+checks. Other dangling host paths remain refused. Tests:
+`snapshot_worktree_with_a_dangling_legacy_sibling_alias_is_admitted`,
+`snapshot_worktree_rejects_unrelated_dangling_aliases_and_alias_root_escapes`.
+
+1.4. Older runners, in-place runners and Windows runners still require siblings
+to share the repository root's parent directory. For a linked worktree this
+means beside its main checkout, not beside the worktree. In-place runners
+recreate and share host checkouts; Windows uses mapped staging exports rather
+than Linux snapshot mounts. The client checks the runner's Hello before sending
+Have, Run, Prepare or bundles, so an unsupported layout refuses before start.
+Tests: `in_place_and_windows_siblings_still_require_neighbours`,
+`legacy_runner_refuses_non_neighbour_siblings_before_run_and_prepare`,
+`new_direct_client_negotiates_gate_mark_with_pinned_runner` (mixed-version gate).
+
 ## 2. What goes in
 
 The optional cache-fill tip is separate from the submitted snapshot commit.
@@ -186,6 +214,44 @@ Not covered by a test in this repository.
 7.1. Before uploading, `ck-motor` and the runner exchange which commits each
 side has (`have` / `have_reply`), and only missing history is bundled. Test:
 `unchanged_random_file_is_excluded_from_second_bundle` (`safety.rs`).
+
+7.1.1. The runner reports a commit only when one of its snapshot or tip refs
+reaches it, and pins every reported commit with a `refs/held/<commit>` ref for
+six hours. The bundle uses the reported commits as prerequisites, and Git
+accepts a prerequisite with no ref only while the history behind it is
+complete, which the runner's mirror does not promise once the job or workspace
+record that pinned it has expired. Held refs are pruned after six hours and are
+not themselves a reason to report a commit again. Tests:
+`reported_commit_stays_a_valid_prerequisite_after_its_record_is_pruned`,
+`held_refs_expire_and_unreferenced_commits_are_not_reported`
+(`crates/motor-runner/src/tests/held_prerequisites.rs`).
+
+7.1.2. One unusable ref in a mirror fails every later bundle fetch into it,
+because Git's connectivity check reads every ref. A ref is unusable when its
+file is empty or unreadable, or when its commit or that commit's root tree is
+missing; an unclean stop can leave any of these. When a bundle fetch fails,
+the runner checks the ref files, each ref's commit and root tree, and the
+failed bundle's prerequisites, without walking history, and removes the
+unusable refs. It never deletes objects, because checkouts borrow them. If it
+removed anything, the job is refused before start as `transfer_interrupted`
+with a detail starting `mirror_repaired:` that names the refs. The next
+attempt's have reply no longer reports them, so the sender bundles what they
+pinned. The runner runs the same check on every mirror when it starts.
+Tests: `an_empty_mirror_ref_file_is_removed_after_the_fetch_it_breaks`,
+`a_mirror_ref_at_a_missing_commit_is_removed_after_the_fetch_it_breaks`,
+`startup_removes_unusable_mirror_refs` (same file).
+
+7.1.3. The have reply lists only the newest held commits: a held commit whose
+child is also held is left out, so a default-branch tip behind a held snapshot,
+or a snapshot behind a later held commit, is not named. `ck-motor` therefore
+sends a repository's bundle only when its snapshot commit or tip is not
+reachable from the reported commits. When everything is reachable it sends no
+bundle for that repository, because the runner needs the commits as objects in
+its mirror, not a bundle for each repository; an empty bundle would be refused
+by Git. Tests: `no_bundle_when_runner_holds_a_snapshot_with_the_tip_behind_it`,
+`no_bundle_when_runner_holds_a_descendant_of_snapshot_and_tip`,
+`sibling_and_main_bundles_are_skipped_independently`
+(`crates/motor-module/src/snapshot.rs`).
 
 7.2. Git dependencies pinned in `Cargo.lock` are sent as separate bundles when
 the runner advertises support; older runners receive none. Tests:

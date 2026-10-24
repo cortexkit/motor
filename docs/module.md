@@ -1,6 +1,6 @@
 # The ck-motor module
 
-`ck-motor` is motor's client. It runs on the caller's Mac as a reserved module
+`ck-motor` is motor's client. It runs on the caller's machine as a reserved module
 of the CortexKit daemon (SubC). It receives `exec-remote/v1` requests, captures a
 snapshot of the caller's checkout, and sends it with the command to
 `motor-runner` over SSH. This document covers how it is placed, who may call it,
@@ -24,7 +24,9 @@ components. They do not ship in this repository.
 - Environment: the daemon supplies `SUBC_MODULE_ID=ck-motor` and the launch
   nonce. `PATH` must reach `ssh` and `git`. `HOME` and `XDG_DATA_HOME` locate the
   development storage fallback. No runner secret is passed in the environment.
-- The manifest's `capabilities.provides` is exactly `["exec-remote/v1"]`.
+- The manifest's `capabilities.provides` is `["exec-remote/v1", "flow-scopes/v1",
+  "exec-remote-return/v1", "exec-remote-return/v2"]`, plus `exec-remote-windows/v1` when a Windows runner
+  is configured and `exec-remote-net/v1` when `network_routing` is on.
 - Operations: `exec.run`, `exec.attach`, `exec.cancel`, `exec.status`,
   `workspace.prepare`, `workspace.drop`, and the read-only `runner.health` report.
 
@@ -44,6 +46,7 @@ The config file is JSONC. Unknown keys are refused. All keys are optional.
 | `windows_runners` | `[]` (omitted) | Ordered Windows endpoints: `name`, `host`, `port` (22), `user`, pinned OpenSSH `host_key`, `instance`, `state_root`, `max_concurrent` (1). Takes precedence over the legacy pair. See [windows-jobs.md](windows-jobs.md). |
 | `worktree_roots` | `$XDG_DATA_HOME/cortexkit/alfonso/worktrees` | Absolute roots under which linked worktrees are recognised as task workspaces. |
 | `queue_wait_limit_s` | `300` | Default queue-wait budget for a job. |
+| `hosted_repositories` | `[]` (omitted) | Absolute main-checkout repository roots whose ordinary Linux jobs request hosted leases instead of the direct runner. See [repository routing](#hosted-repository-routing). |
 | `network_routing` | `false` | Forward a caller's request for outbound network. When off, such requests are refused with `network_unsupported`. |
 | `admit_direct_exec` | `false` | Admit direct local callers (`ck motor run`) for their own jobs. |
 | `direct_exec_max_timeout_secs` | `7200` | Longest timeout a direct run may ask for. |
@@ -143,13 +146,67 @@ recovery continue to distinguish the codes below.
 | `runner_agent_start_failed` | The agent could not start. Retried the same way. |
 | `runner_ssh_config_invalid` | The SSH alias could not be resolved. Not retried. |
 | `runner_agent_stopped` | The agent stopped. |
-| `runner_sign_missing`, `runner_sign_grant_refused`, `runner_sign_invalid_response`, `runner_sign_unavailable` | A signature was refused. Latched until `ck-motor` restarts. |
+| `runner_sign_missing`, `runner_sign_grant_refused` | The vault had no signing credential, or refused the grant. New jobs are refused for 30 seconds, then the next sign request asks the vault again; re-creating the credential or re-approving the grant does not need a restart. |
+| `runner_sign_invalid_response`, `runner_sign_unavailable` | The vault sent a reply the agent could not use, or was unavailable. New jobs are refused for 2 seconds, then the next sign request asks the vault again. |
 
 Tests: `missing_key_fails_health_and_run_before_snapshot_or_ssh`,
 `refused_grant_fails_health_and_run_before_snapshot_or_ssh`,
 `missing_enrollment_recovers_health_without_restart`,
 `credential_backoff_doubles_caps_and_stops_on_shutdown`,
-`agent_start_failure_recovers_without_restart`.
+`agent_start_failure_recovers_without_restart`,
+`transient_sign_failure_is_retried_after_backoff_and_health_recovers`,
+`refused_sign_grant_is_retried_after_longer_backoff_once_reapproved`.
+
+### Retry hints on credential refusals
+
+Only a transient signing failure (`runner_sign_unavailable`,
+`runner_sign_invalid_response`) puts the terminal record's optional
+`retry_after_ms` on its refusal. The hint is the time left in the agent's
+backoff for that failure: once it passes, the next job's sign request asks the
+vault again, so a caller can wait and retry remotely instead of running the job
+somewhere else. It does not promise the vault has recovered. Prepare replies
+carry the same hint.
+
+| Code | `retry_after_ms` |
+| --- | --- |
+| `runner_sign_unavailable`, `runner_sign_invalid_response` | The milliseconds left in the agent's 2-second backoff for that failure, rounded up: at least 1, at most 2000. |
+| `runner_sign_missing`, `runner_sign_grant_refused` | Absent. An operator must re-create the credential or re-approve the grant; a wait-and-retry hint would make a caller retry in a loop. |
+| `runner_credential_*`, `runner_agent_start_failed`, `runner_agent_stopped`, `runner_ssh_config_invalid` | Absent. Most need an operator to fix the vault, the agent or the SSH alias; the background retries above have no fixed time a caller could wait for. |
+
+The hint is set wherever a connector refusal becomes a refusal: the check
+before the snapshot, and a refusal found while opening the runner channel. Both
+the agent route and `ck motor run` receive it, and `ck motor run` prints it in
+its refusal line as `(retry after N ms)`. The field is omitted, not `null`,
+when there is no hint, and older callers that know it read it as written. Tests:
+`transient_sign_failures_hint_the_time_left_in_their_backoff`,
+`repairable_sign_failures_carry_no_hint`,
+`transient_sign_refusal_hints_the_backoff_left_and_the_hint_shrinks`,
+`connector_retry_hint_reaches_run_and_prepare_refusals`,
+`a_refusal_line_names_its_retry_hint_only_when_it_has_one`,
+`oldest_production_client_decodes_new_refusal_tags_as_unknown_with_detail`.
+
+### Retry hints on capacity refusals
+
+A job the build server refuses because its queue wait ran out
+(`refused_before_start`, reason `queue_wait_exceeded`) carries a
+`retry_after_ms` hint when another job's completion is what frees it: enough
+free permits, a running job's workspace, a queued job ahead in the same files,
+or a job using this checkout as a sibling. The hint is the median queue wait of
+the jobs the runner started in the last hour, clamped to 1000-60000 ms, and it
+is absent when the job can never fit or when nothing started recently. A job
+moved to hosted capacity by a spill withdrawal carries none: its caller is never
+refused. The exact rules are in
+[wire-protocol.md](wire-protocol.md#5-refusals-and-the-no-start-proof) (5.5 and
+5.6). The field is the same one signing refusals use, so a client that already
+reads it needs no change, and can wait out the hint and retry remotely instead of
+running the job somewhere else. The runner computes the hint, so it appears once
+the runner is deployed: `ck-motor` only passes the terminal record through.
+
+Tests: `capacity_refusal_carries_the_recent_median_queue_wait_as_its_retry_hint`,
+`capacity_retry_hint_is_clamped_to_its_bounds`,
+`impossible_demand_refusal_carries_no_retry_hint`,
+`capacity_refusal_without_recent_starts_carries_no_retry_hint`,
+`spill_withdrawal_carries_no_retry_hint`.
 
 ## Storage
 
@@ -275,6 +332,90 @@ master before stopping the agent, and removes its runtime directory. A force-kil
 skips that cleanup: stop any
 orphaned SSH master before reusing a crashed installation's storage root.
 
+## Agent runs: hosted usage and returned files
+
+These additions to AFT's `exec.run`, `exec.attach` and `exec.status` follow
+`cortexkit-exec-remote-types` 0.2.10. Source: `crates/motor-module/src/agent_route.rs`.
+
+**Hosted usage.** A job whose Run frame went to a hosted runner (first-party or
+Boat) has `hosted` on its terminal record. It holds `placement`, the lease's
+host (for example `ovh-1` or `boat:<sandbox_id>`), and `billed_vcpu_ms` once
+billing has settled. Build-server jobs omit `hosted`, and so do spills that went
+back to the build server. ck-motor adds no wait for billing. The job stream
+already holds a first-party hosted terminal up to five seconds for the host's
+settlement record, and settles a Boat job with the broker before sending its
+terminal record. If billing is still pending after that, `billed_vcpu_ms` is
+absent. A
+later `exec.attach` re-sends the terminal record and `exec.status` returns it,
+both with the figure as it stands at that moment.
+
+**Returned files.** `return_paths` names files relative to the request's `cwd`;
+`return_max_bytes` caps their total size, 262,144 bytes when absent. A larger
+cap is refused as `invalid_params` before any job exists, whether or not paths
+accompany it. Each path is joined to `cwd`, then the same lexical bounds as
+direct runs apply before start: an absolute path, `..`, more than 64 paths or a
+path outside the workspace is refused as `request_rejected` with
+`return_paths_exceeded`. Hosted runners collect files in the same way as the
+build server. The runner's result reaches the caller as a `return_result` record
+immediately before the terminal record, with cwd-relative paths. Collection
+failures (`over_cap`, `missing`, `escape`, `not_regular`, `frame_limit`) do not
+change the job's outcome. A reattach from before the record's `seq` replays it.
+
+Only a request with non-empty `return_paths` receives the record. This route
+has no per-caller capability handshake: `started` goes to every caller, and
+older callers skip it as an unknown record. ck-motor instead lists `exec-remote-return/v1` among
+its capabilities, and a caller sends paths only to a module that lists it.
+Callers built before 0.2.9 cannot send the field, so they never receive the
+record.
+
+**Chunked returned files.** A request that also sets `return_chunked` gets up
+to 10 MiB of files (64 paths at most) instead of 256 KiB. `return_max_bytes`
+then defaults to, and may be at most, 10,485,760; above 262,144 bytes it is
+allowed only with `return_chunked`. Instead of `return_result`, the stream
+carries `return_chunk` records (at most 512 KiB of one file each, all of one
+file's chunks before the next file's, in request order) and then one
+`return_manifest` immediately before the terminal record. The manifest lists
+every requested path exactly as the caller sent it, with its size and SHA-256,
+or a failure: `missing`, `not_regular`, `escape`, `over_cap` (with the file's
+size; it would have passed the cap, which the runner decides before reading any
+file, so it has no chunks) or `read_error` (the file changed size, or its path
+named a different file, while it was read; its bytes are not sent). Paths are
+collected through the same no-follow walk as `return_result`.
+
+The runner keeps returned bytes for one hour after the job ends, in their own
+directory beside the job record, written and synced before the record that
+names them, like replayed output. Within that hour a reattach replays the same
+chunks and manifest at the same seqs. After it, a replay sends no chunks and
+the manifest at its original seq, with each returned entry turned into
+`expired` (keeping its size) and `total_bytes` 0. That leaves a seq gap just
+before the manifest; callers that set `return_chunked` accept it. The job
+record itself still lives for the usual 24 hours.
+
+ck-motor lists `exec-remote-return/v2` next to v1, and a caller sets
+`return_chunked` only for a module that lists it. The runner advertises
+support with `return_chunked` in its Hello. A runner without it (an older
+build-server, tenant or Boat image, or a Windows runner, which refuses returned
+files altogether) gets no Run: the job is refused before start as
+`request_rejected` with `return_chunked_unsupported`. Callers that do not set
+the flag get exactly the `return_result` behaviour above. `ck motor run` does
+not offer chunked return.
+
+Tests: `agent_route::tests` in `crates/motor-module/src/agent_route_tests.rs`
+(hosted usage, settled and pending billing, a hosted return result, the chunked
+cap and path echo), `crates/motor-module/tests/it/return_paths.rs`
+(`return_chunked_agent_caller_gets_a_verified_430_kb_file`,
+`return_paths_agent_v1_caller_gets_only_return_result`,
+`return_chunked_runner_without_capability_refuses_before_run`),
+`crates/motor-runner/src/tests/return_paths.rs`
+(`return_chunked_430_kb_file_round_trips_through_replay_and_restart`,
+`return_chunked_replay_after_one_hour_skips_chunks_and_leaves_a_seq_gap`),
+`crates/motor-runner/src/return_paths.rs` (the 10 MiB cap, growth and a file
+swapped for a symlink), and in
+`crates/motor-module/tests/it/operator_cli.rs`
+`agent_return_paths_send_return_result_immediately_before_the_terminal`,
+`agent_without_return_paths_never_receives_a_return_result`,
+`agent_over_cap_return_max_bytes_is_invalid_params_and_never_runs`.
+
 ## Direct runs
 
 `ck motor run [--vcpus N] [--sibling PATH]... [--env NAME=VALUE]... [--timeout SECONDS] [--cwd PATH] [--secret-file PATH] -- COMMAND...`
@@ -327,10 +468,12 @@ it exits 204 and submits nothing. See
 ### Reattaching after a disconnect
 
 At submission `ck-motor` generates 32 random bytes with the OS CSPRNG, encoded
-as 64 lowercase hex characters. `run` prints one stderr line with the job ID
-and secret. Keep the secret private: possession grants attach, status and cancel for
-that job, not submission or access to any other job. For scripts, prefer a new
-file outside the checkout and captured command logs:
+as 64 lowercase hex characters. Keep the secret private: possession grants
+attach, status and cancel for that job, not submission or access to any other
+job. Without `--secret-file`, `run` saves the secret in a new file named by job
+ID under a per-user `0700` directory in ck-motor's data root, and prints only
+the job ID and file path to stderr. `attach JOB_ID` discovers that default file
+automatically. For scripts that need a caller-selected path, use:
 
 ```sh
 ck motor run --secret-file /private/job.key -- 'cargo test'
@@ -339,10 +482,12 @@ ck motor attach JOB_ID --secret-file /private/job.key --status
 ```
 
 `--secret-file` on `run` creates a new file with mode `0600`, refuses an existing
-file (including a symlink), and prints its path instead of the secret. Without
-`--secret-file`, `attach` reads one line from stdin. Never place the secret in
-argv or an environment variable; neither is an accepted input channel. Do not
-enable shell tracing while handling it. Delete the file when no longer needed.
+file (including a symlink), and prints its path instead of the secret. Default
+files are created exclusively with mode `0600`, removed when a terminal record is
+received, and swept once they exceed the 24-hour job retention. If no default
+file exists, `attach` reads one line from stdin; `--secret-file PATH` selects an
+explicit file. Never place the secret in argv or an environment variable; neither
+is an accepted input channel. Do not enable shell tracing while handling it.
 
 `attach` replays output from the start in order, then follows a still-running
 job to its terminal outcome. It has the same exit-code contract as `run`.
@@ -372,6 +517,120 @@ refusal equivalence (`crates/motor-module/tests/it/operator_cli.rs`):
 `cli_attach_refusals_are_byte_identical_and_secret_file_hides_the_secret`.
 CLI unit tests: `secret_file_is_private_new_and_never_overwrites`,
 `attach_never_accepts_an_argv_secret_or_echoes_it`.
+
+## Hosted repository routing
+
+`hosted_repositories` selects repositories for a staged hosted rollout without
+changing other fleet traffic. Matching uses the resolved `repository_root`, not
+the workspace key: the main checkout, linked worker worktrees and linked gate
+checkouts share that identity. Independent clones have different identities and
+must be listed separately. Paths are canonicalized for comparison; entries must
+be absolute. The empty default is omitted from serialized Config so older clients
+with closed schemas can still read it.
+
+Both agent and direct jobs for a listed repository request a lease before any
+direct-runner submission. The lease sends `avoid_host: null` (ignoring
+`spill_avoid_host`) and `allow_spill: false`, restricting placement to registered
+hosts rather than Boat. These jobs never enter the spill path or fall back to the
+direct runner after a hosted failure; a `no_host_fits` answer, described below,
+is a routing correction, not a failure. Windows stays on its direct runner. Outbound-network jobs can use
+hosted leases: the request's `net` flag must match the signed lease claim, and
+`network_routing` must still be enabled. Unlisted jobs retain their existing
+direct and spill behavior; spilled leases and shadow leases send `allow_spill:
+true`.
+
+For a repository-routed job, broker `503 no_capacity` responses wait for
+`Retry-After` (seconds, clamped to 1–30 seconds; missing or invalid means one
+second) before retrying the identical request, including its job ID. Capacity
+and `202 provisioning` retries share one queue-wait deadline. Exhaustion yields
+a typed retryable refusal, never local execution. The broker can grant a lease
+from a stale view of the host, which then refuses the job as full (`host_full`,
+or `capacity`). A routed job waits two seconds and asks again with the same job
+ID and lease body, within the same queue-wait deadline. The contract allows
+this: a re-request before admission returns the same reservation and placement
+with a fresh run token. These waits don't count against the three placement
+attempts. When the deadline passes, the job gets the same refusal as for
+`no_capacity` (`hosted_capacity`, runner full, retry after 2 s), and the unused
+reservation is released. That holds when the deadline cuts off the lease request
+that asks again after a `host_full` refusal: the job was waiting for the host, so
+it is refused as runner full, not unreachable. A broker that has not answered
+the job's first lease request when the deadline passes gives
+`hosted_provisioning` (unreachable). Before the durable `run_sent`
+marker, refusals identify repository-selected routing with the exact detail text
+`hosted stage-1 routing (hosted_repositories)`.
+After that marker the existing hosted reattach/finish path governs an ambiguous
+submission.
+
+A broker answer of `no_host_fits` (HTTP 422, `{"error":"no_host_fits",
+"max_vcpus":N}`) means no host it could ever use holds the job's vCPUs, so a
+retry cannot succeed. For a repository-routed job that has not sent its Run
+frame, this undoes the routing choice rather than failing the job: ck-motor
+removes the job's hosted route, stores `routed_direct_reason: "no_host_fits"`
+on the job, logs one INFO event `hosted no_host_fits; routing to build server`
+with `job_id`, `vcpus` and `max_vcpus` (`unknown` when the broker omitted it),
+and submits the job to the build server like any unlisted job. The lease is not
+retried, and nothing is released or finished because nothing was booked. The
+stored decision survives restart, so a later attach reads the job from the build
+server. Time already spent waiting on the broker is taken off the job's
+queue-wait limit once, in whole seconds, and the reduced limit is both what the
+Run frame carries and what ck-motor enforces; a positive limit never drops below
+one second. The job does not spill. For spilled and shadow leases
+`no_host_fits` is an ordinary refusal: a spill goes back to the build server
+and a shadow is skipped, each after one lease request. The error code decides;
+a missing or non-numeric `max_vcpus` is read as unknown. Each selected job logs one INFO event, `routed to hosted
+(hosted_repositories)`, with `job_id` and `repo` fields. Hosted health metrics
+include `hosted_routed_jobs_1h`, counting repository-selected jobs (including
+refusals) in the last hour, and `hosted_no_host_fits_1h`, counting
+repository-selected jobs sent to the build server after `no_host_fits` in the
+last hour (these are not in `hosted_routed_jobs_1h`); stored route decisions
+survive restart.
+
+A lease refused with HTTP 403 `{"error":"account_closed"}` means the hosted
+account was closed for good: none of its jobs may run anywhere. On every route
+(configured, repository-routed, spilled, shadow or a direct hosted test) the
+lease is not retried and the job is refused before start with
+`RequestRejected` and detail `hosted_account_closed: hosted account closed`,
+with no retry delay and no local or direct fallback. A spilled job is not sent
+back to the build server either, unlike after `no_capacity`. Only lease
+creation carries this code; a 403 elsewhere stays `hosted_auth`. A job the
+broker placed before the closure keeps its normal answers. Tests:
+`cloud_account_closed_lease_is_one_final_request_on_every_route`,
+`closed_account_rerequest_of_a_placed_job_still_runs_but_a_new_job_is_refused`,
+`spilled_account_closed_is_refused_and_never_resubmitted`.
+
+Tests: `listed_main_and_linked_agent_and_direct_jobs_use_hosted_without_avoiding_a_host`,
+`unlisted_and_windows_jobs_keep_the_direct_path`,
+`stage1_pre_run_failures_are_typed_and_never_submit_directly`,
+`stage1_lost_run_ack_reattaches_without_direct_fallback`,
+`stage1_no_capacity_retries_the_identical_body_then_runs_on_the_host`,
+`stage1_no_capacity_and_provisioning_share_one_bounded_queue_deadline`,
+`stage1_host_full_waits_and_asks_again_until_the_host_admits_the_job`,
+`stage1_host_full_until_the_queue_budget_ends_refuses_like_no_capacity`,
+`stage1_queue_budget_ending_during_a_lease_request_refuses_for_what_the_job_waited_on`,
+`stage1_no_host_fits_runs_on_the_build_server_once_and_fitting_jobs_stay_hosted`,
+`stage1_no_host_fits_decision_survives_restart_and_attaches_to_the_build_server`,
+`stage1_no_host_fits_after_a_capacity_wait_sends_the_remaining_queue_wait`,
+`spill_no_host_fits_resubmits_to_the_build_server_without_retrying`,
+`shadow_no_host_fits_is_one_request_with_or_without_max_vcpus`,
+`no_host_fits_decision_trims_queue_wait_once_and_is_counted_for_an_hour`,
+`unlisted_spill_eligible_job_still_withdraws_and_sends_allow_spill_true`,
+`shadow_lease_explicitly_allows_spill`, and
+`hosted_routed_counter_only_counts_repository_routes_in_the_last_hour`.
+The canonical `no-spill-lease.json` fixture from `cortexkit-cloud` is pinned under
+`crates/motor-lease/contracts/cloud/`. Tests
+`cloud_no_spill_request_serializes_to_the_exact_canonical_bytes_and_hash`,
+`stage1_cloud_no_spill_reply_honors_retry_after_and_preserves_the_stored_request`,
+and `stored_allow_spill_presence_and_value_survive_lease_re_requests` check its
+hash projection, capacity reply, and stable re-request policy. Requester keys are
+excluded from the lease hash; an absent `allow_spill` and either explicit boolean
+have distinct hashes, so the stored request preserves presence as well as value.
+CLOUD's `no-host-fits-lease.json` (from `cortexkit-cloud` `916347e`) is pinned
+beside it: `stage1_cloud_no_host_fits_reply_routes_the_job_to_the_build_server`
+sends its exact 422 reply bytes through ck-motor's broker client, and
+`cloud_no_host_fits_reply_bytes_match_fake` checks the fake broker gives the
+same answer.
+`python3 scripts/mixed-version.py` checks the default Config against the pinned
+older client.
 
 ## Hosted shadow comparisons
 

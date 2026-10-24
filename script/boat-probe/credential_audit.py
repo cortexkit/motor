@@ -51,7 +51,10 @@ def credential_audit(roots=None, environment=None):
                             result["credential_paths"].append(str(path))
                     elif "credential" in lower:
                         # Installed SDK source filenames are not account credential stores.
-                        if lower.endswith((".py", ".pyc", ".js", ".ts", ".map")):
+                        # Boat's base image also caches toolchain sources (Node's under
+                        # ~/.nvm/.cache), whose C++ and ES-module files carry such names.
+                        if lower.endswith((".py", ".pyc", ".js", ".mjs", ".cjs", ".ts", ".mts", ".cts",
+                                           ".map", ".c", ".cc", ".cpp", ".h", ".hpp")):
                             result["source_lookalikes"].append(str(path))
                         else:
                             result["credential_paths"].append(str(path))

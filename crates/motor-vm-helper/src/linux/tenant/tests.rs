@@ -1,5 +1,60 @@
 use super::*;
+use std::io::BufRead;
 use std::os::unix::net::UnixListener;
+
+#[test]
+fn snapshot_deadline_scales_with_memory_and_reserves_helper_cleanup_budget() {
+    assert_eq!(snapshot_create_timeout(1024), Duration::from_secs(60));
+    assert_eq!(snapshot_create_timeout(28 * 1024), Duration::from_secs(478));
+    assert_eq!(snapshot_create_timeout(30 * 1024), Duration::from_secs(480));
+    assert_eq!(snapshot_create_timeout(u64::MAX), Duration::from_secs(480));
+}
+
+#[test]
+fn firecracker_create_timeout_names_the_endpoint_and_uncertain_writer() {
+    let scratch = cortexkit_test_support::ScratchDir::new("create-timeout");
+    let listener = UnixListener::bind(scratch.join("api.sock")).unwrap();
+    let (done, wait) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        assert_eq!(request, "PUT /snapshot/create HTTP/1.1\r\n");
+        wait.recv().unwrap();
+    });
+    let mut uncertain = false;
+    let error =
+        create_snapshot(scratch.path(), Duration::from_millis(20), &mut uncertain).unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.starts_with(crate::tenant::SNAPSHOT_CREATE_UNCERTAIN),
+        "{text}"
+    );
+    assert!(
+        text.contains("PUT /snapshot/create step=read_status request_started=true"),
+        "{text}"
+    );
+    assert!(
+        text.contains("api_timeout") && text.contains("timeout_ms=20"),
+        "{text}"
+    );
+    done.send(()).unwrap();
+    thread.join().unwrap();
+    assert!(uncertain, "a sent create must quarantine the VM on timeout");
+
+    let error = create_snapshot(
+        &scratch.join("missing"),
+        Duration::from_millis(20),
+        &mut uncertain,
+    )
+    .unwrap_err();
+    assert!(!uncertain, "a connection failure did not start a writer");
+    assert!(error.0.starts_with("suspend_create_not_sent"));
+    assert!(error
+        .0
+        .contains("step=open_jail_root request_started=false"));
+}
 
 #[test]
 fn hosted_connect_line_reaches_firecracker_in_one_write() {
@@ -151,4 +206,18 @@ fn hosted_firecracker_bodies_match_the_published_1_17_schema() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn hosted_running_marker_is_written_whole_and_removal_tolerates_absence() {
+    let scratch = cortexkit_test_support::ScratchDir::new("running-marker");
+    let marker = scratch.join("running.json");
+    write_running_marker(&marker).unwrap();
+    let value: Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+    assert!(value["at_ms"].as_u64().unwrap() > 0);
+    assert!(!scratch.join("running.pending").exists());
+    remove_running_marker(&marker).unwrap();
+    assert!(!marker.exists());
+    // A clean stop of a VM that never wrote a marker must still succeed.
+    remove_running_marker(&marker).unwrap();
 }

@@ -63,11 +63,17 @@ fn cloud_final_files_match_their_manifest_digests() {
         serde_json::from_slice(&std::fs::read(root.join("digest-manifest.json")).unwrap()).unwrap();
     for path in [
         "cloud/runners-contract.md",
+        "cloud/bad-request.json",
+        "cloud/no-spill-lease.json",
+        "cloud/no-host-fits-lease.json",
         "cloud/boat-lease.json",
         "cloud/job-tokens.json",
         "cloud/host-signature.json",
         "cloud/lease.json",
         "cloud/usage-settlement.json",
+        "cloud/settled-reattach.json",
+        "cloud/shadow-lease.json",
+        "cloud/account-closure.json",
     ] {
         let entry = manifest
             .files
@@ -78,6 +84,69 @@ fn cloud_final_files_match_their_manifest_digests() {
             sha256_hex(&std::fs::read(root.join(path)).unwrap()),
             entry.sha256,
             "digest mismatch: {path}"
+        );
+    }
+}
+
+#[test]
+fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("contracts/cloud");
+    // These published digests are independent of the editable manifest. Adding
+    // a policy vector must not change the existing cloud vectors' pinned bytes.
+    for (path, digest) in [
+        (
+            "runners-contract.md",
+            "1249be8d6ccaecc3ec3d8d738c43a27d5f999ebc4a51bd0ef8d4d84d088b815c",
+        ),
+        (
+            "bad-request.json",
+            "92bc738250dc962214b60b9c4da205922eae18dc6c6618b2a2eb6c74256f1c62",
+        ),
+        (
+            "no-host-fits-lease.json",
+            "a9b710bf74e5e5b385cbeff3119fbeb17e58ff1a314389bf3f29edc34e1f1c2c",
+        ),
+        (
+            "no-spill-lease.json",
+            "167deadc03d9a1d8e43edf80af8a7ab840ee9641fe485c9c70a8859af0229b94",
+        ),
+        (
+            "boat-lease.json",
+            "a8bdda4fa90dff6607e534efabfa1a17c71b52377af91b714a7a50b9fd4f83bb",
+        ),
+        (
+            "host-signature.json",
+            "9c8876854bb955aa4468ffe9cf61f68d31327bc4e13367813f8c2e89c5e1b398",
+        ),
+        (
+            "job-tokens.json",
+            "541eccc153088ef5be8755bdda9d633bed44237544acae6e365be4124eecc8bb",
+        ),
+        (
+            "lease.json",
+            "aa3996947d5da23807cd32813be57c673610c23ed704d92bf95b24db8ee14d81",
+        ),
+        (
+            "usage-settlement.json",
+            "4f53e2eb16dd586308f31f9a9ffe986c1f214a65aa45dd973f2a3de1f63084b7",
+        ),
+        (
+            "settled-reattach.json",
+            "59308e456afcde26a9fa9973bd9b243a67f8f8cb3886dc8f20c344c597176b16",
+        ),
+        (
+            "shadow-lease.json",
+            "cf0f4481a403e2ab3ab2e7cf65a3375bf70131e4e2e8ad1786e6541c9cf33574",
+        ),
+        (
+            "account-closure.json",
+            "8e3ce5eae03d06e985194f02bd817b7b45a0340e65a4bda8193969cbb3b0569e",
+        ),
+    ] {
+        assert_eq!(
+            sha256_hex(&std::fs::read(root.join(path)).unwrap()),
+            digest,
+            "{path}"
         );
     }
 }

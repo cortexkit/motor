@@ -13,6 +13,11 @@
 # anything there that has been idle for six hours.
 set -uo pipefail
 
+# The operator's login umask is 002, which makes test fixtures group-writable,
+# and the root-owned-path and tenant-path tests then fail on their own scratch
+# trees. Runner jobs and CI use 022.
+umask 022
+
 export TMPDIR=${TMPDIR:-/srv/build/tmp}
 export CARGO_HOME=/srv/build/cargo-home
 export RUSTUP_HOME=/home/ubuntu/.rustup

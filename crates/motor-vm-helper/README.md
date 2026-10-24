@@ -9,7 +9,8 @@ instance runs jobs.
 its host prerequisites, installation, protocol, restart behavior and tests.
 The helper's fixed storage root is `/var/lib/motor-vm`, the root-trusted bind
 view of `/srv/build/vm`. Install and enable the versioned
-`systemd/var-lib-motor\x2dvm.mount` unit and
+`systemd/motor-vm-storage.mount` unit (installed as `var-lib-motor\x2dvm.mount`,
+the name systemd requires for that path) and
 `systemd/motor-vm-storage-private.service` companion before starting the helper.
 The companion runs `mount --make-rprivate` after mounting, so mounts cannot
 propagate back through the source alias; the helper requires it. The install
@@ -63,6 +64,27 @@ succeeds. Recovery runs inside the guest only: mount for XFS journal replay,
 unmount, `xfs_repair -n`, remount, then Git integrity checks before runner start.
 `recovery_complete` checks the guest's successful recovery generation before
 durably removing the host flag. Failure leaves it set. Clean starts are unchanged.
+
+Unclean stops are detected even when nothing ran to record them. Just before a
+tenant VMM starts, the helper fsyncs a `running.json` marker beside the
+generation file. Only a `stop_tenant` whose guest preparation succeeded, or a
+completed suspend, removes it. Any later request for a tenant whose VM is not
+running but whose marker is present first writes `unclean-stop.json` (reason
+`vm_stopped_without_clean_stop`). That covers a helper killed by SIGKILL, a
+host power loss and a VMM that died on its own. A root-owned marker written by
+hand (`{}` is enough) makes the next start run recovery the same way.
+
+Stopping the service is a clean stop. The unit uses `KillMode=mixed`, so
+SIGTERM reaches only the helper, not the tenant VMMs in its cgroup. The
+helper takes SIGTERM and SIGINT on one thread and, once any request in
+progress finishes, runs `stop_tenant` for every running tenant, refuses all
+later requests and exits. A tenant whose preparation fails is recorded as
+unclean before its VMM is killed. Each tenant's outcome and stop time go to
+the journal. systemd then SIGKILLs what is left (job VMs). `TimeoutStopSec`
+covers one in-flight suspend and one tenant's stop; the unit file shows the
+arithmetic. Tests: `service_stop_signal_runs_the_clean_tenant_stop_before_the_helper_exits`,
+`service_stop_signal_records_a_tenant_whose_guest_flush_fails_as_unclean`,
+`killed_helper_leaves_the_running_marker_so_the_next_start_runs_recovery`.
 
 The host's `motor_tenant` nftables table is independent of the guest's per-job
 `motor_net` table. On a shared build server it also cooperates with the host's

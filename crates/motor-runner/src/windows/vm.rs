@@ -168,11 +168,18 @@ impl Resources {
             attached: false,
             cleaned: false,
             cleanup_attempted: false,
-            cleanup_on_drop: true,
+            // Not armed until this attempt owns the paths: if the staging
+            // directory already exists, an earlier attempt for the same job
+            // is not cleaned up yet, and its overlay, socket and staging must
+            // not be deleted by this one's failure.
+            cleanup_on_drop: false,
             child: Box::new(NotBooted),
         };
         fs::create_dir(&resources.staging)
             .map_err(|error| path_error("create staging directory", &resources.staging, error))?;
+        // The staging directory is removed last when an attempt is cleaned
+        // up, so creating it proves no earlier attempt's files remain.
+        resources.cleanup_on_drop = true;
         fs::set_permissions(&resources.staging, fs::Permissions::from_mode(0o700))
             .map_err(|error| path_error("chmod staging directory", &resources.staging, error))?;
         acl(config, "u:motor-prep:rwx", &resources.staging)?;
@@ -256,6 +263,8 @@ impl Resources {
                 "Windows VM host requires Linux",
             ));
         }
+        #[cfg(target_os = "linux")]
+        crate::systemd::require_job_memory_budget()?;
         self.child = Box::new(SystemdChild {
             child: Command::new("/usr/bin/sudo")
                 .args(args)
@@ -443,6 +452,9 @@ pub(super) fn qemu_args(
         "--wait".into(),
         "--collect".into(),
         format!("--unit={unit}"),
+        crate::JOB_MEMORY_PROPERTIES[0].into(),
+        crate::JOB_MEMORY_PROPERTIES[1].into(),
+        crate::JOB_MEMORY_PROPERTIES[2].into(),
         "--property=User=motor-qemu".into(),
         "--property=SupplementaryGroups=kvm".into(),
         "--property=ProtectSystem=strict".into(),

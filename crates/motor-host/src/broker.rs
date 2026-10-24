@@ -214,6 +214,9 @@ impl Sender {
             .expect("host lock")
             .finish_request(&request, status, &body)?
         {
+            if request.path.ends_with("/heartbeat") && (200..300).contains(&status) {
+                self.closed_accounts(&body, now_ms);
+            }
             self.in_flight = None;
             self.failures = 0;
             self.retry_at_ms = 0;
@@ -229,6 +232,24 @@ impl Sender {
             );
         }
         Ok(())
+    }
+    /// Records the closed accounts a heartbeat reply lists. The heartbeat
+    /// already succeeded: a journal failure here is logged, and the broker
+    /// lists the same subjects again in its next reply.
+    fn closed_accounts(&self, reply: &Value, now_ms: u64) {
+        let subjects = crate::closure::closed_subjects(reply);
+        if subjects.is_empty() {
+            return;
+        }
+        let result = self
+            .runtime
+            .host
+            .lock()
+            .expect("host lock")
+            .close_subjects(&subjects, now_ms);
+        if let Err(error) = result {
+            tracing::error!(%error, "closed_accounts_not_recorded");
+        }
     }
     fn failed(&mut self, now_ms: u64) {
         self.failures = self.failures.saturating_add(1);

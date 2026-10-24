@@ -115,6 +115,8 @@ impl Boat {
                             platforms: vec!["linux".into()],
                             default_branch_tip: false,
                             return_paths: false,
+                            return_chunked: false,
+                            sibling_paths: false,
                         },
                     )
                     .await
@@ -432,6 +434,9 @@ async fn cloud_boat_vectors_match_client_request_lease_and_finish_types() {
         serde_json::from_value(booked_request["placement_hint"].clone()).unwrap(),
         serde_json::from_value(booked_request["avoid_host"].clone()).unwrap(),
         RequesterJwk::from_key(&key.verifying_key()),
+        // Every lease ck-motor sends that can reach Boat (spill and shadow)
+        // allows spilling.
+        Some(true),
     )
     .unwrap();
     let built = serde_json::to_value(&lease_request).unwrap();
@@ -448,6 +453,7 @@ async fn cloud_boat_vectors_match_client_request_lease_and_finish_types() {
             "placement_hint",
             "avoid_host",
             "timeout_s",
+            "allow_spill",
         ] {
             assert_eq!(
                 built[field], expected[field],
@@ -668,6 +674,7 @@ async fn cloud_boat_provisioning_response_retries_then_parses_booked_lease() {
             &vector["booked"]["request"]["body"],
             "hosted-test-bearer".into(),
             tokio::time::Instant::now() + Duration::from_secs(30),
+            Error::Provisioning(MIN_PROVISIONING_RETRY_MS),
         )
         .await
         .unwrap();
@@ -737,6 +744,7 @@ async fn cloud_boat_provisioning_budget_exhaustion_is_retryable_and_bounded() {
             &vector["provisioning"]["request"]["body"],
             "hosted-test-bearer".into(),
             started + Duration::from_millis(budget_ms),
+            Error::Provisioning(MIN_PROVISIONING_RETRY_MS),
         )
         .await;
     let elapsed = started.elapsed();
@@ -910,6 +918,7 @@ fn a_lease_body_stored_before_avoid_host_existed_loads_as_avoiding_none() {
             None,
             Some("build-server-1".into()),
             RequesterJwk::from_key(&SigningKey::from_bytes(&[3; 32]).verifying_key()),
+            Some(true),
         )
         .unwrap(),
     )
@@ -934,7 +943,7 @@ fn a_lease_body_stored_before_avoid_host_existed_loads_as_avoiding_none() {
 /// A git checkout with one commit below this crate's target directory. Hosted
 /// workspace paths must be under /Users or /home, so the tests using it need a
 /// checkout in one of those roots, which test scratch directories are not.
-fn committed_repo() -> (tests::harness::Scratch, std::path::PathBuf) {
+pub(crate) fn committed_repo() -> (tests::harness::Scratch, std::path::PathBuf) {
     let scratch = tests::harness::Scratch(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
@@ -967,7 +976,7 @@ fn committed_repo() -> (tests::harness::Scratch, std::path::PathBuf) {
 }
 
 /// Every output byte of `stream`, and its terminal.
-async fn records(mut stream: crate::JobStream) -> (Vec<u8>, TerminalRecord) {
+pub(crate) async fn records(mut stream: crate::JobStream) -> (Vec<u8>, TerminalRecord) {
     let mut output = Vec::new();
     let terminal = tokio::time::timeout(Duration::from_secs(30), async {
         loop {

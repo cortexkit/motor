@@ -7,6 +7,7 @@ use motor_lease::{
 use motor_protocol::*;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::VecDeque,
     future::Future,
     pin::Pin,
     sync::{
@@ -50,6 +51,7 @@ impl Connector for NoSsh {
 #[derive(Clone, Copy)]
 pub enum Behavior {
     Normal,
+    CompleteRun,
     ConnectFailure,
     DropHave,
     Refuse(&'static str),
@@ -59,12 +61,35 @@ pub enum Behavior {
     DropRunAck,
     WrongHello,
     ReturnCapFailure,
+    /// The run connection carries `Started` and the first output record; the
+    /// job then ends on the host, which reports its usage to the broker and
+    /// drops the connection before the rest of the output and the terminal
+    /// reach ck-motor. An attach replays everything from its cursor.
+    SettleThenDrop,
+    /// Like `CompleteRun`, but the runner ends the job as outcome_unknown on
+    /// the live connection after `UNKNOWN_WALL_MS`, with no detail, as
+    /// motor-runner does.
+    UnknownTerminal,
 }
+
+/// Wall time of the `UnknownTerminal` job's terminal.
+pub const UNKNOWN_WALL_MS: u64 = 794_950;
+
+/// The host key the harness registers with its fake broker, so the fake host
+/// can sign its own usage report.
+pub const HOST_MACHINE_SEED: [u8; 32] = [11; 32];
+/// Exit code and output of the `SettleThenDrop` job.
+pub const SETTLED_EXIT_CODE: i32 = 41;
+pub const SETTLED_OUTPUT: [&[u8]; 2] = [b"before the drop\n", b"after the drop\n"];
+
+type LeaseReplies = Arc<Mutex<VecDeque<(u16, serde_json::Value, &'static str)>>>;
 
 pub struct Harness {
     pub route: HostedJobState,
     pub broker: Arc<Mutex<FakeBroker>>,
     pub requests: Arc<Mutex<Vec<String>>>,
+    pub lease_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    pub lease_replies: LeaseReplies,
     pub tokens: Arc<AtomicUsize>,
     pub iats: Arc<Mutex<Vec<u64>>>,
     pub runs: Arc<AtomicUsize>,
@@ -72,6 +97,13 @@ pub struct Harness {
     pub finished: Arc<std::sync::atomic::AtomicBool>,
     pub drop_lease: Arc<std::sync::atomic::AtomicBool>,
     pub release_admitted: Arc<std::sync::atomic::AtomicBool>,
+    /// Refusal reasons the host sends, one per run connection and in order,
+    /// before it falls back to its behavior.
+    pub host_refusals: Arc<Mutex<VecDeque<&'static str>>>,
+    /// The 1-based number of the `/v1/leases` request the broker reads and
+    /// records but never answers, holding its connection open as a broker
+    /// that stopped responding would; 0 answers every request.
+    pub unanswered_lease: Arc<AtomicUsize>,
     pub tasks: Vec<JoinHandle<()>>,
 }
 impl Drop for Harness {
@@ -139,11 +171,18 @@ impl Harness {
             .unwrap(),
         ));
         std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
+        broker.lock().unwrap().register_host(
+            "test-host".into(),
+            SigningKey::from_bytes(&HOST_MACHINE_SEED).verifying_key(),
+        );
         let tokens = Arc::new(AtomicUsize::new(0));
         let iats = Arc::new(Mutex::new(Vec::new()));
         let runs = Arc::new(AtomicUsize::new(0));
         let frames = Arc::new(Mutex::new(Vec::new()));
+        let host_refusals = Arc::new(Mutex::new(VecDeque::<&'static str>::new()));
         let host_task = tokio::spawn({
+            let broker = broker.clone();
+            let host_refusals = host_refusals.clone();
             let tokens = tokens.clone();
             let iats = iats.clone();
             let runs = runs.clone();
@@ -156,6 +195,8 @@ impl Harness {
                     let iats = iats.clone();
                     let runs = runs.clone();
                     let frames = frames.clone();
+                    let host_refusals = host_refusals.clone();
+                    let broker = broker.clone();
                     tokio::spawn(async move {
                         let Ok(mut tls) = acceptor.accept(socket).await else {
                             return;
@@ -209,7 +250,15 @@ impl Harness {
                         Nonces::default()
                             .verify(&challenge, &claims, &requester_jwk, &sig, now_s())
                             .unwrap();
-                        if let Behavior::Refuse(reason) = behavior {
+                        let queued = if purpose == Purpose::Run {
+                            host_refusals.lock().unwrap().pop_front()
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = queued.or(match behavior {
+                            Behavior::Refuse(reason) => Some(reason),
+                            _ => None,
+                        }) {
                             if purpose == Purpose::Run {
                                 super::super::tls::write(
                                     &mut tls,
@@ -245,6 +294,8 @@ impl Harness {
                             &mut tls,
                             &Frame::Hello {
                                 return_paths: false,
+                                return_chunked: false,
+                                sibling_paths: false,
                                 protocol_version: if matches!(behavior, Behavior::WrongHello) {
                                     PROTOCOL_VERSION + 1
                                 } else {
@@ -274,7 +325,13 @@ impl Harness {
                                             repositories: repositories
                                                 .into_iter()
                                                 .map(|mut r| {
-                                                    r.commits.clear();
+                                                    if !matches!(
+                                                        behavior,
+                                                        Behavior::CompleteRun
+                                                            | Behavior::UnknownTerminal
+                                                    ) {
+                                                        r.commits.clear();
+                                                    }
                                                     r
                                                 })
                                                 .collect(),
@@ -284,9 +341,54 @@ impl Harness {
                                     .await
                                     .unwrap();
                                 }
-                                Frame::Run(_) => {
+                                Frame::Run(run) => {
                                     runs.fetch_add(1, Ordering::SeqCst);
+                                    if matches!(behavior, Behavior::SettleThenDrop) {
+                                        settle_then_drop(&mut tls, &broker, &claims, run.network)
+                                            .await;
+                                        return;
+                                    }
                                     if matches!(behavior, Behavior::DropRunAck) {
+                                        return;
+                                    }
+                                    if matches!(
+                                        behavior,
+                                        Behavior::CompleteRun | Behavior::UnknownTerminal
+                                    ) {
+                                        let mut accepted = Accepted::new(id, 0);
+                                        accepted.network = run.network;
+                                        let terminal =
+                                            if matches!(behavior, Behavior::UnknownTerminal) {
+                                                TerminalRecord::new(
+                                                    id,
+                                                    Outcome::OutcomeUnknown,
+                                                    UNKNOWN_WALL_MS,
+                                                    0,
+                                                    0,
+                                                )
+                                            } else {
+                                                TerminalRecord::new(
+                                                    id,
+                                                    Outcome::Exit { code: 23 },
+                                                    0,
+                                                    0,
+                                                    0,
+                                                )
+                                            };
+                                        for frame in [
+                                            Frame::Accepted(accepted),
+                                            Frame::Terminal(terminal),
+                                            Frame::HostedTerminal(HostedTerminal {
+                                                job_id: id,
+                                                placement: "first_party/test-host".into(),
+                                                billed_vcpu_ms: 6001,
+                                                max_runtime_s: claims.max_s,
+                                            }),
+                                        ] {
+                                            motor_protocol::write_frame_async(&mut tls, &frame)
+                                                .await
+                                                .unwrap();
+                                        }
                                         return;
                                     }
                                 }
@@ -299,7 +401,11 @@ impl Harness {
                                     .unwrap();
                                     return;
                                 }
-                                Frame::Attach(_) => {
+                                Frame::Attach(attach) => {
+                                    if matches!(behavior, Behavior::SettleThenDrop) {
+                                        replay_settled(&mut tls, &claims, attach.from_seq).await;
+                                        return;
+                                    }
                                     if matches!(behavior, Behavior::ReturnCapFailure) {
                                         motor_protocol::write_frame_async(
                                             &mut tls,
@@ -359,16 +465,27 @@ impl Harness {
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let broker_url = format!("http://{}", http.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let lease_bodies = Arc::new(Mutex::new(Vec::new()));
+        let lease_replies = Arc::new(Mutex::new(
+            VecDeque::<(u16, serde_json::Value, &'static str)>::new(),
+        ));
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let drop_lease = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release_admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unanswered_lease = Arc::new(AtomicUsize::new(0));
         let http_task = tokio::spawn({
             let broker = broker.clone();
             let requests = requests.clone();
+            let lease_bodies = lease_bodies.clone();
+            let lease_replies = lease_replies.clone();
             let finished = finished.clone();
             let drop_lease = drop_lease.clone();
             let release_admitted = release_admitted.clone();
+            let unanswered_lease = unanswered_lease.clone();
             async move {
+                // Connections of unanswered requests, kept open until the
+                // harness is dropped and aborts this task.
+                let mut unanswered = Vec::new();
                 while let Ok((mut socket, _)) = http.accept().await {
                     let mut bytes = Vec::new();
                     loop {
@@ -380,6 +497,14 @@ impl Harness {
                         if bytes.ends_with(b"\r\n\r\n") {
                             break;
                         }
+                    }
+                    // A client may open a connection and close it before
+                    // writing anything, as an HTTP client does when the
+                    // request it was connecting for is cancelled. That is not
+                    // a request; anything else that was sent is parsed as
+                    // one, and a malformed request still panics.
+                    if bytes.is_empty() {
+                        continue;
                     }
                     let text = String::from_utf8_lossy(&bytes);
                     let path = text
@@ -406,29 +531,47 @@ impl Harness {
                     let mut body = vec![0; length];
                     socket.read_exact(&mut body).await.unwrap();
                     requests.lock().unwrap().push(path.clone());
-                    let reply =
-                        if release_admitted.load(Ordering::SeqCst) && path.ends_with("/release") {
-                            motor_lease::fake::BrokerReply::error(409, "job_admitted")
-                        } else if finished.load(Ordering::SeqCst) && path.ends_with("/reattach") {
-                            motor_lease::fake::BrokerReply::error(409, "job_finished")
-                        } else {
-                            broker.lock().unwrap().handle(
-                                BrokerRequest {
-                                    content_type: Some("application/json"),
-                                    method: "POST",
-                                    path: &path,
-                                    bearer: bearer.as_deref(),
-                                    host_headers: None,
-                                    body: &body,
-                                },
-                                now_s() * 1000,
-                            )
+                    let stub = if path == "/v1/leases" {
+                        let number = {
+                            let mut bodies = lease_bodies.lock().unwrap();
+                            bodies.push(body.clone());
+                            bodies.len()
                         };
+                        if number == unanswered_lease.load(Ordering::SeqCst) {
+                            unanswered.push(socket);
+                            continue;
+                        }
+                        lease_replies.lock().unwrap().pop_front()
+                    } else {
+                        None
+                    };
+                    let mut retry_after = "";
+                    let reply = if let Some((status, body, delay)) = stub {
+                        retry_after = delay;
+                        motor_lease::fake::BrokerReply { status, body }
+                    } else if release_admitted.load(Ordering::SeqCst) && path.ends_with("/release")
+                    {
+                        motor_lease::fake::BrokerReply::error(409, "job_admitted")
+                    } else if finished.load(Ordering::SeqCst) && path.ends_with("/reattach") {
+                        motor_lease::fake::BrokerReply::error(409, "job_finished")
+                    } else {
+                        broker.lock().unwrap().handle(
+                            BrokerRequest {
+                                content_type: Some("application/json"),
+                                method: "POST",
+                                path: &path,
+                                bearer: bearer.as_deref(),
+                                host_headers: None,
+                                body: &body,
+                            },
+                            now_s() * 1000,
+                        )
+                    };
                     if path == "/v1/leases" && drop_lease.swap(false, Ordering::SeqCst) {
                         continue;
                     }
                     let body = serde_json::to_vec(&reply.body).unwrap();
-                    let head = format!("HTTP/1.1 {} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", reply.status, body.len());
+                    let head = format!("HTTP/1.1 {} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: {retry_after}\r\nConnection: close\r\n\r\n", reply.status, body.len());
                     socket.write_all(head.as_bytes()).await.unwrap();
                     socket.write_all(&body).await.unwrap();
                 }
@@ -442,6 +585,8 @@ impl Harness {
             },
             broker,
             requests,
+            lease_bodies,
+            lease_replies,
             tokens,
             iats,
             runs,
@@ -449,6 +594,8 @@ impl Harness {
             finished,
             drop_lease,
             release_admitted,
+            host_refusals,
+            unanswered_lease,
             tasks: vec![host_task, http_task],
         }
     }
@@ -470,5 +617,143 @@ impl Harness {
         )
         .with_timeout(30)
         .with_weight_hint(2)
+    }
+}
+
+/// Milliseconds of runtime the `SettleThenDrop` host reports per vCPU; the
+/// broker settles `vcpus * SETTLED_RUNTIME_MS` and the replayed
+/// `HostedTerminal` bills the same amount.
+pub const SETTLED_RUNTIME_MS: u64 = 3000;
+
+/// The `SettleThenDrop` job's sequenced records: `Started`, then one output
+/// record per `SETTLED_OUTPUT` entry.
+fn settled_records(id: Uuid) -> Vec<(u64, Frame)> {
+    let mut records = vec![(
+        0,
+        Frame::Started {
+            job_id: id,
+            seq: 0,
+            queue_wait_ms: 0,
+            started_at_ms: 1_730_000_000_000,
+            path_mapping: None,
+        },
+    )];
+    for (seq, bytes) in (1..).zip(SETTLED_OUTPUT) {
+        records.push((
+            seq,
+            Frame::Output(Output::new(
+                seq,
+                OutputStream::Stdout,
+                BytePayload(bytes.to_vec()),
+            )),
+        ));
+    }
+    records
+}
+
+/// The run connection of `Behavior::SettleThenDrop`: ck-motor receives the
+/// acknowledgement, `Started` and the first output record. The job then ends
+/// on the host, which reports its usage to the broker (settling the job there)
+/// and drops the connection before the last output record and the terminal
+/// are delivered.
+async fn settle_then_drop<W: tokio::io::AsyncWrite + Unpin>(
+    socket: &mut W,
+    broker: &Mutex<FakeBroker>,
+    claims: &Claims,
+    network: Option<Network>,
+) {
+    let id = Uuid::parse_str(&claims.jti).unwrap();
+    let mut accepted = Accepted::new(id, 0);
+    accepted.network = network;
+    motor_protocol::write_frame_async(socket, &Frame::Accepted(accepted))
+        .await
+        .unwrap();
+    for (_, frame) in settled_records(id).into_iter().take(2) {
+        motor_protocol::write_frame_async(socket, &frame)
+            .await
+            .unwrap();
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let usage = Usage {
+        job_id: claims.jti.clone(),
+        vcpus: claims.vcpus,
+        started_at_ms: now_ms - SETTLED_RUNTIME_MS,
+        ended_at_ms: now_ms,
+        mem_peak_mib: None,
+        egress_bytes: None,
+        outcome: UsageOutcome::Exit,
+    };
+    let body = serde_json::to_vec(&usage).unwrap();
+    let path = "/v1/hosts/test-host/usage";
+    let headers = HostHeaders::sign(
+        "test-host",
+        "POST",
+        path,
+        &body,
+        now_ms,
+        now_ms * 1000,
+        &SigningKey::from_bytes(&HOST_MACHINE_SEED),
+    )
+    .unwrap();
+    let reply = broker.lock().unwrap().handle(
+        BrokerRequest {
+            content_type: Some("application/json"),
+            method: "POST",
+            path,
+            bearer: None,
+            host_headers: Some(&headers),
+            body: &body,
+        },
+        now_ms,
+    );
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(
+        reply.body["settled_vcpu_ms"],
+        u64::from(claims.vcpus) * SETTLED_RUNTIME_MS
+    );
+}
+
+/// An attach to the ended `SettleThenDrop` job: the host replays its retained
+/// records from the caller's cursor, then the terminal and the hosted
+/// settlement it already reported. It reports no usage again.
+async fn replay_settled<W: tokio::io::AsyncWrite + Unpin>(
+    socket: &mut W,
+    claims: &Claims,
+    from_seq: u64,
+) {
+    let id = Uuid::parse_str(&claims.jti).unwrap();
+    for (seq, frame) in settled_records(id) {
+        if seq >= from_seq {
+            motor_protocol::write_frame_async(socket, &frame)
+                .await
+                .unwrap();
+        }
+    }
+    for frame in [
+        Frame::Terminal(
+            TerminalRecord::new(
+                id,
+                Outcome::Exit {
+                    code: SETTLED_EXIT_CODE,
+                },
+                SETTLED_RUNTIME_MS,
+                0,
+                0,
+            )
+            .with_ran(Ran::Remote),
+        ),
+        Frame::HostedTerminal(HostedTerminal {
+            job_id: id,
+            placement: "first_party/test-host".into(),
+            billed_vcpu_ms: u64::from(claims.vcpus) * SETTLED_RUNTIME_MS,
+            max_runtime_s: claims.max_s,
+        }),
+    ] {
+        motor_protocol::write_frame_async(socket, &frame)
+            .await
+            .unwrap();
     }
 }

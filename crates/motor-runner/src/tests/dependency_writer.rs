@@ -23,12 +23,27 @@ async fn leased_job_is_not_delayed_by_fill(tenant_vm: bool, boat_profile: bool) 
     config.tenant_vm = tenant_vm;
     config.boat_profile = boat_profile;
     config.boat_memory_max_bytes = boat_profile.then_some(2 << 30);
+    if boat_profile {
+        config.free_space_probe = Arc::new(|_| Ok(63 << 30));
+        #[cfg(target_os = "linux")]
+        {
+            config.boat_storage_trim = Arc::new(|| Ok(()));
+        }
+    }
     config.max_weight = 4;
     config.base_commands = vec![format!(
         "while test ! -e '{}'; do sleep .02; done",
         release.display()
     )];
-    let runner = Runner::open(config).unwrap();
+    let runner = if boat_profile {
+        Runner::open_with_backend(
+            config,
+            Box::new(super::boat_disk::SchedulerFixtureBackend::default()),
+        )
+        .unwrap()
+    } else {
+        Runner::open(config).unwrap()
+    };
     let (request, bytes) = f.run("true");
     let upload = f.spool(&runner, &request, &bytes);
     let mut prepare = prepare_for(&request);
@@ -149,15 +164,13 @@ fn descriptor_changes_for_toolchain_and_command_without_lockfile_changes() {
     let f = Fixture::new();
     let tip = git(&f.main, &["rev-parse", "HEAD"]);
     let descriptor = crate::writer::fill::descriptor;
-    let first = descriptor(&f.main, &tip, "rustc A", "cargo build").unwrap();
-    assert_ne!(
-        first,
-        descriptor(&f.main, &tip, "rustc B", "cargo build").unwrap()
-    );
-    assert_ne!(
-        first,
-        descriptor(&f.main, &tip, "rustc A", "cargo test").unwrap()
-    );
+    let compilers = Compilers::default();
+    let of = |toolchain: &str, command: &str| {
+        descriptor(&f.main, &tip, toolchain, command, None, &compilers).unwrap()
+    };
+    let first = of("rustc A", "cargo build");
+    assert_ne!(first, of("rustc B", "cargo build"));
+    assert_ne!(first, of("rustc A", "cargo test"));
 }
 
 #[tokio::test]
@@ -261,7 +274,7 @@ async fn writer_lockfile_mutation_fails_and_scratch_is_removed() {
 }
 
 #[tokio::test]
-async fn writer_is_idle_only_singleton_and_not_age_promoted_on_large_and_small_hosts() {
+async fn writer_is_a_singleton_that_waits_for_free_permits_on_large_and_small_hosts() {
     for capacity in [16, 2] {
         let f = Fixture::new();
         let writer_release = f.scratch.join("writer-release");
@@ -290,7 +303,11 @@ async fn writer_is_idle_only_singleton_and_not_age_promoted_on_large_and_small_h
             ),
         );
         first.weight_hint = Some(capacity);
-        f.submit(&runner, &first, &bytes);
+        // Submitted as a branch tip, so that it queues no fill: a fill queued
+        // with it would take its permits first.
+        assert_run_accepted(&runner, &first);
+        let spool = f.spool(&runner, &first, &bytes);
+        runner.fetch_run(&first, &spool.directory, false).unwrap();
         until(|| {
             runner
                 .status()
@@ -347,6 +364,23 @@ async fn writer_is_idle_only_singleton_and_not_age_promoted_on_large_and_small_h
         );
         base_done(&runner).await;
     }
+}
+
+/// Waits for job `id` to end and asserts that it exited 0. A failure prints
+/// the whole terminal record, including any refusal detail, the job's
+/// output and the writer diagnostics, so an intermittent failure explains
+/// itself.
+#[cfg(target_os = "linux")]
+async fn assert_exited(f: &Fixture, runner: &Runner, id: Uuid) {
+    let terminal = terminal(runner, id).await;
+    assert_eq!(
+        terminal.outcome,
+        Outcome::Exit { code: 0 },
+        "terminal: {terminal:?}\nrefusal detail: {:?}\noutput:\n{}\n{}",
+        terminal.refusal_detail(),
+        replay_text(runner, id),
+        writer_diagnostics(f, runner)
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -458,10 +492,7 @@ pub(super) async fn isolated_graph_fixture() {
     r.git_dependencies = vec![declaration.clone()];
     bytes.push(dep_bytes.clone());
     f.submit(&runner, &r, &bytes);
-    assert_eq!(
-        terminal(&runner, r.job_id).await.outcome,
-        Outcome::Exit { code: 0 }
-    );
+    assert_exited(&f, &runner, r.job_id).await;
     base_done(&runner).await;
     assert_eq!(
         repository(&f, &runner).result,
@@ -481,10 +512,7 @@ pub(super) async fn isolated_graph_fixture() {
         job.git_dependencies = vec![declaration.clone()];
         bytes.push(dep_bytes.clone());
         f.submit(&runner, &job, &bytes);
-        assert_eq!(
-            terminal(&runner, job.job_id).await.outcome,
-            Outcome::Exit { code: 0 }
-        );
+        assert_exited(&f, &runner, job.job_id).await;
         let output = replay_text(&runner, job.job_id);
         assert!(
             counter(&output, "Cache hits") >= 4,
@@ -514,9 +542,11 @@ pub(super) async fn isolated_graph_fixture() {
         "[build]\nrustc-wrapper='./hostile.sh'\n",
     )
     .unwrap();
-    fs::write(f.main.join("hostile.sh"), "#!/bin/bash\nif touch /motor-cache/wrapper-poison 2>/dev/null; then exit 77; fi\nexec \"$@\"\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(f.main.join("hostile.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_helpers::write_test_executable(
+        &f.main.join("hostile.sh"),
+        b"#!/bin/bash\nif touch /motor-cache/wrapper-poison 2>/dev/null; then exit 77; fi\nexec \"$@\"\n",
+    )
+    .unwrap();
     commit(&f.main, "unmerged hostile branch\n");
     let count = writer_count(&runner);
     let (mut branch, mut bytes) = job_at(
@@ -528,10 +558,7 @@ pub(super) async fn isolated_graph_fixture() {
     branch.git_dependencies = vec![declaration];
     bytes.push(dep_bytes);
     f.submit(&runner, &branch, &bytes);
-    assert_eq!(
-        terminal(&runner, branch.job_id).await.outcome,
-        Outcome::Exit { code: 0 }
-    );
+    assert_exited(&f, &runner, branch.job_id).await;
     base_done(&runner).await;
     assert_eq!(writer_count(&runner), count);
     assert!(!runner.config().sccache_dir().join("poison").exists());
@@ -868,13 +895,15 @@ fn failed_descriptor_request_queues_nothing() {
     let mut prepare = prepare_for(&r);
     prepare.bundles = r.bundles.clone();
     runner.fetch_prepare(&prepare, &upload.directory).unwrap();
-    let descriptor = crate::writer::fill::descriptor(
-        &runner.core.trees.mirror(&f.root),
-        &r.integration_tip,
-        &runner.core.rustc_version,
-        &runner.config().base_commands.join(" && "),
-    )
-    .unwrap();
+    let descriptor = runner
+        .fill_identity(
+            &runner.core.trees.mirror(&f.root),
+            &r.integration_tip,
+            &runner.config().base_commands.join(" && "),
+            true,
+        )
+        .0
+        .unwrap();
     let mut inner = runner.core.inner.lock().unwrap();
     inner
         .catalog
@@ -892,36 +921,162 @@ fn failed_descriptor_request_queues_nothing() {
     );
 }
 
+/// Under steady load the foreground queue never empties, and the oldest
+/// queued job usually waits for more permits than are free. A cache fill
+/// must still get through: it is tried before that job and takes only free
+/// permits, the repository whose jobs arrived last fills first, and the
+/// single writer slot keeps the next fill waiting until this one ends.
 #[tokio::test]
-async fn queued_foreground_blocks_writer_even_when_writer_fits_idle_capacity() {
+async fn one_fill_reaches_free_permits_past_a_queued_job_that_does_not_fit() {
+    let f = Fixture::new();
+    let release = f.scratch.join("fill-release");
+    let mut config = f.config();
+    config.max_weight = 16;
+    config.base_commands = vec![format!(
+        "while test ! -e '{}'; do sleep .02; done",
+        release.display()
+    )];
+    let runner = Runner::open(config).unwrap();
+    // Two repositories with mirrors: the fixture's main one, and commons.
+    let (main, bytes) = f.run("true");
+    let upload = f.spool(&runner, &main, &bytes);
+    let mut prepare = prepare_for(&main);
+    prepare.bundles = main.bundles.clone();
+    runner.fetch_prepare(&prepare, &upload.directory).unwrap();
+    let (mut commons, _) = job_at(&f, "commons-job", "true");
+    let (manifest, bundle) = f.bundle(&f.sibling, &f.canonical, 0);
+    let tip = git(&f.sibling, &["rev-parse", "HEAD"]);
+    commons.repository_root = f.canonical.clone();
+    commons.bundles = vec![manifest];
+    commons.siblings = vec![];
+    commons.snapshot_commit = tip.clone();
+    commons.integration_tip = tip.clone();
+    commons.base_commit = Some(tip.clone());
+    commons.tree_hash = git(&f.sibling, &["rev-parse", "HEAD^{tree}"]);
+    let upload = f.spool(&runner, &commons, &[bundle]);
+    let mut prepare = prepare_for(&commons);
+    prepare.bundles = commons.bundles.clone();
+    runner.fetch_prepare(&prepare, &upload.directory).unwrap();
+    let (main_fill, commons_fill, aged) = {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let now = runner.now();
+        // A main job holds 12 of 16 permits; a commons job, accepted later
+        // and past its backfill grace, waits for all 16.
+        inner.order += 1;
+        let mut held = Job::new(Uuid::now_v7(), Some(main.clone()), now, inner.order, 12);
+        held.state = JobState::Running;
+        inner.jobs.insert(held.id, held);
+        inner.order += 1;
+        let mut waiting = Job::new(Uuid::now_v7(), Some(commons.clone()), now, inner.order, 16);
+        waiting.state = JobState::Queued;
+        waiting.queued_ms = Some(now - BACKFILL_GRACE_MS - 1);
+        let aged = waiting.id;
+        inner.jobs.insert(aged, waiting);
+        // The main fill is queued first, so queue order alone would pick it.
+        let fill = |inner: &mut Inner, root: &str, tip: &str, key: &str| {
+            runner.queue_base(inner, root, tip, key, &[], &[]).unwrap();
+            inner
+                .jobs
+                .values()
+                .filter(|j| j.base && j.request.as_ref().unwrap().repository_root == root)
+                .map(|j| j.id)
+                .max()
+                .unwrap()
+        };
+        let main_fill = fill(&mut inner, &f.root, &main.integration_tip, &f.key);
+        let commons_fill = fill(&mut inner, &f.canonical, &tip, &commons.workspace_key);
+        (main_fill, commons_fill, aged)
+    };
+    until_with_diagnostics(
+        || runner.core.inner.lock().unwrap().writer.is_some(),
+        || {
+            format!(
+                "no fill started past the queued job; {}",
+                runner_diagnostics(&runner)
+            )
+        },
+    )
+    .await;
+    settle().await;
+    // Read under the state lock, assert after releasing it: a failed
+    // assertion while holding it would poison it for the runner's threads.
+    let (writer, weight, main_setup, aged_setup) = {
+        let inner = runner.core.inner.lock().unwrap();
+        (
+            inner.writer,
+            inner.jobs[&commons_fill].weight,
+            inner.jobs[&main_fill].setup_ms,
+            inner.jobs[&aged].setup_ms,
+        )
+    };
+    assert_eq!(
+        writer,
+        Some(commons_fill),
+        "the fill for the repository with the newest job must go first"
+    );
+    assert_eq!(weight, 4);
+    assert_eq!(
+        main_setup, None,
+        "a second fill started while the first was running"
+    );
+    assert_eq!(aged_setup, None);
+    fs::write(&release, "").unwrap();
+    terminal(&runner, commons_fill).await;
+    // The queued job still waits, and the next fill starts all the same.
+    assert_eq!(
+        terminal(&runner, main_fill).await.outcome,
+        Outcome::Exit { code: 0 }
+    );
+    let aged_setup = runner.core.inner.lock().unwrap().jobs[&aged].setup_ms;
+    assert!(aged_setup.is_none());
+    runner.begin_drain(Duration::from_secs(1), false);
+}
+
+/// A fill that does not fit yet keeps the permits that come free for itself:
+/// otherwise small jobs arriving behind it would take each one, and under
+/// steady load the fill would never start.
+#[tokio::test]
+async fn a_waiting_fill_keeps_free_permits_from_later_jobs() {
     let f = Fixture::new();
     let mut config = f.config();
     config.max_weight = 16;
     let runner = Runner::open(config).unwrap();
-    let (r, bytes) = f.run("true");
-    let upload = f.spool(&runner, &r, &bytes);
-    let mut prepare = prepare_for(&r);
-    prepare.bundles = r.bundles.clone();
+    let (main, bytes) = f.run("true");
+    let upload = f.spool(&runner, &main, &bytes);
+    let mut prepare = prepare_for(&main);
+    prepare.bundles = main.bundles.clone();
     runner.fetch_prepare(&prepare, &upload.directory).unwrap();
-    let id = {
+    let (small, _) = job_at(&f, "small", "true");
+    let (fill, small) = {
         let mut inner = runner.core.inner.lock().unwrap();
-        let mut held = Job::new(Uuid::now_v7(), Some(r.clone()), runner.now(), 1, 12);
+        let now = runner.now();
+        // 13 of 16 permits are held: the 4-permit fill does not fit, a
+        // 1-permit job would.
+        inner.order += 1;
+        let mut held = Job::new(Uuid::now_v7(), Some(main.clone()), now, inner.order, 13);
         held.state = JobState::Running;
         inner.jobs.insert(held.id, held);
-        let mut foreground = Job::new(Uuid::now_v7(), Some(r.clone()), runner.now(), 2, 16);
-        foreground.state = JobState::Queued;
-        inner.jobs.insert(foreground.id, foreground);
         runner
-            .queue_base(&mut inner, &f.root, &r.integration_tip, &f.key, &[], &[])
+            .queue_base(&mut inner, &f.root, &main.integration_tip, &f.key, &[], &[])
             .unwrap();
-        inner.jobs.values().find(|j| j.base).unwrap().id
+        let fill = inner.jobs.values().find(|j| j.base).unwrap().id;
+        inner.order += 1;
+        let mut waiting = Job::new(small.job_id, Some(small.clone()), now, inner.order, 1);
+        waiting.state = JobState::Queued;
+        waiting.queued_ms = Some(now);
+        inner.jobs.insert(waiting.id, waiting);
+        (fill, small.job_id)
     };
     settle().await;
-    let started = runner.core.inner.lock().unwrap().jobs[&id].setup_ms;
+    let (writer, small_setup) = {
+        let inner = runner.core.inner.lock().unwrap();
+        (inner.writer, inner.jobs[&small].setup_ms)
+    };
     runner.begin_drain(Duration::from_secs(1), false);
+    assert_eq!(writer, None);
     assert_eq!(
-        started, None,
-        "writer used idle capacity while foreground work was queued"
+        small_setup, None,
+        "a later job took the permits fill {fill} is waiting for"
     );
 }
 
@@ -1133,6 +1288,7 @@ async fn empty_and_invalid_writer_statistics_fail_with_a_persisted_reason() {
                 Ok(backend::ExecutionOutcome::Unix(
                     std::process::ExitStatus::from_raw(0),
                 )),
+                true,
             )
             .unwrap();
         let g = repository(&f, &runner);
@@ -1319,4 +1475,117 @@ async fn isolated_state_acl_stays_private_after_startup_and_cache_fill() {
         writer_diagnostics(&f, &runner)
     );
     assert_private();
+}
+
+/// Eviction moves the compiler cache aside, puts an empty one in its place
+/// and then deletes the old one. If that deletion fails, the cache jobs see
+/// is still empty, so the fill records must go and the repository refill.
+#[tokio::test]
+async fn compiler_cache_emptied_by_a_failed_eviction_is_filled_again() {
+    use std::os::unix::fs::PermissionsExt;
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "an undeletable entry requires a non-root runner"
+    );
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.free_space_floor_bytes = 100;
+    let fleet = config.sccache_dir();
+    let shard = fleet.join("0");
+    let pressure = Arc::new(AtomicBool::new(false));
+    let pressured = pressure.clone();
+    let cached = shard.clone();
+    // Below the hard floor for as long as the cache holds its entry.
+    config.free_space_probe = Arc::new(move |_| {
+        Ok(if pressured.load(Ordering::SeqCst) && cached.exists() {
+            10
+        } else {
+            300
+        })
+    });
+    let runner = Runner::open(config).unwrap();
+    warm(&f, &runner).await;
+    let filled = repository(&f, &runner).filled_descriptor;
+    assert!(filled.is_some());
+    let fills = writer_count(&runner);
+    // An entry in a read-only shard cannot be deleted by the runner.
+    fs::create_dir_all(&shard).unwrap();
+    fs::write(shard.join("entry"), "cached").unwrap();
+    fs::set_permissions(&shard, fs::Permissions::from_mode(0o500)).unwrap();
+    pressure.store(true, Ordering::SeqCst);
+    let _ = runner.ensure_disk_space().unwrap();
+    pressure.store(false, Ordering::SeqCst);
+    // Let the fixture clean up the copy that could not be deleted.
+    let trash = runner.config().state_dir().join("trash");
+    let mut stranded = false;
+    for entry in fs::read_dir(&trash).unwrap() {
+        let retired = entry.unwrap().path().join("0");
+        if retired.is_dir() {
+            fs::set_permissions(&retired, fs::Permissions::from_mode(0o700)).unwrap();
+            stranded = true;
+        }
+    }
+    assert!(stranded, "the eviction did not fail after moving the cache");
+    assert!(
+        fleet.is_dir() && !shard.exists(),
+        "the cache was not emptied"
+    );
+    assert_eq!(
+        repository(&f, &runner).filled_descriptor,
+        None,
+        "a fill is still recorded for an empty compiler cache"
+    );
+    runner.tick().unwrap();
+    base_done(&runner).await;
+    assert_eq!(
+        writer_count(&runner),
+        fills + 1,
+        "the cache was not refilled"
+    );
+    assert_eq!(repository(&f, &runner).filled_descriptor, filled);
+}
+
+/// A compiler cache emptied while the runner was down (by hand, or by an
+/// eviction that moved it aside and did not live to save the catalog) holds
+/// none of the recorded fills; one that still holds entries keeps them.
+#[tokio::test]
+async fn restart_forgets_fills_of_an_emptied_compiler_cache() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    let fleet = config.sccache_dir();
+    let runner = Runner::open(config.clone()).unwrap();
+    warm(&f, &runner).await;
+    let filled = repository(&f, &runner).filled_descriptor.unwrap();
+    let fills = writer_count(&runner);
+    fs::create_dir_all(fleet.join("0/1")).unwrap();
+    drop(runner);
+    // Ticks are driven by hand, so a refill cannot replace the records the
+    // assertions read before it runs.
+    config.manual_tick = true;
+    let runner = reopen(config.clone());
+    assert!(
+        repository(&f, &runner)
+            .filled_descriptors
+            .contains_key(&filled),
+        "a restart forgot the fills of a cache that still holds entries"
+    );
+    drop(runner);
+    fs::remove_dir_all(fleet.join("0")).unwrap();
+    let runner = reopen(config);
+    assert!(
+        repository(&f, &runner).filled_descriptors.is_empty(),
+        "a fill is still recorded for an empty compiler cache"
+    );
+    runner.tick().unwrap();
+    base_done(&runner).await;
+    assert_eq!(
+        writer_count(&runner),
+        fills + 1,
+        "the cache was not refilled"
+    );
+    assert_eq!(
+        repository(&f, &runner).filled_descriptor.as_ref(),
+        Some(&filled)
+    );
 }

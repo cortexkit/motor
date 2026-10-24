@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Operator tool: bootstrap a builder and populate a source copy by hand.
 # Normal jobs use the ck-motor execution service; this script does not deploy it.
-# Bootstrap the dedicated Ubuntu builder from a Mac; no private Git fetches.
+# Bootstrap the dedicated Ubuntu builder from the operator machine; no private Git fetches.
 set -euo pipefail
 host=${RUNNER_HOST:-alfonso-runner}
 script_dir=$(cd "$(dirname "$0")" && pwd)
@@ -35,13 +35,15 @@ sudo -n apt-get update
 # Workspace build.rs files invoke rustc and hash Cargo.lock, with no generators.
 # Bundled SQLite/crypto dependencies need the C toolchain. unzip is required by
 # Bun's installer; xz and CA certificates are required by toolchain downloads.
+# musl-tools supplies musl-gcc to compile the ring crate's C code for the static tenant runner.
 sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  build-essential clang lld pkg-config libssl-dev sqlite3 git rsync curl jq \
-  ca-certificates unzip xz-utils unattended-upgrades ufw nodejs npm
+  build-essential clang lld musl-tools pkg-config libssl-dev sqlite3 git rsync curl jq \
+  ca-certificates unzip xz-utils binaryen unattended-upgrades ufw nodejs npm
 sudo -n install -d -o ubuntu -g ubuntu /srv/build /srv/build/src /srv/build/target /srv/build/cargo-home /srv/build/tools-target /srv/build/mirrors /srv/build/bundles
 
-# Mac paths must share the generations' XFS device: FICLONE cannot cross from
-# /srv/build to the root filesystem. Refuse to hide pre-existing /Users data;
+# Caller paths under /Users (where macOS clients keep checkouts) must share the
+# generations' XFS device: FICLONE cannot cross from /srv/build to the root
+# filesystem. Refuse to hide pre-existing /Users data;
 # moving an existing installation onto the array requires an operator first.
 sudo -n install -d -o ubuntu -g ubuntu -m 0755 /srv/build/Users /Users
 if ! mountpoint -q /Users && [ -n "$(sudo -n find /Users -mindepth 1 -maxdepth 1 -print -quit)" ]; then
@@ -158,6 +160,13 @@ fi
 # shellcheck disable=SC2086 # policy_args is empty or two validated words.
 ssh -o BatchMode=yes -o ForwardAgent=no "$host" python3 - $policy_args < "$script_dir/inbound_policy.py"
 "$script_dir/sync.sh" "$root"
+# Keep the versioned runtime binaries available through the same job-visible
+# paths on the build server as on Boat; Cargo tool installation remains separate.
+ssh -o BatchMode=yes -o ForwardAgent=no "$host" "bash -s -- $name" <<'REMOTE'
+set -euo pipefail
+cd "/srv/build/src/$1"
+bash script/runner/install-tools.sh build-server runtime-only
+REMOTE
 # Some source copies provide a checksum-verified NATS fixture installer.
 # The motor repository has no NATS tests or installer; provision it only when
 # the source repository requests it, not as a dependency on another checkout.

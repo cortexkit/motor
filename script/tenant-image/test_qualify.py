@@ -2,6 +2,7 @@
 """Portable qualification plumbing tests, never VM qualification evidence."""
 import base64
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 import socket
@@ -29,6 +30,124 @@ def frames():
 
 
 class QualificationTests(unittest.TestCase):
+    def test_qualification_cannot_check_an_image_with_different_parity_inputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / 'repo'
+            (repo / 'script/runner').mkdir(parents=True)
+            hashes = {}
+            for name in q.PARITY_FILES:
+                relative = 'script/runner/' + name
+                (repo / relative).write_text(name)
+                hashes[relative] = hashlib.sha256(name.encode()).hexdigest()
+            (root / 'manifest.json').write_text(json.dumps({'versions': {'runner_inputs_sha256': hashes}}))
+            (root / 'tools.json').write_text(json.dumps({'parity': {'observed': {'tools': {'gnutest': {'sha256': 'a' * 64}}}}}))
+            self.assertEqual('a' * 64, q.parity_inputs(root, repo))
+            (repo / 'script/runner/toolchain.json').write_text('changed contract')
+            with self.assertRaisesRegex(RuntimeError, 'parity input differs.*toolchain.json'):
+                q.parity_inputs(root, repo)
+
+    def test_real_job_parity_command_checks_and_propagates_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checker = root / 'toolchain-parity.py'
+            checker.write_text('import sys\nassert sys.argv[1:6] == ["--check", "--role", "tenant", "--job", "--gnu-test-sha256"]\nprint("parity measured")\nsys.exit(7)\n')
+            command = f'd="{root}"; ' + q.parity_job_command('a' * 64, 1) + 'echo false-success'
+            result = subprocess.run(['sh', '-c', command], cwd=root, capture_output=True, text=True)
+            self.assertEqual(1, result.returncode)
+            self.assertEqual('parity measured\n', result.stderr)
+            self.assertEqual('', result.stdout)
+            checker.write_text(checker.read_text().replace('sys.exit(7)', 'sys.exit(0)'))
+            result = subprocess.run(['sh', '-c', command], cwd=root, capture_output=True, text=True)
+            self.assertEqual(0, result.returncode)
+            self.assertEqual('false-success\n', result.stdout)
+        with self.assertRaisesRegex(ValueError, 'package-qualified'):
+            q.parity_job_command('', 1)
+
+    def test_javascript_setup_runs_in_the_booted_guest_and_in_every_job(self):
+        guest = q.module('javascript_guest', q.HERE / 'guest/hosted_qualify.py')
+        self.assertEqual(q.JAVASCRIPT_SETUP, guest.JAVASCRIPT_SETUP)
+        self.assertLess(q.STEPS.index("toolchain parity"), q.STEPS.index("javascript setup"))
+        self.assertLess(q.STEPS.index("javascript setup"), q.STEPS.index("first job"))
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = Path(tmp)
+
+            def runner(*args):
+                Path(args[-1]).mkdir()
+                return guest.RUNNER_JAVASCRIPT_PASS + '\n'
+            with mock.patch.object(guest, 'run', side_effect=runner) as run, \
+                 mock.patch('builtins.print') as printed:
+                guest.javascript_setup_probe(scratch)
+            self.assertEqual(('/usr/local/bin/motor-runner', 'check-javascript-setup', '--tenant-vm',
+                              '--scratch', str(scratch / 'javascript-setup')), run.call_args.args)
+            printed.assert_called_once_with(q.JAVASCRIPT_SETUP, flush=True)
+            with mock.patch.object(guest, 'run', side_effect=lambda *a: Path(a[-1]).mkdir() or 'FAIL\n'), \
+                 self.assertRaisesRegex(RuntimeError, 'did not pass'):
+                guest.javascript_setup_probe(scratch)
+            # Each job's repository carries all three lockfile kinds, and the
+            # job fails unless setup installed them without lifecycle scripts.
+            fixture = scratch / 'fixture'
+            fixture.mkdir()
+            q.stage_javascript_fixtures(fixture)
+            for manager, lockfile in (('bun', 'bun.lock'), ('npm', 'package-lock.json'), ('pnpm', 'pnpm-lock.yaml')):
+                self.assertTrue((fixture / manager / lockfile).is_file())
+                self.assertFalse((fixture / manager / 'node_modules').exists())
+            command = 'set -eu; ' + q.javascript_job_command() + 'echo installed'
+            result = subprocess.run(['sh', '-c', command], cwd=fixture, capture_output=True, text=True)
+            self.assertEqual(1, result.returncode)
+            self.assertEqual('runner setup did not install the bun fixture\n', result.stderr)
+            for manager in q.JAVASCRIPT_MANAGERS:
+                (fixture / manager / 'node_modules/fixture-dep').mkdir(parents=True)
+                (fixture / manager / 'node_modules/fixture-dep/index.js').write_text('')
+            result = subprocess.run(['sh', '-c', command], cwd=fixture, capture_output=True, text=True)
+            self.assertEqual('installed\n', result.stdout)
+            (fixture / 'pnpm/lifecycle-ran').write_text('ran')
+            result = subprocess.run(['sh', '-c', command], cwd=fixture, capture_output=True, text=True)
+            self.assertEqual('the pnpm fixture lifecycle script ran\n', result.stderr)
+
+    def test_trusted_cargo_fetch_runs_online_in_a_helper_with_a_cold_cache(self):
+        guest = q.module('cargo_fetch_guest', q.HERE / 'guest/hosted_qualify.py')
+        self.assertEqual(q.CARGO_FETCH, guest.CARGO_FETCH)
+        self.assertLess(q.STEPS.index("javascript setup"), q.STEPS.index("trusted cargo fetch"))
+        self.assertLess(q.STEPS.index("trusted cargo fetch"), q.STEPS.index("first job"))
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = Path(tmp)
+            target = scratch / 'cargo-fetch'
+            target.mkdir()
+            (target / 'warm-cache').write_text('must not be reused')
+
+            def runner(*args):
+                self.assertFalse(target.exists())
+                target.mkdir()
+                return guest.RUNNER_CARGO_FETCH_PASS + '\n'
+            with mock.patch.object(guest, 'run', side_effect=runner) as run, \
+                 mock.patch('builtins.print') as printed:
+                guest.cargo_fetch_probe(scratch)
+            self.assertEqual(('/usr/local/bin/motor-runner', 'check-tenant-cargo-fetch',
+                              '--scratch', str(target)), run.call_args.args)
+            self.assertFalse(target.exists())
+            printed.assert_called_once_with(q.CARGO_FETCH, flush=True)
+            with mock.patch.object(guest, 'run', return_value='FAIL\n'), \
+                 self.assertRaisesRegex(RuntimeError, 'did not pass'):
+                guest.cargo_fetch_probe(scratch)
+            with mock.patch.object(guest, 'run', side_effect=RuntimeError('DNS failed')), \
+                 self.assertRaisesRegex(RuntimeError, 'DNS failed'):
+                guest.cargo_fetch_probe(scratch)
+
+    def test_guest_host_parity_must_match_image_gnutest_inventory(self):
+        guest = q.module('parity_guest', q.HERE / 'guest/hosted_qualify.py')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'gnutest.sha256').write_text('a' * 64)
+            report = {'passed': True, 'observed': {'tools': {'gnutest': {'sha256': 'a' * 64}}}}
+            with mock.patch.object(guest, 'run', return_value=json.dumps(report)) as run, mock.patch('builtins.print'):
+                guest.toolchain_probe(root)
+            self.assertEqual(('python3', str(root / 'toolchain-parity.py'), '--check', '--role', 'tenant'), run.call_args.args)
+            self.assertEqual(report, json.loads((root / 'parity-host.json').read_text()))
+            report['observed']['tools']['gnutest']['sha256'] = 'b' * 64
+            with mock.patch.object(guest, 'run', return_value=json.dumps(report)), self.assertRaisesRegex(RuntimeError, 'gnutest differs'):
+                guest.toolchain_probe(root)
+
     def test_program_staging_copies_bytes_not_symlink_or_writable_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -203,6 +322,11 @@ class QualificationTests(unittest.TestCase):
         guest = q.module("guest_name_service", q.HERE / "guest/hosted_qualify.py")
         self.assertEqual(guest.NAME_SERVICE, q.NAME_SERVICE)
         self.assertEqual(guest.TOOL_TREES, q.TOOL_TREES)
+        self.assertEqual(guest.ROOT_PATHS, q.ROOT_PATHS)
+        self.assertLess(q.STEPS.index("tool trees"), q.STEPS.index("root paths"))
+        self.assertLess(q.STEPS.index("root paths"), q.STEPS.index("vsock isolation"))
+        provision = __import__("inspect").getsource(q.Harness.provision)
+        self.assertIn('shutil.copyfile(HERE / "guest/root_paths.py", dest / "root_paths.py")', provision)
         self.assertLess(q.STEPS.index("name service"), q.STEPS.index("tool trees"))
         self.assertLess(q.STEPS.index("tool trees"), q.STEPS.index("vsock isolation"))
         self.assertIn("name service", q.STEPS)

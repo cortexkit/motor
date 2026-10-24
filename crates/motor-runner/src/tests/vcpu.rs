@@ -28,11 +28,11 @@ fn assert_oom_detail_uses_configured_limits(runner: &Runner, job: &Job, detail: 
 }
 
 #[test]
-fn oom_detail_keeps_the_production_sixteen_and_twenty_eight_gib_wording() {
+fn oom_detail_keeps_per_job_limit_and_advice_without_claiming_which_budget_was_hit() {
     let config = Config::new("unused", "main");
     assert_eq!(
         crate::engine::oom_memory_limit_detail(&config, 2, 8),
-        "the job's memory limit of 16 GiB was reached; the kernel killed a process and the job was stopped. Request more vCPUs, for example linux,8c, to raise the limit to 28 GiB."
+        "the kernel OOM-killed a process and the job was stopped (per-job memory limit of 16 GiB; the shared host memory budget also applies). Request more vCPUs, for example linux,8c, to raise the limit to 28 GiB."
     );
 }
 
@@ -112,6 +112,39 @@ fn explicit_sandbox_reservation_admits_one_through_eight_vcpus() {
         assert!(runner.cpu_refusal(claim).is_none());
     }
     assert!(runner.cpu_refusal(9).unwrap().1.contains("1..=8"));
+}
+
+/// A tenant VM is sized for its tenant's largest job, so an 8-vCPU tenant
+/// runner must admit an 8-vCPU lease without any flag; the build server's
+/// default still keeps one core for the daemon on the same topology.
+#[test]
+fn tenant_mode_never_reserves_a_daemon_core() {
+    let eight = || CpuTopology::new((0..8).map(|cpu| vec![cpu]).collect()).unwrap();
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.tenant_vm = true;
+    assert!(config.reserve_daemon_core, "the flag keeps its default");
+    config.cpu_topology = Some(eight());
+    let runner = Runner::open(config).unwrap();
+    assert_eq!(runner.core.cpus.capacity(), 8);
+    for claim in 1..=8 {
+        assert!(runner.cpu_refusal(claim).is_none(), "vcpu {claim}");
+    }
+    let detail = runner.cpu_refusal(9).unwrap().1;
+    assert!(detail.contains("1..=8"), "{detail}");
+    assert!(detail.contains("disabled in tenant mode"), "{detail}");
+
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.cpu_topology = Some(eight());
+    let runner = Runner::open(config).unwrap();
+    assert_eq!(runner.core.cpus.capacity(), 7);
+    let detail = runner.cpu_refusal(8).unwrap().1;
+    assert!(
+        detail.contains("vcpu request 8 is outside the supported range 1..=7")
+            && detail.contains("daemon core reservation enabled"),
+        "{detail}"
+    );
 }
 
 #[tokio::test]
@@ -249,6 +282,7 @@ fn cpu_reservations_release_on_terminal() {
                     RefusalReason::LostToRestart,
                     "restart before launch",
                     Some("restart before launch".into()),
+                    None,
                     runner.now(),
                 );
                 runner.save(&inner.jobs[&request.job_id]).unwrap();
@@ -445,6 +479,44 @@ async fn isolated_oom_stop_records_detail_and_health_counter() {
     assert_eq!(runner.runner_status().health.unwrap().counts.oom_stops, 1);
 }
 
+fn systemd_show_requests_result(args: &[&str]) -> bool {
+    args.first() == Some(&"show")
+        && args.iter().any(|arg| {
+            arg.strip_prefix("--property=")
+                .is_some_and(|names| names.split(',').any(|name| name == "Result"))
+        })
+}
+
+#[test]
+fn oom_observation_matches_single_and_combined_result_queries() {
+    for args in [
+        vec!["show", "--property=Result", "motor-job.service"],
+        vec![
+            "show",
+            "--property=ControlGroup,MemoryPeak,MemoryMax,Result,ExecMainCode,ExecMainStatus",
+            "motor-job.service",
+        ],
+        vec![
+            "show",
+            "motor-job.service",
+            "--property=Result,ExecMainStatus",
+        ],
+    ] {
+        assert!(systemd_show_requests_result(&args), "{args:?}");
+    }
+    for args in [
+        vec!["show", "--property=ExecMainStatus", "motor-job.service"],
+        vec![
+            "show",
+            "--property=OtherResult,ResultSuffix",
+            "motor-job.service",
+        ],
+        vec!["reset-failed", "--property=Result", "motor-job.service"],
+    ] {
+        assert!(!systemd_show_requests_result(&args), "{args:?}");
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires trusted operator, motor-job account, sudo and systemd cgroup OOM support"]
@@ -545,14 +617,16 @@ async fn isolated_oom_group_kill_preserves_signal_and_memory_detail() {
                 .args(["-n", "/usr/bin/systemctl"])
                 .args(args)
                 .output()?;
-            if args.contains(&"--property=Result") {
+            // Finalization can read Result with memory/exit properties in one
+            // query, then skip the older single-property OOM fallback query.
+            if systemd_show_requests_result(args) {
                 let job: Job = read_json(&record)?;
                 let launch = job
                     .process
                     .and_then(|process| process.unit)
                     .ok_or_else(|| io::Error::other("started job has no unit identity"))?;
                 let unit = crate::backend::host_unit_name(launch);
-                if args.last() != Some(&unit.as_str()) {
+                if !args.contains(&unit.as_str()) {
                     return Ok(output);
                 }
                 let status = Command::new("/usr/bin/sudo")
@@ -560,6 +634,7 @@ async fn isolated_oom_group_kill_preserves_signal_and_memory_detail() {
                         "-n",
                         "/usr/bin/systemctl",
                         "show",
+                        "--property=LoadState",
                         "--property=Result",
                         "--property=ExecMainCode",
                         "--property=ExecMainStatus",
@@ -570,10 +645,11 @@ async fn isolated_oom_group_kill_preserves_signal_and_memory_detail() {
                 let exit = fs::read_to_string(&exit_file).map_err(|error| error.to_string());
                 let modified = fs::metadata(&exit_file).and_then(|meta| meta.modified());
                 let status = String::from_utf8_lossy(&status.stdout).into_owned();
+                let result_read = String::from_utf8_lossy(&output.stdout).into_owned();
                 println!(
-                    "OOM_FINISH_OBSERVATION: unit={unit}\n{status}exit={exit:?} mtime={modified:?}"
+                    "OOM_FINISH_OBSERVATION: unit={unit}\nconsumed query:\n{result_read}retained unit:\n{status}exit={exit:?} mtime={modified:?}"
                 );
-                *observed.lock().unwrap() = Some((status, exit));
+                *observed.lock().unwrap() = Some((result_read, status, exit));
             }
             Ok(output)
         })
@@ -589,13 +665,22 @@ async fn isolated_oom_group_kill_preserves_signal_and_memory_detail() {
 
     let terminal = terminal(&runner, request.job_id).await;
     let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
-    let (status, exit) = observed.lock().unwrap().clone().unwrap();
+    let (result_read, status, exit) = observed
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("finalization must query the job unit's Result before collecting it");
     println!(
         "OOM_TERMINAL_OBSERVATION: outcome={:?} monitoring_error={:?} memory_limit_detail={:?}",
         terminal.outcome, job.monitoring_error, job.memory_limit_detail
     );
     assert!(
-        status.contains("Result=oom-kill"),
+        result_read.lines().any(|line| line == "Result=oom-kill"),
+        "the last Result read by the runner must prove the OOM kill: {result_read}"
+    );
+    assert!(
+        status.lines().any(|line| line == "LoadState=loaded")
+            && status.lines().any(|line| line == "Result=oom-kill"),
         "the failed unit must still be loaded when finish inspects it: {status}"
     );
     assert_eq!(
@@ -724,7 +809,7 @@ fn durable_exit_falls_back_to_retained_status_when_missing_or_invalid() {
                 fs::write(&exit, contents).unwrap();
             }
             let before = calls.load(Ordering::SeqCst);
-            let status = runner.durable_exit_status(process, &exit).unwrap();
+            let status = runner.durable_exit_status(process, &exit).0.unwrap();
             assert_eq!(backend::ExecutionOutcome::Unix(status).wire(), expected);
             assert_eq!(calls.load(Ordering::SeqCst), before + 1);
         }
@@ -732,7 +817,7 @@ fn durable_exit_falls_back_to_retained_status_when_missing_or_invalid() {
     fs::write(&exit, "55\n").unwrap();
     let before = calls.load(Ordering::SeqCst);
     assert_eq!(
-        runner.durable_exit_status(process, &exit).unwrap().code(),
+        runner.durable_exit_status(process, &exit).0.unwrap().code(),
         Some(55)
     );
     assert_eq!(
@@ -746,6 +831,7 @@ fn durable_exit_falls_back_to_retained_status_when_missing_or_invalid() {
     main_status.store(0, Ordering::SeqCst);
     let error = runner
         .durable_exit_status(process, &exit)
+        .0
         .unwrap_err()
         .to_string();
     assert!(error.contains("durable exit unavailable"), "{error}");
@@ -754,7 +840,7 @@ fn durable_exit_falls_back_to_retained_status_when_missing_or_invalid() {
 }
 
 #[test]
-fn oom_without_any_exit_status_records_an_explicit_unknown_detail() {
+fn oom_without_any_exit_status_reports_proven_kill_not_unknown() {
     for contents in [None, Some("")] {
         let f = Fixture::new();
         let mut config = f.config();
@@ -807,16 +893,188 @@ fn oom_without_any_exit_status_records_an_explicit_unknown_detail() {
         }
         runner.follow_unit(request.job_id).unwrap();
         let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
-        assert_eq!(job.terminal.unwrap().outcome, Outcome::OutcomeUnknown);
+        let terminal = job.terminal.unwrap();
+        assert_eq!(terminal.outcome, Outcome::Signal { signal: 9 });
+        assert!(terminal.refusal_detail().unwrap().contains("out of memory"));
         let detail = job.memory_limit_detail.unwrap();
         assert!(detail.contains("memory limit of 16 GiB"), "{detail}");
-        assert!(detail.contains("exit status could not be read"), "{detail}");
-        assert!(
-            detail.contains("systemd exit status unavailable"),
-            "{detail}"
-        );
-        assert!(job_output(&runner, request.job_id).contains("systemd exit status unavailable"));
+        assert!(job.monitoring_error.is_none());
         assert_eq!(runner.runner_status().health.unwrap().counts.oom_stops, 1);
+    }
+}
+
+/// A Boat job's PID namespace init that fails exits 226 before the wrapper
+/// reads the gate, so the command never ran. That must reach the caller as a
+/// retry-safe refusal carrying the init's reason, never as "exit 226". The
+/// same status with an exit file is the job's own exit. Without a complete
+/// init report or exit file, execution is unknown and must not be retried as
+/// though the command never ran.
+#[cfg(target_os = "linux")]
+#[test]
+fn boat_pid_namespace_setup_failure_is_refused_before_start_not_reported_as_exit() {
+    use crate::isolation::pid_init;
+    let line = format!(
+        "{}mount the namespace's proc: Operation not permitted (os error 1)",
+        pid_init::SETUP_FAILURE_PREFIX
+    );
+    let complete = format!("{line}\n");
+    let prefix_only = format!("{}\n", pid_init::SETUP_FAILURE_PREFIX);
+    for (case, exit_file, setup_error, boat_init) in [
+        ("setup failure", "", complete.as_str(), true),
+        ("job exited 226", "226\n", complete.as_str(), true),
+        ("no init line", "", "", true),
+        ("torn init line", "", line.as_str(), true),
+        ("prefix without step", "", prefix_only.as_str(), true),
+        ("oversized exit", "", "", true),
+        ("sparse exit", "", "", true),
+        ("supervisor wait failed", "", complete.as_str(), true),
+        ("job exited 227", "227\n", "", true),
+        ("unit without the init", "", complete.as_str(), false),
+    ] {
+        let f = Fixture::new();
+        let mut config = f.config();
+        config.boat_profile = true;
+        config.boat_memory_max_bytes = Some(2 << 30);
+        config.free_space_probe = Arc::new(|_| Ok(63 << 30));
+        config.private_pids = !boat_init;
+        let supervisor_failed = case == "supervisor wait failed";
+        config.systemd_command = Some(Arc::new(move |args| {
+            let text = match args {
+                ["show", "--property=LoadState", "--property=ActiveState", _] => {
+                    "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+                }
+                ["show", "--property=ExecMainCode", "--property=ExecMainStatus", _] => {
+                    if supervisor_failed {
+                        "ExecMainCode=1\nExecMainStatus=227\n"
+                    } else {
+                        "ExecMainCode=1\nExecMainStatus=226\n"
+                    }
+                }
+                ["show", "--property=Result", _] => "Result=exit-code\n",
+                ["show", "--property=ControlGroup,MemoryPeak,MemoryMax,Result,ExecMainCode,ExecMainStatus", _] => {
+                    "Result=exit-code\n"
+                }
+                ["reset-failed", _] | ["list-units", ..] => "",
+                _ => panic!("unexpected systemd command: {args:?}"),
+            };
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: text.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            })
+        }));
+        let runner = Runner::open(config).unwrap();
+        let (request, _) = f.run("true");
+        runner.accept(request.clone()).unwrap();
+        {
+            let mut inner = runner.core.inner.lock().unwrap();
+            let job = inner.jobs.get_mut(&request.job_id).unwrap();
+            job.state = JobState::Running;
+            job.started_ms = Some(runner.now());
+            job.started = Some(Started::new(0, 0, runner.now()));
+            job.next_seq = 1;
+            job.durable_output = true;
+            job.process = Some(platform::ProcessIdentity {
+                pid: 0,
+                start: 0,
+                unit: Some(Uuid::now_v7()),
+            });
+            runner.save(job).unwrap();
+        }
+        let output = runner
+            .config()
+            .state_dir()
+            .join("sandboxes")
+            .join(request.job_id.to_string())
+            .join("output");
+        fs::create_dir_all(&output).unwrap();
+        for name in ["stdout", "stderr"] {
+            fs::write(output.join(name), "").unwrap();
+        }
+        fs::write(output.join("exit"), exit_file).unwrap();
+        if case == "oversized exit" {
+            // A valid-looking prefix plus whitespace must not be accepted by
+            // parsing a truncated prefix or reread into the privileged daemon.
+            fs::write(output.join("exit"), format!("226\n{}", " ".repeat(1 << 20))).unwrap();
+        } else if case == "sparse exit" {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(output.join("exit"))
+                .unwrap();
+            file.set_len(1 << 40).unwrap();
+        }
+        fs::write(output.join(pid_init::SETUP_ERROR_FILE), setup_error).unwrap();
+        if case == "job exited 226" {
+            let process = runner.core.inner.lock().unwrap().jobs[&request.job_id].process;
+            let (status, observation) = runner.durable_exit_status(process, &output.join("exit"));
+            assert!(matches!(observation, Ok(Some(226))));
+            fs::write(output.join("exit"), "now malformed").unwrap();
+            assert!(
+                !runner.unproven_pid_bootstrap_status(&status, &observation),
+                "classification must consume the original bounded observation"
+            );
+            fs::write(output.join("exit"), exit_file).unwrap();
+        }
+        runner.follow_unit(request.job_id).unwrap();
+        let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
+        let terminal = job.terminal.clone().unwrap();
+        assert_execution_ended_wire(&terminal, true);
+        if case == "setup failure" {
+            assert_eq!(
+                terminal.outcome,
+                Outcome::RefusedBeforeStart {
+                    reason: RefusalReason::WorkspaceSetupFailed
+                },
+                "{case}"
+            );
+            assert_eq!(terminal.ran, Some(Ran::None), "{case}");
+            assert_eq!(terminal.refusal_detail(), Some(line.as_str()), "{case}");
+            assert_eq!(job.state, JobState::Tombstone, "{case}");
+            assert!(job.started.is_none() && job.started_ms.is_none(), "{case}");
+        } else if case.starts_with("job exited") || !boat_init {
+            assert_eq!(
+                terminal.outcome,
+                Outcome::Exit {
+                    code: if case == "job exited 227" { 227 } else { 226 }
+                },
+                "{case}"
+            );
+        } else {
+            assert_eq!(terminal.outcome, Outcome::OutcomeUnknown, "{case}");
+            let detail = terminal
+                .refusal_detail()
+                .expect("unknown must explain itself");
+            for expected in [
+                "pid_bootstrap_unproven",
+                "memory.peak=",
+                "memory.events[",
+                "ExecMainCode=",
+                "ExecMainStatus=",
+                "workspace[free_bytes=",
+                "runner_state[free_bytes=",
+                "free_inodes=",
+            ] {
+                assert!(
+                    detail.contains(expected),
+                    "{case}: missing {expected}: {detail}"
+                );
+            }
+            assert!(detail.len() <= REFUSAL_DETAIL_MAX_BYTES);
+            assert!(
+                job.started.is_some(),
+                "no proof that job never started: {case}"
+            );
+            let output = job_output(&runner, request.job_id);
+            let code = if supervisor_failed { 227 } else { 226 };
+            assert!(
+                output.contains(&format!("bootstrap status {code}")),
+                "{case}: {output}"
+            );
+            assert!(
+                output.contains("setup evidence unavailable"),
+                "{case}: {output}"
+            );
+        }
     }
 }
 

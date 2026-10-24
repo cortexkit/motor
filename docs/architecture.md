@@ -10,7 +10,7 @@ them. Each part's details live in the linked documents.
 
 | Part | Where | Runs on | Role |
 | --- | --- | --- | --- |
-| `ck-motor` | `crates/motor-module` | Caller's Mac | CortexKit daemon module: admits callers, captures snapshots, holds the SSH connection, follows job streams. [module.md](module.md) |
+| `ck-motor` | `crates/motor-module` | Caller's machine | CortexKit daemon module: admits callers, captures snapshots, holds the SSH connection, follows job streams. [module.md](module.md) |
 | Protocol | `crates/motor-protocol` | Both | Framed client-runner protocol and codec; re-exports the caller types. [wire-protocol.md](wire-protocol.md) |
 | `motor-runner` | `crates/motor-runner` | Build server | Admission, queueing, Git mirrors, workspaces, execution, retained output. |
 | Linux sandbox | `crates/motor-runner/src/isolation*`, `systemd.rs`, `network*.rs` | Build server | Runs each Linux job as `motor-job` in a transient systemd service. [job-isolation.md](job-isolation.md) |
@@ -61,6 +61,22 @@ them. Each part's details live in the linked documents.
 
 Between jobs, maintenance expires old history and idle workspaces, cleans up
 under disk pressure, and runs compile-cache fills when no job is waiting.
+
+A repository's Git mirror that no job has used for 30 days is retired
+(`MIRROR_UNUSED_MS` in `crates/motor-runner/src/retirement.rs`), on the build
+server, in tenant VMs and in Boat sandboxes alike. Use is read from the
+records that depend on the mirror (jobs, including use as a declared sibling;
+workspaces; transfers; warm-build fills; have-reply pins) and kept durably in
+the catalog (`mirror_used_ms`), so a restart neither resets the clock nor
+counts as use. A retained job, an in-flight setup, transfer or prepare, a
+running fill, a non-Head workspace, held refs or a running compaction keep the
+mirror whatever its age. Retirement discards the repository's Head
+workspaces, sibling checkout, warm-build record and fill checkout, and its
+JavaScript install and manager caches, then the mirror, each by rename into
+`trash` and a background purge, under the ref and state locks, and logs one
+`retired unused repository` line listing what went. Shared caches (Cargo
+registry, compile cache) and `git-deps` dependency mirrors are not per
+repository and are left to disk-pressure eviction.
 
 ## State on the runner
 

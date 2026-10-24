@@ -18,9 +18,9 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{BufRead, Read, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use subc_client_rs::{
     async_trait, CallError, CallOptions, ConsumerOptions, RouteHandle, SubcConsumer,
@@ -31,6 +31,11 @@ use tokio::{
     sync::{mpsc, Mutex},
     time::Instant,
 };
+
+mod records;
+#[cfg(test)]
+mod return_tests;
+mod returned_files;
 
 /// Nothing ran: the request was refused before the command started (by
 /// ck-motor, the runner or the daemon), or it could not be submitted.
@@ -70,6 +75,7 @@ See `ck motor run --help` for the options and exit statuses.";
 pub const HELP: &str = "\
 usage: ck motor run [--vcpus N] [--sibling PATH]... [--env NAME=VALUE]...
                     [--timeout SECONDS] [--cwd PATH] [--secret-file PATH]
+                    [--platform linux|windows|macos] [--net]
                     [--allow-spill | --hosted] -- COMMAND...
 
 Runs COMMAND on the remote build server against a snapshot of the git checkout
@@ -77,6 +83,9 @@ that contains --cwd (default: the current directory), and streams its stdout
 and stderr here as they arrive.
 
   --vcpus N           vCPUs to reserve (the runner's default when omitted)
+  --platform NAME     linux (default), windows or macos; macos is direct-only
+  --net               allow outbound IPv4 internet (package and tool fetches);
+                      jobs are offline without it
   --sibling PATH      also send this sibling repository (repeatable)
   --env NAME=VALUE    set an environment variable for the job (repeatable).
                       Nothing is inherited from this shell; ck-motor forwards
@@ -86,8 +95,11 @@ and stderr here as they arrive.
                       7200; ck-motor may be configured with a lower cap)
   --cwd PATH          directory to run in; its git checkout is the workspace
   --return-path PATH  return this absolute workspace file (repeatable, at most 64)
-  --return-max-bytes N  cap total returned raw bytes (default and maximum 262144)
-  --secret-file PATH  save the reattach secret in a new 0600 file instead of stderr
+  --return-max-bytes N  cap total returned raw bytes (default/maximum 10485760;
+                       legacy runners are capped at 262144)
+  --secret-file PATH  save the reattach secret in this new 0600 file (optional)
+  --record-file PATH  save Accepted/Started/Output/Terminal JSONL to a new 0600
+                      file, without route credentials (output may be sensitive)
   --allow-spill       allow this gate job to spill to hosted capacity when configured
   --hosted            operator test of the hosted path: run this one job on a
                       hosted runner, never on the build server; a lease that
@@ -108,14 +120,19 @@ Exit status: the command's own exit code; 128+N when a signal N killed it;
 Ctrl-C or SIGTERM cancels the job and waits for its outcome; a second one stops
 waiting. If the route closes, run tries to reattach for up to 60 seconds without
 resubmitting the job. The job keeps running until it ends or its timeout stops it.
-Save the one-time job ID and secret printed on stderr, or use
---secret-file. Reconnect with `ck motor attach JOB_ID`, reading the secret from
-stdin, or `ck motor attach JOB_ID --secret-file PATH`. Keep one connection per job, and run
-parallel jobs from separate checkouts: the runner runs one job per workspace at
-a time.";
+Save the one-time job ID printed on stderr and the secret file path, or use
+--secret-file. By default, the secret is saved in ck-motor's private data
+directory and only its path is printed; `ck motor attach JOB_ID` finds it there.
+An explicit --secret-file overrides that location. Reconnect with `ck motor attach JOB_ID`,
+or use `ck motor attach JOB_ID --secret-file PATH`. Keep one connection per job,
+and run parallel jobs from separate checkouts: the runner runs one job per
+workspace at a time.";
 
 /// What `ck motor run` was asked to do.
 #[derive(Debug, PartialEq, Eq)]
+// Parsed once per CLI invocation; boxing the only data-bearing variant adds
+// an allocation without reducing a collection or long-lived object's size.
+#[allow(clippy::large_enum_variant)]
 pub enum Invocation {
     Help,
     Run(RunArgs),
@@ -124,12 +141,15 @@ pub enum Invocation {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RunArgs {
     pub vcpus: Option<u32>,
+    pub net: bool,
+    pub platform: Option<motor_protocol::Platform>,
     pub siblings: Vec<PathBuf>,
     pub env: BTreeMap<String, String>,
     pub timeout: u64,
     pub cwd: Option<PathBuf>,
     pub command: Vec<String>,
     pub secret_file: Option<PathBuf>,
+    pub record_file: Option<PathBuf>,
     pub return_paths: Vec<String>,
     pub return_max_bytes: Option<u64>,
     pub allow_spill: bool,
@@ -153,10 +173,22 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
             if parsed.hosted && parsed.allow_spill {
                 return Err("--hosted and --allow-spill cannot be combined".into());
             }
+            if parsed.platform == Some(motor_protocol::Platform::Macos)
+                && (parsed.hosted || parsed.allow_spill)
+            {
+                return Err(
+                    "--platform macos cannot be combined with --hosted or --allow-spill".into(),
+                );
+            }
+            validate_return_args(&parsed)?;
             return Ok(Invocation::Run(parsed));
         }
         if word == "-h" || word == "--help" {
             return Ok(Invocation::Help);
+        }
+        if word == "--net" {
+            parsed.net = true;
+            continue;
         }
         if word == "--allow-spill" {
             parsed.allow_spill = true;
@@ -173,11 +205,13 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
         if !matches!(
             name,
             "--vcpus"
+                | "--platform"
                 | "--sibling"
                 | "--env"
                 | "--timeout"
                 | "--cwd"
                 | "--secret-file"
+                | "--record-file"
                 | "--return-path"
                 | "--return-max-bytes"
         ) {
@@ -195,6 +229,18 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
                 .ok_or_else(|| format!("{name} needs a value"))?,
         };
         match name {
+            "--platform" => {
+                parsed.platform = Some(match value.as_str() {
+                    "linux" => motor_protocol::Platform::Linux,
+                    "windows" => motor_protocol::Platform::Windows,
+                    "macos" => motor_protocol::Platform::Macos,
+                    _ => {
+                        return Err(format!(
+                            "--platform needs linux, windows or macos, got {value:?}"
+                        ))
+                    }
+                });
+            }
             "--vcpus" => {
                 parsed.vcpus = Some(
                     value
@@ -218,6 +264,7 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
             "--sibling" => parsed.siblings.push(PathBuf::from(value)),
             "--cwd" => parsed.cwd = Some(PathBuf::from(value)),
             "--secret-file" => parsed.secret_file = Some(PathBuf::from(value)),
+            "--record-file" => parsed.record_file = Some(PathBuf::from(value)),
             "--return-path" => parsed.return_paths.push(value),
             "--return-max-bytes" => {
                 parsed.return_max_bytes = Some(value.parse().map_err(|_| {
@@ -236,10 +283,72 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
     Err("missing -- before the command".into())
 }
 
+fn workspace_root(cwd: Option<&Path>) -> Result<PathBuf, String> {
+    let cwd = cwd.map(Path::to_path_buf).map_or_else(
+        || std::env::current_dir().map_err(|error| format!("current directory: {error}")),
+        Ok,
+    )?;
+    let root = crate::snapshot::git(
+        &cwd,
+        &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+    )
+    .map_err(|error| format!("{} is not in a git checkout: {error}", cwd.display()))?;
+    canonical(Path::new(&root), "workspace")
+}
+
+fn validate_return_args(args: &RunArgs) -> Result<(), String> {
+    for path in &args.return_paths {
+        if path.len() > 4096 {
+            return Err(format!("--return-path {path:?} exceeds 4096 bytes"));
+        }
+        if !Path::new(path).is_absolute() {
+            let hint = if path.starts_with('$') {
+                "; a shell variable inside single quotes isn't expanded"
+            } else {
+                ""
+            };
+            return Err(format!(
+                "--return-path {path:?} must be an absolute workspace file{hint}"
+            ));
+        }
+    }
+    if !args.return_paths.is_empty() {
+        let root = workspace_root(args.cwd.as_deref())?;
+        for path in &args.return_paths {
+            returned_files::relative_path(&root, Path::new(path)).map_err(|_| {
+                format!(
+                    "--return-path {path:?} must be inside workspace {}",
+                    root.display()
+                )
+            })?;
+        }
+    }
+    if args.return_paths.len() > 64 {
+        return Err("--return-path accepts at most 64 paths".into());
+    }
+    if args
+        .return_max_bytes
+        .is_some_and(|cap| cap > cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP)
+    {
+        return Err("--return-max-bytes exceeds the 10485760 byte cap".into());
+    }
+    Ok(())
+}
+
+fn return_cap(args: &RunArgs) -> u64 {
+    args.return_max_bytes
+        .unwrap_or(if args.return_paths.is_empty() {
+            motor_protocol::RETURN_MAX_BYTES
+        } else {
+            cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP
+        })
+}
+
 pub const ATTACH_HELP: &str = "\
 usage: ck motor attach JOB_ID [--secret-file PATH] [--status]
 
-Reads the job's secret from one line of stdin, or from --secret-file PATH.
+Uses the saved default secret for JOB_ID when available, otherwise reads one
+line of stdin; --secret-file PATH selects an explicit secret file.
 Secrets are never accepted as arguments or from environment variables.
 Replays output from the start, then streams until the job ends. --status prints
 the current state and outcome as JSON without streaming (exit 0 while running).
@@ -285,6 +394,7 @@ pub fn parse_attach_args(args: &[String]) -> Result<Option<AttachArgs>, String> 
 pub struct SecretFile {
     file: fs::File,
     path: PathBuf,
+    remove_on_terminal: bool,
 }
 
 impl SecretFile {
@@ -293,10 +403,27 @@ impl SecretFile {
             .write(true)
             .create_new(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
         Ok(Self {
             file,
             path: path.into(),
+            remove_on_terminal: false,
+        })
+    }
+
+    fn create_default(directory: &Path, job_id: Uuid) -> std::io::Result<Self> {
+        let path = default_secret_path(directory, job_id);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        Ok(Self {
+            file,
+            path,
+            remove_on_terminal: true,
         })
     }
 
@@ -304,6 +431,105 @@ impl SecretFile {
         writeln!(self.file, "{secret}")?;
         self.file.sync_all()
     }
+
+    fn remove_after_terminal(&self) -> std::io::Result<()> {
+        fs::remove_file(&self.path)
+    }
+}
+
+const JOB_SECRET_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_SECRET_DIRECTORY: &str = "direct-secrets";
+
+fn default_secret_path(directory: &Path, job_id: Uuid) -> PathBuf {
+    directory.join(job_id.to_string())
+}
+
+/// The module's data directory, named by the module id the daemon runs it under
+/// (`SUBC_MODULE_ID`, as the module itself uses), so the CLI's secret files sit
+/// beside the module's own data rather than under a legacy module name.
+fn cli_module_data_dir() -> std::io::Result<PathBuf> {
+    let module_id =
+        std::env::var("SUBC_MODULE_ID").unwrap_or_else(|_| crate::module::DEFAULT_MODULE_ID.into());
+    crate::module::module_data_dir(&module_id)
+}
+
+fn prepare_default_secret_directory() -> std::io::Result<PathBuf> {
+    let data_root = cli_module_data_dir()?;
+    prepare_default_secret_directory_under(&data_root)
+}
+
+fn prepare_default_secret_directory_under(data_root: &Path) -> std::io::Result<PathBuf> {
+    fs::create_dir_all(data_root)?;
+    let directory = data_root.join(DEFAULT_SECRET_DIRECTORY);
+    match fs::DirBuilder::new().mode(0o700).create(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    // Open without following a link, then set the mode through the directory
+    // handle so an existing link cannot redirect the permission change.
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(&directory)?;
+    handle.set_permissions(fs::Permissions::from_mode(0o700))?;
+    sweep_default_secrets(&directory)?;
+    Ok(directory)
+}
+
+fn existing_default_secret_directory() -> std::io::Result<Option<PathBuf>> {
+    let directory = cli_module_data_dir()?.join(DEFAULT_SECRET_DIRECTORY);
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            let handle = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(&directory)?;
+            if metadata.permissions().mode() & 0o777 != 0o700 {
+                handle.set_permissions(fs::Permissions::from_mode(0o700))?;
+            }
+            sweep_default_secrets(&directory)?;
+            Ok(Some(directory))
+        }
+        Ok(_) => Err(std::io::Error::other(
+            "default secret path is not a directory",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn sweep_default_secrets(directory: &Path) -> std::io::Result<()> {
+    let now = SystemTime::now();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(job_id) = name.parse::<Uuid>() else {
+            continue;
+        };
+        if job_id.to_string() != name {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_file()
+            && now
+                .duration_since(metadata.modified()?)
+                .is_ok_and(|age| age > JOB_SECRET_RETENTION)
+        {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn open_default_secret(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
 }
 
 fn read_secret(reader: impl Read) -> String {
@@ -351,6 +577,7 @@ pub fn command_line(words: &[String]) -> String {
 /// contains the working directory and the repository root is that checkout's
 /// main checkout, as AFT keys them; ck-motor validates both again.
 pub fn build_request(args: &RunArgs) -> Result<RunRequest, String> {
+    validate_return_args(args)?;
     let cwd = match &args.cwd {
         Some(cwd) => cwd.clone(),
         None => std::env::current_dir().map_err(|e| format!("current directory: {e}"))?,
@@ -381,6 +608,11 @@ pub fn build_request(args: &RunArgs) -> Result<RunRequest, String> {
     )
     .with_env(args.env.clone())
     .with_timeout(args.timeout)
+    .with_return_paths(args.return_paths.clone())
+    .with_return_chunked(
+        !args.return_paths.is_empty() || return_cap(args) > motor_protocol::RETURN_MAX_BYTES,
+    )
+    .with_return_max_bytes(return_cap(args))
     .with_siblings(
         args.siblings
             .iter()
@@ -389,6 +621,12 @@ pub fn build_request(args: &RunArgs) -> Result<RunRequest, String> {
     );
     if let Some(vcpus) = args.vcpus {
         request = request.with_weight_hint(vcpus);
+    }
+    if args.net {
+        request = request.with_network(motor_protocol::Network::Outbound);
+    }
+    if let Some(platform) = &args.platform {
+        request = request.with_platform(platform.clone());
     }
     Ok(request)
 }
@@ -480,6 +718,10 @@ where
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ExecClient: Send + Sync {
+    /// Fallback checkout for an attachment without saved workspace metadata.
+    fn local_workspace(&self) -> Option<&Path> {
+        None
+    }
     /// Start `exec.run`. Records arrive as the serialized `StreamRecord`
     /// bodies ck-motor emits.
     async fn run(&self, request: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError>;
@@ -531,6 +773,50 @@ pub async fn drive_run<C: ExecClient + ?Sized>(
     err: &mut dyn Write,
     interrupts: &mut mpsc::Receiver<()>,
 ) -> u8 {
+    drive_run_recorded(client, request, secret_file, None, out, err, interrupts).await
+}
+
+async fn drive_run_recorded<C: ExecClient + ?Sized>(
+    client: &C,
+    request: &RunRequest,
+    secret_file: Option<SecretFile>,
+    records: Option<records::Capture>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    interrupts: &mut mpsc::Receiver<()>,
+) -> u8 {
+    let default_secret_directory = if secret_file.is_none() {
+        match prepare_default_secret_directory() {
+            Ok(directory) => Some(directory),
+            Err(error) => {
+                let _ = writeln!(err, "ck motor run: cannot create secret file: {error}");
+                return EXIT_USAGE;
+            }
+        }
+    } else {
+        None
+    };
+    drive_run_with_secret_directory(
+        client,
+        request,
+        (secret_file, records),
+        default_secret_directory,
+        out,
+        err,
+        interrupts,
+    )
+    .await
+}
+
+async fn drive_run_with_secret_directory<C: ExecClient + ?Sized>(
+    client: &C,
+    request: &RunRequest,
+    files: (Option<SecretFile>, Option<records::Capture>),
+    default_secret_directory: Option<PathBuf>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    interrupts: &mut mpsc::Receiver<()>,
+) -> u8 {
     let stream = match client.run(request).await {
         Ok(stream) => stream,
         Err(SubmitError::NotSent(message) | SubmitError::CapabilityUnavailable(message)) => {
@@ -549,9 +835,19 @@ pub async fn drive_run<C: ExecClient + ?Sized>(
         client,
         stream,
         Session {
+            returns: returned_files::Returns::new(
+                Some(PathBuf::from(&request.workspace_key)),
+                Some(request.return_paths.clone()),
+                request
+                    .return_max_bytes
+                    .unwrap_or(cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP),
+            ),
             job_id: None,
             secret: None,
-            secret_file,
+            secret_file: files.0,
+            records: files.1,
+            default_secret_directory,
+            default_secret_file: None,
         },
         out,
         err,
@@ -561,15 +857,31 @@ pub async fn drive_run<C: ExecClient + ?Sized>(
 }
 
 struct Session {
+    records: Option<records::Capture>,
+    returns: returned_files::Returns,
     job_id: Option<Uuid>,
     secret: Option<String>,
     secret_file: Option<SecretFile>,
+    default_secret_directory: Option<PathBuf>,
+    default_secret_file: Option<PathBuf>,
 }
 
 pub async fn drive_attach<C: ExecClient + ?Sized>(
     client: &C,
     args: &AttachArgs,
     secret: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    interrupts: &mut mpsc::Receiver<()>,
+) -> u8 {
+    drive_attach_inner(client, args, secret, None, out, err, interrupts).await
+}
+
+async fn drive_attach_inner<C: ExecClient + ?Sized>(
+    client: &C,
+    args: &AttachArgs,
+    secret: &str,
+    default_secret_file: Option<PathBuf>,
     out: &mut dyn Write,
     err: &mut dyn Write,
     interrupts: &mut mpsc::Receiver<()>,
@@ -582,6 +894,11 @@ pub async fn drive_attach<C: ExecClient + ?Sized>(
                     "{}",
                     serde_json::to_string(&status).expect("serializable status")
                 );
+                if status.terminal.is_some() {
+                    if let Some(path) = &default_secret_file {
+                        let _ = fs::remove_file(path);
+                    }
+                }
                 status.terminal.as_ref().map_or(0, exit_code)
             }
             Err(failure) => attach_failure(failure, err),
@@ -595,9 +912,20 @@ pub async fn drive_attach<C: ExecClient + ?Sized>(
         client,
         stream,
         Session {
+            records: None,
+            returns: returned_files::Returns::new(
+                client
+                    .local_workspace()
+                    .map(Path::to_path_buf)
+                    .or_else(|| workspace_root(None).ok()),
+                None,
+                cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP,
+            ),
             job_id: Some(args.job_id),
             secret: Some(secret.into()),
             secret_file: None,
+            default_secret_directory: None,
+            default_secret_file,
         },
         out,
         err,
@@ -729,6 +1057,7 @@ async fn consume<C: ExecClient + ?Sized>(
                         {
                             Ok(replacement) => {
                                 stream = replacement;
+                                session.returns.restart();
                                 received = false;
                                 continue;
                             }
@@ -771,6 +1100,12 @@ async fn consume<C: ExecClient + ?Sized>(
                 ) {
                     job_id = Some(id);
                     session.secret = Some(secret.into());
+                    if session.secret_file.is_none() {
+                        session.secret_file = session
+                            .default_secret_directory
+                            .as_deref()
+                            .and_then(|directory| SecretFile::create_default(directory, id).ok());
+                    }
                     if let Some(file) = session.secret_file.as_mut() {
                         if file.save(secret).is_err() {
                             let _ = writeln!(
@@ -785,15 +1120,51 @@ async fn consume<C: ExecClient + ?Sized>(
                             file.path.display()
                         );
                     } else {
-                        let _ = writeln!(err, "ck motor run: job_id={id} secret={secret}");
+                        let _ = writeln!(
+                            err,
+                            "ck motor run: could not save the reattach secret for job_id={id}"
+                        );
+                        return EXIT_UNKNOWN;
                     }
                 }
             }
         }
+        // The direct route adds its own `hosted` object (the stored hosted
+        // route) beside the record's fields. Take it out before decoding:
+        // the shared terminal record has a `hosted` field of a different
+        // shape, and the record would otherwise fail to decode.
         let hosted = value
-            .get("hosted")
-            .cloned()
+            .as_object_mut()
+            .and_then(|record| record.remove("hosted"))
             .and_then(|v| serde_json::from_value::<crate::HostedJobState>(v).ok());
+        if let Some(paths) = value
+            .as_object_mut()
+            .and_then(|record| record.remove("return_paths"))
+        {
+            if let Ok(paths) = serde_json::from_value::<Vec<String>>(paths) {
+                session.returns.requested(paths);
+            }
+        }
+        if let Some(workspace) = value
+            .as_object_mut()
+            .and_then(|record| record.remove("return_workspace"))
+        {
+            if let Some(workspace) = workspace.as_str() {
+                session.returns.job_workspace(workspace);
+            }
+        }
+        // The direct v1 interface attaches the runner's stored result as
+        // metadata. Newer streams also support standalone shared records.
+        if let Some(result) = value
+            .as_object_mut()
+            .and_then(|record| record.remove("return_result"))
+        {
+            if let Ok(result) = serde_json::from_value::<motor_protocol::ReturnResult>(result) {
+                if let Some(result) = crate::agent_route::return_record(result, "") {
+                    session.returns.legacy(&result);
+                }
+            }
+        }
         let record: StreamRecord = match serde_json::from_value(value) {
             Ok(record) => record,
             Err(error) => {
@@ -804,6 +1175,12 @@ async fn consume<C: ExecClient + ?Sized>(
                 continue;
             }
         };
+        if let Some(capture) = &mut session.records {
+            if let Err(error) = capture.record(&record) {
+                let _ = writeln!(err, "ck motor {name}: record capture failed: {error}");
+                return EXIT_UNKNOWN;
+            }
+        }
         match record {
             StreamRecord::Accepted(accepted) => {
                 if let Some(state) = &hosted {
@@ -856,6 +1233,7 @@ async fn consume<C: ExecClient + ?Sized>(
                 };
             }
             StreamRecord::Terminal(terminal) => {
+                session.returns.finish(err);
                 if let Some(state) = &hosted {
                     let _ = writeln!(
                         err,
@@ -864,7 +1242,25 @@ async fn consume<C: ExecClient + ?Sized>(
                         state.billed_line()
                     );
                 }
+                if let Some(file) = session
+                    .secret_file
+                    .as_ref()
+                    .filter(|file| file.remove_on_terminal)
+                {
+                    let _ = file.remove_after_terminal();
+                }
+                if let Some(path) = &session.default_secret_file {
+                    let _ = fs::remove_file(path);
+                }
                 return settle_named(&terminal, name, err);
+            }
+            StreamRecord::ReturnResult(result) => session.returns.legacy(&result),
+            StreamRecord::ReturnChunk(chunk) => session.returns.chunk(&chunk),
+            StreamRecord::ReturnManifest(manifest) => {
+                // Started occupies sequence zero even when the job emits no output.
+                session
+                    .returns
+                    .manifest(&manifest, last_output_seq.unwrap_or(0))
             }
             _ => {}
         }
@@ -874,6 +1270,7 @@ async fn consume<C: ExecClient + ?Sized>(
 fn reattach_hint(job_id: Option<Uuid>, secret_file: Option<&SecretFile>, err: &mut dyn Write) {
     if let Some(id) = job_id {
         let file = secret_file
+            .filter(|file| !file.remove_on_terminal)
             .map(|file| {
                 format!(
                     " {}",
@@ -976,7 +1373,7 @@ pub struct SubcClient {
     consumer: SubcConsumer,
     route: Mutex<Option<ClientRoute>>,
     workspace: PathBuf,
-    returns: crate::ReturnOptions,
+    return_workspace: Option<PathBuf>,
     allow_spill: bool,
     hosted: bool,
 }
@@ -1011,7 +1408,7 @@ impl SubcClient {
             consumer,
             route: Mutex::new(None),
             workspace: workspace.to_owned(),
-            returns: crate::ReturnOptions::default(),
+            return_workspace: workspace_root(Some(workspace)).ok(),
             allow_spill: false,
             hosted: false,
         })
@@ -1123,8 +1520,11 @@ fn connection_error(error: CallError) -> SubmitError {
 
 #[async_trait]
 impl ExecClient for SubcClient {
+    fn local_workspace(&self) -> Option<&Path> {
+        self.return_workspace.as_deref()
+    }
     async fn run(&self, request: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError> {
-        let mut params = self.returns.params(request);
+        let mut params = serde_json::to_value(request).expect("serializable request");
         if self.allow_spill {
             params["allow_spill"] = json!(true);
         }
@@ -1225,6 +1625,18 @@ pub async fn main(args: &[String]) -> u8 {
             return EXIT_USAGE;
         }
     };
+    let records = match args
+        .record_file
+        .as_deref()
+        .map(records::Capture::create)
+        .transpose()
+    {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("ck motor run: cannot create record file: {error}");
+            return EXIT_USAGE;
+        }
+    };
     let mut interrupts = match interrupt_signals() {
         Ok(interrupts) => interrupts,
         Err(error) => {
@@ -1246,20 +1658,15 @@ pub async fn main(args: &[String]) -> u8 {
             return EXIT_REFUSED;
         }
     };
-    client.returns = crate::ReturnOptions {
-        return_paths: args.return_paths.clone(),
-        return_max_bytes: args
-            .return_max_bytes
-            .unwrap_or(motor_protocol::RETURN_MAX_BYTES),
-    };
     client.allow_spill = args.allow_spill;
     client.hosted = args.hosted;
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
-    drive_run(
+    drive_run_recorded(
         &client,
         &request,
         secret_file,
+        records,
         &mut out,
         &mut err,
         &mut interrupts,
@@ -1321,6 +1728,34 @@ pub async fn hosted_check_main(args: &[String]) -> u8 {
     }
 }
 
+fn attach_secret(args: &AttachArgs, stdin: impl Read) -> (String, Option<PathBuf>) {
+    let default_directory = existing_default_secret_directory().ok().flatten();
+    attach_secret_from_directory(args, stdin, default_directory)
+}
+
+fn attach_secret_from_directory(
+    args: &AttachArgs,
+    stdin: impl Read,
+    default_directory: Option<PathBuf>,
+) -> (String, Option<PathBuf>) {
+    if let Some(path) = &args.secret_file {
+        return (
+            fs::File::open(path).map(read_secret).unwrap_or_default(),
+            None,
+        );
+    }
+    let default_file =
+        default_directory.map(|directory| default_secret_path(&directory, args.job_id));
+    if let Some(path) = default_file {
+        match open_default_secret(&path) {
+            Ok(file) => return (read_secret(file), Some(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return (String::new(), None),
+        }
+    }
+    (read_secret(stdin), None)
+}
+
 pub async fn attach_main(args: &[String]) -> u8 {
     let args = match parse_attach_args(args) {
         Ok(Some(args)) => args,
@@ -1333,10 +1768,7 @@ pub async fn attach_main(args: &[String]) -> u8 {
             return EXIT_USAGE;
         }
     };
-    let secret = match &args.secret_file {
-        Some(path) => fs::File::open(path).map(read_secret).unwrap_or_default(),
-        None => read_secret(std::io::stdin().lock()),
-    };
+    let (secret, default_secret_file) = attach_secret(&args, std::io::stdin().lock());
     let workspace = match std::env::current_dir() {
         Ok(path) => path,
         Err(_) => {
@@ -1355,10 +1787,11 @@ pub async fn attach_main(args: &[String]) -> u8 {
         Ok(client) => client,
         Err(failure) => return attach_failure(failure, &mut std::io::stderr()),
     };
-    drive_attach(
+    drive_attach_inner(
         &client,
         &args,
         &secret,
+        default_secret_file,
         &mut std::io::stdout(),
         &mut std::io::stderr(),
         &mut interrupts,
@@ -1467,6 +1900,69 @@ mod tests {
     }
 
     #[test]
+    fn default_secret_file_is_private_and_attachable_by_job_id() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-default-secret");
+        let directory = super::prepare_default_secret_directory_under(scratch.path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let job_id = motor_protocol::Uuid::now_v7();
+        let secret = "d".repeat(64);
+        let mut file = super::SecretFile::create_default(&directory, job_id).unwrap();
+        file.save(&secret).unwrap();
+        assert_eq!(
+            std::fs::metadata(&file.path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let args = super::AttachArgs {
+            job_id,
+            secret_file: None,
+            status: false,
+        };
+        let (loaded, path) =
+            super::attach_secret_from_directory(&args, &b""[..], Some(directory.clone()));
+        assert_eq!(loaded, secret);
+        assert_eq!(path, Some(file.path.clone()));
+
+        let linked_id = motor_protocol::Uuid::now_v7();
+        let link = super::default_secret_path(&directory, linked_id);
+        std::os::unix::fs::symlink(&file.path, &link).unwrap();
+        assert!(super::SecretFile::create_default(&directory, linked_id).is_err());
+    }
+
+    #[test]
+    fn default_secret_sweep_removes_only_expired_job_files() {
+        use std::fs::FileTimes;
+
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-secret-sweep");
+        let directory = super::prepare_default_secret_directory_under(scratch.path()).unwrap();
+        let expired = motor_protocol::Uuid::now_v7();
+        let current = motor_protocol::Uuid::now_v7();
+        let expired_path = super::default_secret_path(&directory, expired);
+        let current_path = super::default_secret_path(&directory, current);
+        std::fs::write(&expired_path, "old\n").unwrap();
+        std::fs::write(&current_path, "new\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&expired_path)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(
+                std::time::SystemTime::now()
+                    - super::JOB_SECRET_RETENTION
+                    - std::time::Duration::from_secs(1),
+            ))
+            .unwrap();
+
+        super::sweep_default_secrets(&directory).unwrap();
+        assert!(!expired_path.exists());
+        assert!(current_path.exists());
+    }
+
+    #[test]
     fn attach_never_accepts_an_argv_secret_or_echoes_it() {
         let id = motor_protocol::Uuid::now_v7().to_string();
         let secret = "a".repeat(64);
@@ -1562,7 +2058,7 @@ mod tests {
     #[test]
     fn arguments_map_onto_the_run_request_fields() {
         let Ok(Invocation::Run(args)) = parse_args(&words(
-            "--vcpus 4 --sibling /a --sibling=/b --env CI=1 --env RUSTFLAGS=-D=warnings --timeout=90 --cwd /w -- cargo test -p x",
+            "--vcpus 4 --sibling /a --sibling=/b --env CI=1 --env RUSTFLAGS=-D=warnings --timeout=90 --cwd /w --record-file=/evidence.jsonl -- cargo test -p x",
         )) else {
             panic!("expected a run")
         };
@@ -1570,6 +2066,8 @@ mod tests {
             args,
             RunArgs {
                 vcpus: Some(4),
+                net: false,
+                platform: None,
                 siblings: vec!["/a".into(), "/b".into()],
                 env: [("CI", "1"), ("RUSTFLAGS", "-D=warnings")]
                     .into_iter()
@@ -1579,6 +2077,7 @@ mod tests {
                 cwd: Some("/w".into()),
                 command: words("cargo test -p x"),
                 secret_file: None,
+                record_file: Some("/evidence.jsonl".into()),
                 return_paths: Vec::new(),
                 return_max_bytes: None,
                 allow_spill: false,
@@ -1595,6 +2094,7 @@ mod tests {
         };
         assert_eq!(args.timeout, DEFAULT_TIMEOUT_SECS);
         assert_eq!(args.vcpus, None);
+        assert!(!args.net);
         assert!(!args.allow_spill);
         let Ok(Invocation::Run(args)) = parse_args(&words("--allow-spill -- true")) else {
             panic!("expected a run")
@@ -1618,21 +2118,64 @@ mod tests {
     }
 
     #[test]
+    fn net_flag_sends_outbound_network_and_default_omits_it() {
+        let scratch = cortexkit_test_support::ScratchDir::new("cli-net");
+        crate::snapshot::git(scratch.path(), &["init", "--quiet"]).unwrap();
+        for net in [false, true] {
+            let mut words = vec!["--cwd".to_owned(), scratch.path().display().to_string()];
+            if net {
+                words.push("--net".into());
+            }
+            words.extend(["--".into(), "true".into()]);
+            let Ok(Invocation::Run(args)) = parse_args(&words) else {
+                panic!("expected a run")
+            };
+            assert_eq!(args.net, net);
+            let request = build_request(&args).unwrap();
+            let params = serde_json::to_value(&request).unwrap();
+            if net {
+                assert_eq!(request.network, Some(motor_protocol::Network::Outbound));
+                assert_eq!(params["network"], "outbound");
+            } else {
+                assert_eq!(request.network, None);
+                assert!(params.get("network").is_none(), "{params}");
+            }
+        }
+    }
+
+    #[test]
     fn return_paths_cli_options_are_repeatable_and_merge_into_direct_request() {
-        let Ok(Invocation::Run(args)) = parse_args(&words(
-            "--return-path /w/one --return-path=/w/two --return-max-bytes 1 -- true",
-        )) else {
+        let scratch = cortexkit_test_support::ScratchDir::new("cli-repeatable-returns");
+        let root = fs::canonicalize(scratch.path()).unwrap();
+        crate::snapshot::git(&root, &["init", "-q"]).unwrap();
+        let paths = vec![
+            root.join("one").display().to_string(),
+            root.join("two").display().to_string(),
+        ];
+        let Ok(Invocation::Run(args)) = parse_args(&[
+            "--cwd".into(),
+            root.display().to_string(),
+            "--return-path".into(),
+            paths[0].clone(),
+            format!("--return-path={}", paths[1]),
+            "--return-max-bytes".into(),
+            "1".into(),
+            "--".into(),
+            "true".into(),
+        ]) else {
             panic!("expected run")
         };
-        assert_eq!(args.return_paths, vec!["/w/one", "/w/two"]);
+        assert_eq!(args.return_paths, paths);
         assert_eq!(args.return_max_bytes, Some(1));
-        let request = RunRequest::new("/w", "/w", "/w", "true");
+        let key = root.to_str().unwrap();
+        let request = RunRequest::new(key, key, key, "true");
         let params = crate::ReturnOptions {
             return_paths: args.return_paths,
             return_max_bytes: args.return_max_bytes.unwrap(),
+            return_chunked: false,
         }
         .params(&request);
-        assert_eq!(params["return_paths"], json!(["/w/one", "/w/two"]));
+        assert_eq!(params["return_paths"], json!(paths));
         assert_eq!(params["return_max_bytes"], 1);
         assert_eq!(params["command"], "true");
         let empty = crate::ReturnOptions::default().params(&request);
@@ -1651,6 +2194,7 @@ mod tests {
             "--env NOEQUALS -- true",
             "--env =v -- true",
             "--bogus -- true",
+            "--net=true -- true",
             "--",
             "--timeout",
         ] {
@@ -1747,6 +2291,37 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_line_names_its_retry_hint_only_when_it_has_one() {
+        let id = Uuid::now_v7();
+        let refused = TerminalRecord::new(
+            id,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::RunnerAuthenticationFailed,
+            },
+            0,
+            0,
+            0,
+        );
+        for (terminal, line) in [
+            (
+                refused
+                    .clone()
+                    .with_refusal_detail("runner_sign_unavailable")
+                    .with_retry_after_ms(1500),
+                format!("ck motor run: refused before start: runner_authentication_failed: runner_sign_unavailable (retry after 1500 ms) (job_id={id})\n"),
+            ),
+            (
+                refused.with_refusal_detail("runner_sign_grant_refused"),
+                format!("ck motor run: refused before start: runner_authentication_failed: runner_sign_grant_refused (job_id={id})\n"),
+            ),
+        ] {
+            let mut err = Vec::new();
+            assert_eq!(settle(&terminal, &mut err), EXIT_REFUSED);
+            assert_eq!(String::from_utf8(err).unwrap(), line);
+        }
+    }
+
+    #[test]
     fn the_workspace_is_the_checkout_containing_cwd() {
         let scratch = cortexkit_test_support::ScratchDir::new("cli-workspace");
         let main = fs::canonicalize(scratch.path()).unwrap().join("main");
@@ -1838,6 +2413,51 @@ mod hosted_cli_tests {
         }
     }
 
+    struct DirectRunClient(Vec<Vec<u8>>);
+    #[async_trait]
+    impl ExecClient for DirectRunClient {
+        async fn run(&self, _: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError> {
+            Ok(Box::new(Records(VecDeque::from(self.0.clone()))))
+        }
+        async fn attach(&self, _: Uuid, _: &str) -> Result<Box<dyn RecordStream>, SubmitError> {
+            unreachable!()
+        }
+        async fn status(&self, _: Uuid, _: &str) -> Result<JobStatusReply, SubmitError> {
+            unreachable!()
+        }
+        async fn cancel(&self, _: Uuid, _: Option<&str>) -> Result<(), String> {
+            unreachable!()
+        }
+    }
+
+    struct SecretCheckingClient {
+        expected_secret: String,
+    }
+    #[async_trait]
+    impl ExecClient for SecretCheckingClient {
+        async fn run(&self, _: &RunRequest) -> Result<Box<dyn RecordStream>, SubmitError> {
+            unreachable!()
+        }
+        async fn attach(
+            &self,
+            job_id: Uuid,
+            secret: &str,
+        ) -> Result<Box<dyn RecordStream>, SubmitError> {
+            assert_eq!(secret, self.expected_secret);
+            let terminal = TerminalRecord::new(job_id, Outcome::Exit { code: 0 }, 0, 0, 0);
+            Ok(Box::new(Records(VecDeque::from([serde_json::to_vec(
+                &StreamRecord::Terminal(terminal),
+            )
+            .unwrap()]))))
+        }
+        async fn status(&self, _: Uuid, _: &str) -> Result<JobStatusReply, SubmitError> {
+            unreachable!()
+        }
+        async fn cancel(&self, _: Uuid, _: Option<&str>) -> Result<(), String> {
+            unreachable!()
+        }
+    }
+
     #[tokio::test]
     async fn hosted_cli_completion_prints_billing_and_keeps_real_exit_code() {
         for (billed, billing, expected) in [
@@ -1870,9 +2490,17 @@ mod hosted_cli_tests {
                 &UnusedClient,
                 Box::new(records),
                 Session {
+                    records: None,
+                    returns: returned_files::Returns::new(
+                        None,
+                        None,
+                        cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP,
+                    ),
                     job_id: Some(id),
                     secret: None,
                     secret_file: None,
+                    default_secret_directory: None,
+                    default_secret_file: None,
                 },
                 &mut out,
                 &mut err,
@@ -1882,6 +2510,183 @@ mod hosted_cli_tests {
             assert_eq!(code, 23);
             assert!(String::from_utf8(err).unwrap().contains(expected));
         }
+    }
+
+    #[tokio::test]
+    async fn record_file_captures_protocol_without_cli_diagnostics_or_credentials() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-cli-record-file");
+        let directory = prepare_default_secret_directory_under(scratch.path()).unwrap();
+        let path = scratch.join("records.jsonl");
+        let id = Uuid::now_v7();
+        let mut accepted =
+            json!({"type":"accepted", "job_id":id, "queue_position":0, "platform":"macos"});
+        accepted["direct_job"] = json!({"job_id":id,"secret":"private-reattach-token"});
+        let records = [
+            accepted,
+            json!(StreamRecord::Started(motor_protocol::Started::new(0, 0, 1))),
+            json!(StreamRecord::Output(motor_protocol::Output::new(
+                1,
+                OutputStream::Stdout,
+                motor_protocol::BytePayload(vec![0, 255, 10])
+            ))),
+            json!(StreamRecord::Output(motor_protocol::Output::new(
+                2,
+                OutputStream::Stderr,
+                motor_protocol::BytePayload(b"guest error\n".to_vec())
+            ))),
+            json!(StreamRecord::Terminal(TerminalRecord::new(
+                id,
+                Outcome::Exit { code: 23 },
+                1,
+                0,
+                0
+            ))),
+        ];
+        let client = DirectRunClient(
+            records
+                .iter()
+                .map(|r| serde_json::to_vec(r).unwrap())
+                .collect(),
+        );
+        let request = RunRequest::new("workspace", "repository", "workspace", "false");
+        let (_, mut interrupts) = mpsc::channel(1);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = drive_run_with_secret_directory(
+            &client,
+            &request,
+            (None, Some(records::Capture::create(&path).unwrap())),
+            Some(directory),
+            &mut out,
+            &mut err,
+            &mut interrupts,
+        )
+        .await;
+        assert_eq!(code, 23);
+        assert_eq!(out, vec![0, 255, 10]);
+        assert!(String::from_utf8_lossy(&err).contains("secret-file="));
+        let capture = std::fs::read_to_string(path).unwrap();
+        assert!(!capture.contains("private-reattach-token") && !capture.contains("secret-file="));
+        let saved: Vec<serde_json::Value> = capture
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(saved.len(), 5);
+        assert_eq!(saved[0]["platform"], "macos");
+        assert_eq!(saved[1]["type"], "started");
+        assert_eq!(saved[2]["bytes"], "AP8K");
+        assert_eq!(saved[3]["bytes"], "Z3Vlc3QgZXJyb3IK");
+        assert_eq!(saved[4]["outcome"], json!({"type":"exit", "code":23}));
+    }
+
+    #[tokio::test]
+    async fn default_run_secret_never_reaches_output_and_attach_finds_it_by_id() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-cli-default-secret");
+        let directory = prepare_default_secret_directory_under(scratch.path()).unwrap();
+        let job_id = Uuid::now_v7();
+        let secret = "c".repeat(64);
+        let terminal = TerminalRecord::new(job_id, Outcome::Exit { code: 0 }, 0, 0, 0);
+        let mut record = serde_json::to_value(StreamRecord::Terminal(terminal)).unwrap();
+        record["direct_job"] = json!({ "job_id": job_id, "secret": secret });
+        let client = DirectRunClient(vec![serde_json::to_vec(&record).unwrap()]);
+        let request = RunRequest::new("workspace", "repository", "workspace", "true");
+        let (_, mut interrupts) = mpsc::channel(1);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        let code = drive_run_with_secret_directory(
+            &client,
+            &request,
+            (None, None),
+            Some(directory.clone()),
+            &mut out,
+            &mut err,
+            &mut interrupts,
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert!(!out
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()));
+        assert!(!err
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()));
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains(&format!("job_id={job_id} secret-file=")));
+        assert!(!default_secret_path(&directory, job_id).exists());
+
+        let attach_id = Uuid::now_v7();
+        let attach_secret = "e".repeat(64);
+        let mut secret_file = SecretFile::create_default(&directory, attach_id).unwrap();
+        secret_file.save(&attach_secret).unwrap();
+        let args = AttachArgs {
+            job_id: attach_id,
+            secret_file: None,
+            status: false,
+        };
+        let (loaded_secret, default_file) =
+            attach_secret_from_directory(&args, &b""[..], Some(directory.clone()));
+        assert_eq!(loaded_secret, attach_secret);
+        let client = SecretCheckingClient {
+            expected_secret: attach_secret,
+        };
+        let (_, mut interrupts) = mpsc::channel(1);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = drive_attach_inner(
+            &client,
+            &args,
+            &loaded_secret,
+            default_file,
+            &mut out,
+            &mut err,
+            &mut interrupts,
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert!(!default_secret_path(&directory, attach_id).exists());
+    }
+
+    #[tokio::test]
+    async fn default_secret_save_collision_refuses_without_printing_the_secret() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-cli-secret-collision");
+        let directory = prepare_default_secret_directory_under(scratch.path()).unwrap();
+        let job_id = Uuid::now_v7();
+        let secret = "f".repeat(64);
+        let target = scratch.join("target");
+        std::fs::write(&target, "do not replace").unwrap();
+        std::os::unix::fs::symlink(&target, default_secret_path(&directory, job_id)).unwrap();
+        let terminal = TerminalRecord::new(job_id, Outcome::Exit { code: 0 }, 0, 0, 0);
+        let mut record = serde_json::to_value(StreamRecord::Terminal(terminal)).unwrap();
+        record["direct_job"] = json!({ "job_id": job_id, "secret": secret });
+        let client = DirectRunClient(vec![serde_json::to_vec(&record).unwrap()]);
+        let request = RunRequest::new("workspace", "repository", "workspace", "true");
+        let (_, mut interrupts) = mpsc::channel(1);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+
+        let code = drive_run_with_secret_directory(
+            &client,
+            &request,
+            (None, None),
+            Some(directory),
+            &mut out,
+            &mut err,
+            &mut interrupts,
+        )
+        .await;
+        assert_eq!(code, EXIT_UNKNOWN);
+        assert!(!out
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()));
+        assert!(!err
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()));
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            format!("ck motor run: could not save the reattach secret for job_id={job_id}\n")
+        );
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "do not replace");
     }
 }
 

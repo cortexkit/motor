@@ -874,26 +874,11 @@ impl Snapshots {
             })?;
         }
         let mut snapshots = Vec::new();
-        let parent = fs::canonicalize(root)
-            .ok()
-            .and_then(|p| p.parent().map(Path::to_path_buf));
         for (i, sibling) in siblings.iter().enumerate() {
             let path = fs::canonicalize(sibling).map_err(|error| Failure {
                 tree_hash: hash.clone(),
                 check: format!("sibling {sibling} cannot be resolved: {error}"),
             })?;
-            if path.parent() != parent.as_deref() {
-                // motor-runner recreates each sibling on the build host at this
-                // same absolute path and accepts only direct neighbours of the
-                // repository root, so it would refuse a sibling anywhere else.
-                return Err(Failure {
-                    tree_hash: hash,
-                    check: format!(
-                        "sibling {} must sit in the same folder as the repository root {root}; for a linked worktree, the repository root is its main checkout",
-                        path.display()
-                    ),
-                });
-            }
             snapshots.push(
                 snapshot(
                     &path,
@@ -945,6 +930,23 @@ impl Snapshots {
             })
             .collect()
     }
+    /// In-place and Windows runners still reconstruct siblings beside the main
+    /// checkout. Check their advertised mode before sending Have, Run or Prepare.
+    pub fn validate_sibling_paths(&self, arbitrary_paths: bool) -> io::Result<()> {
+        if arbitrary_paths {
+            return Ok(());
+        }
+        let root = Path::new(&self.main.repository);
+        for sibling in &self.siblings {
+            if Path::new(&sibling.repository).parent() != root.parent() {
+                return Err(io::Error::other(format!(
+                    "sibling {} must sit in the same folder as the repository root {}; this runner does not advertise sibling_paths; for a linked worktree, the repository root is its main checkout",
+                    sibling.repository, root.display()
+                )));
+            }
+        }
+        Ok(())
+    }
     pub fn candidates(&self, previous: &BTreeMap<String, String>) -> Vec<RepositoryCandidates> {
         std::iter::once(&self.main)
             .chain(&self.siblings)
@@ -993,18 +995,6 @@ impl Snapshots {
             if !needed {
                 continue;
             }
-            let mut refs = Refs {
-                path: snapshot.path.clone(),
-                names: Vec::new(),
-            };
-            refs.add(format!("refs/ck-motor/{id}/snapshot"), &snapshot.commit)?;
-            if let Some(tip) = &snapshot.tip {
-                if !held.contains(tip) {
-                    refs.add(format!("refs/ck-motor/{id}/tip"), tip)?;
-                }
-            }
-            let index = manifests.len() as u32;
-            let path = self.spool.0.join(format!("bundle-{index}"));
             // Exclude what the runner reports holding: the candidates we
             // offered, and the commits its own refs point at (its earlier
             // integration tips and snapshots), as far as we have them locally.
@@ -1021,6 +1011,33 @@ impl Snapshots {
                     excluded.push(commit.clone());
                 }
             }
+            // The runner reports only the newest held commits, so a commit it
+            // holds as an ancestor of a reported one is not listed: a default
+            // branch tip behind a held snapshot, or a snapshot behind a held
+            // later commit. Then every object this bundle would carry is
+            // already on the runner, and `git bundle create` refuses the empty
+            // bundle. The runner only needs the objects in its mirror, not a
+            // bundle per repository, so send none for this repository.
+            let mut missing = vec!["rev-list".to_owned(), "--max-count=1".to_owned()];
+            missing.push(snapshot.commit.clone());
+            missing.extend(snapshot.tip.iter().filter(|t| !held.contains(t)).cloned());
+            missing.extend(excluded.iter().map(|commit| format!("^{commit}")));
+            let missing: Vec<&str> = missing.iter().map(String::as_str).collect();
+            if git(&snapshot.path, &missing)?.is_empty() {
+                continue;
+            }
+            let mut refs = Refs {
+                path: snapshot.path.clone(),
+                names: Vec::new(),
+            };
+            refs.add(format!("refs/ck-motor/{id}/snapshot"), &snapshot.commit)?;
+            if let Some(tip) = &snapshot.tip {
+                if !held.contains(tip) {
+                    refs.add(format!("refs/ck-motor/{id}/tip"), tip)?;
+                }
+            }
+            let index = manifests.len() as u32;
+            let path = self.spool.0.join(format!("bundle-{index}"));
             let mut parents = vec![snapshot.commit.clone()];
             for commit in &excluded {
                 if git(
@@ -1552,7 +1569,7 @@ mod tests {
     }
 
     #[test]
-    fn sibling_beside_a_linked_worktree_names_the_main_checkout_it_must_sit_beside() {
+    fn sibling_beside_a_linked_worktree_requires_snapshot_paths_capability() {
         let (scratch, checkout, spool, _) = repository();
         let gate = scratch.join("gate");
         fs::create_dir_all(&gate).unwrap();
@@ -1571,7 +1588,7 @@ mod tests {
         let sibling = fs::canonicalize(gate.join("sibling")).unwrap();
         let storage = Storage::open(&spool.join("store")).unwrap();
 
-        let failure = Snapshots::build(
+        let snapshots = Snapshots::build(
             &Config::default(),
             text(&linked).unwrap(),
             text(&root).unwrap(),
@@ -1581,13 +1598,13 @@ mod tests {
             None,
             &storage,
         )
-        .err()
-        .expect("a sibling beside the linked worktree, not its main checkout, must refuse");
+        .unwrap();
 
+        snapshots.validate_sibling_paths(true).unwrap();
         assert_eq!(
-            failure.check,
+            snapshots.validate_sibling_paths(false).unwrap_err().to_string(),
             format!(
-                "sibling {} must sit in the same folder as the repository root {}; for a linked worktree, the repository root is its main checkout",
+                "sibling {} must sit in the same folder as the repository root {}; this runner does not advertise sibling_paths; for a linked worktree, the repository root is its main checkout",
                 sibling.display(),
                 root.display()
             )
@@ -1732,6 +1749,108 @@ mod tests {
         let snapshots = build_snapshots(&checkout, &checkout, &spool);
         assert_eq!(snapshots.main.tip, None);
         assert_eq!(snapshots.bundle(Uuid::now_v7(), &[]).unwrap().len(), 1);
+    }
+
+    fn held(repository: &str, commits: &[&str]) -> RepositoryCandidates {
+        RepositoryCandidates {
+            repository: repository.into(),
+            commits: commits.iter().map(|c| (*c).to_owned()).collect(),
+        }
+    }
+
+    /// A runner reuses its sandbox warm: it holds an earlier snapshot of this
+    /// checkout and reports only that newest commit, not the default branch
+    /// tip behind it. Nothing is missing, so no bundle is sent; `git bundle
+    /// create` would otherwise refuse the empty bundle and fail the job.
+    #[test]
+    fn no_bundle_when_runner_holds_a_snapshot_with_the_tip_behind_it() {
+        let (scratch, checkout, spool, head) = repository();
+        git(&checkout, &["branch", "-m", "main"]).unwrap();
+        origin(&checkout, &scratch.join("origin.git"));
+        fs::write(checkout.join("source.txt"), "uncommitted edit\n").unwrap();
+        let snapshots = build_snapshots(&checkout, &checkout, &spool);
+        assert_eq!(snapshots.main.tip.as_deref(), Some(head.as_str()));
+        assert_ne!(snapshots.main.commit, head);
+        let repository = snapshots.main.repository.clone();
+        let warm = [held(&repository, &[&snapshots.main.commit])];
+        assert!(snapshots.bundle(Uuid::now_v7(), &warm).unwrap().is_empty());
+        // The tip alone, held without the snapshot, still needs one.
+        let cold = [held(&repository, &[&head])];
+        assert_eq!(snapshots.bundle(Uuid::now_v7(), &cold).unwrap().len(), 1);
+    }
+
+    /// The runner holds a commit that descends from both the snapshot and the
+    /// tip, such as a later snapshot ref of the same branch, so it has every
+    /// object already and no bundle is sent.
+    #[test]
+    fn no_bundle_when_runner_holds_a_descendant_of_snapshot_and_tip() {
+        let (scratch, checkout, spool, head) = repository();
+        git(&checkout, &["branch", "-m", "main"]).unwrap();
+        origin(&checkout, &scratch.join("origin.git"));
+        let snapshots = build_snapshots(&checkout, &checkout, &spool);
+        assert_eq!(snapshots.main.commit, head);
+        assert_eq!(snapshots.main.tip.as_deref(), Some(head.as_str()));
+        fs::write(checkout.join("source.txt"), "later\n").unwrap();
+        let later = prepare_commit(&checkout, &head);
+        let repository = snapshots.main.repository.clone();
+        let warm = [held(&repository, &[&later])];
+        assert!(snapshots.bundle(Uuid::now_v7(), &warm).unwrap().is_empty());
+        assert_eq!(snapshots.bundle(Uuid::now_v7(), &[]).unwrap().len(), 1);
+    }
+
+    /// Each repository is decided on its own: a sibling the runner already
+    /// covers gets no bundle while the main repository still gets one, and
+    /// the other way round, with manifest indexes numbered from zero.
+    #[test]
+    fn sibling_and_main_bundles_are_skipped_independently() {
+        let (scratch, checkout, spool, head) = repository();
+        git(&checkout, &["branch", "-m", "feature"]).unwrap();
+        git(
+            &scratch,
+            &["clone", "-q", text(&checkout).unwrap(), "sibling"],
+        )
+        .unwrap();
+        let sibling = fs::canonicalize(scratch.join("sibling")).unwrap();
+        fs::write(sibling.join("source.txt"), "sibling edit\n").unwrap();
+        let root = fs::canonicalize(&checkout).unwrap();
+        let storage = Storage::open(&spool.join("store")).unwrap();
+        let snapshots = Snapshots::build(
+            &Config::default(),
+            text(&root).unwrap(),
+            text(&root).unwrap(),
+            &[text(&sibling).unwrap().to_string()],
+            &spool,
+            Uuid::now_v7(),
+            None,
+            &storage,
+        )
+        .unwrap_or_else(|failure| panic!("{}", failure.check));
+        let main = snapshots.main.repository.clone();
+        let sibling_snapshot = &snapshots.siblings[0];
+        assert_ne!(sibling_snapshot.commit, head);
+        // A later commit in the sibling, descending from its snapshot.
+        fs::write(sibling.join("source.txt"), "sibling later\n").unwrap();
+        let later = prepare_commit(&sibling, &sibling_snapshot.commit);
+        let sibling_repository = sibling_snapshot.repository.clone();
+
+        let covered_sibling = [held(&sibling_repository, &[&later])];
+        let manifests = snapshots.bundle(Uuid::now_v7(), &covered_sibling).unwrap();
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(
+            (manifests[0].index, manifests[0].repository.as_str()),
+            (0, main.as_str())
+        );
+
+        let covered_main = [held(&main, &[&head])];
+        let manifests = snapshots.bundle(Uuid::now_v7(), &covered_main).unwrap();
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(
+            (manifests[0].index, manifests[0].repository.as_str()),
+            (0, sibling_repository.as_str())
+        );
+
+        let both = [held(&main, &[&head]), held(&sibling_repository, &[&later])];
+        assert!(snapshots.bundle(Uuid::now_v7(), &both).unwrap().is_empty());
     }
 
     #[test]

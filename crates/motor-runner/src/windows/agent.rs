@@ -62,6 +62,16 @@ impl Runtime {
     pub(crate) fn cleanup_pending(&self, id: Uuid) -> bool {
         self.cleanup_ids.lock().unwrap().contains(&id)
     }
+    /// Mark `id`'s cleanup pending, or done, as a failed VM stop would.
+    #[cfg(test)]
+    pub(crate) fn set_cleanup_pending(&self, id: Uuid, pending: bool) {
+        let mut ids = self.cleanup_ids.lock().unwrap();
+        if pending {
+            ids.insert(id);
+        } else {
+            ids.remove(&id);
+        }
+    }
     pub(crate) fn retry_cleanups(&self) {
         // Give each queued job at most one attempt per pass, and cap the work
         // so a broken unit cannot monopolize maintenance or starve later jobs.
@@ -644,7 +654,7 @@ pub(super) fn materialize(config: &Config, trees: &Trees, setup: &Setup) -> io::
         target: PathBuf::from(&setup.request.workspace_key).join("target"),
         wrapper: None,
         sandbox: None,
-        windows: Some(Mutex::new(Some(handle))),
+        vm: Some(Mutex::new(Some(Box::new(handle)))),
     })
 }
 
@@ -670,7 +680,11 @@ fn materialize_attempt(
     )
     .map_err(|error| super::vm::path_error("prepare job staging", &staging, error))?;
     let tar = super::prep::prepare(config, trees, setup, &resources.staging).map_err(|error| {
-        super::vm::path_error("materialize job staging", &resources.staging, error)
+        if super::prep_error::is_reported(&error) {
+            error
+        } else {
+            super::vm::path_error("materialize job staging", &resources.staging, error)
+        }
     })?;
     if control.cancel.load(Ordering::Acquire) > 0 {
         return Err(invalid("Windows setup cancelled"));

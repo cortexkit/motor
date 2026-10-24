@@ -104,6 +104,19 @@ pub(crate) fn launch(command: &str, cwd: &Path, env: &[(String, String)]) -> io:
     let (gate_read, gate_write) = pipe()?;
     let (stdout_read, stdout_write) = pipe()?;
     let (stderr_read, stderr_write) = pipe()?;
+    // Computed before the fork because the child may not allocate. The child
+    // keeps only the inherited stdin, stdout and stderr (0-2; the job's pipes
+    // replace 1 and 2 after the gate), the gate's read end and the job's output
+    // write ends. See `close_inherited_descriptors` for why everything else goes.
+    let close = descriptor_ranges_to_close(&[
+        0,
+        1,
+        2,
+        gate_read.as_raw_fd(),
+        stdout_write.as_raw_fd(),
+        stderr_write.as_raw_fd(),
+    ]);
+    let close_fallback_end = descriptor_limit();
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(io::Error::last_os_error());
@@ -112,9 +125,8 @@ pub(crate) fn launch(command: &str, cwd: &Path, env: &[(String, String)]) -> io:
         // Everything allocated above the fork. Only async-signal-safe syscalls
         // are used here; allocator/runtime locks can be held by other threads.
         unsafe {
-            libc::close(gate_write.as_raw_fd());
-            libc::close(stdout_read.as_raw_fd());
-            libc::close(stderr_read.as_raw_fd());
+            // This also closes the parent's ends of the three pipes.
+            close_inherited_descriptors(&close, close_fallback_end);
             if libc::setpgid(0, 0) != 0 {
                 libc::_exit(126);
             }
@@ -161,8 +173,84 @@ pub(crate) fn launch(command: &str, cwd: &Path, env: &[(String, String)]) -> io:
     })
 }
 
-// The portable backend exists for protocol/in-process tests on the Mac. The
-// production crash-safe process-group launch backend is Linux-only.
+/// Inclusive descriptor ranges that cover every descriptor number except
+/// `keep`, ending at the largest number `close_range` accepts.
+#[cfg(any(target_os = "linux", test))]
+fn descriptor_ranges_to_close(keep: &[std::os::fd::RawFd]) -> Vec<(u32, u32)> {
+    let mut keep: Vec<u32> = keep
+        .iter()
+        .filter_map(|&fd| u32::try_from(fd).ok())
+        .collect();
+    keep.sort_unstable();
+    keep.dedup();
+    let mut ranges = Vec::new();
+    let mut next = 0u32;
+    for fd in keep {
+        if fd > next {
+            ranges.push((next, fd - 1));
+        }
+        // A RawFd is at most i32::MAX, so this cannot overflow.
+        next = fd + 1;
+    }
+    ranges.push((next, u32::MAX));
+    ranges
+}
+
+/// Bound for the close-one-at-a-time fallback: a process cannot open a
+/// descriptor at or above its open-file limit. An unlimited or huge limit is
+/// capped at the kernel's default `fs.nr_open` so the fallback stays bounded.
+#[cfg(target_os = "linux")]
+fn descriptor_limit() -> u32 {
+    const DEFAULT_NR_OPEN: u32 = 1 << 20;
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return DEFAULT_NR_OPEN;
+    }
+    u32::try_from(limit.rlim_cur)
+        .unwrap_or(DEFAULT_NR_OPEN)
+        .min(DEFAULT_NR_OPEN)
+}
+
+/// Close the descriptors in `ranges` in a freshly forked launch child.
+///
+/// The child waits at the gate until the job's Started record is durable, which
+/// can take a long time under load, and until it execs it holds a copy of every
+/// descriptor the whole runner had open at the fork, whatever thread opened it.
+/// An flock belongs to the open file all those copies share, and a socket or
+/// pipe end stays open while any copy exists. Without this, a lock the runner
+/// has released by closing its descriptor (the runner state lock, cache locks,
+/// store locks) stays held, a listening socket the runner closed stays open and
+/// still completes connections, and a reader waits for EOF on another command's
+/// output pipe until the job starts.
+///
+/// Only async-signal-safe system calls: another thread may have held the
+/// allocator lock at the fork. `close_range` needs Linux 5.9; when it fails
+/// (ENOSYS on older kernels), the range is closed one descriptor at a time,
+/// but only below `fallback_end`.
+#[cfg(target_os = "linux")]
+unsafe fn close_inherited_descriptors(ranges: &[(u32, u32)], fallback_end: u32) {
+    for &(first, last) in ranges {
+        let closed = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                first as libc::c_uint,
+                last as libc::c_uint,
+                0 as libc::c_uint,
+            )
+        };
+        if closed != 0 {
+            let mut fd = first;
+            while fd <= last && fd < fallback_end {
+                unsafe { libc::close(fd as libc::c_int) };
+                fd += 1;
+            }
+        }
+    }
+}
+
+// The portable backend exists for protocol/in-process tests on non-Linux Unix
+// development hosts such as macOS. The production crash-safe process-group
+// launch backend is Linux-only.
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn launch(command: &str, cwd: &Path, env: &[(String, String)]) -> io::Result<Launch> {
     use std::os::fd::{FromRawFd, IntoRawFd};
@@ -221,6 +309,15 @@ pub(crate) fn unit_alive(process: Option<ProcessIdentity>) -> io::Result<Option<
 }
 
 impl Launch {
+    /// The write ledgers of this launch's cache sockets, if it is a fill.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn cache_ledgers(
+        &self,
+    ) -> Vec<std::sync::Arc<crate::remote_cache::gateway::WriteLedger>> {
+        self.runtime
+            .as_ref()
+            .map_or_else(Vec::new, |runtime| runtime.cache_ledgers())
+    }
     pub fn release(&mut self) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         {
@@ -417,9 +514,42 @@ pub(crate) fn build_wrapper(
     Ok(())
 }
 
+/// An open JavaScript cache lock file; lock it with `lock_exclusive` or
+/// `try_lock_exclusive`.
+///
+/// Dropping it releases the lock explicitly before closing the file. A process
+/// that another thread forks gets a copy of every open descriptor and keeps it
+/// until it execs (or for good, if it never does). An flock belongs to the open
+/// file that every copy shares, so closing our descriptor alone would leave the
+/// lock held by that copy for a while, and eviction or the next setup step
+/// would see the cache entry as still in use. An explicit unlock releases it
+/// for every copy at once.
+pub(crate) struct JavascriptCacheLock(File);
+
+impl JavascriptCacheLock {
+    // Outside tests only the Linux JavaScript install step waits for this
+    // lock; eviction only tries it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn lock_exclusive(&self) -> io::Result<()> {
+        fs2::FileExt::lock_exclusive(&self.0)
+    }
+
+    pub(crate) fn try_lock_exclusive(&self) -> io::Result<()> {
+        fs2::FileExt::try_lock_exclusive(&self.0)
+    }
+}
+
+impl Drop for JavascriptCacheLock {
+    fn drop(&mut self) {
+        // When this open file holds no lock (a failed try), unlocking is a
+        // no-op: flock state belongs to the open file, not to the path.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 /// Keep cache-use locks outside evictable entries so a rename or deletion cannot
 /// give another setup step a different lock for the same install key.
-pub(crate) fn javascript_cache_lock(state: &Path, key: &str) -> io::Result<File> {
+pub(crate) fn javascript_cache_lock(state: &Path, key: &str) -> io::Result<JavascriptCacheLock> {
     if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(io::Error::other("invalid JavaScript cache key"));
     }
@@ -431,6 +561,7 @@ pub(crate) fn javascript_cache_lock(state: &Path, key: &str) -> io::Result<File>
         .read(true)
         .write(true)
         .open(locks.join(key))
+        .map(JavascriptCacheLock)
 }
 
 #[cfg(test)]
@@ -501,6 +632,84 @@ mod tests {
         assert!(launch.wait().unwrap().success());
         launch.reap();
         assert_eq!(stdout, "0022\n755\n");
+    }
+
+    #[test]
+    fn descriptor_ranges_cover_everything_but_kept_descriptors() {
+        assert_eq!(
+            descriptor_ranges_to_close(&[0, 1, 2, 7, 5, 5, -1]),
+            vec![(3, 4), (6, 6), (8, u32::MAX)]
+        );
+        assert_eq!(descriptor_ranges_to_close(&[1, 0]), vec![(2, u32::MAX)]);
+        assert_eq!(
+            descriptor_ranges_to_close(&[3]),
+            vec![(0, 2), (4, u32::MAX)]
+        );
+    }
+
+    /// A launch child parked at the gate must not keep the runner's locks and
+    /// sockets alive after the runner closes them.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn parked_launch_child_does_not_hold_parent_locks_or_sockets() {
+        use std::time::{Duration, Instant};
+
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-parked-child-descriptors");
+        let lock_path = scratch.join("lock");
+        let lock = File::create(&lock_path).unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let mut launch = launch("echo out; echo err >&2", &scratch, &[]).unwrap();
+        let pid = launch.identity.pid;
+        // Closing the only descriptor releases an flock and stops a listener,
+        // unless a copy of the descriptor lives on in the parked child.
+        drop(lock);
+        drop(listener);
+
+        let probe = File::open(&lock_path).unwrap();
+        // The child closes its copies right after the fork, which may run a
+        // little after `launch` returns; a parked child holding them never does.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let lock_released = fs2::FileExt::try_lock_exclusive(&probe).is_ok();
+            let listener_closed = matches!(
+                std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1)),
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused
+            );
+            if lock_released && listener_closed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "parked child still holds parent descriptors: \
+                 lock_released={lock_released} listener_closed={listener_closed}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Still parked: the child has not exec'd bash yet.
+        assert_eq!(
+            std::fs::read_link(format!("/proc/{pid}/exe")).unwrap(),
+            std::fs::read_link("/proc/self/exe").unwrap()
+        );
+        // Stdin, stdout, stderr, the gate and the job's two output pipes.
+        let open: Vec<_> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(open.len() <= 6, "parked child has descriptors {open:?}");
+
+        // The descriptors the job needs survived.
+        launch.release().unwrap();
+        let mut stdout = String::new();
+        launch.stdout.read_to_string(&mut stdout).unwrap();
+        let mut stderr = String::new();
+        launch.stderr.read_to_string(&mut stderr).unwrap();
+        assert!(launch.wait().unwrap().success());
+        launch.reap();
+        assert_eq!((stdout.as_str(), stderr.as_str()), ("out\n", "err\n"));
     }
 
     #[test]

@@ -13,6 +13,20 @@ const MAX_DRAIN_TIMEOUT_S: u64 = 86_400;
 mod native_service;
 
 fn main() -> io::Result<()> {
+    // A Boat job unit execs the runner as its PID namespace init. Dispatch it
+    // first: it must fork while the process is still single-threaded, before
+    // any runtime or logging starts, and its arguments carry the job command
+    // as raw bytes.
+    #[cfg(target_os = "linux")]
+    {
+        let mut raw = std::env::args_os().skip(1);
+        if raw
+            .next()
+            .is_some_and(|mode| mode == motor_runner::JOB_PID_INIT_MODE)
+        {
+            motor_runner::job_pid_init(raw.collect());
+        }
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(windows)]
     if args.first().is_some_and(|arg| arg == "service") {
@@ -45,6 +59,29 @@ async fn run(args: Vec<String>) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     if args == ["check-permissions-helper"] {
         return motor_runner::check_permissions_helper();
+    }
+    #[cfg(target_os = "linux")]
+    if args
+        .first()
+        .is_some_and(|arg| arg == "check-tenant-cargo-fetch")
+    {
+        if args.len() != 3 || args[1] != "--scratch" {
+            return Err(io::Error::other(
+                "check-tenant-cargo-fetch requires --scratch DIR",
+            ));
+        }
+        motor_runner::check_tenant_cargo_fetch(std::path::Path::new(&args[2]))?;
+        println!(
+            "PASS runner trusted cargo prefetch: itoa 1.0.18 fetched online into a cold cache"
+        );
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    if args
+        .first()
+        .is_some_and(|arg| arg == "check-javascript-setup")
+    {
+        return check_javascript_setup(&args[1..]);
     }
     #[cfg(target_os = "linux")]
     if args.first().is_some_and(|arg| arg == "tenant-agent") {
@@ -96,7 +133,7 @@ async fn run(args: Vec<String>) -> io::Result<()> {
                     let mut socket = motor_runner::local_transport::connect(&config.socket_path()).await?;
                     write_frame_async(
                         &mut socket,
-                        &Frame::Hello { return_paths: false, protocol_version: PROTOCOL_VERSION, started: true, default_branch_tip: false, gate_jobs: false, platforms: Vec::new() },
+                        &Frame::Hello { return_paths: false, return_chunked: false, sibling_paths: false, protocol_version: PROTOCOL_VERSION, started: true, default_branch_tip: false, gate_jobs: false, platforms: Vec::new() },
                     )
                     .await?;
                     loop {
@@ -291,9 +328,42 @@ async fn run(args: Vec<String>) -> io::Result<()> {
             Ok(())
         }
         _ => Err(io::Error::other(
-              "usage: motor-runner serve|connect|drain|resume|tenant-agent [--instance NAME] [--drain-timeout-s SECONDS] [--backend host|vm|windows-vm] [--tenant-vm] [--vm-config FILE]",
+              "usage: motor-runner serve|connect|drain|resume|tenant-agent [--instance NAME] [--drain-timeout-s SECONDS] [--backend host|vm|windows-vm|macos-vm] [--tenant-vm] [--vm-config FILE] [--development-allow-host-backend]",
         )),
     }
+}
+
+/// `check-javascript-setup --scratch DIR [--tenant-vm] [--boat-profile]`:
+/// the role flags are the ones `serve` takes, so the check looks for the
+/// JavaScript tools exactly where that serving runner will.
+#[cfg(target_os = "linux")]
+fn check_javascript_setup(args: &[String]) -> io::Result<()> {
+    let mut config = Config::new("/nonexistent", "javascript-setup-check");
+    let mut scratch = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--tenant-vm" => config.tenant_vm = true,
+            "--boat-profile" => config.boat_profile = true,
+            "--scratch" => {
+                scratch =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        io::Error::other("--scratch needs a directory")
+                    })?))
+            }
+            _ => return Err(io::Error::other(format!("unknown option {arg}"))),
+        }
+    }
+    let scratch =
+        scratch.ok_or_else(|| io::Error::other("check-javascript-setup requires --scratch DIR"))?;
+    println!(
+        "{}",
+        motor_runner::check_javascript_setup(&config, &scratch)?
+    );
+    println!(
+        "PASS runner JavaScript setup: bun.lock, package-lock.json and pnpm-lock.yaml installs"
+    );
+    Ok(())
 }
 
 fn configure_options(
@@ -310,6 +380,11 @@ fn configure_options(
         }
         if arg == "--boat-profile" {
             config.boat_profile = true;
+            config.disk_reserve_bytes = motor_runner::BOAT_DISK_RESERVE_BYTES;
+            continue;
+        }
+        if arg == "--development-allow-host-backend" {
+            config.development_allow_host_backend = true;
             continue;
         }
         let value = args
@@ -341,6 +416,24 @@ fn configure_options(
                 config.free_space_eviction_bytes = Some(value.parse().map_err(io::Error::other)?)
             }
             "--workspace-root" => config.workspace_roots.push(value.into()),
+            "--snapshot-prefetch-timeout-s" => {
+                config.snapshot_prefetch_timeout =
+                    std::time::Duration::from_secs(value.parse().map_err(io::Error::other)?)
+            }
+            "--snapshot-javascript-timeout-s" => {
+                config.snapshot_javascript_timeout =
+                    std::time::Duration::from_secs(value.parse().map_err(io::Error::other)?)
+            }
+            "--sibling-freshness-entries" => {
+                config.sibling_freshness_entries = value.parse().map_err(io::Error::other)?
+            }
+            "--sibling-snapshot-cap" => {
+                config.sibling_snapshot_cap = value.parse().map_err(io::Error::other)?
+            }
+            "--sibling-snapshot-idle-s" => {
+                config.sibling_snapshot_idle =
+                    std::time::Duration::from_secs(value.parse().map_err(io::Error::other)?)
+            }
             "--owned-workspace-root" => config.owned_workspace_roots.push(value.into()),
             "--backend" => config.backend = value.parse()?,
             "--job-network" => config.job_network = Some(value.parse()?),
@@ -574,7 +667,7 @@ mod tests {
             .unwrap_err();
         assert!(error
             .to_string()
-            .contains("expected host, vm or windows-vm"));
+            .contains("expected host, vm, windows-vm or macos-vm"));
     }
 
     #[test]

@@ -8,10 +8,14 @@ use std::{
 };
 
 fn diagnostic_message(message: &str) -> String {
+    let mut bytes = 0;
     message
         .chars()
-        .take(240)
         .map(|c| if c.is_control() { ' ' } else { c })
+        .take_while(|c| {
+            bytes += c.len_utf8();
+            bytes <= 1024
+        })
         .collect()
 }
 
@@ -237,6 +241,7 @@ pub fn watch_cache<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn exercise(fail: bool) -> (Result<(), CacheFailure>, usize, usize) {
         let (events_tx, events_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();

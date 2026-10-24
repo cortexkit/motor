@@ -28,6 +28,8 @@ const LEGACY_RETENTION_MS: u64 = 49 * 60 * 60 * 1000;
 const MAX_VERIFIED_TIPS: usize = 256;
 const MAX_FAILED_TIPS: usize = 256;
 const FAILED_TIP_TTL: Duration = Duration::from_secs(60);
+/// The stored `routed_direct_reason` of a job the broker answered `no_host_fits`.
+const NO_HOST_FITS: &str = "no_host_fits";
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -46,6 +48,17 @@ pub(crate) struct Job {
     pub hosted: Option<crate::hosted::HostedJobState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_result: Option<ReturnResult>,
+    /// The `cwd` of an `exec-remote/v1` request that asked for returned files.
+    /// Only such requests set it. It marks the stored return result as one the
+    /// agent route forwards, and turns the absolute paths the runner reports
+    /// back into the cwd-relative paths the caller asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_cwd: Option<String>,
+    /// The returned-file paths of a chunked agent request or a direct CLI
+    /// request, exactly as sent. Manifests echo these spellings; direct attach
+    /// also needs the list to report a legacy all-or-nothing return failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_requested: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_secret_hash: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -77,11 +90,65 @@ pub(crate) struct Job {
     /// under this ID. The caller keeps using its original job ID throughout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_server_job_id: Option<Uuid>,
+    /// Why a job first routed to hosted runners by `hosted_repositories` was
+    /// sent to the build server instead, before any hosted placement. Set
+    /// together with removing the job's hosted route, so a restart or a later
+    /// attach treats it as an ordinary build-server job. The only reason so
+    /// far is `no_host_fits`: no hosted host could ever hold its vCPUs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_direct_reason: Option<String>,
+}
+// Journal equality follows the serialized record. The migration marker is only
+// in-memory bookkeeping and must not turn an unchanged record into an upsert.
+impl PartialEq for Job {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            legacy_shape: _,
+            hosted,
+            return_result,
+            return_cwd,
+            return_requested,
+            direct_secret_hash,
+            gate_job,
+            runner_instance,
+            windows_runner,
+            attribution,
+            queue_wait_limit_s,
+            pending_cancel,
+            local_terminal,
+            terminal_observed_at_ms,
+            terminal_delivered_at_ms,
+            retain_until_ms,
+            workspace_key,
+            build_server_job_id,
+            routed_direct_reason,
+        } = self;
+        hosted == &other.hosted
+            && return_result == &other.return_result
+            && return_cwd == &other.return_cwd
+            && return_requested == &other.return_requested
+            && direct_secret_hash == &other.direct_secret_hash
+            && gate_job == &other.gate_job
+            && runner_instance == &other.runner_instance
+            && windows_runner == &other.windows_runner
+            && attribution == &other.attribution
+            && queue_wait_limit_s == &other.queue_wait_limit_s
+            && pending_cancel == &other.pending_cancel
+            && local_terminal == &other.local_terminal
+            && terminal_observed_at_ms == &other.terminal_observed_at_ms
+            && terminal_delivered_at_ms == &other.terminal_delivered_at_ms
+            && retain_until_ms == &other.retain_until_ms
+            && workspace_key == &other.workspace_key
+            && build_server_job_id == &other.build_server_job_id
+            && routed_direct_reason == &other.routed_direct_reason
+    }
 }
 impl Job {
     fn lacks_newer_fields(&self) -> bool {
         self.hosted.is_none()
             && self.return_result.is_none()
+            && self.return_cwd.is_none()
+            && self.return_requested.is_none()
             && self.direct_secret_hash.is_none()
             && !self.gate_job
             && self.runner_instance.is_none()
@@ -92,6 +159,7 @@ impl Job {
             && self.retain_until_ms.is_none()
             && self.workspace_key.is_none()
             && self.build_server_job_id.is_none()
+            && self.routed_direct_reason.is_none()
     }
 
     fn legacy_expired(&self, id: Uuid, now: u64) -> bool {
@@ -182,7 +250,7 @@ fn deserialize_jobs<'de, D: serde::Deserializer<'de>>(
         .map(|jobs| jobs.into_iter().map(|(id, job)| (id, job.0)).collect())
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct VerifiedTip {
     pub remote_url: String,
     pub branch: String,
@@ -265,9 +333,28 @@ pub(crate) struct Storage {
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     tip_checks: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
     failed_tips: Mutex<BTreeMap<VerificationKey, Instant>>,
-    _lease: File,
+    // Fields drop after `Drop for Storage` returns, so the lease is released
+    // only once the compactor is joined and the final checkpoint is written.
+    _lease: StoreLease,
     #[cfg(test)]
     write_count: std::sync::atomic::AtomicUsize,
+}
+
+/// The locked `lease` file that makes one process the store's only writer.
+///
+/// The lock belongs to the open file description, not to this descriptor.
+/// A child forked by any thread of this process shares that description until
+/// it execs (close-on-exec only acts at exec), and closing our descriptor
+/// leaves the lock held for as long as such a child lives. Unlocking
+/// explicitly releases it for the whole description, so a dropped store's
+/// lease is free at once regardless of what other threads have forked.
+struct StoreLease(File);
+impl Drop for StoreLease {
+    fn drop(&mut self) {
+        if let Err(error) = FileExt::unlock(&self.0) {
+            tracing::warn!(%error, "storage lease unlock failed; it is released when the file closes");
+        }
+    }
 }
 
 impl Drop for Storage {
@@ -337,6 +424,16 @@ impl Storage {
             state.jobs.entry(id).or_default().return_result = Some(result);
         })
     }
+    pub(crate) fn return_cwd(&self, id: Uuid, cwd: String) -> io::Result<()> {
+        self.update(|state| {
+            state.jobs.entry(id).or_default().return_cwd = Some(cwd);
+        })
+    }
+    pub(crate) fn return_requested(&self, id: Uuid, paths: Vec<String>) -> io::Result<()> {
+        self.update(|state| {
+            state.jobs.entry(id).or_default().return_requested = Some(paths);
+        })
+    }
     pub(crate) fn hosted_update(
         &self,
         id: Uuid,
@@ -360,6 +457,72 @@ impl Storage {
             .rev()
             .filter_map(|j| j.hosted.clone())
             .find(|h| h.lease_attempted)
+    }
+    pub(crate) fn hosted_routed_jobs_1h(&self) -> usize {
+        self.hosted_routed_jobs_1h_at(now_ms())
+    }
+    fn hosted_routed_jobs_1h_at(&self, now: u64) -> usize {
+        self.jobs_minted_in_last_hour(now, |job| {
+            job.hosted
+                .as_ref()
+                .is_some_and(|route| route.repository_routed)
+        })
+    }
+    /// Jobs selected by `hosted_repositories` in the last hour that the broker
+    /// answered `no_host_fits`, and that therefore ran on the build server.
+    pub(crate) fn hosted_no_host_fits_1h(&self) -> usize {
+        self.hosted_no_host_fits_1h_at(now_ms())
+    }
+    fn hosted_no_host_fits_1h_at(&self, now: u64) -> usize {
+        self.jobs_minted_in_last_hour(now, |job| {
+            job.routed_direct_reason.as_deref() == Some(NO_HOST_FITS)
+        })
+    }
+    /// Counts the jobs matching `matches` whose job ID was minted in the hour
+    /// before `now`. Job IDs are UUIDv7, so the ID carries its creation time.
+    fn jobs_minted_in_last_hour(&self, now: u64, matches: impl Fn(&Job) -> bool) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .jobs
+            .iter()
+            .filter(|(id, job)| {
+                matches(job)
+                    && id.get_timestamp().is_some_and(|timestamp| {
+                        let (seconds, nanos) = timestamp.to_unix();
+                        let minted = seconds.saturating_mul(1000) + u64::from(nanos) / 1_000_000;
+                        now.checked_sub(minted)
+                            .is_some_and(|age| age < 60 * 60 * 1000)
+                    })
+            })
+            .count()
+    }
+    /// Durably send a repository-routed job to the build server because the
+    /// broker answered `no_host_fits` before any placement. The hosted route
+    /// is removed, so nothing later releases or finishes a lease the broker
+    /// never booked, and a restart attaches to the build server instead of
+    /// asking for a lease again.
+    ///
+    /// The build server's queue-wait limit starts when it receives the Run
+    /// frame, and both it and ck-motor enforce the stored limit. The time
+    /// already spent asking for a lease is taken off that limit here, once,
+    /// so the job waits no longer in total than its limit allowed. It is
+    /// rounded down to whole seconds, and a positive limit stays at least one
+    /// second, because the build server reads zero as "refuse if it has to
+    /// queue at all".
+    pub(crate) fn routed_direct_no_host_fits(&self, id: Uuid, spent_ms: u64) -> io::Result<()> {
+        self.update(|s| {
+            if let Some(job) = s.jobs.get_mut(&id) {
+                job.hosted = None;
+                job.routed_direct_reason = Some(NO_HOST_FITS.into());
+                if job.queue_wait_limit_s > 0 {
+                    job.queue_wait_limit_s = job
+                        .queue_wait_limit_s
+                        .saturating_sub(spent_ms / 1000)
+                        .max(1);
+                }
+            }
+        })
     }
     pub(crate) fn hosted_route(
         &self,
@@ -432,6 +595,7 @@ impl Storage {
                 error
             }
         })?;
+        let lease = StoreLease(lease);
         let metrics = Arc::new(journal::Metrics::default());
         let (state, backend) = journal::open(root, &metrics)?;
         let state = Arc::new(Mutex::new(state));
@@ -1211,5 +1375,186 @@ mod verified_tip_tests {
         }
         assert_eq!(storage.failed_tips.lock().unwrap().len(), MAX_FAILED_TIPS);
         assert!(!storage.tip_failed_recently(&key, now + Duration::from_secs(1)));
+    }
+}
+
+#[cfg(test)]
+mod hosted_routing_health_tests {
+    use super::*;
+
+    #[test]
+    fn hosted_routed_counter_only_counts_repository_routes_in_the_last_hour() {
+        let scratch = cortexkit_test_support::ScratchDir::new("hosted-route-health");
+        let storage = Storage::open(&scratch).unwrap();
+        let now = now_ms();
+        for (age, routed) in [(0, true), (3_599_999, true), (3_600_000, true), (0, false)] {
+            let minted = now - age;
+            let id = Uuid::new_v7(uuid::Timestamp::from_unix(
+                uuid::NoContext,
+                minted / 1000,
+                ((minted % 1000) * 1_000_000) as u32,
+            ));
+            storage.create(id, 30, None, None, false).unwrap();
+            storage
+                .hosted_route(
+                    id,
+                    crate::HostedJobState {
+                        repository_routed: routed,
+                        ..crate::HostedJobState::default()
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(storage.hosted_routed_jobs_1h_at(now), 2);
+        assert_eq!(storage.hosted_routed_jobs_1h_at(now + 3_600_000), 0);
+        drop(storage);
+        let storage = Storage::open(&scratch).unwrap();
+        assert_eq!(storage.hosted_routed_jobs_1h_at(now), 2);
+    }
+
+    /// Sending a routed job to the build server removes its hosted route,
+    /// records why, and takes the whole seconds already spent off its
+    /// queue-wait limit exactly once; all of it survives reopening the store.
+    #[test]
+    fn no_host_fits_decision_trims_queue_wait_once_and_is_counted_for_an_hour() {
+        let scratch = cortexkit_test_support::ScratchDir::new("hosted-no-host-fits");
+        let storage = Storage::open(&scratch).unwrap();
+        let now = now_ms();
+        let mut ids = Vec::new();
+        for (age, limit, spent_ms, remaining) in [
+            (0, 300, 2_999, 298),
+            (3_599_999, 2, 5_000, 1),
+            (3_600_000, 300, 0, 300),
+            (0, 0, 5_000, 0),
+        ] {
+            let minted = now - age;
+            let id = Uuid::new_v7(uuid::Timestamp::from_unix(
+                uuid::NoContext,
+                minted / 1000,
+                ((minted % 1000) * 1_000_000) as u32,
+            ));
+            storage.create(id, limit, None, None, false).unwrap();
+            storage
+                .hosted_route(
+                    id,
+                    crate::HostedJobState {
+                        repository_routed: true,
+                        lease_attempted: true,
+                        ..crate::HostedJobState::default()
+                    },
+                )
+                .unwrap();
+            storage.routed_direct_no_host_fits(id, spent_ms).unwrap();
+            ids.push((id, remaining, age));
+        }
+        // Not a no_host_fits decision: a routed job still on its hosted route.
+        let routed = Uuid::new_v7(uuid::Timestamp::from_unix(
+            uuid::NoContext,
+            now / 1000,
+            ((now % 1000) * 1_000_000) as u32,
+        ));
+        storage.create(routed, 300, None, None, false).unwrap();
+        storage
+            .hosted_route(
+                routed,
+                crate::HostedJobState {
+                    repository_routed: true,
+                    ..crate::HostedJobState::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(storage.hosted_no_host_fits_1h_at(now), 3);
+        assert_eq!(storage.hosted_no_host_fits_1h_at(now + 3_600_000), 0);
+        drop(storage);
+        let storage = Storage::open(&scratch).unwrap();
+        assert_eq!(storage.hosted_no_host_fits_1h_at(now), 3);
+        assert_eq!(storage.hosted_routed_jobs_1h_at(now), 1);
+        for (id, remaining, age) in ids {
+            let job = storage.job(id).unwrap();
+            assert!(job.hosted.is_none(), "age {age}");
+            assert_eq!(job.routed_direct_reason.as_deref(), Some("no_host_fits"));
+            assert_eq!(job.queue_wait_limit_s, remaining, "age {age}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod lease_release_tests {
+    use super::*;
+    use std::os::fd::FromRawFd;
+
+    /// A child forked from this process that parks before exec, holding a
+    /// copy of every descriptor the process had open at fork time.
+    ///
+    /// This is what motor-runner's Linux launch backend does when the tests
+    /// run it in-process: its child waits on a gate pipe until the job's start
+    /// record is durably saved, which on a loaded machine takes many
+    /// milliseconds. Close-on-exec does not help until the child execs.
+    struct ParkedChild {
+        pid: libc::pid_t,
+        gate: Option<File>,
+    }
+    impl ParkedChild {
+        fn fork() -> Self {
+            let mut fds = [0; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            // Keep the pipe out of processes other tests exec meanwhile, so
+            // only this child can hold its read end open.
+            for fd in fds {
+                assert_eq!(
+                    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                    0
+                );
+            }
+            let [read, write] = fds;
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+            if pid == 0 {
+                // Only async-signal-safe calls between fork and exit: another
+                // thread may hold the allocator's lock.
+                unsafe {
+                    libc::close(write);
+                    let mut byte = 0u8;
+                    while libc::read(read, (&mut byte as *mut u8).cast(), 1) < 0 {}
+                    libc::_exit(0);
+                }
+            }
+            unsafe { libc::close(read) };
+            Self {
+                pid,
+                gate: Some(unsafe { File::from_raw_fd(write) }),
+            }
+        }
+    }
+    impl Drop for ParkedChild {
+        fn drop(&mut self) {
+            // Closing the gate lets the child read end-of-file and exit.
+            drop(self.gate.take());
+            let mut status = 0;
+            unsafe { libc::waitpid(self.pid, &mut status, 0) };
+        }
+    }
+
+    /// Dropping a store must release its lease at once, even when a forked
+    /// child still shares the lease file's open file description; otherwise
+    /// an immediate reopen in the same process (or by a restarted daemon)
+    /// sees the lease as held by another process.
+    #[test]
+    fn dropped_store_releases_its_lease_while_a_forked_child_shares_the_descriptor() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-storage-lease-release");
+        for round in 0..20 {
+            let storage = Storage::open(&scratch).unwrap();
+            let child = ParkedChild::fork();
+            drop(storage);
+            let reopened = Storage::open(&scratch)
+                .unwrap_or_else(|error| panic!("round {round}: reopen after drop: {error}"));
+            assert_eq!(
+                Storage::open(&scratch).err().map(|error| error.kind()),
+                Some(io::ErrorKind::WouldBlock),
+                "round {round}: the reopened store must still own the lease exclusively"
+            );
+            drop(reopened);
+            drop(child);
+        }
     }
 }

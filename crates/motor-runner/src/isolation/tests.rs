@@ -7,6 +7,12 @@ mod writer;
 #[path = "privilege.rs"]
 mod privilege;
 
+#[path = "command_golden_tests.rs"]
+mod command_golden;
+
+#[path = "remote_cache_tests.rs"]
+mod remote_cache;
+
 #[test]
 fn stale_lockfile_refusal_says_to_update_it_locally() {
     // Both wordings Cargo has used for a manifest edited past its lockfile.
@@ -91,6 +97,13 @@ fn systemd_job_command_enforces_recorded_cpu_set_and_memory() {
             17_179_869_184_u64
         };
         assert!(args.contains(&format!("--property=MemoryMax={memory_max}").as_str()));
+        for property in [
+            "Slice=motor-jobs.slice",
+            "OOMScoreAdjust=900",
+            "OOMPolicy=kill",
+        ] {
+            assert!(args.contains(&format!("--property={property}").as_str()));
+        }
         assert!(args.contains(
             &format!(
                 "--property=TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev,size={memory_max}"
@@ -114,12 +127,98 @@ fn systemd_job_command_enforces_recorded_cpu_set_and_memory() {
 }
 
 #[test]
+#[ignore = "requires installed memory-policy units and a running user-service runner on a dedicated host"]
+fn isolated_job_memory_budget_and_oom_priority_protect_runner() {
+    let f = Fixture::new();
+    let sandbox = f.sandbox();
+    let (status, stdout, stderr) = output(
+        &sandbox,
+        "cat /proc/self/oom_score_adj /proc/self/cgroup",
+        &f.workspace,
+    );
+    assert!(status.success(), "{stderr}");
+    assert_eq!(stdout.lines().next(), Some("900"));
+    assert!(
+        stdout.contains("/motor.slice/motor-jobs.slice/"),
+        "{stdout}"
+    );
+
+    let runner_unit =
+        std::env::var("MOTOR_TEST_RUNNER_UNIT").unwrap_or_else(|_| "motor-runner.service".into());
+    let runner = Command::new("/usr/bin/systemctl")
+        .args([
+            "--user",
+            "show",
+            "--value",
+            "--property=MainPID",
+            &runner_unit,
+        ])
+        .output()
+        .unwrap();
+    assert!(runner.status.success());
+    let pid: u32 = String::from_utf8(runner.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        pid > 0,
+        "start the installed runner user service before this test"
+    );
+    assert_eq!(
+        fs::read_to_string(format!("/proc/{pid}/oom_score_adj"))
+            .unwrap()
+            .trim(),
+        "-900"
+    );
+    let group = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+    assert!(!group.contains("/motor-jobs.slice"), "{group}");
+
+    crate::systemd::require_job_memory_budget().unwrap();
+    let group = Path::new("/sys/fs/cgroup/motor.slice/motor-jobs.slice");
+    let limit = |name| {
+        fs::read_to_string(group.join(name))
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let high = limit("memory.high");
+    let max = limit("memory.max");
+    let meminfo = fs::read_to_string("/proc/meminfo").unwrap();
+    let total: u64 = meminfo
+        .lines()
+        .find(|l| l.starts_with("MemTotal:"))
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse::<u64>()
+        .unwrap()
+        * 1024;
+    assert!(
+        high > 0 && high < max && max < total,
+        "high={high} max={max} total={total}"
+    );
+}
+
+fn test_identity() -> pid_init::JobIdentity {
+    pid_init::JobIdentity {
+        uid: 997,
+        gid: 996,
+        groups: vec![996],
+        proc_protections: vec![("/proc/sys".into(), true)],
+    }
+}
+
+#[test]
 fn boat_command_preserves_isolation_and_limits_without_private_pids() {
     let f = Fixture::new();
     for (boat, private_pids) in [(false, true), (true, false), (true, true)] {
         let command = f
             .command_sandbox()
             .with_boat_profile(boat, private_pids, Some(14 * (1 << 30)))
+            .with_pid_init(Some(test_identity()))
             .without_provider_environment(&["BOAT_FUTURE".to_owned()])
             .command("true", &f.workspace, &[], true, &[1, 2], 2)
             .unwrap();
@@ -135,18 +234,24 @@ fn boat_command_preserves_isolation_and_limits_without_private_pids() {
             "PrivateNetwork=yes",
             "PrivateDevices=yes",
             "ProtectProc=invisible",
+            "ProtectKernelTunables=yes",
             "NoNewPrivileges=yes",
             "KillMode=control-group",
-            "User=motor-job",
         ] {
             assert!(args.contains(&format!("--property={property}").as_str()));
         }
+        // Without PrivatePIDs the unit starts as root for the PID namespace
+        // init, which drops to motor-job itself before the wrapper runs.
+        assert_eq!(args.contains(&"--property=User=motor-job"), private_pids);
         assert!(args
             .iter()
             .any(|a| a.starts_with("--property=TemporaryFileSystem=/dev/shm:")));
         assert_eq!(args.contains(&"--property=CPUQuota=200%"), boat);
         assert_eq!(args.contains(&"--property=TasksMax=4096"), boat);
-        assert_eq!(args.contains(&"--property=ProcSubset=pid"), boat);
+        // Boat jobs see the same non-process /proc entries as build-server
+        // jobs (/proc/stat, /proc/meminfo, ...): the sandbox VM runs one job,
+        // so those entries describe nothing but that job's own machine.
+        assert!(!args.iter().any(|a| a.contains("ProcSubset")), "{args:?}");
         assert_eq!(
             args.contains(
                 &"--property=UnsetEnvironment=ASCII_TOKEN BOAT_CURRENT_ID_FILE BOAT_FUTURE BOAT_ID"
@@ -154,6 +259,349 @@ fn boat_command_preserves_isolation_and_limits_without_private_pids() {
             boat
         );
     }
+}
+
+/// The Boat unit for systemd before 257 differs from the PrivatePIDs Boat
+/// unit only where the PID namespace init needs it: no PrivatePIDs, no User=
+/// or Group=, the init's capabilities, RestrictNamespaces=pid, the setup-error
+/// bind, and the init in front of the unchanged wrapper argv.
+#[test]
+fn boat_pid_init_unit_changes_only_what_the_init_needs() {
+    let f = Fixture::new();
+    let render = |private_pids: bool, durable: bool| {
+        let sandbox = f
+            .command_sandbox()
+            .with_boat_profile(true, private_pids, Some(14 << 30))
+            .with_pid_init(Some(test_identity()));
+        let mut sandbox = sandbox;
+        sandbox.read_write = vec![f.workspace.to_str().unwrap().into()];
+        let env = [("RUST_LOG".to_string(), "info".to_string())];
+        let command = sandbox
+            .command("cargo test", &f.workspace, &env, durable, &[1, 2], 2)
+            .unwrap();
+        let id = sandbox.id.to_string();
+        command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap().replace(&id, "<ID>"))
+            .collect::<Vec<_>>()
+    };
+    let setup_error = format!(
+        "{}:/motor-output/setup-error",
+        f.scratch.join("unprepared/output/setup-error").display()
+    );
+    let workspace = f.workspace.to_str().unwrap();
+    for durable in [true, false] {
+        let private = render(true, durable);
+        let init = render(false, durable);
+        let removed = [
+            "--property=PrivatePIDs=yes".to_owned(),
+            "--property=User=motor-job".to_owned(),
+            "--property=Group=motor-job".to_owned(),
+            "--property=CapabilityBoundingSet=".to_owned(),
+            "--property=RestrictNamespaces=yes".to_owned(),
+            format!("--property=BindPaths={workspace}"),
+        ];
+        let added = [
+            format!(
+                "--property=CapabilityBoundingSet={}",
+                pid_init::UNIT_CAPABILITIES
+            ),
+            "--property=RestrictNamespaces=pid".to_owned(),
+            format!("--property=BindPaths={workspace} {setup_error}"),
+        ];
+        for arg in removed.iter() {
+            assert!(private.contains(arg), "{arg} missing from {private:?}");
+            assert!(!init.contains(arg), "{arg} kept in {init:?}");
+        }
+        for arg in added.iter() {
+            assert!(init.contains(arg), "{arg} missing from {init:?}");
+        }
+        // The init's own arguments sit right before the wrapper's.
+        let start = init
+            .iter()
+            .position(|arg| arg == pid_init::INSTALLED_RUNNER)
+            .unwrap();
+        assert_eq!(
+            init[start..start + 7],
+            [
+                pid_init::INSTALLED_RUNNER,
+                pid_init::MODE,
+                "997",
+                "996",
+                "996",
+                "[[\"/proc/sys\",true]]",
+                "--"
+            ]
+        );
+        assert_eq!(init[start + 7], "/bin/bash");
+        // Everything else is the same argv in the same order.
+        let rest = |args: &[String], drop: &[String]| -> Vec<String> {
+            args.iter()
+                .filter(|arg| !drop.contains(arg))
+                .cloned()
+                .collect()
+        };
+        let mut init_rest = rest(&init, &added);
+        init_rest.drain(start - added.len()..start - added.len() + 7);
+        assert_eq!(init_rest, rest(&private, &removed), "durable={durable}");
+    }
+}
+
+#[test]
+fn boat_var_tmp_bind_uses_the_same_quota_covered_runtime_as_tmp() {
+    use std::os::unix::process::ExitStatusExt;
+    let f = Fixture::new();
+    let sandbox = f
+        .command_sandbox()
+        .with_boat_profile(true, false, Some(14 << 30));
+    fs::create_dir_all(&sandbox.root).unwrap();
+    crate::systemd::with_process_hook(
+        Box::new(|_| {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }),
+        || {
+            let sandbox = sandbox.with_boat_temporary_paths().unwrap();
+            assert_eq!(
+                sandbox.read_write,
+                [format!(
+                    "{}:/var/tmp",
+                    f.scratch.join("unprepared/tmp").display()
+                )]
+            );
+            assert!(sandbox.root.join("var").is_dir());
+            assert!(!fs::symlink_metadata(sandbox.root.join("var"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        },
+    );
+}
+
+#[test]
+fn boat_writer_unit_is_structurally_refused_even_if_cache_is_requested() {
+    with_prepared_boat_sandbox(true, |f, sandbox| {
+        let env = [("SCCACHE_DIR".into(), "/motor-cache".into())];
+        let error = sandbox
+            .command(
+                "touch /motor-cache/unlimited",
+                &f.workspace,
+                &env,
+                true,
+                &[1],
+                1,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            error.to_string(),
+            "Boat jobs cannot use dependency writer units"
+        );
+    });
+}
+
+/// The answer to a command sandbox preparation runs that needs sudo or the
+/// job accounts, so the real mount construction can run without either:
+/// `id` reports made-up account ids, and sudo, setfacl, chown and chmod
+/// succeed without doing anything. Every other command gets `None` and runs.
+fn fake_privileged_output(command: &Command) -> Option<io::Result<std::process::Output>> {
+    use std::os::unix::process::ExitStatusExt;
+    let program = command.get_program().to_string_lossy();
+    if program.ends_with("/id") {
+        let args: Vec<_> = command.get_args().collect();
+        let stdout = if args[0] == "-u" {
+            format!(
+                "{}\n",
+                unsafe { libc::geteuid() } + if args[1] == WRITER_USER { 10002 } else { 10001 }
+            )
+        } else {
+            format!("{}\n", args[1].to_string_lossy())
+        };
+        return Some(Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.into_bytes(),
+            stderr: Vec::new(),
+        }));
+    }
+    if ["sudo", "setfacl", "chown", "chmod"].iter().any(|name| {
+        Path::new(command.get_program())
+            .file_name()
+            .is_some_and(|actual| actual == *name)
+    }) {
+        return Some(Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }));
+    }
+    None
+}
+
+fn with_prepared_boat_sandbox(writer: bool, inspect: impl FnOnce(&Fixture, Sandbox)) {
+    let f = Fixture::new();
+    fs::create_dir_all(f.workspace.join("src")).unwrap();
+    fs::write(f.workspace.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    fs::write(
+        f.workspace.join("Cargo.toml"),
+        "[package]\nname = 'quota-mount-fixture'\nversion = '0.1.0'\nedition = '2021'\n",
+    )
+    .unwrap();
+    fs::write(
+        f.workspace.join("Cargo.lock"),
+        "version = 3\n[[package]]\nname = 'quota-mount-fixture'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    workspace::git(&f.workspace, &["init", "-q"]).unwrap();
+    workspace::git(&f.workspace, &["add", "."]).unwrap();
+    let tree = workspace::git(&f.workspace, &["write-tree"]).unwrap();
+    let target = f.scratch.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let id = Uuid::now_v7();
+    // Exercise the real mount construction. Only account/privileged operations
+    // are substituted; Git, Cargo fetch and the filesystem layout remain real.
+    crate::systemd::with_process_hook(
+        Box::new(|command| fake_privileged_output(command).unwrap_or_else(|| command.output())),
+        || {
+            let javascript = JavascriptTools::for_role(ToolchainRole::Boat);
+            let sandbox = if writer {
+                Sandbox::prepare_writer(
+                    id,
+                    &f.state,
+                    &f.workspace,
+                    &target,
+                    None,
+                    &f.state.join("slots"),
+                    1,
+                    &BTreeMap::new(),
+                    &tree,
+                    &javascript,
+                    true,
+                    None,
+                )
+            } else {
+                Sandbox::prepare_role(
+                    id,
+                    &f.state,
+                    &f.workspace,
+                    &target,
+                    &[],
+                    None,
+                    &f.state.join("slots"),
+                    1,
+                    &BTreeMap::new(),
+                    &tree,
+                    f.workspace.to_str().unwrap(),
+                    false,
+                    false,
+                    false,
+                    None,
+                    &javascript,
+                    None,
+                )
+                .map(|sandbox| sandbox.with_boat_profile(true, true, Some(14 << 30)))
+            }
+            .unwrap()
+            .with_boat_temporary_paths()
+            .unwrap()
+            .with_pid_init(Some(test_identity()));
+            inspect(&f, sandbox);
+        },
+    );
+}
+
+#[test]
+fn boat_unit_every_writable_bind_is_backed_by_a_job_quota_root() {
+    use std::os::unix::ffi::OsStringExt;
+    for writer in [false, true] {
+        with_prepared_boat_sandbox(writer, |f, mut sandbox| {
+            let target = f.scratch.join("target");
+            let roots = crate::boat_quota::job_roots(
+                &f.workspace,
+                &target,
+                &sandbox.runtime.0,
+                &f.state.join("spools").join("fixture"),
+            );
+            for private_pids in [true, false] {
+                sandbox.private_pids = private_pids;
+                let command = sandbox.command("true", &f.workspace, &[], true, &[1], 1);
+                if writer {
+                    assert_eq!(
+                        command.unwrap_err().to_string(),
+                        "Boat jobs cannot use dependency writer units"
+                    );
+                    continue;
+                }
+                let command = command.unwrap();
+                let args: Vec<_> = command
+                    .get_args()
+                    .map(|arg| arg.to_str().unwrap())
+                    .collect();
+                assert!(args.contains(&"--property=ProtectSystem=strict"));
+                assert!(args.contains(&"--property=ProtectHome=tmpfs"));
+                assert!(!args
+                    .iter()
+                    .any(|arg| arg.starts_with("--property=ReadWritePaths=")));
+                let binds = args
+                    .iter()
+                    .find_map(|arg| arg.strip_prefix("--property=BindPaths="))
+                    .unwrap();
+                assert!(!binds.is_empty(), "empty mount plan cannot prove coverage");
+                for bind in binds.split_whitespace() {
+                    let source = bind.split(':').next().unwrap();
+                    let mut bytes = Vec::new();
+                    let mut encoded = source.bytes();
+                    while let Some(byte) = encoded.next() {
+                        match byte {
+                            b'\\' => {
+                                assert_eq!(encoded.next(), Some(b'x'));
+                                let hex: String =
+                                    encoded.by_ref().take(2).map(char::from).collect();
+                                bytes.push(u8::from_str_radix(&hex, 16).unwrap());
+                            }
+                            b'%' => {
+                                assert_eq!(encoded.next(), Some(b'%'));
+                                bytes.push(b'%');
+                            }
+                            byte => bytes.push(byte),
+                        }
+                    }
+                    let source = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+                    assert!(
+                        roots.iter().any(|root| source.starts_with(root)),
+                        "unquota'd writable source in Boat unit: {}",
+                        source.display()
+                    );
+                }
+            }
+        });
+    }
+}
+
+#[test]
+fn boat_pid_init_unit_refuses_loader_variables_and_a_missing_identity() {
+    let f = Fixture::new();
+    let sandbox = || {
+        f.command_sandbox()
+            .with_boat_profile(true, false, Some(14 << 30))
+    };
+    let error = sandbox()
+        .command("true", &f.workspace, &[], true, &[1], 1)
+        .unwrap_err();
+    assert!(error.to_string().contains("identity"), "{error}");
+    let env = [("LD_PRELOAD".to_string(), "/tmp/x.so".to_string())];
+    let error = sandbox()
+        .with_pid_init(Some(test_identity()))
+        .command("true", &f.workspace, &env, true, &[1], 1)
+        .unwrap_err();
+    assert!(error.to_string().contains("LD_PRELOAD"), "{error}");
+    // Units without the init keep their environment rules.
+    assert!(f
+        .command_sandbox()
+        .command("true", &f.workspace, &env, true, &[1], 1)
+        .is_ok());
 }
 
 #[test]
@@ -300,6 +748,7 @@ impl Fixture {
             runtime: std::sync::Arc::new(RuntimeDir(
                 self.scratch.join("unprepared"),
                 std::sync::OnceLock::new(),
+                std::sync::OnceLock::new(),
             )),
             retain_failed: false,
             network: false,
@@ -307,7 +756,9 @@ impl Fixture {
             private_pids: true,
             boat_profile: false,
             boat_memory_max: None,
+            pid_init: None,
             provider_unset_env: Vec::new(),
+            cache_forwarders: Vec::new(),
             parent_umask: 0o022,
             memory_floor_gib: None,
             user: USER,
@@ -427,6 +878,7 @@ fn systemd_job_command_preserves_shell_source_and_forces_private_tmp() {
         runtime: std::sync::Arc::new(RuntimeDir(
             f.scratch.join("unprepared"),
             std::sync::OnceLock::new(),
+            std::sync::OnceLock::new(),
         )),
         retain_failed: false,
         network: false,
@@ -434,7 +886,9 @@ fn systemd_job_command_preserves_shell_source_and_forces_private_tmp() {
         private_pids: true,
         boat_profile: false,
         boat_memory_max: None,
+        pid_init: None,
         provider_unset_env: Vec::new(),
+        cache_forwarders: Vec::new(),
         parent_umask: 0o022,
         memory_floor_gib: None,
         user: USER,
@@ -924,7 +1378,9 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 private_pids: true,
                 boat_profile: false,
                 boat_memory_max: None,
+                pid_init: None,
                 provider_unset_env: Vec::new(),
+                cache_forwarders: Vec::new(),
                 parent_umask: 0o022,
                 memory_floor_gib: None,
                 user: USER,
@@ -976,7 +1432,9 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 private_pids: true,
                 boat_profile: false,
                 boat_memory_max: None,
+                pid_init: None,
                 provider_unset_env: Vec::new(),
+                cache_forwarders: Vec::new(),
                 parent_umask: 0o022,
                 memory_floor_gib: None,
                 user: USER,
@@ -1325,10 +1783,24 @@ fn cache_readiness_probe_checks_live_tcp_and_abstract_socket_endpoints() {
     use std::{
         net::TcpListener,
         os::{
+            fd::AsRawFd,
             linux::net::SocketAddrExt,
             unix::net::{SocketAddr, UnixListener},
         },
     };
+    // Other test threads keep forking processes, and each one shares every
+    // open descriptor until it execs, so a dropped listener can go on
+    // accepting for a moment. shutdown() stops a listening socket for every
+    // copy at once. A child parked before exec holds copies during each check,
+    // so the closed case cannot pass or fail by timing.
+    fn stop_listening(fd: &impl AsRawFd) {
+        assert_eq!(
+            unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_RDWR) },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+    }
     let scratch = cortexkit_test_support::ScratchDir::new("sccache-readiness");
     let probe = prepare_cache_readiness_probe(scratch.path()).unwrap();
     let tcp = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -1342,8 +1814,11 @@ fn cache_readiness_probe_checks_live_tcp_and_abstract_socket_endpoints() {
             .success()
     };
     assert!(tcp_status());
-    drop(tcp);
+    let forked = crate::test_helpers::fork_before_exec().unwrap();
+    stop_listening(&tcp);
     assert!(!tcp_status());
+    drop(forked);
+    drop(tcp);
     let name = format!("motor-cache-probe-{}", Uuid::now_v7());
     let socket = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
     let listener = UnixListener::bind_addr(&socket).unwrap();
@@ -1355,14 +1830,16 @@ fn cache_readiness_probe_checks_live_tcp_and_abstract_socket_endpoints() {
             .success()
     };
     assert!(uds_status());
-    drop(listener);
+    let forked = crate::test_helpers::fork_before_exec().unwrap();
+    stop_listening(&listener);
     assert!(!uds_status());
+    drop(forked);
+    drop(listener);
 }
 
 #[test]
 fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new();
     let output = f.scratch.join("driver-output");
     let tools = f.scratch.join("driver-tools");
@@ -1375,9 +1852,15 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
             "#!/bin/bash\nprintf '{\"stats\":{\"cache_misses\":{\"counts\":{\"Rust\":0}}}}\\n'\n",
         ),
     ] {
-        fs::write(tools.join(name), script).unwrap();
-        fs::set_permissions(tools.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_helpers::write_test_executable(&tools.join(name), script.as_bytes()).unwrap();
     }
+    // The writer shell runs this from the tool mount, as the sandbox installs
+    // it; its Cargo check itself is the stub `python3` above.
+    crate::test_helpers::write_test_executable(
+        &tools.join("writer-cargo-check.sh"),
+        crate::writer::fill::CARGO_CHECK.as_bytes(),
+    )
+    .unwrap();
     let mut sandbox = Sandbox {
         id: Uuid::now_v7(),
         root: f.scratch.join("root"),
@@ -1391,6 +1874,7 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
         runtime: std::sync::Arc::new(RuntimeDir(
             f.scratch.join("unprepared"),
             std::sync::OnceLock::new(),
+            std::sync::OnceLock::new(),
         )),
         retain_failed: false,
         network: false,
@@ -1398,7 +1882,9 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
         private_pids: true,
         boat_profile: false,
         boat_memory_max: None,
+        pid_init: None,
         provider_unset_env: Vec::new(),
+        cache_forwarders: Vec::new(),
         parent_umask: 0o022,
         memory_floor_gib: None,
         user: USER,
@@ -1426,7 +1912,10 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
             let shell = args[args.len() - 3]
                 .to_str()
                 .unwrap()
-                .replace("/motor-output", output.to_str().unwrap());
+                .replace("/motor-output", output.to_str().unwrap())
+                // The writer shell reaches the installed helpers through the
+                // tool mount; this fixture provides them in a directory.
+                .replace("/motor-tools", tools.to_str().unwrap());
             let mut child = Command::new("/bin/bash")
                 .args(["-c", &shell, USER, raw])
                 .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
@@ -1508,18 +1997,24 @@ fn nested_cargo_fetch_failure_logs_lockfile_and_crate_without_refusing() {
             .into_os_string()
     }));
     let mut skipped = Vec::new();
-    prefetch_cargo_with(&f.workspace, "HEAD", false, NESTED_CARGO_FETCH_TIMEOUT, |directory| {
-        let mut command = workspace::dependencies::fetch_command(
-            &f.state,
-            directory,
-            &BTreeMap::new(),
-            &f.scratch.join("cargo"),
-            &rustup,
-        )?;
-        command.env("CARGO_NET_OFFLINE", "true");
-        Ok(command)
-    },
-    |path, error| skipped.push((path.to_path_buf(), error.to_owned())),)
+    prefetch_cargo_with(
+        &f.workspace,
+        "HEAD",
+        false,
+        NESTED_CARGO_FETCH_TIMEOUT,
+        |directory| {
+            let mut command = workspace::dependencies::fetch_command(
+                &f.state,
+                directory,
+                &BTreeMap::new(),
+                &f.scratch.join("cargo"),
+                &rustup,
+            )?;
+            command.env("CARGO_NET_OFFLINE", "true");
+            Ok(command)
+        },
+        |path, error| skipped.push((path.to_path_buf(), error.to_owned())),
+    )
     .unwrap();
     assert_eq!(skipped.len(), 1);
     assert_eq!(skipped[0].0, Path::new("probes/helper/Cargo.lock"));
@@ -1597,19 +2092,25 @@ fn cargo_stale_lock_fixture(stale_root: bool) {
     }));
     let mut fetched = Vec::new();
     let mut skipped = Vec::new();
-    let result = prefetch_cargo_with(&f.workspace, "HEAD", false, NESTED_CARGO_FETCH_TIMEOUT, |directory| {
-        fetched.push(directory.to_path_buf());
-        let mut command = workspace::dependencies::fetch_command(
-            &f.state,
-            directory,
-            &BTreeMap::new(),
-            &f.scratch.join("cargo"),
-            &rustup,
-        )?;
-        command.env("CARGO_NET_OFFLINE", "true");
-        Ok(command)
-    },
-    |path, error| skipped.push((path.to_path_buf(), error.to_owned())),);
+    let result = prefetch_cargo_with(
+        &f.workspace,
+        "HEAD",
+        false,
+        NESTED_CARGO_FETCH_TIMEOUT,
+        |directory| {
+            fetched.push(directory.to_path_buf());
+            let mut command = workspace::dependencies::fetch_command(
+                &f.state,
+                directory,
+                &BTreeMap::new(),
+                &f.scratch.join("cargo"),
+                &rustup,
+            )?;
+            command.env("CARGO_NET_OFFLINE", "true");
+            Ok(command)
+        },
+        |path, error| skipped.push((path.to_path_buf(), error.to_owned())),
+    );
     if stale_root {
         let error = result.unwrap_err().to_string();
         assert!(
@@ -1642,19 +2143,25 @@ fn nested_cargo_fetch_deadline_skips_stall_and_gives_next_lock_a_fresh_bound() {
     let marker = f.scratch.join("ready");
     let mut skipped = Vec::new();
     let started = Instant::now();
-    prefetch_cargo_with(&f.workspace, "HEAD", false, Duration::from_millis(200), |directory| {
-        let mut command = Command::new("sh");
-        command.arg("-c");
-        if directory.ends_with("a-stalled") {
-            command.arg("printf 'cargo diagnostic before stall' >&2; sleep 30");
-        } else {
-            command
-                .arg("sleep 0.02; printf fetched > \"$MARKER\"")
-                .env("MARKER", &marker);
-        }
-        Ok(command)
-    },
-    |path, error| skipped.push((path.to_path_buf(), error.to_owned())),)
+    prefetch_cargo_with(
+        &f.workspace,
+        "HEAD",
+        false,
+        Duration::from_millis(200),
+        |directory| {
+            let mut command = Command::new("sh");
+            command.arg("-c");
+            if directory.ends_with("a-stalled") {
+                command.arg("printf 'cargo diagnostic before stall' >&2; sleep 30");
+            } else {
+                command
+                    .arg("sleep 0.02; printf fetched > \"$MARKER\"")
+                    .env("MARKER", &marker);
+            }
+            Ok(command)
+        },
+        |path, error| skipped.push((path.to_path_buf(), error.to_owned())),
+    )
     .unwrap();
     assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(fs::read_to_string(marker).unwrap(), "fetched");
@@ -1793,6 +2300,7 @@ fn cargo_prefetch_fixture(nested: bool) {
         &BTreeMap::new(),
         &cargo,
         &rustup,
+        None,
     )
     .unwrap();
     let missing = metadata();
@@ -1810,8 +2318,10 @@ fn cargo_prefetch_fixture(nested: bool) {
         "tip dependency must initially be absent"
     );
     let routes = BTreeMap::from([(url, mirror)]);
-    prefetch_cargo_dependencies(true, false, &f.state, &tip, "HEAD", &routes, &cargo, &rustup)
-        .unwrap();
+    prefetch_cargo_dependencies(
+        true, false, &f.state, &tip, "HEAD", &routes, &cargo, &rustup, None,
+    )
+    .unwrap();
     let ready = metadata();
     assert!(
         ready.status.success(),
@@ -1837,6 +2347,7 @@ fn runtime_cleanup_reservation_survives_until_last_handle_is_dropped() {
     let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let runtime = std::sync::Arc::new(RuntimeDir(
         scratch.join("absent-runtime"),
+        std::sync::OnceLock::new(),
         std::sync::OnceLock::new(),
     ));
     runtime.track(count.clone());
@@ -2082,5 +2593,400 @@ fn tenant_job_unit_does_not_inherit_daemon_dns_or_network_authority() {
         !words.iter().any(|word| word.contains("motor-tenant-daemon")
             || word.contains("JoinsNamespaceOf")
             || word.contains("CARGO_HOME=/tenant/cargo-home"))
+    );
+}
+
+/// The trusted prefetch resolves a `../b/crate` path dependency from the
+/// sibling's snapshot, not from the host checkout at the sibling's path. The
+/// host checkout's crate declares a dependency that the workspace's
+/// Cargo.lock lacks, so a `--locked` fetch reading it fails; the snapshot's
+/// crate matches the lock.
+#[test]
+#[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
+fn isolated_prefetch_resolves_sibling_path_dependency_from_snapshot() {
+    let scratch = cortexkit_test_support::ScratchDir::new("snapshot-prefetch-view");
+    let mut config = crate::engine::Config::new(
+        scratch.join("runner"),
+        format!("isotest{}", &Uuid::now_v7().simple().to_string()[24..]),
+    );
+    config.isolate_jobs = true;
+    let state = config.state_dir();
+    fs::create_dir_all(&state).unwrap();
+    let workspace = scratch.join("source/a");
+    let host = scratch.join("source/b");
+    let snapshot = config.sibling_snapshots_dir().join("b/1");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(workspace.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname='a'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nb-crate={path='../b/crate'}\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("Cargo.lock"),
+        "version=4\n[[package]]\nname='a'\nversion='0.1.0'\ndependencies=['b-crate']\n[[package]]\nname='b-crate'\nversion='0.1.0'\n",
+    )
+    .unwrap();
+    let package = "[package]\nname='b-crate'\nversion='0.1.0'\nedition='2021'\n";
+    for (root, manifest) in [
+        (&snapshot, package.to_string()),
+        (
+            &host,
+            format!("{package}[dependencies]\nmotor_missing_probe='=0.1.0'\n"),
+        ),
+    ] {
+        fs::create_dir_all(root.join("crate/src")).unwrap();
+        fs::write(root.join("crate/src/lib.rs"), "pub fn b() {}\n").unwrap();
+        fs::write(root.join("crate/Cargo.toml"), manifest).unwrap();
+    }
+    let cargo = scratch.join("cargo-home");
+    fs::create_dir_all(&cargo).unwrap();
+    let rustup = PathBuf::from(std::env::var_os("RUSTUP_HOME").unwrap_or_else(|| {
+        PathBuf::from(std::env::var_os("HOME").unwrap())
+            .join(".rustup")
+            .into_os_string()
+    }));
+    let fetch = |snapshots: Option<&SnapshotSiblings<'_>>| {
+        prefetch_cargo_dependencies(
+            false,
+            false,
+            &state,
+            &workspace,
+            "HEAD",
+            &BTreeMap::new(),
+            &cargo,
+            &rustup,
+            snapshots,
+        )
+    };
+    // Today's in-place prefetch reads the host checkout and fails.
+    assert!(fetch(None).is_err());
+    fetch(Some(&SnapshotSiblings {
+        config: &config,
+        siblings: vec![(snapshot.clone(), host.clone())],
+    }))
+    .unwrap();
+}
+
+/// A job sees each sibling at its canonical path and, from a worktree in
+/// another directory, at the `../<name>` alias. With in-place siblings both
+/// mounts show the checkout at the canonical path; in snapshot mode both show
+/// the sibling's snapshot, never the host checkout at that path.
+#[test]
+fn sibling_mounts_bind_the_snapshot_at_the_sibling_path_and_its_alias() {
+    let config = crate::engine::Config::new("/state-root", "main");
+    let sibling = |path: &str| SiblingSnapshot {
+        canonical_path: path.into(),
+        commit: "a".repeat(40),
+        tree_hash: "b".repeat(40),
+        base_commit: None,
+    };
+    let worktree = Path::new("/w/worktrees/a");
+    let beside = Path::new("/w/source/a");
+    let siblings = [sibling("/w/source/commons")];
+    let snapshot = PathBuf::from("/state-root/main/sibling-snapshots/commons/s1");
+    let snapshots = SnapshotSiblings {
+        config: &config,
+        siblings: vec![(snapshot, PathBuf::from("/w/source/commons"))],
+    };
+    let mounts = |workspace: &Path, snapshots: Option<&SnapshotSiblings<'_>>| {
+        sibling_mounts(workspace, &siblings, snapshots).unwrap()
+    };
+
+    assert_eq!(
+        mounts(worktree, None),
+        [
+            (
+                "/w/source/commons".to_string(),
+                PathBuf::from("/w/source/commons")
+            ),
+            (
+                "/w/source/commons:/w/worktrees/commons".to_string(),
+                PathBuf::from("/w/worktrees/commons")
+            ),
+        ]
+    );
+    assert_eq!(
+        mounts(worktree, Some(&snapshots)),
+        [
+            (
+                "/state-root/main/sibling-snapshots/commons/s1:/w/source/commons".to_string(),
+                PathBuf::from("/w/source/commons")
+            ),
+            (
+                "/state-root/main/sibling-snapshots/commons/s1:/w/worktrees/commons".to_string(),
+                PathBuf::from("/w/worktrees/commons")
+            ),
+        ]
+    );
+    // Beside the sibling, `../commons` is its canonical path: one mount.
+    assert_eq!(
+        mounts(beside, Some(&snapshots)),
+        [(
+            "/state-root/main/sibling-snapshots/commons/s1:/w/source/commons".to_string(),
+            PathBuf::from("/w/source/commons")
+        )]
+    );
+    // A sibling without a resolved snapshot is refused rather than mounted
+    // from the host.
+    assert!(sibling_mounts(worktree, &[sibling("/w/source/other")], Some(&snapshots)).is_err());
+}
+
+/// The job's Git config names the workspace and every place a sibling is
+/// mounted, the canonical path and the `../<name>` alias, exactly and without
+/// a wildcard.
+#[test]
+fn job_git_config_lists_the_workspace_and_both_sibling_mounts_as_safe() {
+    let scratch = cortexkit_test_support::ScratchDir::new("safe-directories");
+    let config = crate::engine::Config::new("/state-root", "main");
+    let workspace = Path::new("/w/worktrees/a");
+    let siblings = [SiblingSnapshot {
+        canonical_path: "/w/source/commons".into(),
+        commit: "a".repeat(40),
+        tree_hash: "b".repeat(40),
+        base_commit: None,
+    }];
+    let snapshots = SnapshotSiblings {
+        config: &config,
+        siblings: vec![(
+            PathBuf::from("/state-root/main/sibling-snapshots/commons/s1"),
+            PathBuf::from("/w/source/commons"),
+        )],
+    };
+    for snapshots in [None, Some(&snapshots)] {
+        let file = scratch.join(format!("gitconfig-{}", snapshots.is_some()));
+        let mounts = sibling_mounts(workspace, &siblings, snapshots).unwrap();
+        write_safe_directories(&file, &safe_directories(workspace, &mounts)).unwrap();
+        let listed = workspace::git(
+            &scratch,
+            &[
+                "config",
+                "--file",
+                file.to_str().unwrap(),
+                "--get-all",
+                "safe.directory",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            listed.lines().collect::<Vec<_>>(),
+            [
+                "/w/worktrees/a",
+                "/w/source/commons",
+                "/w/worktrees/commons"
+            ],
+            "snapshots: {}",
+            snapshots.is_some()
+        );
+    }
+}
+
+/// Git inside a job reads a sibling owned by another account, through a
+/// read-only mount, at both the sibling's path and its alias. Bind mounts
+/// need root, so the test stands in for each mount with a read-only copy of a
+/// dissociated snapshot, and Git's own test switch
+/// makes it treat every repository as owned by someone else. With the job's
+/// Git config, `rev-parse`, `log` and `status` work and print no warning; a
+/// directory the config does not list is refused, as the alias was before it
+/// was listed.
+#[test]
+fn job_git_reads_a_sibling_owned_by_another_account_at_its_path_and_alias() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = cortexkit_test_support::ScratchDir::new("safe-sibling-git");
+    let root = fs::canonicalize(&*scratch).unwrap();
+    let git_in = |directory: &Path, args: &[&str]| {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    let source = root.join("source");
+    fs::create_dir_all(&source).unwrap();
+    git_in(&source, &["init", "-q"]);
+    fs::write(source.join("source"), "first\n").unwrap();
+    git_in(&source, &["add", "."]);
+    git_in(
+        &source,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "first",
+        ],
+    );
+    let head = workspace::git(&source, &["rev-parse", "HEAD"]).unwrap();
+    // A snapshot as creation leaves it: a shared clone, dissociated from the
+    // repository it was cloned from.
+    let snapshot = root.join("snapshot");
+    git_in(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--shared",
+            source.to_str().unwrap(),
+            snapshot.to_str().unwrap(),
+        ],
+    );
+    assert!(snapshot.join(".git/objects/info/alternates").is_file());
+    crate::sibling_snapshots::store::dissociate(&snapshot).unwrap();
+    fs::remove_dir_all(&source).unwrap();
+
+    let workspace = root.join("w/worktrees/a");
+    let canonical = root.join("w/source/commons");
+    let alias = root.join("w/worktrees/commons");
+    let unlisted = root.join("w/worktrees/unlisted");
+    let siblings = [SiblingSnapshot {
+        canonical_path: canonical.to_string_lossy().into_owned(),
+        commit: head.clone(),
+        tree_hash: "b".repeat(40),
+        base_commit: None,
+    }];
+    let config = crate::engine::Config::new("/state-root", "main");
+    let snapshots = SnapshotSiblings {
+        config: &config,
+        siblings: vec![(snapshot.clone(), canonical.clone())],
+    };
+    let mounts = sibling_mounts(&workspace, &siblings, Some(&snapshots)).unwrap();
+    let gitconfig = root.join("gitconfig");
+    write_safe_directories(&gitconfig, &safe_directories(&workspace, &mounts)).unwrap();
+    for (_, destination) in &mounts {
+        copy_read_only(&snapshot, destination);
+    }
+    copy_read_only(&snapshot, &unlisted);
+    for path in [&canonical, &alias, &unlisted] {
+        let mode = fs::metadata(path.join("source"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o222, 0, "{} is read-only", path.display());
+    }
+
+    let run = |directory: &Path, args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(args)
+            .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+    };
+    for path in [&canonical, &alias] {
+        for (args, expected) in [
+            (&["rev-parse", "HEAD"][..], format!("{head}\n")),
+            (&["log", "-1", "--format=%H"][..], format!("{head}\n")),
+            (&["status", "--porcelain"][..], String::new()),
+        ] {
+            let output = run(path, args);
+            assert!(
+                output.status.success() && output.stderr.is_empty(),
+                "git {args:?} at {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        }
+    }
+    let refused = run(&unlisted, &["rev-parse", "HEAD"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("dubious ownership"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    for path in [&canonical, &alias, &unlisted] {
+        make_writable(path);
+    }
+}
+
+/// Copies `source` to `target` and removes every write bit, as a read-only
+/// mount of a snapshot shows it.
+fn copy_read_only(source: &Path, target: &Path) {
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let status = Command::new("cp")
+        .arg("-pR")
+        .arg(source)
+        .arg(target)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let status = Command::new("chmod")
+        .args(["-R", "a-w"])
+        .arg(target)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// Gives the owner write access again, so the scratch directory can go.
+fn make_writable(path: &Path) {
+    let status = Command::new("chmod")
+        .args(["-R", "u+w"])
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+#[ignore = "requires a trusted operator host with root mount namespaces"]
+fn isolated_boat_full_disk_wrapper_preserves_preallocated_exit() {
+    let f = Fixture::new();
+    let mut sandbox = f.command_sandbox();
+    sandbox.boat_profile = true;
+    sandbox.private_pids = false;
+    sandbox.pid_init = Some(test_identity());
+    let command = sandbox
+        .command("exit 23", &f.workspace, &[], true, &[], 4)
+        .unwrap();
+    let shell = command
+        .get_args()
+        .find_map(|arg| arg.to_str().filter(|s| s.starts_with("IFS= read")))
+        .unwrap()
+        .replace("/motor-output", "\"$MOTOR_OUTPUT\"");
+    let mount = f.scratch.join("full-disk");
+    fs::create_dir(&mount).unwrap();
+    let output = crate::privilege::command("/usr/bin/unshare")
+        .args([
+            "--mount",
+            "/bin/bash",
+            "-c",
+            r#"
+set -eu
+mount --make-rprivate /
+mount -t tmpfs -o size=1M tmpfs "$1"
+export MOTOR_OUTPUT="$1"
+printf '%32s' '' >"$1/exit"
+touch "$1/stdout" "$1/stderr"
+dd if=/dev/zero of="$1/fill" bs=4096 status=none 2>/dev/null && exit 91
+# A failed fresh write proves the fixture really exhausted the mounted volume.
+if printf x >"$1/control" 2>/dev/null; then exit 92; fi
+set +e
+/bin/bash -c "$2" motor-job 'exit 23' <<<g
+code=$?
+set -e
+test "$code" = 23
+test "$(stat -c %s "$1/exit")" = 32
+test "$(tr -d ' \n' <"$1/exit")" = 23
+"#,
+            "full-disk-probe",
+        ])
+        .arg(&mount)
+        .arg(&shell)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status={:?}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
     );
 }

@@ -70,6 +70,24 @@ pub(crate) fn reader_environment(env: &mut BTreeMap<String, String>, size_gib: u
     }
 }
 
+/// Whether the shared compiler cache at `fleet` may hold compiled entries:
+/// whether any one-hex-digit path exists at its top level. sccache 0.18.0
+/// stores each entry under such a directory (see `writer::cache`), and the
+/// only other directory the runner creates there, `preprocessor/`, holds no
+/// Rust entries, so a cache without one is empty. A missing cache is empty.
+/// Only the Linux runner has a shared cache to inspect.
+#[cfg(target_os = "linux")]
+pub(crate) fn holds_entries(fleet: &Path) -> io::Result<bool> {
+    for shard in "0123456789abcdef".chars() {
+        match fs::symlink_metadata(fleet.join(shard.to_string())) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
 /// Follow Cargo's ancestor search and its preference for config over config.toml.
 /// Read data only: never invoke Cargo or a workspace wrapper as the runner.
 pub(crate) fn configured_wrapper(workspace: &Path, cwd: &Path) -> io::Result<bool> {
@@ -170,7 +188,7 @@ mod tests {
 mod wrapper_tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
-    use std::{os::unix::fs::PermissionsExt, process::Command};
+    use std::process::Command;
 
     fn run(
         available: bool,
@@ -183,7 +201,11 @@ mod wrapper_tests {
         let backend = scratch.join("backend");
         let compiler = scratch.join("rustc");
         let events = scratch.join("events");
-        fs::write(&wrapper, include_str!("sccache-wrapper.sh")).unwrap();
+        crate::test_helpers::write_test_executable(
+            &wrapper,
+            include_str!("sccache-wrapper.sh").as_bytes(),
+        )
+        .unwrap();
         fs::write(
             wrapper.with_extension("backend"),
             backend.to_string_lossy().as_bytes(),
@@ -194,16 +216,18 @@ mod wrapper_tests {
         if already_running {
             fs::write(&state, "").unwrap();
         }
-        fs::write(&ready, "#!/bin/bash\ntest -f \"$STATE\"\n").unwrap();
-        fs::write(&backend, format!("#!/bin/bash\ncase \"$1\" in\n--start-server) echo startup >> \"$EVENTS\"; {}; exit {};;\n--show-stats) echo stats >> \"$EVENTS\"; exit 0;;\n*) if [[ -n ${{CARGO_INCREMENTAL+x}} || -n ${{CARGO_BUILD_INCREMENTAL+x}} ]]; then exit 77; fi; echo cached >> \"$EVENTS\"; exec \"$@\";;\nesac\n", if available {"touch \"$STATE\""} else {":"}, if available {0} else {2})).unwrap();
-        fs::write(
-            &compiler,
-            format!("#!/bin/bash\necho compiler >> \"$EVENTS\"\nexit {compiler_exit}\n"),
+        crate::test_helpers::write_test_executable(&ready, b"#!/bin/bash\ntest -f \"$STATE\"\n")
+            .unwrap();
+        crate::test_helpers::write_test_executable(
+            &backend,
+            format!("#!/bin/bash\ncase \"$1\" in\n--start-server) echo startup >> \"$EVENTS\"; {}; exit {};;\n--show-stats) echo stats >> \"$EVENTS\"; exit 0;;\n*) if [[ -n ${{CARGO_INCREMENTAL+x}} || -n ${{CARGO_BUILD_INCREMENTAL+x}} ]]; then exit 77; fi; echo cached >> \"$EVENTS\"; exec \"$@\";;\nesac\n", if available {"touch \"$STATE\""} else {":"}, if available {0} else {2}).as_bytes(),
         )
         .unwrap();
-        for path in [&wrapper, &backend, &compiler, &ready] {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_helpers::write_test_executable(
+            &compiler,
+            format!("#!/bin/bash\necho compiler >> \"$EVENTS\"\nexit {compiler_exit}\n").as_bytes(),
+        )
+        .unwrap();
         let mut command = Command::new(&wrapper);
         command
             .env("EVENTS", &events)

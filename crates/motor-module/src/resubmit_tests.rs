@@ -164,6 +164,53 @@ async fn spill_refused_by_hosted_runner_before_run_resubmits() {
     assert!(!requests.iter().any(|p| p.ends_with("/reattach")));
 }
 
+/// The hosted runner answered the have exchange, but ck-motor could not build
+/// the bundle for it, so no Run frame was sent: the spill goes back to the
+/// build server under a new ID rather than ending refused_before_start /
+/// snapshot_failed. The fixture holds a ref named `refs/ck-motor`, which
+/// makes every `refs/ck-motor/<id>/...` bundle ref impossible to create; the
+/// build server reports holding every commit, so it needs no bundle.
+#[tokio::test]
+async fn spill_whose_bundle_fails_before_run_resubmits() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = ScratchDir::new("motor-spill-bundle-failed");
+    let repo = fixture_repo(&scratch);
+    assert!(std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["update-ref", "refs/ck-motor", "HEAD"])
+        .status()
+        .unwrap()
+        .success());
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        spill_config(&h.route.broker_url),
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let id = Uuid::now_v7();
+    let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(60)).await;
+    assert_one_build_server_job(id, &records);
+    let resubmitted = assert_resubmitted_once(id, &log.lock().unwrap(), 30);
+    let job = motor.storage.job(id).unwrap();
+    assert_eq!(job.build_server_job_id, Some(resubmitted));
+    // The hosted runner answered the have exchange and never got a Run frame.
+    assert!(h
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|f| matches!(f, Frame::Have { .. })));
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    let requests = h.requests.lock().unwrap();
+    assert!(
+        requests.last().unwrap().ends_with("/release"),
+        "{requests:?}"
+    );
+    assert!(!requests.iter().any(|p| p.ends_with("/reattach")));
+}
+
 /// Once the Run frame may have reached a hosted runner, a lost acknowledgement
 /// is followed by reattaching to that runner, never by a second submission.
 #[tokio::test]
@@ -261,4 +308,71 @@ async fn restart_between_resubmit_and_run_attaches_build_server_id() {
     let log = log.lock().unwrap();
     assert_eq!(log.attaches, vec![before_run, after_run]);
     assert!(log.runs.is_empty(), "a restart never submits again");
+}
+
+/// A spilled job whose lease CLOUD refuses with 403 `account_closed` is not
+/// sent back to the build server: a closed account must not run anything
+/// anywhere. The caller gets one typed refusal that says not to repeat the
+/// request, and nothing falls back. (`no_capacity` still sends a spill back:
+/// `spilled_no_capacity_resubmits_to_build_server_as_one_stream`.)
+#[tokio::test]
+async fn spilled_account_closed_is_refused_and_never_resubmitted() {
+    let (status, body) = crate::hosted::tests::cloud_account_closed_reply();
+    let broker = crate::hosted::test_http::Http::new(move |path, _| {
+        if path == "/v1/leases" {
+            (status, body.clone())
+        } else {
+            (404, serde_json::json!({"error": "job_unknown"}))
+        }
+    })
+    .await;
+    let scratch = ScratchDir::new("motor-spill-account-closed");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        spill_config(&broker.url),
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let id = Uuid::now_v7();
+    let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(30)).await;
+    let Some(StreamRecord::Terminal(terminal)) = records.last() else {
+        panic!("{records:?}")
+    };
+    assert_eq!(terminal.job_id, id);
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RequestRejected
+        }
+    );
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(terminal.retry_after_ms, None);
+    assert_eq!(
+        terminal.refusal_detail.as_deref(),
+        Some("hosted_account_closed: hosted account closed")
+    );
+    // The build server saw only the first submission, which the spill
+    // withdrew; nothing was submitted again.
+    let log = log.lock().unwrap();
+    assert_eq!(log.runs, vec![(id, 0)]);
+    assert_eq!(log.withdraws, vec![id]);
+    let requests = broker.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(path, _)| path == "/v1/leases")
+            .count(),
+        1,
+        "{requests:?}"
+    );
+    assert!(!requests
+        .iter()
+        .any(|(path, _)| path.ends_with("/reattach") || path.ends_with("/finish")));
+    assert!(motor.storage.job(id).unwrap().build_server_job_id.is_none());
+    let state = motor.hosted_state(id).unwrap();
+    assert!(state.hosted_no_fallback);
+    assert_eq!(state.hosted_code.as_deref(), Some("hosted_account_closed"));
 }

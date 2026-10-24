@@ -1,0 +1,887 @@
+use super::*;
+use std::collections::BTreeSet;
+
+fn os(args: &[&str]) -> Vec<OsString> {
+    args.iter().map(OsString::from).collect()
+}
+
+#[test]
+fn exec_start_round_trips_through_the_init_arguments() {
+    let identity = JobIdentity {
+        uid: 997,
+        gid: 996,
+        groups: vec![996, 4242],
+        proc_protections: vec![("/proc/sys".into(), true)],
+    };
+    let wrapper = [
+        "/bin/bash",
+        "-c",
+        "IFS= read -r -n 1 || exit 125",
+        "motor-job",
+        "echo 'a b'",
+    ];
+    let command = exec_start(&identity, &wrapper);
+    assert_eq!(
+        command[..7],
+        [
+            INSTALLED_RUNNER,
+            MODE,
+            "997",
+            "996",
+            "996,4242",
+            "[[\"/proc/sys\",true]]",
+            "--"
+        ]
+    );
+    let plan = parse_args(command[2..].iter().map(OsString::from).collect()).unwrap();
+    assert_eq!(plan.identity, identity);
+    assert_eq!(
+        plan.argv,
+        wrapper.map(|arg| CString::new(arg).unwrap()).to_vec()
+    );
+    // An account with no supplementary groups passes an empty list.
+    let bare = JobIdentity {
+        uid: 5,
+        gid: 6,
+        groups: Vec::new(),
+        proc_protections: vec![("/proc/sys".into(), true)],
+    };
+    let command = exec_start(&bare, &["/bin/true"]);
+    assert_eq!(command[4], "");
+    assert_eq!(
+        parse_args(command[2..].iter().map(OsString::from).collect())
+            .unwrap()
+            .identity,
+        bare
+    );
+}
+
+#[test]
+fn init_arguments_refuse_root_and_malformed_commands() {
+    for (mut args, why) in [
+        (os(&["0", "5", "5", "--", "/bin/true"]), "root uid"),
+        (os(&["5", "0", "5", "--", "/bin/true"]), "root gid"),
+        (os(&["5", "5", "5,0", "--", "/bin/true"]), "group 0"),
+        (os(&["5", "5", "5", "/bin/true"]), "missing --"),
+        (os(&["5", "5", "5", "--"]), "no wrapper"),
+        (os(&["5", "5", "5", "--", "bash"]), "relative wrapper"),
+        (
+            os(&["five", "5", "5", "--", "/bin/true"]),
+            "non-numeric uid",
+        ),
+        (
+            os(&["5", "5", "5,x", "--", "/bin/true"]),
+            "non-numeric group",
+        ),
+        (os(&["5", "5"]), "truncated"),
+    ] {
+        if args.len() >= 3 {
+            args.insert(3, OsString::from("[[\"/proc/sys\",true]]"));
+        }
+        assert!(parse_args(args).is_err(), "{why} must be refused");
+    }
+}
+
+#[test]
+fn exit_and_signal_statuses_forward_unchanged() {
+    // waitpid status encoding: exit code in bits 8-15, signal in 0-6, core 7.
+    for code in [0, 1, 23, 125, 137, 226, 255] {
+        assert_eq!(forwarded(code << 8), Forward::Exit(code));
+    }
+    for signal in [libc::SIGKILL, libc::SIGTERM, libc::SIGSEGV] {
+        assert_eq!(
+            forwarded(signal),
+            Forward::Signal {
+                signal,
+                core_dumped: false
+            }
+        );
+        assert_eq!(
+            forwarded(signal | 0x80),
+            Forward::Signal {
+                signal,
+                core_dumped: true
+            }
+        );
+    }
+}
+
+#[test]
+fn supervisor_reproduces_real_exit_and_sigkill_wait_status() {
+    for status in [
+        0,
+        23 << 8,
+        125 << 8,
+        137 << 8,
+        226 << 8,
+        libc::SIGKILL,
+        libc::SIGTERM,
+        libc::SIGSEGV | 0x80,
+    ] {
+        // SAFETY: the forked child only changes signal state and exits; it
+        // neither allocates nor touches the test harness after fork.
+        let observed = unsafe {
+            let child = libc::fork();
+            assert!(child >= 0);
+            if child == 0 {
+                forward(status);
+            }
+            let mut observed = 0;
+            assert_eq!(libc::waitpid(child, &mut observed, 0), child);
+            observed
+        };
+        assert_eq!(
+            observed,
+            status & !0x80,
+            "supervisor preserves signal without duplicating child core: {status:#x}"
+        );
+    }
+}
+
+#[test]
+fn proc_submounts_are_the_direct_children_of_the_top_proc_mount() {
+    // A job root's mounts: the old /proc, its protected submounts (one with a
+    // nested mount of its own), the new proc at the staging directory, and a
+    // name with an escaped space that only looks like /proc.
+    let table = "\
+20 1 0:5 / / ro - ext4 /dev/vda rw
+25 20 0:22 / /proc rw,nosuid,nodev,noexec - proc proc rw,hidepid=invisible
+26 25 0:22 /sys /proc/sys ro,nosuid,nodev,noexec - proc proc rw,hidepid=invisible
+27 26 0:40 / /proc/sys/fs/binfmt_misc rw - autofs systemd-1 rw
+28 25 0:22 /sysrq-trigger /proc/sysrq-trigger ro - proc proc rw
+29 25 0:6 /null /proc/kcore ro - devtmpfs udev rw
+30 20 0:41 / /dev/shm rw - tmpfs tmpfs rw
+31 30 0:42 / /dev/shm/.motor-pid-init rw - proc proc rw,hidepid=invisible
+32 20 0:43 / /proc\\040x rw - tmpfs tmpfs rw
+";
+    assert_eq!(
+        proc_submounts(table).unwrap(),
+        ["/proc/sys", "/proc/sysrq-trigger", "/proc/kcore"]
+    );
+    // A second proc stacked on /proc: only the top one's children count.
+    let stacked = format!(
+        "{table}40 25 0:50 / /proc rw - proc proc rw\n41 40 0:50 /sys /proc/sys ro - proc proc rw\n"
+    );
+    assert_eq!(proc_submounts(&stacked).unwrap(), ["/proc/sys"]);
+    assert!(proc_submounts("20 1 0:5 / / ro - ext4 /dev/vda rw\n").is_err());
+    assert!(proc_submounts("garbage\n").is_err());
+    assert_eq!(unescape("/a\\040b\\134c\\011"), "/a b\\c\t");
+    assert_eq!(unescape("/trailing\\04"), "/trailing\\04");
+}
+
+#[test]
+fn proc_protections_must_equal_the_independent_reference_after_moves() {
+    let table = "25 20 0:22 / /proc rw - proc proc rw\n26 25 0:22 /sys /proc/sys ro - proc proc rw\n27 25 0:22 /irq /proc/irq ro - proc proc rw\n";
+    let expected = vec![("/proc/irq".into(), true), ("/proc/sys".into(), true)];
+    verify_proc_protections(table, &expected).unwrap();
+    assert!(verify_proc_protections(
+        &table.replace("27 25 0:22 /irq /proc/irq ro - proc proc rw\n", ""),
+        &expected
+    )
+    .is_err());
+    assert!(verify_proc_protections(
+        &table.replace("/sys /proc/sys ro", "/sys /proc/sys rw"),
+        &expected
+    )
+    .is_err());
+    assert!(verify_proc_protections(table, &[]).is_err());
+    assert!(verify_proc_protections(table, &[("/proc/sys".into(), true)]).is_err());
+}
+
+#[test]
+fn post_credential_drop_rearms_parent_death_signal() {
+    // The portable child uses its current IDs; privileged transitions are
+    // additionally observed in the live bootstrap's root-only telemetry.
+    unsafe {
+        let parent_fd = libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) as i32;
+        assert!(parent_fd >= 0);
+        let child = libc::fork();
+        assert!(child >= 0);
+        if child == 0 {
+            let parent = libc::getppid();
+            if libc::setresgid(libc::getgid(), libc::getgid(), libc::getgid()) != 0
+                || libc::setresuid(libc::getuid(), libc::getuid(), libc::getuid()) != 0
+            {
+                libc::_exit(1);
+            }
+            libc::prctl(libc::PR_SET_PDEATHSIG, 0);
+            if arm_parent_death_signal(parent, parent_fd).is_err() {
+                libc::_exit(2);
+            }
+            let mut signal = 0i32;
+            if libc::prctl(libc::PR_GET_PDEATHSIG, &mut signal) != 0 || signal != libc::SIGKILL {
+                libc::_exit(3);
+            }
+            libc::_exit(0);
+        }
+        libc::close(parent_fd);
+        let mut status = 0;
+        assert_eq!(libc::waitpid(child, &mut status, 0), child);
+        assert_eq!(status, 0);
+    }
+}
+
+#[test]
+fn job_group_sigcont_does_not_reach_supervisor_session() {
+    unsafe {
+        let supervisor = libc::fork();
+        assert!(supervisor >= 0);
+        if supervisor == 0 {
+            if libc::setsid() < 0 {
+                libc::_exit(1);
+            }
+            let mut blocked = std::mem::zeroed::<libc::sigset_t>();
+            libc::sigemptyset(&mut blocked);
+            libc::sigaddset(&mut blocked, libc::SIGCONT);
+            libc::sigprocmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut());
+            let job = libc::fork();
+            if job < 0 {
+                libc::_exit(2);
+            }
+            if job == 0 {
+                if separate_session().is_err()
+                    || libc::getsid(0) != libc::getpid()
+                    || libc::getpgrp() != libc::getpid()
+                {
+                    libc::_exit(3);
+                }
+                if libc::kill(0, libc::SIGCONT) != 0 {
+                    libc::_exit(4);
+                }
+                libc::_exit(0);
+            }
+            let mut status = 0;
+            if libc::waitpid(job, &mut status, 0) != job || status != 0 {
+                libc::_exit(5);
+            }
+            libc::sigpending(&mut blocked);
+            libc::_exit(if libc::sigismember(&blocked, libc::SIGCONT) == 0 {
+                0
+            } else {
+                6
+            });
+        }
+        let mut status = 0;
+        assert_eq!(libc::waitpid(supervisor, &mut status, 0), supervisor);
+        assert_eq!(status, 0, "job kill(0, SIGCONT) reached supervisor");
+    }
+}
+
+#[test]
+fn parent_pidfd_rejects_death_even_when_ppid_is_unchanged() {
+    unsafe {
+        let target = libc::fork();
+        assert!(target >= 0);
+        if target == 0 {
+            libc::_exit(0);
+        }
+        // A zombie remains addressable until waitpid, avoiding a PID-reuse race.
+        let fd = libc::syscall(libc::SYS_pidfd_open, target, 0) as i32;
+        assert!(fd >= 0);
+        let mut status = 0;
+        assert_eq!(libc::waitpid(target, &mut status, 0), target);
+        let tester = libc::fork();
+        assert!(tester >= 0);
+        if tester == 0 {
+            let parent = libc::getppid();
+            libc::_exit(if arm_parent_death_signal(parent, fd).is_err() {
+                0
+            } else {
+                1
+            });
+        }
+        libc::close(fd);
+        assert_eq!(libc::waitpid(tester, &mut status, 0), tester);
+        assert_eq!(
+            status, 0,
+            "dead supervisor was accepted despite unchanged PPid"
+        );
+    }
+}
+
+#[test]
+fn supervisor_wait_failure_cannot_write_a_setup_record() {
+    use std::os::fd::AsRawFd;
+    let path = cortexkit_test_support::scratch_root()
+        .join(format!("supervisor-report-{}", uuid::Uuid::now_v7()));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let file = fs::File::create(&path).unwrap();
+    unsafe {
+        let child = libc::fork();
+        assert!(child >= 0);
+        if child == 0 {
+            let fd = file.as_raw_fd();
+            // Owned handles are closed even if open reused a missing standard
+            // descriptor; a borrowed stderr fallback must remain open.
+            if libc::dup2(fd, libc::STDIN_FILENO) != libc::STDIN_FILENO {
+                libc::_exit(2);
+            }
+            drop(Report {
+                fd: libc::STDIN_FILENO,
+                owned: true,
+            });
+            if libc::fcntl(libc::STDIN_FILENO, libc::F_GETFD) != -1 {
+                libc::_exit(3);
+            }
+            drop(Report {
+                fd: libc::STDERR_FILENO,
+                owned: false,
+            });
+            if libc::fcntl(libc::STDERR_FILENO, libc::F_GETFD) == -1 {
+                libc::_exit(4);
+            }
+            drop(Report { fd, owned: true });
+            if libc::fcntl(fd, libc::F_GETFD) != -1 {
+                libc::_exit(1);
+            }
+            // A positive PID which is not our child forces waitpid's ECHILD
+            // error, rather than using a wildcard wait target.
+            supervise(libc::getppid());
+        }
+        let mut status = 0;
+        assert_eq!(libc::waitpid(child, &mut status, 0), child);
+        assert_eq!(libc::WEXITSTATUS(status), SUPERVISOR_FAILED);
+    }
+    assert_eq!(fs::read(&path).unwrap(), b"");
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_runner_outside_the_installed_path_refuses_to_serve_boat_jobs() {
+    // The test binary is not the installed runner.
+    let error = check_installed_runner().unwrap_err().to_string();
+    assert!(error.contains(INSTALLED_RUNNER), "{error}");
+}
+
+#[test]
+fn a_missing_installed_runner_refuses_to_serve_boat_jobs() {
+    let missing = cortexkit_test_support::scratch_root()
+        .join(format!("missing-runner-{}", uuid::Uuid::now_v7()));
+    let error = check_runner_path(&std::env::current_exe().unwrap(), &missing).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert!(
+        error.to_string().contains(missing.to_str().unwrap()),
+        "{error}"
+    );
+}
+
+#[test]
+fn loader_and_allocator_variables_are_refused() {
+    assert!(refuse_loader_environment(["PATH", "HOME", "RUST_LOG", "CARGO_TERM_COLOR"]).is_ok());
+    for name in [
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "GLIBC_TUNABLES",
+        "GCONV_PATH",
+        "LOCPATH",
+        "MALLOC_ARENA_MAX",
+    ] {
+        let error = refuse_loader_environment(["PATH", name]).unwrap_err();
+        assert!(error.to_string().contains(name), "{error}");
+    }
+}
+
+/// An errno the filter returns in tests, so a refusal from this filter is
+/// told apart from the kernel's or another filter's EPERM.
+const TEST_ERRNO: u16 = libc::EUCLEAN as u16;
+const TEST_SETATTR_ERRNO: u16 = libc::EREMOTEIO as u16;
+const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
+
+/// Run a classic-BPF seccomp program the way the kernel does, for the opcodes
+/// the filter uses, recording every instruction executed.
+fn evaluate(
+    program: &[SockFilter],
+    arch: u32,
+    nr: u32,
+    args: [u64; 2],
+    seen: &mut BTreeSet<usize>,
+    branches: &mut BTreeSet<(usize, usize)>,
+) -> u32 {
+    let mut data = [0u8; 64];
+    data[0..4].copy_from_slice(&nr.to_ne_bytes());
+    data[4..8].copy_from_slice(&arch.to_ne_bytes());
+    for (i, arg) in args.iter().enumerate() {
+        data[16 + 8 * i..24 + 8 * i].copy_from_slice(&arg.to_ne_bytes());
+    }
+    let (mut a, mut pc) = (0u32, 0usize);
+    loop {
+        seen.insert(pc);
+        let insn = program[pc];
+        let jump = |taken: bool| pc + 1 + usize::from(if taken { insn.jt } else { insn.jf });
+        let next = match insn.code {
+            BPF_LD_W_ABS => {
+                let at = insn.k as usize;
+                a = u32::from_ne_bytes(data[at..at + 4].try_into().unwrap());
+                pc + 1
+            }
+            BPF_ALU_AND_K => {
+                a &= insn.k;
+                pc + 1
+            }
+            BPF_JMP_JEQ_K => jump(a == insn.k),
+            BPF_JMP_JSET_K => jump(a & insn.k != 0),
+            BPF_RET_K => return insn.k,
+            code => panic!("unexpected opcode {code:#x} at {pc}"),
+        };
+        if matches!(insn.code, BPF_JMP_JEQ_K | BPF_JMP_JSET_K) {
+            branches.insert((pc, next));
+        }
+        pc = next;
+        assert!(pc < program.len(), "jump past the end of the program");
+    }
+}
+
+#[test]
+fn namespace_filter_refuses_new_pid_namespaces_and_clone3_on_every_path() {
+    let program = namespace_filter_with_setattr_errno(TEST_ERRNO, TEST_SETATTR_ERRNO);
+    let deny = SECCOMP_RET_ERRNO | u32::from(TEST_ERRNO);
+    let pid = u64::from(CLONE_NEWPID);
+    let net = 0x4000_0000_u64;
+    let sigchld = 17_u64;
+    let x32 = X32_SYSCALL_BIT;
+    let x86 = AUDIT_ARCH_X86_64;
+    let i386 = AUDIT_ARCH_I386;
+    let mut seen = BTreeSet::new();
+    let mut branches = BTreeSet::new();
+    for (name, arch, nr, args, refused) in [
+        ("x86_64 unshare pid", x86, X86_64_UNSHARE, [pid, 0], true),
+        (
+            "x86_64 unshare pid+net",
+            x86,
+            X86_64_UNSHARE,
+            [pid | net, 0],
+            true,
+        ),
+        ("x86_64 unshare net", x86, X86_64_UNSHARE, [net, 0], false),
+        (
+            "x86_64 clone pid",
+            x86,
+            X86_64_CLONE,
+            [pid | sigchld, 0],
+            true,
+        ),
+        ("x86_64 clone", x86, X86_64_CLONE, [sigchld, 0], false),
+        ("x86_64 setns pid", x86, X86_64_SETNS, [3, pid], true),
+        ("x86_64 setns any", x86, X86_64_SETNS, [3, 0], true),
+        ("x86_64 setns net", x86, X86_64_SETNS, [3, net], false),
+        ("x86_64 other call", x86, 39, [pid, pid], false),
+        (
+            "x86_64 high argument bits",
+            x86,
+            X86_64_UNSHARE,
+            [pid | 1 << 40, 0],
+            true,
+        ),
+        ("x32 unshare pid", x86, X86_64_UNSHARE | x32, [pid, 0], true),
+        ("x32 clone pid", x86, X86_64_CLONE | x32, [pid, 0], true),
+        ("x32 setns any", x86, X86_64_SETNS | x32, [3, 0], true),
+        ("x32 other call", x86, 39 | x32, [pid, 0], false),
+        ("i386 unshare pid", i386, I386_UNSHARE, [pid, 0], true),
+        ("i386 unshare net", i386, I386_UNSHARE, [net, 0], false),
+        ("i386 clone pid", i386, I386_CLONE, [pid, 0], true),
+        ("i386 clone", i386, I386_CLONE, [sigchld, 0], false),
+        ("i386 setns pid", i386, I386_SETNS, [3, pid], true),
+        ("i386 setns any", i386, I386_SETNS, [3, 0], true),
+        ("i386 setns net", i386, I386_SETNS, [3, net], false),
+        // i386 numbers 272 and 56 are other calls; only x86_64 uses them for
+        // unshare and clone.
+        ("i386 x86_64 numbers", i386, X86_64_UNSHARE, [pid, 0], false),
+        ("i386 other call", i386, 20, [pid, 0], false),
+        ("native fssetxattr", x86, 16, [3, 0x401c_5820], true),
+        ("native setflags", x86, 16, [3, 0x4008_6602], true),
+        ("compat setflags", i386, 54, [3, 0x4004_6602], true),
+        ("compat fssetxattr", i386, 54, [3, 0x401c_5820], true),
+        ("x32 fssetxattr", x86, 514 | x32, [3, 0x401c_5820], true),
+        ("x32 setflags", x86, 514 | x32, [3, 0x4004_6602], true),
+        ("fsgetxattr", x86, 16, [3, 0x801c_581f], false),
+        ("getflags", x86, 16, [3, 0x8008_6601], false),
+        ("compat getflags", i386, 54, [3, 0x8004_6601], false),
+        ("x32 getter", x86, 514 | x32, [3, 0x801c_581f], false),
+        ("unrelated ioctl", x86, 16, [3, 0x5413], false),
+        (
+            "ioctl high bits",
+            x86,
+            16,
+            [3, (1 << 40) | 0x401c_5820],
+            true,
+        ),
+        ("x86 clone3", x86, CLONE3, [pid, 88], false),
+        ("x32 clone3", x86, CLONE3 | x32, [pid, 88], false),
+        ("i386 clone3", i386, CLONE3, [pid, 88], false),
+        ("native file_setattr", x86, 469, [3, 0], false),
+        ("x32 file_setattr", x86, 469 | x32, [3, 0], false),
+        ("i386 file_setattr", i386, 469, [3, 0], false),
+        ("native file_getattr", x86, 468, [3, 0], false),
+        ("x32 file_getattr", x86, 468 | x32, [3, 0], false),
+        ("i386 file_getattr", i386, 468, [3, 0], false),
+        // Any unrecognized architecture fails closed in this filter itself.
+        (
+            "aarch64 unshare pid",
+            AUDIT_ARCH_AARCH64,
+            97,
+            [pid, 0],
+            false,
+        ),
+    ] {
+        let result = evaluate(&program, arch, nr, args, &mut seen, &mut branches);
+        let expected = if arch != x86 && arch != i386 {
+            SECCOMP_RET_KILL_PROCESS
+        } else if nr & !x32 == CLONE3 {
+            SECCOMP_RET_ERRNO | libc::ENOSYS as u32
+        } else if nr & !x32 == 469 {
+            SECCOMP_RET_ERRNO | u32::from(TEST_SETATTR_ERRNO)
+        } else if refused {
+            deny
+        } else {
+            SECCOMP_RET_ALLOW
+        };
+        assert_eq!(result, expected, "{name}");
+    }
+    let every: BTreeSet<_> = (0..program.len()).collect();
+    assert_eq!(
+        seen, every,
+        "every instruction and jump target must be exercised"
+    );
+    let every_branch: BTreeSet<_> = program
+        .iter()
+        .enumerate()
+        .filter(|(_, insn)| matches!(insn.code, BPF_JMP_JEQ_K | BPF_JMP_JSET_K))
+        .flat_map(|(pc, insn)| {
+            [
+                (pc, pc + 1 + usize::from(insn.jt)),
+                (pc, pc + 1 + usize::from(insn.jf)),
+            ]
+        })
+        .collect();
+    assert_eq!(branches, every_branch, "both arms of every jump must run");
+    // Only the two refusal errnos differ from the production program.
+    let production = namespace_filter(libc::EPERM as u16);
+    assert_eq!(production.len(), program.len());
+    for (real, tested) in production.iter().zip(&program) {
+        if tested.k == deny {
+            assert_eq!(real.k, SECCOMP_RET_ERRNO | libc::EPERM as u32);
+        } else if tested.k == SECCOMP_RET_ERRNO | u32::from(TEST_SETATTR_ERRNO) {
+            assert_eq!(real.k, SECCOMP_RET_ERRNO | libc::ENOSYS as u32);
+        } else {
+            assert_eq!(real, tested);
+        }
+    }
+}
+
+/// Install the filter in a forked child and make real system calls. The child
+/// exits 0 when every call behaves as expected, or with the number of the
+/// first unexpected one. An unimplemented x32 ABI returns ENOSYS; an inherited
+/// filter may instead kill foreign-ABI calls. Report those outcomes separately
+/// from ABIs that actually executed the checks. The interpreter covers any ABI
+/// that cannot execute here.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn installed_filter_refuses_new_pid_namespaces_in_a_real_process() {
+    const ABI_UNAVAILABLE: i32 = 77;
+    // Invalid flags are rejected before pointers are used on supporting kernels.
+    // This child has not installed the test filter. ENOSYS means the syscall is
+    // unavailable in its inherited environment, not necessarily in the kernel.
+    let kernel_status = unsafe {
+        let child = libc::fork();
+        assert!(child >= 0);
+        if child == 0 {
+            // Pin the ABI independently of the production filter constant.
+            let result = libc::syscall(469, -1, 0, 0, 0, u32::MAX);
+            libc::_exit(if result == -1 {
+                *libc::__errno_location()
+            } else {
+                0
+            });
+        }
+        let mut status = 0;
+        assert_eq!(libc::waitpid(child, &mut status, 0), child);
+        status
+    };
+    assert!(
+        libc::WIFEXITED(kernel_status),
+        "unfiltered file_setattr child died: {kernel_status:#x}"
+    );
+    let kernel_errno = libc::WEXITSTATUS(kernel_status);
+    assert!(
+        matches!(kernel_errno, libc::EINVAL | libc::ENOSYS),
+        "unexpected unfiltered file_setattr errno {kernel_errno}"
+    );
+    eprintln!(
+        "unfiltered file_setattr: {} (errno {kernel_errno})",
+        if kernel_errno == libc::EINVAL {
+            "syscall available"
+        } else {
+            "syscall unavailable (kernel or inherited policy)"
+        }
+    );
+    let program = namespace_filter_with_setattr_errno(TEST_ERRNO, TEST_SETATTR_ERRNO);
+    let filter = SockFprog {
+        len: program.len() as u16,
+        filter: program.as_ptr(),
+    };
+    // SAFETY: the child runs only system calls and _exit; nothing allocates
+    // after fork.
+    let mut abi_statuses = [0i32; 2];
+    let status = unsafe {
+        let mut telemetry = [0; 2];
+        assert_eq!(libc::pipe2(telemetry.as_mut_ptr(), libc::O_CLOEXEC), 0);
+        let child = libc::fork();
+        assert!(child >= 0);
+        if child == 0 {
+            libc::close(telemetry[0]);
+            if libc::prctl(PR_SET_NO_NEW_PRIVS, 1 as libc::c_ulong, 0, 0, 0) != 0 {
+                libc::_exit(30);
+            }
+            if libc::prctl(
+                PR_SET_SECCOMP,
+                SECCOMP_MODE_FILTER,
+                &filter as *const SockFprog,
+            ) != 0
+            {
+                libc::_exit(31);
+            }
+            let ours = libc::c_int::from(TEST_ERRNO);
+            let setter_errno = libc::c_int::from(TEST_SETATTR_ERRNO);
+            let refused_here =
+                |result: libc::c_long| result == -1 && *libc::__errno_location() == ours;
+            // errno belongs to the most recent syscall, not to its saved
+            // return value. Capture both before evaluating the next call.
+            let observed = |result: libc::c_long| (result, *libc::__errno_location());
+            let pid = libc::c_long::from(CLONE_NEWPID);
+            let checks = [
+                (
+                    observed(libc::syscall(libc::SYS_ioctl, -1, 0x401c_5820_u32, 0)),
+                    true,
+                ),
+                (
+                    observed(libc::syscall(libc::SYS_ioctl, -1, 0x4008_6602_u32, 0)),
+                    true,
+                ),
+                (
+                    observed(libc::syscall(libc::SYS_ioctl, -1, 0x4004_6602_u32, 0)),
+                    true,
+                ),
+                (
+                    observed(libc::syscall(libc::SYS_ioctl, -1, 0x801c_581f_u32, 0)),
+                    false,
+                ),
+                (
+                    observed(libc::syscall(libc::SYS_ioctl, -1, 0x8008_6601_u32, 0)),
+                    false,
+                ),
+                (observed(libc::syscall(libc::SYS_unshare, pid)), true),
+                (
+                    observed(libc::syscall(libc::SYS_unshare, libc::CLONE_NEWUTS)),
+                    false,
+                ),
+                (
+                    observed(libc::syscall(
+                        libc::SYS_clone,
+                        pid | libc::CLONE_THREAD as libc::c_long,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )),
+                    true,
+                ),
+                // CLONE_THREAD without CLONE_SIGHAND is EINVAL, so nothing forks.
+                (
+                    observed(libc::syscall(
+                        libc::SYS_clone,
+                        libc::CLONE_THREAD,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )),
+                    false,
+                ),
+                (observed(libc::syscall(libc::SYS_setns, -1, pid)), true),
+                (observed(libc::syscall(libc::SYS_setns, -1, 0)), true),
+                (
+                    observed(libc::syscall(libc::SYS_setns, -1, libc::CLONE_NEWNET)),
+                    false,
+                ),
+            ];
+            for (index, ((result, errno), refused)) in checks.into_iter().enumerate() {
+                if (result == -1 && errno == ours) != refused {
+                    libc::_exit(index as libc::c_int + 1);
+                }
+            }
+            let mut clone_args = [0u64; 11];
+            clone_args[0] = u64::from(CLONE_NEWPID);
+            if libc::syscall(
+                libc::SYS_clone3,
+                clone_args.as_ptr(),
+                std::mem::size_of_val(&clone_args),
+            ) != -1
+                || *libc::__errno_location() != libc::ENOSYS
+            {
+                libc::_exit(8);
+            }
+            if libc::syscall(469, -1, 0, 0, 0, 0) != -1 || *libc::__errno_location() != setter_errno
+            {
+                libc::_exit(40);
+            }
+            let getter = observed(libc::syscall(468, -1, 0, 0, 0, 0));
+            if getter == (-1, ours) || getter == (-1, setter_errno) {
+                libc::_exit(41);
+            }
+            // Preserve the raw wait status, including the signal number.
+            let isolated = |check: &dyn Fn() -> i32| -> i32 {
+                let grandchild = libc::fork();
+                if grandchild == 0 {
+                    libc::_exit(check());
+                }
+                if grandchild < 0 {
+                    libc::_exit(32);
+                }
+                let mut status = 0;
+                if libc::waitpid(grandchild, &mut status, 0) != grandchild {
+                    libc::_exit(33);
+                }
+                status
+            };
+            let x32 = isolated(&|| {
+                let available = libc::syscall((39 | X32_SYSCALL_BIT) as libc::c_long);
+                if available == -1 && *libc::__errno_location() == libc::ENOSYS {
+                    return ABI_UNAVAILABLE;
+                }
+                if available <= 0 {
+                    return 1;
+                }
+                let x32_unshare = libc::c_long::from(X86_64_UNSHARE | X32_SYSCALL_BIT);
+                let setter = observed(libc::syscall(
+                    (469 | X32_SYSCALL_BIT) as libc::c_long,
+                    -1,
+                    0,
+                    0,
+                    0,
+                    u32::MAX,
+                ));
+                let getter = observed(libc::syscall(
+                    (468 | X32_SYSCALL_BIT) as libc::c_long,
+                    -1,
+                    0,
+                    0,
+                    0,
+                    u32::MAX,
+                ));
+                i32::from(
+                    !(refused_here(libc::syscall(x32_unshare, pid))
+                        && setter == (-1, setter_errno)
+                        && getter != (-1, ours)
+                        && getter != (-1, setter_errno)),
+                )
+            });
+            let i386 = isolated(&|| {
+                let call = |nr: u32, arg: u32| -> i32 {
+                    let result: i32;
+                    std::arch::asm!(
+                        "push rbx",
+                        "mov ebx, {arg:e}",
+                        "int 0x80",
+                        "pop rbx",
+                        arg = in(reg) arg,
+                        inlateout("eax") nr as i32 => result,
+                        in("ecx") 0u32,
+                        in("edx") 0u32,
+                        in("esi") 0u32,
+                        in("edi") u32::MAX,
+                        out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+                    );
+                    result
+                };
+                let available = call(20, 0);
+                if available == -libc::ENOSYS {
+                    return ABI_UNAVAILABLE;
+                }
+                if available <= 0 {
+                    return 1;
+                }
+                let getter = call(468, u32::MAX);
+                i32::from(
+                    !(call(I386_UNSHARE, CLONE_NEWPID) == -ours
+                        && call(I386_UNSHARE, libc::CLONE_NEWUTS as u32) != -ours
+                        && call(469, u32::MAX) == -setter_errno
+                        && getter != -ours
+                        && getter != -setter_errno),
+                )
+            });
+            if libc::WIFEXITED(x32) && !matches!(libc::WEXITSTATUS(x32), 0 | ABI_UNAVAILABLE) {
+                libc::_exit(20);
+            }
+            if libc::WIFEXITED(i386) && !matches!(libc::WEXITSTATUS(i386), 0 | ABI_UNAVAILABLE) {
+                libc::_exit(21);
+            }
+            let statuses = [x32, i386];
+            if libc::write(
+                telemetry[1],
+                statuses.as_ptr().cast(),
+                std::mem::size_of_val(&statuses),
+            ) != std::mem::size_of_val(&statuses) as isize
+            {
+                libc::_exit(34);
+            }
+            libc::_exit(0);
+        }
+        libc::close(telemetry[1]);
+        let mut status = 0;
+        assert_eq!(libc::waitpid(child, &mut status, 0), child);
+        let count = libc::read(
+            telemetry[0],
+            abi_statuses.as_mut_ptr().cast(),
+            std::mem::size_of_val(&abi_statuses),
+        );
+        libc::close(telemetry[0]);
+        if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+            assert_eq!(count, std::mem::size_of_val(&abi_statuses) as isize);
+        }
+        status
+    };
+    assert!(
+        libc::WIFEXITED(status),
+        "filter test child died: {status:#x}"
+    );
+    let code = libc::WEXITSTATUS(status);
+    assert_eq!(code, 0, "filter test check {code} behaved unexpectedly");
+    eprintln!("native ABI: filtered setter/getter checks ran");
+    for (raw, name) in abi_statuses.into_iter().zip(["x32", "i386"]) {
+        if libc::WIFSIGNALED(raw) {
+            eprintln!(
+                "{name} ABI: blocked by signal {}; checks did not run, interpreter coverage only",
+                libc::WTERMSIG(raw)
+            );
+        } else if libc::WIFEXITED(raw) && libc::WEXITSTATUS(raw) == ABI_UNAVAILABLE {
+            eprintln!(
+                "{name} ABI: getpid returned ENOSYS; checks did not run, interpreter coverage only"
+            );
+        } else {
+            assert!(
+                libc::WIFEXITED(raw) && libc::WEXITSTATUS(raw) == 0,
+                "unexpected {name} wait status {raw:#x}"
+            );
+            eprintln!("{name} ABI: filtered setter/getter checks ran");
+        }
+    }
+}
+
+#[test]
+fn setup_report_overwrites_allocated_block_without_truncation() {
+    use std::os::fd::IntoRawFd;
+    let scratch = cortexkit_test_support::ScratchDir::new("pid-init-report");
+    let path = scratch.path().join("setup-error");
+    fs::write(&path, [b' '; REPORT_BYTES]).unwrap();
+    let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let report = Report {
+        fd: file.into_raw_fd(),
+        owned: true,
+    };
+    report.write("{\"longer_old_telemetry\":true}\n");
+    report.write("failure: test\n");
+    let contents = fs::read_to_string(path).unwrap();
+    assert_eq!(contents.len(), REPORT_BYTES);
+    assert_eq!(contents.trim_end(), "failure: test");
+}

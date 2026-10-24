@@ -30,6 +30,8 @@ fn lease(id: Uuid, purpose: LeasePurpose) -> VerifiedLease {
 fn hello() -> Frame {
     Frame::Hello {
         return_paths: false,
+        return_chunked: false,
+        sibling_paths: false,
         protocol_version: motor_protocol::PROTOCOL_VERSION,
         started: true,
         default_branch_tip: false,
@@ -885,6 +887,88 @@ async fn return_paths_tenant_cap_one_returns_failure_before_real_terminal_and_re
     .await
     .unwrap();
     assert_eq!(frame(&mut socket).await, Some(Frame::ReturnResult(result)));
+    assert!(matches!(frame(&mut socket).await, Some(Frame::Terminal(_))));
+    drop(socket);
+    task.await.unwrap().unwrap();
+}
+
+// Hosted jobs run this same runner code over the tenant socket; chunked
+// returned files must reach the host relay there too, on the run and on a
+// later attach.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn return_chunked_tenant_sends_chunks_and_manifest_before_terminal_and_replays() {
+    let f = Fixture::new();
+    let runner = open(&f);
+    let (mut request, bytes) = f.run("head -c 600000 /dev/urandom > returned; exit 17");
+    request.return_paths = vec![format!("{}/returned", f.key)];
+    request.return_max_bytes = RETURN_CHUNKED_MAX_BYTES_CAP;
+    request.return_chunked = true;
+    request.timeout = Some(30);
+    request.weight_hint = Some(2);
+    let id = request.job_id;
+    let (mut socket, task) = connect(&runner, lease(id, LeasePurpose::Run)).await;
+    write_frame_async(&mut socket, &Frame::Run(request.clone()))
+        .await
+        .unwrap();
+    assert!(matches!(frame(&mut socket).await, Some(Frame::Accepted(_))));
+    for (index, data) in bytes.iter().enumerate() {
+        write_frame_async(
+            &mut socket,
+            &Frame::BundleChunk {
+                index: index as u32,
+                offset: 0,
+                data: BytePayload(data.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    until(|| runner.job_status(id).unwrap().state == "queued").await;
+    runner.tick().unwrap();
+    let mut returned = Vec::new();
+    loop {
+        match frame(&mut socket).await.unwrap() {
+            frame @ (Frame::ReturnChunk(_) | Frame::ReturnManifest(_)) => returned.push(frame),
+            Frame::ReturnResult(_) => panic!("chunked request got return_result"),
+            Frame::Terminal(t) => {
+                assert_eq!(t.outcome, Outcome::Exit { code: 17 });
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some(Frame::ReturnManifest(manifest)) = returned.last().cloned() else {
+        panic!("manifest precedes the terminal: {returned:?}")
+    };
+    let mut assembler = ReturnAssembler::new(&request.return_paths, RETURN_CHUNKED_MAX_BYTES_CAP);
+    let mut received = Vec::new();
+    for frame in &returned[..returned.len() - 1] {
+        let Frame::ReturnChunk(chunk) = frame else {
+            panic!("only chunks before the manifest")
+        };
+        received.extend_from_slice(assembler.accept_chunk(chunk).unwrap());
+    }
+    assert!(assembler.finish(&manifest).unwrap()[0].is_returned());
+    assert_eq!(
+        received,
+        fs::read(Path::new(&f.key).join("returned")).unwrap()
+    );
+    drop(socket);
+    task.await.unwrap().unwrap();
+    let (mut socket, task) = connect(&runner, lease(id, LeasePurpose::Attach)).await;
+    let Frame::ReturnChunk(first) = &returned[0] else {
+        unreachable!()
+    };
+    write_frame_async(
+        &mut socket,
+        &Frame::Attach(AttachRequest::new(id, first.seq)),
+    )
+    .await
+    .unwrap();
+    for expected in &returned {
+        assert_eq!(frame(&mut socket).await.as_ref(), Some(expected));
+    }
     assert!(matches!(frame(&mut socket).await, Some(Frame::Terminal(_))));
     drop(socket);
     task.await.unwrap().unwrap();

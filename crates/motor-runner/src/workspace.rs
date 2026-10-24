@@ -18,6 +18,11 @@ pub(crate) mod dependencies;
 mod transfer;
 pub(crate) use dependencies::validate_dependencies;
 
+/// A file in each JavaScript install and manager cache entry naming the
+/// mirror (`name` of the repository root) whose installs created it, so the
+/// entry can be retired with that repository.
+pub(crate) const JAVASCRIPT_CACHE_OWNER: &str = "motor-repository";
+
 pub(crate) fn name(path: &str) -> String {
     format!("{:x}", Sha256::digest(path.as_bytes()))
 }
@@ -57,6 +62,16 @@ pub(crate) fn git(path: &Path, args: &[&str]) -> io::Result<String> {
         .to_string())
 }
 
+/// `git` with its standard output returned byte for byte, for output that
+/// carries paths: a path need not be valid UTF-8.
+pub(crate) fn git_bytes(path: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
+    let output = git_command(path).args(args).output()?;
+    if !output.status.success() {
+        return Err(invalid(String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(output.stdout)
+}
+
 pub(crate) fn delete_refs(path: &Path, references: &[String]) -> io::Result<()> {
     if references.is_empty() {
         return Ok(());
@@ -64,6 +79,28 @@ pub(crate) fn delete_refs(path: &Path, references: &[String]) -> io::Result<()> 
     let mut input = String::from("start\n");
     for reference in references {
         input.push_str(&format!("delete {reference}\n"));
+    }
+    input.push_str("prepare\ncommit\n");
+    let mut command = git_command(path);
+    command.args(["update-ref", "--stdin"]);
+    let output = git_input(command, input.as_bytes())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(invalid(String::from_utf8_lossy(&output.stderr)))
+    }
+}
+
+/// Point each named ref at its commit in one transaction. Git refuses a target
+/// object the repository does not have, so a successful call proves every
+/// commit is present and now a ref target.
+pub(crate) fn update_refs(path: &Path, references: &[(String, String)]) -> io::Result<()> {
+    if references.is_empty() {
+        return Ok(());
+    }
+    let mut input = String::from("start\n");
+    for (reference, commit) in references {
+        input.push_str(&format!("update {reference} {commit}\n"));
     }
     input.push_str("prepare\ncommit\n");
     let mut command = git_command(path);
@@ -148,6 +185,7 @@ pub(crate) fn validate(
     workspace: &str,
     repository: &str,
     siblings: &[SiblingSnapshot],
+    snapshot_paths: bool,
 ) -> io::Result<()> {
     if !absolute(workspace)
         || !absolute(repository)
@@ -157,11 +195,34 @@ pub(crate) fn validate(
     }
     for s in siblings {
         if !absolute(&s.canonical_path)
-            || Path::new(&s.canonical_path).parent() != Path::new(repository).parent()
+            || (!snapshot_paths
+                && Path::new(&s.canonical_path).parent() != Path::new(repository).parent())
             || s.canonical_path == repository
             || Path::new(workspace).starts_with(&s.canonical_path)
         {
             return Err(invalid("invalid sibling path"));
+        }
+    }
+    if snapshot_paths {
+        let mut paths = vec![
+            destination(Path::new(workspace))?,
+            destination(Path::new(repository))?,
+        ];
+        for (sibling, alias) in siblings.iter().zip(sibling_aliases(workspace, siblings)?) {
+            let path = destination(Path::new(&sibling.canonical_path))?;
+            let alias = alias.canonical;
+            for mount in [&path, &alias] {
+                if paths
+                    .iter()
+                    .any(|other| mount.starts_with(other) || other.starts_with(mount))
+                {
+                    return Err(invalid(
+                        "sibling or its worktree alias overlaps workspace, repository or another sibling",
+                    ));
+                }
+            }
+            paths.push(path);
+            paths.push(alias);
         }
     }
     Ok(())
@@ -169,12 +230,19 @@ pub(crate) fn validate(
 
 /// Resolve existing ancestors as well as future destinations. A missing suffix
 /// must not hide an existing symlink pointing outside an authorized root.
-fn destination(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn destination(path: &Path) -> io::Result<PathBuf> {
     match fs::canonicalize(path) {
         Ok(path) => Ok(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if fs::symlink_metadata(path).is_ok() {
-                return Err(error);
+            match fs::symlink_metadata(path) {
+                // Created after canonicalize looked, by a setup running
+                // alongside (a first workspace and a cache fill both create
+                // the shared parent folder): look once more.
+                Ok(metadata) if !metadata.file_type().is_symlink() => {
+                    return fs::canonicalize(path);
+                }
+                Ok(_) => return Err(error),
+                Err(_) => {}
             }
             let parent = path
                 .parent()
@@ -194,39 +262,9 @@ pub(crate) fn validate_destinations(
     cwd: Option<&str>,
     siblings: &[SiblingSnapshot],
 ) -> io::Result<()> {
-    let allowed: Vec<_> = roots
-        .iter()
-        .map(|root| {
-            destination(root).map_err(|error| {
-                invalid(format!(
-                    "cannot resolve owned root: path={} allowed_roots={roots:?}: {error}",
-                    root.display()
-                ))
-            })
-        })
-        .collect::<io::Result<_>>()?;
-    let resolve = |path: &str| -> io::Result<PathBuf> {
-        if absolute(path) {
-            let canonical = destination(Path::new(path)).map_err(|error| {
-                invalid(format!(
-                    "cannot resolve destination: path={path} allowed_roots={roots:?}: {error}"
-                ))
-            })?;
-            // Compare resolved paths only: a root or a request path may reach the
-            // same directory through a symlinked prefix (macOS /var is
-            // /private/var), and what matters is where the files actually land.
-            if allowed
-                .iter()
-                .any(|resolved| canonical.starts_with(resolved) && canonical != *resolved)
-            {
-                return Ok(canonical);
-            }
-        }
-        Err(invalid(format!(
-            "destination outside runner-owned roots: path={path} allowed_roots={roots:?}; \
-             move the checkout under one of the allowed roots"
-        )))
-    };
+    let allowed = allowed_roots(roots)?;
+    let resolve =
+        |path: &str| authorize_destination(roots, &allowed, path, destination(Path::new(path)));
     let workspace = resolve(key)?;
     if let Some(cwd) = cwd {
         if !resolve(cwd)?.starts_with(&workspace) {
@@ -237,6 +275,118 @@ pub(crate) fn validate_destinations(
         resolve(&sibling.canonical_path)?;
     }
     Ok(())
+}
+
+fn allowed_roots(roots: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
+    roots
+        .iter()
+        .map(|root| {
+            destination(root).map_err(|error| {
+                invalid(format!(
+                    "cannot resolve owned root: path={} allowed_roots={roots:?}: {error}",
+                    root.display()
+                ))
+            })
+        })
+        .collect()
+}
+
+fn authorize_destination(
+    roots: &[PathBuf],
+    allowed: &[PathBuf],
+    path: &str,
+    canonical: io::Result<PathBuf>,
+) -> io::Result<PathBuf> {
+    if absolute(path) {
+        let canonical = canonical.map_err(|error| {
+            invalid(format!(
+                "cannot resolve destination: path={path} allowed_roots={roots:?}: {error}"
+            ))
+        })?;
+        // Compare resolved paths only: a root or a request path may reach the
+        // same directory through a symlinked prefix (macOS /var is
+        // /private/var), and what matters is where the files actually land.
+        if allowed
+            .iter()
+            .any(|resolved| canonical.starts_with(resolved) && canonical != *resolved)
+        {
+            return Ok(canonical);
+        }
+    }
+    Err(invalid(format!(
+        "destination outside runner-owned roots: path={path} allowed_roots={roots:?}; \
+             move the checkout under one of the allowed roots"
+    )))
+}
+
+/// A snapshot sibling's worktree alias and its resolved mount destination.
+/// A dangling host alias is accepted only if its target resolves to the sibling's
+/// authorized path. The sandbox hides that link with a snapshot mount.
+pub(crate) struct SiblingAlias {
+    pub path: PathBuf,
+    pub canonical: PathBuf,
+}
+
+pub(crate) fn validate_alias_destinations(
+    roots: &[PathBuf],
+    aliases: &[SiblingAlias],
+) -> io::Result<()> {
+    let allowed = allowed_roots(roots)?;
+    for alias in aliases {
+        authorize_destination(
+            roots,
+            &allowed,
+            alias
+                .path
+                .to_str()
+                .ok_or_else(|| invalid("non-UTF8 sibling alias"))?,
+            Ok(alias.canonical.clone()),
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn sibling_aliases(
+    key: &str,
+    siblings: &[SiblingSnapshot],
+) -> io::Result<Vec<SiblingAlias>> {
+    siblings
+        .iter()
+        .map(|sibling| {
+            let path = Path::new(key)
+                .parent()
+                .ok_or_else(|| invalid("workspace has no parent"))?
+                .join(
+                    Path::new(&sibling.canonical_path)
+                        .file_name()
+                        .ok_or_else(|| invalid("sibling path has no name"))?,
+                );
+            let canonical = match destination(&path) {
+                Ok(canonical) => canonical,
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        && fs::symlink_metadata(&path).is_ok_and(|m| m.is_symlink()) =>
+                {
+                    let parent = path
+                        .parent()
+                        .ok_or_else(|| invalid("alias has no parent"))?;
+                    let target = parent.join(fs::read_link(&path)?);
+                    if destination(&target)? != destination(Path::new(&sibling.canonical_path))? {
+                        return Err(error);
+                    }
+                    // Retiring an in-place sibling leaves its worktree alias dangling.
+                    // Snapshot mounts hide that host link: validate the virtual mount
+                    // node, but only for a link to this sibling's authorized path.
+                    destination(parent)?.join(
+                        path.file_name()
+                            .ok_or_else(|| invalid("alias has no name"))?,
+                    )
+                }
+                Err(error) => return Err(error),
+            };
+            Ok(SiblingAlias { path, canonical })
+        })
+        .collect()
 }
 
 pub(crate) struct Trees {
@@ -251,6 +401,138 @@ pub(crate) struct Trees {
 /// have reply, newest integration tips first. The sender checks each one
 /// locally, so the bound keeps a long-lived runner's reply cheap to use.
 const HELD_REPORT_LIMIT: usize = 32;
+
+/// Namespace of the refs a have reply leaves behind: one per reported commit,
+/// named `refs/held/<commit>`. The sender builds its bundle with the
+/// reported commits as prerequisites, and git accepts a prerequisite only when
+/// it is reachable from a ref or its whole unreferenced history is still
+/// intact. The records that keep snapshot and tip refs alive can expire
+/// between the reply and the bundle's arrival, so the reply pins its own refs.
+/// The runner prunes them once the offer's lifetime has passed.
+pub(crate) const HELD_REFS: &str = "refs/held/";
+
+/// Prerequisite commits a bundle file declares: the `-<oid>` lines of its
+/// header, which ends at the first empty line, before the pack data.
+pub(crate) fn bundle_prerequisites(path: &Path) -> io::Result<Vec<String>> {
+    use std::io::{BufRead, Read};
+    // A header lists every ref and prerequisite; a megabyte is far more than
+    // any real bundle needs, and the bound keeps a corrupt file from being
+    // read whole.
+    let mut reader = io::BufReader::new(fs::File::open(path)?).take(1 << 20);
+    let mut prerequisites = Vec::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 || line == b"\n" {
+            return Ok(prerequisites);
+        }
+        if let Some(rest) = line.strip_prefix(b"-") {
+            let oid: String = String::from_utf8_lossy(rest)
+                .chars()
+                .take_while(char::is_ascii_hexdigit)
+                .collect();
+            if !oid.is_empty() {
+                prerequisites.push(oid);
+            }
+        }
+    }
+}
+
+/// A loose ref file holds an object id or a `ref: ` symbolic target. After an
+/// unclean stop a ref file can be empty or partly written; git then fails
+/// every fetch's connectivity check while `for-each-ref` only warns about it.
+fn valid_loose_ref(content: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(content) else {
+        return false;
+    };
+    let text = text.trim_end_matches('\n');
+    text.starts_with("ref: ")
+        || (matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Remove the refs of a mirror that git cannot use, and return each removed
+/// ref with the reason. A ref is unusable when its file is unreadable, its
+/// commit or that commit's root tree is missing, or it points at one of
+/// `commits` (a failed bundle's prerequisites) whose root tree is missing.
+/// One such ref makes every later bundle fetch into the mirror fail, and a
+/// have reply would keep reporting what it points at. Objects are never
+/// deleted: checkouts borrow them through alternates. The check reads only
+/// the ref files, one `for-each-ref` and one `cat-file --batch-check`, so it
+/// does not walk history. Callers hold the runner's ref mutation lock.
+pub(crate) fn repair_mirror(mirror: &Path, commits: &[String]) -> io::Result<Vec<String>> {
+    let mut removed = Vec::new();
+    let mut pending = vec![mirror.join("refs")];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_none_or(|e| e != "lock")
+                && !valid_loose_ref(&fs::read(&path).unwrap_or_default())
+            {
+                fs::remove_file(&path)?;
+                let name = path.strip_prefix(mirror).unwrap_or(&path);
+                removed.push(format!("{} (unreadable ref file)", name.display()));
+            }
+        }
+    }
+    let listed = git(
+        mirror,
+        &["for-each-ref", "--format=%(objectname) %(refname)"],
+    )?;
+    let refs: Vec<(&str, &str)> = listed.lines().filter_map(|l| l.split_once(' ')).collect();
+    let mut input = String::new();
+    for (oid, _) in &refs {
+        input.push_str(&format!("{oid}\n{oid}^{{tree}}\n"));
+    }
+    for commit in commits {
+        input.push_str(&format!("{commit}^{{tree}}\n"));
+    }
+    let mut command = git_command(mirror);
+    command.args(["cat-file", "--batch-check=%(objecttype)"]);
+    let output = git_input(command, input.as_bytes())?;
+    if !output.status.success() {
+        return Err(invalid(String::from_utf8_lossy(&output.stderr)));
+    }
+    let types = String::from_utf8_lossy(&output.stdout);
+    let types: Vec<&str> = types.lines().collect();
+    if types.len() != refs.len() * 2 + commits.len() {
+        return Err(invalid("cat-file --batch-check answered a different count"));
+    }
+    let broken_commits: BTreeSet<&str> = commits
+        .iter()
+        .zip(&types[refs.len() * 2..])
+        .filter(|(_, kind)| **kind != "tree")
+        .map(|(commit, _)| commit.as_str())
+        .collect();
+    let mut stale = Vec::new();
+    for (i, (oid, name)) in refs.iter().enumerate() {
+        let reason = if types[2 * i] != "commit" {
+            "commit missing"
+        } else if types[2 * i + 1] != "tree" {
+            "tree missing"
+        } else if broken_commits.contains(oid) {
+            "prerequisite tree missing"
+        } else {
+            continue;
+        };
+        stale.push((name.to_string(), reason));
+    }
+    let names: Vec<String> = stale.iter().map(|(name, _)| name.clone()).collect();
+    if delete_refs(mirror, &names).is_err() {
+        // One ref the transaction cannot lock must not keep the others.
+        stale.retain(|(name, _)| git(mirror, &["update-ref", "-d", name]).is_ok());
+    }
+    removed.extend(
+        stale
+            .into_iter()
+            .map(|(name, reason)| format!("{name} ({reason})")),
+    );
+    Ok(removed)
+}
 
 /// A mirror is compacted once it holds more than this many ordinary packs.
 const MAX_MIRROR_PACKS: usize = 3;
@@ -279,6 +561,26 @@ pub(crate) fn record_workspace(
     now: u64,
 ) {
     record_siblings(catalog, siblings);
+    record_workspace_entry(catalog, key, root, commit, siblings, now);
+}
+
+/// Record a populated workspace without recording sibling checkouts, for a
+/// setup that mounted its siblings from snapshots and so checked none out at
+/// its host path. The entry's sibling freshness record is kept: it describes
+/// the workspace's `target/`, which a new setup keeps.
+pub(crate) fn record_workspace_entry(
+    catalog: &mut Catalog,
+    key: &str,
+    root: &str,
+    commit: &str,
+    siblings: &[SiblingSnapshot],
+    now: u64,
+) {
+    let sibling_freshness = catalog
+        .workspaces
+        .remove(key)
+        .map(|previous| previous.sibling_freshness)
+        .unwrap_or_default();
     catalog.workspaces.insert(
         key.to_string(),
         Workspace {
@@ -287,6 +589,7 @@ pub(crate) fn record_workspace(
             snapshot: commit.to_string(),
             siblings: siblings.to_vec(),
             used_ms: now,
+            sibling_freshness,
         },
     );
 }
@@ -310,19 +613,64 @@ pub(crate) fn record_siblings(catalog: &mut Catalog, siblings: &[SiblingSnapshot
 /// (or under `[package.metadata.motor]` for a single-package repository), and
 /// they run in order. A Cargo project that declares nothing builds every
 /// target of its whole workspace, and a tree with no root `Cargo.toml` has
-/// nothing to warm. The runner never assumes a particular repository's
-/// package names.
+/// nothing to warm from Cargo. The runner never assumes a particular
+/// repository's package names.
+#[cfg(test)]
 pub(crate) fn warm_command(mirror: &Path, commit: &str) -> String {
     warm_plan(mirror, commit).0
 }
 
 /// Keep whether the command was explicitly requested, even when it equals the
 /// default: a requested command must run rather than take a no-dependency shortcut.
+///
+/// A tree with no root `Cargo.toml` has no Cargo fill, so whatever its
+/// `.motor/cache.toml` declares is the whole warm plan. Its steps are
+/// explicit for the same reason, and a tree that declares nothing still runs
+/// `true`.
+///
+/// The one command a fill runs is the plan's steps joined with `&&`, which is
+/// what [`warm_steps`] returns separately for a caller that keeps the steps.
+#[cfg(test)]
 pub(crate) fn warm_plan(mirror: &Path, commit: &str) -> (String, bool) {
-    let Ok(manifest) = git(mirror, &["show", &format!("{commit}:Cargo.toml")]) else {
-        return ("true".to_string(), false);
-    };
-    manifest_warm_plan(&manifest, commit)
+    let (steps, explicit) = warm_steps(mirror, commit);
+    (steps.join(" && "), explicit)
+}
+
+/// The warm build as the ordered steps a fill runs, together with whether any
+/// of them was explicitly requested.
+///
+/// A Cargo tree warms with Cargo's own command, then with whatever
+/// `.motor/cache.toml` declares. A tree with no root `Cargo.toml` has no Cargo
+/// command and warms from its declaration alone. Steps run in this order in one
+/// shell, so a failing step fails the fill.
+pub(crate) fn warm_steps(mirror: &Path, commit: &str) -> (Vec<String>, bool) {
+    let declared: Vec<String> = crate::writer::declaration::read(mirror, commit)
+        .ok()
+        .flatten()
+        .map(|declaration| {
+            declaration
+                .fills
+                .iter()
+                .map(crate::writer::declaration::Step::command)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut steps = Vec::new();
+    let mut explicit = false;
+    if let Ok(manifest) = git(mirror, &["show", &format!("{commit}:Cargo.toml")]) {
+        let (cargo, requested) = manifest_warm_plan(&manifest, commit);
+        steps.push(cargo);
+        explicit = requested;
+    }
+    // Declared steps follow the Cargo warm command in the same fill, so a Cargo
+    // tree that also declares a ccache step runs both. A tree with neither
+    // warms with `true`, as it did before declarations existed.
+    steps.extend(declared.iter().cloned());
+    explicit |= !declared.is_empty();
+    if steps.is_empty() {
+        steps.push("true".to_string());
+    }
+    (steps, explicit)
 }
 
 /// The warm command a root `Cargo.toml` declares, or the whole-workspace
@@ -485,6 +833,8 @@ impl Trees {
     /// up to 32 pinned ref targets as hints for older clients. Offered ancestry
     /// is not capped: a common older branch must remain a bundle prerequisite
     /// even when newer refs belong to snapshots the sender does not possess.
+    /// The answer is only valid while those refs exist; `Runner::have` pins
+    /// it with `HELD_REFS` before replying.
     pub fn have(&self, repositories: Vec<RepositoryCandidates>) -> Vec<RepositoryCandidates> {
         repositories
             .into_iter()
@@ -513,6 +863,9 @@ impl Trees {
                 // every candidate/ref pair. Report the newest common frontier
                 // independently of the fallback ref cap: recent dirty snapshots
                 // can crowd out the old branch tip the sender actually knows.
+                // Held refs (see HELD_REFS) are deliberately not walked:
+                // they exist only to keep an earlier reply valid, and counting
+                // them would let every reply renew the previous one forever.
                 let history = git(
                     &path,
                     &[
@@ -789,8 +1142,22 @@ impl Trees {
         tree_hash: &str,
         caller_commit: &str,
     ) -> io::Result<()> {
+        self.siblings(Path::new(key), siblings, recorded)?;
+        self.populate_main(key, root, commit, tree_hash, caller_commit)
+    }
+    /// The main-workspace part of `populate`: check out the source,
+    /// preserving an existing target directory. A setup that mounts its
+    /// siblings from snapshots calls this alone, so it never touches a
+    /// sibling's host path.
+    pub(crate) fn populate_main(
+        &self,
+        key: &str,
+        root: &str,
+        commit: &str,
+        tree_hash: &str,
+        caller_commit: &str,
+    ) -> io::Result<()> {
         let path = Path::new(key);
-        self.siblings(path, siblings, recorded)?;
         self.sync_workspace(root, path, commit, tree_hash, caller_commit)?;
         let target = path.join("target");
         if !target.exists() {

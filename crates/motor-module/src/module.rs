@@ -112,14 +112,31 @@ fn is_health_flow(scope: Option<&ScopeStamp>) -> bool {
 /// `runon: "windows"` only to a module that lists it. The daemon refuses a
 /// module's HELLO unless every capability is spelled `<name>/v<N>`.
 pub(crate) const WINDOWS_CAPABILITY: &str = "exec-remote-windows/v1";
+pub(crate) const MACOS_CAPABILITY: &str = "exec-remote-macos/v1";
 pub(crate) const NETWORK_CAPABILITY: &str = "exec-remote-net/v1";
+/// Always advertised: an `exec.run` request may carry `return_paths`, and the
+/// job's stream then has a `return_result` record before its terminal record.
+/// Callers send non-empty `return_paths` only to a module that lists it.
+pub(crate) const RETURN_CAPABILITY: &str = "exec-remote-return/v1";
+/// Always advertised next to `RETURN_CAPABILITY`: an `exec.run` request may set
+/// `return_chunked`, and the job's stream then has `return_chunk` records and
+/// one `return_manifest` before its terminal record instead of `return_result`.
+/// A runner too old to send them refuses the job with
+/// `return_chunked_unsupported` before it runs.
+pub(crate) const RETURN_CHUNKED_CAPABILITY: &str =
+    cortexkit_exec_remote_types::RETURN_CHUNKED_CAPABILITY;
 
 pub fn manifest(module_id: &str) -> ModuleManifest {
     manifest_with_config(module_id, &Config::default())
 }
 
 pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest {
-    let mut provides = vec![CAPABILITY.into(), FLOW_SCOPES_CAPABILITY.into()];
+    let mut provides = vec![
+        CAPABILITY.into(),
+        FLOW_SCOPES_CAPABILITY.into(),
+        RETURN_CAPABILITY.into(),
+        RETURN_CHUNKED_CAPABILITY.into(),
+    ];
     if !config.windows_runners.is_empty()
         || (config.windows_runner_instance.is_some() && config.windows_runner_state_root.is_some())
     {
@@ -127,6 +144,9 @@ pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest 
     }
     if config.network_routing {
         provides.push(NETWORK_CAPABILITY.into());
+    }
+    if config.macos_runner.is_some() {
+        provides.push(MACOS_CAPABILITY.into());
     }
     ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
         .trust_tier(Some(TrustTier::FirstParty))
@@ -281,7 +301,7 @@ pub struct Handler {
     health_sampler: Arc<Mutex<crate::health_cache::Sampler>>,
     write_engram_catalog: bool,
 }
-fn module_data_dir(module_id: &str) -> io::Result<PathBuf> {
+pub(crate) fn module_data_dir(module_id: &str) -> io::Result<PathBuf> {
     module_data_dir_for(
         module_id,
         std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
@@ -352,6 +372,10 @@ impl Handler {
     pub(crate) fn with_storage_ready_deadline(mut self, deadline: std::time::Duration) -> Self {
         self.storage_ready_deadline = deadline;
         self
+    }
+    #[cfg(test)]
+    pub(crate) fn ssh_connector(&self) -> Option<Arc<SshConnector>> {
+        self.ssh.get().cloned()
     }
     pub fn with_credentials(mut self, resolver: Arc<dyn CredentialResolver>) -> Self {
         self.resolver = resolver;
@@ -927,7 +951,7 @@ impl ModuleHandler for Handler {
         } else {
             self.ssh
                 .get()
-                .and_then(|ssh| crate::Connector::refusal(ssh.as_ref()))
+                .and_then(|ssh| ssh.health_refusal())
                 .map(str::to_owned)
         };
         let mut report = self
@@ -1002,28 +1026,48 @@ impl ModuleHandler for Handler {
                     let _permit = match RunPermit::acquire(&self.run_count) {
                         Some(permit) => permit,
                         None => {
-                            pump(&ctx, motor.refuse_capacity()?).await?;
+                            pump(&ctx, motor.refuse_capacity()?, 0).await?;
+                            return Ok(HandlerOutcome::Streamed);
+                        }
+                    };
+                    let mut request: RunRequest = parse(envelope.params)?;
+                    let returns = match crate::agent_route::take_return_request(&mut request) {
+                        Ok(returns) => returns,
+                        Err(crate::agent_route::ReturnRequestError::InvalidParams(message)) => {
+                            return Ok(HandlerOutcome::Error {
+                                code: "invalid_params".into(),
+                                message,
+                            });
+                        }
+                        Err(crate::agent_route::ReturnRequestError::Rejected(code)) => {
+                            let stream = motor.refuse_before_start(
+                                RefusalReason::RequestRejected,
+                                Some(code.into()),
+                            )?;
+                            pump(&ctx, stream, 0).await?;
                             return Ok(HandlerOutcome::Streamed);
                         }
                     };
                     pump(
                         &ctx,
-                        motor.run_attributed(
-                            parse(envelope.params)?,
+                        motor.run_agent(
+                            request,
                             self.attribution(ctx.route_handle(), envelope.preset),
+                            returns,
                         )?,
+                        0,
                     )
                     .await
                     .map(|()| HandlerOutcome::Streamed)
                 }
-                "exec.attach" => pump(
-                    &ctx,
-                    motor.attach(
-                        serde_json::from_value(envelope.params).map_err(io::Error::other)?,
-                    )?,
-                )
-                .await
-                .map(|()| HandlerOutcome::Streamed),
+                "exec.attach" => {
+                    let request: AttachRequest =
+                        serde_json::from_value(envelope.params).map_err(io::Error::other)?;
+                    let from_seq = request.from_seq;
+                    pump(&ctx, motor.attach(request)?, from_seq)
+                        .await
+                        .map(|()| HandlerOutcome::Streamed)
+                }
                 "exec.cancel" => response(
                     motor
                         .cancel(serde_json::from_value(envelope.params).map_err(io::Error::other)?)
@@ -1074,11 +1118,14 @@ pub(crate) async fn status_reply(
 ) -> io::Result<HandlerOutcome> {
     let platform = optional_platform(params)?;
     if let Some(id) = params.get("job_id") {
-        response(
-            motor
-                .job_status(serde_json::from_value(id.clone()).map_err(io::Error::other)?)
-                .await?,
-        )
+        let id = serde_json::from_value(id.clone()).map_err(io::Error::other)?;
+        let reply = motor.job_status(id).await?;
+        // Billing may have settled after the job's terminal record was
+        // streamed; the status reply carries the figure as it stands now.
+        response(crate::agent_route::status_with_hosted(
+            reply,
+            motor.hosted_state(id).as_ref(),
+        ))
     } else if !matches!(platform, None | Some(motor_protocol::Platform::Linux)) {
         let reply = motor.runner_status_for(platform.as_ref()).await?;
         if params.get("disk").and_then(serde_json::Value::as_bool) == Some(true) {
@@ -1126,8 +1173,9 @@ async fn reply(ctx: &RequestCtx, value: impl serde::Serialize) -> io::Result<()>
         .await
         .map_err(io::Error::other)
 }
-async fn pump(ctx: &RequestCtx, stream: JobStream) -> io::Result<()> {
-    forward(ctx.cancelled(), stream, |record| reply(ctx, record)).await
+/// Forward a job to an agent caller, whose resume cursor is `from_seq`.
+async fn pump(ctx: &RequestCtx, stream: JobStream, from_seq: u64) -> io::Result<()> {
+    crate::agent_route::pump(ctx, stream, from_seq).await
 }
 
 /// `pump` for a direct caller, writing each direct job's acceptance and
@@ -1144,6 +1192,7 @@ async fn pump_direct_secret(
     let id = stream.job_id;
     let storage = stream.storage();
     let mut terminal = false;
+    let mut return_context_sent = false;
     let result = forward(ctx.cancelled(), stream, |record| {
         match &record {
             StreamRecord::Accepted(_) => {
@@ -1164,6 +1213,15 @@ async fn pump_direct_secret(
             .map(|secret| serde_json::json!({"job_id": id, "secret": secret.expose()}));
         let hosted = storage.job(id).and_then(|j| j.hosted_route());
         let return_result = storage.job(id).and_then(|j| j.return_result);
+        let return_paths = if return_context_sent {
+            None
+        } else {
+            storage.job(id).and_then(|j| j.return_requested)
+        };
+        return_context_sent = true;
+        let return_workspace = return_paths
+            .as_ref()
+            .and_then(|_| storage.job(id)?.workspace_key);
         async move {
             let mut value = serde_json::to_value(record).map_err(io::Error::other)?;
             if let Some(direct_job) = direct_job {
@@ -1174,6 +1232,13 @@ async fn pump_direct_secret(
             }
             if let Some(result) = return_result {
                 value["return_result"] = serde_json::to_value(result).map_err(io::Error::other)?;
+            }
+            if let Some(paths) = return_paths {
+                value["return_paths"] = serde_json::to_value(paths).map_err(io::Error::other)?;
+            }
+            if let Some(workspace) = return_workspace {
+                value["return_workspace"] =
+                    serde_json::to_value(workspace).map_err(io::Error::other)?;
             }
             reply(ctx, value).await
         }

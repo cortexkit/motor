@@ -61,6 +61,45 @@ entry under `/etc/motor-vm-helper/tenants`, and the host-readable
 bindings are refused. Failure intentionally retains partially created disk
 data; inspect it manually, never delete a tenant disk as automatic rollback.
 
+`provision.py repair-from-registry <tenant>` fixes one known drift: an image
+swapped by hand, before `switch-image` existed, left the provisioning record
+(`/etc/motor-host/provision/<tenant>.json`) naming the old image while the
+helper registry names the image that actually boots, and `switch-image` refuses
+such records. The repair copies the registry's `image_version` into the
+provisioning record only when that image exists, its files are root-owned, it
+passes the image inventory check and its manifest names it, and every other
+registry field is exactly what provisioning would have written from the
+record. It replaces the record atomically, keeping its mode and key order, so
+`install.sh --check` accepts it, and prints the one change it made. Records
+that already agree are left alone. Tests:
+`test_switch_image_refuses_the_live_mismatch_until_it_is_repaired`,
+`test_repair_refuses_without_changing_anything_unless_only_the_image_differs`.
+
+`provision.py switch-image <tenant> <image>` refuses while `motor-host.service`
+or `motor-vm-helper.service` is active, and the refusal names the clean stop:
+`sudo systemctl stop motor-host.service motor-vm-helper.service`. Stopping the
+helper stops each running tenant VM cleanly (guest drain, sync and freeze, then
+the VM) before it exits, so the switch never cuts a guest's power. If the
+helper's `running.json` marker is still in the tenant home, the last stop was
+not clean; the switch goes ahead and warns that the next start runs the
+in-guest recovery check. The procedure is in `docs/hosted-host.md`. Tests:
+`test_switch_image_refuses_when_either_service_is_running`,
+`test_switch_image_warns_when_the_last_vm_stop_was_unclean`.
+
+`provision.py remove-tenant <tenant> [--dry-run | --purge-now]` removes a
+departed customer's tenant. Like `switch-image` it refuses while
+`motor-host.service` or `motor-vm-helper.service` is active. Under the provision
+lock it copies the tenant's records into
+`/var/lib/motor-vm/removed/<tenant>-<unix seconds>/records/`, deletes its tap,
+drops its binding, provisioning record and registry entry, and moves its home
+(disk, suspend and stale snapshots, markers) to `.../home`; the helper deletes
+the folder 7 days later, and its startup reconciliation drops the tenant's
+firewall rules. `--dry-run` lists everything and changes nothing; `--purge-now`
+deletes at once. `removal-layout.json` pins the same list for the helper's
+automatic `remove_tenant`. The procedure and how to undo a removal are in
+`docs/hosted-host.md`. Tests: `test_remove_tenant_*`,
+`test_removal_layout_is_the_one_the_helper_removes`.
+
 Portable tests: `python3 -W error script/tenant-provision/test_provision.py`.
 Real provisioning, networking and suspend/restore qualification require an
 operator-controlled host; the portable tests do not claim VM isolation proof.

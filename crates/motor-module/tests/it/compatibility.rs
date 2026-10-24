@@ -12,6 +12,82 @@ use std::{
 use tokio::io::AsyncWriteExt;
 use tokio::{net::TcpListener, process::Command};
 
+#[tokio::test]
+#[ignore = "dedicated CI gate: python3 scripts/mixed-version.py builds the pinned production runner"]
+async fn pinned_old_runner_refuses_macos_platform_before_start() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    async fn next_message(stream: &mut tokio::net::UnixStream) -> Option<Frame> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let frame = read_frame_async(stream).await.unwrap();
+                if !matches!(frame, Some(Frame::Heartbeat { .. })) {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+    let binary = std::env::var_os("MOTOR_COMPAT_RUNNER")
+        .expect("run python3 scripts/mixed-version.py to build the unchanged pinned runner");
+    let f = Fixture::new(Cut::None, 28).await;
+    let state = f.scratch.join("old-macos-refusal");
+    let socket = cortexkit_test_support::scratch_root()
+        .parent()
+        .unwrap()
+        .join(format!(
+            "old-macos-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+    let mut helper = Command::new(binary)
+        .args([&state, &socket, f.remote_key.parent().unwrap()])
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        BufReader::new(helper.stdout.take().unwrap()).read_line(&mut ready),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ready, "ready\n");
+    let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    write_frame_async(&mut stream, &legacy_hello())
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_message(&mut stream).await,
+        Some(Frame::Hello { .. })
+    ));
+    let id = Uuid::now_v7();
+    let run: Frame = serde_json::from_value(serde_json::json!({
+        "type": "run", "job_id": id, "platform": "macos", "workspace_key": f.key,
+        "repository_root": f.main, "cwd": f.key, "command": "touch must-not-start",
+        "env": {}, "queue_wait_limit_s": 300, "snapshot_commit": "commit",
+        "tree_hash": "tree", "integration_tip": "", "siblings": [], "bundles": []
+    }))
+    .unwrap();
+    write_frame_async(&mut stream, &run).await.unwrap();
+    let reply = next_message(&mut stream).await;
+    assert!(
+        matches!(
+            reply,
+            Some(Frame::Refusal(Refusal {
+                reason: RefusalReason::PlatformUnsupported,
+                ..
+            }))
+        ),
+        "old runner must refuse macos before starting: {reply:?}"
+    );
+    assert!(!f.remote_key.join("must-not-start").exists());
+    helper.kill().await.unwrap();
+    helper.wait().await.unwrap();
+}
+
 struct RunnerHello {
     proxy: Arc<Proxy>,
     frame: Arc<Mutex<Option<Frame>>>,
@@ -105,6 +181,66 @@ async fn successful_run(motor: &crate::Motor, request: RunRequest) {
     })
     .await
     .expect("current client Run hung");
+}
+
+async fn refuse_non_neighbour_before_transfer(motor: &crate::Motor, f: &Fixture) {
+    let path = f.scratch.join("side-checkouts/commons");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    crate::snapshot::git(
+        path.parent().unwrap(),
+        &["clone", "-q", f.sibling.to_str().unwrap(), "commons"],
+    )
+    .unwrap();
+    f.proxy.frames.lock().unwrap().clear();
+    let mut request = f.request("touch should-not-run");
+    request.siblings = vec![path.to_str().unwrap().into()];
+    let records = super::recovery::collect(motor.run(request).unwrap()).await;
+    let terminal = super::recovery::terminal(&records);
+    assert!(matches!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::WorkspaceKeyRejected
+        }
+    ));
+    assert!(terminal
+        .refusal_detail
+        .as_deref()
+        .unwrap()
+        .contains("does not advertise sibling_paths"));
+    let reply = motor.prepare(serde_json::from_value(serde_json::json!({
+        "workspace_key": f.key, "repository_root": f.main, "base_commit": "HEAD", "siblings": [path]
+    })).unwrap()).await.unwrap();
+    assert!(matches!(
+        reply.outcome,
+        PrepareOutcome::RefusedBeforeStart {
+            reason: RefusalReason::WorkspaceKeyRejected
+        }
+    ));
+    assert!(reply
+        .refusal_detail()
+        .unwrap()
+        .contains("does not advertise sibling_paths"));
+    assert!(!f.proxy.frames.lock().unwrap().iter().any(|frame| matches!(
+        frame,
+        Frame::Run(_) | Frame::Prepare(_) | Frame::Have { .. } | Frame::BundleChunk { .. }
+    )));
+    assert!(!f.remote_key.join("should-not-run").exists());
+}
+
+#[tokio::test]
+async fn legacy_runner_refuses_non_neighbour_siblings_before_run_and_prepare() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let motor = crate::Motor::with_connector(
+        f.config.clone(),
+        &f.scratch.join("module-state"),
+        Arc::new(RunnerHello {
+            proxy: f.proxy.clone(),
+            frame: Arc::new(Mutex::new(None)),
+            legacy_reply: true,
+        }),
+    )
+    .unwrap();
+    refuse_non_neighbour_before_transfer(&motor, &f).await;
 }
 
 #[tokio::test]
@@ -210,6 +346,94 @@ async fn new_direct_client_negotiates_gate_mark_with_pinned_runner() {
     }
     assert_eq!(record["base"], false);
     assert_eq!(record["terminal"]["outcome"]["code"], 0);
+    refuse_non_neighbour_before_transfer(&motor, &f).await;
+    helper.kill().await.unwrap();
+    helper.wait().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "dedicated CI gate: python3 scripts/mixed-version.py builds the pinned production runner"]
+async fn new_agent_chunked_return_is_refused_by_pinned_runner_before_run() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let helper = std::env::var_os("MOTOR_COMPAT_RUNNER")
+        .expect("run python3 scripts/mixed-version.py to build the unchanged pinned runner");
+    let mut f = Fixture::new(Cut::None, 28).await;
+    let state = f.scratch.join("old-runner-state");
+    let socket = cortexkit_test_support::scratch_root()
+        .parent()
+        .unwrap()
+        .join(format!(
+            "old-motor-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+    let mut helper = Command::new(helper)
+        .args([&state, &socket, f.remote_key.parent().unwrap()])
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        BufReader::new(helper.stdout.take().unwrap()).read_line(&mut ready),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ready, "ready\n", "pinned runner failed before serving");
+    f.use_external_runner_socket(socket);
+    let hello = Arc::new(Mutex::new(None));
+    let motor = crate::Motor::with_connector(
+        f.config.clone(),
+        &f.scratch.join("module-state"),
+        Arc::new(RunnerHello {
+            proxy: f.proxy.clone(),
+            frame: hello.clone(),
+            legacy_reply: false,
+        }),
+    )
+    .unwrap();
+    // An agent asking for chunked returned files from a runner that predates
+    // them is refused with a clear reason, before any Run frame is sent.
+    let mut request = f
+        .request("touch should-not-run")
+        .with_return_paths(vec!["out".into()])
+        .with_return_chunked(true);
+    let returns = crate::agent_route::take_return_request(&mut request).unwrap();
+    let records = super::recovery::collect(motor.run_agent(request, None, returns).unwrap()).await;
+    let terminal = super::recovery::terminal(&records);
+    assert!(matches!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RequestRejected
+        }
+    ));
+    let Some(Frame::Hello {
+        return_paths,
+        return_chunked,
+        ..
+    }) = hello.lock().unwrap().clone()
+    else {
+        panic!("runner Hello must be observed")
+    };
+    assert!(!return_chunked, "the pinned runner predates chunked return");
+    // A runner that predates returned files altogether is refused for that
+    // first; one that has them but not chunking, for chunking.
+    let expected = if return_paths {
+        "return_chunked_unsupported"
+    } else {
+        "return_paths_unsupported"
+    };
+    assert_eq!(terminal.refusal_detail.as_deref(), Some(expected));
+    assert!(!f
+        .proxy
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame, Frame::Run(_))));
+    assert!(!f.remote_key.join("should-not-run").exists());
     helper.kill().await.unwrap();
     helper.wait().await.unwrap();
 }
@@ -836,6 +1060,10 @@ async fn oldest_production_client_keeps_typed_queue_and_setup_refusal_details() 
         fs::write(&config, serde_json::to_vec(&f.config).unwrap()).unwrap();
         let mut request = f.request("echo forbidden > typed-refusal-marker");
         if !setup_failure {
+            // The runner is the only job in its queue, so its waiting phase is
+            // "demand exceeds capacity": it asks for more permits than the
+            // one-permit runner can ever grant, and a wait cannot help it.
+            // That is the refusal this pinned client must read, hint or not.
             request.queue_wait_limit_s = Some(0);
         }
         fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
@@ -874,6 +1102,8 @@ async fn oldest_production_client_keeps_typed_queue_and_setup_refusal_details() 
             assert!(detail.contains("held_permits=0/1"), "{detail}");
         }
         assert_eq!(terminal.ran, Some(Ran::None));
+        // A refusal that waiting cannot clear carries no hint, and the pinned
+        // client reads the field it already knows as written.
         assert_eq!(terminal.retry_after_ms(), None);
         assert!(!live
             .iter()
@@ -891,25 +1121,36 @@ async fn oldest_production_client_decodes_new_refusal_tags_as_unknown_with_detai
     let helper =
         std::env::var_os("MOTOR_COMPAT_CLIENT").expect("run python3 scripts/mixed-version.py");
     let f = Fixture::new(Cut::None, 28).await;
-    for (reason, tag, detail) in [
+    for (reason, tag, detail, retry_after_ms) in [
         (
             RefusalReason::LostToRestart,
             "lost_to_restart",
             "runner restarted before the job could start",
+            None,
         ),
         (
             RefusalReason::RequestRejected,
             "request_rejected",
             "prepare_unsupported: Prepare is unsupported by the Windows instance",
+            None,
         ),
         (
             RefusalReason::RunnerAuthenticationFailed,
             "runner_authentication_failed",
             "runner_sign_missing",
+            None,
+        ),
+        // A transient signing failure carries a retry hint, which the oldest
+        // client must read as written.
+        (
+            RefusalReason::RunnerAuthenticationFailed,
+            "runner_authentication_failed",
+            "runner_sign_unavailable",
+            Some(1500),
         ),
     ] {
-        let path = f.scratch.join(format!("{tag}.json"));
-        let terminal = TerminalRecord::new(
+        let path = f.scratch.join(format!("{tag}-{detail}.json"));
+        let mut terminal = TerminalRecord::new(
             Uuid::now_v7(),
             Outcome::RefusedBeforeStart { reason },
             0,
@@ -918,6 +1159,7 @@ async fn oldest_production_client_decodes_new_refusal_tags_as_unknown_with_detai
         )
         .with_refusal_detail(detail)
         .with_ran(Ran::None);
+        terminal.retry_after_ms = retry_after_ms;
         fs::write(
             &path,
             serde_json::to_vec(&StreamRecord::Terminal(terminal)).unwrap(),
@@ -947,6 +1189,6 @@ async fn oldest_production_client_decodes_new_refusal_tags_as_unknown_with_detai
         assert_eq!(old["reason"], tag);
         assert_eq!(old["refusal_detail"], detail);
         assert_eq!(old["ran"], "none");
-        assert_eq!(old["retry_after_ms"], serde_json::Value::Null);
+        assert_eq!(old["retry_after_ms"], serde_json::json!(retry_after_ms));
     }
 }

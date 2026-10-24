@@ -13,14 +13,24 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod diagnostics;
-mod dns;
+pub(crate) mod dns;
+pub(crate) use dns::DIRECTORY as DNS_DIRECTORY;
 mod network;
 mod paths;
 mod runner_socket;
 mod snapshot;
 
 const ARGS: &str = "/tenant/runner-args";
-const ROOTS: [&str; 2] = ["/Users", "/home"];
+/// Written by tenant attachment once it has placed the daemon's private
+/// resolver file. The runner that attachment starts reads it to decide whether
+/// a snapshot helper unit binds that resolver; every runner is started before
+/// the file exists. It lives on `/run`, which a fresh boot of the VM clears,
+/// so no stale marker outlives the resolver it describes.
+pub(crate) const DNS_MARKER: &str = "/run/motor-tenant-dns";
+/// The tenant's workspace roots, each bound from the tenant disk over the
+/// image's own directory before the runner starts. Nothing the runner runs
+/// may live beneath them in the image.
+pub(crate) const ROOTS: [&str; 2] = ["/Users", "/home"];
 
 pub async fn serve_agent() -> io::Result<()> {
     let listener = crate::vsock::Listener::bind(54)?;
@@ -128,7 +138,19 @@ async fn dispatch(
         }
         TenantAgentRequest::Resume => forward(Frame::Resume).await,
         TenantAgentRequest::Status => forward(Frame::Status).await,
-        TenantAgentRequest::Diagnostics { https } => diagnostics::collect(https).await,
+        TenantAgentRequest::Diagnostics {
+            https,
+            since_unix_s,
+            until_unix_s,
+            jti,
+        } => {
+            let query = diagnostics::JournalQuery {
+                since_unix_s,
+                until_unix_s,
+                jti,
+            };
+            diagnostics::collect(https, query).await
+        }
         TenantAgentRequest::PrepareSnapshot { kind } => {
             let _guard = attach.lock().await;
             snapshot::prepare(kind).await
@@ -186,6 +208,8 @@ async fn forward_socket(
         &mut socket,
         &Frame::Hello {
             return_paths: false,
+            return_chunked: false,
+            sibling_paths: false,
             protocol_version: PROTOCOL_VERSION,
             started: true,
             default_branch_tip: false,
@@ -374,10 +398,12 @@ fn clock_and_rng(unix_ms: u64, seed: &str) -> io::Result<()> {
         bytes: seed,
     };
     let random = OpenOptions::new().write(true).open("/dev/urandom")?;
-    if unsafe { libc::ioctl(random.as_raw_fd(), 0x40085203 as libc::c_ulong, &entropy) } < 0 {
+    // `libc::Ioctl` is the request type of the target's libc: unsigned long on
+    // glibc, int on musl (the tenant runner is a static musl build).
+    if unsafe { libc::ioctl(random.as_raw_fd(), 0x40085203 as libc::Ioctl, &entropy) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    if unsafe { libc::ioctl(random.as_raw_fd(), 0x5207 as libc::c_ulong) } < 0 {
+    if unsafe { libc::ioctl(random.as_raw_fd(), 0x5207 as libc::Ioctl) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -479,6 +505,7 @@ fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
         fs::write(path, contents)?;
     }
     dns::install(Path::new(dns::DIRECTORY), &resolvers, 0)?;
+    fs::write(DNS_MARKER, generation.to_string())?;
     command("hostname", &[&hostname])?;
     fs::write("/etc/hostname", format!("{hostname}\n"))?;
     fs::write("/etc/machine-id", format!("{machine_id}\n"))?;
@@ -670,7 +697,7 @@ fn reflink_probe(source: &Path, destination: &Path) -> io::Result<()> {
         if unsafe {
             libc::ioctl(
                 target.as_raw_fd(),
-                0x40049409 as libc::c_ulong,
+                0x40049409 as libc::Ioctl,
                 source.as_raw_fd(),
             )
         } < 0
@@ -723,6 +750,8 @@ fn runner_command(
         "--unit=motor-tenant-runner",
         "--collect",
         "--service-type=exec",
+        "--property=OOMScoreAdjust=-900",
+        "--property=OOMPolicy=continue",
         "--setenv=CARGO_HOME=/tenant/cargo-home",
         "--property=PrivateMounts=yes",
         "--property=BindReadOnlyPaths=/run/motor-tenant-daemon/resolv.conf:/etc/resolv.conf",
@@ -780,6 +809,8 @@ mod tests {
             .map(|word| word.to_str().unwrap())
             .collect();
         assert!(words.contains(&"--property=PrivateMounts=yes"));
+        assert!(words.contains(&"--property=OOMScoreAdjust=-900"));
+        assert!(words.contains(&"--property=OOMPolicy=continue"));
         assert!(words.contains(
             &"--property=BindReadOnlyPaths=/run/motor-tenant-daemon/resolv.conf:/etc/resolv.conf"
         ));
@@ -894,6 +925,11 @@ mod tests {
             "{hosts}"
         );
         assert!(hosts.lines().any(|line| line == "127.0.0.1\tlocalhost"));
+        // Attachment announces the private resolver in a systemd-owned file
+        // that survives its runner's restart and is gone after the VM boots
+        // again, which is what tells a helper's unit whether to bind it.
+        assert_eq!(DNS_MARKER, "/run/motor-tenant-dns");
+        assert!(Path::new(DNS_DIRECTORY).is_absolute());
     }
 
     #[tokio::test]
@@ -947,6 +983,8 @@ mod tests {
                     &mut socket,
                     &Frame::Hello {
                         return_paths: false,
+                        return_chunked: false,
+                        sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: false,

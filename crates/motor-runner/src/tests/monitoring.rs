@@ -1,5 +1,31 @@
 use super::*;
 
+#[test]
+fn restart_discards_unpublished_records_but_quarantines_missing_published_records() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.manual_tick = true;
+    config.disable_warm_builds = true;
+    let (request, _) = f.run("true");
+    let state = config.state_dir();
+    let staging = state.join("job-staging").join(request.job_id.to_string());
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("record.tmp"), b"half a record").unwrap();
+    let published = Uuid::now_v7();
+    fs::create_dir_all(state.join("jobs").join(published.to_string())).unwrap();
+    let runner = Runner::open(config).unwrap();
+    assert!(!state.join("job-staging").exists());
+    assert!(!runner.core.quarantined.contains_key(&request.job_id));
+    assert!(runner.core.quarantined.contains_key(&published));
+    assert!(!runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .contains_key(&request.job_id));
+}
+
 fn running_record(f: &Fixture, runner: &Runner) -> Uuid {
     let (request, _) = f.run("true");
     runner.accept(request.clone()).unwrap();
@@ -10,6 +36,120 @@ fn running_record(f: &Fixture, runner: &Runner) -> Uuid {
     job.durable_output = true;
     runner.save(job).unwrap();
     request.job_id
+}
+
+#[test]
+fn execution_ended_wire_real_status() {
+    use std::os::unix::process::ExitStatusExt;
+    for status in [
+        backend::ExecutionOutcome::Unix(std::process::ExitStatus::from_raw(7 << 8)),
+        backend::ExecutionOutcome::Signal { signal: 15 },
+        backend::ExecutionOutcome::WindowsExit { code: 0xC000_0005 },
+    ] {
+        let f = Fixture::new();
+        let runner = Runner::open(f.config()).unwrap();
+        let id = running_record(&f, &runner);
+        runner.finish_execution(id, Ok(status), false).unwrap();
+        let disk: Job = read_json(&runner.record_path(id)).unwrap();
+        let terminal = disk.terminal.unwrap();
+        assert_eq!(terminal.outcome, status.wire());
+        assert_execution_ended_wire(&terminal, true);
+    }
+}
+
+#[test]
+fn execution_ended_wire_before_start() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let cancel = Uuid::now_v7();
+    runner.cancel(cancel).unwrap();
+    let (request, _) = f.run("true");
+    runner.accept(request.clone()).unwrap();
+    runner
+        .refuse(
+            request.job_id,
+            RefusalReason::WorkspaceSetupFailed,
+            "setup failed",
+        )
+        .unwrap();
+    for id in [cancel, request.job_id] {
+        let disk: Job = read_json(&runner.record_path(id)).unwrap();
+        let terminal = disk.terminal.unwrap();
+        assert_eq!(terminal.ran, Some(Ran::None));
+        assert_execution_ended_wire(&terminal, true);
+    }
+}
+
+#[test]
+fn execution_ended_wire_unknown_monitor() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let id = running_record(&f, &runner);
+    runner
+        .finish(id, Err(io::Error::other("monitor unavailable")))
+        .unwrap();
+    let disk: Job = read_json(&runner.record_path(id)).unwrap();
+    let terminal = disk.terminal.unwrap();
+    assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
+    assert_execution_ended_wire(&terminal, false);
+}
+
+#[test]
+fn execution_ended_wire_restart_lost() {
+    let f = Fixture::new();
+    let config = f.config();
+    let mut job = Job::new(Uuid::now_v7(), None, (config.clock)(), 0, 0);
+    job.state = JobState::Running;
+    job.started_ms = Some((config.clock)());
+    let record = config
+        .state_dir()
+        .join("jobs")
+        .join(job.id.to_string())
+        .join("record.json");
+    atomic_json(&record, &job).unwrap();
+    let runner = Runner::open(config).unwrap();
+    let disk: Job = read_json(&record).unwrap();
+    assert_eq!(disk.state, JobState::Lost);
+    assert_execution_ended_wire(disk.terminal.as_ref().unwrap(), false);
+    assert_execution_ended_wire(
+        runner.core.inner.lock().unwrap().jobs[&job.id]
+            .terminal
+            .as_ref()
+            .unwrap(),
+        false,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn execution_ended_wire_cache_fill_setup() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let (request, _) = f.run("true");
+    let mut job = Job::new(request.job_id, Some(request), runner.now(), 1, 0);
+    job.base = true;
+    let error = crate::writer::CacheFill::begin(runner.config())
+        .err()
+        .unwrap();
+    let mut inner = runner.core.inner.lock().unwrap();
+    inner
+        .catalog
+        .repositories
+        .entry(f.root.clone())
+        .or_default();
+    inner.writer = Some(job.id);
+    inner.jobs.insert(job.id, job.clone());
+    runner.fail_cache_fill(&mut inner, &job, error).unwrap();
+    drop(inner);
+    assert!(poll(Duration::from_secs(5), || {
+        let inner = runner.core.inner.lock().unwrap();
+        inner.writer.is_none() && !inner.base_finishes.contains_key(&job.id)
+    }));
+    let disk: Job = read_json(&runner.record_path(job.id)).unwrap();
+    let terminal = disk.terminal.unwrap();
+    assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_execution_ended_wire(&terminal, true);
 }
 
 #[tokio::test]
@@ -82,15 +222,8 @@ async fn monitor_output_enospc_retries_terminal_and_drain_completes() {
     wait_for(|| runner.drain_result() == Some(false)).await;
     monitor.join().unwrap();
     let disk: Job = read_json(&runner.record_path(id)).unwrap();
-    assert_eq!(disk.terminal.unwrap().outcome, Outcome::OutcomeUnknown);
-    assert_eq!(
-        disk.monitoring_error.as_deref(),
-        Some(
-            io::Error::from_raw_os_error(libc::ENOSPC)
-                .to_string()
-                .as_str()
-        )
-    );
+    assert_eq!(disk.terminal.unwrap().outcome, Outcome::Exit { code: 101 });
+    assert_eq!(disk.monitoring_error, None);
 }
 
 #[tokio::test]
@@ -103,10 +236,38 @@ async fn cancel_after_monitor_lost_an_exited_process_finalizes_record() {
     let terminal = disk.terminal.unwrap();
     assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
     assert_eq!(terminal.killed, Some(Killed::Cancel));
+    assert_execution_ended_wire(&terminal, false);
 }
 
 fn systemd_runner(f: &Fixture, state: &str) -> (Runner, Arc<Mutex<Vec<Vec<String>>>>) {
     systemd_runner_with_state(f, Arc::new(Mutex::new(state.to_string())))
+}
+
+#[test]
+fn execution_ended_wire_oom_without_liveness() {
+    let f = Fixture::new();
+    let (runner, _) = systemd_runner(&f, "Result=oom-kill\n");
+    let id = running_record(&f, &runner);
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .get_mut(&id)
+        .unwrap()
+        .process = Some(platform::ProcessIdentity {
+        pid: 0,
+        start: 0,
+        unit: Some(Uuid::now_v7()),
+    });
+    runner
+        .finish(id, Err(io::Error::other("exit status lost")))
+        .unwrap();
+    let disk: Job = read_json(&runner.record_path(id)).unwrap();
+    let terminal = disk.terminal.unwrap();
+    assert_eq!(terminal.outcome, Outcome::Signal { signal: 9 });
+    assert_execution_ended_wire(&terminal, false);
 }
 
 /// Like `systemd_runner`, but the reported unit state can change during the test.
@@ -229,7 +390,7 @@ fn oom_result_records_detail_and_preserves_the_exit_code() {
             let job: Job = read_json(&runner.record_path(id)).unwrap();
             assert_eq!(job.terminal.unwrap().outcome, Outcome::Exit { code });
             let detail = format!(
-            "the job's memory limit of {limit} GiB was reached; the kernel killed a process and the job was stopped.{advice}"
+            "the kernel OOM-killed a process and the job was stopped (per-job memory limit of {limit} GiB; the shared host memory budget also applies).{advice}"
         );
             assert_eq!(job.memory_limit_detail, oom.then_some(detail.clone()));
             assert_eq!(
@@ -337,7 +498,9 @@ async fn cancel_recorded_after_unit_exit_finalizes_without_signalling() {
         .unwrap()
         .kill = None;
     runner.cancel(id).unwrap();
-    assert_eq!(terminal(&runner, id).await.outcome, Outcome::OutcomeUnknown);
+    let terminal = terminal(&runner, id).await;
+    assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
+    assert_execution_ended_wire(&terminal, true);
     assert!(commands
         .lock()
         .unwrap()
@@ -367,6 +530,7 @@ async fn pipe_output_failure_drains_verbose_child_and_releases_workspace() {
     f.submit(&runner, &request, &bytes);
     let result = terminal(&runner, request.job_id).await;
     assert_eq!(result.outcome, Outcome::OutcomeUnknown);
+    assert_execution_ended_wire(&result, true);
     assert!(Path::new(&f.key).join("pipe-completed").exists());
     let inner = runner.core.inner.lock().unwrap();
     assert!(!Runner::occupied(&inner, &f.key));
@@ -479,18 +643,7 @@ async fn corrupt_job_record_is_quarantined_without_losing_identity_or_safe_histo
             .is_err()
     );
     drop(runner);
-    let mut reopened = None;
-    assert!(poll(Duration::from_secs(5), || {
-        match Runner::open(config.clone()) {
-            Ok(runner) => {
-                reopened = Some(runner);
-                true
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
-            Err(error) => panic!("quarantine restart failed: {error}"),
-        }
-    }));
-    let reopened = reopened.unwrap();
+    let reopened = reopen_with_message(|| Runner::open(config.clone()), "quarantine restart");
     assert_eq!(
         reopened.job_status(request.job_id).unwrap().state,
         "quarantined"
@@ -635,18 +788,7 @@ fn missing_job_record_retains_a_durable_fence_across_repeated_startup() {
     assert!(serde_json::from_slice::<Job>(&placeholder).is_err());
     drop(runner);
     fs::remove_dir_all(&directory).unwrap();
-    let mut reopened = None;
-    assert!(poll(Duration::from_secs(5), || {
-        match Runner::open(config.clone()) {
-            Ok(runner) => {
-                reopened = Some(runner);
-                true
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
-            Err(error) => panic!("quarantine restart failed: {error}"),
-        }
-    }));
-    let reopened = reopened.unwrap();
+    let reopened = reopen_with_message(|| Runner::open(config.clone()), "quarantine restart");
     assert_eq!(
         reopened.job_status(request.job_id).unwrap().state,
         "quarantined"
@@ -716,6 +858,9 @@ fn failed_workspace_expiry_preserves_catalog_and_continues_maintenance() {
 struct EnumeratingBackend;
 
 impl Backend for EnumeratingBackend {
+    fn failed_job_units(&self, _: &Config) -> io::Result<u64> {
+        Ok(0)
+    }
     fn live_units(&self, config: &Config) -> io::Result<Option<BTreeSet<String>>> {
         backend::live_job_units(config).map(Some)
     }
@@ -761,6 +906,15 @@ fn enumerated_quarantine(
     listing: &str,
     failed: bool,
 ) -> (Runner, Uuid, Arc<Mutex<EnumeratedUnits>>) {
+    enumerated_quarantine_with(f, listing, failed, |_, _| {})
+}
+
+fn enumerated_quarantine_with(
+    f: &Fixture,
+    listing: &str,
+    failed: bool,
+    configure: impl FnOnce(&mut Config, Uuid),
+) -> (Runner, Uuid, Arc<Mutex<EnumeratedUnits>>) {
     use std::os::unix::process::ExitStatusExt;
     let mut config = f.config();
     // A forced refresh bypasses throttling, not a busy probe. These fixtures
@@ -774,6 +928,7 @@ fn enumerated_quarantine(
         .join("record.json");
     fs::create_dir_all(record.parent().unwrap()).unwrap();
     fs::write(record, b"{broken job}").unwrap();
+    configure(&mut config, id);
     let state = Arc::new(Mutex::new(EnumeratedUnits {
         listing: listing.to_string(),
         failed,
@@ -810,6 +965,254 @@ fn enumerated_quarantine(
     )
 }
 
+fn quarantine_disk_fixture(
+    f: &Fixture,
+    owner: &str,
+) -> (Runner, Uuid, Arc<Mutex<EnumeratedUnits>>, PathBuf) {
+    let trash = f.config().state_dir().join("trash/evict-me");
+    let reclaim = trash.clone();
+    let (runner, id, state) = enumerated_quarantine_with(f, "", false, |config, id| {
+        config.disable_warm_builds = true;
+        config.free_space_floor_bytes = 100;
+        config.free_space_probe = Arc::new(move |_| Ok(if reclaim.exists() { 10 } else { 200 }));
+        let (mut request, _) = f.run("true");
+        request.job_id = id;
+        let marker = QuarantinedJob {
+            id,
+            request: (owner == "request").then_some(request),
+            process: (owner == "process").then_some(platform::ProcessIdentity {
+                pid: 1,
+                start: 1,
+                unit: Some(Uuid::now_v7()),
+            }),
+            observed_ms: 1,
+        };
+        atomic_json_private(
+            &config
+                .state_dir()
+                .join("quarantine")
+                .join(format!("{id}.json")),
+            &marker,
+        )
+        .unwrap();
+        atomic_json_private(
+            &config
+                .state_dir()
+                .join("jobs")
+                .join(id.to_string())
+                .join("record.json"),
+            &serde_json::json!({"quarantined_job": id}),
+        )
+        .unwrap();
+    });
+    fs::create_dir_all(&trash).unwrap();
+    fs::write(trash.join("discardable"), b"cache garbage").unwrap();
+    (runner, id, state, trash)
+}
+
+#[test]
+fn empty_placeholder_quarantine_does_not_turn_low_disk_into_permanent_full_disk() {
+    let f = Fixture::new();
+    let (runner, id, _, trash) = quarantine_disk_fixture(&f, "none");
+    assert_eq!(
+        runner
+            .runner_status()
+            .health
+            .unwrap()
+            .cleanup_blocked_by_quarantine,
+        vec![id]
+    );
+    let logs = QuarantineLogs::default();
+    tracing::subscriber::with_default(logs.clone(), || {
+        assert!(runner.ensure_disk_space().unwrap().is_none());
+    });
+    let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        output
+            .matches("disk cleanup proceeding past ownerless quarantine")
+            .count(),
+        1,
+        "{output}"
+    );
+    assert!(
+        output.contains("WARN") && output.contains(&id.to_string()),
+        "{output}"
+    );
+    assert!(
+        !trash.exists(),
+        "an ownerless placeholder must not block eviction"
+    );
+    let health = runner.runner_status().health.unwrap();
+    assert!(health.cleanup_blocked_by_quarantine.is_empty());
+    let mut legacy = serde_json::to_value(&health).unwrap();
+    assert!(legacy.get("cleanup_blocked_by_quarantine").is_none());
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("cleanup_blocked_by_quarantine");
+    assert!(serde_json::from_value::<RunnerHealth>(legacy)
+        .unwrap()
+        .cleanup_blocked_by_quarantine
+        .is_empty());
+    assert!(runner
+        .config()
+        .state_dir()
+        .join("quarantine")
+        .join(format!("{id}.json"))
+        .exists());
+    assert_eq!(runner.job_status(id).unwrap().state, "quarantined");
+    assert!(runner.replay(id, 0).is_err());
+    assert!(runner.ensure_reconciled().is_err());
+    let (mut request, _) = f.run("true");
+    request.job_id = id;
+    assert!(matches!(
+        runner.accept(request).unwrap(),
+        Admission::Duplicate
+    ));
+}
+
+#[test]
+fn recovered_quarantine_owner_keeps_disk_cleanup_and_health_fenced() {
+    for owner in ["request", "process"] {
+        let f = Fixture::new();
+        let (runner, id, _, trash) = quarantine_disk_fixture(&f, owner);
+        assert!(runner.ensure_disk_space().unwrap().is_some());
+        assert!(trash.exists());
+        let health = serde_json::to_value(runner.runner_status().health.unwrap()).unwrap();
+        assert_eq!(
+            health["cleanup_blocked_by_quarantine"],
+            serde_json::json!([id])
+        );
+    }
+}
+
+#[test]
+fn ownerless_quarantine_requires_fresh_complete_idle_inventory_and_no_sandbox() {
+    for blocker in [
+        "failed",
+        "malformed",
+        "unknown",
+        "busy",
+        "launching",
+        "sandbox",
+        "sandbox-error",
+    ] {
+        let f = Fixture::new();
+        let (runner, id, state, trash) = quarantine_disk_fixture(&f, "none");
+        match blocker {
+            "failed" => state.lock().unwrap().failed = true,
+            "malformed" => {
+                state.lock().unwrap().listing = "motor-job-broken.service loaded\n".into()
+            }
+            "unknown" => {
+                state.lock().unwrap().listing = format!(
+                    "{} loaded active running command\n",
+                    backend::host_unit_name(Uuid::now_v7())
+                )
+            }
+            "launching" => {
+                runner
+                    .core
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .launching
+                    .insert(Uuid::now_v7());
+            }
+            "sandbox" => {
+                fs::create_dir_all(
+                    runner
+                        .config()
+                        .state_dir()
+                        .join("sandboxes")
+                        .join(id.to_string()),
+                )
+                .unwrap();
+            }
+            "sandbox-error" => {
+                let path = runner.config().state_dir().join("sandboxes");
+                if path.exists() {
+                    fs::remove_dir_all(&path).unwrap();
+                }
+                fs::write(path, b"not a directory").unwrap();
+            }
+            _ => {}
+        }
+        let busy = (blocker == "busy").then(|| runner.core.quarantine_probe.lock().unwrap());
+        assert!(runner.ensure_disk_space().unwrap().is_some(), "{blocker}");
+        assert!(trash.exists(), "{blocker}");
+        assert_eq!(
+            runner
+                .runner_status()
+                .health
+                .unwrap()
+                .cleanup_blocked_by_quarantine,
+            vec![id]
+        );
+        drop(busy);
+        runner.core.inner.lock().unwrap().launching.clear();
+    }
+}
+
+#[derive(Clone, Default)]
+struct QuarantineLogs(Arc<Mutex<Vec<u8>>>);
+
+impl tracing::Subscriber for QuarantineLogs {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut bytes = self.0.lock().unwrap();
+        write!(bytes, "{} ", event.metadata().level()).unwrap();
+        event.record(&mut QuarantineFields(&mut bytes));
+        writeln!(bytes).unwrap();
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+struct QuarantineFields<'a>(&'a mut Vec<u8>);
+impl tracing::field::Visit for QuarantineFields<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        write!(self.0, "{}={value:?} ", field.name()).unwrap();
+    }
+}
+
+#[test]
+fn quarantine_cleanup_errors_name_ids_and_are_limited_to_once_per_five_minutes() {
+    let f = Fixture::new();
+    let (runner, id, _, trash) = quarantine_disk_fixture(&f, "request");
+    let logs = QuarantineLogs::default();
+    tracing::subscriber::with_default(logs.clone(), || {
+        fs::remove_dir_all(&trash).unwrap();
+        assert!(runner.ensure_disk_space().unwrap().is_none());
+        assert!(
+            logs.0.lock().unwrap().is_empty(),
+            "no eviction was requested"
+        );
+        fs::create_dir_all(&trash).unwrap();
+        for advance in [0, 0, 299_999, 1] {
+            f.clock.fetch_add(advance, Ordering::SeqCst);
+            assert!(runner.ensure_disk_space().unwrap().is_some());
+        }
+    });
+    let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        output
+            .matches("runner disk cleanup blocked by quarantine")
+            .count(),
+        2,
+        "{output}"
+    );
+    assert_eq!(output.matches(&id.to_string()).count(), 2, "{output}");
+    assert_eq!(output.matches("ERROR").count(), 2, "{output}");
+}
+
 #[test]
 fn quarantine_without_unaccounted_units_allows_unrelated_admission() {
     let f = Fixture::new();
@@ -828,6 +1231,69 @@ fn quarantine_without_unaccounted_units_allows_unrelated_admission() {
     assert!(runner.allow_prepare().is_ok());
     assert_eq!(runner.job_status(quarantined).unwrap().state, "quarantined");
     assert!(runner.ensure_reconciled().is_err());
+}
+
+/// A job being launched has a live unit before its record names it. While
+/// such a launch is in flight, an unmatched unit may be its own, so it does
+/// not close the admission fence; once no launch is in flight, it does.
+#[test]
+fn quarantine_does_not_fence_on_the_unit_of_a_job_being_launched() {
+    let f = Fixture::new();
+    let (runner, _, state) = enumerated_quarantine(&f, "", false);
+    assert!(runner.ensure_admission_ownership().is_ok());
+    let launching = Uuid::now_v7();
+    let name = backend::host_unit_name(Uuid::now_v7());
+    state.lock().unwrap().listing = format!("{name} loaded activating start waiting\n");
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .launching
+        .insert(launching);
+    runner.refresh_quarantine_admission(true);
+    assert!(
+        runner.ensure_admission_ownership().is_ok(),
+        "a launching job's unit closed the admission fence"
+    );
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .launching
+        .remove(&launching);
+    runner.refresh_quarantine_admission(true);
+    assert!(runner
+        .ensure_admission_ownership()
+        .unwrap_err()
+        .to_string()
+        .contains(&name));
+}
+
+/// The deferral counts: with more unmatched units than launches in flight,
+/// at least one unit belongs to no launch, and the fence closes.
+#[test]
+fn quarantine_fences_on_more_unmatched_units_than_launches() {
+    let f = Fixture::new();
+    let (runner, _, state) = enumerated_quarantine(&f, "", false);
+    let first = backend::host_unit_name(Uuid::now_v7());
+    let second = backend::host_unit_name(Uuid::now_v7());
+    state.lock().unwrap().listing = format!(
+        "{first} loaded activating start waiting\n{second} loaded activating start waiting\n"
+    );
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .launching
+        .insert(Uuid::now_v7());
+    runner.refresh_quarantine_admission(true);
+    assert!(
+        runner.ensure_admission_ownership().is_err(),
+        "two unmatched units were taken for one launch"
+    );
 }
 
 #[test]
@@ -1084,18 +1550,19 @@ fn slow_replay_reads_leave_unrelated_control_operations_responsive() {
         let runner = runner.clone();
         move || runner.replay(id, 0)
     });
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    entered.recv().unwrap();
     let (request, _) = f.run("true");
     let (control, reply) = responsive_controls(&runner, request);
-    let responsive = reply.recv_timeout(Duration::from_secs(1));
-    drop(release);
-    let frames = reader.join().unwrap().unwrap();
-    control.join().unwrap();
-    assert_eq!(
-        responsive.ok(),
-        Some(true),
+    // Complete every control before releasing storage. Host scheduling delay
+    // is not evidence that the controls waited for the replay read.
+    assert!(
+        reply.recv().unwrap(),
         "replay storage stalled unrelated controls"
     );
+    assert!(!reader.is_finished(), "replay must still be held");
+    control.join().unwrap();
+    drop(release);
+    let frames = reader.join().unwrap().unwrap();
     assert!(matches!(frames.first(), Some(Frame::Output(o)) if o.bytes.0 == b"replayed output"));
 }
 
@@ -1467,6 +1934,9 @@ fn slow_ref_pruning_leaves_unrelated_control_operations_responsive() {
     let release = ReleaseIo(pause.clone());
     let armed = Arc::new(AtomicBool::new(false));
     let mut config = f.config();
+    // Disable background ticks so the runner.maintenance() call below, not the
+    // scheduler, enters the one-shot pruning hold.
+    config.manual_tick = true;
     config.long_work = Some({
         let armed = armed.clone();
         Arc::new(move |label| {
@@ -1487,18 +1957,19 @@ fn slow_ref_pruning_leaves_unrelated_control_operations_responsive() {
         let runner = runner.clone();
         move || runner.maintenance()
     });
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    entered.recv().unwrap();
     let (request, _) = f.run("true");
     let (control, reply) = responsive_controls(&runner, request);
-    let responsive = reply.recv_timeout(Duration::from_secs(1));
-    drop(release);
-    pruner.join().unwrap().unwrap();
-    control.join().unwrap();
-    assert_eq!(
-        responsive.ok(),
-        Some(true),
+    // The Git step remains paused until all controls complete, irrespective of
+    // how long the host takes to schedule their worker.
+    assert!(
+        reply.recv().unwrap(),
         "ref pruning stalled unrelated controls"
     );
+    assert!(!pruner.is_finished(), "ref pruning must still be held");
+    control.join().unwrap();
+    drop(release);
+    pruner.join().unwrap().unwrap();
     assert!(git(
         &mirror,
         &[
@@ -1690,4 +2161,148 @@ fn ref_pruning_batches_stale_deletions_without_dropping_held_refs() {
         .lines()
         .any(|reference| reference == format!("refs/tips/{}", request.integration_tip)));
     runner.cancel(request.job_id).unwrap();
+}
+
+#[test]
+fn boat_oom_killed_init_without_exit_is_definite_and_explained() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.boat_profile = true;
+    config.free_space_probe = Arc::new(|_| Ok(63 << 30));
+    config.boat_memory_max_bytes = Some(12_500_000_000);
+    config.systemd_command = Some(Arc::new(|args| {
+        use std::os::unix::process::ExitStatusExt;
+        let text = match args {
+            ["show", "--property=LoadState", "--property=ActiveState", _] => "LoadState=loaded\nActiveState=failed\n",
+            ["show", "--property=ExecMainCode", "--property=ExecMainStatus", _] => "ExecMainCode=0\nExecMainStatus=0\n",
+            ["show", "--property=Result", _] => "Result=oom-kill\n",
+            ["show", "--property=ControlGroup,MemoryPeak,MemoryMax,Result,ExecMainCode,ExecMainStatus", _] => "Result=oom-kill\nMemoryPeak=12500000000\nMemoryMax=12500000000\nExecMainCode=0\nExecMainStatus=0\n",
+            ["reset-failed", _] | ["list-units", ..] => "",
+            _ => panic!("unexpected systemd command: {args:?}"),
+        };
+        Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: text.as_bytes().to_vec(),
+            stderr: vec![],
+        })
+    }));
+    let runner = Runner::open(config).unwrap();
+    let id = running_record(&f, &runner);
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .get_mut(&id)
+        .unwrap()
+        .process = Some(platform::ProcessIdentity {
+        pid: 0,
+        start: 0,
+        unit: Some(Uuid::now_v7()),
+    });
+    let directory = runner
+        .config()
+        .state_dir()
+        .join("sandboxes")
+        .join(id.to_string())
+        .join("output");
+    fs::create_dir_all(&directory).unwrap();
+    for name in ["stdout", "stderr", "exit"] {
+        fs::write(directory.join(name), "").unwrap();
+    }
+    runner.follow_unit(id).unwrap();
+    let job: Job = read_json(&runner.record_path(id)).unwrap();
+    let terminal = job.terminal.unwrap();
+    assert_eq!(terminal.outcome, Outcome::Signal { signal: 9 });
+    assert_execution_ended_wire(&terminal, true);
+    assert_eq!(terminal.ran, Some(Ran::Remote));
+    let detail = terminal.refusal_detail().unwrap();
+    for expected in [
+        "rule=out_of_memory",
+        "out of memory",
+        "memory.peak=12500000000",
+        "memory.max=12500000000",
+        "memory.max_hit=true",
+        "ExecMainCode=0",
+        "ExecMainStatus=0",
+        "workspace[free_bytes=",
+        "free_inodes=",
+        "runner_state[free_bytes=",
+    ] {
+        assert!(detail.contains(expected), "missing {expected}: {detail}");
+    }
+    assert!(detail.len() <= REFUSAL_DETAIL_MAX_BYTES);
+    let decoded: TerminalRecord =
+        serde_json::from_value(serde_json::to_value(&terminal).unwrap()).unwrap();
+    assert_eq!(decoded, terminal);
+}
+
+#[test]
+fn boat_disk_full_replay_keeps_real_exit_and_explanation() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.boat_profile = true;
+    config.boat_memory_max_bytes = Some(12_500_000_000);
+    config.free_space_floor_bytes = u64::MAX;
+    // Admission has headroom; the end-of-job statvfs snapshot is below this floor.
+    config.free_space_probe = Arc::new(|_| Ok(u64::MAX));
+    config.before_job_write = Some(Arc::new(|path| {
+        if path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("chunk-")
+        {
+            Err(io::Error::from_raw_os_error(libc::ENOSPC))
+        } else {
+            Ok(())
+        }
+    }));
+    let runner = Runner::open(config).unwrap();
+    let id = running_record(&f, &runner);
+    let directory = runner
+        .config()
+        .state_dir()
+        .join("sandboxes")
+        .join(id.to_string())
+        .join("output");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("stdout"), "all suites passed\n").unwrap();
+    fs::write(directory.join("stderr"), "").unwrap();
+    fs::write(directory.join("exit"), "101\n                            ").unwrap();
+    runner.monitor_unit(id);
+    let job: Job = read_json(&runner.record_path(id)).unwrap();
+    let terminal = job.terminal.unwrap();
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 101 });
+    assert_eq!(terminal.ran, Some(Ran::Remote));
+    let detail = terminal.refusal_detail().unwrap();
+    assert!(detail.contains("rule=disk_full"), "{detail}");
+    assert!(detail.contains("disk full: the job ran"), "{detail}");
+    assert!(
+        detail.contains("withdrawal=disk_below_floor volume=runner_state"),
+        "{detail}"
+    );
+    assert!(detail.contains("free_inodes="), "{detail}");
+    assert!(detail.len() <= REFUSAL_DETAIL_MAX_BYTES);
+}
+
+#[test]
+fn cancel_after_durable_unit_exit_recovers_command_status() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    let id = running_record(&f, &runner);
+    let directory = runner
+        .config()
+        .state_dir()
+        .join("sandboxes")
+        .join(id.to_string())
+        .join("output");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("exit"), "23\n").unwrap();
+    runner.cancel(id).unwrap();
+    let job: Job = read_json(&runner.record_path(id)).unwrap();
+    let terminal = job.terminal.unwrap();
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+    assert_eq!(terminal.killed, Some(Killed::Cancel));
 }

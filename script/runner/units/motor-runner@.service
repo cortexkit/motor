@@ -2,6 +2,9 @@
 Description=CortexKit motor-runner (exec-remote/v1 runner, instance %i)
 
 [Service]
+# Includes the Windows instance; requires the user-manager OOM drop-in.
+OOMScoreAdjust=-900
+OOMPolicy=continue
 Environment=HOME=/home/ubuntu
 Environment=CARGO_HOME=/srv/build/cargo-home
 Environment=RUSTUP_HOME=/home/ubuntu/.rustup

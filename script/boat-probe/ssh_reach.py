@@ -1,4 +1,4 @@
-"""Pinned SSH and loopback TLS measurements, controlled from the operator's Mac."""
+"""Pinned SSH and loopback TLS measurements, controlled from the operator machine."""
 from __future__ import annotations
 
 import base64
@@ -13,6 +13,7 @@ import tempfile
 import time
 
 from reach import tcp_probe
+from probe import provider_sizing_matches
 
 RESTRICTION = 'restrict,port-forwarding,permitopen="127.0.0.1:9443",command="/bin/false"'
 OTHER_PORT = 9444
@@ -66,6 +67,12 @@ def process(argv, timeout=20, input_text=None):
         result.update(exit_code=completed.returncode, stdout=completed.stdout, stderr=completed.stderr)
     except (OSError, subprocess.TimeoutExpired) as error:
         result["error"] = str(error)
+        # Keep what a timed-out command printed before it was killed: a client
+        # that never finishes still shows how far it got.
+        for name in ("stdout", "stderr"):
+            partial = getattr(error, name, None)
+            if partial is not None:
+                result["partial_" + name] = partial.decode(errors="replace") if isinstance(partial, bytes) else partial
     result["seconds"] = time.monotonic() - start
     return result
 
@@ -390,7 +397,7 @@ class SSHReach:
         self.data["ssh_version"] = process(["ssh", "-V"])
         item, self.runner.data["create"] = self.runner.create()
         sid = item["id"]
-        self.check("create_large", item.get("vcpu") == 8 and item.get("memoryGB") == 16, item)
+        self.check("create_" + self.runner.size, provider_sizing_matches(item, self.runner.size), item)
         temporary = tempfile.TemporaryDirectory(prefix="boat-ssh-probe-")
         directory = Path(temporary.name)
         directory.chmod(0o700)

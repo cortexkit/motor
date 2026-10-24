@@ -88,6 +88,8 @@ fn connect_forwards_short_frames_before_socket_eof() {
     let listener = listener(scratch.path());
     let hello = Frame::Hello {
         return_paths: false,
+        return_chunked: false,
+        sibling_paths: false,
         protocol_version: PROTOCOL_VERSION,
         started: true,
         default_branch_tip: false,
@@ -221,6 +223,8 @@ fn drain_executable_sends_bounded_hold_request_and_reports_deadline() {
             read_frame(&mut socket).unwrap(),
             Some(Frame::Hello {
                 return_paths: false,
+                return_chunked: false,
+                sibling_paths: false,
                 protocol_version: PROTOCOL_VERSION,
                 started: true,
                 default_branch_tip: false,
@@ -232,6 +236,8 @@ fn drain_executable_sends_bounded_hold_request_and_reports_deadline() {
             &mut socket,
             &Frame::Hello {
                 return_paths: false,
+                return_chunked: false,
+                sibling_paths: false,
                 protocol_version: PROTOCOL_VERSION,
                 started: true,
                 default_branch_tip: false,
@@ -314,6 +320,8 @@ fn resume_executable_negotiates_admin_frame_and_rejects_legacy_eof() {
             &mut socket,
             &Frame::Hello {
                 return_paths: false,
+                return_chunked: false,
+                sibling_paths: false,
                 protocol_version: PROTOCOL_VERSION,
                 started: true,
                 default_branch_tip: false,

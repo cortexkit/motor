@@ -1,24 +1,24 @@
 //! Native queries for the sealed VM's RAW or GPT cache disk.
 
-#[cfg(not(feature = "hyperv-runner"))]
-use motor_winagent::cache::mount_script;
 use motor_winagent::cache::{
-    CACHE_DISK_SERIAL, CacheStorage, CacheVolume, DiskLayout, PartitionKind, storage_serial,
+    BASIC_DATA_PARTITION, CACHE_DISK_SERIAL, CacheStorage, CacheVolume, DiskLayout,
+    cache_partition, partition_kind, require_uninitialized, storage_serial,
 };
 use motor_winagent::cache_steps::{CacheReporter, CacheStep};
 use std::{
     io,
     mem::{offset_of, size_of, zeroed},
-    process::{Command, Stdio},
     ptr::{null, null_mut},
     thread,
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::*,
+    Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom},
     Storage::FileSystem::*,
     System::{IO::DeviceIoControl, Ioctl::*, SystemInformation::GetWindowsDirectoryW},
 };
+use windows_sys::core::GUID;
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -40,6 +40,7 @@ fn win32(ok: i32) -> io::Result<()> {
         Ok(())
     }
 }
+
 struct Handle(HANDLE);
 impl Handle {
     fn open(
@@ -169,6 +170,53 @@ fn disk_serial(disk: &Handle, reporter: &CacheReporter) -> io::Result<String> {
     )?;
     storage_serial(&bytes).map(str::to_owned)
 }
+/// Send one fixed-size input structure to a disk control code that returns
+/// nothing. These calls change the partition table, so errors name the change.
+fn control<T>(handle: &Handle, code: u32, input: &T, what: &str) -> io::Result<()> {
+    let mut returned = 0;
+    unsafe {
+        win32(DeviceIoControl(
+            handle.0,
+            code,
+            (input as *const T).cast(),
+            size_of::<T>() as u32,
+            null_mut(),
+            0,
+            &mut returned,
+            null_mut(),
+        ))
+    }
+    .map_err(|error| io::Error::new(error.kind(), format!("{what}: {error}")))
+}
+/// A random (version 4) GUID for the new disk and partition identifiers.
+/// Windows renames a disk whose GUID collides with another attached disk, so
+/// the cache must never reuse a fixed value.
+fn random_guid() -> io::Result<GUID> {
+    let mut bytes = [0u8; 16];
+    let status = unsafe {
+        BCryptGenRandom(
+            null_mut(),
+            bytes.as_mut_ptr(),
+            bytes.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status < 0 {
+        return Err(io::Error::other(format!(
+            "random GUID failed: NTSTATUS {status:#x}"
+        )));
+    }
+    let mut value = u128::from_be_bytes(bytes);
+    value = (value & !(0xf << 76)) | (0x4 << 76);
+    value = (value & !(0x3 << 62)) | (0x2 << 62);
+    Ok(GUID::from_u128(value))
+}
+fn guid_value(guid: GUID) -> u128 {
+    (u128::from(guid.data1) << 96)
+        | (u128::from(guid.data2) << 80)
+        | (u128::from(guid.data3) << 64)
+        | u128::from(u64::from_be_bytes(guid.data4))
+}
 fn extents(volume: &str, reporter: &CacheReporter) -> io::Result<Vec<u32>> {
     let handle = Handle::open(
         volume.trim_end_matches('\\'),
@@ -260,7 +308,10 @@ impl WindowsStorage {
         }
         Ok(attributes.Attributes)
     }
-    fn scan_volumes(&self) -> io::Result<Vec<CacheVolume>> {
+    /// Volume GUID paths of the volumes that include this disk, each with the
+    /// disk numbers of its extents. Uses only queries that also work on a
+    /// volume without a file system.
+    fn disk_volumes(&self) -> io::Result<Vec<(String, Vec<u32>)>> {
         let mut name = [0u16; 256];
         let raw = self.reporter.step(CacheStep::FirstVolume, || {
             let raw = unsafe { FindFirstVolumeW(name.as_mut_ptr(), name.len() as u32) };
@@ -276,27 +327,7 @@ impl WindowsStorage {
             let path = text(&name)?;
             let disks = extents(&path, &self.reporter)?;
             if disks.contains(&self.number) {
-                let mut label = [0u16; 256];
-                let mut filesystem = [0u16; 256];
-                self.reporter
-                    .step(CacheStep::VolumeInformation, || unsafe {
-                        win32(GetVolumeInformationW(
-                            wide(&path).as_ptr(),
-                            label.as_mut_ptr(),
-                            label.len() as u32,
-                            null_mut(),
-                            null_mut(),
-                            null_mut(),
-                            filesystem.as_mut_ptr(),
-                            filesystem.len() as u32,
-                        ))
-                    })?;
-                found.push(CacheVolume {
-                    path,
-                    disks,
-                    filesystem: text(&filesystem)?,
-                    label: text(&label)?,
-                });
+                found.push((path, disks));
             }
             let more = self.reporter.step(CacheStep::NextVolume, || {
                 if unsafe { FindNextVolumeW(volumes.0, name.as_mut_ptr(), name.len() as u32) } != 0
@@ -315,6 +346,64 @@ impl WindowsStorage {
             }
         }
         Err(invalid("too many volumes"))
+    }
+    fn scan_volumes(&self) -> io::Result<Vec<CacheVolume>> {
+        let mut found = Vec::new();
+        for (path, disks) in self.disk_volumes()? {
+            let mut label = [0u16; 256];
+            let mut filesystem = [0u16; 256];
+            self.reporter
+                .step(CacheStep::VolumeInformation, || unsafe {
+                    win32(GetVolumeInformationW(
+                        wide(&path).as_ptr(),
+                        label.as_mut_ptr(),
+                        label.len() as u32,
+                        null_mut(),
+                        null_mut(),
+                        null_mut(),
+                        filesystem.as_mut_ptr(),
+                        filesystem.len() as u32,
+                    ))
+                })?;
+            found.push(CacheVolume {
+                path,
+                disks,
+                filesystem: text(&filesystem)?,
+                label: text(&label)?,
+            });
+        }
+        Ok(found)
+    }
+    /// Wait for Windows to publish the volume of the partition just written.
+    /// It must be the only volume on this disk and lie entirely on it.
+    fn new_volume(&self) -> io::Result<String> {
+        self.reporter.step(CacheStep::VolumeDiscovery, || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match self.disk_volumes() {
+                    Ok(volumes) if volumes.len() == 1 => {
+                        let (path, disks) = volumes.into_iter().next().unwrap();
+                        if disks != [self.number] {
+                            return Err(invalid("new cache volume spans other disks"));
+                        }
+                        return Ok(path);
+                    }
+                    Ok(volumes) if volumes.len() > 1 => {
+                        return Err(invalid("new cache disk has several volumes"));
+                    }
+                    Err(error) if error.raw_os_error() != Some(ERROR_NOT_READY as i32) => {
+                        return Err(error);
+                    }
+                    _ if Instant::now() >= deadline => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "new cache volume did not appear",
+                        ));
+                    }
+                    _ => thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        })
     }
 }
 
@@ -401,22 +490,7 @@ impl CacheStorage for WindowsStorage {
                         return Err(invalid("invalid GPT partition"));
                     }
                     let guid = unsafe { part.Anonymous.Gpt.PartitionType };
-                    let kind = match (guid.data1, guid.data2, guid.data3, guid.data4) {
-                        (
-                            0xebd0a0a2,
-                            0xb9e5,
-                            0x4433,
-                            [0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7],
-                        ) => PartitionKind::BasicData,
-                        (
-                            0xe3c9e316,
-                            0x0b5c,
-                            0x4db8,
-                            [0x81, 0x7d, 0xf9, 0x2d, 0xf0, 0x02, 0x15, 0xae],
-                        ) => PartitionKind::Reserved,
-                        _ => PartitionKind::Other,
-                    };
-                    parts.push(kind);
+                    parts.push(partition_kind(guid_value(guid)));
                 }
                 Ok(DiskLayout::Gpt(parts))
             }
@@ -458,51 +532,95 @@ impl CacheStorage for WindowsStorage {
     }
 
     fn initialize_raw(&mut self) -> io::Result<()> {
-        self.reporter.step(CacheStep::InitializeRaw, || {
-            #[cfg(feature = "hyperv-runner")]
-            let script =
-                motor_winagent::cache::mount_script_with_serial(self.number, &self.expected_serial);
-            #[cfg(not(feature = "hyperv-runner"))]
-            let script = mount_script(self.number);
-            // The script rechecks serial, boot/system status and RAW before formatting.
-            // Discard output to keep both process memory and the wait bounded.
-            let mut child =
-                Command::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
-                    .args([
-                        "-NoLogo",
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-Command",
-                        &script,
-                    ])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()?;
+        let reporter = self.reporter.clone();
+        reporter.step(CacheStep::InitializeRaw, || {
             let deadline = Instant::now() + Duration::from_secs(30);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) if status.success() => return Ok(()),
-                    Ok(Some(status)) => {
-                        return Err(io::Error::other(format!(
-                            "cache initialization failed: {status}"
-                        )));
-                    }
-                    Ok(None) if Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(10))
-                    }
-                    result => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(result.err().unwrap_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                "cache initialization timed out",
-                            )
-                        }));
-                    }
-                }
+            // Recheck the serial and RAW layout through the held handle, and
+            // confirm the disks running Windows exclude this disk, immediately
+            // before the first write. A disk that already has a partition
+            // table (including one left by an interrupted initialization) is
+            // refused; the host then discards it.
+            if disk_serial(&self.disk, &reporter)? != self.expected_serial() {
+                return Err(invalid("cache disk serial changed"));
             }
+            let windows = self.windows_disks()?;
+            if windows.is_empty() || windows.contains(&self.number) {
+                return Err(invalid("cache disk may hold running Windows"));
+            }
+            require_uninitialized(self.layout()?)?;
+
+            let mut create: CREATE_DISK = unsafe { zeroed() };
+            create.PartitionStyle = PARTITION_STYLE_GPT;
+            create.Anonymous.Gpt = CREATE_DISK_GPT {
+                DiskId: random_guid()?,
+                MaxPartitionCount: 128,
+            };
+            control(&self.disk, IOCTL_DISK_CREATE_DISK, &create, "create GPT")?;
+            query(
+                &self.disk,
+                IOCTL_DISK_UPDATE_PROPERTIES,
+                &[],
+                &reporter,
+                CacheStep::UpdateProperties,
+            )?;
+
+            // Read back the usable range Windows chose for the new GPT, then
+            // write one Basic Data partition covering it.
+            let bytes = query(
+                &self.disk,
+                IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
+                &[],
+                &reporter,
+                CacheStep::DiskLayout,
+            )?;
+            let style: u32 = value(
+                &bytes,
+                offset_of!(DRIVE_LAYOUT_INFORMATION_EX, PartitionStyle),
+            )?;
+            if style != PARTITION_STYLE_GPT as u32 {
+                return Err(invalid("created cache disk is not GPT"));
+            }
+            let gpt: DRIVE_LAYOUT_INFORMATION_GPT =
+                value(&bytes, offset_of!(DRIVE_LAYOUT_INFORMATION_EX, Anonymous))?;
+            let (start, length) = cache_partition(gpt.StartingUsableOffset, gpt.UsableLength)?;
+            let mut layout: DRIVE_LAYOUT_INFORMATION_EX = unsafe { zeroed() };
+            layout.PartitionStyle = PARTITION_STYLE_GPT as u32;
+            layout.PartitionCount = 1;
+            layout.Anonymous.Gpt = gpt;
+            let partition = &mut layout.PartitionEntry[0];
+            partition.PartitionStyle = PARTITION_STYLE_GPT;
+            partition.StartingOffset = start;
+            partition.PartitionLength = length;
+            partition.PartitionNumber = 1;
+            partition.RewritePartition = true;
+            let mut name = [0u16; 36];
+            for (slot, unit) in name.iter_mut().zip("motor cache".encode_utf16()) {
+                *slot = unit;
+            }
+            partition.Anonymous.Gpt = PARTITION_INFORMATION_GPT {
+                PartitionType: GUID::from_u128(BASIC_DATA_PARTITION),
+                PartitionId: random_guid()?,
+                // Keep Windows from giving the cache a drive letter; it is only
+                // reachable through its mount folder.
+                Attributes: GPT_BASIC_DATA_ATTRIBUTE_NO_DRIVE_LETTER,
+                Name: name,
+            };
+            control(
+                &self.disk,
+                IOCTL_DISK_SET_DRIVE_LAYOUT_EX,
+                &layout,
+                "write cache partition",
+            )?;
+            query(
+                &self.disk,
+                IOCTL_DISK_UPDATE_PROPERTIES,
+                &[],
+                &reporter,
+                CacheStep::UpdateProperties,
+            )?;
+
+            let volume = self.new_volume()?;
+            motor_winagent::cache_format::run(&volume, deadline)
         })
     }
 

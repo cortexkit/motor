@@ -19,7 +19,28 @@ use std::{
 };
 
 pub(crate) fn setup_step<T>(step: &str, result: io::Result<T>) -> io::Result<T> {
-    result.map_err(|error| io::Error::other(format!("{step}: {error}")))
+    result.map_err(|error| {
+        io::Error::other(SetupError {
+            step: step.to_owned(),
+            error,
+        })
+    })
+}
+
+#[derive(Debug)]
+struct SetupError {
+    step: String,
+    error: io::Error,
+}
+impl std::fmt::Display for SetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.step, self.error)
+    }
+}
+impl std::error::Error for SetupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 /// How this runner instance runs jobs; each instance serves one platform.
@@ -32,6 +53,7 @@ pub enum BackendKind {
     Host,
     Vm,
     WindowsVm,
+    MacosVm,
 }
 
 impl FromStr for BackendKind {
@@ -42,7 +64,10 @@ impl FromStr for BackendKind {
             "host" => Ok(Self::Host),
             "vm" => Ok(Self::Vm),
             "windows-vm" => Ok(Self::WindowsVm),
-            _ => Err(invalid("unknown backend; expected host, vm or windows-vm")),
+            "macos-vm" => Ok(Self::MacosVm),
+            _ => Err(invalid(
+                "unknown backend; expected host, vm, windows-vm or macos-vm",
+            )),
         }
     }
 }
@@ -61,6 +86,10 @@ pub(crate) fn select(config: &Config) -> io::Result<Box<dyn Backend>> {
             Err(invalid("--backend windows-vm requires --vm-config <file>"))
         }
         BackendKind::WindowsVm => Ok(Box::new(crate::windows::WindowsBackend)),
+        #[cfg(unix)]
+        BackendKind::MacosVm => Ok(Box::new(crate::macos::MacosBackend)),
+        #[cfg(not(unix))]
+        BackendKind::MacosVm => Err(invalid("macos-vm requires macOS")),
     }
 }
 
@@ -73,7 +102,12 @@ pub(crate) struct Setup {
     pub base: bool,
     /// Sibling checkout paths mapped to their commits when setup was reserved.
     /// Checkout compares these with the requested commits before reusing files.
+    /// Empty in sibling snapshot mode, which never checks a sibling out.
     pub recorded: BTreeMap<String, String>,
+    /// In sibling snapshot mode, for a job that is not a warm build: its
+    /// siblings' snapshots, resolved by the setup thread before
+    /// materialization. `None` when siblings are checked out in place.
+    pub snapshots: Option<crate::sibling_snapshots::JobSiblings>,
 }
 
 pub(crate) struct Prepared {
@@ -81,7 +115,7 @@ pub(crate) struct Prepared {
     pub target: PathBuf,
     pub wrapper: Option<PathBuf>,
     pub sandbox: Option<Box<dyn IsolationLauncher>>,
-    pub windows: Option<std::sync::Mutex<Option<crate::windows::PreparedVm>>>,
+    pub vm: Option<std::sync::Mutex<Option<Box<dyn Execution>>>>,
 }
 
 /// Owns the prepared service and mount configuration. Tests can substitute a
@@ -117,6 +151,9 @@ pub(crate) struct Launch {
     pub process: Option<platform::ProcessIdentity>,
     pub durable_output: bool,
     pub execution: Box<dyn Execution>,
+    /// The write ledgers of the unit's cache sockets; empty for a unit that is
+    /// not a fill or has no remote cache.
+    pub cache_ledgers: Vec<std::sync::Arc<crate::remote_cache::gateway::WriteLedger>>,
 }
 
 pub(crate) struct Output {
@@ -139,13 +176,21 @@ pub(crate) trait Execution: Send {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ExecutionOutcome {
     Unix(ExitStatus),
-    WindowsExit { code: u32 },
+    WindowsExit {
+        code: u32,
+    },
+    #[cfg(unix)]
+    Signal {
+        signal: i32,
+    },
 }
 impl ExecutionOutcome {
     pub(crate) fn success(&self) -> bool {
         match self {
             Self::Unix(status) => status.success(),
             Self::WindowsExit { code } => *code == 0,
+            #[cfg(unix)]
+            Self::Signal { .. } => false,
         }
     }
     pub(crate) fn wire(self) -> motor_protocol::Outcome {
@@ -168,6 +213,8 @@ impl ExecutionOutcome {
                     },
                 }),
             Self::WindowsExit { code } => windows_outcome(code),
+            #[cfg(unix)]
+            Self::Signal { signal } => motor_protocol::Outcome::Signal { signal },
         }
     }
 }
@@ -316,13 +363,24 @@ pub(crate) fn live_job_units(config: &Config) -> io::Result<std::collections::BT
             String::from_utf8_lossy(&output.stderr)
         )));
     }
-    if output.stdout.len() > 1024 * 1024 {
+    parse_live_job_units(&output.stdout)
+}
+
+/// Each row ends with the unit's description, which systemd-run fills with the
+/// job's whole command line, so a row can be as long as any command a caller
+/// sends. Only the four leading fields are read; the bounds cover the listing
+/// as a whole, never one row, so one long command can't refuse every job.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn parse_live_job_units(
+    stdout: &[u8],
+) -> io::Result<std::collections::BTreeSet<String>> {
+    if stdout.len() > 64 * 1024 * 1024 {
         return Err(io::Error::other("live job unit listing exceeds size limit"));
     }
-    let text = std::str::from_utf8(&output.stdout).map_err(io::Error::other)?;
+    let text = std::str::from_utf8(stdout).map_err(io::Error::other)?;
     let mut units = std::collections::BTreeSet::new();
     for (index, line) in text.lines().enumerate() {
-        if index >= 10_000 || line.len() > 4096 {
+        if index >= 10_000 {
             return Err(io::Error::other("live job unit listing exceeds row limit"));
         }
         let mut fields = line.split_whitespace();
@@ -390,6 +448,13 @@ impl Backend for HostBackend {
             Some(&r.cwd),
             &r.siblings,
         )?;
+        if config.sibling_snapshot_mode() && !s.base {
+            workspace::validate(&r.workspace_key, &r.repository_root, &r.siblings, true)?;
+            workspace::validate_alias_destinations(
+                &config.owned_workspace_roots,
+                &workspace::sibling_aliases(&r.workspace_key, &r.siblings)?,
+            )?;
+        }
         if !s.base {
             crate::writer::validate_paths(
                 config,
@@ -402,6 +467,17 @@ impl Backend for HostBackend {
             return Err(io::Error::other("dependency writer account is unavailable"));
         }
         let path = PathBuf::from(if s.base { &r.cwd } else { &r.workspace_key });
+        #[cfg(target_os = "linux")]
+        if config.boat_profile && path.exists() {
+            // Bound hostile cached trees before permission repair or checkout
+            // starts a separate, potentially much larger traversal.
+            setup_step(
+                "preflight Boat cached tree",
+                crate::boat_quota::preflight_cached_tree(&path).map_err(|error| {
+                    crate::boat_quota::cache_walk_error(error, config.boat_cold_materialization)
+                }),
+            )?;
+        }
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && path.exists() {
             crate::setup_log::phase("restore workspace access", || {
@@ -433,9 +509,10 @@ impl Backend for HostBackend {
         // separate from the workspace check because a job's first run has no
         // workspace yet while its siblings can already exist. Admission never
         // lets a sibling be prepared while a job is running in it, so no job is
-        // affected.
+        // affected. A job that mounts its siblings from snapshots never reads
+        // or writes their host paths, so it leaves them alone.
         #[cfg(target_os = "linux")]
-        if config.isolate_jobs {
+        if config.isolate_jobs && s.snapshots.is_none() {
             for sibling in &r.siblings {
                 let sibling = std::path::Path::new(&sibling.canonical_path);
                 if !sibling.is_dir() {
@@ -476,8 +553,18 @@ impl Backend for HostBackend {
             });
             setup_step(
                 "populate workspace",
-                crate::setup_log::phase("populate workspace", || {
-                    trees.populate(
+                crate::setup_log::phase("populate workspace", || match &s.snapshots {
+                    // Each sibling comes from its snapshot, mounted at the
+                    // sibling's path by the sandbox: only the main workspace
+                    // is checked out on the host.
+                    Some(_) => trees.populate_main(
+                        &r.workspace_key,
+                        &r.repository_root,
+                        &r.snapshot_commit,
+                        &r.tree_hash,
+                        &caller_commit,
+                    ),
+                    None => trees.populate(
                         &r.workspace_key,
                         &r.repository_root,
                         &r.snapshot_commit,
@@ -485,7 +572,7 @@ impl Backend for HostBackend {
                         &s.recorded,
                         &r.tree_hash,
                         &caller_commit,
-                    )
+                    ),
                 }),
             )?;
         }
@@ -587,6 +674,15 @@ impl Backend for HostBackend {
                 })
                 .collect();
             trees.refresh_dependency_aliases(&lockfile, &routes)?;
+            // In snapshot mode the sandbox mounts each sibling's snapshot at
+            // the sibling's path, and the Cargo prefetch sees the same view.
+            let snapshots =
+                s.snapshots
+                    .as_ref()
+                    .map(|snapshots| crate::isolation::SnapshotSiblings {
+                        config,
+                        siblings: snapshots.mounts(),
+                    });
             let sandbox = setup_step(
                 "prepare isolated job sandbox",
                 crate::setup_log::phase("prepare isolated sandbox", || {
@@ -601,6 +697,9 @@ impl Backend for HostBackend {
                             config.rustc_slots,
                             &routes,
                             &r.tree_hash,
+                            &crate::isolation::JavascriptTools::for_config(config),
+                            config.boat_profile,
+                            None,
                         )
                     } else {
                         crate::isolation::Sandbox::prepare_with_dependencies(
@@ -617,6 +716,9 @@ impl Backend for HostBackend {
                             &r.repository_root,
                             config.tenant_vm,
                             config.shared_compile_cache(),
+                            snapshots.as_ref(),
+                            &crate::isolation::JavascriptTools::for_config(config),
+                            None,
                         )
                     }
                     // When a job ends, the engine checks whether systemd stopped its
@@ -633,6 +735,7 @@ impl Backend for HostBackend {
                                 config.private_pids,
                                 config.boat_memory_max_bytes,
                             )
+                            .with_pid_init(config.pid_init.clone())
                             .without_provider_environment(&config.boat_unset_environment)
                     })
                     .and_then(|sandbox| {
@@ -656,6 +759,24 @@ impl Backend for HostBackend {
                 }),
             )?;
             let sandbox = sandbox.tracking_cleanup(config.background_deletes.clone());
+            let sandbox = if config.boat_profile {
+                let sandbox = sandbox.with_boat_temporary_paths()?;
+                let runtime = trees.state.join("sandboxes").join(s.id.to_string());
+                let spool = trees.state.join("spools").join(s.id.to_string());
+                fs::create_dir_all(&spool)?;
+                setup_step(
+                    "install Boat job disk quota",
+                    crate::boat_quota::prepare(
+                        &trees.state,
+                        s.id,
+                        crate::boat_quota::job_roots(&path, &target, &runtime, &spool),
+                        config.boat_cold_materialization,
+                    ),
+                )?;
+                sandbox
+            } else {
+                sandbox
+            };
             wrapper = sandbox.wrapper.clone();
             Some(Box::new(sandbox) as Box<dyn IsolationLauncher>)
         } else {
@@ -671,7 +792,7 @@ impl Backend for HostBackend {
             target,
             wrapper,
             sandbox,
-            windows: None,
+            vm: None,
         })
     }
     fn launch(
@@ -688,6 +809,23 @@ impl Backend for HostBackend {
             setup_step(
                 "verify Boat storage",
                 verify_boat_storage(Path::new("/Users"), &config.state_dir(), &prepared.cwd),
+            )?;
+        }
+        #[cfg(target_os = "linux")]
+        if config.boat_profile {
+            let workspace = Path::new(if s.base { &r.cwd } else { &r.workspace_key });
+            setup_step(
+                "verify Boat quota lease",
+                crate::boat_quota::validate_for_launch(
+                    &trees.state,
+                    s.id,
+                    &crate::boat_quota::job_roots(
+                        workspace,
+                        &prepared.target,
+                        &trees.state.join("sandboxes").join(s.id.to_string()),
+                        &trees.state.join("spools").join(s.id.to_string()),
+                    ),
+                ),
             )?;
         }
         let mut env = BTreeMap::new();
@@ -760,10 +898,15 @@ impl Backend for HostBackend {
             // The non-isolated host backend is development-only and does not pin CPUs.
             platform::launch(&s.request.command, &prepared.cwd, &env)
         }?;
+        #[cfg(target_os = "linux")]
+        let cache_ledgers = launch.cache_ledgers();
+        #[cfg(not(target_os = "linux"))]
+        let cache_ledgers = Vec::new();
         Ok(Launch {
             process: Some(launch.identity),
             durable_output: launch.durable_output,
             execution: Box::new(launch),
+            cache_ledgers,
         })
     }
 
@@ -896,9 +1039,20 @@ fn compile_cache_environment(
     prepared: &Prepared,
     env: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
+    scrub_inherited_cache_environment(config, setup, env);
     if !config.shared_compile_cache() {
         env.retain(|key, _| key != "RUSTC_WRAPPER" && !key.starts_with("SCCACHE_"));
-        return Ok(());
+        // Without the shared cache an isolated Rust job still builds in the same fixed
+        // folder as on the build server; the sandbox binds it to the job's own
+        // target folder (`compile_cache_mounts`).
+        #[cfg(target_os = "linux")]
+        if config.isolate_jobs && rust_job(setup) {
+            env.insert(
+                "CARGO_TARGET_DIR".into(),
+                crate::compile_cache::TARGET.into(),
+            );
+        }
+        return remote_cache_environment(config, setup, env);
     }
     if let Some(wrapper) = &prepared.wrapper {
         env.insert(
@@ -909,12 +1063,7 @@ fn compile_cache_environment(
         env.remove("RUSTC_WRAPPER");
     }
     #[cfg(target_os = "linux")]
-    if config.isolate_jobs
-        && (setup.base
-            || Path::new(&setup.request.workspace_key)
-                .join("Cargo.toml")
-                .is_file())
-    {
+    if config.isolate_jobs && rust_job(setup) {
         crate::compile_cache::reader_environment(env, config.sccache_size_gib);
         if setup.base {
             env.insert("SCCACHE_LOCAL_RW_MODE".into(), "READ_WRITE".into());
@@ -936,7 +1085,104 @@ fn compile_cache_environment(
     }
     #[cfg(not(target_os = "linux"))]
     let _ = setup;
+    remote_cache_environment(config, setup, env)
+}
+
+/// A cache fill, or a job whose workspace root is a Cargo workspace.
+#[cfg(target_os = "linux")]
+fn rust_job(setup: &Setup) -> bool {
+    setup.base
+        || Path::new(&setup.request.workspace_key)
+            .join("Cargo.toml")
+            .is_file()
+}
+
+/// The runner's own environment can carry sccache and AWS settings (an
+/// operator's shell, an inherited unit, a caller request that reached the
+/// allowlist). None of them may shape a job: they would either override the
+/// local level-1 settings the runner adds afterwards or point the tool at a
+/// store this job may not use. They are removed only while the remote cache
+/// can be on for this unit, because with it off every job environment must be
+/// exactly what it was before the cache existed, operator settings included;
+/// scrubbing always runs before anything is added, so it never removes a
+/// value the runner generated.
+pub(crate) fn scrub_inherited_cache_environment(
+    config: &Config,
+    setup: &Setup,
+    env: &mut BTreeMap<String, String>,
+) {
+    // The writer branch below runs for every fill on every host type, but only
+    // the build server's fills and its Rust jobs ever reach the cache: every
+    // other unit must keep exactly the environment base gave it.
+    if config.remote_cache_available(setup.base).is_none() {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if !(setup.base || rust_job(setup)) {
+        return;
+    }
+    #[cfg(not(target_os = "linux"))]
+    if !setup.base {
+        return;
+    }
+    env.retain(|key, _| {
+        !crate::remote_cache::environment::INHERITED_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+    });
+}
+
+/// The remote cache's job delta, when the integration is on for this unit.
+///
+/// It is on only when the runner switch, the cache tenant's `enabled` state
+/// and job isolation all hold: without isolation a job runs as the runner's
+/// own account and could open the keys, so the switch is ignored there. The
+/// gateway's generation is the authority on `enabled`. Nothing starts the
+/// gateway yet, so no unit is switched on and every role keeps today's
+/// environment; `remote_cache_job_environment` is what a switched-on unit
+/// would add on top of that baseline.
+fn remote_cache_environment(
+    config: &Config,
+    setup: &Setup,
+    env: &mut BTreeMap<String, String>,
+) -> io::Result<()> {
+    let Some((generation, forwarders)) = config.unit_remote_cache(setup.base) else {
+        return Ok(());
+    };
+    remote_cache_job_environment(
+        crate::remote_cache::provisioning::HostRole::of(config),
+        &forwarders,
+        &generation,
+        setup.base,
+        env,
+    );
     Ok(())
+}
+
+/// Apply one host type's remote cache delta to `env`: exactly the difference
+/// between its switch-off job environment and its switch-on one. `env` must
+/// already hold the role's baseline.
+pub(crate) fn remote_cache_job_environment(
+    role: crate::remote_cache::provisioning::HostRole,
+    forwarders: &[crate::remote_cache::transport::Forwarder],
+    generation: &crate::remote_cache::provisioning::ActiveGeneration,
+    fill: bool,
+    env: &mut BTreeMap<String, String>,
+) {
+    let mut delta = crate::remote_cache::environment::delta(
+        role,
+        forwarders,
+        &generation.bucket,
+        &generation.region,
+    );
+    if fill {
+        delta.extend(crate::remote_cache::environment::fill_values());
+        delta.insert(
+            "SCCACHE_S3_RW_MODE".into(),
+            crate::remote_cache::environment::READ_WRITE_MODE.into(),
+        );
+    }
+    env.extend(delta);
 }
 
 // Preserve only the daemon context toolchains need. Request values are filtered

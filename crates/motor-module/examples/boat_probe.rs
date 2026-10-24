@@ -18,12 +18,28 @@ impl Connector for Forward {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    // stdout carries only the final JSON result. stderr records the client's
+    // own log lines and when each stage was reached, so a probe that kills a
+    // client with no terminal can tell whether the job was never accepted,
+    // accepted but never started, or started and never finished.
+    let _ = motor_module::logging::init();
+    let began = std::time::Instant::now();
+    let stage = |text: std::fmt::Arguments| {
+        eprintln!("boat_probe +{:.3}s {text}", began.elapsed().as_secs_f64());
+    };
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.len() != 4 {
+    if !(4..=6).contains(&args.len()) {
         return Err(io::Error::other(
-            "usage: boat_probe LOOPBACK_ADDRESS REPOSITORY STORAGE COMMAND",
+            "usage: boat_probe LOOPBACK_ADDRESS REPOSITORY STORAGE COMMAND [VCPUS [TIMEOUT_SECONDS]]",
         ));
     }
+    // The probe passes the sandbox's measured vCPU count as the job weight, so a job fits
+    // every Boat size; without it the weight stays 8 (a whole large sandbox), as before.
+    let vcpus: u32 = match args.get(4) {
+        Some(text) => text.parse().map_err(io::Error::other)?,
+        None => 8,
+    };
+    let timeout = job_timeout(args.get(5).map(String::as_str))?;
     let address: std::net::SocketAddr = args[0].parse().map_err(io::Error::other)?;
     if !address.ip().is_loopback() {
         return Err(io::Error::other("probe requires a loopback SSH forward"));
@@ -34,20 +50,38 @@ async fn main() -> io::Result<()> {
         Arc::new(Forward(address)),
     )?;
     let request = RunRequest::new(&args[1], &args[1], &args[1], &args[3])
-        .with_timeout(120)
-        .with_weight_hint(8);
+        .with_timeout(timeout)
+        .with_weight_hint(vcpus);
     let mut stream = motor.run(request)?;
+    stage(format_args!("job submitted"));
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
+    let mut output_records = 0u64;
     while let Some(record) = stream.records.recv().await {
         match record? {
-            StreamRecord::Accepted(_) => {}
-            StreamRecord::Output(output) => match output.stream {
-                OutputStream::Stdout => stdout.extend_from_slice(&output.bytes.0),
-                OutputStream::Stderr => stderr.extend_from_slice(&output.bytes.0),
-                _ => return Err(io::Error::other("unknown job output stream")),
-            },
+            StreamRecord::Accepted(accepted) => stage(format_args!(
+                "accepted job_id={} queue_position={}",
+                accepted.job_id, accepted.queue_position
+            )),
+            StreamRecord::Started(started) => stage(format_args!(
+                "started queue_wait_ms={}",
+                started.queue_wait_ms
+            )),
+            StreamRecord::Output(output) => {
+                output_records += 1;
+                if output_records == 1 {
+                    stage(format_args!("first output seq={}", output.seq));
+                }
+                match output.stream {
+                    OutputStream::Stdout => stdout.extend_from_slice(&output.bytes.0),
+                    OutputStream::Stderr => stderr.extend_from_slice(&output.bytes.0),
+                    _ => return Err(io::Error::other("unknown job output stream")),
+                }
+            }
             StreamRecord::Terminal(terminal) => {
+                stage(format_args!(
+                    "terminal after {output_records} output records"
+                ));
                 stream.acknowledge_terminal()?;
                 println!(
                     "{}",
@@ -58,8 +92,48 @@ async fn main() -> io::Result<()> {
                 );
                 return Ok(());
             }
-            _ => {}
+            other => stage(format_args!("other record {}", record_kind(&other))),
         }
     }
     Err(io::Error::other("job stream ended without a terminal"))
+}
+
+fn job_timeout(value: Option<&str>) -> io::Result<u64> {
+    let seconds = value
+        .map(str::parse::<u64>)
+        .transpose()
+        .map_err(io::Error::other)?
+        .unwrap_or(120);
+    if !(1..=900).contains(&seconds) {
+        return Err(io::Error::other(
+            "probe job timeout must be between 1 and 900 seconds",
+        ));
+    }
+    Ok(seconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn existing_probe_deadline_stays_120_seconds() {
+        assert_eq!(job_timeout(None).unwrap(), 120);
+    }
+    #[test]
+    fn quota_deadline_is_explicit_and_bounded() {
+        assert_eq!(job_timeout(Some("900")).unwrap(), 900);
+        for value in ["0", "901", "not-a-number"] {
+            assert!(job_timeout(Some(value)).is_err());
+        }
+    }
+}
+
+/// The record's variant name, for the stage log.
+fn record_kind(record: &StreamRecord) -> &'static str {
+    match record {
+        StreamRecord::ReturnResult(_) => "return_result",
+        StreamRecord::ReturnChunk(_) => "return_chunk",
+        StreamRecord::ReturnManifest(_) => "return_manifest",
+        _ => "unrecognized",
+    }
 }

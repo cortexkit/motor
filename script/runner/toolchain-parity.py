@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Read-only inventory of the Linux runner's job-visible toolchain."""
+"""Read-only inventory of a runner's job-visible toolchain."""
 
 import argparse
+import fnmatch
 import hashlib
 import importlib.util
 import json
@@ -13,13 +14,32 @@ import shutil
 import subprocess
 
 HERE = Path(__file__).resolve().parent
+PARITY_FILES = tuple((HERE / "parity-files.txt").read_text().splitlines())
 MANIFEST = HERE / "toolchain.json"
+LOCAL_BIN = Path("/usr/local/bin")
+# A tenant VM binds the tenant's own directories over these image paths before
+# its runner starts, so no tool the tenant runner executes may live beneath them.
+TENANT_WORKSPACE_ROOTS = ("/home", "/Users")
+HOST_ONLY_LOCAL_BIN_PATTERNS = ("motor-host*", "firecracker-*", "jailer-*")
 if 'seed' not in globals():
     seed_spec = importlib.util.spec_from_file_location('cargo_seed', HERE / 'cargo-seed.py')
     if seed_spec is None or seed_spec.loader is None:
         raise ImportError('cannot load Cargo seed inventory')
     seed = importlib.util.module_from_spec(seed_spec)
     seed_spec.loader.exec_module(seed)
+if 'syscall_surface' not in globals():
+    syscall_spec = importlib.util.spec_from_file_location('syscall_surface', HERE / 'syscall-surface.py')
+    if syscall_spec is None or syscall_spec.loader is None:
+        raise ImportError('cannot load syscall surface probe')
+    syscall_surface = importlib.util.module_from_spec(syscall_spec)
+    syscall_spec.loader.exec_module(syscall_surface)
+if 'remote_cache_environment' not in globals():
+    remote_cache_spec = importlib.util.spec_from_file_location(
+        'remote_cache_environment', HERE / 'remote-cache-environment.py')
+    if remote_cache_spec is None or remote_cache_spec.loader is None:
+        raise ImportError('cannot load remote cache environment')
+    remote_cache_environment = importlib.util.module_from_spec(remote_cache_spec)
+    remote_cache_spec.loader.exec_module(remote_cache_environment)
 
 
 def output(*args, env=None):
@@ -32,6 +52,18 @@ def optional_text(path):
         return Path(path).read_text().strip()
     except (FileNotFoundError, PermissionError):
         return None
+
+
+def local_bin_entries(directory=LOCAL_BIN):
+    try:
+        return sorted(path.name for path in directory.iterdir()
+                      if path.is_file() and os.access(path, os.X_OK))
+    except FileNotFoundError:
+        return []
+
+
+def host_only_local_bin(name):
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in HOST_ONLY_LOCAL_BIN_PATTERNS)
 
 
 def binary_version(path, env):
@@ -54,14 +86,96 @@ def binary_version(path, env):
         return {"version": None, "error": str(error)}
 
 
-def capture(manifest=None, job=False):
+def tool_version(path, env, observed, version_from=None):
+    if version_from:
+        source = observed.get(version_from) or {}
+        return {"version": source.get("version"), "exit_code": source.get("exit_code", 1)}
+    return binary_version(path, env)
+
+
+def role_manifest(manifest, role, job=False):
+    """Select the role's toolchain roots; jobs keep registry caches in /motor-home/cargo."""
+    return {**manifest, **manifest.get('layout_by_role', {}).get(role, {}).get('job' if job else 'host', {})}
+
+
+def runtime_capture():
+    import tempfile
+
+    runtime = {'proc': {}, 'inotify': {}, 'tmpdir': tempfile.gettempdir()}
+    for name in ('self/mountinfo', 'cpuinfo', 'meminfo'):
+        try:
+            runtime['proc'][name] = bool(Path('/proc', name).read_text())
+        except OSError:
+            runtime['proc'][name] = False
+    for name in ('max_user_instances', 'max_user_watches', 'max_queued_events'):
+        value = optional_text('/proc/sys/fs/inotify/' + name)
+        runtime['inotify'][name] = int(value) if value else None
+    try:
+        with tempfile.TemporaryFile(dir='/dev/shm') as shared:
+            shared.write(b'shared memory probe')
+        runtime['dev_shm_writable'] = True
+    except OSError:
+        runtime['dev_shm_writable'] = False
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / 'exec-probe'
+            executable.write_text('#!/bin/sh\nexit 0\n')
+            executable.chmod(0o700)
+            runtime['tmpdir_exec'] = subprocess.run([str(executable)], timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        runtime['tmpdir_exec'] = False
+    runtime['sshd_executable'] = os.access('/usr/sbin/sshd', os.X_OK)
+    runtime['api_mounts'] = [line for line in (optional_text('/proc/self/mountinfo') or '').splitlines()
+                             if line.split()[4] in ('/proc', '/dev/shm')]
+    try:
+        runtime['visible_pids'] = len([path for path in Path('/proc').iterdir() if path.name.isdigit()])
+    except OSError:
+        runtime['visible_pids'] = None
+    return runtime
+
+
+def job_identity(job, role='build-server'):
+    if job:
+        return {'uid': os.getuid(), 'gid': os.getgid()}
+    import pwd
+    try:
+        account = pwd.getpwnam('motor-job')
+    except KeyError:
+        return None
+    identity: dict[str, object] = {'uid': account.pw_uid, 'gid': account.pw_gid}
+    if role == 'boat':
+        import grp
+        try:
+            primary_group = grp.getgrgid(account.pw_gid).gr_name
+        except KeyError:
+            primary_group = None
+        minimum = re.search(r'^\s*UID_MIN\s+(\d+)\s*(?:#.*)?$', optional_text('/etc/login.defs') or '', re.M)
+        identity.update(primary_group=primary_group, shell=account.pw_shell,
+                        uid_min=int(minimum.group(1)) if minimum else None)
+    return identity
+
+
+def macos_parity():
+    spec = importlib.util.spec_from_file_location('macos_parity', HERE.parent / 'macos-runner/parity.py')
+    if spec is None or spec.loader is None:
+        raise ImportError('cannot load macOS toolchain inventory')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def capture(manifest=None, job=False, role="build-server", remote_cache_on=False):
+    if role == "macos":
+        return macos_parity().capture(manifest, job)
     paths = manifest or {}
     cargo_home = Path(paths.get("cargo_home", os.environ.get("CARGO_HOME", "/srv/build/cargo-home")))
     rustup_home = Path(paths.get("rustup_home", os.environ.get("RUSTUP_HOME", "/home/ubuntu/.rustup")))
     env = dict(os.environ, CARGO_HOME=str(cargo_home), RUSTUP_HOME=str(rustup_home),
                RUSTUP_AUTO_INSTALL="0", RUSTUP_NO_UPDATE_CHECK="1")
     if not job:
-        env["PATH"] = str(cargo_home / "bin") + ":/home/ubuntu/.bun/bin:" + os.environ.get("PATH", os.defpath)
+        bun_dir = Path(tool_path(paths.get("tools", {}).get("bun", {}), role, job)
+                       or "/home/ubuntu/.bun/bin/bun").parent
+        env["PATH"] = str(cargo_home / "bin") + f":{bun_dir}:" + os.environ.get("PATH", os.defpath)
     rustup = str(cargo_home / "bin/rustup")
     toolchains = {}
     target_payloads = {}
@@ -89,13 +203,19 @@ def capture(manifest=None, job=False):
         if path.is_file():
             metadata[str(root)] = json.loads(path.read_text())
     tools = {}
-    names = {"node", "npm", "bun", "pnpm", "nats-server", "wasm-opt", "esbuild",
+    names = {"node", "npm", "bun", "pnpm", "nats-server", "wasm-opt", "esbuild", "git",
              "x86_64-w64-mingw32-gcc", "x86_64-w64-mingw32-g++"}
+    names.update(paths.get("tools", {}))
     names.update(paths.get("gnu_coreutils", {}))
     for directory in env["PATH"].split(":"):
         if directory:
             names.update(path.name for path in Path(directory).glob("gnu*") if path.is_file())
-    for name in sorted(names):
+    # A tool whose version is read from another tool's measurement (pnpm's
+    # pn, pnpx and pnx aliases take pnpm's) is measured after the tools without
+    # one. Alphabetical order alone would reach pn before pnpm and record no
+    # version for it.
+    specs = paths.get("tools", {})
+    for name in sorted(names, key=lambda name: (bool(specs.get(name, {}).get("version_from")), name)):
         path = shutil.which(name, path=env["PATH"])
         if path is None and name in paths.get("gnu_coreutils", {}):
             candidate = paths["gnu_coreutils"][name]
@@ -104,8 +224,10 @@ def capture(manifest=None, job=False):
             owner = "" if job else subprocess.run(
                 ["dpkg-query", "-S", str(Path(path).resolve())], text=True,
                 capture_output=True, timeout=30).stdout.strip()
+            version = tool_version(path, env, tools,
+                                   paths.get("tools", {}).get(name, {}).get("version_from"))
             tools[name] = {"path": path, "realpath": str(Path(path).resolve()),
-                           **binary_version(path, env), "package": owner}
+                           **version, "package": owner}
             if name == 'gnutest':
                 tools[name]['sha256'] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
         else:
@@ -118,20 +240,27 @@ def capture(manifest=None, job=False):
     job_names = set(paths.get('job_environment', {}))
     for role_environment in paths.get('job_environment_by_role', {}).values():
         job_names.update(role_environment)
+    if remote_cache_on:
+        job_names.update(remote_cache_environment.JOB_ENVIRONMENT_BY_ROLE[role])
     mountinfo = Path('/proc/self/mountinfo').read_text() if job else ''
     wrapper = {}
     if job:
         contract = paths['compile_wrapper']
         resolved = shutil.which(os.environ.get('RUSTC_WRAPPER', ''), path=env['PATH'])
         cache_path = shutil.which('sccache', path=env['PATH'])
+        # A role without a shared compile cache has no supervisor file or
+        # backend; its wrapper is the runner's own sccache, and only a
+        # switch-on job has one at all.
+        wrapper_path = contract['sccache_path'] if remote_cache_on and role != 'build-server' else None
         wrapper = {
             'resolved': resolved,
             'supervisor_cache': optional_text(contract['supervisor_cache_file']),
             'sccache_path': cache_path,
             'sccache_sha256': hashlib.sha256(Path(cache_path).read_bytes()).hexdigest() if cache_path else None,
             'backend': optional_text(contract['sccache_path'] + '.backend'),
-            'wrapper_readonly': readonly_mount(contract['sccache_path'], mountinfo),
-            'backend_readonly': readonly_mount(contract['backend'], mountinfo),
+            'wrapper_readonly': readonly_mount(wrapper_path or contract['sccache_path'], mountinfo),
+            'backend_readonly': (readonly_mount(contract['backend'], mountinfo)
+                                 if wrapper_path is None else None),
         }
     return {
         "schema": 1,
@@ -144,23 +273,47 @@ def capture(manifest=None, job=False):
         "cargo_home": str(cargo_home), "rustup_home": str(rustup_home),
         "cargo_binaries": binaries, "cargo_metadata": metadata,
         "tools": tools, "apt_packages": packages,
+        "local_bin_entries": [] if job else local_bin_entries(),
         "environment": {name: env.get(name) for name in (
             "PATH", "CC", "CXX", "WASM_BINDGEN_BIN", "WASM_OPT_BIN", "ESBUILD_BIN",
             "RUSTFLAGS", "CARGO_BUILD_TARGET", "PKG_CONFIG_PATH")},
         "job_environment": {name: os.environ.get(name) for name in sorted(job_names)},
         "compile_wrapper": wrapper,
         "mountinfo": mountinfo,
+        "runtime": runtime_capture() if job else {},
+        "syscalls": syscall_surface.capture(),
+        "job_identity": job_identity(job, role),
         "cargo_registry": seed.capture(os.environ.get('CARGO_HOME', cargo_home) if job else cargo_home, strict=False),
     }
+
+
+def tool_path(spec, role, job=False):
+    """Where `role` puts a manifest tool: jobs see `job_path` when the tool has
+    one (Bun, which the runner mounts there), otherwise both hosts and jobs use
+    the role's `path_by_role` entry or the measured build-server `path`."""
+    if job and "job_path" in spec:
+        return spec["job_path"]
+    return spec.get("path_by_role", {}).get(role, spec.get("path"))
 
 
 def first_line(text):
     return text.splitlines()[0] if text else ""
 
 
-def validate(manifest):
+def validate(manifest, role="build-server"):
+    if role == "macos":
+        macos_parity().validate(manifest, json.loads(MANIFEST.read_text()))
+        return
     if manifest["schema"] != 1 or manifest["rust_default"] not in manifest["rust_toolchains"]:
         raise ValueError("invalid parity schema or default toolchain")
+    identities = manifest.get('job_identity_by_role', {})
+    if set(identities) != {'build-server', 'boat', 'tenant'} or identities['boat'] != 'system-assigned':
+        raise ValueError('invalid role-specific job identities')
+    for pinned_role in ('build-server', 'tenant'):
+        identity = identities[pinned_role]
+        if (not isinstance(identity, dict) or set(identity) != {'uid', 'gid'}
+                or any(type(value) is not int or value <= 0 for value in identity.values())):
+            raise ValueError('invalid numeric job identity: ' + pinned_role)
     for key in ("rustup",):
         if not re.fullmatch(r"\d+\.\d+\.\d+", manifest[key]):
             raise ValueError("unpinned version: " + key)
@@ -174,11 +327,70 @@ def validate(manifest):
         std = sorted(component.removeprefix("rust-std-") for component in spec["components"] if component.startswith("rust-std-"))
         if std != spec["targets"]:
             raise ValueError("Rust targets and components disagree: " + name)
-    for name, pattern in {"node": r"v\d+\.\d+\.\d+", "npm": r"\d+\.\d+\.\d+",
-                          "bun": r"\d+\.\d+\.\d+", "pnpm": r"\d+\.\d+\.\d+",
+    for name, pattern in {"node": r"v\d+\.\d+\.\d+", "node22": r"v\d+\.\d+\.\d+",
+                          "npm": r"\d+\.\d+\.\d+", "npx": r"\d+\.\d+\.\d+",
+                          "corepack": r"\d+\.\d+\.\d+", "bun": r"\d+\.\d+\.\d+",
+                          "bun-1.3.14": r"\d+\.\d+\.\d+", "pnpm": r"\d+\.\d+\.\d+",
+                          "pnpx": r"\d+\.\d+\.\d+", "pnx": r"\d+\.\d+\.\d+",
                           "nats-server": r"nats-server: v\d+\.\d+\.\d+"}.items():
-        if not re.fullmatch(pattern, manifest["tools"][name]["version"]):
+        if name in manifest["tools"] and not re.fullmatch(pattern, manifest["tools"][name]["version"]):
             raise ValueError("unpinned version: " + name)
+    archive_urls = {
+        "bun-1.3.14": "https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-x64.zip",
+        "node22": "https://nodejs.org/dist/v22.22.1/node-v22.22.1-linux-x64.tar.xz",
+    }
+    archive_layouts = {
+        "bun-1.3.14": ("1.3.14", "zip", "/usr/local/lib/bun/1.3.14", "bin/bun",
+                        "/usr/local/bin/bun-1.3.14"),
+        "node22": ("v22.22.1", "tar.xz", "/usr/local/lib/nodejs/22.22.1", "bin/node",
+                   "/usr/local/bin/node22"),
+    }
+    for name, url in archive_urls.items():
+        if name not in manifest["tools"]:
+            continue
+        spec = manifest["tools"][name]
+        archive = spec.get("archive", {})
+        if archive.get("url") != url or not re.fullmatch(r"[a-f0-9]{64}", archive.get("sha256", "")):
+            raise ValueError("invalid pinned archive: " + name)
+        version, archive_format, install_dir, install_path, link = archive_layouts[name]
+        if (spec["version"] != version or archive.get("format") != archive_format
+                or archive.get("install_dir") != install_dir or archive.get("install_path") != install_path
+                or spec["path"] != link):
+            raise ValueError("invalid archive install layout: " + name)
+        if name == "bun-1.3.14" and archive.get("archive_path") != "bun-linux-x64/bun":
+            raise ValueError("invalid Bun archive binary: " + name)
+        if name == "node22" and archive.get("strip_components") != 1:
+            raise ValueError("invalid Node archive root: " + name)
+    wasm_opt = manifest["tools"].get("wasm-opt")
+    if wasm_opt is not None:
+        match = re.fullmatch(r"wasm-opt version (\d+)", wasm_opt.get("version", ""))
+        if not match:
+            raise ValueError("unpinned version: wasm-opt")
+        release = match.group(1)
+        source = wasm_opt.get("source", {})
+        url = (f"https://github.com/WebAssembly/binaryen/releases/download/version_{release}/"
+               f"binaryen-version_{release}-x86_64-linux.tar.gz")
+        expected_paths = {"boat": "/usr/local/bin/wasm-opt", "tenant": "/usr/local/bin/wasm-opt"}
+        expected_realpaths = {role: f"/usr/local/lib/binaryen/{release}/bin/wasm-opt"
+                              for role in ("boat", "tenant")}
+        if (source.get("url") != url or not re.fullmatch(r"[a-f0-9]{64}", source.get("sha256", ""))
+                or source.get("archive_root") != f"binaryen-version_{release}"
+                or source.get("install_dir") != f"/usr/local/lib/binaryen/{release}"
+                or wasm_opt.get("path") != "/usr/bin/wasm-opt"
+                or wasm_opt.get("path_by_role") != expected_paths
+                or wasm_opt.get("realpath_suffix_by_role") != expected_realpaths):
+            raise ValueError("invalid pinned Binaryen archive or install layout")
+    git = manifest["tools"].get("git")
+    if git is not None:
+        validate_git(git)
+    bun = manifest["tools"].get("bun")
+    if bun is not None:
+        validate_bun(bun, manifest)
+    for name, spec in manifest["tools"].items():
+        source = spec.get("version_from")
+        if source and (source not in manifest["tools"]
+                       or manifest["tools"][source].get("version") != spec.get("version")):
+            raise ValueError("invalid version source: " + name)
     defaults = set()
     for tool in manifest["cargo_installs"]:
         if "git" in tool:
@@ -199,18 +411,90 @@ def validate(manifest):
         raise ValueError('invalid trusted compiler cache wrapper hash')
 
 
+def validate_git(spec):
+    """Boat and tenant images build the server's git release from source. Tie
+    the source URL, install directory and image paths to the measured version,
+    so refreshing the server's version without new source pins fails here."""
+    match = re.fullmatch(r"git version (\d+\.\d+\.\d+)", spec.get("version", ""))
+    if not match:
+        raise ValueError("unpinned version: git")
+    release = match.group(1)
+    source = spec.get("source", {})
+    install_dir = "/usr/local/lib/git/" + release
+    if (source.get("url") != f"https://www.kernel.org/pub/software/scm/git/git-{release}.tar.xz"
+            or not re.fullmatch(r"[a-f0-9]{64}", source.get("sha256", ""))):
+        raise ValueError("invalid pinned git source: " + release)
+    if (source.get("install_dir") != install_dir
+            or spec.get("path_by_role") != {role: "/usr/local/bin/git" for role in ("boat", "tenant")}
+            or any(spec.get("realpath_suffix_by_role", {}).get(role) != install_dir + "/bin/git"
+                   for role in ("boat", "tenant"))):
+        raise ValueError("invalid git install layout: " + release)
+    packages = source.get("build_packages")
+    if not packages or not all(re.fullmatch(r"[a-z0-9][a-z0-9+.-]+", name) for name in packages):
+        raise ValueError("invalid git build packages")
+
+
+def validate_bun(spec, manifest):
+    """The runner runs Bun from its role's manifest path and mounts that
+    directory into jobs at job_path, which every role's job PATH searches.
+    The tenant's path must avoid the directories the tenant agent binds over."""
+    job_dir = str(Path(spec.get("job_path", "")).parent)
+    for role, environment in manifest["job_environment_by_role"].items():
+        if job_dir not in environment["PATH"].split(":"):
+            raise ValueError(f"Bun's job directory {job_dir} is not on the {role} job PATH")
+    if spec["path"] != spec.get("job_path") or set(spec.get("path_by_role", {})) - {"boat", "tenant"}:
+        raise ValueError("invalid Bun install layout")
+    tenant = tool_path(spec, "tenant")
+    if any(tenant == root or tenant.startswith(root + "/") for root in TENANT_WORKSPACE_ROOTS):
+        raise ValueError(f"tenant Bun at {tenant} would be hidden by the tenant's bound workspace roots")
+
+
 def readonly_mount(path, mountinfo):
     matches = [line.split() for line in mountinfo.splitlines()
                if path == line.split()[4] or path.startswith(line.split()[4].rstrip("/") + "/")]
     return bool(matches) and "ro" in max(matches, key=lambda row: len(row[4]))[5].split(",")
 
 
-def differences(manifest, actual, role="build-server", job=False, gnu_test_sha256=None):
+def expected_job_environment(manifest, role, job, remote_cache_on):
+    """The job environment one role must have in the requested switch state.
+
+    With the remote cache on, the expected environment is the switch-off one
+    plus exactly the delta in `remote-cache-environment.py`, and leftovers of
+    the other state are drift like any other value.
+    """
+    if not job:
+        return {}
+    environment = {**manifest['job_environment'], **manifest['job_environment_by_role'][role]}
+    if remote_cache_on:
+        environment.update(remote_cache_environment.environment(role))
+    return environment
+
+
+def differences(manifest, actual, role="build-server", job=False, gnu_test_sha256=None,
+                remote_cache_on=False):
+    if role == "macos":
+        return macos_parity().differences(manifest, actual, job)
+    manifest = role_manifest(manifest, role, job)
     errors = []
 
     def equal(name, expected, observed):
         if expected != observed:
             errors.append(f"{name}: expected {expected!r}, observed {observed!r}")
+
+    identity = actual.get('job_identity')
+    if manifest['job_identity_by_role'][role] == 'system-assigned':
+        if not identity or any(type(identity.get(key)) is not int or identity[key] <= 0 for key in ('uid', 'gid')):
+            errors.append('motor-job identity: missing non-root job account')
+        elif not job:
+            minimum = identity.get('uid_min')
+            if type(minimum) is not int or not 0 < identity['uid'] < minimum:
+                errors.append('motor-job identity: uid must be below UID_MIN')
+            equal('motor-job primary group', 'motor-job', identity.get('primary_group'))
+            if identity.get('shell') not in ('/usr/sbin/nologin', '/sbin/nologin', '/bin/false', '/usr/bin/false'):
+                errors.append('motor-job identity: login shell is not disabled')
+    else:
+        equal('motor-job identity', manifest['job_identity_by_role'][role], identity)
+    errors.extend(syscall_surface.differences(actual.get('syscalls', {}), job=job))
 
     for key in ("rust_default", "rust_profile", "cargo_home", "rustup_home"):
         equal(key, manifest[key], actual.get(key))
@@ -246,15 +530,45 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
     tools = actual.get("tools", {})
     for name, expected in manifest["tools"].items():
         observed = tools.get(name) or {}
-        equal(name + " path", expected["path"], observed.get("path"))
+        # A tool the image installs beside a distribution copy, like git,
+        # resolves from another directory there; its version is still exact.
+        equal(name + " path", tool_path(expected, role, job), observed.get("path"))
         equal(name + " --version exit", 0, observed.get("exit_code"))
         version = first_line(observed.get("version"))
-        if "version" in expected:
+        if name == "wasm-opt":
+            expected_major = re.fullmatch(r"wasm-opt version (\d+)", expected.get("version", ""))
+            actual_major = re.match(r"wasm-opt version (\d+)(?:\s|$)", version)
+            if (not expected_major or not actual_major
+                    or expected_major.group(1) != actual_major.group(1)):
+                expected_value = expected_major.group(1) if expected_major else None
+                observed_value = actual_major.group(1) if actual_major else version
+                errors.append(f"wasm-opt major version: expected {expected_value!r}, observed {observed_value!r}")
+        elif "version" in expected:
             equal(name + " version", expected["version"], version)
         elif not re.fullmatch(expected["version_pattern"], version):
             errors.append(name + ": unexpected distro tool version " + repr(version))
-        if "realpath_suffix" in expected and not observed.get("realpath", "").endswith(expected["realpath_suffix"]):
-            errors.append(name + ": wrong compiler thread model")
+        realpath_suffix = expected.get("realpath_suffix_by_role", {}).get(role, expected.get("realpath_suffix"))
+        if realpath_suffix and not observed.get("realpath", "").endswith(realpath_suffix):
+            errors.append(name + ": wrong resolved executable path")
+    # The remote cache's job variables are exactly the ones its switch state
+    # adds, on every host type. A role that keeps one in the other state is not
+    # in the state it claims, and the failure names the variable.
+    if job:
+        declared = ({**manifest['job_environment'],
+                     **manifest['job_environment_by_role'][role]})
+        remote = remote_cache_environment.environment(role)
+        for name in sorted(set(remote) - set(declared)):
+            expected = remote[name] if remote_cache_on else None
+            if actual.get('job_environment', {}).get(name) != expected:
+                equal('job ' + name, expected, actual.get('job_environment', {}).get(name))
+
+    if role == "build-server" and not job:
+        catalogued = {name for name, spec in manifest["tools"].items()
+                      if spec["path"].startswith(str(LOCAL_BIN) + "/")}
+        uncatalogued = sorted(name for name in actual.get("local_bin_entries", [])
+                              if name not in catalogued and not host_only_local_bin(name))
+        if uncatalogued:
+            errors.append("uncatalogued job-visible /usr/local/bin entries: " + ", ".join(uncatalogued))
     for name in manifest["gnu_coreutils"]:
         observed = tools.get(name) or {}
         equal(name + " path", manifest["gnu_coreutils"][name], observed.get("path"))
@@ -273,9 +587,27 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
         if not observed.get("path") or not identified:
             errors.append(name + ": missing GNU coreutils alias")
     if job:
-        environment = {**manifest['job_environment'], **manifest['job_environment_by_role'][role]}
+        environment = expected_job_environment(manifest, role, job, remote_cache_on)
+        observed = actual.get("job_environment", {})
         for name, expected in environment.items():
-            equal("job " + name, expected, actual.get("job_environment", {}).get(name))
+            equal("job " + name, expected, observed.get(name))
+        # The remote cache's variables are exactly the ones its switch state
+        # adds. A role that keeps one in the other state is not in the state
+        # it claims, and the variables it keeps are named in the failure.
+        contract = set(manifest['job_environment']) | set(manifest['job_environment_by_role'][role])
+        for name in sorted(set(remote_cache_environment.JOB_ENVIRONMENT_BY_ROLE[role]) - contract):
+            expected = remote_cache_environment.environment(role).get(name) if remote_cache_on else None
+            if observed.get(name) != expected:
+                equal("job " + name, expected, observed.get(name))
+        runtime = actual.get('runtime', {})
+        for name in ('self/mountinfo', 'cpuinfo', 'meminfo'):
+            equal('/proc/' + name + ' readable', True, runtime.get('proc', {}).get(name))
+        for name in ('dev_shm_writable', 'tmpdir_exec', 'sshd_executable'):
+            equal('job ' + name, True, runtime.get(name))
+        for name, minimum in manifest.get('inotify_minimum', {}).items():
+            value = runtime.get('inotify', {}).get(name)
+            if not isinstance(value, int) or value < minimum:
+                errors.append(f'inotify {name}: expected at least {minimum}, observed {value!r}')
         # Only build-server jobs read the shared compile cache through the
         # runner's wrapper. Boat jobs compile directly: no cache is filled there,
         # and an empty read-only cache breaks C builds that cc-rs routes to it.
@@ -287,6 +619,16 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
                 equal('compiler cache ' + name, contract[name], wrapper.get(name))
             for name in ('wrapper_readonly', 'backend_readonly'):
                 equal('compiler cache ' + name, True, wrapper.get(name))
+        elif remote_cache_on and environment.get('RUSTC_WRAPPER'):
+            # Boat and tenant VMs keep no compile cache of their own, so with
+            # the remote cache on, their wrapper is the runner's trusted
+            # sccache from the read-only tool mount.
+            wrapper = actual.get('compile_wrapper', {})
+            equal('compiler wrapper resolution', environment['RUSTC_WRAPPER'], wrapper.get('resolved'))
+            equal('compiler cache sccache_path', manifest['compile_wrapper']['sccache_path'],
+                  wrapper.get('sccache_path'))
+            equal('compiler cache wrapper_readonly', True, wrapper.get('wrapper_readonly'))
+            equal('compiler supervisor cache', None, wrapper.get('supervisor_cache'))
         if not readonly_mount(manifest["rustup_home"], actual.get("mountinfo", "")):
             errors.append("job rustup home is not mounted read-only")
     else:
@@ -294,7 +636,7 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
         for name in required:
             if name not in actual.get("apt_packages", {}):
                 errors.append("missing apt package: " + name)
-        if role == "boat":
+        if role in ("boat", "tenant"):
             equal("sccache build inputs", manifest["sccache"]["inputs_sha256"], actual.get("sccache_inputs_sha256"))
             artifacts = actual.get('sccache_artifacts') or {}
             equal('sccache artifact inputs', manifest['sccache']['inputs_sha256'], artifacts.get('inputs_sha256'))
@@ -303,15 +645,27 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
     return errors
 
 
-def check(manifest, role="build-server", job=False, gnu_test_sha256=None, cargo_registry=None):
+def check(manifest, role="build-server", job=False, gnu_test_sha256=None, cargo_registry=None,
+          remote_cache_on=False):
+    if role == "macos":
+        validate(manifest, role)
+        actual = capture(manifest, job=job, role=role)
+        errors = differences(manifest, actual, role, job)
+        encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+        return {"passed": not errors, "errors": errors, "role": role, "job": job,
+                "remote_cache": remote_cache_on,
+                "manifest_sha256": hashlib.sha256(encoded).hexdigest(), "observed": actual}
     validate(manifest)
-    actual = capture(manifest, job=job)
-    if role == "boat" and not job:
-        marker = Path("/srv/build/sccache-inputs.sha256")
+    actual = capture(role_manifest(manifest, role, job), job=job, role=role,
+                     remote_cache_on=remote_cache_on)
+    if role in ("boat", "tenant") and not job:
+        state = Path('/usr/local/lib/motor' if role == 'tenant' else '/srv/build')
+        marker = state / "sccache-inputs.sha256"
         actual["sccache_inputs_sha256"] = marker.read_text() if marker.is_file() else None
-        artifacts = Path('/srv/build/sccache-artifacts.json')
+        artifacts = state / 'sccache-artifacts.json'
         actual['sccache_artifacts'] = json.loads(artifacts.read_text()) if artifacts.is_file() else None
-    errors = differences(manifest, actual, role, job, gnu_test_sha256)
+    errors = differences(manifest, actual, role, job, gnu_test_sha256,
+                         remote_cache_on=remote_cache_on)
     registry = None
     if cargo_registry is not None:
         seed.validate(cargo_registry)
@@ -333,6 +687,7 @@ def check(manifest, role="build-server", job=False, gnu_test_sha256=None, cargo_
                                           if manifest["rustup_home"] in line.split()[:6])
     encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     return {"passed": not errors, "errors": errors, "role": role, "job": job,
+            "remote_cache": remote_cache_on,
             "manifest_sha256": hashlib.sha256(encoded).hexdigest(), "observed": actual,
             "cargo_registry": registry}
 
@@ -390,21 +745,36 @@ def main():
     modes.add_argument("--check", action="store_true", help="compare live state with the manifest; exit nonzero on drift")
     modes.add_argument("--from-capture", type=Path, help="refresh measured manifest fields from captured JSON to stdout")
     parser.add_argument("--manifest", type=Path, default=MANIFEST)
-    parser.add_argument("--role", choices=("build-server", "boat"), default="build-server")
+    parser.add_argument("--role", choices=("build-server", "boat", "tenant", "macos"), default="build-server")
     parser.add_argument("--job", action="store_true", help="check inside a real Rust job, including PATH and read-only rustup")
+    parser.add_argument("--remote-cache", choices=("on", "off"), default="off",
+                        help="with --job: this role's job environment with the remote compile cache switched on or off; every role qualifies in both states")
     parser.add_argument('--gnu-test-sha256', help='for --job: hash of gnutest from the fresh package-qualified host check')
     parser.add_argument('--cargo-seed-manifest', type=Path, help='trusted server seed inventory; required for Boat parity')
     parser.add_argument('--cargo-seed-sha256', help='independently recorded server seed manifest digest')
     args = parser.parse_args()
+    if args.role == "macos" and args.from_capture:
+        parser.error('macOS pins must be reviewed against the build-server manifest, not refreshed from capture')
     if bool(args.cargo_seed_manifest) != bool(args.cargo_seed_sha256):
         parser.error('--cargo-seed-manifest and --cargo-seed-sha256 must be supplied together')
+    if args.remote_cache == "on" and not args.job:
+        parser.error('--remote-cache on describes a job environment; it needs --job')
     if args.capture:
-        result = capture()
+        # The manifest names tools beyond the built-in list (pinned variants such
+        # as bun-1.3.14) and the GNU coreutils locations; without it the capture
+        # omits them and --from-capture refuses it as unmeasured.
+        manifest = json.loads(args.manifest.read_text())
+        if args.role == "macos":
+            result = capture(manifest, job=args.job, role=args.role)
+        else:
+            result = capture(role_manifest(manifest, args.role, args.job), job=args.job, role=args.role,
+                             remote_cache_on=args.remote_cache == "on")
     else:
         manifest = json.loads(args.manifest.read_text())
         result = refresh(manifest, json.loads(args.from_capture.read_text())) if args.from_capture else check(
             manifest, args.role, args.job, args.gnu_test_sha256,
-            seed.verified_manifest(args.cargo_seed_manifest, args.cargo_seed_sha256) if args.cargo_seed_manifest else None)
+            seed.verified_manifest(args.cargo_seed_manifest, args.cargo_seed_sha256) if args.cargo_seed_manifest else None,
+            remote_cache_on=args.remote_cache == "on")
     print(json.dumps(result, indent=2, sort_keys=True))
     return 1 if args.check and not result["passed"] else 0
 
