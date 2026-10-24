@@ -110,7 +110,8 @@ function Invoke-RunnerNative {
         [Parameter(Mandatory)][string]$FilePath,
         [string[]]$ArgumentList = @(),
         [Parameter(Mandatory)][string]$Operation,
-        [Parameter(Mandatory)][string]$LogPath
+        [Parameter(Mandatory)][string]$LogPath,
+        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 180
     )
     $quotedArguments = @($ArgumentList | ForEach-Object { ConvertTo-RunnerNativeArgument $_ })
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
@@ -118,18 +119,34 @@ function Invoke-RunnerNative {
     $startInfo.Arguments = [string]::Join(' ', [string[]]$quotedArguments)
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
+    $timedOut = $false
+    $terminated = $true
+    $killError = $null
+    $processId = $null
+    $exitCode = $null
+    $stdout = ''
+    $stderr = ''
     try {
         if (-not $process.Start()) { throw "Cannot start native command $Operation" }
+        $processId = $process.Id
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
-        $process.WaitForExit()
-        $stdout = $stdoutTask.GetAwaiter().GetResult()
-        $stderr = $stderrTask.GetAwaiter().GetResult()
-        $exitCode = $process.ExitCode
+        # Native diagnostics are noninteractive; EOF prevents commands waiting for console input.
+        $process.StandardInput.Close()
+        $finished = $process.WaitForExit([int]([TimeSpan]::FromSeconds($TimeoutSeconds).TotalMilliseconds))
+        if (-not $finished) {
+            $timedOut = $true
+            try { $process.Kill() } catch { $killError = [string]$_ }
+            $terminated = $process.WaitForExit(5000)
+        }
+        if ($stdoutTask.Wait(5000)) { $stdout = $stdoutTask.GetAwaiter().GetResult() }
+        if ($stderrTask.Wait(5000)) { $stderr = $stderrTask.GetAwaiter().GetResult() }
+        if ($process.HasExited) { $exitCode = $process.ExitCode }
     } finally {
         $process.Dispose()
     }
@@ -138,10 +155,16 @@ function Invoke-RunnerNative {
         operation = $Operation
         executable = $FilePath
         arguments = [string]::Join(' ', [string[]]$quotedArguments)
+        process_id = $processId
+        timeout_seconds = $TimeoutSeconds
+        timed_out = $timedOut
+        termination_confirmed = $terminated
+        kill_error = $killError
         exit_code = $exitCode
         stderr = $stderr
     }
     [IO.File]::AppendAllText($LogPath, (ConvertTo-Json -InputObject $entry -Compress) + "`r`n", [Text.UTF8Encoding]::new($false))
+    if ($timedOut) { throw "Native command $Operation timed out after $TimeoutSeconds seconds; process_id=$processId; terminated=$terminated; see $LogPath" }
     if ($exitCode -ne 0) { throw "Native command $Operation failed exit=$exitCode; see $LogPath" }
     return [pscustomobject]@{ exit_code=$exitCode; stdout=$stdout; stderr=$stderr }
 }

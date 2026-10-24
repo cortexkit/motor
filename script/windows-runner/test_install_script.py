@@ -45,6 +45,31 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("exit /b 0", fixture)
         self.assertIn('Invoke-RunnerNative -FilePath "$env:SystemRoot\\System32\\cmd.exe"', fixture)
 
+    def test_native_commands_close_stdin_and_kill_timed_out_processes(self):
+        accounts = (HERE / "accounts.ps1").read_text()
+        fixture = (HERE / "test_scripts.ps1").read_text()
+        self.assertIn("RedirectStandardInput = $true", accounts)
+        self.assertIn("$process.StandardInput.Close()", accounts)
+        self.assertIn("$process.WaitForExit([int]([TimeSpan]::FromSeconds($TimeoutSeconds).TotalMilliseconds))", accounts)
+        self.assertIn("$process.Kill()", accounts)
+        self.assertIn("Native command $Operation timed out after $TimeoutSeconds seconds", accounts)
+        self.assertIn("native-command-closes-empty-stdin-before-waiting", fixture)
+        self.assertIn("native-timeout-fixture", fixture)
+        self.assertIn("termination_confirmed = $terminated", accounts)
+
+    def test_sshd_effective_policy_check_uses_system_without_weakening_match(self):
+        install = (HERE / "install.ps1").read_text()
+        helper = (HERE / "verify-sshd-system.ps1").read_text()
+        self.assertIn("Invoke-RunnerSshPolicyAsSystem $sshdConfig", install)
+        self.assertIn("Register-ScheduledTask -TaskName $taskName -Action $action -Settings $settings -User 'SYSTEM'", install)
+        self.assertIn("verify-sshd-system.ps1", install)
+        self.assertIn("-Operation 'verify restricted SSH policy as SYSTEM'", helper)
+        self.assertIn("-TimeoutSeconds 30", helper)
+        self.assertIn("user=motor-ssh,host=localhost,addr=127.0.0.1", helper)
+        self.assertIn("Match User motor-ssh", install)
+        self.assertIn("AuthenticationMethods publickey", install)
+        self.assertIn("PasswordAuthentication no", install)
+
 
     def test_ssh_account_resolution_precedes_config_rewrite(self):
         install = (HERE / "install.ps1").read_text()

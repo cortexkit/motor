@@ -49,7 +49,7 @@ Protect-RunnerPath "$Root\state\ally\local-registry-cache" $nativeLogPath
 Protect-RunnerPath "$Root\staging" $nativeLogPath
 Copy-Item "$Bundle\bin\*" "$Root\bin" -Recurse
 Copy-Item "$Bundle\prep-toolchain" $Root -Recurse
-foreach ($name in @('hyperv.ps1','parent-identity.ps1','guest-evidence.ps1','accounts.ps1','qualify.ps1','qualify-peer.ps1','uninstall.ps1','run-system.ps1','qualify-jobs.py')) { Copy-Item "$PSScriptRoot\$name" "$Root\bin" }
+foreach ($name in @('hyperv.ps1','parent-identity.ps1','guest-evidence.ps1','accounts.ps1','qualify.ps1','qualify-peer.ps1','uninstall.ps1','run-system.ps1','verify-sshd-system.ps1','qualify-jobs.py')) { Copy-Item "$PSScriptRoot\$name" "$Root\bin" }
 foreach ($name in @('common.ps1','process.ps1')) { Copy-Item "$PSScriptRoot\..\hyperv-spike\$name" "$Root\bin" }
 $parent = "$Root\baselines\ally-hvsock.vhdx"
 Copy-Item -LiteralPath $ParentPath -Destination $parent
@@ -80,6 +80,38 @@ function New-OwnedUser([string]$Name) {
     Save-Installation
     return $secret
 }
+
+function Invoke-RunnerSshPolicyAsSystem([string]$ConfigPath) {
+    $operation = 'verify restricted SSH policy as SYSTEM'
+    $resultPath = Join-Path "$Root\evidence" ("sshd-policy-system-" + [Guid]::NewGuid().ToString('N') + '.json')
+    $taskName = 'MotorRunnerSshPolicy-' + [Guid]::NewGuid().ToString('N')
+    $helperPath = Join-Path "$Root\bin" 'verify-sshd-system.ps1'
+    $powershell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $taskArguments = @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$helperPath,'-ConfigPath',$ConfigPath,'-ResultPath',$resultPath,'-NativeLogPath',$nativeLogPath)
+    $arguments = [string]::Join(' ', [string[]]@($taskArguments | ForEach-Object { ConvertTo-RunnerNativeArgument $_ }))
+    $action = New-ScheduledTaskAction -Execute $powershell -Argument $arguments
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds 60) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    $registered = $false
+    try {
+        Register-ScheduledTask -TaskName $taskName -Action $action -Settings $settings -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+        $registered = $true
+        Start-ScheduledTask -TaskName $taskName
+        $deadline = [DateTime]::UtcNow.AddSeconds(65)
+        while (-not (Test-Path -LiteralPath $resultPath)) {
+            if ([DateTime]::UtcNow -ge $deadline) {
+                try { Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } catch { }
+                throw "$operation timed out after 65 seconds; see $nativeLogPath"
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+        if (-not $result.success) { throw "$operation failed: $($result.error); see $nativeLogPath" }
+        return [string]$result.stdout
+    } finally {
+        if ($registered) { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue }
+    }
+}
+
 $null = New-OwnedUser 'motor-ssh'
 $sshSid = $installation.accounts['motor-ssh']
 $resolvedSshSid = Resolve-RunnerTrusteeSid 'motor-ssh'
@@ -141,8 +173,8 @@ try {
     throw "OpenSSH rejected the restricted entry configuration; original restored: $_"
 }
 try {
-    $effectiveResult = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\OpenSSH\sshd.exe" -ArgumentList @('-T', '-f', $sshdConfig, '-C', 'user=motor-ssh,host=localhost,addr=127.0.0.1') -Operation 'verify restricted SSH policy' -LogPath $nativeLogPath
-    $effective = @($effectiveResult.stdout -split '\r?\n' | Where-Object { $_ })
+    $effectiveOutput = Invoke-RunnerSshPolicyAsSystem $sshdConfig
+    $effective = @($effectiveOutput -split '\r?\n' | Where-Object { $_ })
     $policy = $effective -join "`n"
     foreach ($rule in @('(?m)^authenticationmethods publickey$','(?m)^passwordauthentication no$','(?m)^allowtcpforwarding no$','(?m)^allowagentforwarding no$','(?m)^permittty no$','(?m)^forcecommand C:/ProgramData/MotorRunner/bin/motor-runner.exe connect --instance ally --state-root C:/ProgramData/MotorRunner/state$')) {
         if ($policy -notmatch $rule) { throw "Effective SSH restriction missing: $rule" }

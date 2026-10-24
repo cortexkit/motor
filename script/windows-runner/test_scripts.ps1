@@ -82,6 +82,31 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         Write-Host 'PASS native-command-exit-code-ignores-stderr-and-logs-it'
         $count++
 
+        $stdinScript = Join-Path $nativeFixtureRoot 'stdin-eof.ps1'
+        [IO.File]::WriteAllText($stdinScript, '[Console]::In.ReadToEnd(); [Console]::Out.WriteLine("native-stdin-eof-probe")', [Text.UTF8Encoding]::new($false))
+        $stdinResult = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$stdinScript) -Operation 'native-empty-stdin-fixture' -LogPath $nativeLog -TimeoutSeconds 5
+        if ($stdinResult.exit_code -ne 0 -or $stdinResult.stdout -notmatch 'native-stdin-eof-probe') {
+            throw 'FAIL native-command-closes-empty-stdin-before-waiting'
+        }
+        Write-Host 'PASS native-command-closes-empty-stdin-before-waiting'
+        $count++
+
+        $timeoutScript = Join-Path $nativeFixtureRoot 'timeout.ps1'
+        [IO.File]::WriteAllText($timeoutScript, 'Start-Sleep -Seconds 30', [Text.UTF8Encoding]::new($false))
+        $timeoutStarted = [Diagnostics.Stopwatch]::StartNew()
+        $timeoutError = $null
+        try {
+            $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$timeoutScript) -Operation 'native-timeout-fixture' -LogPath $nativeLog -TimeoutSeconds 1
+        } catch {
+            $timeoutError = $_.Exception.Message
+        }
+        $timeoutRecords = @(Get-Content -LiteralPath $nativeLog | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object operation -eq 'native-timeout-fixture')
+        if ($timeoutError -notmatch 'Native command native-timeout-fixture timed out after 1 seconds' -or $timeoutStarted.Elapsed.TotalSeconds -gt 10 -or $timeoutRecords.Count -ne 1 -or -not $timeoutRecords[0].timed_out -or -not $timeoutRecords[0].termination_confirmed -or $timeoutRecords[0].process_id -le 0) {
+            throw "FAIL native-command-timeout-kills-and-identifies-operation: $timeoutError"
+        }
+        Write-Host 'PASS native-command-timeout-kills-and-identifies-operation'
+        $count++
+
         # A directory an elevated administrator creates on a client edition of
         # Windows is owned by that user; Protect-RunnerPath must leave it owned
         # by Administrators, or the runner and uninstaller refuse it.
