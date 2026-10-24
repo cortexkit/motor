@@ -24,7 +24,7 @@ print(json.dumps(
 ))
 "#;
     let output = Command::new("python3")
-        .args(["-c", &python])
+        .args(["-c", python])
         .arg(&script)
         .output()
         .expect("run the parity copy with python3");
