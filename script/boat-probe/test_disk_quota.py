@@ -6,6 +6,19 @@ import disk_quota
 
 
 class DiskQuotaChecks(unittest.TestCase):
+    def test_backing_allocation_requires_a_real_drop_on_the_expected_image(self):
+        before = dict(expected_backing=True, backing_file='/var/lib/motor-boat.xfs', backing_allocated_blocks=1000)
+        after = dict(before, backing_allocated_blocks=100)
+        self.assertTrue(disk_quota.backing_allocation_dropped(before, after))
+        for change in ({'backing_allocated_blocks': 1000}, {'backing_allocated_blocks': 1001},
+                       {'backing_allocated_blocks': None}, {'backing_allocated_blocks': True},
+                       {'backing_allocated_blocks': -1}, {'expected_backing': False},
+                       {'backing_file': '/other.xfs'}):
+            with self.subTest(change=change):
+                self.assertFalse(disk_quota.backing_allocation_dropped(before, dict(after, **change)))
+        self.assertFalse(disk_quota.backing_allocation_dropped({}, after))
+        self.assertFalse(disk_quota.backing_allocation_dropped(before, {}))
+
     def evidence(self):
         result = dict(code=73, stdout=json.dumps(dict(lane='tmp', errno=errno.EDQUOT,
                       projects={name: 1 for name in ('workspace', 'target', 'home', 'tmp', 'var_tmp', 'stdout', 'stderr', 'exit', 'cache-stats')},

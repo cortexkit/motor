@@ -10,6 +10,7 @@ import json
 import os
 import pwd
 import stat
+import subprocess
 import sys
 from pathlib import Path
 import tempfile
@@ -359,7 +360,8 @@ class RecipeTests(unittest.TestCase):
         mount = writes['/etc/systemd/system/var-lib-motor\\x2dboat.mount']
         self.assertIn('Requires=motor-boat-restored.service', mount)
         self.assertIn('After=motor-boat-restored.service', mount)
-        self.assertIn('Options=loop,noatime,prjquota,discard', mount)
+        self.assertIn('Options=loop,noatime,prjquota\n', mount)
+        self.assertNotIn(',discard', mount)
         for name in ('/etc/systemd/system/var-lib-motor\\x2dboat.mount', '/etc/systemd/system/Users.mount'):
             for directive in ('Requires', 'After'):
                 values = next(line.split('=', 1)[1].split() for line in writes[name].splitlines() if line.startswith(directive + '='))
@@ -413,13 +415,13 @@ class RecipeTests(unittest.TestCase):
 
     def test_storage_rejects_non_reflink_xfs_and_failed_clone(self):
         with patch.object(start, 'mounts', return_value=[]), patch.object(start, 'state_mount'), \
-             patch.object(start, 'users_mount'), patch.object(start.subprocess, 'check_output', side_effect=['rw,prjquota,discard', 'reflink=0']), \
+             patch.object(start, 'users_mount'), patch.object(start.subprocess, 'check_output', side_effect=['rw,prjquota', 'reflink=0']), \
              self.assertRaisesRegex(RuntimeError, 'reflink enabled'):
             start.check_storage()
         with tempfile.TemporaryDirectory() as tmp, patch.object(start, 'STATE', Path(tmp)), \
              patch.object(start, 'USERS', Path(tmp)), patch.object(start, 'mounts', return_value=[]), \
              patch.object(start, 'state_mount'), patch.object(start, 'users_mount'), \
-             patch.object(start.subprocess, 'check_output', side_effect=['rw,prjquota,discard', 'reflink=1']), \
+             patch.object(start.subprocess, 'check_output', side_effect=['rw,prjquota', 'reflink=1']), \
              patch.object(start.fcntl, 'ioctl', side_effect=OSError(95, 'unsupported')), self.assertRaises(OSError):
              start.check_storage()
 
@@ -429,11 +431,30 @@ class RecipeTests(unittest.TestCase):
              self.assertRaisesRegex(RuntimeError, 'requires enforced XFS project quotas'):
             start.check_storage()
 
-    def test_storage_requires_discard_for_outer_disk_reclamation(self):
-        with patch.object(start, 'mounts', return_value=[]), patch.object(start, 'state_mount'), \
-             patch.object(start, 'users_mount'), patch.object(start.subprocess, 'check_output', return_value='rw,prjquota'), \
-             self.assertRaisesRegex(RuntimeError, 'requires discard'):
-            start.check_storage()
+    def test_trim_storage_invokes_bounded_fstrim_on_verified_mount(self):
+        with self.storage_watch_paths(), patch.object(start, 'mounts', return_value=['verified']), \
+             patch.object(start, 'state_mount') as mount, patch.object(start.subprocess, 'run') as run:
+            start.trim_storage()
+        mount.assert_called_once_with(['verified'])
+        run.assert_called_once_with(['/usr/sbin/fstrim', '--verbose', str(start.STATE)], check=True, timeout=30)
+
+    def test_trim_storage_refuses_changed_identity_or_mount(self):
+        with self.storage_watch_paths(), patch.object(start, 'storage_identity', return_value=(1792, 128, 999)), \
+             patch.object(start.subprocess, 'run') as run, self.assertRaisesRegex(RuntimeError, 'changed Boat storage'):
+            start.trim_storage()
+        run.assert_not_called()
+        with self.storage_watch_paths(), patch.object(start, 'mounts', return_value=[]), \
+             patch.object(start, 'state_mount', side_effect=RuntimeError('not XFS')), \
+             patch.object(start.subprocess, 'run') as run, self.assertRaisesRegex(RuntimeError, 'not XFS'):
+            start.trim_storage()
+        run.assert_not_called()
+
+    def test_trim_storage_propagates_failure_and_timeout(self):
+        for error in (subprocess.CalledProcessError(1, 'fstrim'), subprocess.TimeoutExpired('fstrim', 30)):
+            with self.subTest(error=error), self.storage_watch_paths(), patch.object(start, 'mounts', return_value=[]), \
+                 patch.object(start, 'state_mount'), patch.object(start.subprocess, 'run', side_effect=error), \
+                 self.assertRaises(type(error)):
+                start.trim_storage()
 
     def test_prepare_storage_never_mounts_over_nonempty_views(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -557,6 +578,20 @@ class RecipeTests(unittest.TestCase):
                 start.watch_storage(pause=pause)
             self.assertEqual(polls, ['unhealthy', 'unhealthy', 'healthy'])
 
+    def test_root_shortage_without_capacity_recovery_stays_withdrawn(self):
+        with self.storage_watch_paths() as (_, marker, health):
+            def stats(path):
+                return Mock(f_bavail=(10 if str(path) == '/' else 60) << 30, f_frsize=1, f_favail=10000)
+            polls = []
+            def pause(_):
+                polls.append(json.loads(health.read_text())['status'])
+                self.assertFalse(marker.exists())
+                if len(polls) == 3:
+                    raise InterruptedError('no evictable capacity')
+            with patch.object(start.os, 'statvfs', side_effect=stats), self.assertRaises(InterruptedError):
+                start.watch_storage(pause=pause)
+            self.assertEqual(polls, ['unhealthy'] * 3)
+
     def test_capacity_sample_cannot_overwrite_a_newer_locked_withdrawal(self):
         with self.storage_watch_paths() as (_, marker, health):
             available = {'root': 64 << 30}
@@ -608,6 +643,28 @@ class RecipeTests(unittest.TestCase):
         with patch.object(start, 'storage_lock', side_effect=AssertionError('caller already holds this lock')), patch.object(start.os, 'statvfs', return_value=stats) as probe:
             self.assertTrue(start.quota_capacity_ready())
         self.assertEqual(probe.call_args_list, [unittest.mock.call(start.STATE), unittest.mock.call('/')])
+
+    def test_storage_withdrawal_records_root_capacity_and_inodes(self):
+        with self.storage_watch_paths() as (_, marker, _):
+            def stats(path):
+                return Mock(f_bavail=123 if str(path) == '/' else 456, f_frsize=4096,
+                            f_favail=789 if str(path) == '/' else 987)
+            with patch.object(start.os, 'statvfs', side_effect=stats):
+                start.withdraw_storage('cold_quota_capacity_below_floor')
+            volumes = json.loads(marker.with_name('endpoint-withdrawal.json').read_text())['volumes']
+            self.assertEqual(volumes['root'], {'volume': '/', 'free_bytes': 123 * 4096, 'free_inodes': 789})
+            self.assertEqual(set(volumes), {'root', 'runner_state', 'workspace'})
+
+    def test_storage_withdrawal_records_root_probe_failure(self):
+        with self.storage_watch_paths() as (_, marker, _):
+            def stats(path):
+                if str(path) == '/':
+                    raise OSError('root unavailable')
+                return Mock(f_bavail=456, f_frsize=4096, f_favail=987)
+            with patch.object(start.os, 'statvfs', side_effect=stats):
+                start.withdraw_storage()
+            root = json.loads(marker.with_name('endpoint-withdrawal.json').read_text())['volumes']['root']
+            self.assertEqual(root, {'volume': '/', 'probe_error': 'root unavailable'})
 
     def test_storage_watch_starts_withdrawn_before_reading_evidence(self):
         with self.storage_watch_paths() as (_, marker, health):

@@ -85,6 +85,8 @@ pub struct Config {
     pub(crate) boat_cold_materialization: bool,
     #[cfg(target_os = "linux")]
     pub(crate) boat_readiness_withdraw: Arc<dyn Fn() -> io::Result<()> + Send + Sync>,
+    #[cfg(target_os = "linux")]
+    pub(crate) boat_storage_trim: Arc<dyn Fn() -> io::Result<()> + Send + Sync>,
     /// One-job Boat budget measured at boot, after idle overhead and headroom.
     /// Never used for the fleet profile's per-vCPU memory rule.
     pub boat_memory_max_bytes: Option<u64>,
@@ -367,6 +369,8 @@ impl Config {
             boat_cold_materialization: false,
             #[cfg(target_os = "linux")]
             boat_readiness_withdraw: Arc::new(crate::boat_quota::withdraw_ready),
+            #[cfg(target_os = "linux")]
+            boat_storage_trim: Arc::new(crate::boat_quota::trim_storage),
             boat_memory_max_bytes: None,
             #[cfg(target_os = "linux")]
             private_pids: true,

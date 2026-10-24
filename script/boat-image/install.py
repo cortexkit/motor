@@ -435,7 +435,7 @@ def state(pins):
                      "DefaultDependencies=no\nConflicts=umount.target\nBefore=umount.target\nRequires=motor-boat-restored.service\n"
                      "After=motor-boat-restored.service\nConditionPathExists=!/run/motor-boat-storage.json\n[Mount]\n"
                      "What=/var/lib/motor-boat.xfs\nWhere=/var/lib/motor-boat\n"
-                     "Type=xfs\nOptions=loop,noatime,prjquota,discard\n")
+                     "Type=xfs\nOptions=loop,noatime,prjquota\n")
     Path("/Users").mkdir(exist_ok=True)
     Path("/etc/systemd/system/Users.mount").write_text(
         "[Unit]\nDefaultDependencies=no\nConflicts=umount.target\nBefore=umount.target\nRequires=var-lib-motor\\x2dboat.mount\n"

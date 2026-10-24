@@ -665,9 +665,18 @@ the floor, otherwise the original twice-floor rule applies.
 
 ### Per-job disk quota
 
-The Boat state mount uses XFS `prjquota,discard`; startup refuses a mount without
-project enforcement. `discard` returns freed loop-image extents to the outer
-filesystem, rather than leaving an ever-growing sparse file after eviction.
+The Boat state mount uses XFS `prjquota`; startup refuses a mount without
+project enforcement. After pressure eviction or a cold-workspace retry, the runner
+runs bounded `fstrim` on the verified XFS mount and rechecks the lesser of XFS and
+root free space. Idle upkeep does this below the readiness floor even with no
+eviction candidates: restored free extents can still occupy the sparse backing
+file on the outer disk. Batching discard avoids synchronous discard on job writes
+and reclaims free extents from before a provider snapshot, unlike online discard.
+Trim failure or insufficient capacity does not authorize admission or readiness.
+`idle_boat_runner_recovers_outer_capacity_only_after_eviction_and_trim` covers the
+runner recovery; the resumed quota probe compares `stat -c %b` on the backing file
+before stop and after the first normal job (which may trigger cold eviction on a
+larger sandbox).
 Existing images must be rebuilt/remounted while services are stopped; a live
 remount cannot safely enable XFS project quotas.
 

@@ -25,6 +25,10 @@ async fn leased_job_is_not_delayed_by_fill(tenant_vm: bool, boat_profile: bool) 
     config.boat_memory_max_bytes = boat_profile.then_some(2 << 30);
     if boat_profile {
         config.free_space_probe = Arc::new(|_| Ok(63 << 30));
+        #[cfg(target_os = "linux")]
+        {
+            config.boat_storage_trim = Arc::new(|| Ok(()));
+        }
     }
     config.max_weight = 4;
     config.base_commands = vec![format!(

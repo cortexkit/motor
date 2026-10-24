@@ -122,6 +122,16 @@ sys.exit(73 if observed in (errno.EDQUOT, errno.ENOSPC) else 74)
 '''
 
 
+def backing_allocation_dropped(before, after):
+    # Boat can recreate the backing inode on restore; compare the verified
+    # backing path and allocated sectors, not inode numbers across snapshots.
+    return (before.get('expected_backing') is True and after.get('expected_backing') is True
+            and before.get('backing_file') == after.get('backing_file') == '/var/lib/motor-boat.xfs'
+            and type(before.get('backing_allocated_blocks')) is int
+            and type(after.get('backing_allocated_blocks')) is int
+            and 0 <= after['backing_allocated_blocks'] < before['backing_allocated_blocks'])
+
+
 def job(lane, token=None):
     if lane not in LANES + (RETAINED_LANE,):
         raise ValueError('unknown quota probe lane')

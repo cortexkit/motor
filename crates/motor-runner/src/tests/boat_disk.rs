@@ -420,6 +420,10 @@ fn boat_config(
     c.free_space_floor_bytes = (32 * GIB) + (64 << 20);
     c.free_space_eviction_bytes = Some(40 * GIB);
     c.disk_reserve_bytes = 4096;
+    #[cfg(target_os = "linux")]
+    {
+        c.boat_storage_trim = Arc::new(|| Ok(()));
+    }
     c.free_space_probe = Arc::new(probe);
     c.manual_tick = true;
     c
@@ -534,6 +538,118 @@ fn idle_boat_runner_frees_its_disk_after_a_job_filled_it_and_admits_again() {
         runner.accept(request).unwrap(),
         Admission::Accepted(0)
     ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn idle_boat_runner_recovers_outer_capacity_only_after_eviction_and_trim() {
+    let f = Fixture::new();
+    let filled = f.scratch.join("remote/worktrees/b");
+    let root_free = Arc::new(AtomicU64::new(60 * GIB));
+    let trims = Arc::new(AtomicU64::new(0));
+    let mut config = boat_config(&f, {
+        let root_free = root_free.clone();
+        move |path| {
+            Ok(if path == Path::new("/") {
+                root_free.load(Ordering::SeqCst)
+            } else {
+                60 * GIB
+            })
+        }
+    });
+    config.boat_storage_trim = {
+        let (filled, root_free, trims) = (filled.clone(), root_free.clone(), trims.clone());
+        Arc::new(move || {
+            assert!(
+                !filled.exists(),
+                "trim must follow eviction, not precede it"
+            );
+            trims.fetch_add(1, Ordering::SeqCst);
+            root_free.store(60 * GIB, Ordering::SeqCst);
+            Ok(())
+        })
+    };
+    let runner = Runner::open(config).unwrap();
+    workspace(&runner, &filled, runner.now() - 1);
+    root_free.store(10 * GIB, Ordering::SeqCst);
+    let reserve = runner.core.trees.state.join("disk-reserve");
+    let _ = fs::remove_file(&reserve);
+    runner.disk_upkeep().unwrap();
+    assert!(!filled.exists());
+    assert_eq!(trims.load(Ordering::SeqCst), 1);
+    assert_eq!(fs::metadata(reserve).unwrap().len(), 4096);
+    assert!(
+        (runner.core.config.free_space_probe)(&runner.core.trees.state).unwrap()
+            >= crate::boat_quota::READY_FREE_BYTES
+    );
+    let (request, _) = f.run("true");
+    assert!(matches!(
+        runner.accept(request).unwrap(),
+        Admission::Accepted(0)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn idle_boat_runner_without_reclaimable_capacity_stays_below_readiness_floor() {
+    let f = Fixture::new();
+    let free = Arc::new(AtomicU64::new(60 * GIB));
+    let trims = Arc::new(AtomicU64::new(0));
+    let mut config = boat_config(&f, {
+        let free = free.clone();
+        move |_| Ok(free.load(Ordering::SeqCst))
+    });
+    config.boat_storage_trim = {
+        let trims = trims.clone();
+        Arc::new(move || {
+            trims.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    };
+    let runner = Runner::open(config).unwrap();
+    let reserve = runner.core.trees.state.join("disk-reserve");
+    let _ = fs::remove_file(&reserve);
+    free.store(10 * GIB, Ordering::SeqCst);
+    runner.disk_upkeep().unwrap();
+    assert_eq!(trims.load(Ordering::SeqCst), 1);
+    assert!(
+        !reserve.exists(),
+        "no reserve is published while capacity is low"
+    );
+    assert!(
+        (runner.core.config.free_space_probe)(&runner.core.trees.state).unwrap()
+            < crate::boat_quota::READY_FREE_BYTES
+    );
+    let (request, _) = f.run("true");
+    assert!(matches!(
+        runner.accept(request).unwrap(),
+        Admission::DiskFull(_)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn idle_boat_runner_trim_failure_does_not_restore_reserve_or_admit() {
+    let f = Fixture::new();
+    let free = Arc::new(AtomicU64::new(60 * GIB));
+    let mut config = boat_config(&f, {
+        let free = free.clone();
+        move |_| Ok(free.load(Ordering::SeqCst))
+    });
+    config.boat_storage_trim = Arc::new(|| Err(io::Error::other("trim timed out")));
+    let runner = Runner::open(config).unwrap();
+    let reserve = runner.core.trees.state.join("disk-reserve");
+    let _ = fs::remove_file(&reserve);
+    free.store(10 * GIB, Ordering::SeqCst);
+    assert!(runner
+        .disk_upkeep()
+        .unwrap_err()
+        .to_string()
+        .contains("trim timed out"));
+    assert!(!reserve.exists());
+    assert!(!runner.core.inner.lock().unwrap().restoring_reserve);
+    let (request, _) = f.run("true");
+    assert!(runner.accept(request).is_err());
 }
 
 #[test]
