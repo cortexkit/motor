@@ -1031,6 +1031,7 @@ fn compile_cache_environment(
     prepared: &Prepared,
     env: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
+    scrub_inherited_cache_environment(config, setup, env);
     if !config.shared_compile_cache() {
         env.retain(|key, _| key != "RUSTC_WRAPPER" && !key.starts_with("SCCACHE_"));
         // Without the shared cache an isolated Rust job still builds in the same fixed
@@ -1043,7 +1044,7 @@ fn compile_cache_environment(
                 crate::compile_cache::TARGET.into(),
             );
         }
-        return Ok(());
+        return remote_cache_environment(config, setup, env);
     }
     if let Some(wrapper) = &prepared.wrapper {
         env.insert(
@@ -1076,7 +1077,7 @@ fn compile_cache_environment(
     }
     #[cfg(not(target_os = "linux"))]
     let _ = setup;
-    Ok(())
+    remote_cache_environment(config, setup, env)
 }
 
 /// A cache fill, or a job whose workspace root is a Cargo workspace.
@@ -1086,6 +1087,94 @@ fn rust_job(setup: &Setup) -> bool {
         || Path::new(&setup.request.workspace_key)
             .join("Cargo.toml")
             .is_file()
+}
+
+/// The runner's own environment can carry sccache and AWS settings (an
+/// operator's shell, an inherited unit, a caller request that reached the
+/// allowlist). None of them may shape a job: they would either override the
+/// local level-1 settings the runner adds afterwards or point the tool at a
+/// store this job may not use. They are removed only while the remote cache
+/// can be on for this unit, because with it off every job environment must be
+/// exactly what it was before the cache existed, operator settings included;
+/// scrubbing always runs before anything is added, so it never removes a
+/// value the runner generated.
+pub(crate) fn scrub_inherited_cache_environment(
+    config: &Config,
+    setup: &Setup,
+    env: &mut BTreeMap<String, String>,
+) {
+    // The writer branch below runs for every fill on every host type, but only
+    // the build server's fills and its Rust jobs ever reach the cache: every
+    // other unit must keep exactly the environment base gave it.
+    if config.remote_cache_available(setup.base).is_none() {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if !(setup.base || rust_job(setup)) {
+        return;
+    }
+    #[cfg(not(target_os = "linux"))]
+    if !setup.base {
+        return;
+    }
+    env.retain(|key, _| {
+        !crate::remote_cache::environment::INHERITED_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+    });
+}
+
+/// The remote cache's job delta, when the integration is on for this unit.
+///
+/// It is on only when the runner switch, the cache tenant's `enabled` state
+/// and job isolation all hold: without isolation a job runs as the runner's
+/// own account and could open the keys, so the switch is ignored there. The
+/// gateway's generation is the authority on `enabled`. Nothing starts the
+/// gateway yet, so no unit is switched on and every role keeps today's
+/// environment; `remote_cache_job_environment` is what a switched-on unit
+/// would add on top of that baseline.
+fn remote_cache_environment(
+    config: &Config,
+    setup: &Setup,
+    env: &mut BTreeMap<String, String>,
+) -> io::Result<()> {
+    let Some((generation, forwarders)) = config.unit_remote_cache(setup.base) else {
+        return Ok(());
+    };
+    remote_cache_job_environment(
+        crate::remote_cache::provisioning::HostRole::of(config),
+        &forwarders,
+        &generation,
+        setup.base,
+        env,
+    );
+    Ok(())
+}
+
+/// Apply one host type's remote cache delta to `env`: exactly the difference
+/// between its switch-off job environment and its switch-on one. `env` must
+/// already hold the role's baseline.
+pub(crate) fn remote_cache_job_environment(
+    role: crate::remote_cache::provisioning::HostRole,
+    forwarders: &[crate::remote_cache::transport::Forwarder],
+    generation: &crate::remote_cache::provisioning::ActiveGeneration,
+    fill: bool,
+    env: &mut BTreeMap<String, String>,
+) {
+    let mut delta = crate::remote_cache::environment::delta(
+        role,
+        forwarders,
+        &generation.bucket,
+        &generation.region,
+    );
+    if fill {
+        delta.extend(crate::remote_cache::environment::fill_values());
+        delta.insert(
+            "SCCACHE_S3_RW_MODE".into(),
+            crate::remote_cache::environment::READ_WRITE_MODE.into(),
+        );
+    }
+    env.extend(delta);
 }
 
 // Preserve only the daemon context toolchains need. Request values are filtered

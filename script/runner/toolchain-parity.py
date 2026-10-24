@@ -32,6 +32,13 @@ if 'syscall_surface' not in globals():
         raise ImportError('cannot load syscall surface probe')
     syscall_surface = importlib.util.module_from_spec(syscall_spec)
     syscall_spec.loader.exec_module(syscall_surface)
+if 'remote_cache_environment' not in globals():
+    remote_cache_spec = importlib.util.spec_from_file_location(
+        'remote_cache_environment', HERE / 'remote-cache-environment.py')
+    if remote_cache_spec is None or remote_cache_spec.loader is None:
+        raise ImportError('cannot load remote cache environment')
+    remote_cache_environment = importlib.util.module_from_spec(remote_cache_spec)
+    remote_cache_spec.loader.exec_module(remote_cache_environment)
 
 
 def output(*args, env=None):
@@ -146,7 +153,7 @@ def macos_parity():
     return module
 
 
-def capture(manifest=None, job=False, role="build-server"):
+def capture(manifest=None, job=False, role="build-server", remote_cache_on=False):
     if role == "macos":
         return macos_parity().capture(manifest, job)
     paths = manifest or {}
@@ -217,20 +224,27 @@ def capture(manifest=None, job=False, role="build-server"):
     job_names = set(paths.get('job_environment', {}))
     for role_environment in paths.get('job_environment_by_role', {}).values():
         job_names.update(role_environment)
+    if remote_cache_on:
+        job_names.update(remote_cache_environment.JOB_ENVIRONMENT_BY_ROLE[role])
     mountinfo = Path('/proc/self/mountinfo').read_text() if job else ''
     wrapper = {}
     if job:
         contract = paths['compile_wrapper']
         resolved = shutil.which(os.environ.get('RUSTC_WRAPPER', ''), path=env['PATH'])
         cache_path = shutil.which('sccache', path=env['PATH'])
+        # A role without a shared compile cache has no supervisor file or
+        # backend; its wrapper is the runner's own sccache, and only a
+        # switch-on job has one at all.
+        wrapper_path = contract['sccache_path'] if remote_cache_on and role != 'build-server' else None
         wrapper = {
             'resolved': resolved,
             'supervisor_cache': optional_text(contract['supervisor_cache_file']),
             'sccache_path': cache_path,
             'sccache_sha256': hashlib.sha256(Path(cache_path).read_bytes()).hexdigest() if cache_path else None,
             'backend': optional_text(contract['sccache_path'] + '.backend'),
-            'wrapper_readonly': readonly_mount(contract['sccache_path'], mountinfo),
-            'backend_readonly': readonly_mount(contract['backend'], mountinfo),
+            'wrapper_readonly': readonly_mount(wrapper_path or contract['sccache_path'], mountinfo),
+            'backend_readonly': (readonly_mount(contract['backend'], mountinfo)
+                                 if wrapper_path is None else None),
         }
     return {
         "schema": 1,
@@ -420,7 +434,23 @@ def readonly_mount(path, mountinfo):
     return bool(matches) and "ro" in max(matches, key=lambda row: len(row[4]))[5].split(",")
 
 
-def differences(manifest, actual, role="build-server", job=False, gnu_test_sha256=None):
+def expected_job_environment(manifest, role, job, remote_cache_on):
+    """The job environment one role must have in the requested switch state.
+
+    With the remote cache on, the expected environment is the switch-off one
+    plus exactly the delta in `remote-cache-environment.py`, and leftovers of
+    the other state are drift like any other value.
+    """
+    if not job:
+        return {}
+    environment = {**manifest['job_environment'], **manifest['job_environment_by_role'][role]}
+    if remote_cache_on:
+        environment.update(remote_cache_environment.environment(role))
+    return environment
+
+
+def differences(manifest, actual, role="build-server", job=False, gnu_test_sha256=None,
+                remote_cache_on=False):
     if role == "macos":
         return macos_parity().differences(manifest, actual, job)
     manifest = role_manifest(manifest, role, job)
@@ -487,6 +517,18 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
         realpath_suffix = expected.get("realpath_suffix_by_role", {}).get(role, expected.get("realpath_suffix"))
         if realpath_suffix and not observed.get("realpath", "").endswith(realpath_suffix):
             errors.append(name + ": wrong resolved executable path")
+    # The remote cache's job variables are exactly the ones its switch state
+    # adds, on every host type. A role that keeps one in the other state is not
+    # in the state it claims, and the failure names the variable.
+    if job:
+        declared = ({**manifest['job_environment'],
+                     **manifest['job_environment_by_role'][role]})
+        remote = remote_cache_environment.environment(role)
+        for name in sorted(set(remote) - set(declared)):
+            expected = remote[name] if remote_cache_on else None
+            if actual.get('job_environment', {}).get(name) != expected:
+                equal('job ' + name, expected, actual.get('job_environment', {}).get(name))
+
     if role == "build-server" and not job:
         catalogued = {name for name, spec in manifest["tools"].items()
                       if spec["path"].startswith(str(LOCAL_BIN) + "/")}
@@ -512,9 +554,18 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
         if not observed.get("path") or not identified:
             errors.append(name + ": missing GNU coreutils alias")
     if job:
-        environment = {**manifest['job_environment'], **manifest['job_environment_by_role'][role]}
+        environment = expected_job_environment(manifest, role, job, remote_cache_on)
+        observed = actual.get("job_environment", {})
         for name, expected in environment.items():
-            equal("job " + name, expected, actual.get("job_environment", {}).get(name))
+            equal("job " + name, expected, observed.get(name))
+        # The remote cache's variables are exactly the ones its switch state
+        # adds. A role that keeps one in the other state is not in the state
+        # it claims, and the variables it keeps are named in the failure.
+        contract = set(manifest['job_environment']) | set(manifest['job_environment_by_role'][role])
+        for name in sorted(set(remote_cache_environment.JOB_ENVIRONMENT_BY_ROLE[role]) - contract):
+            expected = remote_cache_environment.environment(role).get(name) if remote_cache_on else None
+            if observed.get(name) != expected:
+                equal("job " + name, expected, observed.get(name))
         runtime = actual.get('runtime', {})
         for name in ('self/mountinfo', 'cpuinfo', 'meminfo'):
             equal('/proc/' + name + ' readable', True, runtime.get('proc', {}).get(name))
@@ -535,6 +586,16 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
                 equal('compiler cache ' + name, contract[name], wrapper.get(name))
             for name in ('wrapper_readonly', 'backend_readonly'):
                 equal('compiler cache ' + name, True, wrapper.get(name))
+        elif remote_cache_on and environment.get('RUSTC_WRAPPER'):
+            # Boat and tenant VMs keep no compile cache of their own, so with
+            # the remote cache on, their wrapper is the runner's trusted
+            # sccache from the read-only tool mount.
+            wrapper = actual.get('compile_wrapper', {})
+            equal('compiler wrapper resolution', environment['RUSTC_WRAPPER'], wrapper.get('resolved'))
+            equal('compiler cache sccache_path', manifest['compile_wrapper']['sccache_path'],
+                  wrapper.get('sccache_path'))
+            equal('compiler cache wrapper_readonly', True, wrapper.get('wrapper_readonly'))
+            equal('compiler supervisor cache', None, wrapper.get('supervisor_cache'))
         if not readonly_mount(manifest["rustup_home"], actual.get("mountinfo", "")):
             errors.append("job rustup home is not mounted read-only")
     else:
@@ -551,23 +612,27 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
     return errors
 
 
-def check(manifest, role="build-server", job=False, gnu_test_sha256=None, cargo_registry=None):
+def check(manifest, role="build-server", job=False, gnu_test_sha256=None, cargo_registry=None,
+          remote_cache_on=False):
     if role == "macos":
         validate(manifest, role)
         actual = capture(manifest, job=job, role=role)
         errors = differences(manifest, actual, role, job)
         encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
         return {"passed": not errors, "errors": errors, "role": role, "job": job,
+                "remote_cache": remote_cache_on,
                 "manifest_sha256": hashlib.sha256(encoded).hexdigest(), "observed": actual}
     validate(manifest)
-    actual = capture(role_manifest(manifest, role, job), job=job, role=role)
+    actual = capture(role_manifest(manifest, role, job), job=job, role=role,
+                     remote_cache_on=remote_cache_on)
     if role in ("boat", "tenant") and not job:
         state = Path('/usr/local/lib/motor' if role == 'tenant' else '/srv/build')
         marker = state / "sccache-inputs.sha256"
         actual["sccache_inputs_sha256"] = marker.read_text() if marker.is_file() else None
         artifacts = state / 'sccache-artifacts.json'
         actual['sccache_artifacts'] = json.loads(artifacts.read_text()) if artifacts.is_file() else None
-    errors = differences(manifest, actual, role, job, gnu_test_sha256)
+    errors = differences(manifest, actual, role, job, gnu_test_sha256,
+                         remote_cache_on=remote_cache_on)
     registry = None
     if cargo_registry is not None:
         seed.validate(cargo_registry)
@@ -589,6 +654,7 @@ def check(manifest, role="build-server", job=False, gnu_test_sha256=None, cargo_
                                           if manifest["rustup_home"] in line.split()[:6])
     encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     return {"passed": not errors, "errors": errors, "role": role, "job": job,
+            "remote_cache": remote_cache_on,
             "manifest_sha256": hashlib.sha256(encoded).hexdigest(), "observed": actual,
             "cargo_registry": registry}
 
@@ -648,6 +714,8 @@ def main():
     parser.add_argument("--manifest", type=Path, default=MANIFEST)
     parser.add_argument("--role", choices=("build-server", "boat", "tenant", "macos"), default="build-server")
     parser.add_argument("--job", action="store_true", help="check inside a real Rust job, including PATH and read-only rustup")
+    parser.add_argument("--remote-cache", choices=("on", "off"), default="off",
+                        help="with --job: this role's job environment with the remote compile cache switched on or off; every role qualifies in both states")
     parser.add_argument('--gnu-test-sha256', help='for --job: hash of gnutest from the fresh package-qualified host check')
     parser.add_argument('--cargo-seed-manifest', type=Path, help='trusted server seed inventory; required for Boat parity')
     parser.add_argument('--cargo-seed-sha256', help='independently recorded server seed manifest digest')
@@ -656,6 +724,8 @@ def main():
         parser.error('macOS pins must be reviewed against the build-server manifest, not refreshed from capture')
     if bool(args.cargo_seed_manifest) != bool(args.cargo_seed_sha256):
         parser.error('--cargo-seed-manifest and --cargo-seed-sha256 must be supplied together')
+    if args.remote_cache == "on" and not args.job:
+        parser.error('--remote-cache on describes a job environment; it needs --job')
     if args.capture:
         # The manifest names tools beyond the built-in list (pinned variants such
         # as bun-1.3.14) and the GNU coreutils locations; without it the capture
@@ -664,12 +734,14 @@ def main():
         if args.role == "macos":
             result = capture(manifest, job=args.job, role=args.role)
         else:
-            result = capture(role_manifest(manifest, args.role, args.job), job=args.job, role=args.role)
+            result = capture(role_manifest(manifest, args.role, args.job), job=args.job, role=args.role,
+                             remote_cache_on=args.remote_cache == "on")
     else:
         manifest = json.loads(args.manifest.read_text())
         result = refresh(manifest, json.loads(args.from_capture.read_text())) if args.from_capture else check(
             manifest, args.role, args.job, args.gnu_test_sha256,
-            seed.verified_manifest(args.cargo_seed_manifest, args.cargo_seed_sha256) if args.cargo_seed_manifest else None)
+            seed.verified_manifest(args.cargo_seed_manifest, args.cargo_seed_sha256) if args.cargo_seed_manifest else None,
+            remote_cache_on=args.remote_cache == "on")
     print(json.dumps(result, indent=2, sort_keys=True))
     return 1 if args.check and not result["passed"] else 0
 

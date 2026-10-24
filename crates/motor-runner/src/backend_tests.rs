@@ -596,6 +596,195 @@ fn isolated_launch_cache_environment_preserves_wrapper_precedence() {
     }
 }
 
+/// The pinned switch-off environments: what base fd9ac13f's
+/// `compile_cache_environment` produced for each role and unit kind. The sets
+/// below are written from that version's rules, not read back from the code
+/// under test, so a change to either side shows up as a difference here.
+///
+/// The fixture is a Cargo workspace at `<scratch>/workspace`, an inherited
+/// `RUSTFLAGS=-C debuginfo=1`, and `SCCACHE_LOCAL_RW_MODE`, `SCCACHE_DIR` and
+/// `SCCACHE_BUCKET` exported by the runner's own environment.
+#[cfg(target_os = "linux")]
+#[test]
+fn switched_off_environments_match_the_base_runner_for_every_role_and_kind() {
+    // Base clears RUSTC_WRAPPER and every SCCACHE_* name whenever it has no
+    // shared compile cache, and replaces them on the build server with its own
+    // read-only local level 1.
+    const BUILD_SERVER_JOB: &[(&str, &str)] = &[
+        ("CARGO_HOME", "/motor-home/cargo"),
+        ("CARGO_NET_OFFLINE", "true"),
+        ("CARGO_TARGET_DIR", "/run/motor/target"),
+        ("RUSTC_WRAPPER", "sccache"),
+        ("RUSTFLAGS", "-C debuginfo=1"),
+        ("SCCACHE_CACHE_SIZE", "200G"),
+        ("SCCACHE_DIR", "/motor-cache"),
+        ("SCCACHE_IGNORE_SERVER_IO_ERROR", "1"),
+        ("SCCACHE_LOCAL_RW_MODE", "READ_ONLY"),
+    ];
+    // A build-server fill also makes the local level 1 writable, compiles
+    // dependencies with Cargo's incremental flag, and gets its own sccache
+    // server on an abstract socket named from the instance and the fill id.
+    // The runner strips every SCCACHE_* value it inherited before adding its
+    // own, so base's fill keeps only the runner's names.
+    const BUILD_SERVER_FILL: &[(&str, &str)] = &[
+        ("CARGO_INCREMENTAL", "1"),
+        ("CARGO_HOME", "/motor-home/cargo"),
+        ("CARGO_NET_OFFLINE", "true"),
+        ("CARGO_TARGET_DIR", "/run/motor/target"),
+        ("RUSTC_WRAPPER", "sccache"),
+        ("RUSTFLAGS", "-C debuginfo=1"),
+        ("SCCACHE_CACHE_SIZE", "200G"),
+        ("SCCACHE_DIR", "/motor-cache"),
+        ("SCCACHE_IGNORE_SERVER_IO_ERROR", "1"),
+        ("SCCACHE_LOCAL_RW_MODE", "READ_WRITE"),
+    ];
+    // Boat and tenant VMs have no shared compile cache, so base strips both
+    // the wrapper and every cache setting, and the Cargo environment that goes
+    // with them; a Rust job there keeps only the fixed target folder.
+    const HOSTED_JOB: &[(&str, &str)] = &[
+        ("CARGO_TARGET_DIR", "/run/motor/target"),
+        ("RUSTFLAGS", "-C debuginfo=1"),
+    ];
+    // Those roles have no writer, so with the switch off a hosted job and a
+    // hosted fill share one set.
+    const HOSTED_FILL: &[(&str, &str)] = HOSTED_JOB;
+
+    let exported = [
+        ("SCCACHE_LOCAL_RW_MODE", "operator-mode"),
+        ("SCCACHE_DIR", "/operator/cache"),
+        ("SCCACHE_BUCKET", "operator-bucket"),
+    ];
+    // (case, boat, tenant, fill, pinned environment)
+    type Case<'a> = (&'a str, bool, bool, bool, &'a [(&'a str, &'a str)]);
+    let cases: [Case; 6] = [
+        ("build-server job", false, false, false, BUILD_SERVER_JOB),
+        ("build-server fill", false, false, true, BUILD_SERVER_FILL),
+        ("boat job", true, false, false, HOSTED_JOB),
+        ("boat fill", true, false, true, HOSTED_FILL),
+        ("tenant job", false, true, false, HOSTED_JOB),
+        ("tenant fill", false, true, true, HOSTED_FILL),
+    ];
+    for (case, boat, tenant, fill, pinned) in cases {
+        let scratch = ScratchDir::new("motor-switch-off-golden");
+        fs::write(scratch.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let mut config = Config::new(scratch.join("state"), "main");
+        config.isolate_jobs = true;
+        config.boat_profile = boat;
+        config.tenant_vm = tenant;
+        let mut setup = setup(scratch.path());
+        setup.base = fill;
+        let prepared = Prepared {
+            cwd: scratch.path().into(),
+            target: scratch.join("target"),
+            wrapper: None,
+            sandbox: None,
+            vm: None,
+        };
+        // The switch is off: nothing starts the gateway, so no generation is
+        // served and the unit must look exactly as it did before the cache.
+        assert!(config.unit_remote_cache(fill).is_none(), "{case}");
+        let mut env: BTreeMap<String, String> = exported
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        env.insert("RUSTFLAGS".into(), "-C debuginfo=1".into());
+        compile_cache_environment(&config, &setup, &prepared, &mut env).unwrap();
+        let mut expected: BTreeMap<String, String> = pinned
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        if fill && !boat && !tenant {
+            let uds = config.writer_sccache_server_uds(setup.id);
+            assert!(uds.starts_with("\\x00motor-sccache-"), "{case}");
+            expected.insert("SCCACHE_SERVER_UDS".into(), uds);
+        }
+        assert_eq!(env, expected, "{case}");
+    }
+}
+
+/// Nothing the runner inherited survives into a unit the remote cache can be
+/// on for, and everything base kept survives into one it cannot be on for.
+/// Which of the two applies depends on the switch, never on nothing: with the
+/// switch off a unit's environment is exactly what it was before the cache.
+#[cfg(target_os = "linux")]
+#[test]
+fn inherited_sccache_and_aws_settings_follow_the_switch_state() {
+    let inherited = || {
+        BTreeMap::from([
+            ("SCCACHE_LOG".to_string(), "trace".to_string()),
+            ("AWS_ACCESS_KEY_ID".to_string(), "real-key".to_string()),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "real-secret".to_string(),
+            ),
+            ("AWS_EC2_METADATA_DISABLED".to_string(), "false".to_string()),
+            ("RUSTFLAGS".to_string(), "-C debuginfo=1".to_string()),
+        ])
+    };
+    let run = |boat: bool, tenant: bool, fill: bool, isolate: bool| {
+        let scratch = ScratchDir::new("motor-cache-scrub");
+        fs::write(scratch.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let mut config = Config::new(scratch.join("state"), "main");
+        config.isolate_jobs = isolate;
+        config.boat_profile = boat;
+        config.tenant_vm = tenant;
+        let mut setup = setup(scratch.path());
+        setup.base = fill;
+        let prepared = Prepared {
+            cwd: scratch.path().into(),
+            target: scratch.join("target"),
+            wrapper: None,
+            sandbox: None,
+            vm: None,
+        };
+        let available = config.remote_cache_available(fill).is_some();
+        let mut env = inherited();
+        compile_cache_environment(&config, &setup, &prepared, &mut env).unwrap();
+        (available, env)
+    };
+
+    // A build-server unit with the switch on: an inherited sccache or AWS
+    // setting would override the local level-1 values or point the tool at a
+    // store the unit may not use, so none of them survives.
+    for fill in [false, true] {
+        let (available, env) = run(false, false, fill, true);
+        assert!(available, "fill={fill}");
+        assert!(env.keys().all(|key| !key.starts_with("AWS_")), "{env:?}");
+        assert_eq!(env.get("SCCACHE_LOG"), None, "fill={fill}: {env:?}");
+        assert_eq!(env["RUSTFLAGS"], "-C debuginfo=1", "fill={fill}");
+    }
+
+    // Without isolation the switch is ignored, so the unit keeps base's
+    // environment, inherited values included.
+    for fill in [false, true] {
+        let (available, env) = run(false, false, fill, false);
+        assert!(!available, "fill={fill}");
+        assert_eq!(env["AWS_ACCESS_KEY_ID"], "real-key", "fill={fill}");
+        assert_eq!(env["AWS_SECRET_ACCESS_KEY"], "real-secret", "fill={fill}");
+        assert_eq!(env["AWS_EC2_METADATA_DISABLED"], "false", "fill={fill}");
+        assert_eq!(env["SCCACHE_LOG"], "trace", "fill={fill}");
+        assert_eq!(env["RUSTFLAGS"], "-C debuginfo=1", "fill={fill}");
+    }
+
+    // Boat and tenant VMs never have the cache on, for a job or a fill, so
+    // the scrub never runs for them. What their units keep is base's own
+    // answer: every SCCACHE_* value is stripped because these profiles have no
+    // shared compile cache, while an AWS setting, which base never touched,
+    // stays.
+    for (boat, tenant) in [(true, false), (false, true)] {
+        for fill in [false, true] {
+            let (available, env) = run(boat, tenant, fill, true);
+            let case = format!("boat={boat} tenant={tenant} fill={fill}");
+            assert!(!available, "{case}");
+            assert_eq!(env["AWS_ACCESS_KEY_ID"], "real-key", "{case}");
+            assert_eq!(env["AWS_SECRET_ACCESS_KEY"], "real-secret", "{case}");
+            assert_eq!(env["AWS_EC2_METADATA_DISABLED"], "false", "{case}");
+            assert_eq!(env.get("SCCACHE_LOG"), None, "{case}: {env:?}");
+            assert_eq!(env["RUSTFLAGS"], "-C debuginfo=1", "{case}");
+        }
+    }
+}
+
 #[test]
 fn a_long_job_command_in_the_unit_description_does_not_refuse_the_listing() {
     // systemd-run puts the whole command line in the description column, so
