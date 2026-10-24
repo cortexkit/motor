@@ -169,7 +169,10 @@ impl Host {
     /// advertisement is zero and its leases are refused without calling the
     /// helper; the next start attempt waits [`START_RETRY_MS`].
     pub fn start_refused(&mut self, tenant: &str, case: &str, now_ms: u64) {
-        self.advert.entry(tenant.to_owned()).or_default().start_refused = Some(StartRefusal {
+        self.advert
+            .entry(tenant.to_owned())
+            .or_default()
+            .start_refused = Some(StartRefusal {
             case: case.to_owned(),
             retry_at_ms: now_ms.saturating_add(START_RETRY_MS),
         });
@@ -203,7 +206,12 @@ impl Host {
     /// Records a probe of a running tenant's guest memory: the runner's
     /// `mem_available_bytes`, `None` when its health reply lacks it, or the
     /// probe's failure.
-    pub fn record_memory(&mut self, tenant: &str, now_ms: u64, reading: Result<Option<u64>, String>) {
+    pub fn record_memory(
+        &mut self,
+        tenant: &str,
+        now_ms: u64,
+        reading: Result<Option<u64>, String>,
+    ) {
         self.advert.entry(tenant.to_owned()).or_default().memory = Some(MemorySample {
             at_ms: now_ms,
             reading,
@@ -284,7 +292,11 @@ impl Host {
             Some(MemorySample {
                 reading: Ok(Some(bytes)),
                 ..
-            }) => ((bytes / MIB).saturating_sub(reserve_mib), None, String::new()),
+            }) => (
+                (bytes / MIB).saturating_sub(reserve_mib),
+                None,
+                String::new(),
+            ),
             Some(MemorySample {
                 reading: Ok(None), ..
             }) => (0, Some(MemoryCase::MissingField), String::new()),

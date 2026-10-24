@@ -166,7 +166,8 @@ async fn wake_quota_and_relay_failures_are_internal_not_capacity() {
     }
 }
 #[tokio::test]
-async fn helper_start_refusal_is_host_full_before_run_and_holds_the_tenant_until_a_start_succeeds() {
+async fn helper_start_refusal_is_host_full_before_run_and_holds_the_tenant_until_a_start_succeeds()
+{
     for case in [
         "capacity_json",
         "fit",
@@ -209,14 +210,22 @@ async fn helper_start_refusal_is_host_full_before_run_and_holds_the_tenant_until
             "{case}"
         );
         assert!(task.await.unwrap().is_err());
-        assert_eq!(*fake.calls.lock().unwrap(), vec!["wake".to_owned()], "{case}");
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            vec!["wake".to_owned()],
+            "{case}"
+        );
         let now = unix_ms();
         let retry_at = {
             let mut h = runtime.host.lock().unwrap();
             assert_eq!(h.start_refusal_case("tenant"), Some(case));
             let memory = h.free_mem_mib(now);
             let heartbeat = h.heartbeat(now, memory, true);
-            assert_eq!((heartbeat.free_vcpus, heartbeat.free_mem_mib), (0, 0), "{case}");
+            assert_eq!(
+                (heartbeat.free_vcpus, heartbeat.free_mem_mib),
+                (0, 0),
+                "{case}"
+            );
             assert_eq!(h.share("tenant", now), 0);
             h.start_retry_at("tenant").unwrap()
         };
@@ -238,7 +247,12 @@ async fn helper_start_refusal_is_host_full_before_run_and_holds_the_tenant_until
         assert_eq!(fake.calls.lock().unwrap().len(), 1);
         assert!(runtime.retry_refused_starts(retry_at).is_err());
         assert_eq!(fake.calls.lock().unwrap().len(), 2);
-        let next = runtime.host.lock().unwrap().start_retry_at("tenant").unwrap();
+        let next = runtime
+            .host
+            .lock()
+            .unwrap()
+            .start_retry_at("tenant")
+            .unwrap();
         assert_eq!(next, retry_at + motor_host::state::START_RETRY_MS);
         runtime.retry_refused_starts(next - 1).unwrap();
         assert_eq!(fake.calls.lock().unwrap().len(), 2);
@@ -254,7 +268,12 @@ async fn helper_start_refusal_is_host_full_before_run_and_holds_the_tenant_until
             assert_eq!(h.free_mem_mib(now), 10_240 - 2_048);
             h.guest_unready("tenant");
         }
-        assert!(fake.calls.lock().unwrap().iter().all(|call| call != "relay:52"));
+        assert!(fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|call| call != "relay:52"));
     }
 }
 async fn hello(

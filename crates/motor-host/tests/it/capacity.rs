@@ -169,7 +169,11 @@ fn restarted_host_between_threshold_and_release_and_failed_probes_still_refuse()
     assert_eq!(logs.count("host_storage_low"), 0);
 
     for (capacity, free, detail) in [
-        (Ok(capacity_values()), Err("statvfs failed".to_owned()), "statvfs failed"),
+        (
+            Ok(capacity_values()),
+            Err("statvfs failed".to_owned()),
+            "statvfs failed",
+        ),
         (
             Err("capacity.json missing".to_owned()),
             Ok(u64::MAX),
@@ -394,7 +398,10 @@ impl Control for Probe {
         bail!("unexpected suspend")
     }
     fn available_bytes(&self) -> Result<u64> {
-        self.free.lock().unwrap().ok_or_else(|| anyhow::anyhow!("statvfs failed"))
+        self.free
+            .lock()
+            .unwrap()
+            .ok_or_else(|| anyhow::anyhow!("statvfs failed"))
     }
     fn capacity(&self) -> Result<Capacity> {
         self.capacity
@@ -436,9 +443,18 @@ fn heartbeats_continue_while_latched_and_carry_the_probed_guest_memory() {
     publisher.step(t0 + 1).unwrap();
     let heartbeat = last_heartbeat(&runtime);
     assert_eq!((heartbeat.free_vcpus, heartbeat.free_mem_mib), (64, 77_824));
-    assert_eq!(*probe.statuses.lock().unwrap(), 0, "a stopped tenant is not probed");
+    assert_eq!(
+        *probe.statuses.lock().unwrap(),
+        0,
+        "a stopped tenant is not probed"
+    );
 
-    runtime.host.lock().unwrap().guest_ready("tenant", 1).unwrap();
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .guest_ready("tenant", 1)
+        .unwrap();
     *probe.status.lock().unwrap() =
         Some(json!({"ok":true,"health":{"mem_available_bytes": 70 * GIB}}));
     publisher.step(t0 + 2).unwrap();
@@ -509,5 +525,133 @@ fn capacity_file_must_be_complete_owned_and_protected() {
     ] {
         write(&body, 0o644);
         assert!(capacity::read(&path, uid).is_err(), "{body}");
+    }
+}
+
+/// Operator fixture: a sparse tenant disk on a small loop-mounted XFS volume
+/// is filled by a writer under an admitted lease. motor-host's real capacity
+/// file reader and statvfs probe must refuse new leases while free space is
+/// still above the direct runner's own refusal floor.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires trusted operator host sudo and loop mount privileges; never run on shared runners"]
+fn isolated_sparse_disk_on_loop_filesystem_trips_the_latch_before_the_direct_runner_floor() {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::process::Command;
+    const DIRECT_RUNNER_FLOOR: u64 = 64 * MIB;
+    fn sudo(args: &[&str]) {
+        let status = Command::new("sudo").arg("-n").args(args).status().unwrap();
+        assert!(status.success(), "sudo {args:?}");
+    }
+    struct Mount(std::path::PathBuf);
+    impl Drop for Mount {
+        fn drop(&mut self) {
+            sudo(&["umount", self.0.to_str().unwrap()]);
+        }
+    }
+    let directory = scratch();
+    let image = directory.path().join("volume.img");
+    let mount = directory.path().join("volume");
+    std::fs::create_dir(&mount).unwrap();
+    std::fs::File::create(&image)
+        .unwrap()
+        .set_len(512 * MIB)
+        .unwrap();
+    assert!(Command::new("mkfs.xfs")
+        .args(["-q", "-f"])
+        .arg(&image)
+        .status()
+        .unwrap()
+        .success());
+    sudo(&[
+        "mount",
+        "-o",
+        "loop",
+        image.to_str().unwrap(),
+        mount.to_str().unwrap(),
+    ]);
+    let _mount = Mount(mount.clone());
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() }.to_string();
+    sudo(&["chown", &uid, mount.to_str().unwrap()]);
+    let values = Capacity {
+        storage_margin_bytes: 32 * MIB,
+        ..capacity_values()
+    };
+    let staged = directory.path().join("capacity.staged");
+    std::fs::write(
+        &staged,
+        serde_json::to_vec(&json!({
+            "windows_vm_bytes": values.windows_vm_bytes,
+            "host_reserve_bytes": values.host_reserve_bytes,
+            "jobs_min_bytes": values.jobs_min_bytes,
+            "storage_margin_bytes": values.storage_margin_bytes,
+            "growth_allowance_bytes": values.growth_allowance_bytes,
+            "tenant_memory_reserve_bytes": values.tenant_memory_reserve_bytes,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let capacity_path = mount.join("capacity.json");
+    sudo(&[
+        "install",
+        "-o",
+        "root",
+        "-g",
+        "root",
+        "-m",
+        "0644",
+        staged.to_str().unwrap(),
+        capacity_path.to_str().unwrap(),
+    ]);
+    // The tenant's floor equals the direct runner's floor (provisioning
+    // refuses a smaller one), idle suspend is off, so the threshold is
+    // floor + margin, 96 MiB.
+    let mut tenant = tenant_one();
+    tenant.host_floor_bytes = DIRECT_RUNNER_FLOOR;
+    tenant.max_weight = Some(1_000);
+    let mut host = host_with(vec![("vm", tenant)]);
+    host.enforce_storage();
+    let threshold = host.storage_threshold(&values).unwrap();
+    assert_eq!(threshold, 96 * MIB);
+    let helper = Arc::new(motor_host::helper::Helper {
+        socket: directory.path().join("no-helper.sock"),
+        storage: mount.clone(),
+        capacity: capacity_path,
+        guest_init: BTreeMap::new(),
+    });
+    let runtime = Runtime::new("host".into(), host, helper.clone());
+    let now = NOW * 1000;
+    runtime.probe_storage();
+    assert!(!runtime.host.lock().unwrap().storage_refusing());
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .claim(claims(JOB), now)
+        .unwrap();
+    // The tenant disk is sparse and longer than the whole volume.
+    let mut disk = std::fs::File::create(mount.join("disk.img")).unwrap();
+    disk.set_len(2 * GIB).unwrap();
+    let chunk = vec![0x5a; 4 * MIB as usize];
+    for n in 1u64.. {
+        disk.seek(SeekFrom::Start((n - 1) * chunk.len() as u64))
+            .unwrap();
+        disk.write_all(&chunk).unwrap();
+        disk.sync_all().unwrap();
+        runtime.probe_storage();
+        let free = helper.available_bytes().unwrap();
+        let job = format!("00000000-0000-7000-8000-{:012x}", n + 16);
+        let admitted = runtime.host.lock().unwrap().claim(claims(&job), now);
+        if let Err(error) = admitted {
+            assert!(
+                matches!(error, Error::Refused(Refusal::HostFull)),
+                "{error}"
+            );
+            assert!(free < threshold, "refused at {free} free");
+            assert!(free >= DIRECT_RUNNER_FLOOR, "refused only at {free} free");
+            return;
+        }
+        assert!(free >= threshold, "admitted at {free} free");
     }
 }

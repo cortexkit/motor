@@ -321,7 +321,8 @@ impl Heartbeats {
         if due || changed {
             let previous_health = healthy;
             healthy = true;
-            for tenant in tenants.iter().cloned() {
+            // The memory probe below needs the list again.
+            for tenant in tenants.clone() {
                 // Snapshot I/O can exceed an ordinary helper RPC deadline.
                 // Publish lifecycle state without queueing a stale adopt behind
                 // the same tenant's suspend/wake/administrative operation.

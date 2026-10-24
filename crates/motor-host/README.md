@@ -210,6 +210,52 @@ request combines `tenant` with one guest control operation: `drain` with
 those typed requests are forwarded on port 54; none is accepted on the TLS job
 path by the host admin service.
 
+### Capacity advertisement and storage refusal
+
+A registered host reads `/etc/motor-host/capacity.json`, the same root-owned
+file provisioning and the helper read. It must hold exactly the six byte values
+(`windows_vm_bytes`, `host_reserve_bytes`, `jobs_min_bytes`,
+`storage_margin_bytes`, `growth_allowance_bytes`,
+`tenant_memory_reserve_bytes`), each a non-negative integer, with
+`jobs_min_bytes` at least 1, and be a regular file owned by root that neither
+its group nor other users can write. The host re-reads it on every probe.
+
+Before every admission and every heartbeat the host measures the capacity file
+and `statvfs` free bytes (`f_bavail * f_frsize`) of `storage`. The storage
+threshold is the largest per-tenant `host_floor_bytes` plus the suspend reserve
+(the guest RAM when `idle_suspend_s` is above 0, otherwise 0), plus
+`storage_margin_bytes`. Below it, or when the probe fails or the capacity file is
+unusable, a latch sets: new runs are refused with `host_full`, heartbeats still go
+out with `free_vcpus: 0`, and `host_storage_low` is logged once per transition.
+The latch clears only on a successful probe at or above the threshold plus
+`storage_margin_bytes` (`host_storage_recovered`). The host starts latched, so a
+restart cannot skip that margin. Only new work is refused: a lease already
+delivered to the runner may still be replaced, and admitted jobs keep running and
+allocating. The reserve keeps an idle suspend possible at the threshold.
+
+Heartbeat `free_vcpus` is, per tenant, the permit budget (`max_weight`, or
+`vcpu_ceiling` without it) minus the counted claims, whether the VM is running,
+stopped, suspended or waking. `free_mem_mib` is, per tenant, memory the guest
+can give a job, not the host's: a tenant that is not running advertises its guest
+RAM, so the broker can place the lease that wakes it; a running tenant
+advertises the `mem_available_bytes` its runner reports in the `status` health
+reply, sampled every 15 seconds. Both are floored to MiB and reduced by
+`tenant_memory_reserve_bytes`, saturating at 0. A running tenant whose reply
+lacks the field, whose probe failed, or whose sample is older than 30 seconds
+advertises 0 and logs `tenant_memory_unavailable` naming the case. Without a
+valid capacity file no memory is advertised. Each heartbeat field is the maximum
+over the host's tenants; admission binds a job to its own tenant and stays the
+real gate.
+
+When the helper refuses to start a tenant (a typed `start_refused` reply for an
+invalid capacity file, a memory misfit, the jobs-slice cap, a resize journal or
+activation, and similar host policy), the lease ends before Run with retryable
+`host_full`, not `internal_failure`, and `tenant_start_refused` is logged with
+the case. The tenant then advertises `free_vcpus: 0` and `free_mem_mib: 0`, and
+its leases are refused without calling the helper. The host retries the start
+itself at most once every 60 seconds; a successful start restores the
+advertisement.
+
 ## Sandbox admission mode
 
 `motor-host --sandbox <config.json>` reuses the host admission state machine,
@@ -274,6 +320,15 @@ framed relay and helper descriptor tests. `tests/it/` is folded into library tes
 Actual Firecracker restore, cgroup enforcement, root-owned registry permissions
 and free-space accounting on the operator filesystem require the dedicated
 hosted VM qualification lane; portable tests are not that qualification.
+
+The operator-only fixture
+`isolated_sparse_disk_on_loop_filesystem_trips_the_latch_before_the_direct_runner_floor`
+(ignored by default; it needs passwordless `sudo` for a loop mount, the root-owned
+capacity file, and `mkfs.xfs`) fills a sparse tenant disk on a 512 MiB loop XFS
+volume under an admitted lease and checks that new leases are refused below the
+storage threshold while free space is still above the direct runner's floor. Run it
+by hand on a trusted operator host with
+`cargo test -p motor-host --lib -- --ignored isolated_sparse_disk`.
 
 The image qualification must also exercise an unclean stop during a Git write:
 verify that the durable host `unclean-stop.json` survives agent/helper restart;

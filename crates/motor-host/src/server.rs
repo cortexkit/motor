@@ -399,7 +399,10 @@ impl Runtime {
         if !self.host.lock().expect("host lock").storage_enforced() {
             return;
         }
-        let capacity = self.control.capacity().map_err(|error| format!("{error:#}"));
+        let capacity = self
+            .control
+            .capacity()
+            .map_err(|error| format!("{error:#}"));
         let free = self
             .control
             .available_bytes()
@@ -413,7 +416,11 @@ impl Runtime {
     /// and returns the first failure. The tick runs the same retries on their
     /// own threads.
     pub fn retry_refused_starts(self: &Arc<Self>, now_ms: u64) -> Result<()> {
-        let due = self.host.lock().expect("host lock").start_retries_due(now_ms);
+        let due = self
+            .host
+            .lock()
+            .expect("host lock")
+            .start_retries_due(now_ms);
         let mut failure = None;
         for tenant in due {
             if let Err(error) = self.ensure_at(&tenant, now_ms) {
@@ -488,10 +495,11 @@ impl Runtime {
                         retry_in_ms = crate::state::START_RETRY_MS,
                         "tenant_start_refused"
                     );
-                    self.host
-                        .lock()
-                        .expect("host lock")
-                        .start_refused(tenant, &refused.case, now_ms);
+                    self.host.lock().expect("host lock").start_refused(
+                        tenant,
+                        &refused.case,
+                        now_ms,
+                    );
                     return Error::Refused(Refusal::HostFull);
                 }
                 tracing::error!(tenant, detail=%error, "tenant_recovery_or_initialization_failed");
