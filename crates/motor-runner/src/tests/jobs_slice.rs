@@ -54,7 +54,12 @@ fn jobs_slice_below_the_job_floor_refuses_admission_before_start() {
     let f = Fixture::new();
     let mut config = f.config();
     config.isolate_jobs = true;
-    config.shared_read_roots = Some((f.scratch.join("cargo"), f.scratch.join("rustup"), None));
+    // The admission decision is what these tests exercise; the shared
+    // read-only trees are the host's library directories, not this runner's
+    // data, so the state root stands in for them and needs no ACL grant.
+    let shared = f.scratch.join("state/shared");
+    fs::create_dir_all(&shared).unwrap();
+    config.shared_read_roots = Some((shared.clone(), shared, None));
     config.memory_floor_gib = Some(16);
     config.systemd_command = Some(engine_replies((16 << 30) - 1));
     let runner = Runner::open(config).unwrap();
@@ -74,7 +79,12 @@ fn jobs_slice_at_the_job_floor_admits_and_clamps_instead_of_refusing() {
     let f = Fixture::new();
     let mut config = f.config();
     config.isolate_jobs = true;
-    config.shared_read_roots = Some((f.scratch.join("cargo"), f.scratch.join("rustup"), None));
+    // The admission decision is what these tests exercise; the shared
+    // read-only trees are the host's library directories, not this runner's
+    // data, so the state root stands in for them and needs no ACL grant.
+    let shared = f.scratch.join("state/shared");
+    fs::create_dir_all(&shared).unwrap();
+    config.shared_read_roots = Some((shared.clone(), shared, None));
     config.memory_floor_gib = Some(16);
     config.systemd_command = Some(engine_replies(16 << 30));
     let floor = config.memory_floor_gib;
