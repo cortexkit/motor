@@ -74,7 +74,7 @@ fn assert_refused_without_start(
     assert!(job.cpus.is_empty() && job.process.is_none() && job.setup_ms.is_none());
     assert_eq!(runner.status().queue_depth, 0);
     assert!(!Path::new(&f.key).join("must-not-start").exists());
-    terminal.refusal_detail().unwrap_or_default()
+    terminal.refusal_detail().unwrap_or_default().to_owned()
 }
 
 /// A slice one byte below the floor every job unit requests refuses the job.
