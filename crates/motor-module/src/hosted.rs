@@ -187,9 +187,33 @@ pub(crate) enum Error {
     AccountInvalid,
     /// The lease body breaks CLOUD's lease schema, so the broker would refuse
     /// it, or did, with 400 `bad_request`. Carries the offending body member
-    /// when ck-motor found it before sending; the broker's refusal does not
-    /// name one. Nothing was booked either way.
-    RequestInvalid(Option<&'static str>),
+    /// when ck-motor found it before sending or the broker named a safe field
+    /// in its refusal. Nothing was booked either way.
+    RequestInvalid(Option<RequestField>),
+}
+
+/// A broker-supplied member name safe to put in logs and refusal details.
+/// Inline storage keeps lease errors copyable without retaining reply bodies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RequestField {
+    bytes: [u8; 64],
+    len: u8,
+}
+impl RequestField {
+    fn new(field: &str) -> Option<Self> {
+        if field.len() > 64 || !field.bytes().all(|b| (b' '..=b'~').contains(&b)) {
+            return None;
+        }
+        let mut bytes = [0; 64];
+        bytes[..field.len()].copy_from_slice(field.as_bytes());
+        Some(Self {
+            bytes,
+            len: field.len() as u8,
+        })
+    }
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)]).expect("validated ASCII field")
+    }
 }
 /// How long a shadow waits for the broker to provision its sandbox. Resuming a
 /// stopped Boat sandbox takes about 100 s and a cold start from the prepared
@@ -280,10 +304,16 @@ impl Error {
             format!("{}: a person must run `ck account login`", self.code())
         } else if self == Self::AccountClosed {
             format!("{}: hosted account closed", self.code())
-        } else if let Self::RequestInvalid(Some(field)) = self {
+        } else if let Some(field) = self.request_field() {
             format!("{}: {field}", self.code())
         } else {
             self.code().into()
+        }
+    }
+    fn request_field(&self) -> Option<&str> {
+        match self {
+            Self::RequestInvalid(Some(field)) => Some(field.as_str()),
+            _ => None,
         }
     }
     /// [`Self::detail`], followed by the broker's own error code when it
@@ -352,10 +382,10 @@ pub(crate) fn validate(request: &RunRequest) -> Result<(), Error> {
         .timeout
         .is_some_and(|s| LEASE_TIMEOUT_S.contains(&s))
     {
-        return Err(Error::RequestInvalid(Some("timeout_s")));
+        return Err(Error::RequestInvalid(RequestField::new("timeout_s")));
     }
     if !LEASE_VCPUS.contains(&lease_vcpus(request)) {
-        return Err(Error::RequestInvalid(Some("vcpus")));
+        return Err(Error::RequestInvalid(RequestField::new("vcpus")));
     }
     let paths = [
         &request.workspace_key,
@@ -537,6 +567,7 @@ fn warn_lease_body(
             "hosted lease body invalid; not sent"),
         Some(http_status) => tracing::warn!(job_id = %id, route, http_status,
             broker_code = broker_code.unwrap_or("none"),
+            field = field.unwrap_or("unknown"),
             vcpus = body.vcpus, timeout_s = body.timeout_s, platform = %body.platform,
             net = body.net, allow_spill, placement_hint = %placement_hint, avoid_host,
             "hosted lease body refused by broker"),
@@ -770,9 +801,14 @@ impl Client {
                     Some("sandbox_lost") if status == 409 => Error::SandboxLost,
                     // The broker could not parse the lease body. Nothing was
                     // booked, so a spilled job can go back to the build
-                    // server; the refusal does not say which member was wrong.
+                    // server. Old brokers may omit the offending member.
                     Some("bad_request") if status == 400 && path == "/v1/leases" => {
-                        Error::RequestInvalid(None)
+                        Error::RequestInvalid(
+                            code.as_ref()
+                                .and_then(|v| v.get("field"))
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(RequestField::new),
+                        )
                     }
                     Some("job_conflict" | "bad_request") => Error::Rejected,
                     other if status == 409 => {
@@ -894,7 +930,7 @@ impl Client {
         // each attempt below puts in is freshly generated and always valid.
         if let Some(field) = invalid_lease_field(&body, false) {
             warn_lease_body(id, &body, route, None, None, Some(field));
-            return Err(Error::RequestInvalid(Some(field)));
+            return Err(Error::RequestInvalid(RequestField::new(field)));
         }
         storage
             .hosted_update(id, |state| state.lease_request = Some(body.clone()))
@@ -969,7 +1005,7 @@ impl Client {
                             route,
                             Some(status),
                             self.broker_code().as_deref(),
-                            None,
+                            error.request_field(),
                         );
                     }
                     match error {
@@ -1097,7 +1133,7 @@ impl Client {
         };
         if let Some(field) = invalid_lease_field(&body, true) {
             warn_lease_body(id, &body, "shadow", None, None, Some(field));
-            return Err(Error::RequestInvalid(Some(field)));
+            return Err(Error::RequestInvalid(RequestField::new(field)));
         }
         let deadline = tokio::time::Instant::now() + SHADOW_PROVISIONING_BUDGET;
         let lease: Lease = self
@@ -1109,7 +1145,7 @@ impl Client {
                 Error::Provisioning(MIN_PROVISIONING_RETRY_MS),
             )
             .await
-            .inspect_err(|_| {
+            .inspect_err(|error| {
                 if let Some(status) = self.broker_client_error() {
                     warn_lease_body(
                         id,
@@ -1117,7 +1153,7 @@ impl Client {
                         "shadow",
                         Some(status),
                         self.broker_code().as_deref(),
-                        None,
+                        error.request_field(),
                     );
                 }
             })?;

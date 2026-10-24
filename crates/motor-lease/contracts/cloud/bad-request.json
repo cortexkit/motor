@@ -1,0 +1,203 @@
+{
+  "note": "TEST-ONLY bytes produced by the broker: authenticated client requests refused with 400 bad_request, each reply naming the failing body member in field. Request and reply bodies are exact bytes; the Authorization header (a client token signed by the machine seed) is omitted.",
+  "test_only_machine_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "clock_ms": 1792195200123,
+  "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "cases": [
+    {
+      "name": "timeout_s over 7200",
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"job_id\":\"019e4567-89ab-7cde-8012-3456789abcde\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":{\"host\":\"host-a\",\"vm\":\"warm-vm-1\"},\"avoid_host\":null,\"timeout_s\":7201,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":true}"
+      },
+      "reply": {
+        "status": 400,
+        "body": "{\"error\":\"bad_request\",\"field\":\"timeout_s\"}"
+      }
+    },
+    {
+      "name": "malformed workspace_key_hash",
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"job_id\":\"019e4567-89ab-7cde-8012-3456789abcde\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"not-a-hash\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":{\"host\":\"host-a\",\"vm\":\"warm-vm-1\"},\"avoid_host\":null,\"timeout_s\":100,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":true}"
+      },
+      "reply": {
+        "status": 400,
+        "body": "{\"error\":\"bad_request\",\"field\":\"workspace_key_hash\"}"
+      }
+    },
+    {
+      "name": "missing allow_spill",
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"job_id\":\"019e4567-89ab-7cde-8012-3456789abcde\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":{\"host\":\"host-a\",\"vm\":\"warm-vm-1\"},\"avoid_host\":null,\"timeout_s\":100,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"}}"
+      },
+      "reply": {
+        "status": 400,
+        "body": "{\"error\":\"bad_request\",\"field\":\"allow_spill\"}"
+      }
+    },
+    {
+      "name": "extra member, reported as body without its name",
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"job_id\":\"019e4567-89ab-7cde-8012-3456789abcde\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":{\"host\":\"host-a\",\"vm\":\"warm-vm-1\"},\"avoid_host\":null,\"timeout_s\":100,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":true,\"evil<script>\":true}"
+      },
+      "reply": {
+        "status": 400,
+        "body": "{\"error\":\"bad_request\",\"field\":\"body\"}"
+      }
+    },
+    {
+      "name": "body that is not JSON",
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "not json"
+      },
+      "reply": {
+        "status": 400,
+        "body": "{\"error\":\"bad_request\",\"field\":\"body\"}"
+      }
+    },
+    {
+      "name": "body that is not an object",
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "[]"
+      },
+      "reply": {
+        "status": 400,
+        "body": "{\"error\":\"bad_request\",\"field\":\"body\"}"
+      }
+    },
+    {
+      "name": "malformed nested requester_jwk.x",
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"job_id\":\"019e4567-89ab-7cde-8012-3456789abcde\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":{\"host\":\"host-a\",\"vm\":\"warm-vm-1\"},\"avoid_host\":null,\"timeout_s\":100,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"too-short\"},\"allow_spill\":true}"
+      },
+      "reply": {
+        "status": 400,
+        "body": "{\"error\":\"bad_request\",\"field\":\"requester_jwk.x\"}"
+      }
+    },
+    {
+      "name": "malformed nested placement_hint.host",
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"job_id\":\"019e4567-89ab-7cde-8012-3456789abcde\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":{\"host\":\"host/a\",\"vm\":\"warm-vm-1\"},\"avoid_host\":null,\"timeout_s\":100,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":true}"
+      },
+      "reply": {
+        "status": 400,
+        "body": "{\"error\":\"bad_request\",\"field\":\"placement_hint.host\"}"
+      }
+    },
+    {
+      "name": "shadow with allow_spill false, reported on shadow",
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"job_id\":\"019e4567-89ab-7cde-8012-3456789abcde\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":{\"host\":\"host-a\",\"vm\":\"warm-vm-1\"},\"avoid_host\":null,\"timeout_s\":100,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":false,\"shadow\":true}"
+      },
+      "reply": {
+        "status": 400,
+        "body": "{\"error\":\"bad_request\",\"field\":\"shadow\"}"
+      }
+    },
+    {
+      "name": "reattach with a wrong requester_jwk.crv",
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"X25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"}}"
+      },
+      "reply": {
+        "status": 400,
+        "body": "{\"error\":\"bad_request\",\"field\":\"requester_jwk.crv\"}"
+      }
+    },
+    {
+      "name": "finish with a negative run_ms",
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/finish",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"outcome\":\"exit\",\"run_ms\":-1}"
+      },
+      "reply": {
+        "status": 400,
+        "body": "{\"error\":\"bad_request\",\"field\":\"run_ms\"}"
+      }
+    },
+    {
+      "name": "release with an extra member",
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/release",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"evil<script>\":true}"
+      },
+      "reply": {
+        "status": 400,
+        "body": "{\"error\":\"bad_request\",\"field\":\"body\"}"
+      }
+    },
+    {
+      "name": "wrong Content-Type, which is not about the body and has no field",
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "headers": {
+          "Content-Type": "text/plain"
+        },
+        "body": "{\"job_id\":\"019e4567-89ab-7cde-8012-3456789abcde\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":{\"host\":\"host-a\",\"vm\":\"warm-vm-1\"},\"avoid_host\":null,\"timeout_s\":100,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":true}"
+      },
+      "reply": {
+        "status": 400,
+        "body": "{\"error\":\"bad_request\"}"
+      }
+    }
+  ]
+}

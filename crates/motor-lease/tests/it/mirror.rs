@@ -63,6 +63,7 @@ fn cloud_final_files_match_their_manifest_digests() {
         serde_json::from_slice(&std::fs::read(root.join("digest-manifest.json")).unwrap()).unwrap();
     for path in [
         "cloud/runners-contract.md",
+        "cloud/bad-request.json",
         "cloud/no-spill-lease.json",
         "cloud/no-host-fits-lease.json",
         "cloud/boat-lease.json",
@@ -95,7 +96,11 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "16240ddd26005635016681be58c2b8a1ff1393f35c187ab4abe9d89b1f95c26a",
+            "1249be8d6ccaecc3ec3d8d738c43a27d5f999ebc4a51bd0ef8d4d84d088b815c",
+        ),
+        (
+            "bad-request.json",
+            "92bc738250dc962214b60b9c4da205922eae18dc6c6618b2a2eb6c74256f1c62",
         ),
         (
             "no-host-fits-lease.json",
