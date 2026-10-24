@@ -353,12 +353,17 @@ impl Host {
     }
     pub fn heartbeat(&self, now_ms: u64, free_mem_mib: u64, healthy: bool) -> Heartbeat {
         Heartbeat {
-            free_vcpus: self
-                .tenants
-                .values()
-                .map(|t| u64::from(t.budget().saturating_sub(self.share(&t.tenant, now_ms))))
-                .max()
-                .unwrap_or(0),
+            // While host storage is low, new leases are refused, so no free
+            // vCPUs are advertised and the broker places no new work here.
+            free_vcpus: if self.storage_refusing() {
+                0
+            } else {
+                self.tenants
+                    .values()
+                    .map(|t| self.tenant_free_vcpus(t, now_ms))
+                    .max()
+                    .unwrap_or(0)
+            },
             free_mem_mib,
             queued: self
                 .snapshot

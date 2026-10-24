@@ -123,6 +123,13 @@ mod tests {
 
     #[test]
     fn unauthenticated_sockets_are_capped_without_queueing_and_slots_are_reused() {
+        // This test logs the same summary statement as the one above. While
+        // exactly one subscriber is registered, tracing decides a statement's
+        // interest from the first thread that reaches it; reaching it here
+        // with no subscriber could disable it for the test above. A
+        // discarding subscriber keeps the statement enabled.
+        let sink = motor_protocol::logging::LineSubscriber::new("[host]", std::io::sink());
+        let _subscriber = tracing::subscriber::set_default(sink);
         let ingress = Ingress::default();
         let peer = "192.0.2.1:1234".parse().unwrap();
         let mut slots: Vec<_> = (0..UNAUTHENTICATED_LIMIT)

@@ -3,6 +3,7 @@ mod admission_capacity;
 mod billing;
 #[cfg(target_os = "linux")]
 mod broker;
+mod capacity;
 mod closure;
 mod enroll;
 mod helper;

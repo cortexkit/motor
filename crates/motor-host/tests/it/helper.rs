@@ -175,6 +175,7 @@ fn helper_initialization_holds_one_vcpu_until_attach_or_post_restore_reply() {
         let helper = Helper {
             socket: path,
             storage: directory.path().to_path_buf(),
+            capacity: directory.path().join("capacity.json"),
             guest_init: BTreeMap::from([(
                 "tenant".into(),
                 json!({"address":"10.200.1.2/30","gateway":"10.200.1.1","resolvers":["1.1.1.1"],"hostname":"motor-1","machine_id":"12345678901234567890123456789012"}),
@@ -238,6 +239,7 @@ fn recovery_guest_pass_clears_flag_but_failure_or_unreachable_guest_keeps_tenant
         let helper = Helper {
             socket,
             storage: directory.path().into(),
+            capacity: directory.path().join("capacity.json"),
             guest_init: BTreeMap::from([("tenant".into(), json!({}))]),
         };
         let response = helper.wake("tenant", None);
@@ -254,4 +256,53 @@ fn recovery_guest_pass_clears_flag_but_failure_or_unreachable_guest_keeps_tenant
         }
         worker.join().unwrap();
     }
+}
+
+#[test]
+fn helper_start_refused_reply_is_a_typed_start_refusal_and_stops_the_wake() {
+    let directory = scratch();
+    let socket = directory.path().join("helper.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let worker = std::thread::spawn(move || {
+        for (op, reply) in [
+            (
+                "adopt",
+                json!({"result":"tenant","running":false,"restored":false,"generation":1}),
+            ),
+            (
+                "ensure",
+                json!({"result":"start_refused","case":"fit","message":"reserved_bytes=1 exceeds MemTotal_bytes=0"}),
+            ),
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["op"], op);
+            writeln!(stream, "{reply}").unwrap();
+        }
+        // No quota, relay or guest initialization follows a refused start.
+        listener.set_nonblocking(true).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(listener.accept().is_err());
+    });
+    let helper = Helper {
+        socket,
+        storage: directory.path().into(),
+        capacity: directory.path().join("capacity.json"),
+        guest_init: BTreeMap::from([("tenant".into(), json!({}))]),
+    };
+    let error = helper.wake("tenant", None).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<motor_host::helper::StartRefused>(),
+        Some(&motor_host::helper::StartRefused {
+            case: "fit".into(),
+            message: "reserved_bytes=1 exceeds MemTotal_bytes=0".into(),
+        })
+    );
+    worker.join().unwrap();
+    // The helper reads its configured capacity file; an incomplete one is refused.
+    std::fs::write(directory.path().join("capacity.json"), "{}").unwrap();
+    assert!(helper.capacity().is_err());
 }
