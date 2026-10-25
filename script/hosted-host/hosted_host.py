@@ -391,6 +391,8 @@ def runner_log_lines(reply: dict) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
+    network_install = commands.add_parser('install-network-settings')
+    network_install.add_argument('--source', required=True, type=Path)
     host = commands.add_parser("host")
     host.add_argument("--host-id", required=True)
     host.add_argument("--port", type=int, default=PORT)
@@ -421,6 +423,9 @@ def main() -> int:
     runner_log.add_argument("--job", help="keep only entries naming this job id (jti)")
     args = parser.parse_args()
     try:
+        if args.command == 'install-network-settings':
+            load_network_policy().install_settings(args.source)
+            return 0
         if args.command in {'network', 'check-uplink'}:
             policy = load_network_policy()
             settings = policy.checked_settings({'uplink': args.uplink, 'public_ipv4': args.public_ip})

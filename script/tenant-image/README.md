@@ -445,6 +445,11 @@ Install the [explicit host uplink settings and outbound policy](../../docs/runne
 first. Qualification reads `/etc/motor-network.json` into its transient helper
 config; neither the helper nor the network loader chooses an interface from a
 default route. The interface must be UP with the configured public IPv4 address.
+Images using the runner's network success-generation protocol must include the
+matching `motor_network_ready.py` and guest network unit. The guest publishes
+`/run/motor-net-ready` only after its boot-time nft load succeeds; construction
+must not publish a marker in the image. Rebuild the image when upgrading from a
+table-only runner probe.
 
 Budget, **not measured results**: allow 5–15 minutes after builds, approximately
 53 GiB peak incremental disk plus the delivered executable/logs, and about

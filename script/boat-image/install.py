@@ -659,6 +659,8 @@ def install_units(systemd=Path("/etc/systemd/system")):
         run("install", "-m", "0755", str(HERE / name), "/usr/local/libexec/" + name)
     run("install", "-m", "0644", str(ROOT / "script/runner/motor-net.nft"),
         "/usr/local/libexec/motor-boat-net.nft")
+    run("install", "-m", "0644", str(ROOT / "script/runner/motor_network_ready.py"),
+        "/usr/local/libexec/motor_network_ready.py")
     for name in RETIRED_UNITS:
         if (systemd / name).exists() or (systemd / name).is_symlink():
             subprocess.run(["systemctl", "disable", "--now", name], check=False)

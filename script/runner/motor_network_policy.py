@@ -15,17 +15,22 @@ import shlex
 import signal
 import stat
 import subprocess
+import types
 
 LOCK = pathlib.Path('/run/motor-network/lock')
 SOURCE = pathlib.Path('/etc/nftables.d/motor-net.nft')
 SETTINGS = pathlib.Path('/etc/motor-network.json')
+TEMPLATE = pathlib.Path('/usr/local/libexec/motor-net-template.nft')
+readiness = types.ModuleType('motor_network_ready')
+exec(compile(pathlib.Path(__file__).with_name('motor_network_ready.py').read_bytes(),
+             'motor_network_ready.py', 'exec'), readiness.__dict__)
 
 
 def checked_settings(value):
     if not isinstance(value, dict) or set(value) != {'uplink', 'public_ipv4'}:
         raise ValueError('network settings require exactly uplink and public_ipv4')
     uplink = value['uplink']
-    if not isinstance(uplink, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,15}', uplink) or uplink in {'.', '..', 'lo'}:
+    if not isinstance(uplink, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,14}', uplink) or uplink in {'any', 'lo'}:
         raise ValueError(f'invalid uplink {uplink!r}')
     address = ipaddress.IPv4Address(value['public_ipv4'])
     if not address.is_global or address.is_multicast:
@@ -49,7 +54,7 @@ def validate_uplink(settings, addresses=None):
     return settings
 
 
-def read_settings():
+def read_settings(check_link=True):
     fd = os.open(SETTINGS, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     with os.fdopen(fd) as source:
         metadata = os.fstat(source.fileno())
@@ -58,17 +63,35 @@ def read_settings():
         text = source.read(4097)
     if len(text) > 4096:
         raise ValueError('network settings exceed read bound')
-    return validate_uplink(checked_settings(json.loads(text)))
+    settings = checked_settings(json.loads(text))
+    return validate_uplink(settings) if check_link else settings
 
 
 def render_source(source, uplink):
     # Keep the historical file as the shared host/guest template. Its three
     # interface tokens are replaced only with the explicit, validated host name.
-    if not isinstance(uplink, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,15}', uplink) or uplink in {'.', '..', 'lo'}:
+    if not isinstance(uplink, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,14}', uplink) or uplink in {'any', 'lo'}:
         raise ValueError(f'invalid uplink {uplink!r}')
     if source.count('"enp6s0"') != 3:
         raise ValueError('network template must contain exactly three uplink tokens')
     return source.replace('"enp6s0"', f'"{uplink}"')
+
+
+def install_settings(source):
+    settings = checked_settings(json.loads(source.read_text()))
+    with network_lock(mutate=True):
+        readiness.invalidate()
+        temporary = SETTINGS.with_name('.motor-network-settings-' + os.urandom(16).hex())
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, 'w') as output:
+                os.fchmod(output.fileno(), 0o644)
+                output.write(json.dumps(settings, indent=2) + '\n')
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, SETTINGS)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def command(*args, input=None):
@@ -362,20 +385,48 @@ def apply(transaction):
     command('/usr/sbin/nft', '--file', '-', input=transaction)
 
 
+def checked_source(settings):
+    def read(path):
+        metadata = path.lstat()
+        assert stat.S_ISREG(metadata.st_mode) and metadata.st_uid == 0 and not metadata.st_mode & 0o022, 'unsafe versioned network source'
+        return path.read_text()
+    expected = render_source(read(TEMPLATE), settings['uplink'])
+    if read(SOURCE) != expected:
+        raise ValueError(f"network source does not match uplink {settings['uplink']} and the canonical template")
+    return expected
+
+
 def load():
     """Reload owned policy without restarting the helper or any tenant VM."""
     with network_lock(mutate=True):
-        settings = read_settings()
+        load_locked()
+
+
+def load_locked(publish=True):
+    """Called only while holding the exclusive network mutation lock."""
+    readiness.invalidate()
+    opened = False
+    taps = set()
+    try:
+        settings = read_settings(check_link=False)
         uplink = settings['uplink']
-        metadata = SOURCE.lstat()
-        assert stat.S_ISREG(metadata.st_mode) and metadata.st_uid == 0 and not metadata.st_mode & 0o022, 'unsafe versioned network source'
-        source = SOURCE.read_text()
+        source = checked_source(settings)
         document = table('inet', 'motor_tenant')
         policy_error = None
         try:
             taps, closed = tenant_snapshot(document, source, uplink=uplink)
         except (AssertionError, KeyError, TypeError, ValueError) as error:
             policy_error, taps, closed = error, set(), set()
+        net_document = table('inet', 'motor_net')
+        try:
+            validate_uplink(settings)
+        except (OSError, RuntimeError, ValueError):
+            fence = members('motor_tenant', 'closed_taps', taps) if document is not None and policy_error is None else ''
+            if net_document is not None:
+                fence += members('motor_net', 'tenant_taps', set())
+            if fence:
+                apply(fence)
+            raise
         ufw_error = None
         try:
             prior = inspect_ufw(uplink=uplink) if document is not None and policy_error is None else (set(), set())
@@ -385,20 +436,32 @@ def load():
         transaction = ''
         if document is not None and policy_error is None:
             transaction += members('motor_tenant', 'closed_taps', closed | (taps - ready))
-        if table('inet', 'motor_net') is not None:
+        if net_document is not None:
             transaction += 'delete table inet motor_net\n'
         transaction += source + '\n' + members('motor_net', 'tenant_taps', ready)
         apply(transaction)
         if policy_error is not None:
-            print(f'FENCED: unsupported tenant policy; update helper and run --check: {policy_error}')
-            return
+            raise RuntimeError(f'FENCED: unsupported tenant policy; update helper and run --check: {policy_error}')
         if ufw_error is not None:
             raise RuntimeError(f'tenant UFW policy is fenced/unready: {ufw_error}')
         if document is not None:
             try:
                 reconcile_ufw(taps, prior, uplink=uplink)
+                # Rules match interface names, so a same-name replacement inherits
+                # them. Only root can rename interfaces; that case is out of scope.
+                validate_uplink(settings)
             except (AssertionError, OSError, RuntimeError, ValueError):
                 apply(members('motor_tenant', 'closed_taps', taps) + members('motor_net', 'tenant_taps', set()))
                 raise
             apply(members('motor_tenant', 'closed_taps', set()) + members('motor_net', 'tenant_taps', taps))
+            opened = True
+        if publish:
+            validate_uplink(settings)
+            readiness.publish()
         print('PASS: motor_net loaded with guarded exact tenant delegation')
+        return settings, taps
+    except BaseException:
+        readiness.invalidate()
+        if opened:
+            apply(members('motor_tenant', 'closed_taps', taps) + members('motor_net', 'tenant_taps', set()))
+        raise

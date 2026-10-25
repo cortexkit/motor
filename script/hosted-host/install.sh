@@ -150,7 +150,11 @@ place() {
     fi
   fi
   [ -e "$dest" ] && cp -p "$dest" "$dest.bak-$(date -u +%Y%m%dT%H%M%SZ)"
-  install -o "${owner%%:*}" -g "${owner##*:}" -m "$mode" "$src" "$dest"
+  if [ "$dest" = "$NETWORK_CONFIG" ]; then
+    render install-network-settings --source "$src"
+  else
+    install -o "${owner%%:*}" -g "${owner##*:}" -m "$mode" "$src" "$dest"
+  fi
   echo "installed $dest"
 }
 

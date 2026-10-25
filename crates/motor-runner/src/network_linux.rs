@@ -5,7 +5,8 @@ use serde_json::Value;
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io,
+    io::{self, Read},
+    path::Path,
     process::Command,
     time::Instant,
 };
@@ -27,10 +28,11 @@ fn sudo(path: &str, args: &[&str]) -> io::Result<String> {
 }
 
 pub(crate) fn probe() -> io::Result<()> {
-    sudo("/usr/sbin/nft", &["list", "table", "inet", "motor_net"])?;
-    if fs::read_to_string("/proc/sys/net/ipv4/ip_forward")?.trim() != "1" {
-        return Err(io::Error::other("network requires net.ipv4.ip_forward=1"));
-    }
+    probe_policy(
+        sudo,
+        || read_success_generation(Path::new("/run/motor-net-ready"), 0),
+        || fs::read_to_string("/proc/sys/net/ipv4/ip_forward"),
+    )?;
     // Permission queries never execute the mutating probe commands. Keep the
     // shared inventory in sync with attach and cleanup, including namespace entry.
     // A root runner that runs its helpers directly has no grants to query.
@@ -55,6 +57,55 @@ pub(crate) fn probe() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn probe_policy(
+    mut command: impl FnMut(&str, &[&str]) -> io::Result<String>,
+    generation: impl FnOnce() -> io::Result<Uuid>,
+    forwarding: impl FnOnce() -> io::Result<String>,
+) -> io::Result<()> {
+    command("/usr/sbin/nft", &["list", "table", "inet", "motor_net"])?;
+    // A failed or interrupted reload can leave the previous table in the kernel.
+    // Only a root-published completed load, not table existence, authorizes attach.
+    generation()?;
+    if forwarding()?.trim() != "1" {
+        return Err(io::Error::other("network requires net.ipv4.ip_forward=1"));
+    }
+    Ok(())
+}
+
+fn read_success_generation(path: &Path, owner: u32) -> io::Result<Uuid> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != owner
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o022 != 0
+        || metadata.len() > 1024
+    {
+        return Err(io::Error::other("unsafe network success generation"));
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Ready {
+        schema: u8,
+        generation: String,
+    }
+    let mut bytes = Vec::new();
+    file.by_ref().take(1025).read_to_end(&mut bytes)?;
+    let ready: Ready = serde_json::from_slice(&bytes)?;
+    let generation = Uuid::parse_str(&ready.generation).map_err(io::Error::other)?;
+    if ready.schema != 1
+        || generation.get_version_num() != 4
+        || generation.simple().to_string() != ready.generation
+    {
+        return Err(io::Error::other("invalid network success generation"));
+    }
+    Ok(generation)
 }
 
 /// The host-wide lock that keeps attach and startup reconciliation from
@@ -302,6 +353,9 @@ pub(crate) fn attach(id: Uuid) -> io::Result<()> {
         namespace(pid, IP, &["link", "set", "dev", "eth0", "up"])?;
         sudo(IP, &["link", "set", "dev", &name, "up"])?;
         namespace(pid, IP, &["route", "add", "default", "via", &gateway])?;
+        // Keep the command gate closed if a policy load began or failed while
+        // links were being created. The error path removes the unstarted veth.
+        probe()?;
         Ok(())
     })();
     if result.is_err() {
@@ -318,6 +372,67 @@ pub(crate) fn attach(id: Uuid) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn existing_table_after_failed_reload_does_not_authorize_attach() {
+        use super::*;
+        let root = std::env::temp_dir().join(format!("motor-policy-ready-{}", Uuid::now_v7()));
+        fs::create_dir(&root).unwrap();
+        let marker = root.join("ready");
+        let generation = Uuid::parse_str("c61f406a-764b-4df3-ae85-52b43aa520b9").unwrap();
+        fs::write(
+            &marker,
+            serde_json::json!({"schema":1,"generation":generation.simple().to_string()})
+                .to_string(),
+        )
+        .unwrap();
+        let owner = unsafe { libc::geteuid() };
+        let probe = || {
+            probe_policy(
+                |_, _| Ok("table inet motor_net { old policy }".into()),
+                || read_success_generation(&marker, owner),
+                || Ok("1".into()),
+            )
+        };
+        probe().unwrap();
+        // The loader invalidates its generation before attempting a reload;
+        // the old kernel table can survive a failed nft --check unchanged.
+        fs::remove_file(&marker).unwrap();
+        assert!(
+            probe().is_err(),
+            "an existing table must not bypass an unfinished or failed load"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn policy_success_generation_requires_safe_owner_mode_and_canonical_record() {
+        use super::*;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = std::env::temp_dir().join(format!("motor-policy-marker-{}", Uuid::now_v7()));
+        fs::create_dir(&root).unwrap();
+        let marker = root.join("ready");
+        let owner = unsafe { libc::geteuid() };
+        fs::write(
+            &marker,
+            serde_json::json!({"schema":1,"generation":"c61f406a764b4df3ae8552b43aa520b9"})
+                .to_string(),
+        )
+        .unwrap();
+        read_success_generation(&marker, owner).unwrap();
+        assert!(read_success_generation(&marker, owner.wrapping_add(1)).is_err());
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(read_success_generation(&marker, owner).is_err());
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
+        let alias = root.join("alias");
+        symlink(&marker, &alias).unwrap();
+        assert!(read_success_generation(&alias, owner).is_err());
+        for invalid in ["{}", "{\"schema\":1,\"generation\":\"not-a-generation\"}"] {
+            fs::write(&marker, invalid).unwrap();
+            assert!(read_success_generation(&marker, owner).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
     #[test]
     fn pool_and_names_are_distinct_and_bounded() {

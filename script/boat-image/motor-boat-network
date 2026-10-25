@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import runpy
 
 IP = '/usr/sbin/ip'
 NFT = '/usr/sbin/nft'
@@ -21,11 +22,15 @@ def main():
     parser.add_argument('--check', action='store_true', help='validate without changing firewall or sysctls')
     parser.add_argument('--template', type=Path, default=Path('/usr/local/libexec/motor-boat-net.nft'))
     args = parser.parse_args()
+    readiness = None
+    if not args.check:
+        readiness = runpy.run_path('/usr/local/libexec/motor_network_ready.py')
+        readiness['invalidate']()
     for binary in (IP, NFT, SYSCTL, UFW):
         if not Path(binary).is_file():
             raise SystemExit('required administrator executable is missing: ' + binary)
     routes = json.loads(run(IP, '-j', '-4', 'route', 'show', 'default', capture_output=True).stdout)
-    if not routes or not re.fullmatch(r'[a-zA-Z0-9_.-]+', routes[0]['dev']):
+    if not routes or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,14}', routes[0]['dev']) or routes[0]['dev'] in {'any', 'lo'}:
         raise SystemExit('no verified IPv4 egress interface; refusing outbound job networking')
     interface = routes[0]['dev']
     rules = args.template.read_text()
@@ -47,6 +52,7 @@ def main():
     available = next(int(line.split()[1]) * 1024 for line in meminfo.splitlines() if line.startswith('MemAvailable:'))
     Path('/run/motor-boat-memory.json').write_text(json.dumps({'meminfo_before_runner': meminfo,
         'mem_available_bytes': available, 'nproc': run('/usr/bin/nproc', capture_output=True).stdout.strip()}) + '\n')
+    readiness['publish']()
 
 
 if __name__ == '__main__':

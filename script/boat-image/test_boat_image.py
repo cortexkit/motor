@@ -1092,6 +1092,22 @@ class RecipeTests(unittest.TestCase):
         self.assertFalse(any('-w' in call for call in calls))
         self.assertFalse(any(call[:2] == (network.NFT, '-f') for call in calls))
 
+    def test_failed_existing_table_reload_clears_boat_readiness_before_any_setup(self):
+        clear, publish = Mock(), Mock()
+        def run(*args, **kwargs):
+            clear.assert_called_once()
+            if args[:2] == (network.NFT, '--check'):
+                raise RuntimeError('existing-table reload failed')
+            return Mock(stdout='[{"dev":"eth0"}]')
+        template = install.ROOT / 'script/runner/motor-net.nft'
+        with patch.object(network.runpy, 'run_path', return_value={'invalidate': clear, 'publish': publish}), \
+                patch.object(network, 'run', run), patch.object(network.subprocess, 'run', return_value=Mock(returncode=0)), \
+                patch.object(network.Path, 'is_file', return_value=True), \
+                patch.object(sys, 'argv', ['network', '--template', str(template)]):
+            with self.assertRaisesRegex(RuntimeError, 'reload failed'):
+                network.main()
+        publish.assert_not_called()
+
     def test_unit_preflight_collects_all_statuses_and_journals_before_stopping(self):
         failure = install.subprocess.CalledProcessError(1, 'systemctl start')
         with patch.object(install, 'run', side_effect=failure), patch.object(install.subprocess, 'run') as collect:

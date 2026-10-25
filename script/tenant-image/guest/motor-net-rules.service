@@ -5,7 +5,9 @@ Before=motor-tenant-agent.service
 
 [Service]
 Type=oneshot
+ExecStartPre=/usr/bin/rm -f /run/motor-net-ready
 ExecStart=/usr/sbin/nft -f /etc/nftables.d/motor-net.nft
+ExecStartPost=/usr/bin/python3 -I /usr/local/libexec/motor_network_ready.py --publish
 StandardOutput=journal+console
 StandardError=journal+console
 RemainAfterExit=yes

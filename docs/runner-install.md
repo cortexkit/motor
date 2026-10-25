@@ -308,6 +308,18 @@ The explicit uplink and its public IPv4 address are persisted in root-owned
 interface must exist, be UP and carry that address. When a hosted helper config
 exists its settings must agree. The literal job address pool is unchanged;
 rendering with `--uplink enp6s0` preserves the build server's original policy.
+Interface names must be 1–15 ASCII bytes, start with an alphanumeric, contain
+only letters, digits, `_`, `.` or `-`, and must not be `any` or `lo`.
+Settings, the rendered file and the installed canonical template are checked
+together under the network lock. A stale source for another uplink is refused
+before any nftables or UFW call; installation holds the same lock while writing.
+
+Every mutating policy load first removes `/run/motor-net-ready`. Only complete
+success publishes a new root-owned generation there. The runner requires that
+generation at startup and both before and after attachment, so an old kernel
+table left by a failed reload cannot authorize a new job. Host, Boat and tenant
+guest policy producers all implement this protocol; old images without it fail
+closed and must be rebuilt, not given a table-only compatibility fallback.
 Run the default read-only diff as the trusted runner account to verify its
 non-root `sudo` grants. Running `--check` as root skips verification of that
 account's non-root `sudo` grants.

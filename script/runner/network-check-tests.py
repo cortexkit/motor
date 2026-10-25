@@ -246,6 +246,18 @@ class TenantDelegationTests(unittest.TestCase):
         settings = patch.object(self.policy, 'read_settings', return_value={'uplink': 'enp6s0', 'public_ipv4': '8.8.8.8'})
         settings.start()
         self.addCleanup(settings.stop)
+        validation = patch.object(self.policy, 'validate_uplink', return_value={'uplink': 'enp6s0', 'public_ipv4': '8.8.8.8'})
+        self.validation = validation.start()
+        self.addCleanup(validation.stop)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.policy.readiness.READY = pathlib.Path(directory.name) / 'ready'
+        root = patch.object(self.policy.readiness, 'require_root')
+        root.start()
+        self.addCleanup(root.stop)
+        ready = patch.object(self.policy.readiness, 'require_ready')
+        ready.start()
+        self.addCleanup(ready.stop)
         self.root = pathlib.Path(__file__).parent
         self.source = (self.root / 'motor-net.nft').read_text()
         self.net = json.loads((self.root / 'test-fixtures/nft-motor-net-v2-added-set.json').read_text())
@@ -279,6 +291,68 @@ class TenantDelegationTests(unittest.TestCase):
                 self.policy.live_grants(broken, uplink="enp6s0")
         with self.assertRaises(AssertionError):
             self.policy.owned_grants(self.OWNED, True, uplink="enp6s0")
+
+    def test_stale_source_for_other_settings_refuses_before_any_firewall_call(self):
+        source = SimpleNamespace(read_text=lambda: self.source, lstat=lambda: SimpleNamespace(st_mode=0o100644, st_uid=0))
+        self.policy.readiness.publish()
+        with patch.object(self.policy, 'network_lock', return_value=contextlib.nullcontext()), \
+                patch.object(self.policy, 'read_settings', return_value={'uplink': 'eno1', 'public_ipv4': '8.8.8.8'}), \
+                patch.object(self.policy, 'SOURCE', source), patch.object(self.policy, 'TEMPLATE', source), \
+                patch.object(self.policy, 'table', return_value=None) as table, patch.object(self.policy, 'apply') as apply, \
+                patch.object(self.policy, 'command') as command, patch.object(self.policy, 'reconcile_ufw') as ufw:
+            with self.assertRaisesRegex(ValueError, 'source does not match uplink eno1'):
+                self.policy.load()
+        table.assert_not_called()
+        apply.assert_not_called()
+        command.assert_not_called()
+        ufw.assert_not_called()
+        self.assertFalse(self.policy.readiness.READY.exists())
+
+    def test_existing_table_failed_reload_withdraws_success_generation(self):
+        source = SimpleNamespace(read_text=lambda: self.source, lstat=lambda: SimpleNamespace(st_mode=0o100644, st_uid=0))
+        self.policy.readiness.publish()
+        calls = []
+        def command(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ('/usr/sbin/nft', '--check'):
+                raise RuntimeError('injected nft check failure on an existing table')
+            raise AssertionError(f'unexpected applying/UFW command {args}')
+        with patch.object(self.policy, 'network_lock', return_value=contextlib.nullcontext()), \
+                patch.object(self.policy, 'SOURCE', source), patch.object(self.policy, 'TEMPLATE', source), \
+                patch.object(self.policy, 'table', side_effect=lambda family, name: None if name == 'motor_tenant' else self.net), \
+                patch.object(self.policy, 'command', side_effect=command), patch.object(self.policy, 'reconcile_ufw') as ufw:
+            with self.assertRaisesRegex(RuntimeError, 'nft check failure'):
+                self.policy.load()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], ('/usr/sbin/nft', '--check'))
+        ufw.assert_not_called()
+        self.assertFalse(self.policy.readiness.READY.exists(), 'old table must not retain a successful-load authorization')
+
+    def test_installer_holds_network_lock_for_every_write_and_load(self):
+        held = False
+        events = []
+        @contextlib.contextmanager
+        def lock(*, mutate):
+            nonlocal held
+            self.assertTrue(mutate)
+            held = True
+            try:
+                yield
+            finally:
+                held = False
+        def checked(label):
+            self.assertTrue(held, label)
+            events.append(label)
+        settings = {'uplink': 'enp6s0', 'public_ipv4': '8.8.8.8'}
+        with patch.object(self.policy, 'network_lock', side_effect=lock), \
+                patch.object(self.installer, 'sudo', side_effect=lambda *a, **k: checked(a)), \
+                patch.object(self.policy, 'checked_source', side_effect=lambda _: checked('source binding')), \
+                patch.object(self.policy, 'load_locked', side_effect=lambda **_: (checked('load'), set())), \
+                patch.object(self.installer, 'prerequisites', side_effect=lambda **_: checked('checks')):
+            self.installer.install_policy({pathlib.Path('/etc/test-network'): 'test\n'}, settings)
+        self.assertIn('load', events)
+        self.assertIn('checks', events)
+        self.assertTrue(self.policy.readiness.READY.exists())
 
     def test_checker_rejects_missing_source_in_comment_owned_grant(self):
         with self.assertRaises(AssertionError):
@@ -358,19 +432,59 @@ class TenantDelegationTests(unittest.TestCase):
             self.policy.reconcile_ufw({'mtap1'}, ({'mtap1'}, {'mtap1'}), uplink="enp6s0")
         command.assert_not_called()
 
-    def load_plan(self, tenant, net, prior=({'mtap1'}, {'mtap1'}), failure=False, inspect_failure=False):
+    def load_plan(self, tenant, net, prior=({'mtap1'}, {'mtap1'}), failure=False, inspect_failure=False, late_failure=False, initial_failure=False):
         source = SimpleNamespace(read_text=lambda: self.source, lstat=lambda: SimpleNamespace(st_mode=0o100644, st_uid=0))
         writes = []
         with patch.object(self.policy, 'network_lock', return_value=contextlib.nullcontext()), patch.object(self.policy, 'SOURCE', source), \
+                patch.object(self.policy, 'TEMPLATE', source), \
                 patch.object(self.policy, 'table', side_effect=lambda family, name: tenant if name == 'motor_tenant' else net), \
                 patch.object(self.policy, 'apply', side_effect=writes.append), patch.object(self.policy, 'inspect_ufw', return_value=prior, side_effect=RuntimeError('UFW failure') if inspect_failure else None) as inspect, \
                 patch.object(self.policy, 'reconcile_ufw', side_effect=RuntimeError('UFW failure') if failure else None):
-            if failure or inspect_failure:
+            if late_failure or initial_failure:
+                error = ValueError('uplink disappeared before final gate')
+                self.validation.side_effect = [error] if initial_failure else [dict(uplink='enp6s0', public_ipv4='8.8.8.8'), error]
+                with self.assertRaisesRegex(ValueError, 'before final gate'):
+                    self.policy.load()
+            elif failure or inspect_failure:
                 with self.assertRaisesRegex(RuntimeError, 'UFW failure'):
                     self.policy.load()
             else:
                 self.policy.load()
         return writes, inspect.call_count
+
+    def test_uplink_disappears_before_final_gate_and_remains_closed(self):
+        writes, _ = self.load_plan(self.tenant, self.net, late_failure=True)
+        self.assertEqual(len(writes), 2, 'must fence instead of briefly opening before a later readiness check')
+        self.assertNotIn('add element inet motor_tenant closed_taps { "mtap1" }', writes[0])
+        self.assertIn('add element inet motor_tenant closed_taps { "mtap1" }', writes[-1])
+        self.assertFalse(self.policy.readiness.READY.exists())
+
+    def test_initial_uplink_failure_fences_existing_ready_gate(self):
+        writes, inspected = self.load_plan(self.tenant, self.net, initial_failure=True)
+        self.assertEqual(inspected, 0)
+        self.assertEqual(len(writes), 1)
+        self.assertIn('add element inet motor_tenant closed_taps { "mtap1" }', writes[0])
+        self.assertNotIn('add element inet motor_net tenant_taps', writes[0])
+        self.assertFalse(self.policy.readiness.READY.exists())
+
+    def test_healthy_reload_keeps_ready_gate_open_but_closes_unready_gate(self):
+        tenant = copy.deepcopy(self.tenant)
+        next(e['set'] for e in tenant['nftables'] if e.get('set', {}).get('name') == 'closed_taps')['elem'] = []
+        writes, _ = self.load_plan(tenant, self.net)
+        self.assertNotIn('add element inet motor_tenant closed_taps { "mtap1" }', writes[0])
+        self.assertIn('add element inet motor_net tenant_taps { "mtap1" }', writes[0])
+        self.validation.reset_mock()
+        writes, _ = self.load_plan(tenant, self.net, prior=(set(), set()))
+        self.assertIn('add element inet motor_tenant closed_taps { "mtap1" }', writes[0])
+
+    def test_completed_load_publishes_a_fresh_success_generation(self):
+        self.policy.readiness.publish()
+        previous = self.policy.readiness.READY.read_bytes()
+        self.load_plan(None, self.net)
+        current = json.loads(self.policy.readiness.READY.read_text())
+        self.assertEqual(current['schema'], 1)
+        self.assertEqual(len(current['generation']), 32)
+        self.assertNotEqual(self.policy.readiness.READY.read_bytes(), previous)
 
     def test_load_plans_are_fail_closed_for_both_install_orders_and_reboot(self):
         first, calls = self.load_plan(None, self.net)
@@ -383,9 +497,9 @@ class TenantDelegationTests(unittest.TestCase):
         reboot, _ = self.load_plan(None, None)
         self.assertNotIn('add element inet motor_net tenant_taps', ''.join(reboot))
         legacy = json.loads((self.root / 'test-fixtures/nft-motor-tenant-v1-capture.json').read_text())
-        fenced, calls = self.load_plan(legacy, self.net)
-        self.assertEqual(calls, 0, 'legacy object presence cannot authorize delegation')
-        self.assertNotIn('add element inet motor_net tenant_taps', ''.join(fenced))
+        with self.assertRaisesRegex(RuntimeError, 'unsupported tenant policy'):
+            self.load_plan(legacy, self.net)
+        self.assertFalse(self.policy.readiness.READY.exists())
 
     def test_loader_ufw_failure_closes_tap_and_removes_delegation(self):
         writes, _ = self.load_plan(self.tenant, self.net, failure=True)
@@ -420,6 +534,17 @@ class HostUplinkSettingsTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.policy.checked_settings(value)
 
+    def test_interface_name_rules_reject_aliases_wildcards_and_options(self):
+        source = pathlib.Path(__file__).with_name('motor-net.nft').read_text()
+        for name in ['any', '-eno1', '.eno1', '_eno1', 'eno1:0', 'eno/1', 'en o1', 'eno\t1', 'enö1', 'e'*16]:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, 'uplink'):
+                    self.policy.checked_settings(dict(self.settings, uplink=name))
+                with self.assertRaisesRegex(ValueError, 'uplink'):
+                    self.policy.render_source(source, name)
+        for name in ['e', 'eno1', 'bond0.100', 'A_b-c.2', 'e'*15]:
+            self.assertEqual(self.policy.checked_settings(dict(self.settings, uplink=name))['uplink'], name)
+
     def test_uplink_uses_only_the_explicit_interface_not_a_route_guess(self):
         with patch.object(self.policy, 'command', return_value=json.dumps(self.addresses)) as command:
             self.assertEqual(self.policy.validate_uplink(self.settings), self.settings)
@@ -452,15 +577,40 @@ class HostUplinkSettingsTests(unittest.TestCase):
         self.assertEqual(alternate.count('"eno1"'), 3)
         self.assertEqual(alternate.replace('"eno1"', '"enp6s0"'), source)
 
-    def test_loader_refuses_invalid_uplink_before_any_firewall_change(self):
+    def test_loader_refuses_invalid_settings_before_any_firewall_change(self):
         with patch.object(self.policy, 'network_lock', return_value=contextlib.nullcontext()), \
-                patch.object(self.policy, 'read_settings', side_effect=ValueError('uplink eno1 is missing')), \
+                patch.object(self.policy.readiness, 'invalidate'), \
+                patch.object(self.policy, 'read_settings', side_effect=ValueError('invalid network settings')), \
                 patch.object(self.policy, 'apply') as apply, patch.object(self.policy, 'table') as table:
-            with self.assertRaisesRegex(ValueError, 'uplink eno1 is missing'):
+            with self.assertRaisesRegex(ValueError, 'invalid network settings'):
                 self.policy.load()
         apply.assert_not_called()
         table.assert_not_called()
 
+
+
+class SuccessGenerationProtocolTests(unittest.TestCase):
+    def test_publication_is_atomic_fresh_and_invalidation_removes_old_success(self):
+        ready = load_script('motor_network_ready.py')
+        with tempfile.TemporaryDirectory() as directory, patch.object(ready, 'require_root'):
+            ready.READY = pathlib.Path(directory) / 'ready'
+            ready.publish()
+            first = ready.READY.read_bytes()
+            record = json.loads(first)
+            self.assertEqual(record['schema'], 1)
+            self.assertEqual(len(record['generation']), 32)
+            self.assertEqual(ready.READY.stat().st_mode & 0o777, 0o644)
+            ready.publish()
+            self.assertNotEqual(first, ready.READY.read_bytes())
+            ready.invalidate()
+            self.assertFalse(ready.READY.exists())
+
+    def test_generation_cannot_be_published_or_cleared_by_an_unprivileged_caller(self):
+        ready = load_script('motor_network_ready.py')
+        with patch.object(ready.os, 'geteuid', return_value=1234):
+            for operation in [ready.invalidate, ready.publish]:
+                with self.assertRaises(PermissionError):
+                    operation()
 
 
 if __name__ == '__main__':

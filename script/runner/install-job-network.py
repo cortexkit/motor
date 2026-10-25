@@ -15,6 +15,7 @@ import tempfile
 import sys
 import stat
 import types
+import contextlib
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.dont_write_bytecode = True
@@ -49,11 +50,11 @@ def permissions():
     print('PASS: sudo -n accepts all 18 network command forms (permission queries only)')
 
 
-def prerequisites(allow_fenced=False):
+def prerequisites(allow_fenced=False, locked=False):
     assert os.geteuid() == 0, 'run full network --check as root'
     settings = tenant_policy.read_settings()
     uplink = settings['uplink']
-    with tenant_policy.network_lock():
+    with contextlib.nullcontext() if locked else tenant_policy.network_lock():
         actual = check_ruleset(json.loads(sudo('/usr/sbin/nft', '-j', 'list', 'table', 'inet', 'motor_net').stdout), uplink=uplink)
         source = (HERE / 'motor-net.nft').read_text()
         document = tenant_policy.table('inet', 'motor_tenant')
@@ -74,6 +75,8 @@ def prerequisites(allow_fenced=False):
     assert any('mnet-+' in line and uplink in line and 'ALLOW FWD' in line for line in route.splitlines()), 'narrow ufw route allowance missing'
     assert pathlib.Path('/proc/sys/net/ipv4/ip_forward').read_text().strip() == '1', 'ip_forward is not 1'
     check_persistence()
+    if not locked:
+        tenant_policy.readiness.require_ready()
     permissions()
     print('PASS: motor_net loaded and IPv4 forwarding enabled')
 
@@ -167,11 +170,17 @@ def desired_files(settings):
     tenant_policy.checked_settings(settings)
     return {
         tenant_policy.SETTINGS: json.dumps(settings, indent=2) + '\n',
+        tenant_policy.TEMPLATE: (HERE / 'motor-net.nft').read_text(),
         NFT: tenant_policy.render_source((HERE / 'motor-net.nft').read_text(), settings['uplink']),
         SYSCTL: 'net.ipv4.ip_forward=1\n',
         POLICY: (HERE / 'motor_network_policy.py').read_text(),
+        POLICY.with_name('motor_network_ready.py'): (HERE / 'motor_network_ready.py').read_text(),
         LOADER: '''#!/usr/bin/python3 -I
-import runpy
+import os, runpy
+try:
+    os.unlink('/run/motor-net-ready')
+except FileNotFoundError:
+    pass
 runpy.run_path('/usr/local/libexec/motor_network_policy.py')['load']()
 ''',
         UNIT: '''[Unit]
@@ -182,6 +191,7 @@ Before=motor-runner.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+ExecStartPre=/usr/bin/rm -f /run/motor-net-ready
 ExecStart=/usr/local/libexec/motor-net-load
 [Install]
 WantedBy=multi-user.target
@@ -248,19 +258,37 @@ def main():
     if not args.apply:
         print('DRY RUN: no host state changed; use --apply to install')
         return
-    with tempfile.TemporaryDirectory(prefix='motor-net-install-') as temp:
-        for index, (path, text) in enumerate(desired.items()):
-            source = pathlib.Path(temp) / str(index)
-            source.write_text(text)
-            sudo('/usr/bin/install', '-d', '-m', '0755', str(path.parent))
-            sudo('/usr/bin/install', '-m', '0755' if path == LOADER else '0644', str(source), str(path))
-    sudo('/usr/bin/systemctl', 'daemon-reload')
-    sudo('/usr/local/libexec/motor-net-load')
-    sudo('/usr/sbin/sysctl', '-q', '-w', 'net.ipv4.ip_forward=1')
-    sudo('/usr/sbin/ufw', 'route', 'allow', 'in', 'on', 'mnet-+', 'out', 'on', uplink)
+    install_policy(desired, settings)
     sudo('/usr/bin/systemctl', 'enable', '--now', 'motor-net-rules.service')
     prerequisites(allow_fenced=True)
     print('Persistent rules/sysctl installed; run --check after helper reconciliation. UFW input rules unchanged.')
+
+
+def install_policy(desired, settings):
+    with tenant_policy.network_lock(mutate=True):
+        tenant_policy.readiness.invalidate()
+        loaded = None
+        try:
+            with tempfile.TemporaryDirectory(prefix='motor-net-install-') as temp:
+                for index, (path, text) in enumerate(desired.items()):
+                    source = pathlib.Path(temp) / str(index)
+                    source.write_text(text)
+                    sudo('/usr/bin/install', '-d', '-m', '0755', str(path.parent))
+                    sudo('/usr/bin/install', '-m', '0755' if path == LOADER else '0644', str(source), str(path))
+            tenant_policy.checked_source(settings)
+            sudo('/usr/bin/systemctl', 'daemon-reload')
+            sudo('/usr/sbin/sysctl', '-q', '-w', 'net.ipv4.ip_forward=1')
+            sudo('/usr/sbin/ufw', 'route', 'allow', 'in', 'on', 'mnet-+', 'out', 'on', settings['uplink'])
+            loaded = tenant_policy.load_locked(publish=False)
+            prerequisites(allow_fenced=True, locked=True)
+            tenant_policy.validate_uplink(settings)
+            tenant_policy.readiness.publish()
+        except BaseException:
+            tenant_policy.readiness.invalidate()
+            if loaded is not None and loaded[1]:
+                tenant_policy.apply(tenant_policy.members('motor_tenant', 'closed_taps', loaded[1])
+                                    + tenant_policy.members('motor_net', 'tenant_taps', set()))
+            raise
 
 
 if __name__ == '__main__':
