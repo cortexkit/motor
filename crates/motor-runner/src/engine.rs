@@ -241,10 +241,10 @@ pub struct Config {
     pub(crate) before_replay_read: Option<JobWriteHook>,
     #[cfg(test)]
     pub(crate) systemd_command: Option<crate::systemd::CommandHook>,
-    /// Stands in for the jobs slice ceiling the runner records from systemd, so
-    /// portable fixtures need no manager of their own.
+    /// Supplies the jobs slice's `MemoryMax` for fixtures that must not depend
+    /// on the host's real slice. Production always reads systemd.
     #[cfg(test)]
-    pub(crate) slice_budget_probe: Option<u64>,
+    pub(crate) slice_ceiling_probe: Option<Arc<dyn Fn() -> io::Result<u64> + Send + Sync>>,
     /// Replaces `sibling_snapshot_mode()`, so portable fixtures can run either
     /// sibling mode without the isolated host backend.
     #[cfg(test)]
@@ -282,6 +282,7 @@ pub struct Config {
     #[cfg(test)]
     pub(crate) long_work: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
     #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) shared_read_roots: Option<(PathBuf, PathBuf, Option<PathBuf>)>,
 }
 
@@ -495,7 +496,7 @@ impl Config {
             #[cfg(test)]
             systemd_command: None,
             #[cfg(test)]
-            slice_budget_probe: None,
+            slice_ceiling_probe: None,
             #[cfg(test)]
             sibling_snapshot_mode_override: None,
             #[cfg(test)]
@@ -733,20 +734,16 @@ fn slice_memory_refusal(floor: u64, remembered: u64) -> Option<(RefusalReason, S
         .map(|detail| (RefusalReason::WorkspaceSetupFailed, detail))
 }
 
-/// The memory ceiling the jobs slice puts on a job unit, when there is one.
-/// The runner records it at startup and on every maintenance pass, outside the
-/// state lock; an empty record means no reading is kept, which leaves job
-/// limits as they were.
-fn slice_ceiling(_config: &Config) -> Option<u64> {
-    #[cfg(test)]
-    if let Some(budget) = _config.slice_budget_probe {
-        return crate::systemd::JobMemoryBudget::from_max(budget).map(|budget| budget.max);
-    }
-    let _ = _config;
-    None
-}
-
-pub(crate) fn oom_memory_limit_detail(_config: &Config, weight: u32, capacity: u32) -> String {
+/// The OOM advice for a stopped job. `slice_ceiling` is the jobs slice's
+/// `MemoryMax` as the runner last recorded it, or `NO_JOB_MEMORY_BUDGET` when
+/// no reading is kept: the slice caps every job unit's limit, so a request it
+/// clamps cannot buy more memory and the advice must not suggest one.
+pub(crate) fn oom_memory_limit_detail(
+    _config: &Config,
+    weight: u32,
+    capacity: u32,
+    slice_ceiling: u64,
+) -> String {
     if let Some(bytes) = _config.boat_memory_max_bytes {
         return format!("the kernel OOM-killed a process and the job was stopped (Boat job memory budget {} bytes; the shared host memory budget also applies). More vCPUs do not increase this sandbox's usable memory.", bytes);
     }
@@ -762,13 +759,13 @@ pub(crate) fn oom_memory_limit_detail(_config: &Config, weight: u32, capacity: u
     // largest job this host can admit. When the jobs slice caps job limits, a
     // larger vCPU count cannot buy more memory, so the advice names that cap.
     let mut more = (weight.max(4) * 2).min(capacity);
-    if let Some(slice_max) = slice_ceiling(_config) {
+    if let Some(slice) = crate::systemd::JobMemoryBudget::from_max(slice_ceiling) {
         // The slice clamps this job's limit, so only a request that still
         // raises the limit below the clamp is worth recommending.
         #[cfg(test)]
-        let raised = |vcpus: u32| crate::backend::memory_max(vcpus, floor_gib).min(slice_max);
+        let raised = |vcpus: u32| crate::backend::memory_max(vcpus, floor_gib).min(slice.max);
         #[cfg(not(test))]
-        let raised = |vcpus: u32| crate::backend::memory_max(vcpus).min(slice_max);
+        let raised = |vcpus: u32| crate::backend::memory_max(vcpus).min(slice.max);
         if more > weight && raised(more) <= raised(weight) {
             more = weight;
         }
@@ -809,7 +806,7 @@ fn boat_memory_override_requires_explicit_profile_and_budget() {
     let mut config = Config::new("/unused", "boat");
     config.boat_profile = true;
     config.boat_memory_max_bytes = Some(14 << 30);
-    let detail = oom_memory_limit_detail(&config, 8, 8);
+    let detail = oom_memory_limit_detail(&config, 8, 8, crate::systemd::NO_JOB_MEMORY_BUDGET);
     assert!(detail.contains("15032385536 bytes"));
     assert!(!detail.contains("28 GiB"));
 }
@@ -3214,6 +3211,14 @@ impl Runner {
     /// admission. Callers run this outside the state lock: it spawns
     /// systemctl, and admission holds that lock.
     fn refresh_slice_budget(&self) {
+        #[cfg(test)]
+        if let Some(probe) = &self.core.config.slice_ceiling_probe {
+            let max = probe().unwrap_or(crate::systemd::NO_JOB_MEMORY_BUDGET);
+            self.core
+                .slice_budget
+                .store(max, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         let max = crate::systemd::read_job_memory_budget()
             .map_or(crate::systemd::NO_JOB_MEMORY_BUDGET, |budget| budget.max);
         self.core
@@ -7751,7 +7756,14 @@ impl Runner {
                 .unwrap_or(false);
         self.finish_step(id, &job.kill, "unit result read", finish_started);
         let memory_limit_detail = oom_stopped.then(|| {
-            oom_memory_limit_detail(&self.core.config, job.weight, self.core.cpus.claim_limit())
+            oom_memory_limit_detail(
+                &self.core.config,
+                job.weight,
+                self.core.cpus.claim_limit(),
+                self.core
+                    .slice_budget
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
         });
         if let Some(detail) = &memory_limit_detail {
             #[cfg(test)]

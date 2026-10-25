@@ -810,7 +810,9 @@ impl Drop for Fixture {
     }
 }
 /// A job unit asks for the slice's `MemoryMax` at most, and keeps its own
-/// smaller request. This starts a real sandbox, so it is an operator fixture:
+/// smaller request. The claim is derived from the slice actually read, so the
+/// fixture holds on any host size. This starts a real sandbox and reads the
+/// live slice, so it is an operator fixture:
 ///
 /// ```text
 /// cargo test -p motor-runner --lib -- --ignored isolated_job_unit_memory_max_is_clamped_to_the_jobs_slice
@@ -833,16 +835,24 @@ fn isolated_job_unit_memory_max_is_clamped_to_the_jobs_slice() {
             .parse::<u64>()
             .unwrap()
     };
-    // A request above the slice runs under the slice's own ceiling.
-    let large = f
+    let sandbox = f
         .sandbox()
         .with_slice_budget(slice)
         .with_memory_floor_gib(Some(16));
-    assert!(crate::backend::memory_max(30, Some(16)) > slice.max);
-    assert_eq!(memory_max(&large, 30), slice.max);
-    // A request below it keeps the job's own limit.
+    // The smallest claim among the 32 vCPUs a VM may use whose own limit the
+    // slice clamps. A slice above all of them cannot show a clamp at all.
+    let claim = (1..=32).find(|vcpus| crate::backend::memory_max(*vcpus, Some(16)) > slice.max);
+    let Some(claim) = claim else {
+        eprintln!(
+            "slice MemoryMax={} is above every admissible job limit; nothing to clamp",
+            slice.max
+        );
+        return;
+    };
+    assert_eq!(memory_max(&sandbox, claim), slice.max);
+    // A claim below the clamp keeps the job's own limit.
     assert_eq!(
-        memory_max(&large, 2),
+        memory_max(&sandbox, 2),
         crate::backend::memory_max(2, Some(16))
     );
 }

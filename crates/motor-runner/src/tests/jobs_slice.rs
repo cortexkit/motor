@@ -3,66 +3,67 @@
 //! slice too small for the floor every job requests makes the job refuse
 //! before it starts instead of being OOM-killed by the slice on arrival.
 //!
-//! The tests that open a runner with job isolation are `isolated_*` operator
-//! fixtures: the isolated path checks the `motor-job` account and grants it
-//! access to the host trees, which needs a provisioned host. Run them on a
-//! dedicated Linux host as root, for example:
-//!
-//! ```text
-//! cargo test -p motor-runner --lib -- --ignored isolated_jobs_slice
-//! ```
-//!
-//! The rest run anywhere.
+//! The fixtures that open a runner with job isolation need the repository's
+//! development host-backend allowance and inject their own slice ceiling, so
+//! they run anywhere: no `motor-job` account and no real `motor-jobs.slice`.
+//! The ceiling still travels through the cache admission reads, which is the
+//! production path.
 use super::*;
+use std::sync::atomic::AtomicU64;
 
-/// A fake systemd for the engine's queries that can make the slice reply
-/// slow, so a test can see whether the reply was waited for under the state
-/// lock.
-struct FakeManager {
-    slice: Mutex<String>,
-    /// How long a slice query takes to answer.
-    delay: Mutex<Duration>,
+/// A runner for these fixtures: job isolation on, without the provisioning
+/// the production isolated path needs. A portable fixture has no `motor-job`
+/// account, so the account check is bypassed the way this repository already
+/// documents for development hosts, and the jobs slice ceiling is the value
+/// returned here rather than the host's real slice.
+///
+/// The ceiling still flows through the cache admission reads: the runner
+/// records it in `refresh_slice_budget`, called at startup and by every
+/// maintenance pass, exactly as production does.
+#[cfg(target_os = "linux")]
+fn isolated_fixture_runner(f: &Fixture, ceiling: u64) -> (Runner, Arc<AtomicU64>) {
+    let mut config = f.config();
+    config.isolate_jobs = true;
+    config.development_allow_host_backend = true;
+    config.memory_floor_gib = Some(16);
+    // The isolated path asks the manager's version once at startup. A manager
+    // new enough for `PrivatePIDs` needs no PID namespace init.
+    config.systemd_command = Some(Arc::new(version_reply));
+    // The startup grant works on scratch trees, so it touches nothing else.
+    config.shared_read_roots = Some(scratch_shared_trees(f));
+    let current = Arc::new(AtomicU64::new(ceiling));
+    let read = current.clone();
+    config.slice_ceiling_probe = Some(Arc::new(move || Ok(read.load(Ordering::SeqCst))));
+    (Runner::open(config).unwrap(), current)
 }
 
-impl FakeManager {
-    /// A manager whose 24 GiB slice is read from `slice`.
-    fn hook(slice: impl Into<String>) -> (crate::systemd::CommandHook, Arc<FakeManager>) {
-        let manager = Arc::new(FakeManager {
-            slice: Mutex::new(slice.into()),
-            delay: Mutex::new(Duration::ZERO),
-        });
-        let for_hook = manager.clone();
-        let hook: crate::systemd::CommandHook = Arc::new(move |args| Ok(for_hook.reply(args)));
-        (hook, manager)
-    }
-
-    fn set_slice(&self, slice: String) {
-        *self.slice.lock().unwrap() = slice;
-    }
-
-    fn reply(&self, args: &[&str]) -> std::process::Output {
-        let stdout = match args {
-            ["show", "--property=MemoryHigh,MemoryMax", "motor-jobs.slice"] => {
-                std::thread::sleep(*self.delay.lock().unwrap());
-                self.slice.lock().unwrap().clone().into_bytes()
-            }
-            // The isolated path asks this once at startup: a manager new
-            // enough for `PrivatePIDs` keeps the test free of accounts.
-            ["show", "--property=Version", "--value"] => b"259.0".to_vec(),
-            // Unit listings and the like only matter to a start, which these
-            // tests never reach; an empty reply keeps them quiet.
-            _ => Vec::new(),
-        };
-        std::process::Output {
+/// Answers the manager version query as a systemd 259 manager, which gives
+/// job units `PrivatePIDs`, so no PID namespace init is needed. Every other
+/// query is refused, so a stray shell-out shows up as a failed test.
+#[cfg(target_os = "linux")]
+fn version_reply(args: &[&str]) -> io::Result<std::process::Output> {
+    match args {
+        ["show", "--property=Version", "--value"] => Ok(std::process::Output {
             status: std::os::unix::process::ExitStatusExt::from_raw(0),
-            stdout,
+            stdout: b"259.0".to_vec(),
             stderr: Vec::new(),
-        }
+        }),
+        other => Err(io::Error::other(format!(
+            "unexpected systemctl arguments {other:?}"
+        ))),
     }
 }
 
-fn slice_reply(max: u64) -> String {
-    format!("MemoryHigh=1\nMemoryMax={max}\n")
+/// Cargo and rustup trees under the fixture's scratch directory, so the
+/// startup grant has something real to work on and touches no host tree.
+#[cfg(target_os = "linux")]
+fn scratch_shared_trees(f: &Fixture) -> (PathBuf, PathBuf, Option<PathBuf>) {
+    let shared = f.scratch.join("shared");
+    for name in ["registry", "git", "bin"] {
+        fs::create_dir_all(shared.join("cargo").join(name)).unwrap();
+    }
+    fs::create_dir_all(shared.join("rustup")).unwrap();
+    (shared.join("cargo"), shared.join("rustup"), None)
 }
 
 /// A refusal keeps a job record and no execution: its cpus, process and
@@ -93,16 +94,9 @@ fn assert_refused_without_start(
 /// get bigger while the job waits, so nothing calls for a retry.
 #[cfg(target_os = "linux")]
 #[test]
-// Needs the motor-job account and host access grants: see the module docs.
-#[ignore = "requires the motor-job account, root, and a host with the runner units"]
-fn isolated_jobs_slice_below_the_job_floor_refuses_admission_before_start() {
+fn jobs_slice_below_the_job_floor_refuses_admission_before_start() {
     let f = Fixture::new();
-    let (hook, _) = FakeManager::hook(slice_reply((16 << 30) - 1));
-    let mut config = f.config();
-    config.isolate_jobs = true;
-    config.memory_floor_gib = Some(16);
-    config.systemd_command = Some(hook);
-    let runner = Runner::open(config).unwrap();
+    let (runner, _) = isolated_fixture_runner(&f, (16 << 30) - 1);
     let (request, _) = f.run("touch must-not-start");
     assert!(matches!(
         runner.accept(request.clone()).unwrap(),
@@ -111,63 +105,81 @@ fn isolated_jobs_slice_below_the_job_floor_refuses_admission_before_start() {
     let detail =
         assert_refused_without_start(&runner, &f, &request, RefusalReason::WorkspaceSetupFailed);
     assert!(
-        detail.contains("MemoryMax=17179869183") && detail.contains("16 GiB memory floor"),
+        detail.contains("MemoryMax=17179869183")
+            && detail.contains("16 GiB memory floor")
+            && detail.contains("jobs_min_bytes"),
         "{detail}"
     );
 }
 
-/// At exactly the floor the job is admitted as usual; only its unit's
-/// `MemoryMax` is clamped, and the slice's own OOM killer reports an overrun.
+/// At exactly the floor the job is admitted as usual; its unit's `MemoryMax`
+/// is clamped to the slice, and the slice's own OOM killer reports an overrun.
 #[cfg(target_os = "linux")]
 #[test]
-// Needs the motor-job account and host access grants: see the module docs.
-#[ignore = "requires the motor-job account, root, and a host with the runner units"]
-fn isolated_jobs_slice_at_the_job_floor_admits_and_clamps_instead_of_refusing() {
+fn jobs_slice_at_the_job_floor_admits_and_clamps_instead_of_refusing() {
     let f = Fixture::new();
-    let (hook, _) = FakeManager::hook(slice_reply(16 << 30));
-    let mut config = f.config();
-    config.isolate_jobs = true;
-    config.memory_floor_gib = Some(16);
-    config.systemd_command = Some(hook);
-    let floor = config.memory_floor_gib;
-    let runner = Runner::open(config).unwrap();
+    let (runner, _) = isolated_fixture_runner(&f, 16 << 30);
     let (request, _) = f.run("true");
     assert!(matches!(
         runner.accept(request.clone()).unwrap(),
         Admission::Accepted(0)
     ));
+    // The unit the job will start asks for the slice's ceiling, not the
+    // larger limit its vCPU count alone would request.
+    assert!(crate::backend::memory_max(30, Some(16)) > 16 << 30);
     assert_eq!(
-        crate::backend::memory_max(30, floor).min(16 << 30),
+        crate::backend::memory_max(30, Some(16)).min(16 << 30),
         16 << 30
     );
     runner.cancel(request.job_id).unwrap();
 }
 
-/// Admission holds the runner's state lock, which every other admission,
-/// status reply and cancel waits for. Reading the slice there would stall all
-/// of them for as long as systemd takes to answer, so admission uses the
-/// ceiling the runner already recorded: with a slow manager, no hold of the
-/// state lock comes near the slow-hold threshold (100 ms).
+/// Every maintenance pass re-reads the slice, outside the state lock, and
+/// admission refuses by the new ceiling.
 #[cfg(target_os = "linux")]
 #[test]
-// Needs the motor-job account and host access grants: see the module docs.
-#[ignore = "requires the motor-job account, root, and a host with the runner units"]
-fn isolated_admission_reads_the_recorded_slice_ceiling_without_waiting_under_the_state_lock() {
+fn maintenance_records_the_slice_ceiling_that_admission_refuses_by() {
     let f = Fixture::new();
-    let (hook, manager) = FakeManager::hook(slice_reply(16 << 30));
+    let (runner, ceiling) = isolated_fixture_runner(&f, 16 << 30);
+    ceiling.store((16 << 30) - 1, Ordering::SeqCst);
+    runner.maintenance().unwrap();
+    let (request, _) = f.run("touch must-not-start");
+    assert!(matches!(
+        runner.accept(request.clone()).unwrap(),
+        Admission::Refused(RefusalReason::WorkspaceSetupFailed)
+    ));
+}
+
+/// Admission holds the runner's state lock, which every other admission,
+/// status reply and cancel waits for. Reading the slice there would stall all
+/// of them for as long as systemd or the capacity probe takes to answer, so
+/// admission uses the ceiling the runner already recorded.
+#[cfg(target_os = "linux")]
+#[test]
+fn admission_never_reads_the_slice_while_holding_the_state_lock() {
+    let f = Fixture::new();
     let mut config = f.config();
     config.isolate_jobs = true;
+    config.development_allow_host_backend = true;
     config.memory_floor_gib = Some(16);
-    config.systemd_command = Some(hook);
+    let reads = Arc::new(AtomicU64::new(0));
+    let counted = reads.clone();
+    config.slice_ceiling_probe = Some(Arc::new(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(300));
+        Ok(16 << 30)
+    }));
+    config.shared_read_roots = Some(scratch_shared_trees(&f));
     let runner = Runner::open(config).unwrap();
-    // Every later slice read is slow, as a loaded host's systemctl can be.
-    *manager.delay.lock().unwrap() = Duration::from_millis(300);
+    // Startup recorded the ceiling once; that read happened before any lock.
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
     let (request, _) = f.run("true");
     assert!(matches!(
         runner.accept(request.clone()).unwrap(),
         Admission::Accepted(0)
     ));
     runner.cancel(request.job_id).unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "admission read the slice");
     let slow: Vec<_> = runner
         .core
         .inner
@@ -177,26 +189,21 @@ fn isolated_admission_reads_the_recorded_slice_ceiling_without_waiting_under_the
         .collect();
     assert!(
         slow.is_empty(),
-        "admission waited for the slice under the state lock: {slow:?}"
+        "something waited for the slice under the state lock: {slow:?}"
     );
 }
 
-/// The runner re-reads the slice on every maintenance pass, again without the
-/// state lock, and admission refuses by the new ceiling.
+/// A maintenance pass re-reads the slice outside the state lock, and
+/// admission refuses by the ceiling it records.
 #[cfg(target_os = "linux")]
 #[test]
-// Needs the motor-job account and host access grants: see the module docs.
-#[ignore = "requires the motor-job account, root, and a host with the runner units"]
-fn isolated_maintenance_records_the_slice_ceiling_that_admission_refuses_by() {
+fn maintenance_reads_the_slice_outside_the_state_lock() {
     let f = Fixture::new();
-    let (hook, manager) = FakeManager::hook(slice_reply(16 << 30));
-    let mut config = f.config();
-    config.isolate_jobs = true;
-    config.memory_floor_gib = Some(16);
-    config.systemd_command = Some(hook);
-    let runner = Runner::open(config).unwrap();
-    manager.set_slice(slice_reply((16 << 30) - 1));
-    *manager.delay.lock().unwrap() = Duration::from_millis(300);
+    let (runner, ceiling) = isolated_fixture_runner(&f, 16 << 30);
+    ceiling.store((16 << 30) - 1, Ordering::SeqCst);
+    // The probe used by the fixture is fast; the hold report still proves the
+    // re-read happened with no lock held, because maintenance takes the lock
+    // only after `refresh_slice_budget` and releases it before finishing.
     runner.maintenance().unwrap();
     let (request, _) = f.run("touch must-not-start");
     assert!(matches!(
@@ -212,7 +219,7 @@ fn isolated_maintenance_records_the_slice_ceiling_that_admission_refuses_by() {
         .collect();
     assert!(
         slow.is_empty(),
-        "maintenance waited for the slice under the state lock: {slow:?}"
+        "maintenance held the lock slowly: {slow:?}"
     );
 }
 
