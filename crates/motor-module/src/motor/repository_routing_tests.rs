@@ -542,14 +542,13 @@ async fn stage1_no_capacity_and_provisioning_share_one_bounded_queue_deadline() 
             ));
         }
         let (scratch, repo) = committed_repo();
-        let config = Config {
-            queue_wait_limit_s: 2,
-            ..config(&h, &repo)
-        };
+        let config = config(&h, &repo);
         let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
         let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
         let started = tokio::time::Instant::now();
-        let stream = motor.run(request(&repo)).unwrap();
+        let mut run_request = request(&repo);
+        run_request.queue_wait_limit_s = Some(2);
+        let stream = motor.run(run_request).unwrap();
         let id = stream.job_id;
         let job = tokio::spawn(records(stream));
         for replies in 1..=2 {
@@ -712,8 +711,8 @@ async fn stage1_no_host_fits_runs_on_the_build_server_once_and_fitting_jobs_stay
     assert!(lease_settlement_requests(&h).is_empty());
     {
         let log = log.lock().unwrap();
-        // Routing used none of the default 300-second queue-wait limit.
-        assert_eq!(log.runs, vec![(id, 300)]);
+        // Routing used none of the request's 30-second queue-wait budget.
+        assert_eq!(log.runs, vec![(id, 30)]);
         assert!(log.withdraws.is_empty());
     }
     assert!(motor.hosted_state(id).is_none());
@@ -852,6 +851,7 @@ async fn stage1_no_host_fits_after_a_capacity_wait_sends_the_remaining_queue_wai
         Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), Arc::new(peer)).unwrap();
     let mut large = request(&repo);
     large.weight_hint = Some(16);
+    large.queue_wait_limit_s = Some(300);
     let stream = motor.run(large).unwrap();
     let id = stream.job_id;
     let (_, terminal) = records(stream).await;
@@ -915,7 +915,7 @@ async fn stage1_cloud_no_host_fits_reply_routes_the_job_to_the_build_server() {
         vector["request"]["body"]["allow_spill"]
     );
     assert_eq!(*h.requests.lock().unwrap(), vec!["/v1/leases".to_owned()]);
-    assert_eq!(log.lock().unwrap().runs, vec![(id, 300)]);
+    assert_eq!(log.lock().unwrap().runs, vec![(id, 30)]);
     assert_eq!(
         motor
             .storage
@@ -1061,14 +1061,13 @@ async fn stage1_host_full_until_the_queue_budget_ends_refuses_like_no_capacity()
     let _clock = HeldClock::new();
     let h = Harness::new(Behavior::Refuse("host_full")).await;
     let (scratch, repo) = committed_repo();
-    let config = Config {
-        queue_wait_limit_s: 3,
-        ..config(&h, &repo)
-    };
+    let config = config(&h, &repo);
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
     let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
     let started = tokio::time::Instant::now();
-    let stream = motor.run(request(&repo)).unwrap();
+    let mut run_request = request(&repo);
+    run_request.queue_wait_limit_s = Some(3);
+    let stream = motor.run(run_request).unwrap();
     let id = stream.job_id;
     let job = tokio::spawn(records(stream));
     until_host_full_wait(&h, &motor, id, 1).await;
@@ -1137,14 +1136,13 @@ async fn stage1_queue_budget_ending_during_a_lease_request_refuses_for_what_the_
         let leases = if after_host_full { 2 } else { 1 };
         h.unanswered_lease.store(leases, Ordering::SeqCst);
         let (scratch, repo) = committed_repo();
-        let config = Config {
-            queue_wait_limit_s: 3,
-            ..config(&h, &repo)
-        };
+        let config = config(&h, &repo);
         let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
         let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
         let started = tokio::time::Instant::now();
-        let stream = motor.run(request(&repo)).unwrap();
+        let mut run_request = request(&repo);
+        run_request.queue_wait_limit_s = Some(3);
+        let stream = motor.run(run_request).unwrap();
         let id = stream.job_id;
         let job = tokio::spawn(records(stream));
         if after_host_full {

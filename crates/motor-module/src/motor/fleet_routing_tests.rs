@@ -428,10 +428,11 @@ async fn fleet_capacity_budget_ends_with_a_retryable_refusal_not_a_lost_job() {
     ));
     let (scratch, repo) = committed_repo();
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
-    let mut config = config(&h);
-    config.queue_wait_limit_s = 1;
+    let config = config(&h);
     let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
-    let stream = motor.run(request(&repo)).unwrap();
+    let mut run_request = request(&repo);
+    run_request.queue_wait_limit_s = Some(1);
+    let stream = motor.run(run_request).unwrap();
     let id = stream.job_id;
     let (_, terminal) = records(stream).await;
     assert_eq!(

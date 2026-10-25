@@ -305,14 +305,13 @@ async fn fleet_without_capacity_refuses_at_the_queue_budget_not_after_three_plac
     model.max_weight = 0;
     *tenant(&h) = Some(model);
     let (scratch, repo) = committed_repo();
-    let config = Config {
-        queue_wait_limit_s: 10,
-        ..config(&h)
-    };
+    let config = config(&h);
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
     let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
     let started = tokio::time::Instant::now();
-    let stream = motor.run(request(&repo)).unwrap();
+    let mut run_request = request(&repo);
+    run_request.queue_wait_limit_s = Some(10);
+    let stream = motor.run(run_request).unwrap();
     let id = stream.job_id;
     let job = tokio::spawn(records(stream));
     for tokens in 1..=4 {

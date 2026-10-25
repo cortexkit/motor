@@ -7,6 +7,144 @@ use std::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+fn queue_budget_config() -> Config {
+    Config {
+        spill_to_hosted: true,
+        ..Config::default()
+    }
+}
+
+fn queue_budget_request() -> RunRequest {
+    let mut request = RunRequest::new(
+        "/home/test/repo",
+        "/home/test/repo",
+        "/home/test/repo",
+        "true",
+    )
+    .with_timeout(3600);
+    request.weight_hint = Some(4);
+    request
+}
+
+fn submitted_queue_budget(config: Config, request: RunRequest, gate: bool) -> u64 {
+    let scratch = ScratchDir::new("motor-queue-budget");
+    let motor = Motor::open(config, &scratch).unwrap();
+    // Submission stores the budget before the spawned job starts running.
+    let stream = if gate {
+        motor.run_direct(request, None)
+    } else {
+        motor.run(request)
+    }
+    .unwrap();
+    motor.storage.job(stream.job_id).unwrap().queue_wait_limit_s
+}
+
+#[tokio::test]
+async fn queue_budget_16c_defaults_to_thirty_minutes() {
+    let mut request = queue_budget_request();
+    request.weight_hint = Some(16);
+    assert_eq!(
+        submitted_queue_budget(queue_budget_config(), request, false),
+        1800
+    );
+}
+
+#[tokio::test]
+async fn queue_budget_net_defaults_to_thirty_minutes() {
+    let mut request = queue_budget_request();
+    request.network = Some(Network::Outbound);
+    assert_eq!(
+        submitted_queue_budget(queue_budget_config(), request, false),
+        1800
+    );
+}
+
+#[tokio::test]
+async fn queue_budget_windows_defaults_to_thirty_minutes() {
+    let mut request = queue_budget_request();
+    request.platform = Some(Platform::Windows);
+    assert_eq!(
+        submitted_queue_budget(queue_budget_config(), request, false),
+        1800
+    );
+}
+
+#[tokio::test]
+async fn queue_budget_disabled_spill_defaults_to_thirty_minutes() {
+    let mut config = queue_budget_config();
+    config.spill_to_hosted = false;
+    assert_eq!(
+        submitted_queue_budget(config, queue_budget_request(), false),
+        1800
+    );
+}
+
+#[tokio::test]
+async fn queue_budget_invalid_hosted_timeout_defaults_to_thirty_minutes() {
+    let mut request = queue_budget_request();
+    request.timeout = Some(7201);
+    assert_eq!(
+        submitted_queue_budget(queue_budget_config(), request, false),
+        1800
+    );
+}
+
+#[tokio::test]
+async fn queue_budget_spill_eligible_4c_keeps_five_minutes() {
+    assert_eq!(
+        submitted_queue_budget(queue_budget_config(), queue_budget_request(), false),
+        300
+    );
+}
+
+#[tokio::test]
+async fn queue_budget_spill_eligible_keeps_configured_default() {
+    let mut config = queue_budget_config();
+    config.queue_wait_limit_s = 90;
+    assert_eq!(
+        submitted_queue_budget(config, queue_budget_request(), false),
+        90
+    );
+}
+
+#[tokio::test]
+async fn queue_budget_explicit_limit_wins_for_spill_and_non_spill_jobs() {
+    for weight in [4, 16] {
+        for limit in [0, 7, 2400] {
+            let mut request = queue_budget_request();
+            request.weight_hint = Some(weight);
+            request.queue_wait_limit_s = Some(limit);
+            request.timeout = Some(600);
+            assert_eq!(
+                submitted_queue_budget(queue_budget_config(), request, false),
+                limit
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn queue_budget_non_spill_default_is_capped_by_ten_minute_timeout() {
+    let mut request = queue_budget_request();
+    request.weight_hint = Some(16);
+    request.timeout = Some(600);
+    assert_eq!(
+        submitted_queue_budget(queue_budget_config(), request, false),
+        600
+    );
+}
+
+#[tokio::test]
+async fn queue_budget_gate_keeps_thirty_minutes_despite_explicit_limit_and_timeout() {
+    let mut request = queue_budget_request();
+    request.queue_wait_limit_s = Some(7);
+    request.timeout = Some(600);
+    assert_eq!(
+        submitted_queue_budget(queue_budget_config(), request, true),
+        1800
+    );
+}
+
 struct ClockPeer {
     queue_ms: Arc<AtomicU64>,
     withdrawn: Arc<AtomicBool>,
