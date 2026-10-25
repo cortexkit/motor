@@ -678,8 +678,9 @@ pub(super) fn lease_settlement_requests(h: &Harness) -> Vec<String> {
 /// lease request answered `no_host_fits`, then runs on the build server with
 /// its real exit code. Nothing was booked, so nothing is released or finished.
 /// A job that fits keeps the hosted route.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stage1_no_host_fits_runs_on_the_build_server_once_and_fitting_jobs_stay_hosted() {
+    let clock = HeldClock::new();
     let h = Harness::new(Behavior::CompleteRun).await;
     h.broker.lock().unwrap().knobs.max_vcpus = Some(8);
     let (scratch, repo) = committed_repo();
@@ -692,7 +693,15 @@ async fn stage1_no_host_fits_runs_on_the_build_server_once_and_fitting_jobs_stay
     large.weight_hint = Some(16);
     let stream = motor.run(large).unwrap();
     let id = stream.job_id;
-    let (output, terminal) = records(stream).await;
+    let job = tokio::spawn(records(stream));
+    until("the build-server Run", || {
+        !log.lock().unwrap().runs.is_empty()
+    })
+    .await;
+    // Freeze the budget through routing, then let the direct peer's simulated
+    // queue timer run so it can send Started and Terminal.
+    drop(clock);
+    let (output, terminal) = job.await.unwrap();
     assert_eq!(terminal.outcome, Outcome::Exit { code: 7 });
     assert_eq!(output, b"build server output\n");
     let bodies = lease_bodies(&h);
@@ -703,8 +712,7 @@ async fn stage1_no_host_fits_runs_on_the_build_server_once_and_fitting_jobs_stay
     assert!(lease_settlement_requests(&h).is_empty());
     {
         let log = log.lock().unwrap();
-        // The lease answer arrives within a second, so none of the default
-        // 300-second queue-wait limit is taken off.
+        // Routing used none of the default 300-second queue-wait limit.
         assert_eq!(log.runs, vec![(id, 300)]);
         assert!(log.withdraws.is_empty());
     }
@@ -714,6 +722,7 @@ async fn stage1_no_host_fits_runs_on_the_build_server_once_and_fitting_jobs_stay
     assert_eq!(job.routed_direct_reason.as_deref(), Some("no_host_fits"));
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
 
+    let _hosted_clock = HeldClock::new();
     let mut fitting = request(&repo);
     fitting.weight_hint = Some(8);
     let stream = motor.run(fitting).unwrap();
@@ -856,8 +865,11 @@ async fn stage1_no_host_fits_after_a_capacity_wait_sends_the_remaining_queue_wai
 /// CLOUD's pinned `no_host_fits` reply, byte for byte and without
 /// Retry-After, goes through ck-motor's real broker response parser: the
 /// routed 16-vCPU job asks once and then runs on the build server.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stage1_cloud_no_host_fits_reply_routes_the_job_to_the_build_server() {
+    // Loopback I/O and filesystem work must not spend the queue budget whose
+    // exact remaining value is asserted below.
+    let clock = HeldClock::new();
     let vector: serde_json::Value = serde_json::from_str(include_str!(
         "../../../motor-lease/contracts/cloud/no-host-fits-lease.json"
     ))
@@ -885,7 +897,15 @@ async fn stage1_cloud_no_host_fits_reply_routes_the_job_to_the_build_server() {
     large.weight_hint = Some(vector["request"]["body"]["vcpus"].as_u64().unwrap() as u32);
     let stream = motor.run(large).unwrap();
     let id = stream.job_id;
-    let (_, terminal) = records(stream).await;
+    let job = tokio::spawn(records(stream));
+    until("the build-server Run", || {
+        !log.lock().unwrap().runs.is_empty()
+    })
+    .await;
+    // The Run now contains the frozen queue budget. Allow the direct peer's
+    // simulated queue timer to advance before awaiting its terminal record.
+    drop(clock);
+    let (_, terminal) = job.await.unwrap();
     assert_eq!(terminal.outcome, Outcome::Exit { code: 7 });
     let bodies = lease_bodies(&h);
     assert_eq!(bodies.len(), 1);

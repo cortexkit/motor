@@ -561,8 +561,11 @@ async fn oversized_fleet_jobs_are_refused_before_start_naming_both_routes_limits
 /// advertisement of exactly 75,264 MiB. At one MiB less the broker answers
 /// `no_capacity`, and the canary fails without any Run when its queue budget
 /// ends: the warm canary's failure outcome.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn twenty_one_vcpu_canary_qualifies_against_the_78_gib_guest_advertisement() {
+    let _clock = HeldClock::new();
+    let waits = crate::logging::Captured::default();
+    let _logs = crate::logging::scoped(waits.clone());
     assert_eq!(TENANT_1_STOPPED_FREE_MEM_MIB, 77_824);
     assert_eq!(
         (1..=64u32)
@@ -597,7 +600,14 @@ async fn twenty_one_vcpu_canary_qualifies_against_the_78_gib_guest_advertisement
         canary.queue_wait_limit_s = Some(1);
         let stream = motor.run(canary).unwrap();
         let id = stream.job_id;
-        let (_, terminal) = records(stream).await;
+        let job = tokio::spawn(records(stream));
+        if !placed {
+            // Spend the budget only after the broker has actually answered.
+            // A busy host must not expire this canary before its lease request.
+            until_retry_wait(&waits).await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        let terminal = terminal_without_more_time(job).await;
         let state = motor.hosted_state(id).unwrap();
         assert!(state.repository_routed);
         assert!(motor
