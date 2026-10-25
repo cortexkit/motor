@@ -416,13 +416,15 @@ def validate(pins):
             raise ValueError(f"runner input changed without refreshing its pin: {name}")
 
 
-def state(pins):
+def state():
     image = Path("/var/lib/motor-boat.xfs")
     STATE.mkdir(parents=True, exist_ok=True)
     if not image.exists():
-        # Sparse capacity avoids padding the provider's disk snapshot with zeros.
+        # Match the build root's capacity without allocating its free blocks.
+        # Job quotas still use real free space on both XFS and the restored root.
+        root = os.statvfs("/")
         with image.open("xb") as stream:
-            stream.truncate(pins["state_gib"] * 1024**3)
+            stream.truncate(root.f_blocks * root.f_frsize)
         run("mkfs.xfs", "-q", "-m", "reflink=1", str(image))
     mount = Path("/etc/systemd/system/var-lib-motor\\x2dboat.mount")
     # Storage preparation starts these units explicitly after restore cleanup.
@@ -681,7 +683,7 @@ def configure(pins, revision):
     cpus = int(run("nproc", capture=True))
     # The runner-disk mount written by state() requires motor-boat-restored.service.
     install_units()
-    state(pins)
+    state()
     inotify = '/etc/sysctl.d/60-motor-inotify.conf'
     shutil.copy2(ROOT / 'script/runner/sysctl/60-motor-inotify.conf', inotify)
     run('sysctl', '-p', inotify)

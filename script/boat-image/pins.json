@@ -4,7 +4,6 @@
   "ubuntu_archive": "https://archive.ubuntu.com/ubuntu",
   "ubuntu_security": "https://security.ubuntu.com/ubuntu",
   "systemd_min": 255,
-  "state_gib": 64,
   "probe_port": 19443,
   "runner_inputs_sha256": {
     "script/runner/units/system/motor-jobs.slice": "9ff0c0e449aa78f5b0c3ea6d1f0ea86e81983e2bf16569b6e52106777b1ade3d",

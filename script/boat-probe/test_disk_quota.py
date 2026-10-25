@@ -1,3 +1,4 @@
+import ast
 import errno
 import contextlib
 import io
@@ -13,6 +14,46 @@ import quota_adversarial
 
 
 class DiskQuotaChecks(unittest.TestCase):
+    def test_capacity_and_observer_allow_more_than_32gib_but_keep_both_reserves(self):
+        observer = ast.parse(disk_quota.OBSERVER)
+        allowance = next(node for node in ast.walk(observer) if isinstance(node, ast.Assign)
+                         and ast.unparse(node.targets[0]) == "before['physical_allowance_bytes']")
+        for root, xfs, expected in ((108107579392, 140 << 30, 82270666752),
+                                    (140 << 30, 108107579392, 82270666752),
+                                    (24 << 30, 140 << 30, 0), (140 << 30, 24 << 30, 0)):
+            with self.subTest(root=root, xfs=xfs), \
+                 patch.object(os, 'statvfs', side_effect=lambda path: Mock(
+                     f_bavail=root if path == '/' else xfs, f_frsize=1)), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                exec(compile(quota_adversarial.CAPACITY, '<capacity>', 'exec'), {})
+                self.assertEqual(json.loads(output.getvalue())['cap_bytes'], expected)
+                scope = {'before': dict(root_free_bytes=root, xfs_free_bytes=xfs)}
+                exec(compile(ast.Module(body=[allowance], type_ignores=[]), '<observer-allowance>', 'exec'), scope)
+                self.assertEqual(scope['before']['physical_allowance_bytes'], expected)
+
+    def test_full_fill_continues_past_32gib_until_refusal(self):
+        more = next(node for node in ast.walk(ast.parse(disk_quota.JOB_SOURCE))
+                    if isinstance(node, ast.FunctionDef) and node.name == 'more')
+        scope: dict[str, object] = {'QUOTA_FILL_BYTES': 0}
+        exec(compile(ast.Module(body=[more], type_ignores=[]), '<fill-condition>', 'exec'), scope)
+        condition = scope['more']
+        assert callable(condition)
+        for written in (0, 32 << 30, 80 << 30, 128 << 30):
+            scope['written'] = written
+            self.assertTrue(condition())
+        scope['QUOTA_FILL_BYTES'] = disk_quota.CHARGE_BYTES
+        for written, expected in ((0, True), (disk_quota.CHARGE_BYTES, False)):
+            scope['written'] = written
+            self.assertEqual(condition(), expected)
+
+    def test_reflink_baseline_can_use_root_bound_capacity_above_24gib(self):
+        source = disk_quota.reflink_seed(68 << 30)
+        self.assertTrue(source.startswith('BASELINE_BYTES=73014444032\n'))
+        compile(source, '<large-reflink-seed>', 'exec')
+        for invalid in (True, 0, (64 << 20) - 1, 1.5):
+            with self.assertRaises(ValueError):
+                disk_quota.reflink_seed(invalid)
+
     def test_only_retained_job_deadline_is_rounded_up_and_capped_by_phase_lifetime(self):
         for remaining, expected in ((600, 600), (600.1, 601), (2000, 1800), (0.1, 1)):
             self.assertEqual(disk_quota.job_seconds('retained_target', remaining), expected)

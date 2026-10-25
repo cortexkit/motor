@@ -19,7 +19,6 @@ const MOUNT: &str = "/var/lib/motor-boat";
 // Provisional: the existing admission floor, not a measured Boat snapshot bound.
 // The write-to-quota + stop/resume probe records the headroom needed to tune it.
 const PROVISIONAL_RESERVE: u64 = 24 * 1024 * 1024 * 1024;
-const BLOCK_CAP: u64 = 32 * 1024 * 1024 * 1024;
 const INODE_CAP: u64 = 65_536;
 const INODE_RESERVE: u64 = 8192;
 pub(crate) const MIN_COLD_CAP_BYTES: u64 = 8 << 30;
@@ -601,11 +600,13 @@ fn prepare_with(
     let (root, _) = system.available(Path::new("/"))?;
     // The replay tail is written by the runner, outside the job project. Keep
     // its maximum size in addition to the provisional snapshot reserve.
+    // Sparse XFS capacity is not physical capacity: both free-space samples
+    // bound the total job allowance, without a separate fixed block ceiling.
     let bytes = budget(
         xfs,
         root,
         0,
-        BLOCK_CAP,
+        u64::MAX,
         PROVISIONAL_RESERVE + crate::storage::REPLAY_BYTES,
     )
     .map_err(|_| {

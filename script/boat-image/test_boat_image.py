@@ -340,6 +340,40 @@ class RecipeTests(unittest.TestCase):
         self.assertIn('motor-boat-host.path', install.RETIRED_UNITS)
         self.assertNotIn('motor-boat-host.path', install.UNITS)
 
+    def test_fresh_state_image_is_sparse_and_matches_build_root_total(self):
+        for root_bytes in (157154062336, 50 * 1024**3):
+            with self.subTest(root_bytes=root_bytes), tempfile.TemporaryDirectory() as directory:
+                image = Path(directory) / 'state.xfs'
+                original_open = Path.open
+                def open_image(path, *args, **kwargs):
+                    self.assertEqual(str(path), '/var/lib/motor-boat.xfs')
+                    return original_open(image, *args, **kwargs)
+                with patch.object(install.Path, 'open', autospec=True, side_effect=open_image), \
+                     patch.object(install.Path, 'exists', return_value=False), \
+                     patch.object(install.Path, 'mkdir'), patch.object(install.Path, 'write_text'), \
+                     patch.object(install, 'run') as run, patch.object(install, 'tempfile'), \
+                     patch.object(install, 'fcntl'), patch.object(install.Path, 'read_bytes', return_value=b''), \
+                     patch.object(install.os, 'statvfs', return_value=Mock(
+                         f_blocks=root_bytes // 4096, f_frsize=4096, f_bavail=1)) as geometry:
+                    install.state()
+                geometry.assert_called_once_with('/')
+                self.assertEqual(image.stat().st_size, root_bytes)
+                self.assertEqual(image.stat().st_blocks, 0)
+                self.assertEqual(run.call_args_list[0].args,
+                                 ('mkfs.xfs', '-q', '-m', 'reflink=1', '/var/lib/motor-boat.xfs'))
+
+    def test_existing_state_image_is_never_resized_or_reformatted(self):
+        with patch.object(install.Path, 'exists', return_value=True), \
+             patch.object(install.Path, 'open') as open_image, \
+             patch.object(install.Path, 'mkdir'), patch.object(install.Path, 'write_text'), \
+             patch.object(install, 'run') as run, patch.object(install, 'tempfile'), \
+             patch.object(install, 'fcntl'), patch.object(install.Path, 'read_bytes', return_value=b''), \
+             patch.object(install.os, 'statvfs') as geometry:
+            install.state()
+        open_image.assert_not_called()
+        geometry.assert_not_called()
+        self.assertNotIn('mkfs.xfs', [call.args[0] for call in run.call_args_list])
+
     def test_runner_mount_and_identity_watcher_wait_for_boat_restore(self):
         for name in ('motor-boat.service', 'motor-boat-host.service', 'motor-boat-identity.service'):
             text = (HERE / name).read_text()
@@ -358,7 +392,7 @@ class RecipeTests(unittest.TestCase):
              patch.object(install, 'tempfile'), patch.object(install, 'fcntl'), \
              patch.object(install.Path, 'read_bytes', return_value=b''):
             install.run.return_value = 'xfs'
-            install.state(self.pins)
+            install.state()
         mount = writes['/etc/systemd/system/var-lib-motor\\x2dboat.mount']
         self.assertIn('Requires=motor-boat-restored.service', mount)
         self.assertIn('After=motor-boat-restored.service', mount)

@@ -9,7 +9,7 @@ from quota_adversarial import BASELINE_JOB, CAPACITY, DEEP_JOB, reflink_seed
 RESERVE_BYTES = 24 * 1024**3  # Provisional until stop/resume headroom is measured.
 LANES = ('tmp', 'home', 'var_tmp', 'output_stdout', 'workspace', 'target', 'reused_target', 'reflink_target')
 RETAINED_LANE = 'retained_target'
-# Filling a lane to the real cap writes about 12 GiB and takes a minute or more,
+# Filling a lane to the real cap can write tens of GiB and take several minutes,
 # so only the lanes whose proof needs the limit fill to it: the retained target
 # (EDQUOT/ENOSPC at the job's own hard limit, the reserve at that limit, and a
 # quota-sized target kept across stop/resume) and the reflink target (unique
@@ -102,7 +102,7 @@ with marker.open('w+b', buffering=0) as barrier:
     written = 0
     def more():
         # QUOTA_FILL_BYTES 0 fills until the quota refuses a write.
-        return written < QUOTA_FILL_BYTES if QUOTA_FILL_BYTES else written <= 32 * 1024**3
+        return written < QUOTA_FILL_BYTES if QUOTA_FILL_BYTES else True
     try:
         if QUOTA_LANE == 'output_stdout':
             output_fd = os.open('/motor-output/stdout', os.O_RDWR)
@@ -301,7 +301,7 @@ while time.monotonic() < deadline:
             continue
         if report.get('phase') == 'before-fill':
             before = dict(root_free_bytes=free('/'), xfs_free_bytes=free('/var/lib/motor-boat'))
-            before['physical_allowance_bytes'] = max(0, min(32 * 1024**3, min(before.values()) - 24 * 1024**3 - 64 * 1024**2))
+            before['physical_allowance_bytes'] = max(0, min(before.values()) - 24 * 1024**3 - 64 * 1024**2)
             # The project's charge before any fill byte, so a charge-only lane
             # can show its own writes were added to the job's quota.
             try:

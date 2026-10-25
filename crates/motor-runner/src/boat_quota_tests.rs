@@ -133,6 +133,7 @@ struct FakeSystem {
     mount: PathBuf,
     state: Mutex<KernelState>,
     free: AtomicU64,
+    root_free: AtomicU64,
     fail_monitor: AtomicBool,
     release_barrier: Mutex<Option<Arc<Barrier>>>,
 }
@@ -142,6 +143,7 @@ impl FakeSystem {
             mount: mount.to_owned(),
             state: Mutex::new(KernelState::default()),
             free: AtomicU64::new(128 << 30),
+            root_free: AtomicU64::new(128 << 30),
             fail_monitor: AtomicBool::new(false),
             release_barrier: Mutex::new(None),
         }
@@ -163,6 +165,7 @@ impl FakeSystem {
             mount: self.mount.clone(),
             state: Mutex::new(self.state.lock().unwrap().clone()),
             free: AtomicU64::new(self.free.load(Ordering::Relaxed)),
+            root_free: AtomicU64::new(self.root_free.load(Ordering::Relaxed)),
             fail_monitor: AtomicBool::new(false),
             release_barrier: Mutex::new(None),
         }
@@ -223,8 +226,13 @@ impl QuotaSystem for FakeSystem {
         );
         Ok(())
     }
-    fn available(&self, _: &Path) -> io::Result<(u64, u64)> {
-        Ok((self.free.load(Ordering::Relaxed), 1 << 24))
+    fn available(&self, path: &Path) -> io::Result<(u64, u64)> {
+        let free = if path == Path::new("/") {
+            &self.root_free
+        } else {
+            &self.free
+        };
+        Ok((free.load(Ordering::Relaxed), 1 << 24))
     }
     fn monitor(&self, _: &Path, _: u32, _: u64) -> io::Result<()> {
         if self.fail_monitor.load(Ordering::Relaxed) {
@@ -628,6 +636,34 @@ fn consumed_upload_spool_is_not_a_required_job_mount_at_launch() {
     let lease: Lease = serde_json::from_slice(&fs::read(fixture.manifest(id)).unwrap()).unwrap();
     fs::remove_dir(lease.roots.last().unwrap()).unwrap();
     validate_for_launch_with(fixture.system.as_ref(), &fixture.state, id, &lease.roots).unwrap();
+}
+
+#[test]
+fn installed_quota_uses_both_disks_above_32gib_without_initial_credit() {
+    for (xfs, root) in [
+        (140 << 30, 108_107_579_392),
+        (108_107_579_392, 140 << 30),
+        (140 << 30, 108_107_579_903),
+    ] {
+        let fixture = Fixture::new();
+        fixture.system.free.store(xfs, Ordering::Relaxed);
+        fixture.system.root_free.store(root, Ordering::Relaxed);
+        let id = Uuid::now_v7();
+        fixture.prepare(id).unwrap();
+        let lease: Lease =
+            serde_json::from_slice(&fs::read(fixture.manifest(id)).unwrap()).unwrap();
+        let usage = fixture.system.quota(lease.project, None).unwrap();
+        assert_eq!(lease.blocks * 512, 82_270_666_752);
+        assert_eq!(usage.block_hard, lease.blocks);
+        assert!(lease.initial_blocks > 0);
+        assert_eq!(
+            lease.growth_bytes,
+            82_270_666_752 - lease.initial_blocks * 512
+        );
+        assert_eq!(usage.inode_hard, usage.inodes + INODE_CAP);
+        assert!(lease.blocks * 512 + PROVISIONAL_RESERVE + crate::storage::REPLAY_BYTES <= xfs);
+        assert!(lease.blocks * 512 + PROVISIONAL_RESERVE + crate::storage::REPLAY_BYTES <= root);
+    }
 }
 
 #[test]
