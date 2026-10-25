@@ -158,4 +158,3 @@ async fn cancel_without_a_granted_lease_settles_the_never_ran_booking_once() {
         "a booking nothing ever ran on closes as never having run"
     );
 }
-
