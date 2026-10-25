@@ -234,6 +234,26 @@ class ImageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "differs from versions.txt"):
             image.inventory(target, self.versions)
 
+    def test_verify_accepts_an_installed_image_built_from_older_pins(self):
+        # A rollback switches back to an image built before today's pins
+        # changed; its own recorded pins and hashes are what must hold.
+        target = self.build()
+        self.change_pin("node", "24.20.0")
+        self.assertEqual(image.verify(target)["version"], "test-1")
+
+    def test_verify_rejects_tampering_and_self_inconsistency(self):
+        target = self.build()
+        (target / "rootfs").chmod(0o644)
+        (target / "rootfs").write_bytes(b"wrong rootfs")
+        with self.assertRaisesRegex(ValueError, "rootfs SHA-256"):
+            image.verify(target)
+        target = self.build("test-2")
+        self.change_pin("node", "24.20.0")
+        (target / "versions.txt").chmod(0o644)
+        (target / "versions.txt").write_text(self.versions.read_text())
+        with self.assertRaisesRegex(ValueError, "differs from its manifest"):
+            image.verify(target)
+
     def test_failed_build_remains_reserved_and_cannot_pass_inventory(self):
         def fail(*_args):
             raise RuntimeError("stopped before unmount")

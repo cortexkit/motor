@@ -431,8 +431,10 @@ def systemd_active_state(unit):
 
 
 def inventory_image(image):
+    # Integrity only: switch-image also goes back to an older installed image
+    # for a rollback, whose pins rightly differ from today's versions.txt.
     builder = Path(__file__).resolve().parents[1] / "tenant-image" / "build.py"
-    subprocess.run([sys.executable, str(builder), "inventory", str(image)], check=True)
+    subprocess.run([sys.executable, str(builder), "verify", str(image)], check=True)
 
 
 def suspend_snapshot_to_move(suspend, manifest):
