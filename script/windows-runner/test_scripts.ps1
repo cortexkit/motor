@@ -41,12 +41,11 @@ function global:Remove-LocalUser { $script:prepRemoved = $true }
 if ((Get-Command secedit.exe).CommandType -ne 'Function') { throw 'Policy fixture mock is not installed; refusing to run a real secedit command' }
 try {
     $sid = 'S-1-5-21-111-222-333-1001'
-    [IO.File]::WriteAllText((Join-Path $root 'prep-secret.dpapi'), 'test-only-secret-marker')
     Remove-RunnerPrepAccount $root $sid
-    if (-not $script:prepRemoved -or (Test-Path -LiteralPath (Join-Path $root 'prep-secret.dpapi'))) { throw 'Legacy install retained its prep account or secret' }
+    if (-not $script:prepRemoved) { throw 'Legacy install retained its prep account' }
     if (($script:effective -join "`n") -match ([regex]::Escape($sid) + '|motor-prep')) { throw 'Legacy install retained prep batch rights' }
     if (($script:effective -join "`n") -notmatch 'SeBatchLogonRight = \*S-1-5-32-544') { throw 'Cleanup lost unrelated administrator rights' }
-    Write-Host 'PASS legacy-install-removes-prep-account-rights-and-secret'
+    Write-Host 'PASS legacy-install-removes-prep-account-rights'
     $count++
     $script:prepPresent = $false
     $script:prepRemoved = $false
@@ -163,6 +162,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         $count++
     } finally { Remove-Item -LiteralPath $nativeFixtureRoot -Recurse -Force }
     . "$PSScriptRoot\guest-agent-identity.ps1"
+    . "$PSScriptRoot\guest-evidence.ps1"
     $parentAgentHash = 'A' * 64
     $otherAgentHash = 'B' * 64
     if ((Get-RunnerProvisionedAgentHash "$parentAgentHash  motor-winagent.exe") -cne $parentAgentHash) { throw 'FAIL parent-agent-record-match' }
@@ -170,6 +170,114 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
     if (Get-RunnerProvisionedAgentHash $null) { throw 'FAIL parent-agent-record-missing' }
     Write-Host 'PASS parent-agent-record-match-mismatch-missing'
     $count++
+    $identityFixture = Join-Path ([IO.Path]::GetTempPath()) ('motor-agent-identity-' + [Guid]::NewGuid())
+    New-Item -ItemType Directory -Path $identityFixture | Out-Null
+    $global:identityFixtureParent = Join-Path $identityFixture 'parent.vhdx'
+    $global:identityFixtureRecord = Join-Path $identityFixture 'winagent.sha256'
+    $global:identityFixtureAssigned = $false
+    $global:identityFixtureRemoved = $false
+    $global:identityFixtureDismounted = $false
+    $global:identityFixtureNeverVolume = $false
+    $global:identityFixtureVolumeQueries = 0
+    $global:identityFixtureAddCalls = 0
+    [IO.File]::WriteAllText($global:identityFixtureParent, 'fixture VHDX')
+    [IO.File]::WriteAllText($global:identityFixtureRecord, "$parentAgentHash  motor-winagent.exe`n")
+    function global:Mount-VHD {
+        [CmdletBinding()]
+        param([string]$Path, [switch]$ReadOnly, [switch]$Passthru)
+        if (-not $ReadOnly -or -not $Passthru) { throw 'Fixture requires read-only passthrough mount' }
+        return [pscustomobject]@{Path=$Path}
+    }
+    function global:Get-Disk {
+        [CmdletBinding()]
+        param([Parameter(ValueFromPipeline=$true)]$InputObject)
+        process { return [pscustomobject]@{Number=42; UniqueId='fixture-disk'; Location='fixture'} }
+    }
+    function global:Get-VHD {
+        [CmdletBinding()]
+        param([int]$DiskNumber)
+        return [pscustomobject]@{Path=$global:identityFixtureParent; ParentPath='fixture-parent'}
+    }
+    function global:Get-Partition {
+        [CmdletBinding()]
+        param([int]$DiskNumber, [int]$PartitionNumber, [string]$DriveLetter)
+        $letter = if ($PSBoundParameters.ContainsKey('DriveLetter')) { $DriveLetter } elseif ($global:identityFixtureAssigned) { 'F' } else { $null }
+        return [pscustomobject]@{DiskNumber=42; PartitionNumber=1; DriveLetter=$letter; GptType='{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'; Guid='fixture-partition'}
+    }
+    function global:Add-PartitionAccessPath {
+        [CmdletBinding()]
+        param([Parameter(ValueFromPipeline=$true)]$InputObject, [switch]$AssignDriveLetter)
+        process { $global:identityFixtureAssigned = $true; $global:identityFixtureAddCalls++ }
+    }
+    function global:Get-Volume {
+        [CmdletBinding()]
+        param([string]$DriveLetter)
+        $global:identityFixtureVolumeQueries++
+        if ($global:identityFixtureNeverVolume -or $global:identityFixtureVolumeQueries -lt 3) { throw "No MSFT_Volume objects found with DriveLetter $DriveLetter yet" }
+        return [pscustomobject]@{DriveLetter=$DriveLetter; UniqueId='fixture-volume'; FileSystemLabel='ALLY'}
+    }
+    function global:Remove-PartitionAccessPath {
+        [CmdletBinding()]
+        param([Parameter(ValueFromPipeline=$true)]$InputObject, [string]$AccessPath)
+        process {
+            if ($AccessPath -ne 'F:\') { throw "Unexpected fixture access path $AccessPath" }
+            $global:identityFixtureRemoved = $true
+            $global:identityFixtureAssigned = $false
+        }
+    }
+    function global:Dismount-VHD {
+        [CmdletBinding()]
+        param([string]$Path)
+        if ($global:identityFixtureAssigned) { throw 'Fixture drive letter was not removed before dismount' }
+        $global:identityFixtureDismounted = $true
+    }
+    function global:Get-Item {
+        [CmdletBinding()]
+        param([string]$LiteralPath, [switch]$Force)
+        if ($LiteralPath -in @('F:\build', 'F:\build\provision')) {
+            return [pscustomobject]@{FullName=$LiteralPath; PSIsContainer=$true; Attributes=[IO.FileAttributes]::Directory}
+        }
+        if ($LiteralPath -eq 'F:\build\provision\winagent.sha256') {
+            return [pscustomobject]@{FullName=$global:identityFixtureRecord; PSIsContainer=$false; Attributes=[IO.FileAttributes]::Archive}
+        }
+        throw "Unexpected sealed-agent fixture path $LiteralPath"
+    }
+    try {
+        $identityEvidence = Join-Path $identityFixture 'evidence'
+        New-Item -ItemType Directory -Path $identityEvidence | Out-Null
+        $hash = Get-RunnerSealedAgentHash $global:identityFixtureParent $identityEvidence 3
+        $identity = Get-Content -LiteralPath (Join-Path $identityEvidence 'mounted-disk-identity.json') -Raw | ConvertFrom-Json
+        if ($hash -cne $parentAgentHash -or $global:identityFixtureVolumeQueries -lt 3 -or $global:identityFixtureAddCalls -ne 1 -or -not $global:identityFixtureRemoved -or -not $global:identityFixtureDismounted -or $identity.volume_unique_id -cne 'fixture-volume') { throw 'FAIL sealed-agent-volume-wait-retries-and-reads-identity' }
+        Write-Host 'PASS sealed-agent-volume-wait-retries-and-reads-identity'
+        $count++
+
+        $global:identityFixtureAssigned = $true
+        $global:identityFixtureRemoved = $false
+        $global:identityFixtureDismounted = $false
+        $global:identityFixtureNeverVolume = $false
+        $global:identityFixtureVolumeQueries = 0
+        $global:identityFixtureAddCalls = 0
+        $hash = Get-RunnerSealedAgentHash $global:identityFixtureParent $identityEvidence 3
+        if ($hash -cne $parentAgentHash -or $global:identityFixtureAddCalls -ne 0 -or -not $global:identityFixtureRemoved -or -not $global:identityFixtureDismounted) { throw 'FAIL sealed-agent-volume-already-assigned-letter-is-removed' }
+        Write-Host 'PASS sealed-agent-volume-already-assigned-letter-is-removed'
+        $count++
+
+        $global:identityFixtureAssigned = $false
+        $global:identityFixtureRemoved = $false
+        $global:identityFixtureDismounted = $false
+        $global:identityFixtureNeverVolume = $true
+        $global:identityFixtureVolumeQueries = 0
+        $error = $null
+        try { $null = Get-RunnerSealedAgentHash $global:identityFixtureParent $identityEvidence 1 } catch { $error = [string]$_ }
+        $identity = Get-Content -LiteralPath (Join-Path $identityEvidence 'mounted-disk-identity.json') -Raw | ConvertFrom-Json
+        if ($error -notmatch 'Timed out after 1 seconds.*disk 42 partition 1.*drive letter ''F''' -or -not $global:identityFixtureRemoved -or -not $global:identityFixtureDismounted -or $identity.drive_letter -cne 'F') { throw "FAIL sealed-agent-volume-timeout-cleans-up-and-names-disk: $error" }
+        Write-Host 'PASS sealed-agent-volume-timeout-cleans-up-and-names-disk'
+        $count++
+    } finally {
+        Remove-Item Function:\Mount-VHD,Function:\Get-Disk,Function:\Get-VHD,Function:\Get-Partition,Function:\Add-PartitionAccessPath,Function:\Get-Volume,Function:\Remove-PartitionAccessPath,Function:\Dismount-VHD,Function:\Get-Item -ErrorAction SilentlyContinue
+        Remove-Variable -Name identityFixtureParent,identityFixtureRecord,identityFixtureAssigned,identityFixtureRemoved,identityFixtureDismounted,identityFixtureNeverVolume,identityFixtureVolumeQueries,identityFixtureAddCalls -Scope Global -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $identityFixture -Recurse -Force
+    }
     $global:diskInventoryGetDiskCalls = 0
     $global:diskInventoryPerDiskQuery = $false
     $global:diskInventoryFixtureMode = ''

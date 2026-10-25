@@ -221,7 +221,7 @@ Save-Installation
 $cargoHash = (Get-FileHash "$Root\prep-toolchain\bin\cargo.exe" -Algorithm SHA256).Hash
 $parentAgentHash = ''
 try {
-    $sealedAgentHash = Get-RunnerSealedAgentHash $parent
+    $sealedAgentHash = Get-RunnerSealedAgentHash $parent "$Root\evidence"
     if ($sealedAgentHash) {
         $parentAgentHash = $sealedAgentHash
     } else {

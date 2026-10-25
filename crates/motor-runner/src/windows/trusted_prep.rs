@@ -1,22 +1,7 @@
 //! Windows job preparation fetches lockfile-selected registry artifacts as SYSTEM.
 //! Cargo runs only in the offline guest or in explicitly selected diagnostics.
 use super::*;
-use std::{
-    collections::BTreeMap,
-    mem::{size_of, zeroed},
-    ptr::{null, null_mut},
-    time::{Duration, Instant},
-};
-use windows_sys::Win32::{
-    Foundation::{CloseHandle, LocalFree, HANDLE, WAIT_OBJECT_0},
-    Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB},
-    Security::{
-        CreateRestrictedToken, GetTokenInformation, LogonUserW, TokenUser, DISABLE_MAX_PRIVILEGE,
-        LOGON32_LOGON_BATCH, LOGON32_PROVIDER_DEFAULT, SID_AND_ATTRIBUTES, TOKEN_USER,
-        WRITE_RESTRICTED,
-    },
-    System::{JobObjects::*, Threading::*},
-};
+use std::collections::BTreeMap;
 mod local_registry;
 mod system;
 
@@ -32,187 +17,6 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
 
-struct BatchHandle(HANDLE);
-impl Drop for BatchHandle {
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.0) };
-    }
-}
-
-fn batch_token(root: &Path, restrict: bool) -> io::Result<BatchHandle> {
-    let mut bytes = fs::read(root.join("prep-secret.dpapi"))?;
-    let input = CRYPT_INTEGER_BLOB {
-        cbData: bytes.len() as u32,
-        pbData: bytes.as_mut_ptr(),
-    };
-    let mut output: CRYPT_INTEGER_BLOB = unsafe { zeroed() };
-    unsafe {
-        checked(CryptUnprotectData(
-            &input,
-            null_mut(),
-            null(),
-            null(),
-            null(),
-            0,
-            &mut output,
-        ))?;
-    }
-    let secret = unsafe { std::slice::from_raw_parts_mut(output.pbData, output.cbData as usize) };
-    let mut password: Vec<u16> = secret
-        .iter()
-        .map(|byte| u16::from(*byte))
-        .chain(Some(0))
-        .collect();
-    for byte in secret {
-        unsafe { std::ptr::write_volatile(byte, 0) };
-    }
-    unsafe { LocalFree(output.pbData.cast()) };
-    let mut result = null_mut();
-    let success = unsafe {
-        LogonUserW(
-            wide("motor-prep").as_ptr(),
-            wide(".").as_ptr(),
-            password.as_ptr(),
-            LOGON32_LOGON_BATCH,
-            LOGON32_PROVIDER_DEFAULT,
-            &mut result,
-        )
-    };
-    for unit in &mut password {
-        unsafe { std::ptr::write_volatile(unit, 0) };
-    }
-    checked(success)?;
-    let base = BatchHandle(result);
-    if !restrict {
-        return Ok(base);
-    }
-    let mut required = 0;
-    unsafe { GetTokenInformation(base.0, TokenUser, null_mut(), 0, &mut required) };
-    let mut user = vec![0u64; (required as usize).div_ceil(8)];
-    unsafe {
-        checked(GetTokenInformation(
-            base.0,
-            TokenUser,
-            user.as_mut_ptr().cast(),
-            required,
-            &mut required,
-        ))?;
-        let sid = (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid;
-        let restriction = SID_AND_ATTRIBUTES {
-            Sid: sid,
-            Attributes: 0,
-        };
-        let mut restricted = null_mut();
-        // For each permitted write, the account's Windows security identifier
-        // must be allowed by both the file's normal access list and the restricted token.
-        checked(CreateRestrictedToken(
-            base.0,
-            DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,
-            0,
-            null(),
-            0,
-            null(),
-            1,
-            &restriction,
-            &mut restricted,
-        ))?;
-        Ok(BatchHandle(restricted))
-    }
-}
-
-/// Starts one isolated `motor-prep` batch process and waits for its exit.
-fn run_as_batch(
-    config: &Config,
-    command: &mut Command,
-    cwd: &Path,
-    restrict: bool,
-    timeout: Duration,
-) -> io::Result<()> {
-    let root = &config.windows.as_ref().unwrap().layout_root;
-    let token = batch_token(root, restrict)?;
-    let program = command
-        .get_program()
-        .to_str()
-        .ok_or_else(|| invalid("non-UTF8 prep program"))?;
-    let mut args = vec![motor_winagent::quote_windows_arg(program)];
-    for arg in command.get_args() {
-        args.push(motor_winagent::quote_windows_arg(
-            arg.to_str()
-                .ok_or_else(|| invalid("non-UTF8 prep argument"))?,
-        ));
-    }
-    let mut line = wide(&args.join(" "));
-    let mut env = BTreeMap::new();
-    for (key, value) in command.get_envs() {
-        if let Some(value) = value {
-            env.insert(
-                key.to_string_lossy().into_owned(),
-                value.to_string_lossy().into_owned(),
-            );
-        }
-    }
-    let environment = motor_winagent::environment::encode_block(&env)?;
-    unsafe {
-        let job = BatchHandle(CreateJobObjectW(null(), null()));
-        if job.0.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
-        limits.BasicLimitInformation.LimitFlags =
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        limits.BasicLimitInformation.ActiveProcessLimit = 32;
-        checked(SetInformationJobObject(
-            job.0,
-            JobObjectExtendedLimitInformation,
-            (&raw const limits).cast(),
-            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        ))?;
-        let mut startup: STARTUPINFOW = zeroed();
-        startup.cb = size_of::<STARTUPINFOW>() as u32;
-        let mut info: PROCESS_INFORMATION = zeroed();
-        checked(CreateProcessAsUserW(
-            token.0,
-            wide(program).as_ptr(),
-            line.as_mut_ptr(),
-            null(),
-            null(),
-            0,
-            CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-            environment.as_ptr().cast(),
-            wide(&cwd.to_string_lossy()).as_ptr(),
-            &startup,
-            &mut info,
-        ))?;
-        let process = BatchHandle(info.hProcess);
-        let thread = BatchHandle(info.hThread);
-        if AssignProcessToJobObject(job.0, process.0) == 0 {
-            let error = io::Error::last_os_error();
-            TerminateProcess(process.0, 1);
-            WaitForSingleObject(process.0, 5000);
-            return Err(error);
-        }
-        if ResumeThread(thread.0) == u32::MAX {
-            return Err(io::Error::last_os_error());
-        }
-        let deadline = Instant::now() + timeout;
-        while WaitForSingleObject(process.0, 50) != WAIT_OBJECT_0 {
-            if Instant::now() >= deadline {
-                return Err(invalid(format!(
-                    "Windows trusted preparation exceeded {} seconds",
-                    timeout.as_secs()
-                )));
-            }
-        }
-        let mut code = 0;
-        checked(GetExitCodeProcess(process.0, &mut code))?;
-        if code != 0 {
-            return Err(invalid(format!(
-                "Windows trusted preparation process exited {code}"
-            )));
-        }
-    }
-    Ok(())
-}
 
 pub(super) fn log_phase(progress_path: &Path, phase: &str) -> io::Result<()> {
     use std::io::Write;
@@ -869,6 +673,7 @@ pub(super) fn local_registry_entry(config: Config) -> io::Result<()> {
             &rustc,
             &fixture,
             &stage,
+            &stage.join("proof-cache"),
             &report_path,
             &progress_path,
         )?;
@@ -911,107 +716,213 @@ pub(super) fn local_registry_entry(config: Config) -> io::Result<()> {
     cleanup
 }
 
-/// Tests normal batch file access and verifies the restricted token cannot
-/// read the credential or write outside staging.
-pub(super) fn qualify(config: &Config) -> io::Result<()> {
-    let root = &config.windows.as_ref().unwrap().layout_root;
-    let stage = root.join("staging").join(Uuid::now_v7().to_string());
-    fs::create_dir_all(stage.join("fetch-manifests"))?;
-    fs::create_dir_all(stage.join("fetch-temp"))?;
-    let credential = root.join("prep-secret.dpapi");
-    drop(fs::File::open(&credential)?);
-    let outside = PathBuf::from(r"C:\Windows\Temp")
-        .join(format!("motor-prep-outside-{}.txt", Uuid::now_v7()));
-    let probe = stage.join("fetch-manifests/probe.exe");
-    fs::copy(std::env::current_exe()?, &probe)?;
-    let result = (|| {
-        super::vm::checked(super::vm::control(
-            config,
-            "GrantPrep",
-            None,
-            &["-Staging".into(), stage.to_string_lossy().into()],
-        )?)?;
-        for (mode, restrict) in [("base-control", false), ("restricted", true)] {
-            let output = stage.join(format!("fetch-temp/{mode}.json"));
-            let mut command = Command::new(&probe);
-            command
-                .arg("prep-probe")
-                .arg(mode)
-                .arg(&credential)
-                .arg(&outside)
-                .arg(&output)
-                .env_clear()
-                .env("SYSTEMROOT", r"C:\Windows");
-            run_as_batch(
-                config,
-                &mut command,
+
+
+/// Verifies the SYSTEM production path against a cold local-registry fixture.
+pub(super) fn qualify_prep_system(config: &Config) -> io::Result<()> {
+    use sha2::{Digest, Sha256};
+    use windows_service::{
+        service::{ServiceAccess, ServiceState},
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let vm = config
+        .windows
+        .as_ref()
+        .ok_or_else(|| invalid("SYSTEM prep qualification requires Windows VM configuration"))?;
+    let root = vm.layout_root.as_path();
+    if root != Path::new(r"C:\ProgramData\MotorRunner")
+        || config.instance != "ally"
+        || config.backend != crate::BackendKind::WindowsVm
+    {
+        return Err(invalid("SYSTEM prep qualification requires the installed Ally runner"));
+    }
+    let id = Uuid::now_v7();
+    let staging_root = root.join("staging");
+    let stage = staging_root.join(format!("qualify-prep-{id}"));
+    let cache_base = config.state_dir().join(LOCAL_REGISTRY_CACHE_DIRECTORY);
+    let cache_parent = cache_base.join("qualification");
+    let cache_root = cache_parent.join(id.to_string());
+    let fixture = stage.join("fetch-manifests/offline-cargo");
+    let report_path = root.join("evidence").join(format!("qualify-prep-{id}.json"));
+    let proof_report_path = root
+        .join("evidence")
+        .join(format!("qualify-prep-{id}.registry.json"));
+    let progress_path = root
+        .join("evidence")
+        .join(format!("qualify-prep-{id}.progress.jsonl"));
+    let mut report = serde_json::json!({
+        "production_path": "SYSTEM locked local registry; Cargo runs offline",
+        "fixture_crate": "cfg-if 1.0.4",
+        "staging_root": staging_root,
+        "fixture_staging": stage,
+        "protected_cache_root": cache_base,
+        "fixture_cache": cache_root,
+        "staging_removed": false,
+        "cache_removed": false
+    });
+    let result: io::Result<()> = (|| {
+        system::require_system()?;
+        log_phase(&progress_path, "verify-system-token").map_err(|error| {
+            super::prep::error_at_path("write qualification progress", &progress_path, error)
+        })?;
+
+        let vm_config_path = config
+            .vm_config
+            .as_deref()
+            .ok_or_else(|| invalid("SYSTEM prep qualification requires --vm-config"))?;
+        let loaded = super::VmConfig::load(vm_config_path).map_err(|error| {
+            super::prep::error_at_path("read Windows VM configuration", vm_config_path, error)
+        })?;
+        if loaded.layout_root != root {
+            return Err(invalid("VM configuration names a different runner root"));
+        }
+
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .map_err(io::Error::other)?;
+        let status = manager
+            .open_service("MotorRunner", ServiceAccess::QUERY_STATUS)
+            .and_then(|service| service.query_status())
+            .map_err(io::Error::other)?;
+        if status.current_state != ServiceState::Stopped {
+            return Err(invalid("Stop MotorRunner before SYSTEM prep qualification"));
+        }
+
+        crate::filesystem::identity(&staging_root).map_err(|error| {
+            super::prep::error_at_path("check protected staging root", &staging_root, error)
+        })?;
+        crate::filesystem::identity(&cache_base).map_err(|error| {
+            super::prep::error_at_path("check protected local-registry cache", &cache_base, error)
+        })?;
+        fs::create_dir_all(&cache_parent).map_err(|error| {
+            super::prep::error_at_path("create qualification cache directory", &cache_parent, error)
+        })?;
+        if cache_root.exists() {
+            return Err(invalid(format!(
+                "qualification cache already exists: {}",
+                cache_root.display()
+            )));
+        }
+        fs::create_dir_all(fixture.join("src")).map_err(|error| {
+            super::prep::error_at_path("create qualification fixture", &fixture, error)
+        })?;
+        fs::create_dir_all(stage.join("fetch-temp")).map_err(|error| {
+            super::prep::error_at_path("create qualification staging", &stage, error)
+        })?;
+
+        let lock_path = root.join("prep.lock");
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| super::prep::error_at_path("open preparation lock", &lock_path, error))?;
+        lock_exclusive_bounded(&lock, "SYSTEM prep qualification prep.lock")?;
+
+        let cargo = root.join("prep-toolchain/bin/cargo.exe");
+        let rustc = root.join("prep-toolchain/bin/rustc.exe");
+        let cargo_bytes = fs::read(&cargo)
+            .map_err(|error| super::prep::error_at_path("read pinned Cargo", &cargo, error))?;
+        let cargo_sha256 = format!("{:x}", Sha256::digest(&cargo_bytes));
+        if cargo_sha256 != loaded.prep_cargo_sha256.to_ascii_lowercase() {
+            return Err(invalid(format!(
+                "pinned Cargo SHA-256 mismatch at {}",
+                cargo.display()
+            )));
+        }
+        let rustc_bytes = fs::read(&rustc)
+            .map_err(|error| super::prep::error_at_path("read pinned rustc", &rustc, error))?;
+        let rustc_sha256 = format!("{:x}", Sha256::digest(&rustc_bytes));
+        report["toolchain"] = serde_json::json!({
+            "cargo": cargo,
+            "cargo_sha256": cargo_sha256,
+            "rustc": rustc,
+            "rustc_sha256": rustc_sha256
+        });
+
+        fs::write(fixture.join("Cargo.toml"), OFFLINE_CARGO_MANIFEST).map_err(|error| {
+            super::prep::error_at_path("write qualification Cargo.toml", &fixture.join("Cargo.toml"), error)
+        })?;
+        fs::write(fixture.join("Cargo.lock"), OFFLINE_CARGO_LOCK).map_err(|error| {
+            super::prep::error_at_path("write qualification Cargo.lock", &fixture.join("Cargo.lock"), error)
+        })?;
+        fs::write(fixture.join("src/lib.rs"), "pub fn offline_fixture() {}\n").map_err(|error| {
+            super::prep::error_at_path("write qualification source", &fixture.join("src/lib.rs"), error)
+        })?;
+
+        log_phase(&progress_path, "run-production-local-registry-preparation").map_err(|error| {
+            super::prep::error_at_path("write qualification progress", &progress_path, error)
+        })?;
+        let proof = local_registry::prove(
+            &cargo,
+            &rustc,
+            &fixture,
+            &stage,
+            &cache_root,
+            &proof_report_path,
+            &progress_path,
+        )
+        .map_err(|error| {
+            super::prep::error_at_path(
+                &format!(
+                    "run local-registry fixture with cache {} and staging",
+                    cache_root.display()
+                ),
                 &stage,
-                restrict,
-                Duration::from_secs(600),
-            )?;
-            let bytes = fs::read(&output)?;
-            fs::write(root.join(format!("evidence/prep-{mode}.json")), &bytes)?;
-            let proof: serde_json::Value = serde_json::from_slice(&bytes).map_err(invalid)?;
-            let expected = if restrict { "denied" } else { "allowed" };
-            if proof["outside_write"] != expected
-                || proof["allowed_write"] != "allowed"
-                || (restrict && proof["credential_read"] != "denied")
-            {
-                return Err(invalid(
-                    "prep qualification did not exercise the expected native access checks",
-                ));
-            }
+                error,
+            )
+        })?;
+        let first_downloads = proof["first_job_downloads"]["total"].as_u64();
+        let second_downloads = proof["second_job_downloads"]["total"].as_u64();
+        let proof_cache = proof["persistent_cache"]
+            .as_str()
+            .map(PathBuf::from)
+            .ok_or_else(|| invalid("local-registry proof omitted its persistent cache path"))?;
+        let job_registry = proof["local_registry"]
+            .as_str()
+            .map(PathBuf::from)
+            .ok_or_else(|| invalid("local-registry proof omitted its job registry path"))?;
+        if proof["proof_passed"] != true
+            || first_downloads != Some(3)
+            || second_downloads != Some(0)
+            || proof_cache != cache_root
+            || !proof_cache.starts_with(&cache_base)
+            || !job_registry.starts_with(&stage)
+        {
+            return Err(invalid(format!(
+                "local-registry qualification did not prove a cold crate fetch confined to cache {} and staging {}",
+                cache_root.display(),
+                stage.display()
+            )));
         }
-        if outside.exists() {
-            return Err(invalid("prep qualification left an outside file"));
-        }
+        report["local_registry_proof"] = proof;
+        report["writes_confined_to_protected_roots"] = true;
+        system::write_diagnostic_update(&report_path, &report).map_err(|error| {
+            super::prep::error_at_path("write qualification report", &report_path, error)
+        })?;
         Ok(())
     })();
-    if outside.exists() {
-        fs::remove_file(&outside)?;
-    }
-    remove_staging(config, &stage)?;
-    result
-}
 
-/// The child uses direct file operations so shell redirection failures cannot
-/// be mistaken for denied credential reads or outside writes.
-pub(crate) fn probe(arguments: &[String]) -> io::Result<()> {
-    if arguments.len() != 4 {
-        return Err(invalid(
-            "prep-probe requires mode, credential, outside and result paths",
-        ));
+    let cache_cleanup = remove_staging(config, &cache_root)
+        .map_err(|error| super::prep::error_at_path("remove qualification cache", &cache_root, error));
+    let staging_cleanup = remove_staging(config, &stage)
+        .map_err(|error| super::prep::error_at_path("remove qualification staging", &stage, error));
+    report["cache_removed"] = serde_json::json!(cache_cleanup.is_ok() && !cache_root.exists());
+    report["staging_removed"] = serde_json::json!(staging_cleanup.is_ok() && !stage.exists());
+    if let Err(error) = &result {
+        report["error"] = serde_json::json!(error.to_string());
     }
-    let mode = arguments[0].as_str();
-    let credential = Path::new(&arguments[1]);
-    let outside = Path::new(&arguments[2]);
-    let output = Path::new(&arguments[3]);
-    let proof = match mode {
-        "base-control" => {
-            fs::write(outside, b"unrestricted batch write control")?;
-            fs::remove_file(outside)?;
-            serde_json::json!({"outside_write":"allowed","allowed_write":"allowed"})
-        }
-        "restricted" => {
-            match fs::File::open(credential) {
-                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
-                _ => {
-                    return Err(invalid(
-                        "restricted batch token did not deny opening the real runner credential",
-                    ))
-                }
-            }
-            match fs::write(outside, b"must be denied") {
-                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
-                _ => {
-                    return Err(invalid(
-                        "restricted batch token did not deny the controlled outside write",
-                    ))
-                }
-            }
-            serde_json::json!({"credential_read":"denied","outside_write":"denied","allowed_write":"allowed"})
-        }
-        _ => return Err(invalid("unknown prep-probe mode")),
-    };
-    fs::write(output, serde_json::to_vec(&proof).map_err(invalid)?)
+    if let Err(error) = &cache_cleanup {
+        report["cache_cleanup_error"] = serde_json::json!(error.to_string());
+    }
+    if let Err(error) = &staging_cleanup {
+        report["staging_cleanup_error"] = serde_json::json!(error.to_string());
+    }
+    system::write_diagnostic_update(&report_path, &report).map_err(|error| {
+        super::prep::error_at_path("write qualification report", &report_path, error)
+    })?;
+    result?;
+    cache_cleanup?;
+    staging_cleanup
 }

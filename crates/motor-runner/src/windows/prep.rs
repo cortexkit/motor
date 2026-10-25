@@ -33,6 +33,13 @@ fn mapped(path: &str) -> io::Result<PathBuf> {
     Ok(PathBuf::from("m").join(path.trim_start_matches('/')))
 }
 
+pub(crate) fn error_at_path(operation: &str, path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("{operation} {}: {error}", path.display()),
+    )
+}
+
 pub(super) fn prepare(
     config: &Config,
     trees: &Trees,
@@ -1320,5 +1327,25 @@ mod nested_lockfile_tests {
         assert!(names.contains("root-dependency"));
         assert!(names.contains("nested-dependency"));
         assert!(!names.contains("orphan-dependency"));
+    }
+}
+
+
+#[cfg(test)]
+mod path_error_tests {
+    use super::*;
+    use cortexkit_test_support::ScratchDir;
+
+    #[test]
+    fn not_found_error_names_the_missing_path() {
+        let scratch = ScratchDir::new("windows-prep-not-found-path");
+        let missing = scratch.join("prep-toolchain/bin/cargo.exe");
+        let source = fs::read(&missing).unwrap_err();
+        let error = super::error_at_path("read pinned Cargo", &missing, source);
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            error.to_string().contains(&missing.to_string_lossy().to_string()),
+            "{error}"
+        );
     }
 }

@@ -29,10 +29,6 @@ fn main() -> io::Result<()> {
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(windows)]
-    if args.first().is_some_and(|arg| arg == "prep-probe") {
-        return motor_runner::hyperv_prep_probe(&args[1..]);
-    }
-    #[cfg(windows)]
     if args.first().is_some_and(|arg| arg == "service") {
         return native_service::dispatch();
     }

@@ -1071,6 +1071,7 @@ pub(super) fn prove(
     rustc: &Path,
     fixture: &Path,
     stage: &Path,
+    cache_root: &Path,
     report_path: &Path,
     progress_path: &Path,
 ) -> io::Result<Value> {
@@ -1078,7 +1079,7 @@ pub(super) fn prove(
     let lock_path = fixture.join("Cargo.lock");
     let lock_before = fs::read(&lock_path)?;
     let lockfile = std::str::from_utf8(&lock_before).map_err(invalid)?;
-    let proof_cache = stage.join("proof-cache");
+    let proof_cache = cache_root.to_path_buf();
     let first_home = stage.join("fetch-temp/local-registry-first-job");
     let second_home = stage.join("fetch-temp/local-registry-second-job");
     let no_git_routes = BTreeMap::new();

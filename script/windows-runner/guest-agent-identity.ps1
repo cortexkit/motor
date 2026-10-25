@@ -6,8 +6,8 @@ function Get-RunnerProvisionedAgentHash([AllowNull()][string]$RecordText) {
     return $match.Groups[1].Value.ToUpperInvariant()
 }
 
-function Get-RunnerSealedAgentHash([string]$Parent) {
-    $value = Use-DiagnosticWindowsDisk -Path $Parent -EvidenceDirectory '' -Action {
+function Get-RunnerSealedAgentHash([string]$Parent, [string]$EvidenceDirectory = '', [int]$VolumeWaitSeconds = 15) {
+    $value = Use-DiagnosticWindowsDisk -Path $Parent -EvidenceDirectory $EvidenceDirectory -VolumeWaitSeconds $VolumeWaitSeconds -Action {
         param($volume)
         $record = Get-PlainGuestItem $volume 'build\provision\winagent.sha256'
         if (-not $record -or $record.PSIsContainer) { return $null }

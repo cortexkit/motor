@@ -62,9 +62,6 @@ function Remove-RunnerPrepAccount([string]$Root, [string]$Sid) {
         $profile | Remove-CimInstance
         if (Test-Path -LiteralPath $path) { throw 'motor-prep profile cleanup did not complete' }
     }
-    if (Test-Path -LiteralPath "$Root\prep-secret.dpapi") {
-        Remove-Item -LiteralPath "$Root\prep-secret.dpapi" -Force
-    }
     if ($account) { Remove-LocalUser motor-prep }
 }
 function Protect-RunnerPath {

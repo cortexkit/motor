@@ -119,6 +119,24 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("parent-agent-record-match-mismatch-missing", fixture)
         self.assertIn("Get-RunnerProvisionedAgentHash $null", fixture)
 
+    def test_sealed_agent_reader_waits_for_volume_and_always_removes_mount(self):
+        install = (HERE / "install.ps1").read_text()
+        evidence = (HERE / "guest-evidence.ps1").read_text()
+        identity = (HERE / "guest-agent-identity.ps1").read_text()
+        fixture = (HERE / "test_scripts.ps1").read_text()
+        self.assertIn('Get-RunnerSealedAgentHash $parent "$Root\\evidence"', install)
+        self.assertIn("function Wait-RunnerDiagnosticVolume", evidence)
+        self.assertIn("VolumeWaitSeconds = 15", evidence)
+        self.assertIn("Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber", evidence)
+        self.assertIn("Get-Volume -DriveLetter $partition.DriveLetter", evidence)
+        self.assertIn("Timed out after $TimeoutSeconds seconds", evidence)
+        self.assertIn("Remove-PartitionAccessPath -AccessPath $accessPath", evidence)
+        self.assertIn("Dismount-VHD -Path $Path", evidence)
+        self.assertIn("Use-DiagnosticWindowsDisk -Path $Parent -EvidenceDirectory $EvidenceDirectory -VolumeWaitSeconds $VolumeWaitSeconds", identity)
+        self.assertIn("sealed-agent-volume-wait-retries-and-reads-identity", fixture)
+        self.assertIn("sealed-agent-volume-already-assigned-letter-is-removed", fixture)
+        self.assertIn("sealed-agent-volume-timeout-cleans-up-and-names-disk", fixture)
+
     def test_service_refuses_mismatch_and_reports_readiness(self):
         root = HERE.parents[1] / "crates/motor-runner/src"
         host = (root / "windows/hyperv_host.rs").read_text()

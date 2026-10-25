@@ -80,12 +80,8 @@ pub(crate) fn probe_peers() -> io::Result<()> {
     hvsock::probe_peers()
 }
 #[cfg(windows)]
-pub(crate) fn prep_probe(arguments: &[String]) -> io::Result<()> {
-    trusted_prep::probe(arguments)
-}
-#[cfg(windows)]
 pub(crate) fn qualify_prep(config: &Config) -> io::Result<()> {
-    trusted_prep::qualify(config)
+    trusted_prep::qualify_prep_system(config)
 }
 #[cfg(windows)]
 pub(crate) fn qualify_prep_offline_cargo(config: Config) -> io::Result<()> {

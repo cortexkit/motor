@@ -62,10 +62,39 @@ function Save-GuestAgentEvents([string]$Source, [string]$Channel, [string]$Desti
         } catch { Set-Content -LiteralPath "$Destination\guest-boot-query-status.txt" -Value ($_ | Out-String) -Encoding UTF8 }
     }
 }
-function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action, [string]$EvidenceDirectory) {
+function Wait-RunnerDiagnosticVolume([int]$DiskNumber, [int]$PartitionNumber, [int]$TimeoutSeconds, [ref]$AssignedDriveLetter) {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $lastError = 'partition drive letter has not appeared'
+    while ($clock.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        try {
+            $partition = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction Stop
+            if ($partition -and $partition.DriveLetter) {
+                $AssignedDriveLetter.Value = [string]$partition.DriveLetter
+                try {
+                    $volumes = @(Get-Volume -DriveLetter $partition.DriveLetter -ErrorAction Stop)
+                    $reverse = @(Get-Partition -DriveLetter $partition.DriveLetter -ErrorAction Stop)
+                    if ($volumes.Count -eq 1 -and $reverse.Count -eq 1 -and $reverse[0].DiskNumber -eq $DiskNumber -and $reverse[0].PartitionNumber -eq $PartitionNumber) {
+                        return [pscustomobject]@{partition=$partition; volume=$volumes[0]}
+                    }
+                    $lastError = "drive letter $($partition.DriveLetter) is not yet associated with one volume and the expected partition"
+                } catch { $lastError = [string]$_ }
+            } else {
+                $lastError = "partition $PartitionNumber on disk $DiskNumber has no drive letter yet"
+            }
+        } catch { $lastError = [string]$_ }
+        Start-Sleep -Milliseconds 100
+    }
+    $letter = [string]$AssignedDriveLetter.Value
+    throw "Timed out after $TimeoutSeconds seconds waiting for a volume on disk $DiskNumber partition $PartitionNumber drive letter '$letter': $lastError"
+}
+
+function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action, [string]$EvidenceDirectory, [int]$VolumeWaitSeconds = 15) {
     $identity = [ordered]@{utc=[DateTime]::UtcNow.ToString('o'); requested_path=[IO.Path]::GetFullPath($Path); read_only=$true; matched=$false}
     $mounted = $false
     $assigned = $false
+    $assignedDriveLetter = $null
+    $diskNumber = $null
+    $partitionNumber = $null
     $partition = $null
     try {
         # Mark the mount before Get-Disk, so a failed disk query still dismounts.
@@ -73,6 +102,7 @@ function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action, [string]
         $mounted = $true
         $identity['mount_returned_path'] = $image.Path
         $disk = $image | Get-Disk
+        $diskNumber = [int]$disk.Number
         $identity['disk_number'] = $disk.Number
         $identity['disk_unique_id'] = [string]$disk.UniqueId
         $identity['disk_location'] = [string]$disk.Location
@@ -83,17 +113,22 @@ function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action, [string]
         $partitions = @(Get-Partition -DiskNumber $disk.Number | Where-Object { $_.GptType -eq '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}' })
         if ($partitions.Count -ne 1) { throw 'Expected one Windows basic-data partition' }
         $partition = $partitions[0]
+        $partitionNumber = [int]$partition.PartitionNumber
+        if ($partition.DriveLetter) {
+            $assignedDriveLetter = [string]$partition.DriveLetter
+            $assigned = $true
+        }
         if (-not $partition.DriveLetter) {
             $partition | Add-PartitionAccessPath -AssignDriveLetter | Out-Null
             $assigned = $true
-            $partition = Get-Partition -DiskNumber $disk.Number -PartitionNumber $partition.PartitionNumber
         }
-        $volume = "$($partition.DriveLetter):\"
-        $reverse = @(Get-Partition -DriveLetter $partition.DriveLetter)
-        if ($reverse.Count -ne 1 -or $reverse[0].DiskNumber -ne $disk.Number -or $reverse[0].PartitionNumber -ne $partition.PartitionNumber) { throw 'Guest drive letter resolves to a different disk or partition' }
-        $volumeInfo = Get-Volume -DriveLetter $partition.DriveLetter
+        $binding = Wait-RunnerDiagnosticVolume -DiskNumber $diskNumber -PartitionNumber $partitionNumber -TimeoutSeconds $VolumeWaitSeconds -AssignedDriveLetter ([ref]$assignedDriveLetter)
+        $partition = $binding.partition
+        $volumeInfo = $binding.volume
+        $volume = "$($assignedDriveLetter):\"
         $identity['partition_number'] = $partition.PartitionNumber
         $identity['partition_guid'] = [string]$partition.Guid
+        $identity['drive_letter'] = $assignedDriveLetter
         $identity['volume_path'] = $volume
         $identity['volume_unique_id'] = [string]$volumeInfo.UniqueId
         $identity['volume_label'] = [string]$volumeInfo.FileSystemLabel
@@ -104,11 +139,27 @@ function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action, [string]
         & $Action $volume
     } catch {
         $identity['error'] = [string]$_
+        if ($assignedDriveLetter) { $identity['drive_letter'] = $assignedDriveLetter }
+        if ($null -ne $partitionNumber) { $identity['partition_number'] = $partitionNumber }
         if ($EvidenceDirectory) { Save-Json "$EvidenceDirectory\mounted-disk-identity.json" $identity }
         throw
     } finally {
         try {
-            if ($assigned -and $partition -and $partition.DriveLetter) { $partition | Remove-PartitionAccessPath -AccessPath "$($partition.DriveLetter):\" }
+            if ($assigned -and $null -ne $diskNumber -and $null -ne $partitionNumber) {
+                $cleanupClock = [Diagnostics.Stopwatch]::StartNew()
+                while (-not $assignedDriveLetter -and $cleanupClock.Elapsed.TotalSeconds -lt 5) {
+                    try {
+                        $cleanupPartition = Get-Partition -DiskNumber $diskNumber -PartitionNumber $partitionNumber -ErrorAction Stop
+                        if ($cleanupPartition.DriveLetter) { $assignedDriveLetter = [string]$cleanupPartition.DriveLetter }
+                    } catch { }
+                    if (-not $assignedDriveLetter) { Start-Sleep -Milliseconds 100 }
+                }
+                if (-not $assignedDriveLetter) { throw "Assigned drive letter for disk $diskNumber partition $partitionNumber was not found during cleanup" }
+                $cleanupPartition = Get-Partition -DiskNumber $diskNumber -PartitionNumber $partitionNumber -ErrorAction Stop
+                if (-not $cleanupPartition) { throw "Partition $partitionNumber on disk $diskNumber disappeared before drive-letter cleanup" }
+                $accessPath = [string]$assignedDriveLetter + ':\'
+                $cleanupPartition | Remove-PartitionAccessPath -AccessPath $accessPath -ErrorAction Stop | Out-Null
+            }
         } finally { if ($mounted) { Dismount-VHD -Path $Path } }
     }
 }

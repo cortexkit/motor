@@ -169,12 +169,6 @@ pub fn hyperv_probe_peers() -> std::io::Result<()> {
 
 #[cfg(windows)]
 #[doc(hidden)]
-pub fn hyperv_prep_probe(arguments: &[String]) -> std::io::Result<()> {
-    windows::prep_probe(arguments)
-}
-
-#[cfg(windows)]
-#[doc(hidden)]
 pub fn hyperv_qualify_prep(config: Config) -> std::io::Result<()> {
     let runner = Runner::open_for_qualification(config)?;
     windows::qualify_prep(runner.config())

@@ -112,19 +112,27 @@ class TrustedPrepDiagnosticTests(unittest.TestCase):
         self.assertCodeIn('let local_registry = cargo_home.join("local-registry")', self.agent)
         self.assertCodeIn("local_registry_config_is_rewritten_to_absolute_guest_cargo_home", self.agent)
 
-    def test_batch_probe_is_limited_to_explicit_prep_qualification(self):
-        self.assertFalse((WINDOWS / "trusted_prep/launch").exists())
-        self.assertFalse((WINDOWS / "trusted_prep/lowbox.rs").exists())
-        self.assertFalse((HERE / "test_prep_access_checks.py").exists())
-        self.assertIn("CreateRestrictedToken(", self.prep)
-        self.assertIn("run_as_batch(", self.prep)
-        self.assertCodeIn("pub fn hyperv_prep_probe(arguments: &[String])", self.library)
-        self.assertCodeIn("trusted_prep::probe(arguments)", self.windows)
-        self.assertCodeIn('arg == "prep-probe"', self.main)
-        self.assertCodeIn("hyperv_prep_probe(&args[1..])", self.main)
+    def test_qualify_prep_runs_production_local_registry_without_legacy_secret(self):
         self.assertIn("Runner-Check 'qualify-prep'", self.qualify)
-        production = self.prep.split("pub(super) fn prepare_local_registry(", 1)[1].split("pub(super) fn offline_cargo_entry", 1)[0]
-        self.assertNotIn("run_as_batch", production)
+        self.assertCodeIn('"qualify-prep" => motor_runner::hyperv_qualify_prep(config)', self.main)
+        self.assertCodeIn("pub fn hyperv_qualify_prep(config: Config)", self.library)
+        self.assertCodeIn("Runner::open_for_qualification(config)", self.library)
+        self.assertCodeIn("trusted_prep::qualify_prep_system(config)", self.windows)
+        self.assertCodeIn("pub(super) fn qualify_prep_system(config: &Config)", self.prep)
+        self.assertCodeIn("local_registry::prove(", self.prep)
+        self.assertCodeIn("LOCAL_REGISTRY_CACHE_DIRECTORY", self.prep)
+        self.assertCodeIn("cache_parent.join(id.to_string())", self.prep)
+        self.assertCodeIn("first_downloads != Some(3)", self.prep)
+        self.assertCodeIn("second_downloads != Some(0)", self.prep)
+        self.assertCodeIn("proof_cache.starts_with(&cache_base)", self.prep)
+        self.assertCodeIn("job_registry.starts_with(&stage)", self.prep)
+        self.assertIn("not_found_error_names_the_missing_path", self.prepare)
+        self.assertIn("error_at_path", self.prepare)
+        self.assertNotIn("prep-secret.dpapi", self.prep)
+        self.assertNotIn("prep-secret.dpapi", (HERE / "accounts.ps1").read_text())
+        self.assertNotIn("CreateRestrictedToken", self.prep)
+        self.assertNotIn("hyperv_prep_probe", self.library)
+        self.assertNotIn("prep-probe", self.main)
 
     def test_local_registry_proof_logs_durable_phases_and_skips_extra_parent_validation(self):
         local_registry_entry = self.prep.split("pub(super) fn local_registry_entry", 1)[1]
