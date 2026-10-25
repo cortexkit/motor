@@ -179,7 +179,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
     New-Item -ItemType Directory -Path $identityFixture | Out-Null
     try {
         Import-Module Hyper-V
-        # Keep the fixture volume unlettered to exercise its volume GUID path directly.
+        # Keep a drive letter and GUID path together; the reader must not require Get-Volume.
         New-VHD -Path $identityVolumeVhdx -Dynamic -SizeBytes 128MB | Out-Null
         $volumeImage = Mount-VHD -Path $identityVolumeVhdx -Passthru
         $identityVolumeMounted = $true
@@ -188,24 +188,20 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         if ($null -eq $volumeDiskNumber) { throw 'FAIL sealed-agent-volume-fixture-disk-number-missing' }
         $volumeDiskNumber = [int]$volumeDiskNumber
         Initialize-Disk -Number $volumeDiskNumber -PartitionStyle GPT | Out-Null
-        $volumePartition = New-Partition -DiskNumber $volumeDiskNumber -UseMaximumSize -AssignDriveLetter:$false
+        $volumePartition = New-Partition -DiskNumber $volumeDiskNumber -UseMaximumSize -AssignDriveLetter
         Format-Volume -Partition $volumePartition -FileSystem NTFS -NewFileSystemLabel IdentityFixture -Confirm:$false | Out-Null
         $volumePartitionNumber = Get-RunnerPropertyValue $volumePartition 'PartitionNumber'
         if ($null -eq $volumePartitionNumber) { throw 'FAIL sealed-agent-volume-fixture-partition-number-missing' }
         $volumePartitionNumber = [int]$volumePartitionNumber
         $volumePartition = Get-Partition -DiskNumber $volumeDiskNumber -PartitionNumber $volumePartitionNumber
         $volumeBinding = Wait-RunnerDiagnosticVolume -DiskNumber $volumeDiskNumber -PartitionNumber $volumePartitionNumber -TimeoutSeconds 15
-        $partitionLetter = Get-RunnerPropertyValue $volumePartition 'DriveLetter'
-        if ($partitionLetter) {
-            $volumePartition | Remove-PartitionAccessPath -AccessPath ($partitionLetter + ':\') -ErrorAction Stop | Out-Null
-            $volumePartition = Get-Partition -DiskNumber $volumeDiskNumber -PartitionNumber $volumePartitionNumber
-            $volumeBinding = Wait-RunnerDiagnosticVolume -DiskNumber $volumeDiskNumber -PartitionNumber $volumePartitionNumber -TimeoutSeconds 15
-        }
-        $identityVolumePath = [string](Get-RunnerPropertyValue $volumeBinding.volume 'Path')
-        $partitionLetter = Get-RunnerPropertyValue $volumePartition 'DriveLetter'
-        $volumeLetter = Get-RunnerPropertyValue $volumeBinding.volume 'DriveLetter'
-        if ($partitionLetter -or $volumeLetter -or -not (Test-RunnerVolumeGuidPath $identityVolumePath)) {
-            throw 'FAIL sealed-agent-volume-fixture-requires-no-letter-and-a-volume-guid-path'
+        $identityVolumePath = [string]$volumeBinding.volume_path
+        $identityVolumeAccessPaths = @($volumeBinding.access_paths)
+        $identityVolumeDriveLetter = [string](Get-RunnerPropertyValue $volumePartition 'DriveLetter')
+        $guidAccessPaths = @($identityVolumeAccessPaths | Where-Object { Test-RunnerVolumeGuidPath ([string]$_) })
+        $letterAccessPaths = @($identityVolumeAccessPaths | Where-Object { [string]$_ -match '\A[A-Z]:\\\z' })
+        if ($guidAccessPaths.Count -ne 1 -or -not $identityVolumeDriveLetter -or $letterAccessPaths.Count -lt 1) {
+            throw 'FAIL sealed-agent-volume-fixture-requires-a-letter-and-one-volume-guid-access-path'
         }
         [IO.Directory]::CreateDirectory([IO.Path]::Combine($identityVolumePath, 'Windows')) | Out-Null
         $identityVolumeRecord = [IO.Path]::Combine($identityVolumePath, 'build\provision\winagent.sha256')
@@ -214,9 +210,10 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
 
         $global:identityFixtureParent = Join-Path $identityFixture 'parent.vhdx'
         $global:identityFixtureVolumePath = $identityVolumePath
-        $global:identityFixtureDriveLetter = $null
+        $global:identityFixtureDriveLetter = $identityVolumeDriveLetter
         $global:identityFixtureDismounted = $false
-        $global:identityFixtureNeverVolume = $false
+        $global:identityFixtureNeverGuidPath = $false
+        $global:identityFixtureAccessPathQueries = 0
         $global:identityFixtureVolumeQueries = 0
         $global:identityFixtureAddCalls = 0
         $global:identityFixtureAccessPathTouched = $false
@@ -239,11 +236,11 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         }
         function global:Get-Partition {
             [CmdletBinding()]
-            param([int]$DiskNumber, [int]$PartitionNumber, [string]$DriveLetter, $Volume)
-            if ($PSBoundParameters.ContainsKey('Volume')) {
-                return [pscustomobject]@{DiskNumber=42; PartitionNumber=1; DriveLetter=$global:identityFixtureDriveLetter}
-            }
-            return [pscustomobject]@{DiskNumber=42; PartitionNumber=1; DriveLetter=$global:identityFixtureDriveLetter; GptType='{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'; Guid='fixture-partition'}
+            param([int]$DiskNumber, [int]$PartitionNumber)
+            $global:identityFixtureAccessPathQueries++
+            $accessPaths = @([string]$global:identityFixtureDriveLetter + ':\')
+            if (-not $global:identityFixtureNeverGuidPath -and $global:identityFixtureAccessPathQueries -ge 3) { $accessPaths += $global:identityFixtureVolumePath }
+            return [pscustomobject]@{DiskNumber=42; PartitionNumber=1; DriveLetter=$global:identityFixtureDriveLetter; AccessPaths=$accessPaths; GptType='{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'; Guid='fixture-partition'}
         }
         function global:Add-PartitionAccessPath {
             [CmdletBinding()]
@@ -252,11 +249,12 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         }
         function global:Get-Volume {
             [CmdletBinding()]
-            param($Partition)
+            param($Partition, [string]$DriveLetter, [string[]]$Path)
             $global:identityFixtureVolumeQueries++
-            if ($global:identityFixtureNeverVolume -or $global:identityFixtureVolumeQueries -lt 3) { return }
-            return [pscustomobject]@{Path=$global:identityFixtureVolumePath; DriveLetter=$global:identityFixtureDriveLetter; UniqueId='fixture-volume'; FileSystemLabel='ALLY'}
+            return
         }
+        if (@(Get-Volume -Partition $volumePartition).Count -ne 0) { throw 'FAIL sealed-agent-volume-fixture-Get-Volume-must-return-no-object' }
+        $global:identityFixtureVolumeQueries = 0
         function global:Remove-PartitionAccessPath {
             [CmdletBinding()]
             param([Parameter(ValueFromPipeline=$true)]$InputObject, [string]$AccessPath)
@@ -273,27 +271,29 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
             New-Item -ItemType Directory -Path $identityEvidence | Out-Null
             $hash = Get-RunnerSealedAgentHash $global:identityFixtureParent $identityEvidence 3
             $identity = Get-Content -LiteralPath (Join-Path $identityEvidence 'mounted-disk-identity.json') -Raw | ConvertFrom-Json
-            $identityVolumeUniqueId = Get-RunnerPropertyValue $identity 'volume_unique_id'
+            $identityAccessPaths = @(Get-RunnerPropertyValue $identity 'partition_access_paths')
             $identityVolumeGuidPath = Get-RunnerPropertyValue $identity 'volume_guid_path'
             $identityDriveLetter = Get-RunnerPropertyValue $identity 'drive_letter'
-            if ($hash -cne $parentAgentHash -or $global:identityFixtureVolumeQueries -lt 3 -or $global:identityFixtureAddCalls -ne 0 -or $global:identityFixtureAccessPathTouched -or -not $global:identityFixtureDismounted -or $identityVolumeUniqueId -cne 'fixture-volume' -or $identityVolumeGuidPath -cne $identityVolumePath -or $identityDriveLetter) { throw 'FAIL sealed-agent-volume-wait-retries-and-reads-identity' }
+            $fixtureLetterPath = [string]$global:identityFixtureDriveLetter + ':\'
+            if ($hash -cne $parentAgentHash -or $global:identityFixtureAccessPathQueries -lt 3 -or $global:identityFixtureVolumeQueries -ne 0 -or $global:identityFixtureAddCalls -ne 0 -or $global:identityFixtureAccessPathTouched -or -not $global:identityFixtureDismounted -or $identityVolumeGuidPath -cne $identityVolumePath -or $identityDriveLetter -cne $global:identityFixtureDriveLetter -or $identityAccessPaths -notcontains $identityVolumePath -or $identityAccessPaths -notcontains $fixtureLetterPath) { throw 'FAIL sealed-agent-volume-wait-retries-and-reads-identity' }
             Write-Host 'PASS sealed-agent-volume-wait-retries-and-reads-identity'
             $count++
 
             $global:identityFixtureDriveLetter = 'F'
             $global:identityFixtureDismounted = $false
+            $global:identityFixtureAccessPathQueries = 0
             $global:identityFixtureVolumeQueries = 0
             $hash = Get-RunnerSealedAgentHash $global:identityFixtureParent $identityEvidence 3
             $identity = Get-Content -LiteralPath (Join-Path $identityEvidence 'mounted-disk-identity.json') -Raw | ConvertFrom-Json
             $identityVolumeGuidPath = Get-RunnerPropertyValue $identity 'volume_guid_path'
             $identityDriveLetter = Get-RunnerPropertyValue $identity 'drive_letter'
-            if ($hash -cne $parentAgentHash -or $global:identityFixtureAddCalls -ne 0 -or $global:identityFixtureAccessPathTouched -or -not $global:identityFixtureDismounted -or $identityVolumeGuidPath -cne $identityVolumePath -or $identityDriveLetter -cne 'F') { throw 'FAIL sealed-agent-volume-ignores-existing-drive-letter' }
+            if ($hash -cne $parentAgentHash -or $global:identityFixtureAccessPathQueries -lt 3 -or $global:identityFixtureVolumeQueries -ne 0 -or $global:identityFixtureAddCalls -ne 0 -or $global:identityFixtureAccessPathTouched -or -not $global:identityFixtureDismounted -or $identityVolumeGuidPath -cne $identityVolumePath -or $identityDriveLetter -cne 'F') { throw 'FAIL sealed-agent-volume-ignores-existing-drive-letter' }
             Write-Host 'PASS sealed-agent-volume-ignores-existing-drive-letter'
             $count++
 
-            $global:identityFixtureDriveLetter = $null
             $global:identityFixtureDismounted = $false
-            $global:identityFixtureNeverVolume = $true
+            $global:identityFixtureNeverGuidPath = $true
+            $global:identityFixtureAccessPathQueries = 0
             $global:identityFixtureVolumeQueries = 0
             $failure = $null
             # Start without the previous case's record, so a stale volume path can't
@@ -307,28 +307,32 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
                 $property = $identity.PSObject.Properties['volume_guid_path']
                 if ($property) { $recordedVolumePath = $property.Value }
             }
-            if ($failure -notmatch 'Timed out after 1 seconds.*volume GUID path on disk 42 partition 1' -or $global:identityFixtureAddCalls -ne 0 -or $global:identityFixtureAccessPathTouched -or -not $global:identityFixtureDismounted -or $recordedVolumePath) { throw "FAIL sealed-agent-volume-timeout-unmounts: $failure" }
+            if ($failure -notmatch 'Timed out after 1 seconds.*volume GUID path in partition 1 AccessPaths on disk 42' -or $global:identityFixtureVolumeQueries -ne 0 -or $global:identityFixtureAddCalls -ne 0 -or $global:identityFixtureAccessPathTouched -or -not $global:identityFixtureDismounted -or $recordedVolumePath) { throw "FAIL sealed-agent-volume-timeout-unmounts: $failure" }
             Write-Host 'PASS sealed-agent-volume-timeout-unmounts'
             $count++
         } finally {
-            Remove-Item Function:\Mount-VHD,Function:\Get-Disk,Function:\Get-VHD,Function:\Get-Partition,Function:\Add-PartitionAccessPath,Function:\Get-Volume,Function:\Remove-PartitionAccessPath,Function:\Dismount-VHD -ErrorAction SilentlyContinue
-            Remove-Variable -Name identityFixtureParent,identityFixtureVolumePath,identityFixtureDriveLetter,identityFixtureDismounted,identityFixtureNeverVolume,identityFixtureVolumeQueries,identityFixtureAddCalls,identityFixtureAccessPathTouched -Scope Global -ErrorAction SilentlyContinue
+            Remove-Item Function:\Mount-VHD,Function:\Get-Disk,Function:\Get-VHD,Function:\Get-Partition,Function:\Add-PartitionAccessPath,Function:\Remove-PartitionAccessPath,Function:\Dismount-VHD -ErrorAction SilentlyContinue
+            Remove-Variable -Name identityFixtureParent,identityFixtureVolumePath,identityFixtureDriveLetter,identityFixtureDismounted,identityFixtureNeverGuidPath,identityFixtureAccessPathQueries,identityFixtureAddCalls,identityFixtureAccessPathTouched -Scope Global -ErrorAction SilentlyContinue
         }
 
         Dismount-VHD -Path $identityVolumeVhdx
         $identityVolumeMounted = $false
         $identityEvidence = Join-Path $identityFixture 'real-vhd-evidence'
         New-Item -ItemType Directory -Path $identityEvidence | Out-Null
+        $global:identityFixtureVolumeQueries = 0
         $hash = Get-RunnerSealedAgentHash $identityVolumeVhdx $identityEvidence 15
         $identity = Get-Content -LiteralPath (Join-Path $identityEvidence 'mounted-disk-identity.json') -Raw | ConvertFrom-Json
         $actualVolumeGuidPath = Get-RunnerPropertyValue $identity 'volume_guid_path'
         $actualDriveLetter = Get-RunnerPropertyValue $identity 'drive_letter'
         $actualVolumePath = Get-RunnerPropertyValue $identity 'volume_path'
-        if ($hash -cne $parentAgentHash -or -not (Test-RunnerVolumeGuidPath $actualVolumeGuidPath) -or $actualDriveLetter -or $actualVolumePath -cne $identityVolumePath) { throw 'FAIL sealed-agent-volume-guid-path-real-vhd' }
+        $actualAccessPaths = @(Get-RunnerPropertyValue $identity 'partition_access_paths')
+        $actualLetterPath = $identityVolumeDriveLetter + ':\'
+        if ($hash -cne $parentAgentHash -or $global:identityFixtureVolumeQueries -ne 0 -or -not (Test-RunnerVolumeGuidPath $actualVolumeGuidPath) -or $actualDriveLetter -cne $identityVolumeDriveLetter -or $actualVolumePath -cne $identityVolumePath -or $actualAccessPaths -notcontains $identityVolumePath -or $actualAccessPaths -notcontains $actualLetterPath) { throw 'FAIL sealed-agent-volume-guid-path-real-vhd' }
         Write-Host 'PASS sealed-agent-volume-guid-path-real-vhd'
         $count++
     } finally {
         Remove-Item Function:\Mount-VHD,Function:\Get-Disk,Function:\Get-VHD,Function:\Get-Partition,Function:\Add-PartitionAccessPath,Function:\Get-Volume,Function:\Remove-PartitionAccessPath,Function:\Dismount-VHD -ErrorAction SilentlyContinue
+        Remove-Variable -Name identityFixtureVolumeQueries -Scope Global -ErrorAction SilentlyContinue
         if ($identityVolumeMounted) { Dismount-VHD -Path $identityVolumeVhdx -ErrorAction SilentlyContinue }
         if (Test-Path -LiteralPath $identityVolumeVhdx) { Remove-Item -LiteralPath $identityVolumeVhdx -Force -ErrorAction SilentlyContinue }
         Remove-Item -LiteralPath $identityFixture -Recurse -Force -ErrorAction SilentlyContinue

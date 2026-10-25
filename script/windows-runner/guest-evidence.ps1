@@ -95,38 +95,25 @@ function Save-GuestAgentEvents([string]$Source, [string]$Channel, [string]$Desti
     }
 }
 function Wait-RunnerDiagnosticVolume([int]$DiskNumber, [int]$PartitionNumber, [int]$TimeoutSeconds) {
-    # Resolve the partition through Storage's volume association, not a session drive letter.
-
+    # Read the GUID path from the partition; read-only VHD mounts may have no Get-Volume object.
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    $lastError = 'partition has not been associated with a volume GUID path'
+    $lastError = 'partition AccessPaths has not acquired a volume GUID path'
     while ($clock.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
             $partition = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction Stop
             if ($partition) {
-                try {
-                    $volumes = @(Get-Volume -Partition $partition -ErrorAction Stop)
-                    if ($volumes.Count -eq 1) {
-                        $volumePath = [string](Get-RunnerPropertyValue $volumes[0] 'Path')
-                        if (-not (Test-RunnerVolumeGuidPath $volumePath)) {
-                            $lastError = 'the volume has no valid GUID path yet'
-                            Start-Sleep -Milliseconds 100
-                            continue
-                        }
-                        $reverse = @(Get-Partition -Volume $volumes[0] -ErrorAction Stop)
-                        if ($reverse.Count -eq 1) {
-                            $reverseDisk = Get-RunnerPropertyValue $reverse[0] 'DiskNumber'
-                            $reversePartition = Get-RunnerPropertyValue $reverse[0] 'PartitionNumber'
-                            if ($reverseDisk -eq $DiskNumber -and $reversePartition -eq $PartitionNumber) {
-                                return [pscustomobject]@{partition=$partition; volume=$volumes[0]}
-                            }
-                        }
-                        $lastError = 'volume GUID path does not map back to the expected partition'
-                    } elseif ($volumes.Count -gt 1) {
-                        throw "Partition $PartitionNumber on disk $DiskNumber maps to several volumes"
-                    } else {
-                        $lastError = 'partition has not been associated with one volume GUID path yet'
-                    }
-                } catch { $lastError = [string]$_ }
+                $rawAccessPaths = Get-RunnerPropertyValue $partition 'AccessPaths'
+                $accessPaths = @()
+                if ($null -ne $rawAccessPaths) { $accessPaths = @($rawAccessPaths) }
+                $guidPaths = @($accessPaths | Where-Object { Test-RunnerVolumeGuidPath ([string]$_) })
+                if ($guidPaths.Count -eq 1) {
+                    return [pscustomobject]@{partition=$partition; volume_path=[string]$guidPaths[0]; access_paths=$accessPaths}
+                }
+                if ($guidPaths.Count -gt 1) {
+                    $lastError = 'partition has several volume GUID access paths'
+                } else {
+                    $lastError = 'partition AccessPaths has no volume GUID path yet'
+                }
             } else {
                 $lastError = "partition $PartitionNumber on disk $DiskNumber has not appeared yet"
             }
@@ -172,15 +159,14 @@ function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action, [string]
         $partitionNumber = [int]$partitionNumberValue
         $binding = Wait-RunnerDiagnosticVolume -DiskNumber $diskNumber -PartitionNumber $partitionNumber -TimeoutSeconds $VolumeWaitSeconds
         $partition = $binding.partition
-        $volumeInfo = $binding.volume
-        $volume = [string](Get-RunnerPropertyValue $volumeInfo 'Path')
+        $volume = [string]$binding.volume_path
+        $accessPaths = @($binding.access_paths)
         $identity['partition_number'] = $partitionNumber
         $identity['partition_guid'] = [string](Get-RunnerPropertyValue $partition 'Guid')
+        $identity['partition_access_paths'] = $accessPaths
         $identity['volume_path'] = $volume
         $identity['volume_guid_path'] = $volume
-        $identity['drive_letter'] = [string](Get-RunnerPropertyValue $volumeInfo 'DriveLetter')
-        $identity['volume_unique_id'] = [string](Get-RunnerPropertyValue $volumeInfo 'UniqueId')
-        $identity['volume_label'] = [string](Get-RunnerPropertyValue $volumeInfo 'FileSystemLabel')
+        $identity['drive_letter'] = [string](Get-RunnerPropertyValue $partition 'DriveLetter')
         $identity['matched'] = $true
         if ($EvidenceDirectory) { Save-Json "$EvidenceDirectory\mounted-disk-identity.json" $identity }
         $windows = Get-PlainGuestItem $volume 'Windows'

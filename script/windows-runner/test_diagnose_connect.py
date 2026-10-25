@@ -40,9 +40,14 @@ class ConnectDiagnosticTests(unittest.TestCase):
         mount = shared.split("function Use-DiagnosticWindowsDisk", 1)[1].split("function Save-DiagnosticGuestEvidence", 1)[0]
         self.assertLess(mount.index("$mounted = $true"), mount.index("$disk = $image | Get-Disk"))
         wait = shared.split("function Wait-RunnerDiagnosticVolume", 1)[1].split("function Use-DiagnosticWindowsDisk", 1)[0]
-        self.assertIn("Get-Volume -Partition $partition", wait)
-        self.assertIn("Get-Partition -Volume $volumes[0]", wait)
+        self.assertIn("$rawAccessPaths = Get-RunnerPropertyValue $partition 'AccessPaths'", wait)
+        self.assertIn("$guidPaths = @($accessPaths | Where-Object", wait)
+        self.assertIn("if ($guidPaths.Count -eq 1)", wait)
         self.assertIn("Test-RunnerVolumeGuidPath", wait)
+        self.assertNotIn("Get-Volume -Partition", shared)
+        self.assertNotIn("Get-Volume -DriveLetter", shared)
+        self.assertNotIn("| Get-Volume", shared)
+        self.assertNotIn("Get-Partition -Volume", shared)
         self.assertNotIn("Add-PartitionAccessPath", mount)
         self.assertNotIn("Remove-PartitionAccessPath", mount)
         self.assertIn("ReparsePoint", shared)

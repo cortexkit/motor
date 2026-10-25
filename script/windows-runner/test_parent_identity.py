@@ -38,17 +38,21 @@ class ParentVerificationTests(unittest.TestCase):
         self.assertIn("$identity.requested_path", collector)
         self.assertNotIn("New-VHD", collector)
         self.assertIn("mounted-disk-identity.json", collector)
+        self.assertIn("$identity['partition_access_paths'] = $accessPaths", collector)
         self.assertIn("$identity['volume_guid_path'] = $volume", collector)
         mount = collector.split("function Use-DiagnosticWindowsDisk", 1)[1].split("function Save-DiagnosticGuestEvidence", 1)[0]
         self.assertIn("Get-PlainGuestItem $volume 'Windows'", mount)
         self.assertNotIn("Add-PartitionAccessPath", mount)
+        self.assertNotIn("Remove-PartitionAccessPath", mount)
         wait = collector.split("function Wait-RunnerDiagnosticVolume", 1)[1].split("function Use-DiagnosticWindowsDisk", 1)[0]
-        self.assertIn("Get-Volume -Partition $partition", wait)
-        self.assertIn("Get-Partition -Volume $volumes[0]", wait)
+        self.assertIn("$rawAccessPaths = Get-RunnerPropertyValue $partition 'AccessPaths'", wait)
+        self.assertIn("$guidPaths = @($accessPaths | Where-Object", wait)
+        self.assertIn("if ($guidPaths.Count -eq 1)", wait)
         self.assertIn("Test-RunnerVolumeGuidPath", wait)
-        self.assertIn("$reverse.Count -eq 1", wait)
-        self.assertIn("$reverseDisk -eq $DiskNumber", wait)
-        self.assertIn("$reversePartition -eq $PartitionNumber", wait)
+        self.assertNotIn("Get-Volume -Partition", collector)
+        self.assertNotIn("Get-Volume -DriveLetter", collector)
+        self.assertNotIn("| Get-Volume", collector)
+        self.assertNotIn("Get-Partition -Volume", collector)
 
     def test_qualification_settle_is_bounded_and_offline_proof_remains_required(self):
         native = (HERE.parents[1] / "crates/motor-runner/src/windows/hyperv.rs").read_text()
