@@ -618,7 +618,6 @@ pub(crate) struct Catalog {
     pub compile_cache_used_ms: Option<u64>,
     /// The remote cache's switch state this runner last acted on, so a change
     /// made while it was stopped is still a transition at the first re-read.
-    #[cfg(unix)]
     #[serde(default, skip_serializing_if = "Seen::is_default")]
     pub publishing_seen: Seen,
 }
@@ -635,7 +634,6 @@ impl Default for Catalog {
             transferred: BTreeMap::new(),
             mirror_used_ms: BTreeMap::new(),
             compile_cache_used_ms: None,
-            #[cfg(unix)]
             publishing_seen: Seen::default(),
         }
     }

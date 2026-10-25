@@ -213,13 +213,11 @@ pub struct Config {
     /// repository with a local fill record is refilled within this period, so
     /// it must stay well below the store's 30-day lifecycle (see
     /// [`crate::remote_cache::publication::validate_bounds`]).
-    #[cfg(unix)]
     pub refresh_period: Duration,
     /// How long a descriptor that failed to publish waits before a fill of it
     /// may be queued again. It must stay below `refresh_period`, and
     /// `refresh_period` plus the fixed 48 h refill bound plus this must stay
     /// below the store's lifecycle.
-    #[cfg(unix)]
     pub publish_retry_interval: Duration,
     /// Keep fixtures focused on foreground jobs without using drain to suppress
     /// maintenance: draining also refuses accepted jobs that are still queued.
@@ -493,9 +491,7 @@ impl Config {
             }),
             background_deletes: Arc::default(),
             base_commands: Vec::new(),
-            #[cfg(unix)]
             refresh_period: crate::remote_cache::publication::default_refresh_period(),
-            #[cfg(unix)]
             publish_retry_interval:
                 crate::remote_cache::publication::default_publish_retry_interval(),
             #[cfg(test)]
@@ -881,7 +877,6 @@ struct Inner {
     /// The remote cache's switch state this runner last acted on; saved with
     /// the catalog so a change made while it was stopped is still a
     /// transition at the first re-read.
-    #[cfg(unix)]
     publishing_seen: crate::remote_cache::publishing::Seen,
     /// When the remote cache's refresh timer last ran, in runner-clock
     /// milliseconds. Only a publishing runner uses it.
@@ -2279,7 +2274,6 @@ impl Runner {
             publishing_switch,
             catalog.publishing_seen.clone(),
         );
-        #[cfg(unix)]
         let publishing_seen = catalog.publishing_seen.clone();
         if config.remote_cache && !config.isolate_jobs {
             config.remote_cache_error = Some("isolate_jobs is off; runner switch ignored".into());
@@ -2332,7 +2326,6 @@ impl Runner {
                     dispatch: 0,
                     dropping: BTreeSet::new(),
                     maintained_ms: now,
-                    #[cfg(unix)]
                     publishing_seen,
                     #[cfg(unix)]
                     refreshed_ms: None,
