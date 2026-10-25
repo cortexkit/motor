@@ -3,7 +3,9 @@
 //! host saves the Started job record on disk before asking the guest to run the
 //! command, so a failed record write or a crash before that request starts nothing.
 use crate::{backend::*, engine::Config, platform, storage::*, workspace::Trees};
-use motor_protocol::{RefusalReason, Uuid, WindowsGuestAgentReadiness};
+#[cfg(any(windows, test))]
+use motor_protocol::RefusalReason;
+use motor_protocol::{Uuid, WindowsGuestAgentReadiness};
 use serde::Deserialize;
 #[cfg(any(unix, test))]
 use std::process::Output;
@@ -130,6 +132,10 @@ pub(crate) struct VmConfig {
     #[serde(default = "one_slot")]
     pub concurrent_jobs: u32,
 }
+/// The guest agent's readiness for the sealed parent is read by the Windows
+/// service and its qualification commands; the Unix backend never starts a
+/// Windows guest, so only the portable tests use it there.
+#[cfg(any(windows, test))]
 pub(crate) fn guest_agent_readiness(
     parent_agent_sha256: Option<&str>,
     release_agent_sha256: &str,
@@ -413,6 +419,7 @@ impl Backend for WindowsBackend {
     }
 }
 
+#[cfg(any(windows, test))]
 pub(crate) fn guest_agent_refusal(
     readiness: Option<&WindowsGuestAgentReadiness>,
 ) -> Option<(RefusalReason, String)> {

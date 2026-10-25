@@ -1,7 +1,7 @@
 //! Cache identity, fail-closed storage decisions, and fresh-disk initialization.
 
 use std::io;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub const CACHE_DISK_SERIAL: &str = "motor-cache";
 /// `MSFT_Disk.BusType` value for SCSI.
@@ -367,6 +367,75 @@ pub struct PreparedCache {
     pub volume_ms: u64,
 }
 
+/// The Windows error a device reports while it is still being brought online.
+/// Spelled out here so the volume wait compiles and is tested on every host,
+/// not only where the Windows headers are available.
+pub const ERROR_NOT_READY: u32 = 21;
+
+/// Wait until Windows publishes the volume of the partition just written.
+///
+/// A device that is still coming online answers `ERROR_NOT_READY`, so that code
+/// is retried until the deadline. Anything else is returned at once: a volume
+/// spanning other disks, several candidate volumes, or a malformed answer is a
+/// real failure, and retrying it would only delay the refusal. The retry keeps
+/// working only as long as the errors reaching it still carry their OS code.
+pub fn wait_for_new_volume(
+    deadline: Instant,
+    number: u32,
+    volumes: &dyn Fn() -> io::Result<Vec<(String, Vec<u32>)>>,
+) -> io::Result<String> {
+    loop {
+        match volumes() {
+            Ok(volumes) if volumes.len() == 1 => {
+                let (path, disks) = volumes.into_iter().next().unwrap();
+                if disks != [number] {
+                    return Err(io::Error::other("new cache volume spans other disks"));
+                }
+                return Ok(path);
+            }
+            Ok(volumes) if volumes.len() > 1 => {
+                return Err(io::Error::other("new cache disk has several volumes"));
+            }
+            Err(error) if error.raw_os_error() != Some(ERROR_NOT_READY as i32) => {
+                return Err(error);
+            }
+            _ if Instant::now() >= deadline => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "new cache volume did not appear",
+                ));
+            }
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+/// Wait until the cache volume set is published and non-empty.
+///
+/// The same rule as `wait_for_new_volume`: only `ERROR_NOT_READY` is retried,
+/// so a volume that is malformed or ambiguous is refused at once rather than
+/// after five seconds of retries.
+pub fn wait_for_volumes<T>(
+    deadline: Instant,
+    volumes: &dyn Fn() -> io::Result<Vec<T>>,
+) -> io::Result<Vec<T>> {
+    loop {
+        match volumes() {
+            Ok(volumes) if !volumes.is_empty() => return Ok(volumes),
+            Err(error) if error.raw_os_error() != Some(ERROR_NOT_READY as i32) => {
+                return Err(error);
+            }
+            _ if Instant::now() >= deadline => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "cache volume did not appear",
+                ));
+            }
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
 fn check_disk(
     storage: &mut impl CacheStorage,
     number: u32,
@@ -511,6 +580,8 @@ pub fn empty_mount_directory(path: &std::path::Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::cache_steps::CacheStep;
+
     #[test]
     fn hyperv_cache_selection_requires_exact_two_disk_scsi_topology() {
         use super::*;
@@ -736,6 +807,138 @@ mod tests {
                 lun: 1,
             }),
         }
+    }
+
+    /// An error shaped the way Windows reports one: `io::Error::from_raw_os_error`
+    /// carries the code, and every wrapper on the cache path must keep it.
+    fn not_ready() -> io::Error {
+        io::Error::from_raw_os_error(ERROR_NOT_READY as i32)
+    }
+
+    #[test]
+    fn not_ready_volume_is_retried_until_it_is_published() {
+        let attempts = std::cell::Cell::new(0);
+        // The step on the real path is what used to drop the code; go through
+        // it so this test covers that too. The receiver must outlive the wait,
+        // or the reporter refuses to report.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reporter = crate::cache_steps::CacheReporter::new(sender);
+        let published = wait_for_new_volume(Instant::now() + Duration::from_secs(5), 7, &|| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 3 {
+                return reporter.step(CacheStep::VolumeExtents, || {
+                    Err::<Vec<(String, Vec<u32>)>, _>(not_ready())
+                });
+            }
+            Ok(vec![("published-cache-volume".to_owned(), vec![7])])
+        })
+        .unwrap();
+        assert_eq!(published, "published-cache-volume");
+        assert_eq!(attempts.get(), 3);
+        // Two failing steps went through the reporter, each reporting a start
+        // and an end; the successful attempt made no step call.
+        assert_eq!(receiver.try_iter().count(), 4);
+    }
+
+    #[test]
+    fn not_ready_volume_that_never_appears_times_out() {
+        let attempts = std::cell::Cell::new(0);
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let error = wait_for_new_volume(deadline, 7, &|| {
+            attempts.set(attempts.get() + 1);
+            Err(not_ready())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "new cache volume did not appear");
+        assert!(attempts.get() > 1, "the wait never retried");
+    }
+
+    #[test]
+    fn malformed_volume_answer_is_not_retried() {
+        // Not a not-ready error, so it is a real failure: one attempt, returned
+        // immediately, even though the deadline would allow many retries.
+        let attempts = std::cell::Cell::new(0);
+        let error = wait_for_new_volume(Instant::now() + Duration::from_secs(5), 7, &|| {
+            attempts.set(attempts.get() + 1);
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed extents",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("malformed extents"));
+
+        // The same for an unambiguous answer: two volumes is not "not ready".
+        let attempts = std::cell::Cell::new(0);
+        let error = wait_for_new_volume(Instant::now() + Duration::from_secs(5), 7, &|| {
+            attempts.set(attempts.get() + 1);
+            Ok(vec![
+                ("Volume{a}".to_owned(), vec![7]),
+                ("Volume{b}".to_owned(), vec![7]),
+            ])
+        })
+        .unwrap_err();
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(error.to_string(), "new cache disk has several volumes");
+    }
+
+    #[test]
+    fn step_reports_the_error_as_the_system_reported_it() {
+        // The waits above decide on this error's Windows code, so a step that
+        // rebuilt the error from a message would silently turn every retry
+        // into a first-attempt failure. The step records itself separately.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reporter = crate::cache_steps::CacheReporter::new(sender);
+        let error = reporter
+            .step::<()>(CacheStep::VolumeExtents, || Err(not_ready()))
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_NOT_READY as i32));
+        let events: Vec<crate::cache_steps::StepEvent> = receiver.try_iter().collect();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            crate::cache_steps::StepEvent::Begin(CacheStep::VolumeExtents)
+        ));
+        assert!(matches!(
+            events[1],
+            crate::cache_steps::StepEvent::End(CacheStep::VolumeExtents, _, true)
+        ));
+        // An error without a code stays without one.
+        let plain = reporter
+            .step(CacheStep::VolumeExtents, || {
+                Err::<(), _>(io::Error::new(io::ErrorKind::InvalidData, "no code"))
+            })
+            .unwrap_err();
+        assert_eq!(plain.raw_os_error(), None);
+        assert_eq!(plain.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(plain.to_string(), "no code");
+    }
+
+    #[test]
+    fn volume_set_wait_retries_only_not_ready() {
+        let attempts = std::cell::Cell::new(0);
+        let volumes = wait_for_volumes(Instant::now() + Duration::from_secs(5), &|| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 2 {
+                return Err(not_ready());
+            }
+            Ok(vec!["published"])
+        })
+        .unwrap();
+        assert_eq!(volumes, ["published"]);
+        assert_eq!(attempts.get(), 2);
+
+        let attempts = std::cell::Cell::new(0);
+        let error = wait_for_volumes::<&str>(Instant::now() + Duration::from_secs(5), &|| {
+            attempts.set(attempts.get() + 1);
+            Err(io::Error::other("ambiguous volume"))
+        })
+        .unwrap_err();
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(error.to_string(), "ambiguous volume");
     }
 
     #[test]

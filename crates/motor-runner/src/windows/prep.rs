@@ -33,6 +33,8 @@ fn mapped(path: &str) -> io::Result<PathBuf> {
     Ok(PathBuf::from("m").join(path.trim_start_matches('/')))
 }
 
+/// Only the Windows trusted-preparation code reports errors by path.
+#[cfg(any(windows, test))]
 pub(crate) fn error_at_path(operation: &str, path: &Path, error: io::Error) -> io::Error {
     io::Error::new(
         error.kind(),
@@ -1331,7 +1333,6 @@ mod nested_lockfile_tests {
     }
 }
 
-
 #[cfg(test)]
 mod path_error_tests {
     use super::*;
@@ -1345,7 +1346,9 @@ mod path_error_tests {
         let error = super::error_at_path("read pinned Cargo", &missing, source);
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(
-            error.to_string().contains(&missing.to_string_lossy().to_string()),
+            error
+                .to_string()
+                .contains(&missing.to_string_lossy().to_string()),
             "{error}"
         );
     }

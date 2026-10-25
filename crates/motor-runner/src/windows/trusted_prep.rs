@@ -17,7 +17,6 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
 
-
 pub(super) fn log_phase(progress_path: &Path, phase: &str) -> io::Result<()> {
     use std::io::Write;
 
@@ -716,8 +715,6 @@ pub(super) fn local_registry_entry(config: Config) -> io::Result<()> {
     cleanup
 }
 
-
-
 /// Verifies the SYSTEM production path against a cold local-registry fixture.
 pub(super) fn qualify_prep_system(config: &Config) -> io::Result<()> {
     use sha2::{Digest, Sha256};
@@ -735,7 +732,9 @@ pub(super) fn qualify_prep_system(config: &Config) -> io::Result<()> {
         || config.instance != "ally"
         || config.backend != crate::BackendKind::WindowsVm
     {
-        return Err(invalid("SYSTEM prep qualification requires the installed Ally runner"));
+        return Err(invalid(
+            "SYSTEM prep qualification requires the installed Ally runner",
+        ));
     }
     let id = Uuid::now_v7();
     let staging_root = root.join("staging");
@@ -744,7 +743,9 @@ pub(super) fn qualify_prep_system(config: &Config) -> io::Result<()> {
     let cache_parent = cache_base.join("qualification");
     let cache_root = cache_parent.join(id.to_string());
     let fixture = stage.join("fetch-manifests/offline-cargo");
-    let report_path = root.join("evidence").join(format!("qualify-prep-{id}.json"));
+    let report_path = root
+        .join("evidence")
+        .join(format!("qualify-prep-{id}.json"));
     let proof_report_path = root
         .join("evidence")
         .join(format!("qualify-prep-{id}.registry.json"));
@@ -817,7 +818,9 @@ pub(super) fn qualify_prep_system(config: &Config) -> io::Result<()> {
             .read(true)
             .write(true)
             .open(&lock_path)
-            .map_err(|error| super::prep::error_at_path("open preparation lock", &lock_path, error))?;
+            .map_err(|error| {
+                super::prep::error_at_path("open preparation lock", &lock_path, error)
+            })?;
         lock_exclusive_bounded(&lock, "SYSTEM prep qualification prep.lock")?;
 
         let cargo = root.join("prep-toolchain/bin/cargo.exe");
@@ -842,18 +845,34 @@ pub(super) fn qualify_prep_system(config: &Config) -> io::Result<()> {
         });
 
         fs::write(fixture.join("Cargo.toml"), OFFLINE_CARGO_MANIFEST).map_err(|error| {
-            super::prep::error_at_path("write qualification Cargo.toml", &fixture.join("Cargo.toml"), error)
+            super::prep::error_at_path(
+                "write qualification Cargo.toml",
+                &fixture.join("Cargo.toml"),
+                error,
+            )
         })?;
         fs::write(fixture.join("Cargo.lock"), OFFLINE_CARGO_LOCK).map_err(|error| {
-            super::prep::error_at_path("write qualification Cargo.lock", &fixture.join("Cargo.lock"), error)
+            super::prep::error_at_path(
+                "write qualification Cargo.lock",
+                &fixture.join("Cargo.lock"),
+                error,
+            )
         })?;
-        fs::write(fixture.join("src/lib.rs"), "pub fn offline_fixture() {}\n").map_err(|error| {
-            super::prep::error_at_path("write qualification source", &fixture.join("src/lib.rs"), error)
-        })?;
+        fs::write(fixture.join("src/lib.rs"), "pub fn offline_fixture() {}\n").map_err(
+            |error| {
+                super::prep::error_at_path(
+                    "write qualification source",
+                    &fixture.join("src/lib.rs"),
+                    error,
+                )
+            },
+        )?;
 
-        log_phase(&progress_path, "run-production-local-registry-preparation").map_err(|error| {
-            super::prep::error_at_path("write qualification progress", &progress_path, error)
-        })?;
+        log_phase(&progress_path, "run-production-local-registry-preparation").map_err(
+            |error| {
+                super::prep::error_at_path("write qualification progress", &progress_path, error)
+            },
+        )?;
         let proof = local_registry::prove(
             &cargo,
             &rustc,
@@ -904,8 +923,9 @@ pub(super) fn qualify_prep_system(config: &Config) -> io::Result<()> {
         Ok(())
     })();
 
-    let cache_cleanup = remove_staging(config, &cache_root)
-        .map_err(|error| super::prep::error_at_path("remove qualification cache", &cache_root, error));
+    let cache_cleanup = remove_staging(config, &cache_root).map_err(|error| {
+        super::prep::error_at_path("remove qualification cache", &cache_root, error)
+    });
     let staging_cleanup = remove_staging(config, &stage)
         .map_err(|error| super::prep::error_at_path("remove qualification staging", &stage, error));
     report["cache_removed"] = serde_json::json!(cache_cleanup.is_ok() && !cache_root.exists());

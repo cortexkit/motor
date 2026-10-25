@@ -9,7 +9,6 @@ use std::{
     io,
     mem::{offset_of, size_of, zeroed},
     ptr::{null, null_mut},
-    thread,
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
@@ -239,10 +238,8 @@ fn scsi_address(disk: &Handle, reporter: &CacheReporter) -> io::Result<Option<Sc
             {
                 Ok(None)
             }
-            _ => Err(io::Error::new(
-                error.kind(),
-                format!("cache disk SCSI address: {error}"),
-            )),
+            // Keep the code: whether a disk has a SCSI address is decided on it.
+            _ => Err(error),
         };
     }
     if returned as usize != size_of::<SCSI_ADDRESS>() {
@@ -256,8 +253,9 @@ fn scsi_address(disk: &Handle, reporter: &CacheReporter) -> io::Result<Option<Sc
     }))
 }
 /// Send one fixed-size input structure to a disk control code that returns
-/// nothing. These calls change the partition table, so errors name the change.
-fn control<T>(handle: &Handle, code: u32, input: &T, what: &str) -> io::Result<()> {
+/// nothing. These calls change the partition table, so they only run after
+/// the layout and identity checks have passed.
+fn control<T>(handle: &Handle, code: u32, input: &T) -> io::Result<()> {
     let mut returned = 0;
     unsafe {
         win32(DeviceIoControl(
@@ -271,7 +269,8 @@ fn control<T>(handle: &Handle, code: u32, input: &T, what: &str) -> io::Result<(
             null_mut(),
         ))
     }
-    .map_err(|error| io::Error::new(error.kind(), format!("{what}: {error}")))
+    // The error is returned as the system reported it: rebuilding it from a
+    // custom message here would erase the Windows code callers decide on.
 }
 /// A random (version 4) GUID for the new disk and partition identifiers.
 /// Windows renames a disk whose GUID collides with another attached disk, so
@@ -501,31 +500,11 @@ impl WindowsStorage {
     /// It must be the only volume on this disk and lie entirely on it.
     fn new_volume(&self) -> io::Result<String> {
         self.reporter.step(CacheStep::VolumeDiscovery, || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                match self.disk_volumes() {
-                    Ok(volumes) if volumes.len() == 1 => {
-                        let (path, disks) = volumes.into_iter().next().unwrap();
-                        if disks != [self.number] {
-                            return Err(invalid("new cache volume spans other disks"));
-                        }
-                        return Ok(path);
-                    }
-                    Ok(volumes) if volumes.len() > 1 => {
-                        return Err(invalid("new cache disk has several volumes"));
-                    }
-                    Err(error) if error.raw_os_error() != Some(ERROR_NOT_READY as i32) => {
-                        return Err(error);
-                    }
-                    _ if Instant::now() >= deadline => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "new cache volume did not appear",
-                        ));
-                    }
-                    _ => thread::sleep(Duration::from_millis(10)),
-                }
-            }
+            motor_winagent::cache::wait_for_new_volume(
+                Instant::now() + Duration::from_secs(5),
+                self.number,
+                &|| self.disk_volumes(),
+            )
         })
     }
 }
@@ -685,7 +664,7 @@ impl CacheStorage for WindowsStorage {
                 DiskId: random_guid()?,
                 MaxPartitionCount: 128,
             };
-            control(&self.disk, IOCTL_DISK_CREATE_DISK, &create, "create GPT")?;
+            control(&self.disk, IOCTL_DISK_CREATE_DISK, &create)?;
             query(
                 &self.disk,
                 IOCTL_DISK_UPDATE_PROPERTIES,
@@ -735,12 +714,7 @@ impl CacheStorage for WindowsStorage {
                 Attributes: GPT_BASIC_DATA_ATTRIBUTE_NO_DRIVE_LETTER,
                 Name: name,
             };
-            control(
-                &self.disk,
-                IOCTL_DISK_SET_DRIVE_LAYOUT_EX,
-                &layout,
-                "write cache partition",
-            )?;
+            control(&self.disk, IOCTL_DISK_SET_DRIVE_LAYOUT_EX, &layout)?;
             query(
                 &self.disk,
                 IOCTL_DISK_UPDATE_PROPERTIES,
@@ -758,22 +732,10 @@ impl CacheStorage for WindowsStorage {
         self.reporter.step(CacheStep::VolumeDiscovery, || {
             // PnP may publish the volume after the disk has come online. Never retry
             // a malformed/ambiguous candidate, only an absent or not-yet-ready volume.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                match self.scan_volumes() {
-                    Ok(volumes) if !volumes.is_empty() => return Ok(volumes),
-                    Err(error) if error.raw_os_error() != Some(ERROR_NOT_READY as i32) => {
-                        return Err(error);
-                    }
-                    _ if Instant::now() >= deadline => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "cache volume did not appear",
-                        ));
-                    }
-                    _ => thread::sleep(Duration::from_millis(10)),
-                }
-            }
+            motor_winagent::cache::wait_for_volumes(
+                Instant::now() + Duration::from_secs(5),
+                &|| self.scan_volumes(),
+            )
         })
     }
 }

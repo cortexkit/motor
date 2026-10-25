@@ -120,7 +120,7 @@ impl CacheReporter {
                 result.is_err(),
             ))
             .map_err(|_| io::Error::other("cache observer stopped"))?;
-        result.map_err(|error| io::Error::new(error.kind(), format!("{step:?}: {error}")))
+        result
     }
 }
 
