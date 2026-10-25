@@ -302,20 +302,50 @@ fn guid_value(guid: GUID) -> u128 {
         | (u128::from(guid.data3) << 64)
         | u128::from(u64::from_be_bytes(guid.data4))
 }
-fn extents(volume: &str, reporter: &CacheReporter) -> io::Result<Vec<u32>> {
+/// Disk numbers of a volume's extents, or `None` for a volume that isn't
+/// backed by disk extents at all. A Hyper-V job VM's virtual DVD is such a
+/// volume: it answers `ERROR_INVALID_FUNCTION`. A volume with no disk extents
+/// can't lie on the cache disk, so callers looking for volumes on a disk skip
+/// it. The code is checked inside the step, because the step's error wrapping
+/// drops the raw OS error.
+fn extents(volume: &str, reporter: &CacheReporter) -> io::Result<Option<Vec<u32>>> {
     let handle = Handle::open(
         volume.trim_end_matches('\\'),
         0,
         reporter,
         CacheStep::VolumeOpen,
     )?;
-    let bytes = query(
-        &handle,
-        IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
-        &[],
-        reporter,
-        CacheStep::VolumeExtents,
-    )?;
+    let bytes = reporter.step(CacheStep::VolumeExtents, || {
+        let mut output = vec![0u8; 64 * 1024];
+        let mut returned = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle.0,
+                IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                null(),
+                0,
+                output.as_mut_ptr().cast(),
+                output.len() as u32,
+                &mut returned,
+                null_mut(),
+            )
+        };
+        if ok == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_INVALID_FUNCTION as i32) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        if returned as usize > output.len() {
+            return Err(invalid("oversized storage response"));
+        }
+        output.truncate(returned as usize);
+        Ok(Some(output))
+    })?;
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
     let count: u32 = value(&bytes, 0)?;
     if count == 0 || count > 128 {
         return Err(invalid("unexpected volume extent count"));
@@ -328,7 +358,8 @@ fn extents(volume: &str, reporter: &CacheReporter) -> io::Result<Vec<u32>> {
             )?;
             Ok(extent.DiskNumber)
         })
-        .collect()
+        .collect::<io::Result<Vec<u32>>>()
+        .map(Some)
 }
 
 pub struct WindowsStorage {
@@ -416,8 +447,9 @@ impl WindowsStorage {
         let mut found = Vec::new();
         for _ in 0..128 {
             let path = text(&name)?;
-            let disks = extents(&path, &self.reporter)?;
-            if disks.contains(&self.number) {
+            if let Some(disks) = extents(&path, &self.reporter)?
+                && disks.contains(&self.number)
+            {
                 found.push((path, disks));
             }
             let more = self.reporter.step(CacheStep::NextVolume, || {
@@ -538,7 +570,10 @@ impl CacheStorage for WindowsStorage {
                     volume.len() as u32,
                 ))
             })?;
-        extents(&text(&volume)?, &self.reporter)
+        // The Windows volume must resolve to real disks; without them the
+        // cache disk can't be proven separate from running Windows.
+        extents(&text(&volume)?, &self.reporter)?
+            .ok_or_else(|| invalid("Windows volume reports no disk extents"))
     }
 
     fn layout(&mut self) -> io::Result<DiskLayout> {
