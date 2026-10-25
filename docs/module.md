@@ -65,16 +65,7 @@ budget lets them retain their place in the build-server queue rather than
 rejoining at the back after a refusal. Gate jobs keep their fixed 30-minute
 budget, regardless of the request's queue limit or execution timeout. The
 resolved budget is stored per job in the checkpoint/journal and reused after a
-module restart. Tests (`crates/motor-module/src/queue_tests.rs`):
-`queue_budget_16c_defaults_to_thirty_minutes`,
-`queue_budget_net_defaults_to_thirty_minutes`,
-`queue_budget_windows_defaults_to_thirty_minutes`,
-`queue_budget_disabled_spill_defaults_to_thirty_minutes`,
-`queue_budget_invalid_hosted_timeout_defaults_to_thirty_minutes`,
-`queue_budget_spill_eligible_4c_keeps_five_minutes`,
-`queue_budget_explicit_limit_wins_for_spill_and_non_spill_jobs`,
-`queue_budget_non_spill_default_is_capped_by_ten_minute_timeout`,
-`queue_budget_gate_keeps_thirty_minutes_despite_explicit_limit_and_timeout`.
+module restart.
 
 Source: `crates/motor-module/src/config.rs`.
 
