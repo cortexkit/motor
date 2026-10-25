@@ -1109,6 +1109,20 @@ class RecipeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             start.budget(1<<30, 1<<29)
 
+    def test_jobs_slice_takes_the_measured_budget_at_runtime(self):
+        # The installed slice's generic percentages would clamp a Boat job below its
+        # measured budget (live: 14.25 GB slice against a 14.64 GB budget).
+        with patch.object(start.subprocess, 'run') as run:
+            start.size_jobs_slice(14638120960)
+        run.assert_called_once_with(
+            ['/usr/bin/systemctl', 'set-property', '--runtime', 'motor-jobs.slice',
+             'MemoryMax=14638120960', 'MemoryHigh=14638120960'], check=True)
+
+    def test_start_sizes_the_slice_before_the_runner_is_executed(self):
+        source = Path(start.__file__).read_text()
+        main = source[source.index("Path('/var/lib/motor-boat/budget.json')"):]
+        self.assertLess(main.index('size_jobs_slice(limit)'), main.index('os.execv('))
+
     def test_apt_index_failure_is_fatal_and_transient_retry_is_bounded(self):
         failed = Mock(returncode=100, stdout="", stderr="503 Service Unavailable")
         with patch.object(install.subprocess, 'run', return_value=failed) as run:

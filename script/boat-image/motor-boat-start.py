@@ -513,7 +513,22 @@ def main():
     evidence = dict(baseline, runner_idle_cgroup=str(cgroup), runner_idle_samples_bytes=samples,
                     runner_idle_bytes=overhead, margin_bytes=MARGIN, memory_max_bytes=limit)
     Path('/var/lib/motor-boat/budget.json').write_text(json.dumps(evidence, indent=2) + '\n')
+    size_jobs_slice(limit)
     os.execv(command[0], [*command, '--boat-memory-max-bytes', str(limit)])
+
+
+def size_jobs_slice(limit):
+    """Give the shared jobs slice this sandbox's measured budget.
+
+    The installed slice is sized for a shared build server (MemoryMax 85% and
+    MemoryHigh 75% of RAM). A Boat sandbox runs one tenant's jobs beside a small,
+    measured runner, so its budget is the precise ceiling: leaving the generic
+    percentages in place would clamp every job below it and reclaim-throttle
+    jobs well before it. The setting is runtime-only, so every boot measures
+    again, and it is applied before the runner starts and reads the slice.
+    """
+    subprocess.run(['/usr/bin/systemctl', 'set-property', '--runtime', 'motor-jobs.slice',
+                    f'MemoryMax={limit}', f'MemoryHigh={limit}'], check=True)
 
 
 if __name__ == '__main__':
