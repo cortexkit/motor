@@ -737,7 +737,7 @@ mod guest {
             let disks = motor_winagent::cache_format::hyperv_disk_inventory(
                 Instant::now() + motor_winagent::cache_steps::HYPERV_DISK_INVENTORY_TIMEOUT,
             )?;
-            diagnostic!("Hyper-V disk topology {disks:?}");
+            diagnostic!("Hyper-V cache disk inventory: {disks:?}");
             motor_winagent::cache::select_hyperv_cache_disk(&disks)
         }
         #[cfg(not(feature = "hyperv-runner"))]

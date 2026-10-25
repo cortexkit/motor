@@ -4,6 +4,8 @@ use std::io;
 use std::time::Instant;
 
 pub const CACHE_DISK_SERIAL: &str = "motor-cache";
+/// `MSFT_Disk.BusType` value for SCSI; the prior PowerShell filter accepted only SCSI.
+pub const HYPERV_SCSI_BUS_TYPE: u16 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HypervDisk {
@@ -44,9 +46,6 @@ pub fn join_hyperv_disk_inventory(
             let disk = by_number
                 .get(&location.number)
                 .ok_or_else(|| io::Error::other("SCSI location has no matching storage disk"))?;
-            if disk.bus_type != 1 {
-                return Err(io::Error::other("unexpected non-SCSI disk in Hyper-V job"));
-            }
             Ok(HypervDisk {
                 number: location.number,
                 lun: location.lun,
@@ -61,8 +60,23 @@ pub fn join_hyperv_disk_inventory(
 /// This runner expects the OS at SCSI LUN 0 and the cache at LUN 1. Require the
 /// complete two-disk topology, not merely the absence of a virtio serial.
 pub fn select_hyperv_cache_disk(disks: &[HypervDisk]) -> io::Result<u32> {
+    let unexpected_bus: Vec<_> = disks
+        .iter()
+        .filter(|disk| disk.bus_type != HYPERV_SCSI_BUS_TYPE)
+        .map(|disk| {
+            format!(
+                "disk_number={} lun={} bus_type={} boot={} system={}",
+                disk.number, disk.lun, disk.bus_type, disk.boot, disk.system
+            )
+        })
+        .collect();
+    if !unexpected_bus.is_empty() {
+        return Err(io::Error::other(format!(
+            "unexpected Hyper-V bus type; expected SCSI (1): {}",
+            unexpected_bus.join(", ")
+        )));
+    }
     if disks.len() != 2
-        || disks.iter().any(|disk| disk.bus_type != 1)
         || disks
             .iter()
             .filter(|d| d.lun == 0 && d.boot && d.system)
@@ -380,14 +394,14 @@ mod tests {
         let os = || HypervDisk {
             number: 0,
             lun: 0,
-            bus_type: 1,
+            bus_type: HYPERV_SCSI_BUS_TYPE,
             boot: true,
             system: true,
         };
         let cache = || HypervDisk {
             number: 1,
             lun: 1,
-            bus_type: 1,
+            bus_type: HYPERV_SCSI_BUS_TYPE,
             boot: false,
             system: false,
         };
@@ -405,8 +419,10 @@ mod tests {
         duplicate.number = 0;
         assert!(select_hyperv_cache_disk(&[os(), duplicate]).is_err());
         let mut non_scsi = cache();
-        non_scsi.bus_type = 3;
-        assert!(select_hyperv_cache_disk(&[os(), non_scsi]).is_err());
+        non_scsi.bus_type = 10;
+        let failure = select_hyperv_cache_disk(&[os(), non_scsi]).unwrap_err();
+        assert!(failure.to_string().contains("disk_number=1"));
+        assert!(failure.to_string().contains("bus_type=10"));
     }
 
     #[test]
@@ -414,13 +430,13 @@ mod tests {
         let storage = [
             HypervStorageDisk {
                 number: 0,
-                bus_type: 1,
+                bus_type: HYPERV_SCSI_BUS_TYPE,
                 boot: true,
                 system: true,
             },
             HypervStorageDisk {
                 number: 1,
-                bus_type: 1,
+                bus_type: HYPERV_SCSI_BUS_TYPE,
                 boot: false,
                 system: false,
             },
@@ -431,6 +447,13 @@ mod tests {
         ];
         let disks = join_hyperv_disk_inventory(&storage, &locations).unwrap();
         assert_eq!(select_hyperv_cache_disk(&disks).unwrap(), 1);
+
+        let mut storage_with_sas_disk = storage;
+        storage_with_sas_disk[1].bus_type = 10;
+        let joined = join_hyperv_disk_inventory(&storage_with_sas_disk, &locations).unwrap();
+        let failure = select_hyperv_cache_disk(&joined).unwrap_err();
+        assert!(failure.to_string().contains("disk_number=1"));
+        assert!(failure.to_string().contains("bus_type=10"));
 
         assert!(
             join_hyperv_disk_inventory(&storage, &[HypervDiskLocation { number: 7, lun: 1 }])
@@ -444,14 +467,14 @@ mod tests {
         let os = HypervDisk {
             number: 0,
             lun: 0,
-            bus_type: 1,
+            bus_type: HYPERV_SCSI_BUS_TYPE,
             boot: true,
             system: true,
         };
         let cache = HypervDisk {
             number: 1,
             lun: 1,
-            bus_type: 1,
+            bus_type: HYPERV_SCSI_BUS_TYPE,
             boot: false,
             system: false,
         };

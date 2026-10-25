@@ -25,12 +25,29 @@ class CacheDiskInventoryTests(unittest.TestCase):
     def test_selection_keeps_topology_refusals_and_its_cold_start_budget(self):
         cache = (ROOT / "crates/motor-winagent/src/cache.rs").read_text()
         self.assertIn("hyperv_selection_still_refuses_three_disks_boot_cache_and_missing_lun", cache)
-        self.assertIn("unexpected non-SCSI disk in Hyper-V job", cache)
+        self.assertIn("unexpected Hyper-V bus type; expected SCSI (1)", cache)
+        self.assertIn("disk_number={} lun={} bus_type={} boot={} system={}", cache)
 
         steps = (ROOT / "crates/motor-winagent/src/cache_steps.rs").read_text()
         self.assertIn("pub const HYPERV_DISK_INVENTORY_TIMEOUT: Duration = Duration::from_secs(5)", steps)
         self.assertIn("CacheStep::DiskSelection => HYPERV_DISK_INVENTORY_TIMEOUT", steps)
         self.assertIn("allow five seconds for cold storage-provider", steps)
+
+    def test_disk_inventory_is_logged_before_bus_selection(self):
+        agent = (ROOT / "crates/motor-winagent/src/main.rs").read_text()
+        cache_disk = agent.split("fn cache_disk(", 1)[1].split(
+            '#[cfg(not(feature = "hyperv-runner"))]', 1
+        )[0]
+        log = 'diagnostic!("Hyper-V cache disk inventory: {disks:?}")'
+        selection = "select_hyperv_cache_disk(&disks)"
+        self.assertIn(log, cache_disk)
+        self.assertLess(cache_disk.index(log), cache_disk.index(selection))
+        diag = (ROOT / "crates/motor-winagent/src/hyperv_diag.rs").read_text()
+        self.assertIn(r'C:\ProgramData\Motor\hyperv-agent.log', diag)
+        self.assertIn("pub fn event(message: &str)", diag)
+        manifest = (ROOT / "crates/motor-winagent/Cargo.toml").read_text()
+        self.assertIn('hyperv-hvsock = ["hyperv-spike"]', manifest)
+        self.assertIn('hyperv-runner = ["hyperv-hvsock"]', manifest)
 
 
 if __name__ == "__main__":
