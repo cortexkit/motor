@@ -84,12 +84,12 @@ fn a_workspace_the_runner_cannot_repair_is_refused_with_the_side_the_step_and_th
     ));
     let detail = refusal_detail(&runner, request.job_id);
     for expected in [
-        "the runner's copy of the workspace on the build server is unreadable to the runner account",
+        "the runner's copy of the workspace on the runner's host is unreadable to the runner account",
         &format!("path={}", f.key),
         "step=listing the directory for runner base checkouts",
         "errno=EACCES (Permission denied (os error 13))",
         "the runner did not repair it: this runner does not isolate jobs",
-        "retrying will not help until an operator repairs it on the build server",
+        "retrying will not help until an operator repairs it on the runner's host",
         &format!(
             "sudo setfacl -R -P -m u:{}:rwX -- '{}'",
             unsafe { libc::geteuid() },

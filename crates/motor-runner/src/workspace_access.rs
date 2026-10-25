@@ -177,9 +177,9 @@ impl Repairs {
         };
         let target = root.map_or(unreadable.path.as_path(), PathBuf::as_path);
         format!(
-            "the runner's copy of the workspace on the build server is unreadable to the runner \
+            "the runner's copy of the workspace on the runner's host is unreadable to the runner \
              account: path={} step={} errno={} ({}); {remedy}; retrying will not help until an \
-             operator repairs it on the build server: {}",
+             operator repairs it on the runner's host: {}",
             unreadable.path.display(),
             unreadable.step,
             unreadable.errno(),
@@ -291,7 +291,7 @@ fn outcome(result: io::Result<()>) -> Repair {
     }
 }
 
-/// The command an operator runs on the build server to give the runner back
+/// The command an operator runs on the runner's host to give the runner back
 /// read access to `root`. `setfacl -m` recalculates every ACL mask it writes,
 /// so this also undoes a mask a job zeroed with chmod.
 fn operator_command(root: &Path) -> String {
