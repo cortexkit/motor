@@ -45,7 +45,9 @@ class DiskQuotaChecks(unittest.TestCase):
             fill.write_bytes(b'x' * (2 * 1024**2))
             source = quota_adversarial.retained_sample({'job_id': job_id, 'host_fill_path': str(fill),
                                                        'lease': {'growth_bytes': 18 * 1024**2}})
-            real_path, statvfs = pathlib.Path, os.statvfs
+            # The concrete class: Python 3.11's Path.__new__ compares cls against
+            # the module's Path, which this test patches, and then fails.
+            real_path, statvfs = pathlib.PosixPath, os.statvfs
             def path(value):
                 return root / 'state' if value == '/var/lib/motor-boat/state/boat' else real_path(value)
             def sample(active):
