@@ -110,6 +110,77 @@ fn staged_activation() -> ResizeActivation {
     .unwrap()
 }
 
+fn start_and_activate(c: &mut Controller<Fake>) -> Response {
+    let prepared = c.handle("a", Operation::PrepareStart).unwrap();
+    if matches!(prepared.reply, Reply::StartRefused { .. }) {
+        return prepared;
+    }
+    c.handle("a", Operation::Activate).unwrap()
+}
+
+#[test]
+fn legacy_start_and_adopt_cannot_expose_a_staged_tenant_as_running() {
+    for running in [false, true] {
+        for op in [Operation::Ensure, Operation::Restore, Operation::Adopt] {
+            let mut c = Controller(Fake {
+                running,
+                activation: Some(staged_activation()),
+                ..Fake::default()
+            });
+            assert!(matches!(
+                c.handle("a", op).unwrap().reply,
+                Reply::StartRefused {
+                    case: StartRefusalCase::Activation,
+                    ..
+                }
+            ));
+            assert!(c.0.activation.is_some());
+            assert!(!c
+                .0
+                .calls
+                .iter()
+                .any(|s| s == "apply-resize" || s == "load-base-size-tap"));
+        }
+    }
+}
+
+#[test]
+fn pending_activation_fences_job_relays_and_snapshot_but_not_control() {
+    let mut c = Controller(Fake {
+        running: true,
+        activation: Some(staged_activation()),
+        ..Fake::default()
+    });
+    for op in [
+        Operation::Relay(52),
+        Operation::Relay(53),
+        Operation::Suspend,
+    ] {
+        assert!(c.handle("a", op).is_err());
+    }
+    assert!(c.handle("a", Operation::Relay(54)).is_ok());
+    assert!(!c.0.calls.iter().any(|s| s == "snapshot" || s == "prepare"));
+    c.0.fail = "staged-read";
+    assert!(c.handle("a", Operation::Relay(52)).is_err());
+}
+
+#[test]
+fn activation_is_tenant_only_and_idempotent_without_pending_intent() {
+    let request = json!({"op":"activate", "tenant":"a"});
+    assert!(serde_json::from_value::<crate::Request>(request.clone()).is_ok());
+    let mut untrusted = request;
+    untrusted["runner_args"] = json!("untrusted");
+    assert!(serde_json::from_value::<crate::Request>(untrusted).is_err());
+    let mut c = Controller(Fake::default());
+    for _ in 0..2 {
+        assert!(matches!(
+            c.handle("a", Operation::Activate).unwrap().reply,
+            Reply::Tenant { running: false, .. }
+        ));
+    }
+    assert_eq!(c.0.calls, ["registry", "registry"]);
+}
+
 #[test]
 fn unreadable_staged_activation_refuses_before_any_snapshot_or_boot_mutation() {
     let mut c = Controller(Fake {
@@ -131,13 +202,13 @@ fn unreadable_staged_activation_refuses_before_any_snapshot_or_boot_mutation() {
 }
 
 #[test]
-fn staged_activation_orders_reply_disk_sync_space_and_removal_before_wake_returns() {
+fn staged_activation_waits_for_explicit_activation_then_syncs_checks_and_completes() {
     let mut c = Controller(Fake {
         activation: Some(staged_activation()),
         saved: Some(key(4)),
         ..Fake::default()
     });
-    let reply = c.handle("a", Operation::Ensure).unwrap().reply;
+    let reply = c.handle("a", Operation::PrepareStart).unwrap().reply;
     assert!(matches!(
         reply,
         Reply::Tenant {
@@ -146,6 +217,9 @@ fn staged_activation_orders_reply_disk_sync_space_and_removal_before_wake_return
             ..
         }
     ));
+    assert!(c.0.activation.is_some());
+    assert!(!c.0.calls.iter().any(|s| s == "apply-resize"));
+    c.handle("a", Operation::Activate).unwrap();
     assert_eq!(
         c.0.calls,
         [
@@ -156,6 +230,7 @@ fn staged_activation_orders_reply_disk_sync_space_and_removal_before_wake_return
             "unlink-fsync",
             "generation-fsync",
             "resume",
+            "registry",
             "apply-resize",
             "agent-reply",
             "disk-fsync",
@@ -176,7 +251,7 @@ fn activation_without_quota_growth_never_probes_space() {
         ..Fake::default()
     });
     assert!(matches!(
-        c.handle("a", Operation::Restore).unwrap().reply,
+        start_and_activate(&mut c).reply,
         Reply::Tenant { running: true, .. }
     ));
     assert!(!c.0.calls.iter().any(|s| s == "post-grow-space"));
@@ -201,7 +276,7 @@ fn activation_guest_and_host_failures_cleanly_stop_and_redeliver() {
             fail: if guest_failure { "" } else { failure },
             ..Fake::default()
         });
-        let reply = c.handle("a", Operation::Ensure).unwrap().reply;
+        let reply = start_and_activate(&mut c).reply;
         assert!(
             matches!(
                 reply,
@@ -222,7 +297,7 @@ fn activation_guest_and_host_failures_cleanly_stop_and_redeliver() {
         c.0.calls.clear();
         c.0.fail = "";
         c.0.activation_failure = "";
-        c.handle("a", Operation::Ensure).unwrap();
+        start_and_activate(&mut c);
         assert!(c.0.running && c.0.activation.is_none(), "{failure}");
         assert_eq!(c.0.calls.iter().filter(|s| *s == "apply-resize").count(), 1);
         assert!(c.0.calls.iter().any(|s| s == "load-base-size-tap"));
@@ -239,7 +314,7 @@ fn post_grow_refuses_160_gib_and_one_byte_short_then_redelivers_at_exact_require
             ..Fake::default()
         });
         assert!(matches!(
-            c.handle("a", Operation::Ensure).unwrap().reply,
+            start_and_activate(&mut c).reply,
             Reply::StartRefused {
                 case: StartRefusalCase::PostGrowSpace,
                 ..
@@ -250,7 +325,7 @@ fn post_grow_refuses_160_gib_and_one_byte_short_then_redelivers_at_exact_require
         assert!(!c.0.calls.iter().any(|s| s == "staged-unlink-fsync"));
         c.0.space = 208 * GIB;
         assert!(matches!(
-            c.handle("a", Operation::Ensure).unwrap().reply,
+            start_and_activate(&mut c).reply,
             Reply::Tenant { running: true, .. }
         ));
         assert!(c.0.activation.is_none());
@@ -267,7 +342,7 @@ fn activation_prepare_stop_failure_preserves_recovery_and_redelivers() {
         ..Fake::default()
     });
     assert!(matches!(
-        c.handle("a", Operation::Ensure).unwrap().reply,
+        start_and_activate(&mut c).reply,
         Reply::StartRefused { .. }
     ));
     assert!(!c.0.running);
@@ -281,7 +356,7 @@ fn activation_prepare_stop_failure_preserves_recovery_and_redelivers() {
     c.0.fail = "";
     c.0.activation_failure = "";
     assert!(matches!(
-        c.handle("a", Operation::Ensure).unwrap().reply,
+        start_and_activate(&mut c).reply,
         Reply::Tenant {
             running: true,
             restored: false,
@@ -303,18 +378,18 @@ fn activation_failed_stop_cannot_be_adopted_on_the_next_ensure() {
         ..Fake::default()
     });
     assert!(matches!(
-        c.handle("a", Operation::Ensure).unwrap().reply,
+        start_and_activate(&mut c).reply,
         Reply::StartRefused { .. }
     ));
     assert!(c.0.running && c.0.activation.is_some());
     c.0.activation_failure = "";
     assert!(matches!(
-        c.handle("a", Operation::Ensure).unwrap().reply,
+        start_and_activate(&mut c).reply,
         Reply::StartRefused { .. }
     ));
     assert!(c.0.activation.is_some());
     assert!(matches!(
-        c.handle("a", Operation::Ensure).unwrap().reply,
+        start_and_activate(&mut c).reply,
         Reply::Tenant {
             running: true,
             restored: false,

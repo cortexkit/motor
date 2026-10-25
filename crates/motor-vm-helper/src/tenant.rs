@@ -30,6 +30,8 @@ pub fn validate_port(port: u32) -> Result<()> {
 #[derive(Debug, Clone, Copy)]
 pub enum Operation {
     Ensure,
+    PrepareStart,
+    Activate,
     AttachDisk,
     Suspend,
     Restore,
@@ -311,7 +313,10 @@ impl<B: Backend> Controller<B> {
         if let Operation::Remove = op {
             return self.remove(tenant);
         }
-        if matches!(op, Operation::Ensure | Operation::Restore) {
+        if matches!(
+            op,
+            Operation::Ensure | Operation::Restore | Operation::PrepareStart
+        ) {
             if let Err(refusal) = self.0.check_start(tenant) {
                 return Ok(refused_response(refusal));
             }
@@ -325,19 +330,48 @@ impl<B: Backend> Controller<B> {
         }
         self.record_lost_vm(tenant, &r)?;
         let mut restored = self.0.was_restored(tenant);
+        // Legacy callers cannot complete the attach/activate handshake. Hide a
+        // pending VM from adopt, and refuse legacy starts instead of returning
+        // a success that an older host would advertise as ready.
+        if matches!(
+            op,
+            Operation::Ensure | Operation::Restore | Operation::Adopt
+        ) {
+            let error = match self.0.staged_resize(&r) {
+                Ok(None) => None,
+                Ok(Some(_)) => Some(Error(
+                    "staged resize requires prepare_start, attach_tenant, then activate".into(),
+                )),
+                Err(error) => Some(error),
+            };
+            if let Some(error) = error {
+                return Ok(refused_response(start_refused(
+                    StartRefusalCase::Activation,
+                    error,
+                )));
+            }
+        }
         match op {
-            Operation::Ensure | Operation::Restore => {
+            Operation::Ensure | Operation::Restore | Operation::PrepareStart => {
                 if self.0.running(tenant) {
                     // A failed activation stop may have left a live VM. Never
                     // adopt it while durable provisioning intent is pending.
                     match self.0.staged_resize(&r) {
                         Ok(Some(_)) => {
                             if let Err(error) = self.stop_cleanly(tenant, &r) {
-                                return Ok(refused_response(start_refused(StartRefusalCase::Activation, error)));
+                                return Ok(refused_response(start_refused(
+                                    StartRefusalCase::Activation,
+                                    error,
+                                )));
                             }
                         }
-                        Ok(None) => {},
-                        Err(error) => return Ok(refused_response(start_refused(StartRefusalCase::Activation, error))),
+                        Ok(None) => {}
+                        Err(error) => {
+                            return Ok(refused_response(start_refused(
+                                StartRefusalCase::Activation,
+                                error,
+                            )))
+                        }
                     }
                 }
                 if self.0.unclean(&r)? && self.0.running(tenant) {
@@ -349,6 +383,33 @@ impl<B: Backend> Controller<B> {
                         Err(StartError::Refused(refusal)) => return Ok(refused_response(refusal)),
                         Err(StartError::Other(error)) => return Err(error),
                     };
+                }
+            }
+            Operation::Activate => {
+                let result = match self.0.staged_resize(&r) {
+                    Ok(Some(activation)) if self.0.running(tenant) => {
+                        self.activate(tenant, &r, &activation)
+                    }
+                    Ok(None) => Ok(()),
+                    pending => {
+                        let mut refusal = start_refused(
+                            StartRefusalCase::Activation,
+                            pending.err().unwrap_or_else(|| {
+                                Error("resize requires a running tenant".into())
+                            }),
+                        );
+                        if let Err(stop) = self.stop_cleanly(tenant, &r) {
+                            refusal
+                                .message
+                                .push_str(&format!("; clean stop failed: {stop}"));
+                        }
+                        Err(StartError::Refused(refusal))
+                    }
+                };
+                match result {
+                    Ok(()) => {}
+                    Err(StartError::Refused(refusal)) => return Ok(refused_response(refusal)),
+                    Err(StartError::Other(error)) => return Err(error),
                 }
             }
             Operation::AttachDisk => self.0.drive(tenant, &r)?,
@@ -365,6 +426,11 @@ impl<B: Backend> Controller<B> {
                 }));
             }
             Operation::Relay(port) => {
+                if port != 54 && self.0.staged_resize(&r)?.is_some() {
+                    return Err(Error(
+                        "resize activation pending; job relay is fenced".into(),
+                    ));
+                }
                 return Ok(Response {
                     reply: Reply::Relay { fd_count: 1 },
                     fds: vec![self.0.relay(tenant, port).map_err(|error| {
@@ -372,12 +438,17 @@ impl<B: Backend> Controller<B> {
                             "open_relay tenant={tenant} port={port} step=open_guest_connection: {error}"
                         ))
                     })?],
-                })
+                });
             }
             Operation::Stop => {
                 self.stop_cleanly(tenant, &r)?;
             }
             Operation::Suspend => {
+                if self.0.staged_resize(&r)?.is_some() {
+                    return Err(Error(
+                        "resize activation pending; snapshot is fenced".into(),
+                    ));
+                }
                 if !self.0.running(tenant) {
                     return Err(Error("tenant is not running".into()));
                 }
@@ -396,9 +467,9 @@ impl<B: Backend> Controller<B> {
                         // writer. Kill and reap it before deleting any output.
                         // Prepare already drained jobs and froze the filesystem,
                         // but the next boot must still perform unclean recovery.
-                        self.0.stop(tenant).map_err(|stop| Error(format!(
-                            "suspend_create_stop_failed: {error}; stop: {stop}"
-                        )))?;
+                        self.0.stop(tenant).map_err(|stop| {
+                            Error(format!("suspend_create_stop_failed: {error}; stop: {stop}"))
+                        })?;
                         // The running marker already forces recovery if this
                         // reason cannot be recorded after the writer is stopped.
                         let record = self.0.mark_unclean(&r, &error.to_string());
@@ -629,9 +700,6 @@ impl<B: Backend> Controller<B> {
             }
         }
         result?;
-        if let Some(activation) = activation {
-            self.activate(tenant, r, &activation)?;
-        }
         Ok(false)
     }
 }

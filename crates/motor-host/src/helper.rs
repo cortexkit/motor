@@ -183,10 +183,15 @@ impl Control for Helper {
             .to_owned())
     }
     fn adopt(&self, tenant: &str) -> Result<bool> {
-        Ok(self.request(json!({"op":"adopt", "tenant":tenant}))?.0["running"] == true)
+        let (reply, _) = self.request(json!({"op":"adopt", "tenant":tenant}))?;
+        check_start_reply(&reply)?;
+        Ok(reply["running"] == true)
     }
     fn wake(&self, tenant: &str, initialized_generation: Option<u64>) -> Result<u64> {
-        let (adopted, _) = self.request(json!({"op":"adopt", "tenant":tenant}))?;
+        let (adopted, _) = self
+            .request(json!({"op":"adopt", "tenant":tenant}))
+            .map_err(|error| self.activation_refused(tenant, error))?;
+        let activation_pending = adopted["result"] == "start_refused";
         let running = adopted["running"] == true;
         if running
             && adopted["recovery_required"] == true
@@ -194,31 +199,61 @@ impl Control for Helper {
                 .request(json!({"op":"recovery_complete","tenant":tenant}))
                 .is_ok()
         {
+            self.activate(tenant)?;
             return adopted["generation"].as_u64().context("helper generation");
         }
         let (reply, _) = if running && adopted["recovery_required"] != true {
             (adopted, vec![])
         } else {
-            self.request(json!({"op":"ensure", "tenant":tenant}))?
+            self.request(json!({"op":"prepare_start", "tenant":tenant}))
+                .map_err(|error| {
+                    if activation_pending {
+                        self.activation_refused(tenant, error)
+                    } else {
+                        error
+                    }
+                })?
         };
-        if reply["result"] == "start_refused" {
-            return Err(StartRefused {
-                case: reply["case"].as_str().unwrap_or("unknown").to_owned(),
-                message: reply["message"].as_str().unwrap_or("").to_owned(),
+        check_start_reply(&reply).map_err(|error| {
+            if activation_pending {
+                self.activation_refused(tenant, error)
+            } else {
+                error
             }
-            .into());
-        }
-        let generation = reply["generation"].as_u64().context("helper generation")?;
+        })?;
+        let generation = reply["generation"]
+            .as_u64()
+            .context("helper generation")
+            .map_err(|error| {
+                if activation_pending {
+                    self.activation_refused(tenant, error)
+                } else {
+                    error
+                }
+            })?;
         let recovery = reply["recovery_required"] == true;
         if recovery || !running || initialized_generation != Some(generation) {
-            self.quota(tenant, 1)?;
+            self.quota(tenant, 1).map_err(|error| {
+                if activation_pending {
+                    self.activation_refused(tenant, error)
+                } else {
+                    error
+                }
+            })?;
             let mut request = if reply["restored"] == true {
                 json!({"op":"post_restore"})
             } else {
                 let mut request = self
                     .guest_init
                     .get(tenant)
-                    .context("tenant guest configuration")?
+                    .context("tenant guest configuration")
+                    .map_err(|error| {
+                        if activation_pending {
+                            self.activation_refused(tenant, error)
+                        } else {
+                            error
+                        }
+                    })?
                     .clone();
                 request["op"] = json!("attach_tenant");
                 request["generation"] = json!(generation);
@@ -235,6 +270,12 @@ impl Control for Helper {
                 result => {
                     let detail: String = format!("{result:?}").chars().take(4096).collect();
                     tracing::error!(tenant, detail, "tenant_recovery_or_initialization_failed");
+                    if activation_pending {
+                        return Err(self.activation_refused(
+                            tenant,
+                            anyhow::anyhow!("guest tenant initialization failed: {detail}"),
+                        ));
+                    }
                     return Err(crate::state::Error::Refused(
                         crate::state::Refusal::InternalFailure,
                     ))
@@ -242,9 +283,17 @@ impl Control for Helper {
                 }
             }
             if recovery {
-                self.request(json!({"op":"recovery_complete", "tenant":tenant}))?;
+                self.request(json!({"op":"recovery_complete", "tenant":tenant}))
+                    .map_err(|error| {
+                        if activation_pending {
+                            self.activation_refused(tenant, error)
+                        } else {
+                            error
+                        }
+                    })?;
             }
         }
+        self.activate(tenant)?;
         Ok(generation)
     }
     fn quota(&self, tenant: &str, vcpus: u32) -> Result<()> {
@@ -277,6 +326,48 @@ impl Control for Helper {
     fn capacity(&self) -> Result<crate::capacity::Capacity> {
         crate::capacity::read(&self.capacity, 0)
     }
+}
+
+impl Helper {
+    fn activate(&self, tenant: &str) -> Result<()> {
+        let result = (|| {
+            let (reply, _) = self.request(json!({"op":"activate", "tenant":tenant}))?;
+            check_start_reply(&reply)?;
+            ensure!(
+                reply["result"] == "tenant" && reply["running"] == true,
+                "unexpected helper activation reply"
+            );
+            Ok(())
+        })();
+        result.map_err(|error| self.activation_refused(tenant, error))
+    }
+
+    fn activation_refused(&self, tenant: &str, error: anyhow::Error) -> anyhow::Error {
+        let mut refusal = error
+            .downcast_ref::<StartRefused>()
+            .cloned()
+            .unwrap_or_else(|| StartRefused {
+                case: "activation".into(),
+                message: format!("{error:#}"),
+            });
+        if let Err(stop) = self.stop(tenant) {
+            refusal
+                .message
+                .push_str(&format!("; clean stop failed: {stop:#}"));
+        }
+        refusal.into()
+    }
+}
+
+fn check_start_reply(reply: &Value) -> Result<()> {
+    if reply["result"] == "start_refused" {
+        return Err(StartRefused {
+            case: reply["case"].as_str().unwrap_or("unknown").to_owned(),
+            message: reply["message"].as_str().unwrap_or("").to_owned(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// How long the host waits for the guest's reply to a control request. A

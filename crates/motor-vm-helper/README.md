@@ -171,8 +171,12 @@ workspace and owned-workspace roots. The optional state root is `/tenant/state`.
 The helper validates this grammar before sending anything to the guest.
 
 A pending activation forces a cold base load, even if a saved snapshot matches.
-After drive PATCH and resume, the helper sends `apply_resize` on the agent
-channel with the staged `runner_args`. The guest reply must acknowledge its grow,
+The host uses `prepare_start` (tenant id only) to load, PATCH and resume the VM,
+then sends `attach_tenant` on the guest control channel. Only after attachment
+succeeds does the host call helper `activate` (also tenant id only). The helper
+reads its own staged record and sends `apply_resize` on the agent channel with
+the staged `runner_args`. Attachment is required because resize drains and
+restarts the tenant runner. The guest reply must acknowledge its grow,
 argument write and durability barriers. Only after that reply does the helper
 fsync its open disk file. When `quota_grew` is true, it then checks host available
 bytes against the operating requirement on the disk's filesystem:
@@ -199,3 +203,76 @@ barrier refusals, clean-stop recovery and re-delivery. These helper doubles do
 not exercise real XFS growth or guest-side barriers; those need separate
 validation on a disposable tenant, on a dedicated root/KVM host with a
 resize-capable tenant image.
+
+The host calls `activate` on every wake, including adopted VMs and retries; no
+pending intent is a no-op success. It verifies the VM is still running before
+declaring readiness. Until activation succeeds, the host neither advertises
+free tenant capacity nor opens the job relay. The helper additionally fences
+job/event relays (52/53) and suspend while intent is pending; control port 54
+remains available for attachment and resize. A host crash after attachment or
+during activation leaves the staged intent for the next cold start. A helper
+restart kills old VMMs and records recovery as usual.
+
+Cold tenants can still advertise capacity to attract their first lease, but
+the host withdraws that capacity as soon as a wake starts and restores it only
+on success. Startup recovery recognizes a pending-activation adopt refusal and
+finishes that tenant's start before the host begins advertising. A lease may
+be reserved during startup, but delivery to the runner remains fenced.
+
+The protocol additions fail closed during mixed-version deployment: legacy
+`ensure`, `restore`, and `adopt` return `start_refused` without a running success
+while activation is pending. Thus an old host cannot adopt or ready the interim
+VM. An old helper rejects the new operation names, so a new host cannot skip the
+activation handshake either. Deploy both **motor-host** and **motor-vm-helper**;
+the existing resize-capable guest image is unchanged (no image build or
+`switch-image`). Tests:
+`cold_staged_resize_attaches_before_activation_and_never_advertises_or_delivers_early`,
+`resize_crash_after_attach_cold_boots_and_redelivers_before_ready`,
+`legacy_start_and_adopt_cannot_expose_a_staged_tenant_as_running`, and
+`pending_activation_fences_job_relays_and_snapshot_but_not_control`.
+
+### Real staged-resize qualification
+
+`motor-host`'s ignored `isolated_staged_resize_cold_start` test runs the real
+`Runtime` retry path, host `Helper`, helper daemon, and guest agent. It requires
+root and a dedicated Linux/KVM host with **all registered tenants stopped**,
+`motor-host.service` inactive, and the new `motor-vm-helper.service` active.
+Use only a disposable tenant named `resize-canary-*`, configured in the selected
+host config's bindings. The test never targets `tenant-1`, edits a registry,
+mounts a disk, submits real work, or opens the production host journal. It leaves
+the throwaway tenant cleanly stopped and does not delete its disk or snapshots.
+The helper must admit the peer listed in `/etc/motor-vm-helper.json`; the test
+reads protected records as root, temporarily connects as that peer, and restores
+root for completion assertions. Run only this test in its isolated nextest
+process, not alongside other privileged work.
+
+Prepare the fixture with the ordinary provisioner **offline**: increase its disk
+quota so `runner-args.staged` has `quota_grew: true`, and leave it stopped. Do not
+bypass the provisioner's host-wide quiescence or pending-intent checks; if another
+tenant has pending activation, finish that cutover before preparing this fixture.
+Use an existing `resize-v1` image. After deploying the new helper and selecting a
+host config that binds the throwaway tenant, run from the repository on the
+operator host:
+
+```sh
+sudo systemctl stop motor-host.service
+sudo systemctl start motor-vm-helper.service
+sudo --preserve-env=PATH env \
+  MOTOR_VM_TEST_TENANT=resize-canary-1 \
+  MOTOR_RESIZE_OPERATOR_ACK=stopped-disposable-tenant \
+  MOTOR_HOST_TEST_CONFIG=/etc/motor-host/host.json \
+  env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
+  cargo nextest run --locked -p motor-host --lib \
+    -E 'test(=tests::resize_operator::isolated_staged_resize_cold_start)' \
+    --run-ignored only --no-tests fail --nocapture
+```
+
+The test checks a stopped fixture, staged ownership/mode, resized disk length,
+real cold attach/resize success, host readiness, effective weight/cache/floor
+arguments via `args_status`, staged-intent removal after the real post-grow check,
+and clean-stop marker removal. No skip counts as qualification; retain the
+printed PASS and args-status output. A failure leaves intent pending unless all
+activation barriers already completed, and cleanup always attempts to stop the
+throwaway VM. Investigate any cleanup failure before restarting motor-host.
+Portable CI deliberately ignores this test; it does not establish real XFS or
+Firecracker behavior.

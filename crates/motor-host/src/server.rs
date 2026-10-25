@@ -301,7 +301,20 @@ impl Runtime {
             .map(|t| t.tenant.clone())
             .collect();
         for tenant in tenants {
-            if self.control.adopt(&tenant)? {
+            let needs_start = match self.control.adopt(&tenant) {
+                Ok(running) => running,
+                // Pending intent deliberately hides the interim VM from adopt.
+                // Finish its cold-start handshake before startup advertises it.
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::helper::StartRefused>()
+                        .is_some() =>
+                {
+                    true
+                }
+                Err(error) => return Err(error),
+            };
+            if needs_start {
                 if let Err(error) = self.ensure(&tenant) {
                     tracing::error!(tenant, detail = %format!("{error:#}"), "tenant_recovery_pending");
                 }
@@ -482,6 +495,7 @@ impl Runtime {
             )
         };
         if !ready {
+            self.host.lock().expect("host lock").start_pending(tenant);
             tracing::info!(tenant, initialized_generation = ?generation, "tenant_wake_started");
             let generation = self.control.wake(tenant, generation).map_err(|error| {
                 if let Some(refused) = error.downcast_ref::<crate::helper::StartRefused>() {
@@ -495,12 +509,18 @@ impl Runtime {
                         retry_in_ms = crate::state::START_RETRY_MS,
                         "tenant_start_refused"
                     );
-                    self.host.lock().expect("host lock").start_refused(
-                        tenant,
-                        &refused.case,
-                        now_ms,
-                    );
+                    let mut host = self.host.lock().expect("host lock");
+                    host.start_refused(tenant, &refused.case, now_ms);
+                    host.start_attempt_failed(tenant);
                     return Error::Refused(Refusal::HostFull);
+                }
+                {
+                    // A failed or unreadable handshake cannot establish that
+                    // activation finished. Keep capacity withdrawn and retry
+                    // even when the failure was not a typed helper refusal.
+                    let mut host = self.host.lock().expect("host lock");
+                    host.start_refused(tenant, "initialization", now_ms);
+                    host.start_attempt_failed(tenant);
                 }
                 tracing::error!(tenant, detail=%error, "tenant_recovery_or_initialization_failed");
                 error
