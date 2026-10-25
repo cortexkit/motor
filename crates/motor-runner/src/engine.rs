@@ -3025,10 +3025,9 @@ impl Runner {
         if self.core.config.windows_instance() {
             request.weight_hint = Some(4);
         }
-        // Read the jobs slice before taking the state lock: `run_refusal` asks
-        // about admission and runs under it, and spawning systemctl there would
-        // stall every other admission, status reply and cancel.
-        self.refresh_slice_budget();
+        // Admission reads only the recorded ceiling: the slice changes when an
+        // operator re-renders it, and the maintenance pass re-reads it there,
+        // so neither this hot path nor the state lock spawns systemctl.
         let (_admission, initial_refusal) = {
             let _restore = self.reserve_restore_barrier();
             let mut inner = self.core.inner.lock().unwrap();

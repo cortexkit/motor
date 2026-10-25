@@ -117,37 +117,12 @@ fn admission_accepts_when_the_recorded_slice_covers_the_floor() {
     runner.cancel(request.job_id).unwrap();
 }
 
-/// Every maintenance pass re-reads the slice, and admission refuses by the
-/// ceiling it records.
+/// Maintenance re-reads the ceiling, and the next job decided after that pass
+/// refuses by it. Admission itself never asks again, so this is the only place
+/// a changed slice takes effect, and the wait is at most one maintenance
+/// interval.
 #[test]
-fn maintenance_records_the_slice_ceiling_that_admission_refuses_by() {
-    let f = Fixture::new();
-    let (runner, ceiling) = runner_recording(&f, 24 << 30);
-    let (request, _) = f.run("touch must-not-start");
-    ceiling.store(FLOOR - 1, Ordering::SeqCst);
-    runner.maintenance().unwrap();
-    assert!(matches!(
-        runner.accept(request).unwrap(),
-        Admission::Refused(RefusalReason::WorkspaceSetupFailed)
-    ));
-    let slow: Vec<_> = runner
-        .core
-        .inner
-        .site_holds()
-        .into_iter()
-        .filter(|(_, holds)| holds.longest >= crate::state_lock::SLOW_HOLD)
-        .collect();
-    assert!(
-        slow.is_empty(),
-        "maintenance held the lock slowly: {slow:?}"
-    );
-}
-
-/// Admission re-reads the ceiling for each arrival, before it takes the state
-/// lock, so a slice that shrank since the last pass refuses the very next job
-/// and systemd is never spawned under that lock.
-#[test]
-fn admission_rereads_the_slice_before_deciding_each_job() {
+fn maintenance_picks_up_a_changed_ceiling_before_the_next_job_is_decided() {
     let f = Fixture::new();
     let mut config = f.config();
     config.memory_floor_gib = Some(16);
@@ -160,16 +135,37 @@ fn admission_rereads_the_slice_before_deciding_each_job() {
         Ok(read.load(Ordering::SeqCst))
     }));
     let runner = Runner::open(config).unwrap();
-    let first = reads.load(Ordering::SeqCst);
-    // A slice shrunk since startup, with no maintenance pass in between.
+    // Jobs the size of the last recording are admitted.
+    let (before, _) = f.run("true");
+    assert!(matches!(
+        runner.accept(before.clone()).unwrap(),
+        Admission::Accepted(0)
+    ));
+    runner.cancel(before.job_id).unwrap();
+    // An operator shrinks the slice after startup, with no restart.
     ceiling.store(FLOOR - 1, Ordering::SeqCst);
+    let seen = reads.load(Ordering::SeqCst);
+    runner.maintenance().unwrap();
+    assert!(
+        reads.load(Ordering::SeqCst) > seen,
+        "maintenance did not re-read the slice"
+    );
+    // The next job is decided by the new ceiling.
     let (request, _) = f.run("touch must-not-start");
     assert!(matches!(
         runner.accept(request).unwrap(),
         Admission::Refused(RefusalReason::WorkspaceSetupFailed)
     ));
+    // The re-read happens with no state lock held; a slow one would show here.
+    let slow: Vec<_> = runner
+        .core
+        .inner
+        .site_holds()
+        .into_iter()
+        .filter(|(_, holds)| holds.longest >= crate::state_lock::SLOW_HOLD)
+        .collect();
     assert!(
-        reads.load(Ordering::SeqCst) > first,
-        "admission decided without reading the slice"
+        slow.is_empty(),
+        "maintenance held the lock slowly: {slow:?}"
     );
 }
