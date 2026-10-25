@@ -10,7 +10,8 @@ function Get-RunnerSealedAgentHash([string]$Parent, [string]$EvidenceDirectory =
     $value = Use-DiagnosticWindowsDisk -Path $Parent -EvidenceDirectory $EvidenceDirectory -VolumeWaitSeconds $VolumeWaitSeconds -Action {
         param($volume)
         $record = Get-PlainGuestItem $volume 'build\provision\winagent.sha256'
-        if (-not $record -or $record.PSIsContainer) { return $null }
+        if ($null -eq $record) { return $null }
+        if ($record.PSIsContainer) { return $null }
         Get-RunnerProvisionedAgentHash ([IO.File]::ReadAllText($record.FullName))
     }
     if ($value -is [string] -and $value -match '\A[0-9A-F]{64}\z') { return $value }

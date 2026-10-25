@@ -32,7 +32,10 @@ class ParentVerificationTests(unittest.TestCase):
         remove = script.split("function Remove-Job(", 1)[1].split("function Grant(", 1)[0]
         self.assertLess(remove.index("Assert-JobDiskBinding $Id"), remove.index("Remove-VM"))
         collector = (HERE / "guest-evidence.ps1").read_text()
-        self.assertIn("Get-VHD -DiskNumber $disk.Number", collector)
+        self.assertIn("$diskNumberValue = Get-RunnerPropertyValue $disk 'Number'", collector)
+        self.assertIn("Get-VHD -DiskNumber $diskNumber", collector)
+        self.assertIn("GetFullPath($mappedPath)", collector)
+        self.assertIn("$identity.requested_path", collector)
         self.assertNotIn("New-VHD", collector)
         self.assertIn("mounted-disk-identity.json", collector)
         self.assertIn("$identity['volume_guid_path'] = $volume", collector)
@@ -44,8 +47,8 @@ class ParentVerificationTests(unittest.TestCase):
         self.assertIn("Get-Partition -Volume $volumes[0]", wait)
         self.assertIn("Test-RunnerVolumeGuidPath", wait)
         self.assertIn("$reverse.Count -eq 1", wait)
-        self.assertIn("$reverse[0].DiskNumber -eq $DiskNumber", wait)
-        self.assertIn("$reverse[0].PartitionNumber -eq $PartitionNumber", wait)
+        self.assertIn("$reverseDisk -eq $DiskNumber", wait)
+        self.assertIn("$reversePartition -eq $PartitionNumber", wait)
 
     def test_qualification_settle_is_bounded_and_offline_proof_remains_required(self):
         native = (HERE.parents[1] / "crates/motor-runner/src/windows/hyperv.rs").read_text()

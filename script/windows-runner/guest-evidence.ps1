@@ -7,6 +7,12 @@ function Save-Json([string]$Path, $Value) {
 function Test-RunnerVolumeGuidPath([string]$Path) {
     return [regex]::IsMatch($Path, '\A\\\\\?\\Volume\{[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}\}\\\z')
 }
+function Get-RunnerPropertyValue([object]$Object, [string]$Name) {
+    if ($null -eq $Object) { return $null }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
 function Get-PlainGuestItem([string]$Volume, [string]$Relative) {
     if (-not (Test-RunnerVolumeGuidPath $Volume)) { throw 'Guest volume path is not a volume GUID path' }
     $path = $Volume
@@ -99,10 +105,20 @@ function Wait-RunnerDiagnosticVolume([int]$DiskNumber, [int]$PartitionNumber, [i
             if ($partition) {
                 try {
                     $volumes = @(Get-Volume -Partition $partition -ErrorAction Stop)
-                    if ($volumes.Count -eq 1 -and (Test-RunnerVolumeGuidPath ([string]$volumes[0].Path))) {
+                    if ($volumes.Count -eq 1) {
+                        $volumePath = [string](Get-RunnerPropertyValue $volumes[0] 'Path')
+                        if (-not (Test-RunnerVolumeGuidPath $volumePath)) {
+                            $lastError = 'the volume has no valid GUID path yet'
+                            Start-Sleep -Milliseconds 100
+                            continue
+                        }
                         $reverse = @(Get-Partition -Volume $volumes[0] -ErrorAction Stop)
-                        if ($reverse.Count -eq 1 -and $reverse[0].DiskNumber -eq $DiskNumber -and $reverse[0].PartitionNumber -eq $PartitionNumber) {
-                            return [pscustomobject]@{partition=$partition; volume=$volumes[0]}
+                        if ($reverse.Count -eq 1) {
+                            $reverseDisk = Get-RunnerPropertyValue $reverse[0] 'DiskNumber'
+                            $reversePartition = Get-RunnerPropertyValue $reverse[0] 'PartitionNumber'
+                            if ($reverseDisk -eq $DiskNumber -and $reversePartition -eq $PartitionNumber) {
+                                return [pscustomobject]@{partition=$partition; volume=$volumes[0]}
+                            }
                         }
                         $lastError = 'volume GUID path does not map back to the expected partition'
                     } elseif ($volumes.Count -gt 1) {
@@ -131,35 +147,45 @@ function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action, [string]
         # Mark the mount before Get-Disk, so a failed disk query still dismounts.
         $image = Mount-VHD -Path $Path -ReadOnly -Passthru
         $mounted = $true
-        $identity['mount_returned_path'] = $image.Path
+        $imagePath = [string](Get-RunnerPropertyValue $image 'Path')
+        $identity['mount_returned_path'] = $imagePath
         $disk = $image | Get-Disk
-        $diskNumber = [int]$disk.Number
-        $identity['disk_number'] = $disk.Number
-        $identity['disk_unique_id'] = [string]$disk.UniqueId
-        $identity['disk_location'] = [string]$disk.Location
-        $mapped = @(Get-VHD -DiskNumber $disk.Number)
-        $identity['mapped_vhd_paths'] = @($mapped | ForEach-Object Path)
-        if ($mapped.Count -ne 1 -or -not [StringComparer]::OrdinalIgnoreCase.Equals($identity.requested_path, [IO.Path]::GetFullPath($mapped[0].Path)) -or -not [StringComparer]::OrdinalIgnoreCase.Equals($identity.requested_path, [IO.Path]::GetFullPath($image.Path))) { throw 'Mounted disk does not map back to the requested job child' }
-        $identity['parent_path'] = $mapped[0].ParentPath
-        $partitions = @(Get-Partition -DiskNumber $disk.Number | Where-Object { $_.GptType -eq '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}' })
+        $diskNumberValue = Get-RunnerPropertyValue $disk 'Number'
+        if ($null -eq $diskNumberValue) { throw 'Mounted VHD returned no disk number' }
+        $diskNumber = [int]$diskNumberValue
+        $identity['disk_number'] = $diskNumber
+        $identity['disk_unique_id'] = [string](Get-RunnerPropertyValue $disk 'UniqueId')
+        $identity['disk_location'] = [string](Get-RunnerPropertyValue $disk 'Location')
+        $mapped = @(Get-VHD -DiskNumber $diskNumber)
+        $identity['mapped_vhd_paths'] = @($mapped | ForEach-Object { Get-RunnerPropertyValue $_ 'Path' })
+        if ($mapped.Count -ne 1) { throw 'Mounted disk does not map back to the requested job child' }
+        $mappedPath = [string](Get-RunnerPropertyValue $mapped[0] 'Path')
+        if ([string]::IsNullOrWhiteSpace($mappedPath) -or [string]::IsNullOrWhiteSpace($imagePath)) { throw 'Mounted disk did not report its VHD path' }
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals($identity.requested_path, [IO.Path]::GetFullPath($mappedPath))) { throw 'Mounted disk does not map back to the requested job child' }
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals($identity.requested_path, [IO.Path]::GetFullPath($imagePath))) { throw 'Mounted disk does not map back to the requested job child' }
+        $identity['parent_path'] = [string](Get-RunnerPropertyValue $mapped[0] 'ParentPath')
+        $partitions = @(Get-Partition -DiskNumber $diskNumber | Where-Object { (Get-RunnerPropertyValue $_ 'GptType') -eq '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}' })
         if ($partitions.Count -ne 1) { throw 'Expected one Windows basic-data partition' }
         $partition = $partitions[0]
-        $partitionNumber = [int]$partition.PartitionNumber
+        $partitionNumberValue = Get-RunnerPropertyValue $partition 'PartitionNumber'
+        if ($null -eq $partitionNumberValue) { throw 'Mounted Windows partition returned no partition number' }
+        $partitionNumber = [int]$partitionNumberValue
         $binding = Wait-RunnerDiagnosticVolume -DiskNumber $diskNumber -PartitionNumber $partitionNumber -TimeoutSeconds $VolumeWaitSeconds
         $partition = $binding.partition
         $volumeInfo = $binding.volume
-        $volume = [string]$volumeInfo.Path
-        $identity['partition_number'] = $partition.PartitionNumber
-        $identity['partition_guid'] = [string]$partition.Guid
+        $volume = [string](Get-RunnerPropertyValue $volumeInfo 'Path')
+        $identity['partition_number'] = $partitionNumber
+        $identity['partition_guid'] = [string](Get-RunnerPropertyValue $partition 'Guid')
         $identity['volume_path'] = $volume
         $identity['volume_guid_path'] = $volume
-        $identity['drive_letter'] = [string]$volumeInfo.DriveLetter
-        $identity['volume_unique_id'] = [string]$volumeInfo.UniqueId
-        $identity['volume_label'] = [string]$volumeInfo.FileSystemLabel
+        $identity['drive_letter'] = [string](Get-RunnerPropertyValue $volumeInfo 'DriveLetter')
+        $identity['volume_unique_id'] = [string](Get-RunnerPropertyValue $volumeInfo 'UniqueId')
+        $identity['volume_label'] = [string](Get-RunnerPropertyValue $volumeInfo 'FileSystemLabel')
         $identity['matched'] = $true
         if ($EvidenceDirectory) { Save-Json "$EvidenceDirectory\mounted-disk-identity.json" $identity }
         $windows = Get-PlainGuestItem $volume 'Windows'
-        if (-not $windows -or -not $windows.PSIsContainer) { throw 'Mounted partition is not a Windows volume' }
+        if ($null -eq $windows) { throw 'Mounted partition is not a Windows volume' }
+        if (-not $windows.PSIsContainer) { throw 'Mounted partition is not a Windows volume' }
         & $Action $volume
     } catch {
         $identity['error'] = [string]$_
@@ -216,15 +242,20 @@ function Save-DiagnosticGuestEvidence([string]$Disk, [string]$Destination, [swit
         if ($Lightweight) { return }
         try {
             $agent = Get-PlainGuestItem $volume 'ProgramData\Motor\motor-winagent.exe'
-            if ($agent -and -not $agent.PSIsContainer) {
+            if ($null -eq $agent) {
+                Save-Json "$Destination\guest-agent-binary.json" @{present=$false}
+            } elseif (-not $agent.PSIsContainer) {
                 Save-Json "$Destination\guest-agent-binary.json" @{path='C:\ProgramData\Motor\motor-winagent.exe'; bytes=$agent.Length; sha256=(Get-GuestFileSha256 $agent); modified_utc=$agent.LastWriteTimeUtc.ToString('o')}
-            } else { Save-Json "$Destination\guest-agent-binary.json" @{present=$false} }
+            } else {
+                throw 'Expected guest-agent executable to be a regular file'
+            }
         } catch { Set-Content -LiteralPath "$Destination\guest-agent-error.txt" -Value ($_ | Out-String) -Encoding UTF8 }
         foreach ($channel in @('System','Application')) {
             try {
                 $item = Get-PlainGuestItem $volume "Windows\System32\winevt\Logs\$channel.evtx"
-                if ($item -and -not $item.PSIsContainer) { Save-GuestAgentEvents $item.FullName $channel "$Destination\events" }
-                else { Save-Json "$Destination\$channel-log-state.json" @{present=$false} }
+                if ($null -eq $item) { Save-Json "$Destination\$channel-log-state.json" @{present=$false} }
+                elseif (-not $item.PSIsContainer) { Save-GuestAgentEvents $item.FullName $channel "$Destination\events" }
+                else { throw 'Expected a guest event log file, not a directory' }
             } catch { Set-Content -LiteralPath "$Destination\$channel-log-error.txt" -Value ($_ | Out-String) -Encoding UTF8 }
         }
     }

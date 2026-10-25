@@ -184,18 +184,27 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         $volumeImage = Mount-VHD -Path $identityVolumeVhdx -Passthru
         $identityVolumeMounted = $true
         $volumeDisk = $volumeImage | Get-Disk
-        Initialize-Disk -Number $volumeDisk.Number -PartitionStyle GPT | Out-Null
-        $volumePartition = New-Partition -DiskNumber $volumeDisk.Number -UseMaximumSize -AssignDriveLetter:$false
+        $volumeDiskNumber = Get-RunnerPropertyValue $volumeDisk 'Number'
+        if ($null -eq $volumeDiskNumber) { throw 'FAIL sealed-agent-volume-fixture-disk-number-missing' }
+        $volumeDiskNumber = [int]$volumeDiskNumber
+        Initialize-Disk -Number $volumeDiskNumber -PartitionStyle GPT | Out-Null
+        $volumePartition = New-Partition -DiskNumber $volumeDiskNumber -UseMaximumSize -AssignDriveLetter:$false
         Format-Volume -Partition $volumePartition -FileSystem NTFS -NewFileSystemLabel IdentityFixture -Confirm:$false | Out-Null
-        $volumePartition = Get-Partition -DiskNumber $volumeDisk.Number -PartitionNumber $volumePartition.PartitionNumber
-        $volumeBinding = Wait-RunnerDiagnosticVolume -DiskNumber $volumeDisk.Number -PartitionNumber $volumePartition.PartitionNumber -TimeoutSeconds 15
-        if ($volumePartition.DriveLetter) {
-            $volumePartition | Remove-PartitionAccessPath -AccessPath ([string]$volumePartition.DriveLetter + ':\') -ErrorAction Stop | Out-Null
-            $volumePartition = Get-Partition -DiskNumber $volumeDisk.Number -PartitionNumber $volumePartition.PartitionNumber
-            $volumeBinding = Wait-RunnerDiagnosticVolume -DiskNumber $volumeDisk.Number -PartitionNumber $volumePartition.PartitionNumber -TimeoutSeconds 15
+        $volumePartitionNumber = Get-RunnerPropertyValue $volumePartition 'PartitionNumber'
+        if ($null -eq $volumePartitionNumber) { throw 'FAIL sealed-agent-volume-fixture-partition-number-missing' }
+        $volumePartitionNumber = [int]$volumePartitionNumber
+        $volumePartition = Get-Partition -DiskNumber $volumeDiskNumber -PartitionNumber $volumePartitionNumber
+        $volumeBinding = Wait-RunnerDiagnosticVolume -DiskNumber $volumeDiskNumber -PartitionNumber $volumePartitionNumber -TimeoutSeconds 15
+        $partitionLetter = Get-RunnerPropertyValue $volumePartition 'DriveLetter'
+        if ($partitionLetter) {
+            $volumePartition | Remove-PartitionAccessPath -AccessPath ($partitionLetter + ':\') -ErrorAction Stop | Out-Null
+            $volumePartition = Get-Partition -DiskNumber $volumeDiskNumber -PartitionNumber $volumePartitionNumber
+            $volumeBinding = Wait-RunnerDiagnosticVolume -DiskNumber $volumeDiskNumber -PartitionNumber $volumePartitionNumber -TimeoutSeconds 15
         }
-        $identityVolumePath = [string]$volumeBinding.volume.Path
-        if ($volumePartition.DriveLetter -or $volumeBinding.volume.DriveLetter -or -not (Test-RunnerVolumeGuidPath $identityVolumePath)) {
+        $identityVolumePath = [string](Get-RunnerPropertyValue $volumeBinding.volume 'Path')
+        $partitionLetter = Get-RunnerPropertyValue $volumePartition 'DriveLetter'
+        $volumeLetter = Get-RunnerPropertyValue $volumeBinding.volume 'DriveLetter'
+        if ($partitionLetter -or $volumeLetter -or -not (Test-RunnerVolumeGuidPath $identityVolumePath)) {
             throw 'FAIL sealed-agent-volume-fixture-requires-no-letter-and-a-volume-guid-path'
         }
         [IO.Directory]::CreateDirectory([IO.Path]::Combine($identityVolumePath, 'Windows')) | Out-Null
@@ -264,7 +273,10 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
             New-Item -ItemType Directory -Path $identityEvidence | Out-Null
             $hash = Get-RunnerSealedAgentHash $global:identityFixtureParent $identityEvidence 3
             $identity = Get-Content -LiteralPath (Join-Path $identityEvidence 'mounted-disk-identity.json') -Raw | ConvertFrom-Json
-            if ($hash -cne $parentAgentHash -or $global:identityFixtureVolumeQueries -lt 3 -or $global:identityFixtureAddCalls -ne 0 -or $global:identityFixtureAccessPathTouched -or -not $global:identityFixtureDismounted -or $identity.volume_unique_id -cne 'fixture-volume' -or $identity.volume_guid_path -cne $identityVolumePath -or $identity.drive_letter) { throw 'FAIL sealed-agent-volume-wait-retries-and-reads-identity' }
+            $identityVolumeUniqueId = Get-RunnerPropertyValue $identity 'volume_unique_id'
+            $identityVolumeGuidPath = Get-RunnerPropertyValue $identity 'volume_guid_path'
+            $identityDriveLetter = Get-RunnerPropertyValue $identity 'drive_letter'
+            if ($hash -cne $parentAgentHash -or $global:identityFixtureVolumeQueries -lt 3 -or $global:identityFixtureAddCalls -ne 0 -or $global:identityFixtureAccessPathTouched -or -not $global:identityFixtureDismounted -or $identityVolumeUniqueId -cne 'fixture-volume' -or $identityVolumeGuidPath -cne $identityVolumePath -or $identityDriveLetter) { throw 'FAIL sealed-agent-volume-wait-retries-and-reads-identity' }
             Write-Host 'PASS sealed-agent-volume-wait-retries-and-reads-identity'
             $count++
 
@@ -273,7 +285,9 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
             $global:identityFixtureVolumeQueries = 0
             $hash = Get-RunnerSealedAgentHash $global:identityFixtureParent $identityEvidence 3
             $identity = Get-Content -LiteralPath (Join-Path $identityEvidence 'mounted-disk-identity.json') -Raw | ConvertFrom-Json
-            if ($hash -cne $parentAgentHash -or $global:identityFixtureAddCalls -ne 0 -or $global:identityFixtureAccessPathTouched -or -not $global:identityFixtureDismounted -or $identity.volume_guid_path -cne $identityVolumePath -or $identity.drive_letter -cne 'F') { throw 'FAIL sealed-agent-volume-ignores-existing-drive-letter' }
+            $identityVolumeGuidPath = Get-RunnerPropertyValue $identity 'volume_guid_path'
+            $identityDriveLetter = Get-RunnerPropertyValue $identity 'drive_letter'
+            if ($hash -cne $parentAgentHash -or $global:identityFixtureAddCalls -ne 0 -or $global:identityFixtureAccessPathTouched -or -not $global:identityFixtureDismounted -or $identityVolumeGuidPath -cne $identityVolumePath -or $identityDriveLetter -cne 'F') { throw 'FAIL sealed-agent-volume-ignores-existing-drive-letter' }
             Write-Host 'PASS sealed-agent-volume-ignores-existing-drive-letter'
             $count++
 
@@ -307,7 +321,10 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         New-Item -ItemType Directory -Path $identityEvidence | Out-Null
         $hash = Get-RunnerSealedAgentHash $identityVolumeVhdx $identityEvidence 15
         $identity = Get-Content -LiteralPath (Join-Path $identityEvidence 'mounted-disk-identity.json') -Raw | ConvertFrom-Json
-        if ($hash -cne $parentAgentHash -or -not (Test-RunnerVolumeGuidPath $identity.volume_guid_path) -or $identity.drive_letter -or $identity.volume_path -cne $identityVolumePath) { throw 'FAIL sealed-agent-volume-guid-path-real-vhd' }
+        $actualVolumeGuidPath = Get-RunnerPropertyValue $identity 'volume_guid_path'
+        $actualDriveLetter = Get-RunnerPropertyValue $identity 'drive_letter'
+        $actualVolumePath = Get-RunnerPropertyValue $identity 'volume_path'
+        if ($hash -cne $parentAgentHash -or -not (Test-RunnerVolumeGuidPath $actualVolumeGuidPath) -or $actualDriveLetter -or $actualVolumePath -cne $identityVolumePath) { throw 'FAIL sealed-agent-volume-guid-path-real-vhd' }
         Write-Host 'PASS sealed-agent-volume-guid-path-real-vhd'
         $count++
     } finally {

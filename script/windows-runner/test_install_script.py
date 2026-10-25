@@ -51,6 +51,32 @@ class InstallScriptTests(unittest.TestCase):
                     found += [f'{script.relative_to(HERE.parent)}:{number}: ${name}:' for name in bad.findall(quoted)]
         self.assertEqual(found, [], 'write ${Name}: or $($Name): instead')
 
+    def test_volume_reader_guards_optional_properties_and_wraps_cim_results(self):
+        evidence = (HERE / "guest-evidence.ps1").read_text()
+        self.assertIn("function Get-RunnerPropertyValue", evidence)
+        self.assertIn("$Object.PSObject.Properties[$Name]", evidence)
+        self.assertIn("Get-RunnerPropertyValue $disk 'Number'", evidence)
+        self.assertIn("Get-RunnerPropertyValue $disk 'Location'", evidence)
+        self.assertIn("Get-RunnerPropertyValue $volumeInfo 'DriveLetter'", evidence)
+        self.assertIn("Get-RunnerPropertyValue $volumeInfo 'UniqueId'", evidence)
+        self.assertIn("Get-RunnerPropertyValue $volumeInfo 'FileSystemLabel'", evidence)
+        self.assertIn("$volumes = @(Get-Volume -Partition $partition", evidence)
+        self.assertIn("$reverse = @(Get-Partition -Volume $volumes[0]", evidence)
+        self.assertIn("$mapped = @(Get-VHD -DiskNumber $diskNumber)", evidence)
+        self.assertIn("$partitions = @(Get-Partition -DiskNumber $diskNumber", evidence)
+        self.assertIn("if ($mapped.Count -ne 1)", evidence)
+        self.assertIn("if ($partitions.Count -ne 1)", evidence)
+        self.assertNotIn("$mapped.Count -ne 1 -or", evidence)
+        self.assertIn("$volumePath = [string](Get-RunnerPropertyValue $volumes[0] 'Path')", evidence)
+        self.assertNotIn("$volumes.Count -eq 1 -and", evidence)
+        self.assertNotIn("$reverse.Count -eq 1 -and", evidence)
+
+        fixture = (HERE / "test_scripts.ps1").read_text()
+        self.assertIn("$property = $identity.PSObject.Properties['volume_guid_path']", fixture)
+        self.assertIn("Get-RunnerPropertyValue $identity 'volume_guid_path'", fixture)
+        self.assertNotIn("$identity.volume_path", fixture)
+
+
     def test_no_assignment_to_powershell_automatic_variables(self):
         # $Error, $Input, $Args and the like are PowerShell's own read-only or
         # automatic variables; assigning one fails at run time ("Cannot
