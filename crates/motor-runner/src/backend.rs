@@ -332,10 +332,13 @@ pub(crate) fn memory_floor() -> u64 {
 /// slice's `MemoryMax` is below the floor every job unit requests, so no
 /// admission could ever be honoured. A job whose own limit is merely clamped
 /// is not refused; the slice's OOM killer reports it as it always has.
+///
+/// This is a host configuration fault, not a capacity shortage: waiting cannot
+/// raise the slice, so the detail names the repair the operator applies.
 pub(crate) fn slice_refusal(floor: u64, budget: crate::systemd::JobMemoryBudget) -> Option<String> {
     (floor > budget.max).then(|| {
         format!(
-            "the shared jobs slice MemoryMax={} is below the {} GiB memory floor every job unit requests",
+            "the shared jobs slice MemoryMax={} is below the {} GiB memory floor every job unit requests; raise jobs_min_bytes in /etc/motor-host/capacity.json and re-run provision.py apply-jobs-slice",
             budget.max,
             format_memory_limit_gib(floor)
         )
@@ -353,7 +356,7 @@ fn slice_below_the_job_floor_is_refused_and_a_clamp_is_not() {
     let detail = slice_refusal(floor, budget((16 << 30) - 1)).unwrap();
     assert_eq!(
         detail,
-        "the shared jobs slice MemoryMax=17179869183 is below the 16 GiB memory floor every job unit requests"
+        "the shared jobs slice MemoryMax=17179869183 is below the 16 GiB memory floor every job unit requests; raise jobs_min_bytes in /etc/motor-host/capacity.json and re-run provision.py apply-jobs-slice"
     );
     // At exactly the floor, and above it, jobs run: a clamped job is an
     // ordinary in-slice OOM, not a refusal.

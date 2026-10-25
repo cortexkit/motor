@@ -224,7 +224,10 @@ fn a_slice_below_the_floor_is_a_setup_refusal_and_a_missing_reading_is_none() {
     let floor = 16 << 30;
     let (reason, detail) = crate::engine::slice_memory_refusal(floor, floor - 1).unwrap();
     assert_eq!(reason, RefusalReason::WorkspaceSetupFailed);
-    assert!(detail.contains("memory floor"), "{detail}");
+    assert!(
+        detail.contains("memory floor") && detail.contains("jobs_min_bytes"),
+        "{detail}"
+    );
     assert_eq!(crate::engine::slice_memory_refusal(floor, floor), None);
     assert_eq!(
         crate::engine::slice_memory_refusal(floor, crate::systemd::NO_JOB_MEMORY_BUDGET),
