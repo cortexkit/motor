@@ -748,8 +748,9 @@ mod tests {
         };
         assert!(prepare_cache_with(&mut storage, 7, &nameless_hyperv_identity()).is_ok());
         assert_eq!(storage.mutations, 1);
-        // The virtio path still refuses the same disk, so a log naming the
-        // identity a build relied on stays meaningful.
+        // The serial-only virtio path keeps refusing this disk, so the two
+        // identification paths still disagree exactly where they should: the
+        // guest log then shows which one a job ran with.
         let mut serial_path = FakeStorage::default();
         assert!(prepare_cache_with_serial(&mut serial_path, 7, "").is_err());
         assert_eq!(serial_path.mutations, 0);
@@ -943,8 +944,14 @@ mod tests {
 
     #[test]
     fn native_cache_revalidates_exact_serial_before_mutation() {
+        // Selection chose the disk number by its serial; the disk itself now
+        // reports a different one.
         let mut fake = FakeStorage {
-            serial: "motor-cache-other".into(),
+            serial: CACHE_DISK_SERIAL.into(),
+            identity: DiskIdentity {
+                serial: "motor-cache-other".into(),
+                ..DiskIdentity::default()
+            },
             ..Default::default()
         };
         assert!(prepare_cache(&mut fake, 7).is_err());
