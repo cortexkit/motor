@@ -324,8 +324,8 @@ async fn isolated_job_that_locks_its_workspace_root_does_not_wedge_later_admissi
         ended.refusal_detail()
     );
     base_done(&runner).await;
-    // The job left the root as the production incident did: owned by the
-    // job account at mode 0700. The runner's reclaim at job end set the mask
+    // The job left the root owned by the job account at mode 0700. The
+    // runner's reclaim at job end set the mask
     // to r-x, which stat shows as the group bits, so the runner's entry is
     // effective again and the root is readable; the other bits stay as the
     // job left them.
