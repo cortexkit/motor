@@ -278,69 +278,6 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         Remove-Variable -Name identityFixtureParent,identityFixtureRecord,identityFixtureAssigned,identityFixtureRemoved,identityFixtureDismounted,identityFixtureNeverVolume,identityFixtureVolumeQueries,identityFixtureAddCalls -Scope Global -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $identityFixture -Recurse -Force
     }
-    $global:diskInventoryGetDiskCalls = 0
-    $global:diskInventoryPerDiskQuery = $false
-    $global:diskInventoryFixtureMode = ''
-    function global:Get-Disk {
-        param([uint32]$Number)
-        $global:diskInventoryGetDiskCalls++
-        if ($PSBoundParameters.ContainsKey('Number')) { $global:diskInventoryPerDiskQuery = $true }
-        $disks = @(
-            [pscustomobject]@{Number=[uint32]0; BusType='SCSI'; IsBoot=$true; IsSystem=$true}
-            [pscustomobject]@{Number=[uint32]1; BusType='SCSI'; IsBoot=$false; IsSystem=$false}
-        )
-        switch ($global:diskInventoryFixtureMode) {
-            'empty' { return }
-            'one' { return $disks[0] }
-            'many' { return $disks }
-            default { throw "Unexpected inventory fixture mode $global:diskInventoryFixtureMode" }
-        }
-    }
-    function global:Get-CimInstance {
-        param([string]$ClassName)
-        if ($ClassName -ne 'Win32_DiskDrive') { throw "Unexpected CIM inventory class $ClassName" }
-        $items = @(
-            [pscustomobject]@{Index=[uint32]0; SCSILogicalUnit=[uint32]0}
-            [pscustomobject]@{Index=[uint32]1; SCSILogicalUnit=[uint32]1}
-        )
-        switch ($global:diskInventoryFixtureMode) {
-            'empty' { return }
-            'one' { return $items[0] }
-            'many' { return $items }
-            default { throw "Unexpected inventory fixture mode $global:diskInventoryFixtureMode" }
-        }
-    }
-    try {
-        $inventoryPath = Join-Path $PSScriptRoot 'hyperv_disk_inventory.ps1'
-        Add-Type -AssemblyName System.Web.Extensions
-        $serializer = [System.Web.Script.Serialization.JavaScriptSerializer]::new()
-        foreach ($case in @(
-            [pscustomobject]@{mode='empty'; count=0}
-            [pscustomobject]@{mode='one'; count=1}
-            [pscustomobject]@{mode='many'; count=2}
-        )) {
-            $global:diskInventoryFixtureMode = $case.mode
-            $global:diskInventoryGetDiskCalls = 0
-            $global:diskInventoryPerDiskQuery = $false
-            $inventoryJson = [string](& $inventoryPath)
-            $inventoryRoot = ,($serializer.DeserializeObject($inventoryJson))
-            $inventory = $inventoryRoot[0]
-            if ($inventory -isnot [Array] -or $inventory.Length -ne $case.count) {
-                throw "FAIL hyperv-cache-inventory-$($case.mode)-is-json-array"
-            }
-            if ($global:diskInventoryGetDiskCalls -ne 1 -or $global:diskInventoryPerDiskQuery) {
-                throw 'FAIL hyperv-cache-inventory-uses-one-storage-query'
-            }
-            if ($case.mode -eq 'many' -and ($inventory[0]['number'] -ne 0 -or $inventory[0]['lun'] -ne 0 -or -not $inventory[0]['boot'] -or -not $inventory[0]['system'] -or $inventory[1]['number'] -ne 1 -or $inventory[1]['lun'] -ne 1 -or $inventory[1]['boot'] -or $inventory[1]['system'])) {
-                throw 'FAIL hyperv-cache-inventory-preserves-disk-topology'
-            }
-        }
-        Write-Host 'PASS hyperv-cache-inventory-uses-one-storage-query-and-preserves-topology'
-        $count++
-    } finally {
-        Remove-Item Function:\Get-Disk,Function:\Get-CimInstance
-        Remove-Variable -Name diskInventoryGetDiskCalls,diskInventoryPerDiskQuery,diskInventoryFixtureMode -Scope Global -ErrorAction SilentlyContinue
-    }
     . "$PSScriptRoot\parent-identity.ps1"
     $hypervPath = Join-Path $PSScriptRoot 'hyperv.ps1'
     $hypervTokens = $null

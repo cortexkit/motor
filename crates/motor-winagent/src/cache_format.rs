@@ -7,6 +7,11 @@ use std::{io, time::Instant};
 #[cfg(windows)]
 mod wmi;
 
+#[cfg(windows)]
+pub fn hyperv_disk_inventory(deadline: Instant) -> io::Result<Vec<crate::cache::HypervDisk>> {
+    wmi::hyperv_disk_inventory(deadline)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Volume {
     path: String,

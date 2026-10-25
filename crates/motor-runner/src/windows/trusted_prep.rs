@@ -897,7 +897,7 @@ pub(super) fn qualify_prep_system(config: &Config) -> io::Result<()> {
             )));
         }
         report["local_registry_proof"] = proof;
-        report["writes_confined_to_protected_roots"] = true;
+        report["writes_confined_to_protected_roots"] = serde_json::Value::Bool(true);
         system::write_diagnostic_update(&report_path, &report).map_err(|error| {
             super::prep::error_at_path("write qualification report", &report_path, error)
         })?;

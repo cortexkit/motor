@@ -530,6 +530,7 @@ mod guest {
         result.map_err(Into::into)
     }
 
+    #[cfg(not(feature = "hyperv-runner"))]
     fn powershell(script: &str) -> io::Result<String> {
         let output = std::process::Command::new(
             "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
@@ -728,19 +729,15 @@ mod guest {
             }
         }
     }
-    fn cache_disk(reporter: &CacheReporter) -> io::Result<u32> {
+    fn cache_disk(_reporter: &CacheReporter) -> io::Result<u32> {
         #[cfg(feature = "hyperv-runner")]
         {
-            // Query Get-Disk once for the inventory; a per-drive provider call
-            // delays cache mounting on a cold guest boot.
-            let inventory = reporter.step(CacheStep::DiskSerial, || {
-                powershell(include_str!(
-                    "../../../script/windows-runner/hyperv_disk_inventory.ps1"
-                ))
-            })?;
-            diagnostic!("Hyper-V disk topology {}", inventory);
-            let disks = motor_winagent::cache::parse_hyperv_disk_inventory(&inventory)
-                .map_err(|error| invalid(error.to_string()))?;
+            // Query the Storage and CIM providers in-process; PowerShell startup
+            // consumed the previous cold-boot disk-inventory budget.
+            let disks = motor_winagent::cache_format::hyperv_disk_inventory(
+                Instant::now() + motor_winagent::cache_steps::HYPERV_DISK_INVENTORY_TIMEOUT,
+            )?;
+            diagnostic!("Hyper-V disk topology {disks:?}");
             motor_winagent::cache::select_hyperv_cache_disk(&disks)
         }
         #[cfg(not(feature = "hyperv-runner"))]
@@ -750,7 +747,7 @@ mod guest {
             // and select only that serial, never a disk merely by its number.
             for number in 0..32 {
                 let path = wide(&format!("\\\\.\\PhysicalDrive{number}"));
-                let disk = reporter.step(CacheStep::DiskOpen, || {
+                let disk = _reporter.step(CacheStep::DiskOpen, || {
                     let raw = unsafe {
                         CreateFileW(
                             path.as_ptr(),
@@ -779,7 +776,7 @@ mod guest {
                 let query = [0u32; 3];
                 let mut descriptor = [0u8; 4096];
                 let mut returned = 0;
-                reporter.step(CacheStep::DiskSerial, || unsafe {
+                _reporter.step(CacheStep::DiskSerial, || unsafe {
                     win32(DeviceIoControl(
                         disk.0,
                         IOCTL_STORAGE_QUERY_PROPERTY,

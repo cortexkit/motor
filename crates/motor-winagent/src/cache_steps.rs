@@ -121,6 +121,10 @@ impl CacheReporter {
     }
 }
 
+// Direct CIM avoids PowerShell startup; allow five seconds for cold storage-provider
+// initialization, two seconds beyond the previous three-second inventory limit.
+pub const HYPERV_DISK_INVENTORY_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct CacheLimits {
     pub native: Duration,
     pub total: Duration,
@@ -140,7 +144,8 @@ impl CacheLimits {
         match step {
             CacheStep::InitializeRaw => Duration::from_secs(30),
             CacheStep::UserLogon => Duration::from_secs(10),
-            CacheStep::DiskSelection | CacheStep::VolumeDiscovery => Duration::from_secs(5),
+            CacheStep::DiskSelection => HYPERV_DISK_INVENTORY_TIMEOUT,
+            CacheStep::VolumeDiscovery => Duration::from_secs(5),
             _ => self.native,
         }
     }
@@ -241,6 +246,15 @@ pub fn watch_cache<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hyperv_disk_selection_uses_measured_cold_start_budget() {
+        assert_eq!(
+            CacheLimits::default().step(CacheStep::DiskSelection),
+            HYPERV_DISK_INVENTORY_TIMEOUT
+        );
+        assert_eq!(HYPERV_DISK_INVENTORY_TIMEOUT, Duration::from_secs(5));
+    }
 
     fn exercise(fail: bool) -> (Result<(), CacheFailure>, usize, usize) {
         let (events_tx, events_rx) = mpsc::channel();

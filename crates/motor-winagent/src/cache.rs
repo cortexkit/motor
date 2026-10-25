@@ -5,22 +5,64 @@ use std::time::Instant;
 
 pub const CACHE_DISK_SERIAL: &str = "motor-cache";
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HypervDisk {
     pub number: u32,
     pub lun: u32,
+    pub bus_type: u16,
     pub boot: bool,
     pub system: bool,
 }
 
-pub fn parse_hyperv_disk_inventory(json: &str) -> Result<Vec<HypervDisk>, serde_json::Error> {
-    serde_json::from_str(json)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HypervStorageDisk {
+    pub number: u32,
+    pub bus_type: u16,
+    pub boot: bool,
+    pub system: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HypervDiskLocation {
+    pub number: u32,
+    pub lun: u32,
+}
+
+pub fn join_hyperv_disk_inventory(
+    storage_disks: &[HypervStorageDisk],
+    locations: &[HypervDiskLocation],
+) -> io::Result<Vec<HypervDisk>> {
+    let mut by_number = std::collections::BTreeMap::new();
+    for disk in storage_disks {
+        if by_number.insert(disk.number, disk).is_some() {
+            return Err(io::Error::other("duplicate storage disk number"));
+        }
+    }
+    locations
+        .iter()
+        .map(|location| {
+            let disk = by_number
+                .get(&location.number)
+                .ok_or_else(|| io::Error::other("SCSI location has no matching storage disk"))?;
+            if disk.bus_type != 1 {
+                return Err(io::Error::other("unexpected non-SCSI disk in Hyper-V job"));
+            }
+            Ok(HypervDisk {
+                number: location.number,
+                lun: location.lun,
+                bus_type: disk.bus_type,
+                boot: disk.boot,
+                system: disk.system,
+            })
+        })
+        .collect()
 }
 
 /// This runner expects the OS at SCSI LUN 0 and the cache at LUN 1. Require the
 /// complete two-disk topology, not merely the absence of a virtio serial.
 pub fn select_hyperv_cache_disk(disks: &[HypervDisk]) -> io::Result<u32> {
     if disks.len() != 2
+        || disks.iter().any(|disk| disk.bus_type != 1)
         || disks
             .iter()
             .filter(|d| d.lun == 0 && d.boot && d.system)
@@ -338,12 +380,14 @@ mod tests {
         let os = || HypervDisk {
             number: 0,
             lun: 0,
+            bus_type: 1,
             boot: true,
             system: true,
         };
         let cache = || HypervDisk {
             number: 1,
             lun: 1,
+            bus_type: 1,
             boot: false,
             system: false,
         };
@@ -360,28 +404,62 @@ mod tests {
         let mut duplicate = cache();
         duplicate.number = 0;
         assert!(select_hyperv_cache_disk(&[os(), duplicate]).is_err());
+        let mut non_scsi = cache();
+        non_scsi.bus_type = 3;
+        assert!(select_hyperv_cache_disk(&[os(), non_scsi]).is_err());
     }
 
     #[test]
-    fn hyperv_inventory_parser_requires_a_json_array() {
-        let os = r#"{"number":0,"lun":0,"boot":true,"system":true}"#;
-        let cache = r#"{"number":1,"lun":1,"boot":false,"system":false}"#;
-        let many = format!("[{os},{cache}]");
-        let disks = super::parse_hyperv_disk_inventory(&many).unwrap();
-        assert_eq!(super::select_hyperv_cache_disk(&disks).unwrap(), 1);
-        assert_eq!(super::parse_hyperv_disk_inventory("[]").unwrap().len(), 0);
-        assert_eq!(
-            super::parse_hyperv_disk_inventory(&format!("[{os}]"))
-                .unwrap()
-                .len(),
-            1
-        );
+    fn hyperv_inventory_joins_storage_flags_to_scsi_locations_by_disk_number() {
+        let storage = [
+            HypervStorageDisk {
+                number: 0,
+                bus_type: 1,
+                boot: true,
+                system: true,
+            },
+            HypervStorageDisk {
+                number: 1,
+                bus_type: 1,
+                boot: false,
+                system: false,
+            },
+        ];
+        let locations = [
+            HypervDiskLocation { number: 1, lun: 1 },
+            HypervDiskLocation { number: 0, lun: 0 },
+        ];
+        let disks = join_hyperv_disk_inventory(&storage, &locations).unwrap();
+        assert_eq!(select_hyperv_cache_disk(&disks).unwrap(), 1);
+
         assert!(
-            super::parse_hyperv_disk_inventory(&format!(
-                "{{\"value\":[{os},{cache}],\"Count\":2}}"
-            ))
-            .is_err()
+            join_hyperv_disk_inventory(&storage, &[HypervDiskLocation { number: 7, lun: 1 }])
+                .is_err()
         );
+        assert!(join_hyperv_disk_inventory(&[storage[0], storage[0]], &locations).is_err());
+    }
+
+    #[test]
+    fn hyperv_selection_still_refuses_three_disks_boot_cache_and_missing_lun() {
+        let os = HypervDisk {
+            number: 0,
+            lun: 0,
+            bus_type: 1,
+            boot: true,
+            system: true,
+        };
+        let cache = HypervDisk {
+            number: 1,
+            lun: 1,
+            bus_type: 1,
+            boot: false,
+            system: false,
+        };
+        let mut boot_cache = cache;
+        boot_cache.boot = true;
+        assert!(select_hyperv_cache_disk(&[os, cache, HypervDisk { number: 2, ..cache }]).is_err());
+        assert!(select_hyperv_cache_disk(&[os, boot_cache]).is_err());
+        assert!(select_hyperv_cache_disk(&[os, HypervDisk { lun: 2, ..cache }]).is_err());
     }
 
     #[test]
