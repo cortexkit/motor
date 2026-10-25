@@ -1512,10 +1512,13 @@ fn slow_output_persistence_leaves_unrelated_control_operations_responsive() {
             let runner = runner.clone();
             move || runner.output(id, OutputStream::Stdout, b"durable output")
         });
-        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        entered.recv().unwrap();
         let (request, _) = f.run("true");
         let (control, reply) = responsive_controls(&runner, request);
-        let responsive = reply.recv_timeout(Duration::from_secs(1));
+        // Keep output persistence paused until the controls finish. This checks
+        // their lock independence even when scheduling or durable writes take
+        // seconds; a lock cycle is reported by the test harness's timeout.
+        let responsive = reply.recv();
         drop(release);
         writer.join().unwrap().unwrap();
         control.join().unwrap();

@@ -9,6 +9,7 @@ struct Fake {
     killed: Mutex<Vec<ProcessIdentity>>,
     stop_failure: AtomicBool,
     delete_failure: AtomicBool,
+    delete_errors: Mutex<Vec<(PathBuf, String)>>,
     disk_held: AtomicBool,
     scans: std::sync::atomic::AtomicUsize,
     orphan: Mutex<Option<ProcessIdentity>>,
@@ -58,7 +59,14 @@ impl Host for Fake {
         if self.delete_failure.load(Ordering::Acquire) {
             return Err(invalid("injected delete failure"));
         }
-        remove(path)
+        let result = remove(path);
+        if let Err(error) = &result {
+            self.delete_errors
+                .lock()
+                .unwrap()
+                .push((path.to_owned(), error.to_string()));
+        }
+        result
     }
 }
 fn new_runtime(host: Arc<Fake>) -> Arc<Runtime> {
@@ -660,9 +668,16 @@ fn deep_guest_tree_is_bounded_and_quarantined_without_slot_loss_after_restart() 
     drop(entry);
     drop(runtime);
     let runtime = new_runtime(host.clone());
-    let now = Instant::now();
     runtime.recover(&root).unwrap();
-    assert!(now.elapsed() < Duration::from_secs(2));
+    // Assert the traversal's work bound, not recovery speed on a busy disk.
+    // Quarantine alone could also result from an unrelated cleanup failure.
+    assert_eq!(
+        *host.delete_errors.lock().unwrap(),
+        vec![(
+            record.paths.tree.clone(),
+            "guest tree depth limit exceeded".into()
+        )]
+    );
     let record = runtime
         .entry(record.id)
         .unwrap()

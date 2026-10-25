@@ -126,15 +126,28 @@ fn maintenance_picks_up_a_changed_ceiling_before_the_next_job_is_decided() {
     let f = Fixture::new();
     let mut config = f.config();
     config.memory_floor_gib = Some(16);
+    config.manual_tick = true;
     let ceiling = Arc::new(AtomicU64::new(24 << 30));
     let reads = Arc::new(AtomicU64::new(0));
+    let core = Arc::new(std::sync::OnceLock::<std::sync::Weak<Core>>::new());
+    let probed_core = core.clone();
     let read = ceiling.clone();
     let counted = reads.clone();
     config.slice_ceiling_probe = Some(Arc::new(move || {
+        // Startup probes before the runner is available. On maintenance, test
+        // the lock directly instead of timing cumulative holds from unrelated
+        // operations. Manual ticking leaves no other state-lock contender.
+        if let Some(core) = probed_core.get().and_then(std::sync::Weak::upgrade) {
+            assert!(
+                core.inner.try_lock().is_ok(),
+                "slice ceiling probe ran with the state lock held"
+            );
+        }
         counted.fetch_add(1, Ordering::SeqCst);
         Ok(read.load(Ordering::SeqCst))
     }));
     let runner = Runner::open(config).unwrap();
+    core.set(Arc::downgrade(&runner.core)).unwrap();
     // Jobs the size of the last recording are admitted.
     let (before, _) = f.run("true");
     assert!(matches!(
@@ -156,16 +169,4 @@ fn maintenance_picks_up_a_changed_ceiling_before_the_next_job_is_decided() {
         runner.accept(request).unwrap(),
         Admission::Refused(RefusalReason::WorkspaceSetupFailed)
     ));
-    // The re-read happens with no state lock held; a slow one would show here.
-    let slow: Vec<_> = runner
-        .core
-        .inner
-        .site_holds()
-        .into_iter()
-        .filter(|(_, holds)| holds.longest >= crate::state_lock::SLOW_HOLD)
-        .collect();
-    assert!(
-        slow.is_empty(),
-        "maintenance held the lock slowly: {slow:?}"
-    );
 }
