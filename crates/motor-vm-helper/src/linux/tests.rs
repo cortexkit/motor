@@ -500,6 +500,15 @@ fn cgroup_placement_service() {
         .unwrap();
     let mut settings: crate::config::Config =
         serde_json::from_str(include_str!("../../fixtures/helper.json")).unwrap();
+    // The service lane reconciles real network policy. Use the operator's
+    // explicit host settings, not the portable fixture's example interface/IP.
+    let network: serde_json::Value = serde_json::from_slice(
+        &std::fs::read("/etc/motor-network.json")
+            .expect("install explicit host network settings before the service lane"),
+    )
+    .unwrap();
+    settings.uplink = network["uplink"].as_str().unwrap().into();
+    settings.public_ipv4 = network["public_ipv4"].as_str().unwrap().parse().unwrap();
     settings.slots = vec![config];
     let tenants =
         crate::tenant::Controller(tenant::LinuxTenants::new(&settings, groups.root.clone()));

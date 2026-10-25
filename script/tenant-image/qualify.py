@@ -572,7 +572,8 @@ class Harness:
         # requires one. Only persistent-tenant operations are sent by this lane.
         (self.work / "unused-job-snapshots").mkdir(mode=0o700)
         snapshot = {name: str(self.work / "unused-job-snapshots" / name) for name in ("vmstate", "memory", "rootfs", "record")}
-        helper_config = dict(allowed_uids=[self.uid], socket_gid=self.gid, uid_base=290000,
+        network = module('qualification_network', REPO / 'script/runner/motor_network_policy.py').read_settings()
+        helper_config = dict(**network, allowed_uids=[self.uid], socket_gid=self.gid, uid_base=290000,
                              job_account_range=dict(base=300000, count=1),
                              slots=[dict(cpus=self.args.cpuset, mems="0", cpu_max="100000 100000",
                                          memory_max=GIB, io_weight=10, io_max=None)],

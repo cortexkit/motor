@@ -292,8 +292,8 @@ forwarding, a narrow firewall route allowance, and the `sudo` forms in
 which shows a diff by default:
 
 ```sh
-python3 script/runner/install-job-network.py            # show what would change
-sudo python3 script/runner/install-job-network.py --apply    # install
+python3 script/runner/install-job-network.py --uplink <uplink> --public-ip <public IPv4> # diff
+sudo python3 script/runner/install-job-network.py --apply --uplink <uplink> --public-ip <public IPv4>
 sudo python3 script/runner/install-job-network.py --check    # verify
 ```
 
@@ -303,8 +303,11 @@ It installs `/etc/nftables.d/motor-net.nft` from `script/runner/motor-net.nft`,
 well as live rules, guarded tenant sets and owned UFW grants. Outside
 `motor_net`, reconciliation changes only helper-owned tenant gate sets and
 comment-owned tenant UFW routes; existing job rules and foreign policy remain.
-The policy/checker use the existing `enp6s0` uplink and literal job address pool;
-a different uplink needs a coherent policy/checker update, not a wildcard grant.
+The explicit uplink and its public IPv4 address are persisted in root-owned
+`/etc/motor-network.json`; there is no default or runtime route sniffing. The
+interface must exist, be UP and carry that address. When a hosted helper config
+exists its settings must agree. The literal job address pool is unchanged;
+rendering with `--uplink enp6s0` preserves the build server's original policy.
 Run the default read-only diff as the trusted runner account to verify its
 non-root `sudo` grants. Running `--check` as root skips verification of that
 account's non-root `sudo` grants.

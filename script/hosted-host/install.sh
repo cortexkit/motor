@@ -4,7 +4,7 @@
 # and the agent's one firewall exception. Run as root on the server, from a
 # checkout of this repository. docs/hosted-host.md has the full procedure.
 #
-#   install.sh --checkout DIR --host-id ID --tenant-sub SUB [--build]
+#   install.sh --checkout DIR --host-id ID --tenant-sub SUB --uplink IFACE [--build]
 #              [--target-dir DIR] [--port N] [--public-ip IPV4]
 #              [--tenant-disk-quota-gib N] [--tenant-template FILE]
 #   install.sh --checkout DIR --check [--public-ip IPV4]
@@ -42,6 +42,7 @@ LOADER=/usr/local/libexec/motor-vm-loader
 FIRECRACKER_DIR=/usr/local/lib/firecracker/1.17.0
 HOST_CONFIG=/etc/motor-host/host.json
 HELPER_CONFIG=/etc/motor-vm-helper.json
+NETWORK_CONFIG=/etc/motor-network.json
 TENANT_CONFIG=/etc/motor-host/provision/tenant-1.json
 TENANT_REGISTRY=/etc/motor-vm-helper/tenants/tenant-1.json
 BINDINGS=/etc/motor-host/tenants.json
@@ -62,7 +63,7 @@ usage() {
 
 checkout='' target_dir=/srv/build/target build=0 mode=install
 port='' host_id='' public_ip='' tenant_sub='' tenant_quota='' tenant_image=''
-tenant_template=''
+tenant_template='' uplink=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --checkout) checkout=${2:?}; shift 2 ;;
@@ -77,6 +78,7 @@ while [ $# -gt 0 ]; do
     --tenant-sub) tenant_sub=${2:?}; shift 2 ;;
     --tenant-disk-quota-gib) tenant_quota=${2:?}; shift 2 ;;
     --tenant-template) tenant_template=${2:?}; shift 2 ;;
+    --uplink) uplink=${2:?}; shift 2 ;;
     -h|--help) usage ;;
     *) echo "unknown argument: $1" >&2; usage ;;
   esac
@@ -84,8 +86,9 @@ done
 [ -n "$checkout" ] || usage
 if [ "$mode" = install ]; then
   [ -n "$host_id" ] && [ -n "$tenant_sub" ] || { echo "installing needs --host-id and --tenant-sub" >&2; exit 2; }
-elif [ "$build" = 1 ] || [ -n "$host_id$tenant_sub$tenant_quota$port$tenant_template" ]; then
-  echo "--$mode uses the installed configs; --build, --host-id, --tenant-sub, --tenant-disk-quota-gib, --tenant-template and --port are install options" >&2
+  [ -n "$uplink" ] || { echo "installing needs --uplink (no default)" >&2; exit 2; }
+elif [ "$build" = 1 ] || [ -n "$host_id$tenant_sub$tenant_quota$port$tenant_template$uplink" ]; then
+  echo "--$mode uses the installed configs; --build, --host-id, --tenant-sub, --tenant-disk-quota-gib, --tenant-template, --uplink and --port are install options" >&2
   exit 2
 fi
 # Changes are made only when installing; --start changes nothing until every
@@ -165,6 +168,11 @@ directory() {
 }
 
 preflight() {
+  if render check-uplink --uplink "$uplink" --public-ip "$public_ip"; then
+    ok "uplink $uplink is ready"
+  else
+    fail "uplink $uplink is not ready"
+  fi
   for tool in python3 ufw runuser readelf systemctl findmnt; do
     command -v "$tool" >/dev/null || fail "missing $tool"
   done
@@ -290,10 +298,12 @@ configs() {
     ${tenant_template:+--template "$tenant_template"} \
     ${installed_record:+--installed "$installed_record"} \
     > "$scratch/tenant.json" || { fail "cannot render tenant config"; return; }
-  render helper --uid "$uid" --gid "$gid" --installed "$scratch/tenant.json" \
+  render helper --uid "$uid" --gid "$gid" --uplink "$uplink" --public-ip "$public_ip" --installed "$scratch/tenant.json" \
     > "$scratch/helper.json" || { fail "cannot render helper config"; return; }
   place config "$scratch/host.json" "$HOST_CONFIG" root:root 644
   place config "$scratch/helper.json" "$HELPER_CONFIG" root:root 644
+  render network --uplink "$uplink" --public-ip "$public_ip" > "$scratch/network.json" || { fail "cannot render network settings"; return; }
+  place config "$scratch/network.json" "$NETWORK_CONFIG" root:root 644
   place config "$scratch/tenant.json" "$TENANT_CONFIG" root:root 644
   if [ "$check" = 1 ]; then
     if render check-installed --uid "$uid" --gid "$gid"; then
@@ -413,6 +423,12 @@ if [ "$mode" != install ]; then
   port=$(installed "$HOST_CONFIG" listen)
   host_id=$(installed "$HOST_CONFIG" host_id)
   tenant_sub=$(installed "$TENANT_CONFIG" sub)
+  if [ "$mode" != stop ]; then
+    uplink=$(installed "$HELPER_CONFIG" uplink)
+    installed_ip=$(installed "$HELPER_CONFIG" public_ipv4)
+    [ -z "$public_ip" ] || [ "$public_ip" = "$installed_ip" ] || { echo "--public-ip differs from the installed uplink address" >&2; exit 2; }
+    public_ip=$installed_ip
+  fi
 fi
 # The installed tenant record, when there is one, is the source of the
 # tenant's sizing and image when installing, checking and starting.

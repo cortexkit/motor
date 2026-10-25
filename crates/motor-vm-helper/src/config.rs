@@ -1,6 +1,6 @@
 use crate::{Error, Result};
 use serde::Deserialize;
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, net::Ipv4Addr, path::PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +29,8 @@ pub struct UidRange {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    pub uplink: String,
+    pub public_ipv4: Ipv4Addr,
     pub allowed_uids: Vec<u32>,
     pub socket_gid: u32,
     #[serde(default = "default_uid_base")]
@@ -51,6 +53,12 @@ fn default_uid_base() -> u32 {
 }
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        if !valid_uplink(&self.uplink) || !public_ipv4(self.public_ipv4) {
+            return Err(Error(format!(
+                "invalid uplink {} or public IPv4 address",
+                self.uplink
+            )));
+        }
         let count = u32::try_from(self.slots.len()).map_err(|_| Error("too many slots".into()))?;
         let end = self
             .uid_base
@@ -111,6 +119,30 @@ impl Config {
         }
         Ok(())
     }
+}
+pub(crate) fn valid_uplink(value: &str) -> bool {
+    (1..=15).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        && value != "."
+        && value != ".."
+        && value != "lo"
+}
+
+fn public_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_multicast()
+        || a == 0
+        || a >= 240
+        || (a == 100 && (64..128).contains(&b))
+        || (a == 198 && (b == 18 || b == 19)))
 }
 pub(crate) fn cpu_list(s: &str) -> bool {
     !s.is_empty()

@@ -116,6 +116,30 @@ jobs get their tools and isolation from the tenant image instead.
    not the rental's advertised memory. Keep the storage margins and tenant
    memory reserve unless there is a separate reviewed capacity change.
 
+7. Choose the host's **explicit uplink** and public IPv4 address. Pass
+   `--uplink IFACE` to `install.sh`; there is no default interface and no runtime
+   route discovery. The installer writes both `/etc/motor-vm-helper.json` and
+   root-owned `/etc/motor-network.json`. The helper and network loader refuse a
+   missing/down interface or one without that public IPv4 address. Once the
+   configs are installed, install the shared outbound policy with:
+
+   ```sh
+   sudo python3 script/runner/install-job-network.py --apply \
+     --uplink <uplink> --public-ip <public IPv4>
+   sudo python3 script/runner/install-job-network.py --check
+   ```
+
+   This activates only the outbound-network policy unit, not the host agent or
+   VM helper, and adds no inbound agent allowance. The policy can be checked
+   before a tenant/helper starts: the set of tenant TAP interfaces allowed
+   through the base policy remains empty, so no tenant traffic is authorized.
+   Keep these settings consistent with the helper; the installer refuses a
+   mismatch. On an existing host, stop/drain the helper and agent before
+   changing the uplink. When upgrading the build server, explicitly use
+   `--uplink enp6s0` and its current public address; rendering that interface
+   leaves the original nft/NAT/UFW policy bytes unchanged. Old configs without
+   an explicit uplink/public address deliberately fail closed with the new helper.
+
 The renderer retains the build server's 32-thread topology and excludes
 `12-15,28-31`, even on a host without Windows. A host with a different topology
 needs a reviewed CPU policy change, not a guessed template. First-install
@@ -132,6 +156,7 @@ templates do not bypass provision.py's sizing, resolver or CPU validation.
 | `/etc/systemd/system/motor-host.service` | root, 0644 | `crates/motor-host/systemd/` |
 | `/etc/motor-host/host.json` | root, 0644 | `hosted_host.py host` |
 | `/etc/motor-vm-helper.json` | root, 0644 | `hosted_host.py helper` |
+| `/etc/motor-network.json` | root, 0644 | explicit uplink/public IPv4 shared with the outbound-network loader |
 | `/etc/motor-host/provision/tenant-1.json` | root, 0644 | first install: `hosted_host.py tenant`, `script/hosted-host/tenant-1.json` plus the subject; afterwards the installed record is kept |
 | `/etc/motor-host/capacity.json` | root, 0644 | written by the operator; see [Host capacity](#host-capacity) |
 | `/etc/motor-host/tenants.json` | root, 0644 | created as `{}`; `provision.py` adds the tenant |
@@ -282,7 +307,7 @@ extra rule.
    ```sh
    cd /srv/build/src/motor
    sudo script/hosted-host/install.sh --checkout /srv/build/src/motor --build \
-     --host-id <host-id> --tenant-sub <tenant-sub>
+      --host-id <host-id> --tenant-sub <tenant-sub> --uplink <uplink>
    ```
 
    It creates the `motor-host` account, installs the binaries, shows each new or

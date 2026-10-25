@@ -441,6 +441,10 @@ controllers, XFS with reflink, OpenSSL with Ed25519, Git, xfsprogs, util-linux,
 iproute2, nftables and the pinned Firecracker/jailer 1.17.0. No packages or host
 users are installed. The admission server runs as `nobody` by default; choose a
 different existing unprivileged account with `--host-user` if necessary.
+Install the [explicit host uplink settings and outbound policy](../../docs/runner-install.md#6-optional-job-networking)
+first. Qualification reads `/etc/motor-network.json` into its transient helper
+config; neither the helper nor the network loader chooses an interface from a
+default route. The interface must be UP with the configured public IPv4 address.
 
 Budget, **not measured results**: allow 5–15 minutes after builds, approximately
 53 GiB peak incremental disk plus the delivered executable/logs, and about

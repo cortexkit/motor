@@ -40,7 +40,7 @@ fn hex_comment(value: &str) -> Result<String> {
 fn tap_index(tap: &str) -> Result<u8> {
     index(&format!("motor-tenant-{tap}"))
 }
-fn rule_index(line: &str, chain: &str) -> Result<Option<u8>> {
+fn rule_index(line: &str, chain: &str, uplink: &str) -> Result<Option<u8>> {
     let words: Vec<_> = line.split_whitespace().collect();
     if words.first() != Some(&"-A") || words.get(1) != Some(&chain) {
         return Ok(None);
@@ -63,7 +63,7 @@ fn rule_index(line: &str, chain: &str) -> Result<Option<u8>> {
     let n = tap_index(tap)?;
     let source = format!("10.200.{n}.2");
     if values.len() != 4
-        || values.get("-o") != Some(&"enp6s0")
+        || values.get("-o") != Some(&uplink)
         || values.get("-j") != Some(&"ACCEPT")
         || values.get("-s").map(|s| s.strip_suffix("/32").unwrap_or(s)) != Some(source.as_str())
     {
@@ -74,7 +74,7 @@ fn rule_index(line: &str, chain: &str) -> Result<Option<u8>> {
     Ok(Some(n))
 }
 
-pub(super) fn parse_owned(text: &str, ipv6: bool) -> Result<BTreeSet<u8>> {
+pub(super) fn parse_owned(text: &str, ipv6: bool, uplink: &str) -> Result<BTreeSet<u8>> {
     let mut owned = BTreeSet::new();
     let mut pending = None;
     for line in text.lines() {
@@ -89,7 +89,7 @@ pub(super) fn parse_owned(text: &str, ipv6: bool) -> Result<BTreeSet<u8>> {
                 if comment.starts_with("motor-tenant-") {
                     let n = index(&comment)?;
                     let source = format!("10.200.{n}.2");
-                    let interfaces = format!("in_mtap{n}!out_enp6s0");
+                    let interfaces = format!("in_mtap{n}!out_{uplink}");
                     if ipv6
                         || words.len() != 8
                         || words[..5] != ["route:allow", "any", "any", "0.0.0.0/0", "any"]
@@ -109,6 +109,7 @@ pub(super) fn parse_owned(text: &str, ipv6: bool) -> Result<BTreeSet<u8>> {
                 } else {
                     "ufw-user-forward"
                 },
+                uplink,
             )?;
             match (pending.take(), n) {
                 (Some(expected), Some(actual)) if expected == actual && owned.insert(actual) => {}
@@ -127,7 +128,7 @@ pub(super) fn parse_owned(text: &str, ipv6: bool) -> Result<BTreeSet<u8>> {
     Ok(owned)
 }
 
-pub(super) fn live_grants(text: &str, ipv6: bool) -> Result<BTreeSet<u8>> {
+pub(super) fn live_grants(text: &str, ipv6: bool, uplink: &str) -> Result<BTreeSet<u8>> {
     let mut values = BTreeSet::new();
     for line in text.lines() {
         if let Some(n) = rule_index(
@@ -137,6 +138,7 @@ pub(super) fn live_grants(text: &str, ipv6: bool) -> Result<BTreeSet<u8>> {
             } else {
                 "ufw-user-forward"
             },
+            uplink,
         )? {
             if ipv6 || !values.insert(n) {
                 return Err(Error("IPv6 or duplicate tenant UFW grant".into()));
@@ -183,10 +185,10 @@ fn status_active(status: &str) -> Result<bool> {
     Ok(active)
 }
 
-pub(super) fn inspect() -> Result<State> {
-    let owned = parse_owned(&read_policy("/etc/ufw/user.rules")?, false)?;
+pub(super) fn inspect(uplink: &str) -> Result<State> {
+    let owned = parse_owned(&read_policy("/etc/ufw/user.rules")?, false, uplink)?;
     if Path::new("/etc/ufw/user6.rules").exists() {
-        parse_owned(&read_policy("/etc/ufw/user6.rules")?, true)?;
+        parse_owned(&read_policy("/etc/ufw/user6.rules")?, true, uplink)?;
     }
     let status = command("/usr/sbin/ufw", &["status"])?;
     let active = status_active(&status)?;
@@ -199,6 +201,7 @@ pub(super) fn inspect() -> Result<State> {
     let live = live_grants(
         &command("/usr/sbin/iptables", &["-S", "ufw-user-forward"])?,
         false,
+        uplink,
     )?;
     let before = command("/usr/sbin/iptables", &["-S", "ufw-before-forward"])?;
     if !before.lines().any(|line| {
@@ -223,6 +226,7 @@ pub(super) fn inspect() -> Result<State> {
         live_grants(
             &command("/usr/sbin/ip6tables", &["-S", "ufw6-user-forward"])?,
             true,
+            uplink,
         )?;
     }
     if !live.is_subset(&owned) {
@@ -234,7 +238,7 @@ pub(super) fn inspect() -> Result<State> {
     })
 }
 
-fn arguments(n: u8, delete: bool) -> Vec<String> {
+fn arguments(n: u8, delete: bool, uplink: &str) -> Vec<String> {
     let mut values: Vec<String> = if delete {
         vec!["--force", "delete", "route", "allow"]
     } else {
@@ -249,7 +253,7 @@ fn arguments(n: u8, delete: bool) -> Vec<String> {
         format!("mtap{n}"),
         "out".into(),
         "on".into(),
-        "enp6s0".into(),
+        uplink.into(),
         "from".into(),
         format!("10.200.{n}.2"),
         "to".into(),
@@ -260,7 +264,7 @@ fn arguments(n: u8, delete: bool) -> Vec<String> {
     values
 }
 
-pub(super) fn reconcile(registries: &[Registry], prior: &State) -> Result<State> {
+pub(super) fn reconcile(registries: &[Registry], prior: &State, uplink: &str) -> Result<State> {
     let desired: BTreeSet<_> = registries.iter().map(|r| r.tap_index).collect();
     for (n, delete) in prior
         .owned
@@ -268,7 +272,7 @@ pub(super) fn reconcile(registries: &[Registry], prior: &State) -> Result<State>
         .map(|n| (*n, true))
         .chain(desired.difference(&prior.owned).map(|n| (*n, false)))
     {
-        let args = arguments(n, delete);
+        let args = arguments(n, delete, uplink);
         command(
             "/usr/sbin/ufw",
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -279,14 +283,14 @@ pub(super) fn reconcile(registries: &[Registry], prior: &State) -> Result<State>
         .filter(|n| !prior.ready.contains(n))
     {
         for delete in [true, false] {
-            let args = arguments(*n, delete);
+            let args = arguments(*n, delete, uplink);
             command(
                 "/usr/sbin/ufw",
                 &args.iter().map(String::as_str).collect::<Vec<_>>(),
             )?;
         }
     }
-    let state = inspect()?;
+    let state = inspect(uplink)?;
     if state.owned != desired || state.ready != desired {
         return Err(Error("tenant UFW grants are not live and exact".into()));
     }
@@ -298,36 +302,65 @@ mod tests {
     use super::*;
     const CAPTURE: &str = "### tuple ### route:allow any any 0.0.0.0/0 any 10.200.1.2 in_mtap1!out_enp6s0 comment=6d6f746f722d74656e616e742d6d74617031\n-A ufw-user-forward -i mtap1 -o enp6s0 -s 10.200.1.2 -j ACCEPT\n";
     #[test]
+    fn alternate_uplink_is_used_for_owned_tuples_live_rules_and_commands() {
+        let capture = CAPTURE.replace("enp6s0", "eno1");
+        assert_eq!(
+            parse_owned(&capture, false, "eno1").unwrap(),
+            BTreeSet::from([1])
+        );
+        assert_eq!(
+            live_grants(&capture, false, "eno1").unwrap(),
+            BTreeSet::from([1])
+        );
+        assert!(parse_owned(&capture, false, "enp6s0").is_err());
+        assert_eq!(
+            arguments(1, false, "eno1"),
+            arguments(1, false, "enp6s0")
+                .into_iter()
+                .map(|value| if value == "enp6s0" {
+                    "eno1".into()
+                } else {
+                    value
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    #[test]
     fn owned_ufw_tuple_and_live_grant_require_exact_tap_source_and_direction() {
-        assert_eq!(parse_owned(CAPTURE, false).unwrap(), BTreeSet::from([1]));
+        assert_eq!(
+            parse_owned(CAPTURE, false, "enp6s0").unwrap(),
+            BTreeSet::from([1])
+        );
         for broken in [
             CAPTURE.replace("-i mtap1", "-i mtap+"),
             CAPTURE.replace(" -s 10.200.1.2", ""),
             CAPTURE.replace("-i mtap1 -o enp6s0", "-i enp6s0 -o mtap1"),
         ] {
-            assert!(parse_owned(&broken, false).is_err());
-            assert!(live_grants(&broken, false).is_err());
+            assert!(parse_owned(&broken, false, "enp6s0").is_err());
+            assert!(live_grants(&broken, false, "enp6s0").is_err());
         }
-        assert!(parse_owned(CAPTURE, true).is_err());
+        assert!(parse_owned(CAPTURE, true, "enp6s0").is_err());
         assert!(parse_owned(
             &format!("{CAPTURE}-A ufw-user-forward -i enp6s0 -o mtap1 -j ACCEPT\n"),
-            false
+            false,
+            "enp6s0"
         )
         .is_err());
         assert_eq!(
             live_grants(
                 "-A ufw-user-forward -s 10.200.1.2/32 -i mtap1 -o enp6s0 -j ACCEPT",
-                false
+                false,
+                "enp6s0"
             )
             .unwrap(),
             BTreeSet::from([1])
         );
-        assert_eq!(parse_owned("### tuple ### route:allow any any 0.0.0.0/0 any 0.0.0.0/0 in_mnet-+!out_enp6s0\n-A ufw-user-forward -i mnet-+ -o enp6s0 -j ACCEPT\n",false).unwrap(),BTreeSet::new());
+        assert_eq!(parse_owned("### tuple ### route:allow any any 0.0.0.0/0 any 0.0.0.0/0 in_mnet-+!out_enp6s0\n-A ufw-user-forward -i mnet-+ -o enp6s0 -j ACCEPT\n",false,"enp6s0").unwrap(),BTreeSet::new());
     }
     #[test]
     fn ufw_operations_are_exact_comment_owned_ipv4_outbound_only() {
         assert_eq!(
-            arguments(1, false),
+            arguments(1, false, "enp6s0"),
             [
                 "route",
                 "allow",
@@ -346,7 +379,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            &arguments(1, true)[..4],
+            &arguments(1, true, "enp6s0")[..4],
             ["--force", "delete", "route", "allow"]
         );
     }

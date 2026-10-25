@@ -69,6 +69,9 @@ sudo install -m 0644 crates/motor-vm-helper/systemd/motor-vm-storage.mount '/etc
 sudo install -m 0644 crates/motor-vm-helper/systemd/motor-vm-storage-private.service /etc/systemd/system/
 # Write /etc/motor-vm-helper.json, using crates/motor-vm-helper/fixtures/helper.json
 # as the shape: allowed uid, socket group, CPU topology and job-account range.
+# Set its required uplink and public_ipv4 to this host's actual interface/address;
+# install the same settings and outbound policy with install-job-network.py
+# --apply --uplink IFACE --public-ip IPV4 before starting the helper.
 sudo systemctl daemon-reload
 sudo systemctl enable --now 'var-lib-motor\x2dvm.mount'
 sudo systemctl start motor-vm-storage-private.service
@@ -257,6 +260,9 @@ They run as root, create mounts, cgroups and systemd units, and use fixed uids,
 so run them only on a disposable trusted Linux host, never in hosted CI or a
 build job. Prefix each with the Git-config clearing from
 [CONTRIBUTING.md](../CONTRIBUTING.md#prerequisites).
+The service lane also requires `/etc/motor-network.json` from the explicit-uplink
+network installer and that interface UP with its configured public IPv4 address;
+it reconciles real host policy rather than using the portable fixture's example.
 
 | Command | Needs | Covers |
 | --- | --- | --- |

@@ -29,7 +29,7 @@ CAPACITY = dict(windows_vm_bytes=16 * GIB, host_reserve_bytes=6 * GIB, jobs_min_
                 tenant_memory_reserve_bytes=2 * GIB)
 RENDERED = "[Slice]\nMemoryMax=42949672960\nMemoryHigh=35791394134\n"
 SUB = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV"
-HELPER = {"allowed_uids": [990], "socket_gid": 990, "uid_base": 290000,
+HELPER = {"uplink": "enp6s0", "public_ipv4": "8.8.8.8", "allowed_uids": [990], "socket_gid": 990, "uid_base": 290000,
           "slots": [{"cpus": "0-1", "mems": "0", "cpu_max": "100000 100000", "memory_max": GIB,
                      "io_weight": 10, "io_max": None}],
           "agent_port": 52, "proxy_port": 53}

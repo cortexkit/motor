@@ -93,7 +93,7 @@ impl LinuxTenants {
         // A disk may still have its jail uid after a helper crash. All registry
         // ancestors remain root-controlled; restore ownership only after kill.
         let registries = self.registries()?;
-        tenant_network::install(&registries)?;
+        tenant_network::install(&registries, &self.config)?;
         for r in registries {
             for ancestor in r.disk.parent().unwrap().ancestors() {
                 fs::trusted(ancestor, &std::fs::symlink_metadata(ancestor)?)?;
@@ -691,7 +691,7 @@ impl Backend for LinuxTenants {
         let uid = self.uid(r)?;
         let registries = self.registries()?;
         // Install the deny rules before bringing a tap up, not after it can send.
-        tenant_network::install(&registries)?;
+        tenant_network::install(&registries, &self.config)?;
         tenant_network::ensure(r, uid)
     }
     fn relay(&mut self, tenant: &str, port: u32) -> Result<OwnedFd> {
@@ -715,7 +715,7 @@ impl Backend for LinuxTenants {
         // Reconcile the firewall over every other tenant: that drops this
         // tenant's chains, counter and UFW route grant and leaves the rest.
         let remaining = tenant_network::without(self.registries()?, r);
-        tenant_network::install(&remaining)?;
+        tenant_network::install(&remaining, &self.config)?;
         tenant_network::remove_tap(r)?;
         crate::removal::finish(&paths, tenant, &quarantine)?;
         eprintln!(
