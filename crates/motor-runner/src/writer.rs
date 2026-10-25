@@ -1,7 +1,7 @@
 //! Cache-path validation still runs when the writer account is missing: caller
 //! paths must never cause checkout ownership repair to hand cache storage to
 //! the foreground job account, motor-job.
-use crate::{engine::Config, workspace};
+use crate::{engine::Config, workspace, workspace_access::Unreadable};
 use motor_protocol::SiblingSnapshot;
 use std::{
     fs, io,
@@ -106,7 +106,12 @@ pub(crate) fn validate_paths(
         std::iter::once(workspace)
             .chain(cwd)
             .chain(siblings.iter().map(|s| s.canonical_path.as_str()))
-            .map(|path| Ok((PathBuf::from(path), canonical_future(Path::new(path))?))),
+            .map(|path| {
+                let canonical = canonical_future(Path::new(path)).map_err(|error| {
+                    Unreadable::wrap(Path::new(path), "resolving symlinks in the path", error)
+                })?;
+                Ok((PathBuf::from(path), canonical))
+            }),
     )
 }
 
@@ -145,7 +150,13 @@ fn validate_resolved_paths(
         if protected.iter().any(|owned| overlaps(&canonical, owned))
             || has_base_component(&supplied, &prefix)
             || has_base_component(&canonical, &prefix)
-            || contains_base_checkout(&canonical, &prefix)?
+            || contains_base_checkout(&canonical, &prefix).map_err(|error| {
+                Unreadable::wrap(
+                    &supplied,
+                    "listing the directory for runner base checkouts",
+                    error,
+                )
+            })?
         {
             return Err(io::Error::other(format!(
                 "caller path overlaps writer-owned storage: {}",

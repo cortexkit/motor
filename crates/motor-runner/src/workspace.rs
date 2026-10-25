@@ -299,6 +299,13 @@ fn authorize_destination(
 ) -> io::Result<PathBuf> {
     if absolute(path) {
         let canonical = canonical.map_err(|error| {
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                return crate::workspace_access::Unreadable::wrap(
+                    Path::new(path),
+                    "resolving the path inside the runner-owned roots",
+                    error,
+                );
+            }
             invalid(format!(
                 "cannot resolve destination: path={path} allowed_roots={roots:?}: {error}"
             ))

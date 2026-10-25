@@ -254,6 +254,11 @@ pub struct Config {
     /// on the host's real slice. Production always reads systemd.
     #[cfg(test)]
     pub(crate) slice_ceiling_probe: Option<Arc<dyn Fn() -> io::Result<u64> + Send + Sync>>,
+    /// Replaces the privileged reclaim that gives the runner back read access
+    /// to a checkout a job locked it out of (see `workspace_access`), so
+    /// portable fixtures can exercise the repair without sudo.
+    #[cfg(test)]
+    pub(crate) workspace_access_repair: Option<crate::workspace_access::RepairHook>,
     /// Replaces `sibling_snapshot_mode()`, so portable fixtures can run either
     /// sibling mode without the isolated host backend.
     #[cfg(test)]
@@ -514,6 +519,8 @@ impl Config {
             systemd_command: None,
             #[cfg(test)]
             slice_ceiling_probe: None,
+            #[cfg(test)]
+            workspace_access_repair: None,
             #[cfg(test)]
             sibling_snapshot_mode_override: None,
             #[cfg(test)]
@@ -3101,12 +3108,26 @@ impl Runner {
             {
                 return Ok(Admission::Duplicate);
             }
-            let refusal = self.run_refusal(&inner, &request);
+            let refusal = self.run_refusal(&inner, &request, &Default::default());
             (self.protect_admission(&mut inner, &request), refusal)
+        };
+        // Admission reads inside the workspace (it resolves symlinks in the
+        // caller's paths and lists the workspace for runner base checkouts),
+        // and a job that owned the workspace may have locked the runner out
+        // of it. Repair that here, without the state lock, before the
+        // recheck below validates again (see `workspace_access`).
+        let access = if matches!(
+            initial_refusal,
+            Some((RefusalReason::WorkspaceKeyRejected, _))
+        ) {
+            self.reclaim_workspace_access(&request)
+        } else {
+            Default::default()
         };
         // Recheck ordinary admission after cleanup; another request may have
         // occupied the workspace or queue while deletion ran off the state lock.
-        let disk_full = if initial_refusal.is_none() {
+        // A request the access repair may have cleared gets the disk check too.
+        let disk_full = if initial_refusal.is_none() || access.restored_any() {
             self.ensure_admission_disk_space()?
         } else {
             None
@@ -3143,7 +3164,7 @@ impl Runner {
         // the files may be partly gone. Keep that setup refusal even when the
         // deletion has finished and no overlap is visible by this recheck;
         // otherwise the job would start on a half-deleted workspace.
-        let ordinary_refusal = self.run_refusal(&inner, &request).or_else(|| {
+        let ordinary_refusal = self.run_refusal(&inner, &request, &access).or_else(|| {
             initial_refusal.filter(|(reason, _)| *reason == RefusalReason::WorkspaceSetupFailed)
         });
         let disk_refused = ordinary_refusal.is_none() && disk_full.is_some();
@@ -3290,7 +3311,12 @@ impl Runner {
             .store(max, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn run_refusal(&self, inner: &Inner, request: &Run) -> Option<(RefusalReason, String)> {
+    fn run_refusal(
+        &self,
+        inner: &Inner,
+        request: &Run,
+        access: &crate::workspace_access::Repairs,
+    ) -> Option<(RefusalReason, String)> {
         #[cfg(unix)]
         if request.platform == Some(Platform::Macos) {
             if let Err(error) = crate::macos::validate_paths(request) {
@@ -3420,7 +3446,7 @@ impl Runner {
             Some(&request.cwd),
             &request.siblings,
         ) {
-            Some((RefusalReason::WorkspaceKeyRejected, error.to_string()))
+            Some((RefusalReason::WorkspaceKeyRejected, access.describe(&error)))
         } else if let Err(error) = workspace::validate_dependencies(&request.git_dependencies) {
             Some((RefusalReason::BundleRejected, error.to_string()))
         } else {
@@ -3434,12 +3460,50 @@ impl Runner {
         cwd: Option<&str>,
         siblings: &[SiblingSnapshot],
     ) -> io::Result<()> {
-        self.validate_writer_paths_with_catalog(
-            &self.core.inner.lock().unwrap(),
+        // The state lock is taken for each attempt and released before a
+        // repair runs, so a slow repair holds up no other request.
+        crate::workspace_access::validate_with_repair(
+            &self.core.config,
             workspace,
-            cwd,
             siblings,
+            || {
+                self.validate_writer_paths_with_catalog(
+                    &self.core.inner.lock().unwrap(),
+                    workspace,
+                    cwd,
+                    siblings,
+                )
+            },
         )
+    }
+
+    /// Give the runner back read access to the checkouts an admission must
+    /// read, if a job locked it out. Runs without the state lock; admission
+    /// then validates again under it and describes any failure with what was
+    /// tried here. The probe is the writer-path check admission runs, minus
+    /// the catalogued checkouts that need the state lock: those are runner
+    /// storage, not checkouts a job owned.
+    fn reclaim_workspace_access(&self, request: &Run) -> crate::workspace_access::Repairs {
+        let mut repairs = crate::workspace_access::Repairs::default();
+        if self.core.config.vm_instance() || !workspace::absolute(&request.workspace_key) {
+            return repairs;
+        }
+        let _ = crate::workspace_access::validate_with_repairs(
+            &self.core.config,
+            &request.workspace_key,
+            &request.siblings,
+            &mut repairs,
+            || {
+                crate::writer::validate_paths(
+                    &self.core.config,
+                    &request.workspace_key,
+                    Some(&request.cwd),
+                    &request.siblings,
+                    &[],
+                )
+            },
+        );
+        repairs
     }
 
     fn validate_destinations(
@@ -7897,6 +7961,20 @@ impl Runner {
                 format!("runner: {detail}\n").as_bytes(),
             ) {
                 tracing::warn!(job_id = %id, %error, "OOM detail could not be appended to job output");
+            }
+        }
+        // The job owned its workspace root and may have locked the runner out
+        // of it (see `isolation::restore_runner_root_access`). Give the runner
+        // its read access back before the change scan below reads the
+        // workspace, and so the next admission on it can; the next setup
+        // reclaims the rest of the tree. A failure here only loses the scan.
+        #[cfg(target_os = "linux")]
+        if self.core.config.isolate_jobs && !job.base && !self.core.config.vm_instance() {
+            let root = Path::new(job.key());
+            if fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_dir()) {
+                if let Err(error) = crate::isolation::restore_runner_root_access(root) {
+                    tracing::warn!(job_id = %id, workspace = %root.display(), %error, "cannot restore runner access to the workspace root after the job");
+                }
             }
         }
         let changes = match self.core.backend.collect_changes(&self.core.trees, &job) {

@@ -1931,10 +1931,48 @@ pub(crate) fn restore_runner_access(path: &Path) -> io::Result<()> {
     // mode 0700. Those modes mask even an inherited named ACL. Once the prior
     // job has stopped, the trusted preparer must restore access before Git
     // cleanup or a reflink clone; it never follows job-created symlinks.
+    // Without -n, setfacl -m also recalculates the ACL mask of every entry it
+    // writes, so a mask a job zeroed with chmod 0700 is restored on the way.
     let acl = format!("u:{}:rwX", unsafe { libc::geteuid() });
     checked(
         crate::privilege::command("/usr/bin/setfacl")
             .args(["-R", "-P", "-m", &acl, "--"])
+            .arg(path),
+    )
+}
+
+/// Give the runner account back read access to a caller checkout a job
+/// locked it out of, without changing any owner or the job's own permission
+/// bits. It walks the whole tree as the next setup's reclaim does, so a
+/// directory the job made unreadable below the root is rescued too, and then
+/// restores the root's ACL mask (see `restore_runner_root_access`).
+pub(crate) fn restore_workspace_access(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::other(format!(
+            "checkout is not a physical directory: {}",
+            path.display()
+        )));
+    }
+    restore_runner_access(path)?;
+    restore_runner_root_access(path)
+}
+
+/// Give the runner account back read access to a checkout root after a job.
+/// The job owns its workspace root while it runs, and chmod on a directory
+/// that carries an ACL rewrites the ACL mask: a job that sets the root to
+/// 0700 leaves the runner's named entry listed but masked to nothing, and
+/// every later admission on the workspace fails to read it. This puts the
+/// entry back and sets the mask to r-x, what setup's `chmod 0755` of the
+/// root left before the job ran; read and search are all admission needs,
+/// and the next setup takes ownership back before the runner writes there.
+/// Owners and the job's own mode bits are left alone. `-P` skips a symlink
+/// instead of following it.
+pub(crate) fn restore_runner_root_access(path: &Path) -> io::Result<()> {
+    let acl = format!("u:{}:rwx,m::r-x", unsafe { libc::geteuid() });
+    checked(
+        crate::privilege::command("/usr/bin/setfacl")
+            .args(["-P", "-m", &acl, "--"])
             .arg(path),
     )
 }
