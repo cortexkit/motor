@@ -1785,7 +1785,7 @@ async fn windows_backend_prep_step_failure_reaches_refusal_without_host_paths() 
     assert!(matches!(t.outcome, Outcome::RefusedBeforeStart { .. }));
     let detail = t.refusal_detail.unwrap();
     assert!(
-        detail.contains("windows prep: stage dependencies: link or special file: cargo-home/git/checkouts/dependency/rev/fifo"),
+        detail.contains("windows prep: stage dependencies: special file: cargo-home/git/checkouts/dependency/rev/fifo"),
         "{detail}"
     );
     assert!(detail.contains("exit status: 1"), "{detail}");

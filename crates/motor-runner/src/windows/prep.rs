@@ -7,26 +7,26 @@ use std::{
 };
 
 #[derive(Serialize, Deserialize)]
-struct Snapshot {
-    mirror: PathBuf,
-    commit: String,
-    destination: String,
+pub(super) struct Snapshot {
+    pub(super) mirror: PathBuf,
+    pub(super) commit: String,
+    pub(super) destination: String,
 }
 #[derive(Serialize, Deserialize)]
-struct Plan {
-    staging: PathBuf,
-    snapshots: Vec<Snapshot>,
-    routes: BTreeMap<String, PathBuf>,
-    workspace: String,
-    tree_hash: String,
+pub(super) struct Plan {
+    pub(super) staging: PathBuf,
+    pub(super) snapshots: Vec<Snapshot>,
+    pub(super) routes: BTreeMap<String, PathBuf>,
+    pub(super) workspace: String,
+    pub(super) tree_hash: String,
     #[cfg(any(unix, test))]
-    cargo: PathBuf,
+    pub(super) cargo: PathBuf,
     #[cfg(any(unix, test))]
-    rustup: PathBuf,
+    pub(super) rustup: PathBuf,
     #[cfg(any(unix, test))]
-    toolchain_bin: PathBuf,
+    pub(super) toolchain_bin: PathBuf,
     #[cfg(any(unix, test))]
-    toolchain_source: PathBuf,
+    pub(super) toolchain_source: PathBuf,
 }
 fn mapped(path: &str) -> io::Result<PathBuf> {
     motor_winagent::mapped_cwd(path)?;
@@ -420,7 +420,7 @@ pub(crate) fn execute(plan_path: &Path) -> io::Result<()> {
 }
 
 #[cfg(any(unix, test))]
-fn cargo_command(plan: &Plan, manifest: &Path, args: &[&str]) -> Command {
+pub(super) fn cargo_command(plan: &Plan, manifest: &Path, args: &[&str]) -> Command {
     // Cargo reads repository configuration from its working directory's ancestors,
     // not from the manifest path, so trusted commands run outside extracted trees.
     let mut cmd = Command::new(&plan.cargo);
@@ -610,6 +610,7 @@ pub(crate) fn execute_with_fetch(
         }
     }
     super::prep_error::step("stage dependencies", &plan.staging, || {
+        stage_links_as_text(&plan.staging)?;
         build_tar(&plan.staging)
     })
 }
@@ -888,6 +889,48 @@ fn check_sources(
     Ok(())
 }
 
+/// Replace every link under the fetched dependency trees with a file holding
+/// its target text.
+///
+/// Cargo checks a git dependency out with real symlinks and offers no setting
+/// to refuse them, so after the fetch a dependency's tracked link exists on
+/// the host. Its target text is inert; the link itself is not, because the
+/// guest would resolve it, and for a target outside the repository that is
+/// exactly what must never happen. Staging the text matches Git for Windows'
+/// own checkout, which is what the guest side already assumes.
+#[cfg(any(unix, test))]
+fn stage_links_as_text(staging: &Path) -> io::Result<()> {
+    for name in ["git/checkouts", "git/db"] {
+        let root = staging.join("cargo-home").join(name);
+        if root.exists() {
+            replace_links(&root)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, test))]
+fn replace_links(directory: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_symlink() {
+            // Read the link itself, never what it points at, so a target
+            // outside the tree is recorded as text and never opened.
+            let text = fs::read_link(&path)?
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec();
+            fs::remove_file(&path)?;
+            fs::write(&path, text)?;
+        } else if metadata.is_dir() {
+            replace_links(&path)?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn build_tar(staging: &Path) -> io::Result<()> {
     let mut builder = tar::Builder::new(File::create(staging.join("tree.tar"))?);
     let mut seen = BTreeSet::new();
@@ -931,6 +974,13 @@ fn append(
         return Err(invalid(format!("case collision: {name}")));
     }
     let metadata = fs::symlink_metadata(path)?;
+    // The archive is built on the host, so a link here would mean the host
+    // resolved one. Dependency checkouts happen inside the VM with
+    // `core.symlinks=false`, so a link can only come from an unexpected
+    // source, and shipping it would let it resolve in the guest.
+    if metadata.is_symlink() {
+        return Err(invalid(format!("link in staged tree: {name}")));
+    }
     if metadata.is_dir() {
         builder.append_dir(relative, path)?;
         let mut entries = fs::read_dir(path)?
@@ -943,7 +993,7 @@ fn append(
     } else if metadata.is_file() {
         builder.append_file(relative, &mut File::open(path)?)?;
     } else {
-        return Err(invalid(format!("link or special file: {}", path.display())));
+        return Err(invalid(format!("special file: {name}")));
     }
     Ok(())
 }

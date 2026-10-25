@@ -654,7 +654,10 @@ fn valid_crates_io_config(bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn write_job_cargo_config(cargo_home: &Path, local_registry: Option<&Path>) -> io::Result<()> {
+pub(super) fn write_job_cargo_config(
+    cargo_home: &Path,
+    local_registry: Option<&Path>,
+) -> io::Result<()> {
     let source = if let Some(local_registry) = local_registry {
         source_config(local_registry, "motor-local")?
     } else {
@@ -662,8 +665,36 @@ fn write_job_cargo_config(cargo_home: &Path, local_registry: Option<&Path>) -> i
     };
     let config = format!("{source}[net]\ngit-fetch-with-cli = true\n");
     write_new_file(cargo_home, Path::new("config.toml"), config.as_bytes())?;
-    write_new_file(cargo_home, Path::new("gitconfig"), b"")?;
+    // The job checks dependencies out inside the VM, from the Git repositories
+    // shipped below, so `core.symlinks=false` is what makes a tracked symlink
+    // arrive as a file holding its target text. That is Git for Windows' own
+    // default and it keeps the checkout free of links: a link recorded in a
+    // dependency would otherwise resolve inside the guest, which is exactly
+    // what a target outside the repository must not be allowed to do.
+    write_new_file(
+        cargo_home,
+        Path::new("gitconfig"),
+        b"[core]\n\tsymlinks = false\n",
+    )?;
     Ok(())
+}
+
+/// The job's cargo checks dependencies out inside the VM with this file as
+/// its global Git configuration, so it has to pin links off: a checkout that
+/// honoured a tracked symlink would resolve it inside the guest.
+#[test]
+fn job_gitconfig_pins_symlinks_off() {
+    let directory =
+        std::env::temp_dir().join(format!("motor-winagent-gitconfig-{}", std::process::id()));
+    let cargo_home = directory.join("cargo-home");
+    fs::create_dir_all(&cargo_home).unwrap();
+    write_job_cargo_config(&cargo_home, None).unwrap();
+    let gitconfig = fs::read_to_string(cargo_home.join("gitconfig")).unwrap();
+    assert!(
+        gitconfig.contains("[core]") && gitconfig.contains("symlinks = false"),
+        "job gitconfig does not pin core.symlinks: {gitconfig}"
+    );
+    fs::remove_dir_all(&directory).unwrap();
 }
 
 fn write_git_rewrites(cargo_home: &Path, routes: &BTreeMap<String, PathBuf>) -> io::Result<()> {

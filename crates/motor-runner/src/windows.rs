@@ -31,6 +31,8 @@ mod hvsock;
 pub(crate) mod prep;
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) mod prep_error;
+#[cfg(test)]
+mod staging;
 #[cfg(windows)]
 mod trusted_prep;
 #[cfg(unix)]
