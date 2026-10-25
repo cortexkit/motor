@@ -222,7 +222,9 @@ def verify(image):
     manifest = json.loads((image / "manifest.json").read_text())
     if manifest["version"] != image.name:
         raise ValueError("image manifest version differs from the image's directory name")
-    if load_versions(image / "versions.txt") != manifest["versions"]:
+    # Compare the raw pins, not through load_versions: that also enforces
+    # today's schema, which an image built before a schema change rightly fails.
+    if json.loads((image / "versions.txt").read_text()) != manifest["versions"]:
         raise ValueError("image's versions.txt differs from its manifest")
     for artifact, key in (("vmlinux", "kernel_sha256"), ("rootfs", "rootfs_sha256")):
         if digest(image / artifact) != manifest[key]:

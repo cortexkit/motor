@@ -258,12 +258,14 @@ class ProvisionTests(unittest.TestCase):
         # the unclean-stop record when the tenant next starts.
         self.assertTrue((home / "running.json").exists())
 
-    def test_switch_image_runs_the_hosted_image_inventory_command(self):
+    def test_switch_image_runs_the_hosted_image_integrity_command(self):
+        # `verify`, not `inventory`: a rollback switches back to an installed
+        # image whose pins rightly differ from today's versions.txt.
         with mock.patch.object(p.subprocess, "run") as execute:
             p.inventory_image(self.image)
         command = execute.call_args.args[0]
         self.assertEqual(command[1:], [str(Path(__file__).resolve().parents[1] / "tenant-image" / "build.py"),
-                                       "inventory", str(self.image)])
+                                       "verify", str(self.image)])
         self.assertTrue(execute.call_args.kwargs["check"])
 
     def test_switch_image_updates_both_records_and_builds_the_size_base(self):
