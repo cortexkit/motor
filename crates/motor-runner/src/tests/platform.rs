@@ -111,7 +111,10 @@ fn platform_refusal_precedes_ordinary_admission_checks() {
             _ => unreachable!(),
         }
         assert_eq!(
-            runner.run_refusal(&inner, &request).unwrap().0,
+            runner
+                .run_refusal(&inner, &request, &Default::default())
+                .unwrap()
+                .0,
             RefusalReason::PlatformUnsupported,
             "{obstruction} must not mask platform refusal",
         );

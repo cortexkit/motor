@@ -272,3 +272,129 @@ fn isolated_workspace_prepare_makes_fresh_target_writable_by_job_account() {
     }
     crate::isolation::restore_runner_access(&f.scratch).unwrap();
 }
+
+/// Runs one privileged helper the way the runner does, through sudo.
+fn sudo(program: &str, args: &[&str], path: &Path) {
+    let output = Command::new("/usr/bin/sudo")
+        .args(["-n", program])
+        .args(args)
+        .arg("--")
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{program} {args:?} {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn acl(path: &Path) -> String {
+    let output = Command::new("/usr/bin/getfacl")
+        .args(["-p", "--"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// A job owns its workspace root while it runs. One that chmods the root to
+/// 0700 rewrites the root's ACL mask, so the runner's named entry stays listed
+/// but grants nothing, and every later admission on the workspace used to be
+/// refused with a bare `Permission denied (os error 13)`. The runner now gives
+/// itself read access back when the job ends, and an admission that still
+/// finds the root locked repairs it and admits the job.
+#[tokio::test]
+#[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
+async fn isolated_job_that_locks_its_workspace_root_does_not_wedge_later_admissions() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.isolate_jobs = true;
+    let runner = Runner::open(config).unwrap();
+    let workspace = PathBuf::from(&f.key);
+    let (first, bytes) = f.run("mkdir -p locked/inner && chmod 000 locked && chmod 0700 .");
+    f.submit(&runner, &first, &bytes);
+    let ended = terminal(&runner, first.job_id).await;
+    assert_eq!(
+        ended.outcome,
+        Outcome::Exit { code: 0 },
+        "{:?}",
+        ended.refusal_detail()
+    );
+    base_done(&runner).await;
+    // The job left the root as the production incident did: owned by the
+    // job account at mode 0700. The runner's reclaim at job end set the mask
+    // to r-x, which stat shows as the group bits, so the runner's entry is
+    // effective again and the root is readable; the other bits stay as the
+    // job left them.
+    let metadata = fs::metadata(&workspace).unwrap();
+    assert_ne!(metadata.uid(), unsafe { libc::geteuid() });
+    assert_eq!(metadata.mode() & 0o777, 0o750, "{:o}", metadata.mode());
+    let after_job = acl(&workspace);
+    assert!(after_job.contains("mask::r-x"), "{after_job}");
+    fs::read_dir(&workspace).expect("the runner reads the root after the job ends");
+
+    // Zero the mask again the way the job did, after that reclaim: chmod as
+    // root rewrites the mask exactly as chmod by the owning job does.
+    sudo("/usr/bin/chmod", &["0700"], &workspace);
+    let locked = acl(&workspace);
+    assert!(locked.contains("mask::---"), "{locked}");
+    let error = fs::read_dir(&workspace).expect_err("the root must lock the runner out");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+    let (second, bytes) = f.run("test -d locked");
+    f.submit(&runner, &second, &bytes);
+    let ended = terminal(&runner, second.job_id).await;
+    assert_eq!(
+        ended.outcome,
+        Outcome::Exit { code: 0 },
+        "{:?}",
+        ended.refusal_detail()
+    );
+    crate::isolation::restore_runner_access(&f.scratch).unwrap();
+}
+
+/// The access repair walks the whole tree as root, so it also rescues a
+/// directory a job made unreadable below the root (mode 0000, mask zeroed),
+/// and it leaves the root's mask at r-x without changing any owner.
+#[test]
+#[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
+fn isolated_access_repair_rescues_a_directory_a_job_made_unreadable() {
+    let f = Fixture::new();
+    let root = f.scratch.join("remote/worktrees/locked");
+    let private = root.join("private");
+    fs::create_dir_all(private.join("inner")).unwrap();
+    // Setup grants the runner's ACL entry on the whole tree before a job.
+    crate::isolation::restore_runner_access(&root).unwrap();
+    let chown = Command::new("/usr/bin/sudo")
+        .args(["-n", "/usr/bin/chown", "-R", "motor-job:motor-job", "--"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        chown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&chown.stderr)
+    );
+    sudo("/usr/bin/chmod", &["000"], &private);
+    sudo("/usr/bin/chmod", &["0700"], &root);
+    assert!(fs::read_dir(&root).is_err());
+
+    crate::isolation::restore_workspace_access(&root).unwrap();
+    fs::read_dir(&root).expect("the runner reads the root after the repair");
+    fs::read_dir(&private).expect("the runner reads the locked directory after the repair");
+    fs::read_dir(private.join("inner")).expect("and what lies below it");
+    assert!(acl(&root).contains("mask::r-x"), "{}", acl(&root));
+    for path in [&root, &private] {
+        let metadata = fs::metadata(path).unwrap();
+        assert_ne!(metadata.uid(), unsafe { libc::geteuid() }, "owner kept");
+    }
+    assert_eq!(
+        fs::metadata(&private).unwrap().mode() & 0o700,
+        0,
+        "job bits kept"
+    );
+    crate::isolation::restore_runner_access(&f.scratch).unwrap();
+}

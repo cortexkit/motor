@@ -533,29 +533,46 @@ impl Backend for HostBackend {
     }
     fn materialize(&self, config: &Config, trees: &Trees, s: &Setup) -> io::Result<Prepared> {
         let r = &s.request;
-        workspace::validate_destinations(
-            &config.owned_workspace_roots,
-            if s.base { &r.cwd } else { &r.workspace_key },
-            Some(&r.cwd),
-            &r.siblings,
-        )?;
-        if config.sibling_snapshot_mode() && !s.base {
-            workspace::validate(&r.workspace_key, &r.repository_root, &r.siblings, true)?;
-            workspace::validate_alias_destinations(
+        let validate = || -> io::Result<()> {
+            workspace::validate_destinations(
                 &config.owned_workspace_roots,
-                &workspace::sibling_aliases(&r.workspace_key, &r.siblings)?,
-            )?;
-        }
-        if !s.base {
-            crate::writer::validate_paths(
-                config,
-                &r.workspace_key,
+                if s.base { &r.cwd } else { &r.workspace_key },
                 Some(&r.cwd),
                 &r.siblings,
-                &[],
             )?;
-        } else if !config.writer_enabled() {
-            return Err(io::Error::other("dependency writer account is unavailable"));
+            if config.sibling_snapshot_mode() && !s.base {
+                workspace::validate(&r.workspace_key, &r.repository_root, &r.siblings, true)?;
+                workspace::validate_alias_destinations(
+                    &config.owned_workspace_roots,
+                    &workspace::sibling_aliases(&r.workspace_key, &r.siblings)?,
+                )?;
+            }
+            if !s.base {
+                crate::writer::validate_paths(
+                    config,
+                    &r.workspace_key,
+                    Some(&r.cwd),
+                    &r.siblings,
+                    &[],
+                )?;
+            }
+            Ok(())
+        };
+        if s.base {
+            validate()?;
+            if !config.writer_enabled() {
+                return Err(io::Error::other("dependency writer account is unavailable"));
+            }
+        } else {
+            // These checks read inside the workspace before the access reclaim
+            // below runs, and the previous job may have locked the runner out
+            // of it (see `workspace_access`).
+            crate::workspace_access::validate_with_repair(
+                config,
+                &r.workspace_key,
+                &r.siblings,
+                validate,
+            )?;
         }
         let path = PathBuf::from(if s.base { &r.cwd } else { &r.workspace_key });
         #[cfg(target_os = "linux")]

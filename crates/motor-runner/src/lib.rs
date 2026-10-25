@@ -71,6 +71,7 @@ mod tree_access;
 mod vsock;
 mod windows;
 mod workspace;
+mod workspace_access;
 mod writer;
 #[cfg(target_os = "linux")]
 pub use writer::CacheFill;

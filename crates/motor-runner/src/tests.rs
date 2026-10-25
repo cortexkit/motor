@@ -77,6 +77,8 @@ mod windows_instance;
 #[cfg(target_os = "linux")]
 #[path = "tests/windows_operator.rs"]
 mod windows_operator;
+#[path = "tests/workspace_access.rs"]
+mod workspace_access;
 #[path = "tests/workspace_lifetime.rs"]
 mod workspace_lifetime;
 #[path = "tests/workspace_snapshots.rs"]
