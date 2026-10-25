@@ -38,6 +38,19 @@ class InstallScriptTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIn(path, protected)
 
+    def test_no_drive_qualified_variable_inside_double_quoted_strings(self):
+        # In PowerShell, "$Name:" in an expandable string parses as a drive-qualified
+        # variable (like $env:PATH) and the whole script fails to load. Only
+        # Windows parses these scripts, so catch it here, where CI runs.
+        scopes = 'env|script|global|local|private|using|function|variable|alias'
+        bad = re.compile(r'\$(?!(?:%s):)([A-Za-z_][A-Za-z0-9_]*):(?![:\\/])' % scopes)
+        found = []
+        for script in sorted(HERE.parent.rglob('*.ps1')):
+            for number, line in enumerate(script.read_text(errors='replace').splitlines(), 1):
+                for quoted in re.findall(r'"([^"]*)"', line):
+                    found += [f'{script.relative_to(HERE.parent)}:{number}: ${name}:' for name in bad.findall(quoted)]
+        self.assertEqual(found, [], 'write ${Name}: or $($Name): instead')
+
     def test_local_user_descriptions_fit_windows_limit(self):
         found = 0
         for script in sorted(HERE.glob("*.ps1")):

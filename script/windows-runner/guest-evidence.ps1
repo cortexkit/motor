@@ -117,7 +117,7 @@ function Wait-RunnerDiagnosticVolume([int]$DiskNumber, [int]$PartitionNumber, [i
         } catch { $lastError = [string]$_ }
         Start-Sleep -Milliseconds 100
     }
-    throw "Timed out after $TimeoutSeconds seconds waiting for a volume GUID path on disk $DiskNumber partition $PartitionNumber: $lastError"
+    throw "Timed out after $TimeoutSeconds seconds waiting for a volume GUID path on disk $DiskNumber partition ${PartitionNumber}: $lastError"
 }
 
 function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action, [string]$EvidenceDirectory, [int]$VolumeWaitSeconds = 15) {
