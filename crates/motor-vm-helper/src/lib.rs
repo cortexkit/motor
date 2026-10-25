@@ -66,6 +66,12 @@ pub enum Request {
     Ensure {
         tenant: String,
     },
+    PrepareStart {
+        tenant: String,
+    },
+    Activate {
+        tenant: String,
+    },
     #[serde(alias = "attach-disk")]
     AttachDisk {
         tenant: String,
@@ -403,6 +409,10 @@ impl<M: Machine> Helper<M> {
                 Ok(Response::new(Reply::List { slots }))
             }
             Request::Ensure { tenant } => self.tenant(&tenant, tenant::Operation::Ensure),
+            Request::PrepareStart { tenant } => {
+                self.tenant(&tenant, tenant::Operation::PrepareStart)
+            }
+            Request::Activate { tenant } => self.tenant(&tenant, tenant::Operation::Activate),
             Request::AttachDisk { tenant } => self.tenant(&tenant, tenant::Operation::AttachDisk),
             Request::Suspend { tenant } => self.tenant(&tenant, tenant::Operation::Suspend),
             Request::Restore { tenant } => self.tenant(&tenant, tenant::Operation::Restore),

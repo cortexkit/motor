@@ -1,6 +1,6 @@
 //! What a registered host advertises in its heartbeat, and the two gates that
-//! zero parts of it: the host storage refusal latch and a tenant's start
-//! refusal. The broker places leases only on hosts whose `free_vcpus` and
+//! zero parts of it: the host storage refusal latch and a tenant's pending or
+//! refused start. The broker places leases only on hosts whose `free_vcpus` and
 //! `free_mem_mib` cover the job, so these values decide where work goes, while
 //! [`Host::claim`] stays the real admission gate.
 use super::{Host, Tenant};
@@ -51,6 +51,7 @@ pub(crate) struct TenantAdvert {
     /// logged once when it starts.
     memory_case: Option<MemoryCase>,
     start_refused: Option<StartRefusal>,
+    wake_pending: bool,
 }
 
 struct MemorySample {
@@ -239,14 +240,36 @@ impl Host {
     pub(super) fn start_succeeded(&mut self, tenant: &str) {
         if let Some(advert) = self.advert.get_mut(tenant) {
             advert.start_refused = None;
+            advert.wake_pending = false;
         }
+    }
+
+    /// Cold capacity can attract the first lease, but an in-flight wake must
+    /// not attract more work before guest initialization and activation finish.
+    pub(crate) fn start_pending(&mut self, tenant: &str) {
+        self.advert
+            .entry(tenant.to_owned())
+            .or_default()
+            .wake_pending = true;
+    }
+
+    pub(crate) fn start_attempt_failed(&mut self, tenant: &str) {
+        if let Some(advert) = self.advert.get_mut(tenant) {
+            advert.wake_pending = false;
+        }
+    }
+
+    fn start_fenced(&self, tenant: &str) -> bool {
+        self.advert
+            .get(tenant)
+            .is_some_and(|a| a.wake_pending || a.start_refused.is_some())
     }
 
     /// The heartbeat's `free_vcpus` term for one tenant: its permit budget
     /// minus the counted claims, whether the VM is running, stopped,
-    /// suspended or waking; 0 while it is start-refused.
+    /// or suspended; 0 while a wake is pending or start-refused.
     pub(crate) fn tenant_free_vcpus(&self, tenant: &Tenant, now_ms: u64) -> u64 {
-        if self.start_refusal(&tenant.tenant).is_some() {
+        if self.start_fenced(&tenant.tenant) {
             return 0;
         }
         u64::from(
@@ -260,7 +283,7 @@ impl Host {
     /// place the lease that wakes it; a running tenant advertises its guest's
     /// measured available memory. Both are floored to MiB and reduced by
     /// `tenant_memory_reserve_bytes` rounded up to whole MiB, saturating at
-    /// 0. A running tenant without a usable sample, a start-refused tenant,
+    /// 0. A running tenant without a usable sample, a pending/refused start,
     /// and any tenant while no valid capacity file has been read advertise 0.
     /// Logs each running tenant's unusable-sample case once when it starts.
     pub fn free_mem_mib(&mut self, now_ms: u64) -> u64 {
@@ -279,7 +302,7 @@ impl Host {
         else {
             return 0;
         };
-        if self.start_refusal(&tenant.tenant).is_some() {
+        if self.start_fenced(&tenant.tenant) {
             return 0;
         }
         if !self.is_ready(&tenant.tenant) || self.is_suspending(&tenant.tenant) {

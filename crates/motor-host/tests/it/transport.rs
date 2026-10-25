@@ -77,7 +77,13 @@ impl Control for Fake {
 }
 fn fixture() -> (Arc<Runtime>, Arc<Fake>, SigningKey, SigningKey, Claims) {
     let fake = Arc::new(Fake::default());
-    let runtime = Runtime::new("host".into(), host(), fake.clone());
+    let (runtime, broker, requester, c) = fixture_with_control(fake.clone());
+    (runtime, fake, broker, requester, c)
+}
+pub(super) fn fixture_with_control(
+    control: Arc<dyn Control>,
+) -> (Arc<Runtime>, SigningKey, SigningKey, Claims) {
+    let runtime = Runtime::new("host".into(), host(), control);
     let broker = SigningKey::from_bytes(&[7; 32]);
     let requester = SigningKey::from_bytes(&[8; 32]);
     runtime
@@ -94,7 +100,7 @@ fn fixture() -> (Arc<Runtime>, Arc<Fake>, SigningKey, SigningKey, Claims) {
     c.cnf.jkt = RequesterJwk::from_key(&requester.verifying_key())
         .thumbprint()
         .unwrap();
-    (runtime, fake, broker, requester, c)
+    (runtime, broker, requester, c)
 }
 
 #[tokio::test]
@@ -304,7 +310,7 @@ async fn lease_admitted_before_a_start_refusal_is_refused_at_delivery_without_a_
     assert!(task.await.unwrap().is_err());
     assert!(fake.calls.lock().unwrap().is_empty());
 }
-async fn hello(
+pub(super) async fn hello(
     client: &mut (impl AsyncRead + AsyncWrite + Unpin),
     broker: &SigningKey,
     requester: &SigningKey,
@@ -314,7 +320,7 @@ async fn hello(
     write_frame(client,&json!({"type":"lease_hello","v":1,"token":token,"requester_jwk":RequesterJwk::from_key(&requester.verifying_key())})).await.unwrap();
     read_frame(client).await.unwrap()
 }
-async fn respond(
+pub(super) async fn respond(
     client: &mut (impl AsyncRead + AsyncWrite + Unpin),
     requester: &SigningKey,
     c: &Claims,
@@ -1974,4 +1980,46 @@ async fn attach_after_the_job_ended_replays_the_rest_through_the_hosted_terminal
     assert_clean_eof(&mut client).await;
     drop(client);
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn untyped_wake_failure_withdraws_cold_capacity_and_refreshes_the_retry_deadline() {
+    let (runtime, fake, broker, requester, claims) = fixture();
+    *fake.fail.lock().unwrap() = Some("wake");
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut client, &broker, &requester, &claims).await;
+    assert_eq!(
+        respond(&mut client, &requester, &claims, challenge).await,
+        json!({"type":"lease_ok"})
+    );
+    write_frame(&mut client, &json!({"type":"hello","protocol_version":1}))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_frame(&mut client).await.unwrap(),
+        json!({"type":"lease_refused","reason":"internal_failure"})
+    );
+    assert!(task.await.unwrap().is_err());
+    let retry_at = {
+        let host = runtime.host.lock().unwrap();
+        assert!(!host.is_ready("tenant"));
+        assert_eq!(host.start_refusal_case("tenant"), Some("initialization"));
+        assert_eq!(host.heartbeat(unix_ms(), 0, true).free_vcpus, 0);
+        host.start_retry_at("tenant").unwrap()
+    };
+    assert!(runtime.retry_refused_starts(retry_at).is_err());
+    let next = runtime
+        .host
+        .lock()
+        .unwrap()
+        .start_retry_at("tenant")
+        .unwrap();
+    assert_eq!(next, retry_at + motor_host::state::START_RETRY_MS);
+    *fake.fail.lock().unwrap() = None;
+    runtime.retry_refused_starts(next).unwrap();
+    let host = runtime.host.lock().unwrap();
+    assert!(host.is_ready("tenant"));
+    assert_eq!(host.start_retry_at("tenant"), None);
+    assert_eq!(host.heartbeat(unix_ms(), 0, true).free_vcpus, 2);
 }

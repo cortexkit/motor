@@ -7,6 +7,9 @@ mod capacity;
 mod closure;
 mod enroll;
 mod helper;
+mod resize;
+#[cfg(target_os = "linux")]
+mod resize_operator;
 mod transport;
 
 use motor_host::journal::{FileJournal, Journal};

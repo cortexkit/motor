@@ -86,7 +86,7 @@ fn unexpected_nonblocking_guest_control_is_not_mislabeled_timeout() {
     assert!(!detail.contains("timed out waiting"), "{detail}");
 }
 
-fn descriptor_reply(stream: &UnixStream, fd: &UnixStream) {
+pub(super) fn descriptor_reply(stream: &UnixStream, fd: &UnixStream) {
     let bytes = b"{\"result\":\"relay\",\"fd_count\":1}\n";
     let mut iov = libc::iovec {
         iov_base: bytes.as_ptr().cast_mut().cast(),
@@ -128,7 +128,7 @@ fn helper_initialization_holds_one_vcpu_until_attach_or_post_restore_reply() {
                     json!({"result":"tenant", "running":false, "restored":false, "generation":1}),
                 ),
                 (
-                    "ensure",
+                    "prepare_start",
                     json!({"result":"tenant", "running":true, "restored":restored, "generation":2}),
                 ),
                 (
@@ -136,6 +136,7 @@ fn helper_initialization_holds_one_vcpu_until_attach_or_post_restore_reply() {
                     json!({"result":"tenant", "running":true, "restored":restored, "generation":2}),
                 ),
                 ("open_relay", json!(null)),
+                ("activate", json!({"result":"tenant","running":true})),
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut line = String::new();
@@ -193,7 +194,7 @@ fn recovery_guest_pass_clears_flag_but_failure_or_unreachable_guest_keeps_tenant
         let socket = directory.path().join("helper.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let worker = std::thread::spawn(move || {
-            for op in ["adopt", "ensure", "set_cpu_max", "open_relay"] {
+            for op in ["adopt", "prepare_start", "set_cpu_max", "open_relay"] {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut line = String::new();
                 BufReader::new(stream.try_clone().unwrap())
@@ -234,6 +235,16 @@ fn recovery_guest_pass_clears_flag_but_failure_or_unreachable_guest_keeps_tenant
                     json!({"result":"tenant","running":true,"generation":2})
                 )
                 .unwrap();
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&line).unwrap()["op"],
+                    "activate"
+                );
+                writeln!(stream, "{}", json!({"result":"tenant","running":true})).unwrap();
             }
         });
         let helper = Helper {
@@ -270,7 +281,7 @@ fn helper_start_refused_reply_is_a_typed_start_refusal_and_stops_the_wake() {
                 json!({"result":"tenant","running":false,"restored":false,"generation":1}),
             ),
             (
-                "ensure",
+                "prepare_start",
                 json!({"result":"start_refused","case":"fit","message":"reserved_bytes=1 exceeds MemTotal_bytes=0"}),
             ),
         ] {
@@ -305,4 +316,42 @@ fn helper_start_refused_reply_is_a_typed_start_refusal_and_stops_the_wake() {
     // The helper reads its configured capacity file; an incomplete one is refused.
     std::fs::write(directory.path().join("capacity.json"), "{}").unwrap();
     assert!(helper.capacity().is_err());
+}
+
+#[test]
+fn adopted_vm_must_still_be_running_after_idempotent_activation() {
+    let directory = scratch();
+    let socket = directory.path().join("helper.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let worker = std::thread::spawn(move || {
+        for (op, running) in [("adopt", true), ("activate", false), ("stop_tenant", false)] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["op"], op);
+            writeln!(
+                stream,
+                "{}",
+                json!({"result":"tenant","running":running,"generation":2})
+            )
+            .unwrap();
+        }
+    });
+    let helper = Helper {
+        socket,
+        storage: directory.path().into(),
+        capacity: directory.path().join("capacity.json"),
+        guest_init: BTreeMap::new(),
+    };
+    let error = helper.wake("tenant", Some(2)).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<motor_host::helper::StartRefused>()
+            .unwrap()
+            .case,
+        "activation"
+    );
+    worker.join().unwrap();
 }
