@@ -6,9 +6,34 @@ use std::{
 
 pub(crate) use crate::JOB_MEMORY_PROPERTIES;
 
-/// Refuse execution rather than let systemd synthesize an uncapped implicit slice
-/// when an operator has not yet installed the shared memory policy.
-pub(crate) fn require_job_memory_budget() -> io::Result<()> {
+/// Stands in for the slice's memory ceiling when no usable budget was read.
+/// No slice can have this `MemoryMax`, so it refuses nothing.
+pub(crate) const NO_JOB_MEMORY_BUDGET: u64 = u64::MAX;
+
+/// What the shared jobs slice allows a job unit to request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JobMemoryBudget {
+    /// The slice's `MemoryMax`: the most memory the slice as a whole may use.
+    pub(crate) max: u64,
+    /// The slice's `MemoryHigh`: from here the kernel throttles the whole slice.
+    /// No decision reads it, but it is part of the same reading and the policy
+    /// check requires it to sit strictly below `max`.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub(crate) high: u64,
+}
+
+impl JobMemoryBudget {
+    /// The budget with a remembered ceiling. Only the ceiling drives a
+    /// decision, so callers that cache it do not keep the whole reading.
+    pub(crate) fn from_max(max: u64) -> Option<Self> {
+        (max != NO_JOB_MEMORY_BUDGET).then_some(Self { max, high: 0 })
+    }
+}
+
+/// Read the shared jobs slice's limits. Refuses rather than letting systemd
+/// synthesize an uncapped implicit slice when an operator has not yet
+/// installed the shared memory policy.
+pub(crate) fn read_job_memory_budget() -> io::Result<JobMemoryBudget> {
     let output = systemctl(
         &[
             "show",
@@ -17,21 +42,26 @@ pub(crate) fn require_job_memory_budget() -> io::Result<()> {
         ],
         false,
     )?;
+    job_memory_budget(&output).ok_or_else(|| io::Error::other("motor-jobs.slice has no finite shared memory budget; install the runner system units before admitting jobs"))
+}
+
+/// The jobs slice's limits from a `systemctl show` reply, or `None` when the
+/// slice has no finite `MemoryMax` greater than its `MemoryHigh`. `None` means
+/// jobs must not run: systemd would otherwise give them an uncapped slice.
+pub(crate) fn job_memory_budget(output: &Output) -> Option<JobMemoryBudget> {
     let text = String::from_utf8_lossy(&output.stdout);
     let number = |key| {
         text.lines()
             .find_map(|line| line.strip_prefix(key))
             .and_then(|n| n.parse::<u64>().ok())
     };
-    if output.status.success()
-        && number("MemoryHigh=")
-            .zip(number("MemoryMax="))
-            .is_some_and(|(high, max)| high > 0 && high < max && max < u64::MAX)
-    {
-        Ok(())
-    } else {
-        Err(io::Error::other("motor-jobs.slice has no finite shared memory budget; install the runner system units before admitting jobs"))
-    }
+    output
+        .status
+        .success()
+        .then(|| number("MemoryHigh=").zip(number("MemoryMax=")))
+        .flatten()
+        .filter(|(high, max)| *high > 0 && high < max && *max < u64::MAX)
+        .map(|(high, max)| JobMemoryBudget { max, high })
 }
 
 #[cfg(test)]
@@ -114,9 +144,10 @@ pub(crate) fn private_pids_capability(version: &str, boat_profile: bool) -> io::
     Ok(major >= 257 && !boat_profile)
 }
 
+/// Whether the manager behind a `systemctl show --property=Version` reply can
+/// give job units `PrivatePIDs`.
 #[cfg(target_os = "linux")]
-pub(crate) fn job_private_pids(boat_profile: bool) -> io::Result<bool> {
-    let output = systemctl(&["show", "--property=Version", "--value"], false)?;
+pub(crate) fn manager_private_pids(output: &Output, boat_profile: bool) -> io::Result<bool> {
     if !output.status.success() {
         return Err(io::Error::other(
             "cannot query systemd manager capabilities",

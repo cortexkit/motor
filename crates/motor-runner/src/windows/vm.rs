@@ -264,7 +264,7 @@ impl Resources {
             ));
         }
         #[cfg(target_os = "linux")]
-        crate::systemd::require_job_memory_budget()?;
+        crate::systemd::read_job_memory_budget()?;
         self.child = Box::new(SystemdChild {
             child: Command::new("/usr/bin/sudo")
                 .args(args)

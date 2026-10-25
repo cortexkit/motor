@@ -32,6 +32,8 @@ mod git_dependencies;
 mod health;
 #[path = "tests/held_prerequisites.rs"]
 mod held_prerequisites;
+#[path = "tests/jobs_slice.rs"]
+mod jobs_slice;
 #[path = "tests/migration.rs"]
 mod migration;
 #[path = "tests/monitoring.rs"]

@@ -174,7 +174,7 @@ fn isolated_job_memory_budget_and_oom_priority_protect_runner() {
     let group = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
     assert!(!group.contains("/motor-jobs.slice"), "{group}");
 
-    crate::systemd::require_job_memory_budget().unwrap();
+    crate::systemd::read_job_memory_budget().unwrap();
     let group = Path::new("/sys/fs/cgroup/motor.slice/motor-jobs.slice");
     let limit = |name| {
         fs::read_to_string(group.join(name))
@@ -696,6 +696,39 @@ fn capped_cpu_placement_keeps_requested_memory_limit() {
     ));
 }
 
+#[test]
+fn job_memory_limit_never_exceeds_the_slice_memory_max() {
+    let f = Fixture::new();
+    // A 24 GiB slice: the value the capacity file uses for `jobs_min_bytes`.
+    let slice = crate::systemd::JobMemoryBudget {
+        max: 25_769_803_776,
+        high: 21_474_836_480,
+    };
+    let memory_max = |vcpus, budget| {
+        let sandbox = match budget {
+            Some(budget) => f.command_sandbox().with_slice_budget(budget),
+            None => f.command_sandbox(),
+        };
+        let command = sandbox
+            .command("nproc", &f.workspace, &[], true, &[], vcpus)
+            .unwrap();
+        command
+            .get_args()
+            .filter_map(|arg| arg.to_str())
+            .find_map(|arg| arg.strip_prefix("--property=MemoryMax="))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+    };
+    // A request above the slice asks for the slice's own limit: the unit can
+    // never be granted more, and the slice still reports an overrun as an OOM.
+    assert_eq!(memory_max(30, Some(slice)), 25_769_803_776);
+    // A request below the slice keeps its own limit.
+    assert_eq!(memory_max(2, Some(slice)), 17_179_869_184);
+    // Unread, a runner keeps the requested limit as before.
+    assert_eq!(memory_max(30, None), 112_742_891_520);
+}
+
 struct Fixture {
     cleanup: crate::test_cleanup::Cleanup,
     scratch: PathBuf,
@@ -762,6 +795,7 @@ impl Fixture {
             cache_generation: None,
             parent_umask: 0o022,
             memory_floor_gib: None,
+            slice_budget: std::sync::Mutex::new(None),
             user: USER,
             writer: false,
         }
@@ -776,6 +810,54 @@ impl Drop for Fixture {
         }
     }
 }
+/// A job unit asks for the slice's `MemoryMax` at most, and keeps its own
+/// smaller request. The claim is derived from the slice actually read, so the
+/// fixture holds on any host size. This starts a real sandbox and reads the
+/// live slice, so it is an operator fixture:
+///
+/// ```text
+/// cargo test -p motor-runner --lib -- --ignored isolated_job_unit_memory_max_is_clamped_to_the_jobs_slice
+/// ```
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires root and the motor-job account: it starts a real job unit"]
+fn isolated_job_unit_memory_max_is_clamped_to_the_jobs_slice() {
+    let slice = crate::systemd::read_job_memory_budget().unwrap();
+    let f = Fixture::new();
+    let memory_max = |sandbox: &Sandbox, vcpus: u32| {
+        let command = sandbox
+            .command("true", &f.workspace, &[], true, &[], vcpus)
+            .unwrap();
+        command
+            .get_args()
+            .filter_map(|arg| arg.to_str())
+            .find_map(|arg| arg.strip_prefix("--property=MemoryMax="))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let sandbox = f
+        .sandbox()
+        .with_slice_budget(slice)
+        .with_memory_floor_gib(Some(16));
+    // The smallest claim among the 32 vCPUs a VM may use whose own limit the
+    // slice clamps. A slice above all of them cannot show a clamp at all.
+    let claim = (1..=32).find(|vcpus| crate::backend::memory_max(*vcpus, Some(16)) > slice.max);
+    let Some(claim) = claim else {
+        eprintln!(
+            "slice MemoryMax={} is above every admissible job limit; nothing to clamp",
+            slice.max
+        );
+        return;
+    };
+    assert_eq!(memory_max(&sandbox, claim), slice.max);
+    // A claim below the clamp keeps the job's own limit.
+    assert_eq!(
+        memory_max(&sandbox, 2),
+        crate::backend::memory_max(2, Some(16))
+    );
+}
+
 fn output(
     sandbox: &Sandbox,
     command: &str,
@@ -893,6 +975,7 @@ fn systemd_job_command_preserves_shell_source_and_forces_private_tmp() {
         cache_generation: None,
         parent_umask: 0o022,
         memory_floor_gib: None,
+        slice_budget: std::sync::Mutex::new(None),
         user: USER,
         writer: false,
     };
@@ -1386,6 +1469,7 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 cache_generation: None,
                 parent_umask: 0o022,
                 memory_floor_gib: None,
+                slice_budget: std::sync::Mutex::new(None),
                 user: USER,
                 writer: false,
             };
@@ -1441,6 +1525,7 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 cache_generation: None,
                 parent_umask: 0o022,
                 memory_floor_gib: None,
+                slice_budget: std::sync::Mutex::new(None),
                 user: USER,
                 writer: false,
             };
@@ -1892,6 +1977,7 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
         cache_generation: None,
         parent_umask: 0o022,
         memory_floor_gib: None,
+        slice_budget: std::sync::Mutex::new(None),
         user: USER,
         writer: false,
     };

@@ -31,8 +31,44 @@ fn assert_oom_detail_uses_configured_limits(runner: &Runner, job: &Job, detail: 
 fn oom_detail_keeps_per_job_limit_and_advice_without_claiming_which_budget_was_hit() {
     let config = Config::new("unused", "main");
     assert_eq!(
-        crate::engine::oom_memory_limit_detail(&config, 2, 8),
+        crate::engine::oom_memory_limit_detail(
+            &config,
+            2,
+            8,
+            crate::systemd::NO_JOB_MEMORY_BUDGET
+        ),
         "the kernel OOM-killed a process and the job was stopped (per-job memory limit of 16 GiB; the shared host memory budget also applies). Request more vCPUs, for example linux,8c, to raise the limit to 28 GiB."
+    );
+}
+
+/// A job limit the jobs slice clamps cannot be raised by asking for more
+/// vCPUs, so the OOM advice stops recommending that: the job is already at
+/// the ceiling the host allows. A slice above the job's request leaves the
+/// advice as it was.
+#[test]
+fn oom_advice_stops_recommending_more_vcpus_when_the_slice_caps_the_limit() {
+    let config = Config::new("unused", "main");
+    // A 24 GiB slice, below the 30 GiB an 8-vCPU request would ask for.
+    let capped = crate::engine::oom_memory_limit_detail(&config, 8, 30, 25_769_803_776);
+    assert!(
+        !capped.contains("Request more vCPUs"),
+        "a clamped job cannot buy memory with vCPUs: {capped}"
+    );
+    assert!(
+        capped.contains("already at the maximum of 8 vCPUs"),
+        "{capped}"
+    );
+    // Through the whole detail: a 30-vCPU job needs 112742891520 bytes, above
+    // the 24 GiB slice, so more vCPUs are not the answer and the OOM figures
+    // still name the job's own limit.
+    let whole = crate::engine::oom_memory_limit_detail(&config, 30, 32, 25_769_803_776);
+    assert!(!whole.contains("Request more vCPUs"), "{whole}");
+    assert!(whole.contains("per-job memory limit of 105 GiB"), "{whole}");
+    // A slice above every admissible request changes nothing.
+    let raised = crate::engine::oom_memory_limit_detail(&config, 2, 8, 112_742_891_520);
+    assert!(
+        raised.contains("Request more vCPUs, for example linux,8c"),
+        "{raised}"
     );
 }
 
