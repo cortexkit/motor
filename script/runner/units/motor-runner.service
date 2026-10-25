@@ -10,7 +10,7 @@ Environment=HOME=/home/ubuntu
 Environment=CARGO_HOME=/srv/build/cargo-home
 Environment=RUSTUP_HOME=/home/ubuntu/.rustup
 Environment=PATH=/srv/build/cargo-home/bin:/home/ubuntu/.bun/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/home/ubuntu/.cargo/bin/motor-runner serve --instance main --max-weight 80 --job-network veth --windows-cpus 12-15 --windows-slot-lock /srv/build/motor-windows/slot.lock
+ExecStart=/home/ubuntu/.cargo/bin/motor-runner serve --instance main --max-weight 96 --job-network veth --windows-cpus 12-15 --windows-slot-lock /srv/build/motor-windows/slot.lock --remote-cache true
 Restart=on-failure
 RestartSec=2
 KillMode=mixed
