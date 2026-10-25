@@ -412,6 +412,17 @@ impl Storage {
         }
         self.persistence.checkpoint(&self.state)
     }
+    pub(crate) fn pending_hosted_cancels(&self) -> Vec<Uuid> {
+        self.state
+            .lock()
+            .unwrap()
+            .jobs
+            .iter()
+            .filter_map(|(id, job)| {
+                (job.pending_cancel && job.hosted_route().is_some()).then_some(*id)
+            })
+            .collect()
+    }
     pub(crate) fn pending_finishes(&self) -> Vec<(Uuid, crate::HostedJobState)> {
         self.state
             .lock()

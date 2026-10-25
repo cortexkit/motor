@@ -240,7 +240,7 @@ async fn cancel_during_spill_provisioning_cancels_resubmitted_job_before_run() {
 }
 
 #[tokio::test]
-async fn unknown_outcome_is_withheld_until_runner_cancel_is_acknowledged() {
+async fn attach_unknown_outcome_reports_unconfirmed_cancel_and_retries() {
     let broker = crate::hosted::test_http::Http::new(|_, _| {
         (404, serde_json::json!({"error":"job_unknown"}))
     })
@@ -257,15 +257,189 @@ async fn unknown_outcome_is_withheld_until_runner_cancel_is_acknowledged() {
     motor.storage.create(id, 30, None, None, false).unwrap();
     let mut route = crate::HostedJobState::new(&config);
     route.run_sent = true;
+    route.terminal = Some(
+        TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
+            .with_refusal_detail("hosted stream disconnected before terminal"),
+    );
     motor.storage.hosted_route(id, route).unwrap();
-    let (tx, mut rx) = mpsc::channel(4);
-    assert!(motor.finish_hosted(id, false, &tx).await.is_err());
-    assert!(matches!(
-        rx.try_recv(),
-        Err(mpsc::error::TryRecvError::Empty)
-    ));
+    let records = terminal_of(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+    let [StreamRecord::Terminal(terminal)] = records.as_slice() else {
+        panic!("expected an outcome-unknown terminal, got {records:?}")
+    };
+    assert_eq!(terminal.job_id, id);
+    assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
+    assert!(terminal
+        .refusal_detail
+        .as_deref()
+        .unwrap()
+        .contains("hosted_cancel_unconfirmed"));
+    assert!(terminal
+        .refusal_detail
+        .as_deref()
+        .unwrap()
+        .contains("hosted stream disconnected before terminal"));
     assert!(motor.pending(id));
-    assert!(motor.hosted_state(id).unwrap().terminal.is_none());
+    assert_eq!(
+        motor.hosted_state(id).unwrap().terminal.as_ref(),
+        Some(terminal)
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while broker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p.ends_with("/reattach"))
+            .count()
+            < 5
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Stop the retry task after proving it runs independently of the stream.
+    motor.storage.cancel(id, false).unwrap();
+}
+
+#[tokio::test]
+async fn unknown_outcome_defers_boat_finish_until_cancel_retry_is_acknowledged() {
+    let boat = crate::hosted::boat_tests::Boat::new(0, false).await;
+    let scratch = ScratchDir::new("spill-unknown-cancel-retry-boat");
+    let repo = fixture_repo(&scratch);
+    let config = spill_config(boat.config.broker_url.as_ref().unwrap());
+    let motor = Motor::with_connector(
+        config.clone(),
+        &scratch.join("state"),
+        Arc::new(ResubmitPeer::new()),
+    )
+    .unwrap();
+    let id = Uuid::now_v7();
+    motor.storage.create(id, 30, None, None, false).unwrap();
+    motor
+        .storage
+        .hosted_route(id, crate::HostedJobState::new(&config))
+        .unwrap();
+    let path = repo.to_str().unwrap();
+    let request = RunRequest::new(path, path, path, "exit 7").with_timeout(30);
+    let (channel, _) = motor
+        .hosted_client(motor.hosted_state(id).unwrap())
+        .run(id, &request, &motor.storage)
+        .await
+        .unwrap();
+    drop(channel);
+    motor
+        .storage
+        .hosted_update(id, |s| s.run_sent = true)
+        .unwrap();
+    boat.reattach_unavailable.store(true, Ordering::SeqCst);
+    let (tx, mut rx) = mpsc::channel(4);
+    motor.finish_hosted(id, false, &tx).await.unwrap();
+    assert!(
+        matches!(rx.recv().await.unwrap().unwrap(), StreamRecord::Terminal(t) if t.outcome == Outcome::OutcomeUnknown && t.refusal_detail.as_deref().unwrap().contains("hosted_cancel_unconfirmed"))
+    );
+    assert!(motor.pending(id));
+    assert!(!boat
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(p, _)| p.ends_with("/finish")));
+    boat.reattach_unavailable.store(false, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while motor.pending(id) || !motor.hosted_state(id).unwrap().finish_done {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(boat
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|f| matches!(f, Frame::Cancel(c) if c.job_id == id)));
+    assert!(boat
+        .requests
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .0
+        .ends_with("/finish"));
+}
+
+#[tokio::test]
+async fn restart_retries_unknown_hosted_cancel_before_boat_finish() {
+    let boat = crate::hosted::boat_tests::Boat::new(0, false).await;
+    let scratch = ScratchDir::new("spill-unknown-cancel-restart");
+    let repo = fixture_repo(&scratch);
+    let config = spill_config(boat.config.broker_url.as_ref().unwrap());
+    let motor = Motor::with_connector(
+        config.clone(),
+        &scratch.join("state"),
+        Arc::new(ResubmitPeer::new()),
+    )
+    .unwrap();
+    let id = Uuid::now_v7();
+    motor.storage.create(id, 30, None, None, false).unwrap();
+    motor
+        .storage
+        .hosted_route(id, crate::HostedJobState::new(&config))
+        .unwrap();
+    let path = repo.to_str().unwrap();
+    let request = RunRequest::new(path, path, path, "exit 7").with_timeout(30);
+    let (channel, _) = motor
+        .hosted_client(motor.hosted_state(id).unwrap())
+        .run(id, &request, &motor.storage)
+        .await
+        .unwrap();
+    drop(channel);
+    // Persist the state left when an unknown terminal was delivered before a
+    // cancellation acknowledgement, then reopen without an in-memory worker.
+    let terminal = TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
+        .with_refusal_detail("hosted_cancel_unconfirmed: cancellation intent retained for retry");
+    motor
+        .storage
+        .hosted_update(id, |s| {
+            s.run_sent = true;
+            s.terminal = Some(terminal.clone());
+        })
+        .unwrap();
+    motor.storage.cancel(id, true).unwrap();
+    motor.storage.terminal_observed(id).unwrap();
+    motor.close().await;
+    boat.reattach_unavailable.store(true, Ordering::SeqCst);
+    let motor = Motor::with_connector(
+        config,
+        &scratch.join("state"),
+        Arc::new(ResubmitPeer::new()),
+    )
+    .unwrap();
+    assert!(motor.pending(id));
+    motor.resume_finishes().await;
+    assert!(motor.pending(id));
+    assert!(!boat
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(p, _)| p.ends_with("/finish")));
+    boat.reattach_unavailable.store(false, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while motor.pending(id) || !motor.hosted_state(id).unwrap().finish_done {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(motor.hosted_state(id).unwrap().terminal, Some(terminal));
+    assert!(boat
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|f| matches!(f, Frame::Cancel(c) if c.job_id == id)));
 }
 
 /// A job routed hosted by configuration, not by a spill, goes through the

@@ -23,6 +23,7 @@ pub(crate) struct Boat {
     pub strict_attach: Arc<AtomicBool>,
     pub hang_run: Arc<AtomicBool>,
     pub hold_provisioning: Arc<AtomicBool>,
+    pub reattach_unavailable: Arc<AtomicBool>,
     pub run_refusal: Arc<Mutex<Option<RunRefusal>>>,
     _http: Http,
     _host: JoinHandle<()>,
@@ -204,7 +205,14 @@ impl Boat {
                                 return;
                             }
                             Frame::Cancel(request) => {
+                                let id = request.job_id;
                                 frames.lock().unwrap().push(Frame::Cancel(request));
+                                write_frame_async(
+                                    &mut socket,
+                                    &Frame::CancelReply(CancelReply::new(id)),
+                                )
+                                .await
+                                .unwrap();
                                 return;
                             }
                             _ => panic!("unexpected Boat frame"),
@@ -221,7 +229,10 @@ impl Boat {
         let token_mem = mem_mib.clone();
         let hold_provisioning = Arc::new(AtomicBool::new(false));
         let hold = hold_provisioning.clone();
+        let reattach_unavailable = Arc::new(AtomicBool::new(false));
+        let unavailable = reattach_unavailable.clone();
         let http=Http::new(move |path,body| {
+            if path.ends_with("/reattach") && unavailable.load(Ordering::SeqCst) { return (503, serde_json::json!({"error":"temporarily_unavailable"})); }
             if path.ends_with("/reattach") && lost_reply.load(Ordering::SeqCst) != 0 { return (409, serde_json::json!({"error":"sandbox_lost"})); }
             if path.ends_with("/finish") {return (200,serde_json::json!({"job_id":path.split('/').nth(3).unwrap(),"settled_vcpu_ms":250,"released_vcpu_ms":59750}));}
             // CLOUD admits a Boat job at booking, so release can never end it.
@@ -273,6 +284,7 @@ impl Boat {
             strict_attach,
             hang_run,
             hold_provisioning,
+            reattach_unavailable,
             run_refusal,
             _http: http,
             _host: task,

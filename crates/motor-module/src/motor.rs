@@ -150,7 +150,15 @@ impl Motor {
         self
     }
     async fn resume_finishes(&self) {
+        // A stored unknown terminal can still have unconfirmed cancellation.
+        // Resume it before settlement closes the Boat runner's attach endpoint.
+        for id in self.storage.pending_hosted_cancels() {
+            self.retry_cancel(id);
+        }
         for (id, state) in self.storage.pending_finishes() {
+            if self.pending(id) && self.hosted_state(id).is_some() {
+                continue;
+            }
             let terminal = state.terminal.clone();
             let _ = self
                 .hosted_client(state)
@@ -1721,23 +1729,38 @@ impl Motor {
                 .with_ran(Ran::Unknown("maybe".into()))
         });
         // Exhausting reattach attempts is not evidence that the runner stopped.
-        // Without a runner terminal or a confirmed lost sandbox, require an
-        // acknowledged cancel before telling the caller it is safe to move on.
+        // Attempt cancellation first, but a network failure must not leave the
+        // caller without a terminal. Retain and retry unconfirmed cancellation.
+        let mut cancel_unconfirmed = false;
         if matches!(terminal.outcome, Outcome::OutcomeUnknown)
             && state.run_sent
             && state.hosted_code.as_deref() != Some("hosted_sandbox_lost")
-            && self
-                .storage
-                .job(id)
-                .is_none_or(|job| job.terminal_observed_at_ms.is_none())
+            && (self.pending(id)
+                || self
+                    .storage
+                    .job(id)
+                    .is_none_or(|job| job.terminal_observed_at_ms.is_none()))
         {
             self.storage.cancel(id, true)?;
-            self.send_cancel(id).await?;
+            if let Err(error) = self.send_cancel(id).await {
+                self.log_hosted_failure(id, "cancel", error);
+                cancel_unconfirmed = true;
+                let detail = "hosted_cancel_unconfirmed: runner cancellation was not acknowledged; cancellation intent retained for retry";
+                terminal.refusal_detail =
+                    Some(bounded_detail(match terminal.refusal_detail.take() {
+                        Some(cause) if cause.starts_with("hosted_cancel_unconfirmed:") => cause,
+                        Some(cause) => format!("{detail}; {cause}"),
+                        None => detail.into(),
+                    }));
+            }
         }
-        if self
-            .hosted_client(self.hosted_state(id).unwrap())
-            .finish(id, Some(&terminal), &self.storage)
-            .await?
+        // Settling a Boat booking makes its runner impossible to reattach.
+        // Leave it available for cancellation retries until one is acknowledged.
+        if !cancel_unconfirmed
+            && self
+                .hosted_client(self.hosted_state(id).unwrap())
+                .finish(id, Some(&terminal), &self.storage)
+                .await?
         {
             terminal = Self::sandbox_lost_terminal(id, &state);
         }
@@ -1767,6 +1790,9 @@ impl Motor {
         self.storage
             .hosted_update(id, |s| s.terminal = Some(terminal.clone()))?;
         self.storage.terminal_observed(id)?;
+        if cancel_unconfirmed {
+            self.retry_cancel(id);
+        }
         emit(tx, StreamRecord::Terminal(terminal)).await
     }
     async fn lost_sandbox(
@@ -2231,6 +2257,9 @@ impl Motor {
             self.connector_for_job(id)?;
         }
         if self.hosted_state(id).is_some_and(|s| s.terminal.is_some()) {
+            if self.pending(id) {
+                self.retry_cancel(id);
+            }
             return Ok(CancelReply::new(id));
         }
         // Mark the delivery before the intent is persisted, so the job's
@@ -2254,21 +2283,31 @@ impl Motor {
             .is_err()
         {
             tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "job cancel not delivered; retrying in the background");
-            let motor = self.clone();
-            tokio::spawn(async move {
-                let mut delay = 1;
-                while motor.pending(id) {
-                    if motor.send_cancel(id).await.is_ok() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                    delay = (delay * 2).min(30);
-                }
-            });
+            self.retry_cancel(id);
         } else {
             tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "job cancel delivered to runner");
         }
         Ok(CancelReply::new(id))
+    }
+    fn retry_cancel(&self, id: Uuid) {
+        let motor = self.clone();
+        tokio::spawn(async move {
+            let mut delay = 1;
+            while motor.pending(id) {
+                if motor.send_cancel(id).await.is_ok() {
+                    if let Some(state) = motor.hosted_state(id).filter(|s| s.terminal.is_some()) {
+                        let terminal = state.terminal.clone();
+                        let _ = motor
+                            .hosted_client(state)
+                            .finish(id, terminal.as_ref(), &motor.storage)
+                            .await;
+                    }
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                delay = (delay * 2).min(30);
+            }
+        });
     }
     pub async fn status(&self) -> StatusReply {
         self.disk_status().await.status
