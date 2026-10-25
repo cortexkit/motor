@@ -3320,16 +3320,18 @@ impl Runner {
         self.core
             .slice_budget
             .store(max, std::sync::atomic::Ordering::Relaxed);
+        // Only Linux hosts carry an operator capacity file; elsewhere no
+        // budget is declared.
         #[cfg(target_os = "linux")]
         let declared_min = crate::job_memory_budget::read_declared_jobs_min(Path::new(
             "/etc/motor-host/capacity.json",
-        ));
+        ))
+        .unwrap_or(crate::job_memory_budget::NO_JOB_MEMORY_BUDGET);
         #[cfg(not(target_os = "linux"))]
-        let declared_min = None;
-        self.core.declared_jobs_min.store(
-            declared_min.unwrap_or(crate::job_memory_budget::NO_JOB_MEMORY_BUDGET),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let declared_min = crate::job_memory_budget::NO_JOB_MEMORY_BUDGET;
+        self.core
+            .declared_jobs_min
+            .store(declared_min, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn run_refusal(
