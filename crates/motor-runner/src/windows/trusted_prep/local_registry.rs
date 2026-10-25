@@ -684,8 +684,8 @@ pub(super) fn write_job_cargo_config(
 /// honoured a tracked symlink would resolve it inside the guest.
 #[test]
 fn job_gitconfig_pins_symlinks_off() {
-    let directory =
-        std::env::temp_dir().join(format!("motor-winagent-gitconfig-{}", std::process::id()));
+    let directory = cortexkit_test_support::scratch_root()
+        .join(format!("motor-winagent-gitconfig-{}", std::process::id()));
     let cargo_home = directory.join("cargo-home");
     fs::create_dir_all(&cargo_home).unwrap();
     write_job_cargo_config(&cargo_home, None).unwrap();
