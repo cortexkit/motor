@@ -966,10 +966,13 @@ def protect_vmm(pid, proc=None, oom=None, reread=None):
     """Give the VMM an OOM score below jobs (+900) and above runners (-900).
 
     The jailer execs Firecracker in place, so the jailer's pid is the VMM's.
-    A set or read-back failure is fatal: a VMM ranked like a job could be the
-    kernel's first victim on a host whose memory is already over-committed.
-    `proc` and `oom` are the process's own /proc directory; tests pass a
-    scratch directory instead.
+    The score is set right after spawn, often before that exec, so the process
+    may still be named `jailer`; oom_score_adj survives execve, so setting it
+    then protects the VMM all the same. The pid is our own unreaped child, so
+    nothing else can hold it. A set or read-back failure is fatal: a VMM ranked
+    like a job could be the kernel's first victim on a host whose memory is
+    already over-committed. `proc` and `oom` are the process's own /proc
+    directory; tests pass a scratch directory instead.
     """
     own = Path("/proc") / str(int(pid))
     proc = own if proc is None else proc
@@ -978,8 +981,8 @@ def protect_vmm(pid, proc=None, oom=None, reread=None):
         comm = (proc / "comm").read_text().strip()
     except OSError as error:
         raise RuntimeError(f"cannot confirm the VMM process: {error}") from error
-    if comm != "firecracker":
-        raise RuntimeError(f"expected firecracker, comm={comm!r}")
+    if comm not in ("jailer", "firecracker"):
+        raise RuntimeError(f"expected jailer or firecracker, comm={comm!r}")
 
     def read_back():
         return (oom / "oom_score_adj").read_text()

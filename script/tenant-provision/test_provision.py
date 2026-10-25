@@ -690,8 +690,12 @@ class ProvisionTests(unittest.TestCase):
         self.assertEqual((scratch / "oom_score_adj").read_text(), "-500")
         # A wrong process, a failed write and a wrong read-back all refuse the
         # boot instead of leaving an unprotected VMM running.
+        # Right after spawn the jailer may not have exec'd Firecracker yet;
+        # the score set on it survives the exec.
+        (scratch / "comm").write_text("jailer\n")
+        self.assertEqual(p.protect_vmm(123, proc=scratch, oom=scratch)["comm"], "jailer")
         (scratch / "comm").write_text("bash\n")
-        with self.assertRaisesRegex(RuntimeError, "expected firecracker"):
+        with self.assertRaisesRegex(RuntimeError, "expected jailer or firecracker"):
             p.protect_vmm(123, proc=scratch, oom=scratch)
         (scratch / "comm").write_text("firecracker\n")
         with mock.patch.object(Path, "write_text", side_effect=OSError("injected")), \
