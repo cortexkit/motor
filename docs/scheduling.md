@@ -202,10 +202,13 @@ is permanently reserved. Tests: `capped_head_allows_backfill_only_until_its_grac
   (`crates/motor-runner/src/tests.rs`),
   `streamed_elapsed_queue_time_sets_a_local_deadline`
   (`crates/motor-module/src/queue_tests.rs`).
-- The budget is the request's `queue_wait_limit_s`, else `ck-motor`'s
-  `queue_wait_limit_s` setting (default 300 seconds). Direct `ck motor run`
-  jobs get 30 minutes. A gate job does not shorten the budget of jobs behind
-  it. Test: `worker_behind_gate_keeps_its_full_queue_wait_budget`.
+- An ordinary job's budget is the request's explicit `queue_wait_limit_s`.
+  Without one, spill-eligible jobs use `ck-motor`'s `queue_wait_limit_s` setting
+  (default 300 seconds); jobs that cannot spill get 30 minutes, capped by their
+  execution timeout when present. See the [module configuration](module.md#configuration)
+  for the rules and tests. Direct `ck motor run` gate jobs keep their fixed
+  30-minute budget. A gate job does not shorten the budget of jobs behind it.
+  Test: `worker_behind_gate_keeps_its_full_queue_wait_budget`.
 
 ## Disk admission
 

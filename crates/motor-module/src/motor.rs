@@ -264,13 +264,6 @@ impl Motor {
         // Filter before the request can enter storage, logging, or a wire frame.
         request.env.retain(|name, _| allowed_env(name));
         let id = Uuid::now_v7();
-        let wait = if gate_job {
-            30 * 60
-        } else {
-            request
-                .queue_wait_limit_s
-                .unwrap_or(self.config.queue_wait_limit_s)
-        };
         // repository_root is resolved by the caller from Git's common directory,
         // not the workspace key, which changes for each linked worktree.
         let repository_routed = !hosted_test
@@ -281,10 +274,22 @@ impl Motor {
                     .iter()
                     .any(|listed| std::fs::canonicalize(listed).is_ok_and(|listed| listed == root))
             });
-        let spill = !hosted_test
+        let spill_eligible = !hosted_test
             && !repository_routed
-            && crate::spill::eligible(&self.config, &request, gate_job, allow_gate_spill)
-            && self.config.spill_after_s <= wait;
+            && crate::spill::eligible(&self.config, &request, gate_job, allow_gate_spill);
+        let wait = if gate_job {
+            30 * 60
+        } else {
+            request.queue_wait_limit_s.unwrap_or_else(|| {
+                if spill_eligible {
+                    self.config.queue_wait_limit_s
+                } else {
+                    // Jobs that cannot spill need time to reach their turn on the runner.
+                    (30 * 60).min(request.timeout.unwrap_or(30 * 60))
+                }
+            })
+        };
+        let spill = spill_eligible && self.config.spill_after_s <= wait;
         let instance = self
             .config
             .target(request.platform.as_ref())

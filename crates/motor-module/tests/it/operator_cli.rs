@@ -1522,7 +1522,7 @@ async fn only_direct_routes_mark_gates_and_extend_the_queue_wait() {
     for (channel, override_wait, expected_wait, expected_gate) in [
         (DIRECT_CHANNEL, None, 1800, true),
         (DIRECT_CHANNEL, Some(1), 1800, true),
-        (AFT_CHANNEL, None, 300, false),
+        (AFT_CHANNEL, None, 60, false),
         (AFT_CHANNEL, Some(123), 123, false),
     ] {
         let mut request = timed(&f, "true", 60);

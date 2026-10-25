@@ -45,7 +45,7 @@ The config file is JSONC. Unknown keys are refused. All keys are optional.
 | `windows_runner_instance`, `windows_runner_state_root` | absent | Legacy Windows runner instance and absolute state root. Set both or neither; the instance must differ from `runner_instance`. Used when `windows_runners` is empty. |
 | `windows_runners` | `[]` (omitted) | Ordered Windows endpoints: `name`, `host`, `port` (22), `user`, pinned OpenSSH `host_key`, `instance`, `state_root`, `max_concurrent` (1). Takes precedence over the legacy pair. See [windows-jobs.md](windows-jobs.md). |
 | `worktree_roots` | `$XDG_DATA_HOME/cortexkit/alfonso/worktrees` | Absolute roots under which linked worktrees are recognised as task workspaces. |
-| `queue_wait_limit_s` | `300` | Default queue-wait budget for a job. |
+| `queue_wait_limit_s` | `300` | Default queue-wait budget for a spill-eligible job; see below for jobs that cannot spill. |
 | `hosted_repositories` | `[]` (omitted) | Absolute main-checkout repository roots whose ordinary Linux jobs request hosted leases instead of the direct runner. See [repository routing](#hosted-repository-routing). |
 | `network_routing` | `false` | Forward a caller's request for outbound network. When off, such requests are refused with `network_unsupported`. |
 | `admit_direct_exec` | `false` | Admit direct local callers (`ck motor run`) for their own jobs. |
@@ -55,6 +55,26 @@ The config file is JSONC. Unknown keys are refused. All keys are optional.
 
 The three test controls are refused when `runner_instance` is `main`, so a
 production configuration cannot weaken authentication or fake failures.
+
+An ordinary job's explicit `queue_wait_limit_s` always wins. Without one,
+spill-eligible jobs use the configured default (five minutes); jobs that cannot
+spill use 30 minutes, capped by the job's execution timeout when present. This
+includes net jobs, Windows jobs, jobs above `spill_max_vcpus` (eight by default),
+and jobs excluded by any other spill eligibility or routing rule. The longer
+budget lets them retain their place in the build-server queue rather than
+rejoining at the back after a refusal. Gate jobs keep their fixed 30-minute
+budget, regardless of the request's queue limit or execution timeout. The
+resolved budget is stored per job in the checkpoint/journal and reused after a
+module restart. Tests (`crates/motor-module/src/queue_tests.rs`):
+`queue_budget_16c_defaults_to_thirty_minutes`,
+`queue_budget_net_defaults_to_thirty_minutes`,
+`queue_budget_windows_defaults_to_thirty_minutes`,
+`queue_budget_disabled_spill_defaults_to_thirty_minutes`,
+`queue_budget_invalid_hosted_timeout_defaults_to_thirty_minutes`,
+`queue_budget_spill_eligible_4c_keeps_five_minutes`,
+`queue_budget_explicit_limit_wins_for_spill_and_non_spill_jobs`,
+`queue_budget_non_spill_default_is_capped_by_ten_minute_timeout`,
+`queue_budget_gate_keeps_thirty_minutes_despite_explicit_limit_and_timeout`.
 
 Source: `crates/motor-module/src/config.rs`.
 
