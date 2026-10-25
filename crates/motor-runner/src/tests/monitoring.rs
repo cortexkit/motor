@@ -1720,7 +1720,9 @@ fn unknown_id_publication_fences_admission_without_holding_state_lock() {
         let runner = runner.clone();
         move || runner.replay(id, 0)
     });
-    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    // Wait for the writer to reach the paused write without a wall-clock bound,
+    // for the same reason as the control thread below.
+    entered.recv().unwrap();
     let (mut late, _) = f.run("true");
     late.job_id = id;
     let (other, _) = f.run("true");
@@ -1739,7 +1741,13 @@ fn unknown_id_publication_fences_admission_without_holding_state_lock() {
             send.send(duplicate && admitted).unwrap();
         }
     });
-    let responsive = reply.recv_timeout(Duration::from_secs(1));
+    // Release the paused publication only after the control thread has
+    // finished, so its admissions, status reply and cancel all ran while the
+    // record write was still blocked. A wall-clock bound here fails a correct
+    // runner on a loaded host, where those durable writes can take seconds. A
+    // runner that held the state lock across the paused write would instead
+    // deadlock this wait, and the test harness's timeout reports that.
+    let responsive = reply.recv();
     drop(release);
     assert!(
         matches!(writer.join().unwrap().unwrap().last(), Some(Frame::Terminal(terminal)) if terminal.ran == Some(Ran::None))
