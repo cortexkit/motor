@@ -431,6 +431,27 @@ snapshot alone is not a completed stop: archival still requires sandbox state
 `archived` and `stop.status` `completed`. The portable regression replays both
 sizes' pending-stop observations in `fixtures/full-quota-stops.json`.
 
+A stop that does not complete names Boat's own progress first:
+`stop_at_limit.boat_stop_progress` and the failure reason classify it as
+`boat_stop_never_attempted` (every sample pending with `stop.lastAttemptAt`
+null, state `archiving`, health `ok`), `boat_stop_attempted_not_completed`, or
+`boat_stop_pending_unclassified`, and list the snapshots Boat completed during
+the wait and the snapshot attempts it began after the stop request, with the
+last attempt's status and whether the phase budget ended the wait.
+
+Boat resumes a stopped sandbox from memory (the boot id and the runner's start
+time are unchanged), so the retained job is still running at its barrier after
+resume and the runner rightly keeps its workspace. Before the resumed phase, the
+probe writes the barrier's release byte and waits up to 90 seconds for the
+job's terminal record and inactive unit;
+`disk_quota.retained_job_ended_after_resume` FAILs and stops the phase if it
+does not end. The job keeps its fill, so the resumed checks then see an idle
+workspace holding a quota-sized target, and endpoint readiness is timed from
+the release. `disk_quota.backing_allocation_dropped_after_resume` requires the
+loop file's allocation to drop by the retained target's allocation, less 1 GiB.
+`fixtures/boat-verify-c7c6127f.json` replays the run in which the job was not
+released.
+
 For a longer diagnostic wait, add `--quota-stop-wait-s 1500` to the disk-quota
 invocation below. This raises only the stop-wait cap, not the phase's budget or
 the requested `ttlSeconds: 1800`. Evidence records `requested_wait_seconds`,

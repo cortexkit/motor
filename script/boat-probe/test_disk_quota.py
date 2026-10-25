@@ -104,17 +104,23 @@ class DiskQuotaChecks(unittest.TestCase):
                 self.assertIn('--after-cursor=saved-cursor', run.call_args.args[0])
 
     def test_backing_allocation_requires_a_real_drop_on_the_expected_image(self):
-        before = dict(expected_backing=True, backing_file='/var/lib/motor-boat.xfs', backing_allocated_blocks=1000)
+        # The drop must cover the evicted retained target's allocation (less
+        # RECLAIM_SLACK_BYTES); a shrink of a few sectors is not a reclaim.
+        retained = 4 * 1024**3
+        before = dict(expected_backing=True, backing_file='/var/lib/motor-boat.xfs',
+                      backing_allocated_blocks=1000 + retained // 512)
         after = dict(before, backing_allocated_blocks=100)
-        self.assertTrue(disk_quota.backing_allocation_dropped(before, after))
-        for change in ({'backing_allocated_blocks': 1000}, {'backing_allocated_blocks': 1001},
+        self.assertTrue(disk_quota.backing_allocation_dropped(before, after, retained))
+        for change in ({'backing_allocated_blocks': before['backing_allocated_blocks']},
+                       {'backing_allocated_blocks': before['backing_allocated_blocks'] + 1},
+                       {'backing_allocated_blocks': before['backing_allocated_blocks'] - 900},
                        {'backing_allocated_blocks': None}, {'backing_allocated_blocks': True},
                        {'backing_allocated_blocks': -1}, {'expected_backing': False},
                        {'backing_file': '/other.xfs'}):
             with self.subTest(change=change):
-                self.assertFalse(disk_quota.backing_allocation_dropped(before, dict(after, **change)))
-        self.assertFalse(disk_quota.backing_allocation_dropped({}, after))
-        self.assertFalse(disk_quota.backing_allocation_dropped(before, {}))
+                self.assertFalse(disk_quota.backing_allocation_dropped(before, dict(after, **change), retained))
+        self.assertFalse(disk_quota.backing_allocation_dropped({}, after, retained))
+        self.assertFalse(disk_quota.backing_allocation_dropped(before, {}, retained))
 
     def evidence(self):
         result = dict(code=73, stdout=json.dumps(dict(lane='tmp', errno=errno.EDQUOT,
@@ -343,6 +349,96 @@ class DiskQuotaChecks(unittest.TestCase):
         for stdout in (json.dumps({'errno': None}), json.dumps([]), json.dumps({'inheritance': []}), ''):
             with self.subTest(stdout=stdout):
                 self.assertEqual(disk_quota.file_setattr_status(dict(code=0, stdout=stdout), self.control()), 'FAIL')
+
+
+class RecordedC7c6127fTests(unittest.TestCase):
+    """The phased prepared-image verify at c7c6127f (fixtures/boat-verify-c7c6127f.json)."""
+
+    @staticmethod
+    def recorded():
+        return json.loads(pathlib.Path(__file__).with_name('fixtures').joinpath('boat-verify-c7c6127f.json').read_text())
+
+    def test_recorded_large_stop_is_named_never_attempted_with_boat_snapshot_progress(self):
+        case = self.recorded()['large_quota_stop']
+        progress = disk_quota.stop_progress(case['samples'], case['stop_operation'])
+        self.assertEqual(progress['classification'], 'boat_stop_never_attempted')
+        self.assertEqual((progress['samples'], progress['stop_id'], progress['stop_attempts']),
+                         (44, 'stop_81053a3051114291', []))
+        self.assertEqual(progress['requested_at'], '2026-10-25T04:19:52.690Z')
+        # One periodic snapshot finished during the wait; the next one began a
+        # second later and was still running when the phase budget ran out.
+        self.assertEqual(progress['snapshots_completed_during_wait'], ['2026-10-25T04:29:26.827Z'])
+        self.assertEqual(progress['snapshot_attempts_after_request'], ['2026-10-25T04:29:27.847Z'])
+        self.assertEqual(progress['last_snapshot_status'], 'in_progress')
+        reason = disk_quota.stop_progress_reason(progress, case['wait'])
+        for text in ('boat_stop_never_attempted', 'stop_81053a3051114291', '2026-10-25T04:19:52.690Z', 'all 44 samples',
+                     '2026-10-25T04:29:26.827Z', '2026-10-25T04:29:27.847Z', 'phase budget ended the wait after 1284 s'):
+            self.assertIn(text, reason)
+
+    def test_recorded_default_stop_that_completed_is_not_called_never_attempted(self):
+        case = self.recorded()['default_quota_stop']
+        progress = disk_quota.stop_progress(case['samples'], case['stop_operation'])
+        self.assertEqual(progress['classification'], 'boat_stop_attempted_not_completed')
+        self.assertEqual(progress['stop_attempts'], ['2026-10-25T04:25:38.920Z'])
+        # The archive followed the periodic snapshots Boat finished meanwhile.
+        self.assertEqual(progress['snapshots_completed_during_wait'],
+                         ['2026-10-25T04:17:10.458Z', '2026-10-25T04:21:39.502Z', '2026-10-25T04:25:38.701Z'])
+        self.assertEqual(disk_quota.stop_progress([], None)['classification'], 'unobserved')
+        unhealthy = [dict(sample, sandbox=dict(sample['sandbox'], health='degraded'))
+                     for sample in self.recorded()['large_quota_stop']['samples']]
+        self.assertEqual(disk_quota.stop_progress(unhealthy)['classification'], 'boat_stop_pending_unclassified')
+
+    def test_recorded_two_mib_backing_shrink_is_not_a_reclaimed_target(self):
+        case = self.recorded()['default_resume']
+        before, after = case['backing_before'], case['backing_after']
+        retained = case['retained_at_limit']['retained_allocated_bytes']
+        # The resumed sandbox still held the 12.9 GB target; its backing file
+        # gave back only 4312 sectors.
+        self.assertEqual((before['backing_allocated_blocks'] - after['backing_allocated_blocks']) * 512, 2207744)
+        self.assertFalse(disk_quota.backing_allocation_dropped(before, after, retained))
+        reclaimed = dict(after, backing_allocated_blocks=before['backing_allocated_blocks'] - retained // 512)
+        self.assertTrue(disk_quota.backing_allocation_dropped(before, reclaimed, retained))
+        for bad in (None, 0, disk_quota.RECLAIM_SLACK_BYTES):
+            self.assertFalse(disk_quota.backing_allocation_dropped(before, reclaimed, bad))
+
+    def run_release(self, root, observation, *, ends_after_polls=1, wait_seconds=30):
+        """Run the release source against a fixture runner state; the job's
+        record gains a terminal after `ends_after_polls` waits (None: never)."""
+        record = root / 'jobs' / observation['job_id'] / 'record.json'
+        polls = []
+        def pause(_seconds):
+            polls.append(1)
+            if ends_after_polls is not None and len(polls) >= ends_after_polls:
+                record.write_text(json.dumps({'terminal': {'outcome': {'type': 'exit', 'code': 73}},
+                                              'process': {'unit': '00000000-0000-4000-8000-000000000002'}}))
+        source = quota_adversarial.retained_release(observation, wait_seconds=wait_seconds, state=str(root))
+        output = io.StringIO()
+        with patch('time.sleep', side_effect=pause), patch('subprocess.run', return_value=Mock(returncode=3)), \
+             contextlib.redirect_stdout(output):
+            exec(compile(source, '<retained-release>', 'exec'), {})
+        return json.loads(output.getvalue())
+
+    def test_recorded_retained_job_is_released_after_resume_and_ends(self):
+        observation = self.recorded()['default_resume']['retained_at_limit']
+        for token, ends, released, passed in ((observation['probe_token'], 1, True, True),
+                                              ('another-probe', 1, False, False),
+                                              (observation['probe_token'], None, True, False)):
+            with self.subTest(token=token, ends=ends), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                marker = root / 'sandboxes' / observation['job_id'] / 'home/tmp/boat-quota-at-limit.json'
+                marker.parent.mkdir(parents=True)
+                published = json.dumps({'phase': 'at-limit', 'lane': 'retained_target', 'probe_token': token}).encode()
+                marker.write_bytes(published.ljust(4096, b' '))
+                record = root / 'jobs' / observation['job_id'] / 'record.json'
+                record.parent.mkdir(parents=True)
+                # Recorded at 04:27:48: the job had started and had no terminal.
+                record.write_text(json.dumps({'started_ms': 1, 'terminal': None,
+                                              'process': {'unit': '00000000-0000-4000-8000-000000000002'}}))
+                result = self.run_release(root, observation, ends_after_polls=ends, wait_seconds=30 if ends else 0)
+                self.assertEqual(result['released'], released)
+                self.assertEqual(marker.read_bytes()[:1] == b'!', released)
+                self.assertFalse(result['terminal_before'])
+                self.assertEqual(disk_quota.retained_release_passed(result), passed)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,344 @@
+{
+ "source_revision": "c7c6127f5dfdda291c1f38609f6bd15760414480",
+ "description": "Extracts from the phased prepared-image verify of motor-boat-prepared-4c7dcddb0148 at c7c6127f (25 Oct 04:05-04:52Z), both sizes. Large: the full-quota stop was accepted and never attempted. Default: the stop completed, then after a memory-preserving resume (same boot id) the retained job still held its barrier, so the runner kept its 12.9 GB target, readiness stayed withdrawn and every job was refused runner_disk_full; prepared_clone.root_owned_paths failed on the one sandbox whose guest kernel was 7.0.0-38-generic.",
+ "large_quota_stop": {
+  "sandbox_id": "bx_pv2vg8km",
+  "stop_operation": {
+   "id": "stop_81053a3051114291",
+   "status": "pending",
+   "requestedAt": "2026-10-25T04:19:52.690Z",
+   "lastAttemptAt": null,
+   "error": null,
+   "endedAt": null
+  },
+  "accepted_at": "2026-10-25T04:19:52.775464+00:00",
+  "pre_stop_disk": {
+   "root_free_bytes": 67293958144,
+   "xfs_free_bytes": 32666849280,
+   "retained_allocated_bytes": 34355609600,
+   "backing_file": "/var/lib/motor-boat.xfs",
+   "backing_allocated_bytes": 51890475008,
+   "reserve_floor_bytes": 25769803776
+  },
+  "wait": {
+   "sandbox_id": "bx_pv2vg8km",
+   "expected_states": [
+    "archived"
+   ],
+   "seconds": 1284.005859401077,
+   "polls": 483,
+   "last_sandbox": {
+    "id": "bx_pv2vg8km",
+    "state": "archiving",
+    "error": null,
+    "health": "ok",
+    "healthReason": null,
+    "stop": {
+     "id": "stop_81053a3051114291",
+     "status": "pending",
+     "requestedAt": "2026-10-25T04:19:52.690Z",
+     "lastAttemptAt": null,
+     "error": null,
+     "endedAt": null
+    },
+    "snapshotAvailable": true,
+    "snapshotCompletedAt": "2026-10-25T04:29:26.827Z",
+    "snapshotVerifiedAt": "2026-10-25T04:29:26.827Z",
+    "lastSnapshotAttemptAt": "2026-10-25T04:29:27.847Z",
+    "lastSnapshotStatus": "in_progress"
+   },
+   "requested_wait_seconds": 1800,
+   "remaining_budget_seconds": 1282.829564605141,
+   "effective_wait_seconds": 1282.829564605141,
+   "budget_limited": true
+  },
+  "samples": [
+   {"seconds":0.12528589717112482,"at":"2026-10-25T04:19:52.900799+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293913088,"xfs_free_bytes":32666849280}},
+   {"seconds":30.837978293187916,"at":"2026-10-25T04:20:23.613490+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":61.12774121016264,"at":"2026-10-25T04:20:53.903275+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":92.70097969006747,"at":"2026-10-25T04:21:25.476494+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":121.27827966096811,"at":"2026-10-25T04:21:54.053798+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":152.28825333318673,"at":"2026-10-25T04:22:25.063775+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":180.9400214420166,"at":"2026-10-25T04:22:53.715536+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":210.43131657899357,"at":"2026-10-25T04:23:23.206850+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":240.956411780091,"at":"2026-10-25T04:23:53.731920+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":270.6696783939842,"at":"2026-10-25T04:24:23.445186+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":301.98151177796535,"at":"2026-10-25T04:24:54.757042+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":331.63465834618546,"at":"2026-10-25T04:25:24.410178+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":362.0138875320554,"at":"2026-10-25T04:25:54.789404+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":390.97326538618654,"at":"2026-10-25T04:26:23.748782+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":420.23768028616905,"at":"2026-10-25T04:26:53.013202+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":450.0895679371897,"at":"2026-10-25T04:27:22.865089+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":482.73153824801557,"at":"2026-10-25T04:27:55.507054+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":511.5976686330978,"at":"2026-10-25T04:28:24.373179+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":541.1254194800276,"at":"2026-10-25T04:28:53.900948+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293908992,"xfs_free_bytes":32666849280}},
+   {"seconds":570.807885002112,"at":"2026-10-25T04:29:23.583399+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:18:14.721Z","snapshotVerifiedAt":"2026-10-25T04:18:14.721Z","lastSnapshotAttemptAt":"2026-10-25T04:18:15.461Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293913088,"xfs_free_bytes":32666849280}},
+   {"seconds":603.4386585550383,"at":"2026-10-25T04:29:56.214171+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293892608,"xfs_free_bytes":32666849280}},
+   {"seconds":632.5122633560095,"at":"2026-10-25T04:30:25.287772+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":660.7557762269862,"at":"2026-10-25T04:30:53.531321+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":691.1388792269863,"at":"2026-10-25T04:31:23.914404+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":723.6255105671007,"at":"2026-10-25T04:31:56.401035+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":751.3449094679672,"at":"2026-10-25T04:32:24.120427+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":782.0185602910351,"at":"2026-10-25T04:32:54.794081+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":811.7903737910092,"at":"2026-10-25T04:33:24.565878+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":840.1548987249844,"at":"2026-10-25T04:33:52.930416+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":872.7320365679916,"at":"2026-10-25T04:34:25.507552+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":904.2906047289725,"at":"2026-10-25T04:34:57.066117+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":930.8047139570117,"at":"2026-10-25T04:35:23.580237+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":960.9284348920919,"at":"2026-10-25T04:35:53.703946+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":991.5730372401886,"at":"2026-10-25T04:36:24.348550+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":1020.5667866191361,"at":"2026-10-25T04:36:53.342304+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":1058.5418992771301,"at":"2026-10-25T04:37:31.317415+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":1081.5968241321389,"at":"2026-10-25T04:37:54.372340+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":1110.9140123990364,"at":"2026-10-25T04:38:23.689533+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":1140.3141590179875,"at":"2026-10-25T04:38:53.089673+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":1171.1980781289749,"at":"2026-10-25T04:39:23.973595+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":1202.0928104491904,"at":"2026-10-25T04:39:54.868343+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293904896,"xfs_free_bytes":32666849280}},
+   {"seconds":1232.8810854949988,"at":"2026-10-25T04:40:25.656599+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293900800,"xfs_free_bytes":32666849280}},
+   {"seconds":1261.7505121151917,"at":"2026-10-25T04:40:54.526033+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":34355609600,"root_free_bytes":67293900800,"xfs_free_bytes":32666849280}},
+   {"seconds":1281.9256668551825,"at":"2026-10-25T04:41:14.701177+00:00","sandbox":{"id":"bx_pv2vg8km","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_81053a3051114291","status":"pending","requestedAt":"2026-10-25T04:19:52.690Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:29:26.827Z","snapshotVerifiedAt":"2026-10-25T04:29:26.827Z","lastSnapshotAttemptAt":"2026-10-25T04:29:27.847Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"unavailable","error":"phase budget expired before guest observation"}}
+  ]
+ },
+ "default_quota_stop": {
+  "sandbox_id": "bx_a6kvzryf",
+  "stop_operation": {
+   "id": "stop_bb8bf74f905869de",
+   "status": "pending",
+   "requestedAt": "2026-10-25T04:15:53.173Z",
+   "lastAttemptAt": null,
+   "error": null,
+   "endedAt": null
+  },
+  "accepted_at": "2026-10-25T04:15:53.253166+00:00",
+  "pre_stop_disk": {
+   "root_free_bytes": 25840058368,
+   "xfs_free_bytes": 54121852928,
+   "retained_allocated_bytes": 12901679104,
+   "backing_file": "/var/lib/motor-boat.xfs",
+   "backing_allocated_bytes": 13224759296,
+   "reserve_floor_bytes": 25769803776
+  },
+  "wait": {
+   "sandbox_id": "bx_a6kvzryf",
+   "expected_states": [
+    "archived"
+   ],
+   "requested_wait_seconds": 1800,
+   "remaining_budget_seconds": 1428.7753003821708,
+   "effective_wait_seconds": 1428.7753003821708,
+   "budget_limited": true,
+   "polls": 232,
+   "seconds": 586.77381409402,
+   "last_sandbox": {
+    "id": "bx_a6kvzryf",
+    "state": "archived",
+    "error": null,
+    "health": "ok",
+    "healthReason": null,
+    "stop": {
+     "id": "stop_bb8bf74f905869de",
+     "status": "completed",
+     "requestedAt": null,
+     "lastAttemptAt": "2026-10-25T04:25:38.920Z",
+     "error": null,
+     "endedAt": "2026-10-25T04:25:38.920Z"
+    },
+    "snapshotAvailable": true,
+    "snapshotCompletedAt": "2026-10-25T04:25:38.701Z",
+    "snapshotVerifiedAt": "2026-10-25T04:25:38.701Z",
+    "lastSnapshotAttemptAt": "2026-10-25T04:21:39.673Z",
+    "lastSnapshotStatus": "completed"
+   }
+  },
+  "samples": [
+   {"seconds":0.12571412906982005,"at":"2026-10-25T04:15:53.378958+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:14:39.894Z","snapshotVerifiedAt":"2026-10-25T04:14:39.894Z","lastSnapshotAttemptAt":"2026-10-25T04:15:04.657Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25840017408,"xfs_free_bytes":54121852928}},
+   {"seconds":30.910785420099273,"at":"2026-10-25T04:16:24.164017+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:14:39.894Z","snapshotVerifiedAt":"2026-10-25T04:14:39.894Z","lastSnapshotAttemptAt":"2026-10-25T04:15:04.657Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839996928,"xfs_free_bytes":54121873408}},
+   {"seconds":61.12697637011297,"at":"2026-10-25T04:16:54.380199+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:14:39.894Z","snapshotVerifiedAt":"2026-10-25T04:14:39.894Z","lastSnapshotAttemptAt":"2026-10-25T04:15:04.657Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839992832,"xfs_free_bytes":54121873408}},
+   {"seconds":90.67706796620041,"at":"2026-10-25T04:17:23.930290+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:17:10.458Z","snapshotVerifiedAt":"2026-10-25T04:17:10.458Z","lastSnapshotAttemptAt":"2026-10-25T04:17:10.754Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839976448,"xfs_free_bytes":54121873408}},
+   {"seconds":121.6956621131394,"at":"2026-10-25T04:17:54.948887+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:17:10.458Z","snapshotVerifiedAt":"2026-10-25T04:17:10.458Z","lastSnapshotAttemptAt":"2026-10-25T04:17:10.754Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839992832,"xfs_free_bytes":54121873408}},
+   {"seconds":152.82268136600032,"at":"2026-10-25T04:18:26.075915+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:17:10.458Z","snapshotVerifiedAt":"2026-10-25T04:17:10.458Z","lastSnapshotAttemptAt":"2026-10-25T04:17:10.754Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839992832,"xfs_free_bytes":54121873408}},
+   {"seconds":181.57561002415605,"at":"2026-10-25T04:18:54.828858+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:17:10.458Z","snapshotVerifiedAt":"2026-10-25T04:17:10.458Z","lastSnapshotAttemptAt":"2026-10-25T04:17:10.754Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839992832,"xfs_free_bytes":54121873408}},
+   {"seconds":211.72908020205796,"at":"2026-10-25T04:19:24.982311+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:17:10.458Z","snapshotVerifiedAt":"2026-10-25T04:17:10.458Z","lastSnapshotAttemptAt":"2026-10-25T04:17:10.754Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839992832,"xfs_free_bytes":54121873408}},
+   {"seconds":242.08984905318357,"at":"2026-10-25T04:19:55.343073+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:17:10.458Z","snapshotVerifiedAt":"2026-10-25T04:17:10.458Z","lastSnapshotAttemptAt":"2026-10-25T04:17:10.754Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839992832,"xfs_free_bytes":54121873408}},
+   {"seconds":270.36370580503717,"at":"2026-10-25T04:20:23.616928+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:17:10.458Z","snapshotVerifiedAt":"2026-10-25T04:17:10.458Z","lastSnapshotAttemptAt":"2026-10-25T04:17:10.754Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839988736,"xfs_free_bytes":54121873408}},
+   {"seconds":300.67557470616885,"at":"2026-10-25T04:20:53.928823+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:17:10.458Z","snapshotVerifiedAt":"2026-10-25T04:17:10.458Z","lastSnapshotAttemptAt":"2026-10-25T04:17:10.754Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839988736,"xfs_free_bytes":54121873408}},
+   {"seconds":332.2233469102066,"at":"2026-10-25T04:21:25.476564+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:17:10.458Z","snapshotVerifiedAt":"2026-10-25T04:17:10.458Z","lastSnapshotAttemptAt":"2026-10-25T04:17:10.754Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839988736,"xfs_free_bytes":54121873408}},
+   {"seconds":360.80297959805466,"at":"2026-10-25T04:21:54.056210+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:21:39.502Z","snapshotVerifiedAt":"2026-10-25T04:21:39.502Z","lastSnapshotAttemptAt":"2026-10-25T04:21:39.673Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839968256,"xfs_free_bytes":54121873408}},
+   {"seconds":391.8105470351875,"at":"2026-10-25T04:22:25.063775+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:21:39.502Z","snapshotVerifiedAt":"2026-10-25T04:21:39.502Z","lastSnapshotAttemptAt":"2026-10-25T04:21:39.673Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839984640,"xfs_free_bytes":54121873408}},
+   {"seconds":420.46201366907917,"at":"2026-10-25T04:22:53.715245+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:21:39.502Z","snapshotVerifiedAt":"2026-10-25T04:21:39.502Z","lastSnapshotAttemptAt":"2026-10-25T04:21:39.673Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839984640,"xfs_free_bytes":54121873408}},
+   {"seconds":452.44266548310407,"at":"2026-10-25T04:23:25.695887+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:21:39.502Z","snapshotVerifiedAt":"2026-10-25T04:21:39.502Z","lastSnapshotAttemptAt":"2026-10-25T04:21:39.673Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839984640,"xfs_free_bytes":54121873408}},
+   {"seconds":480.47853300813586,"at":"2026-10-25T04:23:53.731759+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:21:39.502Z","snapshotVerifiedAt":"2026-10-25T04:21:39.502Z","lastSnapshotAttemptAt":"2026-10-25T04:21:39.673Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839984640,"xfs_free_bytes":54121873408}},
+   {"seconds":510.2223524171859,"at":"2026-10-25T04:24:23.475582+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:21:39.502Z","snapshotVerifiedAt":"2026-10-25T04:21:39.502Z","lastSnapshotAttemptAt":"2026-10-25T04:21:39.673Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839984640,"xfs_free_bytes":54121873408}},
+   {"seconds":541.5017853670288,"at":"2026-10-25T04:24:54.755007+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:21:39.502Z","snapshotVerifiedAt":"2026-10-25T04:21:39.502Z","lastSnapshotAttemptAt":"2026-10-25T04:21:39.673Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839984640,"xfs_free_bytes":54121873408}},
+   {"seconds":571.1244120420888,"at":"2026-10-25T04:25:24.377642+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archiving","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"pending","requestedAt":"2026-10-25T04:15:53.173Z","lastAttemptAt":null,"error":null,"endedAt":null},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:21:39.502Z","snapshotVerifiedAt":"2026-10-25T04:21:39.502Z","lastSnapshotAttemptAt":"2026-10-25T04:21:39.673Z","lastSnapshotStatus":"in_progress"},"retained_job":{"status":"observed","job_running":true,"allocated_bytes":12901679104,"root_free_bytes":25839984640,"xfs_free_bytes":54121873408}},
+   {"seconds":586.77381409402,"at":"2026-10-25T04:25:40.027047+00:00","sandbox":{"id":"bx_a6kvzryf","state":"archived","error":null,"health":"ok","healthReason":null,"stop":{"id":"stop_bb8bf74f905869de","status":"completed","requestedAt":null,"lastAttemptAt":"2026-10-25T04:25:38.920Z","error":null,"endedAt":"2026-10-25T04:25:38.920Z"},"snapshotAvailable":true,"snapshotCompletedAt":"2026-10-25T04:25:38.701Z","snapshotVerifiedAt":"2026-10-25T04:25:38.701Z","lastSnapshotAttemptAt":"2026-10-25T04:21:39.673Z","lastSnapshotStatus":"completed"},"retained_job":{"status":"archived"}}
+  ]
+ },
+ "default_resume": {
+  "retained_at_limit": {
+   "job_id": "01a17144-62ef-741b-a1e8-4c05a39f3d39",
+   "probe_token": "83fb7e4f448e4f1d8525ef02a7f84e98",
+   "host_fill_path": "/Users/motor-probe/motor/.cortexkit/boat-job-vvse4b9m/target/quota-inheritance-child-9033a99879814bd69d8e9e1701124cd7/boat-quota-fill",
+   "retained_allocated_bytes": 12901679104,
+   "root_free_bytes": 25840074752,
+   "xfs_free_bytes": 54121852928,
+   "lease": {
+    "project": 20,
+    "roots": [
+     "/Users/motor-probe/motor/.cortexkit/boat-job-vvse4b9m",
+     "/Users/motor-probe/motor/.cortexkit/boat-job-vvse4b9m/target",
+     "/var/lib/motor-boat/state/boat/sandboxes/01a17144-62ef-741b-a1e8-4c05a39f3d39",
+     "/var/lib/motor-boat/state/boat/spools/01a17144-62ef-741b-a1e8-4c05a39f3d39"
+    ],
+    "growth_bytes": 12904017920
+   }
+  },
+  "pre_stop": {
+   "job_running": true,
+   "allocated_bytes": 12901679104,
+   "root_free_bytes": 25840058368,
+   "xfs_free_bytes": 54121852928
+  },
+  "backing_before": {
+   "expected_backing": true,
+   "backing_file": "/var/lib/motor-boat.xfs",
+   "backing_allocated_blocks": 25829608
+  },
+  "backing_after": {
+   "expected_backing": true,
+   "backing_file": "/var/lib/motor-boat.xfs",
+   "backing_allocated_blocks": 25825296
+  },
+  "workspace_eviction": {
+   "workspace": "/Users/motor-probe/motor/.cortexkit/boat-job-vvse4b9m",
+   "workspace_absent": false,
+   "eviction_logged": false,
+   "events": [],
+   "root_free_bytes": 25836048384,
+   "xfs_free_bytes": 54121873408
+  },
+  "endpoint_wait": {
+   "ready": false,
+   "seconds": 122.67787735001184,
+   "polls": 40,
+   "marker": {
+    "exit_code": 1,
+    "stdout": "",
+    "stderr": "cat: /run/motor/endpoint-ready: No such file or directory\n"
+   }
+  },
+  "retained_job_unit_in_runner_cgroup_at": "2026-10-25T04:27:48.051Z",
+  "job_toolchain_parity_result": {
+   "code": 200,
+   "stderr": "",
+   "stdout": "",
+   "terminal": {
+    "bundle_bytes": 0,
+    "job_id": "01a17153-9d6b-71e0-bc6d-98d492b31545",
+    "outcome": {
+     "reason": "runner_disk_full",
+     "type": "refused_before_start"
+    },
+    "queue_wait_ms": 0,
+    "ran": "none",
+    "refusal_detail": "runner_disk_full: free_bytes=25835020288 floor_bytes=34426847232",
+    "tree_hash": "937ec24eed013f41c0fa5776d9c8ecf48c4b6a19",
+    "wall_ms": 0,
+    "workspace_changes": null
+   }
+  },
+  "boot_id_before_and_after": [
+   "90db12b7-3dc4-4642-adb0-ef26f9b62055",
+   "90db12b7-3dc4-4642-adb0-ef26f9b62055"
+  ]
+ },
+ "root_owned": {
+  "default_prepared_clone": {
+   "kernel_release": "7.0.0-38-generic",
+   "report": {
+    "roots": [
+     "/usr/local",
+     "/usr/bin",
+     "/bin",
+     "/usr/sbin",
+     "/sbin",
+     "/srv/build/cargo-home/bin",
+     "/home/ubuntu/.bun/bin",
+     "/home/ubuntu/.rustup"
+    ],
+    "entries": 18527,
+    "offender_count": 922,
+    "offenders": [
+     "/usr/local/lib/node_modules/pnpm/dist/reflink.darwin-x64-3G3H6IW4.node: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/pnpm.cjs: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/reflink.darwin-arm64-2HJ4WGO6.node: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/reflink.win32-x64-msvc-J2TZHRQI.node: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/reflink.win32-arm64-msvc-Q6BARPPB.node: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/node_modules/http-cache-semantics: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/node_modules/promise-retry: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/node_modules/color-convert: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/node_modules/ip-address: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/node_modules/unique-slug: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/node_modules/ssri: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/node_modules/minipass-sized: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/node_modules/balanced-match: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/node_modules/foreground-child: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/node_modules/emoji-regex: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/node_modules/minipass-flush: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/node_modules/minipass-fetch: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/node_modules/agent-base: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/node_modules/retry: uid=1000 gid=1000",
+     "/usr/local/lib/node_modules/pnpm/dist/node_modules/string-width-cjs: uid=1000 gid=1000"
+    ],
+    "missing": [],
+    "provider_restored": [
+     "/usr/local/sbin/ascii-idle-reclaim: uid=1000 (provider-restored)"
+    ]
+   }
+  },
+  "default_resumed": {
+   "kernel_release": "6.8.0-138-generic",
+   "report": {
+    "roots": [
+     "/usr/local",
+     "/usr/bin",
+     "/bin",
+     "/usr/sbin",
+     "/sbin",
+     "/srv/build/cargo-home/bin",
+     "/home/ubuntu/.bun/bin",
+     "/home/ubuntu/.rustup"
+    ],
+    "entries": 17590,
+    "offender_count": 0,
+    "offenders": [],
+    "missing": [],
+    "provider_restored": [
+     "/usr/local/sbin/ascii-idle-reclaim: uid=1000 (provider-restored)"
+    ]
+   }
+  },
+  "large_prepared_clone": {
+   "kernel_release": "6.8.0-138-generic",
+   "report": {
+    "roots": [
+     "/usr/local",
+     "/usr/bin",
+     "/bin",
+     "/usr/sbin",
+     "/sbin",
+     "/srv/build/cargo-home/bin",
+     "/home/ubuntu/.bun/bin",
+     "/home/ubuntu/.rustup"
+    ],
+    "entries": 17590,
+    "offender_count": 0,
+    "offenders": [],
+    "missing": [],
+    "provider_restored": [
+     "/usr/local/sbin/ascii-idle-reclaim: uid=1000 (provider-restored)"
+    ]
+   }
+  }
+ }
+}

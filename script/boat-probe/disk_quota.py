@@ -149,14 +149,98 @@ sys.exit(73 if observed in (errno.EDQUOT, errno.ENOSPC) else 74)
 '''
 
 
-def backing_allocation_dropped(before, after):
+# How much less than the retained target's allocation the backing file may give
+# back and still count as having returned it: XFS metadata, the log and the
+# first resumed job's own writes land in the same file.
+RECLAIM_SLACK_BYTES = 1024**3
+
+
+def backing_allocation_dropped(before, after, retained_bytes):
+    """Whether the sparse backing file returned the evicted retained target's
+    blocks to the root disk. Any smaller allocation is not enough: in the run
+    recorded in fixtures/boat-verify-c7c6127f.json it shrank by 2 MiB while the
+    12.9 GB target was still in place, which is no evidence of eviction or trim."""
     # Boat can recreate the backing inode on restore; compare the verified
     # backing path and allocated sectors, not inode numbers across snapshots.
-    return (before.get('expected_backing') is True and after.get('expected_backing') is True
+    if not (before.get('expected_backing') is True and after.get('expected_backing') is True
             and before.get('backing_file') == after.get('backing_file') == '/var/lib/motor-boat.xfs'
             and type(before.get('backing_allocated_blocks')) is int
             and type(after.get('backing_allocated_blocks')) is int
-            and 0 <= after['backing_allocated_blocks'] < before['backing_allocated_blocks'])
+            and type(retained_bytes) is int and retained_bytes > RECLAIM_SLACK_BYTES
+            and after['backing_allocated_blocks'] >= 0):
+        return False
+    dropped = (before['backing_allocated_blocks'] - after['backing_allocated_blocks']) * 512
+    return dropped >= retained_bytes - RECLAIM_SLACK_BYTES
+
+
+def retained_release_passed(report):
+    """The retained job read its release and ended, so its workspace is idle."""
+    return (isinstance(report, dict) and report.get('released') is True
+            and report.get('job_terminal') is True and report.get('unit_active') is False)
+
+
+def stop_progress(samples, operation=None):
+    """Summarize what Boat did with a stop that has not completed, from the
+    sandbox states sampled while waiting, so a timeout names Boat's own
+    progress instead of only its last state.
+
+    `classification` is 'boat_stop_never_attempted' when every sample shows
+    the stop pending with no attempt (stop.lastAttemptAt null) and the sandbox
+    archiving with health ok, 'boat_stop_attempted_not_completed' when Boat did
+    attempt it, 'boat_stop_pending_unclassified' otherwise, and 'unobserved'
+    without samples. Snapshot times are Boat's
+    own: `snapshots_completed_during_wait` lists snapshotCompletedAt values
+    that first appeared after the first sample, and
+    `snapshot_attempts_after_request` the lastSnapshotAttemptAt values later
+    than the stop request."""
+    states = [sample.get('sandbox') or {} for sample in samples]
+    if not states:
+        return {'classification': 'unobserved', 'samples': 0}
+    stops = [state.get('stop') or {} for state in states]
+    requested = (operation or {}).get('requestedAt') or next(
+        (stop.get('requestedAt') for stop in stops if stop.get('requestedAt')), None)
+    attempted = [stop.get('lastAttemptAt') for stop in stops if stop.get('lastAttemptAt')]
+    completed, attempts = [], []
+    for state in states:
+        done, began = state.get('snapshotCompletedAt'), state.get('lastSnapshotAttemptAt')
+        if done and done != states[0].get('snapshotCompletedAt') and done not in completed:
+            completed.append(done)
+        # ISO-8601 UTC strings in one format compare in time order.
+        if began and requested and began > requested and began not in attempts:
+            attempts.append(began)
+    unhealthy = sorted({state.get('health') for state in states if state.get('health') != 'ok'}, key=str)
+    last = states[-1]
+    if attempted:
+        classification = 'boat_stop_attempted_not_completed'
+    elif (all(state.get('state') == 'archiving' for state in states)
+          and all(stop.get('status') == 'pending' for stop in stops) and not unhealthy):
+        classification = 'boat_stop_never_attempted'
+    else:
+        classification = 'boat_stop_pending_unclassified'
+    return {'classification': classification, 'samples': len(states), 'stop_id': (operation or stops[0]).get('id'),
+            'requested_at': requested, 'stop_attempts': attempted, 'states': sorted({str(s.get('state')) for s in states}),
+            'unhealthy': unhealthy, 'snapshots_completed_during_wait': completed,
+            'snapshot_attempts_after_request': attempts, 'last_snapshot_attempt_at': last.get('lastSnapshotAttemptAt'),
+            'last_snapshot_status': last.get('lastSnapshotStatus')}
+
+
+def stop_progress_reason(progress, wait):
+    """One readable sentence naming Boat's stop progress, for a failure reason."""
+    seconds = wait.get('seconds')
+    limit = ('the phase budget ended the wait' if wait.get('budget_limited')
+             else 'the requested wait ended') + (f" after {seconds:.0f} s" if isinstance(seconds, (int, float)) else '')
+    if progress['classification'] == 'boat_stop_never_attempted':
+        head = (f"boat_stop_never_attempted: Boat accepted stop {progress['stop_id']} at {progress['requested_at']} "
+                f"and never attempted it (stop.lastAttemptAt null and state archiving, health ok, in all "
+                f"{progress['samples']} samples)")
+    elif progress['classification'] == 'boat_stop_attempted_not_completed':
+        head = (f"boat_stop_attempted_not_completed: Boat attempted stop {progress['stop_id']} at "
+                f"{progress['stop_attempts']} without completing it")
+    else:
+        head = f"{progress['classification']}: stop {progress.get('stop_id')} stayed pending (states {progress.get('states')})"
+    return (f"{head}; meanwhile Boat completed snapshots at {progress.get('snapshots_completed_during_wait')} and began "
+            f"snapshot attempts at {progress.get('snapshot_attempts_after_request')}, the last "
+            f"({progress.get('last_snapshot_attempt_at')}) {progress.get('last_snapshot_status')}; {limit}")
 
 
 def resume_eviction_checks(before, after, ready):
