@@ -98,11 +98,11 @@ runner, not while it runs beside it. The guest still advertises
 `memory_max` of its placeable size: 28,672 − 2,048 = 26,624 MiB places
 leases of up to 7 vCPUs ([hosted-cutover.md](hosted-cutover.md#enable-on-one-machine)).
 
-The stage-2 cutover resizes tenant 1 to 24 vCPUs on `0-11,16-27`, 78 GiB, a
-600 GiB sparse disk, a permit budget (`max_weight`) of 64 and idle suspend
-off, and confines the runner's Linux jobs to `12-15,28-31` at
-`--max-weight 16`. The procedure, values and rollback are in
-[tenant1-cutover-runbook.md](tenant1-cutover-runbook.md).
+The fleet cutover in [tenant1-cutover-runbook.md](tenant1-cutover-runbook.md)
+resizes tenant 1 to 24 vCPUs on `0-11,16-27`, 78 GiB, a 600 GiB sparse disk, a
+permit budget (`max_weight`) of 64 and idle suspend off, and confines the
+runner's Linux jobs to `12-15,28-31` at `--max-weight 16`. That runbook holds
+the procedure, the exact values and the rollback.
 
 ### Host capacity
 

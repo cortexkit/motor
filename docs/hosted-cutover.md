@@ -148,8 +148,8 @@ it (`spilled_lease_avoids_the_build_server_and_every_re_request_repeats_it`).
    runner unit's `--max-weight` and `--windows-cpus`; repository defaults are not
    evidence of the deployed values.
 2. Record the tenant's registry and runner admin response before the flip:
-   - `vcpu_ceiling` equals that deployed `--max-weight` (tenant 1's stage-2
-     cutover instead keeps a smaller direct runner beside the tenant; see
+   - `vcpu_ceiling` equals that deployed `--max-weight` (tenant 1's cutover
+     instead keeps a smaller direct runner beside the tenant; see
      [tenant1-cutover-runbook.md](tenant1-cutover-runbook.md));
    - `cpuset` excludes the deployed Windows CPU set;
    - the guest advertises at least `memory_max(N)`, where N is the placeable

@@ -1,4 +1,4 @@
-# Tenant 1 stage-2 cutover runbook
+# Tenant 1 cutover runbook
 
 This runbook moves the fleet's Linux jobs from the build server's direct runner
 onto the hosted path: tenant 1 on host `ovh-1`, which is the build server
@@ -72,9 +72,9 @@ MemoryHigh=35791394134
 
 `MemoryMax` is `jobs_min_bytes + windows_vm_bytes` (40 GiB): the slice holds the
 Windows VM and the direct Linux jobs, and Linux jobs keep 24 GiB while Windows
-uses its full 16 GiB. `MemoryHigh` is `MemoryMax − ⌊MemoryMax / 6⌋`. This is the
-corrected owner ruling that the provisioner implements; it replaces the
-earlier 20 GiB / 24 GiB slice figures. A direct job's unit `MemoryMax` is
+uses its full 16 GiB. `MemoryHigh` is `MemoryMax − ⌊MemoryMax / 6⌋`. These are
+the values `provision.py` renders; plans that quote a 20 GiB / 24 GiB slice
+predate this formula. A direct job's unit `MemoryMax` is
 clamped to the slice `MemoryMax`, and a job is refused before start only if the
 16 GiB floor every job asks for cannot fit the slice.
 
