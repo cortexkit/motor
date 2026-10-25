@@ -70,7 +70,11 @@ contain exactly these six byte-valued, nonnegative u64 integers:
 
 `jobs_min_bytes` must be positive. It may be smaller than `windows_vm_bytes`,
 but their sum must fit in u64. Missing, unreadable or invalid capacity input
-refuses provisioning without writes.
+refuses provisioning without writes. The helper reads the same file and the
+drop-in below on every tenant start and refuses the start without them
+(motor-host then ends the lease before Run as `hosted_host_full`), motor-host
+refuses every lease, and `install.sh --check` fails; so write both before
+installing host binaries that read them.
 Memory fit uses `/proc/meminfo`'s `MemTotal` in checked bytes, not `MemAvailable`:
 
 ```text
@@ -121,7 +125,9 @@ host_floor_bytes + (idle_suspend_s > 0 ? guest RAM : 0)   the suspend reserve
 ```
 
 An operator budget with these values is `/etc/motor-host/capacity.json`. Nothing
-is created when free space falls one byte short. The same rule is exposed as
+is created when free space falls one byte short. A fully allocated disk (an
+image without `sparse-v1`) takes its whole quota on top of this figure, which
+the check does not count. The same rule is exposed as
 `storage_threshold`, `operating_requirement` and `pre_operation_free_bytes`, and
 motor-host keeps the same numbers (`test_storage_requirement_pinned_to_the_cutover_figures`,
 `test_pre_operation_requirement_passes_at_exact_and_refuses_one_byte_short`). On a host that also runs `motor-runner serve`, it reads
@@ -234,7 +240,9 @@ extends `disk.img` sparsely with `truncate`, confirms the staged activation and
 removes the journal. The tenant disk is never mounted: on its next cold start the
 guest grows XFS and installs the arguments (`crates/motor-vm-helper/README.md`,
 "Staged resize activation"). The old snapshots stay in `suspend.resize-<ns>` for
-the operator to delete.
+the operator to delete. The resized record then passes `install.sh --check`,
+which checks the installed record against the helper registry and the helper
+config rather than against the installer's template, and a reinstall keeps it.
 
 After a failure, re-run the same command to resume from the recorded phase;
 different options are refused. Before the commit the disk must still have its
@@ -257,8 +265,9 @@ A `resize.json` that cannot be read, is not valid JSON, has missing or unknown
 keys, another schema version, an unknown phase, or names a base, set-aside or
 staged path the resize would not have created is refused by both resize and
 abort, and the tenant stays start-refused. Recover by hand with both services
-stopped. The old state comes from the copies saved before the resize (the
-cutover runbook saves the records and helper config first); if `resize.json` is
+stopped. The old state comes from copies of the provisioning record, the helper
+registry entry and `/etc/motor-vm-helper.json` saved before the resize (save
+them before every resize); if `resize.json` is
 still readable JSON, its `provision_old`, `registry_old` and `helper_old` hold the
 same bytes, and `provision_new`, `registry_new` and `helper_new` the new ones.
 

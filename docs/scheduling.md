@@ -13,14 +13,25 @@ produce.
   The command's own flags and environment (such as `-j` or `CARGO_BUILD_JOBS`)
   do not change the claim. Test: `claims_are_exact_and_unsized_jobs_always_claim_two`
   (`crates/motor-runner/src/tests/vcpu.rs`).
-- A claim of 0, or larger than the host's allocatable CPUs, is refused before
-  start with `runner_full` and a detail naming the limit. Tests:
+- A claim of 0, or larger than the runner's claim limit, is refused before
+  start with `runner_full` and a detail naming the limit. The claim limit is
+  the host's allocatable CPUs, or `max_weight` when Linux jobs are confined to a
+  CPU list (below). Tests:
   `oversized_and_zero_claims_are_refused_before_start_with_limit_detail`,
   `oversized_vcpu_refusal_detail_reaches_the_run_terminal`
-  (`crates/motor-module/tests/it/recovery.rs`).
-- A claim that fits the host but exceeds `max_weight` is accepted but waits
-  until it fits; it does not block other jobs. Test:
-  `pinned_job_waits_until_its_exact_claim_fits_max_weight`.
+  (`crates/motor-module/tests/it/recovery.rs`),
+  `linux_cpu_list_refuses_claims_above_max_weight_before_start_without_waiting`
+  (`crates/motor-runner/src/tests/vcpu.rs`).
+- A claim that fits the claim limit but exceeds `max_weight` (possible only
+  without a CPU list) is accepted but waits until it fits; it does not block
+  other jobs. Tests: `pinned_job_waits_until_its_exact_claim_fits_max_weight`,
+  `without_a_linux_cpu_list_claims_above_max_weight_still_wait`.
+- When ck-motor sent the job to the build server because the hosted broker
+  answered `no_host_fits`, a `runner_full` refusal at admission also names the
+  hosted maximum: the detail ends `; hosted max_vcpus <n>`, or
+  `; hosted max_vcpus unknown` when the broker gave none. Test:
+  `oversized_fleet_jobs_are_refused_before_start_naming_both_routes_limits`
+  (`crates/motor-module/src/motor/fleet_capacity_tests.rs`).
 - The background warm build claims up to 4 vCPUs, fewer on a smaller host.
   Test: `internal_warm_build_shrinks_to_a_small_host`.
 
@@ -46,6 +57,54 @@ record before setup, and pins the job's service to them with `AllowedCPUs=`.
 - The service's memory cap follows the claim; see
   [job-isolation.md](job-isolation.md#7-limits). Test (operator-only):
   `isolated_four_vcpus_enforce_cpu_set_and_memory_max`.
+
+### Confining Linux jobs to a CPU list
+
+`serve --linux-cpus <list>` (for example `12-15,28-31`) places Linux jobs only
+on the listed online CPUs, with no core held back for the daemon; a sibling
+outside the list is never used. Absent the option, the topology above is
+unchanged. With the option:
+
+- The claim limit is `--max-weight`, not the number of listed CPUs. A claim up
+  to it is admitted and placed on at most as many CPUs as the list has,
+  sharing them as overlapping claims already do; a larger claim is refused
+  before start with `runner_full`, whose detail names the limit and the list,
+  instead of waiting for capacity that can never come. Tests:
+  `linux_cpu_list_confines_placement_and_admits_claims_up_to_max_weight`
+  (`crates/motor-runner/src/cpu_tests.rs`),
+  `linux_cpu_list_runs_a_long_twelve_vcpu_job_on_the_eight_listed_cpus`,
+  `linux_cpu_list_refuses_claims_above_max_weight_before_start_without_waiting`,
+  `linux_cpu_list_must_name_online_cpus` (`crates/motor-runner/src/tests/vcpu.rs`).
+- Windows avoidance (`--windows-cpus` with `--windows-slot-lock`) still
+  applies to the listed CPUs. When the Windows CPUs cover the whole list while
+  the Windows slot is active, placement fails open with its rate-limited
+  warning, so Linux jobs share the Windows threads and never wait for the slot.
+  Tests: `confined_linux_cpus_share_windows_threads_while_the_slot_is_active`,
+  `linux_cpu_list_shares_the_windows_threads_while_the_slot_is_active`.
+- The option is refused on a VM instance, with an empty list, a CPU that is
+  not online, or `--max-weight 0`.
+
+For example, a runner beside a hosted tenant on `0-11,16-27` of a 32-thread
+host runs `--linux-cpus 12-15,28-31 --max-weight 16`: a 12-vCPU job with a
+long timeout is admitted and placed on those 8 threads, and a 17-vCPU job is
+refused before start ([hosted-host.md](hosted-host.md#growing-the-tenant-beside-a-smaller-runner)).
+
+### Memory and the jobs slice
+
+Every Linux job unit runs in `motor-jobs.slice`. A unit's `MemoryMax` is the
+claim's `memory_max` clamped to the slice's `MemoryMax`, so a job that
+outgrows the slice ends as the slice's OOM kill, reported as before. If the
+slice's `MemoryMax` is below the 16 GiB floor every job unit asks for, Linux
+jobs are refused before start with `workspace_setup_failed` and a detail
+naming the repair (raise `jobs_min_bytes` and re-run
+`provision.py apply-jobs-slice`); this is a host setup fault, so it is not
+reported as a full runner. The runner reads the slice's limit at startup and
+at each maintenance pass (at least once a minute), not on every admission.
+Tests: `the_unit_limit_is_clamped_to_the_slice_and_never_above_it`,
+`admission_refuses_before_start_when_the_recorded_slice_is_below_the_floor`,
+`admission_accepts_when_the_recorded_slice_covers_the_floor`,
+`maintenance_picks_up_a_changed_ceiling_before_the_next_job_is_decided`
+(`crates/motor-runner/src/tests/jobs_slice.rs`).
 
 ## Capacity
 
