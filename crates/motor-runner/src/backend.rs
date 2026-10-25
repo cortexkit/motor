@@ -345,6 +345,26 @@ pub(crate) fn slice_refusal(floor: u64, budget: crate::systemd::JobMemoryBudget)
     })
 }
 
+/// The memory limit a Linux job unit asks for. A request larger than the
+/// shared jobs slice can never be honoured, so the unit asks for the slice's
+/// own `MemoryMax`; an overrun still ends as the slice's OOM kill.
+pub(crate) fn job_memory_limit(requested: u64, slice_ceiling: u64) -> u64 {
+    crate::systemd::JobMemoryBudget::from_max(slice_ceiling)
+        .map_or(requested, |slice| requested.min(slice.max))
+}
+
+/// Admission's slice decision. A slice below the floor every job unit asks
+/// for is a host configuration fault that waiting cannot clear, so the job is
+/// refused before start. No reading (`NO_JOB_MEMORY_BUDGET`) refuses nothing,
+/// and a readable slice refuses nothing either.
+pub(crate) fn slice_admission_refusal(
+    floor: u64,
+    slice_ceiling: u64,
+) -> Option<(RefusalReason, String)> {
+    let budget = crate::systemd::JobMemoryBudget::from_max(slice_ceiling)?;
+    slice_refusal(floor, budget).map(|detail| (RefusalReason::WorkspaceSetupFailed, detail))
+}
+
 #[test]
 fn slice_below_the_job_floor_is_refused_and_a_clamp_is_not() {
     let budget = |max| crate::systemd::JobMemoryBudget {

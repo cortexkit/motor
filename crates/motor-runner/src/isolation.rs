@@ -3267,11 +3267,13 @@ impl Sandbox {
         // observed budget (a command built before any unit started), the
         // requested limit stands as it always has.
         let memory_max = self.boat_memory_max.unwrap_or(memory_max);
-        let memory_max = self
-            .slice_budget
-            .lock()
-            .unwrap()
-            .map_or(memory_max, |budget| memory_max.min(budget.max));
+        let memory_max = crate::backend::job_memory_limit(
+            memory_max,
+            self.slice_budget
+                .lock()
+                .unwrap()
+                .map_or(crate::systemd::NO_JOB_MEMORY_BUDGET, |budget| budget.max),
+        );
         cmd.arg(format!("--property=MemoryMax={memory_max}"));
         // Match the host's executable /dev/shm policy while bounding this
         // job's private tmpfs to the same memory limit as the service.

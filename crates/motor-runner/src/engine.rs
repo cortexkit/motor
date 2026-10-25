@@ -728,12 +728,6 @@ impl Config {
 /// every job unit requests is misconfigured, not busy, so the refusal is
 /// `WorkspaceSetupFailed`: callers do not treat that as a capacity signal to
 /// retry, which waiting could never clear.
-fn slice_memory_refusal(floor: u64, remembered: u64) -> Option<(RefusalReason, String)> {
-    let budget = crate::systemd::JobMemoryBudget::from_max(remembered)?;
-    crate::backend::slice_refusal(floor, budget)
-        .map(|detail| (RefusalReason::WorkspaceSetupFailed, detail))
-}
-
 /// The OOM advice for a stopped job. `slice_ceiling` is the jobs slice's
 /// `MemoryMax` as the runner last recorded it, or `NO_JOB_MEMORY_BUDGET` when
 /// no reading is kept: the slice caps every job unit's limit, so a request it
@@ -3193,7 +3187,7 @@ impl Runner {
     /// capacity signal to retry, and would retry this until their queue budget
     /// ran out.
     fn slice_memory_refusal(&self) -> Option<(RefusalReason, String)> {
-        if !self.core.config.isolate_jobs || self.core.config.windows_instance() {
+        if self.core.config.windows_instance() {
             return None;
         }
         let max = self
@@ -3204,7 +3198,7 @@ impl Runner {
         let floor = crate::backend::memory_floor(self.core.config.memory_floor_gib);
         #[cfg(not(test))]
         let floor = crate::backend::memory_floor();
-        slice_memory_refusal(floor, max)
+        crate::backend::slice_admission_refusal(floor, max)
     }
 
     /// Read the jobs slice's limits and remember the memory ceiling for
