@@ -48,6 +48,7 @@ TEST_FILES = [
     "script/windows-vm/test_control.py",
     "script/windows-vm/test_provisioning.py",
     "script/windows-runner/test_cache_manifest.py",
+    "script/windows-runner/test_repin_manifest.py",
     "script/windows-runner/test_diagnose_connect.py",
     "script/windows-runner/test_install_script.py",
     "script/windows-runner/test_powershell_precedence.py",
