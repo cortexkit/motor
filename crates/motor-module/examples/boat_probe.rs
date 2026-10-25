@@ -104,9 +104,10 @@ fn job_timeout(value: Option<&str>) -> io::Result<u64> {
         .transpose()
         .map_err(io::Error::other)?
         .unwrap_or(120);
-    if !(1..=900).contains(&seconds) {
+    // A retained-target stop may use the rest of a 30-minute sandbox budget.
+    if !(1..=1800).contains(&seconds) {
         return Err(io::Error::other(
-            "probe job timeout must be between 1 and 900 seconds",
+            "probe job timeout must be between 1 and 1800 seconds",
         ));
     }
     Ok(seconds)
@@ -122,7 +123,8 @@ mod tests {
     #[test]
     fn quota_deadline_is_explicit_and_bounded() {
         assert_eq!(job_timeout(Some("900")).unwrap(), 900);
-        for value in ["0", "901", "not-a-number"] {
+        assert_eq!(job_timeout(Some("1800")).unwrap(), 1800);
+        for value in ["0", "1801", "not-a-number"] {
             assert!(job_timeout(Some(value)).is_err());
         }
     }

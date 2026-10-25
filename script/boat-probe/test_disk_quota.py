@@ -2,6 +2,9 @@ import errno
 import contextlib
 import io
 import json
+import os
+import pathlib
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -10,6 +13,66 @@ import quota_adversarial
 
 
 class DiskQuotaChecks(unittest.TestCase):
+    def test_only_retained_job_deadline_is_rounded_up_and_capped_by_phase_lifetime(self):
+        for remaining, expected in ((600, 600), (600.1, 601), (2000, 1800), (0.1, 1)):
+            self.assertEqual(disk_quota.job_seconds('retained_target', remaining), expected)
+        for lane in disk_quota.LANES:
+            self.assertEqual(disk_quota.job_seconds(lane, 600), 900)
+
+    def test_retained_hold_requires_live_allocated_samples_not_only_completed_stop(self):
+        initial = {'job_running': True, 'allocated_bytes': 2**30}
+        live = {'sandbox': {'state': 'archiving'},
+                'retained_job': {'status': 'observed', 'job_running': True, 'retained_target_at_limit': True}}
+        archived = {'sandbox': {'state': 'archived', 'stop': {'status': 'completed'}}}
+        self.assertEqual(disk_quota.retained_hold_status([live, archived]), 'PASS')
+        self.assertEqual(disk_quota.retained_hold_status([archived], initial), 'PASS')
+        self.assertEqual(disk_quota.retained_hold_status([archived]), 'INCONCLUSIVE')
+        for change in ({'job_running': False}, {'retained_target_at_limit': False}):
+            failed = dict(live, retained_job=dict(live['retained_job'], **change))
+            self.assertEqual(disk_quota.retained_hold_status([live, failed, archived], initial), 'FAIL')
+        for guest in ({'status': 'unavailable'}, {}, {'status': 'observed', 'job_running': None}):
+            gap = dict(live, retained_job=guest)
+            self.assertEqual(disk_quota.retained_hold_status([live, gap, archived], initial), 'INCONCLUSIVE')
+
+    def test_retained_sample_reads_job_liveness_and_actual_file_allocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            job_id, unit = '00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000002'
+            record = root / 'state/jobs' / job_id / 'record.json'
+            record.parent.mkdir(parents=True)
+            record.write_text(json.dumps({'started_ms': 1, 'terminal': None, 'process': {'unit': unit}}))
+            fill = root / 'retained-fill'
+            fill.write_bytes(b'x' * (2 * 1024**2))
+            source = quota_adversarial.retained_sample({'job_id': job_id, 'host_fill_path': str(fill),
+                                                       'lease': {'growth_bytes': 18 * 1024**2}})
+            real_path, statvfs = pathlib.Path, os.statvfs
+            def path(value):
+                return root / 'state' if value == '/var/lib/motor-boat/state/boat' else real_path(value)
+            def sample(active):
+                output = io.StringIO()
+                with patch.object(pathlib, 'Path', side_effect=path), \
+                     patch.object(os, 'statvfs', side_effect=lambda _: statvfs(directory)), \
+                     patch('subprocess.run', return_value=Mock(returncode=0 if active else 3)), \
+                     contextlib.redirect_stdout(output):
+                    exec(compile(source, '<retained-sample>', 'exec'), {})
+                return json.loads(output.getvalue())
+            observed = sample(True)
+            self.assertTrue(observed['job_running'])
+            self.assertTrue(observed['retained_target_at_limit'])
+            self.assertEqual(observed['allocated_bytes'], 2 * 1024**2)
+            self.assertFalse(sample(False)['job_running'])
+            fill.unlink()
+            observed = sample(True)
+            self.assertEqual(observed['allocated_bytes'], 0)
+            self.assertFalse(observed['retained_target_at_limit'])
+
+    def test_retained_hold_can_cover_the_remaining_phase_without_changing_other_lane_waits(self):
+        source = disk_quota.job('retained_target', 'token', hold_seconds=1700)
+        self.assertIn('QUOTA_HOLD_SECONDS=1700', source)
+        self.assertIn("acknowledged(QUOTA_HOLD_SECONDS if QUOTA_LANE == 'retained_target' else 90)", source)
+        self.assertIn('assert acknowledged()', source)
+        compile(source, '<long-held-job>', 'exec')
+
     def test_resume_requires_retained_workspace_eviction_and_ready_capacity(self):
         before = dict(retained_allocated_bytes=25_501_368_320, lease=dict(roots=['/Users/repo']))
         after = dict(workspace='/Users/repo', workspace_absent=True, eviction_logged=True,

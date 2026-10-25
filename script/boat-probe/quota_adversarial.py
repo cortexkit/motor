@@ -135,6 +135,38 @@ print(json.dumps(dict(job_running=True, allocated_bytes=metadata.st_blocks*512, 
 '''
 
 
+def retained_sample(observation):
+    """Read liveness and allocation without releasing the retained job's barrier."""
+    return 'OBSERVATION=' + repr(observation) + '\n' + r'''
+import datetime, json, os, pathlib, stat, subprocess, uuid
+job_id = str(uuid.UUID(OBSERVATION['job_id']))
+state = pathlib.Path('/var/lib/motor-boat/state/boat')
+try:
+    job = json.loads((state/'jobs'/job_id/'record.json').read_text())
+except FileNotFoundError:
+    job = {}
+unit = (job.get('process') or {}).get('unit')
+active = False
+if unit:
+    unit = str(uuid.UUID(unit))
+    active = subprocess.run(['systemctl', 'is-active', '--quiet', 'motor-job-' + unit + '.service'], timeout=5).returncode == 0
+running = active and job.get('terminal') is None and job.get('started_ms') is not None
+try:
+    metadata = pathlib.Path(OBSERVATION['host_fill_path']).lstat()
+except FileNotFoundError:
+    metadata = None
+allocated = metadata.st_blocks * 512 if metadata is not None else 0
+expected = max(1024**2, OBSERVATION['lease']['growth_bytes'] - 16 * 1024**2)
+retained = metadata is not None and stat.S_ISREG(metadata.st_mode) and allocated >= expected
+def free(path):
+    value = os.statvfs(path)
+    return value.f_bavail * value.f_frsize
+print(json.dumps(dict(job_running=running, allocated_bytes=allocated, retained_target_at_limit=retained,
+                     expected_minimum_bytes=expected, root_free_bytes=free('/'), xfs_free_bytes=free('/var/lib/motor-boat'),
+                     sampled_at=datetime.datetime.now(datetime.timezone.utc).isoformat())))
+'''
+
+
 def resume_eviction_source(workspace, cursor):
     return 'WORKSPACE=' + repr(workspace) + '\nCURSOR=' + repr(cursor) + '\n' + r'''
 import json, os, re, subprocess

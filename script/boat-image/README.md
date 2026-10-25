@@ -857,7 +857,7 @@ next phase starts, and the run's final cleanup retries any deletion that did not
 
 | `--verify-phase` | What it proves | Expected sandbox time |
 | --- | --- | --- |
-| `core` | prepared-clone identity and readiness, storage, host, parity and every real job | about 8 minutes |
+| `core` | prepared-clone identity and readiness, storage, host, parity and every real job; then a plain idle stop/completed archive, resume, endpoint readiness and one normal job, with no quota fill | about 8 minutes plus the plain stop/resume (not yet measured) |
 | `disk-quota` | quota lanes, stop with a quota-sized target, resume, readiness recovery, backing-file shrink, then every real job again after the resume | about 18–20 minutes |
 | `idle` | Boat's idle reclaim (up to 17 minutes idle), then a real job | about 20 minutes |
 
@@ -872,6 +872,15 @@ reported `not_run`, never passed. That run's verdict covers the named phase alon
 `verdict.image_qualified` stays false; separate runs are not combined, so the operator
 qualifies the image from one passing run of each phase. `--max-minutes` applies to
 each phase's sandbox separately.
+
+Core's required plain control is recorded under `runner_host.core_stop_resume`,
+including accepted-response-to-completed timing and pre-stop disk allocation.
+For the separate full-quota diagnostic, `--quota-stop-wait-s` changes its local
+stop-wait cap (default 900 seconds), still bounded by the remaining 30-minute
+phase budget. Lifecycle and retained-job/allocation samples are checkpointed
+about every 30 seconds. See the [probe's wait-budget and sampling details](../boat-probe/README.md#disk-quota-qualification)
+before choosing a longer wait; the flag extends neither the provider TTL nor
+the phase budget, and timeout still fails qualification.
 
 Every real-job fixture includes an npm lockfile and a locally generated tarball
 dependency containing regular files. No registry or project-specific dependency
