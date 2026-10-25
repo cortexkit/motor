@@ -478,12 +478,10 @@ pub(crate) struct StoreIdentity {
     pub prefix: String,
 }
 
-/// The persisted form of a provisioning store identity. The gateway's identity
-/// type lives where it is used to sign; records and comparisons use this one.
-#[cfg(unix)]
 pub(crate) use crate::remote_cache::publishing::Seen;
 
-#[cfg(unix)]
+/// The persisted form of a provisioning store identity. The gateway's identity
+/// type lives where it is used to sign; records and comparisons use this one.
 pub(crate) fn encode_identity(
     identity: &crate::remote_cache::provisioning::StoreIdentity,
 ) -> StoreIdentity {

@@ -39,6 +39,23 @@ def build_revision(revision, label):
         helper.mkdir()
         (helper / "main.rs").write_bytes((ROOT / "scripts/compat-client.rs").read_bytes())
         (helper / "runner.rs").write_bytes((ROOT / "scripts/compat-runner.rs").read_bytes())
+        health_bin = ""
+        if label == "oldest":
+            # This decoder links the archived protocol, not a reconstruction of
+            # its serde rules or the current protocol in the integration suite.
+            (helper / "health.rs").write_text('''fn main() {
+    let frame: motor_protocol::Frame = serde_json::from_reader(std::io::stdin()).unwrap();
+    let motor_protocol::Frame::StatusReply(reply) = frame else { panic!("not status_reply") };
+    let health = reply.health.expect("archived client discarded health");
+    assert_eq!(health.runner_version, "health-compat-fixture");
+    assert_eq!(health.counts.accepted, 7);
+    println!("archived health decoded");
+}
+''')
+            health_bin = '''[[bin]]
+name = "motor-compat-health"
+path = "health.rs"
+'''
         # A separate binary avoids linking two identically named protocol crates
         # and tests the real legacy transport rather than a reconstructed decoder.
         (helper / "Cargo.toml").write_text(f'''[package]
@@ -52,6 +69,7 @@ path = "main.rs"
 [[bin]]
 name = "motor-compat-runner"
 path = "runner.rs"
+{health_bin}
 [dependencies]
 motor-module = {{ path = {json.dumps(str(old / "crates/motor-module"))} }}
 motor-protocol = {{ path = {json.dumps(str(old / "crates/motor-protocol"))} }}
@@ -69,7 +87,35 @@ uuid = "1"
         runner = build_root / f"{label}-runner"
         shutil.copy2(target / "debug/motor-compat-client", client)
         shutil.copy2(target / "debug/motor-compat-runner", runner)
+        if label == "oldest":
+            shutil.copy2(target / "debug/motor-compat-health", build_root / "oldest-health")
         return client, runner
+
+
+def check_health_compatibility():
+    fixture = {
+        "type": "status_reply", "queue_depth": 0, "running_jobs": [],
+        "server_reachable": True, "repositories": [], "rustc_version": "",
+        "health": {
+            "runner_version": "health-compat-fixture", "since_ms": 0,
+            "window_minutes": 60, "free_bytes": None, "queue_depth": 0,
+            "running": [], "counts": {
+                "accepted": 7, "refusals": {}, "evictions": 0,
+                "eviction_bytes": 0, "eviction_failures": 0,
+                "soft_goal_unmet_passes": 0, "skipped_recent": 0,
+            },
+        },
+    }
+    tool = {"hits": 1, "probes": 2, "misses": 3, "breaker_open": 0,
+            "errors": 0, "refusals": {"read": 0, "write": 0}}
+    for present in (False, True):
+        if present:
+            fixture["health"]["remote_cache"] = {
+                "state": "available", "sccache": tool, "ccache": tool,
+            }
+        subprocess.run([str(ROOT / "target/compat-client/oldest-health")],
+                       input=json.dumps(fixture), text=True, check=True, env=CARGO_ENV)
+        print(f"Oldest production client {REVISION}: remote_cache {'present' if present else 'absent'} decoded", flush=True)
 
 
 def main():
@@ -77,6 +123,7 @@ def main():
     run("cargo", "--version")
     run("cargo", "nextest", "--version")
     client, runner = build_revision(REVISION, "oldest")
+    check_health_compatibility()
     rollback, _ = build_revision(ROLLBACK_REVISION, "rollback")
     test_env = CARGO_ENV.copy()
     test_env["MOTOR_COMPAT_CLIENT"] = str(client)

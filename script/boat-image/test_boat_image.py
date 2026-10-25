@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Portable recipe integrity tests, not proof of a functioning Boat host."""
+import base64
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import inspect
 import io
@@ -338,6 +340,40 @@ class RecipeTests(unittest.TestCase):
         self.assertIn('motor-boat-host.path', install.RETIRED_UNITS)
         self.assertNotIn('motor-boat-host.path', install.UNITS)
 
+    def test_fresh_state_image_is_sparse_and_matches_build_root_total(self):
+        for root_bytes in (157154062336, 50 * 1024**3):
+            with self.subTest(root_bytes=root_bytes), tempfile.TemporaryDirectory() as directory:
+                image = Path(directory) / 'state.xfs'
+                original_open = Path.open
+                def open_image(path, *args, **kwargs):
+                    self.assertEqual(str(path), '/var/lib/motor-boat.xfs')
+                    return original_open(image, *args, **kwargs)
+                with patch.object(install.Path, 'open', autospec=True, side_effect=open_image), \
+                     patch.object(install.Path, 'exists', return_value=False), \
+                     patch.object(install.Path, 'mkdir'), patch.object(install.Path, 'write_text'), \
+                     patch.object(install, 'run') as run, patch.object(install, 'tempfile'), \
+                     patch.object(install, 'fcntl'), patch.object(install.Path, 'read_bytes', return_value=b''), \
+                     patch.object(install.os, 'statvfs', return_value=Mock(
+                         f_blocks=root_bytes // 4096, f_frsize=4096, f_bavail=1)) as geometry:
+                    install.state()
+                geometry.assert_called_once_with('/')
+                self.assertEqual(image.stat().st_size, root_bytes)
+                self.assertEqual(image.stat().st_blocks, 0)
+                self.assertEqual(run.call_args_list[0].args,
+                                 ('mkfs.xfs', '-q', '-m', 'reflink=1', '/var/lib/motor-boat.xfs'))
+
+    def test_existing_state_image_is_never_resized_or_reformatted(self):
+        with patch.object(install.Path, 'exists', return_value=True), \
+             patch.object(install.Path, 'open') as open_image, \
+             patch.object(install.Path, 'mkdir'), patch.object(install.Path, 'write_text'), \
+             patch.object(install, 'run') as run, patch.object(install, 'tempfile'), \
+             patch.object(install, 'fcntl'), patch.object(install.Path, 'read_bytes', return_value=b''), \
+             patch.object(install.os, 'statvfs') as geometry:
+            install.state()
+        open_image.assert_not_called()
+        geometry.assert_not_called()
+        self.assertNotIn('mkfs.xfs', [call.args[0] for call in run.call_args_list])
+
     def test_runner_mount_and_identity_watcher_wait_for_boat_restore(self):
         for name in ('motor-boat.service', 'motor-boat-host.service', 'motor-boat-identity.service'):
             text = (HERE / name).read_text()
@@ -356,7 +392,7 @@ class RecipeTests(unittest.TestCase):
              patch.object(install, 'tempfile'), patch.object(install, 'fcntl'), \
              patch.object(install.Path, 'read_bytes', return_value=b''):
             install.run.return_value = 'xfs'
-            install.state(self.pins)
+            install.state()
         mount = writes['/etc/systemd/system/var-lib-motor\\x2dboat.mount']
         self.assertIn('Requires=motor-boat-restored.service', mount)
         self.assertIn('After=motor-boat-restored.service', mount)
@@ -1226,6 +1262,86 @@ class AptInstallTests(unittest.TestCase):
         for package in manifest['apt_packages']['required']:
             if package != 'openssh-server':
                 self.assertIn(package, command)
+
+
+class PnpmInstallTests(unittest.TestCase):
+    """pnpm is installed from its pinned registry release by the shared npm
+    global tree installer, not by `npm install --global`: npm creates the tree
+    with the caller's umask and marks the launcher executable with chmod,
+    neither of which a root-owned, archive-extracted install promises."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.build = Path(temp.name)
+        (self.build / "downloads").mkdir()
+        patch.object(install, "BUILD", self.build).start()
+        self.addCleanup(patch.stopall)
+
+    def manifest(self):
+        return json.loads(install.PARITY_PATH.read_text())
+
+    def test_pnpm_is_installed_from_its_pinned_release_not_by_npm(self):
+        manifest = self.manifest()
+        source = manifest["tools"]["pnpm"]["source"]
+        # The real digest runs on the downloaded bytes: the pin is npm's base64
+        # integrity, digest() is hex, and a mocked digest hid that mismatch.
+        source["sha512"] = base64.b64encode(hashlib.sha512(b"release").digest()).decode()
+        tarball = "https://registry.npmjs.org/pnpm/-/pnpm-11.1.2.tgz"
+        with patch.object(install.urllib.request, "urlretrieve",
+                          side_effect=lambda url, path: Path(path).write_bytes(b"release")) as retrieve, \
+             patch.object(install.urllib.request, "urlopen",
+                          return_value=io.BytesIO(json.dumps({"dist": {
+                              "integrity": "sha512-" + source["sha512"], "tarball": tarball}}).encode())) as metadata, \
+             patch.object(install, "run") as run:
+            install.install_pnpm(manifest)
+        # The registry's per-version metadata path; name@version 404s there.
+        self.assertEqual(metadata.call_args.args[0], "https://registry.npmjs.org/pnpm/11.1.2")
+        commands = [call.args for call in run.call_args_list]
+        self.assertFalse([args for args in commands if args[:2] == ("npm", "install")])
+        installer = commands[-1]
+        self.assertIn(str(install.ROOT / "script/runner/install-npm-tool.py"), installer)
+        option = {installer[index]: installer[index + 1] for index in range(len(installer) - 1)}
+        # Under /usr/local with npm's global layout, and pinned by the exact
+        # registry integrity the manifest records.
+        self.assertEqual(option["--prefix"], "/usr/local")
+        self.assertEqual(option["--name"], "pnpm")
+        self.assertEqual(option["--sha512"], hashlib.sha512(b"release").hexdigest())
+        self.assertEqual(option["--url"], tarball)
+        self.assertEqual(retrieve.call_args.args[0], tarball)
+        self.assertEqual(retrieve.call_args.args[1], self.build / "downloads/pnpm.tgz")
+
+    def test_a_release_that_differs_from_the_pin_is_refused(self):
+        manifest = self.manifest()
+        source = manifest["tools"]["pnpm"]["source"]
+        with patch.object(install.urllib.request, "urlretrieve",
+                          side_effect=lambda url, path: Path(path).write_bytes(b"release")), \
+             patch.object(install.urllib.request, "urlopen",
+                          return_value=io.BytesIO(json.dumps({"dist": {
+                              "integrity": "sha512-" + "A" * 86 + "==",
+                              "tarball": "https://registry.npmjs.org/pnpm/-/pnpm-11.1.2.tgz"}}).encode())), \
+             patch.object(install, "run") as run:
+            with self.assertRaisesRegex(ValueError, "integrity differs from the manifest pin"):
+                install.install_pnpm(manifest)
+        self.assertEqual(run.call_args_list, [])
+        with patch.object(install.urllib.request, "urlretrieve",
+                          side_effect=lambda url, path: Path(path).write_bytes(b"release")), \
+             patch.object(install, "digest", return_value="0" * 128), \
+             patch.object(install.urllib.request, "urlopen",
+                          return_value=io.BytesIO(json.dumps({"dist": {
+                              "integrity": "sha512-" + source["sha512"], "tarball": "x"}}).encode())), \
+             patch.object(install, "run") as run:
+            with self.assertRaisesRegex(ValueError, "pnpm integrity mismatch"):
+                install.install_pnpm(manifest)
+        self.assertEqual(run.call_args_list, [])
+
+    def test_the_installer_is_a_pinned_recipe_input(self):
+        # The recipe runs script/runner/install-npm-tool.py from the source
+        # checkout, so its own content must be pinned like the other installers.
+        self.assertIn("script/runner/install-npm-tool.py", install.RUNNER_INPUTS)
+        for pins in (json.loads((HERE / "pins.json").read_text()),
+                     json.loads((install.ROOT / "script/tenant-image/versions.txt").read_text())):
+            self.assertIn("script/runner/install-npm-tool.py", pins["runner_inputs_sha256"])
 
 
 class BoatBaseLayoutTests(unittest.TestCase):

@@ -18,14 +18,27 @@ The JSON configuration has these required fields:
 - `vcpu_ceiling`, `guest_ram_mib`, `disk_quota_bytes`, `cpuset`, `tap_index` (1–254);
 - `resolvers`: public IPv4 resolver addresses, also configured in the host agent.
 
-Optional fields are `idle_suspend_s` (600), `host_floor_bytes` (128 GiB),
+Optional fields are `idle_suspend_s` (600), `host_floor_bytes` (128 GiB,
+minimum: the direct runner's 128 GiB free-space floor),
 `memory_headroom_mib` (512, minimum 512), `snapshot_memory_high_mib` (16384,
-clamped to guest RAM), and `io_weight` (100, range 1–10000). The default memory
+clamped to guest RAM), `io_weight` (100, range 1–10000), and `max_weight` (the
+permit budget, described below). `idle_suspend_s` 0 means the tenant never
+suspends. The default memory
 limit is `(guest_ram_mib + 512) * 1048576`, with `memory.high` applied **only**
 while creating a snapshot. The fixed jail `pids.max` is `vcpu_ceiling + 64`.
 Snapshot creation has substantial writeback costs; tune the I/O weight and
 headroom on the target host before production use. Weight is proportional
 sharing, not an absolute bandwidth guarantee.
+
+`max_weight` is the tenant's budget of concurrent job permits, counted as
+summed vCPU claims. It is optional: without it the budget is `vcpu_ceiling`,
+which is exactly what the guest runner arguments and host admission used
+before, so a record without the key provisions byte for byte as before.
+`checked()` never adds the key, so `switch-image` and `repair-from-registry`
+compare old records unchanged. When set, it is a positive integer of at most
+4294967295 (the guest's `u32` parser), and at least `vcpu_ceiling`; anything else
+is refused before any write. Both runner arguments, `--max-weight` and
+`--rustc-slots`, carry the budget and stay equal for the guest's own check.
 
 Choose a cpuset excluding the host runner's reserved Windows CPUs. Each tap
 index must be unique and reserves a dedicated no-login uid `400000 + index`;
@@ -38,9 +51,86 @@ overlay and host-only tenant agent enabled, but the runner disabled until
 `rootfs_sha256` and the image toolchain `versions`. Image toolchain pins belong
 to the tenant-image builder, not this provisioning tool.
 
-Provisioning checks **bytes** before allocating anything for the tenant: disk
-quota + suspend RAM + host floor, plus RAM and the temporary placeholder when a
-new size base is needed. On a host that also runs `motor-runner serve`, it reads
+## Host capacity and the jobs slice
+
+Before provisioning, install `/etc/motor-host/capacity.json` as a root-owned
+regular file, mode 0644 (group/world write permission is refused). It must
+contain exactly these six byte-valued, nonnegative u64 integers:
+
+```json
+{
+  "windows_vm_bytes": 17179869184,
+  "host_reserve_bytes": 6442450944,
+  "jobs_min_bytes": 25769803776,
+  "storage_margin_bytes": 8589934592,
+  "growth_allowance_bytes": 68719476736,
+  "tenant_memory_reserve_bytes": 2147483648
+}
+```
+
+`jobs_min_bytes` must be positive. It may be smaller than `windows_vm_bytes`,
+but their sum must fit in u64. Missing, unreadable or invalid capacity input
+refuses provisioning without writes. The helper reads the same file and the
+drop-in below on every tenant start and refuses the start without them
+(motor-host then ends the lease before Run as `hosted_host_full`), motor-host
+refuses every lease, and `install.sh --check` fails; so write both before
+installing host binaries that read them.
+Memory fit uses `/proc/meminfo`'s `MemTotal` in checked bytes, not `MemAvailable`:
+
+```text
+sum((guest_ram_mib + memory_headroom_mib) * 1048576 for every tenant)
+    + windows_vm_bytes + host_reserve_bytes + jobs_min_bytes <= MemTotal
+```
+
+Apply the slice budget before provisioning or installing new host binaries:
+
+```sh
+sudo python3 script/tenant-provision/provision.py apply-jobs-slice
+```
+
+Under `provision.lock`, this checks fit over every registered tenant and refuses
+while any tenant has a `resize.json`. That journal records an unfinished sizing
+change; the slice budget must stay fixed until the resize is resumed or aborted.
+It refuses before changing anything when
+the slice's `MemoryCurrent` is above the proposed `MemoryHigh`, naming the usage.
+It writes `/etc/systemd/system/motor-jobs.slice.d/50-capacity.conf`, runs
+`systemctl daemon-reload`, and verifies the live `MemoryMax` is no higher than
+the budget. Apply or read-back failures are errors; inspect the drop-in and
+live limits before retrying. The drop-in is written even if the slice is not
+installed yet. Provisioning requires its exact rendered bytes and checks the
+live cap too; an unloaded, `not-found` slice requires the same exact file.
+
+`MemoryMax = jobs_min_bytes + windows_vm_bytes` and
+`MemoryHigh = MemoryMax - floor(MemoryMax / 6)`. The slice holds the Windows VM
+plus direct Linux jobs: `jobs_min_bytes` is what direct Linux jobs keep when
+Windows uses its full allowance. The example values render exactly:
+
+```ini
+[Slice]
+MemoryMax=42949672960
+MemoryHigh=35791394134
+```
+
+## Tenant allocation
+
+Provisioning checks **bytes** before allocating anything for the tenant, against
+the same storage rule motor-host applies on every admission and heartbeat:
+
+```text
+host_floor_bytes + (idle_suspend_s > 0 ? guest RAM : 0)   the suspend reserve
+  + storage_margin_bytes                                  the storage threshold
+  + storage_margin_bytes + growth_allowance_bytes         the operating requirement
+  + 2 GiB (mkfs metadata)
+  + guest RAM + 512 MiB, only while the size base is absent
+```
+
+An operator budget with these values is `/etc/motor-host/capacity.json`. Nothing
+is created when free space falls one byte short. A fully allocated disk (an
+image without `sparse-v1`) takes its whole quota on top of this figure, which
+the check does not count. The same rule is exposed as
+`storage_threshold`, `operating_requirement` and `pre_operation_free_bytes`, and
+motor-host keeps the same numbers (`test_storage_requirement_pinned_to_the_cutover_figures`,
+`test_pre_operation_requirement_passes_at_exact_and_refuses_one_byte_short`). On a host that also runs `motor-runner serve`, it reads
 each runner's live arguments (`--free-space-floor-bytes` and `--state-root`,
 defaulting as the runner does). For every runner whose state shares the
 filesystem of `/var/lib/motor-vm`, it refuses unless the free space left after
@@ -53,9 +143,15 @@ runner's arguments cannot be parsed, or if its state root comes from an
 environment it cannot read
 (`test_runner_on_the_same_filesystem_keeps_its_refusal_floor_before_any_mutation`).
 It builds `base/<ceiling>-<ram>/{base.vmstate,base.memory}`
-only if absent. It fully allocates a new disk (never reflinks it), formats XFS
-with reflink enabled, and mounts it only during initial creation of
-`/tenant/runner-args`. It writes generation zero, a root-only helper registry
+only if absent. An image whose manifest lists the capability `sparse-v1` gets a
+disk truncated to the quota, so the guest sees the whole size and only blocks it
+writes occupy the host; any other image gets a fully allocated disk as before
+and is never reflinked. An existing disk is never rewritten, whichever way it
+was created. The base boot asks Firecracker for `discard` on the tenant drive
+with the `Sync` IO engine, so the guest's freed blocks reach the host, and it
+sets the VMM's `oom_score_adj` to -500 and reads it back, refusing the boot when
+either step fails. The disk is formatted XFS with reflink enabled and mounted
+only during initial creation of `/tenant/runner-args`. It writes generation zero, a root-only helper registry
 entry under `/etc/motor-vm-helper/tenants`, and the host-readable
 `/etc/motor-host/tenants.json` binding map. Existing tenants, tap indices and VM
 bindings are refused. Failure intentionally retains partially created disk
@@ -100,6 +196,100 @@ automatic `remove_tenant`. The procedure and how to undo a removal are in
 `docs/hosted-host.md`. Tests: `test_remove_tenant_*`,
 `test_removal_layout_is_the_one_the_helper_removes`.
 
-Portable tests: `python3 -W error script/tenant-provision/test_provision.py`.
+## Offline resize
+
+```sh
+sudo systemctl stop motor-host.service motor-vm-helper.service
+sudo python3 script/tenant-provision/provision.py resize <tenant> \
+    [--vcpu-ceiling N] [--guest-ram-mib N] [--cpuset LIST] [--max-weight N] \
+    [--idle-suspend-s N] [--disk-quota-bytes N]
+sudo python3 script/tenant-provision/provision.py resize --abort <tenant>
+```
+
+A resize changes only the named fields; the rest of the record stays as
+provisioned. Guest RAM and the disk quota only grow. It is a host-wide outage:
+under `provision.lock`, before anything is written, it refuses, each with its own
+message, when either service is active; a Firecracker VMM or jailer is running;
+any registered tenant has `running.json`, `unclean-stop.json`, a helper cgroup
+(`.../motor-vm-helper.service/tenants/tenant-<tap>`) or a jail
+(`/var/lib/motor-vm/jail/tenants/<tenant>`); another tenant has a `resize.json`;
+any tenant still has a `runner-args.staged` (an earlier resize's activation is
+pending: start that tenant once, then stop it); the tenant's image manifest does
+not list `resize-v1`; the disk would shrink or the RAM decrease; the disk's length
+differs from the recorded quota; the new `vcpu_ceiling` is not 1 or even, or is
+above 32; the cpuset overlaps the Windows VM's CPUs (`12-15,28-31`) or another
+tenant; free space is below the pre-operation figure of the storage rule above
+(the threshold is the largest over every registered tenant, with the new record;
+this applies even when only `max_weight` or `idle_suspend_s` changes); the memory
+fit fails with the new RAM replacing the old; or the jobs-slice drop-in is absent,
+differs from the render, or the live cap check fails. Resize verifies the drop-in
+but never writes it.
+
+The journal `tenants/<tenant>/resize.json` (mode 0600) holds the old and new
+records, their exact bytes, the old and new `/etc/motor-vm-helper.json` (slot
+CPUs follow the cpuset), the runner arguments, whether the new size base existed,
+the snapshot set-aside directory, the staged file paths and the phase. Each
+write is an fsynced temporary file renamed over it, then a directory fsync.
+Every path is recorded before the step that creates it. The steps are: build the
+new size base if absent; stage `runner-args.staged` (root-owned, mode 0600, the
+helper's `{"runner_args","quota_grew"}` JSON) and copies of the three new files in
+`resize-staged/`; move `suspend/` aside to `suspend.resize-<ns>` and create an
+empty one, since suspend keys omit the size; then **commit**. After the commit it
+replaces the provisioning record, the helper registry and the helper config,
+extends `disk.img` sparsely with `truncate`, confirms the staged activation and
+removes the journal. The tenant disk is never mounted: on its next cold start the
+guest grows XFS and installs the arguments (`crates/motor-vm-helper/README.md`,
+"Staged resize activation"). The old snapshots stay in `suspend.resize-<ns>` for
+the operator to delete. The resized record then passes `install.sh --check`,
+which checks the installed record against the helper registry and the helper
+config rather than against the installer's template, and a reinstall keeps it.
+
+After a failure, re-run the same command to resume from the recorded phase;
+different options are refused. Before the commit the disk must still have its
+old length, after it exactly the old or the new length. `resize --abort` works
+only before the commit. It first records phase `aborting` (from then on a forward
+resume refuses), moves the snapshots back, removes the staged files, deletes the
+size base only if this resize created it and no registered tenant uses it,
+verifies the old records, helper config and disk length, and only then removes
+the journal. Each step can be repeated, so a failed abort is finished by running
+it again. The jobs-slice drop-in stays. After the commit, abort refuses.
+
+While any `resize.json` exists, provisioning, `switch-image`,
+`repair-from-registry`, `apply-jobs-slice` and a resize of another tenant refuse
+without writing; only resume or abort of that resize and `remove-tenant` run. The
+helper refuses every start of the journaled tenant and `install.sh --check` fails.
+
+### Malformed resize journal
+
+A `resize.json` that cannot be read, is not valid JSON, has missing or unknown
+keys, another schema version, an unknown phase, or names a base, set-aside or
+staged path the resize would not have created is refused by both resize and
+abort, and the tenant stays start-refused. Recover by hand with both services
+stopped. The old state comes from copies of the provisioning record, the helper
+registry entry and `/etc/motor-vm-helper.json` saved before the resize (save
+them before every resize); if `resize.json` is
+still readable JSON, its `provision_old`, `registry_old` and `helper_old` hold the
+same bytes, and `provision_new`, `registry_new` and `helper_new` the new ones.
+
+1. Compare `/etc/motor-host/provision/<tenant>.json`,
+   `/etc/motor-vm-helper/tenants/<tenant>.json` and `/etc/motor-vm-helper.json`
+   with the saved copies, and the `disk.img` length with each record's
+   `disk_quota_bytes`.
+2. If all three files and the disk length are still the old ones, return to the
+   old size. This is safe even if the journal had reached `committed`: nothing
+   after the commit point had been published or extended yet, so the host is
+   exactly as it was before the commit. Move the newest `suspend.resize-*` back
+   to `suspend/` if `suspend/` is empty, delete `runner-args.staged` and
+   `resize-staged/`, and delete the new size base only if no registry entry
+   names its `<vcpu>-<ram>`.
+3. If any of them is already the new one, the resize committed: finish it by
+   writing all three files at the new size, `truncate -s <new quota> disk.img`,
+   and writing `runner-args.staged` as the helper expects (root, 0600).
+4. Move `resize.json` out of the tenant home (keep it for the incident record),
+   then run `install.sh --check` before starting the services.
+
+Tests: `test_resize.py` (`ResizeTests`, loaded by `test_provision.py`).
+
+Portable tests (including the capacity and resize suites): `python3 scripts/run-script-tests.py`.
 Real provisioning, networking and suspend/restore qualification require an
 operator-controlled host; the portable tests do not claim VM isolation proof.

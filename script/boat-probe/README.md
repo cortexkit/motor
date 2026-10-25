@@ -292,11 +292,14 @@ The exit status reports the measurement verdict, and cleanup separately:
 accepted deletes never fails a run: nothing is left running and retrying cannot
 speed it up.
 
-`verdict.inconclusive` lists provider idle-reclaim checks marked `INCONCLUSIVE`. They
-remain `INCONCLUSIVE` in the check list rather than counting as passes, but do
-not block the runner-host verdict. Every parity, storage and other required check
-still needs `PASS`; a failed required check cannot be hidden by an inconclusive
-reclaim observation.
+`verdict.inconclusive` lists every check marked `INCONCLUSIVE`. They remain
+`INCONCLUSIVE` in the check list rather than counting as passes. Only two kinds
+do not block the runner-host verdict, each listed with its reason in
+`verdict.tolerated_inconclusive` and the findings: provider idle-reclaim checks,
+and a file_setattr refusal on a kernel its own control proves lacks the syscall
+(see Disk-quota qualification). Every parity, storage and other required check
+still needs `PASS`; a failed required check cannot be hidden by a tolerated
+inconclusive check.
 
 `Error: none recorded` in rendered findings means no measurement exception was
 caught. It does not override `cleanup_complete: false` or a failed network probe.
@@ -320,35 +323,69 @@ networking follows [Public URLs / raw TCP](https://docs.boat.dev/hosting) and
 [Firewall](https://docs.boat.dev/hosting/firewall): guest root rules, not an
 invented provider firewall API. No live provider assertion follows from these
 portable tests.
+## Plain stop/resume control
+
+The prepared-image `core` phase runs its normal checks and jobs in a fresh
+clone without quota fills, waits for a ready endpoint with no job quota leases,
+then sends a normal Boat stop. It requires `archived` with `stop.status` equal to
+`completed`, resumes, waits for hydration, checks the existing identity's
+endpoint readiness and a no-restart identity reinstall, and runs a normal Node
+job through the pinned SSH forward. The required checks include
+`core_stop_resume.idle_before_stop`, `core_stop_resume.stop_completed`,
+`core_stop_resume.normal_job_after_resume` and the `core_resumed` readiness and
+storage checks. A failed or incomplete control fails core, even if all earlier
+jobs passed. No idle-reclaim wait or quota-fill lane is added to core.
+
+`runner_host.core_stop_resume` records the pre-stop root/XFS free space and loop
+allocation, accepted response, lifecycle samples and `accepted_to_completed_seconds`:
+the monotonic interval from receiving the stop response (normally HTTP 202) to
+observing completed archival. The findings also print that interval. The control
+keeps the standard 900-second stop cap; the quota diagnostic option below does
+not change it.
+
 ## Disk-quota qualification
 
-The runner-host probe fills the real total quota (up to 32 GiB, with nonzero
+The runner-host probe proves the real root/XFS-bound total quota (with nonzero
 random data and fsync) before its stop/resume cycle. It
 first tries native and compat attribute setters, requires EPERM, checks that a
 new file still inherits the job project, then fills that same directory. A
 preallocated barrier lets the root observer measure **both** root and XFS free
 space while the failed write's data is still present. A pre-fill handshake
-captures physical headroom before writes begin. Ordinary lanes require the
-root-read kernel hard limit and near-limit charge, EDQUOT/ENOSPC, a normal failed
-terminal, cleanup/readiness, and a normal next job. Netlink warnings are recorded
+captures physical headroom and the job project's kernel usage before writes begin.
+Both lanes filled to the cap require the root-read kernel hard limit, near-limit
+charge and EDQUOT/ENOSPC. The reflink lane and every charge-only lane then require
+a normal terminal, cleanup/readiness and a normal next job; the retained-target lane
+instead stays live at its limit through the stop and is checked after the resume. Netlink warnings are recorded
 but are not a substitute for those checks: multicast loss must not fake either
 success or failure. Probe results retain `runner_host.disk_quota`,
-including `at_limit.root_free_bytes` and `at_limit.xfs_free_bytes`, so the
+including `at_limit.root_free_bytes` and `at_limit.xfs_free_bytes` from the first
+ordinary lane filled to the cap, so the
 provisional 24-GiB reserve can be tuned empirically. `reserve_at_limit` proves
 only enforcement of that floor, **not its sufficiency**; `reserve_assurance`
 explicitly leaves `sufficiency_proven` false.
 
-Separate jobs exhaust workspace, target, scratch, HOME and `/var/tmp`, and allocate past the same
-limit on the existing root-created `/motor-output/stdout` inode. The stdout lane
-uses `fallocate(KEEP_SIZE)`: it must allocate nearly the entire allowance before
-EDQUOT/ENOSPC and a matching near-full kernel quota, while preserving the root-disk
-reserve. It verifies `st_blocks` as well as project ID, so a refused no-op is not
-a pass. Keeping the file size at zero avoids streaming tens of GiB into the
+Separate jobs write into workspace, target, scratch, HOME and `/var/tmp`, and allocate on
+the existing root-created `/motor-output/stdout` inode. Filling a lane to the real cap
+can write tens of GiB, so only the lanes whose proof needs the limit do so
+(`disk_quota.FULL_LANES`): the reflink target and the retained target. Each of those
+must reach EDQUOT/ENOSPC with a matching near-full kernel quota while the reserve
+holds. Every other lane writes `disk_quota.CHARGE_BYTES` (256 MiB) and passes
+`charge_fill_completed` and `fill_charged_to_job_project`. The root observer reads the
+job project's kernel usage before the first fill byte and again after the last. The
+difference must cover the bytes written, so the kernel charged that path to the same
+hard limit the full lanes prove. A charge-only lane never reports the at-limit checks
+(`job_write_failed`, `filled_real_quota`, `reserve_at_limit`). The stdout lane
+uses `fallocate(KEEP_SIZE)`: its allocated blocks must cover the bytes it allocated,
+with file size zero. It verifies `st_blocks` as well as project ID, so a refused
+no-op is not a pass. Keeping the file size at zero avoids streaming data into the
 operator client; the lane punches its unwritten extents before reporting. Every
 lane checks project IDs for workspace, target, HOME, `/tmp`, `/var/tmp`, stdout,
-stderr, exit and cache-stats. Only quota jobs request the operator example's
-optional bounded 900-second deadline; existing probe invocations still default
-to 120 seconds. `phases[].kernel_release` records `uname -r`.
+stderr, exit and cache-stats. Ordinary quota jobs request a 900-second client
+deadline. The retained-target job instead uses the remaining phase budget,
+capped at 1800 seconds, for its client deadline and marker hold, so it cannot
+silently finish its old 90-second hold during a long stop wait. The operator
+example accepts explicit deadlines through 1800 seconds; invocations without a
+deadline still default to 120 seconds. `phases[].kernel_release` records `uname -r`.
 
 A 64-MiB retained-target baseline must be relabelled and reduce the successor's
 remaining growth. Another job leaves actual FICLONE copies; its successor
@@ -369,6 +406,70 @@ terminals. Stop must archive successfully, resume must hydrate, and the resumed
 phase must run a normal job. This is not merely a stop after unlinking the fill.
 Failure cleanup stops writers and removes only the disposable probe's fills,
 so a failed reserve qualification does not deliberately leave the sandbox full.
+If stop fails or does not complete within `--quota-stop-wait-s` (default 900), or
+the remaining run budget, `disk_quota.stop_with_quota_sized_target` is a named FAIL.
+`runner_host.disk_quota.stop_at_limit` records the accepted response, the last
+observed sandbox/stop/snapshot fields and poll count, and the
+**pre-stop** root/XFS free bytes, retained allocation and loop-file allocation.
+Its `wait.samples` checkpoint the lifecycle fields at the first poll, about every
+30 seconds and at completion/timeout. Samples include `stop.status`,
+`stop.lastAttemptAt`, snapshot attempt/status/completion fields, and a
+`retained_job` observation over the already pinned SSH route (Boat API exec
+refuses `archiving`). The guest read records whether the job unit is still
+active, the target's actual allocated bytes and whether those bytes still meet
+the quota-sized threshold, plus fresh root/XFS free space and client liveness.
+Sampling is read-only and never releases the barrier. SSH reads have a 10-second
+cap and cannot exceed the remaining budget. An unavailable sample is recorded
+as **unknown**, not as a live job or a deleted target. Completed archival needs
+no live-guest observation because the machine is then expected to be down.
+`disk_quota.retained_target_held_during_stop` is FAIL if a pending-stop sample
+observes a dead job or lost allocation, and blocking INCONCLUSIVE if a required
+observation is unavailable; neither qualifies a live/full-quota stop. A fast
+stop with no pending poll uses the measured live, allocated pre-stop guard.
+Those disk samples are not a measurement of snapshot peak space. A completed
+snapshot alone is not a completed stop: archival still requires sandbox state
+`archived` and `stop.status` `completed`. The portable regression replays both
+sizes' pending-stop observations in `fixtures/full-quota-stops.json`.
+
+A stop that does not complete names Boat's own progress first:
+`stop_at_limit.boat_stop_progress` and the failure reason classify it as
+`boat_stop_never_attempted` (every sample pending with `stop.lastAttemptAt`
+null, state `archiving`, health `ok`), `boat_stop_attempted_not_completed`, or
+`boat_stop_pending_unclassified`, and list the snapshots Boat completed during
+the wait and the snapshot attempts it began after the stop request, with the
+last attempt's status and whether the phase budget ended the wait.
+
+Boat resumes a stopped sandbox from memory (the boot id and the runner's start
+time are unchanged), so the retained job is still running at its barrier after
+resume and the runner rightly keeps its workspace. Before the resumed phase, the
+probe writes the barrier's release byte and waits up to 90 seconds for the
+job's terminal record and inactive unit;
+`disk_quota.retained_job_ended_after_resume` FAILs and stops the phase if it
+does not end. The job keeps its fill, so the resumed checks then see an idle
+workspace holding a quota-sized target, and endpoint readiness is timed from
+the release. `disk_quota.backing_allocation_dropped_after_resume` requires the
+loop file's allocation to drop by the retained target's allocation, less 1 GiB.
+`fixtures/boat-verify-c7c6127f.json` replays the run in which the job was not
+released.
+
+For a longer diagnostic wait, add `--quota-stop-wait-s 1500` to the disk-quota
+invocation below. This raises only the stop-wait cap, not the phase's budget or
+the requested `ttlSeconds: 1800`. Evidence records `requested_wait_seconds`,
+`remaining_budget_seconds`, `effective_wait_seconds` and `budget_limited`.
+The effective cap is `min(requested wait, phase deadline - current time)`;
+create/hydration, prior quota lanes and pre-stop measurements have already spent
+some of the 30 minutes. For example, 600 seconds of setup leaves at most 1200
+seconds for the stop alone. Resume and its checks also need
+time afterward; a stop completing at the budget boundary is not a complete
+stop/resume qualification.
+
+`--max-minutes 60` does **not** extend runner-host's 30-minute cap. At a budget
+timeout the run fails and disposable-sandbox cleanup still runs; do not expect
+that sandbox to continue saving after the probe exits. A stop observation longer
+than the remaining phase budget requires a separately approved diagnostic with
+a provider-supported longer lifetime and a correspondingly longer local budget,
+or a shorter setup that reaches the full target earlier. Neither is enabled by
+this flag, and Boat's possible TTL extensions are not a guarantee to rely on.
 
 Before the jobs, an unfiltered root control on the same XFS mount sets and clears
 project inheritance with FSSETXATTR and verifies the actual flag transition. The
@@ -379,20 +480,29 @@ filter before filling its inherited directory. If root can use the syscall, the
 job refusal is a positive PASS. If root gets ENOSYS (for example on a pre-6.17
 kernel), that case is explicitly **INCONCLUSIVE**, not PASS: because root also
 returned ENOSYS, the case cannot establish that the job's ENOSYS came from its
-syscall filter. The result records the
-root control, errno and kernel release. The probe still collects quota and
-stop/resume evidence, but does not claim every required check passed when the
-path-setter case is inconclusive.
+syscall filter. The check reads only that root control and the job's inheritance
+report (its `file_setattr_errno` and the three refused setter ioctls), never the
+fill's exit code, errno or byte count: the refusal happens before the fill, so a
+256 MiB partial fill that exits 0 and a full fill that exits 73 are judged the
+same way. The result records the root control, errno and kernel release. That INCONCLUSIVE does not block the
+verdict only when the check's own control shows the kernel lacks the syscall
+(`file_setattr_supported` false and errno 38, Linux ENOSYS): no job can call it
+there either, and the seccomp rule that denies it on newer kernels is covered by
+the runner's own tests. Findings print it as, for example, "file_setattr absent on
+kernel 6.8.0 (ENOSYS); not applicable". A file_setattr INCONCLUSIVE whose control
+is missing, malformed or reports the syscall present still fails the verdict.
 
 Run on the largest deployed size (`xlarge`) against a **newly rebuilt** prepared
-image. Use the existing credential reader and seed arguments:
+image. Use the existing credential reader and seed arguments. The quota lanes run
+in the `disk-quota` verify phase (see `--verify-phase` in
+[`script/boat-image/README.md`](../boat-image/README.md#operator-probe)):
 
 ```sh
 set -o pipefail
 <key reader> | python3.14 script/boat-probe/probe.py --key-stdin --runner-host \
-  --size xlarge --verify-prepared-image <new-prepared-image> \
-  --cargo-seed-manifest <seed.json> --cargo-seed-archive <seed.tar.gz> \
-  --cargo-seed-sha256 <manifest-sha256> --acknowledge-tenant-one-private-cache \
+  --size xlarge --verify-prepared-image <new-prepared-image> --verify-phase disk-quota \
+  --cargo-seed-manifest <seed.json> --cargo-seed-sha256 <manifest-sha256> \
+  --acknowledge-tenant-one-private-cache \
   --max-minutes 30 --output .cortexkit/internal-docs/research/boat-disk-quota
 ```
 

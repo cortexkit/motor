@@ -4,10 +4,22 @@
 install.sh calls this to produce, on stdout, the exact bytes it installs:
 
   host --host-id ID [--port N]      /etc/motor-host/host.json
-  helper --uid UID --gid GID        /etc/motor-vm-helper.json
-  tenant --sub S [--disk-quota-gib N]
-                                    the provision.py operator JSON for tenant 1
+  helper --uid UID --gid GID [--installed RECORD]
+                                    /etc/motor-vm-helper.json, its slot CPUs
+                                    taken from the installed tenant record
+  tenant --sub S [--disk-quota-gib N] [--installed RECORD]
+                                    the provision.py operator JSON for tenant 1:
+                                    the installed record when there is one,
+                                    the tenant-1.json template on a first install
   public-ip                         the one global IPv4 address of this machine
+
+one check of the installed state, which install.sh --check and --start run:
+
+  check-installed --uid UID --gid GID
+                                    the installed tenant record, its helper
+                                    registry entry, the helper config, the host
+                                    capacity inputs and the jobs slice agree,
+                                    and no resize is pending
 
 and one operator query, which reads motor-host's admin socket as root:
 
@@ -57,6 +69,10 @@ ADMIN_SOCKET = Path("/run/motor-host/admin.sock")
 BINDINGS = Path("/etc/motor-host/tenants.json")
 REGISTRY = Path("/etc/motor-vm-helper/tenants")
 STORAGE = Path("/var/lib/motor-vm")
+# The installed provisioning record of tenant 1 (provision.py's PROVISION
+# directory) and the helper config install.sh writes.
+TENANT_RECORD = Path("/etc/motor-host/provision/tenant-1.json")
+HELPER_CONFIG = Path("/etc/motor-vm-helper.json")
 
 # The build server has 16 cores / 32 threads; thread n and n+16 share a core.
 # The Windows build VM owns cores 12-15 (threads 12-15 and 28-31). Nothing of
@@ -106,11 +122,37 @@ def host_config(host_id: str, port: int = PORT) -> dict:
     }
 
 
-def helper_config(uid: int, gid: int) -> dict:
-    """/etc/motor-vm-helper.json admitting only the motor-host account."""
-    tenant = json.loads(TENANT_FILE.read_text())
+def render_json(value) -> str:
+    """The bytes install.sh installs for a rendered config: two-space JSON and a
+    newline, the layout provision.py also uses when it rewrites these files."""
+    return json.dumps(value, indent=2) + "\n"
+
+
+def read_record(path: Path) -> dict:
+    """An installed tenant provisioning record."""
+    try:
+        record = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as error:
+        raise ValueError(f"cannot read the installed tenant record {path}: {error}") from error
+    if not isinstance(record, dict):
+        raise ValueError(f"the installed tenant record {path} is not a JSON object")
+    return record
+
+
+def helper_config(uid: int, gid: int, tenant: dict | None = None) -> dict:
+    """/etc/motor-vm-helper.json admitting only the motor-host account.
+
+    Its slot CPUs are the tenant's cpuset: the installed record's when one is
+    given, so a resize that moved the tenant (and rewrote this file) is kept,
+    and the template's on a first install."""
+    if tenant is None:
+        tenant = json.loads(TENANT_FILE.read_text())
     if uid <= 0 or gid <= 0:
         raise ValueError("the host agent account must not be root")
+    if not isinstance(tenant.get("cpuset"), str):
+        raise ValueError("the tenant record has no cpuset")
+    if cpus(tenant["cpuset"]) & cpus(WINDOWS_CPUS):
+        raise ValueError(f"tenant cpuset {tenant['cpuset']} overlaps the Windows VM's CPUs {WINDOWS_CPUS}")
     images = STORAGE / "images"
     # Absent files the helper never opens: they are read only when a job slot
     # starts, and no client of this helper asks for one.
@@ -134,21 +176,123 @@ def helper_config(uid: int, gid: int) -> dict:
     }
 
 
-def tenant_config(sub: str, disk_quota_gib: int | None = None, image_version: str | None = None) -> dict:
-    """The provision.py operator JSON for tenant 1, validated by provision.py."""
-    config = json.loads(TENANT_FILE.read_text())
-    config["sub"] = sub
-    if image_version is not None:
-        config["image_version"] = image_version
-    if disk_quota_gib is not None:
-        config["disk_quota_bytes"] = disk_quota_gib * 1024**3
-    provision = load_provision()
-    provision.checked(config)
-    if cpus(config["cpuset"]) & cpus(WINDOWS_CPUS) or max(cpus(config["cpuset"])) >= THREADS:
-        raise ValueError("tenant cpuset must avoid the Windows VM's CPUs")
+def validate_tenant(config: dict, provision=None) -> None:
+    """provision.py's own checks, plus this machine's: the cpuset avoids the
+    Windows VM's CPUs and exists on this host, and the resolvers are the host
+    agent's."""
+    provision = load_provision() if provision is None else provision
+    try:
+        provision.checked(config)
+    except (KeyError, TypeError) as error:
+        raise ValueError(f"invalid tenant record: {error!r}") from error
+    cpuset = cpus(config["cpuset"])
+    if cpuset & cpus(WINDOWS_CPUS):
+        raise ValueError(f"tenant cpuset {config['cpuset']} overlaps the Windows VM's CPUs {WINDOWS_CPUS}")
+    if max(cpuset) >= THREADS:
+        raise ValueError(f"tenant cpuset {config['cpuset']} names a CPU beyond this host's {THREADS} threads")
     if config["resolvers"] != RESOLVERS:
         raise ValueError("tenant resolvers must match the host agent's")
+
+
+def tenant_config(sub: str, disk_quota_gib: int | None = None, image_version: str | None = None,
+                  installed: Path | None = None) -> dict:
+    """The provision.py operator JSON for tenant 1, validated by provision.py.
+
+    With an installed record, that record is the result: its sizing may have
+    been changed by provision.py resize and its image by switch-image, and
+    reinstalling must not put the template's values back. The template
+    applies only to a first install."""
+    if installed is not None:
+        if disk_quota_gib is not None or image_version is not None:
+            raise ValueError("the installed tenant record keeps its sizing and image; change them with "
+                             "provision.py resize or switch-image, not the installer")
+        config = read_record(installed)
+        if config.get("sub") != sub:
+            raise ValueError(f"--tenant-sub differs from the subject in the installed record {installed}")
+    else:
+        config = json.loads(TENANT_FILE.read_text())
+        config["sub"] = sub
+        if image_version is not None:
+            config["image_version"] = image_version
+        if disk_quota_gib is not None:
+            config["disk_quota_bytes"] = disk_quota_gib * 1024**3
+    validate_tenant(config)
     return config
+
+
+def registry_disagreements(record: dict, registry: dict, provision) -> list[str]:
+    """Fields where the helper registry entry is not what provision.py writes
+    for this record: every field the two share, the registry's disk paths, and
+    a field (such as max_weight) present in only one of them."""
+    current = provision.checked(record)
+    expected = {name: value for name, value in current.items() if name not in provision.PROVISION_ONLY}
+    home = provision.ROOT / "tenants" / current["tenant"]
+    expected.update({name: str(home / leaf) for name, leaf in provision.REGISTRY_PATHS.items()})
+    missing = object()
+    return sorted(name for name in set(registry) | set(expected)
+                  if registry.get(name, missing) != expected.get(name, missing))
+
+
+def check_installed(uid: int, gid: int, record_path: Path = TENANT_RECORD, helper_path: Path = HELPER_CONFIG,
+                    provision=None) -> list[str]:
+    """Every problem with the installed tenant state; empty when it is sound.
+
+    The installed record, not the template, is the reference: a tenant
+    resized by provision.py passes as long as its record, its helper registry
+    entry and the helper config agree with each other and with this host.
+    """
+    provision = load_provision() if provision is None else provision
+    problems = []
+
+    def check(label, action):
+        try:
+            action()
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            problems.append(f"{label}: {error}")
+            return False
+        return True
+
+    record = None
+
+    def load():
+        nonlocal record
+        record = read_record(record_path)
+
+    if check(str(record_path), load):
+        check(str(record_path), lambda: validate_tenant(record, provision))
+
+        def registry():
+            path = provision.REGISTRY / f"{provision.component(record['tenant'])}.json"
+            try:
+                entry = json.loads(path.read_text())
+            except (OSError, ValueError) as error:
+                raise ValueError(f"cannot read the helper registry entry {path}: {error}") from error
+            if not isinstance(entry, dict):
+                raise ValueError(f"the helper registry entry {path} is not a JSON object")
+            differ = registry_disagreements(record, entry, provision)
+            if differ:
+                raise ValueError(f"the installed record and {path} differ at {', '.join(differ)}")
+
+        check("helper registry", registry)
+
+        def helper():
+            expected = render_json(helper_config(uid, gid, record))
+            if helper_path.read_text() != expected:
+                raise ValueError("differs from the render of the installed tenant record")
+
+        check(str(helper_path), helper)
+
+    capacity = None
+
+    def read_capacity():
+        nonlocal capacity
+        capacity = provision.read_capacity()
+
+    if check("capacity.json", read_capacity):
+        check("memory fit", lambda: provision.memory_fit(capacity))
+        check("jobs slice", lambda: provision.verify_jobs_slice(capacity))
+    check("resize", provision.refuse_resize_journal)
+    return problems
 
 
 def load_provision():
@@ -241,10 +385,15 @@ def main() -> int:
     helper = commands.add_parser("helper")
     helper.add_argument("--uid", type=int, required=True)
     helper.add_argument("--gid", type=int, required=True)
+    helper.add_argument("--installed", type=Path, help="the installed tenant record; absent on a first install")
     tenant = commands.add_parser("tenant")
     tenant.add_argument("--sub", required=True)
     tenant.add_argument("--disk-quota-gib", type=int)
     tenant.add_argument("--image-version")
+    tenant.add_argument("--installed", type=Path, help="the installed tenant record; absent on a first install")
+    check = commands.add_parser("check-installed")
+    check.add_argument("--uid", type=int, required=True)
+    check.add_argument("--gid", type=int, required=True)
     commands.add_parser("public-ip")
     runner_log = commands.add_parser("runner-log")
     runner_log.add_argument("--tenant", required=True)
@@ -264,16 +413,25 @@ def main() -> int:
                                     check=True, capture_output=True, text=True).stdout
             print(public_ipv4(output))
             return 0
+        if args.command == "check-installed":
+            problems = check_installed(args.uid, args.gid)
+            for problem in problems:
+                print(f"hosted-host: {problem}", file=sys.stderr)
+            if problems:
+                return 1
+            print(f"installed tenant state agrees: {TENANT_RECORD}, its helper registry entry, {HELPER_CONFIG}, "
+                  "capacity.json, the memory fit and the jobs slice; no resize is pending")
+            return 0
         if args.command == "host":
             value = host_config(args.host_id, args.port)
         elif args.command == "helper":
-            value = helper_config(args.uid, args.gid)
+            value = helper_config(args.uid, args.gid, None if args.installed is None else read_record(args.installed))
         else:
-            value = tenant_config(args.sub, args.disk_quota_gib, args.image_version)
+            value = tenant_config(args.sub, args.disk_quota_gib, args.image_version, args.installed)
     except ValueError as error:
         print(f"hosted-host: {error}", file=sys.stderr)
         return 2
-    print(json.dumps(value, indent=2))
+    sys.stdout.write(render_json(value))
     return 0
 
 

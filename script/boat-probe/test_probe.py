@@ -197,6 +197,97 @@ class ParsingTests(unittest.TestCase):
 
 
 
+class SandboxWaitTests(unittest.TestCase):
+    def timed_probe(self, responses, deadline=1800):
+        runner = probe.Probe(FakeClient({('GET', '/sandboxes/bx_test'): responses}), evidence(), MagicMock())
+        runner.deadline = deadline
+        clock = [0.0]
+        def advance(seconds):
+            clock[0] += seconds
+        return runner, clock, patch.object(probe.time, 'monotonic', side_effect=lambda: clock[0]), \
+            patch.object(probe.time, 'sleep', side_effect=advance)
+
+    def test_long_wait_samples_stop_and_snapshot_progress_every_thirty_seconds(self):
+        pending = {'id': 'bx_test', 'state': 'archiving', 'stop': {'status': 'pending', 'lastAttemptAt': None},
+                   'lastSnapshotStatus': 'in_progress', 'lastSnapshotAttemptAt': 'attempt-1',
+                   'snapshotCompletedAt': 'previous'}
+        attempted = dict(pending, stop={'status': 'pending', 'lastAttemptAt': 'stop-attempt-1'})
+        snapshotted = dict(attempted, lastSnapshotStatus='completed', snapshotCompletedAt='new-snapshot')
+        completed = dict(snapshotted, state='archived', stop={'status': 'completed', 'lastAttemptAt': 'stop-attempt-1'})
+        responses = [{'sandbox': pending}] * 15 + [{'sandbox': attempted}] * 15 + \
+            [{'sandbox': snapshotted}] * 470 + [{'sandbox': completed}]
+        runner, clock, ticking, sleeping = self.timed_probe(responses)
+        observation = {}
+        with ticking, sleeping:
+            self.assertEqual(runner.wait_sandbox('bx_test', {'archived'}, 1200, observation=observation), completed)
+        self.assertEqual(clock[0], 1000)
+        self.assertEqual(observation['requested_wait_seconds'], 1200)
+        self.assertEqual(observation['effective_wait_seconds'], 1200)
+        self.assertFalse(observation['budget_limited'])
+        samples = observation['samples']
+        self.assertEqual(len(samples), 35)
+        self.assertEqual([sample['seconds'] for sample in samples[:3]], [0, 30, 60])
+        self.assertIsNone(samples[0]['sandbox']['stop']['lastAttemptAt'])
+        self.assertEqual(samples[1]['sandbox']['stop']['lastAttemptAt'], 'stop-attempt-1')
+        self.assertEqual(samples[2]['sandbox']['lastSnapshotStatus'], 'completed')
+        self.assertEqual(samples[2]['sandbox']['snapshotCompletedAt'], 'new-snapshot')
+        self.assertEqual(samples[-1]['seconds'], 1000)
+        self.assertEqual(samples[-1]['sandbox']['stop']['status'], 'completed')
+        self.assertEqual(runner.checkpoint.call_count, 35)
+
+    def test_wait_cap_and_remaining_phase_budget_both_end_with_failure(self):
+        pending = {'id': 'bx_test', 'state': 'archiving', 'stop': {'status': 'pending'}}
+        for timeout, deadline, expected, limited in ((900, 1800, 900, False), (60, 1800, 60, False),
+                                                     (1200, 70, 70, True)):
+            with self.subTest(timeout=timeout, deadline=deadline):
+                runner, clock, ticking, sleeping = self.timed_probe([{'sandbox': pending}] * 600, deadline)
+                observation = {}
+                with ticking, sleeping, self.assertRaises(probe.SandboxWaitTimeout) as caught:
+                    runner.wait_sandbox('bx_test', {'archived'}, timeout, observation=observation)
+                self.assertEqual(clock[0], expected)
+                self.assertEqual(observation['effective_wait_seconds'], expected)
+                self.assertEqual(observation['budget_limited'], limited)
+                self.assertEqual(caught.exception.evidence['last_sandbox']['stop']['status'], 'pending')
+                self.assertEqual(caught.exception.evidence['samples'], observation['samples'])
+                self.assertEqual(observation['samples'][-1]['seconds'], expected - 2)
+
+    def test_guest_sample_failures_are_explicit_and_do_not_cancel_the_stop_wait(self):
+        pending = {'id': 'bx_test', 'state': 'archiving', 'stop': {'status': 'pending'}}
+        completed = dict(pending, state='archived', stop={'status': 'completed'})
+        runner, clock, ticking, sleeping = self.timed_probe([{'sandbox': pending}] * 16 + [{'sandbox': completed}])
+        observe = MagicMock(side_effect=[OSError('SSH unavailable'),
+                                        {'status': 'observed', 'job_running': False, 'allocated_bytes': 0},
+                                        {'status': 'archived'}])
+        observation = {}
+        with ticking, sleeping:
+            runner.wait_sandbox('bx_test', {'archived'}, 60, observation=observation, on_sample=observe)
+        self.assertEqual(clock[0], 32)
+        self.assertEqual([sample['seconds'] for sample in observation['samples']], [0, 30, 32])
+        self.assertEqual(observation['samples'][0]['retained_job']['status'], 'unavailable')
+        self.assertIn('SSH unavailable', observation['samples'][0]['retained_job']['error'])
+        self.assertFalse(observation['samples'][1]['retained_job']['job_running'])
+        self.assertEqual(observation['samples'][2]['retained_job']['status'], 'archived')
+
+    def test_archived_requires_a_completed_stop_not_a_completed_snapshot(self):
+        pending = {'id': 'bx_test', 'state': 'archived', 'stop': {'status': 'pending'},
+                   'lastSnapshotStatus': 'completed'}
+        completed = dict(pending, stop={'status': 'completed'})
+        client = FakeClient({('GET', '/sandboxes/bx_test'): [
+            {'sandbox': pending}, {'sandbox': completed}]})
+        runner = probe.Probe(client, evidence(), lambda: None)
+        with patch.object(probe.time, 'sleep'):
+            self.assertEqual(runner.wait_sandbox('bx_test', {'archived'}), completed)
+        self.assertEqual(len(client.calls), 2)
+
+    def test_wait_timeout_before_first_poll_has_explicit_missing_last_state(self):
+        runner = probe.Probe(FakeClient({}), evidence(), lambda: None)
+        runner.deadline = 0
+        with self.assertRaises(probe.SandboxWaitTimeout) as caught:
+            runner.wait_sandbox('bx_test', {'archived'})
+        self.assertEqual(caught.exception.evidence['polls'], 0)
+        self.assertEqual(caught.exception.evidence['last_sandbox'], {})
+
+
 class CleanupTests(unittest.TestCase):
     def test_all_resources_deleted_in_reverse_order_and_operation_polled(self):
         data = evidence([{"kind": "sandbox", "id": "bx_23456789"},
@@ -641,6 +732,17 @@ def runner_phase(name, memory_max, code=23):
 
 
 class RunnerHostRenderTests(unittest.TestCase):
+    def test_stop_completion_and_effective_wait_timings_are_rendered(self):
+        data = self.runner_data()
+        data['runner_host']['core_stop_resume'] = {'accepted_to_completed_seconds': 7.5}
+        data['runner_host']['disk_quota'] = {'stop_at_limit': {'accepted_to_completed_seconds': 1000,
+            'wait': {'requested_wait_seconds': 1500, 'effective_wait_seconds': 1192}}}
+        text = self.rendered(data)
+        self.assertIn('| Core plain stop (accepted response to completed) | 7.5 |', text)
+        self.assertIn('| Quota stop (accepted response to completed) | 1000 |', text)
+        self.assertIn('| Quota stop requested wait cap | 1500 |', text)
+        self.assertIn('| Quota stop effective wait within budget | 1192 |', text)
+
     def runner_data(self, status="PASS"):
         data = evidence([waiting_for_uploads(), {"kind": "named-snapshot", "id": "motor-boat-prepared-abc",
                                                   "operator_retained": True}])
@@ -745,6 +847,29 @@ SIZE_REFUSAL = json.dumps({"ok": False, "code": "type_too_small",
 
 
 class SizeOptionTests(unittest.TestCase):
+    def test_quota_stop_wait_defaults_and_explicit_value_reach_runner_host(self):
+        runner_host = load_runner_host()
+        for options, expected in (([], 900), (['--quota-stop-wait-s', '1500'], 1500)):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as tmp:
+                observed = []
+                def run(host):
+                    observed.append(host.probe.quota_stop_wait_s)
+                with patch('sys.argv', ['probe.py', '--runner-host', '--verify-prepared-image', 'prepared',
+                                        '--output', str(Path(tmp) / 'run'), '--cargo-seed-manifest', 'seed.json',
+                                        '--cargo-seed-sha256', 'a' * 64, '--acknowledge-tenant-one-private-cache', *options]), \
+                     patch.object(probe, 'read_key', return_value='fake-key'), patch.object(probe, 'Client', return_value=FakeClient({})), \
+                     patch.object(runner_host.RunnerHost, 'run', run), patch.object(probe.signal, 'signal'), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    probe.main()
+                self.assertEqual(observed, [expected])
+
+    def test_quota_stop_wait_rejects_nonpositive_values_and_other_modes(self):
+        for args in (['--runner-host', '--quota-stop-wait-s', '0'], ['--runner-host', '--quota-stop-wait-s', '-1'],
+                     ['--quota-stop-wait-s', '1500']):
+            with self.subTest(args=args), patch('sys.argv', ['probe.py', *args]), \
+                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                probe.main()
+
     def created_size(self, argv):
         observed = {}
         def run(runner):
@@ -893,6 +1018,205 @@ class SizingRenderTests(unittest.TestCase):
         self.assertIn("Sandbox size: \"default\".", text)
         self.assertIn("initial rust: skipped: the job asks for 8 vCPUs and this default sandbox has 4 usable vCPUs", text)
         self.assertNotIn("SNAPSHOT_SIZE_BOUND", text)
+
+
+class VerifyPhaseVerdictTests(unittest.TestCase):
+    """A verify phase that did not run is reported as not run, never as passed."""
+
+    def verify_data(self, statuses, requested=probe.VERIFY_PHASES):
+        records = probe.verify_phase_records(requested)
+        checks = []
+        for name, status in statuses.items():
+            records[name].update(ran=True, completed=status != 'failed', status=status)
+            checks.append({'name': name + '.check', 'status': 'PASS' if status == 'passed' else 'FAIL'})
+        data = evidence()
+        data.update(measurements_complete=True, runner_host={
+            'checks': checks, 'phases': [], 'verify_phases': records,
+            'all_passed': all(check['status'] == 'PASS' for check in checks)})
+        return data
+
+    def test_selection_is_one_named_phase_or_every_phase_in_order(self):
+        self.assertEqual(probe.VERIFY_PHASES, ('core', 'disk-quota', 'idle'))
+        self.assertEqual(probe.selected_verify_phases(None), probe.VERIFY_PHASES)
+        for phase in probe.VERIFY_PHASES:
+            self.assertEqual(probe.selected_verify_phases(phase), (phase,))
+        with self.assertRaises(probe.ProbeError):
+            probe.selected_verify_phases('quota')
+
+    def test_cli_accepts_only_known_phases_and_only_with_verify_prepared_image(self):
+        base = ['probe.py', '--runner-host', '--output', 'unused', '--cargo-seed-manifest', 'seed.json',
+                '--cargo-seed-sha256', 'a' * 64, '--acknowledge-tenant-one-private-cache']
+        for argv, message in ((base + ['--cargo-seed-archive', 'seed.tar.gz', '--verify-phase', 'core'],
+                               '--verify-phase requires --verify-prepared-image'),
+                              (base + ['--verify-prepared-image', 'motor-boat-prepared-4c7dcddb0148', '--verify-phase', 'quota'],
+                               'invalid choice')):
+            with self.subTest(argv=argv):
+                errors = io.StringIO()
+                with patch('sys.argv', argv), contextlib.redirect_stderr(errors), self.assertRaises(SystemExit):
+                    probe.main()
+                self.assertIn(message, errors.getvalue())
+
+    def test_cli_passes_the_selected_phase_to_the_runner(self):
+        runner_host = load_runner_host()
+        for argv, expected in (([], probe.VERIFY_PHASES), (['--verify-phase', 'disk-quota'], ('disk-quota',))):
+            with self.subTest(argv=argv):
+                observed = {}
+                def run(host):
+                    observed['phases'] = host.probe.verify_phases
+                with tempfile.TemporaryDirectory() as tmp, \
+                     patch('sys.argv', ['probe.py', '--runner-host', '--verify-prepared-image', 'motor-boat-prepared-4c7dcddb0148',
+                                        '--output', str(Path(tmp) / 'run'), '--cargo-seed-manifest', 'seed.json',
+                                        '--cargo-seed-sha256', 'a' * 64, '--acknowledge-tenant-one-private-cache', *argv]), \
+                     patch.object(probe, 'read_key', return_value='fake-key'), patch.object(probe, 'Client', return_value=FakeClient({})), \
+                     patch.object(runner_host.RunnerHost, 'run', run), patch.object(probe.signal, 'signal'), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    probe.main()
+                self.assertEqual(observed['phases'], expected)
+
+    def test_phase_status_passes_only_a_phase_that_ran_to_the_end(self):
+        passing = [{'name': 'prepared_clone.exit', 'status': 'PASS'}]
+        complete = {'ran': True, 'completed': True}
+        self.assertEqual(probe.verify_phase_status(complete, passing), 'passed')
+        # Checks that all passed do not make a phase that never ran a pass.
+        self.assertEqual(probe.verify_phase_status({'ran': False, 'completed': True}, passing), 'not_run')
+        self.assertEqual(probe.verify_phase_status({}, passing), 'not_run')
+        self.assertEqual(probe.verify_phase_status(dict(complete, error='timed out polling command 71694'), passing), 'failed')
+        self.assertEqual(probe.verify_phase_status({'ran': True}, passing), 'failed')
+        self.assertEqual(probe.verify_phase_status(complete, []), 'failed')
+        self.assertEqual(probe.verify_phase_status(complete, passing + [{'name': 'x.y', 'status': 'FAIL'}]), 'failed')
+        self.assertEqual(probe.verify_phase_status(
+            complete, passing + [{'name': 'idle.idle_reclaim_observed', 'status': 'INCONCLUSIVE'}]), 'passed')
+        self.assertEqual(probe.verify_phase_status(
+            complete, passing + [{'name': 'disk_quota.tmp.file_setattr_refusal', 'status': 'INCONCLUSIVE'}]), 'inconclusive')
+        self.assertEqual(probe.verify_phase_status(dict(complete, snapshot_size_bound=True), passing), 'snapshot_size_bound')
+
+    def test_a_single_phase_run_passes_without_qualifying_the_image(self):
+        data = self.verify_data({'core': 'passed'}, requested=('core',))
+        outcome = probe.verdict(data)
+        self.assertTrue(outcome['passed'])
+        self.assertFalse(outcome['image_qualified'])
+        self.assertEqual(outcome['verify_phases'], {'core': 'passed', 'disk-quota': 'not_run', 'idle': 'not_run'})
+        self.assertEqual(outcome['not_run'], ['disk-quota', 'idle'])
+        self.assertEqual(probe.exit_status(data), 0)
+        text = RunnerHostRenderTests().rendered(data)
+        self.assertIn('**PASSED for the phases run; the image is not qualified until every verify phase passes**', text)
+        self.assertIn('Image qualified by this run: **no** (not run: disk-quota, idle).', text)
+        self.assertIn('| disk-quota | false | NOT_RUN |', text)
+        self.assertIn('| idle | false | NOT_RUN |', text)
+        self.assertIn('| core | true | PASSED |', text)
+
+    def test_a_combined_run_passes_only_when_every_phase_ran_and_passed(self):
+        data = self.verify_data({'core': 'passed', 'disk-quota': 'passed', 'idle': 'passed'})
+        outcome = probe.verdict(data)
+        self.assertTrue(outcome['passed'] and outcome['image_qualified'])
+        self.assertEqual(outcome['not_run'], [])
+        self.assertIn('Image qualified by this run: **yes**.', RunnerHostRenderTests().rendered(data))
+        # A requested phase cut short before it started is not run, which fails the run.
+        data = self.verify_data({'core': 'passed', 'disk-quota': 'passed'})
+        outcome = probe.verdict(data)
+        self.assertFalse(outcome['passed'] or outcome['image_qualified'])
+        self.assertEqual(outcome['reasons'], ['verify phase idle: not_run'])
+        self.assertEqual(probe.exit_status(data), 1)
+        # A record claiming a pass without having run is still not run.
+        data['runner_host']['verify_phases']['idle']['status'] = 'passed'
+        self.assertEqual(probe.verdict(data)['verify_phases']['idle'], 'not_run')
+        self.assertFalse(probe.verdict(data)['passed'])
+        data = self.verify_data({'core': 'passed', 'disk-quota': 'failed', 'idle': 'passed'})
+        self.assertIn('verify phase disk-quota: failed', probe.verdict(data)['reasons'])
+
+    def test_section_timings_are_rendered_including_a_step_cut_off_mid_run(self):
+        data = self.verify_data({'core': 'passed'}, requested=('core',))
+        data['runner_host']['section_timings'] = [
+            {'name': 'disk-quota/disk_quota/lane tmp', 'started_at': '2026-01-01T20:40:00+00:00', 'seconds': 61.04, 'outcome': 'completed'},
+            {'name': 'disk-quota/disk_quota/lane home', 'started_at': '2026-01-01T20:41:01+00:00', 'seconds': None, 'outcome': 'running'}]
+        text = RunnerHostRenderTests().rendered(data)
+        self.assertIn('## Section timings', text)
+        self.assertIn('| disk-quota/disk_quota/lane tmp | completed | 2026-01-01T20:40:00+00:00 | 61.0 |', text)
+        self.assertIn('| disk-quota/disk_quota/lane home | running | 2026-01-01T20:41:01+00:00 | "unmeasured" |', text)
+
+
+class FileSetattrToleranceTests(unittest.TestCase):
+    """A file_setattr INCONCLUSIVE passes only when its own control proves the kernel lacks the syscall."""
+
+    def control(self, **change):
+        control = dict(request=0x401c5820, clear_succeeded=True, before_flags=0x200, after_flags=0,
+                       before_project=0, after_project=0, file_setattr_supported=False,
+                       file_setattr_errno=38, kernel_release='6.8.0-1009-boat')
+        control.update(change)
+        return control
+
+    def data(self, evidence):
+        data = RunnerHostRenderTests().runner_data()
+        data['runner_host']['all_passed'] = False
+        data['runner_host']['checks'].append({'name': 'disk_quota.tmp.file_setattr_refusal', 'status': 'INCONCLUSIVE',
+                                              'evidence': evidence})
+        return data
+
+    def test_tolerated_when_the_control_shows_enosys(self):
+        data = self.data({'control': self.control(), 'job': {}, 'observation_gap': 'root got ENOSYS'})
+        outcome = probe.verdict(data)
+        self.assertTrue(outcome['passed'])
+        self.assertEqual(outcome['tolerated_inconclusive'], [
+            {'name': 'runner_host.disk_quota.tmp.file_setattr_refusal',
+             'reason': 'file_setattr absent on kernel 6.8.0-1009-boat (ENOSYS); not applicable'}])
+        self.assertEqual(probe.exit_status(data), 0)
+        self.assertIn('Tolerated inconclusive: `runner_host.disk_quota.tmp.file_setattr_refusal`: '
+                      'file_setattr absent on kernel 6.8.0-1009-boat (ENOSYS); not applicable.',
+                      RunnerHostRenderTests().rendered(data))
+        row = data['runner_host']['checks'][-1]
+        self.assertEqual(probe.verify_phase_status({'ran': True, 'completed': True}, [row]), 'passed')
+
+    def test_recorded_kernel_inconclusives_stay_tolerated_when_stop_phase_errors(self):
+        data = self.data({'control': self.control(kernel_release='6.8.0-138-generic'), 'job': {}})
+        runner = data['runner_host']
+        row = runner['checks'].pop()
+        lanes = ('tmp', 'home', 'var_tmp', 'output_stdout', 'workspace', 'target', 'reused_target', 'reflink_target')
+        runner['checks'].extend(dict(row, name=f'disk_quota.{lane}.file_setattr_refusal') for lane in lanes)
+        runner['verify_phases'] = {'disk-quota': {'requested': True, 'ran': True, 'completed': False, 'status': 'failed',
+                                                'error': 'timed out waiting for sandbox bx_eqat87pz'}}
+        data.update(measurements_complete=False, error='verify phase failed: disk-quota')
+        outcome = probe.verdict(data)
+        self.assertFalse(outcome['passed'])
+        self.assertEqual(outcome['verify_phases']['disk-quota'], 'failed')
+        self.assertEqual(probe.verify_phase_status(runner['verify_phases']['disk-quota'], runner['checks']), 'failed')
+        self.assertTrue(probe.required_checks_passed(runner['checks']))
+        self.assertEqual(len(outcome['inconclusive']), 8)
+        self.assertEqual({item['name'] for item in outcome['tolerated_inconclusive']}, set(outcome['inconclusive']))
+        self.assertNotIn('runner_host checks did not all pass', outcome['reasons'])
+        self.assertEqual(RunnerHostRenderTests().rendered(data).count('Tolerated inconclusive:'), 8)
+
+    def test_not_tolerated_when_the_control_says_the_syscall_exists(self):
+        for change in ({'file_setattr_supported': True}, {'file_setattr_supported': True, 'file_setattr_errno': 0}):
+            with self.subTest(change=change):
+                data = self.data({'control': self.control(**change), 'job': {}})
+                outcome = probe.verdict(data)
+                self.assertFalse(outcome['passed'])
+                self.assertNotIn('tolerated_inconclusive', outcome)
+                self.assertEqual(probe.exit_status(data), 1)
+
+    def test_not_tolerated_when_the_control_is_missing_or_malformed(self):
+        for evidence in ({'job': {}}, {'control': None}, {'control': {}}, None, 'control',
+                         {'control': self.control(file_setattr_supported=None)},
+                         {'control': self.control(file_setattr_errno='38')},
+                         {'control': self.control(file_setattr_errno=True)},
+                         {'control': self.control(file_setattr_errno=78)}):
+            with self.subTest(evidence=evidence):
+                data = self.data(evidence)
+                self.assertFalse(probe.verdict(data)['passed'])
+                self.assertEqual(probe.exit_status(data), 1)
+        data = self.data({'control': self.control()})
+        del data['runner_host']['checks'][-1]['evidence']
+        self.assertFalse(probe.verdict(data)['passed'])
+
+    def test_only_file_setattr_checks_use_the_enosys_control(self):
+        evidence = {'control': self.control()}
+        for name in ('disk_quota.reflink_baseline_headroom', 'disk_quota.tmp.file_setattr_refusal.extra',
+                     'prepared_clone.file_setattr_refusal'):
+            with self.subTest(name=name):
+                self.assertIsNone(probe.tolerated_inconclusive({'name': name, 'status': 'INCONCLUSIVE', 'evidence': evidence}))
+        # A FAIL is never tolerated, whatever its evidence says.
+        self.assertIsNone(probe.tolerated_inconclusive(
+            {'name': 'disk_quota.tmp.file_setattr_refusal', 'status': 'FAIL', 'evidence': evidence}))
 
 
 if __name__ == "__main__":

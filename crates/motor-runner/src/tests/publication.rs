@@ -49,15 +49,10 @@ fn set_publishing(runner: &Runner, state: State) {
     *runner.core.publishing.lock().unwrap() = state;
 }
 
-fn restore_publishing(runner: &Runner) {
-    let seen = runner
-        .core
-        .inner
-        .lock()
-        .unwrap()
-        .catalog
-        .publishing_seen
-        .clone();
+fn restore_publishing(runner: &Runner, seen: crate::remote_cache::publishing::Seen) {
+    // These unisolated fixtures inject publishing rather than enabling the
+    // production switch. Reopening records their real switch as off; restore
+    // the saved injected state, including a tenant switch that was off.
     let mut state = State::new(true);
     State::restore(&mut state, true, seen);
     *runner.core.publishing.lock().unwrap() = state;
@@ -160,17 +155,6 @@ fn cargo_command(f: &Fixture, command: &str) {
     fs::create_dir_all(f.main.join("src")).unwrap();
     fs::write(f.main.join("src/lib.rs"), "").unwrap();
     commit(&f.main, "Cargo warm command\n");
-}
-
-fn declared_runner(f: &Fixture) -> Runner {
-    let mut config = fill_config(f);
-    config.base_commands.clear();
-    let runner = Runner::open(config).unwrap();
-    set_publishing(
-        &runner,
-        State::publishing_in(generation("1", TENANT).identity().recorded()),
-    );
-    runner
 }
 
 fn release_path(f: &Fixture) -> PathBuf {
@@ -296,12 +280,49 @@ const SCCACHE_OK: &str =
     r#"{"stats":{"cache_misses":{"counts":{}},"cache_write_errors":0,"cache_errors":9}}"#;
 
 async fn settle(f: &Fixture, runner: &Runner, job: &Job) {
+    // Successful publishing fixtures need real write evidence too. Tests that
+    // exercise failed or missing statistics install their own ledger first.
+    let h = Harness::new();
+    if runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .fill_ledgers
+        .get(&job.id)
+        .is_none_or(Vec::is_empty)
+    {
+        let tool = if f.main.join("Cargo.toml").is_file() {
+            Tool::Sccache
+        } else {
+            Tool::Ccache
+        };
+        let binding = attach(
+            runner,
+            job,
+            &h,
+            tool,
+            Some(if tool == Tool::Sccache {
+                SCCACHE_OK
+            } else {
+                CCACHE_OK
+            }),
+        );
+        let path = if tool == Tool::Ccache {
+            "/fixture".into()
+        } else {
+            format!("/{BUCKET}/fixture")
+        };
+        assert_eq!(h.put(&binding, &path, b"entry").await.status, 200);
+    }
     fs::write(release_path(f), "").unwrap();
     until(|| {
         let inner = runner.core.inner.lock().unwrap();
         inner.jobs[&job.id].terminal.is_some()
             && inner.writer.is_none()
             && !inner.finalizing.contains(&job.id)
+            && !inner.base_finishes.contains_key(&job.id)
+            && !inner.base_settling.contains(&job.id)
     })
     .await;
     fs::remove_file(release_path(f)).unwrap();
@@ -484,10 +505,18 @@ async fn the_timer_republishes_without_jobs_across_periods_restart_and_empty_pre
             "refresh changed the descriptor"
         );
         if attempt == 1 {
+            let seen = runner
+                .core
+                .inner
+                .lock()
+                .unwrap()
+                .catalog
+                .publishing_seen
+                .clone();
             let config = runner.config().clone();
             drop(runner);
             runner = reopen(config);
-            restore_publishing(&runner);
+            restore_publishing(&runner, seen);
             assert_eq!(repository(&f, &runner).publications, record.publications);
         }
         h.store.clear();
@@ -587,10 +616,18 @@ async fn three_failed_build_retries_hold_a_published_descriptor_until_restart() 
         repository(&f, &runner).failed_descriptor,
         first.writer_descriptor
     );
+    let seen = runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .catalog
+        .publishing_seen
+        .clone();
     let config = runner.config().clone();
     drop(runner);
     let runner = reopen(config);
-    restore_publishing(&runner);
+    restore_publishing(&runner, seen);
     fs::remove_file(f.scratch.join("fail-fill")).unwrap();
     let job = running_fill(&runner, 4).await;
     settle(&f, &runner, &job).await;
@@ -628,10 +665,18 @@ async fn a_retained_publication_survives_put_failure_restart_build_failure_and_s
     assert_eq!(h.put(&binding, "/failed", b"compiled").await.status, 503);
     settle(&f, &runner, &second).await;
     let before = repository(&f, &runner);
+    let seen = runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .catalog
+        .publishing_seen
+        .clone();
     let config = runner.config().clone();
     drop(runner);
     let runner = reopen(config);
-    restore_publishing(&runner);
+    restore_publishing(&runner, seen);
     assert_eq!(repository(&f, &runner).publications, before.publications);
     assert_eq!(
         repository(&f, &runner).publish_failures,
@@ -785,10 +830,18 @@ async fn switch_on_after_restart_and_prefix_changes_queue_real_fills_at_the_rere
     let first = running_fill(&runner, 0).await;
     settle(&f, &runner, &first).await;
     assert!(repository(&f, &runner).publications.is_empty());
+    let seen = runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .catalog
+        .publishing_seen
+        .clone();
     let config = runner.config().clone();
     drop(runner);
     let runner = reopen(config);
-    restore_publishing(&runner);
+    restore_publishing(&runner, seen);
     assert_eq!(
         count_fills(&runner),
         2,
@@ -1069,9 +1122,11 @@ fn a_real_fill_records_its_publication() {
     bounded(|| {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let f = Fixture::new();
-            declare(&f, "printf filled > command-marker");
-            let runner = declared_runner(&f);
-            warm(&f, &runner).await;
+            declare(&f, &controlled_command(&f));
+            let runner = controlled_runner(&f);
+            submit_reader(&f, &runner).await;
+            let job = running_fill(&runner, 0).await;
+            settle(&f, &runner, &job).await;
             let record = repository(&f, &runner);
             assert_eq!(count_fills(&runner), 1);
             assert!(record

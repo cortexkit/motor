@@ -17,12 +17,19 @@
 //! taken from `config.json` at every re-read on its own.
 use serde::Deserialize;
 use std::fmt;
+#[cfg(unix)]
 use std::fs::{self, OpenOptions};
+#[cfg(unix)]
 use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 /// Boat's broker installs the files here on tmpfs, never under /etc, because
 /// Boat archives /etc in snapshots and swaps it late after a restore.
@@ -90,6 +97,7 @@ impl KeyRole {
 }
 
 /// Where this host's provisioning files are and who must own them.
+#[cfg(unix)]
 #[derive(Clone, Debug)]
 pub(crate) struct Layout {
     directory: PathBuf,
@@ -97,6 +105,7 @@ pub(crate) struct Layout {
     owner: u32,
 }
 
+#[cfg(unix)]
 impl Layout {
     pub(crate) fn for_config(config: &crate::Config) -> Self {
         let role = HostRole::of(config);
@@ -261,6 +270,7 @@ impl Layout {
 
 /// Opens one provisioning file without following a symlink and checks it is a
 /// regular file owned by `owner` with exactly `mode`.
+#[cfg(unix)]
 fn read_file(path: &Path, mode: u32, owner: u32) -> Result<Vec<u8>, String> {
     let name = path
         .file_name()
@@ -620,6 +630,7 @@ pub(crate) struct Reread {
 }
 
 /// The active generation and the latest `enabled`, updated by re-reads.
+#[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct Provisioning {
     layout: Layout,
@@ -628,6 +639,7 @@ pub(crate) struct Provisioning {
     status: Status,
 }
 
+#[cfg(unix)]
 impl Provisioning {
     pub(crate) fn new(layout: Layout) -> Self {
         Self {
@@ -727,11 +739,13 @@ impl Provisioning {
 }
 
 /// Shared provisioning state with a background re-reader.
+#[cfg(unix)]
 #[derive(Clone, Debug)]
 pub(crate) struct Watch {
     inner: Arc<Mutex<Provisioning>>,
 }
 
+#[cfg(unix)]
 impl Watch {
     pub(crate) fn new(layout: Layout) -> Self {
         Self {
@@ -749,6 +763,9 @@ impl Watch {
     }
     pub(crate) fn enabled(&self) -> bool {
         self.inner.lock().unwrap().enabled()
+    }
+    pub(crate) fn enabled_setting(&self) -> Option<bool> {
+        self.inner.lock().unwrap().enabled
     }
 
     /// Re-reads the files whenever their metadata changes (checked every
@@ -789,6 +806,6 @@ impl Watch {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "provisioning_tests.rs"]
 mod tests;

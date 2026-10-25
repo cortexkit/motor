@@ -8,7 +8,7 @@ use motor_lease::{Heartbeat, Usage};
 /// The largest integer a JSON number carries exactly (2^53 - 1).
 const SAFE_INTEGER: u64 = (1 << 53) - 1;
 /// The contract bounds `warm` and `running` at 64 entries each.
-const MAX_ENTRIES: usize = 64;
+pub(crate) const MAX_ENTRIES: usize = 64;
 
 fn base64url_hash(value: &str) -> bool {
     value.len() == 43

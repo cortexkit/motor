@@ -112,6 +112,7 @@ async fn main() -> Result<()> {
                 tenant: binding.tenant,
                 sub: binding.sub,
                 vcpu_ceiling: registry.vcpu_ceiling,
+                max_weight: registry.max_weight,
                 guest_ram_mib: registry.guest_ram_mib,
                 idle_suspend_s: registry.idle_suspend_s,
                 host_floor_bytes: registry.host_floor_bytes,
@@ -119,12 +120,17 @@ async fn main() -> Result<()> {
         );
     }
     let (journal, snapshot) = FileJournal::open(&config.journal_dir)?;
+    let mut host = Host::new(tenants, snapshot, Box::new(journal));
+    // Starts latched: no lease is admitted until a probe finds the capacity
+    // file valid and enough host storage free.
+    host.enforce_storage();
     let runtime = Runtime::with_broker(
         config.host_id,
-        Host::new(tenants, snapshot, Box::new(journal)),
+        host,
         Arc::new(Helper {
             socket: config.helper_socket,
             storage: config.storage,
+            capacity: motor_host::capacity::CONFIG.into(),
             guest_init,
         }),
         broker_endpoint,

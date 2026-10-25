@@ -17,7 +17,16 @@
 # <file>.bak-<UTC time>. Keys are created only when none exist and are never
 # replaced. The host id and tenant subject are arguments, not repository
 # defaults; --check, --start and --stop read them from the installed configs.
-# --check verifies everything and changes nothing. --start runs the same checks,
+# The tenant-1.json template sizes the tenant only on a first install: once
+# the tenant record is installed it keeps its sizing and image, which
+# provision.py resize and switch-image change, and the helper config takes its
+# slot CPUs from that record (--tenant-disk-quota-gib is then refused).
+# --check verifies every file and unit this script installs and changes
+# nothing. It also checks the installed tenant record itself (provision.py's
+# checks, a cpuset clear of the Windows CPUs), that the helper registry entry
+# agrees with it, that the helper config is its render, capacity.json, the
+# memory fit and the jobs slice cap, and that no resize.json is pending.
+# --start runs the same checks,
 # then opens the agent's firewall port and enables and starts both units: the
 # broker places work on this host from its first signed heartbeat, so this is
 # the only step that puts it into service, and an enabled unit would otherwise
@@ -46,7 +55,7 @@ UNIT_DIR=/etc/systemd/system
 LOADER_TARGET=x86_64-unknown-linux-musl
 
 usage() {
-  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 2
 }
 
@@ -268,12 +277,23 @@ configs() {
   directory "$KEY_DIR" "$HOST_USER:$HOST_USER" 700
   directory "$JOURNAL_DIR" "$HOST_USER:$HOST_USER" 700
   render host --host-id "$host_id" --port "$port" > "$scratch/host.json" || { fail "cannot render host config"; return; }
-  render helper --uid "$uid" --gid "$gid" > "$scratch/helper.json" || { fail "cannot render helper config"; return; }
-  render tenant ${tenant_sub:+--sub "$tenant_sub"} ${tenant_quota:+--disk-quota-gib "$tenant_quota"} ${tenant_image:+--image-version "$tenant_image"} \
+  # An installed tenant record is rendered back as itself and gives the helper
+  # its slot CPUs; only a first install renders the tenant-1.json template.
+  render helper --uid "$uid" --gid "$gid" ${installed_record:+--installed "$installed_record"} \
+    > "$scratch/helper.json" || { fail "cannot render helper config"; return; }
+  render tenant ${tenant_sub:+--sub "$tenant_sub"} ${tenant_quota:+--disk-quota-gib "$tenant_quota"} \
+    ${installed_record:+--installed "$installed_record"} \
     > "$scratch/tenant.json" || { fail "cannot render tenant config"; return; }
   place config "$scratch/host.json" "$HOST_CONFIG" root:root 644
   place config "$scratch/helper.json" "$HELPER_CONFIG" root:root 644
   place config "$scratch/tenant.json" "$TENANT_CONFIG" root:root 644
+  if [ "$check" = 1 ]; then
+    if render check-installed --uid "$uid" --gid "$gid"; then
+      ok "installed tenant state"
+    else
+      fail "installed tenant state (problems listed above)"
+    fi
+  fi
   # motor-host refuses to start without a binding map. provision.py adds the
   # tenant to it; an existing map is never touched here.
   if [ -f "$BINDINGS" ]; then
@@ -385,7 +405,12 @@ if [ "$mode" != install ]; then
   port=$(installed "$HOST_CONFIG" listen)
   host_id=$(installed "$HOST_CONFIG" host_id)
   tenant_sub=$(installed "$TENANT_CONFIG" sub)
-  tenant_quota=$(python3 -c 'import json,sys; q = json.load(open(sys.argv[1]))["disk_quota_bytes"]; print(q // 2**30 if q % 2**30 == 0 else q)' "$TENANT_CONFIG")
+fi
+# The installed tenant record, when there is one, is the source of the
+# tenant's sizing and image when installing, checking and starting.
+installed_record=''
+if [ "$mode" != stop ] && [ -f "$TENANT_CONFIG" ]; then
+  installed_record=$TENANT_CONFIG
   tenant_image=$(installed "$TENANT_CONFIG" image_version)
 fi
 port=${port:-8443}

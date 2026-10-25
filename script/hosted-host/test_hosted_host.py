@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
@@ -36,6 +37,33 @@ SUB = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV"
 def memory_max_mib(vcpus):
     # motor_lease::memory_max_mib: the per-job kill cap a full-size lease grants.
     return max(vcpus * 3584, 16384)
+
+
+# capacity.json tenant_memory_reserve_bytes (2147483648): a tenant advertises
+# its guest's available memory minus this to the broker as free_mem_mib.
+TENANT_MEMORY_RESERVE_MIB = 2147483648 // 1048576
+
+
+def advertised_mib(guest_ram_mib, reserve_mib=TENANT_MEMORY_RESERVE_MIB):
+    """The most free_mem_mib the tenant ever advertises: all of its RAM, less
+    the reserve (what a stopped tenant advertises)."""
+    return guest_ram_mib - reserve_mib
+
+
+def placeable_vcpus(guest_ram_mib, reserve_mib=TENANT_MEMORY_RESERVE_MIB):
+    """The largest lease, in vCPUs, the broker can place on the tenant: the
+    broker needs memory_max(vcpus) MiB of free_mem_mib. CLOUD's max_job_vcpus
+    ceiling for the host is recorded at this N."""
+    n = 0
+    while memory_max_mib(n + 1) <= advertised_mib(guest_ram_mib, reserve_mib):
+        n += 1
+    return n
+
+
+def cutover_rule(guest_ram_mib, placeable, reserve_mib=TENANT_MEMORY_RESERVE_MIB):
+    """docs/hosted-cutover.md's sizing rule: the guest advertises at least
+    memory_max of the placeable N recorded with CLOUD's ceilings."""
+    return advertised_mib(guest_ram_mib, reserve_mib) >= memory_max_mib(placeable)
 
 
 class HostedHostConfigTests(unittest.TestCase):
@@ -79,8 +107,14 @@ class HostedHostConfigTests(unittest.TestCase):
         self.assertFalse(hosted.cpus(tenant["cpuset"]) & hosted.cpus(hosted.WINDOWS_CPUS))
         # Both hardware threads of the same four cores (n and n+16).
         self.assertEqual({c % 16 for c in hosted.cpus(tenant["cpuset"])}, {8, 9, 10, 11})
-        # A full-size lease may use memory_max(vcpus); the guest must hold it.
-        self.assertGreaterEqual(tenant["guest_ram_mib"], memory_max_mib(tenant["vcpu_ceiling"]))
+        # The broker places a lease only where free_mem_mib covers its
+        # memory_max(vcpus), so the guest must advertise memory_max of the
+        # placeable N recorded with CLOUD's ceilings (7 vCPUs for this 28 GiB
+        # template, 26,624 MiB advertised).
+        placeable = placeable_vcpus(tenant["guest_ram_mib"])
+        self.assertEqual(placeable, 7)
+        self.assertTrue(cutover_rule(tenant["guest_ram_mib"], placeable))
+        self.assertFalse(cutover_rule(tenant["guest_ram_mib"], placeable + 1))
         # 100 GiB: the build disk is shared with the runner's cache guard. The
         # in-VM runner's compile cache is then a quarter of it.
         self.assertEqual(tenant["disk_quota_bytes"], 100 * 1024**3)
@@ -152,6 +186,320 @@ class HostedHostConfigTests(unittest.TestCase):
             with self.subTest(args=args):
                 refused = subprocess.run(["python3", str(HERE / "hosted_host.py"), *args], capture_output=True, text=True)
                 self.assertEqual(refused.returncode, 2)
+
+
+class CutoverRuleTests(unittest.TestCase):
+    def test_placeable_n_comes_from_guest_ram_and_the_reserve(self):
+        # The resized tenant 1: 78 GiB = 79,872 MiB, advertising at most 77,824
+        # MiB, so max(16384, 3584 x N) <= 77,824 gives N = 21; CLOUD's ceilings
+        # are max_job_vcpus 21 and max_job_mem_mib 75,264 (3584 x 21).
+        self.assertEqual(TENANT_MEMORY_RESERVE_MIB, 2048)
+        self.assertEqual(advertised_mib(79872), 77824)
+        self.assertEqual(placeable_vcpus(79872), 21)
+        self.assertEqual(memory_max_mib(21), 75264)
+        self.assertTrue(cutover_rule(79872, 21))
+        self.assertFalse(cutover_rule(79872, 22))
+        # The rollback size, the old 28 GiB guest: 26,624 MiB places 7 vCPUs.
+        self.assertEqual(placeable_vcpus(28672), 7)
+        # Below the 16 GiB floor nothing places.
+        self.assertEqual(placeable_vcpus(16384 + 2047), 0)
+
+
+GIB = 1024**3
+# The values /etc/motor-host/capacity.json holds on the build server.
+CAPACITY = dict(windows_vm_bytes=16 * GIB, host_reserve_bytes=6 * GIB, jobs_min_bytes=24 * GIB,
+                storage_margin_bytes=8 * GIB, growth_allowance_bytes=64 * GIB,
+                tenant_memory_reserve_bytes=2 * GIB)
+# The build server's measured MemTotal, 131,491,984 kB.
+MEMTOTAL = 131491984 * 1024
+# Tenant 1 after the cutover resize.
+RESIZED = dict(vcpu_ceiling=24, cpuset="0-11,16-27", guest_ram_mib=79872, disk_quota_bytes=600 * GIB,
+               max_weight=64, idle_suspend_s=0)
+UID = 998
+# A provision.py module of its own, so the tests can point its paths and probes
+# at a scratch tree.
+provision = hosted.load_provision()
+
+
+class Crash(BaseException):
+    """Stops a resize at a hook point the way a killed process would."""
+
+
+class InstalledStateTests(unittest.TestCase):
+    """install.sh --check (and --start) through check_installed, against a
+    scratch host whose provision.py paths, capacity inputs and systemctl
+    reads are doubles."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.capacity_error = None
+        self.memtotal = MEMTOTAL
+        self.limit = provision.jobs_slice_limits(CAPACITY)[0]
+        self.slice = {"LoadState": "loaded", "MemoryMax": str(self.limit)}
+        patch = mock.patch.multiple(
+            provision, ROOT=self.root / "vm", REGISTRY=self.root / "registry", PROVISION=self.root / "provision",
+            BINDINGS=self.root / "tenants.json", JOBS_DROP_IN=self.root / "jobs.conf",
+            HELPER_CONFIG=self.root / "motor-vm-helper.json", HELPER_CGROUPS=self.root / "cgroup/tenants",
+            read_capacity=self.read_capacity, memtotal_bytes=lambda: self.memtotal,
+            slice_properties=lambda names: {name: self.slice[name] for name in names},
+            runner_processes=lambda: [])
+        patch.start()
+        self.addCleanup(patch.stop)
+        # No external command runs: not systemctl (doubled above), not mount.
+        self.commands = []
+        for target in (provision, provision.subprocess):
+            recorder = mock.patch.object(target, "run", side_effect=lambda *a, **_k: self.commands.append(a))
+            recorder.start()
+            self.addCleanup(recorder.stop)
+        for directory in (provision.REGISTRY, provision.PROVISION, provision.ROOT / "tenants"):
+            directory.mkdir(parents=True)
+        provision.JOBS_DROP_IN.write_text(provision.jobs_slice_render(CAPACITY))
+        self.record_path = provision.PROVISION / "tenant-1.json"
+        self.registry_path = provision.REGISTRY / "tenant-1.json"
+        # A first install: the template, provisioned as provision.py would.
+        self.install(hosted.tenant_config(SUB))
+
+    def read_capacity(self):
+        if self.capacity_error is not None:
+            raise ValueError(self.capacity_error)
+        return dict(CAPACITY)
+
+    def registry_entry(self, record):
+        """The helper registry entry provision() writes for a record."""
+        entry = {k: v for k, v in provision.checked(record).items() if k not in provision.PROVISION_ONLY}
+        home = provision.ROOT / "tenants" / record["tenant"]
+        entry.update({name: str(home / leaf) for name, leaf in provision.REGISTRY_PATHS.items()})
+        return entry
+
+    def install(self, record, registry=None, helper=None):
+        self.record_path.write_text(hosted.render_json(record))
+        self.registry_path.write_text(hosted.render_json(self.registry_entry(record) if registry is None else registry))
+        provision.HELPER_CONFIG.write_text(
+            hosted.render_json(hosted.helper_config(UID, UID, record)) if helper is None else helper)
+
+    def resized(self):
+        return {**hosted.tenant_config(SUB), **RESIZED}
+
+    def problems(self):
+        return hosted.check_installed(UID, UID, self.record_path, provision.HELPER_CONFIG, provision=provision)
+
+    def assertFails(self, needle):
+        problems = self.problems()
+        self.assertTrue(any(needle in problem for problem in problems), (needle, problems))
+
+    def files(self):
+        return {path: path.read_bytes() for path in (self.record_path, self.registry_path, provision.HELPER_CONFIG)}
+
+    def test_a_first_install_passes(self):
+        self.assertEqual(self.problems(), [])
+        self.assertEqual(json.loads(self.record_path.read_text()), {**json.loads(hosted.TENANT_FILE.read_text()), "sub": SUB})
+
+    def test_a_resized_record_passes_and_neither_check_nor_a_render_resets_it(self):
+        record = self.resized()
+        self.install(record)
+        before = self.files()
+        self.assertEqual(self.problems(), [])
+        self.assertEqual(self.files(), before)
+        # install.sh compares the installed files with these renders: the record
+        # renders back as itself, and the helper keeps the resized cpuset.
+        self.assertEqual(hosted.render_json(hosted.tenant_config(SUB, installed=self.record_path)),
+                         self.record_path.read_text())
+        helper = json.loads(provision.HELPER_CONFIG.read_text())
+        self.assertEqual({slot["cpus"] for slot in helper["slots"]}, {"0-11,16-27"})
+        self.assertEqual(self.commands, [])
+
+    def test_a_hand_edited_cpuset_on_the_windows_cpus_fails(self):
+        for cpuset, needle in (("8-15,24-31", "overlaps the Windows VM's CPUs 12-15,28-31"),
+                               ("0-11,16-27,32", "beyond this host's 32 threads")):
+            with self.subTest(cpuset=cpuset):
+                record = dict(self.resized(), cpuset=cpuset)
+                # Record, registry and helper edited alike, so only the cpuset rule
+                # can fail.
+                helper = json.loads(hosted.render_json(hosted.helper_config(UID, UID, self.resized())))
+                for slot in helper["slots"]:
+                    slot["cpus"] = cpuset
+                self.install(record, helper=hosted.render_json(helper))
+                self.assertFails(needle)
+
+    def test_a_mismatch_on_any_shared_field_fails(self):
+        record = self.resized()
+        entry = self.registry_entry(record)
+
+        def other(value):
+            if isinstance(value, bool):
+                return not value
+            if isinstance(value, int):
+                return value + 2
+            return value + "0"
+
+        for name in sorted(entry):
+            with self.subTest(field=name):
+                self.install(record, registry=dict(entry, **{name: other(entry[name])}))
+                self.assertFails(f"differ at {name}")
+        # A field only one side holds: a budget in the record the helper's
+        # admission would not see, and one in the registry the guest would not.
+        without = {k: v for k, v in entry.items() if k != "max_weight"}
+        self.install(record, registry=without)
+        self.assertFails("differ at max_weight")
+        self.install({k: v for k, v in record.items() if k != "max_weight"}, registry=entry)
+        self.assertFails("differ at max_weight")
+        self.install(record)
+        self.assertEqual(self.problems(), [])
+
+    def test_a_helper_config_other_than_the_installed_render_fails(self):
+        record = self.resized()
+        template = hosted.render_json(hosted.helper_config(UID, UID))
+        changed = json.loads(hosted.render_json(hosted.helper_config(UID, UID, record)))
+        changed["slots"][0]["io_weight"] = 20
+        for label, helper in (("the template's cpuset", template), ("another slot weight", hosted.render_json(changed)),
+                              ("another account", hosted.render_json(hosted.helper_config(UID + 1, UID, record)))):
+            with self.subTest(label):
+                self.install(record, helper=helper)
+                self.assertFails("differs from the render of the installed tenant record")
+        self.install(record)
+        provision.HELPER_CONFIG.unlink()
+        self.assertFails(str(provision.HELPER_CONFIG))
+
+    def test_an_invalid_record_fails(self):
+        self.install(self.resized())
+        self.record_path.write_text(hosted.render_json(dict(self.resized(), max_weight=8)))
+        self.assertFails("max_weight must be at least vcpu_ceiling")
+        self.record_path.write_text("{")
+        self.assertFails("cannot read the installed tenant record")
+
+    def test_capacity_fit_and_live_cap_are_checked(self):
+        self.install(self.resized())
+        self.assertEqual(self.problems(), [])
+        self.capacity_error = "invalid capacity.json: not root-owned"
+        self.assertFails("capacity.json: invalid capacity.json: not root-owned")
+        self.capacity_error = None
+        # 78 GiB + 512 MiB headroom + 16 + 6 + 24 GiB fits exactly, not one byte less.
+        needed = (79872 + 512) * 1048576 + 46 * GIB
+        self.memtotal = needed
+        self.assertEqual(self.problems(), [])
+        self.memtotal = needed - 1
+        self.assertFails(f"memory fit: memory fit requires {needed} bytes")
+        self.memtotal = MEMTOTAL
+        for value in (str(self.limit + 1), "infinity"):
+            with self.subTest(MemoryMax=value):
+                self.slice = {"LoadState": "loaded", "MemoryMax": value}
+                self.assertFails("jobs slice: motor-jobs.slice MemoryMax")
+        self.slice = {"LoadState": "not-found", "MemoryMax": "infinity"}
+        self.assertEqual(self.problems(), [])
+        provision.JOBS_DROP_IN.write_text("[Slice]\nMemoryMax=1\n")
+        self.assertFails("jobs slice: jobs-slice drop-in differs")
+        provision.JOBS_DROP_IN.unlink()
+        self.assertFails("jobs slice: missing or unreadable jobs-slice drop-in")
+
+    def test_a_pending_resize_journal_fails(self):
+        journal = provision.ROOT / "tenants" / "tenant-1" / "resize.json"
+        journal.parent.mkdir(parents=True)
+        journal.write_text("{}")
+        self.assertFails(f"resize: pending resize journal: {journal}")
+        journal.unlink()
+        self.assertEqual(self.problems(), [])
+
+    def provisioned_home(self):
+        """The first-install tenant's disk, snapshots and image as provision()
+        leaves them, on an image that can be resized."""
+        record = hosted.tenant_config(SUB)
+        home = provision.ROOT / "tenants" / record["tenant"]
+        (home / "suspend").mkdir(parents=True)
+        (home / "suspend" / "suspend.vmstate").write_bytes(b"old")
+        (home / "generation").write_text("0\n")
+        with (home / "disk.img").open("wb") as disk:
+            disk.truncate(record["disk_quota_bytes"])
+        image = provision.ROOT / "tenant-images" / record["image_version"]
+        image.mkdir(parents=True)
+        (image / "manifest.json").write_text(json.dumps({"version": record["image_version"],
+                                                         "capabilities": ["sparse-v1", "resize-v1"]}))
+
+    def resize(self, hook=None):
+        def make_base(_config, _image, base):
+            base.mkdir(parents=True)
+            for name in ("base.vmstate", "base.memory"):
+                (base / name).write_bytes(b"base")
+
+        with mock.patch.object(provision.shutil, "disk_usage", return_value=mock.Mock(free=1 << 50)):
+            provision.resize("tenant-1", dict(RESIZED), make_base=make_base, check_service=lambda _unit: "inactive",
+                             vmms=lambda: [], hook=hook, output=lambda *_args: None)
+
+    def test_a_cpuset_changing_resize_passes_check_directly(self):
+        self.provisioned_home()
+        self.resize()
+        self.assertEqual(self.problems(), [])
+        self.assertEqual(json.loads(self.record_path.read_text()), self.resized())
+        self.assertEqual(hosted.render_json(hosted.tenant_config(SUB, installed=self.record_path)),
+                         self.record_path.read_text())
+        self.assertEqual(self.commands, [])
+
+    def test_a_resize_resumed_after_a_crash_between_records_and_helper_config_passes_check(self):
+        self.provisioned_home()
+
+        def crash(point):
+            if point == "step:publish:registry":
+                raise Crash(point)
+
+        with self.assertRaises(Crash):
+            self.resize(hook=crash)
+        # The records are the new size and the helper config still the old: the
+        # journal and the stale helper config both fail the check.
+        self.assertEqual(json.loads(self.record_path.read_text()), self.resized())
+        self.assertFails("resize: pending resize journal")
+        self.assertFails("differs from the render of the installed tenant record")
+        self.resize()
+        self.assertEqual(self.problems(), [])
+
+
+class InstalledRenderTests(unittest.TestCase):
+    """The renders install.sh installs, with and without an installed record."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "tenant-1.json"
+        self.record = {**hosted.tenant_config(SUB), **RESIZED}
+        self.path.write_text(hosted.render_json(self.record))
+
+    def cli(self, *args):
+        return subprocess.run(["python3", str(HERE / "hosted_host.py"), *map(str, args)], capture_output=True, text=True)
+
+    def test_an_installed_record_keeps_its_sizing(self):
+        self.assertEqual(hosted.tenant_config(SUB, installed=self.path), self.record)
+        rendered = self.cli("tenant", "--sub", SUB, "--installed", self.path)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertEqual(rendered.stdout, self.path.read_text())
+        helper = self.cli("helper", "--uid", UID, "--gid", UID, "--installed", self.path)
+        self.assertEqual(helper.returncode, 0, helper.stderr)
+        self.assertEqual(helper.stdout, hosted.render_json(hosted.helper_config(UID, UID, self.record)))
+        self.assertEqual({slot["cpus"] for slot in json.loads(helper.stdout)["slots"]}, {"0-11,16-27"})
+
+    def test_a_first_install_uses_the_template(self):
+        template = json.loads(hosted.TENANT_FILE.read_text())
+        rendered = self.cli("tenant", "--sub", SUB)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertEqual(json.loads(rendered.stdout), {**template, "sub": SUB})
+        helper = self.cli("helper", "--uid", UID, "--gid", UID)
+        self.assertEqual(helper.returncode, 0, helper.stderr)
+        self.assertEqual({slot["cpus"] for slot in json.loads(helper.stdout)["slots"]}, {template["cpuset"]})
+
+    def test_an_installed_record_refuses_template_overrides_and_another_subject(self):
+        for args in (["--disk-quota-gib", "400"], ["--image-version", "next-image"]):
+            with self.subTest(args=args):
+                refused = self.cli("tenant", "--sub", SUB, "--installed", self.path, *args)
+                self.assertEqual(refused.returncode, 2)
+                self.assertIn("keeps its sizing and image", refused.stderr)
+        refused = self.cli("tenant", "--sub", "org:01ARZ3NDEKTSV4RRFFQ69G5FAV", "--installed", self.path)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("--tenant-sub differs", refused.stderr)
+        self.path.write_text(hosted.render_json(dict(self.record, cpuset="8-15,24-31")))
+        for kind in (["tenant", "--sub", SUB], ["helper", "--uid", UID, "--gid", UID]):
+            with self.subTest(kind=kind[0]):
+                refused = self.cli(*kind, "--installed", self.path)
+                self.assertEqual(refused.returncode, 2)
+                self.assertIn("overlaps the Windows VM's CPUs", refused.stderr)
 
 
 class RunnerLogTests(unittest.TestCase):
@@ -260,10 +608,44 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn('[ -n "$host_id" ] && [ -n "$tenant_sub" ] || { echo "installing needs --host-id and --tenant-sub"', self.script)
 
     def test_image_version_is_operator_managed_after_a_switch(self):
+        # The installed record carries the image switch-image wrote; installing,
+        # --check and --start render the tenant from that record, so none of
+        # them passes an image.
         self.assertIn('tenant_image=$(installed "$TENANT_CONFIG" image_version)', self.script)
-        self.assertIn('${tenant_image:+--image-version "$tenant_image"}', self.script)
+        self.assertNotIn("--image-version", self.script)
         self.assertIn('tenant image $image matches the helper registry', self.script)
         self.assertIn('TENANT_REGISTRY=/etc/motor-vm-helper/tenants/tenant-1.json', self.script)
+
+    def test_an_installed_record_is_the_render_source_and_the_template_only_a_first_install(self):
+        self.assertRegex(self.script, r'installed_record=\'\'\nif \[ "\$mode" != stop \] && \[ -f "\$TENANT_CONFIG" \]; then\n'
+                                      r'  installed_record=\$TENANT_CONFIG\n')
+        configs = self.function("configs")
+        # Each render with its continuation lines.
+        renders = re.findall(r"render (helper|tenant) ((?:[^\n]*\\\n)*[^\n]*)", configs)
+        self.assertEqual([kind for kind, _ in renders], ["helper", "tenant"])
+        for kind, line in renders:
+            self.assertIn('${installed_record:+--installed "$installed_record"}', line, kind)
+        # --check and --start never re-derive the sizing from the template: the
+        # disk quota is no longer read back to feed a template render.
+        self.assertNotIn('tenant_quota=$(', self.script)
+
+    def test_check_and_start_verify_the_installed_state(self):
+        configs = self.function("configs")
+        self.assertIn('if [ "$check" = 1 ]; then\n    if render check-installed --uid "$uid" --gid "$gid"; then', configs)
+        # The check flag is 1 for --check and --start; only install mode sets it
+        # to 0, which lets place() replace config files.
+        self.assertIn('check=1\n[ "$mode" = install ] && check=0', self.script)
+
+    def test_installer_paths_are_the_provisioner_paths(self):
+        values = dict(re.findall(r"^([A-Z_]+)=(\S+)$", self.script, re.M))
+        self.assertEqual(values["TENANT_CONFIG"], str(hosted.TENANT_RECORD))
+        self.assertEqual(values["HELPER_CONFIG"], str(hosted.HELPER_CONFIG))
+        fresh = hosted.load_provision()
+        self.assertEqual(fresh.PROVISION / "tenant-1.json", hosted.TENANT_RECORD)
+        self.assertEqual(fresh.HELPER_CONFIG, hosted.HELPER_CONFIG)
+        self.assertEqual(fresh.REGISTRY, hosted.REGISTRY)
+        self.assertEqual(fresh.ROOT, hosted.STORAGE)
+        self.assertEqual(fresh.WINDOWS_CPUS, hosted.WINDOWS_CPUS)
 
     def test_firewall_exception_is_the_one_inbound_policy_recognises(self):
         start = self.function("start_units")

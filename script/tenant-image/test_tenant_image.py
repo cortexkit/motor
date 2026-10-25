@@ -84,6 +84,11 @@ class ImageTests(unittest.TestCase):
         pins[key] = value
         self.versions.write_text(json.dumps(pins))
 
+    def test_new_image_advertises_sparse_and_resize_capabilities(self):
+        target = self.build()
+        manifest = json.loads((target / "manifest.json").read_text())
+        self.assertEqual(["sparse-v1", "resize-v1"], manifest["capabilities"])
+
     def test_pins_cover_real_runner_inputs(self):
         pins = image.load_versions(self.versions)
         for name in image.RUNNER_INPUTS:
@@ -228,6 +233,26 @@ class ImageTests(unittest.TestCase):
         self.change_pin("node", "24.20.0")
         with self.assertRaisesRegex(ValueError, "differs from versions.txt"):
             image.inventory(target, self.versions)
+
+    def test_verify_accepts_an_installed_image_built_from_older_pins(self):
+        # A rollback switches back to an image built before today's pins
+        # changed; its own recorded pins and hashes are what must hold.
+        target = self.build()
+        self.change_pin("node", "24.20.0")
+        self.assertEqual(image.verify(target)["version"], "test-1")
+
+    def test_verify_rejects_tampering_and_self_inconsistency(self):
+        target = self.build()
+        (target / "rootfs").chmod(0o644)
+        (target / "rootfs").write_bytes(b"wrong rootfs")
+        with self.assertRaisesRegex(ValueError, "rootfs SHA-256"):
+            image.verify(target)
+        target = self.build("test-2")
+        self.change_pin("node", "24.20.0")
+        (target / "versions.txt").chmod(0o644)
+        (target / "versions.txt").write_text(self.versions.read_text())
+        with self.assertRaisesRegex(ValueError, "differs from its manifest"):
+            image.verify(target)
 
     def test_failed_build_remains_reserved_and_cannot_pass_inventory(self):
         def fail(*_args):
@@ -650,8 +675,61 @@ elif name in ("truncate", "mkfs.ext4"):
 
 root_paths = guest.root_paths
 qualification = module("hosted_qualify", HERE / "guest/hosted_qualify.py")
+discard = module("discard_fixture", HERE / "discard_fixture.py")
 BOAT = HERE.parent / "boat-image"
 INSTALL_TOOLS = HERE.parent / "runner/install-tools.sh"
+
+
+class DiscardTests(unittest.TestCase):
+    def test_isolated_discard_host_threshold_is_at_least_900_mib(self):
+        before = 2 * 1024**3
+        self.assertEqual(900 * 1024**2, discard.assert_reclaimed(before, before - 900 * 1024**2))
+        for after in [before, before - 900 * 1024**2 + 1, before + 1024]:
+            with self.assertRaisesRegex(RuntimeError, "discard reclaimed"):
+                discard.assert_reclaimed(before, after)
+
+    def test_isolated_discard_measures_host_allocated_blocks_not_file_length(self):
+        with tempfile.TemporaryDirectory() as directory:
+            disk = Path(directory) / "disk.img"
+            with disk.open("wb") as file:
+                file.truncate(600 * 1024**3)
+            self.assertEqual(disk.stat().st_blocks * 512, discard.allocated(disk))
+            self.assertLess(discard.allocated(disk), disk.stat().st_size)
+
+    def test_isolated_discard_guest_cold_and_warm_use_measurement_barriers(self):
+        for phase in ("cold", "warm"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                events = []
+
+                def run(argv, **kwargs):
+                    events.append(argv)
+                    self.assertTrue(kwargs["check"])
+                    if argv[0] == "dd":
+                        self.assertIn("count=1024", argv)
+                        self.assertIn("bs=1048576", argv)
+                        self.assertIn("conv=fsync", argv)
+                        (root / "qualification-discard.bin").write_bytes(b"allocated fixture")
+                    if argv[0] == "fstrim":
+                        self.assertFalse((root / "qualification-discard.bin").exists())
+
+                discard.guest_cycle(phase, tenant=root, workspace=root, run=run,
+                                    wait=lambda path: events.append(path.name),
+                                    emit=lambda line, **kw: events.append(line))
+                expected = (["discard-warm-start"] if phase == "warm" else []) + [
+                    ["dd", "if=/dev/zero", f"of={root / 'qualification-discard.bin'}", "bs=1048576", "count=1024", "conv=fsync"],
+                    f"DISCARD {phase} allocated", f"discard-{phase}-measured",
+                    ["sync", "-f", str(root)], ["fstrim", "--verbose", str(root)], f"DISCARD {phase} trimmed"]
+                self.assertEqual(expected, events)
+
+    def test_isolated_discard_control_changes_only_tenant_discard(self):
+        requests = [("/drives/tenant", dict(drive_id="tenant", discard=True, io_engine="Sync")),
+                    ("/drives/rootfs", dict(drive_id="rootfs", is_read_only=True))]
+        controlled = discard.without_discard(requests)
+        self.assertEqual(False, controlled[0][1]["discard"])
+        self.assertEqual("Sync", controlled[0][1]["io_engine"])
+        self.assertEqual(requests[1], controlled[1])
+        self.assertTrue(requests[0][1]["discard"])
 
 
 def unit_paths(unit):

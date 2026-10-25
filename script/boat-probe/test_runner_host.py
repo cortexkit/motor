@@ -11,6 +11,7 @@ import tempfile
 import tarfile
 import base64
 import hashlib
+import re
 import shlex
 import unittest
 
@@ -131,7 +132,7 @@ class RunnerHostTests(unittest.TestCase):
             checker = Path(tmp, 'root_paths.py')
             checker.write_text('BOAT_ROOTS = ("/fixture",)\n'
                                'BOAT_PROVIDER_RESTORED = {"/fixture/tool": 1000}\n'
-                               'def check(roots, provider_files=None):\n'
+                               'def check(roots, provider_files=None, limit=20):\n'
                                '    return {"roots": list(roots), "entries": 7, "offender_count": 0, "offenders": [],\n'
                                '            "provider_files": provider_files}\n')
             with patch.object(host, 'ROOT_PATHS_SCRIPT', checker):
@@ -433,8 +434,13 @@ class RunnerHostTests(unittest.TestCase):
         probe.request.return_value = {'snapshot':{'name':'prepared','status':'ready','snapshotId':'id','sizeBytes':1}}
         probe.create.return_value = ({'id':'bx_test', 'vcpu':8, 'memoryGB':16}, {})
         runner = host.RunnerHost(probe)
-        with self.assertRaisesRegex(ValueError, 'default sizing'):
-            runner.verify_prepared('prepared', Path('.'), 'public', Path('client'))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(host, 'ROOT', Path(tmp)), \
+             patch.object(host, 'job_repository'):
+            Path(tmp, '.cortexkit').mkdir()
+            with self.assertRaisesRegex(ValueError, 'default sizing'):
+                runner.verify_prepared('prepared', Path('.'), 'public', Path('client'))
+        self.assertEqual({name: record['status'] for name, record in runner.data['verify_phases'].items()},
+                         {'core': 'failed', 'disk-quota': 'failed', 'idle': 'failed'})
 
     def test_policy_uses_effective_sshd_values(self):
         sample = {"sshd": {"exit_code": 0, "stdout": "\n".join(k+" "+v for k, v in host.POLICY.items())}}
@@ -936,42 +942,405 @@ class RunnerHostTests(unittest.TestCase):
             self.assertEqual('installed\n', subprocess.run(['sh', '-c', command], cwd=repo,
                                                            capture_output=True, text=True).stdout)
 
-    def test_verify_prepared_hydrates_before_identity_phase_without_recipe_or_restart(self):
+class VerifyPhaseTests(unittest.TestCase):
+    """--verify-prepared-image runs each phase in its own sandbox restored from the same image."""
+
+    def runner(self, fail=None):
         probe = Mock()
         probe.data = {}
         probe.size = 'default'
         probe.request.return_value = {'snapshot':{'name':'prepared','status':'ready','snapshotId':'id','sizeBytes':1}}
-        probe.create.return_value = ({'id':'bx_test', 'vcpu':4, 'memoryGB':8}, {})
-        runner = host.RunnerHost(probe)
+        sandboxes = iter(['bx_core', 'bx_quota', 'bx_idle'])
         order = []
-        probe.wait_hydrated.side_effect = lambda sid: order.append('hydrated')
+        def create(name):
+            sid = next(sandboxes)
+            order.append(('create', name, sid))
+            return {'id': sid, 'vcpu': 4, 'memoryGB': 8}, {}
+        probe.create.side_effect = create
+        probe.wait_hydrated.side_effect = lambda sid: order.append(('hydrated', sid))
+        runner = host.RunnerHost(probe)
+        def step(name, sid):
+            order.append((name, sid))
+            if name == fail:
+                raise ValueError(name + ' broke')
+            runner.check(name + '.ran', True, {})
         def phase(sid, label, *args, **kwargs):
-            order.append(label)
-            return {'node_modules_first': {'result': {'code': 0, 'stdout': 'boat-node-modules'}}}
+            step(label, sid)
+            order.append(('idle_wait_in_phase', kwargs.get('idle', True)))
+            return {'node_modules_first': {'result': {'code': 0, 'stdout': 'boat-node-modules',
+                                                      'terminal': {'outcome': {'type': 'exit', 'code': 0}}}}}
         runner.phase = Mock(side_effect=phase)
-        def disk_quota(*args):
-            order.append('disk_quota')
+        runner.verify_core_resume = Mock(side_effect=lambda sid, *args: step('core_stop_resume', sid))
+        runner.clone_ready = Mock(side_effect=lambda sid, label, *args: step(label, sid))
+        def disk_quota(sid, *args):
+            step('disk_quota', sid)
             runner.data['disk_quota'] = {'stopped_with_retained_target': True}
         runner.disk_quota = Mock(side_effect=disk_quota)
-        runner.replay_cleanup = Mock(side_effect=lambda sid: order.append('cleanup_replay'))
+        runner.release_retained_job = Mock(side_effect=lambda sid: step('release_retained_job', sid))
+        runner.replay_cleanup = Mock(side_effect=lambda sid: step('cleanup_replay', sid))
+        runner.verify_idle = Mock(side_effect=lambda sid, *args: step('idle', sid))
+        runner.release_sandbox = Mock(side_effect=lambda phase, record: order.append(('released', record['sandbox'])))
         runner.execute = Mock(side_effect=AssertionError('must not reconfigure guest'))
+        return runner, probe, order
+
+    def verify(self, runner, phases=None):
         with tempfile.TemporaryDirectory() as tmp, patch.object(host, 'ROOT', Path(tmp)), \
-             patch.object(host, 'job_repository'), patch.dict(sys.modules, {'probe':Mock(READY={'running'})}):
+             patch.object(host, 'job_repository'), patch.dict(sys.modules, {'probe': Mock(READY={'running'})}):
             Path(tmp, '.cortexkit').mkdir()
-            runner.verify_prepared('prepared', Path('.'), 'public', Path('client'))
-        self.assertEqual(order, ['hydrated', 'prepared_clone', 'disk_quota', 'hydrated', 'resumed', 'cleanup_replay'])
+            if phases is None:
+                runner.verify_prepared('prepared', Path('.'), 'public', Path('client'))
+            else:
+                runner.verify_prepared('prepared', Path('.'), 'public', Path('client'), phases)
+
+    def statuses(self, runner):
+        return {name: record['status'] for name, record in runner.data['verify_phases'].items()}
+
+    def test_no_phase_runs_every_phase_in_its_own_sandbox_and_releases_each(self):
+        runner, probe, order = self.runner()
+        self.verify(runner)
+        self.assertEqual(order, [
+            ('create', 'prepared', 'bx_core'), ('hydrated', 'bx_core'), ('prepared_clone', 'bx_core'),
+            ('idle_wait_in_phase', False), ('core_stop_resume', 'bx_core'), ('released', 'bx_core'),
+            ('create', 'prepared', 'bx_quota'), ('hydrated', 'bx_quota'), ('disk_quota_clone', 'bx_quota'),
+            ('disk_quota', 'bx_quota'), ('hydrated', 'bx_quota'), ('release_retained_job', 'bx_quota'),
+            ('resumed', 'bx_quota'), ('idle_wait_in_phase', True),
+            ('cleanup_replay', 'bx_quota'), ('released', 'bx_quota'),
+            ('create', 'prepared', 'bx_idle'), ('hydrated', 'bx_idle'), ('idle', 'bx_idle'), ('released', 'bx_idle')])
+        self.assertEqual(self.statuses(runner), {'core': 'passed', 'disk-quota': 'passed', 'idle': 'passed'})
+        self.assertEqual(runner.data['verify_phases']['core']['check_names'], ['prepared_clone.ran', 'core_stop_resume.ran'])
+        self.assertIn('disk_quota.normal_job_after_stop_resume', runner.data['verify_phases']['disk-quota']['check_names'])
         runner.execute.assert_not_called()
-        probe.create.assert_called_once_with('prepared')
-        self.assertFalse(any(call.args[0] == 'POST' and call.args[1].endswith('/stop') for call in probe.request.call_args_list))
+        # The control method is mocked here; separate tests use mocked provider/client calls to exercise its sequence.
+        posts = [call.args[1] for call in probe.request.call_args_list if call.args[0] == 'POST']
+        self.assertEqual(posts, ['/sandboxes/bx_quota/resume'])
+        timed = [row['name'] for row in runner.data['section_timings']]
+        for name in ('core', 'core/create', 'core/hydrate', 'disk-quota/disk_quota', 'disk-quota/resume',
+                     'disk-quota/cleanup_replay', 'idle'):
+            self.assertIn(name, timed)
+        self.assertTrue(all(row['outcome'] == 'completed' and row['seconds'] is not None
+                            for row in runner.data['section_timings']))
+
+    def test_one_phase_runs_alone_and_the_others_are_not_run_never_passed(self):
+        for phase in host.VERIFY_PHASES:
+            with self.subTest(phase=phase):
+                runner, probe, order = self.runner()
+                self.verify(runner, (phase,))
+                self.assertEqual(probe.create.call_count, 1)
+                self.assertEqual(runner.verify_core_resume.call_count, int(phase == 'core'))
+                if phase == 'core':
+                    runner.disk_quota.assert_not_called()
+                statuses = self.statuses(runner)
+                self.assertEqual(statuses.pop(phase), 'passed')
+                self.assertEqual(set(statuses.values()), {'not_run'})
+                for name in statuses:
+                    record = runner.data['verify_phases'][name]
+                    self.assertEqual((record['requested'], record['ran']), (False, False))
+                    self.assertNotIn('check_names', record)
+
+    def test_a_failed_phase_is_recorded_the_next_still_runs_and_the_run_fails(self):
+        runner, probe, order = self.runner(fail='prepared_clone')
+        with self.assertRaisesRegex(ValueError, 'verify phase failed: core: prepared_clone broke'):
+            self.verify(runner)
+        self.assertEqual(self.statuses(runner), {'core': 'failed', 'disk-quota': 'passed', 'idle': 'passed'})
+        self.assertEqual(runner.data['verify_phases']['core']['error'], 'prepared_clone broke')
+        self.assertEqual(probe.create.call_count, 3)
+        self.assertIn(('released', 'bx_core'), order)
+        core = next(row for row in runner.data['section_timings'] if row['name'] == 'core')
+        self.assertEqual((core['outcome'], core['error']), ('error', 'prepared_clone broke'))
+
+    def test_failed_plain_control_blocks_the_core_phase(self):
+        runner, probe, order = self.runner(fail='core_stop_resume')
+        with self.assertRaisesRegex(ValueError, 'verify phase failed: core: core_stop_resume broke'):
+            self.verify(runner, ('core',))
+        self.assertEqual(self.statuses(runner), {'core': 'failed', 'disk-quota': 'not_run', 'idle': 'not_run'})
+        self.assertIn(('core_stop_resume', 'bx_core'), order)
+        self.assertIn(('released', 'bx_core'), order)
+
+    def test_a_size_refusal_stops_every_later_phase(self):
+        runner, probe, order = self.runner()
+        def refused(name):
+            probe.data['snapshot_size_bound'] = {'requested_size': 'default'}
+            raise RuntimeError('Boat refused the size')
+        probe.create.side_effect = refused
+        with self.assertRaisesRegex(RuntimeError, 'refused'):
+            self.verify(runner)
+        self.assertEqual(self.statuses(runner), {'core': 'snapshot_size_bound', 'disk-quota': 'not_run', 'idle': 'not_run'})
+        runner.release_sandbox.assert_not_called()
+
+    def test_each_phase_restarts_the_wall_clock_budget(self):
+        runner, probe, order = self.runner()
+        runner.budget_seconds = 1800
+        deadlines = []
+        runner.release_sandbox = Mock(side_effect=lambda phase, record: deadlines.append(probe.deadline))
+        clock = __import__('itertools').count()
+        with patch.object(host.time, 'monotonic', side_effect=lambda: float(next(clock))):
+            self.verify(runner)
+        self.assertEqual(len(deadlines), 3)
+        self.assertTrue(deadlines[0] < deadlines[1] < deadlines[2])
+        self.assertTrue(all(deadline >= 1800 for deadline in deadlines))
+
+    def test_the_core_phase_leaves_the_idle_wait_to_the_idle_phase(self):
+        source = __import__('inspect').getsource(host.RunnerHost._phase)
+        self.assertIn("if label in ('prepared_clone', 'snapshot_clone') and idle:", source)
+        idle = __import__('inspect').getsource(host.RunnerHost.verify_idle)
+        self.assertIn('self.idle_reclaim_wait(sid, label, record)', idle)
+        self.assertIn("self.check_job(label + '.after_idle', parsed, 0, marker='boat-node-modules')", idle)
+
+
+class CoreStopResumeTests(unittest.TestCase):
+    def runner(self, fault=None):
+        probe = Mock()
+        probe.data = {}
+        probe.deadline = 1800
+        probe.quota_stop_wait_s = 1500
+        order, clock = [], [0.0]
+        runner = host.RunnerHost(probe)
+        runner.unit_diagnostics = Mock()
+        runner.disk_quota = Mock()
+        idle = {'ready': True, 'leases': ['active'] if fault == 'busy' else [],
+                'root_free_bytes': 50 * 1024**3, 'xfs_free_bytes': 60 * 1024**3}
+        observations = iter([idle, {'backing_allocated_blocks': 1024}, {'restored_storage': True}])
+        def guest_json(_sid, _command, label):
+            order.append(label)
+            return next(observations)
+        runner.guest_json = Mock(side_effect=guest_json)
+        def request(method, path, body):
+            self.assertEqual((method, body), ('POST', {}))
+            order.append(path.rsplit('/', 1)[-1])
+            if path.endswith('/stop'):
+                clock[0] += 5
+                return {'ok': True, 'type': 'sandbox.stopping', 'status': 'archiving'}
+            return {'ok': True}
+        probe.request.side_effect = request
+        def wait(_sid, states, **kwargs):
+            if 'archived' in states:
+                order.append('archived')
+                clock[0] += 7.5
+                return {'state': 'archived', 'stop': {'status': 'pending' if fault == 'pending' else 'completed'}}
+            order.append('ready')
+            return {'state': 'ready'}
+        probe.wait_sandbox.side_effect = wait
+        probe.wait_hydrated.side_effect = lambda sid: order.append('hydrated')
+        runner.route = Mock(return_value=['ssh'])
+        def readiness(sid, label, record, hydrated_at):
+            order.append('endpoint_ready')
+            runner.check(label + '.endpoint_ready_within_bound', fault != 'not-ready', {})
+        runner.existing_then_reinstall = Mock(side_effect=readiness)
+        def execute(sid, command):
+            self.assertEqual(command, 'sudo -n systemctl start motor-boat-bridge')
+            order.append('bridge')
+            return {'stdout': '', 'exitCode': 0}
+        runner.execute = Mock(side_effect=execute)
+        return runner, probe, order, clock
+
+    @contextlib.contextmanager
+    def fakes(self, order, clock, code=0):
+        def forward(argv, directory, deadline, record):
+            record['reaped'] = True
+            return contextlib.nullcontext('address')
+        def job(argv, **kwargs):
+            order.append('job')
+            self.assertEqual(argv[4], host.NODE_CHECK)
+            result = {'code': code, 'stdout': 'boat-node-modules',
+                      'terminal': {'outcome': {'type': 'exit', 'code': code}}}
+            return {'exit_code': 0, 'stdout': json.dumps(result)}
+        with patch.object(host.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(host, 'tunnel', side_effect=forward), patch.object(host, 'process', side_effect=job) as client, \
+             patch.object(host, 'storage_checks', return_value={'storage_ok': True}):
+            yield client
+
+    def test_plain_control_archives_idle_clone_then_resumes_endpoint_and_real_job(self):
+        runner, probe, order, clock = self.runner()
+        with self.fakes(order, clock) as client:
+            runner.verify_core_resume('bx_core', Path('.'), 'public', Path('.'), Path('client'))
+        self.assertEqual(order, ['core idle endpoint before stop', 'core pre-stop storage', 'stop', 'archived',
+                                 'resume', 'ready', 'hydrated', 'endpoint_ready', 'bridge', 'job', 'core resumed job storage'])
+        runner.disk_quota.assert_not_called()
+        self.assertEqual(runner.data['core_stop_resume']['accepted_to_completed_seconds'], 7.5)
+        self.assertEqual(len(probe.wait_sandbox.call_args_list[0].args), 2)
+        self.assertEqual(probe.wait_sandbox.call_args_list[0].args, ('bx_core', {'archived'}))
+        runner.existing_then_reinstall.assert_called_once()
+        client.assert_called_once()
+        checks = {row['name']: row['status'] for row in runner.data['checks']}
+        self.assertEqual(checks['core_stop_resume.idle_before_stop'], 'PASS')
+        self.assertEqual(checks['core_stop_resume.stop_completed'], 'PASS')
+        self.assertEqual(checks['core_stop_resume.normal_job_after_resume'], 'PASS')
+        self.assertTrue(all(status == 'PASS' for status in checks.values()))
+
+    def test_busy_endpoint_never_sends_the_control_stop(self):
+        runner, probe, order, clock = self.runner('busy')
+        with self.fakes(order, clock) as client, self.assertRaisesRegex(ValueError, 'no job quota leases'):
+            runner.verify_core_resume('bx_core', Path('.'), 'public', Path('.'), Path('client'))
+        probe.request.assert_not_called()
+        client.assert_not_called()
+
+    def test_incomplete_archival_or_unready_endpoint_prevents_resumed_job(self):
+        for fault in ('pending', 'not-ready'):
+            with self.subTest(fault=fault):
+                runner, probe, order, clock = self.runner(fault)
+                with self.fakes(order, clock) as client, self.assertRaises(ValueError):
+                    runner.verify_core_resume('bx_core', Path('.'), 'public', Path('.'), Path('client'))
+                client.assert_not_called()
+                self.assertTrue(any(row['status'] == 'FAIL' for row in runner.data['checks']))
+                if fault == 'pending':
+                    self.assertNotIn('resume', order)
+
+    def test_failed_resumed_job_is_a_required_core_failure(self):
+        runner, probe, order, clock = self.runner()
+        with self.fakes(order, clock, code=1):
+            runner.verify_core_resume('bx_core', Path('.'), 'public', Path('.'), Path('client'))
+        check = next(row for row in runner.data['checks'] if row['name'] == 'core_stop_resume.normal_job_after_resume')
+        self.assertEqual(check['status'], 'FAIL')
+        self.assertEqual(host.verify_phase_status({'ran': True, 'completed': True}, runner.data['checks']), 'failed')
+
+
+class SectionTimingTests(unittest.TestCase):
+    def test_sections_nest_record_seconds_and_stay_visible_while_running(self):
+        probe = Mock()
+        probe.data = {}
+        runner = host.RunnerHost(probe)
+        seen = []
+        probe.checkpoint.side_effect = lambda: seen.append([dict(row) for row in runner.data.get('section_timings', [])])
+        with runner.section('core'):
+            with runner.section('create'):
+                pass
+            with self.assertRaises(ValueError):
+                with runner.section('hydrate'):
+                    raise ValueError('timed out waiting for sandbox')
+        rows = {row['name']: row for row in runner.data['section_timings']}
+        self.assertEqual(list(rows), ['core', 'core/create', 'core/hydrate'])
+        self.assertEqual(rows['core/hydrate']['outcome'], 'error')
+        self.assertIn('timed out', rows['core/hydrate']['error'])
+        self.assertEqual((rows['core']['outcome'], rows['core/create']['outcome']), ('completed', 'completed'))
+        self.assertTrue(all(isinstance(row['seconds'], float) for row in rows.values()))
+        # The first checkpoint already shows the step as running, so a killed run names it.
+        self.assertEqual(seen[0], [dict(name='core', started_at=seen[0][0]['started_at'], seconds=None, outcome='running')])
+        self.assertEqual(runner._sections, [])
 
 
 class RetainedQuotaSnapshotTests(unittest.TestCase):
+    def test_pending_stop_samples_use_pinned_ssh_and_preserve_unknown_observations(self):
+        probe = Mock()
+        probe.data = {}
+        probe.deadline = host.time.monotonic() + 1800
+        runner = host.RunnerHost(probe)
+        child = Mock()
+        child.poll.return_value = None
+        guest = {'job_running': True, 'allocated_bytes': 2**30, 'retained_target_at_limit': True,
+                 'root_free_bytes': 50 * 2**30, 'xfs_free_bytes': 40 * 2**30}
+        with patch.object(host, 'process', return_value={'exit_code': 0, 'stdout': json.dumps(guest)}) as ssh:
+            observed = runner.retained_stop_sample({'state': 'archiving'}, {}, ['ssh', 'pinned-host'], child)
+            self.assertEqual(observed['status'], 'observed')
+            self.assertTrue(observed['job_running'])
+            self.assertTrue(observed['client_running'])
+            self.assertEqual(observed['allocated_bytes'], 2**30)
+            self.assertEqual(ssh.call_args.args[0][:2], ['ssh', 'pinned-host'])
+            self.assertIn('sudo -n /usr/bin/python3 -c', ssh.call_args.args[0][-1])
+            self.assertLessEqual(ssh.call_args.kwargs['timeout'], 10)
+        for response in ({'exit_code': 255, 'stderr': 'SSH unavailable'}, {'exit_code': 0, 'stdout': '{}'}):
+            with self.subTest(response=response), patch.object(host, 'process', return_value=response):
+                observed = runner.retained_stop_sample({'state': 'archiving'}, {}, ['ssh', 'pinned-host'], child)
+                self.assertEqual(observed['status'], 'unavailable')
+                self.assertNotIn('job_running', observed)
+        with patch.object(host, 'process') as ssh:
+            observed = runner.retained_stop_sample({'state': 'archived', 'stop': {'status': 'completed'}}, {}, ['ssh'], child)
+            self.assertEqual(observed['status'], 'archived')
+            ssh.assert_not_called()
+        probe.execute.assert_not_called()
+        probe.request.assert_not_called()
+
+    def test_completed_stop_cannot_qualify_a_dead_or_unobserved_retained_job(self):
+        case = json.loads(Path(__file__).with_name('fixtures').joinpath('full-quota-stops.json').read_text())['default']
+        for guest, expected, phase in (({'status': 'observed', 'job_running': False, 'retained_target_at_limit': True}, 'FAIL', 'failed'),
+                                       ({'status': 'unavailable', 'error': 'SSH unavailable'}, 'INCONCLUSIVE', 'inconclusive'),
+                                       ({'status': 'observed', 'job_running': True, 'retained_target_at_limit': True}, 'PASS', 'passed')):
+            with self.subTest(expected=expected):
+                probe = Mock()
+                probe.data = {}
+                probe.quota_stop_wait_s = 1500
+                probe.request.return_value = case['stop_response']
+                def wait(sid, states, seconds, *, observation, on_sample):
+                    observation['samples'] = [{'sandbox': {'state': 'archiving'}, 'retained_job': guest},
+                                               {'sandbox': {'state': 'archived', 'stop': {'status': 'completed'}},
+                                                'retained_job': {'status': 'archived'}}]
+                    return {'state': 'archived', 'stop': {'status': 'completed'}}
+                probe.wait_sandbox.side_effect = wait
+                runner = host.RunnerHost(probe)
+                runner.stop_at_quota_limit(case['sandbox_id'], {}, case)
+                check = next(row for row in runner.data['checks'] if row['name'] == 'disk_quota.retained_target_held_during_stop')
+                self.assertEqual(check['status'], expected)
+                self.assertEqual(host.verify_phase_status({'ran': True, 'completed': True}, runner.data['checks']), phase)
+
+    def test_quota_stop_forwards_its_configured_wait_cap(self):
+        case = json.loads(Path(__file__).with_name('fixtures').joinpath('full-quota-stops.json').read_text())['default']
+        probe = Mock()
+        probe.data = {}
+        probe.quota_stop_wait_s = 1500
+        probe.request.return_value = case['stop_response']
+        probe.wait_sandbox.return_value = {'state': 'archived', 'stop': {'status': 'completed'}}
+        runner = host.RunnerHost(probe)
+        record = {}
+        runner.stop_at_quota_limit(case['sandbox_id'], record, case)
+        probe.wait_sandbox.assert_called_once_with(case['sandbox_id'], {'archived'}, 1500,
+                                                   observation=record['stop_at_limit']['wait'], on_sample=None)
+        self.assertEqual(runner.data['checks'][-1]['status'], 'PASS')
+
+    def test_recorded_full_quota_stop_timeout_names_state_operation_and_disks(self):
+        from probe import Probe
+        recorded = json.loads(Path(__file__).with_name('fixtures').joinpath('full-quota-stops.json').read_text())
+        for size, count, backing_bytes in (('default', 390, 13225811968), ('large', 388, 51881713664)):
+            with self.subTest(size=size):
+                case = recorded[size]
+                sid = case['sandbox_id']
+                polls = []
+                for group in case['poll_groups']:
+                    state = {'id': sid, 'state': 'archiving', 'stop': case['stop_response']['operation'],
+                             **{key: value for key, value in group.items() if key != 'count'}}
+                    polls.extend([{'ok': True, 'type': 'sandbox.info', 'sandbox': state}] * group['count'])
+                self.assertEqual(len(polls), count)
+                client = Mock()
+                response = dict(case['stop_response'], sandbox=polls[0]['sandbox'])
+                client.request.side_effect = [response] + polls
+                probe = Probe(client, {'run_id': 'recorded-stop'}, Mock())
+                probe.deadline = 1800
+                runner = host.RunnerHost(probe)
+                record = {}
+                clock = [0.0]
+                def advance(_seconds):
+                    clock[0] += 901 / count
+                with patch('probe.time.monotonic', side_effect=lambda: clock[0]), patch('probe.time.sleep', side_effect=advance):
+                    with self.assertRaisesRegex(ValueError, '^disk_quota.stop_with_quota_sized_target:'):
+                        runner.stop_at_quota_limit(sid, record, case)
+                failure = next(row for row in runner.data['checks'] if row['name'] == 'disk_quota.stop_with_quota_sized_target')
+                self.assertEqual((failure['name'], failure['status']), ('disk_quota.stop_with_quota_sized_target', 'FAIL'))
+                wait = failure['evidence']['wait']
+                self.assertEqual(wait['polls'], count)
+                self.assertGreaterEqual(wait['seconds'], 900)
+                self.assertEqual(wait['last_sandbox']['state'], 'archiving')
+                self.assertEqual(wait['last_sandbox']['stop']['status'], 'pending')
+                self.assertIsNone(wait['last_sandbox']['stop']['lastAttemptAt'])
+                self.assertEqual(wait['last_sandbox']['lastSnapshotStatus'], case['poll_groups'][-1]['lastSnapshotStatus'])
+                self.assertEqual(failure['evidence']['response'], response)
+                disks = failure['evidence']['pre_stop_disk']
+                self.assertEqual(disks['root_free_bytes'], case['pre_stop']['root_free_bytes'])
+                self.assertEqual(disks['xfs_free_bytes'], case['pre_stop']['xfs_free_bytes'])
+                self.assertEqual(disks['backing_allocated_bytes'], backing_bytes)
+                for value in ('archiving', 'pending', case['stop_response']['operation']['id'],
+                              str(disks['root_free_bytes']), str(disks['xfs_free_bytes'])):
+                    self.assertIn(value, failure['reason'])
+                client.request.assert_any_call('POST', f'/sandboxes/{sid}/stop', {})
+                self.assertEqual(client.request.call_count, count + 1)
+                self.assertNotIn('stopped_with_retained_target', record)
+                self.assertEqual(runner.data['section_timings'][-1]['outcome'], 'error')
+
     def test_snapshot_stops_with_data_held_and_never_on_missing_charge(self):
         import disk_quota
         for valid in (True, False):
             with self.subTest(valid=valid):
                 probe = Mock()
                 probe.data = {}
+                probe.quota_stop_wait_s = 900
+                probe.deadline = 10**12
                 runner = host.RunnerHost(probe)
                 runner.route = Mock(return_value=['ssh'])
                 runner.check_job = Mock()
@@ -994,7 +1363,7 @@ class RetainedQuotaSnapshotTests(unittest.TestCase):
                     return {'stdout': json.dumps(next(responses))}
                 runner.execute = Mock(side_effect=execute)
                 probe.request.side_effect = lambda *args: order.append('stop') or {}
-                probe.wait_sandbox.side_effect = lambda *args: order.append('archived')
+                probe.wait_sandbox.side_effect = lambda *args, **kwargs: order.append('archived')
                 child = Mock(returncode=-15)
                 child.poll.return_value = None
                 child.communicate.return_value = ('', 'client interrupted')
@@ -1012,22 +1381,306 @@ class RetainedQuotaSnapshotTests(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, 'retained target'):
                             runner.disk_quota('bx_test', Path('.'), 'public', Path('.'), Path('client'))
                         probe.request.assert_not_called()
+                    self.assertEqual(host._quota_popen.call_args.args[0][-1], '1800')
+                    row = runner.data['disk_quota']['lanes']['retained_target']
+                    self.assertEqual((row['hold_seconds'], row['job_timeout_seconds']), (1800, 1800))
                 self.assertTrue(any('HOLD_AT_LIMIT=True' in call.args[1] for call in runner.execute.call_args_list))
 
     def test_resume_records_and_checks_backing_allocation_drop(self):
+        # The drop must cover the evicted target's allocation, less the slack;
+        # any smaller allocation used to pass (see
+        # RecordedC7c6127fTests.test_recorded_two_mib_backing_shrink_is_not_a_reclaimed_target).
         import disk_quota
-        for blocks, passed in ((100, True), (1000, False), (None, False)):
+        retained = 4 * 1024**3
+        for blocks, passed in ((1000 + 1024**3 // 512, True), (1000 + 1024**3 // 512 + 1, False),
+                               (100 + 4 * 1024**3 // 512, False), (None, False)):
             with self.subTest(blocks=blocks):
                 probe = Mock()
-                before = dict(expected_backing=True, backing_file='/var/lib/motor-boat.xfs', backing_allocated_blocks=1000)
+                before = dict(expected_backing=True, backing_file='/var/lib/motor-boat.xfs',
+                              backing_allocated_blocks=1000 + retained // 512)
                 probe.data = {}
                 runner = host.RunnerHost(probe)
-                runner.data['disk_quota'] = {'lanes': {disk_quota.RETAINED_LANE: {'pre_stop_storage': before}}}
+                runner.data['disk_quota'] = {'lanes': {disk_quota.RETAINED_LANE: {
+                    'pre_stop_storage': before, 'at_limit': {'retained_allocated_bytes': retained}}}}
                 runner.check = Mock()
                 after = dict(before, backing_allocated_blocks=blocks)
                 runner.quota_reclaimed(after)
-                runner.check.assert_called_once_with('disk_quota.backing_allocation_dropped_after_resume', passed,
-                                                     {'before': before, 'after': after})
+                name, observed, evidence = runner.check.call_args.args
+                self.assertEqual((name, observed), ('disk_quota.backing_allocation_dropped_after_resume', passed))
+                self.assertEqual(evidence, {'before': before, 'after': after, 'retained_allocated_bytes': retained})
+                self.assertEqual(runner.check.call_args.kwargs['reason'] is None, passed)
+
+
+class RecordedDiskQuotaPollTests(unittest.TestCase):
+    """Replays the Boat command results that stopped the disk-quota phase of the
+    prepared-image verify at revision 458c6333 (fixtures/disk-quota-boat-polls.json)."""
+
+    @staticmethod
+    def recorded():
+        return json.loads(Path(__file__).with_name('fixtures').joinpath('disk-quota-boat-polls.json').read_text())
+
+    def replay(self, size, lanes, responses):
+        """Run the disk-quota phase with the recorded guest results; `responses`
+        maps a predicate on the guest command to its recorded Boat status."""
+        import disk_quota
+        recorded = self.recorded()[size]
+        probe = Mock()
+        probe.data = {}
+        probe.quota_stop_wait_s = 900
+        probe.deadline = 10**12
+        runner = host.RunnerHost(probe)
+        runner.route = Mock(return_value=['ssh'])
+        runner.check_job = Mock()
+        cleanups = iter(responses.pop('cleanup'))
+        def ok(value):
+            return {'exitCode': 0, 'stdout': json.dumps(value) + '\n', 'stderr': '', 'status': 'exited'}
+        def execute(sid, command, **kwargs):
+            if shlex.quote(disk_quota.POSITIVE_CONTROL) in command:
+                return ok(recorded['setter_positive_control'])
+            if shlex.quote(disk_quota.CLEANUP) in command:
+                return next(cleanups)
+            for matches, response in responses.items():
+                if matches in command:
+                    return response
+            raise AssertionError('unexpected guest command: ' + command[:200])
+        runner.execute = Mock(side_effect=execute)
+        child = Mock(returncode=0)
+        child.poll.return_value = 0
+        return recorded, runner, probe, child, patch.object(disk_quota, 'LANES', lanes), \
+            patch.object(host, 'tunnel', return_value=contextlib.nullcontext('address')), \
+            patch.object(host, '_quota_popen', return_value=child), patch.object(host, 'EMPTY_OUTPUT_REPOLL_SECONDS', 0, create=True)
+
+    def test_recorded_large_empty_cleanup_poll_is_a_named_failure(self):
+        # Large run: the reused_target job finished and was recorded, then Boat
+        # reported the cleanup wait (process 39139) exited 0 with empty stdout.
+        recorded = self.recorded()['large']
+        poll = recorded['reused_target_cleanup_poll']
+        self.assertEqual((poll['status'], poll['exitCode'], poll['stdout'], poll['stderr']), ('exited', 0, '', ''))
+        deep = {'exitCode': 0, 'stdout': json.dumps(recorded['deep_cleanup']) + '\n', 'status': 'exited'}
+        observer = {'exitCode': 0, 'stdout': json.dumps(recorded['reused_target_at_limit']) + '\n', 'status': 'exited'}
+        _, runner, probe, child, *patches = self.replay('large', ('reused_target',), {
+            'cleanup': [deep, poll], 'EXPECTED_TOKEN=': observer})
+        client = recorded['reused_target_client']
+        child.communicate.return_value = (client['stdout'], client['stderr'])
+        probe.command_status.return_value = poll
+        with patches[0], patches[1], patches[2], patches[3], \
+             patch.object(host, 'process', return_value=recorded['baseline_seed_client']):
+            with self.assertRaisesRegex(ValueError, r'^disk_quota cleanup after lane reused_target: guest command exited 0 '
+                                                    r'with empty stdout .*5 re-polls of Boat process 39139'):
+                runner.disk_quota(recorded['sandbox'], Path('.'), 'public', Path('.'), Path('client'))
+        self.assertEqual(probe.command_status.call_count, host.EMPTY_OUTPUT_REPOLLS)
+        probe.command_status.assert_called_with(recorded['sandbox'], 39139)
+        row = runner.data['disk_quota']['lanes']['reused_target']
+        self.assertEqual(row['result']['code'], 0)
+        self.assertNotIn('cleanup', row)
+        failure = runner.data['guest_failures'][-1]
+        self.assertEqual((failure['label'], failure['reason']), ('disk_quota cleanup after lane reused_target', 'empty stdout'))
+        self.assertEqual(runner.data['empty_output_repolls'][-1]['output_arrived'], False)
+
+    def test_late_guest_output_after_an_empty_exited_poll_is_used_and_recorded(self):
+        poll = self.recorded()['large']['reused_target_cleanup_poll']
+        probe = Mock()
+        probe.data = {}
+        runner = host.RunnerHost(probe)
+        runner.execute = Mock(return_value=poll)
+        late = dict(poll, stdout='{"ready": true, "leases": []}\n')
+        probe.command_status.side_effect = [poll, late]
+        with patch.object(host, 'EMPTY_OUTPUT_REPOLL_SECONDS', 0):
+            self.assertEqual(runner.guest_json('bx', 'cleanup', 'cleanup step'), {'ready': True, 'leases': []})
+        self.assertEqual(probe.command_status.call_count, 2)
+        self.assertEqual(runner.data['empty_output_repolls'][0]['output_arrived'], True)
+        self.assertNotIn('guest_failures', runner.data)
+        # Output that is present but not JSON is named too, with what was printed.
+        runner.execute = Mock(return_value=dict(poll, stdout='Traceback\n'))
+        with self.assertRaisesRegex(ValueError, r"^cleanup step: guest command stdout is not JSON .*'Traceback"):
+            runner.guest_json('bx', 'cleanup', 'cleanup step')
+
+    def test_recorded_default_journal_cursor_after_no_entries_line_is_used(self):
+        # Default run: journalctl printed "-- No entries --" (it always does
+        # with --lines=0) and then the cursor, on the second line.
+        recorded = self.recorded()['default']
+        poll = recorded['journal_cursor_poll']
+        self.assertTrue(poll['stdout'].startswith('-- No entries --\n-- cursor: '))
+        def ok(value):
+            return {'exitCode': 0, 'stdout': json.dumps(value) + '\n', 'status': 'exited'}
+        _, runner, probe, child, *patches = self.replay('default', (), {
+            'cleanup': [ok(recorded['deep_cleanup'])],
+            'EXPECTED_TOKEN=': ok(recorded['retained_target_at_limit']),
+            'OBSERVATION=': ok(recorded['retained_target_pre_stop']),
+            shlex.quote(host.STORAGE_STATE): ok(recorded['retained_target_pre_stop_storage']),
+            '--show-cursor': poll})
+        child.poll.return_value = None
+        child.communicate.return_value = ('', 'client interrupted')
+        probe.request.return_value = {}
+        with patches[0], patches[1], patches[2], patches[3], \
+             patch.object(host, 'process', return_value={'exit_code': 0, 'stdout': json.dumps(dict(code=0, terminal={}, stdout='deep'))}):
+            runner.disk_quota(recorded['sandbox'], Path('.'), 'public', Path('.'), Path('client'))
+        record = runner.data['disk_quota']
+        self.assertTrue(record['stopped_with_retained_target'])
+        self.assertEqual(record['lanes']['retained_target']['eviction_journal_cursor'],
+                         's=4c4ce718decd416491c455c60388f086;i=2000;b=bc54cabec54f4ac0a1532d161f94134d;'
+                         'm=1dce7402;t=65e9e1ed82b65;x=f298a0d395997b89')
+        probe.request.assert_called_once_with('POST', f"/sandboxes/{recorded['sandbox']}/stop", {})
+
+    def test_missing_or_ambiguous_journal_cursor_names_what_journalctl_printed(self):
+        for stdout in ('-- No entries --\n', '', None, '-- cursor: \n', '-- cursor: a\n-- cursor: b\n'):
+            with self.subTest(stdout=stdout):
+                with self.assertRaisesRegex(ValueError, r'did not provide exactly one pre-stop eviction cursor line.*journalctl printed '
+                                            + re.escape(repr(stdout))):
+                    host.journal_cursor(stdout)
+        self.assertEqual(host.journal_cursor('-- cursor: s=1;i=2\n'), 's=1;i=2')
+
+
+class RecordedC7c6127fTests(unittest.TestCase):
+    """The phased prepared-image verify at c7c6127f (fixtures/boat-verify-c7c6127f.json)."""
+
+    @staticmethod
+    def recorded():
+        return json.loads(Path(__file__).with_name('fixtures').joinpath('boat-verify-c7c6127f.json').read_text())
+
+    def resume_runner(self, release):
+        """A disk-quota phase that stopped with the recorded retained job, with
+        every Boat and guest call recorded in `order`."""
+        import disk_quota
+        case = self.recorded()['default_resume']
+        probe = Mock()
+        probe.data = {}
+        probe.deadline = host.time.monotonic() + 1800
+        order = []
+        runner = host.RunnerHost(probe)
+        runner.clone_ready = Mock()
+        def stopped(*args):
+            runner.data['disk_quota'] = {'stopped_with_retained_target': True,
+                                         'lanes': {disk_quota.RETAINED_LANE: {'at_limit': case['retained_at_limit']}}}
+        runner.disk_quota = Mock(side_effect=stopped)
+        probe.request.side_effect = lambda method, path, body: order.append(('request', path)) or {}
+        probe.wait_sandbox.side_effect = lambda *args, **kwargs: order.append(('wait_sandbox',))
+        probe.wait_hydrated.side_effect = lambda *args: order.append(('hydrated',))
+        def guest_json(sid, command, label, timeout=120):
+            order.append(('guest', label, host.time.monotonic()))
+            return release
+        runner.guest_json = Mock(side_effect=guest_json)
+        def phase(sid, label, *args, hydrated_at=None, **kwargs):
+            order.append(('phase', label, hydrated_at))
+            return {'node_modules_first': {'result': {'code': 0}}}
+        runner.phase = Mock(side_effect=phase)
+        runner.check_job = Mock()
+        runner.replay_cleanup = Mock()
+        return runner, order, case
+
+    def test_recorded_resumed_retained_job_is_released_before_readiness_is_timed(self):
+        # At 04:27:48, after the resume, the retained job's unit was still in
+        # the runner's cgroup: Boat had restored memory (same boot id), so the
+        # job still held its barrier and the runner kept its workspace.
+        case = self.recorded()['default_resume']
+        self.assertEqual(*case['boot_id_before_and_after'])
+        self.assertFalse(case['workspace_eviction']['workspace_absent'])
+        release = {'released': True, 'job_terminal': True, 'unit_active': False, 'terminal_before': False}
+        runner, order, _ = self.resume_runner(release)
+        runner.verify_disk_quota('bx_a6kvzryf', Path('.'), 'public', Path('.'), Path('client'))
+        steps = [step[0] if step[0] != 'guest' else step[1] for step in order]
+        self.assertEqual(steps, ['request', 'wait_sandbox', 'hydrated', 'retained job release after resume', 'phase'])
+        self.assertEqual(order[0][1], '/sandboxes/bx_a6kvzryf/resume')
+        command = runner.guest_json.call_args.args[1]
+        self.assertIn(case['retained_at_limit']['probe_token'], command)
+        self.assertIn(case['retained_at_limit']['job_id'], command)
+        # Readiness is timed from the release, not from hydration.
+        self.assertGreaterEqual(order[-1][2], order[-2][2])
+        check = next(row for row in runner.data['checks'] if row['name'] == 'disk_quota.retained_job_ended_after_resume')
+        self.assertEqual(check['status'], 'PASS')
+
+    def test_retained_job_that_does_not_end_after_release_is_a_named_failure(self):
+        for release in ({'released': True, 'job_terminal': False, 'unit_active': True, 'terminal_before': False},
+                        {'released': False, 'marker_error': 'absent', 'job_terminal': False, 'unit_active': True}):
+            with self.subTest(release=release):
+                runner, order, _ = self.resume_runner(release)
+                with self.assertRaisesRegex(ValueError, '^disk_quota.retained_job_ended_after_resume: '):
+                    runner.verify_disk_quota('bx_a6kvzryf', Path('.'), 'public', Path('.'), Path('client'))
+                runner.phase.assert_not_called()
+                check = next(row for row in runner.data['checks'] if row['name'] == 'disk_quota.retained_job_ended_after_resume')
+                self.assertEqual(check['status'], 'FAIL')
+                self.assertIn('"job_terminal": false', check['reason'])
+
+    def test_recorded_never_attempted_quota_stop_reason_names_boat_progress(self):
+        from probe import SandboxWaitTimeout
+        case = self.recorded()['large_quota_stop']
+        probe = Mock()
+        probe.data = {}
+        probe.quota_stop_wait_s = 1800
+        probe.request.return_value = {'operation': case['stop_operation']}
+        def wait(sid, states, seconds, *, observation, on_sample):
+            observation.update(case['wait'], samples=case['samples'])
+            raise SandboxWaitTimeout(sid, states, case['wait']['seconds'], case['wait']['polls'],
+                                     case['samples'][-1]['sandbox'], observation)
+        probe.wait_sandbox.side_effect = wait
+        runner = host.RunnerHost(probe)
+        disk = case['pre_stop_disk']
+        row = {'pre_stop': {'root_free_bytes': disk['root_free_bytes'], 'xfs_free_bytes': disk['xfs_free_bytes'],
+                            'allocated_bytes': disk['retained_allocated_bytes'], 'job_running': True},
+               'pre_stop_storage': {'backing_file': disk['backing_file'],
+                                    'backing_allocated_blocks': disk['backing_allocated_bytes'] // 512}}
+        with self.assertRaisesRegex(ValueError, 'boat_stop_never_attempted: Boat accepted stop stop_81053a3051114291'):
+            runner.stop_at_quota_limit(case['sandbox_id'], {}, row)
+        failure = next(r for r in runner.data['checks'] if r['name'] == 'disk_quota.stop_with_quota_sized_target')
+        self.assertTrue(failure['reason'].startswith(
+            'stop at quota limit did not complete: boat_stop_never_attempted: Boat accepted stop stop_81053a3051114291 '
+            'at 2026-10-25T04:19:52.690Z and never attempted it'))
+        for value in ('2026-10-25T04:29:27.847Z', str(disk['root_free_bytes']), str(disk['xfs_free_bytes'])):
+            self.assertIn(value, failure['reason'])
+        self.assertEqual(failure['evidence']['boat_stop_progress']['classification'], 'boat_stop_never_attempted')
+
+    def test_recorded_refused_resumed_jobs_name_the_runner_refusal(self):
+        parsed = self.recorded()['default_resume']['job_toolchain_parity_result']
+        passed, evidence, reason = host.parity_job_check(parsed)
+        self.assertFalse(passed)
+        self.assertIs(evidence, parsed)
+        self.assertIn('runner refused the job before start: runner_disk_full: free_bytes=25835020288 '
+                      'floor_bytes=34426847232', reason)
+        lane = host.RunnerHost(Mock(data={}))
+        lane.check_job('resumed.node_modules_first', parsed, 0, marker='boat-node-modules')
+        self.assertIn('runner_disk_full: free_bytes=25835020288', lane.data['checks'][0]['reason'])
+        phase = __import__('inspect').getsource(host.RunnerHost._phase)
+        self.assertIn('parity_job_check(parsed)', phase)
+
+    def test_recorded_sandbox_account_pnpm_tree_is_a_named_root_path_failure(self):
+        case = self.recorded()['root_owned']
+        recorded = case['default_prepared_clone']['report']
+        # Every recorded offender is uid 1000 under pnpm; the report kept 20 of 922.
+        offenders = [line.replace('/usr/local/lib/node_modules/pnpm/', f'/usr/local/lib/node_modules/pnpm/{n}/', 1)
+                     for n in range(47) for line in recorded['offenders']][:recorded['offender_count']]
+        with tempfile.TemporaryDirectory() as tmp:
+            checker = Path(tmp, 'root_paths.py')
+            checker.write_text('BOAT_ROOTS = ("/usr/local",)\nBOAT_PROVIDER_RESTORED = {}\nREPORTED = 20\n'
+                               f'OFFENDERS = {offenders!r}\n'
+                               'def check(roots, provider_files=None, limit=REPORTED):\n'
+                               '    return {"roots": list(roots), "entries": 18527, "offender_count": len(OFFENDERS),\n'
+                               '            "offenders": OFFENDERS[:limit], "missing": [], "limit": limit}\n')
+            with patch.object(host, 'ROOT_PATHS_SCRIPT', checker):
+                source = host.root_paths_source()
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                exec(source, {})
+        report = json.loads(output.getvalue())
+        self.assertIsNone(report['limit'])
+        self.assertEqual(len(report['offenders']), 20)
+        self.assertEqual(report['offender_groups'],
+                         [{'directory': '/usr/local/lib/node_modules/pnpm', 'owner': 'uid=1000', 'count': 922}])
+        self.assertFalse(host.root_paths_passed(report))
+        rewalk = dict(report, entries=18527)
+        reason = host.root_paths_reason(report, case['default_prepared_clone']['kernel_release'], rewalk, 30)
+        for text in ('boat_sandbox_account_owns_root_paths: 922 path(s)', "uid 1000, Boat's sandbox account",
+                     "('/usr/local/lib/node_modules/pnpm', 'uid=1000', 922)", 'guest kernel 7.0.0-38-generic',
+                     'a re-walk 30 s later found 922 offender(s) in 18527 entries (first walk: 18527 entries)'):
+            self.assertIn(text, reason)
+        # The same image on the 6.8 kernel sandboxes walked 937 fewer entries, all root's.
+        for clean in ('default_resumed', 'large_prepared_clone'):
+            self.assertEqual(case[clean]['kernel_release'], '6.8.0-138-generic')
+            self.assertEqual((case[clean]['report']['entries'], case[clean]['report']['offender_count']), (17590, 0))
+            self.assertTrue(host.root_paths_passed(case[clean]['report']))
+        mode = dict(report, offender_groups=[{'directory': '/usr/local/bin', 'owner': 'mode', 'count': 1}])
+        self.assertNotIn('boat_sandbox_account', host.root_paths_reason(mode))
+        phase = __import__('inspect').getsource(host.RunnerHost._phase)
+        self.assertIn('root_paths_reason(', phase)
+        self.assertIn("record['root_owned_paths_rewalk']", phase)
 
 
 if __name__ == "__main__":

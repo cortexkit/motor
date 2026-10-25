@@ -5,15 +5,25 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io;
 
+mod advertise;
+pub use advertise::{MemoryCase, MEMORY_FRESH_MS, MEMORY_PROBE_MS, START_RETRY_MS};
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tenant {
     pub tenant: String,
     pub sub: String,
     pub vcpu_ceiling: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_weight: Option<u32>,
     pub guest_ram_mib: u64,
     pub idle_suspend_s: u64,
     pub host_floor_bytes: u64,
+}
+impl Tenant {
+    pub fn budget(&self) -> u32 {
+        self.max_weight.unwrap_or(self.vcpu_ceiling)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -193,6 +203,10 @@ pub struct Host {
     pub(crate) provider_managed: bool,
     /// When the next billing-record retention pass is due; see `retention_tick`.
     pub(crate) retention_due_ms: u64,
+    storage: advertise::StorageLatch,
+    /// The capacity file as last read, `None` while it is missing or invalid.
+    capacity: Option<crate::capacity::Capacity>,
+    advert: BTreeMap<String, advertise::TenantAdvert>,
 }
 impl Host {
     pub fn new(
@@ -212,6 +226,9 @@ impl Host {
             prior_alive_ms: 0,
             provider_managed: false,
             retention_due_ms: 0,
+            storage: Default::default(),
+            capacity: None,
+            advert: BTreeMap::new(),
         }
     }
     /// Replaces the journal, so tests can make writes fail the way a full
@@ -228,6 +245,7 @@ impl Host {
                     tenant: "sandbox".into(),
                     sub: String::new(),
                     vcpu_ceiling: ceiling,
+                    max_weight: None,
                     guest_ram_mib: 0,
                     idle_suspend_s: u64::MAX,
                     host_floor_bytes: 0,
@@ -338,18 +356,26 @@ impl Host {
         self.save(next)
     }
     pub fn share(&self, tenant: &str, now_ms: u64) -> u32 {
+        self.checked_share(tenant, now_ms).unwrap_or(u32::MAX)
+    }
+    fn checked_share(&self, tenant: &str, now_ms: u64) -> Option<u32> {
         self.snapshot
             .leases
             .values()
             .filter(|l| l.tenant == tenant && counted(l, now_ms))
             .map(|l| l.claims.vcpus)
-            .sum()
+            .try_fold(0u32, u32::checked_add)
     }
     pub fn quota(&self, tenant: &str, now_ms: u64) -> u32 {
         if !self.live.get(tenant).is_some_and(|v| v.ready) {
             1
         } else {
-            self.share(tenant, now_ms).max(1)
+            let ceiling = self
+                .tenants
+                .values()
+                .find(|t| t.tenant == tenant)
+                .map_or(1, |t| t.vcpu_ceiling);
+            self.share(tenant, now_ms).min(ceiling).max(1)
         }
     }
     pub fn is_ready(&self, tenant: &str) -> bool {
@@ -397,12 +423,15 @@ impl Host {
         let live = self.live.entry(tenant.to_owned()).or_default();
         live.ready = true;
         live.quota_target = None;
+        self.start_succeeded(tenant);
+        self.reset_memory(tenant);
         Ok(())
     }
     pub fn guest_unready(&mut self, tenant: &str) {
         let live = self.live.entry(tenant.to_owned()).or_default();
         live.ready = false;
         live.quota_target = None;
+        self.reset_memory(tenant);
     }
     pub fn events_connected(&mut self, tenant: &str, now_ms: Option<u64>) {
         self.live
@@ -442,6 +471,33 @@ impl Host {
                 return refuse(Refusal::Auth);
             }
         } else {
+            if claims.vcpus > tenant.vcpu_ceiling {
+                return refuse(Refusal::HostFull);
+            }
+            // Low host storage stops new work. A lease already delivered to
+            // the runner may be replaced, because its job can already be in
+            // the guest.
+            if self.storage_refusing() && !old.as_ref().is_some_and(|l| l.delivered) {
+                return refuse(Refusal::HostFull);
+            }
+            // A tenant the helper refused to start gets no lease until a
+            // start succeeds; motor-host retries the start on its own.
+            if self.start_retry_at(&tenant.tenant).is_some() {
+                return refuse(Refusal::HostFull);
+            }
+            // Released leases still appear in heartbeats, even though they no
+            // longer consume weight. Reusing a job id needs no additional entry.
+            if old.is_none()
+                && self
+                    .snapshot
+                    .leases
+                    .values()
+                    .filter(|l| l.state != LeaseState::Ended)
+                    .count()
+                    >= crate::wire::MAX_ENTRIES
+            {
+                return refuse(Refusal::HostFull);
+            }
             if next.vms.get(&tenant.tenant).is_some_and(|v| v.stop_pending) {
                 return refuse(Refusal::Capacity);
             }
@@ -469,10 +525,11 @@ impl Host {
                 .as_ref()
                 .filter(|l| counted(l, now_ms))
                 .map_or(0, |l| l.claims.vcpus);
-            if u64::from(self.share(&tenant.tenant, now_ms)) - u64::from(previous_share)
-                + u64::from(claims.vcpus)
-                > u64::from(tenant.vcpu_ceiling)
-            {
+            let share = self
+                .checked_share(&tenant.tenant, now_ms)
+                .and_then(|share| share.checked_sub(previous_share))
+                .and_then(|share| share.checked_add(claims.vcpus));
+            if share.is_none_or(|share| share > tenant.budget()) {
                 return refuse(Refusal::HostFull);
             }
             if replacing {
@@ -547,7 +604,11 @@ impl Host {
         {
             return refuse(Refusal::Capacity);
         }
-        if self.share(&lease.tenant, self.observed_at_ms) > tenant.vcpu_ceiling {
+        if lease.claims.vcpus > tenant.vcpu_ceiling
+            || self
+                .checked_share(&lease.tenant, self.observed_at_ms)
+                .is_none_or(|share| share > tenant.budget())
+        {
             return refuse(Refusal::HostFull);
         }
         Ok(if lease.replacing {

@@ -4,11 +4,19 @@
 //! complete generation of them is active; the gateway serves tools over Unix
 //! sockets and signs their requests with that generation; the transport
 //! creates each unit's sockets and the forwarders that expose them inside the
-//! unit's sandbox. Nothing in the runner starts any of them yet.
+//! unit's sandbox. The runtime starts them only for an isolated, opted-in runner.
+//! Records and publication policy are shared across platforms; provisioning
+//! file access, gateways and sandbox transports are Unix-only.
+#[cfg(unix)]
 pub(crate) mod ccache;
+#[cfg(unix)]
 pub(crate) mod environment;
+#[cfg(unix)]
 pub(crate) mod gateway;
 pub(crate) mod provisioning;
 pub(crate) mod publication;
 pub(crate) mod publishing;
+#[cfg(unix)]
+pub(crate) mod runtime;
+#[cfg(unix)]
 pub(crate) mod transport;

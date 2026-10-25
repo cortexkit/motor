@@ -215,7 +215,13 @@ def pid_checks(job, host):
 def lifecycle_failure(result, expected, *, signal=None, marker=None, exact_stdout=None):
     outcome = result.get('terminal', {}).get('outcome', {})
     if type(result.get('code')) is not int or result['code'] != expected:
-        return f"expected client code {expected}; observed {result.get('code')!r}"
+        failure = f"expected client code {expected}; observed {result.get('code')!r}"
+        if isinstance(outcome, dict) and outcome.get('type') == 'refused_before_start':
+            # The runner never started the job; say why rather than only the
+            # client's code for a refusal.
+            detail = result.get('terminal', {}).get('refusal_detail') or outcome.get('reason')
+            failure += f" (runner refused the job before start: {detail})"
+        return failure
     expected_outcome = {'type':'exit', 'code':expected} if signal is None else {'type':'signal', 'signal':signal}
     if outcome != expected_outcome:
         return f"expected terminal.outcome={expected_outcome!r}; observed {outcome!r}"

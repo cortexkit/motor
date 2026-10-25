@@ -39,6 +39,8 @@ mod disk;
 mod health;
 #[path = "migration.rs"]
 mod migration;
+#[path = "remote_cache_engine.rs"]
+mod remote_cache_engine;
 #[path = "retirement.rs"]
 mod retirement;
 #[path = "sibling_eviction.rs"]
@@ -127,6 +129,11 @@ pub struct Config {
     /// also avoid their SMT siblings while the shared slot lock is held.
     pub windows_cpus: Option<String>,
     pub windows_slot_lock: Option<PathBuf>,
+    /// Host CPUs Linux jobs may use, in CPU-list syntax. When set, no core is
+    /// kept back for the daemon and `max_weight`, not the list's length, is the
+    /// largest vCPU claim admitted; a larger claim is refused before start
+    /// instead of waiting. Windows avoidance still applies within the list.
+    pub linux_cpus: Option<String>,
     pub(crate) windows: Option<Arc<crate::windows::VmConfig>>,
     pub(crate) windows_runtime: Arc<crate::windows::Runtime>,
     #[cfg(test)]
@@ -183,6 +190,13 @@ pub struct Config {
     /// Linux production uses systemd services under motor-job. The portable
     /// in-process test backend deliberately leaves this disabled.
     pub isolate_jobs: bool,
+    /// Opt in to the runner-owned remote cache. Ignored without job isolation.
+    pub remote_cache: bool,
+    /// Distinct loopback ports inside each unit's private network namespace.
+    pub remote_cache_forwarder_ports: BTreeMap<String, u16>,
+    #[cfg(unix)]
+    pub(crate) remote_cache_runtime: Option<Arc<crate::remote_cache::runtime::Runtime>>,
+    pub(crate) remote_cache_error: Option<String>,
     /// Outbound networking is opt-in and requires a probed isolated host backend.
     pub job_network: Option<crate::network::JobNetwork>,
     pub(crate) job_network_unavailable: String,
@@ -239,6 +253,15 @@ pub struct Config {
     pub(crate) before_replay_read: Option<JobWriteHook>,
     #[cfg(test)]
     pub(crate) systemd_command: Option<crate::systemd::CommandHook>,
+    /// Supplies the jobs slice's `MemoryMax` for fixtures that must not depend
+    /// on the host's real slice. Production always reads systemd.
+    #[cfg(test)]
+    pub(crate) slice_ceiling_probe: Option<Arc<dyn Fn() -> io::Result<u64> + Send + Sync>>,
+    /// Replaces the privileged reclaim that gives the runner back read access
+    /// to a checkout a job locked it out of (see `workspace_access`), so
+    /// portable fixtures can exercise the repair without sudo.
+    #[cfg(test)]
+    pub(crate) workspace_access_repair: Option<crate::workspace_access::RepairHook>,
     /// Replaces `sibling_snapshot_mode()`, so portable fixtures can run either
     /// sibling mode without the isolated host backend.
     #[cfg(test)]
@@ -276,6 +299,7 @@ pub struct Config {
     #[cfg(test)]
     pub(crate) long_work: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
     #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) shared_read_roots: Option<(PathBuf, PathBuf, Option<PathBuf>)>,
 }
 
@@ -421,6 +445,7 @@ impl Config {
             macos_runtime: Arc::default(),
             windows_cpus: None,
             windows_slot_lock: None,
+            linux_cpus: None,
             windows: None,
             windows_runtime: Arc::new(crate::windows::Runtime::default()),
             #[cfg(test)]
@@ -448,6 +473,14 @@ impl Config {
             sibling_snapshot_idle: DEFAULT_SIBLING_SNAPSHOT_IDLE,
             free_space_probe: Arc::new(|path| fs2::available_space(path)),
             isolate_jobs: false,
+            remote_cache: false,
+            remote_cache_forwarder_ports: BTreeMap::from([
+                ("sccache".into(), 3893),
+                ("ccache".into(), 3894),
+            ]),
+            #[cfg(unix)]
+            remote_cache_runtime: None,
+            remote_cache_error: None,
             job_network: None,
             job_network_unavailable: "--job-network veth is not enabled".into(),
             #[cfg(test)]
@@ -489,6 +522,10 @@ impl Config {
             before_replay_read: None,
             #[cfg(test)]
             systemd_command: None,
+            #[cfg(test)]
+            slice_ceiling_probe: None,
+            #[cfg(test)]
+            workspace_access_repair: None,
             #[cfg(test)]
             sibling_snapshot_mode_override: None,
             #[cfg(test)]
@@ -553,8 +590,8 @@ impl Config {
     /// The gateway serves a generation only when the runner switch, the cache
     /// tenant's `enabled` state and job isolation all hold. Without isolation a
     /// job runs as the runner's own account, which can open the cache keys, so
-    /// the switch is ignored there.
-    #[cfg(unix)]
+    /// the switch is ignored there. Only Linux units carry cache forwarders.
+    #[cfg(target_os = "linux")]
     pub(crate) fn unit_remote_cache(
         &self,
         fill: bool,
@@ -562,11 +599,9 @@ impl Config {
         std::sync::Arc<crate::remote_cache::provisioning::ActiveGeneration>,
         Vec<crate::remote_cache::transport::Forwarder>,
     )> {
-        // Nothing starts the gateway yet, so no generation is ever served and
-        // no unit gets a socket or a forwarder. Wiring the gateway into
-        // startup supplies the generation and the unit's forwarders here.
-        let _ = (fill, self.remote_cache_available(fill));
-        None
+        self.remote_cache_available(fill)?;
+        let runtime = self.remote_cache_runtime.as_ref()?;
+        Some((runtime.watch.admit()?, runtime.forwarders()))
     }
     /// Whether the remote compile cache can be on for a job or a fill of this
     /// runner at all, before provisioning is read: the runner switch must be
@@ -579,10 +614,10 @@ impl Config {
     /// environment, and a missing account fails the fill itself later.
     #[cfg(unix)]
     pub(crate) fn remote_cache_available(&self, fill: bool) -> Option<()> {
-        if !self.isolate_jobs || self.boat_profile || self.tenant_vm {
+        if !self.remote_cache || !self.isolate_jobs || self.vm_instance() {
             return None;
         }
-        if fill && self.vm_instance() {
+        if fill && (self.boat_profile || self.tenant_vm) {
             return None;
         }
         Some(())
@@ -716,7 +751,20 @@ impl Config {
     }
 }
 
-pub(crate) fn oom_memory_limit_detail(_config: &Config, weight: u32, capacity: u32) -> String {
+/// The refusal for a remembered slice ceiling. A host set up below the floor
+/// every job unit requests is misconfigured, not busy, so the refusal is
+/// `WorkspaceSetupFailed`: callers do not treat that as a capacity signal to
+/// retry, which waiting could never clear.
+/// The OOM advice for a stopped job. `slice_ceiling` is the jobs slice's
+/// `MemoryMax` as the runner last recorded it, or `NO_JOB_MEMORY_BUDGET` when
+/// no reading is kept: the slice caps every job unit's limit, so a request it
+/// clamps cannot buy more memory and the advice must not suggest one.
+pub(crate) fn oom_memory_limit_detail(
+    _config: &Config,
+    weight: u32,
+    capacity: u32,
+    slice_ceiling: u64,
+) -> String {
     if let Some(bytes) = _config.boat_memory_max_bytes {
         return format!("the kernel OOM-killed a process and the job was stopped (Boat job memory budget {} bytes; the shared host memory budget also applies). More vCPUs do not increase this sandbox's usable memory.", bytes);
     }
@@ -729,8 +777,20 @@ pub(crate) fn oom_memory_limit_detail(_config: &Config, weight: u32, capacity: u
 
     // Doubling a small request can stay at the memory floor. Start from four
     // vCPUs so the recommendation actually buys more memory, and cap it at the
-    // largest job this host can admit.
-    let more = (weight.max(4) * 2).min(capacity);
+    // largest job this host can admit. When the jobs slice caps job limits, a
+    // larger vCPU count cannot buy more memory, so the advice names that cap.
+    let mut more = (weight.max(4) * 2).min(capacity);
+    if let Some(slice) = crate::job_memory_budget::JobMemoryBudget::from_max(slice_ceiling) {
+        // The slice clamps this job's limit, so only a request that still
+        // raises the limit below the clamp is worth recommending.
+        #[cfg(test)]
+        let raised = |vcpus: u32| crate::backend::memory_max(vcpus, floor_gib).min(slice.max);
+        #[cfg(not(test))]
+        let raised = |vcpus: u32| crate::backend::memory_max(vcpus).min(slice.max);
+        if more > weight && raised(more) <= raised(weight) {
+            more = weight;
+        }
+    }
     let advice = if more > weight {
         #[cfg(test)]
         let more_limit = crate::backend::memory_limit_gib(more, floor_gib);
@@ -767,7 +827,12 @@ fn boat_memory_override_requires_explicit_profile_and_budget() {
     let mut config = Config::new("/unused", "boat");
     config.boat_profile = true;
     config.boat_memory_max_bytes = Some(14 << 30);
-    let detail = oom_memory_limit_detail(&config, 8, 8);
+    let detail = oom_memory_limit_detail(
+        &config,
+        8,
+        8,
+        crate::job_memory_budget::NO_JOB_MEMORY_BUDGET,
+    );
     assert!(detail.contains("15032385536 bytes"));
     assert!(!detail.contains("28 GiB"));
 }
@@ -1301,6 +1366,10 @@ struct Core {
     catalog_written: Mutex<CatalogWritten>,
     health: Mutex<health::Health>,
     repository_usage: Mutex<health::RepositoryUsage>,
+    /// The jobs slice's limits, refreshed outside the state lock so admission
+    /// never runs systemctl while holding it. `None` means no usable budget was
+    /// read, which refuses nothing by itself.
+    slice_budget: std::sync::atomic::AtomicU64,
     background_deletes: Arc<std::sync::atomic::AtomicUsize>,
     _lock: File,
     rustc_version: String,
@@ -1564,6 +1633,14 @@ impl Runner {
     /// the latest re-read of the provisioning files left it.
     #[cfg(unix)]
     pub(crate) fn publishing_policy(&self) -> crate::remote_cache::publication::PublishPolicy {
+        #[cfg(unix)]
+        if let Some(runtime) = &self.core.config.remote_cache_runtime {
+            self.core
+                .publishing
+                .lock()
+                .unwrap()
+                .write_breaker_open_until = runtime.gateway.write_breaker_open_until();
+        }
         self.core
             .publishing
             .lock()
@@ -1579,9 +1656,7 @@ impl Runner {
     /// Applies one re-read of the provisioning files: stores the new state,
     /// forgets invalidated records, saves the catalog without engine locks and
     /// queues any newly unpublished desired tips immediately.
-    // Production startup does not yet run the provisioning watcher.
     #[cfg(unix)]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn observe_publishing(
         &self,
         reread: crate::remote_cache::provisioning::Reread,
@@ -1727,9 +1802,25 @@ impl Runner {
                 ));
             }
         };
+        // Confine after Windows avoidance so the Windows CPUs are checked
+        // against every online CPU, not only the listed ones.
+        let cpus = match &config.linux_cpus {
+            None => cpus,
+            Some(_) if config.vm_instance() => {
+                return Err(invalid(
+                    "--linux-cpus applies only to a runner serving Linux jobs",
+                ));
+            }
+            Some(list) => cpus.confine(&crate::cpu::parse_list(list)?, config.max_weight)?,
+        };
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && !config.windows_instance() {
-            config.private_pids = crate::systemd::job_private_pids(config.boat_profile)?;
+            // The runner's own command hook answers this query in tests, so a
+            // test can run the isolated path without a host manager.
+            let version =
+                crate::backend::systemctl(&config, &["show", "--property=Version", "--value"])?;
+            config.private_pids =
+                crate::systemd::manager_private_pids(&version, config.boat_profile)?;
             if config.boat_profile {
                 config.boat_unset_environment = crate::systemd::provider_environment_names()?;
             }
@@ -2172,8 +2263,8 @@ impl Runner {
         let sibling_fences = config.sibling_fences();
         // The switch is honoured only with job isolation, and only the build
         // server ever writes the cache.
-        #[cfg(unix)]
-        let publishing_switch = config.isolate_jobs
+        let publishing_switch = config.remote_cache
+            && config.isolate_jobs
             && !config.boat_profile
             && !config.tenant_vm
             && !config.vm_instance();
@@ -2190,6 +2281,24 @@ impl Runner {
         );
         #[cfg(unix)]
         let publishing_seen = catalog.publishing_seen.clone();
+        if config.remote_cache && !config.isolate_jobs {
+            config.remote_cache_error = Some("isolate_jobs is off; runner switch ignored".into());
+            tracing::warn!("remote cache switch ignored: isolate_jobs is off");
+        }
+        #[cfg(unix)]
+        if config.remote_cache_available(false).is_none() {
+            config.remote_cache_runtime = None;
+        }
+        #[cfg(unix)]
+        if config.remote_cache_available(false).is_some() && config.remote_cache_runtime.is_none() {
+            match crate::remote_cache::runtime::Runtime::start(&config) {
+                Ok(runtime) => config.remote_cache_runtime = Some(runtime),
+                Err(reason) => {
+                    tracing::warn!(%reason, "remote cache startup failed; serving uncached");
+                    config.remote_cache_error = Some(reason);
+                }
+            }
+        }
         let runner = Self {
             core: Arc::new(Core {
                 reserve_restore: Mutex::new(()),
@@ -2266,6 +2375,9 @@ impl Runner {
                 catalog_written: Mutex::new(CatalogWritten::default()),
                 health,
                 repository_usage: Mutex::new(repository_usage),
+                slice_budget: std::sync::atomic::AtomicU64::new(
+                    crate::job_memory_budget::NO_JOB_MEMORY_BUDGET,
+                ),
                 _lock: lock,
                 rustc_version,
                 compilers: Compilers::probe(&["cc", "c++", "ccache"]),
@@ -2274,6 +2386,24 @@ impl Runner {
         };
         #[cfg(test)]
         tests::register_runner(&runner);
+        if !publishing_switch {
+            let snapshot = {
+                let mut inner = runner.core.inner.lock().unwrap();
+                if inner.publishing_seen.switch {
+                    inner.publishing_seen = crate::remote_cache::publishing::Seen::default();
+                    inner.catalog.publishing_seen = inner.publishing_seen.clone();
+                    Some(runner.catalog_snapshot(&inner)?)
+                } else {
+                    None
+                }
+            };
+            if let Some(snapshot) = snapshot {
+                runner.write_catalog(snapshot)?;
+            }
+        }
+        // The slice's memory ceiling decides admission, and admission runs
+        // under the state lock; read it here, once, before any job is served.
+        runner.refresh_slice_budget();
         // Deletions a previous run moved aside but did not finish.
         if runner.core.quarantined.is_empty() {
             if let Ok(entries) = fs::read_dir(runner.trash()) {
@@ -2318,6 +2448,8 @@ impl Runner {
                 runner.monitor_unit(id);
             });
         }
+        #[cfg(unix)]
+        runner.start_remote_cache();
         #[cfg(test)]
         if runner.core.config.manual_tick {
             return Ok(runner);
@@ -2996,6 +3128,9 @@ impl Runner {
         if self.core.config.windows_instance() {
             request.weight_hint = Some(4);
         }
+        // Admission reads only the recorded ceiling: the slice changes when an
+        // operator re-renders it, and the maintenance pass re-reads it there,
+        // so neither this hot path nor the state lock spawns systemctl.
         let (_admission, initial_refusal) = {
             let _restore = self.reserve_restore_barrier();
             let mut inner = self.core.inner.lock().unwrap();
@@ -3004,12 +3139,26 @@ impl Runner {
             {
                 return Ok(Admission::Duplicate);
             }
-            let refusal = self.run_refusal(&inner, &request);
+            let refusal = self.run_refusal(&inner, &request, &Default::default());
             (self.protect_admission(&mut inner, &request), refusal)
+        };
+        // Admission reads inside the workspace (it resolves symlinks in the
+        // caller's paths and lists the workspace for runner base checkouts),
+        // and a job that owned the workspace may have locked the runner out
+        // of it. Repair that here, without the state lock, before the
+        // recheck below validates again (see `workspace_access`).
+        let access = if matches!(
+            initial_refusal,
+            Some((RefusalReason::WorkspaceKeyRejected, _))
+        ) {
+            self.reclaim_workspace_access(&request)
+        } else {
+            Default::default()
         };
         // Recheck ordinary admission after cleanup; another request may have
         // occupied the workspace or queue while deletion ran off the state lock.
-        let disk_full = if initial_refusal.is_none() {
+        // A request the access repair may have cleared gets the disk check too.
+        let disk_full = if initial_refusal.is_none() || access.restored_any() {
             self.ensure_admission_disk_space()?
         } else {
             None
@@ -3046,7 +3195,7 @@ impl Runner {
         // the files may be partly gone. Keep that setup refusal even when the
         // deletion has finished and no overlap is visible by this recheck;
         // otherwise the job would start on a half-deleted workspace.
-        let ordinary_refusal = self.run_refusal(&inner, &request).or_else(|| {
+        let ordinary_refusal = self.run_refusal(&inner, &request, &access).or_else(|| {
             initial_refusal.filter(|(reason, _)| *reason == RefusalReason::WorkspaceSetupFailed)
         });
         let disk_refused = ordinary_refusal.is_none() && disk_full.is_some();
@@ -3118,17 +3267,87 @@ impl Runner {
     }
 
     fn cpu_refusal(&self, claim: u32) -> Option<(RefusalReason, String)> {
-        if claim == 0 || claim > self.core.cpus.capacity() {
-            Some((RefusalReason::RunnerFull, format!(
-                "vcpu request {claim} is outside the supported range 1..={} (allocatable CPU limit; daemon core reservation {})",
-                self.core.cpus.capacity(), self.core.config.daemon_core_reservation()
-            )))
+        let limit = self.core.cpus.claim_limit();
+        if claim == 0 || claim > limit {
+            let basis = match &self.core.config.linux_cpus {
+                // A confined runner refuses what it could never admit, rather
+                // than accepting a claim above max_weight that would wait forever.
+                Some(list) => format!(
+                    "max_weight limit; Linux jobs share {} CPUs ({list})",
+                    self.core.cpus.capacity()
+                ),
+                None => format!(
+                    "allocatable CPU limit; daemon core reservation {}",
+                    self.core.config.daemon_core_reservation()
+                ),
+            };
+            Some((
+                RefusalReason::RunnerFull,
+                format!(
+                    "vcpu request {claim} is outside the supported range 1..={limit} ({basis})"
+                ),
+            ))
         } else {
             None
         }
     }
 
-    fn run_refusal(&self, inner: &Inner, request: &Run) -> Option<(RefusalReason, String)> {
+    /// A Linux job unit takes its memory limit from the shared jobs slice. A
+    /// slice too small for the floor every job requests refuses the job before
+    /// it starts, instead of letting the slice OOM-kill it on arrival. A slice
+    /// that cannot be read refuses nothing: the start path already refuses
+    /// there, with the reason the slice gave.
+    ///
+    /// The refusal is a host setup fault that waiting cannot clear, so it is
+    /// not reported as a full or busy runner: callers treat that reason as a
+    /// capacity signal to retry, and would retry this until their queue budget
+    /// ran out.
+    fn slice_memory_refusal(&self) -> Option<(RefusalReason, String)> {
+        if self.core.config.windows_instance() {
+            return None;
+        }
+        let max = self
+            .core
+            .slice_budget
+            .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        let floor = crate::backend::memory_floor(self.core.config.memory_floor_gib);
+        #[cfg(not(test))]
+        let floor = crate::backend::memory_floor();
+        crate::backend::slice_admission_refusal(floor, max)
+    }
+
+    /// Read the jobs slice's limits and remember the memory ceiling for
+    /// admission. Callers run this outside the state lock: it spawns
+    /// systemctl, and admission holds that lock.
+    fn refresh_slice_budget(&self) {
+        #[cfg(test)]
+        if let Some(probe) = &self.core.config.slice_ceiling_probe {
+            let max = probe().unwrap_or(crate::job_memory_budget::NO_JOB_MEMORY_BUDGET);
+            self.core
+                .slice_budget
+                .store(max, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        // Only Linux has a jobs slice; elsewhere the ceiling refuses nothing.
+        #[cfg(target_os = "linux")]
+        let max = crate::systemd::read_job_memory_budget()
+            .map_or(crate::job_memory_budget::NO_JOB_MEMORY_BUDGET, |budget| {
+                budget.max
+            });
+        #[cfg(not(target_os = "linux"))]
+        let max = crate::job_memory_budget::NO_JOB_MEMORY_BUDGET;
+        self.core
+            .slice_budget
+            .store(max, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn run_refusal(
+        &self,
+        inner: &Inner,
+        request: &Run,
+        access: &crate::workspace_access::Repairs,
+    ) -> Option<(RefusalReason, String)> {
         #[cfg(windows)]
         if self.core.config.windows_instance() {
             if let Some(refusal) = crate::windows::guest_agent_refusal(
@@ -3215,6 +3434,8 @@ impl Runner {
             request.weight_hint.unwrap_or(2)
         }) {
             Some(refusal)
+        } else if let Some(refusal) = self.slice_memory_refusal() {
+            Some(refusal)
         } else if inner.drain_deadline.is_some() {
             Some((RefusalReason::RunnerDraining, "runner is draining".into()))
         } else if (!self.core.config.windows_instance()
@@ -3268,7 +3489,7 @@ impl Runner {
             Some(&request.cwd),
             &request.siblings,
         ) {
-            Some((RefusalReason::WorkspaceKeyRejected, error.to_string()))
+            Some((RefusalReason::WorkspaceKeyRejected, access.describe(&error)))
         } else if let Err(error) = workspace::validate_dependencies(&request.git_dependencies) {
             Some((RefusalReason::BundleRejected, error.to_string()))
         } else {
@@ -3282,12 +3503,50 @@ impl Runner {
         cwd: Option<&str>,
         siblings: &[SiblingSnapshot],
     ) -> io::Result<()> {
-        self.validate_writer_paths_with_catalog(
-            &self.core.inner.lock().unwrap(),
+        // The state lock is taken for each attempt and released before a
+        // repair runs, so a slow repair holds up no other request.
+        crate::workspace_access::validate_with_repair(
+            &self.core.config,
             workspace,
-            cwd,
             siblings,
+            || {
+                self.validate_writer_paths_with_catalog(
+                    &self.core.inner.lock().unwrap(),
+                    workspace,
+                    cwd,
+                    siblings,
+                )
+            },
         )
+    }
+
+    /// Give the runner back read access to the checkouts an admission must
+    /// read, if a job locked it out. Runs without the state lock; admission
+    /// then validates again under it and describes any failure with what was
+    /// tried here. The probe is the writer-path check admission runs, minus
+    /// the catalogued checkouts that need the state lock: those are runner
+    /// storage, not checkouts a job owned.
+    fn reclaim_workspace_access(&self, request: &Run) -> crate::workspace_access::Repairs {
+        let mut repairs = crate::workspace_access::Repairs::default();
+        if self.core.config.vm_instance() || !workspace::absolute(&request.workspace_key) {
+            return repairs;
+        }
+        let _ = crate::workspace_access::validate_with_repairs(
+            &self.core.config,
+            &request.workspace_key,
+            &request.siblings,
+            &mut repairs,
+            || {
+                crate::writer::validate_paths(
+                    &self.core.config,
+                    &request.workspace_key,
+                    Some(&request.cwd),
+                    &request.siblings,
+                    &[],
+                )
+            },
+        );
+        repairs
     }
 
     fn validate_destinations(
@@ -4566,7 +4825,17 @@ impl Runner {
                     }
                     .into()
                 }),
-            waiting_on: self.queue_wait_phase(&inner, &index, id).map(str::to_owned),
+            // The same label the queue-wait refusal detail carries, so a job
+            // blocked behind a gate job says so before its budget runs out.
+            // A job that is not waiting to start (running, finished) has none.
+            waiting_on: self
+                .queue_wait_phase(&inner, &index, id)
+                .is_some()
+                .then(|| {
+                    let heads = index.heads(&inner, now);
+                    let (label, _) = self.queue_wait_label(&inner, &heads, &index, id, now);
+                    label.to_owned()
+                }),
             terminal: job.and_then(|j| j.terminal.clone()),
             unit: process
                 .and_then(|p| p.unit)
@@ -4817,6 +5086,57 @@ impl Runner {
             .fold(0u32, |held, j| held.saturating_add(j.weight))
     }
 
+    /// The `waiting_on` label for a queued job, and the queue head ahead of it
+    /// that holds it back for capacity, if one does.
+    ///
+    /// Both the per-job status reply and the queue-wait refusal detail report
+    /// this one label, so a client reading either sees the same reason. When
+    /// the job would fit and a head ahead of it holds the queue, the label
+    /// names that head's kind: a gate job, a cache fill, or an older job past
+    /// its backfill grace, waiting for enough free permits (the scheduler
+    /// stops smaller jobs overtaking it so it cannot starve).
+    fn queue_wait_label(
+        &self,
+        inner: &Inner,
+        heads: &[Uuid],
+        index: &DispatchIndex,
+        id: Uuid,
+        now: u64,
+    ) -> (&'static str, Option<(Uuid, bool)>) {
+        let phase = self
+            .queue_wait_phase(inner, index, id)
+            .unwrap_or(QUEUE_ORDER_WAIT);
+        if phase != QUEUE_ORDER_WAIT {
+            return (phase, None);
+        }
+        let blocking = self.blocking_head(inner, heads, id, index.weight, now);
+        let label = match blocking {
+            Some((_, true)) => "gate job ahead",
+            Some((head, false)) if inner.jobs[&head].base => {
+                "cache fill ahead needs more free permits"
+            }
+            Some((_, false)) => "older job ahead needs more free permits",
+            None => QUEUE_ORDER_WAIT,
+        };
+        (label, blocking)
+    }
+
+    /// Whether `waiting_on` names a wait for capacity that could clear on its
+    /// own: enough free permits, or a queue head ahead waiting for them. A job
+    /// that stops smaller jobs overtaking it still takes permits, so those
+    /// waits are capacity waits too. A job held behind its own workspace, a
+    /// sibling checkout or a queued workspace job needs that job to finish and
+    /// its checkout to be released, which a hosted runner cannot do for it.
+    fn capacity_wait(waiting_on: &str) -> bool {
+        matches!(
+            waiting_on,
+            "permits"
+                | "gate job ahead"
+                | "cache fill ahead needs more free permits"
+                | "older job ahead needs more free permits"
+        )
+    }
+
     /// The first queue head ahead of `id` that stops later heads from being
     /// started for capacity, with whether it is a gate job (see
     /// `holds_back_later_heads`).
@@ -4885,10 +5205,12 @@ impl Runner {
         id: Uuid,
     ) -> Option<u64> {
         let phase = self.queue_wait_phase(inner, index, id)?;
-        if !matches!(
-            phase,
-            "permits" | "workspace owner" | "queued workspace job" | SIBLING_USER_WAIT
-        ) {
+        if !(Self::capacity_wait(phase)
+            || matches!(
+                phase,
+                "workspace owner" | "queued workspace job" | SIBLING_USER_WAIT
+            ))
+        {
             return None;
         }
         self.core
@@ -5107,27 +5429,7 @@ impl Runner {
                 )
             })
             .collect();
-        let mut blocking_head = None;
-        let phase = self
-            .queue_wait_phase(inner, index, id)
-            .unwrap_or("queue order");
-        let phase = if phase == "queue order" {
-            // This job would fit, so a job ahead of it holds the queue: a gate
-            // job, a cache fill, or an older job past its backfill grace,
-            // waiting for enough free permits (the scheduler stops smaller
-            // jobs overtaking it so it cannot starve). Name that job.
-            blocking_head = self.blocking_head(inner, &heads, id, index.weight, now);
-            match blocking_head {
-                Some((_, true)) => "gate job ahead",
-                Some((head, false)) if inner.jobs[&head].base => {
-                    "cache fill ahead needs more free permits"
-                }
-                Some((_, false)) => "older job ahead needs more free permits",
-                None => "queue order",
-            }
-        } else {
-            phase
-        };
+        let (phase, blocking_head) = self.queue_wait_label(inner, &heads, index, id, now);
         let blocking = blocking_head
             .map(|(head, _)| {
                 format!(
@@ -5349,6 +5651,8 @@ impl Runner {
     /// Also exposed to fake-clock tests; retention is relative to both terminal
     /// time and mint time, so recent unknown IDs can never rerun an expired job.
     pub fn maintenance(&self) -> io::Result<()> {
+        // Outside the state lock, which maintenance later takes.
+        self.refresh_slice_budget();
         #[cfg(unix)]
         if self.core.config.macos_instance() {
             self.core
@@ -7706,7 +8010,14 @@ impl Runner {
                 .unwrap_or(false);
         self.finish_step(id, &job.kill, "unit result read", finish_started);
         let memory_limit_detail = oom_stopped.then(|| {
-            oom_memory_limit_detail(&self.core.config, job.weight, self.core.cpus.capacity())
+            oom_memory_limit_detail(
+                &self.core.config,
+                job.weight,
+                self.core.cpus.claim_limit(),
+                self.core
+                    .slice_budget
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
         });
         if let Some(detail) = &memory_limit_detail {
             #[cfg(test)]
@@ -7732,6 +8043,20 @@ impl Runner {
                 format!("runner: {detail}\n").as_bytes(),
             ) {
                 tracing::warn!(job_id = %id, %error, "OOM detail could not be appended to job output");
+            }
+        }
+        // The job owned its workspace root and may have locked the runner out
+        // of it (see `isolation::restore_runner_root_access`). Give the runner
+        // its read access back before the change scan below reads the
+        // workspace, and so the next admission on it can; the next setup
+        // reclaims the rest of the tree. A failure here only loses the scan.
+        #[cfg(target_os = "linux")]
+        if self.core.config.isolate_jobs && !job.base && !self.core.config.vm_instance() {
+            let root = Path::new(job.key());
+            if fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_dir()) {
+                if let Err(error) = crate::isolation::restore_runner_root_access(root) {
+                    tracing::warn!(job_id = %id, workspace = %root.display(), %error, "cannot restore runner access to the workspace root after the job");
+                }
             }
         }
         let changes = match self.core.backend.collect_changes(&self.core.trees, &job) {
@@ -7793,27 +8118,28 @@ impl Runner {
         // compiler cache is not evicted meanwhile; and it has no terminal
         // yet, so no second warm build is queued for its repository.
         let base_cleanup = job.base.then(|| {
+            #[cfg(unix)]
+            let ledgers;
             let fill = {
                 let mut inner = self.core.inner.lock().unwrap();
-                Self::take_cache_fill(&mut inner, id)
+                let fill = Self::take_cache_fill(&mut inner, id);
+                #[cfg(unix)]
+                {
+                    ledgers = inner.fill_ledgers.remove(&id).unwrap_or_default();
+                }
+                fill
             };
             self.long_work("base_cleanup");
-            #[cfg_attr(not(unix), allow(unused_mut))]
-            let mut cleanup = self.clean_base(id, fill);
+            let cleanup = self.clean_base(id, fill);
             #[cfg(unix)]
-            {
-                let (ledgers, identity) = {
-                    let mut inner = self.core.inner.lock().unwrap();
-                    (
-                        inner.fill_ledgers.remove(&id).unwrap_or_default(),
-                        job.fill_identity.clone(),
-                    )
-                };
-                cleanup.publication = identity.map(|identity| {
+            let cleanup = {
+                let mut cleanup = cleanup;
+                cleanup.publication = job.fill_identity.clone().map(|identity| {
                     let outcome = self.fill_publication(&identity, id, &ledgers);
                     (identity, outcome)
                 });
-            }
+                cleanup
+            };
             cleanup
         });
         let mut fill_failure = Vec::new();
@@ -8290,9 +8616,17 @@ impl Runner {
             inner.base_finishes.get_mut(&id).unwrap().terminal = None;
         }
         if !recorded {
+            #[cfg(unix)]
+            let (ledgers, identity);
             let fill = {
                 let mut inner = self.core.inner.lock().unwrap();
-                Self::take_cache_fill(&mut inner, id)
+                let fill = Self::take_cache_fill(&mut inner, id);
+                #[cfg(unix)]
+                {
+                    ledgers = inner.fill_ledgers.remove(&id).unwrap_or_default();
+                    identity = inner.jobs[&id].fill_identity.clone();
+                }
+                fill
             };
             self.long_work("base_cleanup");
             let mut cleanup = prepared.unwrap_or_else(|| self.clean_base(id, fill));
@@ -8307,14 +8641,6 @@ impl Runner {
                 self.long_work("base_scratch_retry");
                 cleanup.scratch = self.clean_base(id, None).scratch;
             }
-            #[cfg(unix)]
-            let (ledgers, identity) = {
-                let mut inner = self.core.inner.lock().unwrap();
-                (
-                    inner.fill_ledgers.remove(&id).unwrap_or_default(),
-                    inner.jobs[&id].fill_identity.clone(),
-                )
-            };
             #[cfg(unix)]
             if cleanup.publication.is_none() {
                 cleanup.publication = identity.map(|identity| {
@@ -8553,6 +8879,11 @@ impl Runner {
         ledgers: &[Arc<crate::remote_cache::gateway::WriteLedger>],
     ) -> publication::Outcome {
         self.long_work("publication_drain");
+        if ledgers.is_empty() {
+            return publication::Outcome::Failed {
+                reason: "no cache write sockets".into(),
+            };
+        }
         let (mut keys, mut reason): (Vec<PublishedKey>, Option<String>) = (Vec::new(), None);
         for ledger in ledgers {
             if let Err(error) = ledger.drained() {
@@ -8660,6 +8991,10 @@ impl Runner {
 /// job in this same workspace, so a client can tell an earlier job of its own
 /// from another repository's job that uses this checkout.
 const SIBLING_USER_WAIT: &str = "sibling user of this checkout";
+
+/// The `waiting_on` value for a queued job that none of the named blockers
+/// holds: the scheduler has not reached it yet in this queue order.
+const QUEUE_ORDER_WAIT: &str = "queue order";
 
 /// Build from retained state once per dispatch, then update only the selected
 /// job's weight, checkout reservations and CPU claims after each start.

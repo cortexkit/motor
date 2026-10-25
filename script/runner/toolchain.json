@@ -1,40 +1,4 @@
 {
-  "windows_cross": {
-    "cargo_xwin": "0.23.1",
-    "vs_manifest": "17",
-    "manifest_note": "cargo-xwin 0.23.1 rejects minor 17.14 in --xwin-version despite its help text; component versions remain exact and the resolved manifest/cache content hashes are recorded.",
-    "sdk": "10.0.26100",
-    "crt": "14.44.17.14",
-    "vs_channel_build": "17.14.37806.7",
-    "package_manifest_sha256": "99dda859c4ae3c446eb25620d1a6237bb135d95d14d55cd1d30a15340bb39d80",
-    "resolved_components": {
-      "Microsoft.VC.14.44.17.14.CRT.Headers": "14.44.35220",
-      "Microsoft.VC.14.44.17.14.CRT.Headers.base": "14.44.35220",
-      "Microsoft.VC.14.44.17.14.CRT.Headers.Resources": "14.44.35220",
-      "Microsoft.VC.14.44.17.14.CRT.x64.Desktop": "14.44.35226",
-      "Microsoft.VC.14.44.17.14.CRT.x64.Desktop.base": "14.44.35226",
-      "Win11SDK_10.0.26100": "10.0.26100.15"
-    },
-    "cache_tree_sha256": "7463ca5bdb3be96b45a3a4a4ee5304d9b92d19e72930acc1d806e1eb3e8bf7cb",
-    "sdk_subdir": "xwin",
-    "cache_scope_note": "The tree hash covers the xwin/ subtree with relative paths and explicit file/symlink types. Only generated xwin/DONE hashes sorted LF-separated lines; content and multiplicity remain significant. Every other file byte and symlink target is exact. cargo-xwin creates host clang-cl and cmake/ wrappers outside this subtree; those are generated tool configuration, not SDK/CRT inputs.",
-    "prep_toolchain": {
-      "version": "1.99.0",
-      "target": "x86_64-pc-windows-msvc",
-      "components": {
-        "cargo": "6201b8dcea8cc55ccfa12e842adf1b2c2aa96490a6cb4f129bf03f2df08c80c9",
-        "rustc": "20fed82e629c1ed145f9e9bdee9aad65e790d4237a49bcfc61221eda69e35b14",
-        "rust-std": "adadeafff137a7610884696912b853d4de259c4299ab035b66661e2e0f923ff0"
-      },
-      "cargo_exe_sha256": "c9b44417dc8228b81923a1068a3c09e32d2793f2cced2a816789cf433c1f0d46",
-      "rustc_exe_sha256": "fc40f1c8b65095a22a48c111aadc279c26a049b7e4161e8b99ffe3eb23873e86"
-    },
-    "arch": "x86_64",
-    "variant": "desktop",
-    "cache": "target/windows-cross/cache",
-    "tools": "target/windows-cross/tools",
-    "license_note": "xwin downloads Microsoft MSVC CRT and Windows SDK headers and libraries under the same Microsoft Build Tools/SDK terms accepted by the Windows job image's unattended installation. They are used privately to build our own software, never redistributed. Only our binaries ship; cargo-xwin's MIT licence does not relicense the Microsoft SDK. No latest-version fallback or host-global installation."
-  },
   "accepted_os_differences": [
     "The measured build server is Ubuntu 26.04; Boat remains Ubuntu 24.04 and tenant uses Debian trixie. Kernels, glibc, systemd, Python, native compilers/linkers, SQLite/OpenSSL and distro package versions are not byte-for-byte equivalent. Required package presence and compiler thread model are checked; observed versions are recorded, not pinned across distributions. Git is not among these differences: both images build the server's git release from the pinned kernel.org source into /usr/local/lib/git, ahead of the distro git on PATH, and git --version is checked exactly.",
     "The build server defaults to uutils coreutils and exposes GNU coreutils 9.7 under gnu-prefixed names. Boat defaults to GNU coreutils from Ubuntu 24.04 and supplies the same gnu-prefixed executable names. GNU versions are distro-provided.",
@@ -739,7 +703,21 @@
       "version_from": "pnpm"
     },
     "pnpm": {
+      "layout": {
+        "root": "/usr/local/lib/node_modules/pnpm",
+        "commands": [
+          "/usr/local/bin/pnpm",
+          "/usr/local/bin/pn",
+          "/usr/local/bin/pnpx",
+          "/usr/local/bin/pnx"
+        ]
+      },
       "path": "/usr/local/bin/pnpm",
+      "source": {
+        "registry": "https://registry.npmjs.org/",
+        "package": "pnpm@11.1.2",
+        "sha512": "QVocwll0cx51RVwUaDcb50xapft2IbUNQFbSIkUWCfEUEvI/1gLmFp8eBgRmZB95hZfhvpYaEGiINqZ7FlaUmQ=="
+      },
       "version": "11.1.2"
     },
     "pnpx": {

@@ -46,6 +46,7 @@ pub(crate) struct Transport {
     runtime: tokio::runtime::Handle,
     tenant: String,
     tools: Vec<(Tool, u16)>,
+    fault: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
 }
 
 /// Whose sockets a unit gets.
@@ -97,7 +98,33 @@ impl Transport {
             runtime,
             tenant: tenant.to_string(),
             tools: tools.to_vec(),
+            fault: None,
         })
+    }
+
+    pub(crate) fn reporting(
+        mut self,
+        fault: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    ) -> Self {
+        self.fault = Some(fault);
+        self
+    }
+
+    pub(crate) fn failed(&self, stage: &str, error: &io::Error) {
+        let reason = super::runtime::failure(stage, error);
+        if let Some(fault) = &self.fault {
+            let mut fault = fault.lock().unwrap();
+            if fault.as_ref() != Some(&reason) {
+                tracing::warn!(%reason, "remote cache unavailable; serving uncached");
+                *fault = Some(reason);
+            }
+        }
+    }
+
+    pub(crate) fn ready(&self) {
+        if let Some(fault) = &self.fault {
+            *fault.lock().unwrap() = None;
+        }
     }
 
     /// Creates `directory` (mode 0755, which must not exist yet) and one
@@ -176,7 +203,6 @@ pub(crate) struct Forwarder {
 }
 
 impl Forwarder {
-    #[cfg(test)]
     pub(crate) fn new(tool: Tool, port: u16) -> Self {
         Self { tool, port }
     }

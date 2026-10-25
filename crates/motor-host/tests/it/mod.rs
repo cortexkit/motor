@@ -1,10 +1,15 @@
 mod admission;
+mod admission_capacity;
 mod billing;
 #[cfg(target_os = "linux")]
 mod broker;
+mod capacity;
 mod closure;
 mod enroll;
 mod helper;
+mod resize;
+#[cfg(target_os = "linux")]
+mod resize_operator;
 mod transport;
 
 use motor_host::journal::{FileJournal, Journal};
@@ -49,6 +54,7 @@ fn tenants() -> BTreeMap<String, Tenant> {
             tenant: "tenant".into(),
             sub: claims(JOB).sub,
             vcpu_ceiling: 2,
+            max_weight: None,
             guest_ram_mib: 18432,
             idle_suspend_s: 60,
             host_floor_bytes: 2147483648,

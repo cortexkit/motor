@@ -4,6 +4,7 @@ readiness marker) in each order the broker can produce. The endpoint only
 trusts the production broker's signing keys, so no token it accepts is used."""
 import contextlib
 import base64
+from datetime import datetime, timezone
 import gzip
 import hashlib
 import importlib.util
@@ -25,7 +26,7 @@ from typing import Any, Optional
 
 from credential_audit import SOURCE
 from pid_namespace import PID_SOURCE, TEARDOWN_SOURCE, bootstrap_checks, control_identity_command, lifecycle_failure, outside_control_passes, pid_checks, pid_failure_reason, reference_command, teardown_checks, teardown_job
-from probe import provider_sizing_matches, sizing_error
+from probe import VERIFY_PHASES, provider_sizing_matches, sandbox_lifecycle, sizing_error, verify_phase_records, verify_phase_status
 from ssh_reach import endpoint, pin_host, process, ssh_argv
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -787,6 +788,32 @@ def job_result(text):
     return result
 
 
+JOURNAL_CURSOR_PREFIX = '-- cursor: '
+
+
+def journal_cursor(stdout):
+    """The cursor `journalctl --lines=0 --show-cursor` printed.
+
+    journalctl prints `-- No entries --` before the cursor line whenever it
+    showed no entries, which `--lines=0` guarantees, so the cursor is the line
+    that carries the prefix, not necessarily the first line."""
+    cursors = [line.removeprefix(JOURNAL_CURSOR_PREFIX) for line in (stdout or '').splitlines()
+               if line.startswith(JOURNAL_CURSOR_PREFIX) and line.removeprefix(JOURNAL_CURSOR_PREFIX).strip()]
+    if len(cursors) != 1:
+        raise ValueError('runner journal did not provide exactly one pre-stop eviction cursor line ('
+                         + repr(JOURNAL_CURSOR_PREFIX) + '...); journalctl printed ' + repr(stdout))
+    return cursors[0].strip()
+
+
+# Boat has reported a detached command as exited with code 0 and an empty
+# stdout tail even though the command's only exit-0 path prints: the disk-quota
+# cleanup wait did this once after the reused_target lane. Before treating the
+# output as missing, poll the finished command again in case Boat delivers it
+# late; every poll is kept as evidence either way.
+EMPTY_OUTPUT_REPOLLS = 5
+EMPTY_OUTPUT_REPOLL_SECONDS = 1.0
+
+
 def isolation_result_checks(result, host, weight=None):
     if result['code'] != 0:
         return {'isolation_job_completed': False}
@@ -902,14 +929,64 @@ def parity_passed(report):
 def root_paths_source():
     # Like the parity check, run the operator checkout's rule (the one the image
     # recipes enforce at build time) against the live filesystem in every phase.
-    return ("import json\nscope = {'__name__': 'root_paths'}\n"
+    # Every offender is grouped by owner and package directory before the
+    # report keeps only the first REPORTED, so a failure says whose files they
+    # are and where, not just the first twenty paths.
+    return ("import json, collections, pathlib, re\nscope = {'__name__': 'root_paths'}\n"
             f"exec({ROOT_PATHS_SCRIPT.read_text()!r}, scope)\n"
-            "print(json.dumps(scope['check'](scope['BOAT_ROOTS'], "
-            "provider_files=scope['BOAT_PROVIDER_RESTORED'])))\n")
+            "report = scope['check'](scope['BOAT_ROOTS'], provider_files=scope['BOAT_PROVIDER_RESTORED'], limit=None)\n"
+            "groups = collections.Counter()\n"
+            "for offender in report['offenders']:\n"
+            "    path, _, detail = offender.partition(': ')\n"
+            "    owner = re.match(r'uid=\\d+', detail)\n"
+            f"    groups[(str(pathlib.PurePosixPath(*pathlib.PurePosixPath(path).parts[:{ROOT_PATHS_GROUP_PARTS}])), "
+            "owner.group(0) if owner else 'mode')] += 1\n"
+            "report['offender_groups'] = [dict(directory=d, owner=o, count=c) for (d, o), c in groups.most_common(10)]\n"
+            "report['offenders'] = report['offenders'][:scope.get('REPORTED', 20)]\n"
+            "print(json.dumps(report))\n")
+
+
+# Path components an offender is grouped by: /usr/local/lib/node_modules/<package>.
+ROOT_PATHS_GROUP_PARTS = 6
+# Pause before re-walking a failed root-owned path check.
+ROOT_PATHS_REWALK_SECONDS = 30
+# Boat's sandbox account, which owns Boat's base /usr/local and the files Boat's
+# agent restores (script/boat-image/install.py BOAT_BASE_UID).
+BOAT_SANDBOX_UID = 1000
+
+
+def root_paths_reason(report, kernel=None, rewalk=None, rewalk_seconds=ROOT_PATHS_REWALK_SECONDS):
+    """A failure reason that names whose files broke the rule and where."""
+    count = report.get('offender_count')
+    groups = report.get('offender_groups') or []
+    head = f"{count} path(s) root executes from are not root-owned without group/other write"
+    if groups and all(group.get('owner') == f'uid={BOAT_SANDBOX_UID}' for group in groups):
+        head = (f"boat_sandbox_account_owns_root_paths: {count} path(s) root executes from are owned by uid "
+                f"{BOAT_SANDBOX_UID}, Boat's sandbox account, not root; the image installs them root-owned, so the "
+                f"sandbox's files differ from the image's")
+    persistence = ''
+    if isinstance(rewalk, dict):
+        persistence = (f"; a re-walk {rewalk_seconds} s later found {rewalk.get('offender_count')} offender(s) in "
+                       f"{rewalk.get('entries')} entries (first walk: {report.get('entries')} entries)")
+    return (f"{head}; by directory and owner: {[(g.get('directory'), g.get('owner'), g.get('count')) for g in groups]}"
+            f"; guest kernel {kernel or 'unmeasured'}{persistence}; first: {report.get('offenders')}")
 
 
 def root_paths_passed(report):
     return report.get('offender_count') == 0 and report.get('offenders') == [] and report.get('entries', 0) > 0
+
+
+def parity_job_check(parsed):
+    """(passed, evidence, reason) for the in-job toolchain parity job. A job
+    the runner refused, or one that printed no report, is a failed check that
+    says so, not a JSON decode error that ends the phase."""
+    if parsed.get('code') == 0:
+        try:
+            report = json.loads(parsed.get('stdout') or '')
+        except ValueError as error:
+            return False, parsed, f'toolchain parity job exited 0 without a JSON report: {error}'
+        return parity_passed(report), report, None
+    return False, parsed, lifecycle_failure(parsed, 0)
 
 
 # vCPUs a probe job asks for, by job name, when it needs a fixed count. A job not listed
@@ -1088,7 +1165,36 @@ class RunnerHost:
         self.probe = probe
         self.data = {"checks": [], "phases": [], "all_passed": False}
         self._phase_context: Optional[tuple[str, dict[str, Any]]] = None
+        self._sections: list[str] = []
+        # Seconds each sandbox may be worked on; _run sets it from --max-minutes.
+        self.budget_seconds: Optional[float] = None
         probe.data["runner_host"] = self.data
+
+    @contextlib.contextmanager
+    def section(self, name):
+        """Record the wall time of one named step under runner_host.section_timings.
+
+        The row is checkpointed when the step starts, so a run killed part-way
+        through still shows which step was running and when it began. Nested
+        steps are named with their parents, for example
+        'disk-quota/disk_quota/lane tmp'."""
+        self._sections.append(name)
+        row = {'name': '/'.join(self._sections), 'started_at': datetime.now(timezone.utc).isoformat(),
+               'seconds': None, 'outcome': 'running'}
+        self.data.setdefault('section_timings', []).append(row)
+        self.probe.checkpoint()
+        start = time.monotonic()
+        try:
+            yield row
+            row['outcome'] = 'completed'
+        except BaseException as error:
+            row['outcome'] = 'error'
+            row['error'] = str(error)[:500]
+            raise
+        finally:
+            row['seconds'] = round(time.monotonic() - start, 3)
+            self._sections.pop()
+            self.probe.checkpoint()
 
     def check(self, name, passed, evidence, status=None, reason=None):
         row = {"name": name, "status": status or ("PASS" if passed else "FAIL"), "evidence": evidence}
@@ -1142,6 +1248,40 @@ class RunnerHost:
             self.unit_diagnostics(sid, failure)
             raise ValueError("guest command failed or truncated; see runner_host.guest_failures unit_diagnostics: " + json.dumps(result))
         return result
+
+    def guest_json(self, sid, command, label, timeout=120):
+        """Run a guest command that must print one JSON value, and return it parsed.
+
+        `label` names the step in the error, so an empty or malformed result
+        reads as which call returned what, not as a bare JSON decode error."""
+        result = self.execute(sid, command, timeout=timeout)
+        repolls = []
+        process = result.get('processId')
+        while not (result.get('stdout') or '').strip() and type(process) is int and len(repolls) < EMPTY_OUTPUT_REPOLLS:
+            time.sleep(EMPTY_OUTPUT_REPOLL_SECONDS)
+            result = self.probe.command_status(sid, process)
+            repolls.append(result)
+        if repolls:
+            self.data.setdefault('empty_output_repolls', []).append(
+                {'label': label, 'process': process, 'output_arrived': bool((result.get('stdout') or '').strip()), 'polls': repolls})
+        if repolls and (result.get('exitCode') != 0 or result.get('stdoutTruncated') or result.get('stderrTruncated')):
+            self.data.setdefault('guest_failures', []).append({'label': label, 'command': command, 'result': result,
+                                                               'repolls': repolls, 'reason': 're-poll changed the finished result'})
+            raise ValueError(f'{label}: re-poll of finished Boat process {process} reported a failed or truncated result: '
+                             + json.dumps(result)[:500])
+        stdout = result.get('stdout') or ''
+        if not stdout.strip():
+            self.data.setdefault('guest_failures', []).append({'label': label, 'command': command, 'result': result,
+                                                               'repolls': repolls, 'reason': 'empty stdout'})
+            raise ValueError(f'{label}: guest command exited {result.get("exitCode")} with empty stdout '
+                             f'(stderr {(result.get("stderr") or "")[:200]!r}) after {len(repolls)} re-polls of Boat '
+                             f'process {process}; expected one JSON value; see runner_host.guest_failures')
+        try:
+            return json.loads(stdout)
+        except ValueError as error:
+            self.data.setdefault('guest_failures', []).append({'label': label, 'command': command, 'result': result,
+                                                               'reason': 'stdout is not JSON: ' + str(error)})
+            raise ValueError(f'{label}: guest command stdout is not JSON ({error}): {stdout[:200]!r}') from None
 
     def route(self, sid, directory, public):
         response = self.probe.request("POST", f"/sandboxes/{sid}/sshkey", {"key": public})
@@ -1308,78 +1448,89 @@ class RunnerHost:
         record['existing_then_reinstall'] = {'first': first, 'install': install, 'after': after}
 
     def phase(self, sid, label, directory, public, repository, client, first_started=None,
-              pre_swap_install=None, hydrated_at=None):
+              pre_swap_install=None, hydrated_at=None, idle=True):
+        """`idle` False leaves out the clone's idle-reclaim wait and after_idle job,
+        which --verify-prepared-image runs in its own sandbox."""
         record = {"name": label}
         self.data["phases"].append(record)
-        with self.phase_evidence(sid, record):
+        with self.section(label), self.phase_evidence(sid, record):
             return self._phase(sid, label, directory, public, repository, client, record,
-                               first_started, pre_swap_install, hydrated_at)
+                               first_started, pre_swap_install, hydrated_at, idle)
 
     def _phase(self, sid, label, directory, public, repository, client, record,
-               first_started=None, pre_swap_install=None, hydrated_at=None):
-        argv = self.route(sid, directory, public)
-        upload_seed_input(argv, self.probe.cargo_seed_manifest, 'cargo-seed-expected.json')
-        if label == 'snapshot_clone':
-            self.broker_order(sid, label, record, pre_swap_install, hydrated_at, first_started)
-        elif label == 'prepared_clone':
-            install = self.install_identity(sid)
-            record['identity_install'] = install
-            self.check(label + '.identity_install_accepted', install['accepted'], install)
-            self.readiness(label, self.wait_endpoint(sid, install['started_monotonic']), sid)
-        elif label == 'resumed':
-            self.existing_then_reinstall(sid, label, record, hydrated_at)
-            self.resumed_workspace_eviction(sid, record)
-        else:
-            self.arm_then_install(sid, label, record)
-        record['kernel_release'] = self.execute(sid, 'uname -r')['stdout'].strip()
-        record['storage'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
-        for key, passed in storage_checks(record['storage']).items():
-            self.check(label + '.' + key, passed, record['storage'])
-        record['storage_timeline'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_TIMELINE))['stdout'])
-        self.check(label + '.no_deferred_cleanup_after_readiness', storage_timeline_checks(record['storage_timeline']), record['storage_timeline'])
-        self.execute(sid, 'sudo -n systemctl start motor-boat-bridge')
-        record["host"] = json.loads(self.execute(sid, "sudo -n -E python3 -c " + shlex.quote(HOST))["stdout"])
-        host = record["host"]
-        size = getattr(self.probe, 'size', 'large')
-        usable = usable_vcpus(host)
-        if usable is None:
-            raise ValueError('the sandbox CPU count was not measured; refusing to size probe jobs')
-        record['sizing'] = sizing_record(host, usable)
-        self.probe.data.setdefault('sizing', {}).setdefault(size, {}).setdefault('phases', {})[label] = record['sizing']
-        for key, passed in sizing_checks(record['sizing']).items():
-            self.check(label + '.' + key, passed, record['sizing'], reason=None if passed else sizing_reason(key, record['sizing']))
-        host['job_security_reference'] = json.loads(self.execute(
-            sid, 'sudo -n ' + reference_command())['stdout'])
-        record['toolchain_parity'] = json.loads(self.execute(
-            sid, "sudo -n /usr/bin/python3 -c " + shlex.quote(parity_source(cargo_seed_sha256=self.probe.cargo_seed_sha256)))['stdout'])
-        self.check(label + '.toolchain_parity', parity_passed(record['toolchain_parity']), record['toolchain_parity'])
-        record['root_owned_paths'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(root_paths_source()))['stdout'])
-        self.check(label + '.root_owned_paths', root_paths_passed(record['root_owned_paths']), record['root_owned_paths'],
-                   reason=f"{record['root_owned_paths'].get('offender_count')} path(s) root executes from are not root-owned "
-                          f"without group/other write; first: {record['root_owned_paths'].get('offenders')}")
-        listeners = host["listeners"]["stdout"]
-        self.check(label + ".bridge_loopback_only", f"127.0.0.1:{PORT}" in listeners and
-                   not any(s in listeners for s in (f"0.0.0.0:{PORT}", f"[::]:{PORT}", f"*:{PORT}")), host["listeners"])
-        self.check(label + '.endpoint_loopback_only', '127.0.0.1:9443' in listeners and
-                   not any(s in listeners for s in ('0.0.0.0:9443','[::]:9443','*:9443')), host['listeners'])
-        for key, passed in admission_checks(host).items():
-            self.check(label + '.' + key, passed, {'refusal': host['endpoint_refusal'], 'sockets': host['tenant_sockets']})
-        ssh = process(argv + ["python3 -c " + shlex.quote(ENV_NAMES)])
-        record["ssh_environment"] = ssh
-        self.check(label + ".ssh_environment_measured", ssh.get("exit_code") == 0, ssh)
-        for key, passed in policy_checks(host).items():
-            self.check(label + ".sshd." + key, passed, host["sshd"])
-        self.check(label + ".no_account_credentials", host["credential_audit"]["clean"], host["credential_audit"])
-        self.check(label + ".systemd_environment_measured", host["systemd_env"]["exit_code"] == 0, host["systemd_env"])
-        self.check(label + ".no_provider_runner_environment", not any(host["runner_environment"].values()), host["runner_environment"])
-        self.check(label + '.no_provider_host_environment', not host['idle_services_memory']['motor-boat-host']['provider_environment_names'], host['idle_services_memory']['motor-boat-host'])
-        self.check(label + '.outside_job_cannot_read_provider_tokens', provider_access_denied(host['provider_sanitization']['outside_job_after']), host['provider_sanitization'])
-        self.check(label + '.protected_services_running', bool(host['sshd_pids']) and host['runner_pid'] > 0 and host['idle_services_memory']['motor-boat-host']['main_pid'] > 0, {'runner':host['runner_pid'],'host':host['idle_services_memory']['motor-boat-host']['main_pid'],'sshd':host['sshd_pids']})
-        protected = [host['runner_pid'], host['idle_services_memory']['motor-boat-host']['main_pid'], *host['sshd_pids'], *[p['pid'] for p in host['provider_sanitization']['processes']]]
-        host['outside_pid_controls'] = json.loads(self.execute(sid, control_identity_command(protected))['stdout'])
-        identities = host['outside_pid_controls']['live']
-        protected = [row['pid'] for row in identities]
-        job_script = 'PROVIDER_PATHS=' + repr(host['provider_sanitization']['paths_checked']) + '\nPROVIDER_PIDS=' + repr([p['pid'] for p in host['provider_sanitization']['processes']]) + '\nRUNNER_PID=' + repr(host['runner_pid']) + '\nPROTECTED_PIDS=' + repr(protected) + '\nPROTECTED_IDENTITIES=' + repr(identities) + '\n' + JOB
+               first_started=None, pre_swap_install=None, hydrated_at=None, idle=True):
+        with self.section('endpoint_startup'):
+            argv = self.route(sid, directory, public)
+            upload_seed_input(argv, self.probe.cargo_seed_manifest, 'cargo-seed-expected.json')
+            if label == 'snapshot_clone':
+                self.broker_order(sid, label, record, pre_swap_install, hydrated_at, first_started)
+            elif label == 'prepared_clone':
+                install = self.install_identity(sid)
+                record['identity_install'] = install
+                self.check(label + '.identity_install_accepted', install['accepted'], install)
+                self.readiness(label, self.wait_endpoint(sid, install['started_monotonic']), sid)
+            elif label == 'resumed':
+                self.existing_then_reinstall(sid, label, record, hydrated_at)
+                self.resumed_workspace_eviction(sid, record)
+            else:
+                self.arm_then_install(sid, label, record)
+        with self.section('host_checks'):
+            record['kernel_release'] = self.execute(sid, 'uname -r')['stdout'].strip()
+            record['storage'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
+            for key, passed in storage_checks(record['storage']).items():
+                self.check(label + '.' + key, passed, record['storage'])
+            record['storage_timeline'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_TIMELINE))['stdout'])
+            self.check(label + '.no_deferred_cleanup_after_readiness', storage_timeline_checks(record['storage_timeline']), record['storage_timeline'])
+            self.execute(sid, 'sudo -n systemctl start motor-boat-bridge')
+            record["host"] = json.loads(self.execute(sid, "sudo -n -E python3 -c " + shlex.quote(HOST))["stdout"])
+            host = record["host"]
+            size = getattr(self.probe, 'size', 'large')
+            usable = usable_vcpus(host)
+            if usable is None:
+                raise ValueError('the sandbox CPU count was not measured; refusing to size probe jobs')
+            record['sizing'] = sizing_record(host, usable)
+            self.probe.data.setdefault('sizing', {}).setdefault(size, {}).setdefault('phases', {})[label] = record['sizing']
+            for key, passed in sizing_checks(record['sizing']).items():
+                self.check(label + '.' + key, passed, record['sizing'], reason=None if passed else sizing_reason(key, record['sizing']))
+            host['job_security_reference'] = json.loads(self.execute(
+                sid, 'sudo -n ' + reference_command())['stdout'])
+            record['toolchain_parity'] = json.loads(self.execute(
+                sid, "sudo -n /usr/bin/python3 -c " + shlex.quote(parity_source(cargo_seed_sha256=self.probe.cargo_seed_sha256)))['stdout'])
+            self.check(label + '.toolchain_parity', parity_passed(record['toolchain_parity']), record['toolchain_parity'])
+            record['root_owned_paths'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(root_paths_source()))['stdout'])
+            if not root_paths_passed(record['root_owned_paths']):
+                # Walk once more after a pause: whether the owners persist or
+                # clear tells a provider rewrite from a restore still settling.
+                # The verdict stays on the first walk either way.
+                time.sleep(ROOT_PATHS_REWALK_SECONDS)
+                record['root_owned_paths_rewalk'] = json.loads(self.execute(
+                    sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(root_paths_source()))['stdout'])
+            self.check(label + '.root_owned_paths', root_paths_passed(record['root_owned_paths']), record['root_owned_paths'],
+                       reason=root_paths_reason(record['root_owned_paths'], record.get('kernel_release'),
+                                                record.get('root_owned_paths_rewalk'), ROOT_PATHS_REWALK_SECONDS))
+            listeners = host["listeners"]["stdout"]
+            self.check(label + ".bridge_loopback_only", f"127.0.0.1:{PORT}" in listeners and
+                       not any(s in listeners for s in (f"0.0.0.0:{PORT}", f"[::]:{PORT}", f"*:{PORT}")), host["listeners"])
+            self.check(label + '.endpoint_loopback_only', '127.0.0.1:9443' in listeners and
+                       not any(s in listeners for s in ('0.0.0.0:9443','[::]:9443','*:9443')), host['listeners'])
+            for key, passed in admission_checks(host).items():
+                self.check(label + '.' + key, passed, {'refusal': host['endpoint_refusal'], 'sockets': host['tenant_sockets']})
+            ssh = process(argv + ["python3 -c " + shlex.quote(ENV_NAMES)])
+            record["ssh_environment"] = ssh
+            self.check(label + ".ssh_environment_measured", ssh.get("exit_code") == 0, ssh)
+            for key, passed in policy_checks(host).items():
+                self.check(label + ".sshd." + key, passed, host["sshd"])
+            self.check(label + ".no_account_credentials", host["credential_audit"]["clean"], host["credential_audit"])
+            self.check(label + ".systemd_environment_measured", host["systemd_env"]["exit_code"] == 0, host["systemd_env"])
+            self.check(label + ".no_provider_runner_environment", not any(host["runner_environment"].values()), host["runner_environment"])
+            self.check(label + '.no_provider_host_environment', not host['idle_services_memory']['motor-boat-host']['provider_environment_names'], host['idle_services_memory']['motor-boat-host'])
+            self.check(label + '.outside_job_cannot_read_provider_tokens', provider_access_denied(host['provider_sanitization']['outside_job_after']), host['provider_sanitization'])
+            self.check(label + '.protected_services_running', bool(host['sshd_pids']) and host['runner_pid'] > 0 and host['idle_services_memory']['motor-boat-host']['main_pid'] > 0, {'runner':host['runner_pid'],'host':host['idle_services_memory']['motor-boat-host']['main_pid'],'sshd':host['sshd_pids']})
+            protected = [host['runner_pid'], host['idle_services_memory']['motor-boat-host']['main_pid'], *host['sshd_pids'], *[p['pid'] for p in host['provider_sanitization']['processes']]]
+            host['outside_pid_controls'] = json.loads(self.execute(sid, control_identity_command(protected))['stdout'])
+            identities = host['outside_pid_controls']['live']
+            protected = [row['pid'] for row in identities]
+            job_script = 'PROVIDER_PATHS=' + repr(host['provider_sanitization']['paths_checked']) + '\nPROVIDER_PIDS=' + repr([p['pid'] for p in host['provider_sanitization']['processes']]) + '\nRUNNER_PID=' + repr(host['runner_pid']) + '\nPROTECTED_PIDS=' + repr(protected) + '\nPROTECTED_IDENTITIES=' + repr(identities) + '\n' + JOB
         with tunnel(argv, directory, self.probe.deadline, record.setdefault("tunnel", {})) as address:
             with tempfile.TemporaryDirectory(prefix="motor-boat-client-") as storage:
                 gnu_test_hash = (record['toolchain_parity']['observed']['tools'].get('gnutest') or {}).get('sha256')
@@ -1395,84 +1546,83 @@ class RunnerHost:
                                         ('sigkill_job', 'kill -KILL $$'),
                                         ('job_stdin_eof', "python3 -c 'import os; print(\"boat-stdin-eof\" if os.read(0, 1) == b\"\" else \"unexpected-input\")'"),
                                         ('pid1_ignores_job_sigkill', 'kill -KILL 1; printf boat-pid1-alive')]
-                if label in ('prepared_clone', 'snapshot_clone'):
+                if label in ('prepared_clone', 'snapshot_clone') and idle:
                     jobs.append(('after_idle', NODE_CHECK))
                 for name, command in jobs:
-                    weight, skipped = job_vcpus(JOB_VCPUS.get(name), usable, size)
-                    if skipped:
-                        record.setdefault('skipped_jobs', []).append(
-                            {'name': name, 'requested_vcpus': JOB_VCPUS.get(name), 'usable_vcpus': usable, 'reason': skipped})
-                        self.probe.checkpoint()
-                        continue
-                    if name == 'after_idle':
-                        idle = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(IDLE_RECLAIM), timeout=1050)['stdout'])
-                        record['idle_reclaim'] = idle
-                        status = idle_reclaim_status(idle)
-                        self.check(label + '.idle_reclaim_observed', status == 'PASS', idle, status=status)
-                    result = process([str(client), address, str(repository), storage, command, str(weight)], timeout=min(150, max(1, int(self.probe.deadline-time.monotonic()))))
-                    record[name] = result
-                    if result.get("exit_code") != 0:
-                        failure = "motor client failed: " + json.dumps(result)
-                        self.client_failure_diagnostics(sid, record[name])
-                        raise ValueError(failure + "; sandbox state at failure: runner_host.phases[]." + name + ".sandbox_diagnostics")
-                    parsed = job_result(result["stdout"])
-                    record[name]["result"] = parsed
-                    if first_started is not None and name == 'node_modules_first' and parsed['code'] == 0 and 'boat-node-modules' in parsed['stdout']:
-                        self.data["snapshot_create_to_first_job_seconds"] = time.monotonic() - first_started
-                    if name == 'job_toolchain_parity':
-                        report = json.loads(parsed['stdout'])
-                        self.check(label + '.' + name, parsed['code'] == 0 and parity_passed(report), report)
-                    elif name == 'offline_cargo_seed':
-                        report = json.loads(parsed['stdout']) if parsed['code'] == 0 else parsed
-                        self.check(label + '.' + name, parsed['code'] == 0 and report.get('passed') is True, report)
-                    elif name == 'git_worktree_pushurl_reset':
-                        self.check(label + '.' + name, *git_pushurl_check(parsed))
-                    elif name == 'wasm_opt_120_round_trip':
-                        self.check(label + '.' + name, *wasm_opt_check(parsed))
-                    elif name == "isolation":
-                        checks = isolation_result_checks(parsed, host, weight)
-                        isolation = json.loads(parsed['stdout']) if parsed['code'] == 0 and not all(checks.values()) else {}
-                        for key, passed in checks.items():
-                            reason = None if passed else (pid_failure_reason(key, isolation, host) if parsed['code'] == 0
-                                                         else f"expected isolation job code 0; observed {parsed['code']}")
-                            self.check(label + "." + key, parsed["code"] == 0 and passed, parsed, reason=reason)
-                    elif name == 'sigkill_job':
-                        self.check_job(label + '.sigkill_job_exit_137', parsed, 137)
-                    elif name == 'pid1_ignores_job_sigkill':
-                        self.check_job(label + '.pid1_ignores_job_sigkill', parsed, 0, marker='boat-pid1-alive')
-                    elif name == 'job_stdin_eof':
-                        self.check_job(label + '.job_stdin_eof', parsed, 0, exact_stdout='boat-stdin-eof')
-                    else:
-                        expected = 23 if name == "exit" else 0
-                        marker = "boat-round-trip" if name == "exit" else ("boat-node-modules" if name.startswith('node_modules_') or name == 'after_idle' else "boat-hello")
-                        self.check_job(label + "." + name, parsed, expected, marker=marker)
-                    state = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
-                    record.setdefault('storage_after_jobs', {})[name] = state
-                    if label == 'resumed' and name == 'node_modules_first' and 'disk_quota' in self.data:
-                        # A larger sandbox may stay above the floor at resume;
-                        # its retained target is evicted on the first cold retry.
-                        self.quota_reclaimed(state)
-                    for key, passed in storage_checks(state).items():
-                        self.check(label + '.' + name + '.' + key, passed, state)
+                    with self.section('job ' + name):
+                        weight, skipped = job_vcpus(JOB_VCPUS.get(name), usable, size)
+                        if skipped:
+                            record.setdefault('skipped_jobs', []).append(
+                                {'name': name, 'requested_vcpus': JOB_VCPUS.get(name), 'usable_vcpus': usable, 'reason': skipped})
+                            self.probe.checkpoint()
+                            continue
+                        if name == 'after_idle':
+                            self.idle_reclaim_wait(sid, label, record)
+                        result = process([str(client), address, str(repository), storage, command, str(weight)], timeout=min(150, max(1, int(self.probe.deadline-time.monotonic()))))
+                        record[name] = result
+                        if result.get("exit_code") != 0:
+                            failure = "motor client failed: " + json.dumps(result)
+                            self.client_failure_diagnostics(sid, record[name])
+                            raise ValueError(failure + "; sandbox state at failure: runner_host.phases[]." + name + ".sandbox_diagnostics")
+                        parsed = job_result(result["stdout"])
+                        record[name]["result"] = parsed
+                        if first_started is not None and name == 'node_modules_first' and parsed['code'] == 0 and 'boat-node-modules' in parsed['stdout']:
+                            self.data["snapshot_create_to_first_job_seconds"] = time.monotonic() - first_started
+                        if name == 'job_toolchain_parity':
+                            passed, report, reason = parity_job_check(parsed)
+                            self.check(label + '.' + name, passed, report, reason=reason)
+                        elif name == 'offline_cargo_seed':
+                            report = json.loads(parsed['stdout']) if parsed['code'] == 0 else parsed
+                            self.check(label + '.' + name, parsed['code'] == 0 and report.get('passed') is True, report)
+                        elif name == 'git_worktree_pushurl_reset':
+                            self.check(label + '.' + name, *git_pushurl_check(parsed))
+                        elif name == 'wasm_opt_120_round_trip':
+                            self.check(label + '.' + name, *wasm_opt_check(parsed))
+                        elif name == "isolation":
+                            checks = isolation_result_checks(parsed, host, weight)
+                            isolation = json.loads(parsed['stdout']) if parsed['code'] == 0 and not all(checks.values()) else {}
+                            for key, passed in checks.items():
+                                reason = None if passed else (pid_failure_reason(key, isolation, host) if parsed['code'] == 0
+                                                             else f"expected isolation job code 0; observed {parsed['code']}")
+                                self.check(label + "." + key, parsed["code"] == 0 and passed, parsed, reason=reason)
+                        elif name == 'sigkill_job':
+                            self.check_job(label + '.sigkill_job_exit_137', parsed, 137)
+                        elif name == 'pid1_ignores_job_sigkill':
+                            self.check_job(label + '.pid1_ignores_job_sigkill', parsed, 0, marker='boat-pid1-alive')
+                        elif name == 'job_stdin_eof':
+                            self.check_job(label + '.job_stdin_eof', parsed, 0, exact_stdout='boat-stdin-eof')
+                        else:
+                            expected = 23 if name == "exit" else 0
+                            marker = "boat-round-trip" if name == "exit" else ("boat-node-modules" if name.startswith('node_modules_') or name == 'after_idle' else "boat-hello")
+                            self.check_job(label + "." + name, parsed, expected, marker=marker)
+                        state = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
+                        record.setdefault('storage_after_jobs', {})[name] = state
+                        if label == 'resumed' and name == 'node_modules_first' and 'disk_quota' in self.data:
+                            # A larger sandbox may stay above the floor at resume;
+                            # its retained target is evicted on the first cold retry.
+                            self.quota_reclaimed(state)
+                        for key, passed in storage_checks(state).items():
+                            self.check(label + '.' + name + '.' + key, passed, state)
                 # Observe and stop the unit from the sandbox's root namespace
                 # while the client waits, including a child that escaped setsid.
                 from concurrent.futures import ThreadPoolExecutor
                 for action, expected in [('stop', 143), ('kill', 137)]:
-                    marker = 'boat-pid-teardown-' + label + '-' + action
-                    command = teardown_job(marker)
-                    with ThreadPoolExecutor(max_workers=1) as executor:
-                        pending = executor.submit(process, [str(client), address, str(repository), storage, command, str(usable)], timeout=90)
-                        observed = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(TEARDOWN_SOURCE)
-                                                          + ' ' + shlex.quote(marker) + ' ' + action, timeout=60)['stdout'])
-                        completed = pending.result()
-                    parsed = job_result(completed['stdout']) if completed.get('exit_code') == 0 else {}
-                    record['setsid_' + action] = {'host':observed, 'client':completed, 'result':parsed}
-                    self.check(label + '.setsid_' + action + '_reaped', teardown_checks(observed), observed)
-                    self.check_job(label + '.setsid_' + action + '_exit_' + str(expected), parsed, expected,
-                                   signal=9 if action == 'kill' else None)
-                    if host['systemd_version'] < 257:
-                        for key, passed in bootstrap_checks(observed, host['job_security_reference']).items():
-                            self.check(label + '.setsid_' + action + '.' + key, passed, observed)
+                    with self.section('teardown ' + action):
+                        marker = 'boat-pid-teardown-' + label + '-' + action
+                        command = teardown_job(marker)
+                        with ThreadPoolExecutor(max_workers=1) as executor:
+                            pending = executor.submit(process, [str(client), address, str(repository), storage, command, str(usable)], timeout=90)
+                            observed = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(TEARDOWN_SOURCE)
+                                                              + ' ' + shlex.quote(marker) + ' ' + action, timeout=60)['stdout'])
+                            completed = pending.result()
+                        parsed = job_result(completed['stdout']) if completed.get('exit_code') == 0 else {}
+                        record['setsid_' + action] = {'host':observed, 'client':completed, 'result':parsed}
+                        self.check(label + '.setsid_' + action + '_reaped', teardown_checks(observed), observed)
+                        self.check_job(label + '.setsid_' + action + '_exit_' + str(expected), parsed, expected,
+                                       signal=9 if action == 'kill' else None)
+                        if host['systemd_version'] < 257:
+                            for key, passed in bootstrap_checks(observed, host['job_security_reference']).items():
+                                self.check(label + '.setsid_' + action + '.' + key, passed, observed)
         self.check(label + ".tunnel_reaped", record["tunnel"].get("reaped") is True, record["tunnel"])
         if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith(label + '.')):
             raise ValueError('real job or host checks failed in phase ' + label + '; no snapshot qualification claimed')
@@ -1480,48 +1630,291 @@ class RunnerHost:
 
     def run(self):
         self.directory = None
+        if isinstance(getattr(self.probe, 'verify_prepared_image', None), str):
+            # Listed before any work, so a run that stops early still reports
+            # every phase it did not run as not run.
+            self.data['verify_phases'] = verify_phase_records(self.verify_phase_selection())
         try:
             self._run()
         finally:
             self.data["local_private_keys_removed"] = self.directory is None or not self.directory.exists()
             self.probe.checkpoint()
 
-    def verify_prepared(self, name, directory, public, client):
+    def verify_phase_selection(self):
+        selection = getattr(self.probe, 'verify_phases', None)
+        return tuple(selection) if isinstance(selection, (tuple, list)) else VERIFY_PHASES
+
+    def idle_reclaim_wait(self, sid, label, record):
+        """Leave the sandbox idle long enough for Boat's idle reclaim and record whether it ran."""
+        with self.section('idle_reclaim_wait'):
+            reclaim = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(IDLE_RECLAIM), timeout=1050)['stdout'])
+        record['idle_reclaim'] = reclaim
+        status = idle_reclaim_status(reclaim)
+        self.check(label + '.idle_reclaim_observed', status == 'PASS', reclaim, status=status)
+
+    def verify_prepared(self, name, directory, public, client, phases=VERIFY_PHASES):
+        """Qualify an existing prepared image unchanged, one phase per fresh sandbox.
+
+        Boat stops a sandbox 30 minutes after it starts, and the whole verify
+        takes longer, so each requested phase restores the same image into its
+        own sandbox: core (clone readiness, host, parity and job checks), disk-quota
+        (quota lanes, stop at the limit, resume, readiness recovery, backing-file
+        shrink) and idle (Boat's idle reclaim, then a real job). A phase that fails
+        is recorded and the next one still runs; the run fails afterwards."""
+        records = self.data.get('verify_phases')
+        if not records:
+            records = self.data['verify_phases'] = verify_phase_records(phases)
         self.data['prepared_source'] = snapshot_metadata(self.probe.request('GET', '/named-snapshots/' + name)['snapshot'])
         self.data['prepared_source']['borrowed_not_deleted'] = True
-        started = time.monotonic()
-        item, self.data['create_from_snapshot'] = self.probe.create(name)
-        sid = item['id']
-        size = getattr(self.probe, 'size', 'large')
-        if not provider_sizing_matches(item, size):
-            raise ValueError(sizing_error(size))
-        self.probe.wait_hydrated(sid)
-        self.data['create_from_snapshot']['seconds_to_hydrated'] = time.monotonic() - started
+        failures = []
         with tempfile.TemporaryDirectory(prefix='boat-job-', dir=ROOT / '.cortexkit') as repo:
             repository = Path(repo)
             job_repository(repository, self.probe.cargo_seed_manifest)
-            # Do not restart, reconfigure or mount anything in the guest: that
-            # would repair the startup order this mode is meant to observe.
-            self.phase(sid, 'prepared_clone', directory, public, repository, client, first_started=started)
-            self.disk_quota(sid, directory, public, repository, client)
-            if not self.data['disk_quota'].get('stopped_with_retained_target'):
-                raise ValueError('quota probe did not archive the retained target')
-            self.data['disk_quota']['resume'] = self.probe.request('POST', f'/sandboxes/{sid}/resume', {})
-            from probe import READY, required_checks_passed
-            self.probe.wait_sandbox(sid, READY)
-            self.probe.wait_hydrated(sid)
-            resumed = self.phase(sid, 'resumed', directory, public, repository, client, hydrated_at=time.monotonic())
-            self.check_job('disk_quota.normal_job_after_stop_resume', resumed['node_modules_first']['result'], 0, marker='boat-node-modules')
-            self.replay_cleanup(sid)
+            for phase in VERIFY_PHASES:
+                if phase in phases:
+                    error = self.verify_phase(phase, name, directory, public, client, repository, records[phase])
+                    if error is not None:
+                        failures.append(phase + ': ' + error)
+        from probe import required_checks_passed
         self.data['all_passed'] = bool(self.data['checks']) and all(c['status'] == 'PASS' for c in self.data['checks'])
         self.data['required_checks_passed'] = required_checks_passed(self.data['checks'])
         self.probe.checkpoint()
+        if failures:
+            raise ValueError('verify phase failed: ' + '; '.join(failures))
+
+    def verify_phase(self, phase, name, directory, public, client, repository, record):
+        """Run one phase in a new sandbox restored from `name`, then delete that
+        sandbox. Returns the phase's error text, or None when it ran to the end.
+        A size refusal or an interrupt propagates: every later phase would meet it."""
+        if self.budget_seconds:
+            # The wall-clock budget restarts with each phase's own sandbox.
+            self.probe.deadline = time.monotonic() + self.budget_seconds
+        first_check = len(self.data['checks'])
+        record.update(ran=True, status='running', started_at=datetime.now(timezone.utc).isoformat())
+        self.probe.checkpoint()
+        started = time.monotonic()
+        try:
+            with self.section(phase):
+                sid = self.verify_clone(name, record, started)
+                # Never restart, reconfigure or mount anything in the guest: that
+                # would repair the startup order this mode is meant to observe.
+                if phase == 'core':
+                    self.phase(sid, 'prepared_clone', directory, public, repository, client,
+                               first_started=started, idle=False)
+                    self.verify_core_resume(sid, directory, public, repository, client)
+                elif phase == 'idle':
+                    self.verify_idle(sid, directory, public, repository, client)
+                else:
+                    self.verify_disk_quota(sid, directory, public, repository, client)
+            record['completed'] = True
+        except Exception as error:
+            # Probe.size_bound records Boat's size refusal before raising. Test the
+            # record, not the class: probe.py runs as __main__, so its exception
+            # class is not the one `import probe` would give this module.
+            if self.probe.data.get('snapshot_size_bound'):
+                record['snapshot_size_bound'] = True
+                raise
+            record['error'] = str(error)
+        except BaseException as error:
+            record['error'] = 'interrupted: ' + str(error)
+            raise
+        finally:
+            record['seconds'] = round(time.monotonic() - started, 3)
+            checks = self.data['checks'][first_check:]
+            record['check_names'] = [check['name'] for check in checks]
+            record['status'] = verify_phase_status(record, checks)
+            self.probe.checkpoint()
+        if record.get('sandbox'):
+            self.release_sandbox(phase, record)
+        return record.get('error')
+
+    def verify_clone(self, name, record, started):
+        """Create a sandbox of the requested size from `name` and wait for full hydration."""
+        with self.section('create'):
+            item, created = self.probe.create(name)
+        sid = record['sandbox'] = item['id']
+        record['create_from_snapshot'] = created
+        self.data.setdefault('create_from_snapshot', created)
+        size = getattr(self.probe, 'size', 'large')
+        if not provider_sizing_matches(item, size):
+            raise ValueError(sizing_error(size))
+        with self.section('hydrate'):
+            self.probe.wait_hydrated(sid)
+        created['seconds_to_hydrated'] = time.monotonic() - started
+        return sid
+
+    def release_sandbox(self, phase, record):
+        """Ask Boat to delete a finished phase's sandbox before the next phase
+        creates one, so two are not billed together. A deletion that does not
+        finish is recorded and retried by the run's final cleanup."""
+        from probe import cleanup
+        resource = next((r for r in self.probe.data.get('resources', [])
+                         if r.get('kind') == 'sandbox' and r.get('id') == record['sandbox']), None)
+        if resource is None:
+            return
+        subset = {'resources': [resource], 'pending_creates': [], 'cleanup': self.probe.data.setdefault('cleanup', [])}
+        try:
+            with self.section(phase + '/release_sandbox'):
+                cleanup(self.probe.client, subset, self.probe.checkpoint)
+            record['sandbox_cleanup_state'] = subset.get('cleanup_state')
+        except Exception as error:
+            record['sandbox_cleanup_error'] = str(error)
+        self.probe.checkpoint()
+
+    def clone_ready(self, sid, label, directory, public, record):
+        """Bring a fresh clone's endpoint up the way the broker does (identity
+        install, then the readiness marker) and start the probe's bridge.
+        Returns the pinned SSH argv."""
+        with self.section('endpoint_startup'):
+            argv = self.route(sid, directory, public)
+            install = self.install_identity(sid)
+            record['identity_install'] = install
+            self.check(label + '.identity_install_accepted', install['accepted'], install)
+            self.readiness(label, self.wait_endpoint(sid, install['started_monotonic']), sid)
+            if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith(label + '.')):
+                raise ValueError('the endpoint did not become ready in the ' + label + ' sandbox')
+            self.execute(sid, 'sudo -n systemctl start motor-boat-bridge')
+        return argv
+
+    def verify_core_resume(self, sid, directory, public, repository, client):
+        """Stop an idle, unfilled prepared clone and qualify its resumed endpoint with a real job."""
+        import disk_quota
+        from probe import READY
+        label = 'core_resumed'
+        record: dict[str, Any] = {'name': label, 'wait': {}}
+        self.data['core_stop_resume'] = record
+        self.data['phases'].append(record)
+        with self.section('plain_stop_resume'), self.phase_evidence(sid, record):
+            record['pre_stop_idle'] = self.guest_json(
+                sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CLEANUP), 'core idle endpoint before stop')
+            idle = record['pre_stop_idle'].get('ready') is True and record['pre_stop_idle'].get('leases') == []
+            self.check('core_stop_resume.idle_before_stop', idle, record['pre_stop_idle'])
+            if not idle:
+                raise ValueError('core stop control requires a ready endpoint with no job quota leases')
+            record['pre_stop_storage'] = self.guest_json(
+                sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE), 'core pre-stop storage')
+            with self.section('stop'):
+                try:
+                    record['stop'] = self.probe.request('POST', f'/sandboxes/{sid}/stop', {})
+                    accepted = time.monotonic()
+                    record['accepted_at'] = datetime.now(timezone.utc).isoformat()
+                    archived = self.probe.wait_sandbox(sid, {'archived'}, observation=record['wait'])
+                    record['accepted_to_completed_seconds'] = time.monotonic() - accepted
+                except Exception as error:
+                    self.check('core_stop_resume.stop_completed', False, record,
+                               reason='plain core stop did not complete: ' + str(error))
+                    raise
+                stopped = archived.get('state') == 'archived' and (archived.get('stop') or {}).get('status') == 'completed'
+                self.check('core_stop_resume.stop_completed', stopped, record)
+                if not stopped:
+                    raise ValueError('plain core stop did not report completed archival')
+            with self.section('resume'):
+                record['resume'] = self.probe.request('POST', f'/sandboxes/{sid}/resume', {})
+                self.probe.wait_sandbox(sid, READY)
+                self.probe.wait_hydrated(sid)
+                hydrated_at = time.monotonic()
+            argv = self.route(sid, directory, public)
+            self.existing_then_reinstall(sid, label, record, hydrated_at)
+            if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith(label + '.')):
+                raise ValueError('the core endpoint did not become ready after resume')
+            self.execute(sid, 'sudo -n systemctl start motor-boat-bridge')
+            with tunnel(argv, directory, self.probe.deadline, record.setdefault('tunnel', {})) as address:
+                with tempfile.TemporaryDirectory(prefix='motor-boat-client-') as storage:
+                    result = record['after_resume'] = process(
+                        [str(client), address, str(repository), storage, NODE_CHECK, '1'],
+                        timeout=min(150, max(1, int(self.probe.deadline - time.monotonic()))))
+                    parsed = result['result'] = job_result(result['stdout']) if result.get('exit_code') == 0 else {}
+                    self.check_job('core_stop_resume.normal_job_after_resume', parsed, 0, marker='boat-node-modules')
+                    state = record['storage_after_resume_job'] = self.guest_json(
+                        sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE), 'core resumed job storage')
+                    for key, passed in storage_checks(state).items():
+                        self.check(label + '.after_resume.' + key, passed, state)
+            self.check(label + '.tunnel_reaped', record['tunnel'].get('reaped') is True, record['tunnel'])
+
+    def verify_idle(self, sid, directory, public, repository, client):
+        """Leave a ready clone idle long enough for Boat's idle reclaim, then run a real job."""
+        label = 'idle'
+        record: dict[str, Any] = {'name': label}
+        self.data['phases'].append(record)
+        with self.section(label), self.phase_evidence(sid, record):
+            argv = self.clone_ready(sid, label, directory, public, record)
+            usable = int(self.execute(sid, 'nproc')['stdout'].strip())
+            weight, skipped = job_vcpus(JOB_VCPUS.get('after_idle'), usable, getattr(self.probe, 'size', 'large'))
+            if skipped:
+                raise ValueError('the after_idle job cannot run on this size: ' + skipped)
+            with tunnel(argv, directory, self.probe.deadline, record.setdefault('tunnel', {})) as address:
+                with tempfile.TemporaryDirectory(prefix='motor-boat-client-') as storage:
+                    self.idle_reclaim_wait(sid, label, record)
+                    with self.section('job after_idle'):
+                        result = record['after_idle'] = process(
+                            [str(client), address, str(repository), storage, NODE_CHECK, str(weight)],
+                            timeout=min(150, max(1, int(self.probe.deadline - time.monotonic()))))
+                        if result.get('exit_code') != 0:
+                            self.client_failure_diagnostics(sid, result)
+                            raise ValueError('motor client failed: ' + json.dumps(result)
+                                             + '; sandbox state at failure: runner_host.phases[].after_idle.sandbox_diagnostics')
+                        parsed = result['result'] = job_result(result['stdout'])
+                        self.check_job(label + '.after_idle', parsed, 0, marker='boat-node-modules')
+                        state = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
+                        record.setdefault('storage_after_jobs', {})['after_idle'] = state
+                        for key, passed in storage_checks(state).items():
+                            self.check(label + '.after_idle.' + key, passed, state)
+            self.check(label + '.tunnel_reaped', record['tunnel'].get('reaped') is True, record['tunnel'])
+
+    def verify_disk_quota(self, sid, directory, public, repository, client):
+        """Quota lanes, stop with a quota-sized target, resume, readiness recovery
+        and the backing-file shrink, then the full resumed-phase checks."""
+        label = 'disk_quota_clone'
+        record: dict[str, Any] = {'name': label}
+        self.data['phases'].append(record)
+        with self.phase_evidence(sid, record):
+            self.clone_ready(sid, label, directory, public, record)
+        with self.section('disk_quota'):
+            self.disk_quota(sid, directory, public, repository, client)
+        if not self.data['disk_quota'].get('stopped_with_retained_target'):
+            raise ValueError('quota probe did not archive the retained target')
+        from probe import READY
+        with self.section('resume'):
+            self.data['disk_quota']['resume'] = self.probe.request('POST', f'/sandboxes/{sid}/resume', {})
+            self.probe.wait_sandbox(sid, READY)
+            self.probe.wait_hydrated(sid)
+        self.release_retained_job(sid)
+        # Readiness is timed from the moment the workspace became idle: while
+        # the retained job held it, the runner was right to keep its target.
+        resumed = self.phase(sid, 'resumed', directory, public, repository, client, hydrated_at=time.monotonic())
+        self.check_job('disk_quota.normal_job_after_stop_resume', resumed['node_modules_first']['result'], 0, marker='boat-node-modules')
+        with self.section('cleanup_replay'):
+            self.replay_cleanup(sid)
 
     def replay_cleanup(self, sid):
         record = self.data['deferred_cleanup_replay'] = {}
         with self.phase_evidence(sid, record):
             record.update(json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(DEFERRED_CLEANUP_REPLAY))['stdout']))
             self.check('deferred_cleanup_replay.no_mount_over_live_workspace', cleanup_replay_checks(record), record)
+
+    def release_retained_job(self, sid):
+        """End the retained-target job after resume so its workspace is idle.
+
+        Boat resumes a stopped sandbox from memory, so the job that held its
+        quota-sized target through the stop is still running and still holding
+        its barrier. Until it ends the runner must keep that workspace, the
+        sandbox stays below the admission floor and the endpoint stays unready;
+        the resumed eviction and readiness checks are about an idle target."""
+        import disk_quota
+        import quota_adversarial
+        row = self.data['disk_quota']['lanes'][disk_quota.RETAINED_LANE]
+        with self.section('release_retained_job'):
+            release = row['release_after_resume'] = self.guest_json(
+                sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(quota_adversarial.retained_release(row['at_limit'])),
+                'retained job release after resume', timeout=150)
+            ended = disk_quota.retained_release_passed(release)
+            reason = None if ended else (
+                'the retained-target job did not end after its barrier was released: '
+                + json.dumps({key: release.get(key) for key in ('released', 'marker_error', 'job_terminal',
+                                                                 'unit_active', 'terminal_before', 'seconds')}))
+            self.check('disk_quota.retained_job_ended_after_resume', ended, release, reason=reason)
+            if not ended:
+                raise ValueError('disk_quota.retained_job_ended_after_resume: ' + reason)
 
     def disk_quota(self, sid, directory, public, repository, client):
         import disk_quota
@@ -1534,10 +1927,85 @@ class RunnerHost:
     def quota_reclaimed(self, storage):
         import disk_quota
         record = self.data['disk_quota']
-        before = record.get('lanes', {}).get(disk_quota.RETAINED_LANE, {}).get('pre_stop_storage', {})
-        evidence = record['resumed_backing_allocation'] = {'before': before, 'after': storage}
-        self.check('disk_quota.backing_allocation_dropped_after_resume',
-                   disk_quota.backing_allocation_dropped(before, storage), evidence)
+        row = record.get('lanes', {}).get(disk_quota.RETAINED_LANE, {})
+        before = row.get('pre_stop_storage', {})
+        retained = (row.get('at_limit') or {}).get('retained_allocated_bytes')
+        evidence = record['resumed_backing_allocation'] = {'before': before, 'after': storage, 'retained_allocated_bytes': retained}
+        passed = disk_quota.backing_allocation_dropped(before, storage, retained)
+        reason = None
+        if not passed:
+            blocks = [side.get('backing_allocated_blocks') for side in (before, storage)]
+            dropped = (blocks[0] - blocks[1]) * 512 if all(type(value) is int for value in blocks) else None
+            reason = (f'the backing file did not return the retained target to the root disk: allocation dropped by '
+                      f'{dropped} bytes; the evicted target held {retained} bytes (slack {disk_quota.RECLAIM_SLACK_BYTES})')
+        self.check('disk_quota.backing_allocation_dropped_after_resume', passed, evidence, reason=reason)
+
+    def retained_stop_sample(self, sandbox, observation, argv, child):
+        """Use pinned SSH because Boat rejects API exec while a sandbox is archiving."""
+        import quota_adversarial
+        sample: dict[str, Any] = {'client_running': child.poll() is None}
+        if sandbox.get('state') == 'archived' and (sandbox.get('stop') or {}).get('status') == 'completed':
+            return dict(sample, status='archived')
+        remaining = self.probe.deadline - time.monotonic()
+        if remaining <= 0:
+            return dict(sample, status='unavailable', error='phase budget expired before guest observation')
+        command = 'sudo -n /usr/bin/python3 -c ' + shlex.quote(quota_adversarial.retained_sample(observation))
+        result = process(argv + [command], timeout=min(10, remaining))
+        if result.get('exit_code') != 0:
+            return dict(sample, status='unavailable', error=result.get('error') or result.get('stderr') or 'SSH sample failed',
+                        exit_code=result.get('exit_code'))
+        try:
+            guest = json.loads(result['stdout'])
+            if (not isinstance(guest, dict) or type(guest.get('job_running')) is not bool
+                    or type(guest.get('retained_target_at_limit')) is not bool or type(guest.get('allocated_bytes')) is not int):
+                raise ValueError('guest sample lacks typed liveness/allocation fields')
+        except (ValueError, KeyError) as error:
+            return dict(sample, status='unavailable', error=str(error))
+        return dict(sample, status='observed', **guest)
+
+    def stop_at_quota_limit(self, sid, record, row, sample_job=None):
+        import disk_quota
+        storage = row['pre_stop_storage']
+        blocks = storage.get('backing_allocated_blocks')
+        evidence: dict[str, Any] = {'wait': {}, 'pre_stop_disk': {
+            'root_free_bytes': row['pre_stop'].get('root_free_bytes'),
+            'xfs_free_bytes': row['pre_stop'].get('xfs_free_bytes'),
+            'retained_allocated_bytes': row['pre_stop'].get('allocated_bytes'),
+            'backing_file': storage.get('backing_file'),
+            'backing_allocated_bytes': blocks * 512 if type(blocks) is int else None,
+            'reserve_floor_bytes': disk_quota.RESERVE_BYTES}}
+        record['stop_at_limit'] = evidence
+        with self.section('stop_at_limit'):
+            try:
+                record['stop'] = self.probe.request('POST', f'/sandboxes/{sid}/stop', {})
+                evidence['response'] = record['stop']
+                accepted = time.monotonic()
+                evidence['accepted_at'] = datetime.now(timezone.utc).isoformat()
+                archived = self.probe.wait_sandbox(sid, {'archived'}, self.probe.quota_stop_wait_s,
+                                                   observation=evidence['wait'], on_sample=sample_job)
+                evidence['accepted_to_completed_seconds'] = time.monotonic() - accepted
+            except Exception as error:
+                evidence['error'] = str(error)
+                evidence['wait'] = getattr(error, 'evidence', evidence['wait'])
+                evidence['last_sandbox'] = evidence['wait'].get('last_sandbox') or sandbox_lifecycle(
+                    (record.get('stop') or {}).get('sandbox') or {})
+                progress = evidence['boat_stop_progress'] = disk_quota.stop_progress(
+                    evidence['wait'].get('samples', []), (record.get('stop') or {}).get('operation'))
+                reason = ('stop at quota limit did not complete: ' + disk_quota.stop_progress_reason(progress, evidence['wait'])
+                          + '; ' + json.dumps({
+                              'pre_stop_disk': evidence['pre_stop_disk'], 'last_sandbox': evidence['last_sandbox'],
+                              'error': evidence['error']}))
+                self.check('disk_quota.stop_with_quota_sized_target', False, evidence, reason=reason)
+                raise ValueError('disk_quota.stop_with_quota_sized_target: ' + reason) from error
+            finally:
+                samples = evidence['wait'].get('samples', [])
+                status = evidence['retained_hold_status'] = disk_quota.retained_hold_status(samples, row['pre_stop'])
+                reason = ('retained job ended or its quota-sized target was lost during the stop' if status == 'FAIL' else
+                          'pending-stop samples must observe both a live guest job and its allocated quota-sized target')
+                self.check('disk_quota.retained_target_held_during_stop', status == 'PASS',
+                           {'status': status, 'samples': samples, 'reason': reason}, status=status, reason=reason)
+        evidence['last_sandbox'] = sandbox_lifecycle(archived) if isinstance(archived, dict) else {}
+        self.check('disk_quota.stop_with_quota_sized_target', True, evidence)
 
     def resumed_workspace_eviction(self, sid, phase):
         import disk_quota
@@ -1545,9 +2013,10 @@ class RunnerHost:
         row = self.data['disk_quota']['lanes'][disk_quota.RETAINED_LANE]
         before = row['at_limit']
         workspace = before['lease']['roots'][0]
-        evidence = phase['workspace_eviction'] = json.loads(self.execute(
+        evidence = phase['workspace_eviction'] = self.guest_json(
             sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(
-                quota_adversarial.resume_eviction_source(workspace, row['eviction_journal_cursor'])))['stdout'])
+                quota_adversarial.resume_eviction_source(workspace, row['eviction_journal_cursor'])),
+            'resumed workspace eviction read')
         ready = phase['existing_then_reinstall']['first']['ready']
         for name, passed in disk_quota.resume_eviction_checks(before, evidence, ready).items():
             self.check('resumed.' + name, passed, {'before': before, 'after': evidence, 'ready': ready})
@@ -1556,8 +2025,8 @@ class RunnerHost:
         import disk_quota
         import quota_adversarial
         import uuid
-        control = record['setter_positive_control'] = json.loads(self.execute(
-            sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.POSITIVE_CONTROL))['stdout'])
+        control = record['setter_positive_control'] = self.guest_json(
+            sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.POSITIVE_CONTROL), 'disk_quota setter positive control')
         self.check('disk_quota.fssetxattr_positive_control', disk_quota.positive_control_passed(control), control)
         if not disk_quota.positive_control_passed(control):
             raise ValueError('unfiltered XFS attribute positive control failed')
@@ -1572,91 +2041,104 @@ class RunnerHost:
                     if parsed.get('code') != 0:
                         raise ValueError('adversarial setup job failed: ' + name)
                     return parsed
-                simple_job('deep_tree', disk_quota.DEEP_JOB)
-                record['deep_cleanup'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CLEANUP), timeout=100)['stdout'])
-                self.check('disk_quota.deep_tree_capacity_recovered', record['deep_cleanup'].get('ready') is True and record['deep_cleanup'].get('leases') == [], record['deep_cleanup'])
+                with self.section('deep_tree'):
+                    simple_job('deep_tree', disk_quota.DEEP_JOB)
+                    record['deep_cleanup'] = self.guest_json(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CLEANUP),
+                                                             'disk_quota cleanup after deep_tree', timeout=100)
+                    self.check('disk_quota.deep_tree_capacity_recovered', record['deep_cleanup'].get('ready') is True and record['deep_cleanup'].get('leases') == [], record['deep_cleanup'])
                 for lane in disk_quota.LANES + (disk_quota.RETAINED_LANE,):
-                    if lane == 'reused_target':
-                        simple_job('baseline_seed', disk_quota.BASELINE_JOB, marker='baseline-seeded')
-                    if lane == 'reflink_target':
-                        capacity = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CAPACITY))['stdout'])
-                        record['reflink_seed_capacity'] = capacity
-                        if capacity['baseline_bytes'] < 64 * 1024**2:
-                            self.check('disk_quota.reflink_baseline_headroom', False, capacity, status='INCONCLUSIVE')
-                            continue
-                        simple_job('reflink_seed', disk_quota.reflink_seed(capacity['baseline_bytes']))
-                    row: dict[str, Any] = {}
-                    record.setdefault('lanes', {})[lane] = row
-                    token = uuid.uuid4().hex
-                    command = 'python3 -c ' + shlex.quote(disk_quota.job(lane, token))
-                    invocation = [str(client), address, str(repository), storage, command, '1', '900']
-                    started = time.monotonic()
-                    child = _quota_popen(invocation, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                             text=True, env={key: value for key, value in os.environ.items() if key != 'BOAT_API_KEY'})
-                    complete = False
-                    try:
-                        row['at_limit'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.observer(token, lane == disk_quota.RETAINED_LANE)), timeout=950)['stdout'])
-                        if lane == disk_quota.RETAINED_LANE:
-                            self.check('disk_quota.retained_target_at_limit', disk_quota.retained_checks(row['at_limit']), row['at_limit'])
-                            if not disk_quota.retained_checks(row['at_limit']):
-                                raise ValueError('retained target did not reach an enforced quota boundary')
-                            row['pre_stop'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(quota_adversarial.retained_guard(row['at_limit'])))['stdout'])
-                            if row['pre_stop'].get('job_running') is not True:
-                                raise ValueError('retained target job is no longer live before snapshot')
-                            row['pre_stop_storage'] = json.loads(self.execute(
-                                sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE))['stdout'])
-                            cursor = self.execute(sid, 'sudo -n journalctl --unit=motor-boat.service --lines=0 --show-cursor')['stdout'].strip()
-                            if not cursor.startswith('-- cursor: '):
-                                raise ValueError('runner journal did not provide a pre-stop eviction cursor')
-                            row['eviction_journal_cursor'] = cursor.removeprefix('-- cursor: ')
-                            # Keep the job at its barrier so idle eviction cannot
-                            # remove the full target before the provider snapshots it.
-                            record['stop'] = self.probe.request('POST', f'/sandboxes/{sid}/stop', {})
-                            self.probe.wait_sandbox(sid, {'archived'})
-                            record['stopped_with_retained_target'] = True
-                            row['client_interrupted_for_snapshot'] = True
+                    with self.section('lane ' + lane):
+                        if lane == 'reused_target':
+                            simple_job('baseline_seed', disk_quota.BASELINE_JOB, marker='baseline-seeded')
+                        if lane == 'reflink_target':
+                            capacity = self.guest_json(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CAPACITY),
+                                                       'disk_quota reflink seed capacity')
+                            record['reflink_seed_capacity'] = capacity
+                            if capacity['baseline_bytes'] < 64 * 1024**2:
+                                self.check('disk_quota.reflink_baseline_headroom', False, capacity, status='INCONCLUSIVE')
+                                continue
+                            simple_job('reflink_seed', disk_quota.reflink_seed(capacity['baseline_bytes']))
+                        row: dict[str, Any] = {}
+                        record.setdefault('lanes', {})[lane] = row
+                        token = uuid.uuid4().hex
+                        retained = lane == disk_quota.RETAINED_LANE
+                        job_seconds = disk_quota.job_seconds(lane, self.probe.deadline - time.monotonic())
+                        hold_seconds = job_seconds if retained else 90
+                        row.update(job_timeout_seconds=job_seconds, hold_seconds=hold_seconds)
+                        command = 'python3 -c ' + shlex.quote(disk_quota.job(lane, token, hold_seconds=hold_seconds))
+                        invocation = [str(client), address, str(repository), storage, command, '1', str(job_seconds)]
+                        started = time.monotonic()
+                        child = _quota_popen(invocation, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                                 text=True, env={key: value for key, value in os.environ.items() if key != 'BOAT_API_KEY'})
+                        complete = False
+                        try:
+                            row['at_limit'] = self.guest_json(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.observer(token, lane == disk_quota.RETAINED_LANE)),
+                                                              'disk_quota observer for lane ' + lane, timeout=950)
+                            if lane == disk_quota.RETAINED_LANE:
+                                self.check('disk_quota.retained_target_at_limit', disk_quota.retained_checks(row['at_limit']), row['at_limit'])
+                                if not disk_quota.retained_checks(row['at_limit']):
+                                    raise ValueError('retained target did not reach an enforced quota boundary')
+                                row['pre_stop'] = self.guest_json(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(quota_adversarial.retained_guard(row['at_limit'])),
+                                                                  'disk_quota retained target pre-stop guard')
+                                if row['pre_stop'].get('job_running') is not True:
+                                    raise ValueError('retained target job is no longer live before snapshot')
+                                row['pre_stop_storage'] = self.guest_json(
+                                    sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE), 'disk_quota retained target pre-stop storage')
+                                journal = self.execute(sid, 'sudo -n journalctl --unit=motor-boat.service --lines=0 --show-cursor')
+                                row['eviction_journal_cursor_output'] = journal.get('stdout')
+                                row['eviction_journal_cursor'] = journal_cursor(journal.get('stdout'))
+                                # Keep the job at its barrier so idle eviction cannot
+                                # remove the full target before the provider snapshots it.
+                                self.stop_at_quota_limit(sid, record, row,
+                                    sample_job=lambda sandbox: self.retained_stop_sample(sandbox, row['at_limit'], argv, child))
+                                record['stopped_with_retained_target'] = True
+                                row['client_interrupted_for_snapshot'] = True
+                                complete = True
+                                break
+                            if 'errno' not in row['at_limit']:
+                                raise ValueError('quota job ended before finishing its fill')
+                            stdout, stderr = child.communicate(timeout=1000)
+                            result = dict(argv=invocation, exit_code=child.returncode, stdout=stdout, stderr=stderr, seconds=time.monotonic()-started)
+                            row['client'] = result
+                            row['result'] = job_result(stdout) if child.returncode == 0 else {}
+                            row['cleanup'] = self.guest_json(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CLEANUP),
+                                                             'disk_quota cleanup after lane ' + lane, timeout=100)
+                            row['fill_target_bytes'] = disk_quota.fill_bytes(lane)
+                            for name, passed in disk_quota.checks(row['result'], row['at_limit'], row['cleanup'],
+                                                                  row['fill_target_bytes']).items():
+                                self.check('disk_quota.' + lane + '.' + name, passed, row)
+                            status = disk_quota.file_setattr_status(row['result'], control)
+                            reason = ('unfiltered root file_setattr returned ENOSYS; this cannot distinguish the job filter; uname -r: '
+                                      + control.get('kernel_release', 'unknown')) if status == 'INCONCLUSIVE' else None
+                            self.check('disk_quota.' + lane + '.file_setattr_refusal', status == 'PASS',
+                                       {'control': control, 'job': row['result'], 'observation_gap': reason}, status=status, reason=reason)
+                            # The first ordinary lane filled to the cap keeps its at-limit
+                            # free space here, for tuning the reserve.
+                            if not row['fill_target_bytes']: record.setdefault('at_limit', row['at_limit'])
+                            if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith('disk_quota.' + lane + '.')):
+                                raise ValueError('disk quota lane failed: ' + lane)
+                            normal = process([str(client), address, str(repository), storage, 'printf boat-after-quota', '1'], timeout=120)
+                            row['next_job'] = normal
+                            self.check_job('disk_quota.' + lane + '.normal_job_after_cleanup', job_result(normal['stdout']) if normal.get('exit_code') == 0 else {}, 0, exact_stdout='boat-after-quota')
+                            if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith('disk_quota.' + lane + '.')):
+                                raise ValueError('normal job after quota cleanup failed: ' + lane)
                             complete = True
-                            self.check('disk_quota.stop_with_quota_sized_target', True, row['at_limit'])
-                            break
-                        if 'errno' not in row['at_limit']:
-                            raise ValueError('quota job ended before reaching its write limit')
-                        stdout, stderr = child.communicate(timeout=1000)
-                        result = dict(argv=invocation, exit_code=child.returncode, stdout=stdout, stderr=stderr, seconds=time.monotonic()-started)
-                        row['client'] = result
-                        row['result'] = job_result(stdout) if child.returncode == 0 else {}
-                        row['cleanup'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CLEANUP), timeout=100)['stdout'])
-                        for name, passed in disk_quota.checks(row['result'], row['at_limit'], row['cleanup']).items():
-                            self.check('disk_quota.' + lane + '.' + name, passed, row)
-                        status = disk_quota.file_setattr_status(row['result'], control)
-                        reason = ('unfiltered root file_setattr returned ENOSYS; this cannot distinguish the job filter; uname -r: '
-                                  + control.get('kernel_release', 'unknown')) if status == 'INCONCLUSIVE' else None
-                        self.check('disk_quota.' + lane + '.file_setattr_refusal', status == 'PASS',
-                                   {'control': control, 'job': row['result'], 'observation_gap': reason}, status=status, reason=reason)
-                        if lane == 'tmp': record['at_limit'] = row['at_limit']
-                        if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith('disk_quota.' + lane + '.')):
-                            raise ValueError('disk quota lane failed: ' + lane)
-                        normal = process([str(client), address, str(repository), storage, 'printf boat-after-quota', '1'], timeout=120)
-                        row['next_job'] = normal
-                        self.check_job('disk_quota.' + lane + '.normal_job_after_cleanup', job_result(normal['stdout']) if normal.get('exit_code') == 0 else {}, 0, exact_stdout='boat-after-quota')
-                        if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith('disk_quota.' + lane + '.')):
-                            raise ValueError('normal job after quota cleanup failed: ' + lane)
-                        complete = True
-                    finally:
-                        captured = None
-                        if child.poll() is None:
-                            child.terminate()
-                            try: captured = child.communicate(timeout=5)
-                            except subprocess.TimeoutExpired:
-                                child.kill(); captured = child.communicate()
-                        if row.get('client_interrupted_for_snapshot'):
-                            stdout, stderr = captured if captured is not None else child.communicate()
-                            row['client'] = dict(exit_code=child.returncode, stdout=stdout, stderr=stderr,
-                                                 seconds=time.monotonic()-started, intentionally_interrupted=True)
-                        if not complete:
-                            try:
-                                row['abort_cleanup'] = self.probe.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(quota_adversarial.abort_source(token)), poll_seconds=30)
-                            except Exception as error:
-                                row['abort_cleanup_error'] = str(error)
+                        finally:
+                            captured = None
+                            if child.poll() is None:
+                                child.terminate()
+                                try: captured = child.communicate(timeout=5)
+                                except subprocess.TimeoutExpired:
+                                    child.kill(); captured = child.communicate()
+                            if row.get('client_interrupted_for_snapshot'):
+                                stdout, stderr = captured if captured is not None else child.communicate()
+                                row['client'] = dict(exit_code=child.returncode, stdout=stdout, stderr=stderr,
+                                                     seconds=time.monotonic()-started, intentionally_interrupted=True)
+                            if not complete:
+                                try:
+                                    row['abort_cleanup'] = self.probe.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(quota_adversarial.abort_source(token)), poll_seconds=30)
+                                except Exception as error:
+                                    row['abort_cleanup_error'] = str(error)
                 if not record.get('stopped_with_retained_target'):
                     raise ValueError('no retained-target snapshot qualification was performed')
         if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith('disk_quota.')):
@@ -1675,7 +2157,10 @@ class RunnerHost:
             raise ValueError("local operator client build failed")
         client = ROOT / "target/debug/examples/boat_probe"
         # The 30-minute provider budget starts after the local client is available.
-        self.probe.deadline = time.monotonic() + min(1800, self.probe.minutes * 60)
+        self.budget_seconds = min(1800, self.probe.minutes * 60)
+        self.data['sandbox_budget_seconds'] = self.budget_seconds
+        self.data['quota_stop_wait_s'] = self.probe.quota_stop_wait_s
+        self.probe.deadline = time.monotonic() + self.budget_seconds
         self.data["source_revision"] = revision
         (ROOT / '.cortexkit').mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="motor-boat-ssh-") as temporary:
@@ -1687,7 +2172,7 @@ class RunnerHost:
             public = (directory / "key.pub").read_text().strip()
             verify_image = getattr(self.probe, 'verify_prepared_image', None)
             if verify_image:
-                self.verify_prepared(verify_image, directory, public, client)
+                self.verify_prepared(verify_image, directory, public, client, self.verify_phase_selection())
                 return
             source_image = getattr(self.probe, 'from_prepared_image', None)
             if source_image:

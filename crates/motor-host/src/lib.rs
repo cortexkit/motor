@@ -2,6 +2,7 @@
 
 pub mod billing;
 pub mod broker;
+pub mod capacity;
 pub mod closure;
 pub mod enroll;
 pub mod helper;

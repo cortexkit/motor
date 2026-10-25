@@ -180,6 +180,7 @@ async fn a_slow_hosted_client_receives_every_frame_after_the_tenant_runner_close
                 tenant: "tenant".into(),
                 sub: sub.into(),
                 vcpu_ceiling: 2,
+                max_weight: None,
                 guest_ram_mib: 18432,
                 idle_suspend_s: 600,
                 host_floor_bytes: 0,
@@ -341,16 +342,24 @@ async fn a_slow_hosted_client_receives_every_frame_after_the_tenant_runner_close
     })
     .await
     .expect("the runner did not finish and close its job stream within 60 seconds");
-    runtime
-        .host
-        .lock()
-        .unwrap()
-        .event(
+    {
+        let mut h = runtime.host.lock().unwrap();
+        h.event(
             "tenant",
             &lifecycle(3, TenantEventKind::Terminal, id),
             unix_ms(),
         )
         .unwrap();
+        // motor-host's lifecycle reader runs a billing tick after every
+        // event, and only that tick settles the job (publishes its
+        // hosted_terminal) when the runner's terminal reached the relay before
+        // this Terminal event. That happens when the runner's output arrives in
+        // few enough frames that all of them fit in the client's receive queue
+        // and the socket buffers; motor-host then reads the terminal while
+        // the client is still held back. Without the tick the relay would wait
+        // for a hosted_terminal that never comes.
+        h.billing_tick(unix_ms()).unwrap();
+    }
     // The client still sends a heartbeat every second while it is behind;
     // the first one after the close used to end the relay.
     tokio::time::sleep(Duration::from_millis(2500)).await;

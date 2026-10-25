@@ -21,7 +21,7 @@ BOOT_ARGS = ("console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro "
              "init=/sbin/motor-init net.ifnames=0 ipv6.disable=1 "
              "systemd.unified_cgroup_hierarchy=1")
 RUNNER_INPUTS = (
-    "script/runner/tools.txt", "script/runner/install-tools.sh",
+    "script/runner/tools.txt", "script/runner/install-tools.sh", "script/runner/install-npm-tool.py",
     "script/runner/build-sccache.sh", "script/runner/motor-net.nft",
     "script/runner/patches/sccache-0.18.0-read-only-hits.patch",
     "script/runner/build-git.sh", "script/runner/install-binaryen.py",
@@ -167,6 +167,7 @@ def build(version, output, versions, runner, jobs=4, builder=build_artifacts,
         assert_unmounted(stage, mountinfo_reader)
         manifest = {
             "version": version, "versions": pins, "boot_args": BOOT_ARGS,
+            "capabilities": ["sparse-v1", "resize-v1"],
             "kernel_sha256": digest(stage / "kernel/vmlinux"),
             "rootfs_sha256": digest(stage / "rootfs"),
             "runner_sha256": digest(stage / "motor-runner"),
@@ -206,19 +207,36 @@ def build(version, output, versions, runner, jobs=4, builder=build_artifacts,
     return target
 
 
-def inventory(image, versions):
+def verify(image):
+    """Check an installed image against what it records about itself.
+
+    Switching a tenant to an image that is already installed, including back
+    to an older one for a rollback, needs only this: the image is complete,
+    named as its manifest says, its embedded pins equal its manifest's, and
+    its kernel and root filesystem are the files the manifest hashed. Whether
+    its pins match today's versions.txt matters when an image is built or
+    accepted as new (`inventory`), not when an existing one is chosen.
+    """
     if (image / ".work").exists():
         raise ValueError("incomplete image build still has a staging directory")
     manifest = json.loads((image / "manifest.json").read_text())
-    expected = load_versions(versions)
-    if manifest["version"] != image.name or manifest["versions"] != expected:
-        raise ValueError("image manifest version or toolchain inventory differs from versions.txt")
-    if load_versions(image / "versions.txt") != expected:
-        raise ValueError("image's versions.txt differs from requested versions.txt")
+    if manifest["version"] != image.name:
+        raise ValueError("image manifest version differs from the image's directory name")
+    # Compare the raw pins, not through load_versions: that also enforces
+    # today's schema, which an image built before a schema change rightly fails.
+    if json.loads((image / "versions.txt").read_text()) != manifest["versions"]:
+        raise ValueError("image's versions.txt differs from its manifest")
     for artifact, key in (("vmlinux", "kernel_sha256"), ("rootfs", "rootfs_sha256")):
         if digest(image / artifact) != manifest[key]:
             raise ValueError(f"{artifact} SHA-256 mismatch")
     check_kernel(image / "kernel.config")
+    return manifest
+
+
+def inventory(image, versions):
+    manifest = verify(image)
+    if manifest["versions"] != load_versions(versions):
+        raise ValueError("image manifest version or toolchain inventory differs from versions.txt")
     print("hosted image inventory: 5 checks passed (versions, embedded pins, kernel, rootfs, config)")
 
 
@@ -236,6 +254,7 @@ def main():
     for sub in (create, subs.add_parser("inventory")):
         sub.add_argument("--versions", type=Path, default=HERE / "versions.txt")
     subs.choices["inventory"].add_argument("image", type=Path)
+    subs.add_parser("verify").add_argument("image", type=Path)
     subs.add_parser("check-kernel").add_argument("config", type=Path)
     config = subs.add_parser("kernel-config")
     config.add_argument("output", type=Path)
@@ -256,6 +275,9 @@ def main():
             signal.signal(signal.SIGTERM, previous)
     elif args.command == "inventory":
         inventory(args.image, args.versions)
+    elif args.command == "verify":
+        verify(args.image)
+        print("hosted image integrity: 4 checks passed (name, embedded pins, kernel and rootfs, config)")
     elif args.command == "kernel-config":
         pins = load_versions(args.versions)
         args.output.mkdir(parents=True)

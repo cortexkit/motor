@@ -4,3 +4,4 @@ toolchain.json
 cargo-seed.py
 syscall-surface.py
 remote-cache-environment.py
+install-npm-tool.py

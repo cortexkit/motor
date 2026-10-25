@@ -220,7 +220,10 @@ mod tests {
         assert!(evidence.oom_killed());
         assert!(evidence.detail().contains("max=0,oom=0,oom_kill=1"));
         let config = Config::new("unused", "main");
-        assert!(oom_memory_limit_detail(&config, 2, 80).contains("Request more vCPUs"));
+        assert!(
+            oom_memory_limit_detail(&config, 2, 80, crate::systemd::NO_JOB_MEMORY_BUDGET)
+                .contains("Request more vCPUs")
+        );
     }
 
     #[test]

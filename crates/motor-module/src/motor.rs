@@ -310,9 +310,14 @@ impl Motor {
                 "routed to hosted (hosted_repositories)");
         } else if self.config.hosted_runners
             && matches!(request.platform, None | Some(Platform::Linux))
+            && (!self.config.hosted_fleet_routing
+                || (!gate_job && crate::hosted::validate(&request).is_ok()))
         {
-            self.storage
-                .hosted_route(id, crate::HostedJobState::new(&self.config))?;
+            let mut route = crate::HostedJobState::new(&self.config);
+            route.fleet_routed = self.config.hosted_fleet_routing;
+            route.fleet_no_spill = route.fleet_routed && request.network.is_some();
+            route.hosted_no_fallback = route.fleet_routed;
+            self.storage.hosted_route(id, route)?;
         }
         self.storage
             .retain_job(id, Some(request.workspace_key.clone()))?;
@@ -501,7 +506,7 @@ impl Motor {
                     tracing::info!(job_id = %id, result = released.err().map_or("released", |e| e.code()),
                         run_sent = state.run_sent, "hosted release");
                     if released == Err(crate::hosted::Error::Admitted) {
-                        if state.run_sent || (!state.repository_routed && state.placement.is_some())
+                        if state.run_sent || (!state.capacity_routed() && state.placement.is_some())
                         {
                             let (_, wake) = watch::channel(false);
                             return self.follow(id, 0, None, tx, wake).await;
@@ -538,7 +543,7 @@ impl Motor {
                 other => format!("{code}: {}", other.as_deref().unwrap_or("request refused")),
             })
         } else {
-            detail
+            self.with_spill_attempt(id, detail)
         };
         let detail = if self
             .hosted_state(id)
@@ -722,8 +727,8 @@ impl Motor {
         wake: watch::Receiver<bool>,
     ) -> io::Result<bool> {
         let (mut request, mut returns) = submission;
-        // A repository-routed job the broker could never place runs on the
-        // build server under the queue-wait limit it has left; see
+        // After a repository or fleet route gets no_host_fits, run on the build
+        // server with only the remaining queue-wait budget; see
         // `Storage::routed_direct_no_host_fits`.
         let wait = match self.storage.job(id) {
             Some(job) if job.routed_direct_reason.is_some() => job.queue_wait_limit_s,
@@ -808,7 +813,7 @@ impl Motor {
                     Err(crate::hosted::Error::NoHostFits(max_vcpus))
                         if self
                             .hosted_state(id)
-                            .is_some_and(|s| s.repository_routed && !s.run_sent) =>
+                            .is_some_and(|s| s.capacity_routed() && !s.run_sent) =>
                     {
                         // No hosted host can ever hold this job, so choosing
                         // hosted for it was wrong from the start. This undoes
@@ -817,7 +822,8 @@ impl Motor {
                         // so there is no lease to release or finish.
                         let spent_ms =
                             u64::try_from(spill_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        self.storage.routed_direct_no_host_fits(id, spent_ms)?;
+                        self.storage
+                            .routed_direct_no_host_fits(id, spent_ms, max_vcpus)?;
                         tracing::info!(job_id = %id, vcpus = request.weight_hint.unwrap_or(2),
                             max_vcpus = %max_vcpus.map_or_else(|| "unknown".to_owned(), |n| n.to_string()),
                             "hosted no_host_fits; routing to build server");
@@ -850,14 +856,14 @@ impl Motor {
                             crate::hosted::Error::Admitted
                                 if !self
                                     .hosted_state(id)
-                                    .is_some_and(|s| s.repository_routed && !s.run_sent) =>
+                                    .is_some_and(|s| s.capacity_routed() && !s.run_sent) =>
                             {
                                 return self.follow_inner(id, 0, None, tx, wake, spill_after).await
                             }
                             crate::hosted::Error::SandboxLost
                                 if !self
                                     .hosted_state(id)
-                                    .is_some_and(|s| s.repository_routed && !s.run_sent) =>
+                                    .is_some_and(|s| s.capacity_routed() && !s.run_sent) =>
                             {
                                 return self.lost_sandbox(id, tx).await.map(|_| false)
                             }
@@ -1287,6 +1293,12 @@ impl Motor {
                         .await
                         .map(|_| false);
                 }
+                let detail = if reason == RefusalReason::RunnerFull {
+                    self.with_hosted_max_vcpus(id, detail)
+                } else {
+                    detail
+                };
+                let detail = self.with_spill_attempt(id, detail);
                 let mut terminal =
                     TerminalRecord::new(id, Outcome::RefusedBeforeStart { reason }, 0, 0, 0)
                         .with_ran(Ran::None)
@@ -1453,6 +1465,67 @@ impl Motor {
         if self.hosted_state(id).is_some() {
             tracing::warn!(job_id = %id, step, cause = %cause, "hosted job stopped");
         }
+    }
+    /// A build-server `runner_full` refusal of a job that went there because
+    /// the broker answered `no_host_fits` names the largest size each route
+    /// serves: the build server's own detail, which names its limit, then
+    /// `hosted max_vcpus <n>` from the broker's answer, or `unknown` when the
+    /// answer named no number. The build server's part is shortened if the
+    /// whole would pass the detail size limit, so the hosted figure is kept.
+    /// Other jobs, including ones sent direct before any lease request, keep
+    /// the build server's detail unchanged.
+    fn with_hosted_max_vcpus(&self, id: Uuid, detail: Option<String>) -> Option<String> {
+        let Some(max_vcpus) = self
+            .storage
+            .job(id)
+            .and_then(|job| job.no_host_fits_max_vcpus())
+        else {
+            return detail;
+        };
+        let hosted = format!(
+            "; hosted max_vcpus {}",
+            max_vcpus.map_or_else(|| "unknown".to_owned(), |n| n.to_string())
+        );
+        let mut runner = detail.unwrap_or_else(|| "runner_full".into());
+        let mut end = runner
+            .len()
+            .min(REFUSAL_DETAIL_MAX_BYTES.saturating_sub(hosted.len()));
+        while !runner.is_char_boundary(end) {
+            end -= 1;
+        }
+        runner.truncate(end);
+        Some(runner + &hosted)
+    }
+    /// Name the earlier spill attempt in the refusal detail of a job that a
+    /// spill sent back to the build server. Such a job could not be placed on
+    /// a hosted runner and went back to the build-server queue under a new ID;
+    /// when it is then refused there, the caller learns that the hosted route
+    /// was already tried and why it failed (the broker code stored when the
+    /// job was resubmitted, such as `hosted_provisioning`), which bears on
+    /// whether to try again. `spill_attempted=<code>` goes after the build
+    /// server's own detail; if appending it would exceed the detail size
+    /// limit, the build server's detail is shortened to leave room for it.
+    /// Jobs never sent back keep the detail unchanged.
+    fn with_spill_attempt(&self, id: Uuid, detail: Option<String>) -> Option<String> {
+        let Some(code) = self.storage.job(id).and_then(|job| {
+            job.build_server_job_id?;
+            job.hosted?.hosted_code
+        }) else {
+            return detail;
+        };
+        let note = format!("spill_attempted={code}");
+        let Some(mut detail) = detail.filter(|d| !d.is_empty()) else {
+            return Some(bounded_detail(note));
+        };
+        let separator = "; ";
+        let mut end = detail
+            .len()
+            .min(REFUSAL_DETAIL_MAX_BYTES.saturating_sub(note.len() + separator.len()));
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+        Some(bounded_detail(detail + separator + &note))
     }
     /// The ID the build server knows this job by. It differs from the caller's
     /// job ID only after a spilled job whose hosted route failed before any Run
@@ -1941,6 +2014,10 @@ impl Motor {
                         self.shadows.terminal(id, &terminal);
                     }
                     terminal.refusal_detail = terminal.refusal_detail.map(bounded_detail);
+                    if !hosted && matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }) {
+                        terminal.refusal_detail =
+                            self.with_spill_attempt(id, terminal.refusal_detail.take());
+                    }
                     if hosted {
                         log_hosted_terminal(id, &terminal);
                     }
@@ -2620,6 +2697,10 @@ async fn emit(tx: &mpsc::Sender<io::Result<StreamRecord>>, record: StreamRecord)
 #[path = "queue_tests.rs"]
 mod queue_tests;
 
+#[cfg(test)]
+mod fleet_capacity_tests;
+#[cfg(test)]
+mod fleet_routing_tests;
 #[cfg(test)]
 mod repository_routing_tests;
 

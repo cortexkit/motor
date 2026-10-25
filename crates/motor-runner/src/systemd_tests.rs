@@ -50,17 +50,31 @@ fn installed_units_reserve_host_memory_and_protect_user_runners() {
 
 #[test]
 fn missing_or_unbounded_job_slice_refuses_execution() {
-    for (text, valid) in [
-        ("", false),
-        ("MemoryHigh=infinity\nMemoryMax=infinity\n", false),
-        ("MemoryHigh=100\nMemoryMax=100\n", false),
-        ("MemoryHigh=0\nMemoryMax=100\n", false),
-        ("MemoryHigh=75\nMemoryMax=85\n", true),
+    for (text, budget) in [
+        ("", None),
+        ("MemoryHigh=infinity\nMemoryMax=infinity\n", None),
+        ("MemoryHigh=100\nMemoryMax=100\n", None),
+        ("MemoryHigh=0\nMemoryMax=100\n", None),
+        (
+            "MemoryHigh=75\nMemoryMax=85\n",
+            Some(JobMemoryBudget { max: 85, high: 75 }),
+        ),
     ] {
         with_process_hook(Box::new(move |_| Ok(output(text))), || {
-            assert_eq!(require_job_memory_budget().is_ok(), valid, "{text}");
+            assert_eq!(read_job_memory_budget().ok(), budget, "{text}");
         });
     }
+}
+
+/// Admission keeps only the remembered ceiling, and the placeholder for "no
+/// reading" must never look like a real one.
+#[test]
+fn a_remembered_slice_ceiling_reads_back_as_a_budget() {
+    assert_eq!(
+        JobMemoryBudget::from_max(25_769_803_776).map(|budget| budget.max),
+        Some(25_769_803_776)
+    );
+    assert_eq!(JobMemoryBudget::from_max(NO_JOB_MEMORY_BUDGET), None);
 }
 
 #[test]

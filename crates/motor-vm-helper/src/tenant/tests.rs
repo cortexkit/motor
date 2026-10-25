@@ -10,6 +10,7 @@ pub(crate) fn registry(name: &str) -> Registry {
         suspend: root.join("suspend"),
         image_version: "v1".into(),
         vcpu_ceiling: 2,
+        max_weight: None,
         guest_ram_mib: 18432,
         disk_quota_bytes: 21474836480,
         cpuset: "0-1".into(),
@@ -54,6 +55,10 @@ struct Fake {
     snapshot_uncertain: bool,
     stop_failures: u32,
     record_failures: u32,
+    start_failure: Option<StartRefusalCase>,
+    oom_failures: u32,
+    activation: Option<ResizeActivation>,
+    activation_failure: &'static str,
 }
 impl Default for Fake {
     fn default() -> Self {
@@ -72,6 +77,10 @@ impl Default for Fake {
             snapshot_uncertain: false,
             stop_failures: 0,
             record_failures: 0,
+            start_failure: None,
+            oom_failures: 0,
+            activation: None,
+            activation_failure: "",
         }
     }
 }
@@ -93,7 +102,444 @@ fn key(generation: u64) -> SnapshotKey {
         generation,
     }
 }
+
+fn staged_activation() -> ResizeActivation {
+    ResizeActivation::parse(include_bytes!(
+        "../../tests/vectors/runner-args-staged.json"
+    ))
+    .unwrap()
+}
+
+fn start_and_activate(c: &mut Controller<Fake>) -> Response {
+    let prepared = c.handle("a", Operation::PrepareStart).unwrap();
+    if matches!(prepared.reply, Reply::StartRefused { .. }) {
+        return prepared;
+    }
+    c.handle("a", Operation::Activate).unwrap()
+}
+
+#[test]
+fn legacy_start_and_adopt_cannot_expose_a_staged_tenant_as_running() {
+    for running in [false, true] {
+        for op in [Operation::Ensure, Operation::Restore, Operation::Adopt] {
+            let mut c = Controller(Fake {
+                running,
+                activation: Some(staged_activation()),
+                ..Fake::default()
+            });
+            assert!(matches!(
+                c.handle("a", op).unwrap().reply,
+                Reply::StartRefused {
+                    case: StartRefusalCase::Activation,
+                    ..
+                }
+            ));
+            assert!(c.0.activation.is_some());
+            assert!(!c
+                .0
+                .calls
+                .iter()
+                .any(|s| s == "apply-resize" || s == "load-base-size-tap"));
+        }
+    }
+}
+
+#[test]
+fn pending_activation_fences_job_relays_and_snapshot_but_not_control() {
+    let mut c = Controller(Fake {
+        running: true,
+        activation: Some(staged_activation()),
+        ..Fake::default()
+    });
+    for op in [
+        Operation::Relay(52),
+        Operation::Relay(53),
+        Operation::Suspend,
+    ] {
+        assert!(c.handle("a", op).is_err());
+    }
+    assert!(c.handle("a", Operation::Relay(54)).is_ok());
+    assert!(!c.0.calls.iter().any(|s| s == "snapshot" || s == "prepare"));
+    c.0.fail = "staged-read";
+    assert!(c.handle("a", Operation::Relay(52)).is_err());
+}
+
+#[test]
+fn activation_is_tenant_only_and_idempotent_without_pending_intent() {
+    let request = json!({"op":"activate", "tenant":"a"});
+    assert!(serde_json::from_value::<crate::Request>(request.clone()).is_ok());
+    let mut untrusted = request;
+    untrusted["runner_args"] = json!("untrusted");
+    assert!(serde_json::from_value::<crate::Request>(untrusted).is_err());
+    let mut c = Controller(Fake::default());
+    for _ in 0..2 {
+        assert!(matches!(
+            c.handle("a", Operation::Activate).unwrap().reply,
+            Reply::Tenant { running: false, .. }
+        ));
+    }
+    assert_eq!(c.0.calls, ["registry", "registry"]);
+}
+
+#[test]
+fn unreadable_staged_activation_refuses_before_any_snapshot_or_boot_mutation() {
+    let mut c = Controller(Fake {
+        fail: "staged-read",
+        saved: Some(key(4)),
+        ..Fake::default()
+    });
+    assert!(matches!(
+        c.handle("a", Operation::Ensure).unwrap().reply,
+        Reply::StartRefused {
+            case: StartRefusalCase::Activation,
+            ..
+        }
+    ));
+    assert_eq!(c.0.calls, ["registry", "staged-read"]);
+    assert_eq!(c.0.generation, 4);
+    assert_eq!(c.0.saved, Some(key(4)));
+    assert!(!c.0.running && !c.0.marker);
+}
+
+#[test]
+fn staged_activation_waits_for_explicit_activation_then_syncs_checks_and_completes() {
+    let mut c = Controller(Fake {
+        activation: Some(staged_activation()),
+        saved: Some(key(4)),
+        ..Fake::default()
+    });
+    let reply = c.handle("a", Operation::PrepareStart).unwrap().reply;
+    assert!(matches!(
+        reply,
+        Reply::Tenant {
+            running: true,
+            restored: false,
+            ..
+        }
+    ));
+    assert!(c.0.activation.is_some());
+    assert!(!c.0.calls.iter().any(|s| s == "apply-resize"));
+    c.handle("a", Operation::Activate).unwrap();
+    assert_eq!(
+        c.0.calls,
+        [
+            "registry",
+            "egress",
+            "load-base-size-tap",
+            "drive",
+            "unlink-fsync",
+            "generation-fsync",
+            "resume",
+            "registry",
+            "apply-resize",
+            "agent-reply",
+            "disk-fsync",
+            "post-grow-space",
+            "staged-unlink-fsync"
+        ]
+    );
+    assert!(c.0.activation.is_none());
+}
+
+#[test]
+fn activation_without_quota_growth_never_probes_space() {
+    let mut activation = staged_activation();
+    activation.quota_grew = false;
+    let mut c = Controller(Fake {
+        activation: Some(activation),
+        space: 0,
+        ..Fake::default()
+    });
+    assert!(matches!(
+        start_and_activate(&mut c).reply,
+        Reply::Tenant { running: true, .. }
+    ));
+    assert!(!c.0.calls.iter().any(|s| s == "post-grow-space"));
+    assert!(c.0.activation.is_none());
+}
+
+#[test]
+fn activation_guest_and_host_failures_cleanly_stop_and_redeliver() {
+    for failure in [
+        "xfs-grow",
+        "args-write",
+        "file-fsync",
+        "tenant-fsync",
+        "syncfs",
+        "disk-fsync",
+        "staged-unlink-fsync",
+    ] {
+        let guest_failure = !matches!(failure, "disk-fsync" | "staged-unlink-fsync");
+        let mut c = Controller(Fake {
+            activation: Some(staged_activation()),
+            activation_failure: if guest_failure { failure } else { "" },
+            fail: if guest_failure { "" } else { failure },
+            ..Fake::default()
+        });
+        let reply = start_and_activate(&mut c).reply;
+        assert!(
+            matches!(
+                reply,
+                Reply::StartRefused {
+                    case: StartRefusalCase::Activation,
+                    ..
+                }
+            ),
+            "{failure}: {reply:?}"
+        );
+        assert!(!c.0.running && !c.0.marker && !c.0.unclean, "{failure}");
+        assert!(c.0.activation.is_some(), "{failure}");
+        assert!(c.0.calls.ends_with(&[
+            "prepare".into(),
+            "stop".into(),
+            "clear-running-marker".into()
+        ]));
+        c.0.calls.clear();
+        c.0.fail = "";
+        c.0.activation_failure = "";
+        start_and_activate(&mut c);
+        assert!(c.0.running && c.0.activation.is_none(), "{failure}");
+        assert_eq!(c.0.calls.iter().filter(|s| *s == "apply-resize").count(), 1);
+        assert!(c.0.calls.iter().any(|s| s == "load-base-size-tap"));
+    }
+}
+
+#[test]
+fn post_grow_refuses_160_gib_and_one_byte_short_then_redelivers_at_exact_requirement() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    for space in [160 * GIB, 208 * GIB - 1] {
+        let mut c = Controller(Fake {
+            activation: Some(staged_activation()),
+            space,
+            ..Fake::default()
+        });
+        assert!(matches!(
+            start_and_activate(&mut c).reply,
+            Reply::StartRefused {
+                case: StartRefusalCase::PostGrowSpace,
+                ..
+            }
+        ));
+        assert!(!c.0.running && !c.0.marker && !c.0.unclean);
+        assert!(c.0.activation.is_some());
+        assert!(!c.0.calls.iter().any(|s| s == "staged-unlink-fsync"));
+        c.0.space = 208 * GIB;
+        assert!(matches!(
+            start_and_activate(&mut c).reply,
+            Reply::Tenant { running: true, .. }
+        ));
+        assert!(c.0.activation.is_none());
+        assert_eq!(c.0.calls.iter().filter(|s| *s == "apply-resize").count(), 2);
+    }
+}
+
+#[test]
+fn activation_prepare_stop_failure_preserves_recovery_and_redelivers() {
+    let mut c = Controller(Fake {
+        activation: Some(staged_activation()),
+        activation_failure: "xfs-grow",
+        fail: "prepare",
+        ..Fake::default()
+    });
+    assert!(matches!(
+        start_and_activate(&mut c).reply,
+        Reply::StartRefused { .. }
+    ));
+    assert!(!c.0.running);
+    assert!(c.0.marker && c.0.unclean && c.0.activation.is_some());
+    assert!(c
+        .0
+        .calls
+        .ends_with(&["prepare".into(), "unclean-fsync".into(), "stop".into()]));
+    c.0.saved = Some(key(c.0.generation));
+    c.0.calls.clear();
+    c.0.fail = "";
+    c.0.activation_failure = "";
+    assert!(matches!(
+        start_and_activate(&mut c).reply,
+        Reply::Tenant {
+            running: true,
+            restored: false,
+            recovery_required: true,
+            ..
+        }
+    ));
+    assert!(c.0.calls.iter().any(|s| s == "load-base-size-tap"));
+    assert!(c.0.calls.iter().any(|s| s == "apply-resize"));
+    assert!(c.0.activation.is_none());
+}
+
+#[test]
+fn activation_failed_stop_cannot_be_adopted_on_the_next_ensure() {
+    let mut c = Controller(Fake {
+        activation: Some(staged_activation()),
+        activation_failure: "xfs-grow",
+        stop_failures: 2,
+        ..Fake::default()
+    });
+    assert!(matches!(
+        start_and_activate(&mut c).reply,
+        Reply::StartRefused { .. }
+    ));
+    assert!(c.0.running && c.0.activation.is_some());
+    c.0.activation_failure = "";
+    assert!(matches!(
+        start_and_activate(&mut c).reply,
+        Reply::StartRefused { .. }
+    ));
+    assert!(c.0.activation.is_some());
+    assert!(matches!(
+        start_and_activate(&mut c).reply,
+        Reply::Tenant {
+            running: true,
+            restored: false,
+            ..
+        }
+    ));
+    assert!(c.0.activation.is_none());
+    assert_eq!(
+        c.0.calls
+            .iter()
+            .filter(|s| *s == "load-base-size-tap")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn registry_budget_defaults_without_rewriting_keyless_records() {
+    let r = registry("a");
+    let bytes = serde_json::to_value(&r).unwrap();
+    assert!(bytes.get("max_weight").is_none());
+    let old: Registry = serde_json::from_value(bytes.clone()).unwrap();
+    assert_eq!(old.budget(), old.vcpu_ceiling);
+    assert_eq!(serde_json::to_value(&old).unwrap(), bytes);
+    let mut explicit = bytes;
+    explicit["max_weight"] = json!(64);
+    let r: Registry = serde_json::from_value(explicit.clone()).unwrap();
+    r.validate("a").unwrap();
+    assert_eq!(r.budget(), 64);
+    for invalid in [
+        json!(0),
+        json!(1),
+        json!(4294967296_u64),
+        json!("64"),
+        json!(null),
+        json!(1.5),
+    ] {
+        explicit["max_weight"] = invalid;
+        assert!(!serde_json::from_value::<Registry>(explicit.clone())
+            .is_ok_and(|r| r.validate("a").is_ok()));
+    }
+}
+
+#[test]
+fn start_refusals_precede_wake_and_do_not_disable_maintenance_operations() {
+    for case in [
+        StartRefusalCase::CapacityJson,
+        StartRefusalCase::Fit,
+        StartRefusalCase::LiveCap,
+        StartRefusalCase::DropIn,
+        StartRefusalCase::ResizeJournal,
+    ] {
+        let mut c = Controller(Fake {
+            start_failure: Some(case),
+            saved: Some(key(4)),
+            ..Fake::default()
+        });
+        for op in [Operation::Ensure, Operation::Restore] {
+            let reply = c.handle("a", op).unwrap().reply;
+            assert!(matches!(reply, Reply::StartRefused { case: actual, .. } if actual == case));
+            assert_eq!(c.0.calls, ["check-start"]);
+            assert_eq!(c.0.generation, 4);
+            assert_eq!(c.0.saved, Some(key(4)));
+            assert!(!c.0.running && !c.0.marker && !c.0.present);
+            c.0.calls.clear();
+        }
+        assert!(matches!(
+            c.handle("a", Operation::Stop).unwrap().reply,
+            Reply::Tenant { running: false, .. }
+        ));
+        assert!(matches!(
+            c.handle("a", Operation::Metrics).unwrap().reply,
+            Reply::TenantMetrics { .. }
+        ));
+        assert!(matches!(
+            c.handle("a", Operation::Remove).unwrap().reply,
+            Reply::Removed { .. }
+        ));
+        assert_eq!(
+            c.0.calls,
+            ["registry", "registry", "metrics", "registry", "remove"]
+        );
+    }
+}
+
+#[test]
+fn oom_refusal_never_falls_back_or_changes_snapshots_and_generation() {
+    for saved in [false, true] {
+        for failure in ["oom write", "oom readback"] {
+            for count in [1, u32::MAX] {
+                let mut c = Controller(Fake {
+                    saved: saved.then(|| key(4)),
+                    fail: failure,
+                    oom_failures: count,
+                    ..Fake::default()
+                });
+                let response = c.handle("a", Operation::Ensure).unwrap();
+                let reply = serde_json::to_value(response.reply).unwrap();
+                assert_eq!(reply["result"], "start_refused");
+                assert_eq!(reply["case"], "oom");
+                assert!(reply["message"].as_str().unwrap().contains(failure));
+                assert_eq!(c.0.saved, saved.then(|| key(4)));
+                assert_eq!(c.0.generation, 4);
+                assert!(!c.0.running && !c.0.marker && !c.0.present);
+                let expected_load = if saved {
+                    "load-saved-tap"
+                } else {
+                    "load-base-size-tap"
+                };
+                assert_eq!(
+                    c.0.calls,
+                    [
+                        "registry",
+                        "egress",
+                        expected_load,
+                        "stop",
+                        "clear-running-marker"
+                    ]
+                );
+                assert!(!c.0.calls.iter().any(|call| matches!(
+                    call.as_str(),
+                    "unlink-fsync" | "generation-fsync" | "resume" | "drive"
+                )));
+                if count == 1 {
+                    assert!(
+                        matches!(c.handle("a", Operation::Restore).unwrap().reply, Reply::Tenant { running: true, restored, generation: 5, .. } if restored == saved)
+                    );
+                } else {
+                    assert!(matches!(
+                        c.handle("a", Operation::Restore).unwrap().reply,
+                        Reply::StartRefused {
+                            case: StartRefusalCase::Oom,
+                            ..
+                        }
+                    ));
+                    assert_eq!(c.0.generation, 4);
+                    assert_eq!(c.0.saved, saved.then(|| key(4)));
+                }
+            }
+        }
+    }
+}
 impl Backend for Fake {
+    fn check_start(&mut self, _: &str) -> std::result::Result<(), StartRefusal> {
+        if let Some(case) = self.start_failure {
+            self.calls.push("check-start".into());
+            return Err(start_refused(case, "injected failure"));
+        }
+        Ok(())
+    }
     fn unclean(&mut self, _: &Registry) -> Result<bool> {
         Ok(self.unclean)
     }
@@ -155,7 +601,7 @@ impl Backend for Fake {
     fn snapshot_uncertain(&self, _: &str) -> bool {
         self.snapshot_uncertain
     }
-    fn load(&mut self, _: &str, _: &Registry, saved: bool) -> Result<()> {
+    fn load(&mut self, _: &str, _: &Registry, saved: bool) -> StartResult<()> {
         self.running = true;
         // The real backend writes the marker just before the VMM spawns.
         self.marker = true;
@@ -163,7 +609,39 @@ impl Backend for Fake {
             "load-saved-tap"
         } else {
             "load-base-size-tap"
-        })
+        })?;
+        if self.oom_failures > 0 {
+            self.oom_failures -= 1;
+            #[cfg(target_os = "linux")]
+            {
+                return crate::linux::tenant::guarded_snapshot_load(
+                    PathBuf::from("/no-api-on-refused-load").as_path(),
+                    if saved { "suspend" } else { "base" },
+                    "mtap1",
+                    || {
+                        crate::linux::tenant::protect_vmm_with(
+                            |name| {
+                                if name == "comm" {
+                                    Ok("firecracker\n".into())
+                                } else {
+                                    Err(std::io::Error::other("injected read failure"))
+                                }
+                            },
+                            |_| {
+                                if self.fail == "oom write" {
+                                    Err(std::io::Error::other("injected write failure"))
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        )
+                    },
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
+            return Err(start_refused(StartRefusalCase::Oom, self.fail).into());
+        }
+        Ok(())
     }
     fn drive(&mut self, _: &str, _: &Registry) -> Result<()> {
         self.call("drive")
@@ -179,6 +657,75 @@ impl Backend for Fake {
     }
     fn resume(&mut self, _: &str) -> Result<()> {
         self.call("resume")
+    }
+    fn staged_resize(&mut self, _: &Registry) -> Result<Option<ResizeActivation>> {
+        if self.fail == "staged-read" {
+            self.call("staged-read")?;
+        }
+        Ok(self.activation.clone())
+    }
+    fn apply_resize(&mut self, _: &str, activation: &ResizeActivation) -> Result<()> {
+        self.call("apply-resize")?;
+        // Only the Linux branch below sends it to a fake guest.
+        let _ = activation;
+        #[cfg(target_os = "linux")]
+        {
+            use std::{
+                io::{Read, Write},
+                os::unix::net::UnixStream,
+                time::Duration,
+            };
+            let (client, mut server) = UnixStream::pair()?;
+            let args = activation.runner_args.clone();
+            let failure = self.activation_failure;
+            let thread = std::thread::spawn(move || {
+                let mut header = [0; 4];
+                server.read_exact(&mut header).unwrap();
+                let mut bytes = vec![0; u32::from_be_bytes(header) as usize];
+                server.read_exact(&mut bytes).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                    json!({"op":"apply_resize", "runner_args":args})
+                );
+                let reply = if failure.is_empty() {
+                    json!({"ok":true})
+                } else {
+                    json!({"ok":false,"error":failure})
+                };
+                let reply = serde_json::to_vec(&reply).unwrap();
+                server
+                    .write_all(&(reply.len() as u32).to_be_bytes())
+                    .unwrap();
+                server.write_all(&reply).unwrap();
+            });
+            let result = crate::linux::tenant::exchange_agent(
+                client,
+                &json!({"op":"apply_resize", "runner_args":activation.runner_args}),
+                Duration::from_secs(1),
+            );
+            thread.join().unwrap();
+            result?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        if !self.activation_failure.is_empty() {
+            return Err(Error(self.activation_failure.into()));
+        }
+        self.call("agent-reply")
+    }
+    fn sync_disk(&mut self, _: &str) -> Result<()> {
+        self.call("disk-fsync")
+    }
+    fn post_grow_check(&mut self, _: &Registry) -> Result<()> {
+        self.call("post-grow-space")?;
+        if self.space < 208 * 1024 * 1024 * 1024 {
+            return Err(Error("post-grow operating requirement".into()));
+        }
+        Ok(())
+    }
+    fn complete_resize(&mut self, _: &Registry, _: &ResizeActivation) -> Result<()> {
+        self.call("staged-unlink-fsync")?;
+        self.activation = None;
+        Ok(())
     }
     fn prepare(&mut self, _: &str) -> Result<()> {
         self.call("prepare")?;

@@ -267,9 +267,15 @@ exactly that URL. It fails with git before 2.46.
 
 ## Filesystem choice
 
-Boat's measured ext4 root rejects FICLONE (`EOPNOTSUPP`). Use a **64 GiB sparse,
-loop-mounted XFS image** on that disk, with `reflink=1`, not a plain-copy runner
-fallback. The state, warm workspaces, JS install caches and `/Users` workspace
+Boat's measured ext4 root rejects FICLONE (`EOPNOTSUPP`). Use a **sparse,
+loop-mounted XFS image sized to the build sandbox's root filesystem total**,
+with `reflink=1`, not a plain-copy runner fallback. Prepared images are built
+fresh on `large`; sparse capacity does not preallocate root blocks. Restoring
+on a smaller `default` root leaves the apparent loop size unchanged, but job
+quotas remain bounded by real free space on both filesystems. Installation never
+resizes or reformats an existing image, and boot never resizes it. A restore on a
+larger root could leave XFS as the limiting view; rebuild on that larger size to
+use the additional capacity. The state, warm workspaces, JS install caches and `/Users` workspace
 bind all share that filesystem. The recipe actually clones random nonempty data
 between the state mount and workspace bind, and checks the bytes. A loop-image
 or ioctl failure aborts installation rather than changing copy semantics.
@@ -712,13 +718,18 @@ systemd version's private-temporary backing. The live probe verifies project IDs
 on both spellings. Binds of an unexpected
 filesystem fail setup, rather than silently escaping the quota.
 
-The **total** hard block cap is at most 32 GiB, calculated from
+The **total** hard block cap has no fixed byte ceiling. It is calculated from
 `min(XFS available bytes, / available bytes) - provisional reserve - replay tail
 allowance`, rounded down to 512 bytes. The **24-GiB reserve is provisional**,
 not an empirically established snapshot requirement. Initial logical usage
 consumes the cap; it never increases it. Reflinked baseline extents can become
 physical CoW allocations or release logical charge without freeing physical
 space, so initial-plus-growth accounting is unsafe even for sequential jobs.
+`installed_quota_uses_both_disks_above_32gib_without_initial_credit` checks the
+installed hard limit on either limiting filesystem, including block rounding.
+The recipe test `test_fresh_state_image_is_sparse_and_matches_build_root_total`
+checks that the backing file uses total root geometry, not a fixed size or free
+space, and allocates no data blocks.
 
 A reused baseline leaving under 8 GiB of growth is evicted through the same
 owned cache-removal/catalog path as idle eviction, then materialized cold once.
@@ -800,7 +811,9 @@ refusals are proved by the operator probe with successful unfiltered root
 FSSETXATTR controls;
 the job then fills the same directory whose inheritance it could not clear.
 When job-side refusal checks pass but the unfiltered root control reports
-ENOSYS for file_setattr, that live case is INCONCLUSIVE rather than PASS.
+ENOSYS for file_setattr, that live case is INCONCLUSIVE rather than PASS. It does
+not block the probe verdict only when that control shows the syscall unsupported
+with errno 38 (Linux ENOSYS); see the boat-probe README.
 
 ## Fast startup checks and failure evidence
 
@@ -847,6 +860,38 @@ waits for hydration, installs the identity with the broker's exact commands,
 checks readiness and disk identity/order, runs real jobs, and repeats after
 stop/resume. Only the probe-only bridge is explicitly started to transport real
 jobs. The source snapshot is borrowed and never deleted by cleanup.
+
+Boat stops a sandbox 30 minutes after it starts, and the whole qualification
+takes longer, so it is split into phases. Each phase restores the same image
+into its own fresh sandbox. The probe asks Boat to delete that sandbox before the
+next phase starts, and the run's final cleanup retries any deletion that did not finish:
+
+| `--verify-phase` | What it proves | Expected sandbox time |
+| --- | --- | --- |
+| `core` | prepared-clone identity and readiness, storage, host, parity and every real job; then a plain idle stop/completed archive, resume, endpoint readiness and one normal job, with no quota fill | about 8 minutes plus the plain stop/resume (not yet measured) |
+| `disk-quota` | quota lanes, stop with a quota-sized target, resume, readiness recovery, backing-file shrink, then every real job again after the resume | about 18–20 minutes |
+| `idle` | Boat's idle reclaim (up to 17 minutes idle), then a real job | about 20 minutes |
+
+These times are estimates from the phase contents. Each run measures its own
+steps in `runner_host.section_timings` and the findings' "Section timings" table.
+Without `--verify-phase`, one run executes all three in that order and writes one
+verdict that passes only when every phase ran and passed; only such a run sets
+`verdict.image_qualified` to true. A phase that fails is recorded and the next phase
+still runs, except after Boat refuses the size or the run is interrupted, which stops
+the sequence. With `--verify-phase`, only the named phase runs and the others are
+reported `not_run`, never passed. That run's verdict covers the named phase alone and
+`verdict.image_qualified` stays false; separate runs are not combined, so the operator
+qualifies the image from one passing run of each phase. `--max-minutes` applies to
+each phase's sandbox separately.
+
+Core's required plain control is recorded under `runner_host.core_stop_resume`,
+including accepted-response-to-completed timing and pre-stop disk allocation.
+For the separate full-quota diagnostic, `--quota-stop-wait-s` changes its local
+stop-wait cap (default 900 seconds), still bounded by the remaining 30-minute
+phase budget. Lifecycle and retained-job/allocation samples are checkpointed
+about every 30 seconds. See the [probe's wait-budget and sampling details](../boat-probe/README.md#disk-quota-qualification)
+before choosing a longer wait; the flag extends neither the provider TTL nor
+the phase budget, and timeout still fails qualification.
 
 Every real-job fixture includes an npm lockfile and a locally generated tarball
 dependency containing regular files. No registry or project-specific dependency

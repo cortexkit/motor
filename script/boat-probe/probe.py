@@ -52,6 +52,22 @@ class ProbeError(Exception):
     pass
 
 
+def sandbox_lifecycle(item):
+    """Keep stop/snapshot diagnostics without connection URLs or login metadata."""
+    return {key: item[key] for key in ('id', 'state', 'error', 'health', 'healthReason', 'stop',
+                                     'snapshotAvailable', 'snapshotCompletedAt', 'snapshotVerifiedAt',
+                                     'lastSnapshotAttemptAt', 'lastSnapshotStatus') if key in item}
+
+
+class SandboxWaitTimeout(ProbeError):
+    def __init__(self, sid, states, seconds, polls, last, progress=None):
+        self.evidence = {'sandbox_id': sid, 'expected_states': sorted(states), 'seconds': seconds,
+                         'polls': polls, 'last_sandbox': sandbox_lifecycle(last or {})}
+        self.evidence.update(progress or {})
+        super().__init__('timed out waiting for sandbox ' + sid + '; '
+                         + json.dumps({key: value for key, value in self.evidence.items() if key != 'samples'}))
+
+
 class SnapshotSizeBound(ProbeError):
     """Boat rejected a smaller size for a snapshot saved on a larger one: it refused the
     create, or accepted it and then failed restoring the snapshot as too small."""
@@ -208,13 +224,14 @@ class Probe:
     cargo_seed_sha256: 'str | None'
     cargo_seed_archive: 'Path | None'
 
-    def __init__(self, client, data, checkpoint, port=9443, minutes=30, size="large"):
+    def __init__(self, client, data, checkpoint, port=9443, minutes=30, size="large", quota_stop_wait_s=900):
         if size not in SIZES:
             raise ProbeError("unknown Boat sandbox size: " + str(size))
         self.client, self.data, self.checkpoint, self.port = client, data, checkpoint, port
         self.size = size
         self.deadline = time.monotonic() + minutes * 60
         self.minutes = minutes
+        self.quota_stop_wait_s = quota_stop_wait_s
         self.base = ".boat-probe-" + data["run_id"]
         self.source = Path(__file__).with_name("guest.py").read_bytes()
 
@@ -223,17 +240,51 @@ class Probe:
             raise ProbeError("measurement wall-clock budget expired; entering cleanup")
         return self.client.request(*args, **kwargs)
 
-    def wait_sandbox(self, sid, states):
-        until = min(self.deadline, time.monotonic() + 900)
+    def wait_sandbox(self, sid, states, timeout_s=900, *, observation=None, on_sample=None):
+        started = time.monotonic()
+        until = min(self.deadline, started + timeout_s)
+        progress = observation if observation is not None else {}
+        progress.update(sandbox_id=sid, expected_states=sorted(states), requested_wait_seconds=timeout_s,
+                        remaining_budget_seconds=max(0, self.deadline - started),
+                        effective_wait_seconds=max(0, until - started), budget_limited=self.deadline < started + timeout_s,
+                        samples=[])
+        next_sample = started
+        polls, item = 0, None
+        sample = None
+        def capture(sample, item):
+            if on_sample is not None:
+                try:
+                    observed = on_sample(item)
+                    if not isinstance(observed, dict):
+                        raise ValueError('sample observer did not return an object')
+                    sample['retained_job'] = observed
+                except Exception as error:
+                    sample['retained_job'] = {'status': 'unavailable', 'error': str(error)}
+            progress['samples'].append(sample)
+            self.checkpoint()
         while time.monotonic() < until:
             item = sandbox(self.request("GET", "/sandboxes/" + sid))
-            if item.get("state") in states and ("archived" not in states or
-                                                (item.get("stop") or {}).get("status") == "completed"):
+            polls += 1
+            now = time.monotonic()
+            complete = item.get('state') in states and ('archived' not in states or
+                                                       (item.get('stop') or {}).get('status') == 'completed')
+            failed = item.get('state') in {'error', 'cancelled'}
+            progress.update(polls=polls, seconds=now - started, last_sandbox=sandbox_lifecycle(item))
+            sample = {'seconds': now - started, 'at': datetime.now(timezone.utc).isoformat(),
+                      'sandbox': progress['last_sandbox']}
+            if now >= next_sample or complete or failed:
+                capture(sample, item)
+                next_sample = started + (int((now - started) // 30) + 1) * 30
+            if complete:
                 return item
-            if item.get("state") in {"error", "cancelled"}:
+            if failed:
                 raise ProbeError("sandbox entered failure state: " + json.dumps(item))
             time.sleep(2)
-        raise ProbeError("timed out waiting for sandbox " + sid)
+        if sample is not None and progress['samples'][-1] != sample:
+            capture(sample, item)
+        progress.update(polls=polls, seconds=time.monotonic() - started, last_sandbox=sandbox_lifecycle(item or {}))
+        self.checkpoint()
+        raise SandboxWaitTimeout(sid, states, progress['seconds'], polls, item, progress)
 
     def wait_hydrated(self, sid):
         while True:
@@ -263,13 +314,17 @@ class Probe:
         # Boat does not time-limit detached commands; deletion bounds abandoned work.
         until = min(self.deadline, time.monotonic() + poll_seconds + 20)
         while time.monotonic() < until:
-            status = self.request("GET", f"/sandboxes/{sid}/commands/{process}?tailBytes=8388608")
+            status = self.command_status(sid, process)
             if status.get("status") == "exited":
                 return status
             if status.get("status") == "lost":
                 raise ProbeError("Boat lost detached command after agent restart")
             time.sleep(2)
         raise ProbeError("timed out polling command " + str(process))
+
+    def command_status(self, sid, process):
+        """One status poll of a detached command, with up to 8 MiB of its output."""
+        return self.request("GET", f"/sandboxes/{sid}/commands/{process}?tailBytes=8388608")
 
     def guest(self, sid, phase, timeout=90, version="1.85.1", port=None):
         encoded = base64.b64encode(self.source).decode()
@@ -554,13 +609,94 @@ def cleanup_state(data):
     return "purge_pending" if pending else "complete"
 
 
+# Linux's ENOSYS. The evidence comes from a Linux guest, so this is compared as
+# a number rather than with the operator machine's errno module (78 on macOS).
+LINUX_ENOSYS = 38
+FILE_SETATTR_CHECK = re.compile(r'disk_quota\.[^.]+\.file_setattr_refusal')
+
+
+def tolerated_inconclusive(row):
+    """Why an INCONCLUSIVE check does not block the verdict, or None when it does.
+
+    Two cases only. An unproven provider idle reclaim is an observation gap,
+    not a Motor failure. On a kernel without file_setattr the job's ENOSYS
+    cannot show that the seccomp filter refused the call, so that check is
+    INCONCLUSIVE; it is tolerated only when the check's own root control
+    proves the kernel lacks the syscall (not supported, errno ENOSYS): then no
+    job can call it either, and the seccomp rule that denies it on newer
+    kernels is covered by the runner's own tests. A missing or different
+    control keeps the check blocking."""
+    if row.get('status') != 'INCONCLUSIVE':
+        return None
+    name = row.get('name', '')
+    if not isinstance(name, str):
+        return None
+    if name.endswith('.idle_reclaim_observed'):
+        return 'idle reclaim not observed during the wait; provider observation gap'
+    if FILE_SETATTR_CHECK.fullmatch(name):
+        evidence = row.get('evidence')
+        control = evidence.get('control') if isinstance(evidence, dict) else None
+        if (isinstance(control, dict) and control.get('file_setattr_supported') is False
+                and type(control.get('file_setattr_errno')) is int
+                and control['file_setattr_errno'] == LINUX_ENOSYS):
+            release = control.get('kernel_release')
+            kernel = release if isinstance(release, str) and release else 'unknown'
+            return f'file_setattr absent on kernel {kernel} (ENOSYS); not applicable'
+    return None
+
+
 def required_checks_passed(checks):
-    # An unproven provider reclaim is an observation gap, not a Motor failure.
-    # Parity, storage and every other check still require a positive PASS.
+    # Every check needs a positive PASS, except an INCONCLUSIVE that
+    # tolerated_inconclusive explains.
     return bool(checks) and all(
-        row.get('status') == 'PASS' or (row.get('status') == 'INCONCLUSIVE'
-                                      and row.get('name', '').endswith('.idle_reclaim_observed'))
+        row.get('status') == 'PASS' or tolerated_inconclusive(row) is not None
         for row in checks)
+
+
+# --verify-prepared-image phases, in the order a run without --verify-phase
+# runs them. Each restores the image into its own sandbox, because Boat stops a
+# sandbox 30 minutes after it starts and the whole verify takes longer.
+VERIFY_PHASES = ('core', 'disk-quota', 'idle')
+
+
+def selected_verify_phases(phase):
+    """The phases a run executes: the one --verify-phase names, or all of them in order."""
+    if phase is None:
+        return VERIFY_PHASES
+    if phase not in VERIFY_PHASES:
+        raise ProbeError('unknown verify phase: ' + str(phase))
+    return (phase,)
+
+
+def verify_phase_records(requested):
+    """One record per verify phase, all not run yet; `requested` are the ones this run will try."""
+    return {name: {'requested': name in requested, 'ran': False, 'status': 'not_run'} for name in VERIFY_PHASES}
+
+
+def verify_phase_status(record, checks):
+    """'not_run', 'passed', 'inconclusive', 'failed' or 'snapshot_size_bound' for one verify phase.
+
+    Only a phase that started, finished without an error and recorded checks can
+    pass; 'inconclusive' means no check failed but one that tolerated_inconclusive
+    does not explain could not decide, so the phase did not pass."""
+    if record.get('ran') is not True:
+        return 'not_run'
+    if record.get('snapshot_size_bound'):
+        return 'snapshot_size_bound'
+    if record.get('error') or record.get('completed') is not True or not checks:
+        return 'failed'
+    if any(row.get('status') not in ('PASS', 'INCONCLUSIVE') for row in checks):
+        return 'failed'
+    return 'passed' if required_checks_passed(checks) else 'inconclusive'
+
+
+def verify_phase_outcomes(records):
+    """Each verify phase's status, read so that a phase never reported as run is not run."""
+    outcomes = {}
+    for name in VERIFY_PHASES:
+        record = records.get(name) or {}
+        outcomes[name] = record.get('status', 'not_run') if record.get('ran') is True else 'not_run'
+    return outcomes
 
 
 def verdict(data):
@@ -578,6 +714,7 @@ def verdict(data):
                             f"HTTP {bound.get('http_status')} {bound.get('boat_error')}"]}
     reasons = []
     inconclusive = []
+    tolerated = []
     if not data.get("measurements_complete"):
         reasons.append("measurements incomplete")
     if data.get("error"):
@@ -588,12 +725,31 @@ def verdict(data):
         if mode in data:
             checks = data[mode].get('checks', [])
             inconclusive.extend(mode + '.' + row['name'] for row in checks if row.get('status') == 'INCONCLUSIVE')
+            if mode == 'runner_host':
+                tolerated.extend({'name': mode + '.' + row['name'], 'reason': tolerated_inconclusive(row)}
+                                 for row in checks if tolerated_inconclusive(row) is not None)
             if data[mode].get("all_passed") is not True:
                 if mode != 'runner_host' or not required_checks_passed(checks):
                     reasons.append(mode + " checks did not all pass")
+    records = (data.get('runner_host') or {}).get('verify_phases')
+    phases = None
+    if records is not None:
+        phases = verify_phase_outcomes(records)
+        requested = [name for name in VERIFY_PHASES if (records.get(name) or {}).get('requested') is True]
+        if not requested:
+            reasons.append('no verify phase was requested')
+        reasons.extend(f'verify phase {name}: {phases[name]}' for name in requested if phases[name] != 'passed')
     result = {"passed": not reasons, "outcome": "failed" if reasons else "passed", "reasons": reasons}
+    if phases is not None:
+        result['verify_phases'] = phases
+        result['not_run'] = [name for name in VERIFY_PHASES if phases[name] == 'not_run']
+        # A run of one phase can pass; the image is qualified only by every phase.
+        result['image_qualified'] = not reasons and all(status == 'passed' for status in phases.values())
     if inconclusive:
         result['inconclusive'] = inconclusive
+    if tolerated:
+        # INCONCLUSIVE checks that did not block the verdict, with the reason.
+        result['tolerated_inconclusive'] = tolerated
     return result
 
 
@@ -799,6 +955,40 @@ def sizing_section(data):
     return lines
 
 
+def verify_phase_section(runner, outcome):
+    """The --verify-prepared-image phase table; empty for other runner-host runs."""
+    records = runner.get('verify_phases')
+    if records is None:
+        return []
+    phases = verify_phase_outcomes(records)
+    qualified = all(status == 'passed' for status in phases.values()) and outcome.get('passed') is True
+    not_run = [name for name in VERIFY_PHASES if phases[name] == 'not_run']
+    lines = ["## Verify phases", "",
+             "Each phase restores the prepared image into its own sandbox. A phase not run is never a pass.", "",
+             f"Image qualified by this run: **{'yes' if qualified else 'no'}**"
+             + (f" (not run: {', '.join(not_run)})" if not_run else "") + ".", "",
+             "| Phase | Requested | Status | Sandbox | Seconds | Checks | Error |", "| --- | --- | --- | --- | --- | --- | --- |"]
+    for name in VERIFY_PHASES:
+        record = records.get(name) or {}
+        lines.append(f"| {name} | {display(record.get('requested', False))} | {phases[name].upper()} | "
+                     f"{display(record.get('sandbox', 'none'))} | {display(rounded(record.get('seconds'), 1))} | "
+                     f"{len(record.get('check_names', []))} | {display(record.get('error', 'none'))} |")
+    return lines + [""]
+
+
+def section_timing_lines(runner):
+    """Wall time of every recorded step, so an overrun shows where the time went."""
+    rows = runner.get('section_timings') or []
+    lines = ["## Section timings (wall seconds, operator machine)", "",
+             "A step still `running` was in progress when the run stopped.", "",
+             "| Section | Outcome | Started (UTC) | Seconds |", "| --- | --- | --- | --- |"]
+    lines += [f"| {row.get('name')} | {row.get('outcome')} | {row.get('started_at')} | {display(rounded(row.get('seconds'), 1))} |"
+              for row in rows]
+    if not rows:
+        lines.append("| unmeasured | | | |")
+    return lines + [""]
+
+
 def render_runner_host(data):
     """Findings for --runner-host: the verdict, per-phase jobs, timings and job memory budget."""
     runner = data["runner_host"]
@@ -808,6 +998,8 @@ def render_runner_host(data):
     bound = data.get("snapshot_size_bound")
     label = ("SNAPSHOT_SIZE_BOUND" if outcome.get("outcome") == "snapshot_size_bound" else
              "PASSED" if outcome["passed"] else "FAILED")
+    if outcome["passed"] and outcome.get("image_qualified") is False:
+        label += " for the phases run; the image is not qualified until every verify phase passes"
     error = display(data["error"]) if data.get("error") is not None else "none recorded"
     status = data.get("exit_status")
     status_text = (f"Exit status: {status}" if status is not None else
@@ -827,10 +1019,13 @@ def render_runner_host(data):
               f"Sandbox size: {display(data.get('size', 'large'))}.",
               f"Failing checks: {display(failing) if failing else 'none'}.",
               f"Inconclusive preconditions: {display(outcome.get('inconclusive')) if outcome.get('inconclusive') else 'none'}.",
+              *[f"Tolerated inconclusive: `{row.get('name')}`: {row.get('reason')}."
+                for row in outcome.get('tolerated_inconclusive', [])],
              f"Reasons: {display(outcome['reasons']) if outcome['reasons'] else 'none'}.",
              f"Measurement completion: {display(data.get('measurements_complete', False))}. Error: {error}.",
              f"Cleanup state (reported separately from the verdict): {display(cleanup_state(data))}. "
              f"{status_text} (0 passed, 1 failed, 3 resources need --cleanup, 4 snapshot_size_bound).", "",
+             *verify_phase_section(runner, outcome),
              "## Phases", "",
              "Every phase runs real jobs through the motor client over the pinned SSH forward.", "",
              "| Phase | Checks passed | Exit job code | Rust job code | Job seconds (exit / rust / isolation) | "
@@ -861,9 +1056,15 @@ def render_runner_host(data):
     lines += ["## Timing (seconds, measured from the operator machine)", "",
               "| Measurement | Seconds |", "| --- | --- |"]
     prepared, snapshot = runner.get("prepared_image") or {}, runner.get("snapshot") or {}
+    plain_stop = runner.get('core_stop_resume') or {}
+    quota_stop = (runner.get('disk_quota') or {}).get('stop_at_limit') or {}
     for label, value in (("Create to Boat-ready (first sandbox)", runner.get("create", {}).get("seconds_to_ready")),
                          ("Source upload and recipe install", runner.get("install_seconds")),
-                         ("Prepared image save", prepared.get("seconds")),
+                          ("Prepared image save", prepared.get("seconds")),
+                          ("Core plain stop (accepted response to completed)", plain_stop.get('accepted_to_completed_seconds')),
+                          ("Quota stop (accepted response to completed)", quota_stop.get('accepted_to_completed_seconds')),
+                          ("Quota stop requested wait cap", (quota_stop.get('wait') or {}).get('requested_wait_seconds')),
+                          ("Quota stop effective wait within budget", (quota_stop.get('wait') or {}).get('effective_wait_seconds')),
                          ("Measurement snapshot save", snapshot.get("seconds")),
                          ("Create from measurement snapshot to Boat-ready", runner.get("create_from_snapshot", {}).get("seconds_to_ready")),
                          ("Create from measurement snapshot to hydrated", runner.get("create_from_snapshot", {}).get("seconds_to_hydrated")),
@@ -903,6 +1104,7 @@ def render_runner_host(data):
                      f" | {mib(budget.get('memory_max_bytes'))} | {display(job.get('limits', {}).get('memory.max', 'unmeasured'))} |")
     lines += ["", f"Smallest job memory budget across phases: {mib(min(budgets)) if budgets else 'unmeasured'} MiB.", "",
               *sizing_section(data), "",
+              *section_timing_lines(runner),
               "## Snapshots", "",
               "| Role | Name | Snapshot id | Size bytes | Retained | Real jobs qualified |", "| --- | --- | --- | --- | --- | --- |"]
     for role, item in (("prepared source (borrowed, not deleted)", runner.get("prepared_source")),
@@ -938,6 +1140,9 @@ def main(report_stream=None):
     parser.add_argument("--write-template", type=Path, help="export the Markdown findings template, offline")
     parser.add_argument("--findings", type=Path, help="Markdown destination (default: beside JSON)")
     parser.add_argument("--max-minutes", type=int, default=30, choices=range(5, 61), metavar="5..60")
+    parser.add_argument('--quota-stop-wait-s', type=int,
+                        help='runner-host full-quota stop wait cap in seconds (default: 900); '
+                             'still limited by the remaining 30-minute phase budget')
     parser.add_argument("--size", choices=tuple(SIZES), default="large",
                         help="Boat sandbox size for every sandbox this run creates, including "
                              "--verify-prepared-image clones (default: large)")
@@ -959,6 +1164,9 @@ def main(report_stream=None):
     parser.add_argument('--prepared-image', action='store_true', help='explicitly retain a prepared named image for future retry reuse')
     parser.add_argument('--from-prepared-image', help='start from an operator-owned prepared image; reapply this recipe and run all checks')
     parser.add_argument('--verify-prepared-image', help='qualify an existing snapshot unchanged: hydrate, install broker identity, real jobs, resume; no recipe reapply or service restart')
+    parser.add_argument('--verify-phase', choices=VERIFY_PHASES,
+                        help='with --verify-prepared-image, run only this phase in its own sandbox '
+                             '(default: every phase, one sandbox each, one combined verdict)')
     parser.add_argument('--delete-retained-images', action='store_true', help='with --cleanup, also delete explicitly retained prepared images')
     parser.add_argument('--cargo-seed-manifest', type=Path, help='operator server capture, required for runner-host registry parity')
     parser.add_argument('--cargo-seed-sha256', help='independently recorded SHA-256 of the server seed manifest')
@@ -966,6 +1174,11 @@ def main(report_stream=None):
     parser.add_argument('--acknowledge-tenant-one-private-cache', action='store_true',
                         help='required for runner-host: seed/image contain private fleet dependencies, never for customers')
     args = parser.parse_args()
+    if args.quota_stop_wait_s is not None:
+        if not args.runner_host:
+            parser.error('--quota-stop-wait-s requires --runner-host')
+        if args.quota_stop_wait_s <= 0:
+            parser.error('--quota-stop-wait-s must be positive')
     if args.cache_bench or args.cache_profile != 'legacy' or args.cache_baseline or args.cache_samples or any((
             args.cache_image, args.cache_bundle, args.cache_bundle_sha256,
             args.cache_backends, args.cache_prefix, args.cache_repositories)):
@@ -980,6 +1193,8 @@ def main(report_stream=None):
             parser.error('--verify-prepared-image cannot rebuild or retain an image')
         if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', args.verify_prepared_image):
             parser.error('invalid prepared named-snapshot handle')
+    if args.verify_phase and not args.verify_prepared_image:
+        parser.error('--verify-phase requires --verify-prepared-image')
     if args.delete_retained_images and not args.cleanup:
         parser.error('--delete-retained-images requires --cleanup')
     if args.runner_host and not args.cleanup and not args.render:
@@ -1014,11 +1229,13 @@ def main(report_stream=None):
     signal.signal(signal.SIGTERM, interrupt)
     try:
         if not args.cleanup:
-            runner = Probe(client, data, checkpoint, minutes=args.max_minutes, size=args.size)
+            runner = Probe(client, data, checkpoint, minutes=args.max_minutes, size=args.size,
+                           quota_stop_wait_s=args.quota_stop_wait_s if args.quota_stop_wait_s is not None else 900)
             runner.results_path = path.resolve()
             runner.retain_prepared_image = args.prepared_image
             runner.from_prepared_image = args.from_prepared_image
             runner.verify_prepared_image = args.verify_prepared_image
+            runner.verify_phases = selected_verify_phases(args.verify_phase)
             runner.cargo_seed_manifest = args.cargo_seed_manifest
             runner.cargo_seed_sha256 = args.cargo_seed_sha256
             runner.cargo_seed_archive = args.cargo_seed_archive

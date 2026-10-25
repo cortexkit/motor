@@ -26,16 +26,15 @@ mod platform;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod privilege;
 mod return_paths;
-// Nothing in a production build starts the remote cache yet, and its gateway
-// and sandbox transport only ever run on Linux job hosts, so outside Linux
-// tests some of it is unreachable.
-#[cfg(unix)]
+// Cache records and publication policy are portable; the sandbox transport is
+// Unix-only.
 #[cfg_attr(any(not(test), not(target_os = "linux")), allow(dead_code))]
 mod remote_cache;
 mod server;
 mod setup_log;
 // Nothing in a production build uses sibling snapshots yet: production builds
 // keep sibling snapshot mode off, so only tests reach this module.
+mod job_memory_budget;
 #[cfg_attr(not(test), allow(dead_code))]
 mod sibling_snapshots;
 mod spool;
@@ -47,9 +46,9 @@ mod systemd;
 /// systemd-run properties for every job unit. PID 1 starts these system
 /// services, independently of the user manager's protected runner processes.
 /// OOMPolicy also stops surviving job descendants. Kept outside `systemd` so
-/// the argument builders of the Windows VM backend compile on every host,
-/// although only a Linux host runs them.
-#[cfg(unix)]
+/// the Unix-hosted Windows VM argument builders and portable tests can share
+/// the properties, although only a Linux host runs these units.
+#[cfg(any(unix, test))]
 pub(crate) const JOB_MEMORY_PROPERTIES: [&str; 3] = [
     "--property=Slice=motor-jobs.slice",
     "--property=OOMScoreAdjust=900",
@@ -72,6 +71,7 @@ mod tree_access;
 mod vsock;
 mod windows;
 mod workspace;
+mod workspace_access;
 mod writer;
 #[cfg(target_os = "linux")]
 pub use writer::CacheFill;

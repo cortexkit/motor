@@ -1931,10 +1931,48 @@ pub(crate) fn restore_runner_access(path: &Path) -> io::Result<()> {
     // mode 0700. Those modes mask even an inherited named ACL. Once the prior
     // job has stopped, the trusted preparer must restore access before Git
     // cleanup or a reflink clone; it never follows job-created symlinks.
+    // Without -n, setfacl -m also recalculates the ACL mask of every entry it
+    // writes, so a mask a job zeroed with chmod 0700 is restored on the way.
     let acl = format!("u:{}:rwX", unsafe { libc::geteuid() });
     checked(
         crate::privilege::command("/usr/bin/setfacl")
             .args(["-R", "-P", "-m", &acl, "--"])
+            .arg(path),
+    )
+}
+
+/// Give the runner account back read access to a caller checkout a job
+/// locked it out of, without changing any owner or the job's own permission
+/// bits. It walks the whole tree as the next setup's reclaim does, so a
+/// directory the job made unreadable below the root is rescued too, and then
+/// restores the root's ACL mask (see `restore_runner_root_access`).
+pub(crate) fn restore_workspace_access(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::other(format!(
+            "checkout is not a physical directory: {}",
+            path.display()
+        )));
+    }
+    restore_runner_access(path)?;
+    restore_runner_root_access(path)
+}
+
+/// Give the runner account back read access to a checkout root after a job.
+/// The job owns its workspace root while it runs, and chmod on a directory
+/// that carries an ACL rewrites the ACL mask: a job that sets the root to
+/// 0700 leaves the runner's named entry listed but masked to nothing, and
+/// every later admission on the workspace fails to read it. This puts the
+/// entry back and sets the mask to r-x, what setup's `chmod 0755` of the
+/// root left before the job ran; read and search are all admission needs,
+/// and the next setup takes ownership back before the runner writes there.
+/// Owners and the job's own mode bits are left alone. `-P` skips a symlink
+/// instead of following it.
+pub(crate) fn restore_runner_root_access(path: &Path) -> io::Result<()> {
+    let acl = format!("u:{}:rwx,m::r-x", unsafe { libc::geteuid() });
+    checked(
+        crate::privilege::command("/usr/bin/setfacl")
+            .args(["-P", "-m", &acl, "--"])
             .arg(path),
     )
 }
@@ -1999,6 +2037,9 @@ pub(crate) struct Sandbox {
     parent_umask: u32,
     #[cfg(test)]
     memory_floor_gib: Option<u64>,
+    /// The jobs slice's limits, as observed when this sandbox started its unit.
+    /// The unit's `MemoryMax` is clamped to the slice's.
+    slice_budget: std::sync::Mutex<Option<crate::systemd::JobMemoryBudget>>,
     // Operator fixtures reuse the production mount layout with the writer identity.
     user: &'static str,
     writer: bool,
@@ -2014,6 +2055,7 @@ pub(crate) struct Sandbox {
     /// The remote cache forwarders the unit's shell starts before its
     /// command, one per active tool; empty when the unit has no remote cache.
     cache_forwarders: Vec<crate::remote_cache::transport::Forwarder>,
+    cache_generation: Option<std::sync::Arc<crate::remote_cache::provisioning::ActiveGeneration>>,
 }
 
 pub(crate) struct RuntimeDir(
@@ -2731,6 +2773,7 @@ impl Sandbox {
         fs::create_dir_all(&output)?;
         let mut grant_paths = Vec::new();
         let mut writer_grants = Vec::new();
+        let mut remote = remote;
         let output_names = cache_output_names(
             remote.is_some_and(|r| r.has_tool(crate::remote_cache::gateway::Tool::Ccache)),
         );
@@ -2905,11 +2948,17 @@ impl Sandbox {
                 fs::write(&cargo_check, crate::writer::fill::CARGO_CHECK)?;
                 fs::set_permissions(cargo_check, fs::Permissions::from_mode(0o755))?;
             }
-            if remote.is_some() {
+            if let Some(transport) = remote {
                 // The forwarder holds no key, so the unit may read and run it.
                 let forwarder = tools.join(transport::FORWARDER_NAME);
-                fs::copy(prepare_cache_forwarder(state)?, &forwarder)?;
-                fs::set_permissions(&forwarder, fs::Permissions::from_mode(0o755))?;
+                let prepared = prepare_cache_forwarder(state).and_then(|source| {
+                    fs::copy(source, &forwarder)?;
+                    fs::set_permissions(&forwarder, fs::Permissions::from_mode(0o755))
+                });
+                if let Err(error) = prepared {
+                    transport.failed("forwarder preparation", &error);
+                    remote = None;
+                }
             }
             read_only.push(bind(&tools, Path::new("/motor-tools"))?);
             mount_destinations.push(PathBuf::from("/motor-tools"));
@@ -2923,16 +2972,25 @@ impl Sandbox {
             } else {
                 (transport::Role::Job(&job), USER)
             };
-            let sockets = remote.open(&directory, role)?;
+            let sockets = remote.open(&directory, role).and_then(|sockets| {
+                grant_sockets(&sockets.paths(), account)?;
+                Ok(sockets)
+            });
             // Connecting needs write access to the socket file. Only this
             // unit's account gets it, and the directory is bound into this
             // unit's sandbox alone.
-            grant_sockets(&sockets.paths(), account)?;
-            read_only.push(bind(&directory, Path::new(transport::SANDBOX_SOCKETS))?);
-            mount_destinations.push(PathBuf::from(transport::SANDBOX_SOCKETS));
-            cache_forwarders = sockets.forwarders().to_vec();
-            if runtime.2.set(sockets).is_err() {
-                return Err(io::Error::other("sandbox cache sockets were opened twice"));
+            match sockets {
+                Ok(sockets) => match bind(&directory, Path::new(transport::SANDBOX_SOCKETS)) {
+                    Ok(mount) => {
+                        read_only.push(mount);
+                        mount_destinations.push(PathBuf::from(transport::SANDBOX_SOCKETS));
+                        cache_forwarders = sockets.forwarders().to_vec();
+                        let _ = runtime.2.set(sockets);
+                        remote.ready();
+                    }
+                    Err(error) => remote.failed("socket mount", &error),
+                },
+                Err(error) => remote.failed("socket bind or grant", &error),
             }
         }
         // Copy the supervisor into the read-only tool mount. Bind only existing
@@ -3029,6 +3087,7 @@ impl Sandbox {
             parent_umask: 0o022,
             #[cfg(test)]
             memory_floor_gib: None,
+            slice_budget: std::sync::Mutex::new(None),
             user: if writer { WRITER_USER } else { USER },
             writer,
             network: false,
@@ -3039,7 +3098,29 @@ impl Sandbox {
             pid_init: None,
             provider_unset_env: Vec::new(),
             cache_forwarders,
+            cache_generation: None,
         })
+    }
+
+    pub(crate) fn with_cache_generation(
+        mut self,
+        generation: Option<std::sync::Arc<crate::remote_cache::provisioning::ActiveGeneration>>,
+    ) -> Self {
+        if !self.cache_forwarders.is_empty() {
+            self.cache_generation = generation;
+        }
+        self
+    }
+
+    pub(crate) fn cache_generation(
+        &self,
+    ) -> Option<(
+        &crate::remote_cache::provisioning::ActiveGeneration,
+        &[transport::Forwarder],
+    )> {
+        self.cache_generation
+            .as_deref()
+            .map(|generation| (generation, self.cache_forwarders.as_slice()))
     }
 
     /// See [`Sandbox::retain_failed`].
@@ -3099,6 +3180,14 @@ impl Sandbox {
     #[cfg(test)]
     pub(crate) fn with_memory_floor_gib(mut self, floor_gib: Option<u64>) -> Self {
         self.memory_floor_gib = floor_gib;
+        self
+    }
+
+    /// Pin the jobs slice limits a unit would observe at launch, without
+    /// running systemctl; production reads them from the slice itself.
+    #[cfg(test)]
+    pub(crate) fn with_slice_budget(self, budget: crate::systemd::JobMemoryBudget) -> Self {
+        self.slice_budget.lock().unwrap().replace(budget);
         self
     }
 
@@ -3248,7 +3337,20 @@ impl Sandbox {
         let memory_max = crate::backend::memory_max(requested_vcpus, self.memory_floor_gib);
         #[cfg(not(test))]
         let memory_max = crate::backend::memory_max(requested_vcpus);
+        // A job's limit is a ceiling, while the shared slice's is a budget: a
+        // request larger than the slice can never be honoured, so the unit asks
+        // for the slice's own `MemoryMax` instead. An overrun still ends as an
+        // OOM kill, either from the slice or from the unit's own limit. With no
+        // observed budget (a command built before any unit started), the
+        // requested limit stands as it always has.
         let memory_max = self.boat_memory_max.unwrap_or(memory_max);
+        let memory_max = crate::backend::job_memory_limit(
+            memory_max,
+            self.slice_budget
+                .lock()
+                .unwrap()
+                .map_or(crate::systemd::NO_JOB_MEMORY_BUDGET, |budget| budget.max),
+        );
         cmd.arg(format!("--property=MemoryMax={memory_max}"));
         // Match the host's executable /dev/shm policy while bounding this
         // job's private tmpfs to the same memory limit as the service.
@@ -3386,7 +3488,11 @@ impl Sandbox {
         cpus: &[u32],
         requested_vcpus: u32,
     ) -> io::Result<platform::Launch> {
-        crate::systemd::require_job_memory_budget()?;
+        // Resolved before the unit exists and kept for the command built below.
+        self.slice_budget
+            .lock()
+            .unwrap()
+            .replace(crate::systemd::read_job_memory_budget()?);
         #[cfg(test)]
         crate::test_cleanup::record_unit(self.id, cwd);
         #[cfg(test)]

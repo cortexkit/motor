@@ -3,6 +3,8 @@
 use crate::{Error, Reply, Response, Result};
 use serde::{Deserialize, Serialize};
 use std::{os::fd::OwnedFd, path::PathBuf};
+pub(crate) mod activation;
+pub use activation::ResizeActivation;
 
 pub const REGISTRY: &str = "/etc/motor-vm-helper/tenants";
 pub const TENANTS: &str = "/var/lib/motor-vm/tenants";
@@ -28,6 +30,8 @@ pub fn validate_port(port: u32) -> Result<()> {
 #[derive(Debug, Clone, Copy)]
 pub enum Operation {
     Ensure,
+    PrepareStart,
+    Activate,
     AttachDisk,
     Suspend,
     Restore,
@@ -49,6 +53,12 @@ pub struct Registry {
     pub suspend: PathBuf,
     pub image_version: String,
     pub vcpu_ceiling: u32,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_weight"
+    )]
+    pub max_weight: Option<u32>,
     pub guest_ram_mib: u64,
     pub disk_quota_bytes: u64,
     pub cpuset: String,
@@ -64,6 +74,11 @@ pub struct Registry {
     #[serde(default)]
     pub capture_console: bool,
 }
+fn optional_weight<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error> {
+    u32::deserialize(deserializer).map(Some)
+}
 fn default_headroom() -> u64 {
     512
 }
@@ -74,6 +89,9 @@ fn default_io_weight() -> u32 {
     100
 }
 impl Registry {
+    pub fn budget(&self) -> u32 {
+        self.max_weight.unwrap_or(self.vcpu_ceiling)
+    }
     pub fn validate(&self, tenant: &str) -> Result<()> {
         validate_name(tenant)?;
         validate_name(&self.image_version)?;
@@ -84,6 +102,7 @@ impl Registry {
             || self.tap_index == 0
             || self.tap_index == 255
             || !(1..=256).contains(&self.vcpu_ceiling)
+            || self.budget() < self.vcpu_ceiling
             || self.guest_ram_mib == 0
             || self.disk_quota_bytes == 0
             || !(1..=10000).contains(&self.io_weight)
@@ -140,6 +159,10 @@ pub struct SnapshotKey {
 /// Platform methods keep the destructive boundary small. In particular, load
 /// leaves the guest paused; consume must durably unlink before resume is called.
 pub trait Backend {
+    /// Start-only policy checks must not prevent stopping or inspecting a VM.
+    fn check_start(&mut self, _tenant: &str) -> std::result::Result<(), StartRefusal> {
+        Ok(())
+    }
     fn unclean(&mut self, _registry: &Registry) -> Result<bool> {
         Ok(false)
     }
@@ -179,11 +202,26 @@ pub trait Backend {
     fn was_restored(&self, _tenant: &str) -> bool {
         false
     }
-    fn load(&mut self, tenant: &str, r: &Registry, saved: bool) -> Result<()>;
+    fn load(&mut self, tenant: &str, r: &Registry, saved: bool) -> StartResult<()>;
     fn drive(&mut self, tenant: &str, r: &Registry) -> Result<()>;
     fn consume(&mut self, r: &Registry) -> Result<()>;
     fn advance(&mut self, r: &Registry) -> Result<u64>;
     fn resume(&mut self, tenant: &str) -> Result<()>;
+    fn staged_resize(&mut self, _r: &Registry) -> Result<Option<ResizeActivation>> {
+        Ok(None)
+    }
+    fn apply_resize(&mut self, _tenant: &str, _activation: &ResizeActivation) -> Result<()> {
+        Err(Error("resize activation unavailable".into()))
+    }
+    fn sync_disk(&mut self, _tenant: &str) -> Result<()> {
+        Err(Error("tenant disk sync unavailable".into()))
+    }
+    fn post_grow_check(&mut self, _r: &Registry) -> Result<()> {
+        Err(Error("post-grow space check unavailable".into()))
+    }
+    fn complete_resize(&mut self, _r: &Registry, _activation: &ResizeActivation) -> Result<()> {
+        Err(Error("resize completion unavailable".into()))
+    }
     fn prepare(&mut self, tenant: &str) -> Result<()>;
     fn thaw(&mut self, tenant: &str) -> Result<()>;
     fn snapshot(&mut self, tenant: &str, r: &Registry, key: &SnapshotKey) -> Result<()>;
@@ -216,6 +254,56 @@ pub struct Controller<B: Backend>(pub B);
 
 // Backend errors use this prefix only when snapshot/create may still be writing.
 pub(crate) const SNAPSHOT_CREATE_UNCERTAIN: &str = "suspend_create_uncertain";
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartRefusalCase {
+    CapacityJson,
+    Fit,
+    LiveCap,
+    DropIn,
+    ResizeJournal,
+    Oom,
+    Activation,
+    PostGrowSpace,
+}
+#[derive(Debug)]
+pub struct StartRefusal {
+    pub case: StartRefusalCase,
+    pub message: String,
+}
+pub(crate) fn start_refused(case: StartRefusalCase, error: impl std::fmt::Display) -> StartRefusal {
+    StartRefusal {
+        case,
+        message: error.to_string(),
+    }
+}
+#[derive(Debug)]
+pub enum StartError {
+    Refused(StartRefusal),
+    Other(Error),
+}
+pub type StartResult<T> = std::result::Result<T, StartError>;
+impl From<Error> for StartError {
+    fn from(error: Error) -> Self {
+        Self::Other(error)
+    }
+}
+impl From<std::io::Error> for StartError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Other(error.into())
+    }
+}
+impl From<StartRefusal> for StartError {
+    fn from(refusal: StartRefusal) -> Self {
+        Self::Refused(refusal)
+    }
+}
+fn refused_response(refusal: StartRefusal) -> Response {
+    Response::new(Reply::StartRefused {
+        case: refusal.case,
+        message: refusal.message,
+    })
+}
 impl<B: Backend> Controller<B> {
     pub fn handle(&mut self, tenant: &str, op: Operation) -> Result<Response> {
         validate_name(tenant)?;
@@ -224,6 +312,14 @@ impl<B: Backend> Controller<B> {
         }
         if let Operation::Remove = op {
             return self.remove(tenant);
+        }
+        if matches!(
+            op,
+            Operation::Ensure | Operation::Restore | Operation::PrepareStart
+        ) {
+            if let Err(refusal) = self.0.check_start(tenant) {
+                return Ok(refused_response(refusal));
+            }
         }
         let r = self.0.registry(tenant)?;
         r.validate(tenant)?;
@@ -234,13 +330,86 @@ impl<B: Backend> Controller<B> {
         }
         self.record_lost_vm(tenant, &r)?;
         let mut restored = self.0.was_restored(tenant);
+        // Legacy callers cannot complete the attach/activate handshake. Hide a
+        // pending VM from adopt, and refuse legacy starts instead of returning
+        // a success that an older host would advertise as ready.
+        if matches!(
+            op,
+            Operation::Ensure | Operation::Restore | Operation::Adopt
+        ) {
+            let error = match self.0.staged_resize(&r) {
+                Ok(None) => None,
+                Ok(Some(_)) => Some(Error(
+                    "staged resize requires prepare_start, attach_tenant, then activate".into(),
+                )),
+                Err(error) => Some(error),
+            };
+            if let Some(error) = error {
+                return Ok(refused_response(start_refused(
+                    StartRefusalCase::Activation,
+                    error,
+                )));
+            }
+        }
         match op {
-            Operation::Ensure | Operation::Restore => {
+            Operation::Ensure | Operation::Restore | Operation::PrepareStart => {
+                if self.0.running(tenant) {
+                    // A failed activation stop may have left a live VM. Never
+                    // adopt it while durable provisioning intent is pending.
+                    match self.0.staged_resize(&r) {
+                        Ok(Some(_)) => {
+                            if let Err(error) = self.stop_cleanly(tenant, &r) {
+                                return Ok(refused_response(start_refused(
+                                    StartRefusalCase::Activation,
+                                    error,
+                                )));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            return Ok(refused_response(start_refused(
+                                StartRefusalCase::Activation,
+                                error,
+                            )))
+                        }
+                    }
+                }
                 if self.0.unclean(&r)? && self.0.running(tenant) {
                     self.0.stop(tenant)?;
                 }
                 if !self.0.running(tenant) {
-                    restored = self.wake(tenant, &r)?;
+                    restored = match self.wake(tenant, &r) {
+                        Ok(restored) => restored,
+                        Err(StartError::Refused(refusal)) => return Ok(refused_response(refusal)),
+                        Err(StartError::Other(error)) => return Err(error),
+                    };
+                }
+            }
+            Operation::Activate => {
+                let result = match self.0.staged_resize(&r) {
+                    Ok(Some(activation)) if self.0.running(tenant) => {
+                        self.activate(tenant, &r, &activation)
+                    }
+                    Ok(None) => Ok(()),
+                    pending => {
+                        let mut refusal = start_refused(
+                            StartRefusalCase::Activation,
+                            pending.err().unwrap_or_else(|| {
+                                Error("resize requires a running tenant".into())
+                            }),
+                        );
+                        if let Err(stop) = self.stop_cleanly(tenant, &r) {
+                            refusal
+                                .message
+                                .push_str(&format!("; clean stop failed: {stop}"));
+                        }
+                        Err(StartError::Refused(refusal))
+                    }
+                };
+                match result {
+                    Ok(()) => {}
+                    Err(StartError::Refused(refusal)) => return Ok(refused_response(refusal)),
+                    Err(StartError::Other(error)) => return Err(error),
                 }
             }
             Operation::AttachDisk => self.0.drive(tenant, &r)?,
@@ -257,6 +426,11 @@ impl<B: Backend> Controller<B> {
                 }));
             }
             Operation::Relay(port) => {
+                if port != 54 && self.0.staged_resize(&r)?.is_some() {
+                    return Err(Error(
+                        "resize activation pending; job relay is fenced".into(),
+                    ));
+                }
                 return Ok(Response {
                     reply: Reply::Relay { fd_count: 1 },
                     fds: vec![self.0.relay(tenant, port).map_err(|error| {
@@ -264,29 +438,17 @@ impl<B: Backend> Controller<B> {
                             "open_relay tenant={tenant} port={port} step=open_guest_connection: {error}"
                         ))
                     })?],
-                })
+                });
             }
             Operation::Stop => {
-                if self.0.running(tenant) {
-                    let prepared = self.0.prepare_stop(tenant);
-                    let record = match &prepared {
-                        Ok(()) => Ok(()),
-                        Err(error) => self.0.mark_unclean(&r, &error.to_string()),
-                    };
-                    let prepared = prepared.is_ok();
-                    if let Err(error) = self.0.stop(tenant) {
-                        let _ = self.0.thaw(tenant);
-                        return Err(error);
-                    }
-                    record?;
-                    // Only a stop whose guest flush succeeded is clean. After a
-                    // failed flush the marker stays as a second durable record.
-                    if prepared {
-                        self.0.clear_running(&r)?;
-                    }
-                }
+                self.stop_cleanly(tenant, &r)?;
             }
             Operation::Suspend => {
+                if self.0.staged_resize(&r)?.is_some() {
+                    return Err(Error(
+                        "resize activation pending; snapshot is fenced".into(),
+                    ));
+                }
                 if !self.0.running(tenant) {
                     return Err(Error("tenant is not running".into()));
                 }
@@ -305,9 +467,9 @@ impl<B: Backend> Controller<B> {
                         // writer. Kill and reap it before deleting any output.
                         // Prepare already drained jobs and froze the filesystem,
                         // but the next boot must still perform unclean recovery.
-                        self.0.stop(tenant).map_err(|stop| Error(format!(
-                            "suspend_create_stop_failed: {error}; stop: {stop}"
-                        )))?;
+                        self.0.stop(tenant).map_err(|stop| {
+                            Error(format!("suspend_create_stop_failed: {error}; stop: {stop}"))
+                        })?;
                         // The running marker already forces recovery if this
                         // reason cannot be recorded after the writer is stopped.
                         let record = self.0.mark_unclean(&r, &error.to_string());
@@ -419,21 +581,89 @@ impl<B: Backend> Controller<B> {
         }
         failures
     }
-    fn wake(&mut self, tenant: &str, r: &Registry) -> Result<bool> {
-        let key = self.0.key(r)?;
-        let saved = self
+    fn stop_cleanly(&mut self, tenant: &str, r: &Registry) -> Result<()> {
+        if self.0.running(tenant) {
+            let prepared = self.0.prepare_stop(tenant);
+            let record = match &prepared {
+                Ok(()) => Ok(()),
+                Err(error) => self.0.mark_unclean(r, &error.to_string()),
+            };
+            let prepared = prepared.is_ok();
+            if let Err(error) = self.0.stop(tenant) {
+                let _ = self.0.thaw(tenant);
+                return Err(error);
+            }
+            record?;
+            // Only a stop whose guest flush succeeded is clean. After a failed
+            // flush the running marker stays as a second durable recovery record.
+            if prepared {
+                self.0.clear_running(r)?;
+            }
+        }
+        Ok(())
+    }
+    fn activate(
+        &mut self,
+        tenant: &str,
+        r: &Registry,
+        activation: &ResizeActivation,
+    ) -> StartResult<()> {
+        let result = (|| {
+            self.0
+                .apply_resize(tenant, activation)
+                .map_err(|e| start_refused(StartRefusalCase::Activation, e))?;
+            self.0
+                .sync_disk(tenant)
+                .map_err(|e| start_refused(StartRefusalCase::Activation, e))?;
+            if activation.quota_grew {
+                self.0
+                    .post_grow_check(r)
+                    .map_err(|e| start_refused(StartRefusalCase::PostGrowSpace, e))?;
+            }
+            self.0
+                .complete_resize(r, activation)
+                .map_err(|e| start_refused(StartRefusalCase::Activation, e))
+        })();
+        if let Err(mut refusal) = result {
+            if let Err(stop) = self.stop_cleanly(tenant, r) {
+                refusal
+                    .message
+                    .push_str(&format!("; clean stop failed: {stop}"));
+            }
+            return Err(refusal.into());
+        }
+        Ok(())
+    }
+    fn wake(&mut self, tenant: &str, r: &Registry) -> StartResult<bool> {
+        let activation = self
             .0
-            .saved_key(r)
-            .ok()
-            .flatten()
-            .is_some_and(|saved| saved == key)
+            .staged_resize(r)
+            .map_err(|e| start_refused(StartRefusalCase::Activation, e))?;
+        let key = self.0.key(r)?;
+        let saved = activation.is_none()
+            && self
+                .0
+                .saved_key(r)
+                .ok()
+                .flatten()
+                .is_some_and(|saved| saved == key)
             && !self.0.unclean(r)?;
         self.0.egress(tenant, r)?;
         if saved {
             let result = self
                 .0
                 .load(tenant, r, true)
-                .and_then(|()| self.0.drive(tenant, r));
+                .and_then(|()| self.0.drive(tenant, r).map_err(Into::into));
+            let result = match result {
+                Err(StartError::Refused(refusal)) => {
+                    // Policy failures happened before snapshot/load, so the
+                    // saved state is still usable after the operator fixes them.
+                    self.0.stop(tenant)?;
+                    self.0.clear_running(r)?;
+                    return Err(StartError::Refused(refusal));
+                }
+                result => result,
+            };
             if result.is_ok() {
                 let durable = (|| {
                     self.0.consume(r)?;
@@ -443,7 +673,7 @@ impl<B: Backend> Controller<B> {
                     // A failed durability barrier must not leave an apparently
                     // running, paused guest available for adoption by a reconnect.
                     self.0.stop(tenant)?;
-                    return Err(error);
+                    return Err(error.into());
                 }
                 if self
                     .0
@@ -456,17 +686,21 @@ impl<B: Backend> Controller<B> {
             }
             self.0.stop(tenant)?;
         }
-        self.0.consume(r)?;
-        let result = (|| {
+        let result = (|| -> StartResult<()> {
             self.0.load(tenant, r, false)?;
             self.0.drive(tenant, r)?;
+            self.0.consume(r)?;
             self.0.advance(r)?;
-            self.0.resume(tenant)
+            self.0.resume(tenant).map_err(Into::into)
         })();
         if result.is_err() {
             self.0.stop(tenant)?;
+            if matches!(result, Err(StartError::Refused(_))) {
+                self.0.clear_running(r)?;
+            }
         }
-        result.map(|()| false)
+        result?;
+        Ok(false)
     }
 }
 

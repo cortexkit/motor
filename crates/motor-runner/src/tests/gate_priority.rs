@@ -866,3 +866,259 @@ fn a_gate_with_cleanup_pending_fences_nothing() {
     assert_eq!(started, BTreeSet::from([worker]));
     assert_eq!(behind_entry, PAUSED_QUEUE);
 }
+
+/// The per-job status reply names the reason a job cannot start, and a job
+/// that would fit behind a gate job waiting for permits is waiting on that
+/// gate's capacity. Formerly the status reported only "queue order" in this
+/// case while the refusal detail said "gate job ahead", so a client had no way
+/// to learn before the budget ran out that its job was in a capacity queue.
+#[test]
+fn job_status_names_a_gate_job_ahead_as_the_reason() {
+    let f = Fixture::new();
+    let runner = manual_runner(&f);
+    let (request, _) = f.run("true");
+    let now = runner.now();
+    let worker_key = f.scratch.join("remote/worktrees/independent");
+    let worker_id = {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let held = holders(&mut inner, &request, now);
+        inner.jobs.remove(&held[2]);
+        let mut gate = job(&request, &f.key, 8, 2, true, now);
+        gate.request.as_mut().unwrap().siblings.clear();
+        let mut worker = job(&request, text(&worker_key), 2, 1, false, now);
+        worker.request.as_mut().unwrap().siblings.clear();
+        let worker_id = worker.id;
+        inner.jobs.insert(gate.id, gate);
+        inner.jobs.insert(worker.id, worker);
+        runner.dispatch(&mut inner, now).unwrap();
+        assert!(
+            inner.starting.is_empty(),
+            "the 2-permit worker must not overtake the gate"
+        );
+        worker_id
+    };
+    let status = runner.job_status(worker_id).unwrap();
+    assert_eq!(
+        status.waiting_on.as_deref(),
+        Some("gate job ahead"),
+        "{status:?}"
+    );
+    // The status reply and the queue-wait refusal detail share this one
+    // classification, so the gate's label is also what a refusal would carry.
+    let detail = {
+        let inner = runner.core.inner.lock().unwrap();
+        runner.queue_wait_detail_with_index(&inner, &DispatchIndex::build(&inner), worker_id)
+    };
+    assert_eq!(detail.split(';').next(), Some("waiting_on=gate job ahead"));
+}
+
+/// The capacity-wait classification marks which waits count as capacity: a
+/// job behind a gate job or an older job waiting for permits is in a capacity
+/// queue, while a job held behind its own workspace, a sibling user of its
+/// checkout or a queued workspace job is not, because a hosted runner cannot
+/// release that checkout for it. (Those checkout waits can still carry a
+/// retry hint, since the job holding the checkout will release it.)
+#[test]
+fn only_capacity_waits_are_classified_as_capacity_waits() {
+    for (label, capacity) in [
+        ("permits", true),
+        ("gate job ahead", true),
+        ("cache fill ahead needs more free permits", true),
+        ("older job ahead needs more free permits", true),
+        ("workspace owner", false),
+        ("sibling user of this checkout", false),
+        ("sibling checkout owner", false),
+        ("queued workspace job", false),
+        ("workspace setup", false),
+        ("queue order", false),
+    ] {
+        assert_eq!(Runner::capacity_wait(label), capacity, "{label}");
+    }
+}
+
+/// A job blocked behind a gate job is refused with the same capacity-wait
+/// label the status reply showed, so the caller can tell a capacity wait from
+/// a checkout wait when it decides whether to try again.
+#[tokio::test]
+async fn a_job_refused_behind_a_gate_job_reports_a_capacity_wait() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    warm(&f, &runner).await;
+    let release = f.scratch.join("release");
+    let (mut holder, bytes) = job_at(
+        &f,
+        "holder",
+        &format!(
+            "while test ! -e '{}'; do sleep .02; done",
+            release.display()
+        ),
+    );
+    // More than the runner has permits for, so the gate that follows cannot
+    // start until it ends.
+    holder.weight_hint = Some(20);
+    f.submit(&runner, &holder, &bytes);
+    until(|| {
+        runner
+            .status()
+            .running_jobs
+            .iter()
+            .any(|j| j.job_id == holder.job_id)
+    })
+    .await;
+    // A gate job that needs more permits than are free, then a small worker.
+    let (mut gate, bytes) = f.run("true");
+    gate.gate_job = true;
+    gate.weight_hint = Some(16);
+    f.submit(&runner, &gate, &bytes);
+    let (mut worker, bytes) = job_at(&f, "small", "touch must-not-run");
+    worker.weight_hint = Some(2);
+    f.submit(&runner, &worker, &bytes);
+    f.clock.fetch_add(300_000, Ordering::SeqCst);
+    assert_eq!(
+        runner.withdraw(worker.job_id).unwrap(),
+        WithdrawOutcome::Withdrawn
+    );
+    let record = terminal(&runner, worker.job_id).await;
+    let detail = record.refusal_detail().expect("missing queue diagnostic");
+    assert!(
+        detail.starts_with(&format!(
+            "waiting_on=gate job ahead; blocked_by=job={} permits=16;",
+            gate.job_id
+        )),
+        "{detail}"
+    );
+    assert!(
+        Runner::capacity_wait(
+            detail
+                .split(';')
+                .next()
+                .unwrap()
+                .trim_start_matches("waiting_on=")
+        ),
+        "{detail}"
+    );
+    runner.withdraw(gate.job_id).unwrap();
+    fs::write(release, "").unwrap();
+    terminal(&runner, holder.job_id).await;
+    assert!(!Path::new(&worker.workspace_key)
+        .join("must-not-run")
+        .exists());
+}
+
+/// A queued job held back for capacity by a queue head ahead of it, a gate
+/// job, a cache fill or an older job past its backfill grace, is in the same
+/// capacity wait as one waiting for free permits: its queue-wait clock runs,
+/// so the heartbeat's queue wait grows, and once that wait reaches the job's
+/// limit a spill withdrawal succeeds and names the head's label. A job held
+/// by its own workspace owner or by a sibling user of its checkout instead has
+/// its clock paused: its heartbeat wait does not grow, so a client watching
+/// for a spill never reaches its spill wait, and a spill withdrawal is not
+/// accepted. ck-motor decides a spill from that heartbeat wait alone.
+#[test]
+fn only_capacity_waits_run_the_queue_clock_a_spill_watches() {
+    #[derive(Debug, Clone, Copy)]
+    enum Ahead {
+        Gate,
+        CacheFill,
+        OlderJob,
+        WorkspaceOwner,
+        SiblingUser,
+    }
+    for (ahead, label, spills) in [
+        (Ahead::Gate, "gate job ahead", true),
+        (
+            Ahead::CacheFill,
+            "cache fill ahead needs more free permits",
+            true,
+        ),
+        (
+            Ahead::OlderJob,
+            "older job ahead needs more free permits",
+            true,
+        ),
+        (Ahead::WorkspaceOwner, "workspace owner", false),
+        (Ahead::SiblingUser, SIBLING_USER_WAIT, false),
+    ] {
+        let f = Fixture::new();
+        let runner = manual_runner(&f);
+        let (request, _) = f.run("true");
+        let now = runner.now();
+        let worker_key = f.scratch.join("remote/worktrees/independent");
+        let worker_id = {
+            let mut inner = runner.core.inner.lock().unwrap();
+            // 62 of the runner's 64 permits are held: the 2-permit worker
+            // fits, an 8-permit head ahead of it does not.
+            let held = holders(&mut inner, &request, now);
+            inner.jobs.remove(&held[2]);
+            let mut worker = job(&request, text(&worker_key), 2, 2, false, now);
+            match ahead {
+                Ahead::Gate | Ahead::CacheFill | Ahead::OlderJob => {
+                    let mut head = match ahead {
+                        Ahead::Gate => job(&request, &f.key, 8, 1, true, now),
+                        Ahead::OlderJob => {
+                            job(&request, &f.key, 8, 1, false, now - BACKFILL_GRACE_MS)
+                        }
+                        _ => {
+                            let mut fill = job(&request, &f.key, 8, 1, false, now);
+                            fill.base = true;
+                            fill
+                        }
+                    };
+                    head.request.as_mut().unwrap().siblings.clear();
+                    inner.jobs.insert(head.id, head);
+                }
+                Ahead::WorkspaceOwner => {
+                    let mut owner = job(&request, text(&worker_key), 2, 1, false, now);
+                    owner.request.as_mut().unwrap().siblings.clear();
+                    owner.state = JobState::Running;
+                    owner.started_ms = Some(now);
+                    inner.jobs.insert(owner.id, owner);
+                }
+                Ahead::SiblingUser => {
+                    let mut user = sibling_user(&f, &request, "running", 1, now);
+                    user.state = JobState::Running;
+                    user.started_ms = Some(now);
+                    inner.jobs.insert(user.id, user);
+                    worker = workspace_job(&f, &request, 2, false, now);
+                }
+            }
+            worker.request.as_mut().unwrap().siblings.clear();
+            worker.request.as_mut().unwrap().queue_wait_limit_s = 45;
+            let worker_id = worker.id;
+            inner.jobs.insert(worker.id, worker);
+            runner.dispatch(&mut inner, now).unwrap();
+            assert!(
+                !inner.starting.contains(&worker_id),
+                "{ahead:?}: the worker must stay queued"
+            );
+            worker_id
+        };
+        let status = runner.job_status(worker_id).unwrap();
+        assert_eq!(status.waiting_on.as_deref(), Some(label), "{ahead:?}");
+        f.clock.store(now + 45_000, Ordering::SeqCst);
+        let heartbeat_wait = runner.queue_progress(worker_id).elapsed_ms();
+        let outcome = runner.withdraw_for(worker_id, None, true).unwrap();
+        let detail = runner.core.inner.lock().unwrap().jobs[&worker_id]
+            .terminal
+            .as_ref()
+            .and_then(|t| t.refusal_detail().map(str::to_owned));
+        if spills {
+            assert_eq!(heartbeat_wait, Some(45_000), "{ahead:?}");
+            assert_eq!(outcome, WithdrawOutcome::Withdrawn, "{ahead:?}");
+            let detail = detail.unwrap();
+            assert!(
+                detail.starts_with(&format!(
+                    "{}waiting_on={label};",
+                    motor_protocol::SPILL_WITHDRAWAL_DETAIL_PREFIX
+                )),
+                "{ahead:?}: {detail}"
+            );
+            assert!(Runner::capacity_wait(label), "{ahead:?}");
+        } else {
+            assert_eq!(heartbeat_wait, Some(0), "{ahead:?}");
+            assert_eq!(outcome, WithdrawOutcome::Started, "{ahead:?}");
+            assert_eq!(detail, None, "{ahead:?}");
+            assert!(!Runner::capacity_wait(label), "{ahead:?}");
+        }
+    }
+}

@@ -32,6 +32,8 @@ mod git_dependencies;
 mod health;
 #[path = "tests/held_prerequisites.rs"]
 mod held_prerequisites;
+#[path = "tests/jobs_slice.rs"]
+mod jobs_slice;
 #[path = "tests/migration.rs"]
 mod migration;
 #[path = "tests/monitoring.rs"]
@@ -44,6 +46,9 @@ mod platform_refusal;
 mod publication;
 #[path = "tests/refusals.rs"]
 mod refusals;
+#[cfg(target_os = "linux")]
+#[path = "tests/remote_cache_rollout.rs"]
+mod remote_cache_rollout;
 #[path = "tests/repository_retirement.rs"]
 mod repository_retirement;
 #[path = "tests/return_paths.rs"]
@@ -72,6 +77,8 @@ mod windows_instance;
 #[cfg(target_os = "linux")]
 #[path = "tests/windows_operator.rs"]
 mod windows_operator;
+#[path = "tests/workspace_access.rs"]
+mod workspace_access;
 #[path = "tests/workspace_lifetime.rs"]
 mod workspace_lifetime;
 #[path = "tests/workspace_snapshots.rs"]

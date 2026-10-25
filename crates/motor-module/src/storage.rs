@@ -97,6 +97,12 @@ pub(crate) struct Job {
     /// far is `no_host_fits`: no hosted host could ever hold its vCPUs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routed_direct_reason: Option<String>,
+    /// The `max_vcpus` the broker's `no_host_fits` answer named when the job
+    /// was sent to the build server for that reason; None when it named none.
+    /// A build-server `runner_full` refusal of such a job repeats it, so the
+    /// caller sees the largest size each route serves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_direct_hosted_max_vcpus: Option<u64>,
 }
 // Journal equality follows the serialized record. The migration marker is only
 // in-memory bookkeeping and must not turn an unchanged record into an upsert.
@@ -122,6 +128,7 @@ impl PartialEq for Job {
             workspace_key,
             build_server_job_id,
             routed_direct_reason,
+            routed_direct_hosted_max_vcpus,
         } = self;
         hosted == &other.hosted
             && return_result == &other.return_result
@@ -141,9 +148,17 @@ impl PartialEq for Job {
             && workspace_key == &other.workspace_key
             && build_server_job_id == &other.build_server_job_id
             && routed_direct_reason == &other.routed_direct_reason
+            && routed_direct_hosted_max_vcpus == &other.routed_direct_hosted_max_vcpus
     }
 }
 impl Job {
+    /// For a job sent to the build server because the broker answered
+    /// `no_host_fits`, the `max_vcpus` that answer named (inner None when it
+    /// named none). Outer None for every other job.
+    pub(crate) fn no_host_fits_max_vcpus(&self) -> Option<Option<u64>> {
+        (self.routed_direct_reason.as_deref() == Some(NO_HOST_FITS))
+            .then_some(self.routed_direct_hosted_max_vcpus)
+    }
     fn lacks_newer_fields(&self) -> bool {
         self.hosted.is_none()
             && self.return_result.is_none()
@@ -160,6 +175,7 @@ impl Job {
             && self.workspace_key.is_none()
             && self.build_server_job_id.is_none()
             && self.routed_direct_reason.is_none()
+            && self.routed_direct_hosted_max_vcpus.is_none()
     }
 
     fn legacy_expired(&self, id: Uuid, now: u64) -> bool {
@@ -468,7 +484,7 @@ impl Storage {
                 .is_some_and(|route| route.repository_routed)
         })
     }
-    /// Jobs selected by `hosted_repositories` in the last hour that the broker
+    /// Repository- or fleet-routed jobs in the last hour that the broker
     /// answered `no_host_fits`, and that therefore ran on the build server.
     pub(crate) fn hosted_no_host_fits_1h(&self) -> usize {
         self.hosted_no_host_fits_1h_at(now_ms())
@@ -497,7 +513,7 @@ impl Storage {
             })
             .count()
     }
-    /// Durably send a repository-routed job to the build server because the
+    /// Durably send a repository- or fleet-routed job to the build server because the
     /// broker answered `no_host_fits` before any placement. The hosted route
     /// is removed, so nothing later releases or finishes a lease the broker
     /// never booked, and a restart attaches to the build server instead of
@@ -510,11 +526,17 @@ impl Storage {
     /// rounded down to whole seconds, and a positive limit stays at least one
     /// second, because the build server reads zero as "refuse if it has to
     /// queue at all".
-    pub(crate) fn routed_direct_no_host_fits(&self, id: Uuid, spent_ms: u64) -> io::Result<()> {
+    pub(crate) fn routed_direct_no_host_fits(
+        &self,
+        id: Uuid,
+        spent_ms: u64,
+        hosted_max_vcpus: Option<u64>,
+    ) -> io::Result<()> {
         self.update(|s| {
             if let Some(job) = s.jobs.get_mut(&id) {
                 job.hosted = None;
                 job.routed_direct_reason = Some(NO_HOST_FITS.into());
+                job.routed_direct_hosted_max_vcpus = hosted_max_vcpus;
                 if job.queue_wait_limit_s > 0 {
                     job.queue_wait_limit_s = job
                         .queue_wait_limit_s
@@ -1421,11 +1443,11 @@ mod hosted_routing_health_tests {
         let storage = Storage::open(&scratch).unwrap();
         let now = now_ms();
         let mut ids = Vec::new();
-        for (age, limit, spent_ms, remaining) in [
-            (0, 300, 2_999, 298),
-            (3_599_999, 2, 5_000, 1),
-            (3_600_000, 300, 0, 300),
-            (0, 0, 5_000, 0),
+        for (age, limit, spent_ms, remaining, max_vcpus) in [
+            (0, 300, 2_999, 298, Some(21)),
+            (3_599_999, 2, 5_000, 1, None),
+            (3_600_000, 300, 0, 300, Some(8)),
+            (0, 0, 5_000, 0, None),
         ] {
             let minted = now - age;
             let id = Uuid::new_v7(uuid::Timestamp::from_unix(
@@ -1444,8 +1466,10 @@ mod hosted_routing_health_tests {
                     },
                 )
                 .unwrap();
-            storage.routed_direct_no_host_fits(id, spent_ms).unwrap();
-            ids.push((id, remaining, age));
+            storage
+                .routed_direct_no_host_fits(id, spent_ms, max_vcpus)
+                .unwrap();
+            ids.push((id, remaining, age, max_vcpus));
         }
         // Not a no_host_fits decision: a routed job still on its hosted route.
         let routed = Uuid::new_v7(uuid::Timestamp::from_unix(
@@ -1469,10 +1493,11 @@ mod hosted_routing_health_tests {
         let storage = Storage::open(&scratch).unwrap();
         assert_eq!(storage.hosted_no_host_fits_1h_at(now), 3);
         assert_eq!(storage.hosted_routed_jobs_1h_at(now), 1);
-        for (id, remaining, age) in ids {
+        for (id, remaining, age, max_vcpus) in ids {
             let job = storage.job(id).unwrap();
             assert!(job.hosted.is_none(), "age {age}");
             assert_eq!(job.routed_direct_reason.as_deref(), Some("no_host_fits"));
+            assert_eq!(job.routed_direct_hosted_max_vcpus, max_vcpus, "age {age}");
             assert_eq!(job.queue_wait_limit_s, remaining, "age {age}");
         }
     }

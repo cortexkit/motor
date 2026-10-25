@@ -1,0 +1,72 @@
+{
+  "source_revision": "cfd88753dc9bcffa7149dfa981e5bcef283d68f0",
+  "description": "Projected stop/snapshot lifecycle fields and pre-stop disk samples from two prepared-image qualification runs with a live job holding a quota-sized target. Poll groups repeat consecutive identical projected observations.",
+  "default": {
+    "sandbox_id": "bx_eqat87pz",
+    "stop_http_status": 202,
+    "stop_response": {
+      "ok": true,
+      "type": "sandbox.stopping",
+      "id": "bx_eqat87pz",
+      "status": "archiving",
+      "forced": false,
+      "operation": {
+        "id": "stop_c07f214be6cbbff1",
+        "status": "pending",
+        "requestedAt": "2026-10-25T00:04:21.784Z",
+        "lastAttemptAt": null,
+        "error": null,
+        "endedAt": null
+      }
+    },
+    "pre_stop": {
+      "job_running": true,
+      "allocated_bytes": 12901679104,
+      "root_free_bytes": 25838981120,
+      "xfs_free_bytes": 54121857024
+    },
+    "pre_stop_storage": {
+      "backing_file": "/var/lib/motor-boat.xfs",
+      "backing_allocated_blocks": 25831664
+    },
+    "poll_groups": [
+      {"count": 4, "lastSnapshotStatus": "in_progress", "snapshotCompletedAt": "2026-10-25T00:02:43.131Z", "lastSnapshotAttemptAt": "2026-10-25T00:03:08.549Z"},
+      {"count": 104, "lastSnapshotStatus": "in_progress", "snapshotCompletedAt": "2026-10-25T00:04:28.975Z", "lastSnapshotAttemptAt": "2026-10-25T00:04:29.549Z"},
+      {"count": 282, "lastSnapshotStatus": "completed", "snapshotCompletedAt": "2026-10-25T00:08:25.234Z", "lastSnapshotAttemptAt": "2026-10-25T00:04:29.549Z"}
+    ]
+  },
+  "large": {
+    "sandbox_id": "bx_cuakannp",
+    "stop_http_status": 202,
+    "stop_response": {
+      "ok": true,
+      "type": "sandbox.stopping",
+      "id": "bx_cuakannp",
+      "status": "archiving",
+      "forced": false,
+      "operation": {
+        "id": "stop_9f6fcd09886ef0d9",
+        "status": "pending",
+        "requestedAt": "2026-10-25T00:07:35.259Z",
+        "lastAttemptAt": null,
+        "error": null,
+        "endedAt": null
+      }
+    },
+    "pre_stop": {
+      "job_running": true,
+      "allocated_bytes": 34355609600,
+      "root_free_bytes": 67302338560,
+      "xfs_free_bytes": 32666882048
+    },
+    "pre_stop_storage": {
+      "backing_file": "/var/lib/motor-boat.xfs",
+      "backing_allocated_blocks": 101331472
+    },
+    "poll_groups": [
+      {"count": 247, "lastSnapshotStatus": "in_progress", "snapshotCompletedAt": "2026-10-25T00:05:43.566Z", "lastSnapshotAttemptAt": "2026-10-25T00:05:43.738Z"},
+      {"count": 31, "lastSnapshotStatus": "completed", "snapshotCompletedAt": "2026-10-25T00:16:59.828Z", "lastSnapshotAttemptAt": "2026-10-25T00:05:43.738Z"},
+      {"count": 110, "lastSnapshotStatus": "in_progress", "snapshotCompletedAt": "2026-10-25T00:16:59.828Z", "lastSnapshotAttemptAt": "2026-10-25T00:18:21.433Z"}
+    ]
+  }
+}

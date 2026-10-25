@@ -451,10 +451,48 @@ files, `runner-tests`, `cargo-artifacts.jsonl` and `provenance.json` remain unde
 `--output`; remove them only after confirming preparation's cleanup succeeded.
 The qualification requires **224 GiB free on `/var/lib/motor-vm` after builds**: a 170 GiB floor
 plus a 54 GiB allocation allowance. It rechecks the floor plus snapshot bytes
-before suspend. It uses 2 vCPUs / 16 GiB guest RAM, a fully allocated 20 GiB XFS
+before suspend. It uses 2 vCPUs / 16 GiB guest RAM, a 20 GiB XFS
 disk, a 16 GiB size base and one 16 GiB suspend image. Snapshot `memory.high` is
 14 GiB only during the helper's paused snapshot window; I/O weight is 10.
 These settings are a qualification workload, not production capacity approval.
+
+New builds advertise `sparse-v1` and `resize-v1` in `manifest.json`. The provisioner
+must build the size base with tenant-drive `discard: true` and `io_engine: "Sync"`;
+old bases must be rebuilt, because drive PATCH on restore cannot enable discard.
+The operator lane's `cold discard` and `warm discard` steps each write and fsync
+1 GiB in the root guest payload, pause while the host records
+`tenants/<name>/disk.img`'s `st_blocks * 512`, then delete, sync and fstrim `/tenant`.
+An ordinary sandboxed job only releases the measurement barrier. Each step refuses
+unless the host allocation falls by at least 900 MiB. Warm measurement follows a
+real helper suspend and restore; a base fallback is a failure. Measurements are
+recorded as `discard_measurement` entries in `raw.jsonl`.
+
+On the dedicated operator host, repeat the same command with a fresh results path
+and `--without-discard`. This control changes only the tenant drive's base-build
+discard bit and must fail `cold discard` (a FAIL is evidence, not a passing
+qualification). The control is recorded in `raw.jsonl`; it never modifies the
+source release. Neither live run belongs on the shared build runner. Portable
+tests check the probe choreography and the exact 900 MiB boundary, not physical
+block reclamation.
+
+The guest agent trims completed runner evictions within its 5-second status poll
+and also trims after 5 minutes of continuous idleness, including after restore.
+Trim failures are logged and retried; trim does not run while the guest filesystem
+is frozen for a snapshot.
+
+The host-only agent channel accepts the strict extension
+`{"op":"apply_resize","runner_args":"..."}` after `attach_tenant`. Arguments
+are limited to 16 KiB and pass the normal tenant argument parser; unknown fields
+are refused. The helper must keep its cold-wake admission barrier closed between
+attachment and activation's reply: attachment alone starts the old-argument
+runner and is not authorization to send a job. Activation refuses `resize_busy`
+if any work remains, closes runner admission with a complete drain, stops the old
+runner, checks the mounted XFS against `/dev/vdb`, and grows only a larger device.
+It then writes arguments with file fsync, atomic rename, directory fsync and
+syncfs, restarts the runner, and waits for its authenticated status/health reply.
+Any failed step refuses the operation; the caller must keep the staged arguments
+and retry on a fresh cold wake. Re-delivery rewrites the same argument bytes and
+does not grow matching geometry. The shared job protocol is unchanged.
 
 The source release is never changed: an exclusive temporary image version
 hard-links its read-only kernel/rootfs and copies the manifest with boot-only

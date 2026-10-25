@@ -4,7 +4,8 @@ This turns the dedicated Linux build server into a hosted-runners host: the
 root `motor-vm-helper`, the unprivileged `motor-host` TLS agent, their
 configs and keys, one tenant VM for our fleet's account, and one public TLS
 port. The existing SSH runner keeps running beside it. Broker-side enrollment
-belongs to CLOUD; this procedure prints the facts CLOUD registers.
+belongs to the broker operator; this procedure prints the facts the broker
+operator registers.
 
 The host id and the tenant's broker subject (`acct:<ULID>`) are installer
 arguments. They are not in this public repository; after installing they live
@@ -26,7 +27,8 @@ checkout `script/runner/sync.sh` maintains at `/srv/build/src/motor`.
 | `/etc/systemd/system/motor-host.service` | root, 0644 | `crates/motor-host/systemd/` |
 | `/etc/motor-host/host.json` | root, 0644 | `hosted_host.py host` |
 | `/etc/motor-vm-helper.json` | root, 0644 | `hosted_host.py helper` |
-| `/etc/motor-host/provision/tenant-1.json` | root, 0644 | `hosted_host.py tenant`: `script/hosted-host/tenant-1.json` plus the subject |
+| `/etc/motor-host/provision/tenant-1.json` | root, 0644 | first install: `hosted_host.py tenant`, `script/hosted-host/tenant-1.json` plus the subject; afterwards the installed record is kept |
+| `/etc/motor-host/capacity.json` | root, 0644 | written by the operator; see [Host capacity](#host-capacity) |
 | `/etc/motor-host/tenants.json` | root, 0644 | created as `{}`; `provision.py` adds the tenant |
 | `/etc/motor-host/keys/{host-signing.key,tls.crt,tls.key}` | motor-host, 0600 | `motor-host keygen`, only when all three are absent |
 | `/var/lib/motor-host/` | motor-host, 0700 | the agent's durable journal |
@@ -63,28 +65,72 @@ the rest and is busy, so tenant 1 starts small:
   on `/srv/build`, which the SSH runner also uses: its disk guard refuses jobs
   below its free-space floor (128 GiB by default) and evicts idle workspaces
   and caches below its eviction threshold (twice the floor by default). A
-  tenant disk cannot be resized later, only reprovisioned.
+  tenant disk only grows, offline, with `provision.py resize`
+  ([`script/tenant-provision/README.md`](../script/tenant-provision/README.md#offline-resize)).
+  On an image that lists the `sparse-v1` capability a new disk is sparse: only
+  the blocks the guest writes occupy the host.
 - `tap_index` 1 (tenant uid 400001), `io_weight` 100, the provisioner's other
   defaults.
 
-`provision.py` checks bytes before it allocates anything. It needs the disk,
-a suspend snapshot (guest RAM), `host_floor_bytes` (128 GiB) and, for a new
-size base, guest RAM plus 512 MiB free. On a host that also runs
-`motor-runner serve`, it also reads each runner's `--free-space-floor-bytes`
-and state root from its live arguments. If a runner's state is on the same
-filesystem as `/var/lib/motor-vm`, the free space left after the disk, snapshot
-and base must stay at or above that runner's refusal floor, where the runner
-starts refusing jobs. Otherwise provisioning refuses with "would leave X GiB
-free ... below motor-runner pid N's refusal floor Y GiB". Here the tenant
-consumes about 156.5 GiB, so with the default 128 GiB floor it needs about
-284.5 GiB free; the provisioner's own `host_floor_bytes` check needs the same.
-Between the floor and the eviction threshold the runner evicts idle
-workspaces, least recently used first, sooner than it would without the
-tenant. Pass `--tenant-disk-quota-gib` at install to change the disk size.
+`provision.py` checks bytes before it allocates anything, with the storage
+rule motor-host also applies on every admission and heartbeat: free space must
+cover `host_floor_bytes` (128 GiB), a suspend reserve of the guest RAM while
+`idle_suspend_s` is above 0, the `storage_margin_bytes` and
+`growth_allowance_bytes` from `capacity.json`, 2 GiB for filesystem metadata
+and, for a new size base, guest RAM plus 512 MiB. For this tenant (28 GiB,
+idle 600, base absent) that is 266.5 GiB free. A fully allocated disk (an
+image without `sparse-v1`) also takes its whole quota at once, which this
+check does not count, so leave that much more. motor-host refuses new leases
+when free space falls below its threshold (here 164 GiB) and resumes only
+8 GiB above it. On a host that also runs `motor-runner serve`, the provisioner
+also reads each runner's `--free-space-floor-bytes` and state root from its
+live arguments. If a runner's state is on the same filesystem as
+`/var/lib/motor-vm`, the free space left after the disk, snapshot and base
+must stay at or above that runner's refusal floor, where the runner starts
+refusing jobs. Otherwise provisioning refuses with "would leave X GiB free ...
+below motor-runner pid N's refusal floor Y GiB". Between the floor and the
+eviction threshold the runner evicts idle workspaces, least recently used
+first, sooner than it would without the tenant. Pass `--tenant-disk-quota-gib`
+at a first install to change the disk size.
 
-The cutover's other requirement, `vcpu_ceiling` equal to the runner's
-`--max-weight`, is deliberately not met: that applies when the hosted route
-replaces the SSH runner, not while it runs beside it.
+The cutover's rule that `vcpu_ceiling` equals the runner's `--max-weight` is
+deliberately not met: that applies when the hosted route replaces the SSH
+runner, not while it runs beside it. The guest still advertises
+`memory_max` of its placeable size: 28,672 − 2,048 = 26,624 MiB places
+leases of up to 7 vCPUs ([hosted-cutover.md](hosted-cutover.md#enable-on-one-machine)).
+
+### Growing the tenant beside a smaller runner
+
+When the tenant takes over most Linux work, the tenant grows and the runner
+shrinks. As a worked example on this server: switch tenant 1 to an image that
+lists the `resize-v1` capability, then resize it offline (`provision.py
+resize`, both services stopped) to 24 vCPUs on `0-11,16-27`, 78 GiB (79,872
+MiB), a 600 GiB sparse disk, a permit budget (`max_weight`) of 64 and
+`idle_suspend_s` 0; and run the runner with
+`--linux-cpus 12-15,28-31 --max-weight 16`, the 8 threads outside the tenant's
+cpuset, shared with the Windows VM
+([scheduling.md](scheduling.md#confining-linux-jobs-to-a-cpu-list)). The
+tenant then advertises at most 77,824 MiB, so the broker's ceilings for the
+host are `max_job_vcpus` 21 and `max_job_mem_mib` 75,264. The memory fit is
+(79,872 + 512) MiB + 16 + 6 + 24 GiB = 124.5 GiB, within this server's
+125.4 GiB `MemTotal`. At idle 0 the storage threshold is 136 GiB, the release
+point 144 GiB and the operating requirement 208 GiB; the resize itself needs
+288.5 GiB (309,774,516,224 bytes) free while its new size base is absent.
+
+### Host capacity
+
+The helper, motor-host and `provision.py` all read
+`/etc/motor-host/capacity.json` (root-owned, mode 0644, never group- or
+world-writable) and require the jobs-slice drop-in that
+`provision.py apply-jobs-slice` writes from it. Without both, the helper
+refuses to start any tenant, motor-host refuses every lease while still
+sending heartbeats, and `install.sh --check` fails. Install them before the
+host binaries; the file's contents and the rendered slice limits are in
+[`script/tenant-provision/README.md`](../script/tenant-provision/README.md#host-capacity-and-the-jobs-slice).
+A helper start refusal (capacity, memory fit, the slice's live cap, a pending
+resize journal) ends the lease before Run as a retryable `hosted_host_full`;
+motor-host logs `tenant_start_refused` with the case, advertises nothing for
+the tenant and retries its start at most once a minute.
 
 The helper's job-slot settings are inert: `motor-host` sends only tenant
 operations, but the helper config requires one slot. It uses slot uid 290000
@@ -140,7 +186,7 @@ extra rule.
    exactly one. `--port` (default 8443) and `--tenant-disk-quota-gib` (default
    100) override the defaults. A declined change or any failed check exits
    nonzero.
-4. Send CLOUD the enrollment block. It is five labelled lines in
+4. Send the broker operator the enrollment block. It is five labelled lines in
    `register-host` argument order, then the filled-in command:
 
    ```text
@@ -157,9 +203,12 @@ extra rule.
    It refuses a config with `fake_broker_url`, an endpoint that is not a public
    IPv4 address with the listen port, and a TLS key that does not match the
    certificate.
-5. Provision tenant 1 (this boots a size base once and allocates its disk):
+5. Write `/etc/motor-host/capacity.json` and apply the jobs slice
+   ([Host capacity](#host-capacity)), then provision tenant 1 (this boots a
+   size base once and creates its disk):
 
    ```sh
+   sudo python3 /srv/build/src/motor/script/tenant-provision/provision.py apply-jobs-slice
    sudo python3 /srv/build/src/motor/script/tenant-provision/provision.py --config /etc/motor-host/provision/tenant-1.json
    ```
 
@@ -193,11 +242,15 @@ extra rule.
    together. An image-mismatched suspend snapshot is moved to a timestamped
    sibling directory rather than deleted, and its new path is printed. The
    command prints the old and new image versions and an exact rollback command.
-   A repeated switch to the same image is safe. `install.sh --check` treats the
-   installed image version as mutable state but still checks the other tenant
-   fields against the checkout template and confirms the registry agrees. The
+   A repeated switch to the same image is safe. `install.sh --check` checks the
+   installed record as it is, image included (see step 6). The
    command never starts the host; run the existing `install.sh --start` only
    after `install.sh --check` and a review of its results.
+
+   To change a tenant's size (vCPUs, cpuset, RAM, disk, `max_weight`,
+   `idle_suspend_s`), use `provision.py resize` with both services stopped; it
+   is an offline, journaled operation described in
+   [`script/tenant-provision/README.md`](../script/tenant-provision/README.md#offline-resize).
 
    If `switch-image` refuses with `provisioning record and helper registry
    image versions differ`, the image was changed outside `switch-image`. The
@@ -212,20 +265,29 @@ extra rule.
    <registry>); no other field changed`, or that nothing changed. It refuses,
    changing nothing, if the registry's image is missing or fails the inventory
    check, or if any other field differs. A hand edit of the record is not a
-   substitute: `install.sh --check` requires the record to be byte-identical to
-   its own rendering (`hosted_host.py tenant`), so reformatting the file or
-   changing its mode fails the check.
+   substitute: `install.sh --check` requires the record and the helper registry
+   to agree on every field, so a record edited alone fails the check.
 
 6. Verify without changing anything. `--check`, `--start` and `--stop` read
-   the host id, subject, port and disk size from the installed configs:
+   the host id, subject and port from the installed configs, and check the
+   installed tenant record as it is, not against the checkout template:
+   `provision.py`'s own record validation; the record and the helper registry
+   agree on every field; `/etc/motor-vm-helper.json` equals the render from the
+   record (its slot CPUs come from the record's cpuset); the cpuset avoids the
+   Windows CPUs and stays within the host's 32 threads; `capacity.json`, the
+   memory fit and the jobs slice's live `MemoryMax`; and that no `resize.json`
+   exists. A resized record therefore passes and is never reset. A reinstall
+   (`--build` or install mode) keeps an installed record's sizing and image
+   and refuses `--tenant-disk-quota-gib`; the template applies only to a first
+   install:
 
    ```sh
    sudo script/hosted-host/install.sh --checkout /srv/build/src/motor --check
    ```
 
-7. Only after CLOUD confirms the registration, start the host. The broker
-   places leases on the host from its first signed heartbeat, so this is the
-   step that puts the host into service:
+7. Only after the broker operator confirms the registration, start the host.
+   The broker places leases on the host from its first signed heartbeat, so
+   this is the step that puts the host into service:
 
    ```sh
    sudo script/hosted-host/install.sh --checkout /srv/build/src/motor --start
@@ -240,7 +302,7 @@ extra rule.
 
 ## Roll back
 
-Ask CLOUD to stop placing on the host, then:
+Ask the broker operator to stop placing on the host, then:
 
 ```sh
 sudo script/hosted-host/install.sh --checkout /srv/build/src/motor --stop

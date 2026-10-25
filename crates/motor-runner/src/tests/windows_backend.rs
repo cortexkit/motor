@@ -618,7 +618,13 @@ fn windows_backend_failed_attempt_keeps_an_earlier_attempt_s_files() {
 #[test]
 fn windows_backend_recovery_notice_describes_only_automatic_retry_policy() {
     let f = Fixture::new();
-    let (c, _) = configure(&f, Fault::None, 0);
+    let (mut c, _) = configure(&f, Fault::None, 0);
+    // No background scheduler tick. A tick holds a strong reference to the
+    // runner while it runs; if one is running when the fixture is dropped,
+    // the fixture's cleanup can still reach the runner and cancels the
+    // hand-inserted Running job, whose missing request then panics in
+    // finalization. With no tick thread the runner is gone by then.
+    c.manual_tick = true;
     let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
     let id = Uuid::now_v7();
     let mut job = Job::new(id, None, 0, 0, 4);
