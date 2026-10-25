@@ -768,7 +768,7 @@ pub(crate) fn oom_memory_limit_detail(
     // largest job this host can admit. When the jobs slice caps job limits, a
     // larger vCPU count cannot buy more memory, so the advice names that cap.
     let mut more = (weight.max(4) * 2).min(capacity);
-    if let Some(slice) = crate::systemd::JobMemoryBudget::from_max(slice_ceiling) {
+    if let Some(slice) = crate::job_memory_budget::JobMemoryBudget::from_max(slice_ceiling) {
         // The slice clamps this job's limit, so only a request that still
         // raises the limit below the clamp is worth recommending.
         #[cfg(test)]
@@ -815,7 +815,12 @@ fn boat_memory_override_requires_explicit_profile_and_budget() {
     let mut config = Config::new("/unused", "boat");
     config.boat_profile = true;
     config.boat_memory_max_bytes = Some(14 << 30);
-    let detail = oom_memory_limit_detail(&config, 8, 8, crate::systemd::NO_JOB_MEMORY_BUDGET);
+    let detail = oom_memory_limit_detail(
+        &config,
+        8,
+        8,
+        crate::job_memory_budget::NO_JOB_MEMORY_BUDGET,
+    );
     assert!(detail.contains("15032385536 bytes"));
     assert!(!detail.contains("28 GiB"));
 }
@@ -2330,7 +2335,7 @@ impl Runner {
                 health,
                 repository_usage: Mutex::new(repository_usage),
                 slice_budget: std::sync::atomic::AtomicU64::new(
-                    crate::systemd::NO_JOB_MEMORY_BUDGET,
+                    crate::job_memory_budget::NO_JOB_MEMORY_BUDGET,
                 ),
                 _lock: lock,
                 rustc_version,
@@ -3263,14 +3268,20 @@ impl Runner {
     fn refresh_slice_budget(&self) {
         #[cfg(test)]
         if let Some(probe) = &self.core.config.slice_ceiling_probe {
-            let max = probe().unwrap_or(crate::systemd::NO_JOB_MEMORY_BUDGET);
+            let max = probe().unwrap_or(crate::job_memory_budget::NO_JOB_MEMORY_BUDGET);
             self.core
                 .slice_budget
                 .store(max, std::sync::atomic::Ordering::Relaxed);
             return;
         }
+        // Only Linux has a jobs slice; elsewhere the ceiling refuses nothing.
+        #[cfg(target_os = "linux")]
         let max = crate::systemd::read_job_memory_budget()
-            .map_or(crate::systemd::NO_JOB_MEMORY_BUDGET, |budget| budget.max);
+            .map_or(crate::job_memory_budget::NO_JOB_MEMORY_BUDGET, |budget| {
+                budget.max
+            });
+        #[cfg(not(target_os = "linux"))]
+        let max = crate::job_memory_budget::NO_JOB_MEMORY_BUDGET;
         self.core
             .slice_budget
             .store(max, std::sync::atomic::Ordering::Relaxed);

@@ -35,6 +35,7 @@ mod server;
 mod setup_log;
 // Nothing in a production build uses sibling snapshots yet: production builds
 // keep sibling snapshot mode off, so only tests reach this module.
+mod job_memory_budget;
 #[cfg_attr(not(test), allow(dead_code))]
 mod sibling_snapshots;
 mod spool;
