@@ -199,13 +199,14 @@ fn disk_identity(disk: &Handle, reporter: &CacheReporter) -> io::Result<DiskIden
         )?,
         0,
     )?;
-    // The driver returns a fixed header (disk size, geometry, partition-table
-    // length) followed by that many partition-table bytes and any trailing
-    // extra. The total length therefore covers the whole reported geometry,
-    // which changes whenever the disk behind the number does.
+    // DISK_GEOMETRY_EX starts with the 24-byte DISK_GEOMETRY, followed by
+    // DiskSize, the disk's length in bytes. The buffer's own length only
+    // reflects the partition information that follows, so it can't identify
+    // a disk.
+    let disk_size: i64 = value(&geometry, size_of::<DISK_GEOMETRY>())?;
     Ok(DiskIdentity {
         serial: storage_serial(&descriptor)?.to_owned(),
-        length_bytes: geometry.len() as u64,
+        length_bytes: u64::try_from(disk_size).map_err(|_| invalid("negative disk size"))?,
         device_number: number.DeviceNumber,
         device_type: number.DeviceType,
         scsi: scsi_address(disk, reporter)?,
@@ -362,17 +363,19 @@ impl WindowsStorage {
         self.expected_identity = identity.clone();
         Ok(identity)
     }
-    fn expected_identity(&self) -> DiskIdentity {
+    /// Whether the disk behind the held handle is still the one to write.
+    /// Hyper-V disks report no serial, so the whole identity pinned at
+    /// selection must match. On the QEMU runner the cache disk is the one
+    /// carrying the fixed `motor-cache` serial, and only that is compared:
+    /// its other fields were never pinned.
+    fn identity_unchanged(&self, actual: &DiskIdentity) -> bool {
         #[cfg(feature = "hyperv-runner")]
         {
-            self.expected_identity.clone()
+            *actual == self.expected_identity
         }
         #[cfg(not(feature = "hyperv-runner"))]
         {
-            DiskIdentity {
-                serial: motor_winagent::cache::CACHE_DISK_SERIAL.to_owned(),
-                ..DiskIdentity::default()
-            }
+            actual.serial == motor_winagent::cache::CACHE_DISK_SERIAL
         }
     }
     fn attributes(&self) -> io::Result<u64> {
@@ -594,7 +597,7 @@ impl CacheStorage for WindowsStorage {
     }
 
     fn make_writable(&mut self) -> io::Result<()> {
-        if disk_identity(&self.disk, &self.reporter)? != self.expected_identity() {
+        if !self.identity_unchanged(&disk_identity(&self.disk, &self.reporter)?) {
             return Err(invalid("cache disk identity changed"));
         }
         let mask = DISK_ATTRIBUTE_OFFLINE | DISK_ATTRIBUTE_READ_ONLY;
@@ -632,7 +635,7 @@ impl CacheStorage for WindowsStorage {
             // before the first write. A disk that already has a partition
             // table (including one left by an interrupted initialization) is
             // refused; the host then discards it.
-            if disk_identity(&self.disk, &reporter)? != self.expected_identity() {
+            if !self.identity_unchanged(&disk_identity(&self.disk, &reporter)?) {
                 return Err(invalid("cache disk identity changed"));
             }
             let windows = self.windows_disks()?;
