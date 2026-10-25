@@ -17,6 +17,13 @@ fn config(h: &Harness, repo: &Path) -> Config {
     }
 }
 
+pub(super) fn control_placement() -> motor_lease::Placement {
+    motor_lease::Placement {
+        host: "control-host".into(),
+        vm: Some("t1".into()),
+    }
+}
+
 pub(super) fn request(workspace: &Path) -> RunRequest {
     let args = crate::cli::RunArgs {
         cwd: Some(workspace.into()),
@@ -57,6 +64,93 @@ fn hosted_repositories_roundtrips_and_default_is_omitted() {
     let restored: Config = serde_json::from_value(wire).unwrap();
     assert_eq!(restored.hosted_repositories, config.hosted_repositories);
     assert!(!restored.hosted_runners);
+}
+
+#[test]
+fn repository_placement_hint_config_roundtrips_absent_null_and_present() {
+    for input in ["{}", r#"{"hosted_repositories_placement_hint":null}"#] {
+        let config: Config = serde_json::from_str(input).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.hosted_repositories_placement_hint, None);
+        let wire = serde_json::to_value(config).unwrap();
+        assert!(wire.get("hosted_repositories_placement_hint").is_none());
+        let restored: Config = serde_json::from_value(wire).unwrap();
+        assert_eq!(restored.hosted_repositories_placement_hint, None);
+    }
+    let config: Config = serde_json::from_value(serde_json::json!({
+        "hosted_repositories": ["/home/operator/project"],
+        "hosted_repositories_placement_hint": {"host":"control-host","vm":"t1"}
+    }))
+    .unwrap();
+    config.validate().unwrap();
+    let wire = serde_json::to_value(config).unwrap();
+    assert_eq!(
+        wire["hosted_repositories_placement_hint"],
+        serde_json::json!({"host":"control-host","vm":"t1"})
+    );
+    let restored: Config = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        restored.hosted_repositories_placement_hint,
+        Some(control_placement())
+    );
+}
+
+#[test]
+fn repository_placement_hint_rejects_invalid_names_and_null_vm() {
+    for hint in [
+        serde_json::json!({"host":"","vm":"t1"}),
+        serde_json::json!({"host":"control-host","vm":null}),
+        serde_json::json!({"host":"control-host","vm":""}),
+        serde_json::json!({"host":"control host","vm":"t1"}),
+        serde_json::json!({"host":"control-host","vm":"a/b"}),
+    ] {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "hosted_repositories_placement_hint": hint
+        }))
+        .unwrap();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("hosted_repositories_placement_hint"));
+    }
+}
+
+#[tokio::test]
+async fn repository_routed_lease_carries_the_configured_hint_without_caching_it_for_other_routes() {
+    let h = Harness::new(Behavior::CompleteRun).await;
+    let (scratch, repo) = committed_repo();
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let mut config = config(&h, &repo);
+    config.hosted_repositories_placement_hint = Some(control_placement());
+    let root = scratch.0.join("state");
+    let motor = Motor::with_connector(config, &root, ssh.clone()).unwrap();
+    let request = request(&repo);
+    let workspace_key = request.workspace_key.clone();
+    let stream = motor.run(request).unwrap();
+    let id = stream.job_id;
+    let (_, terminal) = records(stream).await;
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+    let bodies = lease_bodies(&h);
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(
+        bodies[0]["placement_hint"],
+        serde_json::json!({"host":"control-host","vm":"t1"})
+    );
+    assert_eq!(bodies[0]["allow_spill"], false);
+    assert_eq!(bodies[0]["avoid_host"], serde_json::Value::Null);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    assert!(motor.storage.hosted_placement(&workspace_key).is_none());
+    drop(motor);
+
+    let restored = Motor::with_connector(h.config(), &root, ssh).unwrap();
+    let state = restored.hosted_state(id).unwrap();
+    assert_eq!(state.repository_placement_hint, Some(control_placement()));
+    assert_eq!(
+        state.lease_request.unwrap().placement_hint,
+        Some(control_placement())
+    );
+    assert!(restored.storage.hosted_placement(&workspace_key).is_none());
 }
 
 #[tokio::test]
@@ -516,6 +610,136 @@ async fn stage1_no_capacity_retries_the_identical_body_then_runs_on_the_host() {
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn hinted_no_capacity_retries_the_identical_body_then_runs_without_fallback() {
+    let h = Harness::new(Behavior::CompleteRun).await;
+    h.lease_replies.lock().unwrap().extend([
+        (503, serde_json::json!({"error":"no_capacity"}), "0"),
+        (503, serde_json::json!({"error":"no_capacity"}), "1"),
+    ]);
+    let (scratch, repo) = committed_repo();
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let mut config = config(&h, &repo);
+    config.hosted_repositories_placement_hint = Some(control_placement());
+    let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let started = tokio::time::Instant::now();
+    let stream = motor.run(request(&repo)).unwrap();
+    let id = stream.job_id;
+    let (_, terminal) = records(stream).await;
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    let bodies = h.lease_bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 3);
+    assert!(bodies.iter().all(|body| body == &bodies[0]));
+    let body: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
+    assert_eq!(body["job_id"], id.to_string());
+    assert_eq!(
+        body["placement_hint"],
+        serde_json::json!({"host":"control-host","vm":"t1"})
+    );
+    assert_eq!(body["allow_spill"], false);
+    assert_eq!(motor.hosted_state(id).unwrap().placement_attempts, 1);
+    assert_eq!(h.runs.load(Ordering::SeqCst), 1);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn hinted_no_capacity_exhausts_the_queue_budget_without_fallback() {
+    let h = Harness::new(Behavior::CompleteRun).await;
+    h.lease_replies
+        .lock()
+        .unwrap()
+        .extend((0..10).map(|_| (503, serde_json::json!({"error":"no_capacity"}), "1")));
+    let (scratch, repo) = committed_repo();
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let mut config = config(&h, &repo);
+    config.hosted_repositories_placement_hint = Some(control_placement());
+    let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let mut request = request(&repo);
+    request.queue_wait_limit_s = Some(3);
+    let started = tokio::time::Instant::now();
+    let stream = motor.run(request).unwrap();
+    let id = stream.job_id;
+    let (_, terminal) = tokio::time::timeout(Duration::from_secs(10), records(stream))
+        .await
+        .expect("capacity waits must end within the queue budget");
+    assert!(started.elapsed() >= Duration::from_secs(3));
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RunnerFull
+        }
+    );
+    assert!(terminal.refusal_detail.unwrap().contains("hosted_capacity"));
+    assert!(terminal.retry_after_ms.is_some());
+    let bodies = h.lease_bodies.lock().unwrap();
+    assert!(
+        bodies.len() >= 2,
+        "capacity must be retried before refusing"
+    );
+    assert!(bodies.iter().all(|body| body == &bodies[0]));
+    let body: serde_json::Value = serde_json::from_slice(&bodies[0]).unwrap();
+    assert_eq!(body["allow_spill"], false);
+    assert_eq!(
+        body["placement_hint"],
+        serde_json::json!({"host":"control-host","vm":"t1"})
+    );
+    assert!(motor
+        .storage
+        .job(id)
+        .unwrap()
+        .routed_direct_reason
+        .is_none());
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        lease_settlement_requests(&h),
+        vec![format!("/v1/leases/{id}/release")]
+    );
+}
+
+#[tokio::test]
+async fn hinted_no_host_fits_refuses_without_build_server_correction() {
+    let h = Harness::new(Behavior::CompleteRun).await;
+    h.broker.lock().unwrap().knobs.max_vcpus = Some(8);
+    let (scratch, repo) = committed_repo();
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let mut config = config(&h, &repo);
+    config.hosted_repositories_placement_hint = Some(control_placement());
+    let motor = Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    let mut request = request(&repo);
+    request.weight_hint = Some(16);
+    let stream = motor.run(request).unwrap();
+    let id = stream.job_id;
+    let (_, terminal) = records(stream).await;
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RequestRejected
+        }
+    );
+    assert!(terminal
+        .refusal_detail
+        .unwrap()
+        .contains("hosted_no_host_fits"));
+    let bodies = lease_bodies(&h);
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["allow_spill"], false);
+    assert_eq!(
+        bodies[0]["placement_hint"],
+        serde_json::json!({"host":"control-host","vm":"t1"})
+    );
+    let job = motor.storage.job(id).unwrap();
+    assert!(job.routed_direct_reason.is_none());
+    assert!(job.hosted.unwrap().repository_routed);
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        lease_settlement_requests(&h),
+        vec![format!("/v1/leases/{id}/release")]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn stage1_no_capacity_and_provisioning_share_one_bounded_queue_deadline() {
     let _clock = HeldClock::new();
@@ -590,12 +814,9 @@ async fn unlisted_spill_eligible_job_still_withdraws_and_sends_allow_spill_true(
     let (_listed_scratch, listed) = committed_repo();
     let peer = super::queue_tests::ResubmitPeer::new();
     let log = peer.log.clone();
-    let motor = Motor::with_connector(
-        config(&h, &listed),
-        &scratch.0.join("state"),
-        Arc::new(peer),
-    )
-    .unwrap();
+    let mut config = config(&h, &listed);
+    config.hosted_repositories_placement_hint = Some(control_placement());
+    let motor = Motor::with_connector(config, &scratch.0.join("state"), Arc::new(peer)).unwrap();
     let stream = motor.run(request(&repo)).unwrap();
     let id = stream.job_id;
     let (_, terminal) = records(stream).await;
@@ -605,6 +826,7 @@ async fn unlisted_spill_eligible_job_still_withdraws_and_sends_allow_spill_true(
     assert_eq!(bodies.len(), 1, "Spill does not retry no_capacity");
     assert_eq!(bodies[0]["allow_spill"], true);
     assert_eq!(bodies[0]["avoid_host"], "test-host");
+    assert_eq!(bodies[0]["placement_hint"], serde_json::Value::Null);
     assert_eq!(motor.hosted_health().unwrap()["hosted_routed_jobs_1h"], 0);
 }
 

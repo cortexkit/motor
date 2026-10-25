@@ -332,6 +332,8 @@ impl Motor {
             let mut route = crate::HostedJobState::new(&self.config);
             route.repository_routed = true;
             route.hosted_no_fallback = true;
+            route.repository_placement_hint =
+                self.config.hosted_repositories_placement_hint.clone();
             self.storage.hosted_route(id, route)?;
             tracing::info!(job_id = %id, repo = %request.repository_root,
                 "routed to hosted (hosted_repositories)");
@@ -873,9 +875,11 @@ impl Motor {
                         Ok(channel)
                     }
                     Err(crate::hosted::Error::NoHostFits(max_vcpus))
-                        if self
-                            .hosted_state(id)
-                            .is_some_and(|s| s.capacity_routed() && !s.run_sent) =>
+                        if self.hosted_state(id).is_some_and(|s| {
+                            s.capacity_routed()
+                                && !s.run_sent
+                                && s.repository_placement_hint.is_none()
+                        }) =>
                     {
                         // No hosted host can ever hold this job, so choosing
                         // hosted for it was wrong from the start. This undoes

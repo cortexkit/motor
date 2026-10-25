@@ -45,6 +45,17 @@ addresses; supply verified host keys):
 ]
 ```
 
+An entry's `state_root` must be an absolute POSIX path (for example,
+`/srv/motor/windows`) or an ASCII drive-letter path with forward slashes (for
+example, `C:/ProgramData/MotorRunner/state`). After the root, only ASCII letters,
+digits, `/`, `.`, `_` and `-` are accepted. Exact `..` segments, backslashes,
+whitespace and shell metacharacters are refused: the path is passed unquoted as
+the remote command's `--state-root` argument. Validation errors identify the
+entry and field as `windows_runners[INDEX] (NAME): FIELD ...`, including duplicate
+names. Tests: `ordered_windows_config_accepts_ally_drive_root_and_mixed_posix_entries`,
+`ordered_windows_config_refuses_unsafe_state_roots_with_entry_and_field`,
+`ordered_windows_config_names_every_invalid_entry_field`.
+
 An explicit endpoint uses only the existing vault-signed runner identity: no
 ambient SSH configuration, identities or agents, no forwarded agent, and no
 shared build-server SSH master. A private temporary `known_hosts` file pins

@@ -1,4 +1,4 @@
-use super::repository_routing_tests::{lease_bodies, request, DirectPeer};
+use super::repository_routing_tests::{control_placement, lease_bodies, request, DirectPeer};
 use super::*;
 use crate::hosted::{
     boat_tests::{committed_repo, records},
@@ -52,6 +52,7 @@ async fn fleet_linux_default_platform_jobs_allow_hosted_spill_but_gates_stay_dir
     let mut config = config(&h);
     config.spill_to_hosted = true;
     config.spill_after_s = 0;
+    config.hosted_repositories_placement_hint = Some(control_placement());
     let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
     for (platform, timeout, gate) in [
         (None, 10, false),
@@ -103,6 +104,10 @@ async fn fleet_linux_default_platform_jobs_allow_hosted_spill_but_gates_stay_dir
         assert_eq!(body["platform"], "linux-x64");
         assert_eq!(body["allow_spill"], true);
         assert_eq!(body["avoid_host"], serde_json::Value::Null);
+        assert_ne!(
+            body["placement_hint"],
+            serde_json::to_value(control_placement()).unwrap()
+        );
     }
     assert_eq!(h.runs.load(Ordering::SeqCst), 2);
     assert_eq!(peer.0.load(Ordering::SeqCst), 1);

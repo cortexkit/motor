@@ -200,8 +200,11 @@ async fn shadow_hanging_or_refused_never_changes_callers_stream_or_exit() {
         })
         .await;
         let root = dir.join("state");
+        let mut config = config(&http.url);
+        config.hosted_repositories_placement_hint =
+            Some(crate::motor::repository_routing_tests::control_placement());
         let motor = Motor::with_connector(
-            config(&http.url),
+            config,
             &root,
             Arc::new(PrimaryPeer {
                 shadow_requested: Some(requested),
@@ -246,6 +249,7 @@ async fn shadow_hanging_or_refused_never_changes_callers_stream_or_exit() {
         }
         assert_eq!(leases[0].1["shadow"], true);
         assert_eq!(leases[0].1["avoid_host"], "build-server");
+        assert_eq!(leases[0].1["placement_hint"], serde_json::Value::Null);
         let shadow_id = leases[0].1["job_id"].as_str().unwrap();
         let state = crate::storage::durable_value(&root).unwrap().to_string();
         assert!(
