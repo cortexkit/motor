@@ -1,6 +1,7 @@
 """Destructive-to-job, not destructive-to-sandbox, disk exhaustion qualification."""
 import errno
 import json
+import math
 import uuid
 from quota_inheritance import SOURCE as INHERITANCE, POSITIVE_CONTROL
 from quota_adversarial import BASELINE_JOB, CAPACITY, DEEP_JOB, reflink_seed
@@ -23,6 +24,10 @@ CHARGE_BYTES = 256 * 1024**2  # A multiple of the 8 MiB write and 1 MiB fallocat
 def fill_bytes(lane):
     """Bytes the lane's job writes; 0 means until the kernel refuses the write."""
     return 0 if lane in FULL_LANES else CHARGE_BYTES
+
+
+def job_seconds(lane, remaining):
+    return min(1800, max(1, math.ceil(remaining))) if lane == RETAINED_LANE else 900
 
 # Keep the fill alive until the host measures both filesystems. The barrier is
 # allocated before filling: publishing the errno must not need another block.
@@ -82,8 +87,8 @@ with marker.open('w+b', buffering=0) as barrier:
         barrier.seek(0)
         barrier.write(encoded.ljust(4096, b' '))
         os.fsync(barrier.fileno())
-    def acknowledged():
-        deadline = time.monotonic() + 90
+    def acknowledged(seconds=90):
+        deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             barrier.seek(0)
             if barrier.read(1) == b'!': return True
@@ -126,7 +131,7 @@ with marker.open('w+b', buffering=0) as barrier:
         metadata = os.fstat(output_fd)
         report.update(output_allocated_bytes=metadata.st_blocks * 512, output_size_bytes=metadata.st_size)
     publish(report)
-    if not acknowledged():
+    if not acknowledged(QUOTA_HOLD_SECONDS if QUOTA_LANE == 'retained_target' else 90):
         report['observer_timeout'] = True
     if output_fd is not None:
         # Punch only the probe's unwritten extents; stdout still has size zero.
@@ -166,12 +171,12 @@ def resume_eviction_checks(before, after, ready):
     }
 
 
-def job(lane, token=None):
+def job(lane, token=None, hold_seconds=90):
     if lane not in LANES + (RETAINED_LANE,):
         raise ValueError('unknown quota probe lane')
     token = token or uuid.uuid4().hex
     return ('QUOTA_LANE=' + repr(lane) + '\nQUOTA_PROBE_TOKEN=' + repr(token) + '\nQUOTA_FILL_BYTES='
-            + repr(fill_bytes(lane)) + '\n' + INHERITANCE + JOB_SOURCE)
+            + repr(fill_bytes(lane)) + '\nQUOTA_HOLD_SECONDS=' + repr(hold_seconds) + '\n' + INHERITANCE + JOB_SOURCE)
 
 OBSERVER = r'''
 import ctypes, json, os, pathlib, struct, subprocess, time
@@ -380,6 +385,27 @@ def positive_control_passed(report):
             and bool(report.get('before_flags', 0) & 0x200) and not (report.get('after_flags', 0) & 0x200)
             and isinstance(report.get('before_project'), int)
             and report.get('before_project') == report.get('after_project'))
+
+
+def retained_hold_status(samples, pre_stop=None):
+    """Missing live observations cannot qualify a stop as retaining a live, quota-sized target."""
+    observed = (isinstance(pre_stop, dict) and pre_stop.get('job_running') is True
+                and type(pre_stop.get('allocated_bytes')) is int and pre_stop['allocated_bytes'] > 0)
+    gap = False
+    for sample in samples:
+        state = sample.get('sandbox') or {}
+        if state.get('state') == 'archived' and (state.get('stop') or {}).get('status') == 'completed':
+            continue
+        guest = sample.get('retained_job') or {}
+        if guest.get('status') != 'observed':
+            gap = True
+            continue
+        observed = True
+        if guest.get('job_running') is False or guest.get('retained_target_at_limit') is False:
+            return 'FAIL'
+        if guest.get('job_running') is not True or guest.get('retained_target_at_limit') is not True:
+            gap = True
+    return 'INCONCLUSIVE' if gap or not observed else 'PASS'
 
 
 def file_setattr_status(result, control):

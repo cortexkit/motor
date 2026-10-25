@@ -60,10 +60,12 @@ def sandbox_lifecycle(item):
 
 
 class SandboxWaitTimeout(ProbeError):
-    def __init__(self, sid, states, seconds, polls, last):
+    def __init__(self, sid, states, seconds, polls, last, progress=None):
         self.evidence = {'sandbox_id': sid, 'expected_states': sorted(states), 'seconds': seconds,
                          'polls': polls, 'last_sandbox': sandbox_lifecycle(last or {})}
-        super().__init__('timed out waiting for sandbox ' + sid + '; ' + json.dumps(self.evidence))
+        self.evidence.update(progress or {})
+        super().__init__('timed out waiting for sandbox ' + sid + '; '
+                         + json.dumps({key: value for key, value in self.evidence.items() if key != 'samples'}))
 
 
 class SnapshotSizeBound(ProbeError):
@@ -222,13 +224,14 @@ class Probe:
     cargo_seed_sha256: 'str | None'
     cargo_seed_archive: 'Path | None'
 
-    def __init__(self, client, data, checkpoint, port=9443, minutes=30, size="large"):
+    def __init__(self, client, data, checkpoint, port=9443, minutes=30, size="large", quota_stop_wait_s=900):
         if size not in SIZES:
             raise ProbeError("unknown Boat sandbox size: " + str(size))
         self.client, self.data, self.checkpoint, self.port = client, data, checkpoint, port
         self.size = size
         self.deadline = time.monotonic() + minutes * 60
         self.minutes = minutes
+        self.quota_stop_wait_s = quota_stop_wait_s
         self.base = ".boat-probe-" + data["run_id"]
         self.source = Path(__file__).with_name("guest.py").read_bytes()
 
@@ -237,20 +240,51 @@ class Probe:
             raise ProbeError("measurement wall-clock budget expired; entering cleanup")
         return self.client.request(*args, **kwargs)
 
-    def wait_sandbox(self, sid, states):
+    def wait_sandbox(self, sid, states, timeout_s=900, *, observation=None, on_sample=None):
         started = time.monotonic()
-        until = min(self.deadline, started + 900)
+        until = min(self.deadline, started + timeout_s)
+        progress = observation if observation is not None else {}
+        progress.update(sandbox_id=sid, expected_states=sorted(states), requested_wait_seconds=timeout_s,
+                        remaining_budget_seconds=max(0, self.deadline - started),
+                        effective_wait_seconds=max(0, until - started), budget_limited=self.deadline < started + timeout_s,
+                        samples=[])
+        next_sample = started
         polls, item = 0, None
+        sample = None
+        def capture(sample, item):
+            if on_sample is not None:
+                try:
+                    observed = on_sample(item)
+                    if not isinstance(observed, dict):
+                        raise ValueError('sample observer did not return an object')
+                    sample['retained_job'] = observed
+                except Exception as error:
+                    sample['retained_job'] = {'status': 'unavailable', 'error': str(error)}
+            progress['samples'].append(sample)
+            self.checkpoint()
         while time.monotonic() < until:
             item = sandbox(self.request("GET", "/sandboxes/" + sid))
             polls += 1
-            if item.get("state") in states and ("archived" not in states or
-                                                (item.get("stop") or {}).get("status") == "completed"):
+            now = time.monotonic()
+            complete = item.get('state') in states and ('archived' not in states or
+                                                       (item.get('stop') or {}).get('status') == 'completed')
+            failed = item.get('state') in {'error', 'cancelled'}
+            progress.update(polls=polls, seconds=now - started, last_sandbox=sandbox_lifecycle(item))
+            sample = {'seconds': now - started, 'at': datetime.now(timezone.utc).isoformat(),
+                      'sandbox': progress['last_sandbox']}
+            if now >= next_sample or complete or failed:
+                capture(sample, item)
+                next_sample = started + (int((now - started) // 30) + 1) * 30
+            if complete:
                 return item
-            if item.get("state") in {"error", "cancelled"}:
+            if failed:
                 raise ProbeError("sandbox entered failure state: " + json.dumps(item))
             time.sleep(2)
-        raise SandboxWaitTimeout(sid, states, time.monotonic() - started, polls, item)
+        if sample is not None and progress['samples'][-1] != sample:
+            capture(sample, item)
+        progress.update(polls=polls, seconds=time.monotonic() - started, last_sandbox=sandbox_lifecycle(item or {}))
+        self.checkpoint()
+        raise SandboxWaitTimeout(sid, states, progress['seconds'], polls, item, progress)
 
     def wait_hydrated(self, sid):
         while True:
@@ -1022,9 +1056,15 @@ def render_runner_host(data):
     lines += ["## Timing (seconds, measured from the operator machine)", "",
               "| Measurement | Seconds |", "| --- | --- |"]
     prepared, snapshot = runner.get("prepared_image") or {}, runner.get("snapshot") or {}
+    plain_stop = runner.get('core_stop_resume') or {}
+    quota_stop = (runner.get('disk_quota') or {}).get('stop_at_limit') or {}
     for label, value in (("Create to Boat-ready (first sandbox)", runner.get("create", {}).get("seconds_to_ready")),
                          ("Source upload and recipe install", runner.get("install_seconds")),
-                         ("Prepared image save", prepared.get("seconds")),
+                          ("Prepared image save", prepared.get("seconds")),
+                          ("Core plain stop (accepted response to completed)", plain_stop.get('accepted_to_completed_seconds')),
+                          ("Quota stop (accepted response to completed)", quota_stop.get('accepted_to_completed_seconds')),
+                          ("Quota stop requested wait cap", (quota_stop.get('wait') or {}).get('requested_wait_seconds')),
+                          ("Quota stop effective wait within budget", (quota_stop.get('wait') or {}).get('effective_wait_seconds')),
                          ("Measurement snapshot save", snapshot.get("seconds")),
                          ("Create from measurement snapshot to Boat-ready", runner.get("create_from_snapshot", {}).get("seconds_to_ready")),
                          ("Create from measurement snapshot to hydrated", runner.get("create_from_snapshot", {}).get("seconds_to_hydrated")),
@@ -1100,6 +1140,9 @@ def main(report_stream=None):
     parser.add_argument("--write-template", type=Path, help="export the Markdown findings template, offline")
     parser.add_argument("--findings", type=Path, help="Markdown destination (default: beside JSON)")
     parser.add_argument("--max-minutes", type=int, default=30, choices=range(5, 61), metavar="5..60")
+    parser.add_argument('--quota-stop-wait-s', type=int,
+                        help='runner-host full-quota stop wait cap in seconds (default: 900); '
+                             'still limited by the remaining 30-minute phase budget')
     parser.add_argument("--size", choices=tuple(SIZES), default="large",
                         help="Boat sandbox size for every sandbox this run creates, including "
                              "--verify-prepared-image clones (default: large)")
@@ -1131,6 +1174,11 @@ def main(report_stream=None):
     parser.add_argument('--acknowledge-tenant-one-private-cache', action='store_true',
                         help='required for runner-host: seed/image contain private fleet dependencies, never for customers')
     args = parser.parse_args()
+    if args.quota_stop_wait_s is not None:
+        if not args.runner_host:
+            parser.error('--quota-stop-wait-s requires --runner-host')
+        if args.quota_stop_wait_s <= 0:
+            parser.error('--quota-stop-wait-s must be positive')
     if args.cache_bench or args.cache_profile != 'legacy' or args.cache_baseline or args.cache_samples or any((
             args.cache_image, args.cache_bundle, args.cache_bundle_sha256,
             args.cache_backends, args.cache_prefix, args.cache_repositories)):
@@ -1181,7 +1229,8 @@ def main(report_stream=None):
     signal.signal(signal.SIGTERM, interrupt)
     try:
         if not args.cleanup:
-            runner = Probe(client, data, checkpoint, minutes=args.max_minutes, size=args.size)
+            runner = Probe(client, data, checkpoint, minutes=args.max_minutes, size=args.size,
+                           quota_stop_wait_s=args.quota_stop_wait_s if args.quota_stop_wait_s is not None else 900)
             runner.results_path = path.resolve()
             runner.retain_prepared_image = args.prepared_image
             runner.from_prepared_image = args.from_prepared_image

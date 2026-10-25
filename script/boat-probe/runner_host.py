@@ -1644,6 +1644,7 @@ class RunnerHost:
                 if phase == 'core':
                     self.phase(sid, 'prepared_clone', directory, public, repository, client,
                                first_started=started, idle=False)
+                    self.verify_core_resume(sid, directory, public, repository, client)
                 elif phase == 'idle':
                     self.verify_idle(sid, directory, public, repository, client)
                 else:
@@ -1717,6 +1718,61 @@ class RunnerHost:
                 raise ValueError('the endpoint did not become ready in the ' + label + ' sandbox')
             self.execute(sid, 'sudo -n systemctl start motor-boat-bridge')
         return argv
+
+    def verify_core_resume(self, sid, directory, public, repository, client):
+        """Stop an idle, unfilled prepared clone and qualify its resumed endpoint with a real job."""
+        import disk_quota
+        from probe import READY
+        label = 'core_resumed'
+        record: dict[str, Any] = {'name': label, 'wait': {}}
+        self.data['core_stop_resume'] = record
+        self.data['phases'].append(record)
+        with self.section('plain_stop_resume'), self.phase_evidence(sid, record):
+            record['pre_stop_idle'] = self.guest_json(
+                sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(disk_quota.CLEANUP), 'core idle endpoint before stop')
+            idle = record['pre_stop_idle'].get('ready') is True and record['pre_stop_idle'].get('leases') == []
+            self.check('core_stop_resume.idle_before_stop', idle, record['pre_stop_idle'])
+            if not idle:
+                raise ValueError('core stop control requires a ready endpoint with no job quota leases')
+            record['pre_stop_storage'] = self.guest_json(
+                sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE), 'core pre-stop storage')
+            with self.section('stop'):
+                try:
+                    record['stop'] = self.probe.request('POST', f'/sandboxes/{sid}/stop', {})
+                    accepted = time.monotonic()
+                    record['accepted_at'] = datetime.now(timezone.utc).isoformat()
+                    archived = self.probe.wait_sandbox(sid, {'archived'}, observation=record['wait'])
+                    record['accepted_to_completed_seconds'] = time.monotonic() - accepted
+                except Exception as error:
+                    self.check('core_stop_resume.stop_completed', False, record,
+                               reason='plain core stop did not complete: ' + str(error))
+                    raise
+                stopped = archived.get('state') == 'archived' and (archived.get('stop') or {}).get('status') == 'completed'
+                self.check('core_stop_resume.stop_completed', stopped, record)
+                if not stopped:
+                    raise ValueError('plain core stop did not report completed archival')
+            with self.section('resume'):
+                record['resume'] = self.probe.request('POST', f'/sandboxes/{sid}/resume', {})
+                self.probe.wait_sandbox(sid, READY)
+                self.probe.wait_hydrated(sid)
+                hydrated_at = time.monotonic()
+            argv = self.route(sid, directory, public)
+            self.existing_then_reinstall(sid, label, record, hydrated_at)
+            if any(check['status'] == 'FAIL' for check in self.data['checks'] if check['name'].startswith(label + '.')):
+                raise ValueError('the core endpoint did not become ready after resume')
+            self.execute(sid, 'sudo -n systemctl start motor-boat-bridge')
+            with tunnel(argv, directory, self.probe.deadline, record.setdefault('tunnel', {})) as address:
+                with tempfile.TemporaryDirectory(prefix='motor-boat-client-') as storage:
+                    result = record['after_resume'] = process(
+                        [str(client), address, str(repository), storage, NODE_CHECK, '1'],
+                        timeout=min(150, max(1, int(self.probe.deadline - time.monotonic()))))
+                    parsed = result['result'] = job_result(result['stdout']) if result.get('exit_code') == 0 else {}
+                    self.check_job('core_stop_resume.normal_job_after_resume', parsed, 0, marker='boat-node-modules')
+                    state = record['storage_after_resume_job'] = self.guest_json(
+                        sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(STORAGE_STATE), 'core resumed job storage')
+                    for key, passed in storage_checks(state).items():
+                        self.check(label + '.after_resume.' + key, passed, state)
+            self.check(label + '.tunnel_reaped', record['tunnel'].get('reaped') is True, record['tunnel'])
 
     def verify_idle(self, sid, directory, public, repository, client):
         """Leave a ready clone idle long enough for Boat's idle reclaim, then run a real job."""
@@ -1792,11 +1848,34 @@ class RunnerHost:
         self.check('disk_quota.backing_allocation_dropped_after_resume',
                    disk_quota.backing_allocation_dropped(before, storage), evidence)
 
-    def stop_at_quota_limit(self, sid, record, row):
+    def retained_stop_sample(self, sandbox, observation, argv, child):
+        """Use pinned SSH because Boat rejects API exec while a sandbox is archiving."""
+        import quota_adversarial
+        sample: dict[str, Any] = {'client_running': child.poll() is None}
+        if sandbox.get('state') == 'archived' and (sandbox.get('stop') or {}).get('status') == 'completed':
+            return dict(sample, status='archived')
+        remaining = self.probe.deadline - time.monotonic()
+        if remaining <= 0:
+            return dict(sample, status='unavailable', error='phase budget expired before guest observation')
+        command = 'sudo -n /usr/bin/python3 -c ' + shlex.quote(quota_adversarial.retained_sample(observation))
+        result = process(argv + [command], timeout=min(10, remaining))
+        if result.get('exit_code') != 0:
+            return dict(sample, status='unavailable', error=result.get('error') or result.get('stderr') or 'SSH sample failed',
+                        exit_code=result.get('exit_code'))
+        try:
+            guest = json.loads(result['stdout'])
+            if (not isinstance(guest, dict) or type(guest.get('job_running')) is not bool
+                    or type(guest.get('retained_target_at_limit')) is not bool or type(guest.get('allocated_bytes')) is not int):
+                raise ValueError('guest sample lacks typed liveness/allocation fields')
+        except (ValueError, KeyError) as error:
+            return dict(sample, status='unavailable', error=str(error))
+        return dict(sample, status='observed', **guest)
+
+    def stop_at_quota_limit(self, sid, record, row, sample_job=None):
         import disk_quota
         storage = row['pre_stop_storage']
         blocks = storage.get('backing_allocated_blocks')
-        evidence: dict[str, Any] = {'pre_stop_disk': {
+        evidence: dict[str, Any] = {'wait': {}, 'pre_stop_disk': {
             'root_free_bytes': row['pre_stop'].get('root_free_bytes'),
             'xfs_free_bytes': row['pre_stop'].get('xfs_free_bytes'),
             'retained_allocated_bytes': row['pre_stop'].get('allocated_bytes'),
@@ -1808,10 +1887,14 @@ class RunnerHost:
             try:
                 record['stop'] = self.probe.request('POST', f'/sandboxes/{sid}/stop', {})
                 evidence['response'] = record['stop']
-                archived = self.probe.wait_sandbox(sid, {'archived'})
+                accepted = time.monotonic()
+                evidence['accepted_at'] = datetime.now(timezone.utc).isoformat()
+                archived = self.probe.wait_sandbox(sid, {'archived'}, self.probe.quota_stop_wait_s,
+                                                   observation=evidence['wait'], on_sample=sample_job)
+                evidence['accepted_to_completed_seconds'] = time.monotonic() - accepted
             except Exception as error:
                 evidence['error'] = str(error)
-                evidence['wait'] = getattr(error, 'evidence', {})
+                evidence['wait'] = getattr(error, 'evidence', evidence['wait'])
                 evidence['last_sandbox'] = evidence['wait'].get('last_sandbox') or sandbox_lifecycle(
                     (record.get('stop') or {}).get('sandbox') or {})
                 reason = 'stop at quota limit did not complete: ' + json.dumps({
@@ -1819,6 +1902,13 @@ class RunnerHost:
                     'error': evidence['error']})
                 self.check('disk_quota.stop_with_quota_sized_target', False, evidence, reason=reason)
                 raise ValueError('disk_quota.stop_with_quota_sized_target: ' + reason) from error
+            finally:
+                samples = evidence['wait'].get('samples', [])
+                status = evidence['retained_hold_status'] = disk_quota.retained_hold_status(samples, row['pre_stop'])
+                reason = ('retained job ended or its quota-sized target was lost during the stop' if status == 'FAIL' else
+                          'pending-stop samples must observe both a live guest job and its allocated quota-sized target')
+                self.check('disk_quota.retained_target_held_during_stop', status == 'PASS',
+                           {'status': status, 'samples': samples, 'reason': reason}, status=status, reason=reason)
         evidence['last_sandbox'] = sandbox_lifecycle(archived) if isinstance(archived, dict) else {}
         self.check('disk_quota.stop_with_quota_sized_target', True, evidence)
 
@@ -1876,8 +1966,12 @@ class RunnerHost:
                         row: dict[str, Any] = {}
                         record.setdefault('lanes', {})[lane] = row
                         token = uuid.uuid4().hex
-                        command = 'python3 -c ' + shlex.quote(disk_quota.job(lane, token))
-                        invocation = [str(client), address, str(repository), storage, command, '1', '900']
+                        retained = lane == disk_quota.RETAINED_LANE
+                        job_seconds = disk_quota.job_seconds(lane, self.probe.deadline - time.monotonic())
+                        hold_seconds = job_seconds if retained else 90
+                        row.update(job_timeout_seconds=job_seconds, hold_seconds=hold_seconds)
+                        command = 'python3 -c ' + shlex.quote(disk_quota.job(lane, token, hold_seconds=hold_seconds))
+                        invocation = [str(client), address, str(repository), storage, command, '1', str(job_seconds)]
                         started = time.monotonic()
                         child = _quota_popen(invocation, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                                  text=True, env={key: value for key, value in os.environ.items() if key != 'BOAT_API_KEY'})
@@ -1900,7 +1994,8 @@ class RunnerHost:
                                 row['eviction_journal_cursor'] = journal_cursor(journal.get('stdout'))
                                 # Keep the job at its barrier so idle eviction cannot
                                 # remove the full target before the provider snapshots it.
-                                self.stop_at_quota_limit(sid, record, row)
+                                self.stop_at_quota_limit(sid, record, row,
+                                    sample_job=lambda sandbox: self.retained_stop_sample(sandbox, row['at_limit'], argv, child))
                                 record['stopped_with_retained_target'] = True
                                 row['client_interrupted_for_snapshot'] = True
                                 complete = True
@@ -1968,6 +2063,8 @@ class RunnerHost:
         client = ROOT / "target/debug/examples/boat_probe"
         # The 30-minute provider budget starts after the local client is available.
         self.budget_seconds = min(1800, self.probe.minutes * 60)
+        self.data['sandbox_budget_seconds'] = self.budget_seconds
+        self.data['quota_stop_wait_s'] = self.probe.quota_stop_wait_s
         self.probe.deadline = time.monotonic() + self.budget_seconds
         self.data["source_revision"] = revision
         (ROOT / '.cortexkit').mkdir(exist_ok=True)

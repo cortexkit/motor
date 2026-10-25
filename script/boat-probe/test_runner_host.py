@@ -970,6 +970,7 @@ class VerifyPhaseTests(unittest.TestCase):
             return {'node_modules_first': {'result': {'code': 0, 'stdout': 'boat-node-modules',
                                                       'terminal': {'outcome': {'type': 'exit', 'code': 0}}}}}
         runner.phase = Mock(side_effect=phase)
+        runner.verify_core_resume = Mock(side_effect=lambda sid, *args: step('core_stop_resume', sid))
         runner.clone_ready = Mock(side_effect=lambda sid, label, *args: step(label, sid))
         def disk_quota(sid, *args):
             step('disk_quota', sid)
@@ -998,16 +999,16 @@ class VerifyPhaseTests(unittest.TestCase):
         self.verify(runner)
         self.assertEqual(order, [
             ('create', 'prepared', 'bx_core'), ('hydrated', 'bx_core'), ('prepared_clone', 'bx_core'),
-            ('idle_wait_in_phase', False), ('released', 'bx_core'),
+            ('idle_wait_in_phase', False), ('core_stop_resume', 'bx_core'), ('released', 'bx_core'),
             ('create', 'prepared', 'bx_quota'), ('hydrated', 'bx_quota'), ('disk_quota_clone', 'bx_quota'),
             ('disk_quota', 'bx_quota'), ('hydrated', 'bx_quota'), ('resumed', 'bx_quota'), ('idle_wait_in_phase', True),
             ('cleanup_replay', 'bx_quota'), ('released', 'bx_quota'),
             ('create', 'prepared', 'bx_idle'), ('hydrated', 'bx_idle'), ('idle', 'bx_idle'), ('released', 'bx_idle')])
         self.assertEqual(self.statuses(runner), {'core': 'passed', 'disk-quota': 'passed', 'idle': 'passed'})
-        self.assertEqual(runner.data['verify_phases']['core']['check_names'], ['prepared_clone.ran'])
+        self.assertEqual(runner.data['verify_phases']['core']['check_names'], ['prepared_clone.ran', 'core_stop_resume.ran'])
         self.assertIn('disk_quota.normal_job_after_stop_resume', runner.data['verify_phases']['disk-quota']['check_names'])
         runner.execute.assert_not_called()
-        # Only the disk-quota sandbox is stopped (with its target held) and resumed.
+        # The control method is mocked here; separate tests use mocked provider/client calls to exercise its sequence.
         posts = [call.args[1] for call in probe.request.call_args_list if call.args[0] == 'POST']
         self.assertEqual(posts, ['/sandboxes/bx_quota/resume'])
         timed = [row['name'] for row in runner.data['section_timings']]
@@ -1023,6 +1024,9 @@ class VerifyPhaseTests(unittest.TestCase):
                 runner, probe, order = self.runner()
                 self.verify(runner, (phase,))
                 self.assertEqual(probe.create.call_count, 1)
+                self.assertEqual(runner.verify_core_resume.call_count, int(phase == 'core'))
+                if phase == 'core':
+                    runner.disk_quota.assert_not_called()
                 statuses = self.statuses(runner)
                 self.assertEqual(statuses.pop(phase), 'passed')
                 self.assertEqual(set(statuses.values()), {'not_run'})
@@ -1041,6 +1045,14 @@ class VerifyPhaseTests(unittest.TestCase):
         self.assertIn(('released', 'bx_core'), order)
         core = next(row for row in runner.data['section_timings'] if row['name'] == 'core')
         self.assertEqual((core['outcome'], core['error']), ('error', 'prepared_clone broke'))
+
+    def test_failed_plain_control_blocks_the_core_phase(self):
+        runner, probe, order = self.runner(fail='core_stop_resume')
+        with self.assertRaisesRegex(ValueError, 'verify phase failed: core: core_stop_resume broke'):
+            self.verify(runner, ('core',))
+        self.assertEqual(self.statuses(runner), {'core': 'failed', 'disk-quota': 'not_run', 'idle': 'not_run'})
+        self.assertIn(('core_stop_resume', 'bx_core'), order)
+        self.assertIn(('released', 'bx_core'), order)
 
     def test_a_size_refusal_stops_every_later_phase(self):
         runner, probe, order = self.runner()
@@ -1073,6 +1085,113 @@ class VerifyPhaseTests(unittest.TestCase):
         self.assertIn("self.check_job(label + '.after_idle', parsed, 0, marker='boat-node-modules')", idle)
 
 
+class CoreStopResumeTests(unittest.TestCase):
+    def runner(self, fault=None):
+        probe = Mock()
+        probe.data = {}
+        probe.deadline = 1800
+        probe.quota_stop_wait_s = 1500
+        order, clock = [], [0.0]
+        runner = host.RunnerHost(probe)
+        runner.unit_diagnostics = Mock()
+        runner.disk_quota = Mock()
+        idle = {'ready': True, 'leases': ['active'] if fault == 'busy' else [],
+                'root_free_bytes': 50 * 1024**3, 'xfs_free_bytes': 60 * 1024**3}
+        observations = iter([idle, {'backing_allocated_blocks': 1024}, {'restored_storage': True}])
+        def guest_json(_sid, _command, label):
+            order.append(label)
+            return next(observations)
+        runner.guest_json = Mock(side_effect=guest_json)
+        def request(method, path, body):
+            self.assertEqual((method, body), ('POST', {}))
+            order.append(path.rsplit('/', 1)[-1])
+            if path.endswith('/stop'):
+                clock[0] += 5
+                return {'ok': True, 'type': 'sandbox.stopping', 'status': 'archiving'}
+            return {'ok': True}
+        probe.request.side_effect = request
+        def wait(_sid, states, **kwargs):
+            if 'archived' in states:
+                order.append('archived')
+                clock[0] += 7.5
+                return {'state': 'archived', 'stop': {'status': 'pending' if fault == 'pending' else 'completed'}}
+            order.append('ready')
+            return {'state': 'ready'}
+        probe.wait_sandbox.side_effect = wait
+        probe.wait_hydrated.side_effect = lambda sid: order.append('hydrated')
+        runner.route = Mock(return_value=['ssh'])
+        def readiness(sid, label, record, hydrated_at):
+            order.append('endpoint_ready')
+            runner.check(label + '.endpoint_ready_within_bound', fault != 'not-ready', {})
+        runner.existing_then_reinstall = Mock(side_effect=readiness)
+        def execute(sid, command):
+            self.assertEqual(command, 'sudo -n systemctl start motor-boat-bridge')
+            order.append('bridge')
+            return {'stdout': '', 'exitCode': 0}
+        runner.execute = Mock(side_effect=execute)
+        return runner, probe, order, clock
+
+    @contextlib.contextmanager
+    def fakes(self, order, clock, code=0):
+        def forward(argv, directory, deadline, record):
+            record['reaped'] = True
+            return contextlib.nullcontext('address')
+        def job(argv, **kwargs):
+            order.append('job')
+            self.assertEqual(argv[4], host.NODE_CHECK)
+            result = {'code': code, 'stdout': 'boat-node-modules',
+                      'terminal': {'outcome': {'type': 'exit', 'code': code}}}
+            return {'exit_code': 0, 'stdout': json.dumps(result)}
+        with patch.object(host.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(host, 'tunnel', side_effect=forward), patch.object(host, 'process', side_effect=job) as client, \
+             patch.object(host, 'storage_checks', return_value={'storage_ok': True}):
+            yield client
+
+    def test_plain_control_archives_idle_clone_then_resumes_endpoint_and_real_job(self):
+        runner, probe, order, clock = self.runner()
+        with self.fakes(order, clock) as client:
+            runner.verify_core_resume('bx_core', Path('.'), 'public', Path('.'), Path('client'))
+        self.assertEqual(order, ['core idle endpoint before stop', 'core pre-stop storage', 'stop', 'archived',
+                                 'resume', 'ready', 'hydrated', 'endpoint_ready', 'bridge', 'job', 'core resumed job storage'])
+        runner.disk_quota.assert_not_called()
+        self.assertEqual(runner.data['core_stop_resume']['accepted_to_completed_seconds'], 7.5)
+        self.assertEqual(len(probe.wait_sandbox.call_args_list[0].args), 2)
+        self.assertEqual(probe.wait_sandbox.call_args_list[0].args, ('bx_core', {'archived'}))
+        runner.existing_then_reinstall.assert_called_once()
+        client.assert_called_once()
+        checks = {row['name']: row['status'] for row in runner.data['checks']}
+        self.assertEqual(checks['core_stop_resume.idle_before_stop'], 'PASS')
+        self.assertEqual(checks['core_stop_resume.stop_completed'], 'PASS')
+        self.assertEqual(checks['core_stop_resume.normal_job_after_resume'], 'PASS')
+        self.assertTrue(all(status == 'PASS' for status in checks.values()))
+
+    def test_busy_endpoint_never_sends_the_control_stop(self):
+        runner, probe, order, clock = self.runner('busy')
+        with self.fakes(order, clock) as client, self.assertRaisesRegex(ValueError, 'no job quota leases'):
+            runner.verify_core_resume('bx_core', Path('.'), 'public', Path('.'), Path('client'))
+        probe.request.assert_not_called()
+        client.assert_not_called()
+
+    def test_incomplete_archival_or_unready_endpoint_prevents_resumed_job(self):
+        for fault in ('pending', 'not-ready'):
+            with self.subTest(fault=fault):
+                runner, probe, order, clock = self.runner(fault)
+                with self.fakes(order, clock) as client, self.assertRaises(ValueError):
+                    runner.verify_core_resume('bx_core', Path('.'), 'public', Path('.'), Path('client'))
+                client.assert_not_called()
+                self.assertTrue(any(row['status'] == 'FAIL' for row in runner.data['checks']))
+                if fault == 'pending':
+                    self.assertNotIn('resume', order)
+
+    def test_failed_resumed_job_is_a_required_core_failure(self):
+        runner, probe, order, clock = self.runner()
+        with self.fakes(order, clock, code=1):
+            runner.verify_core_resume('bx_core', Path('.'), 'public', Path('.'), Path('client'))
+        check = next(row for row in runner.data['checks'] if row['name'] == 'core_stop_resume.normal_job_after_resume')
+        self.assertEqual(check['status'], 'FAIL')
+        self.assertEqual(host.verify_phase_status({'ran': True, 'completed': True}, runner.data['checks']), 'failed')
+
+
 class SectionTimingTests(unittest.TestCase):
     def test_sections_nest_record_seconds_and_stay_visible_while_running(self):
         probe = Mock()
@@ -1098,6 +1217,72 @@ class SectionTimingTests(unittest.TestCase):
 
 
 class RetainedQuotaSnapshotTests(unittest.TestCase):
+    def test_pending_stop_samples_use_pinned_ssh_and_preserve_unknown_observations(self):
+        probe = Mock()
+        probe.data = {}
+        probe.deadline = host.time.monotonic() + 1800
+        runner = host.RunnerHost(probe)
+        child = Mock()
+        child.poll.return_value = None
+        guest = {'job_running': True, 'allocated_bytes': 2**30, 'retained_target_at_limit': True,
+                 'root_free_bytes': 50 * 2**30, 'xfs_free_bytes': 40 * 2**30}
+        with patch.object(host, 'process', return_value={'exit_code': 0, 'stdout': json.dumps(guest)}) as ssh:
+            observed = runner.retained_stop_sample({'state': 'archiving'}, {}, ['ssh', 'pinned-host'], child)
+            self.assertEqual(observed['status'], 'observed')
+            self.assertTrue(observed['job_running'])
+            self.assertTrue(observed['client_running'])
+            self.assertEqual(observed['allocated_bytes'], 2**30)
+            self.assertEqual(ssh.call_args.args[0][:2], ['ssh', 'pinned-host'])
+            self.assertIn('sudo -n /usr/bin/python3 -c', ssh.call_args.args[0][-1])
+            self.assertLessEqual(ssh.call_args.kwargs['timeout'], 10)
+        for response in ({'exit_code': 255, 'stderr': 'SSH unavailable'}, {'exit_code': 0, 'stdout': '{}'}):
+            with self.subTest(response=response), patch.object(host, 'process', return_value=response):
+                observed = runner.retained_stop_sample({'state': 'archiving'}, {}, ['ssh', 'pinned-host'], child)
+                self.assertEqual(observed['status'], 'unavailable')
+                self.assertNotIn('job_running', observed)
+        with patch.object(host, 'process') as ssh:
+            observed = runner.retained_stop_sample({'state': 'archived', 'stop': {'status': 'completed'}}, {}, ['ssh'], child)
+            self.assertEqual(observed['status'], 'archived')
+            ssh.assert_not_called()
+        probe.execute.assert_not_called()
+        probe.request.assert_not_called()
+
+    def test_completed_stop_cannot_qualify_a_dead_or_unobserved_retained_job(self):
+        case = json.loads(Path(__file__).with_name('fixtures').joinpath('full-quota-stops.json').read_text())['default']
+        for guest, expected, phase in (({'status': 'observed', 'job_running': False, 'retained_target_at_limit': True}, 'FAIL', 'failed'),
+                                       ({'status': 'unavailable', 'error': 'SSH unavailable'}, 'INCONCLUSIVE', 'inconclusive'),
+                                       ({'status': 'observed', 'job_running': True, 'retained_target_at_limit': True}, 'PASS', 'passed')):
+            with self.subTest(expected=expected):
+                probe = Mock()
+                probe.data = {}
+                probe.quota_stop_wait_s = 1500
+                probe.request.return_value = case['stop_response']
+                def wait(sid, states, seconds, *, observation, on_sample):
+                    observation['samples'] = [{'sandbox': {'state': 'archiving'}, 'retained_job': guest},
+                                               {'sandbox': {'state': 'archived', 'stop': {'status': 'completed'}},
+                                                'retained_job': {'status': 'archived'}}]
+                    return {'state': 'archived', 'stop': {'status': 'completed'}}
+                probe.wait_sandbox.side_effect = wait
+                runner = host.RunnerHost(probe)
+                runner.stop_at_quota_limit(case['sandbox_id'], {}, case)
+                check = next(row for row in runner.data['checks'] if row['name'] == 'disk_quota.retained_target_held_during_stop')
+                self.assertEqual(check['status'], expected)
+                self.assertEqual(host.verify_phase_status({'ran': True, 'completed': True}, runner.data['checks']), phase)
+
+    def test_quota_stop_forwards_its_configured_wait_cap(self):
+        case = json.loads(Path(__file__).with_name('fixtures').joinpath('full-quota-stops.json').read_text())['default']
+        probe = Mock()
+        probe.data = {}
+        probe.quota_stop_wait_s = 1500
+        probe.request.return_value = case['stop_response']
+        probe.wait_sandbox.return_value = {'state': 'archived', 'stop': {'status': 'completed'}}
+        runner = host.RunnerHost(probe)
+        record = {}
+        runner.stop_at_quota_limit(case['sandbox_id'], record, case)
+        probe.wait_sandbox.assert_called_once_with(case['sandbox_id'], {'archived'}, 1500,
+                                                   observation=record['stop_at_limit']['wait'], on_sample=None)
+        self.assertEqual(runner.data['checks'][-1]['status'], 'PASS')
+
     def test_recorded_full_quota_stop_timeout_names_state_operation_and_disks(self):
         from probe import Probe
         recorded = json.loads(Path(__file__).with_name('fixtures').joinpath('full-quota-stops.json').read_text())
@@ -1124,7 +1309,7 @@ class RetainedQuotaSnapshotTests(unittest.TestCase):
                 with patch('probe.time.monotonic', side_effect=lambda: clock[0]), patch('probe.time.sleep', side_effect=advance):
                     with self.assertRaisesRegex(ValueError, '^disk_quota.stop_with_quota_sized_target:'):
                         runner.stop_at_quota_limit(sid, record, case)
-                failure, = runner.data['checks']
+                failure = next(row for row in runner.data['checks'] if row['name'] == 'disk_quota.stop_with_quota_sized_target')
                 self.assertEqual((failure['name'], failure['status']), ('disk_quota.stop_with_quota_sized_target', 'FAIL'))
                 wait = failure['evidence']['wait']
                 self.assertEqual(wait['polls'], count)
@@ -1152,6 +1337,8 @@ class RetainedQuotaSnapshotTests(unittest.TestCase):
             with self.subTest(valid=valid):
                 probe = Mock()
                 probe.data = {}
+                probe.quota_stop_wait_s = 900
+                probe.deadline = 10**12
                 runner = host.RunnerHost(probe)
                 runner.route = Mock(return_value=['ssh'])
                 runner.check_job = Mock()
@@ -1174,7 +1361,7 @@ class RetainedQuotaSnapshotTests(unittest.TestCase):
                     return {'stdout': json.dumps(next(responses))}
                 runner.execute = Mock(side_effect=execute)
                 probe.request.side_effect = lambda *args: order.append('stop') or {}
-                probe.wait_sandbox.side_effect = lambda *args: order.append('archived')
+                probe.wait_sandbox.side_effect = lambda *args, **kwargs: order.append('archived')
                 child = Mock(returncode=-15)
                 child.poll.return_value = None
                 child.communicate.return_value = ('', 'client interrupted')
@@ -1192,6 +1379,9 @@ class RetainedQuotaSnapshotTests(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, 'retained target'):
                             runner.disk_quota('bx_test', Path('.'), 'public', Path('.'), Path('client'))
                         probe.request.assert_not_called()
+                    self.assertEqual(host._quota_popen.call_args.args[0][-1], '1800')
+                    row = runner.data['disk_quota']['lanes']['retained_target']
+                    self.assertEqual((row['hold_seconds'], row['job_timeout_seconds']), (1800, 1800))
                 self.assertTrue(any('HOLD_AT_LIMIT=True' in call.args[1] for call in runner.execute.call_args_list))
 
     def test_resume_records_and_checks_backing_allocation_drop(self):
@@ -1225,6 +1415,8 @@ class RecordedDiskQuotaPollTests(unittest.TestCase):
         recorded = self.recorded()[size]
         probe = Mock()
         probe.data = {}
+        probe.quota_stop_wait_s = 900
+        probe.deadline = 10**12
         runner = host.RunnerHost(probe)
         runner.route = Mock(return_value=['ssh'])
         runner.check_job = Mock()

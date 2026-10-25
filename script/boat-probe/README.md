@@ -323,6 +323,26 @@ networking follows [Public URLs / raw TCP](https://docs.boat.dev/hosting) and
 [Firewall](https://docs.boat.dev/hosting/firewall): guest root rules, not an
 invented provider firewall API. No live provider assertion follows from these
 portable tests.
+## Plain stop/resume control
+
+The prepared-image `core` phase runs its normal checks and jobs in a fresh
+clone without quota fills, waits for a ready endpoint with no job quota leases,
+then sends a normal Boat stop. It requires `archived` with `stop.status` equal to
+`completed`, resumes, waits for hydration, checks the existing identity's
+endpoint readiness and a no-restart identity reinstall, and runs a normal Node
+job through the pinned SSH forward. The required checks include
+`core_stop_resume.idle_before_stop`, `core_stop_resume.stop_completed`,
+`core_stop_resume.normal_job_after_resume` and the `core_resumed` readiness and
+storage checks. A failed or incomplete control fails core, even if all earlier
+jobs passed. No idle-reclaim wait or quota-fill lane is added to core.
+
+`runner_host.core_stop_resume` records the pre-stop root/XFS free space and loop
+allocation, accepted response, lifecycle samples and `accepted_to_completed_seconds`:
+the monotonic interval from receiving the stop response (normally HTTP 202) to
+observing completed archival. The findings also print that interval. The control
+keeps the standard 900-second stop cap; the quota diagnostic option below does
+not change it.
+
 ## Disk-quota qualification
 
 The runner-host probe proves the real total quota (up to 32 GiB, with nonzero
@@ -360,9 +380,12 @@ with file size zero. It verifies `st_blocks` as well as project ID, so a refused
 no-op is not a pass. Keeping the file size at zero avoids streaming data into the
 operator client; the lane punches its unwritten extents before reporting. Every
 lane checks project IDs for workspace, target, HOME, `/tmp`, `/var/tmp`, stdout,
-stderr, exit and cache-stats. Only quota jobs request the operator example's
-optional bounded 900-second deadline; existing probe invocations still default
-to 120 seconds. `phases[].kernel_release` records `uname -r`.
+stderr, exit and cache-stats. Ordinary quota jobs request a 900-second client
+deadline. The retained-target job instead uses the remaining phase budget,
+capped at 1800 seconds, for its client deadline and marker hold, so it cannot
+silently finish its old 90-second hold during a long stop wait. The operator
+example accepts explicit deadlines through 1800 seconds; invocations without a
+deadline still default to 120 seconds. `phases[].kernel_release` records `uname -r`.
 
 A 64-MiB retained-target baseline must be relabelled and reduce the successor's
 remaining growth. Another job leaves actual FICLONE copies; its successor
@@ -383,15 +406,49 @@ terminals. Stop must archive successfully, resume must hydrate, and the resumed
 phase must run a normal job. This is not merely a stop after unlinking the fill.
 Failure cleanup stops writers and removes only the disposable probe's fills,
 so a failed reserve qualification does not deliberately leave the sandbox full.
-If stop fails or does not complete within the existing 900-second wait (or the
-remaining run budget), `disk_quota.stop_with_quota_sized_target` is a named FAIL.
+If stop fails or does not complete within `--quota-stop-wait-s` (default 900), or
+the remaining run budget, `disk_quota.stop_with_quota_sized_target` is a named FAIL.
 `runner_host.disk_quota.stop_at_limit` records the accepted response, the last
-observed sandbox/stop/snapshot fields and poll count on timeout, and the
+observed sandbox/stop/snapshot fields and poll count, and the
 **pre-stop** root/XFS free bytes, retained allocation and loop-file allocation.
+Its `wait.samples` checkpoint the lifecycle fields at the first poll, about every
+30 seconds and at completion/timeout. Samples include `stop.status`,
+`stop.lastAttemptAt`, snapshot attempt/status/completion fields, and a
+`retained_job` observation over the already pinned SSH route (Boat API exec
+refuses `archiving`). The guest read records whether the job unit is still
+active, the target's actual allocated bytes and whether those bytes still meet
+the quota-sized threshold, plus fresh root/XFS free space and client liveness.
+Sampling is read-only and never releases the barrier. SSH reads have a 10-second
+cap and cannot exceed the remaining budget. An unavailable sample is recorded
+as **unknown**, not as a live job or a deleted target. Completed archival needs
+no live-guest observation because the machine is then expected to be down.
+`disk_quota.retained_target_held_during_stop` is FAIL if a pending-stop sample
+observes a dead job or lost allocation, and blocking INCONCLUSIVE if a required
+observation is unavailable; neither qualifies a live/full-quota stop. A fast
+stop with no pending poll uses the measured live, allocated pre-stop guard.
 Those disk samples are not a measurement of snapshot peak space. A completed
 snapshot alone is not a completed stop: archival still requires sandbox state
 `archived` and `stop.status` `completed`. The portable regression replays both
 sizes' pending-stop observations in `fixtures/full-quota-stops.json`.
+
+For a longer diagnostic wait, add `--quota-stop-wait-s 1500` to the disk-quota
+invocation below. This raises only the stop-wait cap, not the phase's budget or
+the requested `ttlSeconds: 1800`. Evidence records `requested_wait_seconds`,
+`remaining_budget_seconds`, `effective_wait_seconds` and `budget_limited`.
+The effective cap is `min(requested wait, phase deadline - current time)`;
+create/hydration, prior quota lanes and pre-stop measurements have already spent
+some of the 30 minutes. For example, 600 seconds of setup leaves at most 1200
+seconds for the stop alone. Resume and its checks also need
+time afterward; a stop completing at the budget boundary is not a complete
+stop/resume qualification.
+
+`--max-minutes 60` does **not** extend runner-host's 30-minute cap. At a budget
+timeout the run fails and disposable-sandbox cleanup still runs; do not expect
+that sandbox to continue saving after the probe exits. A stop observation longer
+than the remaining phase budget requires a separately approved diagnostic with
+a provider-supported longer lifetime and a correspondingly longer local budget,
+or a shorter setup that reaches the full target earlier. Neither is enabled by
+this flag, and Boat's possible TTL extensions are not a guarantee to rely on.
 
 Before the jobs, an unfiltered root control on the same XFS mount sets and clears
 project inheritance with FSSETXATTR and verifies the actual flag transition. The
