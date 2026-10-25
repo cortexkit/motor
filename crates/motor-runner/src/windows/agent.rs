@@ -32,7 +32,8 @@ pub(crate) struct Runtime {
     pub(crate) cache_timings: Mutex<std::collections::BTreeMap<Uuid, motor_winagent::CacheTimings>>,
 }
 impl Runtime {
-    #[cfg(any(windows, test))]
+    // Only the Hyper-V host path sets readiness, and it is Windows-only.
+    #[cfg(windows)]
     pub(crate) fn set_guest_agent_readiness(&self, readiness: WindowsGuestAgentReadiness) {
         *self.guest_agent_readiness.lock().unwrap() = Some(readiness);
     }
