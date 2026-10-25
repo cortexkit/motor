@@ -11,7 +11,7 @@
     "script/runner/tools.txt": "deeae6c16195cbdea75324bc293e48117944e09956eadaa8c4e456f3188d743d",
     "script/runner/install-tools.sh": "381d6d1e0b56690a34a2c6df40f86f90eb6574663e2f91e9d7b27120d752a9ea",
     "script/runner/toolchain.json": "7afa41ae17d0a1a0cb5c6559b056a9bd52f957d3c7a0294e851ad7f4162f1bdc",
-    "script/runner/toolchain-parity.py": "27c615b8c3122df1ea72906309f5f8e7b47ae6228f4b8e2c1949b06dcd265c4e",
+    "script/runner/toolchain-parity.py": "5ad958971dd26918c3481f3782290ac00f6a2f764cda5ac45d8669d03a918ce8",
     "script/runner/syscall-surface.py": "930fb7373920f92ae4b876b7635d586f9dabb4d44e26fc4c9db045b18cbe0368",
     "script/runner/cargo-seed.py": "6759e7b26778d7bb62a5c081bac8162e1ed1ee1b67eca28bec3927e9ee07f485",
     "script/runner/job-account.py": "21f185ddc868150a8bbfe94aa8eac18a50485b87bf8fa043944348dac77ef4ca",

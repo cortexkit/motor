@@ -183,8 +183,8 @@ const DISABLE_ETH0_IPV6: [&str; 3] = ["-q", "-w", "net.ipv6.conf.eth0.disable_ip
 const IPV6_ABSENT: [&str; 3] = ["!", "-e", "/proc/sys/net/ipv6"];
 
 /// Turn off IPv6 on the job's `eth0`, which the job firewall and routes only
-/// cover for IPv4. A kernel booted with `ipv6.disable=1` (the tenant VM image)
-/// or built without IPv6 has no `/proc/sys/net/ipv6` in any namespace: IPv6
+/// cover for IPv4. A kernel booted with `ipv6.disable=1` or built without IPv6
+/// has no `/proc/sys/net/ipv6` in any namespace: IPv6
 /// cannot be enabled there, so a failed write is accepted only when
 /// `ipv6_absent` proves that. Every other failure, including a failed write
 /// while IPv6 exists, still fails the attach with the write's own error.

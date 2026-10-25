@@ -18,7 +18,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 PARITY_FILES = tuple((REPO / "script/runner/parity-files.txt").read_text().splitlines())
 BOOT_ARGS = ("console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro "
-             "init=/sbin/motor-init net.ifnames=0 ipv6.disable=1 "
+             "init=/sbin/motor-init net.ifnames=0 "
              "systemd.unified_cgroup_hierarchy=1")
 RUNNER_INPUTS = (
     "script/runner/tools.txt", "script/runner/install-tools.sh", "script/runner/install-npm-tool.py",

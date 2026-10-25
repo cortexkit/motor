@@ -383,6 +383,22 @@ Require exit 0 and `passed: true`. Archive both outputs; a changed recipe does
 not prove a rebuilt/deployed image passes. Keep the normal disposable-host
 qualification lane for suspend/restore, kernel and isolation evidence.
 
+The guest kernel keeps IPv6 enabled so private job namespaces can use `::1`.
+Before the tenant agent starts, `motor-net-rules.service` disables IPv6 on all
+existing guest interfaces and by default on future interfaces, then enables it
+only on `lo`. It sets `net.core.devconf_inherit_init_net=0` so new job namespaces
+start with kernel defaults rather than inheriting the guest's disabled IPv6.
+A failed sysctl or firewall load prevents the agent from starting. Job `eth0`
+remains IPv4-only; the guest and host IPv6 firewall drops are unchanged. Test:
+`test_ipv6_is_loopback_only_before_the_tenant_agent_can_start`.
+
+The `--job` parity report requires a TCP bind/connect/data exchange over `::1`
+on every Linux role. Its `runtime.ipv6_loopback` diagnostics include the failing
+step and errno, `/proc/cmdline`, `/proc/net/if_inet6` presence and the job's own
+`all`, `default` and `lo` IPv6-disable sysctls. Run qualification inside both
+offline and outbound jobs after deployment; an operator-shell success is not a
+substitute for a job-namespace result.
+
 `qualify.py` is an operator-only lane for an already built image. Run it as root
 on the dedicated Linux KVM server, **not** through the remote-job runner. It
 refuses an existing helper socket, registered tenants, tenant jails, tenant taps,

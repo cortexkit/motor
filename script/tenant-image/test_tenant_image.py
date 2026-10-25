@@ -37,6 +37,19 @@ def resolved_config():
 
 
 class ImageTests(unittest.TestCase):
+    def test_ipv6_is_loopback_only_before_the_tenant_agent_can_start(self):
+        self.assertNotIn('ipv6.disable=', image.BOOT_ARGS)
+        rules = (HERE / 'guest/motor-net-rules.service').read_text().splitlines()
+        setup = ('ExecStartPre=/usr/sbin/sysctl -q -w '
+                 'net.core.devconf_inherit_init_net=0 '
+                 'net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 '
+                 'net.ipv6.conf.lo.disable_ipv6=0')
+        self.assertIn(setup, rules)
+        self.assertLess(rules.index(setup), rules.index('ExecStart=/usr/sbin/nft -f /etc/nftables.d/motor-net.nft'))
+        agent = (HERE / 'guest/motor-tenant-agent.service').read_text().splitlines()
+        self.assertIn('After=local-fs.target motor-net-rules.service', agent)
+        self.assertIn('Requires=motor-net-rules.service', agent)
+
     def test_configure_uses_tenants_pinned_job_identity(self):
         class StopAfterIdentity(Exception):
             pass

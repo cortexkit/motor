@@ -98,10 +98,53 @@ def role_manifest(manifest, role, job=False):
     return {**manifest, **manifest.get('layout_by_role', {}).get(role, {}).get('job' if job else 'host', {})}
 
 
+def ipv6_loopback_capture():
+    import socket
+
+    # Use the caller's network namespace, not a host-side capability check.
+    # Completing a TCP exchange catches missing ::1 as well as socket filters.
+    context = {
+        'cmdline': optional_text('/proc/cmdline'),
+        'if_inet6_present': Path('/proc/net/if_inet6').exists(),
+        'disable_ipv6': {name: optional_text(f'/proc/sys/net/ipv6/conf/{name}/disable_ipv6')
+                         for name in ('all', 'default', 'lo')},
+    }
+    step = 'socket(AF_INET6) listener'
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as listener:
+            listener.settimeout(5)
+            step = 'bind ::1'
+            listener.bind(('::1', 0))
+            step = 'listen ::1'
+            listener.listen(1)
+            step = 'socket(AF_INET6) client'
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as client:
+                client.settimeout(5)
+                step = 'connect ::1'
+                client.connect(listener.getsockname())
+                step = 'accept ::1'
+                with listener.accept()[0] as peer:
+                    peer.settimeout(5)
+                    step = 'exchange ::1'
+                    client.sendall(b'ipv6-loopback')
+                    received = b''
+                    while len(received) < len(b'ipv6-loopback'):
+                        chunk = peer.recv(len(b'ipv6-loopback') - len(received))
+                        if not chunk:
+                            break
+                        received += chunk
+                    return {**context, 'connected': received == b'ipv6-loopback', 'errno': 0,
+                            'step': 'complete' if received == b'ipv6-loopback' else step}
+    except OSError as error:
+        return {**context, 'connected': False, 'step': step, 'errno': error.errno,
+                'error': str(error)}
+
+
 def runtime_capture():
     import tempfile
 
-    runtime = {'proc': {}, 'inotify': {}, 'tmpdir': tempfile.gettempdir()}
+    runtime = {'proc': {}, 'inotify': {}, 'tmpdir': tempfile.gettempdir(),
+               'ipv6_loopback': ipv6_loopback_capture()}
     for name in ('self/mountinfo', 'cpuinfo', 'meminfo'):
         try:
             runtime['proc'][name] = bool(Path('/proc', name).read_text())
@@ -647,6 +690,9 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
             equal('/proc/' + name + ' readable', True, runtime.get('proc', {}).get(name))
         for name in ('dev_shm_writable', 'tmpdir_exec', 'sshd_executable'):
             equal('job ' + name, True, runtime.get(name))
+        loopback = runtime.get('ipv6_loopback', {})
+        if loopback.get('connected') is not True:
+            errors.append(f'job IPv6 loopback bind/connect: expected success, observed {loopback!r}')
         for name, minimum in manifest.get('inotify_minimum', {}).items():
             value = runtime.get('inotify', {}).get(name)
             if not isinstance(value, int) or value < minimum:
