@@ -281,10 +281,10 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
             $global:identityFixtureDismounted = $false
             $global:identityFixtureNeverVolume = $true
             $global:identityFixtureVolumeQueries = 0
-            $error = $null
-            try { $null = Get-RunnerSealedAgentHash $global:identityFixtureParent $identityEvidence 1 } catch { $error = [string]$_ }
+            $failure = $null
+            try { $null = Get-RunnerSealedAgentHash $global:identityFixtureParent $identityEvidence 1 } catch { $failure = [string]$_ }
             $identity = Get-Content -LiteralPath (Join-Path $identityEvidence 'mounted-disk-identity.json') -Raw | ConvertFrom-Json
-            if ($error -notmatch 'Timed out after 1 seconds.*volume GUID path on disk 42 partition 1' -or $global:identityFixtureAddCalls -ne 0 -or $global:identityFixtureAccessPathTouched -or -not $global:identityFixtureDismounted -or $identity.volume_path) { throw "FAIL sealed-agent-volume-timeout-unmounts: $error" }
+            if ($failure -notmatch 'Timed out after 1 seconds.*volume GUID path on disk 42 partition 1' -or $global:identityFixtureAddCalls -ne 0 -or $global:identityFixtureAccessPathTouched -or -not $global:identityFixtureDismounted -or $identity.volume_path) { throw "FAIL sealed-agent-volume-timeout-unmounts: $failure" }
             Write-Host 'PASS sealed-agent-volume-timeout-unmounts'
             $count++
         } finally {

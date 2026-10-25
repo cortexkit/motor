@@ -51,6 +51,20 @@ class InstallScriptTests(unittest.TestCase):
                     found += [f'{script.relative_to(HERE.parent)}:{number}: ${name}:' for name in bad.findall(quoted)]
         self.assertEqual(found, [], 'write ${Name}: or $($Name): instead')
 
+    def test_no_assignment_to_powershell_automatic_variables(self):
+        # $Error, $Input, $Args and the like are PowerShell's own read-only or
+        # automatic variables; assigning one fails at run time ("Cannot
+        # overwrite variable Error") or silently misbehaves. Only Windows runs
+        # these scripts, so catch it here, where CI runs.
+        names = 'error|input|args|host|pid|home|true|false|psitem|this|executioncontext'
+        assignment = re.compile(r'(?<![\w:.])\$(%s)\s*=(?!=)' % names, re.IGNORECASE)
+        found = []
+        for script in sorted(HERE.parent.rglob('*.ps1')):
+            for number, line in enumerate(script.read_text(errors='replace').splitlines(), 1):
+                code = line.split('#', 1)[0]
+                found += [f'{script.relative_to(HERE.parent)}:{number}: ${m}' for m in assignment.findall(code)]
+        self.assertEqual(found, [], 'use a name of your own')
+
     def test_local_user_descriptions_fit_windows_limit(self):
         found = 0
         for script in sorted(HERE.glob("*.ps1")):
