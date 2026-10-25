@@ -25,7 +25,7 @@ class CacheDiskInventoryTests(unittest.TestCase):
     def test_selection_keeps_topology_refusals_and_its_cold_start_budget(self):
         cache = (ROOT / "crates/motor-winagent/src/cache.rs").read_text()
         self.assertIn("hyperv_selection_still_refuses_three_disks_boot_cache_and_missing_lun", cache)
-        self.assertIn("unexpected Hyper-V bus type; expected SCSI (1)", cache)
+        self.assertIn("unexpected Hyper-V bus type; expected SCSI (1) or SAS (10)", cache)
         self.assertIn("disk_number={} lun={} bus_type={} boot={} system={}", cache)
 
         steps = (ROOT / "crates/motor-winagent/src/cache_steps.rs").read_text()

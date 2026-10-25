@@ -4,8 +4,19 @@ use std::io;
 use std::time::Instant;
 
 pub const CACHE_DISK_SERIAL: &str = "motor-cache";
-/// `MSFT_Disk.BusType` value for SCSI; the prior PowerShell filter accepted only SCSI.
+/// `MSFT_Disk.BusType` value for SCSI.
 pub const HYPERV_SCSI_BUS_TYPE: u16 = 1;
+/// `MSFT_Disk.BusType` value for SAS. Disks on a Generation 2 VM's synthetic
+/// SCSI controller report this inside the guest: measured on the Ally on
+/// 2026-10-25 as bus_type 10 for both the OS disk (LUN 0) and the cache
+/// disk (LUN 1).
+pub const HYPERV_SAS_BUS_TYPE: u16 = 10;
+
+/// Bus types a Hyper-V job VM's synthetic SCSI disks may report. Anything
+/// else (USB, SATA, NVMe, a virtual DVD) is not a disk this runner attached.
+/// The two-disk LUN topology in `select_hyperv_cache_disk` stays the real
+/// guard on which disk is the cache.
+pub const HYPERV_ACCEPTED_BUS_TYPES: [u16; 2] = [HYPERV_SCSI_BUS_TYPE, HYPERV_SAS_BUS_TYPE];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HypervDisk {
@@ -62,7 +73,7 @@ pub fn join_hyperv_disk_inventory(
 pub fn select_hyperv_cache_disk(disks: &[HypervDisk]) -> io::Result<u32> {
     let unexpected_bus: Vec<_> = disks
         .iter()
-        .filter(|disk| disk.bus_type != HYPERV_SCSI_BUS_TYPE)
+        .filter(|disk| !HYPERV_ACCEPTED_BUS_TYPES.contains(&disk.bus_type))
         .map(|disk| {
             format!(
                 "disk_number={} lun={} bus_type={} boot={} system={}",
@@ -72,7 +83,7 @@ pub fn select_hyperv_cache_disk(disks: &[HypervDisk]) -> io::Result<u32> {
         .collect();
     if !unexpected_bus.is_empty() {
         return Err(io::Error::other(format!(
-            "unexpected Hyper-V bus type; expected SCSI (1): {}",
+            "unexpected Hyper-V bus type; expected SCSI (1) or SAS (10): {}",
             unexpected_bus.join(", ")
         )));
     }
@@ -418,11 +429,14 @@ mod tests {
         let mut duplicate = cache();
         duplicate.number = 0;
         assert!(select_hyperv_cache_disk(&[os(), duplicate]).is_err());
-        let mut non_scsi = cache();
-        non_scsi.bus_type = 10;
-        let failure = select_hyperv_cache_disk(&[os(), non_scsi]).unwrap_err();
+        let mut sas_cache = cache();
+        sas_cache.bus_type = HYPERV_SAS_BUS_TYPE;
+        assert_eq!(select_hyperv_cache_disk(&[os(), sas_cache]).unwrap(), 1);
+        let mut sata = cache();
+        sata.bus_type = 11;
+        let failure = select_hyperv_cache_disk(&[os(), sata]).unwrap_err();
         assert!(failure.to_string().contains("disk_number=1"));
-        assert!(failure.to_string().contains("bus_type=10"));
+        assert!(failure.to_string().contains("bus_type=11"));
     }
 
     #[test]
@@ -448,12 +462,20 @@ mod tests {
         let disks = join_hyperv_disk_inventory(&storage, &locations).unwrap();
         assert_eq!(select_hyperv_cache_disk(&disks).unwrap(), 1);
 
-        let mut storage_with_sas_disk = storage;
-        storage_with_sas_disk[1].bus_type = 10;
-        let joined = join_hyperv_disk_inventory(&storage_with_sas_disk, &locations).unwrap();
+        // The inventory a real Hyper-V Generation 2 job VM reported on the Ally:
+        // both disks on the synthetic SCSI controller show bus type SAS.
+        let mut ally = storage;
+        ally[0].bus_type = HYPERV_SAS_BUS_TYPE;
+        ally[1].bus_type = HYPERV_SAS_BUS_TYPE;
+        let joined = join_hyperv_disk_inventory(&ally, &locations).unwrap();
+        assert_eq!(select_hyperv_cache_disk(&joined).unwrap(), 1);
+
+        let mut usb = storage;
+        usb[1].bus_type = 7;
+        let joined = join_hyperv_disk_inventory(&usb, &locations).unwrap();
         let failure = select_hyperv_cache_disk(&joined).unwrap_err();
         assert!(failure.to_string().contains("disk_number=1"));
-        assert!(failure.to_string().contains("bus_type=10"));
+        assert!(failure.to_string().contains("bus_type=7"));
 
         assert!(
             join_hyperv_disk_inventory(&storage, &[HypervDiskLocation { number: 7, lun: 1 }])
