@@ -1,6 +1,6 @@
 //! A Linux job unit takes its memory limit from the shared `motor-jobs.slice`:
-//! the unit asks for the slice's `MemoryMax` at most, and a slice below the
-//! floor every job unit requests refuses the job before start.
+//! the unit asks for the slice's `MemoryMax` at most. Only capacity-managed
+//! hosts promise the per-job floor through an operator-declared minimum.
 //!
 //! These run on the plain host backend, with no job isolation, no `motor-job`
 //! account, no sudo and no systemd: the decisions are plain functions the
@@ -12,16 +12,28 @@ use std::sync::atomic::AtomicU64;
 
 const FLOOR: u64 = 16 << 30;
 
-/// A runner that records `ceiling` as the jobs slice's `MemoryMax` without a
-/// manager to ask. The ceiling travels through the same cache admission reads
-/// on the isolated path: `refresh_slice_budget` at startup and on every
-/// maintenance pass.
-fn runner_recording(f: &Fixture, ceiling: u64) -> (Runner, Arc<AtomicU64>) {
+/// Replace systemd with a recorded ceiling and read a fixture capacity file
+/// through the production parser. Both values travel through admission's cache.
+fn runner_recording(
+    f: &Fixture,
+    ceiling: u64,
+    declared_min: Option<u64>,
+) -> (Runner, Arc<AtomicU64>) {
     let mut config = f.config();
     config.memory_floor_gib = Some(16);
+    config.manual_tick = true;
+    let capacity_file = f.scratch.join("capacity.json");
+    if let Some(min) = declared_min {
+        fs::write(&capacity_file, format!(r#"{{"jobs_min_bytes":{min}}}"#)).unwrap();
+    }
     let current = Arc::new(AtomicU64::new(ceiling));
     let read = current.clone();
-    config.slice_ceiling_probe = Some(Arc::new(move || Ok(read.load(Ordering::SeqCst))));
+    config.slice_budget_probe = Some(Arc::new(move || {
+        Ok((
+            read.load(Ordering::SeqCst),
+            crate::job_memory_budget::read_declared_jobs_min(&capacity_file),
+        ))
+    }));
     (Runner::open(config).unwrap(), current)
 }
 
@@ -48,22 +60,33 @@ fn assert_refused_without_start(
     terminal.refusal_detail().unwrap_or_default().to_owned()
 }
 
-/// The slice decision at the boundary the runner uses: one byte below the
-/// floor refuses as a setup fault, at and above it nothing is refused, and a
-/// missing reading refuses nothing.
+/// A declaration below the floor refuses even when the combined slice is
+/// larger. A missing declaration leaves small hosts free to clamp their jobs.
 #[test]
-fn a_slice_below_the_floor_is_a_setup_refusal_and_a_missing_reading_is_none() {
-    let (reason, detail) = crate::backend::slice_admission_refusal(FLOOR, FLOOR - 1).unwrap();
+fn a_declared_budget_below_the_floor_is_a_setup_refusal_and_no_declaration_is_none() {
+    let (reason, detail) =
+        crate::backend::slice_admission_refusal(FLOOR, 40 << 30, Some(FLOOR - 1)).unwrap();
     assert_eq!(reason, RefusalReason::WorkspaceSetupFailed);
     assert!(
-        detail.contains("MemoryMax=17179869183")
+        detail.contains("jobs_min_bytes=17179869183")
             && detail.contains("16 GiB memory floor")
             && detail.contains("jobs_min_bytes"),
         "{detail}"
     );
-    assert_eq!(crate::backend::slice_admission_refusal(FLOOR, FLOOR), None);
     assert_eq!(
-        crate::backend::slice_admission_refusal(FLOOR, crate::systemd::NO_JOB_MEMORY_BUDGET),
+        crate::backend::slice_admission_refusal(FLOOR, FLOOR, Some(FLOOR)),
+        None
+    );
+    assert_eq!(
+        crate::backend::slice_admission_refusal(FLOOR, FLOOR - 1, None),
+        None
+    );
+    assert_eq!(
+        crate::backend::slice_admission_refusal(
+            FLOOR,
+            crate::systemd::NO_JOB_MEMORY_BUDGET,
+            Some(FLOOR)
+        ),
         None
     );
 }
@@ -85,12 +108,12 @@ fn the_unit_limit_is_clamped_to_the_slice_and_never_above_it() {
     );
 }
 
-/// Admission refuses the job before start when the recorded ceiling is below
-/// the floor: no unit starts, and the record proves nothing ran.
+/// The Linux minimum excludes the Windows allowance in the combined slice.
+/// An operator declaration below the floor refuses without starting any work.
 #[test]
-fn admission_refuses_before_start_when_the_recorded_slice_is_below_the_floor() {
+fn admission_refuses_before_start_when_the_declared_minimum_is_below_the_floor() {
     let f = Fixture::new();
-    let (runner, _) = runner_recording(&f, FLOOR - 1);
+    let (runner, _) = runner_recording(&f, 40 << 30, Some(FLOOR - 1));
     let (request, _) = f.run("touch must-not-start");
     assert!(matches!(
         runner.accept(request.clone()).unwrap(),
@@ -99,16 +122,19 @@ fn admission_refuses_before_start_when_the_recorded_slice_is_below_the_floor() {
     let detail =
         assert_refused_without_start(&runner, &f, &request, RefusalReason::WorkspaceSetupFailed);
     assert!(
-        detail.contains("MemoryMax=17179869183") && detail.contains("jobs_min_bytes"),
+        detail.contains("jobs_min_bytes=17179869183")
+            && detail.contains("/etc/motor-host/capacity.json")
+            && detail.contains("provision.py apply-jobs-slice"),
         "{detail}"
     );
 }
 
-/// A recording that covers the floor admits the job as usual.
+/// The 40 GiB slice ceiling and the operator-declared 24 GiB Linux minimum
+/// together cover the 16 GiB per-job floor.
 #[test]
-fn admission_accepts_when_the_recorded_slice_covers_the_floor() {
+fn admission_accepts_when_the_declared_minimum_and_slice_cover_the_floor() {
     let f = Fixture::new();
-    let (runner, _) = runner_recording(&f, 24 << 30);
+    let (runner, _) = runner_recording(&f, 40 << 30, Some(24 << 30));
     let (request, _) = f.run("true");
     assert!(matches!(
         runner.accept(request.clone()).unwrap(),
@@ -117,10 +143,27 @@ fn admission_accepts_when_the_recorded_slice_covers_the_floor() {
     runner.cancel(request.job_id).unwrap();
 }
 
-/// Maintenance re-reads the ceiling, and the next job decided after that pass
-/// refuses by it. Admission itself never asks again, so this is the only place
-/// a changed slice takes effect, and the wait is at most one maintenance
-/// interval.
+#[test]
+fn an_undeclared_boat_sized_slice_admits_eight_vcpus_and_clamps_the_unit_limit() {
+    let f = Fixture::new();
+    let slice = 14_249_590_784;
+    let (runner, _) = runner_recording(&f, slice, None);
+    let (mut request, _) = f.run("true");
+    request.weight_hint = Some(8);
+    assert!(matches!(
+        runner.accept(request.clone()).unwrap(),
+        Admission::Accepted(0)
+    ));
+    assert_eq!(
+        crate::backend::job_memory_limit(crate::backend::memory_max(8, Some(16)), slice),
+        14_249_590_784
+    );
+    runner.cancel(request.job_id).unwrap();
+}
+
+/// A live slice too small to honour the declaration remains a setup fault.
+/// Maintenance refreshes both inputs without holding the state lock; admission
+/// reads the cache without performing either systemctl or capacity-file I/O.
 #[test]
 fn maintenance_picks_up_a_changed_ceiling_before_the_next_job_is_decided() {
     let f = Fixture::new();
@@ -128,12 +171,14 @@ fn maintenance_picks_up_a_changed_ceiling_before_the_next_job_is_decided() {
     config.memory_floor_gib = Some(16);
     config.manual_tick = true;
     let ceiling = Arc::new(AtomicU64::new(24 << 30));
+    let capacity_file = f.scratch.join("capacity.json");
+    fs::write(&capacity_file, r#"{"jobs_min_bytes":25769803776}"#).unwrap();
     let reads = Arc::new(AtomicU64::new(0));
     let core = Arc::new(std::sync::OnceLock::<std::sync::Weak<Core>>::new());
     let probed_core = core.clone();
     let read = ceiling.clone();
     let counted = reads.clone();
-    config.slice_ceiling_probe = Some(Arc::new(move || {
+    config.slice_budget_probe = Some(Arc::new(move || {
         // Startup probes before the runner is available. On maintenance, test
         // the lock directly instead of timing cumulative holds from unrelated
         // operations. Manual ticking leaves no other state-lock contender.
@@ -144,16 +189,25 @@ fn maintenance_picks_up_a_changed_ceiling_before_the_next_job_is_decided() {
             );
         }
         counted.fetch_add(1, Ordering::SeqCst);
-        Ok(read.load(Ordering::SeqCst))
+        Ok((
+            read.load(Ordering::SeqCst),
+            crate::job_memory_budget::read_declared_jobs_min(&capacity_file),
+        ))
     }));
     let runner = Runner::open(config).unwrap();
     core.set(Arc::downgrade(&runner.core)).unwrap();
-    // Jobs the size of the last recording are admitted.
+    // Admission consumes the startup reading without probing the host again.
+    let startup_reads = reads.load(Ordering::SeqCst);
     let (before, _) = f.run("true");
     assert!(matches!(
         runner.accept(before.clone()).unwrap(),
         Admission::Accepted(0)
     ));
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        startup_reads,
+        "admission probed the host"
+    );
     runner.cancel(before.job_id).unwrap();
     // An operator shrinks the slice after startup, with no restart.
     ceiling.store(FLOOR - 1, Ordering::SeqCst);
@@ -169,4 +223,24 @@ fn maintenance_picks_up_a_changed_ceiling_before_the_next_job_is_decided() {
         runner.accept(request).unwrap(),
         Admission::Refused(RefusalReason::WorkspaceSetupFailed)
     ));
+}
+
+#[test]
+fn maintenance_picks_up_a_changed_declaration_without_changing_the_slice() {
+    let f = Fixture::new();
+    let (runner, _) = runner_recording(&f, 40 << 30, Some(24 << 30));
+    fs::write(
+        f.scratch.join("capacity.json"),
+        r#"{"jobs_min_bytes":8589934592,"windows_vm_bytes":34359738368}"#,
+    )
+    .unwrap();
+    runner.maintenance().unwrap();
+    let (request, _) = f.run("touch must-not-start");
+    assert!(matches!(
+        runner.accept(request.clone()).unwrap(),
+        Admission::Refused(RefusalReason::WorkspaceSetupFailed)
+    ));
+    let detail =
+        assert_refused_without_start(&runner, &f, &request, RefusalReason::WorkspaceSetupFailed);
+    assert!(detail.contains("jobs_min_bytes=8589934592"), "{detail}");
 }

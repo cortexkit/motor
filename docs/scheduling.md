@@ -93,17 +93,24 @@ refused before start ([hosted-host.md](hosted-host.md#growing-the-tenant-beside-
 
 Every Linux job unit runs in `motor-jobs.slice`. A unit's `MemoryMax` is the
 claim's `memory_max` clamped to the slice's `MemoryMax`, so a job that
-outgrows the slice ends as the slice's OOM kill, reported as before. If the
-slice's `MemoryMax` is below the 16 GiB floor every job unit asks for, Linux
-jobs are refused before start with `workspace_setup_failed` and a detail
-naming the repair (raise `jobs_min_bytes` and re-run
-`provision.py apply-jobs-slice`); this is a host setup fault, so it is not
-reported as a full runner. The runner reads the slice's limit at startup and
-at each maintenance pass (at least once a minute), not on every admission.
+outgrows the slice ends as the slice's OOM kill, reported as before. Only
+hosts with an operator-declared `jobs_min_bytes` in
+`/etc/motor-host/capacity.json` promise the 16 GiB per-job floor. If that
+minimum or the live slice's `MemoryMax` is below the floor, Linux jobs are
+refused before start with `workspace_setup_failed` and a detail naming the
+repair (raise `jobs_min_bytes` and re-run `provision.py apply-jobs-slice`);
+this is a host setup fault, not a full runner. The declared minimum is
+separate from the combined Linux and Windows slice maximum. Without a
+declaration, Boat, tenant guests and plain build servers admit jobs with
+limits clamped to the slice, even below 16 GiB. The runner reads both the
+slice limit and the declaration at startup and at each maintenance pass (at
+least once a minute), not on every admission.
 Tests: `the_unit_limit_is_clamped_to_the_slice_and_never_above_it`,
-`admission_refuses_before_start_when_the_recorded_slice_is_below_the_floor`,
-`admission_accepts_when_the_recorded_slice_covers_the_floor`,
-`maintenance_picks_up_a_changed_ceiling_before_the_next_job_is_decided`
+`an_undeclared_boat_sized_slice_admits_eight_vcpus_and_clamps_the_unit_limit`,
+`admission_refuses_before_start_when_the_declared_minimum_is_below_the_floor`,
+`admission_accepts_when_the_declared_minimum_and_slice_cover_the_floor`,
+`maintenance_picks_up_a_changed_ceiling_before_the_next_job_is_decided`,
+`maintenance_picks_up_a_changed_declaration_without_changing_the_slice`
 (`crates/motor-runner/src/tests/jobs_slice.rs`).
 
 ## Capacity

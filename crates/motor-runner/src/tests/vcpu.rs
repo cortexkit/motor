@@ -48,7 +48,7 @@ fn oom_detail_keeps_per_job_limit_and_advice_without_claiming_which_budget_was_h
 #[test]
 fn oom_advice_stops_recommending_more_vcpus_when_the_slice_caps_the_limit() {
     let config = Config::new("unused", "main");
-    // A 24 GiB slice, below the 30 GiB an 8-vCPU request would ask for.
+    // A 24 GiB slice, below the 28 GiB an 8-vCPU request would ask for.
     let capped = crate::engine::oom_memory_limit_detail(&config, 8, 30, 25_769_803_776);
     assert!(
         !capped.contains("Request more vCPUs"),
@@ -64,6 +64,9 @@ fn oom_advice_stops_recommending_more_vcpus_when_the_slice_caps_the_limit() {
     let whole = crate::engine::oom_memory_limit_detail(&config, 30, 32, 25_769_803_776);
     assert!(!whole.contains("Request more vCPUs"), "{whole}");
     assert!(whole.contains("per-job memory limit of 105 GiB"), "{whole}");
+    // Tenant guests and plain small hosts can clamp below the 16 GiB floor.
+    let small = crate::engine::oom_memory_limit_detail(&config, 8, 16, 14_249_590_784);
+    assert!(!small.contains("Request more vCPUs"), "{small}");
     // A slice above every admissible request changes nothing.
     let raised = crate::engine::oom_memory_limit_detail(&config, 2, 8, 112_742_891_520);
     assert!(

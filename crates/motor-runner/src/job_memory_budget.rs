@@ -1,8 +1,10 @@
-//! The shared jobs slice's memory ceiling, as admission and OOM advice see it.
+//! The shared jobs slice's ceiling and the operator's declared Linux job budget.
 //!
 //! Plain data with no systemd calls, so code that every platform compiles can
 //! name it. Only Linux reads a real slice (`systemd::read_job_memory_budget`);
 //! elsewhere the ceiling stays [`NO_JOB_MEMORY_BUDGET`] and refuses nothing.
+//! A slice ceiling alone is not a declaration that the host can afford the
+//! per-job memory floor: small hosts deliberately clamp job limits below it.
 
 /// Stands in for the slice's memory ceiling when no usable budget was read.
 /// No slice can have this `MemoryMax`, so it refuses nothing.
@@ -27,3 +29,23 @@ impl JobMemoryBudget {
         (max != NO_JOB_MEMORY_BUDGET).then_some(Self { max, high: 0 })
     }
 }
+
+/// Only capacity-managed hosts declare a guaranteed Linux job budget. The
+/// slice's maximum also includes the Windows allowance, so it cannot stand in
+/// for `jobs_min_bytes`. Boat and tenant guests normally have no capacity file.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn read_declared_jobs_min(path: &std::path::Path) -> Option<u64> {
+    #[derive(serde::Deserialize)]
+    struct Capacity {
+        jobs_min_bytes: u64,
+    }
+
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice::<Capacity>(&bytes)
+        .ok()
+        .map(|capacity| capacity.jobs_min_bytes)
+}
+
+#[cfg(test)]
+pub(crate) type BudgetProbe =
+    std::sync::Arc<dyn Fn() -> std::io::Result<(u64, Option<u64>)> + Send + Sync>;
