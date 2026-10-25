@@ -93,6 +93,9 @@ impl std::error::Error for Unreadable {
 }
 
 /// What the runner did about one unreadable checkout.
+// Only an isolated Linux runner holds a reclaim, so elsewhere outside tests
+// nothing ever restores or fails.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Repair {
     /// The reclaim ran and reported success.
