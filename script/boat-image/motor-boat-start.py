@@ -526,9 +526,15 @@ def size_jobs_slice(limit):
     percentages in place would clamp every job below it and reclaim-throttle
     jobs well before it. The setting is runtime-only, so every boot measures
     again, and it is applied before the runner starts and reads the slice.
+
+    The runner accepts the slice only when MemoryHigh is below MemoryMax, so
+    reclaim starts one margin (512 MiB) below the hard limit.
     """
+    high = limit - MARGIN
+    if high <= 0:
+        raise ValueError('memory budget is smaller than the reclaim margin')
     subprocess.run(['/usr/bin/systemctl', 'set-property', '--runtime', 'motor-jobs.slice',
-                    f'MemoryMax={limit}', f'MemoryHigh={limit}'], check=True)
+                    f'MemoryMax={limit}', f'MemoryHigh={high}'], check=True)
 
 
 if __name__ == '__main__':

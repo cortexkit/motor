@@ -1116,7 +1116,12 @@ class RecipeTests(unittest.TestCase):
             start.size_jobs_slice(14638120960)
         run.assert_called_once_with(
             ['/usr/bin/systemctl', 'set-property', '--runtime', 'motor-jobs.slice',
-             'MemoryMax=14638120960', 'MemoryHigh=14638120960'], check=True)
+             'MemoryMax=14638120960', f'MemoryHigh={14638120960 - start.MARGIN}'], check=True)
+        # The runner refuses a slice whose MemoryHigh is not below MemoryMax
+        # (systemd.rs job_memory_budget), so the two must differ.
+        self.assertLess(14638120960 - start.MARGIN, 14638120960)
+        with self.assertRaises(ValueError):
+            start.size_jobs_slice(start.MARGIN)
 
     def test_start_sizes_the_slice_before_the_runner_is_executed(self):
         source = Path(start.__file__).read_text()
