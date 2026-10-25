@@ -307,7 +307,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
                 $property = $identity.PSObject.Properties['volume_guid_path']
                 if ($property) { $recordedVolumePath = $property.Value }
             }
-            if ($failure -notmatch 'Timed out after 1 seconds.*volume GUID path in partition 1 AccessPaths on disk 42' -or $global:identityFixtureVolumeQueries -ne 0 -or $global:identityFixtureAddCalls -ne 0 -or $global:identityFixtureAccessPathTouched -or -not $global:identityFixtureDismounted -or $recordedVolumePath) { throw "FAIL sealed-agent-volume-timeout-unmounts: $failure" }
+            if ($failure -notmatch 'Timed out after 1 seconds waiting for a volume GUID path on disk 42 partition 1: partition AccessPaths has no volume GUID path yet' -or $global:identityFixtureVolumeQueries -ne 0 -or $global:identityFixtureAddCalls -ne 0 -or $global:identityFixtureAccessPathTouched -or -not $global:identityFixtureDismounted -or $recordedVolumePath) { throw "FAIL sealed-agent-volume-timeout-unmounts: $failure" }
             Write-Host 'PASS sealed-agent-volume-timeout-unmounts'
             $count++
         } finally {
