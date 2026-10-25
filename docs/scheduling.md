@@ -84,8 +84,10 @@ unchanged. With the option:
 - The option is refused on a VM instance, with an empty list, a CPU that is
   not online, or `--max-weight 0`.
 
-The build server's main instance runs `--linux-cpus 12-15,28-31 --max-weight 16`
-beside hosted tenant 1 ([tenant1-cutover-runbook.md](tenant1-cutover-runbook.md)).
+For example, a runner beside a hosted tenant on `0-11,16-27` of a 32-thread
+host runs `--linux-cpus 12-15,28-31 --max-weight 16`: a 12-vCPU job with a
+long timeout is admitted and placed on those 8 threads, and a 17-vCPU job is
+refused before start ([hosted-host.md](hosted-host.md#growing-the-tenant-beside-a-smaller-runner)).
 
 ### Memory and the jobs slice
 

@@ -265,9 +265,9 @@ A `resize.json` that cannot be read, is not valid JSON, has missing or unknown
 keys, another schema version, an unknown phase, or names a base, set-aside or
 staged path the resize would not have created is refused by both resize and
 abort, and the tenant stays start-refused. Recover by hand with both services
-stopped. The old state comes from the copies saved before the resize
-([`docs/tenant1-cutover-runbook.md`](../../docs/tenant1-cutover-runbook.md)
-saves the records and helper config in `/root/tenant1-cutover/saved/` first); if `resize.json` is
+stopped. The old state comes from copies of the provisioning record, the helper
+registry entry and `/etc/motor-vm-helper.json` saved before the resize (save
+them before every resize); if `resize.json` is
 still readable JSON, its `provision_old`, `registry_old` and `helper_old` hold the
 same bytes, and `provision_new`, `registry_new` and `helper_new` the new ones.
 

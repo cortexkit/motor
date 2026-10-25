@@ -4,7 +4,8 @@ This turns the dedicated Linux build server into a hosted-runners host: the
 root `motor-vm-helper`, the unprivileged `motor-host` TLS agent, their
 configs and keys, one tenant VM for our fleet's account, and one public TLS
 port. The existing SSH runner keeps running beside it. Broker-side enrollment
-belongs to CLOUD; this procedure prints the facts CLOUD registers.
+belongs to the broker operator; this procedure prints the facts the broker
+operator registers.
 
 The host id and the tenant's broker subject (`acct:<ULID>`) are installer
 arguments. They are not in this public repository; after installing they live
@@ -98,11 +99,23 @@ runner, not while it runs beside it. The guest still advertises
 `memory_max` of its placeable size: 28,672 − 2,048 = 26,624 MiB places
 leases of up to 7 vCPUs ([hosted-cutover.md](hosted-cutover.md#enable-on-one-machine)).
 
-The fleet cutover in [tenant1-cutover-runbook.md](tenant1-cutover-runbook.md)
-resizes tenant 1 to 24 vCPUs on `0-11,16-27`, 78 GiB, a 600 GiB sparse disk, a
-permit budget (`max_weight`) of 64 and idle suspend off, and confines the
-runner's Linux jobs to `12-15,28-31` at `--max-weight 16`. That runbook holds
-the procedure, the exact values and the rollback.
+### Growing the tenant beside a smaller runner
+
+When the tenant takes over most Linux work, the tenant grows and the runner
+shrinks. As a worked example on this server: switch tenant 1 to an image that
+lists the `resize-v1` capability, then resize it offline (`provision.py
+resize`, both services stopped) to 24 vCPUs on `0-11,16-27`, 78 GiB (79,872
+MiB), a 600 GiB sparse disk, a permit budget (`max_weight`) of 64 and
+`idle_suspend_s` 0; and run the runner with
+`--linux-cpus 12-15,28-31 --max-weight 16`, the 8 threads outside the tenant's
+cpuset, shared with the Windows VM
+([scheduling.md](scheduling.md#confining-linux-jobs-to-a-cpu-list)). The
+tenant then advertises at most 77,824 MiB, so the broker's ceilings for the
+host are `max_job_vcpus` 21 and `max_job_mem_mib` 75,264. The memory fit is
+(79,872 + 512) MiB + 16 + 6 + 24 GiB = 124.5 GiB, within this server's
+125.4 GiB `MemTotal`. At idle 0 the storage threshold is 136 GiB, the release
+point 144 GiB and the operating requirement 208 GiB; the resize itself needs
+288.5 GiB (309,774,516,224 bytes) free while its new size base is absent.
 
 ### Host capacity
 
@@ -173,7 +186,7 @@ extra rule.
    exactly one. `--port` (default 8443) and `--tenant-disk-quota-gib` (default
    100) override the defaults. A declined change or any failed check exits
    nonzero.
-4. Send CLOUD the enrollment block. It is five labelled lines in
+4. Send the broker operator the enrollment block. It is five labelled lines in
    `register-host` argument order, then the filled-in command:
 
    ```text
@@ -272,9 +285,9 @@ extra rule.
    sudo script/hosted-host/install.sh --checkout /srv/build/src/motor --check
    ```
 
-7. Only after CLOUD confirms the registration, start the host. The broker
-   places leases on the host from its first signed heartbeat, so this is the
-   step that puts the host into service:
+7. Only after the broker operator confirms the registration, start the host.
+   The broker places leases on the host from its first signed heartbeat, so
+   this is the step that puts the host into service:
 
    ```sh
    sudo script/hosted-host/install.sh --checkout /srv/build/src/motor --start
@@ -289,7 +302,7 @@ extra rule.
 
 ## Roll back
 
-Ask CLOUD to stop placing on the host, then:
+Ask the broker operator to stop placing on the host, then:
 
 ```sh
 sudo script/hosted-host/install.sh --checkout /srv/build/src/motor --stop
