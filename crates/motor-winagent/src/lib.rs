@@ -703,6 +703,9 @@ impl Command {
     }
 }
 
+// Git dependency rewrites only apply inside the Windows job VM; tests exercise
+// them on every platform.
+#[cfg(any(windows, test))]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GitRewriteManifest {
@@ -710,6 +713,7 @@ struct GitRewriteManifest {
     routes: Vec<GitRewrite>,
 }
 
+#[cfg(any(windows, test))]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GitRewrite {
@@ -717,6 +721,7 @@ struct GitRewrite {
     mirror: String,
 }
 
+#[cfg(any(windows, test))]
 fn local_git_file_url(path: &std::path::Path) -> io::Result<String> {
     let path = path
         .to_str()
@@ -743,6 +748,7 @@ fn local_git_file_url(path: &std::path::Path) -> io::Result<String> {
     Ok(format!("file://{encoded}"))
 }
 
+#[cfg(any(windows, test))]
 fn git_rewrite_environment(cargo_home: &std::path::Path) -> io::Result<BTreeMap<String, String>> {
     safe_directory(cargo_home)?;
     let path = cargo_home.join("git-rewrites.json");
