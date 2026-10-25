@@ -345,7 +345,7 @@ not change it.
 
 ## Disk-quota qualification
 
-The runner-host probe proves the real total quota (up to 32 GiB, with nonzero
+The runner-host probe proves the real root/XFS-bound total quota (with nonzero
 random data and fsync) before its stop/resume cycle. It
 first tries native and compat attribute setters, requires EPERM, checks that a
 new file still inherits the job project, then fills that same directory. A
@@ -366,7 +366,7 @@ explicitly leaves `sufficiency_proven` false.
 
 Separate jobs write into workspace, target, scratch, HOME and `/var/tmp`, and allocate on
 the existing root-created `/motor-output/stdout` inode. Filling a lane to the real cap
-writes about 12 GiB, so only the lanes whose proof needs the limit do so
+can write tens of GiB, so only the lanes whose proof needs the limit do so
 (`disk_quota.FULL_LANES`): the reflink target and the retained target. Each of those
 must reach EDQUOT/ENOSPC with a matching near-full kernel quota while the reserve
 holds. Every other lane writes `disk_quota.CHARGE_BYTES` (256 MiB) and passes

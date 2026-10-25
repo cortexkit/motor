@@ -267,9 +267,15 @@ exactly that URL. It fails with git before 2.46.
 
 ## Filesystem choice
 
-Boat's measured ext4 root rejects FICLONE (`EOPNOTSUPP`). Use a **64 GiB sparse,
-loop-mounted XFS image** on that disk, with `reflink=1`, not a plain-copy runner
-fallback. The state, warm workspaces, JS install caches and `/Users` workspace
+Boat's measured ext4 root rejects FICLONE (`EOPNOTSUPP`). Use a **sparse,
+loop-mounted XFS image sized to the build sandbox's root filesystem total**,
+with `reflink=1`, not a plain-copy runner fallback. Prepared images are built
+fresh on `large`; sparse capacity does not preallocate root blocks. Restoring
+on a smaller `default` root leaves the apparent loop size unchanged, but job
+quotas remain bounded by real free space on both filesystems. Installation never
+resizes or reformats an existing image, and boot never resizes it. A restore on a
+larger root could leave XFS as the limiting view; rebuild on that larger size to
+use the additional capacity. The state, warm workspaces, JS install caches and `/Users` workspace
 bind all share that filesystem. The recipe actually clones random nonempty data
 between the state mount and workspace bind, and checks the bytes. A loop-image
 or ioctl failure aborts installation rather than changing copy semantics.
@@ -712,13 +718,18 @@ systemd version's private-temporary backing. The live probe verifies project IDs
 on both spellings. Binds of an unexpected
 filesystem fail setup, rather than silently escaping the quota.
 
-The **total** hard block cap is at most 32 GiB, calculated from
+The **total** hard block cap has no fixed byte ceiling. It is calculated from
 `min(XFS available bytes, / available bytes) - provisional reserve - replay tail
 allowance`, rounded down to 512 bytes. The **24-GiB reserve is provisional**,
 not an empirically established snapshot requirement. Initial logical usage
 consumes the cap; it never increases it. Reflinked baseline extents can become
 physical CoW allocations or release logical charge without freeing physical
 space, so initial-plus-growth accounting is unsafe even for sequential jobs.
+`installed_quota_uses_both_disks_above_32gib_without_initial_credit` checks the
+installed hard limit on either limiting filesystem, including block rounding.
+The recipe test `test_fresh_state_image_is_sparse_and_matches_build_root_total`
+checks that the backing file uses total root geometry, not a fixed size or free
+space, and allocates no data blocks.
 
 A reused baseline leaving under 8 GiB of growth is evicted through the same
 owned cache-removal/catalog path as idle eviction, then materialized cold once.

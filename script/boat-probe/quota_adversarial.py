@@ -27,7 +27,7 @@ import json, os
 def free(path):
     value = os.statvfs(path)
     return value.f_bavail * value.f_frsize
-cap = min(32 * 1024**3, min(free('/'), free('/var/lib/motor-boat')) - 24 * 1024**3 - 64 * 1024**2)
+cap = max(0, min(free('/'), free('/var/lib/motor-boat')) - 24 * 1024**3 - 64 * 1024**2)
 print(json.dumps(dict(cap_bytes=cap, baseline_bytes=max(0, cap - 8 * 1024**3 - 256 * 1024**2))))
 '''
 
@@ -50,7 +50,7 @@ print(json.dumps(dict(copies=count, logical_bytes=logical, source_bytes=source.s
 
 
 def reflink_seed(baseline_bytes):
-    if type(baseline_bytes) is not int or not (64 * 1024**2 <= baseline_bytes <= 24 * 1024**3):
+    if type(baseline_bytes) is not int or baseline_bytes < 64 * 1024**2:
         raise ValueError('insufficient headroom for a meaningful retained-reflink baseline')
     return 'BASELINE_BYTES=' + str(baseline_bytes) + '\n' + REFLINK_JOB
 
