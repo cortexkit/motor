@@ -148,9 +148,20 @@ it (`spilled_lease_avoids_the_build_server_and_every_re_request_repeats_it`).
    runner unit's `--max-weight` and `--windows-cpus`; repository defaults are not
    evidence of the deployed values.
 2. Record the tenant's registry and runner admin response before the flip:
-   - `vcpu_ceiling` equals that deployed `--max-weight`;
+   - `vcpu_ceiling` equals that deployed `--max-weight` (tenant 1's stage-2
+     cutover instead keeps a smaller direct runner beside the tenant; see
+     [tenant1-cutover-runbook.md](tenant1-cutover-runbook.md));
    - `cpuset` excludes the deployed Windows CPU set;
-   - `guest_ram_mib` is at least `memory_max(vcpu_ceiling)` in MiB;
+   - the guest advertises at least `memory_max(N)`, where N is the placeable
+     size recorded with CLOUD's `max_job_vcpus` ceiling for the host: the
+     broker places a lease only where `free_mem_mib` covers `memory_max` of its
+     vCPUs, and a tenant advertises at most `guest_ram_mib` less
+     `tenant_memory_reserve_bytes` (2,048 MiB). N is the largest size with
+     `memory_max(N) ≤ guest_ram_mib − 2048` in MiB, and CLOUD's ceilings are
+     `max_job_vcpus` N and `max_job_mem_mib` `memory_max(N)`. A 78 GiB guest
+     (79,872 MiB) gives N = 21 (75,264 MiB); a 28 GiB guest gives N = 7.
+     Test: `test_placeable_n_comes_from_guest_ram_and_the_reserve`
+     (`script/hosted-host/test_hosted_host.py`);
    - `disk_quota_bytes` is sized for that host: the tenant disk, a suspend
      snapshot and its size base must leave free space at or above the refusal
      floor of every runner sharing the filesystem. `provision.py` refuses a disk
@@ -160,7 +171,8 @@ it (`spilled_lease_avoids_the_build_server_and_every_re_request_repeats_it`).
    - `args_status` reports `sccache_size_gib` of a quarter of the disk in GiB
      (at most 200), plus the expected owned roots, free-space floor and maximum
      weight from `/tenant/runner-args`.
-   `memory_max(vcpus)` is `max(16 GiB, 3.5 GiB × vcpus)`. Do not substitute the
+   `memory_max(vcpus)` is `max(16 GiB, 3.5 GiB × vcpus)`, in MiB
+   `max(16384, 3584 × vcpus)`. Do not substitute the
    smaller test-tenant values for production provisioning.
 3. Keep the host agent and tenant VM beside the existing SSH runner. Move caches
    onto the persistent tenant disk; allow for a one-time rebuild. Complete the
