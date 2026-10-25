@@ -170,6 +170,7 @@ pub(crate) struct Launch {
     pub execution: Box<dyn Execution>,
     /// The write ledgers of the unit's cache sockets; empty for a unit that is
     /// not a fill or has no remote cache.
+    #[cfg(unix)]
     pub cache_ledgers: Vec<std::sync::Arc<crate::remote_cache::gateway::WriteLedger>>,
 }
 
@@ -1035,12 +1036,13 @@ impl Backend for HostBackend {
         }?;
         #[cfg(target_os = "linux")]
         let cache_ledgers = launch.cache_ledgers();
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(all(unix, not(target_os = "linux")))]
         let cache_ledgers = Vec::new();
         Ok(Launch {
             process: Some(launch.identity),
             durable_output: launch.durable_output,
             execution: Box::new(launch),
+            #[cfg(unix)]
             cache_ledgers,
         })
     }
@@ -1174,6 +1176,7 @@ fn compile_cache_environment(
     prepared: &Prepared,
     env: &mut BTreeMap<String, String>,
 ) -> io::Result<()> {
+    #[cfg(unix)]
     scrub_inherited_cache_environment(config, setup, prepared, env);
     if !config.shared_compile_cache() {
         env.retain(|key, _| key != "RUSTC_WRAPPER" && !key.starts_with("SCCACHE_"));
@@ -1187,7 +1190,10 @@ fn compile_cache_environment(
                 crate::compile_cache::TARGET.into(),
             );
         }
+        #[cfg(unix)]
         return remote_cache_environment(config, setup, prepared, env);
+        #[cfg(not(unix))]
+        return Ok(());
     }
     if let Some(wrapper) = &prepared.wrapper {
         env.insert(
@@ -1220,7 +1226,14 @@ fn compile_cache_environment(
     }
     #[cfg(not(target_os = "linux"))]
     let _ = setup;
-    remote_cache_environment(config, setup, prepared, env)
+    #[cfg(unix)]
+    {
+        remote_cache_environment(config, setup, prepared, env)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(())
+    }
 }
 
 /// A cache fill, or a job whose workspace root is a Cargo workspace.
@@ -1237,6 +1250,7 @@ fn rust_job(setup: &Setup) -> bool {
 /// units sanitize only when prepared with remote sockets, preserving their
 /// baseline otherwise. Using the prepared unit also avoids a tenant switch
 /// change between preparation and launch changing which values are removed.
+#[cfg(unix)]
 pub(crate) fn scrub_inherited_cache_environment(
     config: &Config,
     setup: &Setup,
@@ -1276,6 +1290,7 @@ pub(crate) fn scrub_inherited_cache_environment(
 /// and job isolation all hold: without isolation a job runs as the runner's
 /// own account and could open the keys, so the switch is ignored there. The
 /// prepared sandbox is the authority on which sockets were successfully bound.
+#[cfg(unix)]
 fn remote_cache_environment(
     config: &Config,
     setup: &Setup,
@@ -1316,6 +1331,7 @@ fn remote_cache_environment(
 /// Apply one host type's remote cache delta to `env`: exactly the difference
 /// between its switch-off job environment and its switch-on one. `env` must
 /// already hold the role's baseline.
+#[cfg(unix)]
 pub(crate) fn remote_cache_job_environment(
     role: crate::remote_cache::provisioning::HostRole,
     forwarders: &[crate::remote_cache::transport::Forwarder],

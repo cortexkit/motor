@@ -26,9 +26,8 @@ mod platform;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod privilege;
 mod return_paths;
-// The sandbox transport runs on Linux job hosts. Some component diagnostics
-// and test seams are only used by portable tests.
-#[cfg(unix)]
+// Cache records and publication policy are portable; the sandbox transport is
+// Unix-only.
 #[cfg_attr(any(not(test), not(target_os = "linux")), allow(dead_code))]
 mod remote_cache;
 mod server;
@@ -47,8 +46,9 @@ mod systemd;
 /// systemd-run properties for every job unit. PID 1 starts these system
 /// services, independently of the user manager's protected runner processes.
 /// OOMPolicy also stops surviving job descendants. Kept outside `systemd` so
-/// the argument builders of the Windows VM backend compile on every host,
-/// although only a Linux host runs them.
+/// the Unix-hosted Windows VM argument builders and portable tests can share
+/// the properties, although only a Linux host runs these units.
+#[cfg(any(unix, test))]
 pub(crate) const JOB_MEMORY_PROPERTIES: [&str; 3] = [
     "--property=Slice=motor-jobs.slice",
     "--property=OOMScoreAdjust=900",
