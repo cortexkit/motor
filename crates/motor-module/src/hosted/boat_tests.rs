@@ -22,6 +22,7 @@ pub(crate) struct Boat {
     /// received a Run frame (the connection drops).
     pub strict_attach: Arc<AtomicBool>,
     pub hang_run: Arc<AtomicBool>,
+    pub hold_provisioning: Arc<AtomicBool>,
     pub run_refusal: Arc<Mutex<Option<RunRefusal>>>,
     _http: Http,
     _host: JoinHandle<()>,
@@ -218,11 +219,19 @@ impl Boat {
         let lost_reply = lost.clone();
         let mem_mib = Arc::new(AtomicU64::new(0));
         let token_mem = mem_mib.clone();
+        let hold_provisioning = Arc::new(AtomicBool::new(false));
+        let hold = hold_provisioning.clone();
         let http=Http::new(move |path,body| {
             if path.ends_with("/reattach") && lost_reply.load(Ordering::SeqCst) != 0 { return (409, serde_json::json!({"error":"sandbox_lost"})); }
             if path.ends_with("/finish") {return (200,serde_json::json!({"job_id":path.split('/').nth(3).unwrap(),"settled_vcpu_ms":250,"released_vcpu_ms":59750}));}
             // CLOUD admits a Boat job at booking, so release can never end it.
             if path.ends_with("/release") { return (409, serde_json::json!({"error":"job_admitted"})); }
+            if path.ends_with("/reattach") && job.lock().unwrap().is_none() {
+                return (404, serde_json::json!({"error":"job_unknown"}));
+            }
+            if path == "/v1/leases" && hold.load(Ordering::SeqCst) {
+                return (202, serde_json::json!({"status":"provisioning","retry_after_ms":5000}));
+            }
             if requests_seen.fetch_add(1, Ordering::SeqCst) < provisioning {
                 return (202, serde_json::json!({"status":"provisioning","retry_after_ms":10}));
             }
@@ -263,6 +272,7 @@ impl Boat {
             mem_mib,
             strict_attach,
             hang_run,
+            hold_provisioning,
             run_refusal,
             _http: http,
             _host: task,

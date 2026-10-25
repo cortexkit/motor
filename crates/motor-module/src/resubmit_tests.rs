@@ -37,6 +37,237 @@ async fn terminal_of(mut stream: JobStream) -> Vec<StreamRecord> {
     .unwrap()
 }
 
+async fn wait_for_provisioning(
+    motor: &Motor,
+    id: Uuid,
+    requests: &crate::hosted::test_http::Requests,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _)| p == "/v1/leases")
+            {
+                let state = motor.hosted_state(id).unwrap();
+                assert!(state.lease_attempted);
+                assert!(!state.run_sent);
+                assert!(state.placement.is_none());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+// Drive the submission directly because the portable scratch directory can be
+// outside /home and /Users, which production hosted eligibility rejects.
+fn start_spill(motor: &Motor, repo: &Path, wait: u64) -> JobStream {
+    let id = Uuid::now_v7();
+    motor
+        .storage
+        .create(id, wait, None, Some("test".into()), false)
+        .unwrap();
+    let path = repo.to_str().unwrap();
+    let request = RunRequest::new(path, path, path, "exit 7").with_timeout(30);
+    let (stream, tx, wake) = motor.stream(id);
+    let job = motor.clone();
+    let submission = motor.submission(id);
+    tokio::spawn(async move {
+        let _submission = submission;
+        if let Err(error) = job
+            .run_job(
+                id,
+                (request, crate::ReturnOptions::default()),
+                Vec::new(),
+                (wait, true),
+                &tx,
+                wake,
+            )
+            .await
+        {
+            let _ = tx.send(Err(error)).await;
+        }
+    });
+    stream
+}
+
+fn assert_attached_execution(records: &[StreamRecord], id: Uuid, code: i32, output: &[u8]) {
+    let bytes: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            StreamRecord::Output(output) => Some(output.bytes.0.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(bytes, output, "{records:?}");
+    let terminals: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            StreamRecord::Terminal(terminal) => Some(terminal),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(terminals.len(), 1, "{records:?}");
+    assert_eq!(terminals[0].job_id, id);
+    assert_eq!(terminals[0].outcome, Outcome::Exit { code });
+    assert_eq!(terminals[0].ran, Some(Ran::Remote));
+}
+
+#[tokio::test]
+async fn attach_during_spill_provisioning_follows_boat_grant() {
+    let boat = crate::hosted::boat_tests::Boat::new(0, false).await;
+    boat.hold_provisioning.store(true, Ordering::SeqCst);
+    boat.strict_attach.store(true, Ordering::SeqCst);
+    let scratch = ScratchDir::new("spill-attach-boat-grant");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        spill_config(boat.config.broker_url.as_ref().unwrap()),
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let original = start_spill(&motor, &repo, 30);
+    let id = original.job_id;
+    wait_for_provisioning(&motor, id, &boat.requests).await;
+    drop(original);
+    let mut attached = motor.attach(AttachRequest::new(id, 0)).unwrap();
+    // Provisioning outlasts the hosted follower's three reattach attempts. No
+    // record may claim a terminal while the submission can still send Run.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(11), attached.records.recv())
+            .await
+            .is_err()
+    );
+    assert!(!boat
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(p, _)| p.ends_with("/reattach")));
+    boat.hold_provisioning.store(false, Ordering::SeqCst);
+    let records = terminal_of(attached).await;
+    assert_attached_execution(&records, id, 23, b"same output\n");
+    assert_eq!(boat.runs.load(Ordering::SeqCst), 1);
+    assert_eq!(log.lock().unwrap().runs, vec![(id, 0)]);
+    assert!(motor.storage.job(id).unwrap().build_server_job_id.is_none());
+}
+
+#[tokio::test]
+async fn attach_during_spill_provisioning_follows_timeout_resubmission() {
+    let broker = crate::hosted::test_http::Http::new(|path, _| {
+        if path == "/v1/leases" {
+            (
+                202,
+                serde_json::json!({"status":"provisioning", "retry_after_ms":5000}),
+            )
+        } else {
+            (404, serde_json::json!({"error":"job_unknown"}))
+        }
+    })
+    .await;
+    let scratch = ScratchDir::new("spill-attach-timeout");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        spill_config(&broker.url),
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let original = start_spill(&motor, &repo, 14);
+    let id = original.job_id;
+    wait_for_provisioning(&motor, id, &broker.requests).await;
+    drop(original);
+    let attached = motor.attach(AttachRequest::new(id, 0)).unwrap();
+    let records = terminal_of(attached).await;
+    assert_attached_execution(&records, id, 7, b"build server output\n");
+    assert_resubmitted_once(id, &log.lock().unwrap(), 14);
+    assert!(!broker
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(p, _)| p.ends_with("/reattach")));
+}
+
+#[tokio::test]
+async fn cancel_during_spill_provisioning_cancels_resubmitted_job_before_run() {
+    let broker = crate::hosted::test_http::Http::new(|path, _| {
+        if path == "/v1/leases" {
+            (
+                202,
+                serde_json::json!({"status":"provisioning", "retry_after_ms":5000}),
+            )
+        } else {
+            (404, serde_json::json!({"error":"job_unknown"}))
+        }
+    })
+    .await;
+    let scratch = ScratchDir::new("spill-cancel-timeout");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        spill_config(&broker.url),
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let original = start_spill(&motor, &repo, 1);
+    let id = original.job_id;
+    wait_for_provisioning(&motor, id, &broker.requests).await;
+    drop(original);
+    let attached = motor.attach(AttachRequest::new(id, 0)).unwrap();
+    motor.cancel(CancelRequest::new(id)).await.unwrap();
+    let records = terminal_of(attached).await;
+    assert!(
+        matches!(records.as_slice(), [StreamRecord::Terminal(t)] if t.job_id == id && t.outcome == Outcome::Cancelled),
+        "{records:?}"
+    );
+    let log = log.lock().unwrap();
+    let resubmitted = assert_resubmitted_once(id, &log, 1);
+    assert_eq!(log.cancels, vec![resubmitted]);
+    assert!(log.cancelled_before_run.contains(&resubmitted));
+    assert!(!motor.pending(id));
+}
+
+#[tokio::test]
+async fn unknown_outcome_is_withheld_until_runner_cancel_is_acknowledged() {
+    let broker = crate::hosted::test_http::Http::new(|_, _| {
+        (404, serde_json::json!({"error":"job_unknown"}))
+    })
+    .await;
+    let scratch = ScratchDir::new("spill-unknown-cancel-unacknowledged");
+    let config = spill_config(&broker.url);
+    let motor = Motor::with_connector(
+        config.clone(),
+        &scratch.join("state"),
+        Arc::new(ResubmitPeer::new()),
+    )
+    .unwrap();
+    let id = Uuid::now_v7();
+    motor.storage.create(id, 30, None, None, false).unwrap();
+    let mut route = crate::HostedJobState::new(&config);
+    route.run_sent = true;
+    motor.storage.hosted_route(id, route).unwrap();
+    let (tx, mut rx) = mpsc::channel(4);
+    assert!(motor.finish_hosted(id, false, &tx).await.is_err());
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(motor.pending(id));
+    assert!(motor.hosted_state(id).unwrap().terminal.is_none());
+}
+
 /// A job routed hosted by configuration, not by a spill, goes through the
 /// same steps run_snapshot takes after a lease failure: the hosted client
 /// (which still retries capacity three times), the spill-return decision

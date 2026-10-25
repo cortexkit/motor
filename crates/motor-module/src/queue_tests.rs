@@ -604,6 +604,10 @@ pub(crate) struct BuildServerLog {
     pub withdraws: Vec<Uuid>,
     /// Jobs that ran to completion, which Attach replays.
     pub completed: std::collections::HashSet<Uuid>,
+    pub cancels: Vec<Uuid>,
+    pub cancelled: std::collections::HashSet<Uuid>,
+    pub cancelled_before_run: std::collections::HashSet<Uuid>,
+    admitted: std::collections::HashSet<Uuid>,
 }
 
 /// A build server that is full for a job's first submission and runs its
@@ -671,6 +675,14 @@ async fn resubmitted_result<W: tokio::io::AsyncWrite + Unpin>(peer: &mut W, id: 
         .await
         .unwrap();
 }
+async fn cancelled_result<W: tokio::io::AsyncWrite + Unpin>(peer: &mut W, id: Uuid) {
+    write_frame_async(
+        peer,
+        &Frame::Terminal(TerminalRecord::new(id, Outcome::Cancelled, 0, 0, 0).with_ran(Ran::None)),
+    )
+    .await
+    .unwrap();
+}
 impl Connector for ResubmitPeer {
     fn connect(
         &self,
@@ -722,6 +734,7 @@ impl Connector for ResubmitPeer {
                                 return;
                             }
                             let accepted = Frame::Accepted(Accepted::new(id, 0));
+                            log.lock().unwrap().admitted.insert(id);
                             write_frame_async(&mut peer, &accepted).await.unwrap();
                             let waiting = Frame::Heartbeat {
                                 queue_wait_ms: Some(0),
@@ -750,6 +763,7 @@ impl Connector for ResubmitPeer {
                             // Queue briefly: a job still spill-watched would be
                             // withdrawn here.
                             let until = tokio::time::Instant::now() + Duration::from_millis(300);
+                            let mut detached = false;
                             loop {
                                 match tokio::time::timeout_at(until, read_frame_async(&mut peer))
                                     .await
@@ -759,11 +773,24 @@ impl Connector for ResubmitPeer {
                                         log.lock().unwrap().withdraws.push(job_id)
                                     }
                                     Ok(Ok(Some(_))) => {}
-                                    Ok(_) => return,
+                                    Ok(_) => {
+                                        // Detaching does not withdraw an admitted job.
+                                        detached = true;
+                                        tokio::time::sleep_until(until).await;
+                                        break;
+                                    }
                                 }
                             }
-                            resubmitted_result(&mut peer, id, 0).await;
                             log.lock().unwrap().completed.insert(id);
+                            if detached {
+                                return;
+                            }
+                            let cancelled = log.lock().unwrap().cancelled.contains(&id);
+                            if cancelled {
+                                cancelled_result(&mut peer, id).await;
+                            } else {
+                                resubmitted_result(&mut peer, id, 0).await;
+                            }
                             return;
                         }
                         Frame::Withdraw { job_id, .. } => {
@@ -789,13 +816,22 @@ impl Connector for ResubmitPeer {
                         }
                         Frame::Attach(request) => {
                             let id = request.job_id;
-                            let completed = {
+                            let admitted = {
                                 let mut log = log.lock().unwrap();
                                 log.attaches.push(id);
-                                log.completed.contains(&id)
+                                log.admitted.contains(&id)
                             };
+                            while admitted && !log.lock().unwrap().completed.contains(&id) {
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                            let completed = log.lock().unwrap().completed.contains(&id);
                             if completed {
-                                resubmitted_result(&mut peer, id, request.from_seq).await;
+                                let cancelled = log.lock().unwrap().cancelled.contains(&id);
+                                if cancelled {
+                                    cancelled_result(&mut peer, id).await;
+                                } else {
+                                    resubmitted_result(&mut peer, id, request.from_seq).await;
+                                }
                             } else {
                                 let tombstone = TerminalRecord::new(
                                     id,
@@ -811,6 +847,23 @@ impl Connector for ResubmitPeer {
                                     .await
                                     .unwrap();
                             }
+                            return;
+                        }
+                        Frame::Cancel(request) => {
+                            {
+                                let mut log = log.lock().unwrap();
+                                log.cancels.push(request.job_id);
+                                if !log.admitted.contains(&request.job_id) {
+                                    log.cancelled_before_run.insert(request.job_id);
+                                }
+                                log.cancelled.insert(request.job_id);
+                            }
+                            write_frame_async(
+                                &mut peer,
+                                &Frame::CancelReply(CancelReply::new(request.job_id)),
+                            )
+                            .await
+                            .unwrap();
                             return;
                         }
                         Frame::Heartbeat { .. } => {}
