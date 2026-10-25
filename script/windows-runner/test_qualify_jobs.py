@@ -284,6 +284,14 @@ class QualificationReadinessTests(unittest.TestCase):
         ready.assert_called_once_with(self.root, self.runner, evidence)
         real_jobs.assert_not_called()
 
+    def test_gate_success_is_the_windows_exit_outcome(self):
+        # The live Ally gate exited 0 and reported windows_exit; a Unix exit
+        # check refused it.
+        JOBS.require_gate_success({"outcome": {"type": "windows_exit", "code": 0}})
+        for outcome in ({"type": "windows_exit", "code": 1}, {"type": "exit", "code": 0}, None):
+            with self.assertRaisesRegex(RuntimeError, "gate failed"):
+                JOBS.require_gate_success({"outcome": outcome})
+
     def test_fixture_bundle_refs_match_snapshot_transport_and_import_commits(self):
         def git(repo, *args):
             return subprocess.check_output(["git", "-C", str(repo), *args], stderr=subprocess.STDOUT).decode().strip()

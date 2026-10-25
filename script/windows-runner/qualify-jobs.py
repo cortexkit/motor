@@ -267,6 +267,13 @@ def fixture_bundle(repo, bundle, commit):
         git(repo, "update-ref", "-d", bundle_ref)
 
 
+def require_gate_success(terminal):
+    # Windows jobs report the root process's full 32-bit status as
+    # windows_exit, never the Unix exit variant.
+    if terminal.get("outcome") != {"type": "windows_exit", "code": 0}:
+        raise RuntimeError(f"gate failed: {terminal}")
+
+
 def run(root, runner, evidence, gate):
     require_runner_service()
     repo = evidence / "fixture"
@@ -294,8 +301,7 @@ def run(root, runner, evidence, gate):
             terminal = channel.until("terminal", output)
             (evidence / f"terminal-{iteration}.json").write_text(json.dumps(terminal, indent=2))
             (evidence / f"output-{iteration}.bin").write_bytes(output)
-            if terminal.get("outcome") != {"type": "exit", "code": 0}:
-                raise RuntimeError(f"gate failed: {terminal}")
+            require_gate_success(terminal)
             if output.count(b'Z') < 1024 * 1024:
                 raise RuntimeError("large stdout collection was truncated")
             collection = root / "state/ally/jobs" / job / "windows-changes.tar"
