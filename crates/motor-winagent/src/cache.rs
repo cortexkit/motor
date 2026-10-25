@@ -1,21 +1,92 @@
 //! Cache identity, fail-closed storage decisions, and fresh-disk initialization.
 
 use std::io;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub const CACHE_DISK_SERIAL: &str = "motor-cache";
+/// `MSFT_Disk.BusType` value for SCSI.
+pub const HYPERV_SCSI_BUS_TYPE: u16 = 1;
+/// `MSFT_Disk.BusType` value for SAS. Disks on a Generation 2 VM's synthetic
+/// SCSI controller report this inside the guest: measured on the Ally on
+/// 2026-10-25 as bus_type 10 for both the OS disk (LUN 0) and the cache
+/// disk (LUN 1).
+pub const HYPERV_SAS_BUS_TYPE: u16 = 10;
 
-#[derive(serde::Deserialize)]
+/// Bus types a Hyper-V job VM's synthetic SCSI disks may report. Anything
+/// else (USB, SATA, NVMe, a virtual DVD) is not a disk this runner attached.
+/// The two-disk LUN topology in `select_hyperv_cache_disk` stays the real
+/// guard on which disk is the cache.
+pub const HYPERV_ACCEPTED_BUS_TYPES: [u16; 2] = [HYPERV_SCSI_BUS_TYPE, HYPERV_SAS_BUS_TYPE];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HypervDisk {
     pub number: u32,
     pub lun: u32,
+    pub bus_type: u16,
     pub boot: bool,
     pub system: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HypervStorageDisk {
+    pub number: u32,
+    pub bus_type: u16,
+    pub boot: bool,
+    pub system: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HypervDiskLocation {
+    pub number: u32,
+    pub lun: u32,
+}
+
+pub fn join_hyperv_disk_inventory(
+    storage_disks: &[HypervStorageDisk],
+    locations: &[HypervDiskLocation],
+) -> io::Result<Vec<HypervDisk>> {
+    let mut by_number = std::collections::BTreeMap::new();
+    for disk in storage_disks {
+        if by_number.insert(disk.number, disk).is_some() {
+            return Err(io::Error::other("duplicate storage disk number"));
+        }
+    }
+    locations
+        .iter()
+        .map(|location| {
+            let disk = by_number
+                .get(&location.number)
+                .ok_or_else(|| io::Error::other("SCSI location has no matching storage disk"))?;
+            Ok(HypervDisk {
+                number: location.number,
+                lun: location.lun,
+                bus_type: disk.bus_type,
+                boot: disk.boot,
+                system: disk.system,
+            })
+        })
+        .collect()
 }
 
 /// This runner expects the OS at SCSI LUN 0 and the cache at LUN 1. Require the
 /// complete two-disk topology, not merely the absence of a virtio serial.
 pub fn select_hyperv_cache_disk(disks: &[HypervDisk]) -> io::Result<u32> {
+    let unexpected_bus: Vec<_> = disks
+        .iter()
+        .filter(|disk| !HYPERV_ACCEPTED_BUS_TYPES.contains(&disk.bus_type))
+        .map(|disk| {
+            format!(
+                "disk_number={} lun={} bus_type={} boot={} system={}",
+                disk.number, disk.lun, disk.bus_type, disk.boot, disk.system
+            )
+        })
+        .collect();
+    if !unexpected_bus.is_empty() {
+        return Err(io::Error::other(format!(
+            "unexpected Hyper-V bus type; expected SCSI (1) or SAS (10): {}",
+            unexpected_bus.join(", ")
+        )));
+    }
     if disks.len() != 2
         || disks
             .iter()
@@ -176,6 +247,94 @@ pub fn is_volume_guid_path(path: &str) -> bool {
         })
 }
 
+/// Everything the guest itself can read that names the cache disk, read once
+/// at selection and re-read through the same open handle before every write.
+///
+/// A Hyper-V synthetic SCSI disk carries no serial or product id, so what it
+/// does expose is where the device is wired and how big it is. That is enough
+/// to refuse a disk swapped in behind an already-selected disk number; which
+/// cache belongs to which job stays the host's decision, made in the runner's
+/// own code before the disk is ever attached.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiskIdentity {
+    /// Serial number the device reports, empty when the device reports none.
+    pub serial: String,
+    /// `IOCTL_DISK_GET_DRIVE_GEOMETRY_EX` length in bytes: the reported disk
+    /// size plus partition-table information.
+    pub length_bytes: u64,
+    /// `IOCTL_STORAGE_GET_DEVICE_NUMBER`: the disk number Windows assigned and
+    /// the media type of the device behind it.
+    pub device_number: u32,
+    pub device_type: u32,
+    /// `IOCTL_SCSI_GET_ADDRESS` for SCSI-family disks: the bus address the
+    /// virtual controller put the disk at. `None` on a disk that address
+    /// query does not describe, such as a non-SCSI device.
+    pub scsi: Option<ScsiAddress>,
+}
+
+/// Where a SCSI-family disk sits on its controller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScsiAddress {
+    pub port: u8,
+    pub path_id: u8,
+    pub target_id: u8,
+    pub lun: u8,
+}
+
+impl DiskIdentity {
+    /// A disk that reports no serial has nothing on the device itself to read;
+    /// selection there rests on the SCSI topology and the recheck below.
+    pub fn has_no_serial(&self) -> bool {
+        self.serial.is_empty()
+    }
+}
+
+/// One bounded log line naming every identity value. The next run on new
+/// hardware shows in the log what the guest could read.
+/// Host-supplied content, so control characters are replaced.
+pub fn disk_identity_log(identity: &DiskIdentity) -> String {
+    fn clean(value: &str) -> String {
+        value
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(64)
+            .collect()
+    }
+    let scsi = match identity.scsi {
+        Some(scsi) => format!(
+            "port={} path={} target={} lun={}",
+            scsi.port, scsi.path_id, scsi.target_id, scsi.lun
+        ),
+        None => "not-scsi".to_owned(),
+    };
+    format!(
+        "Hyper-V cache disk identity: serial={:?} length_bytes={} device_number={} device_type={} scsi={}",
+        clean(&identity.serial),
+        identity.length_bytes,
+        identity.device_number,
+        identity.device_type,
+        scsi,
+    )
+}
+
+/// The first field that differs, so a refusal can name it. Every field is
+/// compared, so one log line answers "what changed" without a second run.
+fn difference(expected: &DiskIdentity, actual: &DiskIdentity) -> Option<&'static str> {
+    if expected.serial != actual.serial {
+        Some("serial")
+    } else if expected.length_bytes != actual.length_bytes {
+        Some("length_bytes")
+    } else if expected.device_number != actual.device_number {
+        Some("device_number")
+    } else if expected.device_type != actual.device_type {
+        Some("device_type")
+    } else if expected.scsi != actual.scsi {
+        Some("scsi_address")
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CacheVolume {
     pub path: String,
@@ -190,6 +349,7 @@ pub struct CacheVolume {
 /// this disk.
 pub trait CacheStorage {
     fn serial(&mut self) -> io::Result<String>;
+    fn identity(&mut self) -> io::Result<DiskIdentity>;
     fn windows_disks(&mut self) -> io::Result<Vec<u32>>;
     fn layout(&mut self) -> io::Result<DiskLayout>;
     fn make_writable(&mut self) -> io::Result<()>;
@@ -207,13 +367,86 @@ pub struct PreparedCache {
     pub volume_ms: u64,
 }
 
+/// The Windows error a device reports while it is still being brought online.
+/// Spelled out here so the volume wait compiles and is tested on every host,
+/// not only where the Windows headers are available.
+pub const ERROR_NOT_READY: u32 = 21;
+
+/// Wait until Windows publishes the volume of the partition just written.
+///
+/// A device that is still coming online answers `ERROR_NOT_READY`, so that code
+/// is retried until the deadline. Anything else is returned at once: a volume
+/// spanning other disks, several candidate volumes, or a malformed answer is a
+/// real failure, and retrying it would only delay the refusal. The retry keeps
+/// working only as long as the errors reaching it still carry their OS code.
+pub fn wait_for_new_volume(
+    deadline: Instant,
+    number: u32,
+    volumes: &dyn Fn() -> io::Result<Vec<(String, Vec<u32>)>>,
+) -> io::Result<String> {
+    loop {
+        match volumes() {
+            Ok(volumes) if volumes.len() == 1 => {
+                let (path, disks) = volumes.into_iter().next().unwrap();
+                if disks != [number] {
+                    return Err(io::Error::other("new cache volume spans other disks"));
+                }
+                return Ok(path);
+            }
+            Ok(volumes) if volumes.len() > 1 => {
+                return Err(io::Error::other("new cache disk has several volumes"));
+            }
+            Err(error) if error.raw_os_error() != Some(ERROR_NOT_READY as i32) => {
+                return Err(error);
+            }
+            _ if Instant::now() >= deadline => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "new cache volume did not appear",
+                ));
+            }
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+/// Wait until the cache volume set is published and non-empty.
+///
+/// The same rule as `wait_for_new_volume`: only `ERROR_NOT_READY` is retried,
+/// so a volume that is malformed or ambiguous is refused at once rather than
+/// after five seconds of retries.
+pub fn wait_for_volumes<T>(
+    deadline: Instant,
+    volumes: &dyn Fn() -> io::Result<Vec<T>>,
+) -> io::Result<Vec<T>> {
+    loop {
+        match volumes() {
+            Ok(volumes) if !volumes.is_empty() => return Ok(volumes),
+            Err(error) if error.raw_os_error() != Some(ERROR_NOT_READY as i32) => {
+                return Err(error);
+            }
+            _ if Instant::now() >= deadline => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "cache volume did not appear",
+                ));
+            }
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
 fn check_disk(
     storage: &mut impl CacheStorage,
     number: u32,
-    serial: &str,
+    expected: &DiskIdentity,
 ) -> io::Result<DiskLayout> {
-    if storage.serial()? != serial {
-        return Err(io::Error::other("cache disk serial changed"));
+    let actual = storage.identity()?;
+    if let Some(field) = difference(expected, &actual) {
+        return Err(io::Error::other(format!(
+            "cache disk identity changed: {field} differs; {}",
+            disk_identity_log(&actual)
+        )));
     }
     let windows = storage.windows_disks()?;
     if windows.is_empty() || windows.contains(&number) {
@@ -247,6 +480,8 @@ fn check_disk(
     Ok(layout)
 }
 
+/// Prepare a cache disk whose virtio serial number names it. QEMU assigns
+/// that serial, and the guest re-reads it before every write.
 pub fn prepare_cache(storage: &mut impl CacheStorage, number: u32) -> io::Result<PreparedCache> {
     prepare_cache_with_serial(storage, number, CACHE_DISK_SERIAL)
 }
@@ -259,7 +494,24 @@ pub fn prepare_cache_with_serial(
     if serial.trim().is_empty() || serial.len() > 256 {
         return Err(io::Error::other("cache disk lacks a bounded stable serial"));
     }
-    let raw = matches!(check_disk(storage, number, serial)?, DiskLayout::Raw);
+    let identity = DiskIdentity {
+        serial: serial.to_owned(),
+        ..DiskIdentity::default()
+    };
+    prepare_cache_with(storage, number, &identity)
+}
+
+/// `expected` is what pins the disk between selection and every later write:
+/// it is re-read through the same open handle before each one. A disk swapped
+/// under a running guest, or the same disk number naming a different device,
+/// therefore cannot receive a cache write meant for this cache. Which cache
+/// belongs to which job is the host's decision, made before it attaches one.
+pub fn prepare_cache_with(
+    storage: &mut impl CacheStorage,
+    number: u32,
+    expected: &DiskIdentity,
+) -> io::Result<PreparedCache> {
+    let raw = matches!(check_disk(storage, number, expected)?, DiskLayout::Raw);
     let started = Instant::now();
     storage.make_writable()?;
     let native_attributes_ms = started.elapsed().as_millis() as u64;
@@ -268,7 +520,7 @@ pub fn prepare_cache_with_serial(
     if raw {
         storage.initialize_raw()?;
         powershell_ms = started.elapsed().as_millis() as u64;
-        if !matches!(check_disk(storage, number, serial)?, DiskLayout::Gpt(_)) {
+        if !matches!(check_disk(storage, number, expected)?, DiskLayout::Gpt(_)) {
             return Err(io::Error::other("cache initialization did not create GPT"));
         }
     }
@@ -328,18 +580,22 @@ pub fn empty_mount_directory(path: &std::path::Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::cache_steps::CacheStep;
+
     #[test]
     fn hyperv_cache_selection_requires_exact_two_disk_scsi_topology() {
         use super::*;
         let os = || HypervDisk {
             number: 0,
             lun: 0,
+            bus_type: HYPERV_SCSI_BUS_TYPE,
             boot: true,
             system: true,
         };
         let cache = || HypervDisk {
             number: 1,
             lun: 1,
+            bus_type: HYPERV_SCSI_BUS_TYPE,
             boot: false,
             system: false,
         };
@@ -356,6 +612,82 @@ mod tests {
         let mut duplicate = cache();
         duplicate.number = 0;
         assert!(select_hyperv_cache_disk(&[os(), duplicate]).is_err());
+        let mut sas_cache = cache();
+        sas_cache.bus_type = HYPERV_SAS_BUS_TYPE;
+        assert_eq!(select_hyperv_cache_disk(&[os(), sas_cache]).unwrap(), 1);
+        let mut sata = cache();
+        sata.bus_type = 11;
+        let failure = select_hyperv_cache_disk(&[os(), sata]).unwrap_err();
+        assert!(failure.to_string().contains("disk_number=1"));
+        assert!(failure.to_string().contains("bus_type=11"));
+    }
+
+    #[test]
+    fn hyperv_inventory_joins_storage_flags_to_scsi_locations_by_disk_number() {
+        let storage = [
+            HypervStorageDisk {
+                number: 0,
+                bus_type: HYPERV_SCSI_BUS_TYPE,
+                boot: true,
+                system: true,
+            },
+            HypervStorageDisk {
+                number: 1,
+                bus_type: HYPERV_SCSI_BUS_TYPE,
+                boot: false,
+                system: false,
+            },
+        ];
+        let locations = [
+            HypervDiskLocation { number: 1, lun: 1 },
+            HypervDiskLocation { number: 0, lun: 0 },
+        ];
+        let disks = join_hyperv_disk_inventory(&storage, &locations).unwrap();
+        assert_eq!(select_hyperv_cache_disk(&disks).unwrap(), 1);
+
+        // The inventory a real Hyper-V Generation 2 job VM reported on the Ally:
+        // both disks on the synthetic SCSI controller show bus type SAS.
+        let mut ally = storage;
+        ally[0].bus_type = HYPERV_SAS_BUS_TYPE;
+        ally[1].bus_type = HYPERV_SAS_BUS_TYPE;
+        let joined = join_hyperv_disk_inventory(&ally, &locations).unwrap();
+        assert_eq!(select_hyperv_cache_disk(&joined).unwrap(), 1);
+
+        let mut usb = storage;
+        usb[1].bus_type = 7;
+        let joined = join_hyperv_disk_inventory(&usb, &locations).unwrap();
+        let failure = select_hyperv_cache_disk(&joined).unwrap_err();
+        assert!(failure.to_string().contains("disk_number=1"));
+        assert!(failure.to_string().contains("bus_type=7"));
+
+        assert!(
+            join_hyperv_disk_inventory(&storage, &[HypervDiskLocation { number: 7, lun: 1 }])
+                .is_err()
+        );
+        assert!(join_hyperv_disk_inventory(&[storage[0], storage[0]], &locations).is_err());
+    }
+
+    #[test]
+    fn hyperv_selection_still_refuses_three_disks_boot_cache_and_missing_lun() {
+        let os = HypervDisk {
+            number: 0,
+            lun: 0,
+            bus_type: HYPERV_SCSI_BUS_TYPE,
+            boot: true,
+            system: true,
+        };
+        let cache = HypervDisk {
+            number: 1,
+            lun: 1,
+            bus_type: HYPERV_SCSI_BUS_TYPE,
+            boot: false,
+            system: false,
+        };
+        let mut boot_cache = cache;
+        boot_cache.boot = true;
+        assert!(select_hyperv_cache_disk(&[os, cache, HypervDisk { number: 2, ..cache }]).is_err());
+        assert!(select_hyperv_cache_disk(&[os, boot_cache]).is_err());
+        assert!(select_hyperv_cache_disk(&[os, HypervDisk { lun: 2, ..cache }]).is_err());
     }
 
     #[test]
@@ -411,6 +743,9 @@ mod tests {
 
     struct FakeStorage {
         serial: String,
+        /// What the disk itself reports. Every fixture states it, so the two
+        /// fields cannot drift apart into a fake that is neither device.
+        identity: DiskIdentity,
         windows_disks: Vec<u32>,
         layout: DiskLayout,
         volumes: Vec<CacheVolume>,
@@ -421,6 +756,10 @@ mod tests {
         fn default() -> Self {
             Self {
                 serial: CACHE_DISK_SERIAL.into(),
+                identity: DiskIdentity {
+                    serial: CACHE_DISK_SERIAL.into(),
+                    ..DiskIdentity::default()
+                },
                 windows_disks: vec![0],
                 layout: DiskLayout::Gpt(vec![PartitionKind::Reserved, PartitionKind::BasicData]),
                 volumes: vec![CacheVolume {
@@ -438,6 +777,10 @@ mod tests {
     fn captured_hyperv_serial_is_rechecked_before_any_cache_write() {
         let mut storage = FakeStorage {
             serial: "hyperv-stable-serial".into(),
+            identity: DiskIdentity {
+                serial: "hyperv-stable-serial".into(),
+                ..DiskIdentity::default()
+            },
             ..Default::default()
         };
         assert!(prepare_cache_with_serial(&mut storage, 7, "different-serial").is_err());
@@ -447,9 +790,265 @@ mod tests {
         assert!(prepare_cache_with_serial(&mut storage, 7, "hyperv-stable-serial").is_ok());
         assert_eq!(storage.mutations, 1);
     }
+
+    // What the Ally's Hyper-V job VM reported: an empty serial. The old code
+    // refused it before any write, which is the failure this identity path
+    // exists to replace.
+    fn nameless_hyperv_identity() -> DiskIdentity {
+        DiskIdentity {
+            serial: String::new(),
+            length_bytes: 40 << 30,
+            device_number: 7,
+            device_type: 0,
+            scsi: Some(ScsiAddress {
+                port: 0,
+                path_id: 0,
+                target_id: 0,
+                lun: 1,
+            }),
+        }
+    }
+
+    /// An error shaped the way Windows reports one: `io::Error::from_raw_os_error`
+    /// carries the code, and every wrapper on the cache path must keep it.
+    fn not_ready() -> io::Error {
+        io::Error::from_raw_os_error(ERROR_NOT_READY as i32)
+    }
+
+    #[test]
+    fn not_ready_volume_is_retried_until_it_is_published() {
+        let attempts = std::cell::Cell::new(0);
+        // The step on the real path is what used to drop the code; go through
+        // it so this test covers that too. The receiver must outlive the wait,
+        // or the reporter refuses to report.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reporter = crate::cache_steps::CacheReporter::new(sender);
+        let published = wait_for_new_volume(Instant::now() + Duration::from_secs(5), 7, &|| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 3 {
+                return reporter.step(CacheStep::VolumeExtents, || {
+                    Err::<Vec<(String, Vec<u32>)>, _>(not_ready())
+                });
+            }
+            Ok(vec![("published-cache-volume".to_owned(), vec![7])])
+        })
+        .unwrap();
+        assert_eq!(published, "published-cache-volume");
+        assert_eq!(attempts.get(), 3);
+        // Two failing steps went through the reporter, each reporting a start
+        // and an end; the successful attempt made no step call.
+        assert_eq!(receiver.try_iter().count(), 4);
+    }
+
+    #[test]
+    fn not_ready_volume_that_never_appears_times_out() {
+        let attempts = std::cell::Cell::new(0);
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let error = wait_for_new_volume(deadline, 7, &|| {
+            attempts.set(attempts.get() + 1);
+            Err(not_ready())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "new cache volume did not appear");
+        assert!(attempts.get() > 1, "the wait never retried");
+    }
+
+    #[test]
+    fn malformed_volume_answer_is_not_retried() {
+        // Not a not-ready error, so it is a real failure: one attempt, returned
+        // immediately, even though the deadline would allow many retries.
+        let attempts = std::cell::Cell::new(0);
+        let error = wait_for_new_volume(Instant::now() + Duration::from_secs(5), 7, &|| {
+            attempts.set(attempts.get() + 1);
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed extents",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("malformed extents"));
+
+        // The same for an unambiguous answer: two volumes is not "not ready".
+        let attempts = std::cell::Cell::new(0);
+        let error = wait_for_new_volume(Instant::now() + Duration::from_secs(5), 7, &|| {
+            attempts.set(attempts.get() + 1);
+            Ok(vec![
+                ("Volume{a}".to_owned(), vec![7]),
+                ("Volume{b}".to_owned(), vec![7]),
+            ])
+        })
+        .unwrap_err();
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(error.to_string(), "new cache disk has several volumes");
+    }
+
+    #[test]
+    fn step_reports_the_error_as_the_system_reported_it() {
+        // The waits above decide on this error's Windows code, so a step that
+        // rebuilt the error from a message would silently turn every retry
+        // into a first-attempt failure. The step records itself separately.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reporter = crate::cache_steps::CacheReporter::new(sender);
+        let error = reporter
+            .step::<()>(CacheStep::VolumeExtents, || Err(not_ready()))
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_NOT_READY as i32));
+        let events: Vec<crate::cache_steps::StepEvent> = receiver.try_iter().collect();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            crate::cache_steps::StepEvent::Begin(CacheStep::VolumeExtents)
+        ));
+        assert!(matches!(
+            events[1],
+            crate::cache_steps::StepEvent::End(CacheStep::VolumeExtents, _, true)
+        ));
+        // An error without a code stays without one.
+        let plain = reporter
+            .step(CacheStep::VolumeExtents, || {
+                Err::<(), _>(io::Error::new(io::ErrorKind::InvalidData, "no code"))
+            })
+            .unwrap_err();
+        assert_eq!(plain.raw_os_error(), None);
+        assert_eq!(plain.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(plain.to_string(), "no code");
+    }
+
+    #[test]
+    fn volume_set_wait_retries_only_not_ready() {
+        let attempts = std::cell::Cell::new(0);
+        let volumes = wait_for_volumes(Instant::now() + Duration::from_secs(5), &|| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 2 {
+                return Err(not_ready());
+            }
+            Ok(vec!["published"])
+        })
+        .unwrap();
+        assert_eq!(volumes, ["published"]);
+        assert_eq!(attempts.get(), 2);
+
+        let attempts = std::cell::Cell::new(0);
+        let error = wait_for_volumes::<&str>(Instant::now() + Duration::from_secs(5), &|| {
+            attempts.set(attempts.get() + 1);
+            Err(io::Error::other("ambiguous volume"))
+        })
+        .unwrap_err();
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(error.to_string(), "ambiguous volume");
+    }
+
+    #[test]
+    fn nameless_hyperv_disk_is_prepared_instead_of_refused_for_its_missing_serial() {
+        let identity = nameless_hyperv_identity();
+        assert!(identity.has_no_serial());
+        let mut storage = FakeStorage {
+            identity,
+            ..Default::default()
+        };
+        assert!(prepare_cache_with(&mut storage, 7, &nameless_hyperv_identity()).is_ok());
+        assert_eq!(storage.mutations, 1);
+        // The serial-only virtio path keeps refusing this disk, so the two
+        // identification paths still disagree exactly where they should: the
+        // guest log then shows which one a job ran with.
+        let mut serial_path = FakeStorage::default();
+        assert!(prepare_cache_with_serial(&mut serial_path, 7, "").is_err());
+        assert_eq!(serial_path.mutations, 0);
+    }
+
+    #[test]
+    fn changed_hyperv_disk_identity_is_refused_before_any_cache_write() {
+        let expected = nameless_hyperv_identity();
+        let scsi = |lun| {
+            Some(ScsiAddress {
+                port: 0,
+                path_id: 0,
+                target_id: 0,
+                lun,
+            })
+        };
+        for change in [
+            DiskIdentity {
+                serial: "other-serial".into(),
+                ..expected.clone()
+            },
+            DiskIdentity {
+                length_bytes: (40 << 30) + 4096,
+                ..expected.clone()
+            },
+            DiskIdentity {
+                device_number: 8,
+                ..expected.clone()
+            },
+            DiskIdentity {
+                device_type: 7,
+                ..expected.clone()
+            },
+            DiskIdentity {
+                scsi: scsi(2),
+                ..expected.clone()
+            },
+            DiskIdentity {
+                scsi: None,
+                ..expected.clone()
+            },
+        ] {
+            let mut storage = FakeStorage {
+                serial: change.serial.clone(),
+                identity: change.clone(),
+                ..Default::default()
+            };
+            let Err(failure) = prepare_cache_with(&mut storage, 7, &expected) else {
+                panic!("{change:?} was accepted");
+            };
+            assert!(
+                failure
+                    .to_string()
+                    .starts_with("cache disk identity changed:"),
+                "{failure}"
+            );
+            assert_eq!(storage.mutations, 0, "{change:?} was written");
+            assert_eq!(storage.formats, 0, "{change:?} was formatted");
+        }
+        // The unchanged disk still passes, so the loop above fails only on
+        // the field each case changed.
+        let mut storage = FakeStorage {
+            identity: expected.clone(),
+            ..Default::default()
+        };
+        assert!(prepare_cache_with(&mut storage, 7, &expected).is_ok());
+        assert_eq!(storage.mutations, 1);
+    }
+
+    #[test]
+    fn identity_log_names_every_field_the_guest_read() {
+        let line = disk_identity_log(&nameless_hyperv_identity());
+        assert_eq!(
+            line,
+            "Hyper-V cache disk identity: serial=\"\" length_bytes=42949672960 \
+             device_number=7 device_type=0 scsi=port=0 path=0 target=0 lun=1"
+        );
+        assert!(
+            disk_identity_log(&DiskIdentity {
+                serial: "serial\nwith-control".into(),
+                ..DiskIdentity::default()
+            })
+            .contains("serial=\"serial with-control\"")
+        );
+        assert!(
+            disk_identity_log(&DiskIdentity::default()).ends_with("scsi=not-scsi"),
+            "a non-SCSI disk must say so instead of printing an empty address"
+        );
+    }
     impl CacheStorage for FakeStorage {
         fn serial(&mut self) -> io::Result<String> {
             Ok(self.serial.clone())
+        }
+        fn identity(&mut self) -> io::Result<DiskIdentity> {
+            Ok(self.identity.clone())
         }
         fn windows_disks(&mut self) -> io::Result<Vec<u32>> {
             Ok(self.windows_disks.clone())
@@ -548,8 +1147,14 @@ mod tests {
 
     #[test]
     fn native_cache_revalidates_exact_serial_before_mutation() {
+        // Selection chose the disk number by its serial; the disk itself now
+        // reports a different one.
         let mut fake = FakeStorage {
-            serial: "motor-cache-other".into(),
+            serial: CACHE_DISK_SERIAL.into(),
+            identity: DiskIdentity {
+                serial: "motor-cache-other".into(),
+                ..DiskIdentity::default()
+            },
             ..Default::default()
         };
         assert!(prepare_cache(&mut fake, 7).is_err());
@@ -759,8 +1364,10 @@ mod tests {
             .unwrap()
             .0;
         let first_write = body.find("IOCTL_DISK_CREATE_DISK").unwrap();
+        // The identity the guest read at selection, re-read through the same
+        // held handle: a disk swapped for another one is refused here.
         for guard in [
-            "disk_serial(&self.disk",
+            "disk_identity(&self.disk",
             "self.windows_disks()?",
             "require_uninitialized(self.layout()?)",
         ] {

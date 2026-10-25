@@ -530,6 +530,7 @@ mod guest {
         result.map_err(Into::into)
     }
 
+    #[cfg(not(feature = "hyperv-runner"))]
     fn powershell(script: &str) -> io::Result<String> {
         let output = std::process::Command::new(
             "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
@@ -728,21 +729,15 @@ mod guest {
             }
         }
     }
-    fn cache_disk(reporter: &CacheReporter) -> io::Result<u32> {
+    fn cache_disk(_reporter: &CacheReporter) -> io::Result<u32> {
         #[cfg(feature = "hyperv-runner")]
         {
-            let inventory = reporter.step(CacheStep::DiskSerial, || powershell(r#"
-$ErrorActionPreference='Stop'
-$items = @(Get-CimInstance Win32_DiskDrive | ForEach-Object {
-    $disk = Get-Disk -Number $_.Index
-    if ([string]$disk.BusType -ne 'SCSI') { throw 'Unexpected non-SCSI disk in Hyper-V job' }
-    @{number=[uint32]$_.Index; lun=[uint32]$_.SCSILogicalUnit; boot=[bool]$disk.IsBoot; system=[bool]$disk.IsSystem}
-})
-ConvertTo-Json -InputObject $items -Compress
-"#))?;
-            diagnostic!("Hyper-V disk topology {}", inventory);
-            let disks: Vec<motor_winagent::cache::HypervDisk> =
-                serde_json::from_str(&inventory).map_err(|e| invalid(e.to_string()))?;
+            // Query the Storage and CIM providers in-process; PowerShell startup
+            // consumed the previous cold-boot disk-inventory budget.
+            let disks = motor_winagent::cache_format::hyperv_disk_inventory(
+                Instant::now() + motor_winagent::cache_steps::HYPERV_DISK_INVENTORY_TIMEOUT,
+            )?;
+            diagnostic!("Hyper-V cache disk inventory: {disks:?}");
             motor_winagent::cache::select_hyperv_cache_disk(&disks)
         }
         #[cfg(not(feature = "hyperv-runner"))]
@@ -752,7 +747,7 @@ ConvertTo-Json -InputObject $items -Compress
             // and select only that serial, never a disk merely by its number.
             for number in 0..32 {
                 let path = wide(&format!("\\\\.\\PhysicalDrive{number}"));
-                let disk = reporter.step(CacheStep::DiskOpen, || {
+                let disk = _reporter.step(CacheStep::DiskOpen, || {
                     let raw = unsafe {
                         CreateFileW(
                             path.as_ptr(),
@@ -781,7 +776,7 @@ ConvertTo-Json -InputObject $items -Compress
                 let query = [0u32; 3];
                 let mut descriptor = [0u8; 4096];
                 let mut returned = 0;
-                reporter.step(CacheStep::DiskSerial, || unsafe {
+                _reporter.step(CacheStep::DiskSerial, || unsafe {
                     win32(DeviceIoControl(
                         disk.0,
                         IOCTL_STORAGE_QUERY_PROPERTY,
@@ -844,8 +839,9 @@ ConvertTo-Json -InputObject $items -Compress
             #[cfg(feature = "hyperv-runner")]
             let disk = {
                 let mut storage = crate::storage::WindowsStorage::open(number, reporter)?;
-                let serial = storage.capture_serial()?;
-                motor_winagent::cache::prepare_cache_with_serial(&mut storage, number, &serial)?
+                let identity = storage.capture_identity()?;
+                diagnostic!("{}", motor_winagent::cache::disk_identity_log(&identity));
+                motor_winagent::cache::prepare_cache_with(&mut storage, number, &identity)?
             };
             let volume = disk.volume;
             if !volume.starts_with("\\\\?\\Volume{")
@@ -1511,6 +1507,9 @@ ConvertTo-Json -InputObject $items -Compress
         };
         archive.flush()?;
         unpack_tree(&mut archive, Path::new(SOURCE_ROOT), &home)?;
+        // The archive's host paths do not exist in the VM; pin Cargo to the
+        // absolute local-registry path under the guest user's CARGO_HOME.
+        motor_winagent::rewrite_local_registry_config(&home)?;
         let before = inventory(Path::new(SOURCE_ROOT))?;
         let cwd = PathBuf::from(mapped_cwd(&command.cwd)?);
         if !cwd.is_dir() {

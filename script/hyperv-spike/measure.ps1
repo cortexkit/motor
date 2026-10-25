@@ -93,23 +93,26 @@ try {
             Assert-Spike ($vhd.VhdType -eq 'Differencing' -and $vhd.ParentPath -eq $parent -and (Test-VHD $child)) 'differencing-disk' ($vhd | Select-Object Path,ParentPath,VhdType | Out-String)
             Use-SpikeWindowsDisk $child {
                 param($volume)
-                $nonce = Join-Path $volume 'ProgramData\Motor\hyperv-nonce.txt'
+                $nonce = [IO.Path]::Combine($volume, 'ProgramData\Motor\hyperv-nonce.txt')
                 [IO.File]::WriteAllText($nonce, $id, [Text.UTF8Encoding]::new($false))
-                Assert-Spike ((Get-Acl $nonce).AreAccessRulesProtected -eq $false) 'nonce-inherits-protected-motor-acl' ((Get-Acl $nonce).Sddl)
+                $nonceAcl = [IO.FileInfo]::new($nonce).GetAccessControl()
+                $nonceSddl = $nonceAcl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
+                Assert-Spike (-not $nonceAcl.AreAccessRulesProtected) 'nonce-inherits-protected-motor-acl' $nonceSddl
                 if ($GuestAgentPath) {
                     $agent = Get-SpikePlainGuestItem $volume 'ProgramData\Motor\motor-winagent.exe'
                     if (-not $agent) { throw 'Baseline agent path is missing or reparse' }
-                    $beforeAcl = (Get-Acl -LiteralPath $agent.FullName).Sddl
+                    $beforeAcl = ([IO.FileInfo]::new($agent.FullName).GetAccessControl()).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
                     [IO.File]::WriteAllBytes($agent.FullName, [IO.File]::ReadAllBytes($GuestAgentPath))
-                    Assert-Spike ((Get-FileHash -LiteralPath $agent.FullName).Hash -eq $agentHash) 'overlay-agent-hash' $agentHash
-                    Assert-Spike ((Get-Acl -LiteralPath $agent.FullName).Sddl -eq $beforeAcl) 'overlay-agent-acl-preserved' $beforeAcl
+                    Assert-Spike ((Get-SpikeFileSha256 $agent.FullName) -eq $agentHash) 'overlay-agent-hash' $agentHash
+                    $afterAcl = ([IO.FileInfo]::new($agent.FullName).GetAccessControl()).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)
+                    Assert-Spike ($afterAcl -eq $beforeAcl) 'overlay-agent-acl-preserved' $beforeAcl
                     if ($Transport -eq 'hvsock') {
-                        [IO.File]::WriteAllText((Join-Path $volume 'ProgramData\Motor\hyperv-listen.txt'), $ListenAddress, [Text.UTF8Encoding]::new($false))
-                        [IO.File]::WriteAllText((Join-Path $volume 'ProgramData\Motor\hyperv-agent.log'), "HOST overlay expected-agent=$agentHash transport=hvsock listen=$ListenAddress nonce=$id`r`n", [Text.UTF8Encoding]::new($false))
+                        [IO.File]::WriteAllText([IO.Path]::Combine($volume, 'ProgramData\Motor\hyperv-listen.txt'), $ListenAddress, [Text.UTF8Encoding]::new($false))
+                        [IO.File]::WriteAllText([IO.Path]::Combine($volume, 'ProgramData\Motor\hyperv-agent.log'), "HOST overlay expected-agent=$agentHash transport=hvsock listen=$ListenAddress nonce=$id`r`n", [Text.UTF8Encoding]::new($false))
                         Write-Host "EVIDENCE overlay-hvsock-listen run=$run address=$ListenAddress"
                     } else {
-                        [IO.File]::WriteAllText((Join-Path $volume 'ProgramData\Motor\hyperv-serial-queue.txt'), [string]$activeQueueBytes, [Text.UTF8Encoding]::new($false))
-                        [IO.File]::WriteAllText((Join-Path $volume 'ProgramData\Motor\hyperv-agent.log'), "HOST overlay expected-agent=$agentHash queue=$activeQueueBytes nonce=$id`r`n", [Text.UTF8Encoding]::new($false))
+                        [IO.File]::WriteAllText([IO.Path]::Combine($volume, 'ProgramData\Motor\hyperv-serial-queue.txt'), [string]$activeQueueBytes, [Text.UTF8Encoding]::new($false))
+                        [IO.File]::WriteAllText([IO.Path]::Combine($volume, 'ProgramData\Motor\hyperv-agent.log'), "HOST overlay expected-agent=$agentHash queue=$activeQueueBytes nonce=$id`r`n", [Text.UTF8Encoding]::new($false))
                         Write-Host "EVIDENCE overlay-serial-queue run=$run bytes=$activeQueueBytes"
                     }
                 }

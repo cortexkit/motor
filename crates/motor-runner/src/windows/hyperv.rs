@@ -41,17 +41,50 @@ pub(super) fn control(
     cmd.args(extra).stdin(Stdio::null());
     Ok(cmd)
 }
-pub(super) fn checked(mut command: Command) -> io::Result<std::process::Output> {
-    check_output(crate::native_process::output(&mut command, || false)?)
+pub(super) fn checked(command: Command) -> io::Result<std::process::Output> {
+    checked_control(command, None, || false)
 }
-fn checked_setup(
-    config: &Config,
+pub(super) fn checked_validation(command: Command) -> io::Result<std::process::Output> {
+    // Only startup validation may hash a multi-gigabyte baseline. Leave ordinary
+    // native controls on their shorter deadline, with the same Job Object cleanup.
+    let output = checked_control(
+        command,
+        Some(std::time::Duration::from_secs(15 * 60)),
+        super::service_stop_requested,
+    )?;
+    tracing::info!(validation = %String::from_utf8_lossy(&output.stdout).trim(), "Hyper-V startup validation completed");
+    Ok(output)
+}
+fn checked_setup(config: &Config, command: Command, id: Uuid) -> io::Result<std::process::Output> {
+    checked_control(command, None, || config.windows_runtime.setup_aborted(id))
+}
+fn checked_control(
     mut command: Command,
-    id: Uuid,
+    timeout: Option<std::time::Duration>,
+    cancelled: impl Fn() -> bool,
 ) -> io::Result<std::process::Output> {
-    check_output(crate::native_process::output(&mut command, || {
-        config.windows_runtime.setup_aborted(id)
-    })?)
+    let operation = command
+        .get_args()
+        .skip_while(|arg| *arg != std::ffi::OsStr::new("-Operation"))
+        .nth(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".into());
+    let started = std::time::Instant::now();
+    let output = match timeout {
+        Some(timeout) => {
+            crate::native_process::output_with_timeout(&mut command, timeout, cancelled)
+        }
+        None => crate::native_process::output(&mut command, cancelled),
+    }
+    .and_then(check_output)
+    .map_err(|error| {
+        invalid(format!(
+            "Hyper-V {operation} control failed after {:.1}s: {error}",
+            started.elapsed().as_secs_f64()
+        ))
+    })?;
+    tracing::info!(%operation, elapsed_ms = started.elapsed().as_millis() as u64, "Hyper-V control completed");
+    Ok(output)
 }
 fn check_output(output: std::process::Output) -> io::Result<std::process::Output> {
     if !output.status.success() {
@@ -61,6 +94,184 @@ fn check_output(output: std::process::Output) -> io::Result<std::process::Output
         )));
     }
     Ok(output)
+}
+
+fn qualification_event(
+    config: &Config,
+    id: Uuid,
+    event: &str,
+    detail: serde_json::Value,
+) -> io::Result<()> {
+    use std::io::Write;
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_millis() as u64;
+    let path = config
+        .windows
+        .as_ref()
+        .unwrap()
+        .layout_root
+        .join(format!("evidence/{id}-qualification.jsonl"));
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    serde_json::to_writer(
+        &mut file,
+        &serde_json::json!({"unix_ms":unix_ms,"event":event,"detail":detail}),
+    )
+    .map_err(io::Error::other)?;
+    file.write_all(b"\n")?;
+    file.sync_data()
+}
+
+fn qualification_settle(
+    config: &Config,
+    id: Uuid,
+    worker_pid: u32,
+    dropped: std::time::Instant,
+) -> io::Result<()> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessIoCounters, OpenProcess, IO_COUNTERS, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // Qualification-only timing heuristic: production never depends on guest
+    // logs surviving power-off. Process I/O is not a disk durability barrier;
+    // the nonce-bound offline guest EOF/count assertion remains mandatory.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, worker_pid) };
+    let open_error = raw
+        .is_null()
+        .then(|| io::Error::last_os_error().to_string());
+    let process = if raw.is_null() {
+        None
+    } else {
+        Some(unsafe { OwnedHandle::from_raw_handle(raw) })
+    };
+    let mut previous = None;
+    let mut last_activity = Instant::now();
+    let mut last_record = dropped;
+    let mut quiet = false;
+    let mut available = false;
+    qualification_event(
+        config,
+        id,
+        "host-io-settle-start",
+        serde_json::json!({
+            "source":"vmwp-process-io-not-per-disk", "worker_pid":worker_pid,
+            "open_error":open_error,"minimum_ms":15000,"quiet_window_ms":5000,"maximum_ms":60000,
+            "qualification_only":true,"production_log_durability_dependency":false
+        }),
+    )?;
+    while dropped.elapsed() < Duration::from_secs(60) {
+        let mut sample = None;
+        if let Some(process) = &process {
+            let mut counters: IO_COUNTERS = unsafe { std::mem::zeroed() };
+            if unsafe { GetProcessIoCounters(process.as_raw_handle(), &mut counters) } != 0 {
+                sample = Some((counters.ReadTransferCount, counters.WriteTransferCount));
+            }
+        }
+        available = sample.is_some();
+        if sample != previous {
+            last_activity = Instant::now();
+        }
+        previous = sample;
+        let elapsed_ms = dropped.elapsed().as_millis() as u64;
+        let quiet_ms = last_activity.elapsed().as_millis() as u64;
+        if last_record.elapsed() >= Duration::from_secs(1) {
+            qualification_event(
+                config,
+                id,
+                "host-io-settle-sample",
+                serde_json::json!({
+                    "source":"vmwp-process-io-not-per-disk", "worker_pid":worker_pid,
+                    "since_drop_ms":elapsed_ms,"quiet_ms":quiet_ms,"available":available,
+                    "read_bytes":sample.map(|s|s.0),"write_bytes":sample.map(|s|s.1)
+                }),
+            )?;
+            last_record = Instant::now();
+        }
+        // A quiet vmwp process does not prove guest storage is quiet. Keep the
+        // full diagnostic window instead of ending early on this weak signal.
+        quiet = super::agent::qualification_io_is_quiet(elapsed_ms, quiet_ms, available);
+        std::thread::sleep(
+            Duration::from_millis(250)
+                .min(Duration::from_secs(60).saturating_sub(dropped.elapsed())),
+        );
+    }
+    qualification_event(
+        config,
+        id,
+        "host-io-settle-finished",
+        serde_json::json!({
+            "since_drop_ms":dropped.elapsed().as_millis() as u64,"available":available,
+            "io_quiet":quiet,"reason":"full-diagnostic-window-ended-process-io-not-a-guest-storage-barrier",
+            "agent_log_live_observation":null
+        }),
+    )
+}
+
+fn verify_qualification_guest(
+    config: &Config,
+    id: Uuid,
+    nonce: &str,
+    announced: usize,
+    written: usize,
+    dropped: std::time::Instant,
+) -> io::Result<()> {
+    let evidence = config
+        .windows
+        .as_ref()
+        .unwrap()
+        .layout_root
+        .join(format!("evidence/{id}-guest"));
+    let log = fs::read_to_string(evidence.join("hyperv-agent.log"));
+    let termination = log
+        .as_ref()
+        .ok()
+        .and_then(|text| super::agent::qualification_disconnect_proof(text, nonce, written));
+    qualification_event(
+        config,
+        id,
+        "offline-agent-log-observed",
+        serde_json::json!({
+            "since_drop_ms":dropped.elapsed().as_millis() as u64,"present":log.is_ok(),"current_nonce_terminal_read_matches":termination.is_some(),"termination":termination,
+            "observation":"first-safe-host-observation-after-power-off-not-guest-write-time",
+            "error":log.as_ref().err().map(ToString::to_string)
+        }),
+    )?;
+    for name in ["job-disk-binding.json", "mounted-disk-identity.json"] {
+        let path = evidence.join(name);
+        let bytes = fs::read(&path).map_err(|error| {
+            invalid(format!(
+                "Cannot read qualification identity {}: {error}",
+                path.display()
+            ))
+        })?;
+        let value = super::agent::qualification_json(&bytes, &path.display().to_string())?;
+        if value["matched"] != true || value.get("error").is_some() {
+            return Err(invalid(format!(
+                "Guest disk identity assertion failed; inspect {}",
+                evidence.join(name).display()
+            )));
+        }
+    }
+    let Some(termination) = termination else {
+        return Err(invalid("Guest terminal-read/read-count or no-frame-processing proof missing after bounded qualification window; inspect guest evidence"));
+    };
+    if written == 0 || written >= announced {
+        return Err(invalid("Qualification frame was not partial"));
+    }
+    qualification_event(
+        config,
+        id,
+        "guest-terminal-read-verified",
+        serde_json::json!({
+            "nonce":nonce,"announced":announced,"written":written,"read_total":written,
+            "termination":termination,"no_frame_processed":true,"successful_reply_bytes_after_partial":0
+        }),
+    )
 }
 
 pub(crate) struct Resources {
@@ -126,6 +337,7 @@ impl Resources {
         PathBuf::from(format!("hvsock:{}", self.id))
     }
     pub(super) fn boot(&mut self, config: &Config, nonce: &str) -> io::Result<()> {
+        super::ensure_parent_guard(config)?;
         let vm = config.windows.as_ref().unwrap();
         let cache = vm.caches().disk(&self.workspace);
         checked_setup(
@@ -158,6 +370,7 @@ impl Resources {
                 .parse()
                 .map_err(invalid)?,
         );
+        super::ensure_parent_guard(config)?;
         self.child.0 = Some(Child::spawn(
             control(config, "Run", Some(self.id), &[])?
                 .stdout(Stdio::null())
@@ -175,13 +388,21 @@ impl Resources {
         if self.cleaned {
             return Ok(());
         }
-        checked(control(&self.config, "Remove", Some(self.id), &[])?)?;
+        // Remove collects logs from the stopped guest before deleting its disk.
+        // Finish or terminate the monitor first so a late Start-VM cannot race
+        // that offline disk inspection.
         if let Some(mut child) = self.child.0.take() {
             if child.try_wait()?.is_none() {
                 child.kill()?;
             }
             child.wait()?;
         }
+        let extra = if known {
+            vec!["-LightweightHarvest".into()]
+        } else {
+            Vec::new()
+        };
+        checked(control(&self.config, "Remove", Some(self.id), &extra)?)?;
         if self.attached {
             self.config.windows.as_ref().unwrap().caches().complete(
                 &self.workspace,
@@ -247,8 +468,15 @@ pub(crate) fn qualify_disconnect(config: &Config) -> io::Result<()> {
         .join("staging")
         .join(id.to_string());
     let mut resources = Resources::prepare(config, staging, id, workspace)?;
-    let nonce = Uuid::now_v7().to_string();
+    let nonce = super::agent::fresh_hyperv_nonce();
+    qualification_event(config, id, "vm-prepare-start", serde_json::json!({}))?;
     resources.boot(config, &nonce)?;
+    qualification_event(
+        config,
+        id,
+        "vm-run-requested",
+        serde_json::json!({"vm_id":resources.vm_id}),
+    )?;
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut stream = loop {
         match resources.connect_agent() {
@@ -257,6 +485,7 @@ pub(crate) fn qualify_disconnect(config: &Config) -> io::Result<()> {
             Err(_) => std::thread::sleep(Duration::from_millis(100)),
         }
     };
+    qualification_event(config, id, "agent-connected", serde_json::json!({}))?;
     stream.set_nonblocking(true)?;
     let mut received = Vec::new();
     let hello = loop {
@@ -286,8 +515,21 @@ pub(crate) fn qualify_disconnect(config: &Config) -> io::Result<()> {
             }
         }
     };
-    let mut protocol = motor_winagent::Protocol::new(nonce)?;
+    let mut protocol = motor_winagent::Protocol::new(nonce.clone())?;
     protocol.accept(motor_winagent::Peer::Agent, &hello)?;
+    qualification_event(
+        config,
+        id,
+        "hello-validated",
+        serde_json::json!({"version":motor_winagent::PROTOCOL_VERSION}),
+    )?;
+    let inspect = checked(control(config, "QualifyInspect", Some(id), &[])?)?;
+    let inspect = super::agent::qualification_json(&inspect.stdout, "QualifyInspect stdout")?;
+    let worker_pid = inspect["worker_pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or_else(|| invalid("Qualification VM worker PID unavailable"))?;
+    qualification_event(config, id, "runtime-child-identity-checked", inspect)?;
     let mut frame = Vec::new();
     motor_winagent::write_frame(
         &mut frame,
@@ -309,10 +551,18 @@ pub(crate) fn qualify_disconnect(config: &Config) -> io::Result<()> {
             Err(error) => return Err(error),
         }
     }
+    qualification_event(
+        config,
+        id,
+        "partial-frame-written",
+        serde_json::json!({"announced":frame.len(),"written":written}),
+    )?;
+    let dropped = Instant::now();
     drop(stream);
-    std::thread::sleep(Duration::from_secs(3));
-    checked(control(config, "Harvest", Some(id), &[])?)?;
+    qualification_event(config, id, "stream-dropped", serde_json::json!({}))?;
+    qualification_settle(config, id, worker_pid, dropped)?;
     resources.finalize()?;
+    verify_qualification_guest(config, id, &nonce, frame.len(), written, dropped)?;
     let cache = config.windows.as_ref().unwrap().caches().disk(workspace);
     if cache.exists() || cache.with_extension("attached").exists() {
         return Err(invalid("disconnect left a dirty cache"));

@@ -29,10 +29,6 @@ fn main() -> io::Result<()> {
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(windows)]
-    if args.first().is_some_and(|arg| arg == "prep-probe") {
-        return motor_runner::hyperv_prep_probe(&args[1..]);
-    }
-    #[cfg(windows)]
     if args.first().is_some_and(|arg| arg == "service") {
         return native_service::dispatch();
     }
@@ -95,6 +91,7 @@ async fn run(args: Vec<String>) -> io::Result<()> {
         let _ = motor_protocol::logging::init(LOG_PREFIX);
         return motor_runner::serve_agent().await;
     }
+    #[cfg(unix)]
     if args.first().is_some_and(|arg| arg == "windows-prepare") {
         if args.len() != 2 {
             return Err(io::Error::other("windows-prepare requires a plan file"));
@@ -118,17 +115,13 @@ async fn run(args: Vec<String>) -> io::Result<()> {
     let (job, drain_timeout_s, exit_after) = configure_options(&mut config, args)?;
     match operation.as_str() {
         #[cfg(windows)]
-        "qualify-prep" => {
-            let runner = Runner::open(config)?;
-            motor_runner::hyperv_qualify_prep(runner.config())?;
-            println!("PASS prep-key-read-denied prep-outside-write-denied prep-staging-write-allowed");
-            Ok(())
-        }
+        "qualify-prep" => motor_runner::hyperv_qualify_prep(config),
         #[cfg(windows)]
-        "qualify-disconnect" => {
-            let runner = Runner::open(config)?;
-            motor_runner::hyperv_qualify_disconnect(runner.config())
-        }
+        "qualify-prep-offline-cargo" => motor_runner::hyperv_qualify_prep_offline_cargo(config),
+        #[cfg(windows)]
+        "qualify-prep-local-registry" => motor_runner::hyperv_qualify_prep_local_registry(config),
+        #[cfg(windows)]
+        "qualify-disconnect" => motor_runner::hyperv_qualify_disconnect(config),
         "drain" | "resume" => {
             use motor_protocol::*;
             let resume = operation == "resume";

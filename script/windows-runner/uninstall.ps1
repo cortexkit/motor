@@ -4,6 +4,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if (-not $ConfirmRemoveParentAndState) { throw 'Pass -ConfirmRemoveParentAndState after copying evidence out of the runner root' }
 $Root = 'C:\ProgramData\MotorRunner'
+$nativeLogPath = Join-Path $Root 'uninstall-native.jsonl'
 . "$PSScriptRoot\accounts.ps1"
 if (-not (Test-Path -LiteralPath "$Root\.motor-runner-root")) { throw 'Runner root marker absent; nothing will be deleted' }
 if ((Get-Item -LiteralPath $Root -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing a reparse root' }
@@ -17,13 +18,11 @@ foreach ($name in @('motor-prep','motor-ssh')) {
 $service = Get-Service MotorRunner -ErrorAction SilentlyContinue
 if ($service) {
     if ($service.Status -ne 'Stopped') { Stop-Service MotorRunner; $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(40)) }
-    & sc.exe delete MotorRunner | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw 'Runner service removal failed' }
+    $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('delete', 'MotorRunner') -Operation 'delete runner service' -LogPath $nativeLogPath
     $service.Dispose()
 }
 # Use the installed trusted control script before deleting any disk or account.
-& powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$Root\bin\hyperv.ps1" -Operation Reconcile -Root $Root
-if ($LASTEXITCODE -ne 0) { throw 'VM reconciliation failed; preserving disks and accounts' }
+$null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "$Root\bin\hyperv.ps1", '-Operation', 'Reconcile', '-Root', $Root) -Operation 'reconcile runner VMs before uninstall' -LogPath $nativeLogPath
 if (@(Get-VM -Name 'motor-ally-*' -ErrorAction SilentlyContinue).Count) { throw 'Owned VM remains' }
 if (@(Get-ChildItem "$Root\vm\jobs" -Force).Count) { throw 'Owned job disk remains' }
 $key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\92c268b0-cddd-40a4-a664-f32e50ad35ea'
@@ -33,46 +32,16 @@ if (Test-Path -LiteralPath $key) {
     Remove-Item -LiteralPath $key
 }
 $sshdConfig = 'C:\ProgramData\ssh\sshd_config'
-$config = [IO.File]::ReadAllText($sshdConfig)
-$pattern = '(?ms)^# BEGIN MOTOR RUNNER\r?\n.*?^# END MOTOR RUNNER\r?\n?'
-$matches = [regex]::Matches($config, $pattern)
-if ($matches.Count -gt 1) { throw 'Multiple SSH ownership blocks; manual reconciliation required' }
-if ($matches.Count -eq 1) {
-    $updated = [regex]::Replace($config, $pattern, '')
-    [IO.File]::WriteAllText($sshdConfig, $updated, [Text.UTF8Encoding]::new($false))
-    & 'C:\Windows\System32\OpenSSH\sshd.exe' -t -f $sshdConfig
-    if ($LASTEXITCODE -ne 0) { [IO.File]::WriteAllText($sshdConfig, $config); throw 'SSH configuration removal failed validation; original restored' }
-    Restart-Service sshd
-}
-if ($record.PSObject.Properties['ssh_home']) {
-    if ($record.ssh_home -notmatch '^C:\\Users\\motor-ssh(?:\.[^\\]+)?$') { throw 'Unexpected SSH home path' }
-    $sid = $record.accounts.PSObject.Properties['motor-ssh'].Value
-    $profiles = @(Get-CimInstance Win32_UserProfile | Where-Object SID -eq $sid)
-    if ($profiles.Count -gt 1) { throw 'Ambiguous SSH profile ownership' }
-    if ($profiles.Count -eq 1) {
-        if ($profiles[0].LocalPath -ine $record.ssh_home -or $profiles[0].Loaded) { throw 'SSH profile path changed or is still loaded; close its sessions and retry removal' }
-        $profiles[0] | Remove-CimInstance
-    }
-    if (Test-Path -LiteralPath $record.ssh_home) {
-        if ((Get-Item -LiteralPath $record.ssh_home -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing a reparse SSH home' }
-        Remove-Item -LiteralPath $record.ssh_home -Recurse -Force
-    }
-}
-foreach ($name in @('motor-prep','motor-ssh')) {
-    $expected = $record.accounts.PSObject.Properties[$name]
-    if (-not $expected) { continue }
-    $account = Get-LocalUser $name -ErrorAction SilentlyContinue
-    if ($account -and $account.SID.Value -ne $expected.Value) { throw "Account SID changed: $name; refusing deletion" }
-    if ($name -eq 'motor-prep') { Set-RunnerBatchRights $Root $expected.Value -Remove }
-    if ($account) { Remove-LocalUser $name }
-}
+$null = Remove-RunnerSshInstallState -Installation $record -SshdConfig $sshdConfig -LogPath $nativeLogPath
 if ($record.PSObject.Properties['power']) {
     foreach ($setting in $record.power.ac.PSObject.Properties) {
-        & powercfg.exe /setacvalueindex $record.power.scheme '238c9fa8-0aad-41ed-83f4-97be242c8f20' $setting.Name $setting.Value
-        if ($LASTEXITCODE -ne 0) { throw 'Could not restore original AC sleep/hibernate setting' }
+        $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\powercfg.exe" -ArgumentList @('/setacvalueindex', $record.power.scheme, '238c9fa8-0aad-41ed-83f4-97be242c8f20', $setting.Name, [string]$setting.Value) -Operation "restore power setting $($setting.Name)" -LogPath $nativeLogPath
     }
     # Do not change the active scheme if the operator selected a different one.
-    if ((& powercfg.exe /getactivescheme) -match $record.power.scheme) { & powercfg.exe /setactive $record.power.scheme; if ($LASTEXITCODE -ne 0) { throw 'Could not apply restored power policy' } }
+    $activeScheme = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\powercfg.exe" -ArgumentList @('/getactivescheme') -Operation 'read active power scheme during uninstall' -LogPath $nativeLogPath
+    if ($activeScheme.stdout -match [regex]::Escape($record.power.scheme)) {
+        $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\powercfg.exe" -ArgumentList @('/setactive', $record.power.scheme) -Operation 'restore active power scheme' -LogPath $nativeLogPath
+    }
 }
 Set-VMHost -EnableEnhancedSessionMode ([bool]$record.enhanced_session_before)
 if ($record.PSObject.Properties['provision_root']) {
@@ -82,15 +51,13 @@ if ($record.PSObject.Properties['provision_root']) {
         if (-not (Test-Path -LiteralPath "$provision\.hyperv-spike-root") -or ((Get-Item -LiteralPath $provision -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Adopted provisioning root ownership changed' }
         if (@(Get-VM | Get-VMHardDiskDrive | Where-Object { $_.Path.StartsWith("$provision\", [StringComparison]::OrdinalIgnoreCase) }).Count) { throw 'A VM still uses the adopted provisioning root' }
         if ((Get-FileHash "$provision\parent.vhdx" -Algorithm SHA256).Hash -ne $record.provision_parent_sha256) { throw 'Adopted provisioning parent changed; preserving it' }
-        & icacls.exe "$provision\parent.vhdx" /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' /Q | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw 'Cannot remove the adopted provisioning parent' }
+        $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\icacls.exe" -ArgumentList @("$provision\parent.vhdx", '/grant:r', '*S-1-5-18:F', '*S-1-5-32-544:F', '/Q') -Operation 'restore adopted parent ACL before removal' -LogPath $nativeLogPath
         (Get-Item "$provision\parent.vhdx").IsReadOnly = $false
         Remove-Item -LiteralPath $provision -Recurse -Force
     }
 }
 # Clearing readonly applies only inside the owned root, never to another parent.
-& icacls.exe "$Root\baselines\ally-hvsock.vhdx" /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' /Q | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'Cannot restore write attributes on the owned sealed parent' }
+$null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\icacls.exe" -ArgumentList @("$Root\baselines\ally-hvsock.vhdx", '/grant:r', '*S-1-5-18:F', '*S-1-5-32-544:F', '/Q') -Operation 'restore owned parent ACL before removal' -LogPath $nativeLogPath
 Get-ChildItem -LiteralPath $Root -File -Recurse -Force | ForEach-Object { $_.IsReadOnly = $false }
 Remove-Item -LiteralPath $Root -Recurse -Force
 if ((Test-Path $Root) -or (Test-Path $key) -or (Get-LocalUser motor-prep -ErrorAction SilentlyContinue) -or (Get-LocalUser motor-ssh -ErrorAction SilentlyContinue)) { throw 'Uninstall left owned state' }
