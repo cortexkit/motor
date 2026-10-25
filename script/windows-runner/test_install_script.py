@@ -75,6 +75,9 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("if ($partitions.Count -ne 1)", evidence)
         self.assertIn("$identity['partition_access_paths'] = $accessPaths", evidence)
         self.assertIn("$identity['volume_guid_path'] = $volume", evidence)
+        wait = evidence.split("function Wait-RunnerDiagnosticVolume", 1)[1].split("function Use-DiagnosticWindowsDisk", 1)[0]
+        self.assertIn("$script:RunnerDiagnosticVolumeTimeoutFormat -f $TimeoutSeconds,$DiskNumber,$PartitionNumber,$lastError", wait)
+        self.assertIn("$script:RunnerDiagnosticNoGuidPathMessage", wait)
 
         fixture = (HERE / "test_scripts.ps1").read_text()
         self.assertIn("$property = $identity.PSObject.Properties['volume_guid_path']", fixture)
@@ -82,6 +85,7 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("AccessPaths=$accessPaths", fixture)
         self.assertIn("Get-Volume -Partition $volumePartition", fixture)
         self.assertIn("Get-Volume-must-return-no-object", fixture)
+        self.assertIn("$expectedTimeout = $script:RunnerDiagnosticVolumeTimeoutFormat -f 1,42,1,$script:RunnerDiagnosticNoGuidPathMessage", fixture)
         self.assertNotIn("$identity.volume_path", fixture)
 
 
@@ -209,7 +213,9 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("Get-WinEvent -Path $stagedSource", evidence)
         self.assertNotIn("Copy-Item -LiteralPath $item.FullName", evidence)
         self.assertNotIn("Get-FileHash -LiteralPath $agent.FullName", evidence)
-        self.assertIn("Timed out after $TimeoutSeconds seconds", evidence)
+        self.assertIn("$script:RunnerDiagnosticVolumeTimeoutFormat", evidence)
+        self.assertIn("$timeoutMessage = $script:RunnerDiagnosticVolumeTimeoutFormat -f", evidence)
+        self.assertIn("throw $timeoutMessage", evidence)
         self.assertIn("Dismount-VHD -Path $Path", evidence)
         self.assertIn("Use-DiagnosticWindowsDisk -Path $Parent -EvidenceDirectory $EvidenceDirectory -VolumeWaitSeconds $VolumeWaitSeconds", identity)
         self.assertIn("sealed-agent-volume-wait-retries-and-reads-identity", fixture)

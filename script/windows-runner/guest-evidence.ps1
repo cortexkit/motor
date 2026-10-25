@@ -94,10 +94,12 @@ function Save-GuestAgentEvents([string]$Source, [string]$Channel, [string]$Desti
         if ([IO.File]::Exists($stagedSource)) { [IO.File]::Delete($stagedSource) }
     }
 }
+$script:RunnerDiagnosticVolumeTimeoutFormat = 'Timed out after {0} seconds waiting for a volume GUID path on disk {1} partition {2}: {3}'
+$script:RunnerDiagnosticNoGuidPathMessage = 'partition AccessPaths has no volume GUID path yet'
 function Wait-RunnerDiagnosticVolume([int]$DiskNumber, [int]$PartitionNumber, [int]$TimeoutSeconds) {
     # Read the GUID path from the partition; read-only VHD mounts may have no Get-Volume object.
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    $lastError = 'partition AccessPaths has not acquired a volume GUID path'
+    $lastError = $script:RunnerDiagnosticNoGuidPathMessage
     while ($clock.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
             $partition = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction Stop
@@ -112,7 +114,7 @@ function Wait-RunnerDiagnosticVolume([int]$DiskNumber, [int]$PartitionNumber, [i
                 if ($guidPaths.Count -gt 1) {
                     $lastError = 'partition has several volume GUID access paths'
                 } else {
-                    $lastError = 'partition AccessPaths has no volume GUID path yet'
+                    $lastError = $script:RunnerDiagnosticNoGuidPathMessage
                 }
             } else {
                 $lastError = "partition $PartitionNumber on disk $DiskNumber has not appeared yet"
@@ -120,7 +122,8 @@ function Wait-RunnerDiagnosticVolume([int]$DiskNumber, [int]$PartitionNumber, [i
         } catch { $lastError = [string]$_ }
         Start-Sleep -Milliseconds 100
     }
-    throw "Timed out after $TimeoutSeconds seconds waiting for a volume GUID path on disk $DiskNumber partition ${PartitionNumber}: $lastError"
+    $timeoutMessage = $script:RunnerDiagnosticVolumeTimeoutFormat -f $TimeoutSeconds,$DiskNumber,$PartitionNumber,$lastError
+    throw $timeoutMessage
 }
 
 function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action, [string]$EvidenceDirectory, [int]$VolumeWaitSeconds = 15) {

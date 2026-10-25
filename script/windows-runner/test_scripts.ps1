@@ -296,6 +296,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
             $global:identityFixtureAccessPathQueries = 0
             $global:identityFixtureVolumeQueries = 0
             $failure = $null
+            $expectedTimeout = $script:RunnerDiagnosticVolumeTimeoutFormat -f 1,42,1,$script:RunnerDiagnosticNoGuidPathMessage
             # Start without the previous case's record, so a stale volume path can't
             # satisfy or fail this check; under strict mode an absent property throws.
             $identityFile = Join-Path $identityEvidence 'mounted-disk-identity.json'
@@ -307,7 +308,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
                 $property = $identity.PSObject.Properties['volume_guid_path']
                 if ($property) { $recordedVolumePath = $property.Value }
             }
-            if ($failure -notmatch 'Timed out after 1 seconds waiting for a volume GUID path on disk 42 partition 1: partition AccessPaths has no volume GUID path yet' -or $global:identityFixtureVolumeQueries -ne 0 -or $global:identityFixtureAddCalls -ne 0 -or $global:identityFixtureAccessPathTouched -or -not $global:identityFixtureDismounted -or $recordedVolumePath) { throw "FAIL sealed-agent-volume-timeout-unmounts: $failure" }
+            if ($failure -notlike ('*' + $expectedTimeout + '*') -or $global:identityFixtureVolumeQueries -ne 0 -or $global:identityFixtureAddCalls -ne 0 -or $global:identityFixtureAccessPathTouched -or -not $global:identityFixtureDismounted -or $recordedVolumePath) { throw "FAIL sealed-agent-volume-timeout-unmounts: $failure" }
             Write-Host 'PASS sealed-agent-volume-timeout-unmounts'
             $count++
         } finally {
