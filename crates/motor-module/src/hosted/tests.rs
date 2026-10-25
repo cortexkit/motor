@@ -976,6 +976,69 @@ pub(crate) fn canonical_lease_bytes(body: &motor_lease::LeaseRequest) -> String 
     )
 }
 
+fn assert_client_lease_body_and_hash(body_bytes: &str, expected_hash: &str) {
+    let expected: motor_lease::LeaseRequest = serde_json::from_str(body_bytes).unwrap();
+    assert_eq!(expected.platform, "linux-x64");
+    let mut request = RunRequest::new(
+        "/home/test/repo",
+        "/home/test/repo",
+        "/home/test/repo",
+        "true",
+    )
+    .with_platform(Platform::Linux)
+    .with_timeout(expected.timeout_s)
+    .with_weight_hint(expected.vcpus);
+    if expected.net {
+        request.network = Some(Network::Outbound);
+    }
+    let body = lease_body(
+        Uuid::parse_str(&expected.job_id).unwrap(),
+        &request,
+        (
+            expected.workspace_key_hash.clone(),
+            expected.repo_hash.clone(),
+        ),
+        expected.placement_hint.clone(),
+        expected.avoid_host.clone(),
+        expected.requester_jwk.clone(),
+        expected.allow_spill,
+    )
+    .unwrap();
+    assert_eq!(body, expected);
+    assert_eq!(
+        motor_lease::sha256_hex(canonical_lease_bytes(&body).as_bytes()),
+        expected_hash,
+        "lease hash for {}",
+        expected.job_id
+    );
+}
+
+#[test]
+fn cloud_explicit_only_lease_bodies_match_the_pinned_hashes() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/explicit-only-leases.json"
+    ))
+    .unwrap();
+    let exchanges = vector["exchanges"].as_array().unwrap();
+    assert_eq!(exchanges.len(), 2);
+    for exchange in exchanges {
+        assert_client_lease_body_and_hash(
+            exchange["request"]["body_bytes"].as_str().unwrap(),
+            exchange["lease_hash"].as_str().unwrap(),
+        );
+    }
+}
+
+#[test]
+fn derived_non_null_placement_hint_lease_body_matches_the_cross_check_hash() {
+    // This body is a derived cross-check, not a CLOUD lease-route exchange.
+    let body_bytes = r#"{"job_id":"019e4567-89ab-7cde-8012-3456789abcd8","vcpus":2,"platform":"linux-x64","net":true,"workspace_key_hash":"WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW","repo_hash":"RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR","placement_hint":{"host":"staging-fra-1","vm":"t1"},"avoid_host":null,"timeout_s":100,"requester_jwk":{"kty":"OKP","crv":"Ed25519","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},"allow_spill":true}"#;
+    assert_client_lease_body_and_hash(
+        body_bytes,
+        "bf25b1ca5d91ce3edfb35e7bf66efb259bb5b2877e4e3fc870b090d23b1f1282",
+    );
+}
+
 #[test]
 fn cloud_no_spill_request_serializes_to_the_exact_canonical_bytes_and_hash() {
     let vector: serde_json::Value = serde_json::from_str(include_str!(
@@ -1051,8 +1114,8 @@ fn non_null_hint_keeps_the_pinned_broker_canonical_member_order() {
         host: "control-host".into(),
         vm: Some("t1".into()),
     });
-    // The pinned hash vectors only cover null hints. Preserve their projection
-    // order with a non-null hint, without claiming a broker-supplied hash for it.
+    // This variant derives a non-null hint from the no-spill vector. Preserve its
+    // projection order without claiming a broker-supplied hash for this variant.
     let expected = vector["canonical_lease_bytes"].as_str().unwrap().replace(
         "\"placement_hint\":null",
         "\"placement_hint\":{\"host\":\"control-host\",\"vm\":\"t1\"}",

@@ -1,0 +1,162 @@
+{
+  "note": "TEST-ONLY bytes from the real lease route with Boat enabled, a free ordinary host, and a binding explicit-only hint; the second lease sees the named host full.",
+  "key_id": "test",
+  "test_only_job_seed_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+  "test_only_machine_seed_hex": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+  "clock_ms": 1900000000123,
+  "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "lease_id": "12345678-1234-4321-8765-123456789abc",
+  "hosts": [
+    {
+      "host_id": "ordinary",
+      "explicit_only": false,
+      "max_job_vcpus": 16,
+      "max_job_mem_mib": 65536
+    },
+    {
+      "host_id": "explicit",
+      "explicit_only": true,
+      "max_job_vcpus": 16,
+      "max_job_mem_mib": 65536
+    }
+  ],
+  "snapshots": [
+    {
+      "host_id": "ordinary",
+      "host_generation": 1,
+      "counter": 1,
+      "received_at_ms": 1900000000123,
+      "free_vcpus": 16,
+      "free_mem_mib": 65536,
+      "healthy": true,
+      "queued": 0,
+      "warm": [],
+      "running": []
+    },
+    {
+      "host_id": "explicit",
+      "host_generation": 1,
+      "counter": 1,
+      "received_at_ms": 1900000000123,
+      "free_vcpus": 16,
+      "free_mem_mib": 65536,
+      "healthy": true,
+      "queued": 0,
+      "warm": [
+        {
+          "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "workspace_key_hash": "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW",
+          "vm": "warm"
+        }
+      ],
+      "running": []
+    },
+    {
+      "host_id": "explicit",
+      "host_generation": 1,
+      "counter": 2,
+      "received_at_ms": 1900000000123,
+      "free_vcpus": 0,
+      "free_mem_mib": 0,
+      "healthy": true,
+      "queued": 0,
+      "warm": [
+        {
+          "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "workspace_key_hash": "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW",
+          "vm": "warm"
+        }
+      ],
+      "running": []
+    }
+  ],
+  "exchanges": [
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "body": {
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcd8",
+          "vcpus": 2,
+          "platform": "linux-x64",
+          "net": true,
+          "workspace_key_hash": "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW",
+          "repo_hash": "RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR",
+          "placement_hint": {
+            "host": "explicit",
+            "vm": "warm"
+          },
+          "avoid_host": null,
+          "timeout_s": 100,
+          "requester_jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+          },
+          "allow_spill": true
+        },
+        "body_bytes": "{\"job_id\":\"019e4567-89ab-7cde-8012-3456789abcd8\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW\",\"repo_hash\":\"RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR\",\"placement_hint\":{\"host\":\"explicit\",\"vm\":\"warm\"},\"avoid_host\":null,\"timeout_s\":100,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"},\"allow_spill\":true}"
+      },
+      "lease_hash": "5a119c1b254923f7a37e268efbdf632d3b630bd0369218e9b03e7d8adebf378f",
+      "reply": {
+        "status": 201,
+        "headers": {
+          "Retry-After": null
+        },
+        "body": {
+          "lease_id": "12345678-1234-4321-8765-123456789abc",
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcd8",
+          "placement": {
+            "host": "explicit",
+            "vm": "warm"
+          },
+          "endpoint": "explicit.example:7443",
+          "endpoint_spki_sha256": "SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS",
+          "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QiLCJ0eXAiOiJjay1qb2Irand0In0.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiZXhwbGljaXQiLCJzdWIiOiJhY2N0OjAxQVJaM05ERUtUU1Y0UlJGRlE2OUc1RkFWIiwianRpIjoiMDE5ZTQ1NjctODlhYi03Y2RlLTgwMTItMzQ1Njc4OWFiY2Q4IiwiaWF0IjoxOTAwMDAwMDAwLCJleHAiOjE5MDAwMDAzMDAsInZjcHVzIjoyLCJtZW1fbWliIjoxNjM4NCwicGxhdGZvcm0iOiJsaW51eC14NjQiLCJuZXQiOnRydWUsInBsYWNlbWVudCI6eyJob3N0IjoiZXhwbGljaXQiLCJ2bSI6Indhcm0ifSwibWF4X3MiOjEwMCwiY25mIjp7ImprdCI6Im9nUlpiQ1I1S1RyUEZDQWZ1WW1DTXdqMHc3WXVrM0xyNllXUVdmcGtiZjAifSwicHVycG9zZSI6InJ1biJ9.CxLNJqXNjrvBqOphpq682eQmnhjcxBnP7MrcbBbjMGh_J9Isgxt8l1yHJtmSSHDEEuPP4GdulRC8vh87JXj3Bw",
+          "token_expires_at_ms": 1900000300000,
+          "max_s": 100,
+          "reserved_vcpu_ms": 200000
+        },
+        "body_bytes": "{\"lease_id\":\"12345678-1234-4321-8765-123456789abc\",\"job_id\":\"019e4567-89ab-7cde-8012-3456789abcd8\",\"placement\":{\"host\":\"explicit\",\"vm\":\"warm\"},\"endpoint\":\"explicit.example:7443\",\"endpoint_spki_sha256\":\"SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS\",\"job_token\":\"eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QiLCJ0eXAiOiJjay1qb2Irand0In0.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiZXhwbGljaXQiLCJzdWIiOiJhY2N0OjAxQVJaM05ERUtUU1Y0UlJGRlE2OUc1RkFWIiwianRpIjoiMDE5ZTQ1NjctODlhYi03Y2RlLTgwMTItMzQ1Njc4OWFiY2Q4IiwiaWF0IjoxOTAwMDAwMDAwLCJleHAiOjE5MDAwMDAzMDAsInZjcHVzIjoyLCJtZW1fbWliIjoxNjM4NCwicGxhdGZvcm0iOiJsaW51eC14NjQiLCJuZXQiOnRydWUsInBsYWNlbWVudCI6eyJob3N0IjoiZXhwbGljaXQiLCJ2bSI6Indhcm0ifSwibWF4X3MiOjEwMCwiY25mIjp7ImprdCI6Im9nUlpiQ1I1S1RyUEZDQWZ1WW1DTXdqMHc3WXVrM0xyNllXUVdmcGtiZjAifSwicHVycG9zZSI6InJ1biJ9.CxLNJqXNjrvBqOphpq682eQmnhjcxBnP7MrcbBbjMGh_J9Isgxt8l1yHJtmSSHDEEuPP4GdulRC8vh87JXj3Bw\",\"token_expires_at_ms\":1900000300000,\"max_s\":100,\"reserved_vcpu_ms\":200000}"
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "body": {
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcd9",
+          "vcpus": 2,
+          "platform": "linux-x64",
+          "net": true,
+          "workspace_key_hash": "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW",
+          "repo_hash": "RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR",
+          "placement_hint": {
+            "host": "explicit",
+            "vm": "warm"
+          },
+          "avoid_host": null,
+          "timeout_s": 100,
+          "requester_jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+          },
+          "allow_spill": true
+        },
+        "body_bytes": "{\"job_id\":\"019e4567-89ab-7cde-8012-3456789abcd9\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW\",\"repo_hash\":\"RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR\",\"placement_hint\":{\"host\":\"explicit\",\"vm\":\"warm\"},\"avoid_host\":null,\"timeout_s\":100,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"},\"allow_spill\":true}"
+      },
+      "lease_hash": "3bf45bc3492aa00b67508b57bddb56c5e48ee1924b842ab98c0d02f9fe4c7acf",
+      "reply": {
+        "status": 503,
+        "headers": {
+          "Retry-After": "5"
+        },
+        "body": {
+          "error": "no_capacity"
+        },
+        "body_bytes": "{\"error\":\"no_capacity\"}"
+      }
+    }
+  ]
+}

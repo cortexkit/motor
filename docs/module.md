@@ -674,9 +674,16 @@ hash projection, capacity reply, and stable re-request policy. Requester keys ar
 excluded from the lease hash; an absent `allow_spill` and either explicit boolean
 have distinct hashes, so the stored request preserves presence as well as value.
 `non_null_hint_keeps_the_pinned_broker_canonical_member_order` checks a non-null
-hint in that projection. The pinned hash-bearing broker vectors currently all
-have null hints; a broker-supplied non-null hash vector is still needed for full
-cross-implementation confirmation.
+hint derived from the no-spill vector. The `cortexkit-cloud` fixture
+`explicit-only-leases.json` at commit `54042e7` pins two route-generated leases
+with the non-null hint `{"host":"explicit","vm":"warm"}`. Tests
+`cloud_explicit_only_leases_match_their_pinned_hashes` and
+`cloud_explicit_only_lease_bodies_match_the_pinned_hashes` check motor-lease's hash
+projection from the pinned request bytes and ck-motor's generated lease bodies
+against both broker-supplied hashes. The separate tests
+`derived_non_null_placement_hint_matches_the_cross_check_hash` and
+`derived_non_null_placement_hint_lease_body_matches_the_cross_check_hash` cover
+the derived `staging-fra-1`/`t1` body; it is not a route-generated vector.
 CLOUD's `no-host-fits-lease.json` (from `cortexkit-cloud` `916347e`) is pinned
 beside it: `stage1_cloud_no_host_fits_reply_routes_the_job_to_the_build_server`
 sends its exact 422 reply bytes through ck-motor's broker client, and

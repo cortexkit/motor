@@ -1,4 +1,4 @@
-//! These comparisons execute Motor against immutable, externally supplied bytes.
+//! CLOUD conformance comparisons and explicitly derived lease-hash cross-checks.
 use super::common::*;
 use ed25519_dalek::SigningKey;
 use motor_lease::{
@@ -22,6 +22,50 @@ fn seed(text: &str) -> SigningKey {
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect();
     SigningKey::from_bytes(&bytes.try_into().unwrap())
+}
+
+fn canonical_lease_hash(body_bytes: &str) -> String {
+    let body: LeaseRequest = serde_json::from_str(body_bytes).unwrap();
+    let wire = serde_json::to_string(&body).unwrap();
+    // LeaseRequest orders the hash members before requester_jwk. Requester keys
+    // can rotate without changing a lease, so the broker excludes the final key.
+    let requester = format!(
+        ",\"requester_jwk\":{}}}",
+        serde_json::to_string(&body.requester_jwk).unwrap()
+    );
+    let canonical = format!(
+        "{}}}",
+        wire.strip_suffix(&requester)
+            .expect("requester key is the final wire member")
+    );
+    sha256_hex(canonical.as_bytes())
+}
+
+#[test]
+fn cloud_explicit_only_leases_match_their_pinned_hashes() {
+    let vector = vector("explicit-only-leases.json");
+    let exchanges = vector["exchanges"].as_array().unwrap();
+    assert_eq!(exchanges.len(), 2);
+    for exchange in exchanges {
+        let body_bytes = exchange["request"]["body_bytes"].as_str().unwrap();
+        let body: Value = serde_json::from_str(body_bytes).unwrap();
+        assert_eq!(body, exchange["request"]["body"]);
+        assert_eq!(
+            body["placement_hint"],
+            json!({"host": "explicit", "vm": "warm"})
+        );
+        assert_eq!(canonical_lease_hash(body_bytes), exchange["lease_hash"]);
+    }
+}
+
+#[test]
+fn derived_non_null_placement_hint_matches_the_cross_check_hash() {
+    // This body is a derived cross-check, not a CLOUD lease-route exchange.
+    let body_bytes = r#"{"job_id":"019e4567-89ab-7cde-8012-3456789abcd8","vcpus":2,"platform":"linux-x64","net":true,"workspace_key_hash":"WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW","repo_hash":"RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR","placement_hint":{"host":"staging-fra-1","vm":"t1"},"avoid_host":null,"timeout_s":100,"requester_jwk":{"kty":"OKP","crv":"Ed25519","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},"allow_spill":true}"#;
+    assert_eq!(
+        canonical_lease_hash(body_bytes),
+        "bf25b1ca5d91ce3edfb35e7bf66efb259bb5b2877e4e3fc870b090d23b1f1282"
+    );
 }
 
 #[test]

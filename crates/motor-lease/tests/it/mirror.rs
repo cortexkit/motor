@@ -66,6 +66,7 @@ fn cloud_final_files_match_their_manifest_digests() {
         "cloud/bad-request.json",
         "cloud/no-spill-lease.json",
         "cloud/no-host-fits-lease.json",
+        "cloud/explicit-only-leases.json",
         "cloud/boat-lease.json",
         "cloud/job-tokens.json",
         "cloud/host-signature.json",
@@ -109,6 +110,10 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         (
             "no-spill-lease.json",
             "167deadc03d9a1d8e43edf80af8a7ab840ee9641fe485c9c70a8859af0229b94",
+        ),
+        (
+            "explicit-only-leases.json",
+            "93136da9d2703acee05e80889ed18c1aaa1d0dd1623848548d08c29b5f673708",
         ),
         (
             "boat-lease.json",

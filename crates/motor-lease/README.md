@@ -19,11 +19,12 @@ host can also call `Nonces::prune` explicitly.
 ## Contract fixtures
 
 The broker repository, `cortexkit-cloud`, owns `docs/runners-contract.md` and
-`test-vectors/runners/`. `contracts/cloud/` mirrors twelve canonical files
+`test-vectors/runners/`. `contracts/cloud/` mirrors thirteen canonical files
 verbatim: the contract and `bad-request.json` at commit `df12dca`,
 `account-closure.json` at `e961a71`, `lease.json`, `boat-lease.json`,
 `shadow-lease.json` and `settled-reattach.json` at `e483f20`, `no-host-fits-lease.json` at
-`916347e`, `no-spill-lease.json` at `95fd2d1`, and the other vectors at
+`916347e`, `no-spill-lease.json` at `95fd2d1`, `explicit-only-leases.json` at
+`54042e7`, and the other vectors at
 `00e688e`. `contracts/digest-manifest.json` records source paths,
 revision and SHA-256 values. The digest test checks every file and inventory
 completeness. The conformance tests compare tokens, signing bytes, request bodies
@@ -34,6 +35,12 @@ or rewrite the canonical bytes.
 `requester_jwk` and including an explicitly false `allow_spill` after `timeout_s`.
 It also records the real broker's `503 no_capacity` and `Retry-After` when only a
 full registered host is selectable, even with Boat enabled.
+
+`explicit-only-leases.json` records two real lease-route exchanges with the
+non-null hint `{"host":"explicit","vm":"warm"}`: a placed lease and a second
+lease refused when that host is full. The hash tests use each request's pinned
+`body_bytes` and `lease_hash`; the separate `staging-fra-1`/`t1` hash cross-check
+is derived, not a route-generated vector.
 
 Since `e483f20` the broker requires `allow_spill` on every lease body and
 answers a body without it 400 `bad_request` before claiming the job; the fake

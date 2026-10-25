@@ -40,6 +40,14 @@
       "canonical": true
     },
     {
+      "path": "cloud/explicit-only-leases.json",
+      "sha256": "93136da9d2703acee05e80889ed18c1aaa1d0dd1623848548d08c29b5f673708",
+      "source_repository": "cortexkit-cloud",
+      "source_commit": "54042e70b9ee6eead07970f80bc3a166b86865a5",
+      "source_path": "test-vectors/runners/explicit-only-leases.json",
+      "canonical": true
+    },
+    {
       "path": "cloud/boat-lease.json",
       "sha256": "a8bdda4fa90dff6607e534efabfa1a17c71b52377af91b714a7a50b9fd4f83bb",
       "source_repository": "cortexkit-cloud",
