@@ -606,10 +606,35 @@ fn counter(output: &str, name: &str) -> u64 {
 #[tokio::test]
 async fn restart_stops_writer_before_scratch_cleanup_and_requeues_descriptor() {
     use std::os::unix::process::ExitStatusExt;
+
+    async fn drive_idle(runner: &Runner) {
+        until_with_diagnostics(
+            || {
+                runner.tick().unwrap();
+                let inner = runner.core.inner.lock().unwrap();
+                // A terminal writer can still be publishing its catalog result
+                // or settling scratch cleanup. Wait for those owners as well.
+                inner.jobs.values().all(|job| job.terminal.is_some())
+                    && inner.writer.is_none()
+                    && inner.finalizing.is_empty()
+                    && inner.base_finishes.is_empty()
+                    && inner.base_settling.is_empty()
+            },
+            || runner_diagnostics(runner),
+        )
+        .await;
+    }
+
     let f = Fixture::new();
-    let config = f.config();
+    let mut config = f.config();
+    // The interrupted record below exists only on disk. A background tick must
+    // not consume the unfilled descriptor before the simulated restart.
+    config.manual_tick = true;
     let runner = Runner::open(config.clone()).unwrap();
-    warm(&f, &runner).await;
+    let (request, bytes) = f.run("true");
+    f.submit(&runner, &request, &bytes);
+    drive_idle(&runner).await;
+    assert_exited(&f, &runner, request.job_id).await;
     let mut writer = runner
         .core
         .inner
@@ -640,6 +665,7 @@ async fn restart_stops_writer_before_scratch_cleanup_and_requeues_descriptor() {
     let scratch = config.writer_scratch_dir().join(writer.id.to_string());
     fs::create_dir_all(&scratch).unwrap();
     fs::write(scratch.join("live"), "unit still owns this").unwrap();
+    assert_eq!(writer_count(&runner), count);
     drop(runner);
     let stopped = Arc::new(AtomicBool::new(false));
     let observed = stopped.clone();
@@ -671,8 +697,10 @@ async fn restart_stops_writer_before_scratch_cleanup_and_requeues_descriptor() {
     let runner = reopen(config);
     assert!(stopped.load(Ordering::SeqCst));
     assert!(!scratch.exists());
-    until(|| writer_count(&runner) == count + 1).await;
-    base_done(&runner).await;
+    assert_eq!(writer_count(&runner), count);
+    runner.tick().unwrap();
+    assert_eq!(writer_count(&runner), count + 1);
+    drive_idle(&runner).await;
     assert_eq!(repository(&f, &runner).result, Some(RebuildResult::Ok));
     assert!(runner.core.inner.lock().unwrap().writer.is_none());
 }
