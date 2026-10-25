@@ -250,10 +250,10 @@ pub struct Config {
     pub(crate) before_replay_read: Option<JobWriteHook>,
     #[cfg(test)]
     pub(crate) systemd_command: Option<crate::systemd::CommandHook>,
-    /// Supplies the jobs slice's `MemoryMax` for fixtures that must not depend
-    /// on the host's real slice. Production always reads systemd.
+    /// Supplies the slice ceiling and declared minimum for fixtures that must
+    /// not depend on the host's systemd or capacity file.
     #[cfg(test)]
-    pub(crate) slice_ceiling_probe: Option<Arc<dyn Fn() -> io::Result<u64> + Send + Sync>>,
+    pub(crate) slice_budget_probe: Option<crate::job_memory_budget::BudgetProbe>,
     /// Replaces the privileged reclaim that gives the runner back read access
     /// to a checkout a job locked it out of (see `workspace_access`), so
     /// portable fixtures can exercise the repair without sudo.
@@ -518,7 +518,7 @@ impl Config {
             #[cfg(test)]
             systemd_command: None,
             #[cfg(test)]
-            slice_ceiling_probe: None,
+            slice_budget_probe: None,
             #[cfg(test)]
             workspace_access_repair: None,
             #[cfg(test)]
@@ -746,10 +746,6 @@ impl Config {
     }
 }
 
-/// The refusal for a remembered slice ceiling. A host set up below the floor
-/// every job unit requests is misconfigured, not busy, so the refusal is
-/// `WorkspaceSetupFailed`: callers do not treat that as a capacity signal to
-/// retry, which waiting could never clear.
 /// The OOM advice for a stopped job. `slice_ceiling` is the jobs slice's
 /// `MemoryMax` as the runner last recorded it, or `NO_JOB_MEMORY_BUDGET` when
 /// no reading is kept: the slice caps every job unit's limit, so a request it
@@ -1357,10 +1353,12 @@ struct Core {
     catalog_written: Mutex<CatalogWritten>,
     health: Mutex<health::Health>,
     repository_usage: Mutex<health::RepositoryUsage>,
-    /// The jobs slice's limits, refreshed outside the state lock so admission
-    /// never runs systemctl while holding it. `None` means no usable budget was
-    /// read, which refuses nothing by itself.
+    /// The jobs slice's ceiling for clamping and OOM advice. Refreshing it and
+    /// the declared minimum never performs I/O under the state lock.
     slice_budget: std::sync::atomic::AtomicU64,
+    /// `jobs_min_bytes` from the operator's capacity file, or
+    /// `NO_JOB_MEMORY_BUDGET` when no minimum is declared.
+    declared_jobs_min: std::sync::atomic::AtomicU64,
     background_deletes: Arc<std::sync::atomic::AtomicUsize>,
     _lock: File,
     rustc_version: String,
@@ -2347,6 +2345,9 @@ impl Runner {
                 slice_budget: std::sync::atomic::AtomicU64::new(
                     crate::job_memory_budget::NO_JOB_MEMORY_BUDGET,
                 ),
+                declared_jobs_min: std::sync::atomic::AtomicU64::new(
+                    crate::job_memory_budget::NO_JOB_MEMORY_BUDGET,
+                ),
                 _lock: lock,
                 rustc_version,
                 compilers: Compilers::probe(&["cc", "c++", "ccache"]),
@@ -3261,11 +3262,9 @@ impl Runner {
         }
     }
 
-    /// A Linux job unit takes its memory limit from the shared jobs slice. A
-    /// slice too small for the floor every job requests refuses the job before
-    /// it starts, instead of letting the slice OOM-kill it on arrival. A slice
-    /// that cannot be read refuses nothing: the start path already refuses
-    /// there, with the reason the slice gave.
+    /// Enforce the per-job floor only on hosts with an operator-declared job
+    /// budget. Small undeclared hosts clamp job limits to their shared slice.
+    /// A slice that cannot be read is handled by the start path instead.
     ///
     /// The refusal is a host setup fault that waiting cannot clear, so it is
     /// not reported as a full or busy runner: callers treat that reason as a
@@ -3279,23 +3278,35 @@ impl Runner {
             .core
             .slice_budget
             .load(std::sync::atomic::Ordering::Relaxed);
+        let declared_min = self
+            .core
+            .declared_jobs_min
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let declared_min = (declared_min != crate::job_memory_budget::NO_JOB_MEMORY_BUDGET)
+            .then_some(declared_min);
         #[cfg(test)]
         let floor = crate::backend::memory_floor(self.core.config.memory_floor_gib);
         #[cfg(not(test))]
         let floor = crate::backend::memory_floor();
-        crate::backend::slice_admission_refusal(floor, max)
+        crate::backend::slice_admission_refusal(floor, max, declared_min)
     }
 
-    /// Read the jobs slice's limits and remember the memory ceiling for
-    /// admission. Callers run this outside the state lock: it spawns
-    /// systemctl, and admission holds that lock.
+    /// Cache the observed ceiling separately from the declared Linux minimum:
+    /// the slice may include a Windows allowance or be a percentage of RAM on
+    /// a small host. Callers run all systemctl and capacity-file I/O outside
+    /// the state lock that admission holds.
     fn refresh_slice_budget(&self) {
         #[cfg(test)]
-        if let Some(probe) = &self.core.config.slice_ceiling_probe {
-            let max = probe().unwrap_or(crate::job_memory_budget::NO_JOB_MEMORY_BUDGET);
+        if let Some(probe) = &self.core.config.slice_budget_probe {
+            let (max, declared_min) =
+                probe().unwrap_or((crate::job_memory_budget::NO_JOB_MEMORY_BUDGET, None));
             self.core
                 .slice_budget
                 .store(max, std::sync::atomic::Ordering::Relaxed);
+            self.core.declared_jobs_min.store(
+                declared_min.unwrap_or(crate::job_memory_budget::NO_JOB_MEMORY_BUDGET),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             return;
         }
         // Only Linux has a jobs slice; elsewhere the ceiling refuses nothing.
@@ -3309,6 +3320,16 @@ impl Runner {
         self.core
             .slice_budget
             .store(max, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(target_os = "linux")]
+        let declared_min = crate::job_memory_budget::read_declared_jobs_min(Path::new(
+            "/etc/motor-host/capacity.json",
+        ));
+        #[cfg(not(target_os = "linux"))]
+        let declared_min = None;
+        self.core.declared_jobs_min.store(
+            declared_min.unwrap_or(crate::job_memory_budget::NO_JOB_MEMORY_BUDGET),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     fn run_refusal(

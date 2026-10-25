@@ -699,7 +699,7 @@ fn capped_cpu_placement_keeps_requested_memory_limit() {
 #[test]
 fn job_memory_limit_never_exceeds_the_slice_memory_max() {
     let f = Fixture::new();
-    // A 24 GiB slice: the value the capacity file uses for `jobs_min_bytes`.
+    // A 24 GiB slice, separate from any capacity-file Linux minimum.
     let slice = crate::systemd::JobMemoryBudget {
         max: 25_769_803_776,
         high: 21_474_836_480,
@@ -727,6 +727,12 @@ fn job_memory_limit_never_exceeds_the_slice_memory_max() {
     assert_eq!(memory_max(2, Some(slice)), 17_179_869_184);
     // Unread, a runner keeps the requested limit as before.
     assert_eq!(memory_max(30, None), 112_742_891_520);
+    // An undeclared small host can clamp even below the per-job floor.
+    let small = crate::systemd::JobMemoryBudget {
+        max: 14_249_590_784,
+        high: 12_573_168_640,
+    };
+    assert_eq!(memory_max(8, Some(small)), 14_249_590_784);
 }
 
 struct Fixture {
