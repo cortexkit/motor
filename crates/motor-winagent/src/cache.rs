@@ -247,6 +247,83 @@ pub fn is_volume_guid_path(path: &str) -> bool {
         })
 }
 
+/// What the guest can read back about the cache disk itself, used instead of a
+/// virtio serial to pin the selected disk to the disk the host attached.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiskIdentity {
+    /// Serial number the device reports, empty when the device reports none.
+    pub serial: String,
+    /// Device-reported type, e.g. `SCSI`. Empty when the device reports none.
+    pub product_id: String,
+    /// `STORAGE_DEVICE_DESCRIPTOR.Version`; part of a device's reported
+    /// identity, since it changes the meaning of every offset that follows.
+    pub descriptor_version: u32,
+    /// `IOCTL_DISK_GET_DRIVE_GEOMETRY_EX` length in bytes, which includes the
+    /// trailing partition-table information.
+    pub geometry_bytes: u64,
+}
+
+impl DiskIdentity {
+    /// A Hyper-V synthetic SCSI disk reports neither a serial nor a product id:
+    /// on the Ally both fields arrived empty, so the disk has no name of its
+    /// own inside the guest. Selection then rests on the topology in
+    /// `select_hyperv_cache_disk` alone, which must therefore be exact.
+    pub fn is_nameless(&self) -> bool {
+        self.serial.is_empty() && self.product_id.is_empty()
+    }
+}
+
+/// Names the device-reported identity at its most specific field, so an
+/// operator reading the log can see what actually pinned the cache disk.
+fn summary_part(identity: &DiskIdentity) -> &'static str {
+    if !identity.serial.is_empty() {
+        "serial"
+    } else if !identity.product_id.is_empty() {
+        "product_id"
+    } else {
+        "device_fields"
+    }
+}
+
+/// One bounded log line naming every identity value and where it came from.
+/// The next run on new hardware shows in the log what the guest could read.
+/// Host-supplied content, so control characters are replaced.
+pub fn disk_identity_log(identity: &DiskIdentity) -> String {
+    fn clean(value: &str) -> String {
+        value
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(64)
+            .collect()
+    }
+    let with_serial = !identity.serial.is_empty();
+    format!(
+        "Hyper-V cache disk identity: source={} serial={:?} product_id={:?} descriptor_version={} geometry_bytes={} nameless={}",
+        summary_part(identity),
+        clean(&identity.serial),
+        clean(&identity.product_id),
+        identity.descriptor_version,
+        identity.geometry_bytes,
+        !with_serial && identity.product_id.is_empty(),
+    )
+}
+
+/// Order-independent equality, so a mismatch names both sides whichever
+/// field differs first for the reader.
+fn difference(expected: &DiskIdentity, actual: &DiskIdentity) -> Option<&'static str> {
+    if expected.serial != actual.serial {
+        Some("serial")
+    } else if expected.product_id != actual.product_id {
+        Some("product_id")
+    } else if expected.descriptor_version != actual.descriptor_version {
+        Some("descriptor_version")
+    } else if expected.geometry_bytes != actual.geometry_bytes {
+        Some("geometry_bytes")
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CacheVolume {
     pub path: String,
@@ -261,6 +338,7 @@ pub struct CacheVolume {
 /// this disk.
 pub trait CacheStorage {
     fn serial(&mut self) -> io::Result<String>;
+    fn identity(&mut self) -> io::Result<DiskIdentity>;
     fn windows_disks(&mut self) -> io::Result<Vec<u32>>;
     fn layout(&mut self) -> io::Result<DiskLayout>;
     fn make_writable(&mut self) -> io::Result<()>;
@@ -282,8 +360,17 @@ fn check_disk(
     storage: &mut impl CacheStorage,
     number: u32,
     serial: &str,
+    identity: Option<&DiskIdentity>,
 ) -> io::Result<DiskLayout> {
-    if storage.serial()? != serial {
+    if let Some(expected) = identity {
+        let actual = storage.identity()?;
+        if let Some(field) = difference(expected, &actual) {
+            return Err(io::Error::other(format!(
+                "cache disk identity changed: {field} differs; {}",
+                disk_identity_log(&actual)
+            )));
+        }
+    } else if storage.serial()? != serial {
         return Err(io::Error::other("cache disk serial changed"));
     }
     let windows = storage.windows_disks()?;
@@ -318,6 +405,8 @@ fn check_disk(
     Ok(layout)
 }
 
+/// Prepare a cache disk whose serial number names it. QEMU assigns that
+/// serial, and the guest re-reads it before every write.
 pub fn prepare_cache(storage: &mut impl CacheStorage, number: u32) -> io::Result<PreparedCache> {
     prepare_cache_with_serial(storage, number, CACHE_DISK_SERIAL)
 }
@@ -327,10 +416,50 @@ pub fn prepare_cache_with_serial(
     number: u32,
     serial: &str,
 ) -> io::Result<PreparedCache> {
-    if serial.trim().is_empty() || serial.len() > 256 {
-        return Err(io::Error::other("cache disk lacks a bounded stable serial"));
+    prepare_cache_with(storage, number, serial, None)
+}
+
+/// Prepare a cache disk identified by everything the device reports rather
+/// than by a serial the device does not have.
+pub fn prepare_cache_with_identity(
+    storage: &mut impl CacheStorage,
+    number: u32,
+    identity: &DiskIdentity,
+) -> io::Result<PreparedCache> {
+    prepare_cache_with(storage, number, "", Some(identity))
+}
+
+/// `identity` is what pins the disk between selection and every later write:
+/// it is re-read before each one. A disk swapped under a running guest, or the
+/// same disk number naming a different device, therefore cannot receive a
+/// cache write meant for this cache.
+pub fn prepare_cache_with(
+    storage: &mut impl CacheStorage,
+    number: u32,
+    serial: &str,
+    identity: Option<&DiskIdentity>,
+) -> io::Result<PreparedCache> {
+    match identity {
+        Some(identity) => {
+            // The Hyper-V profile reads a disk that reports no name at all, so
+            // a disk that does report one is a different device in the slot.
+            if !identity.is_nameless() {
+                return Err(io::Error::other(format!(
+                    "cache disk identity is not nameless: {}",
+                    disk_identity_log(identity)
+                )));
+            }
+        }
+        None => {
+            if serial.trim().is_empty() || serial.len() > 256 {
+                return Err(io::Error::other("cache disk lacks a bounded stable serial"));
+            }
+        }
     }
-    let raw = matches!(check_disk(storage, number, serial)?, DiskLayout::Raw);
+    let raw = matches!(
+        check_disk(storage, number, serial, identity)?,
+        DiskLayout::Raw
+    );
     let started = Instant::now();
     storage.make_writable()?;
     let native_attributes_ms = started.elapsed().as_millis() as u64;
@@ -339,7 +468,10 @@ pub fn prepare_cache_with_serial(
     if raw {
         storage.initialize_raw()?;
         powershell_ms = started.elapsed().as_millis() as u64;
-        if !matches!(check_disk(storage, number, serial)?, DiskLayout::Gpt(_)) {
+        if !matches!(
+            check_disk(storage, number, serial, identity)?,
+            DiskLayout::Gpt(_)
+        ) {
             return Err(io::Error::other("cache initialization did not create GPT"));
         }
     }
@@ -560,6 +692,7 @@ mod tests {
 
     struct FakeStorage {
         serial: String,
+        identity: DiskIdentity,
         windows_disks: Vec<u32>,
         layout: DiskLayout,
         volumes: Vec<CacheVolume>,
@@ -570,6 +703,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 serial: CACHE_DISK_SERIAL.into(),
+                identity: DiskIdentity::default(),
                 windows_disks: vec![0],
                 layout: DiskLayout::Gpt(vec![PartitionKind::Reserved, PartitionKind::BasicData]),
                 volumes: vec![CacheVolume {
@@ -596,9 +730,123 @@ mod tests {
         assert!(prepare_cache_with_serial(&mut storage, 7, "hyperv-stable-serial").is_ok());
         assert_eq!(storage.mutations, 1);
     }
+
+    // What the Ally's Hyper-V job VM actually reported: an empty serial and an
+    // empty product id. The old code refused it before any write, which is the
+    // failure this identity path exists to replace.
+    fn nameless_hyperv_identity() -> DiskIdentity {
+        DiskIdentity {
+            serial: String::new(),
+            product_id: String::new(),
+            descriptor_version: 0x28,
+            geometry_bytes: 5_242_880,
+        }
+    }
+
+    #[test]
+    fn nameless_hyperv_disk_is_prepared_instead_of_refused_for_its_missing_serial() {
+        let identity = nameless_hyperv_identity();
+        assert!(identity.is_nameless());
+        let mut storage = FakeStorage {
+            identity,
+            ..Default::default()
+        };
+        assert!(prepare_cache_with_identity(&mut storage, 7, &nameless_hyperv_identity()).is_ok());
+        assert_eq!(storage.mutations, 1);
+        // The serial path still refuses the same disk, so the log records which
+        // identity a build relied on.
+        let mut serial_path = FakeStorage::default();
+        assert!(prepare_cache_with_serial(&mut serial_path, 7, "").is_err());
+        assert_eq!(serial_path.mutations, 0);
+    }
+
+    #[test]
+    fn mismatched_hyperv_disk_identity_is_refused_before_any_cache_write() {
+        let expected = nameless_hyperv_identity();
+        for change in [
+            DiskIdentity {
+                serial: "other-serial".into(),
+                ..expected.clone()
+            },
+            DiskIdentity {
+                product_id: "Virtual HD".into(),
+                ..expected.clone()
+            },
+            DiskIdentity {
+                descriptor_version: 0x30,
+                ..expected.clone()
+            },
+            DiskIdentity {
+                geometry_bytes: 10_485_760,
+                ..expected.clone()
+            },
+        ] {
+            let mut storage = FakeStorage {
+                identity: change.clone(),
+                ..Default::default()
+            };
+            let Err(failure) = prepare_cache_with_identity(&mut storage, 7, &expected) else {
+                panic!("{change:?} was accepted");
+            };
+            assert!(
+                failure
+                    .to_string()
+                    .starts_with("cache disk identity changed:"),
+                "{failure}"
+            );
+            assert_eq!(storage.mutations, 0, "{change:?} was written");
+            assert_eq!(storage.formats, 0, "{change:?} was formatted");
+        }
+    }
+
+    #[test]
+    fn named_disk_cannot_stand_in_for_the_nameless_hyperv_disk() {
+        // A virtio disk moved into the Hyper-V slot reports a serial; the
+        // profile that expects a nameless disk must refuse it, not adopt it.
+        let expected = nameless_hyperv_identity();
+        let named = DiskIdentity {
+            serial: "motor-cache".into(),
+            ..expected.clone()
+        };
+        let mut storage = FakeStorage {
+            serial: "motor-cache".into(),
+            identity: named.clone(),
+            ..Default::default()
+        };
+        let Err(failure) = prepare_cache_with_identity(&mut storage, 7, &named) else {
+            panic!("a named disk was accepted as the Hyper-V cache");
+        };
+        assert_eq!(
+            failure.to_string(),
+            "cache disk identity is not nameless: Hyper-V cache disk identity: source=serial \
+             serial=\"motor-cache\" product_id=\"\" descriptor_version=40 geometry_bytes=5242880 \
+             nameless=false"
+        );
+        assert_eq!(storage.mutations, 0);
+    }
+
+    #[test]
+    fn identity_log_names_every_field_the_guest_read() {
+        let line = disk_identity_log(&nameless_hyperv_identity());
+        assert_eq!(
+            line,
+            "Hyper-V cache disk identity: source=device_fields serial=\"\" product_id=\"\" \
+             descriptor_version=40 geometry_bytes=5242880 nameless=true"
+        );
+        assert!(
+            disk_identity_log(&DiskIdentity {
+                serial: "serial\nwith-control".into(),
+                ..DiskIdentity::default()
+            })
+            .contains("serial=\"serial with-control\"")
+        );
+    }
     impl CacheStorage for FakeStorage {
         fn serial(&mut self) -> io::Result<String> {
             Ok(self.serial.clone())
+        }
+        fn identity(&mut self) -> io::Result<DiskIdentity> {
+            Ok(self.identity.clone())
         }
         fn windows_disks(&mut self) -> io::Result<Vec<u32>> {
             Ok(self.windows_disks.clone())
@@ -908,8 +1156,10 @@ mod tests {
             .unwrap()
             .0;
         let first_write = body.find("IOCTL_DISK_CREATE_DISK").unwrap();
+        // The identity the guest read at selection, re-read through the same
+        // held handle: a disk swapped for another one is refused here.
         for guard in [
-            "disk_serial(&self.disk",
+            "disk_identity(&self.disk",
             "self.windows_disks()?",
             "require_uninitialized(self.layout()?)",
         ] {

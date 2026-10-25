@@ -839,8 +839,9 @@ mod guest {
             #[cfg(feature = "hyperv-runner")]
             let disk = {
                 let mut storage = crate::storage::WindowsStorage::open(number, reporter)?;
-                let serial = storage.capture_serial()?;
-                motor_winagent::cache::prepare_cache_with_serial(&mut storage, number, &serial)?
+                let identity = storage.capture_identity()?;
+                diagnostic!("{}", motor_winagent::cache::disk_identity_log(&identity));
+                motor_winagent::cache::prepare_cache_with_identity(&mut storage, number, &identity)?
             };
             let volume = disk.volume;
             if !volume.starts_with("\\\\?\\Volume{")

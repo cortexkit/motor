@@ -1,7 +1,7 @@
 //! Native queries for the sealed VM's RAW or GPT cache disk.
 
 use motor_winagent::cache::{
-    BASIC_DATA_PARTITION, CACHE_DISK_SERIAL, CacheStorage, CacheVolume, DiskLayout,
+    BASIC_DATA_PARTITION, CACHE_DISK_SERIAL, CacheStorage, CacheVolume, DiskIdentity, DiskLayout,
     cache_partition, partition_kind, require_uninitialized, storage_serial,
 };
 use motor_winagent::cache_steps::{CacheReporter, CacheStep};
@@ -170,6 +170,47 @@ fn disk_serial(disk: &Handle, reporter: &CacheReporter) -> io::Result<String> {
     )?;
     storage_serial(&bytes).map(str::to_owned)
 }
+/// Everything the device itself reports about the disk, in one pass over the
+/// same queries the serial path made. A Hyper-V synthetic disk reports no
+/// serial at all, so the remaining fields have to be read from the same
+/// descriptor rather than looked up separately.
+fn disk_identity(disk: &Handle, reporter: &CacheReporter) -> io::Result<DiskIdentity> {
+    let bytes = query(
+        disk,
+        IOCTL_STORAGE_QUERY_PROPERTY,
+        &[0; 12],
+        reporter,
+        CacheStep::DiskSerial,
+    )?;
+    let product = u32::from_le_bytes(
+        bytes
+            .get(16..20)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or_else(|| invalid("truncated storage device descriptor"))?,
+    );
+    let geometry = query(
+        disk,
+        IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+        &[],
+        reporter,
+        CacheStep::DiskGeometry,
+    )?;
+    // The driver returns a fixed header (disk size, geometry, partition-table
+    // length) followed by that many partition-table bytes and any trailing
+    // extra. The total length is therefore the device's whole reported
+    // geometry, which changes whenever the disk behind the number does.
+    Ok(DiskIdentity {
+        serial: storage_serial(&bytes)?.to_owned(),
+        product_id: descriptor_string(&bytes, product)?,
+        descriptor_version: u32::from_le_bytes(
+            bytes
+                .get(4..8)
+                .and_then(|slice| slice.try_into().ok())
+                .ok_or_else(|| invalid("truncated storage device descriptor"))?,
+        ),
+        geometry_bytes: geometry.len() as u64,
+    })
+}
 /// Send one fixed-size input structure to a disk control code that returns
 /// nothing. These calls change the partition table, so errors name the change.
 fn control<T>(handle: &Handle, code: u32, input: &T, what: &str) -> io::Result<()> {
@@ -248,7 +289,7 @@ fn extents(volume: &str, reporter: &CacheReporter) -> io::Result<Vec<u32>> {
 
 pub struct WindowsStorage {
     #[cfg(feature = "hyperv-runner")]
-    expected_serial: String,
+    expected_identity: DiskIdentity,
     disk: Handle,
     number: u32,
     reporter: CacheReporter,
@@ -257,7 +298,7 @@ impl WindowsStorage {
     pub fn open(number: u32, reporter: &CacheReporter) -> io::Result<Self> {
         Ok(Self {
             #[cfg(feature = "hyperv-runner")]
-            expected_serial: CACHE_DISK_SERIAL.to_owned(),
+            expected_identity: DiskIdentity::default(),
             disk: Handle::open(
                 &format!("\\\\.\\PhysicalDrive{number}"),
                 GENERIC_READ | GENERIC_WRITE,
@@ -268,23 +309,34 @@ impl WindowsStorage {
             reporter: reporter.clone(),
         })
     }
+    /// Read what the device reports and pin it as this disk's identity.
+    /// `make_writable` and `initialize_raw` compare against it through the
+    /// same held handle before writing, so a disk swapped for another one
+    /// under the running guest is refused rather than written.
     #[cfg(feature = "hyperv-runner")]
-    pub fn capture_serial(&mut self) -> io::Result<String> {
-        let serial = disk_serial(&self.disk, &self.reporter)?;
-        if serial.trim().is_empty() || serial.len() > 256 {
-            return Err(invalid("Hyper-V cache lacks a bounded serial"));
+    pub fn capture_identity(&mut self) -> io::Result<DiskIdentity> {
+        let identity = disk_identity(&self.disk, &self.reporter)?;
+        // This profile runs on disks that report no name of their own, so an
+        // unexpected serial or product id means a different device, not a
+        // cache. Detached disks are no longer filtered by the volume mount
+        // manager before this check, and this is what still refuses them.
+        if !identity.is_nameless() {
+            return Err(invalid("Hyper-V cache disk reports a device name"));
         }
-        self.expected_serial.clone_from(&serial);
-        Ok(serial)
+        self.expected_identity = identity.clone();
+        Ok(identity)
     }
-    fn expected_serial(&self) -> &str {
+    fn expected_identity(&self) -> DiskIdentity {
         #[cfg(feature = "hyperv-runner")]
         {
-            &self.expected_serial
+            self.expected_identity.clone()
         }
         #[cfg(not(feature = "hyperv-runner"))]
         {
-            CACHE_DISK_SERIAL
+            DiskIdentity {
+                serial: CACHE_DISK_SERIAL.to_owned(),
+                ..DiskIdentity::default()
+            }
         }
     }
     fn attributes(&self) -> io::Result<u64> {
@@ -412,6 +464,10 @@ impl CacheStorage for WindowsStorage {
         disk_serial(&self.disk, &self.reporter)
     }
 
+    fn identity(&mut self) -> io::Result<DiskIdentity> {
+        disk_identity(&self.disk, &self.reporter)
+    }
+
     fn windows_disks(&mut self) -> io::Result<Vec<u32>> {
         let mut directory = [0u16; 32768];
         let length = self.reporter.step(CacheStep::WindowsDirectory, || {
@@ -502,8 +558,8 @@ impl CacheStorage for WindowsStorage {
     }
 
     fn make_writable(&mut self) -> io::Result<()> {
-        if disk_serial(&self.disk, &self.reporter)? != self.expected_serial() {
-            return Err(invalid("cache disk serial changed"));
+        if disk_identity(&self.disk, &self.reporter)? != self.expected_identity() {
+            return Err(invalid("cache disk identity changed"));
         }
         let mask = DISK_ATTRIBUTE_OFFLINE | DISK_ATTRIBUTE_READ_ONLY;
         if self.attributes()? & mask != 0 {
@@ -535,13 +591,13 @@ impl CacheStorage for WindowsStorage {
         let reporter = self.reporter.clone();
         reporter.step(CacheStep::InitializeRaw, || {
             let deadline = Instant::now() + Duration::from_secs(30);
-            // Recheck the serial and RAW layout through the held handle, and
+            // Recheck the identity and RAW layout through the held handle, and
             // confirm the disks running Windows exclude this disk, immediately
             // before the first write. A disk that already has a partition
             // table (including one left by an interrupted initialization) is
             // refused; the host then discards it.
-            if disk_serial(&self.disk, &reporter)? != self.expected_serial() {
-                return Err(invalid("cache disk serial changed"));
+            if disk_identity(&self.disk, &reporter)? != self.expected_identity() {
+                return Err(invalid("cache disk identity changed"));
             }
             let windows = self.windows_disks()?;
             if windows.is_empty() || windows.contains(&self.number) {
