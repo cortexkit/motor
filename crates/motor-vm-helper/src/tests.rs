@@ -338,7 +338,23 @@ fn config_requires_an_explicit_safe_uplink_and_public_ipv4() {
         broken.as_object_mut().unwrap().remove(missing);
         assert!(serde_json::from_value::<crate::config::Config>(broken).is_err());
     }
-    for uplink in ["", "lo", "..", "mtap*", "eno1\";accept", "0123456789012345"] {
+    for uplink in [
+        "",
+        "lo",
+        "any",
+        "..",
+        "-eno1",
+        ".eno1",
+        "_eno1",
+        "eno1:0",
+        "eno/1",
+        "en o1",
+        "eno\t1",
+        "enö1",
+        "mtap*",
+        "eno1\";accept",
+        "0123456789012345",
+    ] {
         let mut broken = value.clone();
         broken["uplink"] = uplink.into();
         let config: crate::config::Config = serde_json::from_value(broken).unwrap();

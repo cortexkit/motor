@@ -704,7 +704,7 @@ impl Backend for LinuxTenants {
         let jail = Path::new(super::BUILD_ROOT).join(format!("jail/tenants/{tenant}"));
         Ok(self.groups.join(tenant).exists() || jail.exists())
     }
-    fn remove(&mut self, tenant: &str, r: &Registry) -> Result<PathBuf> {
+    fn remove(&mut self, tenant: &str, _r: &Registry) -> Result<PathBuf> {
         let paths = crate::removal::Paths::live();
         let _lock = crate::removal::lock(&paths)?;
         let unix_s = std::time::SystemTime::now()
@@ -712,12 +712,7 @@ impl Backend for LinuxTenants {
             .unwrap_or_default()
             .as_secs();
         let quarantine = crate::removal::begin(&paths, tenant, unix_s)?;
-        // Reconcile the firewall over every other tenant: that drops this
-        // tenant's chains, counter and UFW route grant and leaves the rest.
-        let remaining = tenant_network::without(self.registries()?, r);
-        tenant_network::install(&remaining, &self.config)?;
-        tenant_network::remove_tap(r)?;
-        crate::removal::finish(&paths, tenant, &quarantine)?;
+        crate::removal::finish_with_network(&paths, tenant, &quarantine, tenant_network::remove)?;
         eprintln!(
             "tenant {tenant}: removed records and network; data quarantined at {} until purge",
             quarantine.display()
@@ -730,7 +725,18 @@ impl Backend for LinuxTenants {
         let Some(quarantine) = crate::removal::pending(&paths, tenant)? else {
             return Ok(None);
         };
-        crate::removal::finish(&paths, tenant, &quarantine)?;
+        crate::removal::finish_with_network(&paths, tenant, &quarantine, |registry| {
+            if self
+                .registries()?
+                .iter()
+                .any(|current| current.tap_index == registry.tap_index)
+            {
+                return Err(Error(
+                    "cannot replay removal: tenant TAP index has been reassigned".into(),
+                ));
+            }
+            tenant_network::remove(registry)
+        })?;
         eprintln!(
             "tenant {tenant}: completed an interrupted removal; data quarantined at {}",
             quarantine.display()

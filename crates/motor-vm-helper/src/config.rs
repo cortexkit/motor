@@ -122,6 +122,8 @@ impl Config {
 }
 pub(crate) fn valid_uplink(value: &str) -> bool {
     (1..=15).contains(&value.len())
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value != "any"
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))

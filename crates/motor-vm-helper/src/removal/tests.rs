@@ -56,6 +56,32 @@ fn scratch() -> Scratch {
 }
 
 #[test]
+fn interrupted_removal_replays_network_before_finishing_saved_records() {
+    let s = scratch();
+    let p = &s.paths;
+    let registry = crate::tenant::tests::registry("a");
+    fs::write(p.registry_file("a"), serde_json::to_vec(&registry).unwrap()).unwrap();
+    let quarantine = begin(p, "a", 1234).unwrap();
+    fs::remove_file(p.registry_file("a")).unwrap();
+    assert_eq!(pending(p, "a").unwrap(), Some(quarantine.clone()));
+    let mut cleaned = false;
+    finish_with_network(p, "a", &quarantine, |saved| {
+        assert_eq!(saved.tap_index, 1);
+        assert!(p.home("a").exists());
+        cleaned = true;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        cleaned,
+        "resume must not finish records while owned network resources survive"
+    );
+    assert!(!p.home("a").exists());
+    assert!(quarantine.join("home").exists());
+    assert!(p.home("b").exists());
+}
+
+#[test]
 fn layout_matches_the_list_the_provisioning_script_removes() {
     let pinned: serde_json::Value = serde_json::from_str(include_str!(
         "../../../../script/tenant-provision/removal-layout.json"

@@ -93,6 +93,17 @@ offline operator update before the new helper starts; the helper does not accept
 two spellings or migrate live disk records automatically. Do not change ownership
 of the whole `/srv/build` tree to work around the helper's trust checks.
 
+Tenant removal is cleanup, not a network admission. It fences the selected TAP
+and deletes only its helper-owned chains/counter, membership and comment-owned
+UFW grant, using the grant's saved direction even if the uplink is missing.
+Interrupted removal replays that cleanup before finishing saved records. Normal
+policy reconciliation preserves healthy ready gates; new and unready gates stay
+closed until final uplink validation. Failure of either the initial or final
+uplink validation fences every
+affected gate. Rules bind to interface names;
+a same-name replacement inherits them, and root-only interface renames are
+outside this boundary.
+
 The socket is `/run/motor-vm-helper.sock`, `root:<socket_gid>`, mode `0660`.
 Only uids listed in the config are admitted, checked with `SO_PEERCRED`.
 

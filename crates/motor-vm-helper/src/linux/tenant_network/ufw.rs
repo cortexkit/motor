@@ -297,10 +297,78 @@ pub(super) fn reconcile(registries: &[Registry], prior: &State, uplink: &str) ->
     Ok(state)
 }
 
+fn removal_uplinks(text: &str, target: u8) -> Result<BTreeSet<String>> {
+    let comment = format!("motor-tenant-mtap{target}");
+    let encoded_comment: String = comment.bytes().map(|byte| format!("{byte:02x}")).collect();
+    let mut result = BTreeSet::new();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let Some(tuple) = line.strip_prefix("### tuple ### ") else {
+            continue;
+        };
+        let words: Vec<_> = tuple.split_whitespace().collect();
+        let Some(encoded) = words.iter().find_map(|word| word.strip_prefix("comment=")) else {
+            continue;
+        };
+        if !encoded.eq_ignore_ascii_case(&encoded_comment) {
+            continue;
+        }
+        let prefix = format!("in_mtap{target}!out_");
+        let uplink = words
+            .get(6)
+            .and_then(|value| value.strip_prefix(&prefix))
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 15
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            })
+            .ok_or_else(|| Error("malformed owned removal direction".into()))?;
+        let rule = lines
+            .find(|line| !line.trim().is_empty())
+            .ok_or_else(|| Error("owned UFW tuple has no rule".into()))?;
+        let owned = parse_owned(&format!("{line}\n{rule}\n"), false, uplink)?;
+        if owned != BTreeSet::from([target]) || !result.insert(uplink.into()) {
+            return Err(Error("ambiguous tenant UFW removal grant".into()));
+        }
+    }
+    Ok(result)
+}
+
+pub(super) fn remove_owned(index: u8) -> Result<()> {
+    if !Path::new("/etc/ufw/user.rules").exists() {
+        return Ok(());
+    }
+    // The saved, comment-owned tuple supplies the old interface spelling. Its
+    // existence, address and current configured uplink are irrelevant to deletion.
+    for uplink in removal_uplinks(&read_policy("/etc/ufw/user.rules")?, index)? {
+        let args = arguments(index, true, &uplink);
+        command(
+            "/usr/sbin/ufw",
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?;
+    }
+    if !removal_uplinks(&read_policy("/etc/ufw/user.rules")?, index)?.is_empty() {
+        return Err(Error("owned UFW removal grant survived deletion".into()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     const CAPTURE: &str = "### tuple ### route:allow any any 0.0.0.0/0 any 10.200.1.2 in_mtap1!out_enp6s0 comment=6d6f746f722d74656e616e742d6d74617031\n-A ufw-user-forward -i mtap1 -o enp6s0 -s 10.200.1.2 -j ACCEPT\n";
+    #[test]
+    fn cleanup_uses_only_the_owned_comment_and_saved_direction_even_if_uplink_is_gone() {
+        let gone = CAPTURE.replace("enp6s0", "gone0");
+        assert_eq!(removal_uplinks(&gone, 1).unwrap(), ["gone0".into()].into());
+        assert!(removal_uplinks(&gone, 2).unwrap().is_empty());
+        let foreign = gone.replace("6d6f746f722d74656e616e742d6d74617031", "666f726569676e");
+        assert!(removal_uplinks(&foreign, 1).unwrap().is_empty());
+        assert!(removal_uplinks(&gone.replace("10.200.1.2", "10.200.2.2"), 1).is_err());
+        assert_eq!(arguments(1, true, "gone0")[9], "gone0");
+    }
     #[test]
     fn alternate_uplink_is_used_for_owned_tuples_live_rules_and_commands() {
         let capture = CAPTURE.replace("enp6s0", "eno1");

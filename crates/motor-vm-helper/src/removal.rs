@@ -203,6 +203,22 @@ pub fn finish(paths: &Paths, tenant: &str, quarantine: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Replay network cleanup from the saved registry before finishing either a
+/// normal removal or an interrupted one. Records never outrun network cleanup.
+pub fn finish_with_network(
+    paths: &Paths,
+    tenant: &str,
+    quarantine: &Path,
+    cleanup: impl FnOnce(&crate::tenant::Registry) -> Result<()>,
+) -> Result<()> {
+    let registry: crate::tenant::Registry =
+        serde_json::from_slice(&fs::read(quarantine.join("records/registry.json"))?)
+            .map_err(|e| Error(e.to_string()))?;
+    registry.validate(tenant)?;
+    cleanup(&registry)?;
+    finish(paths, tenant, quarantine)
+}
+
 /// A removal whose records are already gone but whose home was not yet moved:
 /// the newest quarantine folder for this tenant that has saved records and
 /// no `home`, while the tenant's home still exists.
