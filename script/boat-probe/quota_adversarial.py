@@ -167,6 +167,64 @@ print(json.dumps(dict(job_running=running, allocated_bytes=allocated, retained_t
 '''
 
 
+def retained_release(observation, wait_seconds=90, state='/var/lib/motor-boat/state/boat'):
+    """Let the retained-target job finish after the sandbox resumed.
+
+    The job holds its at-limit barrier so its target is still live while Boat
+    archives the sandbox. A Boat resume restores memory (same boot id), so the
+    job and its unit survive the stop and keep holding; the runner then
+    rightly treats the workspace as in use and never evicts it. This writes the
+    barrier's release byte, the same one the observer writes for other lanes,
+    and waits for the runner to record the job's end and its unit to stop.
+    The job keeps its fill (QUOTA_LANE retained_target), so what remains is an
+    idle workspace holding a quota-sized target."""
+    return ('OBSERVATION=' + repr(observation) + '\nWAIT_SECONDS=' + repr(wait_seconds)
+            + '\nSTATE=' + repr(state) + '\n' + r'''
+import json, os, pathlib, subprocess, time, uuid
+job_id = str(uuid.UUID(OBSERVATION['job_id']))
+state = pathlib.Path(STATE)
+marker = state/'sandboxes'/job_id/'home'/'tmp'/'boat-quota-at-limit.json'
+def record():
+    try:
+        return json.loads((state/'jobs'/job_id/'record.json').read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+def unit_active(job):
+    unit = (job.get('process') or {}).get('unit')
+    if not unit:
+        return False
+    name = 'motor-job-' + str(uuid.UUID(unit)) + '.service'
+    return subprocess.run(['systemctl', 'is-active', '--quiet', name], timeout=5).returncode == 0
+started = time.monotonic()
+before = record()
+result = dict(job_id=job_id, marker=str(marker), terminal_before=before.get('terminal') is not None,
+              unit_active_before=unit_active(before), released=False)
+try:
+    report = json.loads(marker.read_bytes().decode().strip() or '{}')
+except FileNotFoundError:
+    result['marker_error'] = 'absent'
+except ValueError as error:
+    result['marker_error'] = 'not the published at-limit report: ' + str(error)
+else:
+    if report.get('probe_token') != OBSERVATION['probe_token'] or report.get('phase') != 'at-limit':
+        result['marker_error'] = 'marker belongs to another probe or phase'
+    else:
+        with marker.open('r+b', buffering=0) as barrier:
+            barrier.write(b'!')
+            os.fsync(barrier.fileno())
+        result['released'] = True
+job = before
+while time.monotonic() - started < WAIT_SECONDS:
+    job = record()
+    if job.get('terminal') is not None and not unit_active(job):
+        break
+    time.sleep(1)
+result.update(job_terminal=job.get('terminal') is not None, unit_active=unit_active(job),
+              terminal=job.get('terminal'), seconds=round(time.monotonic() - started, 3))
+print(json.dumps(result))
+''')
+
+
 def resume_eviction_source(workspace, cursor):
     return 'WORKSPACE=' + repr(workspace) + '\nCURSOR=' + repr(cursor) + '\n' + r'''
 import json, os, re, subprocess

@@ -929,14 +929,64 @@ def parity_passed(report):
 def root_paths_source():
     # Like the parity check, run the operator checkout's rule (the one the image
     # recipes enforce at build time) against the live filesystem in every phase.
-    return ("import json\nscope = {'__name__': 'root_paths'}\n"
+    # Every offender is grouped by owner and package directory before the
+    # report keeps only the first REPORTED, so a failure says whose files they
+    # are and where, not just the first twenty paths.
+    return ("import json, collections, pathlib, re\nscope = {'__name__': 'root_paths'}\n"
             f"exec({ROOT_PATHS_SCRIPT.read_text()!r}, scope)\n"
-            "print(json.dumps(scope['check'](scope['BOAT_ROOTS'], "
-            "provider_files=scope['BOAT_PROVIDER_RESTORED'])))\n")
+            "report = scope['check'](scope['BOAT_ROOTS'], provider_files=scope['BOAT_PROVIDER_RESTORED'], limit=None)\n"
+            "groups = collections.Counter()\n"
+            "for offender in report['offenders']:\n"
+            "    path, _, detail = offender.partition(': ')\n"
+            "    owner = re.match(r'uid=\\d+', detail)\n"
+            f"    groups[(str(pathlib.PurePosixPath(*pathlib.PurePosixPath(path).parts[:{ROOT_PATHS_GROUP_PARTS}])), "
+            "owner.group(0) if owner else 'mode')] += 1\n"
+            "report['offender_groups'] = [dict(directory=d, owner=o, count=c) for (d, o), c in groups.most_common(10)]\n"
+            "report['offenders'] = report['offenders'][:scope.get('REPORTED', 20)]\n"
+            "print(json.dumps(report))\n")
+
+
+# Path components an offender is grouped by: /usr/local/lib/node_modules/<package>.
+ROOT_PATHS_GROUP_PARTS = 6
+# Pause before re-walking a failed root-owned path check.
+ROOT_PATHS_REWALK_SECONDS = 30
+# Boat's sandbox account, which owns Boat's base /usr/local and the files Boat's
+# agent restores (script/boat-image/install.py BOAT_BASE_UID).
+BOAT_SANDBOX_UID = 1000
+
+
+def root_paths_reason(report, kernel=None, rewalk=None, rewalk_seconds=ROOT_PATHS_REWALK_SECONDS):
+    """A failure reason that names whose files broke the rule and where."""
+    count = report.get('offender_count')
+    groups = report.get('offender_groups') or []
+    head = f"{count} path(s) root executes from are not root-owned without group/other write"
+    if groups and all(group.get('owner') == f'uid={BOAT_SANDBOX_UID}' for group in groups):
+        head = (f"boat_sandbox_account_owns_root_paths: {count} path(s) root executes from are owned by uid "
+                f"{BOAT_SANDBOX_UID}, Boat's sandbox account, not root; the image installs them root-owned, so the "
+                f"sandbox's files differ from the image's")
+    persistence = ''
+    if isinstance(rewalk, dict):
+        persistence = (f"; a re-walk {rewalk_seconds} s later found {rewalk.get('offender_count')} offender(s) in "
+                       f"{rewalk.get('entries')} entries (first walk: {report.get('entries')} entries)")
+    return (f"{head}; by directory and owner: {[(g.get('directory'), g.get('owner'), g.get('count')) for g in groups]}"
+            f"; guest kernel {kernel or 'unmeasured'}{persistence}; first: {report.get('offenders')}")
 
 
 def root_paths_passed(report):
     return report.get('offender_count') == 0 and report.get('offenders') == [] and report.get('entries', 0) > 0
+
+
+def parity_job_check(parsed):
+    """(passed, evidence, reason) for the in-job toolchain parity job. A job
+    the runner refused, or one that printed no report, is a failed check that
+    says so, not a JSON decode error that ends the phase."""
+    if parsed.get('code') == 0:
+        try:
+            report = json.loads(parsed.get('stdout') or '')
+        except ValueError as error:
+            return False, parsed, f'toolchain parity job exited 0 without a JSON report: {error}'
+        return parity_passed(report), report, None
+    return False, parsed, lifecycle_failure(parsed, 0)
 
 
 # vCPUs a probe job asks for, by job name, when it needs a fixed count. A job not listed
@@ -1448,9 +1498,16 @@ class RunnerHost:
                 sid, "sudo -n /usr/bin/python3 -c " + shlex.quote(parity_source(cargo_seed_sha256=self.probe.cargo_seed_sha256)))['stdout'])
             self.check(label + '.toolchain_parity', parity_passed(record['toolchain_parity']), record['toolchain_parity'])
             record['root_owned_paths'] = json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(root_paths_source()))['stdout'])
+            if not root_paths_passed(record['root_owned_paths']):
+                # Walk once more after a pause: whether the owners persist or
+                # clear tells a provider rewrite from a restore still settling.
+                # The verdict stays on the first walk either way.
+                time.sleep(ROOT_PATHS_REWALK_SECONDS)
+                record['root_owned_paths_rewalk'] = json.loads(self.execute(
+                    sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(root_paths_source()))['stdout'])
             self.check(label + '.root_owned_paths', root_paths_passed(record['root_owned_paths']), record['root_owned_paths'],
-                       reason=f"{record['root_owned_paths'].get('offender_count')} path(s) root executes from are not root-owned "
-                              f"without group/other write; first: {record['root_owned_paths'].get('offenders')}")
+                       reason=root_paths_reason(record['root_owned_paths'], record.get('kernel_release'),
+                                                record.get('root_owned_paths_rewalk'), ROOT_PATHS_REWALK_SECONDS))
             listeners = host["listeners"]["stdout"]
             self.check(label + ".bridge_loopback_only", f"127.0.0.1:{PORT}" in listeners and
                        not any(s in listeners for s in (f"0.0.0.0:{PORT}", f"[::]:{PORT}", f"*:{PORT}")), host["listeners"])
@@ -1512,8 +1569,8 @@ class RunnerHost:
                         if first_started is not None and name == 'node_modules_first' and parsed['code'] == 0 and 'boat-node-modules' in parsed['stdout']:
                             self.data["snapshot_create_to_first_job_seconds"] = time.monotonic() - first_started
                         if name == 'job_toolchain_parity':
-                            report = json.loads(parsed['stdout'])
-                            self.check(label + '.' + name, parsed['code'] == 0 and parity_passed(report), report)
+                            passed, report, reason = parity_job_check(parsed)
+                            self.check(label + '.' + name, passed, report, reason=reason)
                         elif name == 'offline_cargo_seed':
                             report = json.loads(parsed['stdout']) if parsed['code'] == 0 else parsed
                             self.check(label + '.' + name, parsed['code'] == 0 and report.get('passed') is True, report)
@@ -1821,6 +1878,9 @@ class RunnerHost:
             self.data['disk_quota']['resume'] = self.probe.request('POST', f'/sandboxes/{sid}/resume', {})
             self.probe.wait_sandbox(sid, READY)
             self.probe.wait_hydrated(sid)
+        self.release_retained_job(sid)
+        # Readiness is timed from the moment the workspace became idle: while
+        # the retained job held it, the runner was right to keep its target.
         resumed = self.phase(sid, 'resumed', directory, public, repository, client, hydrated_at=time.monotonic())
         self.check_job('disk_quota.normal_job_after_stop_resume', resumed['node_modules_first']['result'], 0, marker='boat-node-modules')
         with self.section('cleanup_replay'):
@@ -1831,6 +1891,30 @@ class RunnerHost:
         with self.phase_evidence(sid, record):
             record.update(json.loads(self.execute(sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(DEFERRED_CLEANUP_REPLAY))['stdout']))
             self.check('deferred_cleanup_replay.no_mount_over_live_workspace', cleanup_replay_checks(record), record)
+
+    def release_retained_job(self, sid):
+        """End the retained-target job after resume so its workspace is idle.
+
+        Boat resumes a stopped sandbox from memory, so the job that held its
+        quota-sized target through the stop is still running and still holding
+        its barrier. Until it ends the runner must keep that workspace, the
+        sandbox stays below the admission floor and the endpoint stays unready;
+        the resumed eviction and readiness checks are about an idle target."""
+        import disk_quota
+        import quota_adversarial
+        row = self.data['disk_quota']['lanes'][disk_quota.RETAINED_LANE]
+        with self.section('release_retained_job'):
+            release = row['release_after_resume'] = self.guest_json(
+                sid, 'sudo -n /usr/bin/python3 -c ' + shlex.quote(quota_adversarial.retained_release(row['at_limit'])),
+                'retained job release after resume', timeout=150)
+            ended = disk_quota.retained_release_passed(release)
+            reason = None if ended else (
+                'the retained-target job did not end after its barrier was released: '
+                + json.dumps({key: release.get(key) for key in ('released', 'marker_error', 'job_terminal',
+                                                                 'unit_active', 'terminal_before', 'seconds')}))
+            self.check('disk_quota.retained_job_ended_after_resume', ended, release, reason=reason)
+            if not ended:
+                raise ValueError('disk_quota.retained_job_ended_after_resume: ' + reason)
 
     def disk_quota(self, sid, directory, public, repository, client):
         import disk_quota
@@ -1843,10 +1927,18 @@ class RunnerHost:
     def quota_reclaimed(self, storage):
         import disk_quota
         record = self.data['disk_quota']
-        before = record.get('lanes', {}).get(disk_quota.RETAINED_LANE, {}).get('pre_stop_storage', {})
-        evidence = record['resumed_backing_allocation'] = {'before': before, 'after': storage}
-        self.check('disk_quota.backing_allocation_dropped_after_resume',
-                   disk_quota.backing_allocation_dropped(before, storage), evidence)
+        row = record.get('lanes', {}).get(disk_quota.RETAINED_LANE, {})
+        before = row.get('pre_stop_storage', {})
+        retained = (row.get('at_limit') or {}).get('retained_allocated_bytes')
+        evidence = record['resumed_backing_allocation'] = {'before': before, 'after': storage, 'retained_allocated_bytes': retained}
+        passed = disk_quota.backing_allocation_dropped(before, storage, retained)
+        reason = None
+        if not passed:
+            blocks = [side.get('backing_allocated_blocks') for side in (before, storage)]
+            dropped = (blocks[0] - blocks[1]) * 512 if all(type(value) is int for value in blocks) else None
+            reason = (f'the backing file did not return the retained target to the root disk: allocation dropped by '
+                      f'{dropped} bytes; the evicted target held {retained} bytes (slack {disk_quota.RECLAIM_SLACK_BYTES})')
+        self.check('disk_quota.backing_allocation_dropped_after_resume', passed, evidence, reason=reason)
 
     def retained_stop_sample(self, sandbox, observation, argv, child):
         """Use pinned SSH because Boat rejects API exec while a sandbox is archiving."""
@@ -1897,9 +1989,12 @@ class RunnerHost:
                 evidence['wait'] = getattr(error, 'evidence', evidence['wait'])
                 evidence['last_sandbox'] = evidence['wait'].get('last_sandbox') or sandbox_lifecycle(
                     (record.get('stop') or {}).get('sandbox') or {})
-                reason = 'stop at quota limit did not complete: ' + json.dumps({
-                    'pre_stop_disk': evidence['pre_stop_disk'], 'last_sandbox': evidence['last_sandbox'],
-                    'error': evidence['error']})
+                progress = evidence['boat_stop_progress'] = disk_quota.stop_progress(
+                    evidence['wait'].get('samples', []), (record.get('stop') or {}).get('operation'))
+                reason = ('stop at quota limit did not complete: ' + disk_quota.stop_progress_reason(progress, evidence['wait'])
+                          + '; ' + json.dumps({
+                              'pre_stop_disk': evidence['pre_stop_disk'], 'last_sandbox': evidence['last_sandbox'],
+                              'error': evidence['error']}))
                 self.check('disk_quota.stop_with_quota_sized_target', False, evidence, reason=reason)
                 raise ValueError('disk_quota.stop_with_quota_sized_target: ' + reason) from error
             finally:
