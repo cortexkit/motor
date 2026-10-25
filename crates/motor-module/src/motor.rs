@@ -2844,6 +2844,10 @@ mod post_connect_tests;
 #[path = "cancel_delivery_tests.rs"]
 mod cancel_delivery_tests;
 
+#[cfg(test)]
+#[path = "cancel_provisioning_tests.rs"]
+mod cancel_provisioning_tests;
+
 fn incoming_cause(incoming: &io::Result<Incoming>) -> String {
     match incoming {
         Err(error) => error.to_string(),

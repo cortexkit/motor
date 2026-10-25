@@ -22,6 +22,9 @@ pub(crate) struct Boat {
     /// received a Run frame (the connection drops).
     pub strict_attach: Arc<AtomicBool>,
     pub hang_run: Arc<AtomicBool>,
+    /// While the broker holds a lease as provisioning, the runner keeps a Run
+    /// it receives without answering it: the booking is unplaced until the
+    /// broker grants it, and the job stays pending until the grant.
     pub hold_provisioning: Arc<AtomicBool>,
     pub reattach_unavailable: Arc<AtomicBool>,
     pub run_refusal: Arc<Mutex<Option<RunRefusal>>>,
@@ -47,6 +50,8 @@ impl Boat {
         let host = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = host.local_addr().unwrap().port();
         let runs = Arc::new(AtomicUsize::new(0));
+        let run_hold = Arc::new(AtomicBool::new(false));
+        let hold_connections = run_hold.clone();
         let attaches = Arc::new(AtomicUsize::new(0));
         let frames = Arc::new(Mutex::new(Vec::new()));
         let captured = frames.clone();
@@ -62,6 +67,7 @@ impl Boat {
         let task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = host.accept().await {
                 let runs = run_count.clone();
+                let hold_run = hold_connections.clone();
                 let attaches = attach_count.clone();
                 let strict = strict.clone();
                 let hang = hang.clone();
@@ -146,6 +152,9 @@ impl Boat {
                                 if drop_run {
                                     return;
                                 }
+                                if hold_run.load(Ordering::SeqCst) {
+                                    continue;
+                                }
                                 let refused = refusal.lock().unwrap().clone();
                                 if let Some(refused) = refused {
                                     let reply = if refused.after_accept {
@@ -227,7 +236,7 @@ impl Boat {
         let lost_reply = lost.clone();
         let mem_mib = Arc::new(AtomicU64::new(0));
         let token_mem = mem_mib.clone();
-        let hold_provisioning = Arc::new(AtomicBool::new(false));
+        let hold_provisioning = run_hold.clone();
         let hold = hold_provisioning.clone();
         let reattach_unavailable = Arc::new(AtomicBool::new(false));
         let unavailable = reattach_unavailable.clone();
