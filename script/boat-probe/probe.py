@@ -52,6 +52,20 @@ class ProbeError(Exception):
     pass
 
 
+def sandbox_lifecycle(item):
+    """Keep stop/snapshot diagnostics without connection URLs or login metadata."""
+    return {key: item[key] for key in ('id', 'state', 'error', 'health', 'healthReason', 'stop',
+                                     'snapshotAvailable', 'snapshotCompletedAt', 'snapshotVerifiedAt',
+                                     'lastSnapshotAttemptAt', 'lastSnapshotStatus') if key in item}
+
+
+class SandboxWaitTimeout(ProbeError):
+    def __init__(self, sid, states, seconds, polls, last):
+        self.evidence = {'sandbox_id': sid, 'expected_states': sorted(states), 'seconds': seconds,
+                         'polls': polls, 'last_sandbox': sandbox_lifecycle(last or {})}
+        super().__init__('timed out waiting for sandbox ' + sid + '; ' + json.dumps(self.evidence))
+
+
 class SnapshotSizeBound(ProbeError):
     """Boat rejected a smaller size for a snapshot saved on a larger one: it refused the
     create, or accepted it and then failed restoring the snapshot as too small."""
@@ -224,16 +238,19 @@ class Probe:
         return self.client.request(*args, **kwargs)
 
     def wait_sandbox(self, sid, states):
-        until = min(self.deadline, time.monotonic() + 900)
+        started = time.monotonic()
+        until = min(self.deadline, started + 900)
+        polls, item = 0, None
         while time.monotonic() < until:
             item = sandbox(self.request("GET", "/sandboxes/" + sid))
+            polls += 1
             if item.get("state") in states and ("archived" not in states or
                                                 (item.get("stop") or {}).get("status") == "completed"):
                 return item
             if item.get("state") in {"error", "cancelled"}:
                 raise ProbeError("sandbox entered failure state: " + json.dumps(item))
             time.sleep(2)
-        raise ProbeError("timed out waiting for sandbox " + sid)
+        raise SandboxWaitTimeout(sid, states, time.monotonic() - started, polls, item)
 
     def wait_hydrated(self, sid):
         while True:

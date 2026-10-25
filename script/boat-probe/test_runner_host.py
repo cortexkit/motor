@@ -1098,6 +1098,54 @@ class SectionTimingTests(unittest.TestCase):
 
 
 class RetainedQuotaSnapshotTests(unittest.TestCase):
+    def test_recorded_full_quota_stop_timeout_names_state_operation_and_disks(self):
+        from probe import Probe
+        recorded = json.loads(Path(__file__).with_name('fixtures').joinpath('full-quota-stops.json').read_text())
+        for size, count, backing_bytes in (('default', 390, 13225811968), ('large', 388, 51881713664)):
+            with self.subTest(size=size):
+                case = recorded[size]
+                sid = case['sandbox_id']
+                polls = []
+                for group in case['poll_groups']:
+                    state = {'id': sid, 'state': 'archiving', 'stop': case['stop_response']['operation'],
+                             **{key: value for key, value in group.items() if key != 'count'}}
+                    polls.extend([{'ok': True, 'type': 'sandbox.info', 'sandbox': state}] * group['count'])
+                self.assertEqual(len(polls), count)
+                client = Mock()
+                response = dict(case['stop_response'], sandbox=polls[0]['sandbox'])
+                client.request.side_effect = [response] + polls
+                probe = Probe(client, {'run_id': 'recorded-stop'}, Mock())
+                probe.deadline = 1800
+                runner = host.RunnerHost(probe)
+                record = {}
+                clock = [0.0]
+                def advance(_seconds):
+                    clock[0] += 901 / count
+                with patch('probe.time.monotonic', side_effect=lambda: clock[0]), patch('probe.time.sleep', side_effect=advance):
+                    with self.assertRaisesRegex(ValueError, '^disk_quota.stop_with_quota_sized_target:'):
+                        runner.stop_at_quota_limit(sid, record, case)
+                failure, = runner.data['checks']
+                self.assertEqual((failure['name'], failure['status']), ('disk_quota.stop_with_quota_sized_target', 'FAIL'))
+                wait = failure['evidence']['wait']
+                self.assertEqual(wait['polls'], count)
+                self.assertGreaterEqual(wait['seconds'], 900)
+                self.assertEqual(wait['last_sandbox']['state'], 'archiving')
+                self.assertEqual(wait['last_sandbox']['stop']['status'], 'pending')
+                self.assertIsNone(wait['last_sandbox']['stop']['lastAttemptAt'])
+                self.assertEqual(wait['last_sandbox']['lastSnapshotStatus'], case['poll_groups'][-1]['lastSnapshotStatus'])
+                self.assertEqual(failure['evidence']['response'], response)
+                disks = failure['evidence']['pre_stop_disk']
+                self.assertEqual(disks['root_free_bytes'], case['pre_stop']['root_free_bytes'])
+                self.assertEqual(disks['xfs_free_bytes'], case['pre_stop']['xfs_free_bytes'])
+                self.assertEqual(disks['backing_allocated_bytes'], backing_bytes)
+                for value in ('archiving', 'pending', case['stop_response']['operation']['id'],
+                              str(disks['root_free_bytes']), str(disks['xfs_free_bytes'])):
+                    self.assertIn(value, failure['reason'])
+                client.request.assert_any_call('POST', f'/sandboxes/{sid}/stop', {})
+                self.assertEqual(client.request.call_count, count + 1)
+                self.assertNotIn('stopped_with_retained_target', record)
+                self.assertEqual(runner.data['section_timings'][-1]['outcome'], 'error')
+
     def test_snapshot_stops_with_data_held_and_never_on_missing_charge(self):
         import disk_quota
         for valid in (True, False):

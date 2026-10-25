@@ -383,6 +383,15 @@ terminals. Stop must archive successfully, resume must hydrate, and the resumed
 phase must run a normal job. This is not merely a stop after unlinking the fill.
 Failure cleanup stops writers and removes only the disposable probe's fills,
 so a failed reserve qualification does not deliberately leave the sandbox full.
+If stop fails or does not complete within the existing 900-second wait (or the
+remaining run budget), `disk_quota.stop_with_quota_sized_target` is a named FAIL.
+`runner_host.disk_quota.stop_at_limit` records the accepted response, the last
+observed sandbox/stop/snapshot fields and poll count on timeout, and the
+**pre-stop** root/XFS free bytes, retained allocation and loop-file allocation.
+Those disk samples are not a measurement of snapshot peak space. A completed
+snapshot alone is not a completed stop: archival still requires sandbox state
+`archived` and `stop.status` `completed`. The portable regression replays both
+sizes' pending-stop observations in `fixtures/full-quota-stops.json`.
 
 Before the jobs, an unfiltered root control on the same XFS mount sets and clears
 project inheritance with FSSETXATTR and verifies the actual flag transition. The

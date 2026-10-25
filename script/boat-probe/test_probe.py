@@ -197,6 +197,27 @@ class ParsingTests(unittest.TestCase):
 
 
 
+class SandboxWaitTests(unittest.TestCase):
+    def test_archived_requires_a_completed_stop_not_a_completed_snapshot(self):
+        pending = {'id': 'bx_test', 'state': 'archived', 'stop': {'status': 'pending'},
+                   'lastSnapshotStatus': 'completed'}
+        completed = dict(pending, stop={'status': 'completed'})
+        client = FakeClient({('GET', '/sandboxes/bx_test'): [
+            {'sandbox': pending}, {'sandbox': completed}]})
+        runner = probe.Probe(client, evidence(), lambda: None)
+        with patch.object(probe.time, 'sleep'):
+            self.assertEqual(runner.wait_sandbox('bx_test', {'archived'}), completed)
+        self.assertEqual(len(client.calls), 2)
+
+    def test_wait_timeout_before_first_poll_has_explicit_missing_last_state(self):
+        runner = probe.Probe(FakeClient({}), evidence(), lambda: None)
+        runner.deadline = 0
+        with self.assertRaises(probe.SandboxWaitTimeout) as caught:
+            runner.wait_sandbox('bx_test', {'archived'})
+        self.assertEqual(caught.exception.evidence['polls'], 0)
+        self.assertEqual(caught.exception.evidence['last_sandbox'], {})
+
+
 class CleanupTests(unittest.TestCase):
     def test_all_resources_deleted_in_reverse_order_and_operation_polled(self):
         data = evidence([{"kind": "sandbox", "id": "bx_23456789"},
@@ -1040,6 +1061,25 @@ class FileSetattrToleranceTests(unittest.TestCase):
                       RunnerHostRenderTests().rendered(data))
         row = data['runner_host']['checks'][-1]
         self.assertEqual(probe.verify_phase_status({'ran': True, 'completed': True}, [row]), 'passed')
+
+    def test_recorded_kernel_inconclusives_stay_tolerated_when_stop_phase_errors(self):
+        data = self.data({'control': self.control(kernel_release='6.8.0-138-generic'), 'job': {}})
+        runner = data['runner_host']
+        row = runner['checks'].pop()
+        lanes = ('tmp', 'home', 'var_tmp', 'output_stdout', 'workspace', 'target', 'reused_target', 'reflink_target')
+        runner['checks'].extend(dict(row, name=f'disk_quota.{lane}.file_setattr_refusal') for lane in lanes)
+        runner['verify_phases'] = {'disk-quota': {'requested': True, 'ran': True, 'completed': False, 'status': 'failed',
+                                                'error': 'timed out waiting for sandbox bx_eqat87pz'}}
+        data.update(measurements_complete=False, error='verify phase failed: disk-quota')
+        outcome = probe.verdict(data)
+        self.assertFalse(outcome['passed'])
+        self.assertEqual(outcome['verify_phases']['disk-quota'], 'failed')
+        self.assertEqual(probe.verify_phase_status(runner['verify_phases']['disk-quota'], runner['checks']), 'failed')
+        self.assertTrue(probe.required_checks_passed(runner['checks']))
+        self.assertEqual(len(outcome['inconclusive']), 8)
+        self.assertEqual({item['name'] for item in outcome['tolerated_inconclusive']}, set(outcome['inconclusive']))
+        self.assertNotIn('runner_host checks did not all pass', outcome['reasons'])
+        self.assertEqual(RunnerHostRenderTests().rendered(data).count('Tolerated inconclusive:'), 8)
 
     def test_not_tolerated_when_the_control_says_the_syscall_exists(self):
         for change in ({'file_setattr_supported': True}, {'file_setattr_supported': True, 'file_setattr_errno': 0}):

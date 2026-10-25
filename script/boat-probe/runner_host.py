@@ -26,7 +26,7 @@ from typing import Any, Optional
 
 from credential_audit import SOURCE
 from pid_namespace import PID_SOURCE, TEARDOWN_SOURCE, bootstrap_checks, control_identity_command, lifecycle_failure, outside_control_passes, pid_checks, pid_failure_reason, reference_command, teardown_checks, teardown_job
-from probe import VERIFY_PHASES, provider_sizing_matches, sizing_error, verify_phase_records, verify_phase_status
+from probe import VERIFY_PHASES, provider_sizing_matches, sandbox_lifecycle, sizing_error, verify_phase_records, verify_phase_status
 from ssh_reach import endpoint, pin_host, process, ssh_argv
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1792,6 +1792,36 @@ class RunnerHost:
         self.check('disk_quota.backing_allocation_dropped_after_resume',
                    disk_quota.backing_allocation_dropped(before, storage), evidence)
 
+    def stop_at_quota_limit(self, sid, record, row):
+        import disk_quota
+        storage = row['pre_stop_storage']
+        blocks = storage.get('backing_allocated_blocks')
+        evidence: dict[str, Any] = {'pre_stop_disk': {
+            'root_free_bytes': row['pre_stop'].get('root_free_bytes'),
+            'xfs_free_bytes': row['pre_stop'].get('xfs_free_bytes'),
+            'retained_allocated_bytes': row['pre_stop'].get('allocated_bytes'),
+            'backing_file': storage.get('backing_file'),
+            'backing_allocated_bytes': blocks * 512 if type(blocks) is int else None,
+            'reserve_floor_bytes': disk_quota.RESERVE_BYTES}}
+        record['stop_at_limit'] = evidence
+        with self.section('stop_at_limit'):
+            try:
+                record['stop'] = self.probe.request('POST', f'/sandboxes/{sid}/stop', {})
+                evidence['response'] = record['stop']
+                archived = self.probe.wait_sandbox(sid, {'archived'})
+            except Exception as error:
+                evidence['error'] = str(error)
+                evidence['wait'] = getattr(error, 'evidence', {})
+                evidence['last_sandbox'] = evidence['wait'].get('last_sandbox') or sandbox_lifecycle(
+                    (record.get('stop') or {}).get('sandbox') or {})
+                reason = 'stop at quota limit did not complete: ' + json.dumps({
+                    'pre_stop_disk': evidence['pre_stop_disk'], 'last_sandbox': evidence['last_sandbox'],
+                    'error': evidence['error']})
+                self.check('disk_quota.stop_with_quota_sized_target', False, evidence, reason=reason)
+                raise ValueError('disk_quota.stop_with_quota_sized_target: ' + reason) from error
+        evidence['last_sandbox'] = sandbox_lifecycle(archived) if isinstance(archived, dict) else {}
+        self.check('disk_quota.stop_with_quota_sized_target', True, evidence)
+
     def resumed_workspace_eviction(self, sid, phase):
         import disk_quota
         import quota_adversarial
@@ -1870,13 +1900,10 @@ class RunnerHost:
                                 row['eviction_journal_cursor'] = journal_cursor(journal.get('stdout'))
                                 # Keep the job at its barrier so idle eviction cannot
                                 # remove the full target before the provider snapshots it.
-                                record['stop'] = self.probe.request('POST', f'/sandboxes/{sid}/stop', {})
-                                with self.section('stop_at_limit'):
-                                    self.probe.wait_sandbox(sid, {'archived'})
+                                self.stop_at_quota_limit(sid, record, row)
                                 record['stopped_with_retained_target'] = True
                                 row['client_interrupted_for_snapshot'] = True
                                 complete = True
-                                self.check('disk_quota.stop_with_quota_sized_target', True, row['at_limit'])
                                 break
                             if 'errno' not in row['at_limit']:
                                 raise ValueError('quota job ended before finishing its fill')
