@@ -77,6 +77,11 @@ jobs:
         run: env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo check --workspace --all-targets --locked
       - name: Clippy
         run: env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Check the Windows runner without linking, so Ubuntu needs no MinGW linker.
+      - name: Windows runner Clippy
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo clippy -p motor-runner --target x86_64-pc-windows-gnu --lib --bins --locked -- -D warnings
       # The ordinary transport test verifies connection reuse against a real
       # /usr/sbin/sshd. Runner fixtures clone workspaces with FICLONE, which
       # requires native reflinks: ext4 /tmp is not a valid scratch root.

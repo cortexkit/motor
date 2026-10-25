@@ -169,8 +169,10 @@ pub(crate) fn statistics(state: &Path, id: motor_protocol::Uuid) -> io::Result<s
 }
 
 /// The biggest output file the runner reads back from a sandbox.
+#[cfg(unix)]
 const MAX_STATISTICS_BYTES: u64 = 64 * 1024;
 
+#[cfg(unix)]
 fn read_output(state: &Path, id: motor_protocol::Uuid, name: &str) -> io::Result<Vec<u8>> {
     use std::io::Read;
     let path = state
@@ -199,6 +201,7 @@ fn read_output(state: &Path, id: motor_protocol::Uuid, name: &str) -> io::Result
 /// puts the store refused or the transport lost; a fill that sent `all` as its
 /// multi-level write error policy also fails its own command on one, so this
 /// normally agrees with the fill's exit status.
+#[cfg(unix)]
 pub(crate) fn sccache_write_failures(state: &Path, id: motor_protocol::Uuid) -> io::Result<u64> {
     let value = statistics(state, id)?;
     let stats = value.get("stats").unwrap_or(&value);
@@ -210,6 +213,7 @@ pub(crate) fn sccache_write_failures(state: &Path, id: motor_protocol::Uuid) -> 
 
 /// A counter's value, whether it is a bare number or sccache's
 /// `{"counts": {...}, "adv_counts": {...}}` shape.
+#[cfg(unix)]
 fn count_in(value: &serde_json::Value) -> Option<u64> {
     value.as_u64().or_else(|| {
         value
@@ -225,12 +229,14 @@ fn count_in(value: &serde_json::Value) -> Option<u64> {
 /// `remote_storage_timeout`. A file that does not parse as that shape fails
 /// the publication: statistics that cannot be read say nothing about the
 /// writes that happened.
+#[cfg(unix)]
 pub(crate) fn ccache_write_failures(state: &Path, id: motor_protocol::Uuid) -> io::Result<u64> {
     use crate::remote_cache::ccache::{REMOTE_ERROR, REMOTE_TIMEOUT};
     let stats = ccache_statistics(state, id)?;
     Ok(stats[REMOTE_ERROR].saturating_add(stats[REMOTE_TIMEOUT]))
 }
 
+#[cfg(unix)]
 pub(crate) fn ccache_statistics(
     state: &Path,
     id: motor_protocol::Uuid,

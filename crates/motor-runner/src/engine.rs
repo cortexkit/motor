@@ -847,6 +847,7 @@ struct Inner {
     cache_fills: BTreeMap<Uuid, crate::writer::CacheFill>,
     /// Per fill, the write ledgers of its cache sockets, kept until its
     /// publication is decided.
+    #[cfg(unix)]
     fill_ledgers: BTreeMap<Uuid, Vec<std::sync::Arc<crate::remote_cache::gateway::WriteLedger>>>,
     base_finishes: BTreeMap<Uuid, BaseFinish>,
     /// Settlement workers cannot share execution's `finalizing` claim: an
@@ -1625,6 +1626,7 @@ impl Runner {
     /// Applies one re-read of the provisioning files: stores the new state,
     /// forgets invalidated records, saves the catalog without engine locks and
     /// queues any newly unpublished desired tips immediately.
+    #[cfg(unix)]
     pub(crate) fn observe_publishing(
         &self,
         reread: crate::remote_cache::provisioning::Reread,
@@ -2279,6 +2281,7 @@ impl Runner {
                     writer: None,
                     #[cfg(target_os = "linux")]
                     cache_fills: BTreeMap::new(),
+                    #[cfg(unix)]
                     fill_ledgers: BTreeMap::new(),
                     base_finishes: BTreeMap::new(),
                     base_settling: BTreeSet::new(),
@@ -6928,6 +6931,7 @@ impl Runner {
         job.durable_output = launch.durable_output;
         // A fill's write sockets record what its PUTs did, so its publication
         // is decided from them once no PUT is in flight any more.
+        #[cfg(unix)]
         if job.base {
             self.core
                 .inner
@@ -7954,19 +7958,28 @@ impl Runner {
         // compiler cache is not evicted meanwhile; and it has no terminal
         // yet, so no second warm build is queued for its repository.
         let base_cleanup = job.base.then(|| {
-            let (fill, ledgers) = {
+            #[cfg(unix)]
+            let ledgers;
+            let fill = {
                 let mut inner = self.core.inner.lock().unwrap();
-                (
-                    Self::take_cache_fill(&mut inner, id),
-                    inner.fill_ledgers.remove(&id).unwrap_or_default(),
-                )
+                let fill = Self::take_cache_fill(&mut inner, id);
+                #[cfg(unix)]
+                {
+                    ledgers = inner.fill_ledgers.remove(&id).unwrap_or_default();
+                }
+                fill
             };
             self.long_work("base_cleanup");
-            let mut cleanup = self.clean_base(id, fill);
-            cleanup.publication = job.fill_identity.clone().map(|identity| {
-                let outcome = self.fill_publication(&identity, id, &ledgers);
-                (identity, outcome)
-            });
+            let cleanup = self.clean_base(id, fill);
+            #[cfg(unix)]
+            let cleanup = {
+                let mut cleanup = cleanup;
+                cleanup.publication = job.fill_identity.clone().map(|identity| {
+                    let outcome = self.fill_publication(&identity, id, &ledgers);
+                    (identity, outcome)
+                });
+                cleanup
+            };
             cleanup
         });
         let mut fill_failure = Vec::new();
@@ -8443,13 +8456,17 @@ impl Runner {
             inner.base_finishes.get_mut(&id).unwrap().terminal = None;
         }
         if !recorded {
-            let (fill, ledgers, identity) = {
+            #[cfg(unix)]
+            let (ledgers, identity);
+            let fill = {
                 let mut inner = self.core.inner.lock().unwrap();
-                (
-                    Self::take_cache_fill(&mut inner, id),
-                    inner.fill_ledgers.remove(&id).unwrap_or_default(),
-                    inner.jobs[&id].fill_identity.clone(),
-                )
+                let fill = Self::take_cache_fill(&mut inner, id);
+                #[cfg(unix)]
+                {
+                    ledgers = inner.fill_ledgers.remove(&id).unwrap_or_default();
+                    identity = inner.jobs[&id].fill_identity.clone();
+                }
+                fill
             };
             self.long_work("base_cleanup");
             let mut cleanup = prepared.unwrap_or_else(|| self.clean_base(id, fill));
@@ -8464,6 +8481,7 @@ impl Runner {
                 self.long_work("base_scratch_retry");
                 cleanup.scratch = self.clean_base(id, None).scratch;
             }
+            #[cfg(unix)]
             if cleanup.publication.is_none() {
                 cleanup.publication = identity.map(|identity| {
                     let outcome = self.fill_publication(&identity, id, &ledgers);
@@ -8687,6 +8705,7 @@ impl Runner {
     /// Only the tools the plan ran decide the result: statistics of another
     /// tool on the host matter neither way. GET and HEAD outcomes, such as the
     /// `.sccache_check` probe on an empty prefix, never affect it.
+    #[cfg(unix)]
     fn fill_publication(
         &self,
         identity: &StoreIdentity,
