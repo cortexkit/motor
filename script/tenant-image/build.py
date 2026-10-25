@@ -28,6 +28,7 @@ RUNNER_INPUTS = (
     "script/runner/job-account.py",
     "script/runner/units/system/motor-jobs.slice",
     "script/runner/sysctl/60-motor-inotify.conf", "script/boat-image/install.py",
+    "script/runner/journald/60-motor-retention.conf",
     "script/tenant-image/guest/root_paths.py",
 ) + tuple(f"script/runner/{name}" for name in PARITY_FILES)
 

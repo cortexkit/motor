@@ -171,6 +171,49 @@ class JobAccountTests(unittest.TestCase):
 
 
 class CaptureTests(unittest.TestCase):
+    def test_host_capture_measures_declared_policy_and_records_its_removal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'bin').mkdir()
+            policy = root / 'retention.conf'
+            policy.write_bytes(b'[Journal]\nMaxRetentionSec=14day\n')
+            policy.chmod(0o644)
+            manifest = {'cargo_home': tmp, 'rustup_home': tmp, 'host_files': {str(policy): {}}}
+
+            def output(*args, **kwargs):
+                if args[0] == 'dpkg-query' or args[1:] == ('toolchain', 'list'):
+                    return ''
+                return 'stable (default)' if args[1:] == ('default',) else 'rustup 1.29.1'
+
+            original_read = Path.read_text
+
+            def read(path, *args, **kwargs):
+                return 'ID=ubuntu\n' if str(path) == '/etc/os-release' else original_read(path, *args, **kwargs)
+
+            with patch.object(parity, 'output', side_effect=output), \
+                 patch.object(parity.shutil, 'which', return_value=None), \
+                 patch.object(parity.syscall_surface, 'capture', return_value={}), \
+                 patch.object(parity.seed, 'capture', return_value={}), \
+                 patch.object(Path, 'read_text', read):
+                present = parity.capture(manifest)['host_files']
+                policy.unlink()
+                missing = parity.capture(manifest)['host_files']
+            self.assertEqual({str(policy): {'sha256': hashlib.sha256(b'[Journal]\nMaxRetentionSec=14day\n').hexdigest(),
+                                           'uid': os.getuid(), 'gid': os.getgid(), 'mode': 0o644}}, present)
+            self.assertEqual({str(policy): None}, missing)
+
+    def test_host_file_capture_records_bytes_and_permissions_and_rejects_links(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'retention.conf'
+            self.assertIsNone(parity.host_file(path))
+            path.write_bytes(b'[Journal]\nMaxRetentionSec=14day\n')
+            path.chmod(0o644)
+            self.assertEqual({'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                              'uid': os.getuid(), 'gid': os.getgid(), 'mode': 0o644}, parity.host_file(path))
+            link = path.with_suffix('.link')
+            link.symlink_to(path)
+            self.assertIsNone(parity.host_file(link))
+
     def test_job_identity_is_the_process_not_a_host_account_lookup(self):
         with patch.object(parity.os, 'getuid', return_value=997), patch.object(parity.os, 'getgid', return_value=996):
             self.assertEqual({'uid': 997, 'gid': 996}, parity.job_identity(True))
@@ -360,6 +403,7 @@ class ParityTests(unittest.TestCase):
                 'apt_packages': {name: 'distro-version' for name in manifest['apt_packages']['required']
                                  + manifest['apt_packages']['by_role'][role] + ['coreutils', 'gnu-coreutils']},
                 'sccache_inputs_sha256': manifest['sccache']['inputs_sha256'],
+                'host_files': {} if job else copy.deepcopy(manifest['host_files']),
                 'job_environment': {**manifest['job_environment'], **manifest['job_environment_by_role'][role]},
                 'runtime': {'proc': {name: True for name in ('self/mountinfo', 'cpuinfo', 'meminfo')},
                             'inotify': {'max_user_instances': 8192}, 'dev_shm_writable': True,
@@ -403,6 +447,54 @@ class ParityTests(unittest.TestCase):
         with patch.object(parity, 'capture', return_value=captured):
             return parity.check(self.manifest, role=role, job=job, gnu_test_sha256='package-qualified-test',
                                 cargo_registry=self.registry(), remote_cache_on=remote_cache_on)
+
+    def test_journal_retention_is_required_on_every_linux_host_but_not_in_jobs(self):
+        path = '/etc/systemd/journald.conf.d/60-motor-retention.conf'
+        source = parity.HERE / 'journald/60-motor-retention.conf'
+        self.assertEqual({'sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+                          'uid': 0, 'gid': 0, 'mode': 0o644}, self.manifest['host_files'][path])
+        for role in ('build-server', 'boat', 'tenant'):
+            with self.subTest(role=role):
+                actual = self.observed(role)
+                if role in ('boat', 'tenant'):
+                    actual.update(self.manifest['layout_by_role'].get(role, {}).get('host', {}))
+                    actual['sccache_artifacts'] = {
+                        'inputs_sha256': self.manifest['sccache']['inputs_sha256'],
+                        'binaries': {name: actual['cargo_binaries'][name]['sha256']
+                                     for name in self.manifest['sccache']['build_server_sha256']}}
+                self.assertEqual([], parity.differences(self.manifest, actual, role=role))
+                del actual['host_files'][path]
+                errors = parity.differences(self.manifest, actual, role=role)
+                self.assertEqual(1, len(errors))
+                self.assertIn('host file ' + path, errors[0])
+                job_actual = self.observed(role, job=True)
+                job_actual['host_files'] = {}
+                self.assertTrue(self.report(job_actual, role=role, job=True)['passed'])
+
+    def test_journal_retention_content_owner_and_mode_drift_fail_parity(self):
+        path = '/etc/systemd/journald.conf.d/60-motor-retention.conf'
+        for key, value in (('sha256', '0' * 64), ('uid', 1000), ('gid', 1000), ('mode', 0o600)):
+            with self.subTest(key=key):
+                actual = self.observed()
+                actual['host_files'][path][key] = value
+                report = self.report(actual)
+                self.assertFalse(report['passed'])
+                self.assertEqual(1, len(report['errors']))
+                self.assertIn('host file ' + path, report['errors'][0])
+
+    def test_host_file_contract_requires_valid_pins_and_metadata(self):
+        path = '/etc/systemd/journald.conf.d/60-motor-retention.conf'
+        for key, value in (('sha256', 'bad'), ('uid', -1), ('gid', True), ('mode', 0o10000)):
+            with self.subTest(key=key):
+                manifest = copy.deepcopy(self.manifest)
+                manifest['host_files'][path][key] = value
+                with self.assertRaisesRegex(ValueError, 'invalid host file contract'):
+                    parity.validate(manifest)
+        for missing in (None, {}):
+            manifest = copy.deepcopy(self.manifest)
+            manifest['host_files'] = missing
+            with self.assertRaisesRegex(ValueError, 'missing host file contract'):
+                parity.validate(manifest)
 
     # Settings the machine running the tests may export are not part of any
     # role's declared job environment, but the cache capture records them

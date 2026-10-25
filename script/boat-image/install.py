@@ -56,6 +56,7 @@ RUNNER_INPUTS = (
     'script/runner/job-account.py',
     'script/runner/units/system/motor-jobs.slice',
     'script/runner/sysctl/60-motor-inotify.conf',
+    'script/runner/journald/60-motor-retention.conf',
     'script/runner/build-sccache.sh', 'script/runner/patches/sccache-0.18.0-read-only-hits.patch',
     'script/runner/build-git.sh', 'script/runner/install-binaryen.py',
 ) + tuple(f'script/runner/{name}' for name in parity.PARITY_FILES)
@@ -677,6 +678,24 @@ def accounts():
                 "--shell", "/usr/sbin/nologin", account)
 
 
+def install_journal_retention():
+    run("install", "-D", "-o", "root", "-g", "root", "-m", "0644",
+        str(ROOT / "script/runner/journald/60-motor-retention.conf"),
+        "/etc/systemd/journald.conf.d/60-motor-retention.conf")
+    run("systemctl", "restart", "systemd-journald")
+    config = run("systemd-analyze", "cat-config", "systemd/journald.conf", capture=True)
+    section = None
+    retention = None
+    for line in config.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            section = line
+        elif section == "[Journal]" and re.match(r"MaxRetentionSec\s*=", line):
+            retention = line.split("=", 1)[1].strip()
+    if retention != "14day":
+        raise ValueError("journald MaxRetentionSec: expected 14day, observed " + repr(retention))
+
+
 def configure(pins, revision):
     target_directories()
     accounts()
@@ -789,6 +808,7 @@ def main():
     seed_inventory = parity.seed.install(args.cargo_seed_manifest, args.cargo_seed_archive,
                                          args.cargo_seed_sha256, manifest['cargo_home'])
     (BUILD / 'cargo-seed.json').write_text(json.dumps(seed_manifest, indent=2) + '\n')
+    install_journal_retention()
     parity_result = parity.check(manifest, role="boat", cargo_registry=seed_manifest)
     if not parity_result["passed"]:
         raise ValueError("toolchain parity failed: " + json.dumps(parity_result["errors"]))

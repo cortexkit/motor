@@ -1266,6 +1266,8 @@ class AptInstallTests(unittest.TestCase):
                     return 'abc' if command[3] == 'rev-parse' else ''
                 if command[:2] == ('systemctl', 'show'):
                     return '255.4'
+                if command == ('systemd-analyze', 'cat-config', 'systemd/journald.conf'):
+                    return '[Journal]\nMaxRetentionSec=14day\n'
                 if command == ('apt-mark', 'showhold'):
                     return 'openssh-server'
                 if command == ('dpkg-query', '-W', '-f=${db:Status-Status}\t${Version}', 'openssh-server'):

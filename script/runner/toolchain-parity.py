@@ -54,6 +54,18 @@ def optional_text(path):
         return None
 
 
+def host_file(path):
+    path = Path(path)
+    try:
+        info = path.lstat()
+        if not path.is_file() or path.is_symlink():
+            return None
+        return {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "uid": info.st_uid, "gid": info.st_gid, "mode": info.st_mode & 0o7777}
+    except (FileNotFoundError, PermissionError):
+        return None
+
+
 def local_bin_entries(directory=LOCAL_BIN):
     try:
         return sorted(path.name for path in directory.iterdir()
@@ -274,6 +286,7 @@ def capture(manifest=None, job=False, role="build-server", remote_cache_on=False
         "cargo_binaries": binaries, "cargo_metadata": metadata,
         "tools": tools, "apt_packages": packages,
         "local_bin_entries": [] if job else local_bin_entries(),
+        "host_files": {} if job else {path: host_file(path) for path in paths.get("host_files", {})},
         "environment": {name: env.get(name) for name in (
             "PATH", "CC", "CXX", "WASM_BINDGEN_BIN", "WASM_OPT_BIN", "ESBUILD_BIN",
             "RUSTFLAGS", "CARGO_BUILD_TARGET", "PKG_CONFIG_PATH")},
@@ -306,6 +319,16 @@ def validate(manifest, role="build-server"):
         return
     if manifest["schema"] != 1 or manifest["rust_default"] not in manifest["rust_toolchains"]:
         raise ValueError("invalid parity schema or default toolchain")
+    host_files = manifest.get("host_files")
+    if not isinstance(host_files, dict) or not host_files:
+        raise ValueError("missing host file contract")
+    for path, spec in host_files.items():
+        if (not Path(path).is_absolute() or not isinstance(spec, dict)
+                or set(spec) != {"sha256", "uid", "gid", "mode"}
+                or not isinstance(spec["sha256"], str) or not re.fullmatch(r"[a-f0-9]{64}", spec["sha256"])
+                or any(type(spec[key]) is not int or spec[key] < 0 for key in ("uid", "gid", "mode"))
+                or spec["mode"] > 0o7777):
+            raise ValueError("invalid host file contract: " + path)
     identities = manifest.get('job_identity_by_role', {})
     if set(identities) != {'build-server', 'boat', 'tenant'} or identities['boat'] != 'system-assigned':
         raise ValueError('invalid role-specific job identities')
@@ -675,6 +698,8 @@ def differences(manifest, actual, role="build-server", job=False, gnu_test_sha25
         if not readonly_mount(manifest["rustup_home"], actual.get("mountinfo", "")):
             errors.append("job rustup home is not mounted read-only")
     else:
+        for path, expected in manifest["host_files"].items():
+            equal("host file " + path, expected, actual.get("host_files", {}).get(path))
         required = manifest["apt_packages"]["required"] + manifest["apt_packages"]["by_role"][role]
         for name in required:
             if name not in actual.get("apt_packages", {}):

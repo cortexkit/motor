@@ -442,6 +442,14 @@
     "gnuwhoami": "/usr/bin/gnuwhoami",
     "gnuyes": "/usr/bin/gnuyes"
   },
+  "host_files": {
+    "/etc/systemd/journald.conf.d/60-motor-retention.conf": {
+      "sha256": "d2d5e434880b56858792a23d03ad7ba58b157066d7d5f319cc6b6c3d7805cc89",
+      "uid": 0,
+      "gid": 0,
+      "mode": 420
+    }
+  },
   "inotify_minimum": {
     "max_user_instances": 8192
   },

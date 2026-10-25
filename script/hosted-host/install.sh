@@ -11,9 +11,10 @@
 #   install.sh --checkout DIR --start [--public-ip IPV4]
 #   install.sh --checkout DIR --stop
 #
-# Installing is idempotent and never enables or starts a unit. A config or unit
-# that differs from what this script would write is shown as a diff and
-# replaced only after a y answer (end of input is no); the old file is kept as
+# Installing is idempotent and never enables or starts a motor unit. It restarts
+# journald and applies inotify limits after installing the host drop-ins.
+# A config or unit that differs from what this script would write is shown as a
+# diff and replaced only after a y answer (end of input is no); the old file is kept as
 # <file>.bak-<UTC time>. Keys are created only when none exist and are never
 # replaced. The host id and tenant subject are arguments, not repository
 # defaults; --check, --start and --stop read them from the installed configs.
@@ -307,6 +308,17 @@ configs() {
   fi
 }
 
+host_configs() {
+  directory /etc/systemd/journald.conf.d root:root 755
+  directory /etc/sysctl.d root:root 755
+  place config "$checkout/script/runner/journald/60-motor-retention.conf" /etc/systemd/journald.conf.d/60-motor-retention.conf root:root 644
+  place config "$checkout/script/runner/sysctl/60-motor-inotify.conf" /etc/sysctl.d/60-motor-inotify.conf root:root 644
+  if [ "$check" = 0 ] && [ "$problems" = 0 ] && [ "$skipped" = 0 ]; then
+    systemctl restart systemd-journald
+    sysctl -p /etc/sysctl.d/60-motor-inotify.conf
+  fi
+}
+
 units() {
   place config "$checkout/crates/motor-vm-helper/systemd/motor-vm-helper.service" "$UNIT_DIR/motor-vm-helper.service" root:root 644
   place config "$checkout/crates/motor-host/systemd/motor-host.service" "$UNIT_DIR/motor-host.service" root:root 644
@@ -427,6 +439,7 @@ preflight
 account
 binaries
 configs
+host_configs
 units
 keys
 firewall "$port"
@@ -438,5 +451,5 @@ fi
 if [ "$mode" = start ]; then
   start_units
 else
-  echo "hosted host $( [ "$mode" = check ] && echo verified || echo installed ); nothing was enabled or started"
+  echo "hosted host $( [ "$mode" = check ] && echo verified || echo installed ); no motor services were enabled or started"
 fi

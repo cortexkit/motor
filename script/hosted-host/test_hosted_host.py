@@ -590,8 +590,10 @@ class InstallScriptTests(unittest.TestCase):
     def test_units_are_enabled_and_started_only_by_start_and_stopped_only_by_stop(self):
         start, stop = self.function("start_units"), self.function("stop_units")
         outside = self.script.replace(start, "").replace(stop, "")
-        # Installing and checking never enable, start or stop a unit, and never
-        # open or close the agent's port.
+        # Installing may restart journald to apply the host retention policy,
+        # but never changes motor services or opens or closes the agent's port.
+        self.assertEqual(outside.count('systemctl restart systemd-journald'), 1)
+        outside = outside.replace('systemctl restart systemd-journald', '')
         self.assertIsNone(re.search(r"systemctl[^\n]*\b(start|restart|stop|enable|disable|--now)\b", outside))
         self.assertIsNone(re.search(r"\bufw (allow|delete|--force)", outside))
         self.assertEqual(re.findall(r"systemctl (enable --now [\w.-]+)", start),

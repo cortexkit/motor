@@ -267,6 +267,12 @@ def verify_tool_trees(roots=TOOL_TREES, acl=has_access_acl, owner=0, group=0):
     return counts
 
 
+def install_journal_retention():
+    run("install", "-D", "-o", "root", "-g", "root", "-m", "0644",
+        str(BUILD / "script/runner/journald/60-motor-retention.conf"),
+        "/etc/systemd/journald.conf.d/60-motor-retention.conf")
+
+
 def configure(pins):
     spec = importlib.util.spec_from_file_location("job_account", BUILD / "script/runner/job-account.py")
     if spec is None or spec.loader is None:
@@ -298,6 +304,7 @@ def configure(pins):
     Path("/etc/nftables.d/motor-net.nft").write_text(rules.replace("enp6s0", "eth0"))
     Path("/etc/sysctl.d/90-motor.conf").write_text("net.ipv4.ip_forward=1\nkernel.modules_disabled=1\n")
     shutil.copy2(BUILD / "script/runner/sysctl/60-motor-inotify.conf", "/etc/sysctl.d/60-motor-inotify.conf")
+    install_journal_retention()
     Path("/etc/hostname").write_text("motor-tenant\n")
     Path("/etc/hosts").write_text("127.0.0.1 localhost\n127.0.1.1 motor-tenant\n")
     Path("/etc/resolv.conf").unlink(missing_ok=True)

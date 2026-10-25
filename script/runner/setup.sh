@@ -165,6 +165,10 @@ ssh -o BatchMode=yes -o ForwardAgent=no "$host" python3 - $policy_args < "$scrip
 ssh -o BatchMode=yes -o ForwardAgent=no "$host" "bash -s -- $name" <<'REMOTE'
 set -euo pipefail
 cd "/srv/build/src/$1"
+sudo -n install -D -o root -g root -m 0644 script/runner/journald/60-motor-retention.conf /etc/systemd/journald.conf.d/60-motor-retention.conf
+sudo -n systemctl restart systemd-journald
+sudo -n install -D -o root -g root -m 0644 script/runner/sysctl/60-motor-inotify.conf /etc/sysctl.d/60-motor-inotify.conf
+sudo -n sysctl -p /etc/sysctl.d/60-motor-inotify.conf
 bash script/runner/install-tools.sh build-server runtime-only
 REMOTE
 # Some source copies provide a checksum-verified NATS fixture installer.

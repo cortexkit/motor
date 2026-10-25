@@ -38,6 +38,7 @@ TEST_FILES = [
     "script/runner/test_inbound_policy.py",
     "script/runner/test_install_npm_tool.py",
     "script/runner/test_install_units.py",
+    "script/runner/test_journal_retention.py",
     "script/runner/test_review_reaper.py",
     "script/runner/test_sync_lock.py",
     "script/runner/test_toolchain_parity.py",
