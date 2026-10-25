@@ -18,10 +18,14 @@ class ConnectDiagnosticTests(unittest.TestCase):
         self.assertNotIn("New-VM ", self.script)
         self.assertNotIn("New-VHD ", self.script)
 
-    def test_shared_guest_collector_matches_standalone_snapshot(self):
-        embedded = self.script.split("function Save-Json(", 1)[1].split("function Save-HostVmEvents(", 1)[0]
-        shared = (HERE / "guest-evidence.ps1").read_text().split("function Save-Json(", 1)[1]
-        self.assertEqual(embedded.strip(), shared.strip())
+    def test_diagnostic_uses_shared_guid_path_guest_collector(self):
+        self.assertIn('. "$PSScriptRoot\\guest-evidence.ps1"', self.script)
+        self.assertNotIn("function Get-PlainGuestItem(", self.script)
+        shared = (HERE / "guest-evidence.ps1").read_text()
+        self.assertIn("function Get-PlainGuestItem(", shared)
+        self.assertIn("[IO.File]::GetAttributes($path)", shared)
+        self.assertIn("[IO.Path]::Combine($path, $part)", shared)
+        self.assertNotIn("Join-Path $path $part", shared)
         writer = shared.split("function Get-PlainGuestItem(", 1)[0]
         self.assertIn("[Text.UTF8Encoding]::new($false)", writer)
         self.assertNotIn("Set-Content", writer)
@@ -31,10 +35,17 @@ class ConnectDiagnosticTests(unittest.TestCase):
         self.assertLess(cleanup.index("Stop-VM"), cleanup.index("Save-DiagnosticGuestEvidence"))
         self.assertLess(cleanup.index("Save-DiagnosticGuestEvidence"), cleanup.index("-Operation Remove"))
         self.assertLess(cleanup.index("-Operation Remove"), cleanup.index("$parentGuard.Dispose()"))
-        self.assertIn("Mount-VHD -Path $Path -ReadOnly -Passthru", self.script)
-        mount = self.script.split("function Use-DiagnosticWindowsDisk", 1)[1].split("function Save-DiagnosticGuestEvidence", 1)[0]
+        shared = (HERE / "guest-evidence.ps1").read_text()
+        self.assertIn("Mount-VHD -Path $Path -ReadOnly -Passthru", shared)
+        mount = shared.split("function Use-DiagnosticWindowsDisk", 1)[1].split("function Save-DiagnosticGuestEvidence", 1)[0]
         self.assertLess(mount.index("$mounted = $true"), mount.index("$disk = $image | Get-Disk"))
-        self.assertIn("ReparsePoint", self.script)
+        wait = shared.split("function Wait-RunnerDiagnosticVolume", 1)[1].split("function Use-DiagnosticWindowsDisk", 1)[0]
+        self.assertIn("Get-Volume -Partition $partition", wait)
+        self.assertIn("Get-Partition -Volume $volumes[0]", wait)
+        self.assertIn("Test-RunnerVolumeGuidPath", wait)
+        self.assertNotIn("Add-PartitionAccessPath", mount)
+        self.assertNotIn("Remove-PartitionAccessPath", mount)
+        self.assertIn("ReparsePoint", shared)
 
     def test_probe_endpoint_and_timeout_match_host_transport(self):
         source = (HERE.parents[1] / "crates/motor-winagent/src/transport.rs").read_text()
@@ -50,10 +61,45 @@ class ConnectDiagnosticTests(unittest.TestCase):
         self.assertNotIn("BitConverter.ToUInt32", self.script)
 
     def test_guest_event_export_is_service_filtered_and_preserves_xml(self):
-        self.assertIn("motor-winagent(?:\\.exe)?|Motor Windows job agent", self.script)
-        self.assertIn('"EventRecordID=$($_.record_id)"', self.script)
-        self.assertIn("xml=$Event.ToXml()", self.script)
-        self.assertIn("@('System','Application')", self.script)
+        shared = (HERE / "guest-evidence.ps1").read_text()
+        self.assertIn("motor-winagent(?:\\.exe)?|Motor Windows job agent", shared)
+        self.assertIn('"EventRecordID=$($_.record_id)"', shared)
+        self.assertIn("xml=$Event.ToXml()", shared)
+        self.assertIn("@('System','Application')", shared)
+
+    def test_hyperv_spike_vhd_reads_use_guid_paths(self):
+        spike = HERE.parent / "hyperv-spike"
+        common = (spike / "common.ps1").read_text()
+        disk = common.split("function Use-SpikeWindowsDisk", 1)[1].split("function New-SpikeIso", 1)[0]
+        self.assertIn("Get-Volume", disk)
+        self.assertIn("Test-SpikeVolumeGuidPath", disk)
+        self.assertNotIn("Add-PartitionAccessPath", disk)
+        self.assertNotIn("Test-Path", disk)
+        self.assertIn("[IO.Path]::Combine($path, $component)", common)
+        self.assertIn("[IO.FileAttributes]::ReparsePoint", common)
+
+        evidence = (spike / "diagnostics.ps1").read_text()
+        self.assertIn("[IO.File]::Copy($item.FullName", evidence)
+        self.assertIn("Get-SpikeFileSha256", evidence)
+        self.assertNotIn("Get-FileHash -LiteralPath $item.FullName", evidence)
+        self.assertNotIn("Get-WinEvent -Path $path", evidence)
+
+        measure = (spike / "measure.ps1").read_text()
+        self.assertIn("[IO.FileInfo]::new($agent.FullName).GetAccessControl()", measure)
+        self.assertIn("Get-SpikeFileSha256 $agent.FullName", measure)
+        self.assertNotIn("Get-Acl $nonce", measure)
+
+        boot = (spike / "boot-files.ps1").read_text()
+        self.assertIn("Get-Volume -Partition $partition", boot)
+        self.assertIn("$partition.VolumeGuidPath", boot)
+        self.assertIn("Get-SpikeBcdBootArguments $Windows $Letter", boot)
+        self.assertIn("Remove-SpikeDiskDriveLetters $disk.Number", boot)
+
+        provision = (spike / "provision.ps1").read_text()
+        self.assertIn("Get-Volume", provision)
+        self.assertIn("[IO.File]::Copy", provision)
+        self.assertIn("Remove-SpikeDiskDriveLetters $virtualDisk.Number", provision)
+        self.assertIn('dism.exe /Apply-Image', provision)
 
 
 if __name__ == "__main__":

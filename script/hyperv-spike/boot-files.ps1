@@ -30,19 +30,24 @@ function Get-SpikeFreshEsp([int]$DiskNumber, [int]$PartitionNumber) {
     Assert-SpikeEspState $partition $volume $DiskNumber
     $mapping = Get-Partition -DriveLetter $partition.DriveLetter
     Assert-Spike ($mapping.DiskNumber -eq $DiskNumber -and $mapping.PartitionNumber -eq $PartitionNumber) 'esp-letter-resolves-to-target-disk' "$($partition.DriveLetter): disk=$DiskNumber partition=$PartitionNumber"
-    $root = "$($partition.DriveLetter):\"
-    Assert-Spike (Test-Path -LiteralPath $root -PathType Container) 'esp-root-accessible' $root
-    $probe = Join-Path $root ('write-probe-' + [Guid]::NewGuid().ToString('N') + '.txt')
+    # BCDBoot needs a drive letter, but file probes and writes use the volume GUID path.
+    $volumes = @(Get-Volume -Partition $partition)
+    Assert-Spike ($volumes.Count -eq 1 -and (Test-SpikeVolumeGuidPath ([string]$volumes[0].Path))) 'esp-volume-guid-path' "$DiskNumber/$PartitionNumber"
+    $reverse = @(Get-Partition -Volume $volumes[0])
+    Assert-Spike ($reverse.Count -eq 1 -and $reverse[0].DiskNumber -eq $DiskNumber -and $reverse[0].PartitionNumber -eq $PartitionNumber) 'esp-volume-guid-maps-to-partition' $volumes[0].Path
+    $root = [string]$volumes[0].Path
+    Assert-Spike ([IO.Directory]::Exists($root)) 'esp-root-accessible' $root
+    $probe = [IO.Path]::Combine($root, ('write-probe-' + [Guid]::NewGuid().ToString('N') + '.txt'))
     try {
         [IO.File]::WriteAllText($probe, 'motor-esp-write-probe')
         Assert-Spike ([IO.File]::ReadAllText($probe) -eq 'motor-esp-write-probe') 'esp-writable' $probe
-    } finally { if (Test-Path -LiteralPath $probe) { Remove-Item -LiteralPath $probe -Force } }
-    return $partition
+    } finally { if ([IO.File]::Exists($probe)) { [IO.File]::Delete($probe) } }
+    return [pscustomobject]@{DiskNumber=$partition.DiskNumber; PartitionNumber=$partition.PartitionNumber; DriveLetter=[char]$partition.DriveLetter; VolumeGuidPath=$root}
 }
 
-function Invoke-SpikeBcdBoot([string]$Executable, [string]$Windows, [char]$Letter, [string]$Label, [string]$Root, [switch]$Offline) {
-    $version = (Get-Item -LiteralPath $Executable).VersionInfo
-    Write-Host "EVIDENCE bcdboot-$Label executable=$Executable fileVersion=$($version.FileVersion) productVersion=$($version.ProductVersion) SHA256=$((Get-FileHash -LiteralPath $Executable).Hash)"
+function Invoke-SpikeBcdBoot([string]$Executable, [string]$Windows, [char]$Letter, [string]$VolumeGuidPath, [string]$Label, [string]$Root, [switch]$Offline) {
+    $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($Executable)
+    Write-Host "EVIDENCE bcdboot-$Label executable=$Executable fileVersion=$($version.FileVersion) productVersion=$($version.ProductVersion) SHA256=$(Get-SpikeFileSha256 $Executable)"
     $arguments = @(Get-SpikeBcdBootArguments $Windows $Letter -Offline:$Offline)
     Write-Host "EVIDENCE bcdboot-$Label arguments=$($arguments | ConvertTo-Json -Compress)"
     $process = New-Object Diagnostics.Process
@@ -75,7 +80,10 @@ function Invoke-SpikeBcdBoot([string]$Executable, [string]$Windows, [char]$Lette
     }
     $status = if ($code -eq 0) { 'PASS' } else { 'FAIL' }
     Write-Host "$status bcdboot-$Label exit=$code target=${Letter}: (comparison failures are evidence, not installer success)"
-    Get-ChildItem -LiteralPath "${Letter}:\" -File -Recurse -Force | Select-Object FullName,Length | Format-Table -AutoSize | Out-Host
+    [IO.Directory]::EnumerateFiles($VolumeGuidPath, '*', [IO.SearchOption]::AllDirectories) | ForEach-Object {
+        $file = [IO.FileInfo]::new($_)
+        [pscustomobject]@{FullName=$file.FullName; Length=$file.Length}
+    } | Format-Table -AutoSize | Out-Host
     return $code
 }
 
@@ -84,48 +92,55 @@ function Invoke-SpikeBcdBootComparison([string]$Executable, [string]$Windows, [s
     Assert-Spike (-not (Test-Path -LiteralPath $path)) 'fresh-bcdboot-probe-path' $path
     $created = $false
     $mounted = $false
+    $disk = $null
     try {
         # Each executable gets a fresh ESP, so partial files from a failed run
         # cannot make the next executable appear to repair an unrelated failure.
         New-VHD -Path $path -Dynamic -SizeBytes 300MB | Out-Null
         $created = $true
-        $disk = Mount-VHD -Path $path -Passthru | Get-Disk
+        $image = Mount-VHD -Path $path -Passthru
         $mounted = $true
+        $disk = $image | Get-Disk
         Initialize-Disk -Number $disk.Number -PartitionStyle GPT | Out-Null
         $partition = New-Partition -DiskNumber $disk.Number -Size 260MB -GptType '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' -AssignDriveLetter
         $partition | Format-Volume -FileSystem FAT32 -NewFileSystemLabel BootProbe -Confirm:$false | Out-Null
         $partition = Get-SpikeFreshEsp $disk.Number $partition.PartitionNumber
-        [void](Invoke-SpikeBcdBoot $Executable $Windows $partition.DriveLetter $Label $Root -Offline:$Offline)
+        [void](Invoke-SpikeBcdBoot $Executable $Windows $partition.DriveLetter $partition.VolumeGuidPath $Label $Root -Offline:$Offline)
     } finally {
-        if ($mounted) { Dismount-VHD -Path $path }
+        if ($mounted) {
+            try { if ($null -ne $disk) { Remove-SpikeDiskDriveLetters $disk.Number } } finally { Dismount-VHD -Path $path }
+        }
         if ($created) { Remove-Item -LiteralPath $path -Force }
         Assert-Spike (-not (Test-Path -LiteralPath $path)) 'bcdboot-probe-disk-removed' $path
     }
 }
 
-function Install-SpikeBootFiles([int]$DiskNumber, [int]$EspPartitionNumber, [string]$Windows, [string]$Root) {
-    $hostBcdBoot = Join-Path $env:SystemRoot 'System32\bcdboot.exe'
-    $imageBcdBoot = Join-Path $Windows 'System32\bcdboot.exe'
+function Install-SpikeBootFiles([int]$DiskNumber, [int]$EspPartitionNumber, [string]$WindowsVolumePath, [string]$Root, [char]$WindowsDriveLetter) {
+    $hostBcdBoot = [IO.Path]::Combine($env:SystemRoot, 'System32\bcdboot.exe')
+    $windowsDriveRoot = "${WindowsDriveLetter}:\Windows"
+    $imageBcdBoot = [IO.Path]::Combine($windowsDriveRoot, 'System32\bcdboot.exe')
     foreach ($relative in @('System32\bcdboot.exe','System32\Config\BCD-Template','Boot\EFI\bootmgfw.efi','Boot\EFI\bootmgr.efi')) {
-        $file = Join-Path $Windows $relative
-        Assert-Spike (Test-Path -LiteralPath $file -PathType Leaf) 'source-boot-file-present' "$file bytes=$((Get-Item -LiteralPath $file).Length)"
+        $item = Get-SpikePlainGuestItem $WindowsVolumePath "Windows\$relative"
+        Assert-Spike ($item -and -not $item.PSIsContainer) 'source-boot-file-present' "$relative bytes=$(if ($item) { $item.Length } else { 0 })"
     }
-    Write-Host "EVIDENCE source-bootex-present=$(Test-Path -LiteralPath (Join-Path $Windows 'Boot\EFI_EX'))"
+    $bootEx = Get-SpikePlainGuestItem $WindowsVolumePath 'Windows\Boot\EFI_EX'
+    Write-Host "EVIDENCE source-bootex-present=$([bool]$bootEx)"
     $partition = Get-SpikeFreshEsp $DiskNumber $EspPartitionNumber
-    Invoke-SpikeBcdBootComparison $hostBcdBoot $Windows $Root 'host-default'
-    $version = (Get-Item -LiteralPath $hostBcdBoot).VersionInfo
+    [void](Invoke-SpikeBcdBoot $hostBcdBoot $windowsDriveRoot $partition.DriveLetter $partition.VolumeGuidPath 'host-default' $Root)
+    $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($hostBcdBoot)
     if ($version.FileBuildPart -gt 26100 -or ($version.FileBuildPart -eq 26100 -and $version.FilePrivatePart -ge 8037)) {
-        Invoke-SpikeBcdBootComparison $hostBcdBoot $Windows $Root 'host-offline' -Offline
+        $partition = Get-SpikeFreshEsp $DiskNumber $EspPartitionNumber
+        [void](Invoke-SpikeBcdBoot $hostBcdBoot $windowsDriveRoot $partition.DriveLetter $partition.VolumeGuidPath 'host-offline' $Root -Offline)
     } else {
         Write-Host 'SKIP bcdboot-host-offline: /offline is documented only from Windows 11 build 26100.8037 (not a PASS)'
     }
     # Keep the boot-file installer matched to the deployed Server image.
     # /s binds writes to this VHDX and avoids changing the host's NVRAM.
     $partition = Get-SpikeFreshEsp $DiskNumber $EspPartitionNumber
-    $code = Invoke-SpikeBcdBoot $imageBcdBoot $Windows $partition.DriveLetter 'image' $Root
+    $code = Invoke-SpikeBcdBoot $imageBcdBoot $windowsDriveRoot $partition.DriveLetter $partition.VolumeGuidPath 'image' $Root
     Assert-Spike ($code -eq 0) 'uefi-boot-files' "image=$imageBcdBoot target=$($partition.DriveLetter): exit=$code"
     foreach ($relative in @('EFI\Microsoft\Boot\BCD','EFI\Microsoft\Boot\bootmgfw.efi','EFI\Boot\bootx64.efi')) {
-        $file = "$($partition.DriveLetter):\$relative"
-        Assert-Spike (Test-Path -LiteralPath $file -PathType Leaf) 'uefi-boot-output' "$file SHA256=$((Get-FileHash -LiteralPath $file).Hash)"
+        $file = Get-SpikePlainGuestItem $partition.VolumeGuidPath $relative
+        Assert-Spike ($file -and -not $file.PSIsContainer) 'uefi-boot-output' "$relative SHA256=$(if ($file) { Get-SpikeFileSha256 $file.FullName } else { '' })"
     }
 }

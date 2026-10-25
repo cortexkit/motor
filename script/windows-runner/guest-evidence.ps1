@@ -1,22 +1,41 @@
-# Read-only guest diagnostics collected before job-disk removal.
-# diagnose-connect.ps1 embeds these functions so its collector
-# needs no sidecar file; source-level tests keep the function bodies aligned.
+# Shared read-only guest diagnostics used by the installer identity check and
+# diagnose-connect.ps1; both use .NET APIs on volume GUID paths.
 function Save-Json([string]$Path, $Value) {
     $json = ConvertTo-Json -InputObject $Value -Depth 10
     [IO.File]::WriteAllText($Path, $json, [Text.UTF8Encoding]::new($false))
 }
+function Test-RunnerVolumeGuidPath([string]$Path) {
+    return [regex]::IsMatch($Path, '\A\\\\\?\\Volume\{[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}\}\\\z')
+}
 function Get-PlainGuestItem([string]$Volume, [string]$Relative) {
+    if (-not (Test-RunnerVolumeGuidPath $Volume)) { throw 'Guest volume path is not a volume GUID path' }
     $path = $Volume
     foreach ($part in $Relative.Split('\')) {
-        if (-not $part -or $part -in @('.','..') -or $part.Contains(':')) { throw 'Unsafe guest diagnostic path' }
-        $path = Join-Path $path $part
-        try { $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop } catch {
-            if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { return $null }
+        if (-not $part -or $part -in @('.','..') -or $part.Contains(':') -or $part.Contains('/')) { throw 'Unsafe guest diagnostic path' }
+        $path = [IO.Path]::Combine($path, $part)
+        try { $attributes = [IO.File]::GetAttributes($path) } catch [IO.FileNotFoundException] { return $null } catch [IO.DirectoryNotFoundException] { return $null } catch {
             throw "Guest diagnostic lookup failed at $path : $_"
         }
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Guest reparse path refused: $path" }
+        if ($attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Guest reparse path refused: $path" }
+        $isDirectory = [bool]($attributes -band [IO.FileAttributes]::Directory)
+        if ($isDirectory) {
+            $info = [IO.DirectoryInfo]::new($path)
+            $length = 0
+        } else {
+            $info = [IO.FileInfo]::new($path)
+            $length = $info.Length
+        }
+        $item = [pscustomobject]@{FullName=$info.FullName; Name=$info.Name; Attributes=$attributes; PSIsContainer=$isDirectory; Length=$length; LastWriteTimeUtc=$info.LastWriteTimeUtc}
     }
     return $item
+}
+function Get-GuestFileSha256([object]$Item) {
+    $stream = [IO.File]::OpenRead($Item.FullName)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '') } finally {
+        $sha.Dispose()
+        $stream.Dispose()
+    }
 }
 
 function Convert-DiagnosticEvent($Event) {
@@ -27,76 +46,88 @@ function Convert-DiagnosticEvent($Event) {
 function Save-GuestAgentEvents([string]$Source, [string]$Channel, [string]$Destination) {
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
     $selected = [Collections.Generic.List[object]]::new()
+    $stagedSource = Join-Path $Destination "$Channel-source.evtx"
+    # Stage with .NET so event tools read a host path, not a PowerShell drive for the mounted guest.
     try {
-        $query = '*'
-        # Do not filter guest time against host time: integration time sync is off.
-        # Match every provider's XML, not localized message text, to retain crash,
-        # hang and service records even when host message resources are missing.
-        Get-WinEvent -Path $Source -FilterXPath $query -ErrorAction Stop | ForEach-Object {
-            $event = $_
-            try {
-                if ($event.ToXml() -match '(?i)motor-winagent(?:\.exe)?|Motor Windows job agent') { $selected.Add((Convert-DiagnosticEvent $event)) }
-            } finally { $event.Dispose() }
-        }
-    } catch {
-        Set-Content -LiteralPath "$Destination\$Channel-query-status.txt" -Value ($_ | Out-String) -Encoding UTF8
-    }
-    Save-Json "$Destination\$Channel-agent-events.json" $selected.ToArray()
-    for ($offset = 0; $offset -lt $selected.Count; $offset += 128) {
-        $chunk = $selected.GetRange($offset, [Math]::Min(128, $selected.Count - $offset))
-        $ids = @($chunk | ForEach-Object { "EventRecordID=$($_.record_id)" })
-        $filter = '*[System[(' + ($ids -join ' or ') + ')]]'
-        $output = Join-Path $Destination ("$Channel-agent-{0:D3}.evtx" -f [int]($offset / 128))
+        [IO.File]::Copy($Source, $stagedSource, $true)
         try {
-            $text = & wevtutil.exe epl $Source $output /lf:true /ow:true "/q:$filter" 2>&1 | Out-String
-            if ($LASTEXITCODE -ne 0) { throw "wevtutil exit=$LASTEXITCODE $text" }
-        } catch { Add-Content -LiteralPath "$Destination\$Channel-export-errors.txt" -Value ($_ | Out-String) -Encoding UTF8 }
-    }
-    if ($Channel -eq 'System') {
-        try {
-            $boot = @(Get-WinEvent -Path $Source -FilterXPath '*[System[EventID=12 or EventID=13 or EventID=41 or EventID=6005 or EventID=6006 or EventID=6008]]' -MaxEvents 128 | ForEach-Object {
+            $query = '*'
+            # Do not filter guest time against host time: integration time sync is off.
+            # Match every provider's XML, not localized message text, to retain crash,
+            # hang and service records even when host message resources are missing.
+            Get-WinEvent -Path $stagedSource -FilterXPath $query -ErrorAction Stop | ForEach-Object {
                 $event = $_
-                try { Convert-DiagnosticEvent $event } finally { $event.Dispose() }
-            })
-            Save-Json "$Destination\guest-boot-context.json" $boot
-        } catch { Set-Content -LiteralPath "$Destination\guest-boot-query-status.txt" -Value ($_ | Out-String) -Encoding UTF8 }
+                try {
+                    if ($event.ToXml() -match '(?i)motor-winagent(?:\.exe)?|Motor Windows job agent') { $selected.Add((Convert-DiagnosticEvent $event)) }
+                } finally { $event.Dispose() }
+            }
+        } catch {
+            Set-Content -LiteralPath "$Destination\$Channel-query-status.txt" -Value ($_ | Out-String) -Encoding UTF8
+        }
+        Save-Json "$Destination\$Channel-agent-events.json" $selected.ToArray()
+        for ($offset = 0; $offset -lt $selected.Count; $offset += 128) {
+            $chunk = $selected.GetRange($offset, [Math]::Min(128, $selected.Count - $offset))
+            $ids = @($chunk | ForEach-Object { "EventRecordID=$($_.record_id)" })
+            $filter = '*[System[(' + ($ids -join ' or ') + ')]]'
+            $output = Join-Path $Destination ("$Channel-agent-{0:D3}.evtx" -f [int]($offset / 128))
+            try {
+                $text = & wevtutil.exe epl $stagedSource $output /lf:true /ow:true "/q:$filter" 2>&1 | Out-String
+                if ($LASTEXITCODE -ne 0) { throw "wevtutil exit=$LASTEXITCODE $text" }
+            } catch { Add-Content -LiteralPath "$Destination\$Channel-export-errors.txt" -Value ($_ | Out-String) -Encoding UTF8 }
+        }
+        if ($Channel -eq 'System') {
+            try {
+                $boot = @(Get-WinEvent -Path $stagedSource -FilterXPath '*[System[EventID=12 or EventID=13 or EventID=41 or EventID=6005 or EventID=6006 or EventID=6008]]' -MaxEvents 128 | ForEach-Object {
+                    $event = $_
+                    try { Convert-DiagnosticEvent $event } finally { $event.Dispose() }
+                })
+                Save-Json "$Destination\guest-boot-context.json" $boot
+            } catch { Set-Content -LiteralPath "$Destination\guest-boot-query-status.txt" -Value ($_ | Out-String) -Encoding UTF8 }
+        }
+    } finally {
+        if ([IO.File]::Exists($stagedSource)) { [IO.File]::Delete($stagedSource) }
     }
 }
-function Wait-RunnerDiagnosticVolume([int]$DiskNumber, [int]$PartitionNumber, [int]$TimeoutSeconds, [ref]$AssignedDriveLetter) {
+function Wait-RunnerDiagnosticVolume([int]$DiskNumber, [int]$PartitionNumber, [int]$TimeoutSeconds) {
+    # Resolve the partition through Storage's volume association, not a session drive letter.
+
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    $lastError = 'partition drive letter has not appeared'
+    $lastError = 'partition has not been associated with a volume GUID path'
     while ($clock.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         try {
             $partition = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber -ErrorAction Stop
-            if ($partition -and $partition.DriveLetter) {
-                $AssignedDriveLetter.Value = [string]$partition.DriveLetter
+            if ($partition) {
                 try {
-                    $volumes = @(Get-Volume -DriveLetter $partition.DriveLetter -ErrorAction Stop)
-                    $reverse = @(Get-Partition -DriveLetter $partition.DriveLetter -ErrorAction Stop)
-                    if ($volumes.Count -eq 1 -and $reverse.Count -eq 1 -and $reverse[0].DiskNumber -eq $DiskNumber -and $reverse[0].PartitionNumber -eq $PartitionNumber) {
-                        return [pscustomobject]@{partition=$partition; volume=$volumes[0]}
+                    $volumes = @(Get-Volume -Partition $partition -ErrorAction Stop)
+                    if ($volumes.Count -eq 1 -and (Test-RunnerVolumeGuidPath ([string]$volumes[0].Path))) {
+                        $reverse = @(Get-Partition -Volume $volumes[0] -ErrorAction Stop)
+                        if ($reverse.Count -eq 1 -and $reverse[0].DiskNumber -eq $DiskNumber -and $reverse[0].PartitionNumber -eq $PartitionNumber) {
+                            return [pscustomobject]@{partition=$partition; volume=$volumes[0]}
+                        }
+                        $lastError = 'volume GUID path does not map back to the expected partition'
+                    } elseif ($volumes.Count -gt 1) {
+                        throw "Partition $PartitionNumber on disk $DiskNumber maps to several volumes"
+                    } else {
+                        $lastError = 'partition has not been associated with one volume GUID path yet'
                     }
-                    $lastError = "drive letter $($partition.DriveLetter) is not yet associated with one volume and the expected partition"
                 } catch { $lastError = [string]$_ }
             } else {
-                $lastError = "partition $PartitionNumber on disk $DiskNumber has no drive letter yet"
+                $lastError = "partition $PartitionNumber on disk $DiskNumber has not appeared yet"
             }
         } catch { $lastError = [string]$_ }
         Start-Sleep -Milliseconds 100
     }
-    $letter = [string]$AssignedDriveLetter.Value
-    throw "Timed out after $TimeoutSeconds seconds waiting for a volume on disk $DiskNumber partition $PartitionNumber drive letter '$letter': $lastError"
+    throw "Timed out after $TimeoutSeconds seconds waiting for a volume GUID path on disk $DiskNumber partition $PartitionNumber: $lastError"
 }
 
 function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action, [string]$EvidenceDirectory, [int]$VolumeWaitSeconds = 15) {
     $identity = [ordered]@{utc=[DateTime]::UtcNow.ToString('o'); requested_path=[IO.Path]::GetFullPath($Path); read_only=$true; matched=$false}
     $mounted = $false
-    $assigned = $false
-    $assignedDriveLetter = $null
     $diskNumber = $null
     $partitionNumber = $null
     $partition = $null
     try {
+        # Keep the sealed image read-only and use its GUID path without assigning a drive letter.
         # Mark the mount before Get-Disk, so a failed disk query still dismounts.
         $image = Mount-VHD -Path $Path -ReadOnly -Passthru
         $mounted = $true
@@ -114,22 +145,15 @@ function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action, [string]
         if ($partitions.Count -ne 1) { throw 'Expected one Windows basic-data partition' }
         $partition = $partitions[0]
         $partitionNumber = [int]$partition.PartitionNumber
-        if ($partition.DriveLetter) {
-            $assignedDriveLetter = [string]$partition.DriveLetter
-            $assigned = $true
-        }
-        if (-not $partition.DriveLetter) {
-            $partition | Add-PartitionAccessPath -AssignDriveLetter | Out-Null
-            $assigned = $true
-        }
-        $binding = Wait-RunnerDiagnosticVolume -DiskNumber $diskNumber -PartitionNumber $partitionNumber -TimeoutSeconds $VolumeWaitSeconds -AssignedDriveLetter ([ref]$assignedDriveLetter)
+        $binding = Wait-RunnerDiagnosticVolume -DiskNumber $diskNumber -PartitionNumber $partitionNumber -TimeoutSeconds $VolumeWaitSeconds
         $partition = $binding.partition
         $volumeInfo = $binding.volume
-        $volume = "$($assignedDriveLetter):\"
+        $volume = [string]$volumeInfo.Path
         $identity['partition_number'] = $partition.PartitionNumber
         $identity['partition_guid'] = [string]$partition.Guid
-        $identity['drive_letter'] = $assignedDriveLetter
         $identity['volume_path'] = $volume
+        $identity['volume_guid_path'] = $volume
+        $identity['drive_letter'] = [string]$volumeInfo.DriveLetter
         $identity['volume_unique_id'] = [string]$volumeInfo.UniqueId
         $identity['volume_label'] = [string]$volumeInfo.FileSystemLabel
         $identity['matched'] = $true
@@ -139,29 +163,10 @@ function Use-DiagnosticWindowsDisk([string]$Path, [scriptblock]$Action, [string]
         & $Action $volume
     } catch {
         $identity['error'] = [string]$_
-        if ($assignedDriveLetter) { $identity['drive_letter'] = $assignedDriveLetter }
         if ($null -ne $partitionNumber) { $identity['partition_number'] = $partitionNumber }
         if ($EvidenceDirectory) { Save-Json "$EvidenceDirectory\mounted-disk-identity.json" $identity }
         throw
-    } finally {
-        try {
-            if ($assigned -and $null -ne $diskNumber -and $null -ne $partitionNumber) {
-                $cleanupClock = [Diagnostics.Stopwatch]::StartNew()
-                while (-not $assignedDriveLetter -and $cleanupClock.Elapsed.TotalSeconds -lt 5) {
-                    try {
-                        $cleanupPartition = Get-Partition -DiskNumber $diskNumber -PartitionNumber $partitionNumber -ErrorAction Stop
-                        if ($cleanupPartition.DriveLetter) { $assignedDriveLetter = [string]$cleanupPartition.DriveLetter }
-                    } catch { }
-                    if (-not $assignedDriveLetter) { Start-Sleep -Milliseconds 100 }
-                }
-                if (-not $assignedDriveLetter) { throw "Assigned drive letter for disk $diskNumber partition $partitionNumber was not found during cleanup" }
-                $cleanupPartition = Get-Partition -DiskNumber $diskNumber -PartitionNumber $partitionNumber -ErrorAction Stop
-                if (-not $cleanupPartition) { throw "Partition $partitionNumber on disk $diskNumber disappeared before drive-letter cleanup" }
-                $accessPath = [string]$assignedDriveLetter + ':\'
-                $cleanupPartition | Remove-PartitionAccessPath -AccessPath $accessPath -ErrorAction Stop | Out-Null
-            }
-        } finally { if ($mounted) { Dismount-VHD -Path $Path } }
-    }
+    } finally { if ($mounted) { Dismount-VHD -Path $Path } }
 }
 function Save-DiagnosticGuestEvidence([string]$Disk, [string]$Destination, [switch]$Lightweight) {
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
@@ -199,7 +204,7 @@ function Save-DiagnosticGuestEvidence([string]$Disk, [string]$Destination, [swit
                     if ($item.PSIsContainer) { throw 'Expected a regular log file, not a directory' }
                     $target = Join-Path "$Destination\files" $relative
                     New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($target)) -Force | Out-Null
-                    Copy-Item -LiteralPath $item.FullName -Destination $target
+                    [IO.File]::Copy($item.FullName, $target, $true)
                     $entry['present'] = $true
                     $entry['bytes'] = $item.Length
                     $entry['modified_utc'] = $item.LastWriteTimeUtc.ToString('o')
@@ -212,7 +217,7 @@ function Save-DiagnosticGuestEvidence([string]$Disk, [string]$Destination, [swit
         try {
             $agent = Get-PlainGuestItem $volume 'ProgramData\Motor\motor-winagent.exe'
             if ($agent -and -not $agent.PSIsContainer) {
-                Save-Json "$Destination\guest-agent-binary.json" @{path='C:\ProgramData\Motor\motor-winagent.exe'; bytes=$agent.Length; sha256=(Get-FileHash -LiteralPath $agent.FullName -Algorithm SHA256).Hash; modified_utc=$agent.LastWriteTimeUtc.ToString('o')}
+                Save-Json "$Destination\guest-agent-binary.json" @{path='C:\ProgramData\Motor\motor-winagent.exe'; bytes=$agent.Length; sha256=(Get-GuestFileSha256 $agent); modified_utc=$agent.LastWriteTimeUtc.ToString('o')}
             } else { Save-Json "$Destination\guest-agent-binary.json" @{present=$false} }
         } catch { Set-Content -LiteralPath "$Destination\guest-agent-error.txt" -Value ($_ | Out-String) -Encoding UTF8 }
         foreach ($channel in @('System','Application')) {
