@@ -1,7 +1,7 @@
 //! Native queries for the sealed VM's RAW or GPT cache disk.
 
 use motor_winagent::cache::{
-    BASIC_DATA_PARTITION, CACHE_DISK_SERIAL, CacheStorage, CacheVolume, DiskIdentity, DiskLayout,
+    BASIC_DATA_PARTITION, CacheStorage, CacheVolume, DiskIdentity, DiskLayout, ScsiAddress,
     cache_partition, partition_kind, require_uninitialized, storage_serial,
 };
 use motor_winagent::cache_steps::{CacheReporter, CacheStep};
@@ -16,6 +16,7 @@ use windows_sys::Win32::{
     Foundation::*,
     Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom},
     Storage::FileSystem::*,
+    Storage::IscsiDisc::{IOCTL_SCSI_GET_ADDRESS, SCSI_ADDRESS},
     System::{IO::DeviceIoControl, Ioctl::*, SystemInformation::GetWindowsDirectoryW},
 };
 use windows_sys::core::GUID;
@@ -170,24 +171,17 @@ fn disk_serial(disk: &Handle, reporter: &CacheReporter) -> io::Result<String> {
     )?;
     storage_serial(&bytes).map(str::to_owned)
 }
-/// Everything the device itself reports about the disk, in one pass over the
-/// same queries the serial path made. A Hyper-V synthetic disk reports no
-/// serial at all, so the remaining fields have to be read from the same
-/// descriptor rather than looked up separately.
+/// Everything the guest can read that names this disk, in one pass over the
+/// same handle the cache writes go through. A Hyper-V synthetic disk reports
+/// no serial, so the bus address and the reported size carry the identity.
 fn disk_identity(disk: &Handle, reporter: &CacheReporter) -> io::Result<DiskIdentity> {
-    let bytes = query(
+    let descriptor = query(
         disk,
         IOCTL_STORAGE_QUERY_PROPERTY,
         &[0; 12],
         reporter,
         CacheStep::DiskSerial,
     )?;
-    let product = u32::from_le_bytes(
-        bytes
-            .get(16..20)
-            .and_then(|slice| slice.try_into().ok())
-            .ok_or_else(|| invalid("truncated storage device descriptor"))?,
-    );
     let geometry = query(
         disk,
         IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
@@ -195,21 +189,70 @@ fn disk_identity(disk: &Handle, reporter: &CacheReporter) -> io::Result<DiskIden
         reporter,
         CacheStep::DiskGeometry,
     )?;
+    let number: STORAGE_DEVICE_NUMBER = value(
+        &query(
+            disk,
+            IOCTL_STORAGE_GET_DEVICE_NUMBER,
+            &[],
+            reporter,
+            CacheStep::DiskDeviceNumber,
+        )?,
+        0,
+    )?;
     // The driver returns a fixed header (disk size, geometry, partition-table
     // length) followed by that many partition-table bytes and any trailing
-    // extra. The total length is therefore the device's whole reported
-    // geometry, which changes whenever the disk behind the number does.
+    // extra. The total length therefore covers the whole reported geometry,
+    // which changes whenever the disk behind the number does.
     Ok(DiskIdentity {
-        serial: storage_serial(&bytes)?.to_owned(),
-        product_id: descriptor_string(&bytes, product)?,
-        descriptor_version: u32::from_le_bytes(
-            bytes
-                .get(4..8)
-                .and_then(|slice| slice.try_into().ok())
-                .ok_or_else(|| invalid("truncated storage device descriptor"))?,
-        ),
-        geometry_bytes: geometry.len() as u64,
+        serial: storage_serial(&descriptor)?.to_owned(),
+        length_bytes: geometry.len() as u64,
+        device_number: number.DeviceNumber,
+        device_type: number.DeviceType,
+        scsi: scsi_address(disk, reporter)?,
     })
+}
+fn scsi_address(disk: &Handle, reporter: &CacheReporter) -> io::Result<Option<ScsiAddress>> {
+    let mut address: SCSI_ADDRESS = unsafe { zeroed() };
+    address.Length = size_of::<SCSI_ADDRESS>() as u32;
+    let mut returned = 0;
+    let completed = reporter.step(CacheStep::DiskScsiAddress, || unsafe {
+        win32(DeviceIoControl(
+            disk.0,
+            IOCTL_SCSI_GET_ADDRESS,
+            null(),
+            0,
+            (&mut address as *mut SCSI_ADDRESS).cast(),
+            size_of::<SCSI_ADDRESS>() as u32,
+            &mut returned,
+            null_mut(),
+        ))
+    });
+    if completed.is_err() {
+        // A disk the SCSI address query does not describe, such as a
+        // non-SCSI device, answers with an unsupported request rather than
+        // an address. Any other failure still refuses the disk.
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(code)
+                if code == ERROR_INVALID_FUNCTION as i32 || code == ERROR_NOT_SUPPORTED as i32 =>
+            {
+                Ok(None)
+            }
+            _ => Err(io::Error::new(
+                error.kind(),
+                format!("cache disk SCSI address: {error}"),
+            )),
+        };
+    }
+    if returned as usize != size_of::<SCSI_ADDRESS>() {
+        return Err(invalid("truncated SCSI address"));
+    }
+    Ok(Some(ScsiAddress {
+        port: address.PortNumber,
+        path_id: address.PathId,
+        target_id: address.TargetId,
+        lun: address.Lun,
+    }))
 }
 /// Send one fixed-size input structure to a disk control code that returns
 /// nothing. These calls change the partition table, so errors name the change.
@@ -309,20 +352,13 @@ impl WindowsStorage {
             reporter: reporter.clone(),
         })
     }
-    /// Read what the device reports and pin it as this disk's identity.
+    /// Read what the guest can see of this disk and pin it as the identity.
     /// `make_writable` and `initialize_raw` compare against it through the
     /// same held handle before writing, so a disk swapped for another one
     /// under the running guest is refused rather than written.
     #[cfg(feature = "hyperv-runner")]
     pub fn capture_identity(&mut self) -> io::Result<DiskIdentity> {
         let identity = disk_identity(&self.disk, &self.reporter)?;
-        // This profile runs on disks that report no name of their own, so an
-        // unexpected serial or product id means a different device, not a
-        // cache. Detached disks are no longer filtered by the volume mount
-        // manager before this check, and this is what still refuses them.
-        if !identity.is_nameless() {
-            return Err(invalid("Hyper-V cache disk reports a device name"));
-        }
         self.expected_identity = identity.clone();
         Ok(identity)
     }
@@ -334,7 +370,7 @@ impl WindowsStorage {
         #[cfg(not(feature = "hyperv-runner"))]
         {
             DiskIdentity {
-                serial: CACHE_DISK_SERIAL.to_owned(),
+                serial: motor_winagent::cache::CACHE_DISK_SERIAL.to_owned(),
                 ..DiskIdentity::default()
             }
         }

@@ -27,6 +27,8 @@ pub enum CacheStep {
     DiskOpen,
     DiskSerial,
     DiskGeometry,
+    DiskDeviceNumber,
+    DiskScsiAddress,
     WindowsDirectory,
     WindowsMountPath,
     WindowsVolumeName,
