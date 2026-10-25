@@ -460,6 +460,30 @@ most 64 entries. `state` is exactly `reserved`, `admitted` or `started`. The hea
 the host capacity snapshot, timestamped at broker receive time. `queued` is stored but does not
 affect placement.
 
+`free_vcpus` and `free_mem_mib` answer one question for placement: can this host take one more job
+of a given size now? The broker places a lease on a host only if `free_vcpus ≥ vcpus` and
+`free_mem_mib ≥ max(16384, 3584 × vcpus)`. It reads them for nothing else: billing, `no_host_fits`
+and pricing use the registry ceilings and the usage reports instead. A host reports them for the
+machine that runs its jobs:
+
+- `free_vcpus` is the tenant's admission capacity in lease vcpus: its budget (`max_weight`, or
+  `vcpu_ceiling` when that is unset) minus the requested `vcpus` of every lease the host counts. A
+  lease counts while it is reserved, admitted or started and within its maximum duration. It is 0
+  while the tenant's wake is pending or its start was refused, and 0 while the host refuses new
+  work for lack of storage.
+- `free_mem_mib` is the memory available to the tenant machine that runs jobs, not to the host:
+  the tenant guest's available memory as its runner reports it, floored to MiB, minus the host's
+  configured tenant memory reserve (rounded up to MiB), and 0 if that would be negative. A host
+  without a valid capacity configuration reports 0. A stopped or suspended tenant reports its full
+  RAM minus the reserve, so the lease that wakes it can be placed. A running tenant without a fresh
+  sample (older than 30,000 ms, or a failed probe) reports 0.
+- A host with several tenants reports, for each field independently, the maximum over its tenants.
+
+The broker doesn't subtract a placed lease from a snapshot, so several leases placed within one
+heartbeat interval can all pass against the same values. The host's own admission is the real
+limit: a lease it can't take is refused before Run with a fast `hosted_host_full`, which clients
+retry like `no_capacity`.
+
 Running entries are processed in order. An unknown, claim-only or other-host job is listed in
 `ignored` without failing siblings or writing `TenantDO` storage. A settled job placed on this
 host has no effect. A reserved job on this host updates
@@ -570,13 +594,31 @@ the lease either (see step 3 of the lease order).
 lease is 402 `budget_exhausted` and no Boat call is made. While the shared Boat breaker is open
 (after a Boat 429 or 503), the lease is 503 `no_capacity` at once with that wait as Retry-After.
 Then, in one transaction that computes the budget candidate again (402 `budget_exhausted` below
-10 seconds), a provisioning record keyed by `job_id` claims a pool slot: a free ready sandbox,
-else an archived one to resume, else one being stopped (waited for, then resumed), else a new
-sandbox under the cap. Every slot but a free ready one needs a start (a create or a resume), and
-a tenant gets at most its hourly start limit in any hour, resumes included: the account's own
-limit when the operator set one (1 to 1000), else `BOAT_MAX_STARTS_PER_HOUR` (6). Past that the
-lease is 503 `no_capacity` with Retry-After the wait until a start leaves the hour. No slot is
-503 `no_capacity`.
+10 seconds), a provisioning record keyed by `job_id` claims a pool slot. A sandbox records the
+`workspace_key_hash` of the lease last booked on it; an entry with no recorded workspace matches
+nothing, and the hash is compared for equality only. The claim prefers a match: the oldest free
+ready sandbox, else the oldest archived one to resume, else one being stopped (waited for, then
+resumed). Otherwise the order is unchanged: a free ready sandbox, else an archived one to resume,
+else one being stopped (waited for, then resumed), else a new sandbox under the cap, oldest first
+within each state. A matching archived or stopping sandbox needs a start. If that start is not
+allowed right now (the hourly limit is already reached, or the cap leaves no room), the match is
+not waited for and a free ready sandbox is claimed at once, so a resume is never preferred over
+a lease that can run immediately. At claim time the limit's wait, or the cap's refusal, applies
+only when no ready sandbox exists. A claimed ready sandbox whose Boat auto-stop would come before
+the lease's deadline is still stopped and resumed with a new lifetime before booking, and that
+resume is a start like any other. A placement hint still does not select a sandbox. Every slot but a free
+ready one needs a start (a create or a resume), and a tenant gets at most its hourly start limit
+in any hour, resumes included: the account's own limit when the operator set one (1 to 1000),
+else `BOAT_MAX_STARTS_PER_HOUR` (6). Past that the lease is 503 `no_capacity` with Retry-After the
+wait until a start leaves the hour. No slot is 503 `no_capacity`.
+
+Only starts sent to Boat count toward the hourly limit and daily start counter. A claim needing
+a start holds a persisted reservation, as do TTL-cycle and recover steps; the hourly admission
+limit includes reservations plus sent starts in the last hour. The send fence converts the
+reservation into a counted start. A claim ending unsent (including expiry, refusal, release or
+booking a sandbox that became ready) releases its reservation. A sent start is never refunded
+on failure or a lost reply. Replays of a create's persisted idempotency key count once; each
+resume or recover POST sent counts, including a retry after a lost reply.
 
 **Provisioning hold.** The claiming transaction reserves a provisioning hold of
 `min(vcpus × 60000, vcpus × max_s × 1000)` vCPU-ms, the minimum a booked Boat job is charged; it
