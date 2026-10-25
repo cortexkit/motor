@@ -183,11 +183,17 @@ def apply_jobs_slice():
         refuse_resize_journal()
         memory_fit(capacity)
         rendered = jobs_slice_render(capacity)
-        values = slice_properties(("LoadState", "MemoryCurrent"))
+        values = slice_properties(("LoadState", "MemoryCurrent", "ActiveState", "ControlGroup"))
         if values["LoadState"] == "not-found":
             current = 0
         elif values["LoadState"] == "loaded":
-            current = slice_bytes(values["MemoryCurrent"], "MemoryCurrent")
+            # systemd synthesizes an unloaded slice as loaded but inactive,
+            # without a cgroup or a memory counter. Only that empty state is zero.
+            if (values["MemoryCurrent"] == "[not set]" and values["ActiveState"] == "inactive"
+                    and values["ControlGroup"] == ""):
+                current = 0
+            else:
+                current = slice_bytes(values["MemoryCurrent"], "MemoryCurrent")
         else:
             raise ValueError(f"motor-jobs.slice LoadState={values['LoadState']}")
         _maximum, high = jobs_slice_limits(capacity)

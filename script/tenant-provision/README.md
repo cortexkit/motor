@@ -99,6 +99,10 @@ the budget. Apply or read-back failures are errors; inspect the drop-in and
 live limits before retrying. The drop-in is written even if the slice is not
 installed yet. Provisioning requires its exact rendered bytes and checks the
 live cap too; an unloaded, `not-found` slice requires the same exact file.
+On a fresh systemd host an implicit slice can instead report `loaded` but
+`inactive`, with no `ControlGroup` and `MemoryCurrent=[not set]`. Applying the
+budget treats only that empty state as zero usage; an active slice or one with
+a cgroup still requires a numeric usage reading before any drop-in write.
 
 `MemoryMax = jobs_min_bytes + windows_vm_bytes` and
 `MemoryHigh = MemoryMax - floor(MemoryMax / 6)`. The slice holds the Windows VM
