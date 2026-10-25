@@ -74,6 +74,11 @@ pub struct HostedJobState {
     /// Persist the decision so retries and restarts cannot enable local fallback.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) repository_routed: bool,
+    /// The configured placement for a repository-routed job. Save it before
+    /// leasing so a restart or config change cannot unpin the job or enable
+    /// the no_host_fits correction to the build server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repository_placement_hint: Option<Placement>,
     /// Selected by the global fleet route. Persist alongside repository routing
     /// so capacity waits and pre-Run correction survive configuration changes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -495,7 +500,7 @@ fn resource_mismatch(
 /// Whether CLOUD accepts `placement` as a lease's `placement_hint`: a host in
 /// the name grammar, optionally with the `boat:` prefix of a Boat placement,
 /// and a vm in the name grammar (never null).
-fn valid_hint(placement: &Placement) -> bool {
+pub(crate) fn valid_hint(placement: &Placement) -> bool {
     let host = placement
         .host
         .strip_prefix("boat:")
@@ -922,22 +927,34 @@ impl Client {
                 "hosted"
             }
         });
+        let repository_hint = job
+            .hosted
+            .as_ref()
+            .and_then(|state| state.repository_placement_hint.clone());
         let mut body = match job.hosted.and_then(|state| state.lease_request) {
             Some(request) => request,
-            None => lease_body(
-                id,
-                request,
-                (
-                    keyed_hash(&salt, "ck-ws-v1", &request.workspace_key)
-                        .map_err(|_| Error::Path)?,
-                    keyed_hash(&salt, "ck-repo-v1", &request.repository_root)
-                        .map_err(|_| Error::Path)?,
-                ),
-                storage.hosted_placement(&request.workspace_key),
-                avoid_host,
-                RequesterJwk::from_key(&requester()?.verifying_key()),
-                Some(allow_spill),
-            )?,
+            None => {
+                let mut body = lease_body(
+                    id,
+                    request,
+                    (
+                        keyed_hash(&salt, "ck-ws-v1", &request.workspace_key)
+                            .map_err(|_| Error::Path)?,
+                        keyed_hash(&salt, "ck-repo-v1", &request.repository_root)
+                            .map_err(|_| Error::Path)?,
+                    ),
+                    storage.hosted_placement(&request.workspace_key),
+                    avoid_host,
+                    RequesterJwk::from_key(&requester()?.verifying_key()),
+                    Some(allow_spill),
+                )?;
+                // Unlike a cached warm placement, a configured hint is binding.
+                // Never discard it, even if invalid: refuse rather than unpin.
+                if let Some(hint) = repository_hint {
+                    body.placement_hint = Some(hint);
+                }
+                body
+            }
         };
         // Never send a body the broker would refuse. The requester key that
         // each attempt below puts in is freshly generated and always valid.

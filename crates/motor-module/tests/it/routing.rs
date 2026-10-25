@@ -524,6 +524,133 @@ fn ordered_windows_config_defaults_are_omitted_and_legacy_pair_still_routes() {
     assert!(bad.validate().is_err());
 }
 
+fn ally_entry() -> serde_json::Value {
+    serde_json::from_str(r#"{"name":"ally","host":"192.168.1.44","user":"motor-ssh","host_key":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOQbca4geGC+qIj32MrwVGGuBxvSCm8EsEMRT41+YEW8","instance":"ally","state_root":"C:/ProgramData/MotorRunner/state"}"#).unwrap()
+}
+
+fn posix_windows_entry() -> serde_json::Value {
+    let mut entry = ally_entry();
+    entry["name"] = "build-server".into();
+    entry["host"] = "build-server".into();
+    entry["instance"] = "windows".into();
+    entry["state_root"] = "/var/lib/motor-win/state".into();
+    entry
+}
+
+#[test]
+fn ordered_windows_config_accepts_ally_drive_root_and_mixed_posix_entries() {
+    for entries in [
+        vec![ally_entry()],
+        vec![posix_windows_entry(), ally_entry()],
+    ] {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "windows_runners": entries
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        let ally = config.windows_runners.last().unwrap();
+        assert_eq!(ally.name, "ally");
+        assert_eq!(ally.state_root, "C:/ProgramData/MotorRunner/state");
+        assert_eq!(ally.port, 22);
+        assert_eq!(ally.max_concurrent, 1);
+        assert!(!ally.state_root.contains(char::is_whitespace));
+    }
+}
+
+#[test]
+fn ordered_windows_config_refuses_unsafe_state_roots_with_entry_and_field() {
+    for root in [
+        r"C:\x",
+        "C:/a/../b",
+        "C:/a b",
+        "1:/x",
+        "C:x",
+        "C:/a:b",
+        "/a/../b",
+        "C:/a\tb",
+        "C:/a\nb",
+        "C:/a;b",
+        "C:/a&b",
+        "C:/a|b",
+        "C:/a$b",
+        "C:/a`b",
+        "C:/a'b",
+        "C:/a\"b",
+        "C:/a>b",
+        "C:/a<b",
+        "C:/a(b",
+        "C:/a*b",
+        "C:/a?b",
+    ] {
+        let mut entry = ally_entry();
+        entry["state_root"] = root.into();
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "windows_runners": [posix_windows_entry(), entry]
+        }))
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.starts_with("windows_runners[1] (ally): state_root "),
+            "{root:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn ordered_windows_config_names_every_invalid_entry_field() {
+    for (field, value) in [
+        ("name", serde_json::json!("bad name")),
+        ("host", serde_json::json!("-option")),
+        ("host", serde_json::json!("bad host")),
+        ("user", serde_json::json!("-option")),
+        ("user", serde_json::json!("bad user")),
+        ("port", serde_json::json!(0)),
+        ("instance", serde_json::json!("bad.instance")),
+        ("instance", serde_json::json!("")),
+        ("host_key", serde_json::json!("not a key")),
+        (
+            "host_key",
+            serde_json::json!(format!("{}\n", ally_entry()["host_key"].as_str().unwrap())),
+        ),
+        ("max_concurrent", serde_json::json!(0)),
+        ("max_concurrent", serde_json::json!(usize::MAX)),
+    ] {
+        let mut entry = ally_entry();
+        entry[field] = value;
+        let name = entry["name"].as_str().unwrap().to_owned();
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "windows_runners": [posix_windows_entry(), entry]
+        }))
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.starts_with(&format!("windows_runners[1] ({name}): {field} ")),
+            "{error}"
+        );
+    }
+    let config: Config = serde_json::from_value(serde_json::json!({
+        "windows_runners": [ally_entry(), ally_entry()]
+    }))
+    .unwrap();
+    assert_eq!(
+        config.validate().unwrap_err().to_string(),
+        "windows_runners[1] (ally): name must be unique"
+    );
+    let mut macos = posix_windows_entry();
+    macos.as_object_mut().unwrap().remove("name");
+    macos["instance"] = "ally".into();
+    macos["user"] = "motor".into();
+    let config: Config = serde_json::from_value(serde_json::json!({
+        "windows_runners": [posix_windows_entry(), ally_entry()],
+        "macos_runner": macos
+    }))
+    .unwrap();
+    assert_eq!(
+        config.validate().unwrap_err().to_string(),
+        "windows_runners[1] (ally): instance must differ from macos_runner.instance"
+    );
+}
+
 fn write_job(peer: &RoutingPeer, id: Uuid, instance: Option<&str>, pending: bool) {
     fs::create_dir_all(&peer.module_state).unwrap();
     let mut job = json!({"queue_wait_limit_s":900,"pending_cancel":pending,"local_terminal":null});

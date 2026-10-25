@@ -20,6 +20,10 @@ pub struct Config {
     /// resolved repository_root of their main checkout. Windows and macOS stay direct.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosted_repositories: Vec<String>,
+    /// Pin repository-routed leases to this broker placement hint. Spill, shadow
+    /// and fleet routes ignore it; hinted jobs never correct to the direct runner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosted_repositories_placement_hint: Option<motor_lease::Placement>,
     /// Move only proven capacity-permit waits to hosted runners. Defaults are
     /// omitted so older clients with a closed Config schema can still load it.
     #[serde(skip_serializing_if = "is_false")]
@@ -212,30 +216,51 @@ impl WindowsRunner {
                 && s.bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
         };
-        if !plain(&self.name)
-            || !plain(&self.host)
-            || !plain(&self.user)
-            || self.host.starts_with('-')
-            || self.user.starts_with('-')
-            || self.port == 0
-            || self.instance.is_empty()
+        let drive_root = self.state_root.as_bytes().get(..3).is_some_and(|root| {
+            root[0].is_ascii_alphabetic() && root[1] == b':' && root[2] == b'/'
+        });
+        // Only a drive prefix may contain ':'. The allowlist excludes whitespace
+        // and shell metacharacters from this unquoted remote-command argument.
+        let path = if drive_root {
+            &self.state_root[3..]
+        } else {
+            self.state_root.as_str()
+        };
+        let invalid = if !plain(&self.name) {
+            Some("name must be nonempty ASCII letters, digits, '.', '_' or '-'")
+        } else if !plain(&self.host) || self.host.starts_with('-') {
+            Some("host must be nonempty ASCII letters, digits, '.', '_' or '-', and not start with '-'")
+        } else if !plain(&self.user) || self.user.starts_with('-') {
+            Some("user must be nonempty ASCII letters, digits, '.', '_' or '-', and not start with '-'")
+        } else if self.port == 0 {
+            Some("port must be nonzero")
+        } else if self.instance.is_empty()
             || !self
                 .instance
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-            || !self.state_root.starts_with('/')
-            || !self
-                .state_root
+        {
+            Some("instance must be nonempty ASCII letters, digits, '_' or '-'")
+        } else if !(drive_root || self.state_root.starts_with('/'))
+            || !path
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
-            || self.max_concurrent == 0
+            || path.split('/').any(|part| part == "..")
+        {
+            Some("state_root must be an absolute POSIX path or a drive-letter path like C:/..., using only ASCII letters, digits, '/', '.', '_' or '-' after the root, without '..' segments")
+        } else if self.max_concurrent == 0
             || self.max_concurrent > tokio::sync::Semaphore::MAX_PERMITS
-            || self.host_key.contains(['\r', '\n'])
+        {
+            Some("max_concurrent must be positive and no larger than the semaphore permit limit")
+        } else if self.host_key.contains(['\r', '\n'])
             || ssh_key::PublicKey::from_openssh(&self.host_key).is_err()
         {
-            return Err(io::Error::other(
-                "invalid Windows runner endpoint, instance, state root, host key or concurrency",
-            ));
+            Some("host_key must be a single-line OpenSSH public key")
+        } else {
+            None
+        };
+        if let Some(message) = invalid {
+            return Err(io::Error::other(message));
         }
         Ok(())
     }
@@ -320,6 +345,7 @@ impl Default for Config {
             hosted_runners: false,
             hosted_fleet_routing: false,
             hosted_repositories: Vec::new(),
+            hosted_repositories_placement_hint: None,
             spill_to_hosted: false,
             shadow_to_hosted: ShadowConfig::default(),
             spill_after_s: 45,
@@ -371,21 +397,34 @@ impl Config {
             runner.validate()?;
             if runner.instance == self.runner_instance
                 || Some(&runner.instance) == self.windows_runner_instance.as_ref()
-                || self
-                    .windows_runners
-                    .iter()
-                    .any(|windows| windows.instance == runner.instance)
             {
                 return Err(io::Error::other(
                     "macos_runner instance must differ from Linux and Windows instances",
                 ));
             }
+            if let Some((index, windows)) = self
+                .windows_runners
+                .iter()
+                .enumerate()
+                .find(|(_, windows)| windows.instance == runner.instance)
+            {
+                return Err(io::Error::other(format!(
+                    "windows_runners[{index}] ({}): instance must differ from macos_runner.instance",
+                    windows.name
+                )));
+            }
         }
         let mut names = std::collections::HashSet::new();
-        for runner in &self.windows_runners {
-            runner.validate()?;
+        for (index, runner) in self.windows_runners.iter().enumerate() {
+            let error = |message| {
+                io::Error::other(format!(
+                    "windows_runners[{index}] ({}): {message}",
+                    runner.name
+                ))
+            };
+            runner.validate().map_err(|e| error(e.to_string()))?;
             if !names.insert(&runner.name) {
-                return Err(io::Error::other("Windows runner names must be unique"));
+                return Err(error("name must be unique".into()));
             }
         }
         if !self.shadow_to_hosted.sample_rate.is_finite()
@@ -482,6 +521,15 @@ impl Config {
         {
             return Err(io::Error::other(
                 "hosted_repositories must be absolute repository roots",
+            ));
+        }
+        if self
+            .hosted_repositories_placement_hint
+            .as_ref()
+            .is_some_and(|hint| !crate::hosted::valid_hint(hint))
+        {
+            return Err(io::Error::other(
+                "hosted_repositories_placement_hint requires a valid host and non-null vm in the broker name grammar",
             ));
         }
         if self

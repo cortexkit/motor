@@ -43,10 +43,11 @@ The config file is JSONC. Unknown keys are refused. All keys are optional.
 | --- | --- | --- |
 | `runner_instance` | `main` | Runner instance for Linux jobs. |
 | `windows_runner_instance`, `windows_runner_state_root` | absent | Legacy Windows runner instance and absolute state root. Set both or neither; the instance must differ from `runner_instance`. Used when `windows_runners` is empty. |
-| `windows_runners` | `[]` (omitted) | Ordered Windows endpoints: `name`, `host`, `port` (22), `user`, pinned OpenSSH `host_key`, `instance`, `state_root`, `max_concurrent` (1). Takes precedence over the legacy pair. See [windows-jobs.md](windows-jobs.md). |
+| `windows_runners` | `[]` (omitted) | Ordered Windows endpoints: `name`, `host`, `port` (22), `user`, pinned OpenSSH `host_key`, `instance`, `state_root` (absolute POSIX or drive-letter path), `max_concurrent` (1). Takes precedence over the legacy pair. See [windows-jobs.md](windows-jobs.md). |
 | `worktree_roots` | `$XDG_DATA_HOME/cortexkit/alfonso/worktrees` | Absolute roots under which linked worktrees are recognised as task workspaces. |
 | `queue_wait_limit_s` | `300` | Default queue-wait budget for a spill-eligible job; see below for jobs that cannot spill. |
 | `hosted_repositories` | `[]` (omitted) | Absolute main-checkout repository roots whose ordinary Linux jobs request hosted leases instead of the direct runner. See [repository routing](#hosted-repository-routing). |
+| `hosted_repositories_placement_hint` | absent (omitted) | Optional `{ "host": "control-host", "vm": "t1" }` placement hint for repository-routed leases only. Both names must follow the broker grammar; `vm` cannot be null. Hinted jobs never fall back to the build server. |
 | `network_routing` | `false` | Forward a caller's request for outbound network. When off, such requests are refused with `network_unsupported`. |
 | `admit_direct_exec` | `false` | Admit direct local callers (`ck motor run`) for their own jobs. |
 | `direct_exec_max_timeout_secs` | `7200` | Longest timeout a direct run may ask for. |
@@ -557,12 +558,25 @@ Both agent and direct jobs for a listed repository request a lease before any
 direct-runner submission. The lease sends `avoid_host: null` (ignoring
 `spill_avoid_host`) and `allow_spill: false`, restricting placement to registered
 hosts rather than Boat. These jobs never enter the spill path or fall back to the
-direct runner after a hosted failure; a `no_host_fits` answer, described below,
+direct runner after a hosted failure; an unhinted `no_host_fits` answer, described below,
 is a routing correction, not a failure. Windows stays on its direct runner. Outbound-network jobs can use
 hosted leases: the request's `net` flag must match the signed lease claim, and
 `network_routing` must still be enabled. Unlisted jobs retain their existing
 direct and spill behavior; spilled leases and shadow leases send `allow_spill:
 true`.
+
+Set `hosted_repositories_placement_hint` to send exactly that `{host, vm}` hint
+on repository-routed leases, overriding any cached warm placement. The setting
+is omitted from serialized Config when unset, so older clients with closed
+schemas can still read the default config. Spill, shadow and fleet-routing leases
+never inherit the setting, and placements from hinted jobs are not cached as warm
+hints for other jobs. The hint is saved with the job's route before leasing, so
+retries and restarts retain it even if the config changes. With a broker host
+marked `explicit_only`, only a hint naming that host admits the job there; if it
+does not fit, the broker returns retryable `no_capacity` rather than choosing
+another host. Such a refusal waits and retries within the normal queue budget.
+A hinted repository job never corrects to the build server, even on
+`no_host_fits`, and still sends `allow_spill: false` so it cannot run on Boat.
 
 For a repository-routed job, broker `503 no_capacity` responses wait for
 `Retry-After` (seconds, clamped to 1–30 seconds; missing or invalid means one
@@ -588,7 +602,7 @@ submission.
 
 A broker answer of `no_host_fits` (HTTP 422, `{"error":"no_host_fits",
 "max_vcpus":N}`) means no host it could ever use holds the job's vCPUs, so a
-retry cannot succeed. For a repository-routed job that has not sent its Run
+retry cannot succeed. For an unhinted repository-routed job that has not sent its Run
 frame, this undoes the routing choice rather than failing the job: ck-motor
 removes the job's hosted route, stores `routed_direct_reason: "no_host_fits"`
 on the job, logs one INFO event `hosted no_host_fits; routing to build server`
@@ -641,6 +655,16 @@ Tests: `listed_main_and_linked_agent_and_direct_jobs_use_hosted_without_avoiding
 `unlisted_spill_eligible_job_still_withdraws_and_sends_allow_spill_true`,
 `shadow_lease_explicitly_allows_spill`, and
 `hosted_routed_counter_only_counts_repository_routes_in_the_last_hour`.
+Placement-hint coverage:
+`repository_placement_hint_config_roundtrips_absent_null_and_present`,
+`repository_placement_hint_rejects_invalid_names_and_null_vm`,
+`repository_routed_lease_carries_the_configured_hint_without_caching_it_for_other_routes`,
+`hinted_no_capacity_retries_the_identical_body_then_runs_without_fallback`,
+`hinted_no_capacity_exhausts_the_queue_budget_without_fallback`,
+`hinted_no_host_fits_refuses_without_build_server_correction`,
+`unlisted_spill_eligible_job_still_withdraws_and_sends_allow_spill_true`,
+`shadow_hanging_or_refused_never_changes_callers_stream_or_exit`, and
+`fleet_linux_default_platform_jobs_allow_hosted_spill_but_gates_stay_direct`.
 The canonical `no-spill-lease.json` fixture from `cortexkit-cloud` is pinned under
 `crates/motor-lease/contracts/cloud/`. Tests
 `cloud_no_spill_request_serializes_to_the_exact_canonical_bytes_and_hash`,
@@ -649,6 +673,10 @@ and `stored_allow_spill_presence_and_value_survive_lease_re_requests` check its
 hash projection, capacity reply, and stable re-request policy. Requester keys are
 excluded from the lease hash; an absent `allow_spill` and either explicit boolean
 have distinct hashes, so the stored request preserves presence as well as value.
+`non_null_hint_keeps_the_pinned_broker_canonical_member_order` checks a non-null
+hint in that projection. The pinned hash-bearing broker vectors currently all
+have null hints; a broker-supplied non-null hash vector is still needed for full
+cross-implementation confirmation.
 CLOUD's `no-host-fits-lease.json` (from `cortexkit-cloud` `916347e`) is pinned
 beside it: `stage1_cloud_no_host_fits_reply_routes_the_job_to_the_build_server`
 sends its exact 422 reply bytes through ck-motor's broker client, and

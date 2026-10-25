@@ -1039,6 +1039,32 @@ fn cloud_no_spill_request_serializes_to_the_exact_canonical_bytes_and_hash() {
     assert_ne!(spill, canonical);
 }
 
+#[test]
+fn non_null_hint_keeps_the_pinned_broker_canonical_member_order() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/no-spill-lease.json"
+    ))
+    .unwrap();
+    let mut body: motor_lease::LeaseRequest =
+        serde_json::from_str(vector["request"]["body_bytes"].as_str().unwrap()).unwrap();
+    body.placement_hint = Some(Placement {
+        host: "control-host".into(),
+        vm: Some("t1".into()),
+    });
+    // The pinned hash vectors only cover null hints. Preserve their projection
+    // order with a non-null hint, without claiming a broker-supplied hash for it.
+    let expected = vector["canonical_lease_bytes"].as_str().unwrap().replace(
+        "\"placement_hint\":null",
+        "\"placement_hint\":{\"host\":\"control-host\",\"vm\":\"t1\"}",
+    );
+    let canonical = canonical_lease_bytes(&body);
+    assert_eq!(canonical, expected);
+    assert_ne!(
+        motor_lease::sha256_hex(canonical.as_bytes()),
+        vector["lease_hash"]
+    );
+}
+
 /// CLOUD's `no-host-fits-lease.json` records a 16-vCPU repository-routed lease
 /// (`allow_spill: false`) and its lease hash; ck-motor's body for the same job
 /// has the same members and the same hash.

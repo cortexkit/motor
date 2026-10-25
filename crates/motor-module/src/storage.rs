@@ -575,7 +575,11 @@ impl Storage {
             .rev()
             .find(|j| {
                 j.workspace_key.as_deref() == Some(key)
-                    && j.hosted.as_ref().is_some_and(|h| h.placement.is_some())
+                    && j.hosted.as_ref().is_some_and(|h| {
+                        // A host selected by a repository placement hint must
+                        // not become a warm hint for jobs that did not select it.
+                        h.placement.is_some() && h.repository_placement_hint.is_none()
+                    })
             })
             .and_then(|j| j.hosted.as_ref()?.placement.clone())
     }
