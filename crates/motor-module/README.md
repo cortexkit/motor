@@ -3,7 +3,8 @@
 `ck-motor` is motor's client: a reserved module of the CortexKit daemon that
 admits `exec-remote/v1` callers, captures snapshots of their checkouts, and
 sends jobs to `motor-runner` over SSH. It also provides `ck motor run` for
-scripts, and `ck motor attach JOB_ID` to reconnect with a job's one-time secret.
+scripts, `ck motor attach JOB_ID` to reconnect with a job's one-time secret, and
+`ck motor cancel JOB_ID` to stop a job whose run process is gone.
 By default, `run` saves the secret in a private file and prints only its path;
 `attach JOB_ID` finds that file automatically. `--secret-file PATH` selects an
 explicit file. If no default file exists, `attach` reads the secret from stdin;

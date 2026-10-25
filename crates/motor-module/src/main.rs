@@ -35,6 +35,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("attach") => {
             std::process::exit(motor_module::cli::attach_main(&args[1..]).await.into())
         }
+        Some("cancel") => {
+            std::process::exit(motor_module::cli::cancel_main(&args[1..]).await.into())
+        }
         Some("shadow-report") => std::process::exit(
             motor_module::cli::shadow_report_main(&args[1..])
                 .await
