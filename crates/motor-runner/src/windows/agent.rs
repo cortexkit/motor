@@ -18,13 +18,37 @@ use std::{
 
 #[derive(Default)]
 pub(crate) struct Runtime {
+    // Config clones share this guard, so service and qualification lifetimes
+    // deny parent writes/deletion even between their individual control calls.
+    #[cfg(windows)]
+    pub(super) parent_guard: Mutex<Option<(PathBuf, fs::File)>>,
+    #[cfg(windows)]
+    reuse_parent_verification: AtomicBool,
     jobs: Mutex<std::collections::BTreeMap<Uuid, Arc<Control>>>,
     cleanups: Mutex<VecDeque<super::vm::Resources>>,
     cleanup_ids: Mutex<std::collections::BTreeSet<Uuid>>,
+    guest_agent_readiness: Mutex<Option<WindowsGuestAgentReadiness>>,
     #[cfg(test)]
     pub(crate) cache_timings: Mutex<std::collections::BTreeMap<Uuid, motor_winagent::CacheTimings>>,
 }
 impl Runtime {
+    // Only the Hyper-V host path sets readiness, and it is Windows-only.
+    #[cfg(windows)]
+    pub(crate) fn set_guest_agent_readiness(&self, readiness: WindowsGuestAgentReadiness) {
+        *self.guest_agent_readiness.lock().unwrap() = Some(readiness);
+    }
+    pub(crate) fn guest_agent_readiness(&self) -> Option<WindowsGuestAgentReadiness> {
+        self.guest_agent_readiness.lock().unwrap().clone()
+    }
+    #[cfg(windows)]
+    pub(crate) fn reuse_parent_verification_for_qualification(&self) {
+        self.reuse_parent_verification
+            .store(true, Ordering::Release);
+    }
+    #[cfg(windows)]
+    pub(crate) fn reuses_parent_verification(&self) -> bool {
+        self.reuse_parent_verification.load(Ordering::Acquire)
+    }
     #[cfg(test)]
     pub(crate) fn output_blocked(&self, id: Uuid) -> bool {
         self.jobs
@@ -107,6 +131,105 @@ impl Runtime {
             .get(&id)
             .is_some_and(|c| c.cancel.load(Ordering::Acquire) > 0)
     }
+}
+#[cfg(any(windows, test))]
+pub(super) fn fresh_hyperv_nonce() -> String {
+    // The baked guest's DVD reader accepts exactly 32 hexadecimal bytes. Keep
+    // this value unchanged in both the media and the host protocol expectation.
+    Uuid::now_v7().simple().to_string()
+}
+#[cfg(any(windows, test))]
+pub(super) fn qualification_io_is_quiet(elapsed_ms: u64, quiet_ms: u64, available: bool) -> bool {
+    available && elapsed_ms >= 15_000 && quiet_ms >= 5_000
+}
+#[cfg(any(windows, test))]
+pub(super) fn qualification_json(bytes: &[u8], source: &str) -> io::Result<serde_json::Value> {
+    let payload = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    serde_json::from_slice(payload).map_err(|error| {
+        io::Error::other(format!("Invalid qualification JSON from {source}: {error}"))
+    })
+}
+#[cfg(any(windows, test))]
+pub(super) fn qualification_disconnect_proof(
+    log: &str,
+    nonce: &str,
+    written: usize,
+) -> Option<&'static str> {
+    fn number(line: &str, marker: &str) -> Option<usize> {
+        line.split_once(marker)?
+            .1
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    }
+    let (_, episode) = log.rsplit_once(&format!("boot nonce={nonce}"))?;
+    let mut total = 0usize;
+    let mut last_success = None;
+    let mut pending_read = None;
+    let mut inbound_started = false;
+    let mut terminal = None;
+    for line in episode.lines() {
+        if line.contains("reader frame ")
+            || line.contains("reader unexpected host frame")
+            || line.contains("staging ReceiveTree")
+            || line.contains("staging TreeReceived sent")
+        {
+            return None;
+        }
+        if inbound_started
+            && line.contains("io write done bytes=")
+            && number(line, "io write done bytes=")? > 0
+        {
+            return None;
+        }
+        if line.contains("io read start requested=") {
+            let requested = number(line, "io read start requested=")?;
+            if terminal.is_some() || pending_read.is_some() || requested == 0 {
+                return None;
+            }
+            pending_read = Some(requested);
+        } else if line.contains("io read done bytes=") {
+            if terminal.is_some() {
+                return None;
+            }
+            let requested = pending_read.take()?;
+            let bytes = number(line, "io read done bytes=")?;
+            let observed = number(line, " total=")?;
+            if bytes > requested || total.checked_add(bytes)? != observed || observed > written {
+                return None;
+            }
+            total = observed;
+            if bytes == 0 {
+                if last_success != Some(written) || total != written {
+                    return None;
+                }
+                terminal = Some("clean-eof");
+            } else {
+                inbound_started = true;
+                last_success = Some(total);
+            }
+        } else if line.contains("reader error:") {
+            if terminal == Some("clean-eof") {
+                continue;
+            }
+            if terminal.is_some()
+                || pending_read.take().is_none()
+                || last_success != Some(written)
+                || total != written
+            {
+                return None;
+            }
+            terminal = if line.contains("(os error 10053)") {
+                Some("reader-aborted-10053")
+            } else if line.contains("(os error 10054)") {
+                Some("reader-reset-10054")
+            } else {
+                return None;
+            };
+        }
+    }
+    terminal
 }
 struct Registration {
     runtime: Arc<Runtime>,
@@ -568,6 +691,9 @@ fn materialize_attempt(
     if control.cancel.load(Ordering::Acquire) > 0 {
         return Err(invalid("Windows setup cancelled"));
     }
+    #[cfg(windows)]
+    let nonce = fresh_hyperv_nonce();
+    #[cfg(not(windows))]
     let nonce = Uuid::now_v7().to_string();
     let clock = Clock::new(config);
     #[cfg(unix)]
@@ -805,6 +931,116 @@ fn materialize_attempt(
 mod tests {
     use super::*;
     use std::{collections::BTreeMap, os::fd::AsRawFd};
+
+    #[test]
+    fn hyperv_boot_nonce_matches_baked_guest_reader() {
+        let nonce = fresh_hyperv_nonce();
+        assert_eq!(nonce.len(), 32);
+        assert_eq!(
+            motor_winagent::transport::hyperv_nonce(&nonce).unwrap(),
+            nonce
+        );
+        assert!(motor_winagent::transport::hyperv_nonce(&Uuid::now_v7().to_string()).is_err());
+    }
+
+    #[test]
+    fn qualification_settle_requires_a_source_minimum_and_quiet_window() {
+        assert!(!qualification_io_is_quiet(14_999, 14_999, true));
+        assert!(!qualification_io_is_quiet(15_000, 4_999, true));
+        assert!(!qualification_io_is_quiet(60_000, 60_000, false));
+        assert!(qualification_io_is_quiet(15_000, 5_000, true));
+    }
+
+    #[test]
+    fn qualification_json_accepts_ps51_bom_and_names_bad_inputs() {
+        for bytes in [
+            b"{\"matched\":true}".as_slice(),
+            b"\xef\xbb\xbf{\r\n\"matched\":true}",
+        ] {
+            assert_eq!(
+                qualification_json(bytes, "job-disk-binding.json").unwrap()["matched"],
+                true
+            );
+        }
+        for bytes in [b"".as_slice(), b"\xef\xbb\xbf", b"not JSON"] {
+            let error = qualification_json(bytes, "mounted-disk-identity.json").unwrap_err();
+            assert!(error.to_string().contains("mounted-disk-identity.json"));
+        }
+    }
+
+    #[test]
+    fn qualification_disconnect_accepts_clean_eof_and_exact_terminal_reader_errors() {
+        let prefix = "boot nonce=current\nio write done bytes=4 total=4\nio read start requested=196645\nio read done bytes=98322 total=98322\nio read start requested=98323\n";
+        let eof = format!(
+            "{prefix}io read done bytes=0 total=98322\nreader error: failed to fill whole buffer\n"
+        );
+        assert_eq!(
+            qualification_disconnect_proof(&eof, "current", 98322),
+            Some("clean-eof")
+        );
+        let observed = "boot nonce=current\nio read start requested=196645\nio read done bytes=98304 total=98304\nio read start requested=98341\nio read done bytes=18 total=98322\nio read start requested=98323\nreader error: connection aborted (os error 10053)\nio write start requested=4\nio write start requested=4\nservice result: Err(Os { code: 10054 })\n";
+        assert_eq!(
+            qualification_disconnect_proof(observed, "current", 98322),
+            Some("reader-aborted-10053")
+        );
+        for (code, kind) in [
+            (10053, "reader-aborted-10053"),
+            (10054, "reader-reset-10054"),
+        ] {
+            let reset = format!("{prefix}reader error: socket ended (os error {code})\nio write start requested=4\nservice result: Err(Os {{ code: 10054 }})\n");
+            assert_eq!(
+                qualification_disconnect_proof(&reset, "current", 98322),
+                Some(kind)
+            );
+        }
+    }
+
+    #[test]
+    fn qualification_disconnect_rejects_wrong_counts_nonce_or_unobserved_read_end() {
+        let prefix = "boot nonce=current\nio read start requested=196645\nio read done bytes=98322 total=98322\nio read start requested=98323\n";
+        let good = format!("{prefix}reader error: ended (os error 10053)\n");
+        assert!(qualification_disconnect_proof(&good, "old", 98322).is_none());
+        assert!(qualification_disconnect_proof(&good, "current", 98321).is_none());
+        assert!(qualification_disconnect_proof(&good, "current", 98323).is_none());
+        assert!(qualification_disconnect_proof(
+            &format!("{prefix}reader error: ended (os error 10060)\n"),
+            "current",
+            98322
+        )
+        .is_none());
+        assert!(qualification_disconnect_proof(
+            &format!("{prefix}service result: Err(Os {{ code: 10054 }})\n"),
+            "current",
+            98322
+        )
+        .is_none());
+        let no_next = "boot nonce=current\nio read start requested=196645\nio read done bytes=98322 total=98322\nreader error: ended (os error 10053)\n";
+        assert!(qualification_disconnect_proof(no_next, "current", 98322).is_none());
+    }
+
+    #[test]
+    fn qualification_disconnect_rejects_partial_frame_processing_or_successful_reply() {
+        let prefix = "boot nonce=current\nio read start requested=196645\nio read done bytes=98322 total=98322\nio read start requested=98323\n";
+        for forbidden in [
+            "reader frame ReceiveTree bytes=65536",
+            "staging ReceiveTree bytes=65536",
+            "staging TreeReceived sent",
+            "io write done bytes=4 total=278",
+        ] {
+            let bad = format!("{prefix}{forbidden}\nreader error: ended (os error 10053)\n");
+            assert!(
+                qualification_disconnect_proof(&bad, "current", 98322).is_none(),
+                "{forbidden}"
+            );
+            let after = format!("{prefix}reader error: ended (os error 10053)\n{forbidden}\n");
+            assert!(
+                qualification_disconnect_proof(&after, "current", 98322).is_none(),
+                "post-terminal {forbidden}"
+            );
+        }
+        let extra_read = format!("{prefix}reader error: ended (os error 10053)\nio read start requested=1\nio read done bytes=1 total=98323\n");
+        assert!(qualification_disconnect_proof(&extra_read, "current", 98322).is_none());
+    }
 
     fn running_transport(stream: UnixStream, control: Arc<Control>) -> Transport {
         let mut protocol = Protocol::new("nonce").unwrap();

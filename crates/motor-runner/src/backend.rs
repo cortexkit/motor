@@ -113,6 +113,7 @@ pub(crate) struct Setup {
 pub(crate) struct Prepared {
     pub cwd: PathBuf,
     pub target: PathBuf,
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub wrapper: Option<PathBuf>,
     pub sandbox: Option<Box<dyn IsolationLauncher>>,
     pub vm: Option<std::sync::Mutex<Option<Box<dyn Execution>>>>,
@@ -1182,6 +1183,7 @@ impl Execution for platform::Launch {
     }
 }
 
+#[cfg(unix)]
 fn compile_cache_environment(
     config: &Config,
     setup: &Setup,
@@ -1246,6 +1248,16 @@ fn compile_cache_environment(
     {
         Ok(())
     }
+}
+
+#[cfg(not(unix))]
+fn compile_cache_environment(
+    _config: &Config,
+    _setup: &Setup,
+    _prepared: &Prepared,
+    _env: &mut BTreeMap<String, String>,
+) -> io::Result<()> {
+    Ok(())
 }
 
 /// A cache fill, or a job whose workspace root is a Cargo workspace.

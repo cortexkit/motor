@@ -174,15 +174,16 @@ Test-SpikeLogic 'guest-evidence-never-descends-through-reparse-ancestors' {
     $visited = [Collections.Generic.List[string]]::new()
     $read = {
         param($path)
-        $leaf = Split-Path $path -Leaf
+        $leaf = [IO.Path]::GetFileName($path.TrimEnd('\'))
         $visited.Add($leaf)
         if ($leaf -eq 'Temp') { throw 'Followed a guest reparse ancestor' }
         $attributes = if ($leaf -eq 'Local') { [IO.FileAttributes]::ReparsePoint } else { [IO.FileAttributes]::Directory }
         [pscustomobject]@{ FullName=$path; Attributes=$attributes }
     }
-    $item = Get-SpikePlainGuestItem ([IO.Path]::GetTempPath()) 'Users\motor-job\AppData\Local\Temp\motor-tree.tar' $read
+    $volumeRoot = '\\?\Volume{00000000-0000-0000-0000-000000000001}\'
+    $item = Get-SpikePlainGuestItem $volumeRoot 'Users\motor-job\AppData\Local\Temp\motor-tree.tar' $read
     Assert-Logic ($null -eq $item -and ($visited -join ',') -eq 'Users,motor-job,AppData,Local')
-    Assert-Refused { Get-SpikePlainGuestItem ([IO.Path]::GetTempPath()) 'Users\..\Windows' $read } 'Invalid guest diagnostic path'
+    Assert-Refused { Get-SpikePlainGuestItem $volumeRoot 'Users\..\Windows' $read } 'Invalid guest diagnostic path'
 }
 Test-SpikeLogic 'bcdboot-arguments-bind-source-and-explicit-esp-with-verbose-output' {
     $arguments = @(Get-SpikeBcdBootArguments 'F:\Windows' 'E')

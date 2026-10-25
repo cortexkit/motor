@@ -147,11 +147,19 @@ where
 }
 
 #[doc(hidden)]
+#[cfg(unix)]
+#[cfg(unix)]
 pub fn windows_prepare(path: &std::path::Path) -> std::io::Result<()> {
     windows::prepare_entry(path)
 }
 
 pub use motor_protocol::allowed_env;
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn request_windows_service_stop() {
+    windows::request_service_stop();
+}
 
 #[cfg(windows)]
 #[doc(hidden)]
@@ -161,16 +169,24 @@ pub fn hyperv_probe_peers() -> std::io::Result<()> {
 
 #[cfg(windows)]
 #[doc(hidden)]
-pub fn hyperv_qualify_prep(config: &Config) -> std::io::Result<()> {
-    windows::qualify_prep(config)
+pub fn hyperv_qualify_prep(config: Config) -> std::io::Result<()> {
+    let runner = Runner::open_for_qualification(config)?;
+    windows::qualify_prep(runner.config())
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn hyperv_qualify_prep_offline_cargo(config: Config) -> std::io::Result<()> {
+    windows::qualify_prep_offline_cargo(config)
 }
 #[cfg(windows)]
 #[doc(hidden)]
-pub fn hyperv_prep_probe(args: &[String]) -> std::io::Result<()> {
-    windows::prep_probe(args)
+pub fn hyperv_qualify_prep_local_registry(config: Config) -> std::io::Result<()> {
+    windows::qualify_prep_local_registry(config)
 }
 #[cfg(windows)]
 #[doc(hidden)]
-pub fn hyperv_qualify_disconnect(config: &Config) -> std::io::Result<()> {
-    windows::qualify_disconnect(config)
+pub fn hyperv_qualify_disconnect(config: Config) -> std::io::Result<()> {
+    let runner = Runner::open_for_qualification(config)?;
+    windows::qualify_disconnect(runner.config())
 }

@@ -171,7 +171,7 @@ fn pinned_ccache_no_cargo_fill_publishes_and_private_reader_hits_http_remote() {
     );
     compile(&refresh, &refresh_env, true);
     let refresh_stats = ccache::statistics(&stats(&refresh_env)).unwrap();
-    // A warm remote prefix must still be rewritten, not merely read, by fills.
+        // A fill must regenerate and upload entries even when remote storage already has them.
     assert_eq!(refresh_stats[ccache::REMOTE_HIT], 0);
     assert_eq!(refresh_stats["recache"], 2);
     assert!(refresh_stats["remote_storage_write"] >= 2);

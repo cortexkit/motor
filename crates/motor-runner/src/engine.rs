@@ -1,8 +1,9 @@
+#[cfg(unix)]
+use crate::remote_cache::publication;
 use crate::{
     backend::{self, setup_step, Backend, BackendKind, Prepared, Setup},
     cpu::CpuTopology,
     platform,
-    remote_cache::publication,
     storage::*,
     workspace::{self, Trees},
     writer::declaration::Compilers,
@@ -875,6 +876,7 @@ struct Inner {
     publishing_seen: crate::remote_cache::publishing::Seen,
     /// When the remote cache's refresh timer last ran, in runner-clock
     /// milliseconds. Only a publishing runner uses it.
+    #[cfg(unix)]
     refreshed_ms: Option<u64>,
     /// Workspaces being set up without the state lock held, by workspace key
     /// (`base:<root>` for a warm build): a prepare materializing a workspace,
@@ -1048,6 +1050,7 @@ struct BaseCleanup {
     /// Discarding the build's scratch directory, after restoring the
     /// runner's access to it when Linux job isolation is on.
     scratch: io::Result<()>,
+    #[cfg(unix)]
     publication: Option<(StoreIdentity, publication::Outcome)>,
 }
 
@@ -1321,6 +1324,7 @@ struct Core {
     /// The last-seen state of the remote cache's provisioning, and the
     /// publication state derived from it. Without a configuration that is
     /// publishing, this holds a policy that changes nothing.
+    #[cfg(unix)]
     publishing: Mutex<crate::remote_cache::publishing::State>,
     /// Creates sibling snapshots and serializes work on each one; used only
     /// in sibling snapshot mode.
@@ -1606,8 +1610,21 @@ fn private_state_directory(path: &Path) -> io::Result<()> {
 }
 
 impl Runner {
+    #[cfg(windows)]
+    pub(crate) fn open_for_qualification(config: Config) -> io::Result<Self> {
+        // The qualification command runs with the service stopped. Reuse the
+        // service's protected record and the same stable identity checks used
+        // for jobs; this Runner::open call holds a no-write/delete parent handle too.
+        // A privileged writer during the stop gap is trusted; the next service
+        // startup hashes the full parent before admitting jobs.
+        config
+            .windows_runtime
+            .reuse_parent_verification_for_qualification();
+        Self::open(config)
+    }
     /// The publication policy every fill, reuse decision and record reads, as
     /// the latest re-read of the provisioning files left it.
+    #[cfg(unix)]
     pub(crate) fn publishing_policy(&self) -> crate::remote_cache::publication::PublishPolicy {
         #[cfg(unix)]
         if let Some(runtime) = &self.core.config.remote_cache_runtime {
@@ -1625,6 +1642,7 @@ impl Runner {
     }
     /// The store identity the active generation addresses while the cache is
     /// publishing, if any.
+    #[cfg(unix)]
     pub(crate) fn publishing_identity(&self) -> Option<StoreIdentity> {
         self.core.publishing.lock().unwrap().identity()
     }
@@ -1720,6 +1738,7 @@ impl Runner {
         // failed refresh to be retried before the store's lifecycle deletes
         // the entries, so a configuration that breaks that is refused here, at
         // load, rather than after an outage.
+        #[cfg(unix)]
         crate::remote_cache::publication::validate_bounds(
             config.refresh_period,
             config.publish_retry_interval,
@@ -2179,6 +2198,7 @@ impl Runner {
                 repository.desired = None;
             }
             repository.failed_descriptor = None;
+            #[cfg(unix)]
             for failure in repository.publish_failures.values_mut() {
                 if failure.attempts >= publication::PUBLISH_RETRY_ATTEMPTS {
                     failure.attempts = 0;
@@ -2244,7 +2264,9 @@ impl Runner {
         // A configuration flipped while the runner was stopped is still a
         // transition, not a first read: the switch state the previous run
         // last acted on is restored before the first re-read.
+        #[cfg(unix)]
         let mut publishing_state = crate::remote_cache::publishing::State::new(publishing_switch);
+        #[cfg(unix)]
         crate::remote_cache::publishing::State::restore(
             &mut publishing_state,
             publishing_switch,
@@ -2272,6 +2294,7 @@ impl Runner {
         let runner = Self {
             core: Arc::new(Core {
                 reserve_restore: Mutex::new(()),
+                #[cfg(unix)]
                 publishing: Mutex::new(publishing_state),
                 tenant_events,
                 draining: std::sync::atomic::AtomicBool::new(false),
@@ -2302,6 +2325,7 @@ impl Runner {
                     dropping: BTreeSet::new(),
                     maintained_ms: now,
                     publishing_seen,
+                    #[cfg(unix)]
                     refreshed_ms: None,
                     reserved: BTreeMap::new(),
                     starting: BTreeSet::new(),
@@ -3340,6 +3364,18 @@ impl Runner {
         request: &Run,
         access: &crate::workspace_access::Repairs,
     ) -> Option<(RefusalReason, String)> {
+        #[cfg(windows)]
+        if self.core.config.windows_instance() {
+            if let Some(refusal) = crate::windows::guest_agent_refusal(
+                self.core
+                    .config
+                    .windows_runtime
+                    .guest_agent_readiness()
+                    .as_ref(),
+            ) {
+                return Some(refusal);
+            }
+        }
         #[cfg(unix)]
         if request.platform == Some(Platform::Macos) {
             if let Err(error) = crate::macos::validate_paths(request) {
@@ -4312,10 +4348,65 @@ impl Runner {
             repository.result = Some(RebuildResult::Ok);
             return Ok(true);
         }
-        // One policy decides reuse, the publication gate and the retry cap,
-        // and it changes nothing while the remote cache is not publishing.
-        let publishing = self.publishing_policy();
-        let now = self.now();
+        #[cfg(unix)]
+        {
+            // One policy decides reuse, the publication gate and the retry cap,
+            // and it changes nothing while the remote cache is not publishing.
+            let publishing = self.publishing_policy();
+            let now = self.now();
+            if let Some(finished) = repository
+                .filled_descriptors
+                .get(&descriptor)
+                .copied()
+                .filter(|_| {
+                    !explicit_command || !repository.recorded_without_writer.contains(&descriptor)
+                })
+                .filter(|_| publication::reusable(&publishing, repository, &descriptor, now))
+            {
+                repository.filled_descriptor = Some(descriptor);
+                repository.commit = Some(tip.into());
+                repository.finished_ms = Some(finished);
+                repository.result = Some(RebuildResult::Ok);
+                return Ok(true);
+            }
+            if repository.failed_descriptor.as_ref() == Some(&descriptor)
+                && !(publishing.publishing()
+                    && repository.publications.contains_key(&descriptor)
+                    && repository
+                        .publish_failures
+                        .get(&descriptor)
+                        .is_some_and(|failure| {
+                            failure.attempts < publication::PUBLISH_RETRY_ATTEMPTS
+                        }))
+            {
+                repository.result = Some(RebuildResult::Failed);
+                return Ok(true);
+            }
+            match publication::gate(&publishing, repository, &descriptor, now) {
+                publication::Gate::Queue => {}
+                publication::Gate::Wait => {
+                    // The publication failed recently; the refresh timer queues it
+                    // again once the retry interval has passed.
+                    repository.result = Some(RebuildResult::Failed);
+                    return Ok(true);
+                }
+                publication::Gate::Held => {
+                    // Repeated failed publications hold this descriptor like a
+                    // fill that failed as a build until it changes or the runner
+                    // restarts.
+                    if repository.failed_descriptor.as_ref() != Some(&descriptor) {
+                        repository.failed_descriptor = Some(descriptor.clone());
+                        repository.failure_detail = Some(format!(
+                            "publishing {descriptor} failed {} times in a row; the descriptor is held until it changes or the runner restarts",
+                            publication::PUBLISH_RETRY_ATTEMPTS
+                        ));
+                    }
+                    repository.result = Some(RebuildResult::Failed);
+                    return Ok(true);
+                }
+            }
+        }
+        #[cfg(not(unix))]
         if let Some(finished) = repository
             .filled_descriptors
             .get(&descriptor)
@@ -4323,7 +4414,6 @@ impl Runner {
             .filter(|_| {
                 !explicit_command || !repository.recorded_without_writer.contains(&descriptor)
             })
-            .filter(|_| publication::reusable(&publishing, repository, &descriptor, now))
         {
             repository.filled_descriptor = Some(descriptor);
             repository.commit = Some(tip.into());
@@ -4331,39 +4421,10 @@ impl Runner {
             repository.result = Some(RebuildResult::Ok);
             return Ok(true);
         }
-        if repository.failed_descriptor.as_ref() == Some(&descriptor)
-            && !(publishing.publishing()
-                && repository.publications.contains_key(&descriptor)
-                && repository
-                    .publish_failures
-                    .get(&descriptor)
-                    .is_some_and(|failure| failure.attempts < publication::PUBLISH_RETRY_ATTEMPTS))
-        {
+        #[cfg(not(unix))]
+        if repository.failed_descriptor.as_ref() == Some(&descriptor) {
             repository.result = Some(RebuildResult::Failed);
             return Ok(true);
-        }
-        match publication::gate(&publishing, repository, &descriptor, now) {
-            publication::Gate::Queue => {}
-            publication::Gate::Wait => {
-                // The publication failed recently; the refresh timer queues it
-                // again once the retry interval has passed.
-                repository.result = Some(RebuildResult::Failed);
-                return Ok(true);
-            }
-            publication::Gate::Held => {
-                // Repeated failed publications hold this descriptor like a
-                // fill that failed as a build until it changes or the runner
-                // restarts.
-                if repository.failed_descriptor.as_ref() != Some(&descriptor) {
-                    repository.failed_descriptor = Some(descriptor.clone());
-                    repository.failure_detail = Some(format!(
-                        "publishing {descriptor} failed {} times in a row; the descriptor is held until it changes or the runner restarts",
-                        publication::PUBLISH_RETRY_ATTEMPTS
-                    ));
-                }
-                repository.result = Some(RebuildResult::Failed);
-                return Ok(true);
-            }
         }
         repository.result = Some(RebuildResult::Building);
         if inner.jobs.values().any(|j| {
@@ -4434,7 +4495,10 @@ impl Runner {
         let mut job = Job::new(id, Some(request), self.now(), inner.order, claim);
         job.base = true;
         job.writer_descriptor = Some(descriptor);
-        job.fill_started_ms = Some(self.now());
+        #[cfg(unix)]
+        {
+            job.fill_started_ms = Some(self.now());
+        }
         job.state = JobState::Queued;
         self.save(&job)?;
         tracing::info!(job_id = %id, repository = %root, commit = %tip, %command, "warm build queued");
@@ -6263,20 +6327,25 @@ impl Runner {
         // needs from the mirror is read without the state lock (each read runs
         // git); then the list is made again under the lock, and only
         // repositories still wanting the same build are queued.
+        #[cfg(unix)]
         let policy = self.publishing_policy();
         // The refresh timer runs on its own schedule: it needs no job arrival,
         // and it queues through the publication gate like every other caller.
+        #[cfg(unix)]
         let refresh_due = policy.publishing()
             && inner
                 .refreshed_ms
                 .is_none_or(|last| now.saturating_sub(last) >= publication::REFRESH_TICK_MS);
+        #[cfg(unix)]
         if refresh_due {
             inner.refreshed_ms = Some(now);
         }
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut wanted: Vec<(String, BaseRequest)> = Self::desired_bases(&inner)
             .into_iter()
             .filter(|(_, desired)| self.warm_builds_enabled(&desired.tip))
             .collect();
+        #[cfg(unix)]
         if refresh_due {
             for (root, desired) in self.refresh_bases(&inner, &policy, now) {
                 if !wanted.iter().any(|(queued, _)| *queued == root) {
@@ -6305,7 +6374,9 @@ impl Runner {
                 // refuses the queued jobs first.
                 return Ok(());
             }
+            #[cfg_attr(not(unix), allow(unused_mut))]
             let mut current = Self::desired_bases(&inner);
+            #[cfg(unix)]
             if refresh_due {
                 current.extend(self.refresh_bases(&inner, &self.publishing_policy(), now));
             }
@@ -6348,6 +6419,7 @@ impl Runner {
     /// or running for them. The fill is at the repository's recorded `desired`
     /// tip, with no fetch. A dependency-free shortcut record has nothing to
     /// publish and is never queued here.
+    #[cfg(unix)]
     fn refresh_bases(
         &self,
         inner: &Inner,
@@ -6525,7 +6597,9 @@ impl Runner {
         if inner.restoring_reserve {
             return Ok(());
         }
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut job = inner.jobs[&id].clone();
+        #[cfg(unix)]
         if job.base {
             job.fill_started_ms = Some(self.now());
             job.fill_identity = self.publishing_identity();
@@ -7033,6 +7107,7 @@ impl Runner {
         job.sibling_sources = sibling_sources;
         let started_ms = self.now();
         job.started_ms = Some(started_ms);
+        #[cfg(unix)]
         if job.base {
             job.fill_started_ms = Some(started_ms);
             job.fill_identity = self.publishing_identity();
@@ -8656,6 +8731,7 @@ impl Runner {
         BaseCleanup {
             fill,
             scratch,
+            #[cfg(unix)]
             publication: None,
         }
     }
@@ -8696,6 +8772,7 @@ impl Runner {
             inner.writer = None;
         }
         let descriptor = inner.jobs[&r.job_id].writer_descriptor.clone();
+        #[cfg(unix)]
         let mut fill_failure_detail = None;
         let g = inner
             .catalog
@@ -8732,7 +8809,10 @@ impl Runner {
                 .or_else(|| inner.jobs[&r.job_id].monitoring_error.clone())
                 .unwrap_or_else(|| "command/setup did not complete successfully".into());
             tracing::warn!(job_id = %r.job_id, repository = %r.repository_root, reason = %detail, "dependency writer fill failed");
-            fill_failure_detail = Some(detail.clone());
+            #[cfg(unix)]
+            {
+                fill_failure_detail = Some(detail.clone());
+            }
             g.failure_detail = Some(detail);
             // A fill that failed as a fill keeps today's hold on its descriptor.
             // With a publication record, the publish-failure marker below is what
@@ -8745,6 +8825,7 @@ impl Runner {
         // Drain and statistics collection run without the state lock. After
         // reacquiring it, recheck the identity so a provisioning change
         // cannot install an old store's publication after forgetting it.
+        #[cfg(unix)]
         if let (Some(descriptor), Some((identity, mut outcome))) = (descriptor, cleanup.publication)
         {
             let started_ms = inner.jobs[&r.job_id]

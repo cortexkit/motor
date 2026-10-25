@@ -91,17 +91,80 @@ function Wait-SpikeOff([string]$Name, [int]$Seconds) {
     Assert-Spike $true 'vm-off' $Name
 }
 
+function Test-SpikeVolumeGuidPath([string]$Path) {
+    return [regex]::IsMatch($Path, '\A\\\\\?\\Volume\{[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}\}\\\z')
+}
+
+function Get-SpikeFileSha256([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '') } finally {
+        $sha.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Get-SpikePlainGuestItem([string]$Volume, [string]$Relative, [scriptblock]$ReadItem) {
+    if (-not (Test-SpikeVolumeGuidPath $Volume)) { throw 'Guest volume path is not a volume GUID path' }
+    # .NET path access works before PowerShell registers any mount-point drive.
+    if (-not $ReadItem) {
+        $ReadItem = {
+            param($Path)
+            try { $attributes = [IO.File]::GetAttributes($Path) } catch [IO.FileNotFoundException] { return $null } catch [IO.DirectoryNotFoundException] { return $null }
+            if ($attributes -band [IO.FileAttributes]::Directory) {
+                $info = [IO.DirectoryInfo]::new($Path)
+                $length = 0
+            } else {
+                $info = [IO.FileInfo]::new($Path)
+                $length = $info.Length
+            }
+            [pscustomobject]@{FullName=$info.FullName; Name=$info.Name; Attributes=$attributes; PSIsContainer=[bool]($attributes -band [IO.FileAttributes]::Directory); Length=$length; LastWriteTimeUtc=$info.LastWriteTimeUtc}
+        }
+    }
+    # Use .NET to combine and inspect components without resolving a PowerShell drive.
+    $path = $Volume
+    foreach ($component in $Relative.Split('\')) {
+        if (-not $component -or $component -in @('.','..') -or $component.Contains(':') -or $component.Contains('/')) { throw 'Invalid guest diagnostic path' }
+        $path = [IO.Path]::Combine($path, $component)
+        $item = & $ReadItem $path
+        if (-not $item) { return $null }
+        # Check each ancestor before descending so a guest junction cannot
+        # redirect host inspection outside the mounted volume.
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            Write-Host "EVIDENCE skipped-guest-reparse-path $path"
+            return $null
+        }
+    }
+    return $item
+}
+
+function Remove-SpikeDiskDriveLetters([int]$DiskNumber) {
+    foreach ($partition in @(Get-Partition -DiskNumber $DiskNumber -ErrorAction Stop)) {
+        $letter = [string]$partition.DriveLetter
+        if ($letter -match '\A[A-Z]\z') {
+            $accessPath = $letter + ':\'
+            $partition | Remove-PartitionAccessPath -AccessPath $accessPath -ErrorAction Stop | Out-Null
+        }
+    }
+}
+
 function Use-SpikeWindowsDisk([string]$Path, [scriptblock]$Action, [switch]$ReadOnly) {
     $mounted = $false
     try {
-        $disk = Mount-VHD -Path $Path -ReadOnly:$ReadOnly -Passthru | Get-Disk
+        $image = Mount-VHD -Path $Path -ReadOnly:$ReadOnly -Passthru
         $mounted = $true
+        $disk = $image | Get-Disk
         $partition = @(Get-Partition -DiskNumber $disk.Number | Where-Object { $_.GptType -eq '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}' })
         Assert-Spike ($partition.Count -eq 1) 'unique-windows-partition' "$Path disk=$($disk.Number)"
-        if (-not $partition[0].DriveLetter) { $partition[0] | Add-PartitionAccessPath -AssignDriveLetter }
         $partition = Get-Partition -DiskNumber $disk.Number -PartitionNumber $partition[0].PartitionNumber
-        $volume = "$($partition.DriveLetter):\"
-        Assert-Spike (Test-Path (Join-Path $volume 'Windows')) 'windows-partition-mounted' $volume
+        $volumes = @($partition | Get-Volume)
+        Assert-Spike ($volumes.Count -eq 1 -and (Test-SpikeVolumeGuidPath ([string]$volumes[0].Path))) 'windows-volume-guid-path' "$Path disk=$($disk.Number) partition=$($partition.PartitionNumber)"
+        $reverse = @(Get-Partition -Volume $volumes[0])
+        Assert-Spike ($reverse.Count -eq 1 -and $reverse[0].DiskNumber -eq $disk.Number -and $reverse[0].PartitionNumber -eq $partition.PartitionNumber) 'volume-guid-maps-to-mounted-partition' $volumes[0].Path
+        # Use the Storage volume GUID path instead of a session drive letter.
+        $volume = [string]$volumes[0].Path
+        $windows = Get-SpikePlainGuestItem $volume 'Windows'
+        Assert-Spike ($windows -and $windows.PSIsContainer) 'windows-partition-mounted' $volume
         & $Action $volume
     } finally { if ($mounted) { Dismount-VHD -Path $Path } }
 }

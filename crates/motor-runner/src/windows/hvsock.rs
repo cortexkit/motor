@@ -15,6 +15,9 @@ use windows_sys::{
 pub(super) struct Stream(SOCKET);
 impl Drop for Stream {
     fn drop(&mut self) {
+        // Full connection teardown, not shutdown(SD_SEND) followed by a read
+        // drain. The Hyper-V provider can terminate the peer read with a reset
+        // or abort error instead of a zero-byte EOF.
         unsafe { closesocket(self.0) };
     }
 }

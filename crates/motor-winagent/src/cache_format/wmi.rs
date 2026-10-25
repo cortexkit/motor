@@ -11,7 +11,8 @@ use windows::{
             Com::*,
             Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE},
             Variant::{
-                VARIANT, VT_BSTR, VT_DISPATCH, VT_EMPTY, VT_I4, VT_NULL, VT_UI4, VT_UNKNOWN,
+                VARIANT, VT_BOOL, VT_BSTR, VT_DISPATCH, VT_EMPTY, VT_I4, VT_NULL, VT_UI4,
+                VT_UNKNOWN,
             },
             Wmi::*,
         },
@@ -66,6 +67,37 @@ fn string(object: &IWbemClassObject, name: PCWSTR) -> io::Result<String> {
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "cache WMI expected a string property",
+        )),
+    }
+}
+
+fn unsigned(object: &IWbemClassObject, name: PCWSTR) -> io::Result<u32> {
+    let value = property(object, name)?;
+    match value.vt() {
+        VT_I4 => u32::try_from(unsafe { value.Anonymous.Anonymous.Anonymous.lVal })
+            .map_err(|_| io::Error::other("cache WMI returned a negative unsigned property")),
+        VT_UI4 => Ok(unsafe { value.Anonymous.Anonymous.Anonymous.ulVal }),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cache WMI expected an unsigned numeric property",
+        )),
+    }
+}
+
+fn boolean(object: &IWbemClassObject, name: PCWSTR) -> io::Result<bool> {
+    let value = property(object, name)?;
+    if value.vt() != VT_BOOL {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cache WMI expected a Boolean property",
+        ));
+    }
+    match unsafe { value.Anonymous.Anonymous.Anonymous.boolVal.0 } {
+        0 => Ok(false),
+        -1 => Ok(true),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cache WMI returned an invalid Boolean property",
         )),
     }
 }
@@ -194,6 +226,111 @@ impl Provider {
             }
         }
     }
+}
+
+fn connect_namespace(namespace: &str) -> io::Result<IWbemServices> {
+    let locator: IWbemLocator = com("create locator", unsafe {
+        CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER)
+    })?;
+    let empty = BSTR::new();
+    let services = com("connect WMI namespace", unsafe {
+        locator.ConnectServer(
+            &BSTR::from(namespace),
+            &empty,
+            &empty,
+            &empty,
+            WBEM_FLAG_CONNECT_USE_MAX_WAIT.0,
+            &empty,
+            None,
+        )
+    })?;
+    secure(&services)?;
+    Ok(services)
+}
+
+fn query(
+    services: &IWbemServices,
+    query: &str,
+    deadline: Instant,
+) -> io::Result<Vec<IWbemClassObject>> {
+    remaining_ms(deadline)?;
+    let enumerator = com("begin inventory query", unsafe {
+        services.ExecQuery(
+            &BSTR::from("WQL"),
+            &BSTR::from(query),
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+            None,
+        )
+    })?;
+    secure(&enumerator)?;
+    let mut objects = Vec::new();
+    loop {
+        let mut row = [None];
+        let mut returned = 0;
+        let hr = unsafe { enumerator.Next(remaining_ms(deadline)?, &mut row, &mut returned) };
+        com("enumerate inventory", hr.ok())?;
+        if returned == 0 {
+            if hr.0 == WBEM_S_FALSE.0 {
+                return Ok(objects);
+            }
+            if hr.0 == WBEM_S_TIMEDOUT.0 {
+                continue;
+            }
+            return Err(io::Error::other("cache WMI inventory made no progress"));
+        }
+        objects.push(
+            row[0]
+                .take()
+                .ok_or_else(|| io::Error::other("cache WMI returned no inventory object"))?,
+        );
+        if objects.len() > 128 {
+            return Err(io::Error::other(
+                "cache WMI returned too many inventory objects",
+            ));
+        }
+    }
+}
+
+pub(super) fn hyperv_disk_inventory(
+    deadline: Instant,
+) -> io::Result<Vec<crate::cache::HypervDisk>> {
+    let storage = Provider::connect()?;
+    let cimv2 = connect_namespace("ROOT\\CIMV2")?;
+    let storage_disks = query(
+        &storage.services,
+        "SELECT Number, BusType, IsBoot, IsSystem FROM MSFT_Disk",
+        deadline,
+    )?
+    .iter()
+    .map(|object| {
+        let bus_type = unsigned(object, w!("BusType"))?;
+        Ok(crate::cache::HypervStorageDisk {
+            number: unsigned(object, w!("Number"))?,
+            bus_type: u16::try_from(bus_type)
+                .map_err(|_| io::Error::other("cache WMI BusType exceeds UInt16"))?,
+            boot: boolean(object, w!("IsBoot"))?,
+            system: boolean(object, w!("IsSystem"))?,
+        })
+    })
+    .collect::<io::Result<Vec<_>>>()?;
+    let locations = query(
+        &cimv2,
+        "SELECT Index, SCSILogicalUnit FROM Win32_DiskDrive",
+        deadline,
+    )?
+    .iter()
+    .map(|object| {
+        let lun = unsigned(object, w!("SCSILogicalUnit"))?;
+        Ok(crate::cache::HypervDiskLocation {
+            number: unsigned(object, w!("Index"))?,
+            lun: u32::from(
+                u16::try_from(lun)
+                    .map_err(|_| io::Error::other("cache WMI SCSI LUN exceeds UInt16"))?,
+            ),
+        })
+    })
+    .collect::<io::Result<Vec<_>>>()?;
+    crate::cache::join_hyperv_disk_inventory(&storage_disks, &locations)
 }
 
 fn complete(call: &IWbemCallResult, timeout_ms: i32) -> io::Result<bool> {

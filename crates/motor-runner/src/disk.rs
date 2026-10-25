@@ -343,6 +343,7 @@ impl Runner {
                 permits_held: Some(permits_held),
                 permits_cap: Some(self.core.config.max_weight),
                 queue_wait_1h: Some(counters.queue_wait(now)),
+                windows_guest_agent: self.core.config.windows_runtime.guest_agent_readiness(),
                 remote_cache,
             }
         };

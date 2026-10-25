@@ -60,14 +60,20 @@ try {
     # Only the newly created, path-bound VHDX is initialized or formatted.
     New-VHD -Path $disk -Dynamic -SizeBytes 100GB | Out-Null
     $createdDisk = $true
-    $virtualDisk = Mount-VHD -Path $disk -Passthru | Get-Disk
+    $virtualDiskImage = Mount-VHD -Path $disk -Passthru
     $diskMounted = $true
+    $virtualDisk = $virtualDiskImage | Get-Disk
     Initialize-Disk -Number $virtualDisk.Number -PartitionStyle GPT
     $efi = New-Partition -DiskNumber $virtualDisk.Number -Size 260MB -GptType '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' -AssignDriveLetter
     $efi | Format-Volume -FileSystem FAT32 -NewFileSystemLabel System -Confirm:$false | Out-Null
     New-Partition -DiskNumber $virtualDisk.Number -Size 16MB -GptType '{e3c9e316-0b5c-4db8-817d-f92df00215ae}' | Out-Null
     $windows = New-Partition -DiskNumber $virtualDisk.Number -UseMaximumSize -AssignDriveLetter
     $windows | Format-Volume -FileSystem NTFS -NewFileSystemLabel Windows -Confirm:$false | Out-Null
+    $windows = Get-Partition -DiskNumber $virtualDisk.Number -PartitionNumber $windows.PartitionNumber
+    $windowsVolumes = @($windows | Get-Volume)
+    Assert-Spike ($windowsVolumes.Count -eq 1 -and (Test-SpikeVolumeGuidPath ([string]$windowsVolumes[0].Path))) 'windows-volume-guid-path' $windowsVolumes
+    $windowsReverse = @(Get-Partition -Volume $windowsVolumes[0])
+    Assert-Spike ($windowsReverse.Count -eq 1 -and $windowsReverse[0].DiskNumber -eq $virtualDisk.Number -and $windowsReverse[0].PartitionNumber -eq $windows.PartitionNumber) 'windows-volume-maps-to-partition' $windowsVolumes[0].Path
     if (-not (Get-DiskImage -ImagePath $ServerIso).Attached) {
         Mount-DiskImage -ImagePath $ServerIso | Out-Null
         $mountedIso = $true
@@ -77,12 +83,15 @@ try {
     $image = Get-WindowsImage -ImagePath $wim -Index 2
     $image | Format-List ImageName,ImageDescription,ImageIndex,Architecture | Out-Host
     Assert-Spike ($image.ImageName -match 'Server.*2022.*(Desktop Experience)' -and $image.Architecture -eq 9) 'server2022-index2-x64-desktop' $image.ImageName
+    # DISM requires the assigned letter; subsequent PowerShell file access uses the volume GUID path.
     & dism.exe /Apply-Image "/ImageFile:$wim" /Index:2 "/ApplyDir:$($windows.DriveLetter):\" /CheckIntegrity | Out-Host
     Assert-Spike ($LASTEXITCODE -eq 0) 'offline-image-applied' "$($windows.DriveLetter):"
-    $os = "$($windows.DriveLetter):\"
-    New-Item (Join-Path $os 'Windows\Panther') -ItemType Directory -Force | Out-Null
-    Copy-Item (Join-Path $seed 'autounattend.xml') (Join-Path $os 'Windows\Panther\unattend.xml')
-    Install-SpikeBootFiles $virtualDisk.Number $efi.PartitionNumber (Join-Path $os 'Windows') $Root
+    $os = [string]$windowsVolumes[0].Path
+    $windowsRoot = [IO.Path]::Combine($os, 'Windows')
+    [IO.Directory]::CreateDirectory([IO.Path]::Combine($windowsRoot, 'Panther')) | Out-Null
+    [IO.File]::Copy((Join-Path $seed 'autounattend.xml'), [IO.Path]::Combine($windowsRoot, 'Panther\unattend.xml'), $true)
+    Install-SpikeBootFiles $virtualDisk.Number $efi.PartitionNumber $os $Root ([string]$windows.DriveLetter)
+    Remove-SpikeDiskDriveLetters $virtualDisk.Number
     Dismount-VHD -Path $disk
     $diskMounted = $false
     if ($mountedIso) { Dismount-DiskImage -ImagePath $ServerIso; $mountedIso = $false }
@@ -100,31 +109,37 @@ try {
     New-Item $logs -ItemType Directory | Out-Null
     Use-SpikeWindowsDisk $disk {
         param($volume)
-        $provision = Join-Path $volume 'build\provision'
+        $provision = [IO.Path]::Combine($volume, 'build\provision')
         foreach ($file in @('bootstrap.log','os-update-first.log','os-updated','finalize.log','FAILED.txt','provisioned','finalized','winagent.sha256','pwsh-probe.json','pwsh-probe.stdout.log','pwsh-probe.stderr.log','pwsh-host-trace.log','pwsh-startup-diagnostics.log')) {
-            if (Test-Path (Join-Path $provision $file)) { Copy-Item (Join-Path $provision $file) $logs }
+            $source = [IO.Path]::Combine($provision, $file)
+            if ([IO.File]::Exists($source)) { [IO.File]::Copy($source, (Join-Path $logs $file), $true) }
         }
-        Get-ChildItem $provision -Filter '*-updates-*.json' -File | Copy-Item -Destination $logs
+        foreach ($source in [IO.Directory]::EnumerateFiles($provision, '*-updates-*.json')) { [IO.File]::Copy($source, (Join-Path $logs ([IO.Path]::GetFileName($source))), $true) }
         foreach ($file in @('os-update-first.log','bootstrap.log','finalize.log')) {
-            if (Test-Path (Join-Path $logs $file)) { Get-Content (Join-Path $logs $file) | Out-Host }
+            $logPath = Join-Path $logs $file
+            if ([IO.File]::Exists($logPath)) { [IO.File]::ReadAllText($logPath) | Out-Host }
         }
-        if (Test-Path (Join-Path $logs 'FAILED.txt')) { Get-Content (Join-Path $logs 'FAILED.txt') | Out-Host }
-        Assert-Spike (-not (Test-Path (Join-Path $provision 'FAILED.txt'))) 'no-failure-marker' $provision
-        foreach ($file in @('os-updated','provisioned','finalized')) { Assert-Spike (Test-Path (Join-Path $provision $file)) $file (Get-Content (Join-Path $provision $file)) }
-        $bootstrap = Get-Content (Join-Path $provision 'bootstrap.log') -Raw
+        $failureMarker = [IO.Path]::Combine($provision, 'FAILED.txt')
+        if ([IO.File]::Exists($failureMarker)) { [IO.File]::ReadAllText($failureMarker) | Out-Host }
+        Assert-Spike (-not [IO.File]::Exists($failureMarker)) 'no-failure-marker' $provision
+        foreach ($file in @('os-updated','provisioned','finalized')) {
+            $marker = [IO.Path]::Combine($provision, $file)
+            Assert-Spike ([IO.File]::Exists($marker)) $file $(if ([IO.File]::Exists($marker)) { [IO.File]::ReadAllText($marker) } else { '' })
+        }
+        $bootstrap = [IO.File]::ReadAllText([IO.Path]::Combine($provision, 'bootstrap.log'))
         foreach ($right in @('SeBatchLogonRight','SeCreateSymbolicLinkPrivilege')) {
             Assert-Spike ($bootstrap -match "Verified $right for motor-job SID S-1-") 'verified-effective-job-right' $right
         }
-        $agent = Join-Path $volume 'ProgramData\Motor\motor-winagent.exe'
-        $expected = ((Get-Content (Join-Path $provision 'winagent.sha256') -Raw) -split '\s+')[0]
-        Assert-Spike ((Get-FileHash $agent).Hash -eq $expected) 'installed-agent-hash' $expected
-        if (-not $GuestAgentPath) { Copy-Item (Join-Path $provision 'hyperv-spike.exe') (Join-Path $Root 'hyperv-spike.exe') }
+        $agent = [IO.Path]::Combine($volume, 'ProgramData\Motor\motor-winagent.exe')
+        $expected = (([IO.File]::ReadAllText([IO.Path]::Combine($provision, 'winagent.sha256'))) -split '\s+')[0]
+        Assert-Spike ((Get-SpikeFileSha256 $agent) -eq $expected) 'installed-agent-hash' $expected
+        if (-not $GuestAgentPath) { [IO.File]::Copy([IO.Path]::Combine($provision, 'hyperv-spike.exe'), (Join-Path $Root 'hyperv-spike.exe'), $true) }
         if ($GuestAgentPath) {
-            Assert-Spike ((Get-FileHash $agent).Hash -eq (Get-FileHash $GuestAgentPath).Hash) 'sealed-prebuilt-agent' $agent
-            Assert-Spike (-not (Test-Path (Join-Path $volume 'ProgramData\Motor\hyperv-serial-queue.txt'))) 'no-serial-queue-setting' $disk
+            Assert-Spike ((Get-SpikeFileSha256 $agent) -eq (Get-FileHash $GuestAgentPath).Hash) 'sealed-prebuilt-agent' $agent
+            Assert-Spike (-not [IO.File]::Exists([IO.Path]::Combine($volume, 'ProgramData\Motor\hyperv-serial-queue.txt'))) 'no-serial-queue-setting' $disk
         }
         # A baseline never carries a job nonce. Each differencing disk gets its own.
-        Assert-Spike (-not (Test-Path (Join-Path $volume 'ProgramData\Motor\hyperv-nonce.txt'))) 'no-baseline-nonce' $disk
+        Assert-Spike (-not [IO.File]::Exists([IO.Path]::Combine($volume, 'ProgramData\Motor\hyperv-nonce.txt'))) 'no-baseline-nonce' $disk
     } -ReadOnly
     $expected = ((Get-Content (Join-Path $logs 'winagent.sha256') -Raw) -split '\s+')[0]
     if (-not $GuestAgentPath) {
@@ -146,18 +161,19 @@ try {
     throw
 } finally {
     try {
-        if ($diskMounted) { Dismount-VHD -Path $disk }
+        if ($diskMounted) {
+            try { if ($null -ne $virtualDisk) { Remove-SpikeDiskDriveLetters $virtualDisk.Number } } finally { Dismount-VHD -Path $disk }
+        }
         if ($mountedIso) { Dismount-DiskImage -ImagePath $ServerIso }
         if ($lock) {
             Remove-SpikeVM $name
             if ($createdDisk -and -not $sealed) {
                 Use-SpikeWindowsDisk $disk {
                     param($volume)
-                    $provision = Join-Path $volume 'build\provision'
-                    New-Item $provision -ItemType Directory -Force | Out-Null
-                    if (-not (Test-Path (Join-Path $provision 'FAILED.txt'))) {
-                        Set-Content (Join-Path $provision 'FAILED.txt') 'Host provisioning failed; see provision-host.log. This disk is not sealed.'
-                    }
+                    $provision = [IO.Path]::Combine($volume, 'build\provision')
+                    [IO.Directory]::CreateDirectory($provision) | Out-Null
+                    $failureMarker = [IO.Path]::Combine($provision, 'FAILED.txt')
+                    if (-not [IO.File]::Exists($failureMarker)) { [IO.File]::WriteAllText($failureMarker, 'Host provisioning failed; see provision-host.log. This disk is not sealed.') }
                 }
             }
         }

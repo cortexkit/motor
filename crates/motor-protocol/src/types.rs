@@ -184,6 +184,16 @@ pub struct RunnerStatusReply {
     pub health: Option<RunnerHealth>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WindowsGuestAgentReadiness {
+    pub ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_sha256: Option<String>,
+    pub release_agent_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 /// Read-only runner telemetry. In-memory counters reset on restart; repository
 /// usage is rebuilt from retained records.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -223,6 +233,9 @@ pub struct RunnerHealth {
     pub permits_cap: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_wait_1h: Option<HealthQueueWait>,
+    /// Reports the sealed image's guest-agent hash and whether it matches the release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_guest_agent: Option<WindowsGuestAgentReadiness>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_cache: Option<RemoteCacheHealth>,
 }
