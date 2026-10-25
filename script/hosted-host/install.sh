@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Provision this Linux build server as a hosted-runners host: the motor-vm-helper
+# Provision a Linux server as a hosted-runners host: the motor-vm-helper
 # root service, the unprivileged motor-host TLS agent, their configs and keys,
 # and the agent's one firewall exception. Run as root on the server, from a
 # checkout of this repository. docs/hosted-host.md has the full procedure.
 #
 #   install.sh --checkout DIR --host-id ID --tenant-sub SUB [--build]
 #              [--target-dir DIR] [--port N] [--public-ip IPV4]
-#              [--tenant-disk-quota-gib N]
+#              [--tenant-disk-quota-gib N] [--tenant-template FILE]
 #   install.sh --checkout DIR --check [--public-ip IPV4]
 #   install.sh --checkout DIR --start [--public-ip IPV4]
 #   install.sh --checkout DIR --stop
@@ -17,8 +17,9 @@
 # <file>.bak-<UTC time>. Keys are created only when none exist and are never
 # replaced. The host id and tenant subject are arguments, not repository
 # defaults; --check, --start and --stop read them from the installed configs.
-# The tenant-1.json template sizes the tenant only on a first install: once
-# the tenant record is installed it keeps its sizing and image, which
+# The tenant-1.json template sizes the tenant only on a first install;
+# --tenant-template FILE can supply another first-install sizing and image.
+# Once the tenant record is installed it keeps its sizing and image, which
 # provision.py resize and switch-image change, and the helper config takes its
 # slot CPUs from that record (--tenant-disk-quota-gib is then refused).
 # --check verifies every file and unit this script installs and changes
@@ -61,6 +62,7 @@ usage() {
 
 checkout='' target_dir=/srv/build/target build=0 mode=install
 port='' host_id='' public_ip='' tenant_sub='' tenant_quota='' tenant_image=''
+tenant_template=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --checkout) checkout=${2:?}; shift 2 ;;
@@ -74,6 +76,7 @@ while [ $# -gt 0 ]; do
     --public-ip) public_ip=${2:?}; shift 2 ;;
     --tenant-sub) tenant_sub=${2:?}; shift 2 ;;
     --tenant-disk-quota-gib) tenant_quota=${2:?}; shift 2 ;;
+    --tenant-template) tenant_template=${2:?}; shift 2 ;;
     -h|--help) usage ;;
     *) echo "unknown argument: $1" >&2; usage ;;
   esac
@@ -81,8 +84,8 @@ done
 [ -n "$checkout" ] || usage
 if [ "$mode" = install ]; then
   [ -n "$host_id" ] && [ -n "$tenant_sub" ] || { echo "installing needs --host-id and --tenant-sub" >&2; exit 2; }
-elif [ "$build" = 1 ] || [ -n "$host_id$tenant_sub$tenant_quota$port" ]; then
-  echo "--$mode uses the installed configs; --build, --host-id, --tenant-sub, --tenant-disk-quota-gib and --port are install options" >&2
+elif [ "$build" = 1 ] || [ -n "$host_id$tenant_sub$tenant_quota$port$tenant_template" ]; then
+  echo "--$mode uses the installed configs; --build, --host-id, --tenant-sub, --tenant-disk-quota-gib, --tenant-template and --port are install options" >&2
   exit 2
 fi
 # Changes are made only when installing; --start changes nothing until every
@@ -208,6 +211,8 @@ preflight() {
   fi
   if [ -f "$TENANT_REGISTRY" ] && [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image_version"])' "$TENANT_REGISTRY")" = "$image" ]; then
     ok "tenant image $image matches the helper registry"
+  elif [ "$check" = 0 ] && [ ! -e "$TENANT_REGISTRY" ]; then
+    echo "tenant not provisioned yet; run provision.py before --check or --start"
   else
     fail "$TENANT_CONFIG image does not match $TENANT_REGISTRY"
   fi
@@ -222,6 +227,8 @@ build_binaries() {
   runuser -u "$owner" -- bash -c '
     set -euo pipefail
     [ -f /srv/build/runner.env ] && source /srv/build/runner.env
+    # A dedicated host has no SSH runner environment; rustup installs here.
+    if ! command -v cargo >/dev/null && [ -f "$HOME/.cargo/env" ]; then source "$HOME/.cargo/env"; fi
     export CARGO_TARGET_DIR=$2
     cd "$1"
     cargo build --release --locked -p motor-host -p motor-vm-helper
@@ -277,13 +284,14 @@ configs() {
   directory "$KEY_DIR" "$HOST_USER:$HOST_USER" 700
   directory "$JOURNAL_DIR" "$HOST_USER:$HOST_USER" 700
   render host --host-id "$host_id" --port "$port" > "$scratch/host.json" || { fail "cannot render host config"; return; }
-  # An installed tenant record is rendered back as itself and gives the helper
-  # its slot CPUs; only a first install renders the tenant-1.json template.
-  render helper --uid "$uid" --gid "$gid" ${installed_record:+--installed "$installed_record"} \
-    > "$scratch/helper.json" || { fail "cannot render helper config"; return; }
+  # Render once so the helper and tenant use the same cpuset, including a
+  # first-install template override. Installed records still retain their values.
   render tenant ${tenant_sub:+--sub "$tenant_sub"} ${tenant_quota:+--disk-quota-gib "$tenant_quota"} \
+    ${tenant_template:+--template "$tenant_template"} \
     ${installed_record:+--installed "$installed_record"} \
     > "$scratch/tenant.json" || { fail "cannot render tenant config"; return; }
+  render helper --uid "$uid" --gid "$gid" --installed "$scratch/tenant.json" \
+    > "$scratch/helper.json" || { fail "cannot render helper config"; return; }
   place config "$scratch/host.json" "$HOST_CONFIG" root:root 644
   place config "$scratch/helper.json" "$HELPER_CONFIG" root:root 644
   place config "$scratch/tenant.json" "$TENANT_CONFIG" root:root 644
@@ -412,6 +420,10 @@ installed_record=''
 if [ "$mode" != stop ] && [ -f "$TENANT_CONFIG" ]; then
   installed_record=$TENANT_CONFIG
   tenant_image=$(installed "$TENANT_CONFIG" image_version)
+fi
+if [ -n "$tenant_template" ]; then
+  [ -z "$installed_record" ] || { echo "--tenant-template is only for a first install; use provision.py resize or switch-image" >&2; exit 2; }
+  tenant_image=$(installed "$tenant_template" image_version)
 fi
 port=${port:-8443}
 [[ "$port" =~ ^[1-9][0-9]{3,4}$ ]] || { echo "invalid port $port" >&2; exit 2; }

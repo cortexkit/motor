@@ -1,9 +1,10 @@
 # Provision a hosted host
 
-This turns the dedicated Linux build server into a hosted-runners host: the
+This turns a dedicated Linux server into a hosted-runners host: the
 root `motor-vm-helper`, the unprivileged `motor-host` TLS agent, their
 configs and keys, one tenant VM for our fleet's account, and one public TLS
-port. The existing SSH runner keeps running beside it. Broker-side enrollment
+port. On the build server the existing SSH runner keeps running beside it; a
+fresh host needs no SSH runner. Broker-side enrollment
 belongs to the broker operator; this procedure prints the facts the broker
 operator registers.
 
@@ -14,7 +15,111 @@ only in the server's `/etc/motor-host/host.json` and
 `<tenant-sub>` stand for them.
 
 Everything here runs **on the server**, as `ubuntu` with `sudo`, from the
-checkout `script/runner/sync.sh` maintains at `/srv/build/src/motor`.
+checkout at `/srv/build/src/motor` (cloned directly on a fresh host, or maintained
+by `script/runner/sync.sh` on the build server).
+
+## Fresh host preparation
+
+Use a dedicated Ubuntu x86_64 host with KVM, cgroup v2 and systemd 254 or newer.
+These steps prepare the same installer and provisioner used below; do not run
+`script/runner/setup.sh` to create an unused SSH runner. That script assumes an
+XFS array already mounted at `/srv/build`, local operator Rust/Bun/nextest, and
+SSH-runner workspaces, tool caches, account pools and network policy. Hosted
+jobs get their tools and isolation from the tenant image instead.
+
+1. Install host and image-builder prerequisites, then clone public main as the
+   unprivileged build account:
+
+   ```sh
+   sudo apt-get update
+   sudo apt-get install -y git build-essential musl-tools pkg-config libssl-dev \
+     curl ca-certificates python3 binutils ufw xfsprogs util-linux iproute2 \
+     nftables acl rsync jq zstd xz-utils debootstrap debian-archive-keyring \
+     e2fsprogs gcc-13 flex bison bc libelf-dev
+   sudo install -d -o ubuntu -g ubuntu /srv/build/src /srv/build/target
+   git clone https://github.com/cortexkit/motor /srv/build/src/motor
+   cd /srv/build/src/motor
+   git rev-parse HEAD
+   ```
+
+   Set the host's inbound policy to SSH only before installing. If UFW is not
+   already active, allow SSH before enabling it; never reset existing rules:
+
+   ```sh
+   sudo ufw default deny incoming
+   sudo ufw default allow outgoing
+   sudo ufw allow 22/tcp
+   sudo ufw --force enable
+   sudo python3 script/runner/inbound_policy.py
+   ```
+
+2. Prepare an XFS filesystem with reflinks on the operator-selected data disk,
+   persist its UUID mount in `/etc/fstab`, and mount it at `/srv/build/vm`.
+   Formatting is destructive: verify the disk is unused first. A dedicated
+   tenant-only host need not move the checkout or target directory off the root
+   disk. Install and activate the private storage view using
+   [linux-microvm.md](linux-microvm.md#install), stopping before its helper-start
+   command. The source directory `/srv/build/vm` must be root-owned, mode 0755;
+   root-run image and VM operations use only `/var/lib/motor-vm`.
+
+3. Install the pinned Rustup and toolchains from `script/runner/toolchain.json`
+   as `ubuntu`. Reuse the image installer's exact-toolchain routine (including
+   its independent frozen `stable`, not today's moving channel):
+
+   ```sh
+   cd /srv/build/src/motor
+   rustup_version=$(python3 -c 'import json; print(json.load(open("script/runner/toolchain.json"))["rustup"])')
+   curl -fL "https://static.rust-lang.org/rustup/archive/$rustup_version/x86_64-unknown-linux-gnu/rustup-init" -o /srv/build/src/rustup-init
+   curl -fL "https://static.rust-lang.org/rustup/archive/$rustup_version/x86_64-unknown-linux-gnu/rustup-init.sha256" -o /srv/build/src/rustup-init.sha256
+   (cd /srv/build/src && sha256sum -c rustup-init.sha256)
+   chmod 755 /srv/build/src/rustup-init
+   export PATH="$HOME/.cargo/bin:$PATH"
+   python3 - <<'PY'
+   import importlib.util, json
+   from pathlib import Path
+   spec = importlib.util.spec_from_file_location("boat_install", "script/boat-image/install.py")
+   installer = importlib.util.module_from_spec(spec)
+   spec.loader.exec_module(installer)
+   installer.install_rust(json.load(open("script/runner/toolchain.json")), Path("/srv/build/src/rustup-init"))
+   PY
+   ```
+
+   This routine removes unlisted toolchains/components: use it only on a fresh,
+   dedicated account. It installs the musl target as well. No runner.env,
+   shared sccache or compiler supervisor is required to build the host binaries;
+   `install.sh --build` falls back to the checkout owner's `$HOME/.cargo/env`.
+
+4. Install the official Firecracker/jailer release, checking the pinned archive
+   hash before extraction:
+
+   ```sh
+   cd /srv/build/src
+   curl -fL https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-x86_64.tgz -o firecracker-v1.17.0-x86_64.tgz
+   echo '06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558  firecracker-v1.17.0-x86_64.tgz' | sha256sum -c -
+   tar -xzf firecracker-v1.17.0-x86_64.tgz
+   sudo install -d -o root -g root -m 755 /usr/local/lib/firecracker/1.17.0
+   sudo install -o root -g root -m 755 release-v1.17.0-x86_64/firecracker-v1.17.0-x86_64 /usr/local/lib/firecracker/1.17.0/firecracker
+   sudo install -o root -g root -m 755 release-v1.17.0-x86_64/jailer-v1.17.0-x86_64 /usr/local/lib/firecracker/1.17.0/jailer
+   ```
+
+5. Build an image with the existing [tenant-image recipe](../script/tenant-image/README.md#operator-build),
+   using its **static musl** runner build command, and record the source commit,
+   image version and inventory result. Do not assume the build server's image
+   directory exists. Pass that version and the intended sizing in a local
+   first-install template to the procedure below.
+
+6. Write capacity.json and apply the jobs slice as described below. With no
+   Windows VM, set `windows_vm_bytes` to 0. `jobs_min_bytes` must be positive
+   even without a Linux runner; 1 GiB gives the unused jobs slice a small cap.
+   With `host_reserve_bytes` 6 GiB and a 79,872 MiB guest plus 512 MiB headroom,
+   the fit is 78.5 + 0 + 6 + 1 = 85.5 GiB, checked against actual `MemTotal`,
+   not the rental's advertised memory. Keep the storage margins and tenant
+   memory reserve unless there is a separate reviewed capacity change.
+
+The renderer retains the build server's 32-thread topology and excludes
+`12-15,28-31`, even on a host without Windows. A host with a different topology
+needs a reviewed CPU policy change, not a guessed template. First-install
+templates do not bypass provision.py's sizing, resolver or CPU validation.
 
 ## What gets installed
 
@@ -162,11 +267,13 @@ extra rule.
 
 ## Procedure
 
-1. From the operator machine, sync the checkout: `script/runner/sync.sh`.
+1. From the operator machine, sync the build-server checkout with
+   `script/runner/sync.sh`, or clone main on a fresh host as above.
 2. On the server, check the prerequisites: the private `/var/lib/motor-vm`
    storage view ([linux-microvm.md](linux-microvm.md#install)), Firecracker and
    jailer 1.17.0 in `/usr/local/lib/firecracker/1.17.0/`, the qualified tenant
    image in `/var/lib/motor-vm/tenant-images/tenant-20261020-main-806a6d3-20261020T021255Z/`,
+   (or the image built above, selected by a first-install template),
    and the `x86_64-unknown-linux-musl` Rust target. The installer verifies all of
    them and stops at the end with a count of problems if one is missing.
 3. Build and install. The build runs as the checkout's owner, with
@@ -184,8 +291,21 @@ extra rule.
    and does not open the port. The public IPv4 address is discovered from the
    one global address on the machine; pass `--public-ip` if there is not
    exactly one. `--port` (default 8443) and `--tenant-disk-quota-gib` (default
-   100) override the defaults. A declined change or any failed check exits
+   100) override the defaults. `--target-dir` selects a different build output
+   directory. A declined change or any failed check exits
    nonzero.
+
+   On a fresh host, `--tenant-template /path/to/tenant.json` overrides the
+   first-install sizing **and image** without editing a tracked file. Copy
+   `script/hosted-host/tenant-1.json`, omit its `sub` (the installer supplies the
+   argument), and set `image_version`, `vcpu_ceiling`, `cpuset`, `guest_ram_mib`,
+   `disk_quota_bytes`, `max_weight` and `idle_suspend_s` as needed. For the
+   24-vCPU production-size control these are `24`, `0-11,16-27`, `79872`,
+   `644245094400`, `64` and `0`. The helper takes the same rendered cpuset.
+   After a record is installed the template option is refused; use the existing
+   offline resize and image-switch operations. A missing helper registry is
+   expected before provisioning on a first install, but `--check` and `--start`
+   always require it.
 4. Send the broker operator the enrollment block. It is five labelled lines in
    `register-host` argument order, then the filled-in command:
 

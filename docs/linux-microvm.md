@@ -29,7 +29,8 @@ never sends the helper a path, executable, environment or argv.
 The paths below are fixed by this build. `/var/lib/motor-vm` is the helper's
 storage root and has no override; executable and snapshot paths come from the
 JSON configuration. It is a bind mount of the root-owned `/srv/build/vm`
-directory on the XFS build disk. All ancestors of the mounted view are root-owned;
+directory on the XFS build disk (or a dedicated XFS filesystem mounted at
+`/srv/build/vm` on a tenant-only host). All ancestors of the mounted view are root-owned;
 `/srv/build` itself may remain owned by the unprivileged build account. Root VM
 services must use the mounted view, not the source spelling. Renaming the source
 from its writable parent does not move an already established bind mount. The
@@ -39,7 +40,7 @@ chroot mounts back into the source alias. The helper requires that companion,
 and `script/tenant-image/qualify.py` refuses a shared view before starting a VM.
 
 - Linux with cgroup v2, `openat2`, pidfds, `cgroup.kill` and `/dev/userfaultfd`,
-  and XFS with reflink support at `/srv/build`.
+  and XFS with reflink support backing `/srv/build/vm`.
 - systemd 254 or newer (for `DelegateSubgroup=`). The unit is a root system
   service with the cpu, cpuset, memory and io controllers delegated. The helper
   process sits in the unit's `helper` leaf, not the delegation root.

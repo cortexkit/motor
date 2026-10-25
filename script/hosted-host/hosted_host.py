@@ -7,7 +7,7 @@ install.sh calls this to produce, on stdout, the exact bytes it installs:
   helper --uid UID --gid GID [--installed RECORD]
                                     /etc/motor-vm-helper.json, its slot CPUs
                                     taken from the installed tenant record
-  tenant --sub S [--disk-quota-gib N] [--installed RECORD]
+   tenant --sub S [--disk-quota-gib N] [--template FILE] [--installed RECORD]
                                     the provision.py operator JSON for tenant 1:
                                     the installed record when there is one,
                                     the tenant-1.json template on a first install
@@ -195,7 +195,7 @@ def validate_tenant(config: dict, provision=None) -> None:
 
 
 def tenant_config(sub: str, disk_quota_gib: int | None = None, image_version: str | None = None,
-                  installed: Path | None = None) -> dict:
+                  installed: Path | None = None, template: Path | None = None) -> dict:
     """The provision.py operator JSON for tenant 1, validated by provision.py.
 
     With an installed record, that record is the result: its sizing may have
@@ -203,14 +203,14 @@ def tenant_config(sub: str, disk_quota_gib: int | None = None, image_version: st
     reinstalling must not put the template's values back. The template
     applies only to a first install."""
     if installed is not None:
-        if disk_quota_gib is not None or image_version is not None:
+        if disk_quota_gib is not None or image_version is not None or template is not None:
             raise ValueError("the installed tenant record keeps its sizing and image; change them with "
                              "provision.py resize or switch-image, not the installer")
         config = read_record(installed)
         if config.get("sub") != sub:
             raise ValueError(f"--tenant-sub differs from the subject in the installed record {installed}")
     else:
-        config = json.loads(TENANT_FILE.read_text())
+        config = read_record(TENANT_FILE if template is None else template)
         config["sub"] = sub
         if image_version is not None:
             config["image_version"] = image_version
@@ -390,6 +390,7 @@ def main() -> int:
     tenant.add_argument("--sub", required=True)
     tenant.add_argument("--disk-quota-gib", type=int)
     tenant.add_argument("--image-version")
+    tenant.add_argument("--template", type=Path, help="first-install tenant sizing and image, without the subject")
     tenant.add_argument("--installed", type=Path, help="the installed tenant record; absent on a first install")
     check = commands.add_parser("check-installed")
     check.add_argument("--uid", type=int, required=True)
@@ -427,7 +428,7 @@ def main() -> int:
         elif args.command == "helper":
             value = helper_config(args.uid, args.gid, None if args.installed is None else read_record(args.installed))
         else:
-            value = tenant_config(args.sub, args.disk_quota_gib, args.image_version, args.installed)
+            value = tenant_config(args.sub, args.disk_quota_gib, args.image_version, args.installed, args.template)
     except ValueError as error:
         print(f"hosted-host: {error}", file=sys.stderr)
         return 2

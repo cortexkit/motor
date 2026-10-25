@@ -485,6 +485,29 @@ class InstalledRenderTests(unittest.TestCase):
         self.assertEqual(helper.returncode, 0, helper.stderr)
         self.assertEqual({slot["cpus"] for slot in json.loads(helper.stdout)["slots"]}, {template["cpuset"]})
 
+    def test_a_first_install_can_override_the_image_and_sizing_without_a_subject_in_the_template(self):
+        template = dict(self.record, image_version="fresh-main-image")
+        del template["sub"]
+        self.path.write_text(hosted.render_json(template))
+        rendered = self.cli("tenant", "--sub", SUB, "--template", self.path)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertEqual(json.loads(rendered.stdout), dict(template, sub=SUB))
+        self.path.write_text(rendered.stdout)
+        helper = self.cli("helper", "--uid", UID, "--gid", UID, "--installed", self.path)
+        self.assertEqual(helper.returncode, 0, helper.stderr)
+        self.assertEqual({slot["cpus"] for slot in json.loads(helper.stdout)["slots"]}, {"0-11,16-27"})
+
+    def test_a_template_override_cannot_replace_an_installed_record(self):
+        refused = self.cli("tenant", "--sub", SUB, "--installed", self.path, "--template", self.path)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("keeps its sizing and image", refused.stderr)
+
+    def test_a_first_install_template_still_passes_provisioning_checks(self):
+        self.path.write_text(hosted.render_json(dict(self.record, vcpu_ceiling=0)))
+        refused = self.cli("tenant", "--sub", SUB, "--template", self.path)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("vcpu_ceiling", refused.stderr)
+
     def test_an_installed_record_refuses_template_overrides_and_another_subject(self):
         for args in (["--disk-quota-gib", "400"], ["--image-version", "next-image"]):
             with self.subTest(args=args):
@@ -622,12 +645,22 @@ class InstallScriptTests(unittest.TestCase):
         configs = self.function("configs")
         # Each render with its continuation lines.
         renders = re.findall(r"render (helper|tenant) ((?:[^\n]*\\\n)*[^\n]*)", configs)
-        self.assertEqual([kind for kind, _ in renders], ["helper", "tenant"])
-        for kind, line in renders:
-            self.assertIn('${installed_record:+--installed "$installed_record"}', line, kind)
+        self.assertEqual([kind for kind, _ in renders], ["tenant", "helper"])
+        self.assertIn('${installed_record:+--installed "$installed_record"}', renders[0][1])
+        self.assertIn('${tenant_template:+--template "$tenant_template"}', renders[0][1])
+        self.assertIn('--installed "$scratch/tenant.json"', renders[1][1])
         # --check and --start never re-derive the sizing from the template: the
         # disk quota is no longer read back to feed a template render.
         self.assertNotIn('tenant_quota=$(', self.script)
+
+    def test_build_uses_rustup_when_there_is_no_runner_environment(self):
+        build = self.function("build_binaries")
+        self.assertIn('[ -f /srv/build/runner.env ] && source /srv/build/runner.env', build)
+        self.assertIn('if ! command -v cargo >/dev/null && [ -f "$HOME/.cargo/env" ]; then source "$HOME/.cargo/env"; fi', build)
+
+    def test_only_install_can_defer_a_missing_registry_until_provisioning(self):
+        self.assertIn('elif [ "$check" = 0 ] && [ ! -e "$TENANT_REGISTRY" ]; then', self.function("preflight"))
+        self.assertIn('tenant not provisioned yet; run provision.py before --check or --start', self.script)
 
     def test_check_and_start_verify_the_installed_state(self):
         configs = self.function("configs")
