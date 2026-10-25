@@ -700,6 +700,24 @@ class ProvisionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "oom readback"):
             p.protect_vmm(123, proc=scratch, oom=scratch, reread=lambda: "0\n")
 
+    def test_protect_vmm_reads_the_pids_own_proc_directory_by_default(self):
+        # Without overrides it must look in /proc/<pid>, not /proc itself.
+        # A real base build reached `/proc/comm` and failed before this fix.
+        seen = []
+        original = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            seen.append(str(path))
+            if str(path) == "/proc/4242/comm":
+                return "firecracker\n"
+            return original(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", read_text), \
+                mock.patch.object(Path, "write_text", return_value=None):
+            result = p.protect_vmm(4242, reread=lambda: "-500\n")
+        self.assertEqual(seen, ["/proc/4242/comm"])
+        self.assertEqual(result, dict(pid=4242, comm="firecracker", oom_score_adj=-500))
+
     def test_existing_disk_is_never_overwritten(self):
         home = self.root / "tenants/a"
         home.mkdir()

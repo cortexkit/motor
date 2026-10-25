@@ -962,13 +962,18 @@ def boot_args(image):
     return args
 
 
-def protect_vmm(pid, proc=Path("/proc"), oom=Path("/proc"), reread=None):
+def protect_vmm(pid, proc=None, oom=None, reread=None):
     """Give the VMM an OOM score below jobs (+900) and above runners (-900).
 
     The jailer execs Firecracker in place, so the jailer's pid is the VMM's.
     A set or read-back failure is fatal: a VMM ranked like a job could be the
     kernel's first victim on a host whose memory is already over-committed.
+    `proc` and `oom` are the process's own /proc directory; tests pass a
+    scratch directory instead.
     """
+    own = Path("/proc") / str(int(pid))
+    proc = own if proc is None else proc
+    oom = own if oom is None else oom
     try:
         comm = (proc / "comm").read_text().strip()
     except OSError as error:
