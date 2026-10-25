@@ -68,8 +68,21 @@ pub struct Motor {
     /// keeps reading. If it sent a second cancel instead, it would wait for
     /// that reply and then reattach before it could read the terminal.
     cancels_in_flight: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, usize>>>,
+    /// Attach must not follow a withdrawn runner while its submission owner can
+    /// still move the command to another runner. Closing a watch opens the fence.
+    submissions: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, watch::Sender<()>>>>,
 }
 mod agent_run;
+
+struct Submission {
+    motor: Motor,
+    id: Uuid,
+}
+impl Drop for Submission {
+    fn drop(&mut self) {
+        self.motor.submission_ready(self.id);
+    }
+}
 
 /// Marks one `Motor::cancel` call delivering a build-server job's cancel.
 struct CancelInFlight {
@@ -123,6 +136,7 @@ impl Motor {
             shadow_deadline: None,
             windows_slots,
             cancels_in_flight: Arc::default(),
+            submissions: Arc::default(),
         })
     }
     pub fn with_account_tokens(mut self, tokens: Arc<crate::AccountTokens>) -> Self {
@@ -136,7 +150,15 @@ impl Motor {
         self
     }
     async fn resume_finishes(&self) {
+        // A stored unknown terminal can still have unconfirmed cancellation.
+        // Resume it before settlement closes the Boat runner's attach endpoint.
+        for id in self.storage.pending_hosted_cancels() {
+            self.retry_cancel(id);
+        }
         for (id, state) in self.storage.pending_finishes() {
+            if self.pending(id) && self.hosted_state(id).is_some() {
+                continue;
+            }
             let terminal = state.terminal.clone();
             let _ = self
                 .hosted_client(state)
@@ -327,7 +349,9 @@ impl Motor {
         }
         let (stream, tx, rx) = self.stream(id);
         let motor = self.clone();
+        let submission = self.submission(id);
         tokio::spawn(async move {
+            let _submission = submission;
             if macos_not_hosted {
                 let result = motor
                     .refused(
@@ -372,6 +396,9 @@ impl Motor {
         let (stream, tx, rx) = self.stream(id);
         let motor = self.clone();
         tokio::spawn(async move {
+            if !motor.wait_for_submission(id, &tx).await {
+                return;
+            }
             let result = if let Some(t) = motor.storage.job(id).and_then(|j| j.local_terminal) {
                 emit(&tx, StreamRecord::Terminal(t)).await
             } else {
@@ -386,6 +413,36 @@ impl Motor {
             }
         });
         Ok(stream)
+    }
+    fn submission(&self, id: Uuid) -> Submission {
+        let (ready, _) = watch::channel(());
+        self.submissions.lock().unwrap().insert(id, ready);
+        Submission {
+            motor: self.clone(),
+            id,
+        }
+    }
+    fn submission_ready(&self, id: Uuid) {
+        self.submissions.lock().unwrap().remove(&id);
+    }
+    async fn wait_for_submission(
+        &self,
+        id: Uuid,
+        tx: &mpsc::Sender<io::Result<StreamRecord>>,
+    ) -> bool {
+        let ready = self
+            .submissions
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|s| s.subscribe());
+        if let Some(mut ready) = ready {
+            tokio::select! {
+                _ = ready.changed() => {},
+                _ = tx.closed() => return false,
+            }
+        }
+        true
     }
     pub(crate) fn refuse_capacity(&self) -> io::Result<JobStream> {
         self.refuse_before_start(RefusalReason::RunnerFull, None)
@@ -1186,6 +1243,17 @@ impl Motor {
             git_dependencies,
             base_commit: Some(snapshots.main.head.clone()),
         };
+        // A cancellation recorded while the lease was provisioning belongs to
+        // the destination job too, including a newly minted resubmission ID.
+        // Install its tombstone before Run so an empty upload cannot race it.
+        if self.pending(id) {
+            self.send_cancel(id).await?;
+        }
+        if self.storage.job(id).is_some_and(|job| {
+            job.local_terminal.is_some() || job.hosted.is_some_and(|route| route.terminal.is_some())
+        }) {
+            return Err(io::Error::other("job already terminal before Run"));
+        }
         // From this point on even a failed write might have reached the runner.
         // Never resubmit or invent a before-start outcome after attempting run.
         // The hosted route records that durably first: it is what stops a
@@ -1335,6 +1403,11 @@ impl Motor {
         if uploaded.is_err() {
             drop(channel);
             return self.follow_inner(id, 0, None, tx, wake, spill_after).await;
+        }
+        // The first build-server submission can still spill while queued. A
+        // hosted or resubmitted Run cannot move again once its upload completes.
+        if hosted || resubmitted {
+            self.submission_ready(id);
         }
         self.follow_inner(id, 0, Some(channel), tx, wake, spill_after)
             .await
@@ -1543,8 +1616,9 @@ impl Motor {
     /// whatever the broker booked. Jobs routed hosted by configuration never
     /// fall back: only a spill records `spill_wait_ms`.
     fn spill_returnable(&self, id: Uuid) -> bool {
-        self.hosted_state(id)
-            .is_some_and(|route| route.spill_wait_ms.is_some() && !route.run_sent)
+        self.hosted_state(id).is_some_and(|route| {
+            route.spill_wait_ms.is_some() && !route.run_sent && route.terminal.is_none()
+        })
     }
     /// Send a spilled job that never reached a hosted runner back to the build
     /// server, rather than refusing a job that already gave up its place in
@@ -1654,10 +1728,39 @@ impl Motor {
             TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
                 .with_ran(Ran::Unknown("maybe".into()))
         });
-        if self
-            .hosted_client(self.hosted_state(id).unwrap())
-            .finish(id, Some(&terminal), &self.storage)
-            .await?
+        // Exhausting reattach attempts is not evidence that the runner stopped.
+        // Attempt cancellation first, but a network failure must not leave the
+        // caller without a terminal. Retain and retry unconfirmed cancellation.
+        let mut cancel_unconfirmed = false;
+        if matches!(terminal.outcome, Outcome::OutcomeUnknown)
+            && state.run_sent
+            && state.hosted_code.as_deref() != Some("hosted_sandbox_lost")
+            && (self.pending(id)
+                || self
+                    .storage
+                    .job(id)
+                    .is_none_or(|job| job.terminal_observed_at_ms.is_none()))
+        {
+            self.storage.cancel(id, true)?;
+            if let Err(error) = self.send_cancel(id).await {
+                self.log_hosted_failure(id, "cancel", error);
+                cancel_unconfirmed = true;
+                let detail = "hosted_cancel_unconfirmed: runner cancellation was not acknowledged; cancellation intent retained for retry";
+                terminal.refusal_detail =
+                    Some(bounded_detail(match terminal.refusal_detail.take() {
+                        Some(cause) if cause.starts_with("hosted_cancel_unconfirmed:") => cause,
+                        Some(cause) => format!("{detail}; {cause}"),
+                        None => detail.into(),
+                    }));
+            }
+        }
+        // Settling a Boat booking makes its runner impossible to reattach.
+        // Leave it available for cancellation retries until one is acknowledged.
+        if !cancel_unconfirmed
+            && self
+                .hosted_client(self.hosted_state(id).unwrap())
+                .finish(id, Some(&terminal), &self.storage)
+                .await?
         {
             terminal = Self::sandbox_lost_terminal(id, &state);
         }
@@ -1687,6 +1790,9 @@ impl Motor {
         self.storage
             .hosted_update(id, |s| s.terminal = Some(terminal.clone()))?;
         self.storage.terminal_observed(id)?;
+        if cancel_unconfirmed {
+            self.retry_cancel(id);
+        }
         emit(tx, StreamRecord::Terminal(terminal)).await
     }
     async fn lost_sandbox(
@@ -1924,6 +2030,7 @@ impl Motor {
                     started_at_ms,
                     path_mapping,
                 })) if job_id == build_server_id => {
+                    self.submission_ready(id);
                     if let Some(watch) = spill_watch.as_mut() {
                         watch.started();
                     }
@@ -1938,6 +2045,7 @@ impl Motor {
                     backoff = 1;
                 }
                 Ok(Incoming::Frame(Frame::Output(output))) => {
+                    self.submission_ready(id);
                     if let Some(watch) = spill_watch.as_mut() {
                         watch.started();
                     }
@@ -2149,6 +2257,9 @@ impl Motor {
             self.connector_for_job(id)?;
         }
         if self.hosted_state(id).is_some_and(|s| s.terminal.is_some()) {
+            if self.pending(id) {
+                self.retry_cancel(id);
+            }
             return Ok(CancelReply::new(id));
         }
         // Mark the delivery before the intent is persisted, so the job's
@@ -2172,21 +2283,31 @@ impl Motor {
             .is_err()
         {
             tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "job cancel not delivered; retrying in the background");
-            let motor = self.clone();
-            tokio::spawn(async move {
-                let mut delay = 1;
-                while motor.pending(id) {
-                    if motor.send_cancel(id).await.is_ok() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                    delay = (delay * 2).min(30);
-                }
-            });
+            self.retry_cancel(id);
         } else {
             tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "job cancel delivered to runner");
         }
         Ok(CancelReply::new(id))
+    }
+    fn retry_cancel(&self, id: Uuid) {
+        let motor = self.clone();
+        tokio::spawn(async move {
+            let mut delay = 1;
+            while motor.pending(id) {
+                if motor.send_cancel(id).await.is_ok() {
+                    if let Some(state) = motor.hosted_state(id).filter(|s| s.terminal.is_some()) {
+                        let terminal = state.terminal.clone();
+                        let _ = motor
+                            .hosted_client(state)
+                            .finish(id, terminal.as_ref(), &motor.storage)
+                            .await;
+                    }
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                delay = (delay * 2).min(30);
+            }
+        });
     }
     pub async fn status(&self) -> StatusReply {
         self.disk_status().await.status
