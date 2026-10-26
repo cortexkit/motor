@@ -173,6 +173,24 @@ async fn users_runner_hello_matches_pre_mapping_bytes() {
         };
         config.manual_tick = true;
         config.disable_warm_builds = true;
+        // Hello does not expose compiler versions. Supply a fixed version via
+        // the existing toolchain-config seam to skip the startup rustc probe;
+        // the backend remains Host, so all Hello capabilities stay unchanged.
+        let unused_tool = || crate::macos::Tool {
+            path: "/unused-tool".into(),
+            sha256: "0".repeat(64),
+        };
+        config.macos = Some(Arc::new(crate::macos::VmConfig {
+            image: "/unused-image".into(),
+            helper: "/unused-helper".into(),
+            tools: crate::macos::Tools {
+                cargo: unused_tool(),
+                rustc: unused_tool(),
+                bun: unused_tool(),
+                git: unused_tool(),
+            },
+            toolchain_version: "compatibility-rustc".into(),
+        }));
         let runner = Runner::open(config).unwrap();
         let (socket, server) = listener(&f, &runner);
         let mut stream = UnixStream::connect(&*socket).await.unwrap();

@@ -20,6 +20,7 @@ use std::{
 use uuid::Uuid;
 
 mod cargo_fetch;
+mod host_inputs;
 mod hosts;
 mod javascript_tools;
 #[cfg(test)]
@@ -1594,7 +1595,7 @@ fn bind(source: &Path, destination: &Path) -> io::Result<String> {
 /// no mount, and a job that runs `bun` fails to find it.
 fn job_bun_mount(javascript: &JavascriptTools) -> io::Result<Option<(String, PathBuf)>> {
     let source = javascript.bun_dir();
-    if !source.is_dir() {
+    if !host_inputs::is_dir(source) {
         return Ok(None);
     }
     let destination = PathBuf::from(JOB_BUN_DIR);
@@ -2693,11 +2694,11 @@ impl Sandbox {
             // make newly fetched files readable to jobs without rescanning the
             // cache after every trusted dependency fetch.
             let cargo = PathBuf::from(
-                std::env::var_os("CARGO_HOME")
+                host_inputs::environment("CARGO_HOME")
                     .ok_or_else(|| io::Error::other("CARGO_HOME unset"))?,
             );
             let rustup = PathBuf::from(
-                std::env::var_os("RUSTUP_HOME")
+                host_inputs::environment("RUSTUP_HOME")
                     .ok_or_else(|| io::Error::other("RUSTUP_HOME unset"))?,
             );
             prefetch_cargo_dependencies(
@@ -2812,10 +2813,12 @@ impl Sandbox {
         )?;
         prepare_job_home(&host_home)?;
         let shared_cargo = PathBuf::from(
-            std::env::var_os("CARGO_HOME").ok_or_else(|| io::Error::other("CARGO_HOME unset"))?,
+            host_inputs::environment("CARGO_HOME")
+                .ok_or_else(|| io::Error::other("CARGO_HOME unset"))?,
         );
         let rustup = PathBuf::from(
-            std::env::var_os("RUSTUP_HOME").ok_or_else(|| io::Error::other("RUSTUP_HOME unset"))?,
+            host_inputs::environment("RUSTUP_HOME")
+                .ok_or_else(|| io::Error::other("RUSTUP_HOME unset"))?,
         );
         let mut read_only = Vec::new();
         for path in [
@@ -2833,7 +2836,7 @@ impl Sandbox {
             // to this file; without it TLS clients and the openssl CLI fail.
             "/etc/ssl/openssl.cnf",
         ] {
-            if Path::new(path).exists() {
+            if host_inputs::exists(Path::new(path)) {
                 read_only.push(word(Path::new(path))?);
                 mount_destinations.push(PathBuf::from(path));
             }
@@ -2856,7 +2859,7 @@ impl Sandbox {
         // bookkeeping live in the job's private CARGO_HOME, not the shared one.
         for name in ["registry", "git"] {
             let source = shared_cargo.join(name);
-            if source.is_dir() {
+            if host_inputs::is_dir(&source) {
                 let destination = cargo.join(name);
                 read_only.push(bind(&source, &destination)?);
                 mount_destinations.push(destination);
