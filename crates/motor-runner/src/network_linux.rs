@@ -30,6 +30,12 @@ pub(crate) fn operator_generation_path(path: PathBuf) -> OperatorGenerationGuard
     OperatorGenerationGuard(OPERATOR_GENERATION.lock().unwrap().replace(path))
 }
 
+#[cfg(test)]
+#[path = "network_linux/operator.rs"]
+mod operator;
+#[cfg(test)]
+pub(crate) use operator::validated_generation;
+
 fn generation_path() -> PathBuf {
     #[cfg(test)]
     if let Some(path) = OPERATOR_GENERATION.lock().unwrap().clone() {
@@ -105,6 +111,24 @@ fn probe_policy(
 }
 
 fn read_success_generation(path: &Path, owner: u32) -> io::Result<Uuid> {
+    read_success_generation_record(path, owner).map_err(|error| generation_error(path, error))
+}
+
+fn generation_error(path: &Path, error: io::Error) -> io::Error {
+    let problem = if error.kind() == io::ErrorKind::NotFound {
+        "is missing (the host's motor-net rules have not published a success generation)".into()
+    } else {
+        format!(
+            "cannot be used: {error} (a readable, safe motor-net success generation is required)"
+        )
+    };
+    io::Error::new(
+        error.kind(),
+        format!("job network not ready: {} {problem}", path.display()),
+    )
+}
+
+fn read_success_generation_record(path: &Path, owner: u32) -> io::Result<Uuid> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let mut file = OpenOptions::new()
         .read(true)
@@ -117,7 +141,9 @@ fn read_success_generation(path: &Path, owner: u32) -> io::Result<Uuid> {
         || metadata.mode() & 0o022 != 0
         || metadata.len() > 1024
     {
-        return Err(io::Error::other("unsafe network success generation"));
+        return Err(io::Error::other(format!(
+            "unsafe network success generation (requires a single-link regular file owned by uid {owner}, not group/world-writable, at most 1024 bytes)"
+        )));
     }
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -403,6 +429,44 @@ pub(crate) fn attach(id: Uuid) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn readiness_refusal_names_missing_unsafe_and_unreadable_generation() {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("motor-ready-diagnostic-{}", Uuid::now_v7()));
+        fs::create_dir(&root).unwrap();
+        let marker = root.join("motor-net-ready");
+        let owner = unsafe { libc::geteuid() };
+        let missing = read_success_generation(&marker, owner).unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        assert_eq!(missing.to_string(), format!(
+            "job network not ready: {} is missing (the host's motor-net rules have not published a success generation)", marker.display()
+        ));
+        fs::write(
+            &marker,
+            r#"{"schema":1,"generation":"c61f406a764b4df3ae8552b43aa520b9"}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o666)).unwrap();
+        let unsafe_marker = read_success_generation(&marker, owner)
+            .unwrap_err()
+            .to_string();
+        assert!(unsafe_marker.contains(&format!("job network not ready: {}", marker.display())));
+        assert!(unsafe_marker.contains("unsafe network success generation"));
+        // Format permission failures without relying on the test account being
+        // unable to bypass file permissions (the operator may run as root).
+        let unreadable =
+            generation_error(&marker, io::Error::from(io::ErrorKind::PermissionDenied));
+        assert_eq!(unreadable.kind(), io::ErrorKind::PermissionDenied);
+        assert!(unreadable
+            .to_string()
+            .contains(&marker.display().to_string()));
+        assert!(unreadable
+            .to_string()
+            .contains("readable, safe motor-net success generation is required"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn operator_generation_override_is_unprivileged_and_restores_the_previous_path() {
         let previous = super::generation_path();

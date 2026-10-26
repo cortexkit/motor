@@ -51,8 +51,23 @@ def permissions():
 
 
 def prerequisites(allow_fenced=False, locked=False, host_only=False):
+    check_live(allow_fenced=allow_fenced, locked=locked, host_only=host_only)
+    check_persistence()
+    if not locked:
+        tenant_policy.readiness.require_ready()
+    permissions()
+    print('PASS: motor_net base loaded and IPv4 forwarding enabled' + (' (host-only; tenant health independent)' if host_only else ''))
+
+
+def check_live(settings=None, *, allow_fenced=False, locked=False, host_only=False):
+    """Validate live policy without installing files, changing rules or publishing readiness.
+
+    An explicit settings dict passed to check_live is for pre-deployment
+    operator fixtures; production prerequisites still require the trusted
+    installed settings and generation.
+    """
     assert os.geteuid() == 0, 'run full network --check as root'
-    settings = tenant_policy.read_settings()
+    settings = tenant_policy.read_settings() if settings is None else tenant_policy.validate_uplink(settings)
     uplink = settings['uplink']
     with contextlib.nullcontext() if locked else tenant_policy.network_lock():
         actual = check_ruleset(json.loads(sudo('/usr/sbin/nft', '-j', 'list', 'table', 'inet', 'motor_net').stdout), uplink=uplink)
@@ -72,11 +87,6 @@ def prerequisites(allow_fenced=False, locked=False, host_only=False):
     route = sudo('/usr/sbin/ufw', 'status').stdout
     assert any('mnet-+' in line and uplink in line and 'ALLOW FWD' in line for line in route.splitlines()), 'narrow ufw route allowance missing'
     assert pathlib.Path('/proc/sys/net/ipv4/ip_forward').read_text().strip() == '1', 'ip_forward is not 1'
-    check_persistence()
-    if not locked:
-        tenant_policy.readiness.require_ready()
-    permissions()
-    print('PASS: motor_net base loaded and IPv4 forwarding enabled' + (' (host-only; tenant health independent)' if host_only else ''))
 
 
 def check_ruleset(document, tenant_taps=None, *, uplink):

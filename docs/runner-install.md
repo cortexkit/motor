@@ -349,11 +349,14 @@ re-probing, not cross-manager boot ordering. Use this rollout order:
 3. Upgrade/restart the helper using the hosted-host procedure. Tenant faults
    may leave individual TAPs fenced without withdrawing host-job readiness.
    Inspect tenant health separately with the full network `--check`.
-4. Deploy the new runner last, using the user-unit deployment procedure. Run a
+4. Run the ignored `isolated_net_` operator lane against the installed producer
+   before replacing the runner. Do not count a missing-generation refusal as
+   successful network qualification.
+5. Deploy the new runner last, using the user-unit deployment procedure. Run a
    net canary and a non-net canary through the normal client. If a producer
    reload is unfinished or fails, that net request is refused; rerun the real
    producer after fixing it, then retry the canary in the **same runner**.
-5. Resume net admissions only after the canaries pass. Producer-first minimizes
+6. Resume net admissions only after the canaries pass. Producer-first minimizes
    mixed-version windows even though boot-time recovery no longer needs a
    runner restart.
 
@@ -370,6 +373,20 @@ publication/reload/cleanup and the existing privileged network helpers. This
 keeps the shared operator-test lock owned and opened by the same account under
 `fs.protected_regular`; do not chmod/chown/delete that host lock or change the
 sysctl to run a test. The production marker is never withdrawn by these cases.
+Ordinary network fixtures first run the producer's real read-only live-policy
+checker (including canonical rules, uplink, forwarding, tenant gates and UFW),
+then root-publish a generation to their scratch directory through the test-only
+path override. No live rules are loaded or changed. This permits pre-deployment
+testing when the live policy already matches but the old producer has no marker.
+If `/etc/motor-network.json` is not installed, explicitly set both
+`MOTOR_NET_TEST_UPLINK` and `MOTOR_NET_TEST_PUBLIC_IPV4`; no route sniffing or
+interface default is used. The child process in
+`isolated_net_restart_survives_and_cleans_up` reuses the parent's validated
+private generation through the same scratch-path override. A policy mismatch
+still fails closed: deploy producer/helper first,
+then run the lane, then deploy the runner. Scratch generations do not relax the
+production readiness protocol or track concurrent production reloads; keep
+policy changes quiesced during the operator lane.
 Run the default read-only diff as the trusted runner account to verify its
 non-root `sudo` grants. Running `--check` as root skips verification of that
 account's non-root `sudo` grants.

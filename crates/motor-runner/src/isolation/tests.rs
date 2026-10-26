@@ -2628,6 +2628,7 @@ fn isolated_net_attach_failure_discards_unstarted_unit() {
 fn isolated_net_startup_reconciles_leftovers_but_preserves_live_unit() {
     let _guard = net_operator_lock();
     let f = Fixture::new();
+    let (_generation, _) = crate::network::linux::validated_generation(&f.state);
     let root = f.state.join("slots");
     let sandbox = f.sandbox().with_network().unwrap();
     let mut launch = sandbox.launch("true", &f.workspace, &[]).unwrap();

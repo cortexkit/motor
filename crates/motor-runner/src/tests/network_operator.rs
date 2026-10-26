@@ -108,6 +108,7 @@ async fn assert_success(runner: &Runner, request: &Run) {
 
 pub(crate) async fn case(mode: &str) {
     let f = Fixture::new();
+    let (_generation, _) = crate::network::linux::validated_generation(f.scratch.path());
     install_probe(&f);
     let runner = Runner::open(config(&f)).unwrap();
     assert_eq!(
@@ -373,6 +374,9 @@ finally:
 fn restart_child() {
     let root =
         PathBuf::from(std::env::var_os("MOTOR_NET_RESTART_FIXTURE").expect("restart fixture"));
+    let _generation = crate::network::linux::operator_generation_path(PathBuf::from(
+        std::env::var_os("MOTOR_NET_TEST_GENERATION").expect("validated operator generation"),
+    ));
     let request: Run = read_json(&root.join("request.json")).unwrap();
     let runner = Runner::open(restart_config(&root)).unwrap();
     assert_run_accepted(&runner, &request);
@@ -403,6 +407,7 @@ fn restart_child() {
 
 pub(crate) async fn restart() {
     let f = Fixture::new();
+    let (_generation, marker) = crate::network::linux::validated_generation(f.scratch.path());
     install_probe(&f);
     let (mut request, bytes) = f.run("set -eu; python3 network-check.py public; echo ready > marker; while [ ! -f release ]; do sleep 0.05; done; python3 network-check.py public");
     request.network = Some(Network::Outbound);
@@ -419,7 +424,8 @@ pub(crate) async fn restart() {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("MOTOR_NET_RESTART_FIXTURE", f.scratch.path()),
+            .env("MOTOR_NET_RESTART_FIXTURE", f.scratch.path())
+            .env("MOTOR_NET_TEST_GENERATION", &marker),
     )
     .unwrap()
     .wait()

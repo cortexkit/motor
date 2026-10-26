@@ -114,6 +114,45 @@ class HostAddressTests(unittest.TestCase):
 
 
 class NetworkForwardPolicyTests(unittest.TestCase):
+    def test_live_check_uses_canonical_policy_without_writes_or_readiness(self):
+        installer = load_script('install-job-network.py')
+        policy = installer.tenant_policy
+        table = json.loads((pathlib.Path(__file__).parent / 'test-fixtures/nft-motor-net-v2-added-set.json').read_text())
+        settings = {'uplink': 'enp6s0', 'public_ipv4': '8.8.8.8'}
+        original_read = pathlib.Path.read_text
+
+        def read(path, *args, **kwargs):
+            return '1' if str(path) == '/proc/sys/net/ipv4/ip_forward' else original_read(path, *args, **kwargs)
+
+        def readonly(*args, **kwargs):
+            if args == ('/usr/sbin/nft', '-j', 'list', 'table', 'inet', 'motor_net'):
+                return SimpleNamespace(stdout=json.dumps(table))
+            if args == ('/usr/sbin/ufw', 'status'):
+                return SimpleNamespace(stdout='ALLOW FWD mnet-+ enp6s0')
+            self.fail(f'non-read-only command: {args}')
+
+        with patch.object(installer.os, 'geteuid', return_value=0), \
+                patch.object(policy, 'validate_uplink', return_value=settings) as validate, \
+                patch.object(policy, 'network_lock', side_effect=contextlib.nullcontext), \
+                patch.object(policy, 'table', return_value=None), \
+                patch.object(policy, 'tenant_snapshot', return_value=(set(), set())), \
+                patch.object(policy, 'inspect_ufw', return_value=(set(), set())), \
+                patch.object(installer, 'sudo', side_effect=readonly), \
+                patch.object(pathlib.Path, 'read_text', read), \
+                patch.object(installer, 'check_persistence') as persistence, \
+                patch.object(policy.readiness, 'require_ready') as require_ready, \
+                patch.object(policy.readiness, 'publish') as publish, \
+                patch.object(policy.readiness, 'invalidate') as invalidate:
+            installer.check_live(settings=settings)
+            validate.assert_called_once_with(settings)
+            persistence.assert_not_called()
+            require_ready.assert_not_called()
+            publish.assert_not_called()
+            invalidate.assert_not_called()
+            table['nftables'] = [entry for entry in table['nftables'] if entry.get('rule', {}).get('chain') != 'input']
+            with self.assertRaisesRegex(AssertionError, 'input'):
+                installer.check_live(settings=settings)
+
     def test_table_drops_inbound_and_unrelated_forwarding(self):
         table = pathlib.Path(__file__).with_name('motor-net.nft').read_text()
         forward = table.split('chain forward {', 1)[1].split('chain postrouting', 1)[0]
