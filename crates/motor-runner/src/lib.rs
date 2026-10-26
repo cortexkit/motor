@@ -5,6 +5,7 @@ mod backend;
 mod boat_quota;
 #[cfg(target_os = "linux")]
 mod boat_quota_events;
+mod caller_path;
 mod cleanup;
 #[cfg(any(target_os = "linux", test))]
 mod compile_cache;
