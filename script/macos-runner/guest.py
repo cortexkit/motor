@@ -217,6 +217,13 @@ def drop_build_access(build_user, home, sudoers=Path("/etc/sudoers.d/motorbuild"
     run("/usr/bin/dscl", ".", "-create", "/Users/" + build_user, "UserShell", "/usr/bin/false")
     run("/usr/bin/dscl", ".", "-create", "/Users/" + build_user, "Password", "*")
     sudoers.unlink(missing_ok=True)
+    # Locking a shell/password leaves the local account and its admin membership behind.
+    # Delete both before acknowledging the seal; the existing SSH process can finish shutdown.
+    run("/usr/sbin/dseditgroup", "-o", "edit", "-d", build_user, "-t", "user", "admin")
+    run("/usr/bin/dscl", ".", "-delete", "/Users/" + build_user)
+    users = subprocess.check_output(["/usr/bin/dscl", ".", "-list", "/Users"], text=True)
+    if build_user in users.splitlines():
+        raise ValueError("build account still exists after deletion")
 
 
 def seal(manifest, build_user, scratch):

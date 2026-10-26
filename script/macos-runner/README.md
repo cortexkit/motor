@@ -112,8 +112,10 @@ inside the checkout, for example `target/scratch/macos-image`.
 
    The guest rechecks the installed pins, turns Remote Login off, verifies it is
    off, deletes the build account's `.ssh` and temporary sudoers entry, disables
-   its shell/password, removes build sources, and acknowledges sealing before
-   shutdown. The host requires that acknowledgement even if SSH is disconnected
+   its shell/password, removes its admin membership and Directory Services account,
+   verifies the account is gone, removes build sources, and acknowledges sealing
+   before shutdown. Deletion is synchronous, not deferred to a shutdown job. The
+   host requires that acknowledgement even if SSH is disconnected
    by shutdown, and deletes its private/public build key. If Remote Login shutdown
    severs SSH before acknowledgement on a particular macOS release, sealing fails
    closed and requires operator investigation; it is not counted as success.
@@ -134,6 +136,64 @@ inside the checkout, for example `target/scratch/macos-image`.
      --work target/scratch/macos-image --image "$IMAGE"
    tar -xf target/scratch/macos-image/tools.tar -C target/scratch/macos-image
    ```
+
+## Offline guest-agent update
+
+Use `agent-swap` on a dedicated macOS VM host to update a stopped, sealed image
+without restoring the IPSW or repeating Setup Assistant. Run as root so the
+installed binary can retain `root:wheel` ownership. The destination must not
+exist; its parent must already exist on an APFS volume supporting `cp -c` clones.
+There is no full-copy fallback.
+
+1. Build and sign the replacement agent from a known source commit. Review its
+   SHA-256 and full source commit in a new toolchain manifest, changing **only**
+   the `agent` record from the source image's installed lock. Commit that reviewed
+   manifest in this repository; pending or uncommitted locks are rejected. The
+   binary hash is checked before cloning and again on the installed replacement;
+   its source-commit provenance remains the operator's responsibility.
+2. Stop all VMs using the source, then run:
+
+   ```sh
+   sudo python3 script/macos-runner/image.py agent-swap \
+     --from "$SEALED_IMAGE" --to "$UPDATED_IMAGE" \
+     --agent "$NEW_MACAGENT" --manifest script/macos-runner/toolchain.json
+   ```
+
+   `image.json` is generated inside each sealed image directory, not stored in
+   the repository. The recipe checks its complete file inventory, read-only modes
+   and digests, and uses `lsof` to prove the source is stopped. It APFS-clones the
+   four image files into a temporary sibling of the destination, mounts only the
+   clone's Data volume writable, verifies the old installed pins, and atomically
+   replaces `/opt/motor/bin/motor-macagent` in the same directory as `root:wheel`
+   mode `0555`. It updates `/opt/motor/{toolchain.json,agent.sha256,sealed.json}`
+   for the reviewed manifest, re-grants TCC using the replacement's installed
+   code-signing requirement, unmounts/detaches, and recomputes the outer hashes.
+   Only then is the read-only bundle published by rename. Failures leave no
+   destination or staging bundle; the source bytes and modes are not changed.
+3. Re-run installed-daemon qualification before deploying the new image. Portable
+   tests cannot prove APFS cloning, code-signing/TCC behavior, or guest startup.
+
+Earlier sealing code set a non-login shell and `*` password marker for
+`motorbuild` but did not delete its local account or admin membership. Older
+sealed images may retain the account record; there was no scheduled deletion
+to remove it later.
+The swap never deletes or repairs that account: it accepts an absent account, or
+checks the local account plist at
+`/private/var/db/dslocal/nodes/Default/users/motorbuild.plist` offline for
+`/usr/bin/false`, `passwd = ["*"]`, and no enabled authentication authority.
+Every authority string must start with `;DisabledUser;`, or
+both the authority list and `ShadowHashData` must be absent/empty. The password
+marker alone is **not** proof that a ShadowHash password is disabled. The home
+must be `/Users/motorbuild` with no `.ssh` contents or symlinks; unknown states
+are refused with a reason. Direct admin membership (by short name or UUID) is
+printed for operator review, not removed. A retained admin entry does not grant
+login when password authorities are disabled and SSH keys are absent. This does
+not claim to inspect effective network/directory-service group membership.
+
+Tests: `OfflineImageTests` covers cloning, source preservation, replacement and
+TCC metadata, refusal of enabled credentials and partial failures;
+`ImageTests.test_sealing_refuses_if_build_account_survives_deletion` covers the
+seal acknowledgement's account-deletion prerequisite.
 
 ## Host installation and update
 

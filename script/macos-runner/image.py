@@ -185,39 +185,215 @@ def seal(args, manifest):
     print("Guest acknowledged seal and shutdown. Wait for the image-build helper to exit, then run finalize.")
 
 
+def require_stopped(directory):
+    for name in IMAGE_FILES:
+        path = directory / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("image must contain four regular files")
+        result = subprocess.run(["/usr/sbin/lsof", "-t", "--", str(path)], capture_output=True)
+        if result.returncode != 1 or result.stdout or result.stderr:
+            raise ValueError("image still open, or lsof could not prove it stopped")
+
+
+def write_seal(directory, manifest_sha256, ipsw, agent, tcc):
+    (directory / "agent.sha256").write_text(agent["sha256"] + "\n")
+    files = {name: parity.digest(directory / name) for name in (*IMAGE_FILES, "agent.sha256")}
+    (directory / "image.json").write_text(json.dumps({"manifest_sha256": manifest_sha256,
+                                                    "ipsw": ipsw, "agent": agent,
+                                                    "tcc": tcc, "files": files}, indent=2) + "\n")
+    for path in directory.iterdir():
+        path.chmod(0o444)
+    directory.chmod(0o555)
+
+
 def finalize(args, manifest):
     pinlock.require_ready(manifest)
     require_committed(args.manifest)
     receipt = json.loads((args.work / "guest-sealed.json").read_text())
     if receipt != {"manifest_sha256": parity.digest(args.manifest), "remote_login": "Off"} or (args.work / "build_key").exists():
         raise ValueError("missing guest seal acknowledgement or build key still exists")
-    def require_stopped():
-        for name in IMAGE_FILES:
-            path = args.image / name
-            if path.is_symlink() or not path.is_file():
-                raise ValueError("image must contain four regular files")
-            result = subprocess.run(["/usr/sbin/lsof", "-t", "--", str(path)], capture_output=True)
-            if result.returncode != 1 or result.stdout or result.stderr:
-                raise ValueError("image still open, or lsof could not prove it stopped")
-    require_stopped()
+    require_stopped(args.image)
     tcc = grant_agent_access(args.image / "disk.img")
-    require_stopped()
-    (args.image / "agent.sha256").write_text(manifest["agent"]["sha256"] + "\n")
-    files = {name: parity.digest(args.image / name) for name in (*IMAGE_FILES, "agent.sha256")}
-    (args.image / "image.json").write_text(json.dumps({"manifest_sha256": parity.digest(args.manifest),
-                                                       "ipsw": manifest["ipsw"], "agent": manifest["agent"],
-                                                        "tcc": tcc, "files": files}, indent=2) + "\n")
-    for path in args.image.iterdir():
-        path.chmod(0o444)
-    args.image.chmod(0o555)
+    require_stopped(args.image)
+    write_seal(args.image, parity.digest(args.manifest), manifest["ipsw"], manifest["agent"], tcc)
     print("Sealed read-only image; installed-daemon qualification is still required.")
+
+
+def sealed_source(directory):
+    inventory = {*IMAGE_FILES, "agent.sha256"}
+    if directory.is_symlink() or not directory.is_dir() or directory.stat().st_mode & 0o222:
+        raise ValueError("source must be a read-only sealed image directory")
+    if {path.name for path in directory.iterdir()} != inventory | {"image.json"}:
+        raise ValueError("source sealed image inventory differs")
+    for name in (*inventory, "image.json"):
+        path = directory / name
+        if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o222:
+            raise ValueError("source sealed image file is not regular and read-only: " + name)
+    pin = json.loads((directory / "image.json").read_text())
+    if set(pin["files"]) != inventory:
+        raise ValueError("source sealed image digest inventory differs")
+    for name, sha in pin["files"].items():
+        if parity.digest(directory / name) != sha:
+            raise ValueError("source sealed image digest differs: " + name)
+    if (directory / "agent.sha256").read_text() != pin["agent"]["sha256"] + "\n":
+        raise ValueError("source agent digest record differs")
+    if (pin["tcc"]["services"] != list(TCC_SERVICES) or not pin["tcc"]["requirement"].strip()):
+        raise ValueError("source has no sealed TCC grant")
+    require_stopped(directory)
+    return pin
+
+
+def guest_path(mount, relative):
+    relative = Path(relative)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("invalid guest path: " + str(relative))
+    path = mount
+    for part in relative.parts:
+        path = path / part
+        if path.is_symlink():
+            raise ValueError("guest path must not contain symlinks: " + str(relative))
+    return path
+
+
+def require_locked_build_account(mount):
+    node = "private/var/db/dslocal/nodes/Default/"
+    account = guest_path(mount, node + "users/motorbuild.plist")
+    if not account.exists():
+        print("Source motorbuild account: absent")
+        return
+    user = plistlib.loads(account.read_bytes())
+    group = guest_path(mount, node + "groups/admin.plist")
+    membership = "unknown (admin.plist absent)"
+    if group.exists():
+        admin = plistlib.loads(group.read_bytes())
+        direct = ("motorbuild" in admin.get("users", [])
+                  or bool(set(user.get("generateduid", [])) & set(admin.get("groupmembers", []))))
+        membership = "present" if direct else "no direct entry"
+    print("Source motorbuild direct admin membership: " + membership)
+
+    def refuse(reason):
+        raise ValueError("source motorbuild is not provably locked: " + reason)
+
+    if user.get("name") != ["motorbuild"] or user.get("shell") != ["/usr/bin/false"]:
+        refuse("name/shell must identify motorbuild with /usr/bin/false")
+    if user.get("passwd") != ["*"]:
+        refuse("passwd must be the unusable '*' marker")
+    authorities = user.get("authentication_authority", [])
+    hashes = user.get("ShadowHashData", [])
+    if (not isinstance(authorities, list) or not all(isinstance(value, str) for value in authorities)
+            or not isinstance(hashes, list) or not all(isinstance(value, bytes) for value in hashes)):
+        refuse("malformed authentication_authority or ShadowHashData")
+    # The password marker alone does not disable ShadowHash or other authentication methods.
+    # Without an authority or stored hash, only the unusable '*' password remains.
+    if authorities:
+        if not all(value.startswith(";DisabledUser;") for value in authorities):
+            refuse("authentication_authority contains an enabled or unknown method")
+    elif hashes:
+        refuse("ShadowHashData remains without a DisabledUser authority")
+    if user.get("home") != ["/Users/motorbuild"]:
+        refuse("home must be /Users/motorbuild so SSH keys can be checked")
+    ssh = guest_path(mount, "Users/motorbuild/.ssh")
+    if ssh.exists() and (not ssh.is_dir() or any(ssh.iterdir())):
+        refuse("home .ssh contains key files or other unreviewed SSH configuration")
+    print("Source motorbuild account: locked (non-login shell, no enabled password authority, no SSH key files)")
+
+
+def replace_agent(mount, binary, sha256):
+    installed = guest_path(mount, AGENT.lstrip("/"))
+    if not installed.is_file():
+        raise ValueError("source has no installed guest agent")
+    fd, name = tempfile.mkstemp(prefix=".motor-macagent-", dir=installed.parent)
+    staged = Path(name)
+    os.close(fd)
+    try:
+        shutil.copyfile(binary, staged)
+        os.chown(staged, 0, 0)
+        staged.chmod(0o555)
+        if parity.digest(staged) != sha256:
+            raise ValueError("replacement agent SHA-256 differs from reviewed pin")
+        os.replace(staged, installed)
+        if parity.digest(installed) != sha256:
+            raise ValueError("installed agent SHA-256 differs from reviewed pin")
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def swap_guest(mount, args, manifest, source):
+    require_locked_build_account(mount)
+    prefix = guest_path(mount, "opt/motor")
+    lock = guest_path(mount, "opt/motor/toolchain.json")
+    seal_receipt = guest_path(mount, "opt/motor/sealed.json")
+    agent_marker = guest_path(mount, "opt/motor/agent.sha256")
+    installed = guest_path(mount, AGENT.lstrip("/"))
+    old = json.loads(lock.read_text())
+    pinlock.require_ready(old)
+    if (parity.digest(lock) != source["manifest_sha256"]
+            or old["ipsw"] != source["ipsw"] or old["agent"] != source["agent"]):
+        raise ValueError("source guest lock differs from sealed metadata")
+    if {key: value for key, value in old.items() if key != "agent"} != {key: value for key, value in manifest.items() if key != "agent"}:
+        raise ValueError("agent-swap permits only agent changes to the manifest")
+    if parity.digest(installed) != source["agent"]["sha256"]:
+        raise ValueError("source installed agent digest differs")
+    if agent_marker.read_text() != source["agent"]["sha256"] + "\n":
+        raise ValueError("source guest agent digest record differs")
+    if agent_requirement(mount) != source["tcc"]["requirement"]:
+        raise ValueError("source installed requirement differs from sealed TCC grant")
+    receipt = json.loads(seal_receipt.read_text())
+    if receipt != {"manifest_sha256": source["manifest_sha256"], "agent_sha256": source["agent"]["sha256"], "remote_login": "Off"}:
+        raise ValueError("source guest seal receipt differs")
+    replace_agent(mount, args.agent, manifest["agent"]["sha256"])
+    for name, payload in (("toolchain.json", args.manifest.read_bytes()),
+                          ("agent.sha256", (manifest["agent"]["sha256"] + "\n").encode()),
+                          ("sealed.json", (json.dumps({"manifest_sha256": parity.digest(args.manifest),
+                                                       "agent_sha256": manifest["agent"]["sha256"],
+                                                       "remote_login": "Off"}) + "\n").encode())):
+        path = prefix / name
+        path.chmod(0o644)
+        path.write_bytes(payload)
+        path.chmod(0o444)
+    run("/bin/sync")
+
+
+def agent_swap(args, manifest):
+    pinlock.require_ready(manifest)
+    require_committed(args.manifest)
+    if args.agent.is_symlink() or not args.agent.is_file() or parity.digest(args.agent) != manifest["agent"]["sha256"]:
+        raise ValueError("replacement agent SHA-256 differs from reviewed pin")
+    source = sealed_source(args.source)
+    if args.destination.resolve().is_relative_to(args.source.resolve()):
+        raise ValueError("destination must be outside the sealed source directory")
+    if args.destination.exists() or args.destination.is_symlink():
+        raise ValueError("destination already exists")
+    staging = Path(tempfile.mkdtemp(prefix="." + args.destination.name + "-", dir=args.destination.parent))
+    try:
+        for name in IMAGE_FILES:
+            run("/bin/cp", "-c", args.source / name, staging / name)
+            if parity.digest(staging / name) != source["files"][name]:
+                raise ValueError("cloned image digest differs: " + name)
+            (staging / name).chmod(0o600)
+        with mounted_data(staging / "disk.img", writable=True) as mount:
+            swap_guest(mount, args, manifest, source)
+        tcc = grant_agent_access(staging / "disk.img")
+        require_stopped(staging)
+        write_seal(staging, parity.digest(args.manifest), source["ipsw"], manifest["agent"], tcc)
+        if args.destination.exists() or args.destination.is_symlink():
+            raise ValueError("destination already exists")
+        staging.rename(args.destination)
+    finally:
+        if staging.exists():
+            staging.chmod(0o700)
+            shutil.rmtree(staging)
+    print("Swapped and sealed read-only image; installed-daemon qualification is still required.")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("key", "restore", "boot", "provision", "seal", "finalize"))
+    parser.add_argument("operation", choices=("key", "restore", "boot", "provision", "seal", "finalize", "agent-swap"))
     parser.add_argument("--manifest", type=Path, default=HERE / "toolchain.json")
-    parser.add_argument("--work", type=Path, required=True)
+    parser.add_argument("--work", type=Path)
+    parser.add_argument("--from", dest="source", type=Path)
+    parser.add_argument("--to", dest="destination", type=Path)
+    parser.add_argument("--agent", type=Path)
     parser.add_argument("--image", type=Path)
     parser.add_argument("--ipsw", type=Path)
     parser.add_argument("--vm-helper", type=Path)
@@ -228,10 +404,17 @@ def main():
     args = parser.parse_args()
     if sys.platform != "darwin":
         parser.error("image operations require a dedicated macOS VM host")
-    args.work = args.work.resolve()
-    args.work.mkdir(parents=True, exist_ok=True)
+    if args.operation != "agent-swap":
+        if not args.work:
+            parser.error(args.operation + " needs --work")
+        args.work = args.work.resolve()
+        args.work.mkdir(parents=True, exist_ok=True)
     manifest = json.loads(args.manifest.read_text())
-    if args.operation == "key":
+    if args.operation == "agent-swap":
+        if not args.source or not args.destination or not args.agent:
+            parser.error("agent-swap needs --from --to --agent")
+        agent_swap(args, manifest)
+    elif args.operation == "key":
         run("/usr/bin/ssh-keygen", "-t", "ed25519", "-N", "", "-f", args.work / "build_key", "-C", "motor-image-build-only")
         print("Authorize only build_key.pub in the disposable guest; never authorize it on the host.")
     elif args.operation in ("restore", "boot"):
