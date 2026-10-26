@@ -45,21 +45,28 @@ pub(crate) fn check_root(config: &Config, root: &CallerRoot) -> io::Result<()> {
     ))?;
     let owner = expected(config)?;
     check_inner(root, &owner)
-        .and_then(|directory| {
-            #[cfg(target_os = "linux")]
-            if let Some(directory) = directory {
-                let name = PathBuf::from(format!(".motor-trash-{}", config.instance));
-                match directory_at(&directory, &name) {
-                    Ok(trash) => super::trash::validate(&trash)?,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            let _ = directory;
-            Ok(())
-        })
+        .and_then(|directory| check_trash(config, directory))
         .map_err(|e| refusal(root, &owner, e))
+}
+
+/// An existing caller-root trash directory must still be runner-private.
+#[cfg(target_os = "linux")]
+fn check_trash(config: &Config, directory: Option<fs::File>) -> io::Result<()> {
+    if let Some(directory) = directory {
+        let name = PathBuf::from(format!(".motor-trash-{}", config.instance));
+        match directory_at(&directory, &name) {
+            Ok(trash) => super::trash::validate(&trash)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Caller roots are only mapped on Linux, so other platforms have no trash.
+#[cfg(not(target_os = "linux"))]
+fn check_trash<T>(_config: &Config, _directory: T) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
