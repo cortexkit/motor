@@ -1,10 +1,28 @@
 use super::*;
 use std::os::unix::fs::MetadataExt;
 
-#[test]
-#[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
-fn isolated_retained_target_replaces_an_existing_build_script_out_dir_file() {
-    let f = Fixture::new();
+fn fixture_cargo_check(f: &Fixture) -> Command {
+    let mut command = Command::new("cargo");
+    // Host linker/target flags or Cargo-home config select a different OUT_DIR
+    // from the sandbox's defaults, leaving the first generated file unused.
+    command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env(
+            "RUSTUP_HOME",
+            host_inputs::environment("RUSTUP_HOME").unwrap(),
+        )
+        .env("CARGO_HOME", f.scratch.join("fixture-cargo-home"))
+        .env("HOME", &f.scratch)
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("CARGO_TARGET_DIR", f.workspace.join("target"))
+        .args(["check", "--locked", "--manifest-path"])
+        .arg(f.workspace.join("Cargo.toml"))
+        .current_dir(&f.workspace);
+    command
+}
+
+fn build_out_dir_fixture(f: &Fixture) -> PathBuf {
     fs::create_dir_all(f.workspace.join("src")).unwrap();
     fs::write(
         f.workspace.join("Cargo.toml"),
@@ -33,13 +51,7 @@ fn isolated_retained_target_replaces_an_existing_build_script_out_dir_file() {
     .unwrap();
 
     let target = f.workspace.join("target");
-    let first = Command::new("cargo")
-        .args(["check", "--locked", "--manifest-path"])
-        .arg(f.workspace.join("Cargo.toml"))
-        .env("CARGO_TARGET_DIR", &target)
-        .current_dir(&f.workspace)
-        .output()
-        .unwrap();
+    let first = fixture_cargo_check(f).output().unwrap();
     assert!(
         first.status.success(),
         "could not build the target fixture: {}",
@@ -57,6 +69,67 @@ fn isolated_retained_target_replaces_an_existing_build_script_out_dir_file() {
         fs::read_to_string(&destination).unwrap(),
         "pub fn generated() { let _ = 1; }\n"
     );
+    destination
+}
+
+#[test]
+fn retained_target_fixture_ignores_operator_cargo_environment() {
+    const CHILD: &str = "MOTOR_TEST_RETAINED_TARGET_CHILD";
+    const TARGET_FLAGS: &str = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS";
+    if std::env::var_os(CHILD).is_none() {
+        // Re-exec so only this test's child inherits the operator-style flags;
+        // changing the harness environment would race other in-process tests.
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "isolation::tests::target_retention_tests::retained_target_fixture_ignores_operator_cargo_environment",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(TARGET_FLAGS, "-C opt-level=1")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(String::from_utf8_lossy(&child.stdout).contains("1 passed"));
+        return;
+    }
+
+    assert_eq!(std::env::var(TARGET_FLAGS).unwrap(), "-C opt-level=1");
+    let f = Fixture::new();
+    let destination = build_out_dir_fixture(&f);
+    fs::write(
+        f.workspace.join("source.rs"),
+        "pub fn generated() { let _ = 2; }\n",
+    )
+    .unwrap();
+    // The sandbox does not inherit the operator's target-specific flags.
+    let second = fixture_cargo_check(&f)
+        .env_remove(TARGET_FLAGS)
+        .output()
+        .unwrap();
+    assert!(second.status.success(), "{second:?}");
+    let refreshed = PathBuf::from(fs::read_to_string(f.workspace.join("out-dir.txt")).unwrap())
+        .join("bindings.rs");
+    assert_eq!(
+        refreshed, destination,
+        "both builds must use the same OUT_DIR"
+    );
+    assert_eq!(
+        fs::read_to_string(&destination).unwrap(),
+        "pub fn generated() { let _ = 2; }\n"
+    );
+}
+
+#[test]
+#[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
+fn isolated_retained_target_replaces_an_existing_build_script_out_dir_file() {
+    let f = Fixture::new();
+    let destination = build_out_dir_fixture(&f);
 
     fs::write(
         f.workspace.join("source.rs"),
@@ -75,10 +148,16 @@ fn isolated_retained_target_replaces_an_existing_build_script_out_dir_file() {
     assert_eq!(fs::metadata(&destination).unwrap().uid(), job_uid);
     let (status, stdout, stderr) = output(
         &sandbox,
-        "cargo check --locked --manifest-path Cargo.toml",
+        "CARGO_TARGET_DIR=target cargo check --locked --manifest-path Cargo.toml",
         &f.workspace,
     );
     assert!(status.success(), "{stdout}\n{stderr}");
+    let refreshed = PathBuf::from(fs::read_to_string(f.workspace.join("out-dir.txt")).unwrap())
+        .join("bindings.rs");
+    assert_eq!(
+        refreshed, destination,
+        "both builds must use the same OUT_DIR"
+    );
     assert_eq!(
         fs::read_to_string(&destination).unwrap(),
         "pub fn generated() { let _ = 2; }\n"
