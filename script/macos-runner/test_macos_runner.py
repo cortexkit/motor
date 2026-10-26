@@ -218,8 +218,8 @@ class InstallerTests(unittest.TestCase):
                      "authorized_keys_sha256": parity.digest(self.ssh / "authorized_keys")}
         (self.config / "install.json").write_text(json.dumps(installed))
         (self.config / "vm.toml").write_text(install.vm_configuration(self.image, Path(installed["helper"]), self.state / "tools", self.manifest))
-        self.plist = self.root / "daemon.plist"
-        self.plist.write_bytes(plistlib.dumps(install.daemon(Path(installed["runner"]), self.state, "macos", self.config / "vm.toml")))
+        self.plist = self.root / "agent.plist"
+        self.plist.write_bytes(plistlib.dumps(install.agent(Path(installed["runner"]), self.state, "macos", self.config / "vm.toml")))
         files = {}
         for name in (*image.IMAGE_FILES, "agent.sha256"):
             (self.image / name).write_bytes(name.encode())
@@ -244,16 +244,64 @@ class InstallerTests(unittest.TestCase):
                         patch.object(install, "tool_errors", return_value=[]),
                         patch.object(install.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(100, 50, install.FLOOR)),
                         patch.object(install.pwd, "getpwnam", return_value=type("Account", (), {"pw_uid": os.getuid()})),
-                        patch.object(install, "run", return_value=f"trustedusercakeys none\nauthorizedkeysfile {self.ssh}/authorized_keys")]
+                        patch.object(install, "LEGACY_PLIST", self.root / "legacy.plist"),
+                        patch.object(install, "run", side_effect=self.command)]
         for item in self.patches:
             item.start()
             self.addCleanup(item.stop)
+
+    def command(self, *args):
+        if args[0] == "/usr/bin/fdesetup":
+            return "FileVault is Off."
+        if args[0] == "/usr/bin/defaults":
+            return plistlib.dumps({"autoLoginUser": "motor"}).decode()
+        if args[0] == "/bin/launchctl":
+            return "state = running"
+        return f"trustedusercakeys none\nauthorizedkeysfile {self.ssh}/authorized_keys"
 
     def check(self):
         return install.check_install(self.state, self.image, "macos", self.manifest, self.config, self.plist, self.sshd, self.ssh)
 
     def test_valid_installed_fixture_passes(self):
         self.assertEqual(self.check(), [])
+
+    def test_no_aqua_session_reports_restart_even_without_socket(self):
+        self.socket_path.unlink()
+        with patch.object(install, "has_gui_session", return_value=False):
+            errors = " ".join(self.check())
+        self.assertIn("no Aqua login session", errors)
+        self.assertIn("restart for auto-login", errors)
+        self.assertIn("runner socket is missing", errors)
+
+    def test_wrong_auto_login_user_and_filevault_are_refused(self):
+        with patch.object(install, "auto_login_user", return_value="rentamac"):
+            self.assertIn("autoLoginUser must be motor", " ".join(self.check()))
+        with patch.object(install, "run", side_effect=lambda *args: "FileVault is On." if args[0] == "/usr/bin/fdesetup" else self.command(*args)):
+            self.assertIn("FileVault must be off", " ".join(self.check()))
+
+    def test_agent_must_be_running_in_gui_domain(self):
+        target = f"gui/{os.getuid()}/{install.LABEL}"
+        for failure in ("state = waiting", subprocess.CalledProcessError(113, "launchctl")):
+            def command(*args):
+                if args == ("/bin/launchctl", "print", target):
+                    if isinstance(failure, Exception):
+                        raise failure
+                    return failure
+                return self.command(*args)
+            with self.subTest(failure=failure), patch.object(install, "run", side_effect=command):
+                self.assertIn("LaunchAgent is not", " ".join(self.check()))
+
+    def test_agent_requires_aqua_without_daemon_identity_fields(self):
+        valid = plistlib.loads(self.plist.read_bytes())
+        self.assertEqual(valid.get("LimitLoadToSessionType"), "Aqua")
+        self.assertNotIn("UserName", valid)
+        self.assertNotIn("GroupName", valid)
+        for changes in ({"LimitLoadToSessionType": "Background"}, {"UserName": "motor"}, {"GroupName": "staff"}):
+            self.assertIn("Aqua session", " ".join(install.plist_errors({**valid, **changes})))
+
+    def test_legacy_daemon_is_refused(self):
+        install.LEGACY_PLIST.touch()
+        self.assertIn("legacy LaunchDaemon", " ".join(self.check()))
 
     def test_external_state_and_external_image_are_each_refused(self):
         for external in (self.state, self.image):
@@ -268,7 +316,7 @@ class InstallerTests(unittest.TestCase):
         cases = {"authorizedkeysfile .ssh/authorized_keys": "does not pin the runner key file",
                  f"trustedusercakeys /etc/ca.pub\nauthorizedkeysfile {self.ssh}/authorized_keys": "trusts a user CA"}
         for effective, expected in cases.items():
-            with self.subTest(effective=effective), patch.object(install, "run", return_value=effective):
+            with self.subTest(effective=effective), patch.object(install, "run", side_effect=lambda *args: effective if args[:2] == ("/usr/sbin/sshd", "-T") else self.command(*args)):
                 self.assertIn(expected, " ".join(self.check()))
 
     def test_changed_pinned_runner_key_is_refused(self):
@@ -325,11 +373,28 @@ class InstallerTests(unittest.TestCase):
         args = SimpleNamespace(state_root=self.state, image=self.image, tool_bundle=bundle, manifest=manifest_path,
                                runner=runner, vm_helper=helper, runner_key=key, instance="macos")
         account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
-        with patch.multiple(install, CONFIG=self.config, PLIST=self.plist, SSHD=self.sshd, SSH_ROOT=self.ssh), \
-                patch.object(install, "create_account", return_value=account), patch.object(install.os, "chown"), \
-                patch.object(install, "run") as run, patch.object(install.subprocess, "run"):
+        install.LEGACY_PLIST.touch()
+        output = io.StringIO()
+        with patch.multiple(install, CONFIG=self.config, PLIST=self.plist, SSHD=self.sshd, SSH_ROOT=self.ssh, HOME=self.root / "home"), \
+                patch.object(install, "create_account", return_value=account), patch.object(install.os, "chown") as chown, \
+                patch.object(install.os, "fchown"), \
+                patch.object(install, "configure_login", side_effect=[True, False]), \
+                patch.object(install, "has_gui_session", side_effect=[True, False]), patch("sys.stdout", output), \
+                patch.object(install, "run", side_effect=self.command) as run, \
+                patch.object(install.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as subprocess_run:
             install.install(args, self.manifest)
             install.install(args, self.manifest)
+        self.assertFalse(install.LEGACY_PLIST.exists())
+        self.assertEqual(self.plist.stat().st_mode & 0o777, 0o644)
+        bootstraps = [call.args for call in run.call_args_list if call.args[:2] == ("/bin/launchctl", "bootstrap")]
+        self.assertEqual(bootstraps, [("/bin/launchctl", "bootstrap", f"gui/{account.pw_uid}", self.plist)])
+        self.assertEqual(output.getvalue().count("Restart required:"), 1)
+        self.assertIn("no Aqua login session", output.getvalue())
+        self.assertIn((self.plist, 0, 0), [call.args for call in chown.call_args_list])
+        self.assertIn((self.plist.parent, account.pw_uid, account.pw_gid), [call.args for call in chown.call_args_list])
+        stopped = [call.args[0] for call in subprocess_run.call_args_list]
+        self.assertIn(["/bin/launchctl", "bootout", "system/" + install.LABEL], stopped)
+        self.assertIn(["/bin/launchctl", "bootout", f"gui/{account.pw_uid}/" + install.LABEL], stopped)
         signed = [call for call in run.call_args_list if call.args[:2] == ("/usr/bin/codesign", "--force")]
         self.assertEqual(len(signed), 2)
         for call in signed:
@@ -341,6 +406,229 @@ class InstallerTests(unittest.TestCase):
         path = self.config / "vm.toml"
         path.write_text(path.read_text().replace("motor-macvm", "unsigned-macvm"))
         self.assertIn("VM configuration differs from installed pins", self.check())
+
+
+class AutoLoginTests(unittest.TestCase):
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.home = self.root / "motor"
+        self.keychain = self.home / "Library/Keychains/login.keychain-db"
+        self.keychain.parent.mkdir(parents=True)
+        self.keychain.write_bytes(b"original keychain")
+        self.password = self.root / "password"
+        self.backup = self.root / "backup.plist"
+        self.kc = self.root / "kcpassword"
+        self.kc.write_bytes(b"original obfuscated password")
+        self.plist = self.home / "Library/LaunchAgents" / (install.LABEL + ".plist")
+        self.legacy = self.root / "legacy.plist"
+        self.sshd = self.root / "sshd_config"
+        self.sshd.write_text("Port 2222\n" + install.ssh_block())
+        self.user = "rentamac"
+        self.default_keychain = str(self.keychain)
+        self.account = SimpleNamespace(pw_uid=502, pw_gid=20)
+        patches = [patch.multiple(install, HOME=self.home, PASSWORD=self.password, BACKUP=self.backup, CONFIG=self.root,
+                                  KCPASSWORD=self.kc, PLIST=self.plist, LEGACY_PLIST=self.legacy, SSHD=self.sshd),
+                   patch.object(install.os, "chown"), patch.object(install.os, "fchown"),
+                   patch.object(install.pwd, "getpwnam", return_value=self.account),
+                   patch.object(install, "run", side_effect=self.command),
+                   patch.object(install.subprocess, "run", side_effect=self.native_command)]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        self.run: Any = install.run
+        self.native: Any = install.subprocess.run
+        self.fchown: Any = install.os.fchown
+
+    def command(self, *args):
+        if args[:2] == ("/usr/bin/defaults", "export"):
+            values = {} if self.user is None else {"autoLoginUser": self.user}
+            return plistlib.dumps(values).decode()
+        if args[:2] == ("/usr/bin/defaults", "write"):
+            self.user = args[-1]
+        elif args[:2] == ("/usr/bin/defaults", "delete"):
+            self.user = None
+        elif args[:5] == install.as_motor("/usr/bin/security"):
+            self.assertEqual(args[5:8], ("default-keychain", "-d", "user"))
+            if len(args) == 8:
+                return '"' + self.default_keychain + '"'
+            self.assertEqual(args[8], "-s")
+            self.default_keychain = str(args[9]) if len(args) == 10 else ""
+        elif args[:2] == ("/usr/sbin/sshd", "-t"):
+            pass
+        else:
+            self.fail("unexpected command: " + str(args))
+        return ""
+
+    def native_command(self, args, **kwargs):
+        if args[:4] == ["/usr/bin/dscl", ".", "-passwd", "/Users/motor"]:
+            self.assertTrue(args[4])
+        elif args[:6] == list(install.as_motor("/usr/bin/security", "create-keychain")):
+            self.assertEqual(args[6], "-p")
+            Path(args[-1]).write_bytes(b"new keychain")
+        elif args[:2] == ["/bin/launchctl", "bootout"]:
+            pass
+        else:
+            self.fail("unexpected subprocess: " + str(args))
+        return subprocess.CompletedProcess(args, 0)
+
+    def test_kcpassword_has_known_apple_xor_bytes_and_twelve_byte_padding(self):
+        self.assertEqual(install.kcpassword("password"), bytes.fromhex("0de82150a5d3af8ea3b91f7d"))
+        for password in ("", "a" * 11, "a" * 12, "a" * 23):
+            encoded = install.kcpassword(password)
+            self.assertEqual(len(encoded) % 12, 0)
+            key = bytes.fromhex("7d895223d2bcddeaa3b91f")
+            decoded = bytes(value ^ key[index % 11] for index, value in enumerate(encoded))
+            self.assertEqual(decoded, password.encode() + b"\0" * (len(encoded) - len(password)))
+            self.assertGreater(len(encoded), len(password))
+
+    def test_login_setup_reuses_password_and_preserves_original_backup_on_update(self):
+        self.assertTrue(install.configure_login(self.account))
+        password = self.password.read_bytes()
+        original_backup = self.backup.read_bytes()
+        self.assertEqual(self.user, "motor")
+        self.assertEqual(self.kc.read_bytes(), install.kcpassword(password.decode().strip()))
+        self.assertEqual(self.keychain.read_bytes(), b"new keychain")
+        self.assertEqual(self.default_keychain, str(self.keychain))
+        self.assertFalse(install.configure_login(self.account))
+        self.assertEqual(self.password.read_bytes(), password)
+        self.assertEqual(self.backup.read_bytes(), original_backup)
+        creates = [call for call in self.native.call_args_list if "create-keychain" in call.args[0]]
+        self.assertEqual(len(creates), 1, "updates must not destroy VM Secure Enclave keys")
+        for path in (self.password, self.backup, self.kc):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertTrue(self.fchown.called)
+        self.assertTrue(all(call.args[1:] == (0, 0) for call in self.fchown.call_args_list))
+        self.assertFalse(any("unlock-keychain" in str(call) or "login-keychain" in str(call)
+                             for call in self.run.call_args_list + self.native.call_args_list))
+
+    def test_uninstall_restores_login_files_and_stops_both_jobs_idempotently(self):
+        self.default_keychain = str(self.root / "other.keychain-db")
+        Path(self.default_keychain).touch()
+        install.configure_login(self.account)
+        saved_password = self.password.read_text().strip()
+        (self.root / "install.json").write_text(json.dumps({"auto_login_managed": True}))
+        self.plist.parent.mkdir()
+        self.plist.touch()
+        self.legacy.touch()
+        install.uninstall()
+        self.assertEqual(self.user, "rentamac")
+        self.assertEqual(self.kc.read_bytes(), b"original obfuscated password")
+        self.assertEqual(self.keychain.read_bytes(), b"original keychain")
+        self.assertEqual(self.default_keychain, str(self.root / "other.keychain-db"))
+        self.assertFalse(self.password.exists())
+        self.assertFalse(self.backup.exists())
+        self.assertFalse(json.loads((self.root / "install.json").read_text())["auto_login_managed"])
+        self.assertFalse(self.plist.exists())
+        self.assertFalse(self.legacy.exists())
+        self.assertEqual(self.sshd.read_text(), "Port 2222\n")
+        password_changes = [call.args[0][-1] for call in self.native.call_args_list
+                            if call.args[0][:2] == ["/usr/bin/dscl", "."]]
+        self.assertNotEqual(password_changes[-1], saved_password)
+        self.assertGreaterEqual(len(password_changes[-1]), 32)
+        stopped = [call.args[0] for call in self.native.call_args_list if "bootout" in call.args[0]]
+        self.assertIn(["/bin/launchctl", "bootout", "gui/502/" + install.LABEL], stopped)
+        install.uninstall()
+        self.assertEqual(self.user, "rentamac")
+
+    def test_uninstall_restores_absence_of_previous_auto_login_and_keychain(self):
+        self.user = None
+        self.kc.unlink()
+        self.keychain.unlink()
+        self.default_keychain = ""
+        install.configure_login(self.account)
+        install.uninstall()
+        self.assertIsNone(self.user)
+        self.assertFalse(self.kc.exists())
+        self.assertFalse(self.keychain.exists())
+        self.assertEqual(self.default_keychain, "")
+
+    def test_missing_saved_password_does_not_rotate_existing_keychain(self):
+        install.configure_login(self.account)
+        self.password.unlink()
+        with self.assertRaisesRegex(ValueError, "password is missing"):
+            install.configure_login(self.account)
+        self.assertEqual(self.keychain.read_bytes(), b"new keychain")
+
+    def test_previous_motor_auto_login_is_disabled_instead_of_restored(self):
+        self.user = "motor"
+        install.configure_login(self.account)
+        output = io.StringIO()
+        with patch("sys.stdout", output):
+            install.uninstall()
+        self.assertIsNone(self.user)
+        self.assertFalse(self.kc.exists())
+        self.assertIn("Auto-login is now off", output.getvalue())
+        self.assertIn("re-enable auto-login for their own account", output.getvalue())
+
+    def test_missing_backup_is_not_silently_replaced_or_reported_as_restored(self):
+        install.configure_login(self.account)
+        self.backup.unlink()
+        (self.root / "install.json").write_text(json.dumps({"auto_login_managed": True}))
+        with self.assertRaisesRegex(ValueError, "backup is missing"):
+            install.configure_login(self.account)
+        with self.assertRaisesRegex(ValueError, "backup is missing"):
+            install.restore_login()
+        self.assertTrue(self.password.exists())
+
+    def test_interrupted_private_write_preserves_the_original(self):
+        with patch.object(install.os, "replace", side_effect=OSError("interrupted")):
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                install.private_write(self.kc, b"replacement")
+        self.assertEqual(self.kc.read_bytes(), b"original obfuscated password")
+        self.assertEqual(list(self.root.glob(".kcpassword.*")), [])
+
+    def test_password_command_failure_never_exposes_the_password(self):
+        with patch.object(install.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)):
+            with self.assertRaisesRegex(ValueError, "setup failed") as caught:
+                install.configure_login(self.account)
+        self.assertNotIn(self.password.read_text().strip(), str(caught.exception))
+        self.assertEqual(self.keychain.read_bytes(), b"original keychain")
+
+    def test_failed_keychain_creation_can_be_retried_without_losing_backup(self):
+        def fail_create(args, **kwargs):
+            if "create-keychain" in args:
+                return subprocess.CompletedProcess(args, 1)
+            return self.native_command(args, **kwargs)
+        with patch.object(install.subprocess, "run", side_effect=fail_create):
+            with self.assertRaisesRegex(ValueError, "setup failed"):
+                install.configure_login(self.account)
+        saved = self.password.read_bytes()
+        backup = plistlib.loads(self.backup.read_bytes())
+        self.assertEqual(backup["keychain"], b"original keychain")
+        self.assertFalse(backup["keychain_ready"])
+        self.assertTrue(install.configure_login(self.account))
+        self.assertEqual(self.password.read_bytes(), saved)
+        install.uninstall()
+        self.assertEqual(self.keychain.read_bytes(), b"original keychain")
+
+    def test_private_files_refuse_symlinks(self):
+        self.password.symlink_to(self.kc)
+        with self.assertRaises(OSError):
+            install.private_write(self.password, b"secret")
+        self.assertEqual(self.kc.read_bytes(), b"original obfuscated password")
+
+    def test_filevault_on_refuses_before_any_account_or_login_change(self):
+        with patch.object(install, "run", return_value="FileVault is On."), \
+                patch.object(install, "create_account") as create:
+            with self.assertRaisesRegex(ValueError, "FileVault must be off"):
+                install.install(SimpleNamespace(), ready())
+        create.assert_not_called()
+        self.assertFalse(self.backup.exists())
+
+    def test_gui_probe_failure_is_not_a_login_session(self):
+        with patch.object(install, "run", side_effect=subprocess.CalledProcessError(113, "launchctl")) as run:
+            self.assertFalse(install.has_gui_session(self.account))
+        run.assert_called_once_with("/bin/launchctl", "print", "gui/502")
+
+    def test_stop_failure_does_not_remove_a_still_loaded_job(self):
+        self.legacy.touch()
+        with patch.object(install.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)), \
+                patch.object(install, "run", return_value="state = running"):
+            with self.assertRaisesRegex(ValueError, "could not stop launchd job"):
+                install.stop_jobs(self.account)
+        self.assertTrue(self.legacy.exists())
 
 
 class ImageTests(unittest.TestCase):

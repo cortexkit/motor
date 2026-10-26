@@ -8,17 +8,25 @@ from pathlib import Path
 import plistlib
 import pwd
 import re
+import secrets
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 
 import parity
 import pinlock
 
 HERE = Path(__file__).resolve().parent
 LABEL = "io.cortexkit.motor.macos"
-PLIST = Path("/Library/LaunchDaemons/" + LABEL + ".plist")
+HOME = Path("/Users/motor")
+PLIST = HOME / "Library/LaunchAgents" / (LABEL + ".plist")
+LEGACY_PLIST = Path("/Library/LaunchDaemons/" + LABEL + ".plist")
+PASSWORD = Path("/var/root/motor-autologin-password")
+BACKUP = Path("/var/root/motor-autologin-backup.plist")
+KCPASSWORD = Path("/etc/kcpassword")
+LOGINWINDOW = "/Library/Preferences/com.apple.loginwindow"
 CONFIG = Path("/Library/Application Support/Motor/macos")
 SSHD = Path("/etc/ssh/sshd_config")
 SSH_ROOT = Path("/etc/ssh/motor")
@@ -55,9 +63,9 @@ def ssh_block(keys=SSH_ROOT / "authorized_keys"):
             f"    AuthorizedKeysFile {keys}\n    PubkeyAuthentication yes\nMatch all\n" + END + "\n")
 
 
-def daemon(runner, state_root, instance, vm_config):
+def agent(runner, state_root, instance, vm_config):
     return {
-        "Label": LABEL, "UserName": "motor", "GroupName": "staff",
+        "Label": LABEL, "LimitLoadToSessionType": "Aqua",
         "ProgramArguments": [str(runner), "serve", "--instance", instance,
                              "--state-root", str(state_root), "--backend", "macos-vm",
                              "--vm-config", str(vm_config), "--max-weight", "8"],
@@ -71,13 +79,192 @@ def daemon(runner, state_root, instance, vm_config):
 def plist_errors(plist):
     args = plist.get("ProgramArguments", [])
     errors = []
-    if plist.get("UserName") != "motor":
-        errors.append("LaunchDaemon must run as motor")
+    if "UserName" in plist or "GroupName" in plist or plist.get("LimitLoadToSessionType") != "Aqua":
+        errors.append("LaunchAgent must use the motor Aqua session without UserName/GroupName")
     if any(arg.startswith("--development") for arg in args):
-        errors.append("LaunchDaemon passes a development flag")
+        errors.append("LaunchAgent passes a development flag")
     if args.count("--backend") != 1 or args[args.index("--backend") + 1:args.index("--backend") + 2] != ["macos-vm"]:
-        errors.append("LaunchDaemon lacks --backend macos-vm")
+        errors.append("LaunchAgent lacks --backend macos-vm")
     return errors
+
+
+def private_write(path, data):
+    # Keep recovery data intact on interrupted updates, and protect secrets before writing.
+    if path.is_symlink():
+        raise OSError("refusing to replace a symlink: " + str(path))
+    fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            os.fchown(stream.fileno(), 0, 0)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def kcpassword(password):
+    key = bytes.fromhex("7D 89 52 23 D2 BC DD EA A3 B9 1F")
+    data = password.encode("utf-8") + b"\0"
+    data += b"\0" * (-len(data) % 12)
+    return bytes(value ^ key[index % len(key)] for index, value in enumerate(data))
+
+
+def auto_login_user():
+    # Exporting the domain distinguishes an absent key from a failed defaults read.
+    try:
+        values = plistlib.loads(run("/usr/bin/defaults", "export", LOGINWINDOW, "-").encode())
+    except subprocess.CalledProcessError:
+        if not Path(LOGINWINDOW + ".plist").exists():
+            return None
+        raise
+    return values.get("autoLoginUser")
+
+
+def require_filevault_off():
+    if run("/usr/bin/fdesetup", "status") != "FileVault is Off.":
+        raise ValueError("FileVault must be off for motor auto-login; disable it before installing or checking")
+
+
+def as_motor(*args):
+    return ("/usr/bin/sudo", "-H", "-u", "motor", *args)
+
+
+def secret_run(*args):
+    # CalledProcessError includes argv, so never propagate it for password commands.
+    result = subprocess.run([str(arg) for arg in args], capture_output=True)
+    if result.returncode:
+        raise ValueError("runner password/keychain setup failed (exit " + str(result.returncode) + ")")
+
+
+def login_managed():
+    record = CONFIG / "install.json"
+    return record.exists() and json.loads(record.read_text()).get("auto_login_managed", False)
+
+
+def configure_login(account):
+    previous = auto_login_user()
+    keychain = HOME / "Library/Keychains/login.keychain-db"
+    if not BACKUP.exists():
+        if login_managed():
+            raise ValueError("auto-login backup is missing; restore it before updating")
+        backup: dict[str, object] = {"keychain_ready": False}
+        if previous is not None:
+            backup["autoLoginUser"] = previous
+        if KCPASSWORD.exists():
+            backup["kcpassword"] = KCPASSWORD.read_bytes()
+        if keychain.exists():
+            backup["keychain"] = keychain.read_bytes()
+        try:
+            backup["default_keychain"] = run(*as_motor("/usr/bin/security", "default-keychain", "-d", "user")).strip('"')
+        except subprocess.CalledProcessError:
+            pass
+        private_write(BACKUP, plistlib.dumps(backup))
+    backup = plistlib.loads(BACKUP.read_bytes())
+    if not PASSWORD.exists():
+        if backup["keychain_ready"]:
+            raise ValueError("saved motor auto-login password is missing; restore it before updating")
+        private_write(PASSWORD, secrets.token_urlsafe(32).encode() + b"\n")
+    password = PASSWORD.read_text().strip()
+    if not password:
+        raise ValueError("saved motor auto-login password is empty")
+    private_write(PASSWORD, password.encode() + b"\n")
+    secret_run("/usr/bin/dscl", ".", "-passwd", "/Users/motor", password)
+    if not backup["keychain_ready"]:
+        keychain.parent.mkdir(parents=True, exist_ok=True)
+        os.chown(keychain.parent, account.pw_uid, account.pw_gid)
+        keychain.unlink(missing_ok=True)
+        secret_run(*as_motor("/usr/bin/security", "create-keychain", "-p", password, keychain))
+        run(*as_motor("/usr/bin/security", "default-keychain", "-d", "user", "-s", keychain))
+        backup["keychain_ready"] = True
+        private_write(BACKUP, plistlib.dumps(backup))
+    private_write(KCPASSWORD, kcpassword(password))
+    run("/usr/bin/defaults", "write", LOGINWINDOW, "autoLoginUser", "-string", "motor")
+    return previous != "motor"
+
+
+def gui_domain(account):
+    return "gui/" + str(account.pw_uid)
+
+
+def has_gui_session(account):
+    try:
+        run("/bin/launchctl", "print", gui_domain(account))
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def stop_jobs(account):
+    for target in ("system/" + LABEL, gui_domain(account) + "/" + LABEL):
+        result = subprocess.run(["/bin/launchctl", "bootout", target], capture_output=True)
+        if result.returncode:
+            try:
+                run("/bin/launchctl", "print", target)
+            except subprocess.CalledProcessError:
+                continue
+            raise ValueError("could not stop launchd job: " + target)
+    LEGACY_PLIST.unlink(missing_ok=True)
+
+
+def restore_login():
+    if not BACKUP.exists():
+        if PASSWORD.exists() or login_managed():
+            raise ValueError("auto-login backup is missing; restore it before uninstalling")
+        return
+    backup = plistlib.loads(BACKUP.read_bytes())
+    if auto_login_user() is not None:
+        run("/usr/bin/defaults", "delete", LOGINWINDOW, "autoLoginUser")
+    prior_motor = backup.get("autoLoginUser") == "motor"
+    if "kcpassword" in backup and not prior_motor:
+        private_write(KCPASSWORD, backup["kcpassword"])
+    else:
+        KCPASSWORD.unlink(missing_ok=True)
+    if "autoLoginUser" in backup and not prior_motor:
+        run("/usr/bin/defaults", "write", LOGINWINDOW, "autoLoginUser", "-string", backup["autoLoginUser"])
+    account = pwd.getpwnam("motor")
+    keychain = HOME / "Library/Keychains/login.keychain-db"
+    keychain.unlink(missing_ok=True)
+    if "keychain" in backup:
+        private_write(keychain, backup["keychain"])
+        os.chown(keychain, account.pw_uid, account.pw_gid)
+    if backup.get("default_keychain"):
+        run(*as_motor("/usr/bin/security", "default-keychain", "-d", "user", "-s", backup["default_keychain"]))
+    else:
+        run(*as_motor("/usr/bin/security", "default-keychain", "-d", "user", "-s"))
+    # Revoke the installed credential without setting a guessable password or disabling the account.
+    secret_run("/usr/bin/dscl", ".", "-passwd", "/Users/motor", secrets.token_urlsafe(32))
+    if login_managed():
+        record = CONFIG / "install.json"
+        installed = json.loads(record.read_text())
+        installed["auto_login_managed"] = False
+        record.write_text(json.dumps(installed, indent=2) + "\n")
+    PASSWORD.unlink(missing_ok=True)
+    BACKUP.unlink()
+    if prior_motor:
+        print("Auto-login is now off because the previous auto-login user was motor. "
+              "The operator can re-enable auto-login for their own account.")
+
+
+def uninstall():
+    try:
+        stop_jobs(pwd.getpwnam("motor"))
+    except KeyError:
+        subprocess.run(["/bin/launchctl", "bootout", "system/" + LABEL], capture_output=True)
+        LEGACY_PLIST.unlink(missing_ok=True)
+    PLIST.unlink(missing_ok=True)
+    restore_login()
+    original = SSHD.read_text()
+    SSHD.write_text(remove_block(original))
+    try:
+        run("/usr/sbin/sshd", "-t", "-f", SSHD)
+    except Exception:
+        SSHD.write_text(original)
+        raise
+    print("Removed runner jobs and managed SSH block; restored login settings/keychain and revoked the saved motor password. "
+          "Account, image and runner state are retained. Restart to leave the auto-login session.")
 
 
 def entitlement(binary):
@@ -156,6 +343,22 @@ def ssh_errors(text, effective, keys):
 def check_install(state_root, image, instance, manifest, config=CONFIG, plist_path=PLIST,
                   sshd=SSHD, ssh_root=SSH_ROOT):
     errors = []
+    account = pwd.getpwnam("motor")
+    try:
+        require_filevault_off()
+    except ValueError as error:
+        errors.append(str(error))
+    if auto_login_user() != "motor":
+        errors.append("autoLoginUser must be motor; rerun install and restart")
+    if not has_gui_session(account):
+        errors.append("motor has no Aqua login session (" + gui_domain(account) + "); restart for auto-login before --check")
+    else:
+        try:
+            job = run("/bin/launchctl", "print", gui_domain(account) + "/" + LABEL)
+            if not re.search(r"^\s*state = running\s*$", job, re.MULTILINE):
+                errors.append("LaunchAgent is not running in " + gui_domain(account))
+        except subprocess.CalledProcessError:
+            errors.append("LaunchAgent is not loaded in " + gui_domain(account))
     for path in (state_root, image):
         if not internal_volume(path):
             errors.append("not on an internal APFS volume: " + str(path))
@@ -169,15 +372,20 @@ def check_install(state_root, image, instance, manifest, config=CONFIG, plist_pa
         errors.append("VM helper lacks virtualization entitlement")
     plist = plistlib.loads(plist_path.read_bytes())
     errors.extend(plist_errors(plist))
-    expected = daemon(Path(installed["runner"]), state_root, instance, config / "vm.toml")
+    expected = agent(Path(installed["runner"]), state_root, instance, config / "vm.toml")
     if plist != expected:
-        errors.append("LaunchDaemon differs from installed configuration")
+        errors.append("LaunchAgent differs from installed configuration")
+    if LEGACY_PLIST.exists():
+        errors.append("legacy LaunchDaemon plist must be removed; rerun install")
     if (config / "vm.toml").read_text() != vm_configuration(image, helper, state_root / "tools", manifest):
         errors.append("VM configuration differs from installed pins")
     socket = state_root / instance / "runner.sock"
-    metadata = socket.lstat()
-    if not stat.S_ISSOCK(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != pwd.getpwnam("motor").pw_uid:
-        errors.append("runner socket must be motor-owned mode 0600")
+    if not socket.exists():
+        errors.append("runner socket is missing; wait for the Aqua LaunchAgent after restarting")
+    else:
+        metadata = socket.lstat()
+        if not stat.S_ISSOCK(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != account.pw_uid:
+            errors.append("runner socket must be motor-owned mode 0600")
     errors.extend(tool_errors(state_root / "tools", manifest))
     keys = ssh_root / "authorized_keys"
     if parity.digest(keys) != installed["authorized_keys_sha256"]:
@@ -212,6 +420,7 @@ def create_account():
 
 def install(args, manifest):
     pinlock.require_ready(manifest)
+    require_filevault_off()
     server = json.loads((HERE.parent / "runner/toolchain.json").read_text())
     parity.validate(manifest, server)
     for path in (args.state_root, args.image):
@@ -236,7 +445,7 @@ def install(args, manifest):
     args.state_root.chmod(0o700)
     CONFIG.mkdir(parents=True, exist_ok=True)
     CONFIG.chmod(0o755)
-    subprocess.run(["/bin/launchctl", "bootout", "system/" + LABEL], capture_output=True)
+    stop_jobs(account)
     for name, source in (("motor-runner", args.runner), ("motor-macvm", args.vm_helper)):
         destination = CONFIG / name
         if source.resolve() != destination.resolve():
@@ -270,13 +479,25 @@ def install(args, manifest):
     except Exception:
         SSHD.write_text(original)
         raise
-    installed = {"runner": str(CONFIG / "motor-runner"), "helper": str(CONFIG / "motor-macvm"),
+    installed: dict[str, object] = {"runner": str(CONFIG / "motor-runner"), "helper": str(CONFIG / "motor-macvm"),
                  "manifest_sha256": parity.digest(CONFIG / "toolchain.json"),
                  "authorized_keys_sha256": parity.digest(SSH_ROOT / "authorized_keys")}
-    (CONFIG / "install.json").write_text(json.dumps(installed, indent=2) + "\n")
-    PLIST.write_bytes(plistlib.dumps(daemon(CONFIG / "motor-runner", args.state_root, args.instance, CONFIG / "vm.toml")))
+    for directory in (HOME / "Library", PLIST.parent):
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chown(directory, account.pw_uid, account.pw_gid)
+        directory.chmod(0o755)
+    login_changed = configure_login(account)
+    if login_changed:
+        print("Restart required: the auto-login user changed to motor. The installer will not restart the host.")
+    private_write(PLIST, plistlib.dumps(agent(CONFIG / "motor-runner", args.state_root, args.instance, CONFIG / "vm.toml")))
+    os.chown(PLIST, 0, 0)
     PLIST.chmod(0o644)
-    run("/bin/launchctl", "bootstrap", "system", PLIST)
+    installed["auto_login_managed"] = True
+    (CONFIG / "install.json").write_text(json.dumps(installed, indent=2) + "\n")
+    if has_gui_session(account):
+        run("/bin/launchctl", "bootstrap", gui_domain(account), PLIST)
+    else:
+        print("motor has no Aqua login session; restart for auto-login to start the LaunchAgent.")
     print("Installed VM runner. Run --check after launchd creates the socket; no VM qualification is implied.")
 
 
@@ -299,9 +520,7 @@ def main():
     if args.operation == "uninstall":
         if args.check:
             parser.error("--check and uninstall are exclusive")
-        SSHD.write_text(remove_block(SSHD.read_text()))
-        run("/usr/sbin/sshd", "-t", "-f", SSHD)
-        print("Removed only the managed motor sshd block; accounts, image and service are retained.")
+        uninstall()
         return 0
     if not args.image or not args.state_root.is_absolute() or not args.image.is_absolute() or not re.fullmatch(r"[A-Za-z0-9_-]+", args.instance):
         parser.error("absolute --image/--state-root and a plain --instance are required")
@@ -311,7 +530,7 @@ def main():
     parity.validate(manifest, json.loads((HERE.parent / "runner/toolchain.json").read_text()))
     if args.check:
         errors = check_install(args.state_root, args.image, args.instance, manifest)
-        print(json.dumps({"passed": not errors, "checks": 9, "errors": errors}, indent=2))
+        print(json.dumps({"passed": not errors, "checks": 13, "errors": errors}, indent=2))
         return int(bool(errors))
     if os.environ.get("SUDO_USER") != "rentamac":
         parser.error("first install and updates must be invoked by rentamac using sudo")

@@ -129,6 +129,49 @@ other backend requires `--development-allow-host-backend`; production launchd
 configuration must never use that override. The TOML file names absolute `image`
 and `helper` paths, the sealed image's `toolchain_version`, and `[tools.cargo]`,
 `[tools.rustc]`, `[tools.bun]`, `[tools.git]` tables, each with `path` and `sha256`.
+
+The host installer runs the runner as a LaunchAgent in the dedicated non-admin
+`motor` account's GUI login session, not a system LaunchDaemon. Apple's
+Virtualization framework needs an Aqua session to create its Secure Enclave key
+at VM start; outside one, it can fail with `errSecInteractionNotAllowed` (-25308)
+and “The virtual machine encountered a security error.” Merely setting a system
+job's `UserName` does not provide that session.
+
+The installer requires FileVault off and makes motor the auto-login user. A
+random account password is saved root-only at `/var/root/motor-autologin-password`
+(0600). It writes the NUL-terminated, 12-byte-padded Apple XOR encoding to
+`/etc/kcpassword` (root-owned 0600) and sets loginwindow's `autoLoginUser`. This is
+obfuscation, not encryption; automatic login permits physical/console access to
+the dedicated account after restart. Previous login settings and the original
+login keychain are backed up root-only in
+`/var/root/motor-autologin-backup.plist`. The login keychain is recreated with the
+new password and selected as motor's default once; updates preserve it and reuse
+the password. There is no keychain-unlock workaround.
+
+The root-owned 0644 plist is
+`/Users/motor/Library/LaunchAgents/io.cortexkit.motor.macos.plist`, in a directory
+owned by motor. It sets `LimitLoadToSessionType = Aqua`, without `UserName` or
+`GroupName`. Installation removes the old system LaunchDaemon and uses
+`launchctl bootstrap gui/<uid>` / `bootout gui/<uid>/io.cortexkit.motor.macos`.
+Without motor's GUI session it waits for the next login. A changed auto-login
+user requires an operator restart; the installer never reboots the host.
+`--check` verifies the agent configuration, auto-login user, FileVault-off status,
+and that the job is running in `gui/<uid>`; no Aqua session is a clear restart
+refusal, not a skipped check. `InstallerTests` and `AutoLoginTests` in
+`script/macos-runner/test_macos_runner.py` cover this lifecycle hermetically.
+
+Uninstall stops/removes both runner jobs/plists, restores the backed-up
+auto-login settings and login keychain/default, removes the generated password
+and backup, and removes only the managed SSH block. It revokes the saved motor
+credential by rotating to a fresh random password and discarding it; the account
+remains enabled, and the unknown prior password is not recovered. If the previous
+auto-login user was motor, uninstall instead clears auto-login and removes
+`/etc/kcpassword`, avoiding auto-login with an invalid credential; the operator
+can re-enable auto-login for their own account. Account, image and runner
+state remain; restart afterwards to leave the login session. See the
+[installation procedure](../script/macos-runner/README.md#host-installation-and-update)
+for commands and the console-access tradeoff.
+
 Runner resource trees are beneath its state root, separate from its per-instance
 durable output log. Records in `macvm-records` are fsynced before staging;
 two `macvm-locks/slot-N.lock` files and one admission lock enforce capacity.
@@ -157,7 +200,7 @@ Recovery ignores unrelated/temp record-directory entries, while valid ownership
 records with invalid resource paths still fail closed.
 
 The five job-level ignored `macos_qualification_*` integration tests run on the VM host
-against the **installed** launchd daemon through `ck motor run --platform macos`,
+against the **installed** Aqua-session LaunchAgent through `ck motor run --platform macos`,
 not a test-owned runner or an SSH command shell. Set
 `MOTOR_MACOS_QUALIFICATION_WORKSPACE`, `MOTOR_MACOS_QUALIFICATION_STATE_ROOT`, and
 `MOTOR_MACOS_QUALIFICATION_CRATE` to the disposable qualification fixture and

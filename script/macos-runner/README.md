@@ -139,6 +139,7 @@ sudo python3 script/macos-runner/install.py install \
   --image "$IMAGE" --state-root /Users/motor/.motor --instance macos \
   --runner "$RUNNER" --vm-helper "$MACVM" \
   --tool-bundle target/scratch/macos-image/tools --runner-key "$CK_MOTOR_IDENTITY_PUB"
+# Restart the host yourself when prompted, then verify the logged-in runner:
 sudo python3 script/macos-runner/install.py --check \
   --image "$IMAGE" --state-root /Users/motor/.motor --instance macos
 ```
@@ -148,31 +149,78 @@ account. It installs the runner/helper under `/Library/Application Support/Motor
 **re-signs the installed VM-creating helper on every install/update**, and verifies
 its virtualization entitlement. Prep binaries and libraries are copied under
 `<state_root>/tools`, with all four executable hashes checked before and after
-copy. The root-owned LaunchDaemon runs as `motor` and explicitly selects
+copy. The root-owned, mode-0644 LaunchAgent at
+`/Users/motor/Library/LaunchAgents/io.cortexkit.motor.macos.plist` runs in motor's
+GUI login session, with `LimitLoadToSessionType = Aqua` and no `UserName` or
+`GroupName`. Its directory belongs to motor. It explicitly selects
 `--backend macos-vm`, without the development override. The runtime TOML uses the
 runner's existing schema, with absolute image/helper paths and four pinned prep
 tools; no image provenance fields are added to that schema.
+
+**FileVault must be off.** Installation refuses otherwise: automatic login needs
+an unencrypted login path. The dedicated, non-admin `motor` account becomes the
+host's auto-login user, replacing the provider's previous auto-login choice. This
+means anyone with physical/console access after a restart enters that account;
+use only a host where that policy is acceptable. The installer generates a random
+account password and keeps it in `/var/root/motor-autologin-password` (root-only,
+0600). It writes Apple's XOR-obfuscated `/etc/kcpassword` (also root-only, 0600;
+**not encryption**) and sets loginwindow's `autoLoginUser` to `motor`. Before
+changing login settings, it saves the previous user, obfuscated password and login
+keychain in `/var/root/motor-autologin-backup.plist` (root-only, 0600).
+
+On first setup it recreates motor's `~/Library/Keychains/login.keychain-db` with
+the account password and selects it as the user's default keychain. Updates reuse
+the saved password and preserve that keychain, including VM Secure Enclave keys.
+No keychain-unlock workaround is installed. Do not delete the password or backup
+while the installation is active.
+
+Apple's Virtualization framework creates a Secure Enclave key at VM start and
+requires a logged-in Aqua session. A system LaunchDaemon with `UserName = motor`
+is not such a session: VM starts can fail with `errSecInteractionNotAllowed`
+(-25308), reported as “The virtual machine encountered a security error.” The
+installer stops/removes the old `/Library/LaunchDaemons` runner job and uses
+`launchctl bootstrap gui/<uid> <agent-plist>` and
+`launchctl bootout gui/<uid>/io.cortexkit.motor.macos` instead. If motor has no
+GUI session, installation leaves the agent for the next login rather than
+bootstrapping it into a different domain. **Restart is required when the auto-login
+user changes; the installer never restarts the host itself.** Keep motor logged in
+at the console, and do not switch the auto-login user back while serving jobs.
 
 The marked sshd block applies only to `motor` and accepts only the pinned key in
 the root-owned `/etc/ssh/motor/authorized_keys`, with no user CA. When the vault
 key is rotated, rerun the install with the new public key. `sshd -t` validates edits; `--check`
 also checks `sshd -T -C user=motor,...`, not merely a matching comment. Existing
-provider SSH settings are preserved. `install.py uninstall` removes **only** the
-marked block, preserving unrelated sshd content, accounts, service and data.
-Stop the daemon explicitly before retiring the host; uninstall is deliberately
-not a destructive data/account cleanup command.
+provider SSH settings are preserved. `sudo python3 script/macos-runner/install.py
+uninstall` stops the runner in both launchd domains, removes both runner plists
+and the marked SSH block, restores the backed-up auto-login settings and login
+keychain/default, and removes the generated password and backup. The old account
+password is not recoverable: uninstall revokes the saved motor credential by
+rotating to a fresh random password and discarding it, without disabling the
+account. If the previous auto-login user was already motor (for example, a manual
+setup), uninstall instead turns auto-login off and removes `/etc/kcpassword`:
+restoring motor auto-login with a revoked password would leave a broken login.
+The operator can re-enable auto-login for their own account. Uninstall retains
+the account, image, pinned tools and runner state;
+it is not a destructive data/account cleanup command. Restart afterwards to leave
+the motor login session. Repeated uninstall is safe.
 
 `--check` refuses external/non-APFS state or image volumes, missing entitlement,
 wrong effective SSH CA/principals, a non-motor or non-0600 socket, changed tool
 bytes, less than 20 GiB free, or a plist without the VM backend/with a development
 flag. It also verifies the sealed-image inventory and installed lock. A missing
-file or failed native probe is a refusal, not a skipped check.
+file or failed native probe is a refusal, not a skipped check. It verifies the
+exact LaunchAgent configuration, auto-login user, FileVault-off status and a
+running job in `gui/<uid>`. Before motor's Aqua session exists it fails with a
+restart instruction, even if the runner socket has not been created yet.
+`InstallerTests` and `AutoLoginTests` in `test_macos_runner.py` cover these
+contracts with mocked native commands; they never change the test host's users.
 
 ## Verification and qualification
 
 Portable contracts:
 
 ```sh
+python3 script/macos-runner/test_macos_runner.py InstallerTests AutoLoginTests
 python3 -m unittest -v script/macos-runner/test_macos_runner.py script/macos-runner/test_qualification.py script/runner/test_toolchain_parity.py
 ```
 
@@ -195,7 +243,7 @@ capture/check paths and their manifest is unchanged.
 
 Portable checks and Swift typechecking do not qualify a real VM. Run all installed
 `macos_qualification_*` lanes documented in `docs/macos-runner.md`, including
-root-daemon startup, libproc identity, actual internal-disk clones and guest mounts,
+Aqua-session runner startup, libproc identity, actual internal-disk clones and guest mounts,
 vsock/nonce isolation, key deletion and Remote Login shutdown. No such privileged
 or live-VM qualification is claimed by this recipe's portable tests.
 
