@@ -527,3 +527,142 @@ async fn only_caller_root_flag_warms_drops_expires_and_pressure_evicts() {
 async fn isolated_only_caller_root_flag_warms_drops_expires_and_pressure_evicts() {
     only_caller_root_lifecycle(true).await;
 }
+
+#[test]
+fn mapped_detach_reclaims_only_the_pinned_checkout_root_before_rename() {
+    use std::{
+        cell::RefCell,
+        os::unix::{
+            fs::{MetadataExt, PermissionsExt},
+            process::ExitStatusExt,
+        },
+        rc::Rc,
+    };
+    for mode in [0o555, 0o000] {
+        for refuse_repair in [false, true] {
+            let f = Fixture::new();
+            let mut config = configured(&f);
+            let runner = Runner::open(config.clone()).unwrap();
+            let key = "/home/motor-trash-fixture/permissions";
+            let host = plant(&runner, key);
+            let inode = fs::metadata(&host).unwrap().ino();
+            fs::set_permissions(&host, fs::Permissions::from_mode(mode)).unwrap();
+            config.isolate_jobs = true;
+            let observed = Rc::new(RefCell::new(Vec::new()));
+            let recorded = observed.clone();
+            let checkout = host.clone();
+            let result = crate::systemd::with_process_hook(
+                Box::new(move |command| {
+                    let words: Vec<_> = std::iter::once(command.get_program())
+                        .chain(command.get_args())
+                        .map(|word| word.to_string_lossy().into_owned())
+                        .collect();
+                    let operation = words
+                        .iter()
+                        .find(|word| matches!(word.as_str(), "/usr/bin/chown" | "/usr/bin/chmod"))
+                        .unwrap()
+                        .clone();
+                    assert!(!words.iter().any(|word| word == "-R"));
+                    let alias = words.last().unwrap();
+                    assert!(alias.starts_with(&format!("/proc/{}/fd/", std::process::id())));
+                    let pin = alias.strip_suffix("/.").unwrap();
+                    assert_eq!(fs::metadata(pin)?.ino(), inode);
+                    recorded
+                        .borrow_mut()
+                        .push((operation.clone(), alias.clone()));
+                    if refuse_repair {
+                        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                    }
+                    if operation == "/usr/bin/chmod" {
+                        assert!(words.iter().any(|word| word == "0755"));
+                        fs::set_permissions(&checkout, fs::Permissions::from_mode(0o755))?;
+                    }
+                    Ok(std::process::Output {
+                        status: std::process::ExitStatus::from_raw(0),
+                        stdout: vec![],
+                        stderr: vec![],
+                    })
+                }),
+                || paths::trash::detach(&config, &config.caller_roots[0], paths::host(&host)),
+            );
+            let operations = observed.borrow();
+            if refuse_repair {
+                assert!(result.is_err());
+                assert_eq!(operations.len(), 1);
+                assert!(host.exists());
+                assert!(fs::read_dir(trash(&config)).unwrap().next().is_none());
+                fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+            } else {
+                assert_eq!(operations.len(), 2);
+                assert_eq!(operations[0].0, "/usr/bin/chown");
+                assert_eq!(operations[1].0, "/usr/bin/chmod");
+                assert_eq!(operations[0].1, operations[1].1);
+                let retired = result.unwrap().unwrap();
+                assert!(!host.exists());
+                assert_eq!(
+                    fs::read_to_string(retired.path().join("secret")).unwrap(),
+                    key
+                );
+                retired.remove(false, false).unwrap();
+            }
+            assert!(!config.state_dir().join("trash").exists());
+        }
+    }
+}
+
+#[test]
+fn mapped_detach_refuses_source_replacement_during_root_repair() {
+    use std::{
+        os::unix::{
+            fs::{MetadataExt, PermissionsExt},
+            process::ExitStatusExt,
+        },
+        sync::atomic::AtomicUsize,
+    };
+    let f = Fixture::new();
+    let mut config = configured(&f);
+    let runner = Runner::open(config.clone()).unwrap();
+    let key = "/home/motor-trash-fixture/permissions";
+    let host = plant(&runner, key);
+    let inode = fs::metadata(&host).unwrap().ino();
+    fs::set_permissions(&host, fs::Permissions::from_mode(0o555)).unwrap();
+    let outside = f.scratch.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("secret"), "sentinel").unwrap();
+    let outside_mode = fs::metadata(&outside).unwrap().mode();
+    let held = config.caller_roots[0].host_root.join("held-checkout");
+    let original = host.clone();
+    let replacement = outside.clone();
+    let moved = held.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    config.isolate_jobs = true;
+    let result = crate::systemd::with_process_hook(
+        Box::new(move |command| {
+            let alias = command.get_args().last().unwrap().to_str().unwrap();
+            let pin = alias.strip_suffix("/.").unwrap();
+            assert_eq!(fs::metadata(pin)?.ino(), inode);
+            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                fs::set_permissions(&original, fs::Permissions::from_mode(0o755))?;
+                fs::rename(&original, &moved)?;
+                std::os::unix::fs::symlink(&replacement, &original)?;
+            } else {
+                fs::set_permissions(&moved, fs::Permissions::from_mode(0o755))?;
+            }
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: vec![],
+                stderr: vec![],
+            })
+        }),
+        || paths::trash::detach(&config, &config.caller_roots[0], paths::host(&host)),
+    );
+    assert!(result.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(fs::read(outside.join("secret")).unwrap(), b"sentinel");
+    assert_eq!(fs::metadata(&outside).unwrap().mode(), outside_mode);
+    assert_eq!(fs::read_to_string(held.join("secret")).unwrap(), key);
+    assert!(fs::read_dir(trash(&config)).unwrap().next().is_none());
+    fs::remove_file(&host).unwrap();
+    fs::rename(held, host).unwrap();
+}

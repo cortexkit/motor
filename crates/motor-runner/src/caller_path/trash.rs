@@ -114,7 +114,11 @@ pub(crate) fn detach(
     root: &CallerRoot,
     path: HostPath<'_>,
 ) -> io::Result<Option<Retired>> {
-    use std::{ffi::CString, os::fd::AsRawFd, os::unix::ffi::OsStrExt};
+    use std::{
+        ffi::CString,
+        os::fd::{AsRawFd, FromRawFd},
+        os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    };
     let path = path.as_path();
     if path == root.host_root || !startup::canonical_spelling(&path.to_string_lossy()) {
         return Err(io::Error::other("invalid mapped deletion path"));
@@ -153,12 +157,56 @@ pub(crate) fn detach(
             Err(error)
         };
     }
-    if unsafe { metadata.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFLNK {
+    let metadata = unsafe { metadata.assume_init() };
+    if metadata.st_mode & libc::S_IFMT == libc::S_IFLNK {
         return Err(io::Error::other("mapped deletion path is a symlink"));
     }
     let trash = PathBuf::from(format!(".motor-trash-{}", config.instance));
     let directory = owner::directory_at(&host_root, &trash)?;
     validate(&directory)?;
+    let _checkout = if config.isolate_jobs
+        && metadata.st_mode & libc::S_IFMT == libc::S_IFDIR
+        && (metadata.st_uid != unsafe { libc::geteuid() } || metadata.st_mode & 0o200 == 0)
+    {
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let checkout = unsafe { fs::File::from_raw_fd(fd) };
+        let pinned = checkout.metadata()?;
+        if pinned.dev() != metadata.st_dev || pinned.ino() != metadata.st_ino {
+            return Err(io::Error::other("mapped deletion directory changed"));
+        }
+        // Moving a directory between parents updates its '..' entry, requiring
+        // write access to the directory itself. Jobs own their checkout root;
+        // reclaim that inode now and leave recursive repair to the purge.
+        crate::isolation::restore_runner_checkout_root_fd(&checkout)?;
+        let mut current = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                current.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let current = unsafe { current.assume_init() };
+        if current.st_dev != pinned.dev() || current.st_ino != pinned.ino() {
+            return Err(io::Error::other("mapped deletion directory changed"));
+        }
+        Some(checkout)
+    } else {
+        None
+    };
     let name_in_trash = uuid::Uuid::now_v7().to_string();
     let destination = CString::new(name_in_trash.as_str())?;
     if unsafe {

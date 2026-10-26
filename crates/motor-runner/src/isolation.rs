@@ -1896,6 +1896,27 @@ pub(crate) fn restore_runner_checkout_root(path: &Path) -> io::Result<()> {
             path.display()
         )));
     }
+    restore_runner_checkout_root_owner_mode(path)
+}
+
+/// Reclaim only a pinned checkout inode before moving it between parents.
+/// The descriptor keeps privileged helpers off replaceable host path components.
+pub(crate) fn restore_runner_checkout_root_fd(directory: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if !directory.metadata()?.is_dir() {
+        return Err(io::Error::other(
+            "runner checkout descriptor is not a directory",
+        ));
+    }
+    let path = PathBuf::from(format!(
+        "/proc/{}/fd/{}/.",
+        std::process::id(),
+        directory.as_raw_fd()
+    ));
+    restore_runner_checkout_root_owner_mode(&path)
+}
+
+fn restore_runner_checkout_root_owner_mode(path: &Path) -> io::Result<()> {
     let owner = format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
         libc::getegid()
     });
