@@ -52,7 +52,7 @@ impl LinuxMachine {
         if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        config.validate()?;
+        config.validate_resources()?;
         process::refuse_passwd_entries(config.uid_base, config.slots.len())?;
         for path in [&config.jailer, &config.firecracker, &config.loader] {
             fs::trusted_file(path)?;

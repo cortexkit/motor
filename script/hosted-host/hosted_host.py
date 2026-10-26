@@ -7,7 +7,7 @@ install.sh calls this to produce, on stdout, the exact bytes it installs:
   helper --uid UID --gid GID [--installed RECORD]
                                     /etc/motor-vm-helper.json, its slot CPUs
                                     taken from the installed tenant record
-  tenant --sub S [--disk-quota-gib N] [--installed RECORD]
+   tenant --sub S [--disk-quota-gib N] [--template FILE] [--installed RECORD]
                                     the provision.py operator JSON for tenant 1:
                                     the installed record when there is one,
                                     the tenant-1.json template on a first install
@@ -139,14 +139,15 @@ def read_record(path: Path) -> dict:
     return record
 
 
-def helper_config(uid: int, gid: int, tenant: dict | None = None) -> dict:
+def helper_config(uid: int, gid: int, uplink: str, public_ipv4: str, tenant: dict | None = None) -> dict:
     """/etc/motor-vm-helper.json admitting only the motor-host account.
 
     Its slot CPUs are the tenant's cpuset: the installed record's when one is
     given, so a resize that moved the tenant (and rewrote this file) is kept,
     and the template's on a first install."""
+    network = load_network_policy().checked_settings({'uplink': uplink, 'public_ipv4': public_ipv4})
     if tenant is None:
-        tenant = json.loads(TENANT_FILE.read_text())
+        tenant = read_record(TENANT_FILE)
     if uid <= 0 or gid <= 0:
         raise ValueError("the host agent account must not be root")
     if not isinstance(tenant.get("cpuset"), str):
@@ -159,6 +160,7 @@ def helper_config(uid: int, gid: int, tenant: dict | None = None) -> dict:
     unused = {"vmstate": str(images / "job.vmstate"), "rootfs": str(images / "rootfs"),
               "memory": str(images / "job.memory"), "record": str(images / "job.record.json")}
     return {
+        **network,
         "allowed_uids": [uid],
         "socket_gid": gid,
         "uid_base": SLOT_UID_BASE,
@@ -195,7 +197,7 @@ def validate_tenant(config: dict, provision=None) -> None:
 
 
 def tenant_config(sub: str, disk_quota_gib: int | None = None, image_version: str | None = None,
-                  installed: Path | None = None) -> dict:
+                  installed: Path | None = None, template: Path | None = None) -> dict:
     """The provision.py operator JSON for tenant 1, validated by provision.py.
 
     With an installed record, that record is the result: its sizing may have
@@ -203,14 +205,14 @@ def tenant_config(sub: str, disk_quota_gib: int | None = None, image_version: st
     reinstalling must not put the template's values back. The template
     applies only to a first install."""
     if installed is not None:
-        if disk_quota_gib is not None or image_version is not None:
+        if disk_quota_gib is not None or image_version is not None or template is not None:
             raise ValueError("the installed tenant record keeps its sizing and image; change them with "
                              "provision.py resize or switch-image, not the installer")
         config = read_record(installed)
         if config.get("sub") != sub:
             raise ValueError(f"--tenant-sub differs from the subject in the installed record {installed}")
     else:
-        config = json.loads(TENANT_FILE.read_text())
+        config = read_record(TENANT_FILE if template is None else template)
         config["sub"] = sub
         if image_version is not None:
             config["image_version"] = image_version
@@ -276,7 +278,8 @@ def check_installed(uid: int, gid: int, record_path: Path = TENANT_RECORD, helpe
         check("helper registry", registry)
 
         def helper():
-            expected = render_json(helper_config(uid, gid, record))
+            installed = json.loads(helper_path.read_text())
+            expected = render_json(helper_config(uid, gid, installed['uplink'], installed['public_ipv4'], record))
             if helper_path.read_text() != expected:
                 raise ValueError("differs from the render of the installed tenant record")
 
@@ -299,6 +302,15 @@ def load_provision():
     spec = importlib.util.spec_from_file_location("hosted_host_provision", HERE.parent / "tenant-provision" / "provision.py")
     if spec is None or spec.loader is None:
         raise ImportError("cannot load provision.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_network_policy():
+    spec = importlib.util.spec_from_file_location('hosted_network_policy', HERE.parent / 'runner' / 'motor_network_policy.py')
+    if spec is None or spec.loader is None:
+        raise ImportError('cannot load host network policy')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -379,17 +391,26 @@ def runner_log_lines(reply: dict) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
+    network_install = commands.add_parser('install-network-settings')
+    network_install.add_argument('--source', required=True, type=Path)
     host = commands.add_parser("host")
     host.add_argument("--host-id", required=True)
     host.add_argument("--port", type=int, default=PORT)
     helper = commands.add_parser("helper")
     helper.add_argument("--uid", type=int, required=True)
     helper.add_argument("--gid", type=int, required=True)
+    helper.add_argument("--uplink", required=True)
+    helper.add_argument("--public-ip", required=True)
+    for name in ('network', 'check-uplink'):
+        network = commands.add_parser(name)
+        network.add_argument('--uplink', required=True)
+        network.add_argument('--public-ip', required=True)
     helper.add_argument("--installed", type=Path, help="the installed tenant record; absent on a first install")
     tenant = commands.add_parser("tenant")
     tenant.add_argument("--sub", required=True)
     tenant.add_argument("--disk-quota-gib", type=int)
     tenant.add_argument("--image-version")
+    tenant.add_argument("--template", type=Path, help="first-install tenant sizing and image, without the subject")
     tenant.add_argument("--installed", type=Path, help="the installed tenant record; absent on a first install")
     check = commands.add_parser("check-installed")
     check.add_argument("--uid", type=int, required=True)
@@ -402,6 +423,18 @@ def main() -> int:
     runner_log.add_argument("--job", help="keep only entries naming this job id (jti)")
     args = parser.parse_args()
     try:
+        if args.command == 'install-network-settings':
+            load_network_policy().install_settings(args.source)
+            return 0
+        if args.command in {'network', 'check-uplink'}:
+            policy = load_network_policy()
+            settings = policy.checked_settings({'uplink': args.uplink, 'public_ipv4': args.public_ip})
+            if args.command == 'check-uplink':
+                policy.validate_uplink(settings)
+                print(f"uplink {args.uplink} is UP with public IPv4 {args.public_ip}")
+            else:
+                sys.stdout.write(render_json(settings))
+            return 0
         if args.command == "runner-log":
             request = runner_log_request(args.tenant, unix_seconds(args.since),
                                          None if args.until is None else unix_seconds(args.until), args.job)
@@ -425,9 +458,10 @@ def main() -> int:
         if args.command == "host":
             value = host_config(args.host_id, args.port)
         elif args.command == "helper":
-            value = helper_config(args.uid, args.gid, None if args.installed is None else read_record(args.installed))
+            value = helper_config(args.uid, args.gid, args.uplink, args.public_ip,
+                                  None if args.installed is None else read_record(args.installed))
         else:
-            value = tenant_config(args.sub, args.disk_quota_gib, args.image_version, args.installed)
+            value = tenant_config(args.sub, args.disk_quota_gib, args.image_version, args.installed, args.template)
     except ValueError as error:
         print(f"hosted-host: {error}", file=sys.stderr)
         return 2

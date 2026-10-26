@@ -3,6 +3,90 @@ use std::io::BufRead;
 use std::os::unix::net::UnixListener;
 
 #[test]
+fn network_admission_escalates_when_fence_and_vm_containment_both_fail() {
+    let config = serde_json::from_str(include_str!("../../../fixtures/helper.json")).unwrap();
+    let mut tenants = LinuxTenants::new(&config, PathBuf::new());
+    let escalated = std::cell::Cell::new(false);
+    let error = tenants
+        .check_network_with(
+            || Err(Error("uplink invalid".into())),
+            |_| Ok(Vec::new()),
+            |_| Err(Error("NFT unavailable".into())),
+            |_| Err(Error("VMM kill failed".into())),
+            |message| {
+                assert!(message.contains("VMM kill failed"));
+                escalated.set(true);
+            },
+        )
+        .unwrap_err();
+    assert!(
+        escalated.get(),
+        "production must terminate instead of serving with uncontained VMMs"
+    );
+    assert_eq!(error.case, StartRefusalCase::Uplink);
+}
+
+#[test]
+fn network_admission_fences_live_taps_when_registry_is_unreadable() {
+    let config = serde_json::from_str(include_str!("../../../fixtures/helper.json")).unwrap();
+    let mut tenants = LinuxTenants::new(&config, PathBuf::new());
+    let existing = serde_json::json!({"nftables":[
+        {"set":{"name":"tenant_taps","type":"ifname","elem":["mtap7"]}},
+        {"set":{"name":"closed_taps","type":"ifname","elem":[]}}
+    ]});
+    let mut writes = Vec::new();
+    let error = tenants
+        .check_network_with(
+            || Err(Error("configured uplink is down".into())),
+            |_| Err(Error("registry decode failed".into())),
+            |records| {
+                assert!(records.is_empty());
+                tenant_network::fence_policy(records, Some(&existing), None, |text| {
+                    writes.push(text.to_owned());
+                    Ok(())
+                })
+            },
+            |_| panic!("successful gate containment must not stop VMs"),
+            |_| panic!("successful fencing must not terminate the helper"),
+        )
+        .unwrap_err();
+    assert_eq!(error.case, StartRefusalCase::Uplink);
+    assert!(error.message.contains("registry decode failed"));
+    assert_eq!(writes.len(), 1);
+    assert!(writes[0].contains("closed_taps { \"mtap7\" }"));
+}
+
+#[test]
+fn network_admission_fence_failure_stops_vms_without_revalidating() {
+    let config = serde_json::from_str(include_str!("../../../fixtures/helper.json")).unwrap();
+    let mut tenants = LinuxTenants::new(&config, PathBuf::new());
+    let stopped = std::cell::Cell::new(false);
+    let error = tenants
+        .check_network_with(
+            || Err(Error("uplink validation failed".into())),
+            |_| Ok(vec![crate::tenant::tests::registry("a")]),
+            |_| Err(Error("nft write denied".into())),
+            |_| {
+                stopped.set(true);
+                Ok(())
+            },
+            |_| panic!("successful VM containment must not terminate the helper"),
+        )
+        .unwrap_err();
+    assert!(stopped.get());
+    assert!(error.message.contains("nft write denied"));
+    tenants
+        .check_network_with(
+            || Ok(()),
+            |_| panic!("no registry read on valid admission"),
+            |_| panic!("must not fence valid admission"),
+            |_| panic!("must not stop valid admission"),
+            |_| panic!("must not terminate valid admission"),
+        )
+        .unwrap();
+}
+
+#[test]
 fn oom_protection_verifies_identity_write_and_readback() {
     let scratch = cortexkit_test_support::ScratchDir::new("vmm-oom");
     std::fs::write(scratch.join("comm"), "firecracker\n").unwrap();

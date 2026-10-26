@@ -1,6 +1,6 @@
 #[cfg(target_os = "linux")]
 fn main() {
-    use motor_vm_helper::linux::{server, LinuxMachine};
+    use motor_vm_helper::linux::server;
     let result = (|| {
         let mut args = std::env::args_os().skip(1);
         if args.next().as_deref() != Some(std::ffi::OsStr::new("--config")) {
@@ -14,11 +14,7 @@ fn main() {
         if args.next().is_some() {
             return Err(motor_vm_helper::Error("unexpected arguments".into()));
         }
-        let config = server::load_config(std::path::Path::new(&path))?;
-        let count = config.slots.len();
-        let allowed = config.allowed_uids.clone();
-        let gid = config.socket_gid;
-        server::serve(LinuxMachine::new(config)?, count, allowed, gid)
+        server::serve(server::load_config(std::path::Path::new(&path))?)
     })();
     if let Err(e) = result {
         eprintln!("motor-vm-helper: {e}");

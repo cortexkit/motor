@@ -93,8 +93,7 @@ impl LinuxTenants {
         // A disk may still have its jail uid after a helper crash. All registry
         // ancestors remain root-controlled; restore ownership only after kill.
         let registries = self.registries()?;
-        tenant_network::install(&registries)?;
-        for r in registries {
+        for r in &registries {
             for ancestor in r.disk.parent().unwrap().ancestors() {
                 fs::trusted(ancestor, &std::fs::symlink_metadata(ancestor)?)?;
             }
@@ -107,8 +106,69 @@ impl LinuxTenants {
             }
             fs::chown(&file, 0)?;
         }
+        // Network admission is not a prerequisite for serving cleanup/status.
+        // Only a successfully applied uplink fence is a non-fatal startup state;
+        // filesystem, identity and cgroup failures above remain fatal.
+        tenant_network::install_startup(&registries, &self.config)?.serve_cleanup();
         Ok(())
     }
+    fn check_network_with(
+        &mut self,
+        validate: impl FnOnce() -> Result<()>,
+        registries: impl FnOnce(&mut Self) -> Result<Vec<Registry>>,
+        fence: impl FnOnce(&[Registry]) -> Result<()>,
+        contain: impl FnOnce(&mut Self) -> Result<()>,
+        fatal: impl FnOnce(&str),
+    ) -> std::result::Result<(), StartRefusal> {
+        let Err(problem) = validate() else {
+            return Ok(());
+        };
+        let mut message = format!("uplink {}: {problem}", self.config.uplink);
+        let records = registries(self);
+        if let Err(error) = &records {
+            message.push_str(&format!("; registry unreadable: {error}"));
+        }
+        // An unreadable registry is not permission to leave old gates open.
+        // The fence can recover TAP identities from the live tenant table.
+        if let Err(error) = fence(records.as_deref().unwrap_or(&[])) {
+            message.push_str(&format!("; fencing failed: {error}; stopping tenant VMs"));
+            if let Err(error) = contain(self) {
+                message.push_str(&format!("; VM containment failed: {error}"));
+                // Production exits here so systemd tears down the delegated
+                // service cgroup; never keep serving with uncontained VMMs.
+                fatal(&message);
+            }
+        }
+        // Do not revalidate here: recovery during a failed admission must not
+        // turn the refusal's fence into a gate-opening operation.
+        Err(crate::tenant::start_refused(
+            StartRefusalCase::Uplink,
+            message,
+        ))
+    }
+
+    fn contain_network_failure(&mut self) -> Result<()> {
+        let mut errors = Vec::new();
+        for (name, vm) in &mut self.running {
+            // Attempt both containment mechanisms even if one fails, and do
+            // not let one tenant's error prevent killing the remaining VMMs.
+            let _ = std::fs::write(vm.group.join("cgroup.kill"), "1");
+            let _ = vm.child.kill();
+            if let Err(error) = vm
+                .child
+                .wait()
+                .and_then(|_| wait_empty(&vm.group).map_err(|e| std::io::Error::other(e.0)))
+            {
+                errors.push(format!("{name}: {error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(Error(errors.join("; ")))
+        }
+    }
+
     fn registries(&mut self) -> Result<Vec<Registry>> {
         let mut values = Vec::new();
         let entries = match std::fs::read_dir(REGISTRY) {
@@ -189,6 +249,19 @@ fn read_deadline(
     Ok(())
 }
 impl Backend for LinuxTenants {
+    fn check_network(&mut self, _: &str) -> std::result::Result<(), StartRefusal> {
+        let config = self.config.clone();
+        self.check_network_with(
+            || tenant_network::validate_uplink(&config),
+            Self::registries,
+            tenant_network::fence,
+            Self::contain_network_failure,
+            |message| {
+                eprintln!("motor-vm-helper: cannot contain tenant networking: {message}");
+                std::process::exit(1);
+            },
+        )
+    }
     fn check_start(&mut self, tenant: &str) -> std::result::Result<(), StartRefusal> {
         capacity::check_journal(&Path::new(crate::tenant::TENANTS).join(tenant))?;
         let capacity = capacity::read_capacity(Path::new(capacity::CONFIG))?;
@@ -691,7 +764,7 @@ impl Backend for LinuxTenants {
         let uid = self.uid(r)?;
         let registries = self.registries()?;
         // Install the deny rules before bringing a tap up, not after it can send.
-        tenant_network::install(&registries)?;
+        tenant_network::install(&registries, &self.config)?;
         tenant_network::ensure(r, uid)
     }
     fn relay(&mut self, tenant: &str, port: u32) -> Result<OwnedFd> {
@@ -704,20 +777,18 @@ impl Backend for LinuxTenants {
         let jail = Path::new(super::BUILD_ROOT).join(format!("jail/tenants/{tenant}"));
         Ok(self.groups.join(tenant).exists() || jail.exists())
     }
-    fn remove(&mut self, tenant: &str, r: &Registry) -> Result<PathBuf> {
+    fn remove(&mut self, tenant: &str, registry: &Registry) -> Result<PathBuf> {
         let paths = crate::removal::Paths::live();
         let _lock = crate::removal::lock(&paths)?;
+        crate::removal::refuse_reassigned_tap(&paths, tenant, registry, true, |path| {
+            serde_json::from_reader(fs::trusted_file(path)?).map_err(|e| Error(e.to_string()))
+        })?;
         let unix_s = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         let quarantine = crate::removal::begin(&paths, tenant, unix_s)?;
-        // Reconcile the firewall over every other tenant: that drops this
-        // tenant's chains, counter and UFW route grant and leaves the rest.
-        let remaining = tenant_network::without(self.registries()?, r);
-        tenant_network::install(&remaining)?;
-        tenant_network::remove_tap(r)?;
-        crate::removal::finish(&paths, tenant, &quarantine)?;
+        crate::removal::finish_with_network(&paths, tenant, &quarantine, tenant_network::remove)?;
         eprintln!(
             "tenant {tenant}: removed records and network; data quarantined at {} until purge",
             quarantine.display()
@@ -726,11 +797,17 @@ impl Backend for LinuxTenants {
     }
     fn resume_removal(&mut self, tenant: &str) -> Result<Option<PathBuf>> {
         let paths = crate::removal::Paths::live();
-        let _lock = crate::removal::lock(&paths)?;
-        let Some(quarantine) = crate::removal::pending(&paths, tenant)? else {
+        let Some(quarantine) = crate::removal::resume_with_network(
+            &paths,
+            tenant,
+            |path| {
+                serde_json::from_reader(fs::trusted_file(path)?).map_err(|e| Error(e.to_string()))
+            },
+            tenant_network::remove,
+        )?
+        else {
             return Ok(None);
         };
-        crate::removal::finish(&paths, tenant, &quarantine)?;
         eprintln!(
             "tenant {tenant}: completed an interrupted removal; data quarantined at {}",
             quarantine.display()

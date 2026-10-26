@@ -292,8 +292,8 @@ forwarding, a narrow firewall route allowance, and the `sudo` forms in
 which shows a diff by default:
 
 ```sh
-python3 script/runner/install-job-network.py            # show what would change
-sudo python3 script/runner/install-job-network.py --apply    # install
+python3 script/runner/install-job-network.py --uplink <uplink> --public-ip <public IPv4> # diff
+sudo python3 script/runner/install-job-network.py --apply --uplink <uplink> --public-ip <public IPv4>
 sudo python3 script/runner/install-job-network.py --check    # verify
 ```
 
@@ -303,8 +303,90 @@ It installs `/etc/nftables.d/motor-net.nft` from `script/runner/motor-net.nft`,
 well as live rules, guarded tenant sets and owned UFW grants. Outside
 `motor_net`, reconciliation changes only helper-owned tenant gate sets and
 comment-owned tenant UFW routes; existing job rules and foreign policy remain.
-The policy/checker use the existing `enp6s0` uplink and literal job address pool;
-a different uplink needs a coherent policy/checker update, not a wildcard grant.
+The explicit uplink and its public IPv4 address are persisted in root-owned
+`/etc/motor-network.json`; there is no default or runtime route sniffing. The
+interface must exist, be UP and carry that address. When a hosted helper config
+exists its settings must agree. The literal job address pool is unchanged;
+rendering with `--uplink enp6s0` preserves the build server's original policy.
+Interface names must be 1–15 ASCII bytes, start with an alphanumeric, contain
+only letters, digits, `_`, `.` or `-`, and must not be `any` or `lo`.
+Settings, the rendered file and the installed canonical template are checked
+together under the network lock. A stale source for another uplink is refused
+before any nftables or UFW call; installation holds the same lock while writing.
+
+Every mutating policy load first removes `/run/motor-net-ready`. Only complete
+base-policy and uplink success publishes a new root-owned generation there.
+Tenant policy/UFW failures fence the affected tenant, not the host's own jobs;
+`--check --host-only` checks that independent host readiness. The runner re-probes
+the generation for each `net` admission and both before and after attachment,
+so a failed startup probe never latches networking off. A missing generation
+refuses that request with `NetworkUnsupported`; producer recovery lets the next
+`net` request succeed without restarting the process. Non-net requests do not
+probe networking. An old kernel table left by a failed reload cannot authorize
+a new attachment. Host, Boat and tenant
+guest policy producers all implement this protocol; old images without it fail
+closed and must be rebuilt, not given a table-only compatibility fallback.
+
+Attachment is authorized under the generation its final probe validated.
+Publication/withdrawal is not synchronized with the later command-gate byte:
+a later fence affects new jobs and tenant gates, and does not revoke an already
+validated attachment. There is intentionally no extra gate-release probe.
+
+### Deploy the producer before the consumer
+
+The build-server runner is a **user** unit; `Before=motor-runner.service` in a
+system producer unit does not order it. Correctness comes from per-request
+re-probing, not cross-manager boot ordering. Use this rollout order:
+
+1. Quiesce new net work while mixing an old table-only consumer with the new
+   protocol. Check that `/etc/motor-network.json` agrees with the helper's
+   explicit uplink/public IPv4 settings, and that the link is UP.
+2. As the trusted runner account, run the network installer's read-only diff
+   with `--uplink <uplink> --public-ip <public IPv4>` to check its sudo grants.
+   Then apply it as root and run `--check --host-only`. This installs the
+   producer first and requires a genuine root-published generation; never create
+   a marker by hand to bypass a failure. The build server explicitly uses enp6s0.
+3. Upgrade/restart the helper using the hosted-host procedure. Tenant faults
+   may leave individual TAPs fenced without withdrawing host-job readiness.
+   Inspect tenant health separately with the full network `--check`.
+4. Run the ignored `isolated_net_` operator lane against the installed producer
+   before replacing the runner. Do not count a missing-generation refusal as
+   successful network qualification.
+5. Deploy the new runner last, using the user-unit deployment procedure. Run a
+   net canary and a non-net canary through the normal client. If a producer
+   reload is unfinished or fails, that net request is refused; rerun the real
+   producer after fixing it, then retry the canary in the **same runner**.
+6. Resume net admissions only after the canaries pass. Producer-first minimizes
+   mixed-version windows even though boot-time recovery no longer needs a
+   runner restart.
+
+For **Boat**, rebuild and roll the whole image containing the runner, producer
+and marker helper together. Do not swap a new runner into an old image. For
+**tenant VMs**, build a new tenant image with the matching runner, guest network
+unit and marker helper, inventory/qualify it, then use the offline image-switch
+procedure with the host/helper stopped. New consumers on old images fail closed.
+
+The generation operator tests, like the other `isolated_net_*` cases, run as the
+trusted **operator account**, not with `sudo cargo`, `sudo nextest` or a root test
+binary. They use `sudo -n` only for private root-owned producer inputs,
+publication/reload/cleanup and the existing privileged network helpers. This
+keeps the shared operator-test lock owned and opened by the same account under
+`fs.protected_regular`; do not chmod/chown/delete that host lock or change the
+sysctl to run a test. The production marker is never withdrawn by these cases.
+Ordinary network fixtures first run the producer's real read-only live-policy
+checker (including canonical rules, uplink, forwarding, tenant gates and UFW),
+then root-publish a generation to their scratch directory through the test-only
+path override. No live rules are loaded or changed. This permits pre-deployment
+testing when the live policy already matches but the old producer has no marker.
+If `/etc/motor-network.json` is not installed, explicitly set both
+`MOTOR_NET_TEST_UPLINK` and `MOTOR_NET_TEST_PUBLIC_IPV4`; no route sniffing or
+interface default is used. The child process in
+`isolated_net_restart_survives_and_cleans_up` reuses the parent's validated
+private generation through the same scratch-path override. A policy mismatch
+still fails closed: deploy producer/helper first,
+then run the lane, then deploy the runner. Scratch generations do not relax the
+production readiness protocol or track concurrent production reloads; keep
+policy changes quiesced during the operator lane.
 Run the default read-only diff as the trusted runner account to verify its
 non-root `sudo` grants. Running `--check` as root skips verification of that
 account's non-root `sudo` grants.

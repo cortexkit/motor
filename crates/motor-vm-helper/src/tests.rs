@@ -330,6 +330,48 @@ fn storage_companion_stops_propagation_before_helper_start() {
 }
 
 #[test]
+fn config_requires_safe_explicit_network_before_egress_not_cleanup() {
+    let value: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/helper.json")).unwrap();
+    for missing in ["uplink", "public_ipv4"] {
+        let mut broken = value.clone();
+        broken.as_object_mut().unwrap().remove(missing);
+        let config: crate::config::Config = serde_json::from_value(broken).unwrap();
+        config.validate_resources().unwrap();
+        assert!(config.validate_network().is_err());
+    }
+    for uplink in [
+        "",
+        "lo",
+        "any",
+        "..",
+        "-eno1",
+        ".eno1",
+        "_eno1",
+        "eno1:0",
+        "eno/1",
+        "en o1",
+        "eno\t1",
+        "enö1",
+        "mtap*",
+        "eno1\";accept",
+        "0123456789012345",
+    ] {
+        let mut broken = value.clone();
+        broken["uplink"] = uplink.into();
+        let config: crate::config::Config = serde_json::from_value(broken).unwrap();
+        config.validate_resources().unwrap();
+        assert!(config.validate().unwrap_err().0.contains("uplink"));
+    }
+    for ip in ["10.0.0.1", "127.0.0.1", "224.0.0.1", "192.0.2.1"] {
+        let mut broken = value.clone();
+        broken["public_ipv4"] = ip.into();
+        let config: crate::config::Config = serde_json::from_value(broken).unwrap();
+        assert!(config.validate().unwrap_err().0.contains("uplink"));
+    }
+}
+
+#[test]
 fn config_refuses_uid_overlap_invalid_limits_and_paths() {
     let original: crate::config::Config =
         serde_json::from_str(include_str!("../fixtures/helper.json")).unwrap();

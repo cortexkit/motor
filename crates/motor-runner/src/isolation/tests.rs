@@ -2475,6 +2475,30 @@ fn net_operator_lock() -> File {
 }
 
 #[tokio::test]
+#[ignore = "operator only: non-root account with sudo -n, provisioned motor_net and trusted host isolation"]
+async fn isolated_net_generation_appears_after_runner_start_without_restart() {
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "run generation operator tests as the operator account, not via sudo"
+    );
+    let _guard = net_operator_lock();
+    crate::engine::net_operator_case("generation-recovery").await;
+}
+
+#[tokio::test]
+#[ignore = "operator only: non-root account with sudo -n, provisioned motor_net and trusted host isolation"]
+async fn isolated_net_failed_reload_refuses_new_jobs() {
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "run generation operator tests as the operator account, not via sudo"
+    );
+    let _guard = net_operator_lock();
+    crate::engine::net_operator_case("generation-reload").await;
+}
+
+#[tokio::test]
 #[ignore = "operator only: requires provisioned motor_net and trusted host isolation"]
 async fn isolated_net_public_https_dns_read_only_resolver() {
     let _guard = net_operator_lock();
@@ -2606,6 +2630,7 @@ fn isolated_net_attach_failure_discards_unstarted_unit() {
 fn isolated_net_startup_reconciles_leftovers_but_preserves_live_unit() {
     let _guard = net_operator_lock();
     let f = Fixture::new();
+    let (_generation, _) = crate::network::linux::validated_generation(&f.state);
     let root = f.state.join("slots");
     let sandbox = f.sandbox().with_network().unwrap();
     let mut launch = sandbox.launch("true", &f.workspace, &[]).unwrap();
@@ -2641,10 +2666,10 @@ fn isolated_net_startup_reconciles_leftovers_but_preserves_live_unit() {
     config.job_network = Some(crate::network::JobNetwork::Veth);
     config.build_slot_root = root;
     crate::network::initialize(&mut config);
-    assert!(
-        config.job_network.is_some(),
-        "{}",
-        config.job_network_unavailable
+    assert_eq!(
+        crate::network::unsupported(&config),
+        None,
+        "startup must leave actual net admission ready, not merely configured"
     );
     let exists = |name: &str| {
         Command::new("/usr/bin/sudo")

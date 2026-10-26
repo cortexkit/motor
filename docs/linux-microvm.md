@@ -29,7 +29,8 @@ never sends the helper a path, executable, environment or argv.
 The paths below are fixed by this build. `/var/lib/motor-vm` is the helper's
 storage root and has no override; executable and snapshot paths come from the
 JSON configuration. It is a bind mount of the root-owned `/srv/build/vm`
-directory on the XFS build disk. All ancestors of the mounted view are root-owned;
+directory on the XFS build disk (or a dedicated XFS filesystem mounted at
+`/srv/build/vm` on a tenant-only host). All ancestors of the mounted view are root-owned;
 `/srv/build` itself may remain owned by the unprivileged build account. Root VM
 services must use the mounted view, not the source spelling. Renaming the source
 from its writable parent does not move an already established bind mount. The
@@ -39,7 +40,7 @@ chroot mounts back into the source alias. The helper requires that companion,
 and `script/tenant-image/qualify.py` refuses a shared view before starting a VM.
 
 - Linux with cgroup v2, `openat2`, pidfds, `cgroup.kill` and `/dev/userfaultfd`,
-  and XFS with reflink support at `/srv/build`.
+  and XFS with reflink support backing `/srv/build/vm`.
 - systemd 254 or newer (for `DelegateSubgroup=`). The unit is a root system
   service with the cpu, cpuset, memory and io controllers delegated. The helper
   process sits in the unit's `helper` leaf, not the delegation root.
@@ -68,6 +69,9 @@ sudo install -m 0644 crates/motor-vm-helper/systemd/motor-vm-storage.mount '/etc
 sudo install -m 0644 crates/motor-vm-helper/systemd/motor-vm-storage-private.service /etc/systemd/system/
 # Write /etc/motor-vm-helper.json, using crates/motor-vm-helper/fixtures/helper.json
 # as the shape: allowed uid, socket group, CPU topology and job-account range.
+# Set its required uplink and public_ipv4 to this host's actual interface/address;
+# install the same settings and outbound policy with install-job-network.py
+# --apply --uplink IFACE --public-ip IPV4 before starting the helper.
 sudo systemctl daemon-reload
 sudo systemctl enable --now 'var-lib-motor\x2dvm.mount'
 sudo systemctl start motor-vm-storage-private.service
@@ -88,6 +92,69 @@ root-managed configs or tenant registries that name the old source path need an
 offline operator update before the new helper starts; the helper does not accept
 two spellings or migrate live disk records automatically. Do not change ownership
 of the whole `/srv/build` tree to work around the helper's trust checks.
+
+Tenant removal is cleanup, not a network admission. It fences the selected TAP
+and deletes only its helper-owned chains/counter, membership and comment-owned
+UFW grant, using the grant's saved direction even if the uplink is missing.
+Interrupted removal replays that cleanup before finishing saved records. Normal
+policy reconciliation preserves healthy ready gates; new and unready gates stay
+closed until final uplink validation. Failure of either the initial or final
+uplink validation fences every
+affected gate. Rules bind to interface names;
+a same-name replacement inherits them, and root-only interface renames are
+outside this boundary.
+
+An invalid or missing uplink leaves every tenant gate fenced, but does not stop
+the helper from binding its socket. The ordinary `remove_tenant` request still
+works for stopped tenants and resumes an interrupted removal when its registry
+is gone. Status, stopping and other operations that do not open a gate remain
+available. `ensure`, `restore`, `prepare_start` and `set_egress` return a typed
+`start_refused` with case `uplink` and the validation problem. Filesystem trust,
+identity, cgroup cleanup and inability to apply the fence remain startup errors;
+a failed fence is not evidence that serving is safe.
+
+Startup does not acquire `provision.lock`: image qualification holds that lock
+while launching its helper. Removal and resume acquire it within the helper's
+request serialization. Resume checks the saved home device/inode and live
+TAP-index ownership before mutation. If another trusted tenant owns the index,
+network cleanup is refused but the departed tenant's original records and home
+are completed data-only, allowing seven-day purge without touching the new
+owner. Unreadable ownership records or a different home refuse completion.
+Older journals without a saved home identity need explicit manual recovery;
+the helper must not guess which same-name directory they describe.
+Quarantine records do not reserve indexes during provisioning:
+tenant names and home existence do not identify an incarnation. A durable
+`complete` marker prevents a finished removal with no home from being replayed
+against a later same-name tenant, and permits normal seven-day purge.
+Tenant-home and quarantine parents are checked and opened component-by-component
+without symlinks; home movement uses descriptor-relative rename rather than
+following a changed parent spelling.
+
+Portable regressions are
+`invalid_or_missing_uplink_binds_fences_and_serves_cleanup_but_refuses_opening`,
+`qualification_lock_allows_helper_startup_and_reproduces_legacy_lock_failure`,
+`reassigned_resume_completes_only_original_data_without_touching_replacement_network` and
+`completed_homeless_removal_never_revives_for_a_replacement_and_can_be_purged`.
+These use real sockets/flocks and injected network commands, not privileged
+kernel/UFW or VM qualification.
+
+The tenant deny is applied before parsing or withdrawing host delegation. If
+the registry is unreadable, the helper recovers TAP names from the live tenant
+table and closes those gates; the wildcard guard also denies unknown TAPs. If
+network containment fails, it hard-stops the running VMMs instead of relying on
+a refused admission to contain existing traffic. If that containment also fails,
+the helper exits so systemd tears down its delegated service cgroup; it must not
+continue serving with uncontained VMMs. Producer reloads retain every
+pre-existing `closed_taps` member: only a helper reconciliation with fresh uplink
+and UFW validation can release a fence. The helper and producer serialize those
+policy changes on the same network lock.
+
+`TenantMetrics.egress_bytes` is an absolute per-tenant-incarnation byte counter.
+Provisioning resets an existing per-index counter before publishing a new
+registry, and Python removal resets it before releasing that allocation. Rust
+removal deletes it; routine reconciliation never resets a live tenant's counter.
+Motor-host records a fresh per-job baseline and reports a saturating delta, so
+index reuse cannot inherit the former tenant's bytes or produce a negative bill.
 
 The socket is `/run/motor-vm-helper.sock`, `root:<socket_gid>`, mode `0660`.
 Only uids listed in the config are admitted, checked with `SO_PEERCRED`.
@@ -256,6 +323,9 @@ They run as root, create mounts, cgroups and systemd units, and use fixed uids,
 so run them only on a disposable trusted Linux host, never in hosted CI or a
 build job. Prefix each with the Git-config clearing from
 [CONTRIBUTING.md](../CONTRIBUTING.md#prerequisites).
+The service lane also requires `/etc/motor-network.json` from the explicit-uplink
+network installer and that interface UP with its configured public IPv4 address;
+it reconciles real host policy rather than using the portable fixture's example.
 
 | Command | Needs | Covers |
 | --- | --- | --- |

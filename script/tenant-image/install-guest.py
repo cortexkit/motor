@@ -295,6 +295,8 @@ def configure(pins):
     Path("/usr/local/libexec/hosted_image_check.py").chmod(0o755)
     install_services(BUILD / "guest", Path("/etc/systemd/system"))
     run("install", "-o", "root", "-g", "root", "-m", "0644",
+        str(BUILD / "script/runner/motor_network_ready.py"), "/usr/local/libexec/motor_network_ready.py")
+    run("install", "-o", "root", "-g", "root", "-m", "0644",
         str(BUILD / "script/runner/units/system/motor-jobs.slice"),
         "/etc/systemd/system/motor-jobs.slice")
     clear_module_load_requests(Path("/"))

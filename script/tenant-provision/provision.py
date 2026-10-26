@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import traceback
+import types
 import uuid
 
 ROOT = Path("/var/lib/motor-vm")
@@ -52,6 +53,14 @@ SCHEMA = schema_module.SCHEMA
 
 def run(*args):
     return subprocess.run([str(a) for a in args], check=True, capture_output=True, text=True, timeout=300)
+
+
+def reset_egress_counter(index):
+    path = Path(__file__).resolve().parents[1] / 'runner/motor_network_policy.py'
+    policy = types.ModuleType('tenant_network_policy')
+    policy.__file__ = str(path)
+    exec(compile(path.read_bytes(), str(path), 'exec'), policy.__dict__)
+    policy.reset_tenant_counter(index)
 
 
 def u64(value, name):
@@ -183,11 +192,17 @@ def apply_jobs_slice():
         refuse_resize_journal()
         memory_fit(capacity)
         rendered = jobs_slice_render(capacity)
-        values = slice_properties(("LoadState", "MemoryCurrent"))
+        values = slice_properties(("LoadState", "MemoryCurrent", "ActiveState", "ControlGroup"))
         if values["LoadState"] == "not-found":
             current = 0
         elif values["LoadState"] == "loaded":
-            current = slice_bytes(values["MemoryCurrent"], "MemoryCurrent")
+            # systemd synthesizes an unloaded slice as loaded but inactive,
+            # without a cgroup or a memory counter. Only that empty state is zero.
+            if (values["MemoryCurrent"] == "[not set]" and values["ActiveState"] == "inactive"
+                    and values["ControlGroup"] == ""):
+                current = 0
+            else:
+                current = slice_bytes(values["MemoryCurrent"], "MemoryCurrent")
         else:
             raise ValueError(f"motor-jobs.slice LoadState={values['LoadState']}")
         _maximum, high = jobs_slice_limits(capacity)
@@ -675,8 +690,30 @@ def tap_exists(tap):
     return subprocess.run(["ip", "link", "show", "dev", tap], capture_output=True).returncode == 0
 
 
+def tap_metadata(tap):
+    result = subprocess.run(['ip', '-j', '-d', 'link', 'show', 'dev', tap], check=True,
+                            capture_output=True, text=True, env={**os.environ, 'LC_ALL': 'C'})
+    if len(result.stdout) > 65536:
+        raise ValueError('tenant TAP metadata exceeds read bound')
+    links = json.loads(result.stdout)
+    if not isinstance(links, list) or len(links) != 1:
+        raise ValueError('ambiguous tenant TAP metadata')
+    return links[0]
+
+
+def require_owned_tap(tap, tap_index, link):
+    if not isinstance(link, dict):
+        raise ValueError(f'refusing to delete foreign interface {tap}')
+    info = link.get('linkinfo', {})
+    data = info.get('info_data', {})
+    if (link.get('ifname') != tap or info.get('info_kind') != 'tun' or data.get('type') != 'tap'
+            or data.get('persist') is not True or type(data.get('user')) is not int
+            or data['user'] != 400000 + tap_index):
+        raise ValueError(f'refusing to delete foreign interface {tap}')
+
+
 def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, execute=run, has_tap=None,
-                  now=time.time, output=print):
+                  now=time.time, output=print, tap_info=None):
     """Remove a departed customer's tenant from this host.
 
     Refuses unless motor-host.service and motor-vm-helper.service are both
@@ -686,7 +723,8 @@ def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, ex
     quarantine folder, deletes the tap, drops the binding, provisioning record
     and registry entry, and moves the tenant's home (disk, generation, suspend
     snapshots, set-aside stale snapshots and stop markers) into the folder.
-    The helper deletes the folder after QUARANTINE_S; --purge-now deletes it
+    The egress counter is reset before the index is released. The helper deletes
+    the folder after QUARANTINE_S; --purge-now deletes it
     at once. The firewall exemption and UFW route grant are dropped by the
     helper's startup reconciliation, which keeps only registered tenants.
     The shared size base under the image is not per tenant and is kept.
@@ -695,6 +733,7 @@ def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, ex
     tenant = component(tenant)
     check_service = systemd_active_state if check_service is None else check_service
     has_tap = tap_exists if has_tap is None else has_tap
+    tap_info = tap_metadata if tap_info is None else tap_info
     with (ROOT / "provision.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         for unit in ("motor-host.service", "motor-vm-helper.service"):
@@ -730,10 +769,12 @@ def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, ex
         plan += [f"{destination}: {path}" for path in (registry_path, provision_path) if path.exists()]
         plan += [f"{destination}: binding {vm} in {BINDINGS}" for vm in sorted(binding)]
         if has_tap(tap):
+            require_owned_tap(tap, tap_index, tap_info(tap))
             plan.append(f"delete: tap {tap}")
         plan += [f"dropped at the next helper start: {name}" for name in (
             f"nft chain tenant_{tap}_input", f"nft chain tenant_{tap}_forward", f"nft chain tenant_{tap}_nat",
-            f"nft counter tenant_{tap}_egress", f"ufw route motor-tenant-{tap}")]
+            f"ufw route motor-tenant-{tap}")]
+        plan.append(f"reset: nft counter tenant_{tap}_egress")
         if dry_run:
             for line in plan:
                 output(f"would {line}")
@@ -749,6 +790,15 @@ def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, ex
             sync_dir(ROOT)
         quarantine.mkdir(mode=0o700)
         (quarantine / "records").mkdir(mode=0o700)
+        try:
+            metadata = home.lstat()
+        except FileNotFoundError:
+            identity = None
+        else:
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ValueError('tenant home is not a directory')
+            identity = {'dev': metadata.st_dev, 'ino': metadata.st_ino}
+        atomic(quarantine / 'records/home-identity.json', json.dumps(identity))
         for source, saved in ((registry_path, "registry.json"), (provision_path, "provision.json")):
             if source.exists():
                 atomic(quarantine / "records" / saved, source.read_text())
@@ -756,7 +806,11 @@ def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, ex
             atomic(quarantine / "records" / "binding.json", json.dumps(binding, indent=2))
         sync_dir(removed)
         if has_tap(tap):
+            require_owned_tap(tap, tap_index, tap_info(tap))
             execute("ip", "link", "delete", "dev", tap)
+        reset_egress_counter(tap_index)
+        if not home.exists():
+            atomic(quarantine / 'complete', '1\n')
         if binding:
             kept = {vm: entry for vm, entry in bindings.items() if vm not in binding}
             atomic(BINDINGS, json.dumps(kept, indent=2) + "\n")
@@ -771,6 +825,7 @@ def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, ex
             os.rename(home, quarantine / "home")
             sync_dir(home.parent)
             sync_dir(quarantine)
+        atomic(quarantine / 'complete', '1\n')
         if purge_now:
             shutil.rmtree(quarantine)
             sync_dir(removed)
@@ -1201,6 +1256,8 @@ def build_base(c, image, base, console=None, diagnostics=None):
     sync_dir(base.parent)
 
 
+
+
 def provision(c, make_base=build_base, execute=run, stage=None, runners=None):
     capacity = read_capacity()
     # An unfinished resize holds host sizing fixed until it is resumed or aborted.
@@ -1282,6 +1339,9 @@ def provision(c, make_base=build_base, execute=run, stage=None, runners=None):
     atomic(home / "generation", "0\n")
     record = {k: v for k, v in c.items() if k not in {"tenant", "sub", "vm", "resolvers"}}
     record.update(disk=str(disk), generation=str(home / "generation"), suspend=str(home / "suspend"))
+    # Only an unallocated, stopped index reaches publication. Reset legacy
+    # deferred counters before a replacement registry can expose old usage.
+    reset_egress_counter(c["tap_index"])
     atomic(registry, json.dumps(record, indent=2) + "\n")
     registry.chmod(0o644)
     bindings[c["vm"]] = {"tenant": c["tenant"], "sub": c["sub"]}

@@ -37,9 +37,11 @@ fn scratch() -> Scratch {
         fs::create_dir_all(home.join("suspend.stale-v0-1")).unwrap();
         fs::write(home.join("disk.img"), tenant).unwrap();
         fs::write(home.join("suspend/suspend.memory"), tenant).unwrap();
+        let mut registry = crate::tenant::tests::registry(tenant);
+        registry.tap_index = tap;
         fs::write(
             paths.registry.join(format!("{tenant}.json")),
-            format!("{{\"tap_index\":{tap}}}"),
+            serde_json::to_vec(&registry).unwrap(),
         )
         .unwrap();
         fs::write(paths.provision.join(format!("{tenant}.json")), tenant).unwrap();
@@ -53,6 +55,162 @@ fn scratch() -> Scratch {
         _dir: TempRoot(dir),
         paths,
     }
+}
+
+#[test]
+fn removal_rejects_symlinked_home_parent_before_records_or_quarantine_mutation() {
+    use std::os::unix::fs::symlink;
+    let s = scratch();
+    let p = &s.paths;
+    let homes = p.root.join("tenants");
+    let real = p.root.join("real-tenants");
+    fs::rename(&homes, &real).unwrap();
+    symlink(&real, &homes).unwrap();
+    assert!(begin(p, "a", 1000).is_err());
+    assert!(!p.removed().exists());
+    fs::remove_file(&homes).unwrap();
+    fs::rename(&real, &homes).unwrap();
+    let quarantine = begin(p, "a", 1000).unwrap();
+    fs::rename(&homes, &real).unwrap();
+    symlink(&real, &homes).unwrap();
+    let bindings = fs::read(&p.bindings).unwrap();
+    assert!(finish(p, "a", &quarantine).is_err());
+    assert!(p.registry_file("a").exists());
+    assert_eq!(fs::read(&p.bindings).unwrap(), bindings);
+    assert!(real.join("a/disk.img").exists());
+    assert!(!quarantine.join("home").exists());
+}
+
+#[test]
+fn reassigned_resume_completes_only_original_data_without_touching_replacement_network() {
+    let s = scratch();
+    let p = &s.paths;
+    let quarantine = begin(p, "a", 1000).unwrap();
+    fs::remove_file(p.registry_file("a")).unwrap();
+    let mut new_owner = crate::tenant::tests::registry("b");
+    new_owner.tap_index = 1;
+    let new_record = serde_json::to_vec(&new_owner).unwrap();
+    fs::write(p.registry_file("b"), &new_record).unwrap();
+    let before_binding = fs::read(&p.bindings).unwrap();
+    let saved = crate::tenant::tests::registry("a");
+    assert!(
+        refuse_reassigned_tap(p, "a", &saved, false, |path| serde_json::from_slice(
+            &fs::read(path)?
+        )
+        .map_err(|e| Error(e.to_string())))
+        .unwrap_err()
+        .0
+        .contains("reassigned to b")
+    );
+    let result = resume_with_network(
+        p,
+        "a",
+        |path| serde_json::from_slice(&fs::read(path)?).map_err(|e| Error(e.to_string())),
+        |_| panic!("must not delete B's chains, membership, UFW grant or TAP"),
+    );
+    assert_eq!(result.unwrap(), Some(quarantine.clone()));
+    assert_eq!(fs::read(p.registry_file("b")).unwrap(), new_record);
+    assert_ne!(fs::read(&p.bindings).unwrap(), before_binding);
+    let bindings: serde_json::Value =
+        serde_json::from_slice(&fs::read(&p.bindings).unwrap()).unwrap();
+    assert_eq!(
+        bindings,
+        serde_json::json!({"vm-b":{"tenant":"b","sub":"acct:B"}})
+    );
+    assert!(!p.home("a").exists());
+    assert!(p.home("b").exists());
+    assert!(quarantine.join("home/disk.img").exists());
+    assert_eq!(purge(p, 1000 + QUARANTINE_S).unwrap(), vec![quarantine]);
+    assert!(p.home("b").join("disk.img").exists());
+}
+
+#[test]
+fn pending_removal_rejects_replacement_home_before_network_or_data_mutation() {
+    let s = scratch();
+    let p = &s.paths;
+    let quarantine = begin(p, "a", 1000).unwrap();
+    fs::rename(p.home("a"), p.root.join("original-a")).unwrap();
+    fs::create_dir(p.home("a")).unwrap();
+    fs::write(p.home("a").join("replacement"), "keep").unwrap();
+    fs::remove_file(p.registry_file("a")).unwrap();
+    let error = resume_with_network(
+        p,
+        "a",
+        |path| serde_json::from_slice(&fs::read(path)?).map_err(|e| Error(e.to_string())),
+        |_| panic!("old records cannot authorize replacement network cleanup"),
+    )
+    .unwrap_err();
+    assert!(error.0.contains("home no longer matches"));
+    assert!(p.home("a").join("replacement").exists());
+    assert!(!quarantine.join("home").exists());
+}
+
+#[test]
+fn unreadable_registry_blocks_even_data_only_resume() {
+    let s = scratch();
+    let p = &s.paths;
+    let quarantine = begin(p, "a", 1000).unwrap();
+    fs::remove_file(p.registry_file("a")).unwrap();
+    fs::write(p.registry_file("b"), "bad json").unwrap();
+    assert!(resume_with_network(
+        p,
+        "a",
+        |path| serde_json::from_slice(&fs::read(path)?).map_err(|e| Error(e.to_string())),
+        |_| panic!("untrusted ownership must prevent cleanup")
+    )
+    .is_err());
+    assert!(p.home("a").exists());
+    assert!(!quarantine.join("home").exists());
+}
+
+#[test]
+fn completed_homeless_removal_never_revives_for_a_replacement_and_can_be_purged() {
+    let s = scratch();
+    let p = &s.paths;
+    fs::remove_dir_all(p.home("a")).unwrap();
+    let quarantine = begin(p, "a", 1000).unwrap();
+    finish(p, "a", &quarantine).unwrap();
+    assert!(quarantine.join(COMPLETE).is_file());
+    // A replacement may crash after making its home but before its registry.
+    fs::create_dir(p.home("a")).unwrap();
+    fs::write(p.home("a").join("replacement"), "keep").unwrap();
+    assert!(pending(p, "a").unwrap().is_none());
+    assert!(resume_with_network(
+        p,
+        "a",
+        |_| panic!("completed records must not be read"),
+        |_| panic!("completed records must not authorize cleanup")
+    )
+    .unwrap()
+    .is_none());
+    assert_eq!(purge(p, 1000 + QUARANTINE_S).unwrap(), vec![quarantine]);
+    assert!(p.home("a").join("replacement").is_file());
+}
+
+#[test]
+fn interrupted_removal_replays_network_before_finishing_saved_records() {
+    let s = scratch();
+    let p = &s.paths;
+    let registry = crate::tenant::tests::registry("a");
+    fs::write(p.registry_file("a"), serde_json::to_vec(&registry).unwrap()).unwrap();
+    let quarantine = begin(p, "a", 1234).unwrap();
+    fs::remove_file(p.registry_file("a")).unwrap();
+    assert_eq!(pending(p, "a").unwrap(), Some(quarantine.clone()));
+    let mut cleaned = false;
+    finish_with_network(p, "a", &quarantine, |saved| {
+        assert_eq!(saved.tap_index, 1);
+        assert!(p.home("a").exists());
+        cleaned = true;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        cleaned,
+        "resume must not finish records while owned network resources survive"
+    );
+    assert!(!p.home("a").exists());
+    assert!(quarantine.join("home").exists());
+    assert!(p.home("b").exists());
 }
 
 #[test]

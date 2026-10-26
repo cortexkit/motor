@@ -7,6 +7,88 @@ use std::{
 mod lock;
 mod ufw;
 
+pub(super) fn validate_uplink(config: &crate::config::Config) -> Result<()> {
+    config.validate_network()?;
+    use std::os::unix::fs::MetadataExt;
+    let path = std::path::Path::new("/etc/motor-network.json");
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+        || metadata.len() > 4096
+    {
+        return Err(Error(format!(
+            "unsafe network settings for uplink {}",
+            config.uplink
+        )));
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Network {
+        uplink: String,
+        public_ipv4: std::net::Ipv4Addr,
+    }
+    let network: Network = serde_json::from_slice(&std::fs::read(path)?)
+        .map_err(|e| Error(format!("uplink {} network settings: {e}", config.uplink)))?;
+    if network.uplink != config.uplink || network.public_ipv4 != config.public_ipv4 {
+        return Err(Error(format!(
+            "uplink {} differs from /etc/motor-network.json",
+            config.uplink
+        )));
+    }
+    let output = Command::new("/usr/bin/timeout")
+        .args([
+            "--signal=TERM",
+            "--kill-after=2s",
+            "15s",
+            "/usr/sbin/ip",
+            "-j",
+            "-4",
+            "address",
+            "show",
+            "dev",
+            &config.uplink,
+        ])
+        .output()?;
+    if !output.status.success() || output.stdout.len() > 65536 {
+        return Err(Error(format!(
+            "uplink {} is missing or unreadable",
+            config.uplink
+        )));
+    }
+    let addresses = serde_json::from_slice(&output.stdout)
+        .map_err(|e| Error(format!("uplink {} address query: {e}", config.uplink)))?;
+    validate_uplink_addresses(&config.uplink, config.public_ipv4, &addresses)
+}
+
+fn validate_uplink_addresses(
+    uplink: &str,
+    public_ipv4: std::net::Ipv4Addr,
+    addresses: &serde_json::Value,
+) -> Result<()> {
+    let expected = public_ipv4.to_string();
+    let links = addresses
+        .as_array()
+        .ok_or_else(|| Error(format!("uplink {uplink} address query is not a list")))?;
+    let valid = links.len() == 1
+        && links[0]["ifname"] == uplink
+        && links[0]["operstate"] == "UP"
+        && links[0]["flags"]
+            .as_array()
+            .is_some_and(|flags| flags.iter().any(|flag| flag == "UP"))
+        && links[0]["addr_info"].as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item["family"] == "inet" && item["scope"] == "global" && item["local"] == expected
+            })
+        });
+    if !valid {
+        return Err(Error(format!(
+            "uplink {uplink} must exist, be UP and carry public IPv4 {public_ipv4}"
+        )));
+    }
+    Ok(())
+}
+
 fn run(args: &[&str]) -> Result<()> {
     let output = Command::new("/usr/sbin/ip").args(args).output()?;
     if !output.status.success() {
@@ -53,31 +135,78 @@ pub fn ensure(r: &Registry, uid: u32) -> Result<()> {
 
 /// The registries left once `removed` is gone. Tap indices are unique across
 /// registries, so the tap identifies the removed tenant.
-pub fn without(registries: Vec<Registry>, removed: &Registry) -> Vec<Registry> {
+#[cfg(test)]
+fn without(registries: Vec<Registry>, removed: &Registry) -> Vec<Registry> {
     registries
         .into_iter()
         .filter(|r| r.tap_index != removed.tap_index)
         .collect()
 }
 
-/// Deletes a removed tenant's tap. Reconciliation never deletes taps (a
-/// stopped tenant keeps its own), so removal does it explicitly.
+/// Delete only the persistent TAP created for this tenant's reserved uid.
+/// Names alone are not ownership: a foreign interface may occupy the spelling.
 pub fn remove_tap(r: &Registry) -> Result<()> {
+    remove_tap_with(
+        r,
+        || {
+            let tap = r.tap();
+            let output = Command::new("/usr/sbin/ip")
+                .args(["-j", "-d", "link", "show", "dev", &tap])
+                .env("LC_ALL", "C")
+                .output()?;
+            if !output.status.success() {
+                let error = String::from_utf8_lossy(&output.stderr);
+                if error.contains(&format!("Device \"{tap}\" does not exist")) {
+                    return Ok(None);
+                }
+                return Err(Error(format!("cannot inspect tenant TAP {tap}: {error}")));
+            }
+            if output.stdout.len() > 65536 {
+                return Err(Error("tenant TAP metadata exceeds read bound".into()));
+            }
+            let links: Vec<serde_json::Value> =
+                serde_json::from_slice(&output.stdout).map_err(|e| Error(e.to_string()))?;
+            if links.len() != 1 {
+                return Err(Error("ambiguous tenant TAP metadata".into()));
+            }
+            Ok(links.into_iter().next())
+        },
+        |tap| run(&["link", "delete", "dev", tap]),
+    )
+}
+
+fn remove_tap_with(
+    r: &Registry,
+    query: impl FnOnce() -> Result<Option<serde_json::Value>>,
+    delete: impl FnOnce(&str) -> Result<()>,
+) -> Result<()> {
+    let Some(link) = query()? else {
+        return Ok(());
+    };
     let tap = r.tap();
-    let exists = Command::new("/usr/sbin/ip")
-        .args(["link", "show", "dev", &tap])
-        .output()?
-        .status
-        .success();
-    if exists {
-        run(&["link", "delete", "dev", &tap])?;
+    let info = &link["linkinfo"];
+    let owned = (1..=254).contains(&r.tap_index)
+        && link["ifname"] == tap
+        && info["info_kind"] == "tun"
+        && info["info_data"]["type"] == "tap"
+        && info["info_data"]["persist"] == true
+        && info["info_data"]["user"].as_u64() == Some(400000 + u64::from(r.tap_index));
+    if !owned {
+        return Err(Error(format!("refusing to delete foreign interface {tap}")));
     }
-    Ok(())
+    // The shared network lock excludes cooperating writers. Root-only rename
+    // or same-name replacement is outside this name-based ownership contract.
+    delete(&tap)
 }
 
 #[cfg(test)]
 fn rules(registries: &[Registry], existing: Option<&serde_json::Value>) -> Result<String> {
-    policy_rules(registries, existing, &std::collections::BTreeSet::new())
+    policy_rules(
+        "enp6s0",
+        registries,
+        existing,
+        &std::collections::BTreeSet::new(),
+    )
 }
 
 fn private_inventory() -> Result<String> {
@@ -151,6 +280,14 @@ fn prelude(
     if desired.len() != registries.len() || !closed.is_subset(&desired) {
         return Err(Error("duplicate or invalid tenant tap set".into()));
     }
+    gate_prelude(&desired, existing, closed)
+}
+
+fn gate_prelude(
+    desired: &std::collections::BTreeSet<String>,
+    existing: Option<&serde_json::Value>,
+    closed: &std::collections::BTreeSet<String>,
+) -> Result<String> {
     let sets = object_names(existing, "set")?;
     let chains = object_names(existing, "chain")?;
     let mut text = String::new();
@@ -164,7 +301,7 @@ fn prelude(
             ));
         }
     }
-    text.push_str(&set_members("motor_tenant", "tenant_taps", &desired));
+    text.push_str(&set_members("motor_tenant", "tenant_taps", desired));
     text.push_str(&set_members("motor_tenant", "closed_taps", closed));
     if !sets.contains("non_public_v4") {
         text.push_str(
@@ -195,10 +332,14 @@ fn prelude(
 }
 
 fn policy_rules(
+    uplink: &str,
     registries: &[Registry],
     existing: Option<&serde_json::Value>,
     closed: &std::collections::BTreeSet<String>,
 ) -> Result<String> {
+    if !crate::config::valid_uplink(uplink) {
+        return Err(Error(format!("invalid uplink {uplink}")));
+    }
     // Object presence alone cannot prove that an older forward chain has the
     // current denies. Replace rule chains atomically, retaining named counters.
     if existing.is_some_and(|value| {
@@ -306,8 +447,8 @@ fn policy_rules(
             text.push_str(&format!("add rule inet motor_tenant {forward} iifname \"{tap}\" {predicate} counter drop comment \"{comment}\"\n"));
         }
         text.push_str(&format!("add rule inet motor_tenant {forward} iifname \"{tap}\" ip saddr != 10.200.{}.2 counter drop comment \"tenant_source\"\n",r.tap_index));
-        text.push_str(&format!("add rule inet motor_tenant {forward} iifname \"{tap}\" oifname \"enp6s0\" meta nfproto ipv4 ip saddr 10.200.{}.2 ct state new,established,related counter name {counter} accept comment \"tenant_public\"\n",r.tap_index));
-        text.push_str(&format!("add rule inet motor_tenant {forward} oifname \"{tap}\" iifname \"enp6s0\" meta nfproto ipv4 ip daddr 10.200.{}.2 ct state established,related counter accept\n",r.tap_index));
+        text.push_str(&format!("add rule inet motor_tenant {forward} iifname \"{tap}\" oifname \"{uplink}\" meta nfproto ipv4 ip saddr 10.200.{}.2 ct state new,established,related counter name {counter} accept comment \"tenant_public\"\n",r.tap_index));
+        text.push_str(&format!("add rule inet motor_tenant {forward} oifname \"{tap}\" iifname \"{uplink}\" meta nfproto ipv4 ip daddr 10.200.{}.2 ct state established,related counter accept\n",r.tap_index));
         text.push_str(&format!("add rule inet motor_tenant {forward} oifname \"{tap}\" counter drop comment \"tenant_inbound\"\nadd rule inet motor_tenant {forward} iifname \"{tap}\" counter drop comment \"tenant_unmatched\"\n"));
         replace_chain(
             &mut text,
@@ -315,7 +456,7 @@ fn policy_rules(
             &nat,
             "type nat hook postrouting priority srcnat; policy accept;",
         );
-        text.push_str(&format!("add rule inet motor_tenant {nat} iifname \"{tap}\" oifname \"enp6s0\" ip saddr 10.200.{}.2 counter masquerade\n",r.tap_index));
+        text.push_str(&format!("add rule inet motor_tenant {nat} iifname \"{tap}\" oifname \"{uplink}\" ip saddr 10.200.{}.2 counter masquerade\n",r.tap_index));
     }
     Ok(text)
 }
@@ -326,65 +467,366 @@ fn managed_tap(name: &str, suffix: &str) -> Option<String> {
     (index > 0 && index < 255 && digits == index.to_string()).then(|| format!("mtap{index}"))
 }
 
-pub fn install(registries: &[Registry]) -> Result<()> {
+#[derive(Debug)]
+pub(crate) enum NetworkReadiness {
+    Ready,
+    FencedUplink(String),
+}
+
+impl NetworkReadiness {
+    pub(crate) fn serve_cleanup(self) {
+        if let Self::FencedUplink(problem) = self {
+            eprintln!("tenant networking unavailable; cleanup remains available: {problem}");
+        }
+    }
+
+    fn require_ready(self) -> Result<()> {
+        match self {
+            Self::Ready => Ok(()),
+            Self::FencedUplink(problem) => Err(Error(problem)),
+        }
+    }
+}
+
+pub fn install(registries: &[Registry], config: &crate::config::Config) -> Result<()> {
+    install_startup(registries, config)?.require_ready()
+}
+
+pub(super) fn fence(registries: &[Registry]) -> Result<()> {
     let _lock = lock::acquire()?;
     let tables = nft_json(&["-j", "list", "tables"])?;
-    let table = |name: &str| -> Result<Option<serde_json::Value>> {
-        let exists = tables["nftables"]
-            .as_array()
-            .ok_or_else(|| Error("missing nft tables".into()))?
-            .iter()
-            .any(|item| item["table"]["family"] == "inet" && item["table"]["name"] == name);
-        if exists {
-            Ok(Some(nft_json(&["-j", "list", "table", "inet", name])?))
-        } else {
-            Ok(None)
+    let existing = nft_table(&tables, "motor_tenant")?;
+    fence_tenant_gates(registries, existing.as_ref(), apply)?;
+    // Host policy may be corrupt or unreadable. Never let its inspection
+    // prevent the independent tenant deny from reaching the kernel first.
+    let motor_net = nft_table(&tables, "motor_net")?;
+    let revoke = motor_net_members(motor_net.as_ref(), &std::collections::BTreeSet::new())?;
+    if !revoke.is_empty() {
+        apply(&revoke)?;
+    }
+    Ok(())
+}
+
+fn fence_tenant_gates(
+    registries: &[Registry],
+    existing: Option<&serde_json::Value>,
+    mut apply: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let mut taps: std::collections::BTreeSet<_> = registries.iter().map(Registry::tap).collect();
+    if let Some(items) = existing.and_then(|table| table["nftables"].as_array()) {
+        for item in items {
+            for kind in ["chain", "counter"] {
+                if let Some(name) = item[kind]["name"].as_str() {
+                    for suffix in ["_input", "_forward", "_nat", "_egress"] {
+                        if let Some(tap) = managed_tap(name, suffix) {
+                            taps.insert(tap);
+                        }
+                    }
+                }
+            }
+            if let Some(set) = item.get("set") {
+                if ["tenant_taps", "closed_taps"]
+                    .contains(&set["name"].as_str().unwrap_or_default())
+                {
+                    for tap in set["elem"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|v| v.as_str())
+                    {
+                        if managed_tap(&format!("tenant_{tap}_egress"), "_egress").as_deref()
+                            == Some(tap)
+                        {
+                            taps.insert(tap.to_owned());
+                        }
+                    }
+                }
+            }
         }
+    }
+    // Unknown mtap interfaces are also denied by the prelude's wildcard guard.
+    apply(&gate_prelude(&taps, existing, &taps)?)
+}
+
+pub(super) fn fence_policy(
+    registries: &[Registry],
+    existing: Option<&serde_json::Value>,
+    motor_net: Option<&serde_json::Value>,
+    mut apply: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    fence_tenant_gates(registries, existing, &mut apply)?;
+    let text = motor_net_members(motor_net, &std::collections::BTreeSet::new())?;
+    if !text.is_empty() {
+        apply(&text)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn install_startup(
+    registries: &[Registry],
+    config: &crate::config::Config,
+) -> Result<NetworkReadiness> {
+    let _lock = lock::acquire()?;
+    let mut commands = NetworkCommands {
+        config: Some(config),
     };
-    let existing = table("motor_tenant")?;
-    let motor_net = table("motor_net")?;
+    let uplink = config.uplink.as_str();
+    let (existing, motor_net) = commands.tables()?;
     let inspected = if registries.is_empty() && !std::path::Path::new("/usr/sbin/ufw").exists() {
         Ok(ufw::State::default())
     } else {
-        ufw::inspect()
+        ufw::inspect(uplink)
     };
-    reconcile_policy(
+    reconcile_policy_state(
+        uplink,
         registries,
         existing.as_ref(),
         motor_net.as_ref(),
-        inspected,
-        apply,
-        |prior| {
-            if !registries.is_empty() || std::path::Path::new("/usr/sbin/ufw").exists() {
-                ufw::reconcile(registries, prior)?;
-            }
-            Ok(())
+        ReconcileIo {
+            inspected,
+            apply,
+            reconcile_ufw: |prior: &ufw::State| {
+                if !registries.is_empty() || std::path::Path::new("/usr/sbin/ufw").exists() {
+                    ufw::reconcile(registries, prior, uplink)?;
+                }
+                Ok(())
+            },
+            validate_uplink: || commands.validate_uplink(),
         },
     )
 }
 
+trait NetworkAccess {
+    fn validate_uplink(&mut self) -> Result<()>;
+    fn tables(&mut self) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>)>;
+    fn apply(&mut self, text: &str) -> Result<()>;
+    fn remove_ufw(&mut self, index: u8) -> Result<()>;
+    fn remove_tap(&mut self, registry: &Registry) -> Result<()>;
+}
+
+struct NetworkCommands<'a> {
+    config: Option<&'a crate::config::Config>,
+}
+
+impl NetworkAccess for NetworkCommands<'_> {
+    fn validate_uplink(&mut self) -> Result<()> {
+        validate_uplink(
+            self.config
+                .ok_or_else(|| Error("cleanup has no uplink configuration".into()))?,
+        )
+    }
+    fn tables(&mut self) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>)> {
+        let tables = nft_json(&["-j", "list", "tables"])?;
+        Ok((
+            nft_table(&tables, "motor_tenant")?,
+            nft_table(&tables, "motor_net")?,
+        ))
+    }
+    fn apply(&mut self, text: &str) -> Result<()> {
+        apply(text)
+    }
+    fn remove_ufw(&mut self, index: u8) -> Result<()> {
+        ufw::remove_owned(index)
+    }
+    fn remove_tap(&mut self, registry: &Registry) -> Result<()> {
+        remove_tap(registry)
+    }
+}
+
+/// Cleanup uses only tenant-owned names/comments, never a current uplink.
+pub fn remove(registry: &Registry) -> Result<()> {
+    let _lock = lock::acquire()?;
+    remove_with(&mut NetworkCommands { config: None }, registry)
+}
+
+fn remove_with(io: &mut impl NetworkAccess, registry: &Registry) -> Result<()> {
+    let (existing, motor_net) = io.tables()?;
+    let tap = registry.tap();
+    let chains = object_names(existing.as_ref(), "chain")?;
+    let counters = object_names(existing.as_ref(), "counter")?;
+    let input = format!("tenant_{tap}_input");
+    let forward = format!("tenant_{tap}_forward");
+    let nat = format!("tenant_{tap}_nat");
+    let counter = format!("tenant_{tap}_egress");
+    let mut fence = if existing.is_none() {
+        "add table inet motor_tenant\n".into()
+    } else {
+        String::new()
+    };
+    // Retain a complete set of ordinary owned objects until the TAP is gone.
+    // A crash must not leave unfamiliar fence names that block helper restart.
+    if !counters.contains(&counter) {
+        fence.push_str(&format!("add counter inet motor_tenant {counter} {{ }}\n"));
+    }
+    if !chains.contains(&nat) {
+        fence.push_str(&format!("add chain inet motor_tenant {nat} {{ type nat hook postrouting priority srcnat; policy accept; }}\n"));
+    }
+    replace_chain(
+        &mut fence,
+        &chains,
+        &input,
+        "type filter hook input priority -10; policy accept;",
+    );
+    fence.push_str(&format!(
+        "add rule inet motor_tenant {input} iifname \"{tap}\" counter drop\n"
+    ));
+    replace_chain(
+        &mut fence,
+        &chains,
+        &forward,
+        "type filter hook forward priority -10; policy accept;",
+    );
+    for key in ["iifname", "oifname"] {
+        fence.push_str(&format!(
+            "add rule inet motor_tenant {forward} {key} \"{tap}\" counter drop\n"
+        ));
+    }
+    io.apply(&fence)?;
+    let mut revoke = String::new();
+    for (table, document) in [
+        ("motor_tenant", existing.as_ref()),
+        ("motor_net", motor_net.as_ref()),
+    ] {
+        for set in if table == "motor_tenant" {
+            &["tenant_taps", "closed_taps"][..]
+        } else {
+            &["tenant_taps"][..]
+        } {
+            if let Some(mut members) = tap_members(document, set)? {
+                members.remove(&tap);
+                revoke.push_str(&set_members(table, set, &members));
+            }
+        }
+    }
+    if !revoke.is_empty() {
+        io.apply(&revoke)?;
+    }
+    io.remove_ufw(registry.tap_index)?;
+    io.remove_tap(registry)?;
+    let mut finish = String::new();
+    for chain in [&input, &forward, &nat] {
+        finish.push_str(&format!(
+            "flush chain inet motor_tenant {chain}\ndelete chain inet motor_tenant {chain}\n"
+        ));
+    }
+    finish.push_str(&format!("delete counter inet motor_tenant {counter}\n"));
+    if existing.is_none() {
+        // This operation created the table solely for its temporary fence.
+        finish.push_str("delete table inet motor_tenant\n");
+    }
+    io.apply(&finish)
+}
+
+fn tap_members(
+    document: Option<&serde_json::Value>,
+    name: &str,
+) -> Result<Option<std::collections::BTreeSet<String>>> {
+    let Some(document) = document else {
+        return Ok(None);
+    };
+    let sets: Vec<_> = document["nftables"]
+        .as_array()
+        .ok_or_else(|| Error("missing nft objects".into()))?
+        .iter()
+        .filter_map(|item| item.get("set"))
+        .filter(|set| set["name"] == name)
+        .collect();
+    if sets.is_empty() {
+        return Ok(None);
+    }
+    if sets.len() != 1 || sets[0]["type"] != "ifname" || sets[0].get("flags").is_some() {
+        return Err(Error(format!("unsafe tenant membership set {name}")));
+    }
+    let empty = Vec::new();
+    let elements = sets[0]
+        .get("elem")
+        .map_or(Some(&empty), |v| v.as_array())
+        .ok_or_else(|| Error("invalid tenant membership".into()))?;
+    let mut members = std::collections::BTreeSet::new();
+    for element in elements {
+        let value = element
+            .as_str()
+            .ok_or_else(|| Error("invalid tenant member".into()))?;
+        if !value.strip_prefix("mtap").is_some_and(|digits| {
+            digits
+                .parse::<u8>()
+                .is_ok_and(|n| n > 0 && n < 255 && value == format!("mtap{n}"))
+        }) || !members.insert(value.into())
+        {
+            return Err(Error("unsafe tenant member".into()));
+        }
+    }
+    Ok(Some(members))
+}
+
+struct ReconcileIo<Apply, ReconcileUfw, ValidateUplink> {
+    inspected: Result<ufw::State>,
+    apply: Apply,
+    reconcile_ufw: ReconcileUfw,
+    validate_uplink: ValidateUplink,
+}
+
+#[cfg(test)]
 fn reconcile_policy(
+    uplink: &str,
     registries: &[Registry],
     existing: Option<&serde_json::Value>,
     motor_net: Option<&serde_json::Value>,
-    inspected: Result<ufw::State>,
-    mut apply: impl FnMut(&str) -> Result<()>,
-    reconcile_ufw: impl FnOnce(&ufw::State) -> Result<()>,
+    io: ReconcileIo<
+        impl FnMut(&str) -> Result<()>,
+        impl FnOnce(&ufw::State) -> Result<()>,
+        impl FnMut() -> Result<()>,
+    >,
 ) -> Result<()> {
+    reconcile_policy_state(uplink, registries, existing, motor_net, io)?.require_ready()
+}
+
+fn reconcile_policy_state(
+    uplink: &str,
+    registries: &[Registry],
+    existing: Option<&serde_json::Value>,
+    motor_net: Option<&serde_json::Value>,
+    io: ReconcileIo<
+        impl FnMut(&str) -> Result<()>,
+        impl FnOnce(&ufw::State) -> Result<()>,
+        impl FnMut() -> Result<()>,
+    >,
+) -> Result<NetworkReadiness> {
+    let ReconcileIo {
+        inspected,
+        mut apply,
+        reconcile_ufw,
+        mut validate_uplink,
+    } = io;
     use std::collections::BTreeSet;
     let desired: BTreeSet<_> = registries.iter().map(Registry::tap).collect();
+    if let Err(error) = validate_uplink() {
+        fence_policy(registries, existing, motor_net, &mut apply)?;
+        return Ok(NetworkReadiness::FencedUplink(format!(
+            "uplink {uplink}: {error}"
+        )));
+    }
+    let previously_closed = match tap_members(existing, "closed_taps") {
+        Ok(members) => members.unwrap_or_default(),
+        Err(error) => {
+            apply(&prelude(registries, existing, &desired)?)?;
+            return Err(error);
+        }
+    };
     let ready: BTreeSet<_> = inspected
         .as_ref()
         .map(|state| {
             registries
                 .iter()
-                .filter(|r| state.ready.contains(&r.tap_index))
+                .filter(|r| {
+                    state.ready.contains(&r.tap_index) && !previously_closed.contains(&r.tap())
+                })
                 .map(Registry::tap)
                 .collect()
         })
         .unwrap_or_default();
     let closed = desired.difference(&ready).cloned().collect();
-    let transaction = policy_rules(registries, existing, &closed).and_then(|mut text| {
+    let transaction = policy_rules(uplink, registries, existing, &closed).and_then(|mut text| {
         text.push_str(&motor_net_members(motor_net, &ready)?);
         Ok(text)
     });
@@ -408,9 +850,20 @@ fn reconcile_policy(
     }
     // Only live, comment-owned UFW grants may release the per-TAP gate. An
     // earlier failure leaves new/mismatched tenants closed and unready.
+    // Rules match by interface name: a same-name replacement inherits them.
+    // Only root can rename interfaces, so that case is outside this boundary.
+    if let Err(error) = validate_uplink() {
+        let mut fence = set_members("motor_tenant", "closed_taps", &desired);
+        fence.push_str(&motor_net_members(motor_net, &BTreeSet::new())?);
+        apply(&fence)?;
+        return Ok(NetworkReadiness::FencedUplink(format!(
+            "uplink {uplink}: {error}"
+        )));
+    }
     let mut open = set_members("motor_tenant", "closed_taps", &BTreeSet::new());
     open.push_str(&motor_net_members(motor_net, &desired)?);
-    apply(&open)
+    apply(&open)?;
+    Ok(NetworkReadiness::Ready)
 }
 
 fn motor_net_members(
@@ -515,6 +968,19 @@ pub fn egress_bytes(registry: &Registry) -> Result<u64> {
     forward_bytes(&value, &registry.tap())
 }
 
+fn nft_table(tables: &serde_json::Value, name: &str) -> Result<Option<serde_json::Value>> {
+    let exists = tables["nftables"]
+        .as_array()
+        .ok_or_else(|| Error("missing nft tables".into()))?
+        .iter()
+        .any(|item| item["table"]["family"] == "inet" && item["table"]["name"] == name);
+    if exists {
+        Ok(Some(nft_json(&["-j", "list", "table", "inet", name])?))
+    } else {
+        Ok(None)
+    }
+}
+
 fn nft_json(args: &[&str]) -> Result<serde_json::Value> {
     let output = Command::new("/usr/sbin/nft").args(args).output()?;
     if !output.status.success() {
@@ -552,6 +1018,88 @@ fn forward_bytes(value: &serde_json::Value, tap: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tap_deletion_requires_kind_persistence_and_reserved_owner_not_just_name() {
+        let registry = crate::tenant::tests::registry("a");
+        let owned = serde_json::json!({"ifname":"mtap1", "linkinfo":{"info_kind":"tun", "info_data":{"type":"tap","persist":true,"user":400001}}});
+        let mut deleted = Vec::new();
+        remove_tap_with(
+            &registry,
+            || Ok(Some(owned.clone())),
+            |name| {
+                deleted.push(name.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(deleted, ["mtap1"]);
+        for (case, mut foreign) in [owned.clone(), owned.clone(), owned.clone(), owned.clone()]
+            .into_iter()
+            .enumerate()
+        {
+            match case {
+                0 => foreign["linkinfo"]["info_data"]["user"] = 400002.into(),
+                1 => foreign["linkinfo"]["info_kind"] = "dummy".into(),
+                2 => foreign["linkinfo"]["info_data"]["type"] = "tun".into(),
+                _ => foreign["linkinfo"]["info_data"]["persist"] = false.into(),
+            }
+            let result = remove_tap_with(
+                &registry,
+                || Ok(Some(foreign)),
+                |_| panic!("foreign link must not be deleted"),
+            );
+            assert!(result.unwrap_err().0.contains("foreign interface mtap1"));
+        }
+        remove_tap_with(&registry, || Ok(None), |_| panic!("already absent")).unwrap();
+    }
+    #[test]
+    fn explicit_uplink_preserves_the_original_enp6s0_nft_and_nat_bytes() {
+        // Captured from the policy renderer before the uplink became configurable,
+        // for one tenant on TAP 1. The fixture is not generated by this test.
+        let expected = include_str!("../../fixtures/tenant-enp6s0.nft");
+        let registry = crate::tenant::tests::registry("a");
+        let closed = std::collections::BTreeSet::new();
+        assert_eq!(
+            policy_rules("enp6s0", std::slice::from_ref(&registry), None, &closed).unwrap(),
+            expected
+        );
+        assert_eq!(
+            policy_rules("eno1", &[registry], None, &closed).unwrap(),
+            expected.replace("enp6s0", "eno1")
+        );
+    }
+
+    #[test]
+    fn uplink_must_exist_be_up_and_carry_the_configured_public_ipv4() {
+        let ip = "8.8.8.8".parse().unwrap();
+        let good = serde_json::json!([{"ifname":"eno1", "operstate":"UP", "flags":["UP", "LOWER_UP"],
+            "addr_info":[{"family":"inet", "scope":"global", "local":"8.8.8.8"}]}]);
+        validate_uplink_addresses("eno1", ip, &good).unwrap();
+        for broken in [
+            serde_json::json!([]),
+            {
+                let mut value = good.clone();
+                value[0]["operstate"] = "DOWN".into();
+                value
+            },
+            {
+                let mut value = good.clone();
+                value[0]["addr_info"][0]["local"] = "10.0.0.1".into();
+                value
+            },
+            {
+                let mut value = good.clone();
+                value[0]["flags"] = serde_json::json!([]);
+                value
+            },
+        ] {
+            assert!(validate_uplink_addresses("eno1", ip, &broken)
+                .unwrap_err()
+                .0
+                .contains("uplink eno1"));
+        }
+    }
+
     #[test]
     fn tenant_forward_bytes_select_only_own_forward_rule_not_host_or_nat() {
         let value = serde_json::json!({"nftables":[
@@ -731,25 +1279,428 @@ mod tests {
 }
 
 #[cfg(test)]
-mod reconciliation_tests {
+mod cleanup_tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    struct Host {
+        uplink_exists: bool,
+        chains: BTreeSet<String>,
+        counters: BTreeSet<String>,
+        taps: BTreeSet<String>,
+        grants: BTreeSet<u8>,
+        members: std::collections::BTreeMap<String, BTreeSet<String>>,
+        malformed: bool,
+        fence_seen: bool,
+    }
+    impl Host {
+        fn missing_uplink() -> Self {
+            Self {
+                uplink_exists: false,
+                chains: [1, 2]
+                    .into_iter()
+                    .flat_map(|n| {
+                        ["input", "forward", "nat"].map(move |s| format!("tenant_mtap{n}_{s}"))
+                    })
+                    .collect(),
+                counters: ["tenant_mtap1_egress".into(), "tenant_mtap2_egress".into()].into(),
+                taps: ["mtap1".into(), "mtap2".into()].into(),
+                grants: [1, 2].into(),
+                members: [
+                    (
+                        "motor_tenant/tenant_taps".into(),
+                        ["mtap1".into(), "mtap2".into()].into(),
+                    ),
+                    ("motor_tenant/closed_taps".into(), BTreeSet::new()),
+                    (
+                        "motor_net/tenant_taps".into(),
+                        ["mtap1".into(), "mtap2".into()].into(),
+                    ),
+                ]
+                .into(),
+                malformed: false,
+                fence_seen: false,
+            }
+        }
+        fn fenced(&self) -> bool {
+            self.fence_seen && self.chains.contains("tenant_mtap1_forward")
+        }
+    }
+    impl NetworkAccess for Host {
+        fn validate_uplink(&mut self) -> Result<()> {
+            if self.uplink_exists {
+                Ok(())
+            } else {
+                Err(Error("uplink eno1 is missing".into()))
+            }
+        }
+        fn tables(&mut self) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>)> {
+            let mut tenant = Vec::new();
+            for name in &self.chains {
+                tenant.push(serde_json::json!({"chain":{"family":"inet","table":"motor_tenant","name":name}}));
+            }
+            for name in &self.counters {
+                tenant.push(serde_json::json!({"counter":{"family":"inet","table":"motor_tenant","name":name}}));
+            }
+            let mut net = Vec::new();
+            for (name, members) in &self.members {
+                let (table, set) = name.split_once('/').unwrap();
+                let item = serde_json::json!({"set":{"family":"inet","table":table,"name":set,
+                    "type":if self.malformed {"integer"} else {"ifname"},"elem":members}});
+                if table == "motor_tenant" {
+                    tenant.push(item);
+                } else {
+                    net.push(item);
+                }
+            }
+            Ok((
+                Some(serde_json::json!({"nftables":tenant})),
+                Some(serde_json::json!({"nftables":net})),
+            ))
+        }
+        fn apply(&mut self, text: &str) -> Result<()> {
+            for line in text.lines() {
+                if line == "add rule inet motor_tenant tenant_mtap1_forward iifname \"mtap1\" counter drop" {
+                    self.fence_seen = true;
+                }
+                let words: Vec<_> = line.split_whitespace().collect();
+                match words.as_slice() {
+                    ["add", "counter", "inet", "motor_tenant", name, ..] => {
+                        self.counters.insert((*name).into());
+                    }
+                    ["add", "chain", "inet", "motor_tenant", name, ..] => {
+                        self.chains.insert((*name).into());
+                    }
+                    ["delete", "chain", "inet", "motor_tenant", name] => {
+                        assert!(self.chains.remove(*name));
+                    }
+                    ["delete", "counter", "inet", "motor_tenant", name] => {
+                        assert!(self.counters.remove(*name));
+                    }
+                    ["flush", "set", "inet", table, name] => {
+                        self.members
+                            .get_mut(&format!("{table}/{name}"))
+                            .unwrap()
+                            .clear();
+                    }
+                    ["add", "element", "inet", table, name, ..] => {
+                        let elements = line.split_once('{').unwrap().1.split_once('}').unwrap().0;
+                        for value in elements.split(',').map(|s| s.trim().trim_matches('"')) {
+                            self.members
+                                .get_mut(&format!("{table}/{name}"))
+                                .unwrap()
+                                .insert(value.into());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        fn remove_ufw(&mut self, index: u8) -> Result<()> {
+            assert!(self.fenced());
+            assert!(self.grants.remove(&index));
+            Ok(())
+        }
+        fn remove_tap(&mut self, registry: &Registry) -> Result<()> {
+            assert!(self.fenced());
+            assert!(self.taps.remove(&registry.tap()));
+            Ok(())
+        }
+    }
+    #[test]
+    fn removal_with_missing_uplink_deletes_owned_resources_only() {
+        let mut host = Host::missing_uplink();
+        assert!(host.validate_uplink().is_err());
+        remove_with(&mut host, &crate::tenant::tests::registry("a")).unwrap();
+        assert_eq!(
+            host.chains,
+            ["input", "forward", "nat"]
+                .map(|s| format!("tenant_mtap2_{s}"))
+                .into()
+        );
+        assert_eq!(host.counters, ["tenant_mtap2_egress".into()].into());
+        assert_eq!(host.taps, ["mtap2".into()].into());
+        assert_eq!(host.grants, [2].into());
+        assert_eq!(
+            host.members["motor_net/tenant_taps"],
+            ["mtap2".into()].into()
+        );
+        assert_eq!(
+            host.members["motor_tenant/tenant_taps"],
+            ["mtap2".into()].into()
+        );
+    }
+    #[test]
+    fn partial_target_objects_are_cleaned_even_with_no_uplink() {
+        let mut host = Host::missing_uplink();
+        host.chains.remove("tenant_mtap1_nat");
+        host.counters.remove("tenant_mtap1_egress");
+        remove_with(&mut host, &crate::tenant::tests::registry("a")).unwrap();
+        assert_eq!(host.grants, [2].into());
+        assert_eq!(host.taps, ["mtap2".into()].into());
+        assert!(!host
+            .chains
+            .iter()
+            .any(|name| name.starts_with("tenant_mtap1_")));
+        assert!(!host.counters.contains("tenant_mtap1_egress"));
+    }
+    #[test]
+    fn malformed_shared_membership_leaves_removal_fenced_without_deleting_foreign_state() {
+        let mut host = Host::missing_uplink();
+        host.uplink_exists = true;
+        host.malformed = true;
+        assert!(remove_with(&mut host, &crate::tenant::tests::registry("a")).is_err());
+        assert!(host.fenced());
+        assert_eq!(host.taps, ["mtap1".into(), "mtap2".into()].into());
+        assert_eq!(host.grants, [1, 2].into());
+        assert!(host.chains.contains("tenant_mtap2_forward"));
+    }
+}
+
+#[cfg(test)]
+pub(super) mod reconciliation_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_host_delegation_cannot_prevent_tenant_fence() {
+        let existing = serde_json::json!({"nftables":[
+            {"set":{"name":"tenant_taps","type":"ifname","elem":["mtap1","mtap2"]}},
+            {"set":{"name":"closed_taps","type":"ifname","elem":[]}}
+        ]});
+        let broken_host = serde_json::json!({"nftables":[
+            {"set":{"name":"tenant_taps","type":"ipv4_addr"}}
+        ]});
+        let mut writes = Vec::new();
+        let error = fence_policy(&[], Some(&existing), Some(&broken_host), |text| {
+            writes.push(text.to_owned());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.0.contains("motor_net"));
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].contains("closed_taps { \"mtap1\", \"mtap2\" }"));
+        assert!(writes[0].contains("iifname @closed_taps counter drop"));
+        assert!(writes[0].contains("oifname @closed_taps counter drop"));
+    }
+
+    pub(in crate::linux) fn fenced_startup(
+        config: &crate::config::Config,
+    ) -> Result<NetworkReadiness> {
+        let first = crate::tenant::tests::registry("a");
+        let mut second = crate::tenant::tests::registry("b");
+        second.tap_index = 2;
+        let net = serde_json::from_str(include_str!(
+            "../../../../script/runner/test-fixtures/nft-motor-net-v2-added-set.json"
+        ))
+        .unwrap();
+        let mut writes = Vec::new();
+        let state = reconcile_policy_state(
+            &config.uplink,
+            &[first, second],
+            None,
+            Some(&net),
+            ReconcileIo {
+                inspected: Ok(ufw::State::default()),
+                apply: |text: &str| {
+                    writes.push(text.to_owned());
+                    Ok(())
+                },
+                reconcile_ufw: |_: &ufw::State| panic!("invalid uplink must not grant UFW access"),
+                validate_uplink: || config.validate_network(),
+            },
+        )?;
+        assert!(
+            matches!(&state, NetworkReadiness::FencedUplink(problem) if problem.contains("uplink"))
+        );
+        assert_eq!(writes.len(), 2);
+        assert!(writes[0].contains("closed_taps { \"mtap1\", \"mtap2\" }"));
+        assert!(writes[1].contains("flush set inet motor_net tenant_taps\n"));
+        assert!(!writes[1].contains("add element inet motor_net tenant_taps"));
+        Ok(state)
+    }
+    #[test]
+    fn previously_fenced_gate_is_not_reopened_before_final_validation() {
+        let mut existing: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../script/runner/test-fixtures/nft-motor-tenant-v2-added-guards.json"
+        ))
+        .unwrap();
+        let mut net: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../script/runner/test-fixtures/nft-motor-net-v2-added-set.json"
+        ))
+        .unwrap();
+        for item in existing["nftables"].as_array_mut().unwrap() {
+            if item["set"]["name"] == "closed_taps" {
+                item["set"]["elem"] = serde_json::json!(["mtap1"]);
+            }
+        }
+        for item in net["nftables"].as_array_mut().unwrap() {
+            if item["set"]["name"] == "tenant_taps" {
+                item["set"]["elem"] = serde_json::json!(["mtap1"]);
+            }
+        }
+        for final_ok in [false, true] {
+            let writes = std::cell::RefCell::new(Vec::<String>::new());
+            let mut validations = 0;
+            let result = reconcile_policy(
+                "enp6s0",
+                &[crate::tenant::tests::registry("a")],
+                Some(&existing),
+                Some(&net),
+                ReconcileIo {
+                    inspected: Ok(ufw::State {
+                        owned: [1].into(),
+                        ready: [1].into(),
+                    }),
+                    apply: |text: &str| {
+                        writes.borrow_mut().push(text.into());
+                        Ok(())
+                    },
+                    reconcile_ufw: |_: &ufw::State| {
+                        assert!(writes.borrow()[0].contains("closed_taps { \"mtap1\" }"));
+                        Ok(())
+                    },
+                    validate_uplink: || {
+                        validations += 1;
+                        if validations == 2 && !final_ok {
+                            Err(Error("uplink disappeared".into()))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                },
+            );
+            assert_eq!(result.is_ok(), final_ok);
+            let writes = writes.borrow();
+            assert!(writes[0].contains("closed_taps { \"mtap1\" }"));
+            assert!(writes[0].contains("flush set inet motor_net tenant_taps\n"));
+            assert!(!writes[0].contains("add element inet motor_net tenant_taps"));
+            if final_ok {
+                assert!(writes
+                    .last()
+                    .unwrap()
+                    .contains("add element inet motor_net tenant_taps { \"mtap1\" }"));
+            } else {
+                assert!(writes.last().unwrap().contains("closed_taps { \"mtap1\" }"));
+                assert!(!writes
+                    .last()
+                    .unwrap()
+                    .contains("add element inet motor_net tenant_taps"));
+            }
+        }
+    }
+    #[test]
+    fn uplink_disappearing_before_final_open_keeps_existing_tenant_fenced() {
+        let registry = crate::tenant::tests::registry("a");
+        let mut writes = Vec::<String>::new();
+        let mut validations = 0;
+        let result = reconcile_policy(
+            "eno1",
+            &[registry],
+            None,
+            None,
+            ReconcileIo {
+                inspected: Ok(ufw::State {
+                    owned: [1].into(),
+                    ready: [1].into(),
+                }),
+                apply: |text: &str| {
+                    writes.push(text.into());
+                    Ok(())
+                },
+                reconcile_ufw: |_: &ufw::State| Ok(()),
+                validate_uplink: || {
+                    validations += 1;
+                    if validations == 1 {
+                        Ok(())
+                    } else {
+                        Err(Error("uplink eno1 disappeared".into()))
+                    }
+                },
+            },
+        );
+        assert!(result.unwrap_err().0.contains("uplink eno1 disappeared"));
+        assert_eq!(validations, 2);
+        assert!(!writes[0].contains("closed_taps { \"mtap1\" }"));
+        assert!(writes.last().unwrap().contains("closed_taps { \"mtap1\" }"));
+    }
+
+    #[test]
+    fn invalid_uplink_still_installs_the_fail_closed_prelude() {
+        let registry = crate::tenant::tests::registry("a");
+        let mut writes = Vec::<String>::new();
+        let result = reconcile_policy(
+            "eno1",
+            &[registry],
+            None,
+            None,
+            ReconcileIo {
+                inspected: Ok(ufw::State {
+                    owned: [1].into(),
+                    ready: [1].into(),
+                }),
+                apply: |text: &str| {
+                    writes.push(text.into());
+                    Ok(())
+                },
+                reconcile_ufw: |_: &ufw::State| panic!("must not open UFW while uplink is missing"),
+                validate_uplink: || Err(Error("uplink eno1 missing".into())),
+            },
+        );
+        assert!(result.unwrap_err().0.contains("uplink eno1 missing"));
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].contains("closed_taps { \"mtap1\" }"));
+    }
+    #[test]
+    fn healthy_reconcile_preserves_ready_gate_and_closes_only_new_gate() {
+        let first = crate::tenant::tests::registry("a");
+        let mut second = crate::tenant::tests::registry("b");
+        second.tap_index = 2;
+        let mut writes = Vec::<String>::new();
+        reconcile_policy(
+            "eno1",
+            &[first, second],
+            None,
+            None,
+            ReconcileIo {
+                inspected: Ok(ufw::State {
+                    owned: [1].into(),
+                    ready: [1].into(),
+                }),
+                apply: |text: &str| {
+                    writes.push(text.into());
+                    Ok(())
+                },
+                reconcile_ufw: |_: &ufw::State| Ok(()),
+                validate_uplink: || Ok(()),
+            },
+        )
+        .unwrap();
+        assert!(writes[0].contains("closed_taps { \"mtap2\" }"));
+        assert!(!writes[0].contains("closed_taps { \"mtap1\" }"));
+        assert_eq!(writes[1], "flush set inet motor_tenant closed_taps\n");
+    }
     #[test]
     fn ufw_failure_keeps_new_tenant_gate_closed_and_returns_unready() {
         let registry = crate::tenant::tests::registry("a");
         let writes = std::cell::RefCell::new(Vec::<String>::new());
         let error = reconcile_policy(
+            "enp6s0",
             &[registry],
             None,
             None,
-            Ok(ufw::State::default()),
-            |text| {
-                writes.borrow_mut().push(text.into());
-                Ok(())
-            },
-            |_| {
-                assert!(writes.borrow()[0]
-                    .contains("add element inet motor_tenant closed_taps { \"mtap1\" }"));
-                Err(Error("simulated UFW failure".into()))
+            ReconcileIo {
+                inspected: Ok(ufw::State::default()),
+                apply: |text: &str| {
+                    writes.borrow_mut().push(text.into());
+                    Ok(())
+                },
+                reconcile_ufw: |_: &ufw::State| {
+                    assert!(writes.borrow()[0]
+                        .contains("add element inet motor_tenant closed_taps { \"mtap1\" }"));
+                    Err(Error("simulated UFW failure".into()))
+                },
+                validate_uplink: || Ok(()),
             },
         )
         .unwrap_err();
@@ -765,18 +1716,22 @@ mod reconciliation_tests {
         let registry = crate::tenant::tests::registry("a");
         let writes = std::cell::RefCell::new(Vec::<String>::new());
         reconcile_policy(
+            "enp6s0",
             &[registry],
             None,
             None,
-            Ok(ufw::State::default()),
-            |text| {
-                writes.borrow_mut().push(text.into());
-                Ok(())
-            },
-            |_| {
-                assert!(writes.borrow()[0].contains("closed_taps { \"mtap1\" }"));
-                assert!(writes.borrow()[0].contains("tenant_unmatched"));
-                Ok(())
+            ReconcileIo {
+                inspected: Ok(ufw::State::default()),
+                apply: |text: &str| {
+                    writes.borrow_mut().push(text.into());
+                    Ok(())
+                },
+                reconcile_ufw: |_: &ufw::State| {
+                    assert!(writes.borrow()[0].contains("closed_taps { \"mtap1\" }"));
+                    assert!(writes.borrow()[0].contains("tenant_unmatched"));
+                    Ok(())
+                },
+                validate_uplink: || Ok(()),
             },
         )
         .unwrap();
@@ -800,15 +1755,19 @@ mod ufw_failure_fence_tests {
             ready: [1].into(),
         };
         assert!(reconcile_policy(
+            "enp6s0",
             &[registry],
             None,
             None,
-            Ok(state),
-            |text| {
-                writes.push(text.into());
-                Ok(())
+            ReconcileIo {
+                inspected: Ok(state),
+                apply: |text: &str| {
+                    writes.push(text.into());
+                    Ok(())
+                },
+                reconcile_ufw: |_: &ufw::State| Err(Error("UFW failure".into())),
+                validate_uplink: || Ok(()),
             },
-            |_| Err(Error("UFW failure".into()))
         )
         .is_err());
         assert_eq!(writes.len(), 2);
@@ -866,7 +1825,13 @@ mod legacy_migration_tests {
         ))
         .unwrap();
         let registry = crate::tenant::tests::registry("a");
-        let text = policy_rules(&[registry], Some(&document), &["mtap1".into()].into()).unwrap();
+        let text = policy_rules(
+            "enp6s0",
+            &[registry],
+            Some(&document),
+            &["mtap1".into()].into(),
+        )
+        .unwrap();
         assert!(text.contains("tenant_public"));
         assert!(text.contains("tenant_unmatched"));
         assert!(text.contains("closed_taps { \"mtap1\" }"));

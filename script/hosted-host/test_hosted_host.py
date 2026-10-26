@@ -67,6 +67,13 @@ def cutover_rule(guest_ram_mib, placeable, reserve_mib=TENANT_MEMORY_RESERVE_MIB
 
 
 class HostedHostConfigTests(unittest.TestCase):
+    def test_helper_uplink_is_explicit_and_rendered_for_a_different_host(self):
+        config = hosted.helper_config(998, 998, 'eno1', '8.8.8.8')
+        self.assertEqual((config['uplink'], config['public_ipv4']), ('eno1', '8.8.8.8'))
+        for uplink in ['', 'lo', 'mtap*', 'eno1";accept']:
+            with self.subTest(uplink=uplink), self.assertRaises(ValueError):
+                hosted.helper_config(998, 998, uplink, '8.8.8.8')
+
     def test_host_config_has_every_required_motor_host_field_and_no_fake_broker(self):
         config = hosted.host_config(HOST_ID)
         fields = struct_fields("crates/motor-host/src/main.rs", "Config")
@@ -84,7 +91,7 @@ class HostedHostConfigTests(unittest.TestCase):
                 hosted.host_config(host_id)
 
     def test_helper_config_matches_the_helper_struct_and_admits_only_the_host_account(self):
-        config = hosted.helper_config(998, 998)
+        config = hosted.helper_config(998, 998, "enp6s0", "8.8.8.8")
         self.assertEqual(set(config), struct_fields("crates/motor-vm-helper/src/config.rs", "Config") - {"proxy_for_jobs"})
         self.assertEqual(set(config["slots"][0]), struct_fields("crates/motor-vm-helper/src/config.rs", "SlotConfig"))
         self.assertEqual(config["allowed_uids"], [998])
@@ -97,7 +104,7 @@ class HostedHostConfigTests(unittest.TestCase):
         for slot in config["slots"]:
             self.assertFalse(hosted.cpus(slot["cpus"]) & hosted.cpus(hosted.WINDOWS_CPUS))
         with self.assertRaises(ValueError):
-            hosted.helper_config(0, 0)
+            hosted.helper_config(0, 0, "enp6s0", "8.8.8.8")
 
     def test_tenant_one_fits_beside_the_runner_and_passes_provisioning_checks(self):
         tenant = hosted.tenant_config(SUB)
@@ -121,7 +128,7 @@ class HostedHostConfigTests(unittest.TestCase):
         self.assertIn("--sccache-size-gib 25 ", hosted.load_provision().runner_args(tenant))
         self.assertEqual(tenant["resolvers"], hosted.host_config(HOST_ID)["resolvers"])
         # The tenant VM's uid must avoid every helper uid range.
-        helper = hosted.helper_config(998, 998)
+        helper = hosted.helper_config(998, 998, "enp6s0", "8.8.8.8")
         uid = 400000 + tenant["tap_index"]
         self.assertFalse(helper["uid_base"] <= uid < helper["uid_base"] + len(helper["slots"]))
         job = helper["job_account_range"]
@@ -277,7 +284,7 @@ class InstalledStateTests(unittest.TestCase):
         self.record_path.write_text(hosted.render_json(record))
         self.registry_path.write_text(hosted.render_json(self.registry_entry(record) if registry is None else registry))
         provision.HELPER_CONFIG.write_text(
-            hosted.render_json(hosted.helper_config(UID, UID, record)) if helper is None else helper)
+            hosted.render_json(hosted.helper_config(UID, UID, "enp6s0", "8.8.8.8", record)) if helper is None else helper)
 
     def resized(self):
         return {**hosted.tenant_config(SUB), **RESIZED}
@@ -317,7 +324,7 @@ class InstalledStateTests(unittest.TestCase):
                 record = dict(self.resized(), cpuset=cpuset)
                 # Record, registry and helper edited alike, so only the cpuset rule
                 # can fail.
-                helper = json.loads(hosted.render_json(hosted.helper_config(UID, UID, self.resized())))
+                helper = json.loads(hosted.render_json(hosted.helper_config(UID, UID, "enp6s0", "8.8.8.8", self.resized())))
                 for slot in helper["slots"]:
                     slot["cpus"] = cpuset
                 self.install(record, helper=hosted.render_json(helper))
@@ -350,11 +357,11 @@ class InstalledStateTests(unittest.TestCase):
 
     def test_a_helper_config_other_than_the_installed_render_fails(self):
         record = self.resized()
-        template = hosted.render_json(hosted.helper_config(UID, UID))
-        changed = json.loads(hosted.render_json(hosted.helper_config(UID, UID, record)))
+        template = hosted.render_json(hosted.helper_config(UID, UID, "enp6s0", "8.8.8.8"))
+        changed = json.loads(hosted.render_json(hosted.helper_config(UID, UID, "enp6s0", "8.8.8.8", record)))
         changed["slots"][0]["io_weight"] = 20
         for label, helper in (("the template's cpuset", template), ("another slot weight", hosted.render_json(changed)),
-                              ("another account", hosted.render_json(hosted.helper_config(UID + 1, UID, record)))):
+                              ("another account", hosted.render_json(hosted.helper_config(UID + 1, UID, "enp6s0", "8.8.8.8", record)))):
             with self.subTest(label):
                 self.install(record, helper=helper)
                 self.assertFails("differs from the render of the installed tenant record")
@@ -464,6 +471,8 @@ class InstalledRenderTests(unittest.TestCase):
         self.path.write_text(hosted.render_json(self.record))
 
     def cli(self, *args):
+        if args[0] == 'helper':
+            args = (*args, '--uplink', 'enp6s0', '--public-ip', '8.8.8.8')
         return subprocess.run(["python3", str(HERE / "hosted_host.py"), *map(str, args)], capture_output=True, text=True)
 
     def test_an_installed_record_keeps_its_sizing(self):
@@ -473,7 +482,7 @@ class InstalledRenderTests(unittest.TestCase):
         self.assertEqual(rendered.stdout, self.path.read_text())
         helper = self.cli("helper", "--uid", UID, "--gid", UID, "--installed", self.path)
         self.assertEqual(helper.returncode, 0, helper.stderr)
-        self.assertEqual(helper.stdout, hosted.render_json(hosted.helper_config(UID, UID, self.record)))
+        self.assertEqual(helper.stdout, hosted.render_json(hosted.helper_config(UID, UID, "enp6s0", "8.8.8.8", self.record)))
         self.assertEqual({slot["cpus"] for slot in json.loads(helper.stdout)["slots"]}, {"0-11,16-27"})
 
     def test_a_first_install_uses_the_template(self):
@@ -484,6 +493,29 @@ class InstalledRenderTests(unittest.TestCase):
         helper = self.cli("helper", "--uid", UID, "--gid", UID)
         self.assertEqual(helper.returncode, 0, helper.stderr)
         self.assertEqual({slot["cpus"] for slot in json.loads(helper.stdout)["slots"]}, {template["cpuset"]})
+
+    def test_a_first_install_can_override_the_image_and_sizing_without_a_subject_in_the_template(self):
+        template = dict(self.record, image_version="fresh-main-image")
+        del template["sub"]
+        self.path.write_text(hosted.render_json(template))
+        rendered = self.cli("tenant", "--sub", SUB, "--template", self.path)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertEqual(json.loads(rendered.stdout), dict(template, sub=SUB))
+        self.path.write_text(rendered.stdout)
+        helper = self.cli("helper", "--uid", UID, "--gid", UID, "--installed", self.path)
+        self.assertEqual(helper.returncode, 0, helper.stderr)
+        self.assertEqual({slot["cpus"] for slot in json.loads(helper.stdout)["slots"]}, {"0-11,16-27"})
+
+    def test_a_template_override_cannot_replace_an_installed_record(self):
+        refused = self.cli("tenant", "--sub", SUB, "--installed", self.path, "--template", self.path)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("keeps its sizing and image", refused.stderr)
+
+    def test_a_first_install_template_still_passes_provisioning_checks(self):
+        self.path.write_text(hosted.render_json(dict(self.record, vcpu_ceiling=0)))
+        refused = self.cli("tenant", "--sub", SUB, "--template", self.path)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("vcpu_ceiling", refused.stderr)
 
     def test_an_installed_record_refuses_template_overrides_and_another_subject(self):
         for args in (["--disk-quota-gib", "400"], ["--image-version", "next-image"]):
@@ -570,8 +602,8 @@ class InstallScriptTests(unittest.TestCase):
         host = hosted.host_config(HOST_ID)
         self.assertEqual(values["HOST_BINARY"], str(hosted.HOST_BINARY))
         self.assertEqual(values["HELPER_BINARY"], str(hosted.HELPER_BINARY))
-        self.assertEqual(values["LOADER"], hosted.helper_config(998, 998)["loader"])
-        self.assertEqual(values["FIRECRACKER_DIR"] + "/firecracker", hosted.helper_config(998, 998)["firecracker"])
+        self.assertEqual(values["LOADER"], hosted.helper_config(998, 998, "enp6s0", "8.8.8.8")["loader"])
+        self.assertEqual(values["FIRECRACKER_DIR"] + "/firecracker", hosted.helper_config(998, 998, "enp6s0", "8.8.8.8")["firecracker"])
         self.assertEqual(values["SIGNING_KEY"], host["host_signing_key"])
         self.assertEqual(values["TLS_CERT"], host["certificate"])
         self.assertEqual(values["TLS_KEY"], host["private_key"])
@@ -608,6 +640,8 @@ class InstallScriptTests(unittest.TestCase):
     def test_identity_arguments_are_required_and_not_defaulted(self):
         self.assertIn("port='' host_id='' public_ip='' tenant_sub='' tenant_quota='' tenant_image=''", self.script)
         self.assertIn('[ -n "$host_id" ] && [ -n "$tenant_sub" ] || { echo "installing needs --host-id and --tenant-sub"', self.script)
+        self.assertIn('[ -n "$uplink" ] || { echo "installing needs --uplink (no default)"', self.script)
+        self.assertIn('uplink=$(installed "$HELPER_CONFIG" uplink)', self.script)
 
     def test_image_version_is_operator_managed_after_a_switch(self):
         # The installed record carries the image switch-image wrote; installing,
@@ -624,12 +658,22 @@ class InstallScriptTests(unittest.TestCase):
         configs = self.function("configs")
         # Each render with its continuation lines.
         renders = re.findall(r"render (helper|tenant) ((?:[^\n]*\\\n)*[^\n]*)", configs)
-        self.assertEqual([kind for kind, _ in renders], ["helper", "tenant"])
-        for kind, line in renders:
-            self.assertIn('${installed_record:+--installed "$installed_record"}', line, kind)
+        self.assertEqual([kind for kind, _ in renders], ["tenant", "helper"])
+        self.assertIn('${installed_record:+--installed "$installed_record"}', renders[0][1])
+        self.assertIn('${tenant_template:+--template "$tenant_template"}', renders[0][1])
+        self.assertIn('--installed "$scratch/tenant.json"', renders[1][1])
         # --check and --start never re-derive the sizing from the template: the
         # disk quota is no longer read back to feed a template render.
         self.assertNotIn('tenant_quota=$(', self.script)
+
+    def test_build_uses_rustup_when_there_is_no_runner_environment(self):
+        build = self.function("build_binaries")
+        self.assertIn('[ -f /srv/build/runner.env ] && source /srv/build/runner.env', build)
+        self.assertIn('if ! command -v cargo >/dev/null && [ -f "$HOME/.cargo/env" ]; then source "$HOME/.cargo/env"; fi', build)
+
+    def test_only_install_can_defer_a_missing_registry_until_provisioning(self):
+        self.assertIn('elif [ "$check" = 0 ] && [ ! -e "$TENANT_REGISTRY" ]; then', self.function("preflight"))
+        self.assertIn('tenant not provisioned yet; run provision.py before --check or --start', self.script)
 
     def test_check_and_start_verify_the_installed_state(self):
         configs = self.function("configs")

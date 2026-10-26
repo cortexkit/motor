@@ -5,6 +5,42 @@ use motor_lease::{JobState, UsageOutcome};
 use serde_json::{json, Value};
 
 const MS: u64 = NOW * 1000;
+
+#[test]
+fn fresh_counter_baselines_and_unexpected_resets_never_bill_negative_or_wrapped_usage() {
+    for (baseline, last, expected) in [(0, 9, 9), (100, 0, 0)] {
+        let mut h = host();
+        admitted(&mut h, JOB, 1);
+        h.event(
+            "tenant",
+            &event(2, TenantEventKind::Started, Some(JOB), None),
+            MS,
+        )
+        .unwrap();
+        for bytes in [baseline, last] {
+            h.sample(
+                "tenant",
+                Metrics {
+                    memory_bytes: 0,
+                    egress_bytes: bytes,
+                },
+            )
+            .unwrap();
+        }
+        h.event(
+            "tenant",
+            &event(3, TenantEventKind::Terminal, Some(JOB), None),
+            MS + 1000,
+        )
+        .unwrap();
+        h.receive_terminal(JOB, terminal(JOB, "exit"), MS + 1000)
+            .unwrap();
+        assert_eq!(
+            h.snapshot.billing[JOB].usage.as_ref().unwrap().egress_bytes,
+            Some(expected)
+        );
+    }
+}
 fn admitted(h: &mut Host, job: &str, seq: u64) {
     let (id, _) = h.claim(claims(job), MS).unwrap();
     h.delivered(id).unwrap();

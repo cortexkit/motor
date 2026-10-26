@@ -27,13 +27,7 @@ pub(crate) enum Phase {
 pub(crate) type Hook = std::sync::Arc<dyn Fn(Phase) -> io::Result<()> + Send + Sync>;
 
 pub(crate) fn unsupported(config: &Config) -> Option<String> {
-    if config.windows_instance() {
-        Some("outbound network is unavailable on the Windows instance".into())
-    } else if config.job_network.is_none() {
-        Some(config.job_network_unavailable.clone())
-    } else {
-        None
-    }
+    enable(config, false).err().map(|error| error.to_string())
 }
 
 pub(crate) fn initialize(config: &mut Config) {
@@ -47,27 +41,30 @@ pub(crate) fn initialize(config: &mut Config) {
         // firewall probe fails. Live units remain untouched during deployments.
         if real_host {
             if let Err(error) = linux::reconcile() {
-                config.job_network = None;
+                config
+                    .network_cleanup_pending
+                    .store(true, std::sync::atomic::Ordering::Release);
                 config.job_network_unavailable = format!("network startup cleanup failed: {error}");
-                tracing::warn!(%error, "job network cleanup failed; outbound network disabled");
+                tracing::warn!(%error, "job network cleanup failed; net requests will retry");
                 return;
             }
         }
     }
-    let result = enable(config);
+    let result = enable(config, true);
     if let Err(error) = result {
-        config.job_network = None;
         config.job_network_unavailable = error.to_string();
-        tracing::warn!(%error, "job outbound network disabled");
+        tracing::warn!(%error, "job outbound network not ready; net requests will re-probe");
     }
 }
 
-fn enable(config: &Config) -> io::Result<()> {
-    if config.job_network.is_none() {
-        return Err(io::Error::other("--job-network veth is not enabled"));
-    }
+fn enable(config: &Config, full_probe: bool) -> io::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = full_probe;
     if config.windows_instance() {
         return Err(io::Error::other("Windows job network is unsupported"));
+    }
+    if config.job_network.is_none() {
+        return Err(io::Error::other("--job-network veth is not enabled"));
     }
     #[cfg(test)]
     if let Some(hook) = &config.job_network_hook {
@@ -78,7 +75,20 @@ fn enable(config: &Config) -> io::Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        linux::probe()
+        if config
+            .network_cleanup_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            linux::reconcile()?;
+            config
+                .network_cleanup_pending
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        if full_probe {
+            linux::probe()
+        } else {
+            linux::admission_probe()
+        }
     }
     #[cfg(not(target_os = "linux"))]
     Err(io::Error::other("veth job network requires a Linux host"))

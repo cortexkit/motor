@@ -12,8 +12,14 @@ use crate::{Error, Result};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{
+            ffi::OsStrExt,
+            fs::{OpenOptionsExt, PermissionsExt},
+        },
+    },
+    path::{Component, Path, PathBuf},
 };
 
 /// How long a removed tenant's data waits in quarantine before it is deleted.
@@ -22,6 +28,7 @@ use std::{
 /// (time to undo a mistaken removal) plus the host's wait for the tenant's
 /// last job to drain (about a day) stays well inside that promise.
 pub const QUARANTINE_S: u64 = 7 * 24 * 60 * 60;
+const COMPLETE: &str = "complete";
 
 /// Where a tenant's data and records live. Production uses `live()`; tests
 /// point every path into a scratch directory.
@@ -122,6 +129,7 @@ pub fn lock(paths: &Paths) -> Result<File> {
 /// it, so an operator can undo the removal. Nothing is deleted yet.
 pub fn begin(paths: &Paths, tenant: &str, unix_s: u64) -> Result<PathBuf> {
     crate::tenant::validate_name(tenant)?;
+    let _home_parent = directory_no_symlinks(&paths.root.join("tenants"))?;
     let removed = paths.removed();
     match fs::symlink_metadata(&removed) {
         Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
@@ -138,6 +146,13 @@ pub fn begin(paths: &Paths, tenant: &str, unix_s: u64) -> Result<PathBuf> {
     fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o700))?;
     let records = quarantine.join("records");
     fs::create_dir(&records)?;
+    let name = std::ffi::CString::new(tenant).map_err(|e| Error(e.to_string()))?;
+    durable_write(
+        &records.join("home-identity.json"),
+        &serde_json::to_vec(&home_identity(&_home_parent, &name)?)
+            .map_err(|e| Error(e.to_string()))?,
+        0o600,
+    )?;
     for (source, saved) in [
         (paths.registry_file(tenant), "registry.json"),
         (paths.provision_file(tenant), "provision.json"),
@@ -171,6 +186,19 @@ pub fn begin(paths: &Paths, tenant: &str, unix_s: u64) -> Result<PathBuf> {
 /// `pending` finds the quarantine folder and a retry completes it.
 pub fn finish(paths: &Paths, tenant: &str, quarantine: &Path) -> Result<()> {
     crate::tenant::validate_name(tenant)?;
+    // Pin both parents before deleting records. renameat never resolves an
+    // intermediate symlink, even if a spelling is changed after these opens.
+    let home_parent = directory_no_symlinks(&paths.root.join("tenants"))?;
+    let destination = directory_no_symlinks(quarantine)?;
+    let name = std::ffi::CString::new(tenant).map_err(|e| Error(e.to_string()))?;
+    let identity = home_identity(&home_parent, &name)?;
+    check_home_identity(quarantine, &identity)?;
+    let present = !identity.is_null();
+    if !present {
+        // A successful removal with no home must not revive when the same
+        // tenant name is provisioned again later.
+        durable_write(&quarantine.join(COMPLETE), b"1\n", 0o600)?;
+    }
     let bindings = read_bindings(paths)?;
     if bindings.values().any(|entry| entry["tenant"] == tenant) {
         let kept: serde_json::Map<_, _> = bindings
@@ -189,18 +217,194 @@ pub fn finish(paths: &Paths, tenant: &str, quarantine: &Path) -> Result<()> {
             Err(e) => return Err(e.into()),
         }
     }
-    let home = paths.home(tenant);
-    match fs::symlink_metadata(&home) {
-        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
-            fs::rename(&home, quarantine.join("home"))?;
-            sync_dir(home.parent().unwrap())?;
-            sync_dir(quarantine)?;
+    if present {
+        if unsafe {
+            libc::renameat(
+                home_parent.as_raw_fd(),
+                name.as_ptr(),
+                destination.as_raw_fd(),
+                c"home".as_ptr(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
         }
-        Ok(_) => return Err(Error("tenant home is not a directory".into())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+        home_parent.sync_all()?;
+        destination.sync_all()?;
+    }
+    durable_write(&quarantine.join(COMPLETE), b"1\n", 0o600)?;
+    Ok(())
+}
+
+fn home_identity(parent: &File, name: &std::ffi::CStr) -> Result<serde_json::Value> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(serde_json::Value::Null)
+        } else {
+            Err(error.into())
+        };
+    }
+    let metadata = unsafe { metadata.assume_init() };
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(Error("tenant home is not a directory".into()));
+    }
+    Ok(serde_json::json!({"dev":metadata.st_dev,"ino":metadata.st_ino}))
+}
+
+fn check_home_identity(quarantine: &Path, current: &serde_json::Value) -> Result<()> {
+    if current.is_null() {
+        return Ok(());
+    }
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(quarantine.join("records/home-identity.json"))?)
+            .map_err(|e| Error(e.to_string()))?;
+    if &saved != current {
+        return Err(Error(
+            "tenant home no longer matches removal journal; manual recovery required".into(),
+        ));
     }
     Ok(())
+}
+
+fn directory_no_symlinks(path: &Path) -> Result<File> {
+    if !path.is_absolute() {
+        return Err(Error("removal directory must be absolute".into()));
+    }
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")?;
+    for component in path.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => {
+                std::ffi::CString::new(name.as_bytes()).map_err(|e| Error(e.to_string()))?
+            }
+            _ => return Err(Error("invalid removal directory component".into())),
+        };
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        directory = unsafe { File::from_raw_fd(fd) };
+    }
+    Ok(directory)
+}
+
+/// Replay network cleanup from the saved registry before finishing either a
+/// normal removal or an interrupted one. Records never outrun network cleanup.
+pub fn finish_with_network(
+    paths: &Paths,
+    tenant: &str,
+    quarantine: &Path,
+    cleanup: impl FnOnce(&crate::tenant::Registry) -> Result<()>,
+) -> Result<()> {
+    let registry: crate::tenant::Registry =
+        serde_json::from_slice(&fs::read(quarantine.join("records/registry.json"))?)
+            .map_err(|e| Error(e.to_string()))?;
+    registry.validate(tenant)?;
+    cleanup(&registry)?;
+    finish(paths, tenant, quarantine)
+}
+
+/// Resume through the online removal path, checking current index ownership
+/// under the provisioning lock before any saved record can authorize cleanup.
+pub fn resume_with_network(
+    paths: &Paths,
+    tenant: &str,
+    mut read_registry: impl FnMut(&Path) -> Result<crate::tenant::Registry>,
+    cleanup: impl FnOnce(&crate::tenant::Registry) -> Result<()>,
+) -> Result<Option<PathBuf>> {
+    let _lock = lock(paths)?;
+    let Some(quarantine) = pending(paths, tenant)? else {
+        return Ok(None);
+    };
+    let saved = read_registry(&quarantine.join("records/registry.json"))?;
+    saved.validate(tenant)?;
+    let parent = directory_no_symlinks(&paths.root.join("tenants"))?;
+    let name = std::ffi::CString::new(tenant).map_err(|e| Error(e.to_string()))?;
+    check_home_identity(&quarantine, &home_identity(&parent, &name)?)?;
+    if let Some(owner) = reassigned_tap_owner(paths, tenant, &saved, false, &mut read_registry)? {
+        eprintln!("tenant {tenant}: network cleanup refused because TAP index belongs to {owner}; completing data only");
+    } else {
+        cleanup(&saved)?;
+    }
+    finish(paths, tenant, &quarantine)?;
+    Ok(Some(quarantine))
+}
+
+/// An index identifies host network objects and the uid, not an incarnation.
+/// Saved records must never authorize deletion after another tenant reused it.
+pub fn refuse_reassigned_tap(
+    paths: &Paths,
+    tenant: &str,
+    saved: &crate::tenant::Registry,
+    allow_current: bool,
+    mut read_registry: impl FnMut(&Path) -> Result<crate::tenant::Registry>,
+) -> Result<()> {
+    if let Some(name) =
+        reassigned_tap_owner(paths, tenant, saved, allow_current, &mut read_registry)?
+    {
+        return Err(Error(format!(
+            "cannot replay removal: tenant TAP index has been reassigned to {name}"
+        )));
+    }
+    Ok(())
+}
+
+fn reassigned_tap_owner(
+    paths: &Paths,
+    tenant: &str,
+    saved: &crate::tenant::Registry,
+    allow_current: bool,
+    mut read_registry: impl FnMut(&Path) -> Result<crate::tenant::Registry>,
+) -> Result<Option<String>> {
+    let entries = match fs::read_dir(&paths.registry) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut owner = None;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension() != Some(std::ffi::OsStr::new("json")) {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error("invalid registry filename".into()))?;
+        crate::tenant::validate_name(name)?;
+        if allow_current && name == tenant {
+            continue;
+        }
+        let current = read_registry(&path)?;
+        current.validate(name)?;
+        if current.tap_index == saved.tap_index {
+            if name == tenant {
+                return Err(Error("tenant registry reappeared during removal".into()));
+            }
+            owner = Some(name.to_owned());
+        }
+    }
+    Ok(owner)
 }
 
 /// A removal whose records are already gone but whose home was not yet moved:
@@ -214,6 +418,7 @@ pub fn pending(paths: &Paths, tenant: &str) -> Result<Option<PathBuf>> {
     let mut newest: Option<(u64, PathBuf)> = None;
     for (path, name, unix_s) in quarantined(paths)? {
         if name == tenant
+            && !path.join(COMPLETE).exists()
             && path.join("records").is_dir()
             && !path.join("home").exists()
             && newest.as_ref().is_none_or(|(at, _)| unix_s > *at)
@@ -234,7 +439,10 @@ pub fn purge(paths: &Paths, now_s: u64) -> Result<Vec<PathBuf>> {
         if now_s.saturating_sub(unix_s) < QUARANTINE_S {
             continue;
         }
-        if !path.join("home").exists() && paths.home(&tenant).exists() {
+        if !path.join(COMPLETE).exists()
+            && !path.join("home").exists()
+            && paths.home(&tenant).exists()
+        {
             eprintln!(
                 "tenant {tenant}: removal at {unix_s} never moved its home; data is still at {}",
                 paths.home(&tenant).display()

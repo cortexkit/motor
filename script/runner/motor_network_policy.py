@@ -15,9 +15,83 @@ import shlex
 import signal
 import stat
 import subprocess
+import types
 
 LOCK = pathlib.Path('/run/motor-network/lock')
 SOURCE = pathlib.Path('/etc/nftables.d/motor-net.nft')
+SETTINGS = pathlib.Path('/etc/motor-network.json')
+TEMPLATE = pathlib.Path('/usr/local/libexec/motor-net-template.nft')
+readiness = types.ModuleType('motor_network_ready')
+exec(compile(pathlib.Path(__file__).with_name('motor_network_ready.py').read_bytes(),
+             'motor_network_ready.py', 'exec'), readiness.__dict__)
+
+
+def checked_settings(value):
+    if not isinstance(value, dict) or set(value) != {'uplink', 'public_ipv4'}:
+        raise ValueError('network settings require exactly uplink and public_ipv4')
+    uplink = value['uplink']
+    if not isinstance(uplink, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,14}', uplink) or uplink in {'any', 'lo'}:
+        raise ValueError(f'invalid uplink {uplink!r}')
+    address = ipaddress.IPv4Address(value['public_ipv4'])
+    if not address.is_global or address.is_multicast:
+        raise ValueError(f'uplink {uplink} needs a public IPv4 address')
+    return value
+
+
+def validate_uplink(settings, addresses=None):
+    checked_settings(settings)
+    uplink = settings['uplink']
+    if addresses is None:
+        try:
+            addresses = json.loads(command('/usr/sbin/ip', '-j', '-4', 'address', 'show', 'dev', uplink))
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ValueError(f'uplink {uplink} is missing or unreadable: {error}') from error
+    if (not isinstance(addresses, list) or len(addresses) != 1 or addresses[0].get('ifname') != uplink
+            or addresses[0].get('operstate') != 'UP' or 'UP' not in addresses[0].get('flags', [])
+            or not any(item.get('family') == 'inet' and item.get('scope') == 'global'
+                       and item.get('local') == settings['public_ipv4'] for item in addresses[0].get('addr_info', []))):
+        raise ValueError(f"uplink {uplink} must exist, be UP and carry public IPv4 {settings['public_ipv4']}")
+    return settings
+
+
+def read_settings(check_link=True):
+    fd = os.open(SETTINGS, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(fd) as source:
+        metadata = os.fstat(source.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            raise ValueError('unsafe /etc/motor-network.json')
+        text = source.read(4097)
+    if len(text) > 4096:
+        raise ValueError('network settings exceed read bound')
+    settings = checked_settings(json.loads(text))
+    return validate_uplink(settings) if check_link else settings
+
+
+def render_source(source, uplink):
+    # Keep the historical file as the shared host/guest template. Its three
+    # interface tokens are replaced only with the explicit, validated host name.
+    if not isinstance(uplink, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,14}', uplink) or uplink in {'any', 'lo'}:
+        raise ValueError(f'invalid uplink {uplink!r}')
+    if source.count('"enp6s0"') != 3:
+        raise ValueError('network template must contain exactly three uplink tokens')
+    return source.replace('"enp6s0"', f'"{uplink}"')
+
+
+def install_settings(source):
+    settings = checked_settings(json.loads(source.read_text()))
+    with network_lock(mutate=True):
+        readiness.invalidate()
+        temporary = SETTINGS.with_name('.motor-network-settings-' + os.urandom(16).hex())
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, 'w') as output:
+                os.fchmod(output.fileno(), 0o644)
+                output.write(json.dumps(settings, indent=2) + '\n')
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, SETTINGS)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def command(*args, input=None):
@@ -129,7 +203,7 @@ def check_ranges(value, source):
     assert set(ipaddress.collapse_addresses(map(ipaddress.ip_network, actual))) == set(ipaddress.collapse_addresses(map(ipaddress.ip_network, private_ranges(source)))), 'private ranges differ'
 
 
-def live_grants(text, ipv6=False):
+def live_grants(text, ipv6=False, *, uplink):
     grants = set()
     chain = 'ufw6-user-forward' if ipv6 else 'ufw-user-forward'
     for line in text.splitlines():
@@ -143,14 +217,14 @@ def live_grants(text, ipv6=False):
         assert len(values) == len(pairs) and set(values) == {'-i', '-o', '-s', '-j'}, 'tenant UFW grant needs exact source and direction'
         tap = values['-i']
         index = tap_index(tap)
-        assert values['-o'] == 'enp6s0' and values['-j'] == 'ACCEPT', 'extra inbound or wrong uplink grant'
+        assert values['-o'] == uplink and values['-j'] == 'ACCEPT', 'extra inbound or wrong uplink grant'
         assert values['-s'].removesuffix('/32') == f'10.200.{index}.2', 'tenant source restriction missing'
         assert tap not in grants, 'duplicate tenant UFW grant'
         grants.add(tap)
     return grants
 
 
-def owned_grants(text, ipv6=False):
+def owned_grants(text, ipv6=False, *, uplink):
     grants, pending = set(), None
     for line in text.splitlines():
         if line.startswith('### tuple ### '):
@@ -163,10 +237,10 @@ def owned_grants(text, ipv6=False):
                 tap = comment.removeprefix('motor-tenant-')
                 index = tap_index(tap)
                 assert not ipv6 and len(words) == 8 and words[:5] == ['route:allow', 'any', 'any', '0.0.0.0/0', 'any'], 'malformed owned UFW tuple'
-                assert words[5].removesuffix('/32') == f'10.200.{index}.2' and words[6] == f'in_{tap}!out_enp6s0', 'owned UFW source/direction differs'
+                assert words[5].removesuffix('/32') == f'10.200.{index}.2' and words[6] == f'in_{tap}!out_{uplink}', 'owned UFW source/direction differs'
                 pending = tap
         elif line.startswith('-A '):
-            actual = live_grants(line, ipv6)
+            actual = live_grants(line, ipv6, uplink=uplink)
             if pending is None:
                 assert not actual, 'unowned tenant UFW grant'
             else:
@@ -189,15 +263,15 @@ def read_owned(path, required=False):
     return text
 
 
-def inspect_ufw():
-    owned = owned_grants(read_owned(pathlib.Path('/etc/ufw/user.rules'), required=True))
-    owned_grants(read_owned(pathlib.Path('/etc/ufw/user6.rules')), True)
+def inspect_ufw(*, uplink):
+    owned = owned_grants(read_owned(pathlib.Path('/etc/ufw/user.rules'), required=True), uplink=uplink)
+    owned_grants(read_owned(pathlib.Path('/etc/ufw/user6.rules')), True, uplink=uplink)
     status = command('/usr/sbin/ufw', 'status').splitlines()
     active = 'Status: active' in status
     assert active or 'Status: inactive' in status, 'unrecognized UFW status'
     if not active:
         return owned, owned.copy()
-    live = live_grants(command('/usr/sbin/iptables', '-S', 'ufw-user-forward'))
+    live = live_grants(command('/usr/sbin/iptables', '-S', 'ufw-user-forward'), uplink=uplink)
     before = command('/usr/sbin/iptables', '-S', 'ufw-before-forward')
     assert any(shlex.split(line) in [
         ['-A', 'ufw-before-forward', '-m', 'conntrack', '--ctstate', order, '-j', 'ACCEPT']
@@ -206,31 +280,99 @@ def inspect_ufw():
     defaults = pathlib.Path('/etc/default/ufw').read_text()
     if re.search(r'^IPV6=[\"\']?yes[\"\']?\s*$', defaults, re.M):
         read_owned(pathlib.Path('/etc/ufw/user6.rules'), required=True)
-        live_grants(command('/usr/sbin/ip6tables', '-S', 'ufw6-user-forward'), True)
+        live_grants(command('/usr/sbin/ip6tables', '-S', 'ufw6-user-forward'), True, uplink=uplink)
     assert live <= owned, 'live tenant UFW grant is not comment-owned'
     return owned, live & owned
 
 
-def ufw_arguments(tap, delete=False):
+def ufw_arguments(tap, delete=False, *, uplink):
     index = tap_index(tap)
-    return (['--force', 'delete'] if delete else []) + ['route', 'allow', 'in', 'on', tap, 'out', 'on', 'enp6s0', 'from', f'10.200.{index}.2', 'to', 'any', 'comment', f'motor-tenant-{tap}']
+    return (['--force', 'delete'] if delete else []) + ['route', 'allow', 'in', 'on', tap, 'out', 'on', uplink, 'from', f'10.200.{index}.2', 'to', 'any', 'comment', f'motor-tenant-{tap}']
 
 
-def reconcile_ufw(desired, prior):
+def reconcile_ufw(desired, prior, *, uplink):
     owned, ready = prior
     for tap in sorted(owned - desired):
-        command('/usr/sbin/ufw', *ufw_arguments(tap, True))
+        command('/usr/sbin/ufw', *ufw_arguments(tap, True, uplink=uplink))
     for tap in sorted(desired - owned):
-        command('/usr/sbin/ufw', *ufw_arguments(tap))
+        command('/usr/sbin/ufw', *ufw_arguments(tap, uplink=uplink))
     for tap in sorted((desired & owned) - ready):
-        command('/usr/sbin/ufw', *ufw_arguments(tap, True))
-        command('/usr/sbin/ufw', *ufw_arguments(tap))
-    state = inspect_ufw()
+        command('/usr/sbin/ufw', *ufw_arguments(tap, True, uplink=uplink))
+        command('/usr/sbin/ufw', *ufw_arguments(tap, uplink=uplink))
+    state = inspect_ufw(uplink=uplink)
     assert state == (desired, desired), 'tenant UFW grants are not live and exact'
     return state
 
 
-def tenant_snapshot(document, source):
+def reconcile_ufw_taps(desired, prior, *, uplink):
+    """A failed tenant grant must not disable other tenants or host jobs."""
+    owned, ready = prior
+    failed = {}
+    for tap in sorted(owned - desired):
+        try:
+            command('/usr/sbin/ufw', *ufw_arguments(tap, True, uplink=uplink))
+        except (OSError, RuntimeError, ValueError) as error:
+            failed[tap] = str(error)
+    for tap in sorted(desired - ready):
+        try:
+            if tap in owned:
+                command('/usr/sbin/ufw', *ufw_arguments(tap, True, uplink=uplink))
+            command('/usr/sbin/ufw', *ufw_arguments(tap, uplink=uplink))
+        except (OSError, RuntimeError, ValueError) as error:
+            failed[tap] = str(error)
+    try:
+        observed_owned, observed_ready = inspect_ufw(uplink=uplink)
+        healthy = desired & observed_owned & observed_ready
+    except (AssertionError, OSError, RuntimeError, ValueError) as error:
+        # Only previously verified grants we did not change may survive an
+        # unreadable post-update snapshot. New grants remain fenced.
+        healthy = desired & ready
+        for tap in desired - healthy:
+            failed.setdefault(tap, str(error))
+    healthy -= set(failed)
+    for tap in desired - healthy:
+        failed.setdefault(tap, 'tenant grant is not ready')
+    return healthy, failed
+
+
+def tenant_health(document, source, *, uplink):
+    """Validate each registered tenant without making it host-wide readiness."""
+    if document is None:
+        return set(), set(), set(), {}, False
+    try:
+        taps, closed = tenant_snapshot(document, source, uplink=uplink)
+        return taps, closed, taps.copy(), {}, True
+    except (AssertionError, KeyError, TypeError, ValueError) as original:
+        try:
+            sets = [entry['set'] for entry in document['nftables'] if 'set' in entry]
+            taps = exact_taps(next(value for value in sets if value['name'] == 'tenant_taps'))
+            closed = exact_taps(next(value for value in sets if value['name'] == 'closed_taps'))
+            if not closed <= taps:
+                raise ValueError('closed TAP not registered')
+        except (AssertionError, KeyError, TypeError, ValueError, StopIteration):
+            return set(), set(), set(), {'tenant-policy': str(original)}, False
+        good, errors = set(), {}
+        for tap in taps:
+            projected = json.loads(json.dumps(document))
+            entries = []
+            for entry in projected['nftables']:
+                item = next(iter(entry.values()))
+                if 'set' in entry and item['name'] in {'tenant_taps', 'closed_taps'}:
+                    item['elem'] = [tap] if tap in (taps if item['name'] == 'tenant_taps' else closed) else []
+                name = item.get('chain', item.get('name', '')) if isinstance(item, dict) else ''
+                if any(name.startswith(f'tenant_{other}_') for other in taps - {tap}):
+                    continue
+                entries.append(entry)
+            projected['nftables'] = entries
+            try:
+                tenant_snapshot(projected, source, uplink=uplink)
+                good.add(tap)
+            except (AssertionError, KeyError, TypeError, ValueError) as error:
+                errors[tap] = str(error)
+        return taps, closed, good, errors, True
+
+
+def tenant_snapshot(document, source, *, uplink):
     if document is None:
         return set(), set()
     tables, sets, chains, counters, rules = [], {}, {}, set(), {}
@@ -281,15 +423,32 @@ def tenant_snapshot(document, source):
             [incoming, match({'fib': {'result': 'type', 'flags': ['daddr']}}, 'local'), counter, drop],
             [incoming, address('daddr', '@non_public_v4'), counter, drop],
             [incoming, address('saddr', source_ip, '!='), counter, drop],
-            [incoming, interface('oifname', 'enp6s0'), address('saddr', source_ip), states('new', 'established', 'related'), {'counter': f'{prefix}_egress'}, accept],
-            [outgoing, interface('iifname', 'enp6s0'), address('daddr', source_ip), states('established', 'related'), counter, accept],
+            [incoming, interface('oifname', uplink), address('saddr', source_ip), states('new', 'established', 'related'), {'counter': f'{prefix}_egress'}, accept],
+            [outgoing, interface('iifname', uplink), address('daddr', source_ip), states('established', 'related'), counter, accept],
             [outgoing, counter, drop], [incoming, counter, drop],
         ]
-        expected[f'{prefix}_nat'] = [[incoming, interface('oifname', 'enp6s0'), address('saddr', source_ip), counter, {'masquerade': None}]]
+        expected[f'{prefix}_nat'] = [[incoming, interface('oifname', uplink), address('saddr', source_ip), counter, {'masquerade': None}]]
     assert chains == expected_chains, 'tenant chain hooks/priorities differ'
     assert counters == {f'tenant_{tap}_egress' for tap in taps}, 'tenant counters differ'
     assert rules == expected, 'tenant predicates, explicit accepts or final drops differ'
     return taps, closed
+
+
+def reset_tenant_counter(index):
+    """Start a new index incarnation at zero; never reset on policy reload."""
+    tap = f'mtap{index}'
+    tap_index(tap)
+    name = f'tenant_{tap}_egress'
+    with network_lock(mutate=True):
+        document = table('inet', 'motor_tenant')
+        if document is None:
+            return
+        counters = [entry['counter'] for entry in document['nftables']
+                    if entry.get('counter', {}).get('name') == name]
+        assert len(counters) <= 1, 'duplicate tenant egress counter'
+        if counters:
+            assert counters[0]['family'] == 'inet' and counters[0]['table'] == 'motor_tenant', 'foreign tenant counter'
+            command('/usr/sbin/nft', 'reset', 'counter', 'inet', 'motor_tenant', name)
 
 
 def table(family, name):
@@ -311,41 +470,118 @@ def apply(transaction):
     command('/usr/sbin/nft', '--file', '-', input=transaction)
 
 
+def checked_source(settings):
+    def read(path):
+        metadata = path.lstat()
+        assert stat.S_ISREG(metadata.st_mode) and metadata.st_uid == 0 and not metadata.st_mode & 0o022, 'unsafe versioned network source'
+        return path.read_text()
+    expected = render_source(read(TEMPLATE), settings['uplink'])
+    if read(SOURCE) != expected:
+        raise ValueError(f"network source does not match uplink {settings['uplink']} and the canonical template")
+    return expected
+
+
+def tenant_input_guard(document):
+    if document is None:
+        return ''
+    present = any(entry.get('chain', {}).get('name') == 'tenant_guard_input' for entry in document['nftables'])
+    text = ('flush chain inet motor_tenant tenant_guard_input\ndelete chain inet motor_tenant tenant_guard_input\n') if present else ''
+    return text + ('add chain inet motor_tenant tenant_guard_input { type filter hook input priority -20; policy accept; }\n'
+                   'add rule inet motor_tenant tenant_guard_input iifname "mtap*" counter drop\n')
+
+
 def load():
     """Reload owned policy without restarting the helper or any tenant VM."""
     with network_lock(mutate=True):
-        metadata = SOURCE.lstat()
-        assert stat.S_ISREG(metadata.st_mode) and metadata.st_uid == 0 and not metadata.st_mode & 0o022, 'unsafe versioned network source'
-        source = SOURCE.read_text()
+        load_locked()
+
+
+def load_locked(publish=True):
+    """Host readiness describes the base job policy, not tenant health."""
+    readiness.invalidate()
+    try:
+        settings = read_settings(check_link=False)
+        uplink = settings['uplink']
+        source = checked_source(settings)
         document = table('inet', 'motor_tenant')
-        policy_error = None
+        taps, closed, good, issues, has_sets = tenant_health(document, source, uplink=uplink)
+        net_document = table('inet', 'motor_net')
+        base_loaded = False
+
+        def fence_all():
+            text = members('motor_tenant', 'closed_taps', taps) if has_sets else ''
+            if base_loaded or net_document is not None:
+                text += members('motor_net', 'tenant_taps', set())
+            if text:
+                apply(text)
+
         try:
-            taps, closed = tenant_snapshot(document, source)
-        except (AssertionError, KeyError, TypeError, ValueError) as error:
-            policy_error, taps, closed = error, set(), set()
-        ufw_error = None
+            validate_uplink(settings)
+        except (OSError, RuntimeError, ValueError):
+            fence_all()
+            raise
         try:
-            prior = inspect_ufw() if document is not None and policy_error is None else (set(), set())
+            prior = inspect_ufw(uplink=uplink) if good else (set(), set())
+            inspected = True
         except (AssertionError, OSError, RuntimeError, ValueError) as error:
-            ufw_error, prior = error, (set(), set())
-        ready = (taps - closed) & prior[1]
-        transaction = ''
-        if document is not None and policy_error is None:
-            transaction += members('motor_tenant', 'closed_taps', closed | (taps - ready))
-        if table('inet', 'motor_net') is not None:
+            prior, inspected = (set(), set()), False
+            issues.update({tap: str(error) for tap in good})
+        ready = (good - closed) & prior[1]
+        # Tenant-policy errors must not remove the unconditional host-input
+        # boundary while their forwarding delegation is withheld.
+        transaction = tenant_input_guard(document)
+        transaction += members('motor_tenant', 'closed_taps', taps - ready) if has_sets else ''
+        if net_document is not None:
             transaction += 'delete table inet motor_net\n'
         transaction += source + '\n' + members('motor_net', 'tenant_taps', ready)
         apply(transaction)
-        if policy_error is not None:
-            print(f'FENCED: unsupported tenant policy; update helper and run --check: {policy_error}')
-            return
-        if ufw_error is not None:
-            raise RuntimeError(f'tenant UFW policy is fenced/unready: {ufw_error}')
-        if document is not None:
+        base_loaded = True
+        try:
+            validate_uplink(settings)
+        except (OSError, RuntimeError, ValueError):
+            fence_all()
+            raise
+    except BaseException:
+        readiness.invalidate()
+        raise
+
+    # The base table and uplink are now valid. Tenant repair can fail without
+    # revoking outbound networking for this host's own mnet-* jobs.
+    if publish:
+        readiness.publish()
+    if good and inspected:
+        try:
+            healthy, failures = reconcile_ufw_taps(good, prior, uplink=uplink)
+            issues.update(failures)
+        except (AssertionError, OSError, RuntimeError, ValueError) as error:
+            healthy = ready
+            issues['tenant-policy'] = str(error)
+    else:
+        healthy = set()
+    try:
+        # Rules match names; root-only same-name replacement is out of scope.
+        # This is the last tenant-gate validation, not another host-job latch.
+        validate_uplink(settings)
+    except (OSError, RuntimeError, ValueError):
+        readiness.invalidate()
+        fence_all()
+        raise
+    # Only the helper may release an existing tenant fence after validating its
+    # configuration. A producer reload may tighten gates, never reopen them.
+    healthy -= closed
+    if has_sets:
+        try:
+            apply(members('motor_tenant', 'closed_taps', taps - healthy)
+                  + members('motor_net', 'tenant_taps', healthy))
+        except (OSError, RuntimeError, ValueError) as error:
+            # The tenant transaction is isolated from the already loaded base.
+            # On an indeterminate tenant write, fence its affected scope only.
             try:
-                reconcile_ufw(taps, prior)
-            except (AssertionError, OSError, RuntimeError, ValueError):
-                apply(members('motor_tenant', 'closed_taps', taps) + members('motor_net', 'tenant_taps', set()))
-                raise
-            apply(members('motor_tenant', 'closed_taps', set()) + members('motor_net', 'tenant_taps', taps))
-        print('PASS: motor_net loaded with guarded exact tenant delegation')
+                fence_all()
+            except (OSError, RuntimeError, ValueError) as fence_error:
+                issues['tenant-fence'] = str(fence_error)
+            issues['tenant-policy'] = str(error)
+    for tenant, error in sorted(issues.items()):
+        print(f'FENCED tenant {tenant}: {error}')
+    print('PASS: motor_net base loaded; host job networking ready independently of tenant health')
+    return settings, taps

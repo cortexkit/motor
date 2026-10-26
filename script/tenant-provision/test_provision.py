@@ -54,9 +54,15 @@ def config():
 
 
 class ProvisionTests(unittest.TestCase):
+    @staticmethod
+    def owned_tap(tap):
+        return {'ifname': tap, 'linkinfo': {'info_kind': 'tun', 'info_data': {
+            'type': 'tap', 'persist': True, 'user': 400000 + int(tap.removeprefix('mtap'))}}}
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
+        self.reset_counter = mock.Mock()
         # runner_processes would read this machine's real /proc; tests that need
         # a runner pass one explicitly.
         self.patch = mock.patch.multiple(p, ROOT=self.root, REGISTRY=self.root / "registry", PROVISION=self.root / "provision",
@@ -70,7 +76,7 @@ class ProvisionTests(unittest.TestCase):
                                                                  "tenant_memory_reserve_bytes": 2 * 1024**3},
                                           memtotal_bytes=lambda: 128 * 1024**3,
                                           slice_properties=lambda _names: {"LoadState": "loaded", "MemoryMax": "42949672960"},
-                                          runner_processes=lambda: [])
+                                          runner_processes=lambda: [], reset_egress_counter=self.reset_counter)
         self.patch.start()
         p.JOBS_DROP_IN.write_text("[Slice]\nMemoryMax=42949672960\nMemoryHigh=35791394134\n")
         for directory in [p.REGISTRY, p.PROVISION, p.BINDINGS.parent, p.ROOT / "tenants"]:
@@ -160,7 +166,7 @@ class ProvisionTests(unittest.TestCase):
         lines = []
         execute = mock.Mock()
         p.remove_tenant("a", dry_run=True, check_service=lambda _unit: "inactive", execute=execute,
-                        has_tap=lambda tap: tap == "mtap1", now=lambda: 1000, output=lines.append)
+                        has_tap=lambda tap: tap == "mtap1", now=lambda: 1000, output=lines.append, tap_info=self.owned_tap)
         execute.assert_not_called()
         self.assertEqual(self.snapshot_tree(), before)
         listed = "\n".join(lines)
@@ -182,9 +188,10 @@ class ProvisionTests(unittest.TestCase):
         execute = mock.Mock()
         messages = []
         p.remove_tenant("a", check_service=lambda _unit: "inactive", execute=execute,
-                        has_tap=lambda tap: tap in ("mtap1", "mtap2"), now=lambda: 1000, output=messages.append)
+                        has_tap=lambda tap: tap in ("mtap1", "mtap2"), now=lambda: 1000, output=messages.append, tap_info=self.owned_tap)
         execute.assert_called_once_with("ip", "link", "delete", "dev", "mtap1")
         quarantine = p.ROOT / "removed/a-1000"
+        self.assertEqual((quarantine / "complete").read_text(), "1\n")
         self.assertFalse((p.ROOT / "tenants/a").exists())
         self.assertFalse((p.REGISTRY / "a.json").exists())
         self.assertFalse((p.PROVISION / "a.json").exists())
@@ -214,6 +221,35 @@ class ProvisionTests(unittest.TestCase):
                         has_tap=lambda _tap: False, now=lambda: 1000, output=lambda _line: None)
         self.assertFalse((p.ROOT / "tenants/a").exists())
         self.assertEqual(list((p.ROOT / "removed").iterdir()), [])
+
+    def test_remove_tenant_without_home_marks_journal_complete(self):
+        self.removal_records()
+        shutil.rmtree(p.ROOT / 'tenants/a')
+        p.remove_tenant('a', check_service=lambda _: 'inactive', execute=mock.Mock(),
+                        has_tap=lambda _: False, now=lambda: 1000, output=lambda _: None)
+        quarantine = p.ROOT / 'removed/a-1000'
+        self.assertEqual((quarantine / 'complete').read_text(), '1\n')
+        self.assertFalse((quarantine / 'home').exists())
+        self.assertFalse((p.REGISTRY / 'a.json').exists())
+
+    def test_remove_tenant_refuses_foreign_tap_before_any_mutation(self):
+        self.removal_records()
+        before = self.snapshot_tree()
+        for field, value in [('user', 400002), ('type', 'tun'), ('persist', False)]:
+            with self.subTest(field=field):
+                link = self.owned_tap('mtap1')
+                link['linkinfo']['info_data'][field] = value
+                execute = mock.Mock()
+                with self.assertRaisesRegex(ValueError, 'foreign interface mtap1'):
+                    p.remove_tenant('a', check_service=lambda _: 'inactive', execute=execute,
+                                    has_tap=lambda _: True, tap_info=lambda _: link, output=lambda _: None)
+                execute.assert_not_called()
+                self.assertEqual(self.snapshot_tree(), before)
+        link = self.owned_tap('mtap1')
+        link['linkinfo']['info_kind'] = 'dummy'
+        with self.assertRaisesRegex(ValueError, 'foreign interface mtap1'):
+            p.remove_tenant('a', check_service=lambda _: 'inactive', has_tap=lambda _: True,
+                            tap_info=lambda _: link, execute=lambda *_: self.fail('foreign delete'))
         self.assertEqual((p.ROOT / "tenants/b/disk.img").read_bytes(), b"b")
 
     def test_switch_image_refuses_when_either_service_is_running(self):
@@ -732,6 +768,8 @@ class ProvisionTests(unittest.TestCase):
             p.provision(config())
         self.assertEqual((home / "disk.img").read_bytes(), b"keep")
 
+
+
     def test_duplicate_tap_and_binding_are_rejected(self):
         (p.REGISTRY / "b.json").write_text('{"tap_index":1}')
         with self.assertRaisesRegex(ValueError, "tap index"):
@@ -794,6 +832,28 @@ class ProvisionTests(unittest.TestCase):
         self.assertLess(events.index("mount"), events.index("stage"))
         self.assertLess(events.index("stage"), events.index("umount"))
         self.assertEqual((p.REGISTRY / "a.json").stat().st_mode & 0o777, 0o644)
+
+    def test_index_reuse_resets_egress_on_removal_and_before_replacement_publication(self):
+        self.removal_records()
+        counters = {1: 12345, 2: 987}
+        def reset(index):
+            self.assertFalse((p.REGISTRY / 'c.json').exists())
+            counters[index] = 0
+        self.reset_counter.side_effect = reset
+        p.remove_tenant('a', check_service=lambda _: 'inactive', execute=mock.Mock(),
+                        has_tap=lambda _: False, now=lambda: 1000, output=lambda _: None)
+        self.assertEqual(counters, {1: 0, 2: 987})
+        counters[1] = 45678  # Deferred state from an older removal implementation.
+        replacement = config()
+        replacement.update(tenant='c', vm='vm-c')
+        def execute(*args):
+            if args[0] == 'fallocate':
+                args[-1].touch()
+        with mock.patch.object(p.shutil, 'disk_usage', return_value=type('Usage', (), {'free': 2**63})):
+            p.provision(replacement, lambda _c, _i, base: base.mkdir(parents=True), execute)
+        self.assertEqual(self.reset_counter.call_args_list, [mock.call(1), mock.call(1)])
+        self.assertEqual(counters, {1: 0, 2: 987})
+        self.assertTrue((p.REGISTRY / 'c.json').is_file())
 
     def agent_server(self, handler):
         listener = socket.socket(socket.AF_UNIX)

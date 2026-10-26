@@ -108,12 +108,13 @@ async fn assert_success(runner: &Runner, request: &Run) {
 
 pub(crate) async fn case(mode: &str) {
     let f = Fixture::new();
+    let (_generation, _) = crate::network::linux::validated_generation(f.scratch.path());
     install_probe(&f);
     let runner = Runner::open(config(&f)).unwrap();
-    assert!(
-        runner.config().job_network.is_some(),
-        "{}",
-        runner.config().job_network_unavailable
+    assert_eq!(
+        crate::network::unsupported(runner.config()),
+        None,
+        "operator fixture requires a currently valid generation and net admission"
     );
     if mode == "forward" {
         forward_drops(&f, &runner).await;
@@ -211,11 +212,171 @@ pub(crate) async fn case(mode: &str) {
     }
 }
 
+fn generation_root_step(script: &str) -> Command {
+    let mut command = Command::new("/usr/bin/sudo");
+    command.args(["-n", "/usr/bin/python3", "-I", "-c", script]);
+    command
+}
+
+struct GenerationProducerCleanup(PathBuf);
+impl Drop for GenerationProducerCleanup {
+    fn drop(&mut self) {
+        let result = generation_root_step("import pathlib,shutil,sys; p=pathlib.Path(sys.argv[1])/'lockdir'; shutil.rmtree(p) if p.exists() else None")
+            .arg(&self.0).output();
+        if !matches!(result, Ok(ref output) if output.status.success()) {
+            eprintln!("private generation lock cleanup failed: {result:?}");
+        }
+    }
+}
+
+#[test]
+fn generation_privileged_steps_use_noninteractive_sudo_not_a_root_test_process() {
+    let command = generation_root_step("publish-private-generation");
+    assert_eq!(command.get_program(), "/usr/bin/sudo");
+    let args: Vec<_> = command.get_args().collect();
+    assert_eq!(
+        args,
+        [
+            "-n",
+            "/usr/bin/python3",
+            "-I",
+            "-c",
+            "publish-private-generation"
+        ]
+    );
+}
+
+pub(crate) async fn generation(mode: &str) {
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "run generation tests as the operator account; only private producer steps use sudo -n"
+    );
+    let f = Fixture::new();
+    install_probe(&f);
+    let producer = f.scratch.path().join("generation-producer");
+    fs::create_dir_all(&producer).unwrap();
+    // Keep the parent operator-owned so ordinary fixture teardown can unlink
+    // root-owned leaf files. Only the loader's private lock directory needs sudo.
+    let _producer_cleanup = GenerationProducerCleanup(producer.clone());
+    let marker = producer.join("ready");
+    // Exercise real root-owned publication and consumer reads without withdrawing
+    // the production host's generation. Kernel policy and sandbox setup are real.
+    let _generation = crate::network::linux::operator_generation_path(marker.clone());
+    fs::write(
+        producer.join("motor_network_ready.py"),
+        include_str!("../../../../script/runner/motor_network_ready.py"),
+    )
+    .unwrap();
+    fs::write(
+        producer.join("motor_network_policy.py"),
+        include_str!("../../../../script/runner/motor_network_policy.py"),
+    )
+    .unwrap();
+    fs::write(
+        producer.join("template.nft"),
+        include_str!("../../../../script/runner/motor-net.nft"),
+    )
+    .unwrap();
+    fs::write(
+        producer.join("stale.nft"),
+        "# stale source intentionally disagrees with the settings\n",
+    )
+    .unwrap();
+    fs::write(
+        producer.join("settings.json"),
+        r#"{"uplink":"enp6s0","public_ipv4":"8.8.8.8"}"#,
+    )
+    .unwrap();
+    let prepare = generation_root_step(r#"import os,pathlib,stat,sys
+p=pathlib.Path(sys.argv[1])
+for name in ('motor_network_ready.py','motor_network_policy.py','template.nft','stale.nft','settings.json'):
+ f=p/name
+ if not stat.S_ISREG(f.lstat().st_mode): raise RuntimeError('fixture input must be a regular file')
+ os.chown(f,0,0); os.chmod(f,0o644)
+"#).arg(&producer).output().unwrap();
+    assert!(
+        prepare.status.success(),
+        "root-owned private fixture inputs: {}",
+        String::from_utf8_lossy(&prepare.stderr)
+    );
+    let publish = || {
+        let result = generation_root_step(r#"import pathlib,runpy,sys
+ns=runpy.run_path(sys.argv[1]); ns['publish'].__globals__['READY']=pathlib.Path(sys.argv[2]); ns['publish']()"#)
+            .arg(producer.join("motor_network_ready.py")).arg(&marker).output().unwrap();
+        assert!(
+            result.status.success(),
+            "publisher: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    if mode == "generation-reload" {
+        publish();
+    }
+    let runner = Runner::open(config(&f)).unwrap();
+    let refuse = |runner: &Runner| {
+        let (mut request, _) = f.run("touch generation-job-must-not-run");
+        request.network = Some(Network::Outbound);
+        let admission = runner.accept(request.clone()).unwrap();
+        assert!(
+            matches!(
+                admission,
+                Admission::Refused(RefusalReason::NetworkUnsupported)
+            ),
+            "missing generation must refuse this net request before upload"
+        );
+        assert!(!runner.spool_dir(request.job_id).exists());
+    };
+    if mode == "generation-reload" {
+        let (mut first, bytes) = f.run("python3 network-check.py public");
+        first.network = Some(Network::Outbound);
+        f.submit(&runner, &first, &bytes);
+        assert_success(&runner, &first).await;
+        let result = generation_root_step(r#"import pathlib,runpy,shutil,sys
+p=pathlib.Path(sys.argv[1]); ns=runpy.run_path(str(p/'motor_network_policy.py')); g=ns['load'].__globals__
+g['SETTINGS']=p/'settings.json'; g['TEMPLATE']=p/'template.nft'; g['SOURCE']=p/'stale.nft'; g['LOCK']=p/'lockdir'/'lock'
+g['readiness'].READY=p/'ready'
+try: ns['load']()
+finally:
+ if (p/'lockdir').exists(): shutil.rmtree(p/'lockdir')"#).arg(&producer).output().unwrap();
+        assert!(
+            !result.status.success(),
+            "the stale-source reload must fail"
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("source does not match uplink"),
+            "reload must reach the binding guard, not fail fixture permissions: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!marker.exists());
+        assert!(
+            crate::privilege::command("/usr/sbin/nft")
+                .args(["list", "table", "inet", "motor_net"])
+                .status()
+                .unwrap()
+                .success(),
+            "old kernel table must still exist in the failed-reload regression"
+        );
+    }
+    refuse(&runner);
+    let (offline, bytes) = f.run("true");
+    f.submit(&runner, &offline, &bytes);
+    assert_success(&runner, &offline).await;
+    publish();
+    let (mut recovered, bytes) = f.run("python3 network-check.py public");
+    recovered.network = Some(Network::Outbound);
+    f.submit(&runner, &recovered, &bytes);
+    assert_success(&runner, &recovered).await;
+}
+
 #[test]
 #[ignore = "child process for isolated_net_restart_survives_and_cleans_up"]
 fn restart_child() {
     let root =
         PathBuf::from(std::env::var_os("MOTOR_NET_RESTART_FIXTURE").expect("restart fixture"));
+    let _generation = crate::network::linux::operator_generation_path(PathBuf::from(
+        std::env::var_os("MOTOR_NET_TEST_GENERATION").expect("validated operator generation"),
+    ));
     let request: Run = read_json(&root.join("request.json")).unwrap();
     let runner = Runner::open(restart_config(&root)).unwrap();
     assert_run_accepted(&runner, &request);
@@ -246,6 +407,7 @@ fn restart_child() {
 
 pub(crate) async fn restart() {
     let f = Fixture::new();
+    let (_generation, marker) = crate::network::linux::validated_generation(f.scratch.path());
     install_probe(&f);
     let (mut request, bytes) = f.run("set -eu; python3 network-check.py public; echo ready > marker; while [ ! -f release ]; do sleep 0.05; done; python3 network-check.py public");
     request.network = Some(Network::Outbound);
@@ -262,7 +424,8 @@ pub(crate) async fn restart() {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("MOTOR_NET_RESTART_FIXTURE", f.scratch.path()),
+            .env("MOTOR_NET_RESTART_FIXTURE", f.scratch.path())
+            .env("MOTOR_NET_TEST_GENERATION", &marker),
     )
     .unwrap()
     .wait()

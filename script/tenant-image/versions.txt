@@ -36,7 +36,8 @@
     "script/runner/job-account.py": "21f185ddc868150a8bbfe94aa8eac18a50485b87bf8fa043944348dac77ef4ca",
     "script/runner/journald/60-motor-retention.conf": "d2d5e434880b56858792a23d03ad7ba58b157066d7d5f319cc6b6c3d7805cc89",
     "script/runner/sysctl/60-motor-inotify.conf": "2ddb7e2127e6c2c04d2d4c96293e12b39f29a81e58adac0c1a3eb8d432b7b9f4",
-    "script/boat-image/install.py": "6a7217dd7789929d6f0c3666cbeb97ec98925ba606c2f89f160e69c2aaa8f180",
+    "script/boat-image/install.py": "2db66c67a7b19f936c9c1baa1be8d4282a54bcc6e57b156a14621915b55c4f7c",
+    "script/runner/motor_network_ready.py": "b88f38aea384ceda593059d4e33a086164561e486cadb408e9bcd724af8989e5",
     "script/tenant-image/guest/root_paths.py": "2de3c028f009f8e77abe3524fcbbae589b47fd32d5a6af8ab1f55240d0a33c3d"
   },
   "captured_at": "2026-10-17T08:17:09+00:00",

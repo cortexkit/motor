@@ -99,6 +99,10 @@ the budget. Apply or read-back failures are errors; inspect the drop-in and
 live limits before retrying. The drop-in is written even if the slice is not
 installed yet. Provisioning requires its exact rendered bytes and checks the
 live cap too; an unloaded, `not-found` slice requires the same exact file.
+On a fresh systemd host an implicit slice can instead report `loaded` but
+`inactive`, with no `ControlGroup` and `MemoryCurrent=[not set]`. Applying the
+budget treats only that empty state as zero usage; an active slice or one with
+a cgroup still requires a numeric usage reading before any drop-in write.
 
 `MemoryMax = jobs_min_bytes + windows_vm_bytes` and
 `MemoryHigh = MemoryMax - floor(MemoryMax / 6)`. The slice holds the Windows VM
@@ -112,6 +116,21 @@ MemoryHigh=35791394134
 ```
 
 ## Tenant allocation
+
+Only live registry records reserve `tap_index` during provisioning. Quarantine
+records do not: a tenant name and home existence cannot distinguish an old
+removal from a replacement tenant. Online helper resume refuses network cleanup
+for an index claimed by another trusted live tenant, but can finish the departed
+tenant's data-only quarantine after checking its saved home identity. Both
+removal implementations write a durable `complete` marker, including when the
+old home is already absent, so completed records cannot revive after name reuse.
+
+Removal saves the original home's device/inode in the quarantine record; a
+different same-name directory cannot be moved by an old interrupted journal.
+Provisioning resets any existing named egress counter for the chosen index
+before registry publication. Python removal resets that counter before deleting
+the registry; Rust removal deletes it. Reset failures retain the allocation or
+refuse publication rather than exposing a previous tenant's absolute usage.
 
 Provisioning checks **bytes** before allocating anything for the tenant, against
 the same storage rule motor-host applies on every admission and heartbeat:

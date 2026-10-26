@@ -1,4 +1,6 @@
 {
+  "uplink": "enp6s0",
+  "public_ipv4": "1.1.1.1",
   "allowed_uids": [1000],
   "socket_gid": 1000,
   "uid_base": 200000,

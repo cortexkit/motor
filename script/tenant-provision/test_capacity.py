@@ -44,6 +44,8 @@ class CapacityTests(unittest.TestCase):
         self.current = 0
         self.maximum = 128 * GIB * 85 // 100
         self.load_state = "loaded"
+        self.active_state = "active"
+        self.control_group = "/motor-jobs.slice"
         self.fail_reload = False
         self.apply_limit = True
         self.events = []
@@ -62,7 +64,8 @@ class CapacityTests(unittest.TestCase):
             return SimpleNamespace(stdout="")
         self.assertEqual(args[:3], ("systemctl", "show", "-p"))
         self.assertEqual(args[4:], ("motor-jobs.slice",))
-        values = {"LoadState": self.load_state, "MemoryCurrent": str(self.current), "MemoryMax": str(self.maximum)}
+        values = {"LoadState": self.load_state, "MemoryCurrent": str(self.current), "MemoryMax": str(self.maximum),
+                  "ActiveState": self.active_state, "ControlGroup": self.control_group}
         return SimpleNamespace(stdout="".join(f"{name}={values[name]}\n" for name in args[3].split(",")))
 
     def tenant(self, name="a", ram_mib=79872, headroom_mib=512):
@@ -214,7 +217,7 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(p.JOBS_DROP_IN.read_text(), RENDERED)
         self.assertEqual(stat.S_IMODE(p.JOBS_DROP_IN.stat().st_mode), 0o644)
         self.assertEqual(self.maximum, 42949672960)
-        self.assertEqual(self.events, [("systemctl", "show", "-p", "LoadState,MemoryCurrent", "motor-jobs.slice"),
+        self.assertEqual(self.events, [("systemctl", "show", "-p", "LoadState,MemoryCurrent,ActiveState,ControlGroup", "motor-jobs.slice"),
                                        ("write",), ("systemctl", "daemon-reload"),
                                        ("systemctl", "show", "-p", "LoadState,MemoryMax", "motor-jobs.slice")])
 
@@ -232,6 +235,24 @@ class CapacityTests(unittest.TestCase):
         p.apply_jobs_slice()
         self.assertEqual(p.JOBS_DROP_IN.read_text(), RENDERED)
         self.assertIn(("systemctl", "daemon-reload"), self.events)
+
+    def test_apply_accepts_an_implicit_inactive_slice_without_a_cgroup(self):
+        self.current = "[not set]"
+        self.active_state = "inactive"
+        self.control_group = ""
+        p.apply_jobs_slice()
+        self.assertEqual(p.JOBS_DROP_IN.read_text(), RENDERED)
+        self.assertEqual(self.maximum, 42949672960)
+
+    def test_apply_refuses_unset_usage_if_the_slice_can_have_processes(self):
+        self.current = "[not set]"
+        for state, group in [("active", ""), ("inactive", "/motor-jobs.slice"), ("failed", "")]:
+            with self.subTest(state=state, group=group):
+                self.active_state, self.control_group = state, group
+                before = self.tree()
+                with self.assertRaisesRegex(ValueError, "MemoryCurrent is not a byte value"):
+                    p.apply_jobs_slice()
+                self.assertEqual(self.tree(), before)
 
     def test_apply_fit_breaking_proposal_preserves_previous_dropin_and_live_cap(self):
         self.tenant()

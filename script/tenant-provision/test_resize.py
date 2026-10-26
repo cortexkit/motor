@@ -29,7 +29,7 @@ CAPACITY = dict(windows_vm_bytes=16 * GIB, host_reserve_bytes=6 * GIB, jobs_min_
                 tenant_memory_reserve_bytes=2 * GIB)
 RENDERED = "[Slice]\nMemoryMax=42949672960\nMemoryHigh=35791394134\n"
 SUB = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV"
-HELPER = {"allowed_uids": [990], "socket_gid": 990, "uid_base": 290000,
+HELPER = {"uplink": "enp6s0", "public_ipv4": "8.8.8.8", "allowed_uids": [990], "socket_gid": 990, "uid_base": 290000,
           "slots": [{"cpus": "0-1", "mems": "0", "cpu_max": "100000 100000", "memory_max": GIB,
                      "io_weight": 10, "io_max": None}],
           "agent_port": 52, "proxy_port": 53}
@@ -488,8 +488,10 @@ class ResizeTests(unittest.TestCase):
                 self.assertEqual(self.tree(), before)
         self.assertEqual(self.commands, [])
         # remove-tenant still runs, and so do the journaled tenant's abort and resume.
-        p.remove_tenant("b", purge_now=True, check_service=lambda _unit: "inactive", execute=self.record_command,
-                        has_tap=lambda _tap: False, now=lambda: 1000, output=self.output.append)
+        with mock.patch.object(p, 'reset_egress_counter') as reset_counter:
+            p.remove_tenant("b", purge_now=True, check_service=lambda _unit: "inactive", execute=self.record_command,
+                            has_tap=lambda _tap: False, now=lambda: 1000, output=self.output.append)
+        reset_counter.assert_called_once_with(2)
         self.assertFalse((p.REGISTRY / "b.json").exists())
         self.abort()
         self.assertFalse(p.resize_journal_path("a").exists())
