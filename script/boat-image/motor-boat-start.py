@@ -353,7 +353,12 @@ def withdraw_storage(reason='storage_watch_starting'):
         path = ENDPOINT_READY.with_name('endpoint-withdrawal.json')
         # The endpoint starts only after this watcher reports READY. Its systemd
         # RuntimeDirectory does not exist yet on a cold start (or after a stop).
-        path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        try:
+            path.parent.mkdir(mode=0o755, parents=True)
+            # mkdir's mode is filtered by the umask; readers need 0755.
+            path.parent.chmod(0o755)
+        except FileExistsError:
+            pass
         temporary = path.with_suffix('.tmp')
         with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600), 'w') as output:
             output.write(json.dumps(record) + '\n')
