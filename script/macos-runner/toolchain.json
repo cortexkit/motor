@@ -413,8 +413,8 @@
     }
   },
   "agent": {
-    "commit": "27b3c6cecc2d4f1b439434d246fc41d6a6249804",
-    "sha256": "845760c031bbc1869e5ae6c3b561c72d1070bdb19117390b947059d463712d67"
+    "commit": "bd7d99774f54577e64adb517045e0e666c5b0a77",
+    "sha256": "d433d55c1ee98575260bd11676894946f3e5eb8cfcb7a1b83eb3f038bd903864"
   },
   "prep_tools": {
     "cargo": {
