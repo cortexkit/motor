@@ -205,7 +205,8 @@ fn no_units(runner: &Runner) {
 }
 
 /// The standard job user must execute the machine-wide tools but cannot modify
-/// PowerShell. A long checkout must build through the short cache mount.
+/// PowerShell or Bun. A checkout path exceeding 260 characters must build through
+/// the target cache mounted at C:\t instead of writing long output paths.
 #[test]
 #[ignore = "trusted operator: sealed Windows baseline, dedicated accounts, KVM and systemd required"]
 fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
@@ -220,7 +221,7 @@ fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
     let output = run(
         &runner,
         &f,
-        &format!("set -e; rustc -vV; cargo --version; git --version; pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; {probe}; cargo run --offline; test -f target/debug/motor-qualification.exe"),
+        &format!("set -e; rustc -vV; cargo --version; git --version; bun --version; pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; {probe}; cargo run --offline; test -f target/debug/motor-qualification.exe"),
     );
     assert!(
         output.lines().any(|line| line.trim() == "7.6.7"),
@@ -230,6 +231,11 @@ fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
         output.contains("PowerShell installation is read-only"),
         "{output}"
     );
+    assert!(
+        output.lines().any(|line| line.trim() == "1.4.2"),
+        "{output}"
+    );
+    assert!(output.contains("Bun installation is read-only"), "{output}");
     assert!(
         output.contains("short target cache is writable"),
         "{output}"
@@ -246,21 +252,23 @@ $ErrorActionPreference='Stop'
 $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
 if($identity.Name.Split('\')[-1] -cne 'motor-job'){throw "unexpected job user: $($identity.Name)"}
 if(([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'job user is an administrator'}
-$install='C:\Program Files\PowerShell\7'
-if((Get-Command pwsh.exe -ErrorAction Stop).Source -cne "$install\pwsh.exe"){throw 'pwsh resolves outside the protected installation'}
+foreach($tool in @(@{name='PowerShell';command='pwsh.exe';path='C:\Program Files\PowerShell\7'},@{name='Bun';command='bun.exe';path='C:\Program Files\Bun'})) {
+$install=$tool.path
+if((Get-Command $tool.command -ErrorAction Stop).Source -cne (Join-Path $install $tool.command)){throw "$($tool.name) resolves outside the protected installation"}
 $directories=@((Get-Item -LiteralPath $install)) + @(Get-ChildItem -LiteralPath $install -Directory -Recurse -Force -ErrorAction Stop)
 foreach($directory in $directories) {
  $probe=Join-Path $directory.FullName ('motor-write-probe-'+[Guid]::NewGuid().ToString())
  $denied=$false
  try {$file=[IO.File]::Open($probe,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write);$file.Dispose()} catch [UnauthorizedAccessException] {$denied=$true}
- if(-not $denied){Remove-Item -LiteralPath $probe;throw "PowerShell directory is writable: $($directory.FullName)"}
+ if(-not $denied){Remove-Item -LiteralPath $probe;throw "$($tool.name) directory is writable: $($directory.FullName)"}
 }
 foreach($file in Get-ChildItem -LiteralPath $install -File -Recurse -Force -ErrorAction Stop) {
  $denied=$false
  try {$handle=[IO.File]::Open($file.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite);$handle.Dispose()} catch [UnauthorizedAccessException] {$denied=$true}
- if(-not $denied){throw "PowerShell file is writable: $($file.FullName)"}
+ if(-not $denied){throw "$($tool.name) file is writable: $($file.FullName)"}
 }
-Write-Output 'PowerShell installation is read-only'
+Write-Output "$($tool.name) installation is read-only"
+}
 if($env:CARGO_TARGET_DIR -cne 'C:\t'){throw "unexpected target dir: $env:CARGO_TARGET_DIR"}
 $longOutput=Join-Path (Get-Location) 'target\debug\deps\motor_qualification-0123456789abcdef.exe'
 if($longOutput.Length -lt 260){throw "checkout fixture is not long enough: $longOutput"}
@@ -338,6 +346,9 @@ $machinePaths=[Environment]::GetEnvironmentVariable('Path','Machine') -split ';'
 if(-not ($machinePaths | Where-Object {$_.Trim().Trim('"').TrimEnd('\') -ieq $install})){throw 'PowerShell 7 is absent from machine PATH'}
 $found=@(& where.exe pwsh)
 if($LASTEXITCODE -ne 0 -or $found -notcontains "$install\pwsh.exe"){throw "where.exe pwsh failed: $found"}
+$bunInstall='C:\Program Files\Bun'
+if(-not ($machinePaths | Where-Object {$_.Trim().Trim('"').TrimEnd('\') -ieq $bunInstall})){throw 'Bun is absent from machine PATH'}
+if((Get-Command bun.exe -ErrorAction Stop).Source -cne "$bunInstall\bun.exe"){throw 'bun resolves outside the protected installation'}
 foreach($name in @('LOCALAPPDATA','APPDATA','TEMP','TMP')) {
  $directory=[Environment]::GetEnvironmentVariable($name,'Process')
  if([string]::IsNullOrWhiteSpace($directory)){throw "$name is unset"}

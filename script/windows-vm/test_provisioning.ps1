@@ -85,6 +85,7 @@ $checks++
 Write-Host 'PASS developer_mode_absent_key_absent_value_zero_and_one'
 $items = [ordered]@{
     machine_toolchain = @("`$toolchain = '1.99.0'", "`$hostTriple = 'x86_64-pc-windows-msvc'", "`$env:RUSTUP_HOME = 'C:\rust\rustup'", "`$env:CARGO_HOME = 'C:\rust\cargo'", '--default-toolchain $toolchain --default-host $hostTriple --no-modify-path', "SetEnvironmentVariable('RUSTUP_HOME'", "SetEnvironmentVariable('Path'", "'C:\rust' /inheritance:r", ':(OI)(CI)RX')
+    machine_bun = @("`$bunVersion = '1.4.2'", 'bun-v1.4.2/bun-windows-x64.zip', 'bun-v1.4.2/SHASUMS256.txt', 'ce4c17497b2f29712a99d3d53f028de28cd42e3bacb8589599e7f000e49b6405', 'Get-FileHash -LiteralPath $bunArchive -Algorithm SHA256', 'throw ''Bun archive SHA-256 mismatch''', "`$bunInstall = 'C:\Program Files\Bun'", '& icacls $bunInstall /inheritance:r', '*S-1-5-32-545:(OI)(CI)RX', '& icacls $bunInstall /setowner', 'SetEnvironmentVariable(''Path'', "$bunInstall;$machinePath", ''Machine'')', '& "$bunInstall\bun.exe" --version', '$installedBunVersion -cne $bunVersion')
     virtio_serial = @('vioserial\2k22\amd64\vioser.inf', '& pnputil /add-driver', '/install')
     standard_job_user = @("`$jobUser = 'motor-job'", 'New-LocalUser $jobUser', 'Remove-LocalGroupMember $admins', 'SeBatchLogonRight', 'SeCreateSymbolicLinkPrivilege', 'Job SID missing from $right', 'Job baseline must not enable Developer Mode', 'CreateProfile($jobSid', 'job-password.txt', '$credential /inheritance:r')
     service = @('build --release --locked', 'New-Service -Name motor-winagent', '-StartupType Automatic', "StartName -ne 'LocalSystem'", 'Get-FileHash', 'SHA256')
@@ -169,17 +170,18 @@ if ($env:OS -ne 'Windows_NT') {
         function Get-Command { [pscustomobject]@{ Name = 'installed' } }
         function winget { $global:LASTEXITCODE = 0 }
         function git { $global:LASTEXITCODE = 0; 'git version fixture' }
-        function bun { $global:LASTEXITCODE = 0; 'bun version fixture' }
+        function bun { throw 'per-user Bun was accessed in job-baseline mode' }
         function cargo { throw 'per-user Cargo was accessed in job-baseline mode' }
         function rustc { throw 'per-user rustc was accessed in job-baseline mode' }
-        function Invoke-WebRequest { throw 'per-user Rust installer was downloaded' }
+        function Invoke-WebRequest { throw 'per-user installer was downloaded' }
+        function Invoke-RestMethod { throw 'per-user Bun installer was downloaded' }
         try {
             & "$temp/setup-guest.ps1" -JobBaseline
         } catch {
-            throw "FAIL setup_guest_skips_per_user_rust: $_"
+            throw "FAIL setup_guest_skips_per_user_bun_and_rust: $_"
         }
         $checks++
-        Write-Host 'PASS setup_guest_skips_per_user_rust'
+        Write-Host 'PASS setup_guest_skips_per_user_bun_and_rust'
     } finally {
         Remove-PSDrive C,S
         Remove-Item $temp -Recurse -Force
