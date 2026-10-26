@@ -48,7 +48,7 @@
         "rustfmt-aarch64-apple-darwin"
       ],
       "rustc_verbose": "rustc 1.91.0 (f8297e351 2025-10-28)\nbinary: rustc\ncommit-hash: f8297e351a40c1439a467bbbb6879088047f50b3\ncommit-date: 2025-10-28\nhost: aarch64-apple-darwin\nrelease: 1.91.0\nLLVM version: 21.1.2",
-      "sha256": "80f92943f33b6bc2a0bc58148438abbc26d18837ce6b56779f5fce1dfd0cdcff"
+      "sha256": "5c043815a8ae0bac37b2a291f0b874faa23bc4985c4af94f4f0645e7b579939e"
     },
     "1.96.0-aarch64-apple-darwin": {
       "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
@@ -63,7 +63,7 @@
         "rustfmt-aarch64-apple-darwin"
       ],
       "rustc_verbose": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: aarch64-apple-darwin\nrelease: 1.96.0\nLLVM version: 22.1.2",
-      "sha256": "ac9673011b24cd5cbe5d640c8ae0c51a9f577fe3e3ec37b95ad1bd4dc89a6073"
+      "sha256": "f70879b58ea6cd318176cccc7da81093f71a3455ececf67d451b52ed7f07f81c"
     },
     "1.99.0-aarch64-apple-darwin": {
       "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
@@ -182,7 +182,7 @@
       "proxy": true
     },
     "rustup": {
-      "sha256": "f7c7e11eb2e07f006e532a8aaac77b32f4527d305ac386c0c633ca6133d35ca9"
+      "sha256": "ec1b9233e7f72990ecd8e62063fa7f6c3dfc2bec8e97f88bff165f9100ac696a"
     },
     "wasm-bindgen": {
       "version": "wasm-bindgen 0.2.126",
@@ -404,12 +404,12 @@
     "git": {
       "path": "/opt/motor/bin/git",
       "version": "git version 2.53.0",
-      "sha256": "5693dbcb924373eb31af47e732db2d1f7a5922884ea89d43bb1dc2752a388f02"
+      "sha256": "00634360042d50ea50aec26f63f7aa0ab5daabd8eca6088ae511b9b81e8fd800"
     },
     "bash": {
       "path": "/opt/motor/bin/bash",
       "version": "GNU bash, version 5.2.37(1)-release (aarch64-apple-darwin27.0.0)",
-      "sha256": "4044f2f7b64e8c84b9fdf1a313f27dbee99cd00ffc6f2ca45f4fe75056391d82"
+      "sha256": "6effa3adae504f9f9e7e592c98f6143976b677238eedc00091afda3f6f8e2f60"
     }
   },
   "agent": {
@@ -431,7 +431,7 @@
     },
     "git": {
       "path": "bin/git",
-      "sha256": "5693dbcb924373eb31af47e732db2d1f7a5922884ea89d43bb1dc2752a388f02"
+      "sha256": "00634360042d50ea50aec26f63f7aa0ab5daabd8eca6088ae511b9b81e8fd800"
     }
   },
   "job_environment_by_role": {

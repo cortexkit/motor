@@ -97,6 +97,9 @@ def provision(manifest, scratch, measure):
     init.chmod(0o755)
     run(init, "-y", "--no-modify-path", "--profile", manifest["rust_profile"], "--default-toolchain", "none", env=env)
     rustup = PREFIX / "cargo/bin/rustup"
+    # Installing a toolchain otherwise updates rustup itself, and the image
+    # must carry the build server's pinned rustup version.
+    run(rustup, "set", "auto-self-update", "disable", env=env)
     for name, spec in manifest["rust_toolchains"].items():
         if name.startswith("stable-"):
             continue
