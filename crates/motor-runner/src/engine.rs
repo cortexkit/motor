@@ -60,6 +60,8 @@ pub const BOAT_DISK_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 type JobWriteHook = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
 #[cfg(test)]
 type CatalogWriteHook = Arc<dyn Fn(CatalogWrite) -> io::Result<()> + Send + Sync>;
+#[cfg(test)]
+type CallerRootProbe = Arc<dyn Fn(&paths::CallerRoot) -> io::Result<()> + Send + Sync>;
 
 /// A step of a catalog write, for `Config::catalog_write`.
 #[cfg(test)]
@@ -72,6 +74,8 @@ pub(crate) enum CatalogWrite {
     /// A snapshot already covered by a rename whose directory sync failed
     /// is about to retry that sync.
     SyncRetry,
+    /// One file of a two-file save was renamed, but the save is not complete.
+    PhaseRenamed,
 }
 #[cfg(test)]
 type AccountingReportHook = Arc<dyn Fn(Uuid, &[u8]) + Send + Sync>;
@@ -112,6 +116,8 @@ pub struct Config {
     pub caller_roots: Vec<crate::CallerRoot>,
     #[cfg(test)]
     pub(crate) test_allow_unisolated_caller_roots: bool,
+    #[cfg(test)]
+    pub(crate) caller_root_probe: Option<CallerRootProbe>,
     pub state_root: PathBuf,
     pub build_slot_root: PathBuf,
     pub max_queue_depth: usize,
@@ -434,6 +440,8 @@ impl Config {
             caller_roots: Vec::new(),
             #[cfg(test)]
             test_allow_unisolated_caller_roots: false,
+            #[cfg(test)]
+            caller_root_probe: None,
             build_slot_root: state_root.join("build-slots"),
             state_root,
             max_queue_depth: 64,
@@ -1306,14 +1314,18 @@ struct CatalogWritten {
     renamed: u64,
     /// The newest snapshot known durable (its directory synced too).
     synced: u64,
+    /// Retain a failed two-file save so an older snapshot retries it instead of
+    /// overwriting its already-published additions.
+    pending: Option<CatalogSnapshot>,
 }
 
-/// The catalog as serialized under the state lock, for `Runner::write_catalog`
-/// to write after the lock is released.
+/// An owned catalog split copied under the state lock, for
+/// `Runner::write_catalog` to serialize and write after the lock is released.
+#[derive(Clone)]
 #[must_use = "a catalog snapshot changes nothing until it is written"]
 struct CatalogSnapshot {
     generation: u64,
-    bytes: Vec<u8>,
+    split: paths::catalog::Split,
 }
 
 struct Reservation {
@@ -1627,6 +1639,21 @@ fn private_state_directory(path: &Path) -> io::Result<()> {
     crate::filesystem::device(path).map(|_| ())
 }
 
+#[cfg(target_os = "linux")]
+fn prepare_job_shared_roots(config: &Config) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some((cargo_home, rustup_home, bun_bin)) = &config.shared_read_roots {
+        return crate::isolation::prepare_shared_read_access_from(
+            cargo_home,
+            rustup_home,
+            bun_bin.as_deref(),
+        );
+    }
+    crate::isolation::prepare_shared_read_access(&crate::isolation::JavascriptTools::for_config(
+        config,
+    ))
+}
+
 impl Runner {
     #[cfg(windows)]
     pub(crate) fn open_for_qualification(config: Config) -> io::Result<Self> {
@@ -1714,7 +1741,8 @@ impl Runner {
         Self::open_with_backend(config, backend)
     }
     fn open_with_backend(mut config: Config, backend: Box<dyn Backend>) -> io::Result<Self> {
-        paths::startup::filesystem(&config)?;
+        paths::startup::options(&config)?;
+        paths::owner::check(&config)?;
         #[cfg(target_os = "linux")]
         if config.boat_profile {
             config.free_space_floor_bytes = config
@@ -1842,22 +1870,9 @@ impl Runner {
                 crate::isolation::pid_init::check_installed_runner()?;
                 config.pid_init = Some(crate::isolation::job_identity()?);
             }
-            #[cfg(test)]
-            if let Some((cargo_home, rustup_home, bun_bin)) = &config.shared_read_roots {
-                crate::isolation::prepare_shared_read_access_from(
-                    cargo_home,
-                    rustup_home,
-                    bun_bin.as_deref(),
-                )?;
-            } else {
-                crate::isolation::prepare_shared_read_access(
-                    &crate::isolation::JavascriptTools::for_config(&config),
-                )?;
+            if config.caller_roots.is_empty() {
+                prepare_job_shared_roots(&config)?;
             }
-            #[cfg(not(test))]
-            crate::isolation::prepare_shared_read_access(
-                &crate::isolation::JavascriptTools::for_config(&config),
-            )?;
         }
         // The operator's state root may be reached through symlinks (for example
         // when storage lives on another volume). Resolve only that trusted root
@@ -1917,6 +1932,62 @@ impl Runner {
             .write(true)
             .open(state.join("daemon.lock"))?;
         lock.try_lock_exclusive()?;
+        // Collect mappings from both files and all job records before dropping
+        // duplicate keys. A caller-catalog.json copy that loses to catalog.json
+        // can still be the only record requiring a caller-root flag.
+        let persisted = paths::catalog::Split::read(&state)?;
+        let mut pins = persisted.caller.pins();
+        for entry in fs::read_dir(state.join("jobs"))? {
+            let path = entry?.path().join("record.json");
+            match read_json::<serde_json::Value>(&path) {
+                Ok(record) => {
+                    if let Some(mappings) = record.get("mappings") {
+                        pins.extend(
+                            serde_json::from_value::<Vec<paths::CallerRoot>>(mappings.clone())
+                                .map_err(invalid)?,
+                        );
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                // Damaged records are quarantined by normal recovery, but a
+                // malformed JSON record cannot safely hide a mapping pin.
+                Err(error)
+                    if !config.caller_roots.is_empty()
+                        || state.join("caller-roots-ever-enabled").exists() =>
+                {
+                    return Err(invalid(format!(
+                        "cannot inspect job mapping pins {}: {error}",
+                        path.display()
+                    )))
+                }
+                Err(_) => {}
+            }
+        }
+        let mut catalog = persisted.loaded();
+        paths::owner::check(&config)?;
+        paths::catalog::fixed(&config.caller_roots, &pins)?;
+        paths::startup::filesystem(&config)?;
+        if !config.caller_roots.is_empty() {
+            if !state.join("caller-roots-ever-enabled").exists() {
+                crate::storage::atomic_bytes(
+                    &state.join("caller-roots-ever-enabled"),
+                    b"caller roots enabled\n",
+                    true,
+                )?;
+            }
+            paths::owner::claim(&config)?;
+        }
+        paths::catalog::Split::new(&catalog, &config.caller_roots).save(
+            &state,
+            config.windows_instance(),
+            |_, _| Ok(()),
+        )?;
+        // Shared Cargo trees acquire directories and ACLs during preparation.
+        // A mapping refusal must happen before those host trees are changed.
+        #[cfg(target_os = "linux")]
+        if !config.caller_roots.is_empty() && config.isolate_jobs {
+            prepare_job_shared_roots(&config)?;
+        }
         // Holding the daemon lock, this is the only runner of this instance,
         // so any helper unit of this instance belongs to an earlier run.
         #[cfg(any(target_os = "linux", test))]
@@ -1963,11 +2034,6 @@ impl Runner {
         let mut lost = Vec::new();
         // Catalog damage cannot be treated like one damaged execution record:
         // it is the ownership index for every retained workspace and cache.
-        let mut catalog: Catalog = match read_json(&state.join("catalog.json")) {
-            Ok(catalog) => catalog,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Catalog::default(),
-            Err(error) => return Err(invalid(format!("cannot read workspace catalog: {error}"))),
-        };
         let quarantine_root = state.join("quarantine");
         match fs::read_dir(&quarantine_root) {
             Ok(entries) => {
@@ -2246,11 +2312,11 @@ impl Runner {
                 workspace.used_ms = workspace.used_ms.max(finished_ms);
             }
         }
-        if config.windows_instance() {
-            atomic_json_private(&state.join("catalog.json"), &catalog)?;
-        } else {
-            atomic_json(&state.join("catalog.json"), &catalog)?;
-        }
+        paths::catalog::Split::new(&catalog, &config.caller_roots).save(
+            &state,
+            config.windows_instance(),
+            |_, _| Ok(()),
+        )?;
         let order = jobs.values().map(|j| j.order).max().unwrap_or(0);
         #[cfg(unix)]
         let macos_version = config.macos.as_ref().map(|vm| vm.toolchain_version.clone());
@@ -2428,6 +2494,7 @@ impl Runner {
                     runner.purge(entry.path());
                 }
             }
+            paths::owner::purge_trash(&runner.core.config)?;
             runner.clean_sibling_snapshot_leftovers();
             runner.migrate_legacy_storage()?;
         }
@@ -2778,6 +2845,9 @@ impl Runner {
             .join("record.json")
     }
     fn save(&self, job: &Job) -> io::Result<()> {
+        let mut job = job.clone();
+        job.mappings = paths::job_mappings(&job, &self.core.config.caller_roots);
+        let job = &job;
         #[cfg(test)]
         if let Some(write) = &self.core.config.before_job_write {
             write(&self.record_path(job.id))?;
@@ -2846,12 +2916,12 @@ impl Runner {
     fn catalog(&self, inner: &Inner) -> io::Result<()> {
         self.write_catalog(self.catalog_snapshot(inner)?)
     }
-    /// Serialize the catalog for a later `write_catalog`. Call with the state
+    /// Copy and split the catalog for a later `write_catalog`. Call with the state
     /// lock held: the snapshot's generation orders it after every catalog
     /// change made before it.
     fn catalog_snapshot(&self, inner: &Inner) -> io::Result<CatalogSnapshot> {
         Ok(CatalogSnapshot {
-            bytes: serde_json::to_vec(&inner.catalog).map_err(invalid)?,
+            split: paths::catalog::Split::new(&inner.catalog, &self.core.config.caller_roots),
             generation: self
                 .core
                 .catalog_generation
@@ -2878,6 +2948,10 @@ impl Runner {
         if written.synced >= snapshot.generation {
             return Ok(());
         }
+        let snapshot = match written.pending.as_ref() {
+            Some(pending) if pending.generation > snapshot.generation => pending.clone(),
+            _ => snapshot,
+        };
         let path = self.core.trees.state.join("catalog.json");
         if written.renamed >= snapshot.generation {
             #[cfg(test)]
@@ -2886,19 +2960,27 @@ impl Runner {
             }
             crate::filesystem::sync_directory(path.parent().unwrap())?;
             written.synced = written.renamed;
+            written.pending = None;
             return Ok(());
         }
+        written.pending = Some(snapshot.clone());
         self.long_work("catalog_save");
         #[cfg(test)]
         if let Some(hook) = &self.core.config.catalog_write {
             hook(CatalogWrite::Starting)?;
         }
         let written = &mut *written;
-        atomic_bytes_and(
-            &path,
-            &snapshot.bytes,
+        snapshot.split.save(
+            &self.core.trees.state,
             self.core.config.windows_instance(),
-            || {
+            |_, final_write| {
+                if !final_write {
+                    #[cfg(test)]
+                    if let Some(hook) = &self.core.config.catalog_write {
+                        hook(CatalogWrite::PhaseRenamed)?;
+                    }
+                    return Ok(());
+                }
                 // Once renamed into place these bytes are what the path holds
                 // even if the directory sync below fails, so no older snapshot
                 // may be written over them from here on.
@@ -2911,6 +2993,7 @@ impl Runner {
             },
         )?;
         written.synced = snapshot.generation;
+        written.pending = None;
         Ok(())
     }
     fn unit_alive(&self, process: Option<platform::ProcessIdentity>) -> io::Result<Option<bool>> {

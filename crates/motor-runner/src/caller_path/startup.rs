@@ -3,7 +3,7 @@ use crate::{BackendKind, Config};
 use std::{fs, io, path::PathBuf};
 
 /// An operator-supplied mapping. Neither side is normalized on input.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CallerRoot {
     pub caller_prefix: String,
     pub host_root: PathBuf,
@@ -137,7 +137,7 @@ fn test_unisolated(config: &Config) -> bool {
 }
 
 /// Resolve existing ancestors, retaining a nonexistent suffix without creating it.
-fn canonical_future(path: &Path) -> io::Result<PathBuf> {
+pub(super) fn canonical_future(path: &Path) -> io::Result<PathBuf> {
     match fs::canonicalize(path) {
         Ok(path) => Ok(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -370,6 +370,10 @@ pub(super) fn filesystem_with_probe(
         }
     }
     for root in &config.caller_roots {
+        #[cfg(test)]
+        if let Some(probe) = &config.caller_root_probe {
+            probe(root)?;
+        }
         probe_root(config, root).map_err(|error| {
             refusal(
                 root.host_root.display(),

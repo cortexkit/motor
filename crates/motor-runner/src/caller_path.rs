@@ -6,6 +6,8 @@
 use crate::storage::{BaseRequest, Job, LegacyCheckout, RetainedTransfer, Workspace};
 use motor_protocol::{Prepare, Run, SiblingSnapshot};
 use std::path::Path;
+pub(crate) mod catalog;
+pub(crate) mod owner;
 pub(crate) mod startup;
 pub use startup::CallerRoot;
 #[cfg(test)]
@@ -229,6 +231,39 @@ pub(crate) fn legacy_checkout(record: &LegacyCheckout) -> PathPlan<'_> {
 
 pub(crate) fn base(record: &BaseRequest) -> PathPlan<'_> {
     identity(&record.workspace)
+}
+
+/// Each record pins only the mappings referenced by its own paths.
+pub(crate) fn mappings<'a>(
+    roots: &[CallerRoot],
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Vec<CallerRoot> {
+    let paths: Vec<_> = paths.into_iter().map(Path::new).collect();
+    roots
+        .iter()
+        .filter(|root| {
+            paths.iter().any(|path| {
+                *path != Path::new(&root.caller_prefix) && path.starts_with(&root.caller_prefix)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn job_mappings(job: &Job, roots: &[CallerRoot]) -> Vec<CallerRoot> {
+    let Some(request) = &job.request else {
+        return vec![];
+    };
+    mappings(
+        roots,
+        [
+            request.workspace_key.as_str(),
+            request.repository_root.as_str(),
+            request.cwd.as_str(),
+        ]
+        .into_iter()
+        .chain(request.siblings.iter().map(|s| s.canonical_path.as_str())),
+    )
 }
 
 #[cfg(test)]
