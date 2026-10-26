@@ -1,5 +1,6 @@
 pub mod cgroup;
 pub mod fs;
+pub mod offline;
 pub mod process;
 pub mod server;
 pub mod tenant;

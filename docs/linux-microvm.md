@@ -104,6 +104,25 @@ affected gate. Rules bind to interface names;
 a same-name replacement inherits them, and root-only interface renames are
 outside this boundary.
 
+If an invalid or missing uplink prevents the helper from starting, removal is
+still available through a root-only offline command. Drain work and explicitly
+stop both services first, including any failed unit's auto-restart:
+
+```sh
+sudo systemctl stop motor-host.service motor-vm-helper.service
+sudo motor-vm-helper --remove-tenant <tenant>
+# When its registry is already gone but quarantine completion was interrupted:
+sudo motor-vm-helper --resume-removal <tenant>
+```
+
+The offline entry point is selected before any helper config is loaded. It uses
+the same provisioning lock, saved registry, tenant-owned network cleanup and
+quarantine ordering. It refuses active/restarting services, a surviving jail or
+any process with the reserved tenant uid. It checks root-owned state and saved
+records and never starts a VM, helper, agent or broker connection. This is a
+smaller safety change than weakening generic startup cleanup, trust or cgroup
+barriers merely to expose a removal RPC; ordinary helper startup remains strict.
+
 The socket is `/run/motor-vm-helper.sock`, `root:<socket_gid>`, mode `0660`.
 Only uids listed in the config are admitted, checked with `SO_PEERCRED`.
 

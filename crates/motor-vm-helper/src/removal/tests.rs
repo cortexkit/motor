@@ -56,6 +56,83 @@ fn scratch() -> Scratch {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn offline_cli_removes_and_resumes_without_loading_broken_uplink_config() {
+    for resume in [false, true] {
+        let s = scratch();
+        let p = &s.paths;
+        let registry = crate::tenant::tests::registry("a");
+        fs::write(p.registry_file("a"), serde_json::to_vec(&registry).unwrap()).unwrap();
+        if resume {
+            begin(p, "a", 1200).unwrap();
+            fs::remove_file(p.registry_file("a")).unwrap();
+        }
+        let mut cleaned = false;
+        crate::linux::server::dispatch(
+            [
+                std::ffi::OsString::from(if resume {
+                    "--resume-removal"
+                } else {
+                    "--remove-tenant"
+                }),
+                "a".into(),
+            ],
+            |_| {
+                Err(Error(
+                    "uplink invalid: helper cannot reconcile or serve".into(),
+                ))
+            },
+            |tenant, resume_only| {
+                offline_with(
+                    p,
+                    tenant,
+                    resume_only,
+                    1300,
+                    |path| {
+                        serde_json::from_slice(&fs::read(path)?).map_err(|e| Error(e.to_string()))
+                    },
+                    |_| Ok(()),
+                    |saved| {
+                        assert_eq!(saved.tap_index, 1);
+                        cleaned = true;
+                        Ok(())
+                    },
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(cleaned);
+        assert!(!p.home("a").exists());
+        assert!(p.home("b").exists());
+    }
+}
+
+#[test]
+fn offline_removal_refuses_live_service_or_process_before_any_quarantine() {
+    let s = scratch();
+    let p = &s.paths;
+    fs::write(
+        p.registry_file("a"),
+        serde_json::to_vec(&crate::tenant::tests::registry("a")).unwrap(),
+    )
+    .unwrap();
+    let result = offline_with(
+        p,
+        "a",
+        false,
+        1300,
+        |path| serde_json::from_slice(&fs::read(path)?).map_err(|e| Error(e.to_string())),
+        |_| Err(Error("tenant still has a live process".into())),
+        |_| panic!("must not clean a live VM"),
+    );
+    assert!(result.unwrap_err().0.contains("live process"));
+    assert!(!p.removed().exists());
+    assert!(p.registry_file("a").exists());
+    assert!(p.home("a").exists());
+}
+
+#[test]
 fn interrupted_removal_replays_network_before_finishing_saved_records() {
     let s = scratch();
     let p = &s.paths;

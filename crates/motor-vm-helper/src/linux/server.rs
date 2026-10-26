@@ -39,6 +39,41 @@ pub fn peer(stream: &UnixStream) -> Result<Peer> {
         gid: credential.gid,
     })
 }
+/// Offline cleanup is selected before config loading and helper reconciliation.
+pub fn dispatch(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    serve_config: impl FnOnce(&Path) -> Result<()>,
+    offline_remove: impl FnOnce(&str, bool) -> Result<()>,
+) -> Result<()> {
+    let mut args = args.into_iter();
+    let mode = args
+        .next()
+        .ok_or_else(|| Error("expected --config, --remove-tenant or --resume-removal".into()))?;
+    let value = args
+        .next()
+        .ok_or_else(|| Error("missing command argument".into()))?;
+    if args.next().is_some() {
+        return Err(Error("unexpected arguments".into()));
+    }
+    if mode == "--config" {
+        return serve_config(Path::new(&value));
+    }
+    let resume = match mode.to_str() {
+        Some("--remove-tenant") => false,
+        Some("--resume-removal") => true,
+        _ => {
+            return Err(Error(
+                "expected --config, --remove-tenant or --resume-removal".into(),
+            ))
+        }
+    };
+    let tenant = value
+        .to_str()
+        .ok_or_else(|| Error("tenant must be UTF-8".into()))?;
+    crate::tenant::validate_name(tenant)?;
+    offline_remove(tenant, resume)
+}
+
 pub fn serve(
     machine: LinuxMachine,
     count: usize,

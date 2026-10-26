@@ -219,6 +219,39 @@ pub fn finish_with_network(
     finish(paths, tenant, quarantine)
 }
 
+/// Offline administrative removal uses the same journal and cleanup order,
+/// without constructing a helper or loading an uplink configuration.
+pub fn offline_with(
+    paths: &Paths,
+    tenant: &str,
+    resume_only: bool,
+    unix_s: u64,
+    mut read_registry: impl FnMut(&Path) -> Result<crate::tenant::Registry>,
+    mut stopped: impl FnMut(&crate::tenant::Registry) -> Result<()>,
+    cleanup: impl FnOnce(&crate::tenant::Registry) -> Result<()>,
+) -> Result<PathBuf> {
+    crate::tenant::validate_name(tenant)?;
+    let _lock = lock(paths)?;
+    let quarantine = if paths.registry_file(tenant).try_exists()? {
+        if resume_only {
+            return Err(Error("registry still exists; use --remove-tenant".into()));
+        }
+        let registry = read_registry(&paths.registry_file(tenant))?;
+        registry.validate(tenant)?;
+        stopped(&registry)?;
+        begin(paths, tenant, unix_s)?
+    } else {
+        pending(paths, tenant)?
+            .ok_or_else(|| Error("unknown tenant or no interrupted removal".into()))?
+    };
+    // The production reader checks root ownership and all saved-record ancestors.
+    let saved = read_registry(&quarantine.join("records/registry.json"))?;
+    saved.validate(tenant)?;
+    stopped(&saved)?;
+    finish_with_network(paths, tenant, &quarantine, cleanup)?;
+    Ok(quarantine)
+}
+
 /// A removal whose records are already gone but whose home was not yet moved:
 /// the newest quarantine folder for this tenant that has saved records and
 /// no `home`, while the tenant's home still exists.
