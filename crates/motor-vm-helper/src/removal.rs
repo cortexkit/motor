@@ -125,7 +125,6 @@ pub fn lock(paths: &Paths) -> Result<File> {
     Ok(file)
 }
 
-
 /// Creates the quarantine folder and saves copies of the tenant's records in
 /// it, so an operator can undo the removal. Nothing is deleted yet.
 pub fn begin(paths: &Paths, tenant: &str, unix_s: u64) -> Result<PathBuf> {
@@ -296,6 +295,26 @@ pub fn finish_with_network(
     finish(paths, tenant, quarantine)
 }
 
+/// Resume through the online removal path, checking current index ownership
+/// under the provisioning lock before any saved record can authorize cleanup.
+pub fn resume_with_network(
+    paths: &Paths,
+    tenant: &str,
+    mut read_registry: impl FnMut(&Path) -> Result<crate::tenant::Registry>,
+    cleanup: impl FnOnce(&crate::tenant::Registry) -> Result<()>,
+) -> Result<Option<PathBuf>> {
+    let _lock = lock(paths)?;
+    let Some(quarantine) = pending(paths, tenant)? else {
+        return Ok(None);
+    };
+    let saved = read_registry(&quarantine.join("records/registry.json"))?;
+    saved.validate(tenant)?;
+    refuse_reassigned_tap(paths, tenant, &saved, false, &mut read_registry)?;
+    cleanup(&saved)?;
+    finish(paths, tenant, &quarantine)?;
+    Ok(Some(quarantine))
+}
+
 /// An index identifies host network objects and the uid, not an incarnation.
 /// Saved records must never authorize deletion after another tenant reused it.
 pub fn refuse_reassigned_tap(
@@ -335,7 +354,6 @@ pub fn refuse_reassigned_tap(
     Ok(())
 }
 
-
 /// A removal whose records are already gone but whose home was not yet moved:
 /// the newest quarantine folder for this tenant that has saved records and
 /// no `home`, while the tenant's home still exists.
@@ -368,7 +386,10 @@ pub fn purge(paths: &Paths, now_s: u64) -> Result<Vec<PathBuf>> {
         if now_s.saturating_sub(unix_s) < QUARANTINE_S {
             continue;
         }
-        if !path.join(COMPLETE).exists() && !path.join("home").exists() && paths.home(&tenant).exists() {
+        if !path.join(COMPLETE).exists()
+            && !path.join("home").exists()
+            && paths.home(&tenant).exists()
+        {
             eprintln!(
                 "tenant {tenant}: removal at {unix_s} never moved its home; data is still at {}",
                 paths.home(&tenant).display()

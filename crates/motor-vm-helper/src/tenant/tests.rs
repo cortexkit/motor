@@ -91,8 +91,12 @@ impl Default for Fake {
     }
 }
 
-pub(crate) fn degraded_service_fixture() -> Controller<Fake> {
-    Controller(Fake { network_problem: Some("uplink missing0 is absent"), pending_removal: true, ..Fake::default() })
+pub(crate) fn degraded_service_fixture(problem: &'static str) -> Controller<Fake> {
+    Controller(Fake {
+        network_problem: Some(problem),
+        pending_removal: true,
+        ..Fake::default()
+    })
 }
 impl Fake {
     fn call(&mut self, name: &str) -> Result<()> {
@@ -544,7 +548,9 @@ fn oom_refusal_never_falls_back_or_changes_snapshots_and_generation() {
 }
 impl Backend for Fake {
     fn check_network(&mut self, _: &str) -> std::result::Result<(), StartRefusal> {
-        self.network_problem.map_or(Ok(()), |problem| Err(start_refused(StartRefusalCase::Uplink, problem)))
+        self.network_problem.map_or(Ok(()), |problem| {
+            Err(start_refused(StartRefusalCase::Uplink, problem))
+        })
     }
     fn check_start(&mut self, _: &str) -> std::result::Result<(), StartRefusal> {
         if let Some(case) = self.start_failure {
@@ -591,7 +597,9 @@ impl Backend for Fake {
     }
     fn registry(&mut self, _: &str) -> Result<Registry> {
         self.call("registry")?;
-        if self.registry_absent { return Err(Error("registry absent".into())); }
+        if self.registry_absent {
+            return Err(Error("registry absent".into()));
+        }
         Ok(registry("a"))
     }
     fn vm_present(&mut self, _: &str) -> Result<bool> {
@@ -606,7 +614,9 @@ impl Backend for Fake {
     }
     fn resume_removal(&mut self, tenant: &str) -> Result<Option<PathBuf>> {
         self.call("resume-removal")?;
-        Ok(self.pending_removal.then(|| PathBuf::from(format!("/var/lib/motor-vm/removed/{tenant}-1"))))
+        Ok(self
+            .pending_removal
+            .then(|| PathBuf::from(format!("/var/lib/motor-vm/removed/{tenant}-1"))))
     }
     fn key(&mut self, _: &Registry) -> Result<SnapshotKey> {
         Ok(key(self.generation))
@@ -1478,7 +1488,7 @@ fn removal_refuses_an_unknown_tenant_and_a_running_vm_before_touching_anything()
         ..Fake::default()
     });
     assert!(c.handle("a", Operation::Remove).is_err());
-    assert_eq!(c.0.calls, ["registry"]);
+    assert_eq!(c.0.calls, ["registry", "resume-removal"]);
     // A registry entry that belongs to another tenant name.
     let mut c = Controller(Fake::default());
     assert!(c.handle("b", Operation::Remove).is_err());

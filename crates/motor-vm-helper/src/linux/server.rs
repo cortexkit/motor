@@ -40,36 +40,40 @@ pub fn peer(stream: &UnixStream) -> Result<Peer> {
     })
 }
 
-pub(crate) fn initialize_helper<M: crate::Machine>(machine: M, count: usize, allowed: Vec<u32>) -> Result<Helper<M>> {
+fn initialize_helper<M: crate::Machine>(
+    machine: M,
+    count: usize,
+    allowed: Vec<u32>,
+    socket: &Path,
+) -> Result<(Mutex<Helper<M>>, UnixListener)> {
     // Qualification deliberately holds provision.lock while starting a helper.
     // Startup must not acquire it; the helper mutex serializes online removal.
-    Helper::new(machine, count, allowed)
+    let helper = Mutex::new(Helper::new(machine, count, allowed)?);
+    // Cleanup and trust checks run before the socket is bound. An invalid
+    // uplink may still leave a fenced helper serving status, stop and removal.
+    match std::fs::symlink_metadata(socket) {
+        Ok(m) if m.file_type().is_socket() => std::fs::remove_file(socket)?,
+        Ok(_) => return Err(Error("helper socket path is not a socket".into())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok((helper, UnixListener::bind(socket)?))
 }
 
 pub fn serve(config: crate::config::Config) -> Result<()> {
-            let count = config.slots.len();
-            let allowed = config.allowed_uids.clone();
-            let socket_gid = config.socket_gid;
-            let machine = LinuxMachine::new(config)?;
-            // Before any thread exists, so every thread inherits the blocked mask.
-            let signals = crate::signals::StopSignals::block()?;
-            let helper = Arc::new(Mutex::new(initialize_helper(machine, count, allowed)?));
-            // Non-network cleanup/trust barriers still precede the listener. A fenced
-            // uplink is a serving-but-unready state, not a construction failure.
-            // Refuse non-socket state,
-            // rather than unlinking an arbitrary file on a privileged path.
-            match std::fs::symlink_metadata(SOCKET) {
-                Ok(m) if m.file_type().is_socket() => std::fs::remove_file(SOCKET)?,
-                Ok(_) => return Err(Error("helper socket path is not a socket".into())),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-            let listener = UnixListener::bind(SOCKET)?;
-            let path = c"/run/motor-vm-helper.sock";
-            if unsafe { libc::chown(path.as_ptr(), 0, socket_gid) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            std::fs::set_permissions(SOCKET, std::fs::Permissions::from_mode(0o660))?;
+    let count = config.slots.len();
+    let allowed = config.allowed_uids.clone();
+    let socket_gid = config.socket_gid;
+    let machine = LinuxMachine::new(config)?;
+    // Before any thread exists, so every thread inherits the blocked mask.
+    let signals = crate::signals::StopSignals::block()?;
+    let (helper, listener) = initialize_helper(machine, count, allowed, Path::new(SOCKET))?;
+    let helper = Arc::new(helper);
+    let path = c"/run/motor-vm-helper.sock";
+    if unsafe { libc::chown(path.as_ptr(), 0, socket_gid) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    std::fs::set_permissions(SOCKET, std::fs::Permissions::from_mode(0o660))?;
     let maintenance = helper.clone();
     std::thread::spawn(move || loop {
         std::thread::park_timeout(Duration::from_millis(100));
@@ -119,8 +123,8 @@ pub fn serve(config: crate::config::Config) -> Result<()> {
     }
     Ok(())
 }
-fn connection_loop(
-    helper: &Mutex<Helper<LinuxMachine>>,
+fn connection_loop<M: crate::Machine>(
+    helper: &Mutex<Helper<M>>,
     id: u64,
     mut stream: UnixStream,
 ) -> Result<()> {
@@ -215,3 +219,6 @@ pub fn load_config(path: &Path) -> Result<crate::config::Config> {
     config.validate_resources()?;
     Ok(config)
 }
+
+#[cfg(test)]
+mod tests;

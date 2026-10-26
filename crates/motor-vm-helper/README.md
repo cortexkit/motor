@@ -140,13 +140,19 @@ with direct Linux jobs. `MemoryHigh` is `max - floor(max / 6)`. The
 pinned 40 GiB drop-in is `tests/vectors/jobs-slice-capacity.conf`.
 
 A policy refusal replies with `result: "start_refused"`, a typed `case` of
-`capacity_json`, `fit`, `live_cap`, `drop_in`, `resize_journal`, `oom`,
+`uplink`, `capacity_json`, `fit`, `live_cap`, `drop_in`, `resize_journal`, `oom`,
 `activation` or `post_grow_space`, and a
 diagnostic `message`. These refusals do not disable Stop, Metrics, removal or
 startup reconciliation. Both snapshot load paths verify the VMM is named
 `firecracker` and set and read back `oom_score_adj=-500` before snapshot load.
 An OOM protection failure stops and reaps the VMM without consuming saved state,
 advancing the generation or attempting a base fallback.
+
+An invalid or missing uplink fences all tenant gates without disabling the
+helper socket. Gate-opening requests get the `uplink` case with its diagnostic;
+stopped-tenant removal and interrupted-removal replay use the ordinary online
+request path without requiring an uplink. Network fencing must succeed before
+startup continues; other cleanup and trust barriers are unchanged.
 
 On a dedicated fixture host with a stopped disposable tenant, saved snapshots,
 a matching size base, and valid capacity policy, the operator-only

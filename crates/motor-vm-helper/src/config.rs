@@ -31,7 +31,7 @@ pub struct UidRange {
 pub struct Config {
     #[serde(default)]
     pub uplink: String,
-    #[serde(default)]
+    #[serde(default = "missing_public_ipv4")]
     pub public_ipv4: Ipv4Addr,
     pub allowed_uids: Vec<u32>,
     pub socket_gid: u32,
@@ -50,6 +50,10 @@ pub struct Config {
     #[serde(default)]
     pub proxy_for_jobs: bool,
 }
+fn missing_public_ipv4() -> Ipv4Addr {
+    Ipv4Addr::UNSPECIFIED
+}
+
 fn default_uid_base() -> u32 {
     200000
 }
@@ -63,7 +67,11 @@ impl Config {
         if !valid_uplink(&self.uplink) || !public_ipv4(self.public_ipv4) {
             return Err(Error(format!(
                 "invalid uplink {} or public IPv4 address",
-                if self.uplink.is_empty() { "<missing>" } else { &self.uplink }
+                if self.uplink.is_empty() {
+                    "<missing>"
+                } else {
+                    &self.uplink
+                }
             )));
         }
         Ok(())

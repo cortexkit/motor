@@ -484,7 +484,31 @@ pub fn install(registries: &[Registry], config: &crate::config::Config) -> Resul
     install_startup(registries, config)?.require_ready()
 }
 
-pub(crate) fn install_startup(registries: &[Registry], config: &crate::config::Config) -> Result<NetworkReadiness> {
+pub(super) fn fence(registries: &[Registry]) -> Result<()> {
+    let _lock = lock::acquire()?;
+    let (existing, motor_net) = NetworkCommands { config: None }.tables()?;
+    fence_policy(registries, existing.as_ref(), motor_net.as_ref(), apply)
+}
+
+fn fence_policy(
+    registries: &[Registry],
+    existing: Option<&serde_json::Value>,
+    motor_net: Option<&serde_json::Value>,
+    mut apply: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let desired = registries.iter().map(Registry::tap).collect();
+    let mut text = prelude(registries, existing, &desired)?;
+    text.push_str(&motor_net_members(
+        motor_net,
+        &std::collections::BTreeSet::new(),
+    )?);
+    apply(&text)
+}
+
+pub(crate) fn install_startup(
+    registries: &[Registry],
+    config: &crate::config::Config,
+) -> Result<NetworkReadiness> {
     let _lock = lock::acquire()?;
     let mut commands = NetworkCommands {
         config: Some(config),
@@ -714,7 +738,11 @@ fn reconcile_policy_state(
     registries: &[Registry],
     existing: Option<&serde_json::Value>,
     motor_net: Option<&serde_json::Value>,
-    io: ReconcileIo<impl FnMut(&str) -> Result<()>, impl FnOnce(&ufw::State) -> Result<()>, impl FnMut() -> Result<()>>,
+    io: ReconcileIo<
+        impl FnMut(&str) -> Result<()>,
+        impl FnOnce(&ufw::State) -> Result<()>,
+        impl FnMut() -> Result<()>,
+    >,
 ) -> Result<NetworkReadiness> {
     let ReconcileIo {
         inspected,
@@ -725,12 +753,10 @@ fn reconcile_policy_state(
     use std::collections::BTreeSet;
     let desired: BTreeSet<_> = registries.iter().map(Registry::tap).collect();
     if let Err(error) = validate_uplink() {
-        apply(&prelude(registries, existing, &desired)?)?;
-        let revoke = motor_net_members(motor_net, &BTreeSet::new())?;
-        if !revoke.is_empty() {
-            apply(&revoke)?;
-        }
-        return Ok(NetworkReadiness::FencedUplink(format!("uplink {uplink}: {error}")));
+        fence_policy(registries, existing, motor_net, &mut apply)?;
+        return Ok(NetworkReadiness::FencedUplink(format!(
+            "uplink {uplink}: {error}"
+        )));
     }
     let previously_closed = match tap_members(existing, "closed_taps") {
         Ok(members) => members.unwrap_or_default(),
@@ -782,7 +808,9 @@ fn reconcile_policy_state(
         let mut fence = set_members("motor_tenant", "closed_taps", &desired);
         fence.push_str(&motor_net_members(motor_net, &BTreeSet::new())?);
         apply(&fence)?;
-        return Ok(NetworkReadiness::FencedUplink(format!("uplink {uplink}: {error}")));
+        return Ok(NetworkReadiness::FencedUplink(format!(
+            "uplink {uplink}: {error}"
+        )));
     }
     let mut open = set_members("motor_tenant", "closed_taps", &BTreeSet::new());
     open.push_str(&motor_net_members(motor_net, &desired)?);
@@ -1370,8 +1398,44 @@ mod cleanup_tests {
 }
 
 #[cfg(test)]
-mod reconciliation_tests {
+pub(super) mod reconciliation_tests {
     use super::*;
+
+    pub(in crate::linux) fn fenced_startup(
+        config: &crate::config::Config,
+    ) -> Result<NetworkReadiness> {
+        let first = crate::tenant::tests::registry("a");
+        let mut second = crate::tenant::tests::registry("b");
+        second.tap_index = 2;
+        let net = serde_json::from_str(include_str!(
+            "../../../../script/runner/test-fixtures/nft-motor-net-v2-added-set.json"
+        ))
+        .unwrap();
+        let mut writes = Vec::new();
+        let state = reconcile_policy_state(
+            &config.uplink,
+            &[first, second],
+            None,
+            Some(&net),
+            ReconcileIo {
+                inspected: Ok(ufw::State::default()),
+                apply: |text: &str| {
+                    writes.push(text.to_owned());
+                    Ok(())
+                },
+                reconcile_ufw: |_: &ufw::State| panic!("invalid uplink must not grant UFW access"),
+                validate_uplink: || config.validate_network(),
+            },
+        )?;
+        assert!(
+            matches!(&state, NetworkReadiness::FencedUplink(problem) if problem.contains("uplink"))
+        );
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].contains("closed_taps { \"mtap1\", \"mtap2\" }"));
+        assert!(writes[0].contains("flush set inet motor_net tenant_taps\n"));
+        assert!(!writes[0].contains("add element inet motor_net tenant_taps"));
+        Ok(state)
+    }
     #[test]
     fn previously_fenced_gate_is_not_reopened_before_final_validation() {
         let mut existing: serde_json::Value = serde_json::from_str(include_str!(

@@ -194,13 +194,21 @@ fn read_deadline(
 impl Backend for LinuxTenants {
     fn check_network(&mut self, _: &str) -> std::result::Result<(), StartRefusal> {
         if let Err(problem) = tenant_network::validate_uplink(&self.config) {
-            let registries = self.registries().map_err(|e| crate::tenant::start_refused(StartRefusalCase::Uplink, e))?;
-            // Reuse the normal failure path so an unavailable link also revokes
-            // every gate before the typed refusal is returned.
-            tenant_network::install(&registries, &self.config).map_err(|e|
-                crate::tenant::start_refused(StartRefusalCase::Uplink, e))?;
-            return Err(crate::tenant::start_refused(StartRefusalCase::Uplink,
-                format!("uplink {}: {problem}", self.config.uplink)));
+            let registries = self
+                .registries()
+                .map_err(|e| crate::tenant::start_refused(StartRefusalCase::Uplink, e))?;
+            // Do not revalidate and accidentally reopen gates if the link
+            // recovers between the failed admission check and fencing.
+            tenant_network::fence(&registries).map_err(|e| {
+                crate::tenant::start_refused(
+                    StartRefusalCase::Uplink,
+                    format!("{problem}; fencing failed: {e}"),
+                )
+            })?;
+            return Err(crate::tenant::start_refused(
+                StartRefusalCase::Uplink,
+                format!("uplink {}: {problem}", self.config.uplink),
+            ));
         }
         Ok(())
     }
@@ -719,9 +727,12 @@ impl Backend for LinuxTenants {
         let jail = Path::new(super::BUILD_ROOT).join(format!("jail/tenants/{tenant}"));
         Ok(self.groups.join(tenant).exists() || jail.exists())
     }
-    fn remove(&mut self, tenant: &str, _r: &Registry) -> Result<PathBuf> {
+    fn remove(&mut self, tenant: &str, registry: &Registry) -> Result<PathBuf> {
         let paths = crate::removal::Paths::live();
         let _lock = crate::removal::lock(&paths)?;
+        crate::removal::refuse_reassigned_tap(&paths, tenant, registry, true, |path| {
+            serde_json::from_reader(fs::trusted_file(path)?).map_err(|e| Error(e.to_string()))
+        })?;
         let unix_s = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -736,16 +747,17 @@ impl Backend for LinuxTenants {
     }
     fn resume_removal(&mut self, tenant: &str) -> Result<Option<PathBuf>> {
         let paths = crate::removal::Paths::live();
-        let _lock = crate::removal::lock(&paths)?;
-        let Some(quarantine) = crate::removal::pending(&paths, tenant)? else {
+        let Some(quarantine) = crate::removal::resume_with_network(
+            &paths,
+            tenant,
+            |path| {
+                serde_json::from_reader(fs::trusted_file(path)?).map_err(|e| Error(e.to_string()))
+            },
+            tenant_network::remove,
+        )?
+        else {
             return Ok(None);
         };
-        crate::removal::finish_with_network(&paths, tenant, &quarantine, |registry| {
-            crate::removal::refuse_reassigned_tap(&paths, tenant, registry, false, |path| {
-                serde_json::from_reader(fs::trusted_file(path)?).map_err(|e| Error(e.to_string()))
-            })?;
-            tenant_network::remove(registry)
-        })?;
         eprintln!(
             "tenant {tenant}: completed an interrupted removal; data quarantined at {}",
             quarantine.display()

@@ -317,7 +317,10 @@ impl<B: Backend> Controller<B> {
         if let Operation::Remove = op {
             return self.remove(tenant);
         }
-        if matches!(op, Operation::Ensure | Operation::Restore | Operation::PrepareStart | Operation::Egress) {
+        if matches!(
+            op,
+            Operation::Ensure | Operation::Restore | Operation::PrepareStart | Operation::Egress
+        ) {
             if let Err(refusal) = self.0.check_network(tenant) {
                 return Ok(refused_response(refusal));
             }
@@ -425,7 +428,10 @@ impl<B: Backend> Controller<B> {
             Operation::Cpu(vcpus) => self.0.cpu(tenant, &r.cpu_max(vcpus)?)?,
             Operation::Egress => {
                 if let Err(error) = self.0.egress(tenant, &r) {
-                    return Ok(refused_response(start_refused(StartRefusalCase::Uplink, error)));
+                    return Ok(refused_response(start_refused(
+                        StartRefusalCase::Uplink,
+                        error,
+                    )));
                 }
             }
             Operation::Adopt => {}
@@ -661,7 +667,9 @@ impl<B: Backend> Controller<B> {
                 .flatten()
                 .is_some_and(|saved| saved == key)
             && !self.0.unclean(r)?;
-        self.0.egress(tenant, r).map_err(|error| StartError::Refused(start_refused(StartRefusalCase::Uplink, error)))?;
+        self.0
+            .egress(tenant, r)
+            .map_err(|error| StartError::Refused(start_refused(StartRefusalCase::Uplink, error)))?;
         if saved {
             let result = self
                 .0

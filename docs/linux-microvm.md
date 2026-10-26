@@ -104,32 +104,34 @@ affected gate. Rules bind to interface names;
 a same-name replacement inherits them, and root-only interface renames are
 outside this boundary.
 
-If an invalid or missing uplink prevents the helper from starting, removal is
-still available through a root-only offline command. Drain work and explicitly
-stop both services first, including any failed unit's auto-restart:
+An invalid or missing uplink leaves every tenant gate fenced, but does not stop
+the helper from binding its socket. The ordinary `remove_tenant` request still
+works for stopped tenants and resumes an interrupted removal when its registry
+is gone. Status, stopping and other operations that do not open a gate remain
+available. `ensure`, `restore`, `prepare_start` and `set_egress` return a typed
+`start_refused` with case `uplink` and the validation problem. Filesystem trust,
+identity, cgroup cleanup and inability to apply the fence remain startup errors;
+a failed fence is not evidence that serving is safe.
 
-```sh
-sudo systemctl stop motor-host.service motor-vm-helper.service
-sudo motor-vm-helper --remove-tenant <tenant>
-# When its registry is already gone but quarantine completion was interrupted:
-sudo motor-vm-helper --resume-removal <tenant>
-```
-
-The offline entry point is selected before any helper config is loaded. It uses
-the same provisioning lock, saved registry, tenant-owned network cleanup and
-quarantine ordering. It refuses active/restarting services, a surviving jail or
-any process with the reserved tenant uid. It checks root-owned state and saved
-records and never starts a VM, helper, agent or broker connection. This is a
-smaller safety change than weakening generic startup cleanup, trust or cgroup
-barriers merely to expose a removal RPC; ordinary helper startup remains strict.
-Helper construction/reconciliation and socket publication hold that same
-provisioning lock, so a concurrent start cannot race the offline stopped check.
-Resume rechecks live TAP-index ownership from trusted registries before any
-tenant mutation; an index already assigned to another tenant is refused.
-Pending quarantine records reserve their index until the old home is moved.
+Startup does not acquire `provision.lock`: image qualification holds that lock
+while launching its helper. Removal and resume acquire it within the helper's
+request serialization. Resume rechecks live TAP-index ownership from trusted
+registries before any tenant mutation; an index already assigned to another
+tenant is refused. Quarantine records do not reserve indexes during provisioning:
+tenant names and home existence do not identify an incarnation. A durable
+`complete` marker prevents a finished removal with no home from being replayed
+against a later same-name tenant, and permits normal seven-day purge.
 Tenant-home and quarantine parents are checked and opened component-by-component
 without symlinks; home movement uses descriptor-relative rename rather than
 following a changed parent spelling.
+
+Portable regressions are
+`invalid_or_missing_uplink_binds_fences_and_serves_cleanup_but_refuses_opening`,
+`qualification_lock_allows_helper_startup_and_reproduces_legacy_lock_failure`,
+`resume_refuses_reassigned_index_before_any_tenant_mutation` and
+`completed_homeless_removal_never_revives_for_a_replacement_and_can_be_purged`.
+These use real sockets/flocks and injected network commands, not privileged
+kernel/UFW or VM qualification.
 
 The socket is `/run/motor-vm-helper.sock`, `root:<socket_gid>`, mode `0660`.
 Only uids listed in the config are admitted, checked with `SO_PEERCRED`.

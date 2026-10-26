@@ -8,8 +8,12 @@ fn main() {
                 "usage: motor-vm-helper --config /etc/motor-vm-helper.json".into(),
             ));
         }
-        let path = args.next().ok_or_else(|| motor_vm_helper::Error("missing config path".into()))?;
-        if args.next().is_some() { return Err(motor_vm_helper::Error("unexpected arguments".into())); }
+        let path = args
+            .next()
+            .ok_or_else(|| motor_vm_helper::Error("missing config path".into()))?;
+        if args.next().is_some() {
+            return Err(motor_vm_helper::Error("unexpected arguments".into()));
+        }
         server::serve(server::load_config(std::path::Path::new(&path))?)
     })();
     if let Err(e) = result {

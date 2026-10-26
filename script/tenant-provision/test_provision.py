@@ -190,6 +190,7 @@ class ProvisionTests(unittest.TestCase):
                         has_tap=lambda tap: tap in ("mtap1", "mtap2"), now=lambda: 1000, output=messages.append, tap_info=self.owned_tap)
         execute.assert_called_once_with("ip", "link", "delete", "dev", "mtap1")
         quarantine = p.ROOT / "removed/a-1000"
+        self.assertEqual((quarantine / "complete").read_text(), "1\n")
         self.assertFalse((p.ROOT / "tenants/a").exists())
         self.assertFalse((p.REGISTRY / "a.json").exists())
         self.assertFalse((p.PROVISION / "a.json").exists())
@@ -219,6 +220,16 @@ class ProvisionTests(unittest.TestCase):
                         has_tap=lambda _tap: False, now=lambda: 1000, output=lambda _line: None)
         self.assertFalse((p.ROOT / "tenants/a").exists())
         self.assertEqual(list((p.ROOT / "removed").iterdir()), [])
+
+    def test_remove_tenant_without_home_marks_journal_complete(self):
+        self.removal_records()
+        shutil.rmtree(p.ROOT / 'tenants/a')
+        p.remove_tenant('a', check_service=lambda _: 'inactive', execute=mock.Mock(),
+                        has_tap=lambda _: False, now=lambda: 1000, output=lambda _: None)
+        quarantine = p.ROOT / 'removed/a-1000'
+        self.assertEqual((quarantine / 'complete').read_text(), '1\n')
+        self.assertFalse((quarantine / 'home').exists())
+        self.assertFalse((p.REGISTRY / 'a.json').exists())
 
     def test_remove_tenant_refuses_foreign_tap_before_any_mutation(self):
         self.removal_records()

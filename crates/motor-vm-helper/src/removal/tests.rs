@@ -57,7 +57,6 @@ fn scratch() -> Scratch {
     }
 }
 
-
 #[test]
 fn removal_rejects_symlinked_home_parent_before_records_or_quarantine_mutation() {
     use std::os::unix::fs::symlink;
@@ -93,12 +92,12 @@ fn resume_refuses_reassigned_index_before_any_tenant_mutation() {
     let new_record = serde_json::to_vec(&new_owner).unwrap();
     fs::write(p.registry_file("b"), &new_record).unwrap();
     let before_binding = fs::read(&p.bindings).unwrap();
-    let _lock = lock(p).unwrap();
-    let result = finish_with_network(p, "a", &quarantine, |saved| {
-        refuse_reassigned_tap(p, "a", saved, false,
-            |path| serde_json::from_slice(&fs::read(path)?).map_err(|e| Error(e.to_string())))?;
-        panic!("must not delete B's chains, membership, UFW grant or TAP")
-    });
+    let result = resume_with_network(
+        p,
+        "a",
+        |path| serde_json::from_slice(&fs::read(path)?).map_err(|e| Error(e.to_string())),
+        |_| panic!("must not delete B's chains, membership, UFW grant or TAP"),
+    );
     assert!(result.unwrap_err().0.contains("reassigned to b"));
     assert_eq!(fs::read(p.registry_file("b")).unwrap(), new_record);
     assert_eq!(fs::read(&p.bindings).unwrap(), before_binding);
@@ -107,7 +106,29 @@ fn resume_refuses_reassigned_index_before_any_tenant_mutation() {
     assert!(!quarantine.join("home").exists());
 }
 
-
+#[test]
+fn completed_homeless_removal_never_revives_for_a_replacement_and_can_be_purged() {
+    let s = scratch();
+    let p = &s.paths;
+    fs::remove_dir_all(p.home("a")).unwrap();
+    let quarantine = begin(p, "a", 1000).unwrap();
+    finish(p, "a", &quarantine).unwrap();
+    assert!(quarantine.join(COMPLETE).is_file());
+    // A replacement may crash after making its home but before its registry.
+    fs::create_dir(p.home("a")).unwrap();
+    fs::write(p.home("a").join("replacement"), "keep").unwrap();
+    assert!(pending(p, "a").unwrap().is_none());
+    assert!(resume_with_network(
+        p,
+        "a",
+        |_| panic!("completed records must not be read"),
+        |_| panic!("completed records must not authorize cleanup")
+    )
+    .unwrap()
+    .is_none());
+    assert_eq!(purge(p, 1000 + QUARANTINE_S).unwrap(), vec![quarantine]);
+    assert!(p.home("a").join("replacement").is_file());
+}
 
 #[test]
 fn interrupted_removal_replays_network_before_finishing_saved_records() {
