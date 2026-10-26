@@ -238,6 +238,59 @@ fn mapped_writer_fill_binds_its_target_inside_the_caller_checkout() {
 }
 
 #[test]
+fn mapped_source_only_writer_binds_existing_scratch_at_fixed_target() {
+    let f = Fixture::new();
+    let host_root = f.scratch.join("callers/home");
+    let host_checkout = host_root.join("u/.motor-base-main-repo");
+    let caller = Path::new("/home/u/.motor-base-main-repo");
+    fs::create_dir_all(&host_checkout).unwrap();
+    fs::write(host_checkout.join("source"), "source-only warm checkout\n").unwrap();
+    workspace::git(&host_checkout, &["init", "-q"]).unwrap();
+    workspace::git(&host_checkout, &["add", "."]).unwrap();
+    let tree = workspace::git(&host_checkout, &["write-tree"]).unwrap();
+    assert!(!host_checkout.join("Cargo.toml").exists());
+    let target = f.state.join("writer-scratch/fill");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("existing-artifact"), "warm output").unwrap();
+    super::compatibility::with_capture_host(|| {
+        let sandbox = Sandbox::prepare_writer(
+            Uuid::now_v7(),
+            &f.state,
+            crate::caller_path::JobTree::new(&host_checkout, caller),
+            &target,
+            None,
+            &f.state.join("slots"),
+            1,
+            &BTreeMap::new(),
+            &tree,
+            &JavascriptTools::for_role(ToolchainRole::BuildServer),
+            false,
+            None,
+        )
+        .unwrap();
+        let fixed: Vec<_> = sandbox
+            .read_write
+            .iter()
+            .filter(|entry| destination(entry) == "/run/motor/target")
+            .collect();
+        assert_eq!(
+            fixed.len(),
+            1,
+            "fixed target bind missing or duplicated: {:?}",
+            sandbox.read_write
+        );
+        let (source, _) = fixed[0].split_once(':').unwrap();
+        assert_eq!(Path::new(source), target);
+        assert!(Path::new(source).is_dir());
+        assert_eq!(
+            fs::read(Path::new(source).join("existing-artifact")).unwrap(),
+            b"warm output"
+        );
+        assert_no_host_destination(&sandbox, &host_root);
+    });
+}
+
+#[test]
 fn identity_job_tree_keeps_single_word_mounts() {
     let tree = crate::caller_path::JobTree::from(Path::new("/Users/u/repo"));
     assert_eq!(

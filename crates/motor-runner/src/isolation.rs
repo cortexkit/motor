@@ -3658,12 +3658,12 @@ pub(crate) fn compile_cache_mounts(
     read_write: &mut Vec<String>,
     destinations: &mut Vec<PathBuf>,
 ) -> io::Result<()> {
-    if !workspace.join("Cargo.toml").is_file() {
+    if !writer && !workspace.join("Cargo.toml").is_file() {
         return Ok(());
     }
-    // Every Rust job builds in this fixed folder, bound to its own target
-    // folder, whether or not the runner has a shared compile cache. Boat and
-    // tenant jobs thus see the same build paths as build-server jobs.
+    // Rust jobs and warm-build commands use this fixed CARGO_TARGET_DIR, even
+    // when a warm checkout has no Cargo.toml. Bind their own target folder
+    // whether or not the runner has a shared compile cache.
     read_write.push(bind(target, Path::new(crate::compile_cache::TARGET))?);
     destinations.push(PathBuf::from(crate::compile_cache::TARGET));
     if !shared_compile_cache {
