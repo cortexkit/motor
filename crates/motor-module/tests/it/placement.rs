@@ -1694,6 +1694,30 @@ mod request_pools {
 
     #[tokio::test]
     async fn eighty_run_streams_leave_status_cancel_and_attach_responsive() {
+        async fn reply_on(rig: &mut Rig, corr: u64) -> Frame {
+            loop {
+                let frame = read_frame(&mut rig.daemon).await.unwrap().unwrap();
+                if frame.header.corr == corr {
+                    return frame;
+                }
+            }
+        }
+
+        async fn assert_streams_held(rig: &Rig, streams: u64) {
+            let metrics = rig.handler.health().await.metrics.unwrap();
+            assert_eq!(metrics["request_pools"]["long_held"]["in_use"], streams);
+            assert_eq!(metrics["request_pools"]["long_held"]["waiting"], 0);
+            assert_eq!(metrics["request_pools"]["default"]["waiting"], 0);
+            // Only status and health can contribute shared slots here; once
+            // sent, their reply tasks may still be releasing those slots.
+            assert!(
+                metrics["request_pools"]["default"]["in_use"]
+                    .as_u64()
+                    .unwrap()
+                    <= 2
+            );
+        }
+
         let f = Fixture::with_runner_config(Cut::None, 1, None, |config| {
             config.max_queue_depth = 128;
         })
@@ -1707,38 +1731,40 @@ mod request_pools {
         );
         let mut runs = HashMap::new();
         let mut output_corr = None;
+        // The running job cannot finish by itself, so the other jobs remain
+        // queued and all 80 streams hold their slots until explicit cancellation.
+        let mut request = f.request("echo pool-ready; while :; do sleep 600; done");
+        request.weight_hint = Some(1);
         for corr in 100..180 {
-            send_body(
-                &mut rig.daemon,
-                corr,
-                aft_body("exec.run", pool_request(&f)),
-            )
-            .await;
+            send_body(&mut rig.daemon, corr, aft_body("exec.run", &request)).await;
         }
-        tokio::time::timeout(Duration::from_secs(90), async {
-            // Snapshotting and durable job creation belong to the admission
-            // batch budget. Control replies below have separate five-second
-            // deadlines in reply_on, independent of this batch's progress.
-            while runs.len() < 80 {
-                let frame = read_frame(&mut rig.daemon).await.unwrap().unwrap();
-                assert_eq!(
-                    frame.header.ty,
-                    FrameType::StreamData,
-                    "run ended before acceptance: {frame:?}"
-                );
-                let record: StreamRecord = serde_json::from_slice(&frame.body).unwrap();
-                match record {
-                    StreamRecord::Accepted(accepted) => {
-                        runs.insert(frame.header.corr, accepted.job_id);
-                    }
-                    StreamRecord::Terminal(terminal) => panic!("run refused: {terminal:?}"),
-                    StreamRecord::Output(_) => output_corr = Some(frame.header.corr),
-                    _ => {}
+        while runs.len() < 80 {
+            let frame = read_frame(&mut rig.daemon).await.unwrap().unwrap();
+            assert_eq!(
+                frame.header.ty,
+                FrameType::StreamData,
+                "run ended before acceptance: {frame:?}"
+            );
+            let record: StreamRecord = serde_json::from_slice(&frame.body).unwrap();
+            match record {
+                StreamRecord::Accepted(accepted) => {
+                    runs.insert(frame.header.corr, accepted.job_id);
+                    // Check routing during admission, before a misplaced run
+                    // could fill the shared pool and block the rest of the batch.
+                    let metrics = rig.handler.health().await.metrics.unwrap();
+                    assert_eq!(metrics["request_pools"]["default"]["in_use"], 0);
+                    assert!(
+                        metrics["request_pools"]["long_held"]["in_use"]
+                            .as_u64()
+                            .unwrap()
+                            >= runs.len() as u64
+                    );
                 }
+                StreamRecord::Terminal(terminal) => panic!("run refused: {terminal:?}"),
+                StreamRecord::Output(_) => output_corr = Some(frame.header.corr),
+                _ => {}
             }
-        })
-        .await
-        .expect("80 streams must be admitted, not queued behind the default 64 slots");
+        }
         assert_eq!(
             runs.values()
                 .collect::<std::collections::HashSet<_>>()
@@ -1748,26 +1774,26 @@ mod request_pools {
 
         // A queued attach has no output to replay yet. Pick the run that has
         // produced output, so attach responsiveness is observable on the wire.
-        let output_corr = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                if let Some(corr) = output_corr {
-                    break corr;
-                }
-                let frame = read_frame(&mut rig.daemon).await.unwrap().unwrap();
-                if frame.header.ty == FrameType::StreamData
-                    && matches!(
-                        serde_json::from_slice::<StreamRecord>(&frame.body).unwrap(),
-                        StreamRecord::Output(_)
-                    )
-                {
-                    output_corr = Some(frame.header.corr);
-                }
+        let output_corr = loop {
+            if let Some(corr) = output_corr {
+                break corr;
             }
-        })
-        .await
-        .expect("one admitted job must produce its ready marker");
+            let frame = read_frame(&mut rig.daemon).await.unwrap().unwrap();
+            if frame.header.ty == FrameType::StreamData
+                && matches!(
+                    serde_json::from_slice::<StreamRecord>(&frame.body).unwrap(),
+                    StreamRecord::Output(_)
+                )
+            {
+                output_corr = Some(frame.header.corr);
+            }
+        };
         let id = runs[&output_corr];
 
+        // Pool occupancy, not elapsed time, proves the replies below arrive
+        // before the blocked runs release their slots. The test runner supplies
+        // the hang watchdog; no per-operation deadline measures machine speed.
+        assert_streams_held(&rig, 80).await;
         send(
             &mut rig.daemon,
             FrameType::Request,
@@ -1777,6 +1803,7 @@ mod request_pools {
         )
         .await;
         assert_eq!(reply_on(&mut rig, 200).await.header.ty, FrameType::Response);
+        assert_streams_held(&rig, 80).await;
         send(
             &mut rig.daemon,
             FrameType::Request,
@@ -1797,6 +1824,7 @@ mod request_pools {
         assert_eq!(health["request_pools"]["long_held"]["limit"], 256);
         assert_eq!(health["request_pools"]["default"]["limit"], 64);
         assert_eq!(health["request_pools"]["long_held_fallbacks_total"], 0);
+        assert_streams_held(&rig, 80).await;
 
         send_body(
             &mut rig.daemon,
@@ -1814,7 +1842,9 @@ mod request_pools {
         let metrics = report.metrics.unwrap();
         assert_eq!(metrics["request_pools"]["long_held"]["in_use"], 81);
         assert!(serde_json::to_vec(&metrics).unwrap().len() < 16 * 1024);
+        assert_streams_held(&rig, 81).await;
 
+        // Cancellation is the first operation allowed to release a run slot.
         send(
             &mut rig.daemon,
             FrameType::Request,
