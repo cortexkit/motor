@@ -379,7 +379,7 @@ fn boat_job_environment(f: &Fixture, config: &Config, phase: &str) -> BTreeMap<S
         vm: None,
     };
     let trees = Trees {
-        dependency_locks: Mutex::new(BTreeMap::new()),
+        mirror_locks: Mutex::new(BTreeMap::new()),
         mirrors: config.state_dir().join("mirrors"),
         state: config.state_dir(),
         compacting: Arc::default(),
@@ -417,7 +417,7 @@ fn assert_uncached_job_starts(f: &Fixture, config: &Config, phase: &str) {
         snapshots: None,
     };
     let trees = Trees {
-        dependency_locks: Mutex::new(BTreeMap::new()),
+        mirror_locks: Mutex::new(BTreeMap::new()),
         mirrors: config.state_dir().join("mirrors"),
         state: config.state_dir(),
         compacting: Arc::default(),

@@ -244,7 +244,7 @@ impl Staging {
                 mirrors,
                 state: state.clone(),
                 compacting: Arc::new(Mutex::new(BTreeSet::new())),
-                dependency_locks: Mutex::new(BTreeMap::new()),
+                mirror_locks: Mutex::new(BTreeMap::new()),
             },
             state,
             tools,

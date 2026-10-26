@@ -15,6 +15,8 @@ use std::{
 };
 
 pub(crate) mod dependencies;
+#[cfg(test)]
+mod fetch_tests;
 mod transfer;
 pub(crate) use dependencies::validate_dependencies;
 pub(crate) use transfer::bounded_fetch_detail;
@@ -402,7 +404,7 @@ pub(crate) struct Trees {
     pub state: PathBuf,
     /// Mirrors with a compaction in flight.
     pub compacting: Arc<Mutex<BTreeSet<PathBuf>>>,
-    pub dependency_locks: Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>,
+    pub mirror_locks: Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>,
 }
 
 /// At most this many of a mirror's pinned commits are reported back in a
@@ -734,6 +736,15 @@ pub(crate) fn resolve_caller_commit(mirror: &Path, commit: &str, _tree_hash: &st
 }
 
 impl Trees {
+    pub fn mirror_lock(&self, mirror: &Path) -> Arc<Mutex<()>> {
+        self.mirror_locks
+            .lock()
+            .unwrap()
+            .entry(mirror.to_path_buf())
+            .or_default()
+            .clone()
+    }
+
     pub fn mirror(&self, repository: &str) -> PathBuf {
         self.mirrors.join(name(repository))
     }
@@ -754,12 +765,33 @@ impl Trees {
         tip: &str,
         siblings: &[SiblingSnapshot],
     ) -> io::Result<()> {
+        self.fetch_with(
+            directory,
+            bundles,
+            (root, commit, tip, siblings),
+            |_| Ok(()),
+        )
+    }
+
+    fn fetch_with(
+        &self,
+        directory: &Path,
+        bundles: &[BundleManifest],
+        snapshot: (&str, &str, &str, &[SiblingSnapshot]),
+        before_fetch: impl Fn(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let (root, commit, tip, siblings) = snapshot;
         for b in bundles {
             if b.repository != root && !siblings.iter().any(|s| s.canonical_path == b.repository) {
                 return Err(invalid("undeclared bundle repository"));
             }
         }
         for b in bundles {
+            // Initialization and import share one per-mirror guard. Holding it
+            // outside the runner's state lock leaves other repositories free.
+            let mirror = self.mirror(&b.repository);
+            let lock = self.mirror_lock(&mirror);
+            let _fetch_guard = lock.lock().unwrap();
             let mirror = self.ensure_mirror(&b.repository)?;
             // No destination ref: a later failed fetch leaves only unreachable
             // objects, not a held snapshot that have_reply would advertise.
@@ -785,6 +817,7 @@ impl Trees {
                 spool,
             ];
             args.extend(refs);
+            before_fetch(&mirror)?;
             transfer::fetch(&mirror, &args)?;
         }
         for b in bundles {
@@ -931,8 +964,11 @@ impl Trees {
             return;
         }
         let mirror = mirror.to_path_buf();
+        let fetch_lock = self.mirror_lock(&mirror);
         let compacting = self.compacting.clone();
         std::thread::spawn(move || {
+            // Repacking must not rewrite the object store during an import.
+            let _fetch_guard = fetch_lock.lock().unwrap();
             let started = std::time::Instant::now();
             let before = packs(&mirror);
             match git(

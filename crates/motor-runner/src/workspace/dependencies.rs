@@ -54,12 +54,7 @@ impl Trees {
             .join(format!("{}.git", name(url)))
     }
     pub fn dependency_lock(&self, mirror: &Path) -> Arc<Mutex<()>> {
-        self.dependency_locks
-            .lock()
-            .unwrap()
-            .entry(mirror.to_owned())
-            .or_default()
-            .clone()
+        self.mirror_lock(mirror)
     }
     pub fn have_dependencies(&self, urls: Vec<String>) -> io::Result<Vec<GitDependencyCandidates>> {
         let mut reply = Vec::new();
