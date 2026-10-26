@@ -1177,17 +1177,20 @@ async fn cancel_line<C: ExecClient + ?Sized>(
         let _ = writeln!(out, "cancelled");
         return 0;
     };
-    let Some(saved_file) = saved_file else {
-        let _ = writeln!(out, "already finished: {}", describe_outcome(&terminal));
-        return 0;
+    // A cancel is acknowledged before the job's terminal, so a wait that began
+    // while the job was running returns without one. A saved secret file then
+    // settles it: `ck motor run` deletes the file once the running job ends,
+    // so a file still on disk means the job had not ended. A job that started
+    // or was refused before start kept its file, and a job whose terminal
+    // `run` already handled has none left.
+    let ended = match saved_file {
+        Some(saved_file) => saved_file.remove_after_terminal().is_err(),
+        None => true,
     };
-    // The terminal removes the default file only once the job is done, so a
-    // job that started or was refused before start kept its file; a job whose
-    // terminal `run` already handled has none left to remove.
-    if saved_file.remove_after_terminal().is_ok() {
-        let _ = writeln!(out, "cancelled");
-    } else {
+    if ended {
         let _ = writeln!(out, "already finished: {}", describe_outcome(&terminal));
+    } else {
+        let _ = writeln!(out, "cancelled");
     }
     0
 }
@@ -2201,37 +2204,12 @@ mod tests {
         assert!(super::SecretFile::create(&link).is_err());
     }
 
-    /// Sets a variable for one test and restores it afterwards. Tests that
-    /// share a name run in one process, so each such test takes a different
-    /// variable.
-    struct EnvGuard(&'static str, Option<std::ffi::OsString>);
-
-    impl EnvGuard {
-        fn set(name: &'static str, value: &std::ffi::OsStr) -> Self {
-            let previous = std::env::var_os(name);
-            std::env::set_var(name, value);
-            Self(name, previous)
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.1.take() {
-                Some(value) => std::env::set_var(self.0, value),
-                None => std::env::remove_var(self.0),
-            }
-        }
-    }
-
     #[test]
     fn default_secret_file_is_private_and_attachable_by_job_id() {
         use std::os::unix::fs::PermissionsExt;
 
-        // The CLI resolves `direct-secrets` from ck-motor's data root; point
-        // that at this test's scratch directory so the default file is found.
         let scratch = cortexkit_test_support::ScratchDir::new("motor-default-secret");
         let directory = super::prepare_default_secret_directory_under(scratch.path()).unwrap();
-        let _data_root = EnvGuard::set("CK_MOTOR_DATA_ROOT", scratch.path().as_os_str());
         assert_eq!(
             std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
             0o700
@@ -2245,7 +2223,11 @@ mod tests {
             0o600
         );
 
-        let found = super::local_reattach_secret(job_id, None, &b""[..]);
+        // `ck motor attach` and `ck motor cancel` without --secret-file find
+        // this file by the job ID.
+        let found = super::reattach_secret(job_id, None, &b""[..], |id| {
+            super::SecretFile::open_default(&directory, id)
+        });
         assert_eq!(found.secret, secret);
         assert_eq!(found.default_file, Some(file.path.clone()));
         assert!(found.saved_file.is_some());
