@@ -269,6 +269,15 @@ impl Host {
     fn publish_connections(&self) {
         for connection in &self.connections {
             let current = *connection.updates.borrow();
+            if self
+                .snapshot
+                .leases
+                .get(&connection.job)
+                .is_some_and(|lease| lease.refusal == Some(Refusal::Auth))
+            {
+                finish_connection(connection, ConnectionState::Refused(Refusal::Auth));
+                continue;
+            }
             let next = match current {
                 ConnectionState::Closed | ConnectionState::Refused(_) => continue,
                 ConnectionState::Waiting | ConnectionState::Ready
@@ -455,6 +464,14 @@ impl Host {
             return refuse(Refusal::Capacity);
         }
         let old = self.snapshot.leases.get(&claims.jti).cloned();
+        // A heartbeat can revoke this host's placement while the old run token
+        // is still valid. Its signature no longer authorizes admission here.
+        if old
+            .as_ref()
+            .is_some_and(|l| l.refusal == Some(Refusal::Auth))
+        {
+            return refuse(Refusal::Auth);
+        }
         let live = self
             .connections
             .iter()
@@ -635,7 +652,10 @@ impl Host {
                 .send_replace(ConnectionState::Live(lease.state));
             return Ok(());
         }
-        if lease.replacing || lease.state != LeaseState::Reserved {
+        if lease.refusal == Some(Refusal::Auth)
+            || lease.replacing
+            || lease.state != LeaseState::Reserved
+        {
             return refuse(Refusal::Auth);
         }
         lease.delivered = true;

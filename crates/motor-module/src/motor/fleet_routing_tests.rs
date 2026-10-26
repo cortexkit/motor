@@ -139,7 +139,7 @@ async fn fleet_platform_and_timeout_exclusions_never_request_a_lease() {
         (Some(Platform::Macos), Some(600)),
         (None, None),
         (None, Some(9)),
-        (None, Some(7201)),
+        (None, Some(21601)),
     ] {
         let mut request = request(&repo);
         request.platform = platform;
@@ -164,7 +164,7 @@ async fn absent_fleet_key_preserves_global_hosted_validation_refusals() {
     let config = serde_json::from_value(wire).unwrap();
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
     let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
-    for timeout in [None, Some(9), Some(7201)] {
+    for timeout in [None, Some(9), Some(21601)] {
         let mut request = request(&repo);
         request.timeout = timeout;
         let stream = motor.run(request).unwrap();

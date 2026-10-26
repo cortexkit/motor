@@ -87,6 +87,10 @@ pub struct HostedJobState {
     /// before requesting a lease so retries and restarts keep the same policy.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) fleet_no_spill: bool,
+    /// Hosts refused before Run for which no further replacement is attempted.
+    /// Persist before the request so queue retries cannot churn placements.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub(crate) replacement_hosts: std::collections::BTreeSet<String>,
     /// Set durably just before ck-motor sends the Run frame to a hosted
     /// runner. Until then no runner holds the command, so whatever happened to
     /// the lease, the job provably never ran; afterwards it may have.
@@ -429,7 +433,8 @@ fn lease_platform(platform: Option<&motor_protocol::Platform>) -> Result<&'stati
 }
 /// CLOUD's inclusive bounds on a lease body's `timeout_s` (seconds) and
 /// `vcpus`. A body outside them is refused with 400 `bad_request`.
-const LEASE_TIMEOUT_S: std::ops::RangeInclusive<u64> = 10..=7200;
+const LEASE_TIMEOUT_S: std::ops::RangeInclusive<u64> = 10..=21600;
+pub(crate) const BOAT_MAX_TIMEOUT_S: u64 = 7200;
 const LEASE_VCPUS: std::ops::RangeInclusive<u32> = 1..=64;
 /// The vCPU count a lease for `request` asks for.
 fn lease_vcpus(request: &RunRequest) -> u32 {
@@ -976,10 +981,11 @@ impl Client {
             .hosted
             .as_ref()
             .and_then(|state| state.avoid_host.clone());
-        let allow_spill = !job
-            .hosted
-            .as_ref()
-            .is_some_and(|state| state.repository_routed || state.fleet_no_spill);
+        let allow_spill = request.timeout.is_some_and(|s| s <= BOAT_MAX_TIMEOUT_S)
+            && !job
+                .hosted
+                .as_ref()
+                .is_some_and(|state| state.repository_routed || state.fleet_no_spill);
         let route = job.hosted.as_ref().map_or("hosted", |state| {
             if state.spill_wait_ms.is_some() {
                 "spill"
@@ -1039,7 +1045,7 @@ impl Client {
         // returns the host-full refusal (runner full) rather than the
         // transport failure the cut-off causes.
         let mut cut_off = Error::Provisioning(MIN_PROVISIONING_RETRY_MS);
-        loop {
+        'lease_requests: loop {
             let state = storage
                 .job(id)
                 .and_then(|j| j.hosted)
@@ -1085,7 +1091,7 @@ impl Client {
             }
             tracing::info!(job_id = %id, attempt, vcpus = body.vcpus, platform = %body.platform,
                 spilled, "hosted lease requested");
-            let lease: Lease = match self
+            let mut lease: Lease = match self
                 .post_ready_authorized(
                     "/v1/leases",
                     &body,
@@ -1131,76 +1137,125 @@ impl Client {
                     }
                 }
             };
-            let boat = lease.ssh.is_some() || lease.placement.host.starts_with("boat:");
-            // Record the placement before judging the lease. A booked Boat job
-            // can only be settled with finish (release answers job_admitted), so
-            // whatever is decided next must know where the broker placed it.
-            storage
-                .hosted_update(id, |state| state.lease(&lease))
-                .map_err(|_| Error::Broker)?;
-            tracing::info!(job_id = %id, attempt, provider = if boat { "boat" } else { "first_party" },
+            loop {
+                let boat = lease.ssh.is_some() || lease.placement.host.starts_with("boat:");
+                // Record the placement before judging the lease. A booked Boat job
+                // can only be settled with finish (release answers job_admitted), so
+                // whatever is decided next must know where the broker placed it.
+                storage
+                    .hosted_update(id, |state| state.lease(&lease))
+                    .map_err(|_| Error::Broker)?;
+                tracing::info!(job_id = %id, attempt, provider = if boat { "boat" } else { "first_party" },
                 host = %lease.placement.host, vm = lease.placement.vm.as_deref().unwrap_or(""),
                 max_s = lease.max_s, "hosted lease granted");
-            let claims = tls::claims(id, &lease, &key, motor_lease::Purpose::Run)?;
-            if let Some((field, expected, actual)) = resource_mismatch(&claims, &body, boat) {
-                tracing::info!(job_id = %id, field, expected = %expected, actual = %actual,
+                let claims = tls::claims(id, &lease, &key, motor_lease::Purpose::Run)?;
+                if let Some((field, expected, actual)) = resource_mismatch(&claims, &body, boat) {
+                    tracing::info!(job_id = %id, field, expected = %expected, actual = %actual,
                     "hosted lease claims mismatch");
-                return Err(Error::Auth);
-            }
-            storage
-                .hosted_update(id, |state| state.retry_iat = Some(claims.iat))
-                .map_err(|_| Error::Broker)?;
-            if lease.max_s < 10 {
-                return Err(Error::Short);
-            }
-            tracing::info!(job_id = %id, attempt, transport = if lease.ssh.is_some() { "ssh" } else { "tls" },
+                    return Err(Error::Auth);
+                }
+                storage
+                    .hosted_update(id, |state| state.retry_iat = Some(claims.iat))
+                    .map_err(|_| Error::Broker)?;
+                if lease.max_s < 10 {
+                    return Err(Error::Short);
+                }
+                tracing::info!(job_id = %id, attempt, transport = if lease.ssh.is_some() { "ssh" } else { "tls" },
                 "hosted connect started");
-            let connected = self
-                .connect(id, &lease, &key, motor_lease::Purpose::Run)
-                .await;
-            match &connected {
-                Ok(_) => tracing::info!(job_id = %id, attempt, "hosted connect succeeded"),
-                Err(failure) => {
-                    tracing::info!(job_id = %id, attempt, code = failure.error.code(), step = failure.step,
+                let connected = self
+                    .connect(id, &lease, &key, motor_lease::Purpose::Run)
+                    .await;
+                match &connected {
+                    Ok(_) => tracing::info!(job_id = %id, attempt, "hosted connect succeeded"),
+                    Err(failure) => {
+                        tracing::info!(job_id = %id, attempt, code = failure.error.code(), step = failure.step,
                         cause = failure.host_reason.as_deref().unwrap_or(failure.error.code()),
                         host_reason = failure.host_reason.as_deref().unwrap_or(""), "hosted connect failed")
-                }
-            }
-            match connected.map_err(|failure| failure.error) {
-                Ok(channel) => return Ok((channel, lease)),
-                Err(e) if lease.ssh.is_some() => return Err(e),
-                Err(e @ (Error::HostFull | Error::Capacity)) if hosted_test => return Err(e),
-                // The broker's view of the host lags its heartbeats, so it can
-                // grant a lease the host then refuses as full. A routed job
-                // would have queued on the build server, so it waits for the
-                // host instead, within its queue-wait budget, the way it waits
-                // out 503 no_capacity. The host stored nothing for the
-                // refused token, and the broker keeps the reservation, so
-                // asking again with the same job ID and body returns the same
-                // placement with a fresh run token, which the host accepts
-                // because its issue time is later. These waits are not failed
-                // placements, so they don't use up the three placement
-                // attempts.
-                Err(e @ (Error::HostFull | Error::Capacity)) if capacity_routed => {
-                    let retry_at =
-                        tokio::time::Instant::now() + Duration::from_millis(HOST_FULL_RETRY_MS);
-                    if retry_at >= provisioning_deadline {
-                        tokio::time::sleep_until(provisioning_deadline).await;
-                        return Err(Error::NoCapacity(HOST_FULL_RETRY_MS));
                     }
-                    storage
-                        .hosted_update(id, |state| {
-                            state.placement_attempts = state.placement_attempts.saturating_sub(1)
-                        })
-                        .map_err(|_| Error::Broker)?;
-                    tracing::info!(job_id = %id, attempt, code = e.code(),
-                        retry_after_ms = HOST_FULL_RETRY_MS, "hosted host full; waiting to ask again");
-                    cut_off = Error::NoCapacity(HOST_FULL_RETRY_MS);
-                    tokio::time::sleep_until(retry_at).await;
-                    continue;
                 }
-                Err(e) if e.replaceable() && attempt < 2 => continue,
-                Err(e) => return Err(e),
+                if matches!(&connected, Err(failure) if failure.error == Error::HostFull) && !boat {
+                    let state = storage
+                        .job(id)
+                        .and_then(|j| j.hosted)
+                        .ok_or(Error::Broker)?;
+                    if !state.run_sent
+                        && state.repository_placement_hint.is_none()
+                        && !state.replacement_hosts.contains(&lease.placement.host)
+                    {
+                        // A refusal proves this connection never reached Run. Keep
+                        // the reservation and requester key while the broker tries
+                        // another host; any refusal leaves the old placement intact.
+                        storage
+                            .hosted_update(id, |state| {
+                                state.replacement_hosts.insert(lease.placement.host.clone());
+                            })
+                            .map_err(|_| Error::Broker)?;
+                        let replacement = tokio::time::timeout_at(
+                            provisioning_deadline,
+                            self.post::<_, Lease>(
+                                &format!("/v1/leases/{id}/replace"),
+                                &serde_json::json!({}),
+                            ),
+                        )
+                        .await;
+                        match replacement {
+                            Ok(Ok(next)) => {
+                                if next.lease_id != lease.lease_id
+                                    || next.job_id != lease.job_id
+                                    || next.max_s != lease.max_s
+                                    || next.reserved_vcpu_ms != lease.reserved_vcpu_ms
+                                    || next.placement.host == lease.placement.host
+                                    || next.placement.host.starts_with("boat:")
+                                    || next.ssh.is_some()
+                                {
+                                    return Err(Error::Auth);
+                                }
+                                lease = next;
+                                continue;
+                            }
+                            Ok(Err(error)) => tracing::info!(job_id = %id, code = error.code(),
+                            "hosted replace refused; waiting on current placement"),
+                            Err(_) => tracing::info!(job_id = %id, "hosted replace wait expired"),
+                        }
+                    }
+                }
+                match connected.map_err(|failure| failure.error) {
+                    Ok(channel) => return Ok((channel, lease)),
+                    Err(e) if lease.ssh.is_some() => return Err(e),
+                    Err(e @ (Error::HostFull | Error::Capacity)) if hosted_test => return Err(e),
+                    // The broker's view of the host lags its heartbeats, so it can
+                    // grant a lease the host then refuses as full. A routed job
+                    // would have queued on the build server, so it waits for the
+                    // host instead, within its queue-wait budget, the way it waits
+                    // out 503 no_capacity. The host stored nothing for the
+                    // refused token, and the broker keeps the reservation, so
+                    // asking again with the same job ID and body returns the same
+                    // placement with a fresh run token, which the host accepts
+                    // because its issue time is later. These waits are not failed
+                    // placements, so they don't use up the three placement
+                    // attempts.
+                    Err(e @ (Error::HostFull | Error::Capacity)) if capacity_routed => {
+                        let retry_at =
+                            tokio::time::Instant::now() + Duration::from_millis(HOST_FULL_RETRY_MS);
+                        if retry_at >= provisioning_deadline {
+                            tokio::time::sleep_until(provisioning_deadline).await;
+                            return Err(Error::NoCapacity(HOST_FULL_RETRY_MS));
+                        }
+                        storage
+                            .hosted_update(id, |state| {
+                                state.placement_attempts =
+                                    state.placement_attempts.saturating_sub(1)
+                            })
+                            .map_err(|_| Error::Broker)?;
+                        tracing::info!(job_id = %id, attempt, code = e.code(),
+                        retry_after_ms = HOST_FULL_RETRY_MS, "hosted host full; waiting to ask again");
+                        cut_off = Error::NoCapacity(HOST_FULL_RETRY_MS);
+                        tokio::time::sleep_until(retry_at).await;
+                        continue 'lease_requests;
+                    }
+                    Err(e) if e.replaceable() && attempt < 2 => continue 'lease_requests,
+                    Err(e) => return Err(e),
+                }
             }
         }
     }

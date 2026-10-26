@@ -235,6 +235,7 @@ fn hosted_billing_seconds_keep_three_decimals() {
 mod account;
 pub(crate) mod capacity;
 pub(crate) mod harness;
+mod replacement;
 mod settled_reattach;
 use harness::*;
 use motor_protocol::*;
@@ -350,7 +351,18 @@ async fn hosted_capacity_replaces_three_times_but_auth_and_expiry_do_not() {
                 .err(),
             Some(error)
         );
-        assert_eq!(h.requests.lock().unwrap().len(), count);
+        let requests = h.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|p| p.as_str() == "/v1/leases")
+                .count(),
+            count
+        );
+        assert_eq!(
+            requests.iter().filter(|p| p.ends_with("/replace")).count(),
+            usize::from(reason == "host_full")
+        );
         assert_eq!(h.tokens.load(Ordering::SeqCst), count);
         assert!(h
             .iats
@@ -1432,9 +1444,11 @@ fn invalid_lease_field_names_each_member_the_broker_refuses() {
     assert_eq!(invalid_lease_field(&valid, false), None);
     assert_eq!(invalid_lease_field(&valid, true), None);
     type Mutation = fn(&mut LeaseRequest);
-    let accepted: [(&str, Mutation); 6] = [
+    let accepted: [(&str, Mutation); 8] = [
         ("timeout_s 10", |b| b.timeout_s = 10),
         ("timeout_s 7200", |b| b.timeout_s = 7200),
+        ("timeout_s 7201", |b| b.timeout_s = 7201),
+        ("timeout_s 21600", |b| b.timeout_s = 21600),
         ("vcpus 1", |b| b.vcpus = 1),
         ("vcpus 64", |b| b.vcpus = 64),
         ("avoid_host null", |b| b.avoid_host = None),
@@ -1450,7 +1464,7 @@ fn invalid_lease_field_names_each_member_the_broker_refuses() {
         mutate(&mut body);
         assert_eq!(invalid_lease_field(&body, false), None, "{name}");
     }
-    let refused: [(&str, Mutation); 17] = [
+    let refused: [(&str, Mutation); 16] = [
         ("job_id", |b| b.job_id.replace_range(14..15, "4")),
         ("job_id", |b| {
             b.job_id = "0190f0e2-1b2c-7d3e-8f4a-5b6c7d8e9F0a".into()
@@ -1478,8 +1492,7 @@ fn invalid_lease_field_names_each_member_the_broker_refuses() {
         }),
         ("avoid_host", |b| b.avoid_host = Some("boat:bx_1".into())),
         ("timeout_s", |b| b.timeout_s = 9),
-        ("timeout_s", |b| b.timeout_s = 7201),
-        ("timeout_s", |b| b.timeout_s = 10_800),
+        ("timeout_s", |b| b.timeout_s = 21601),
         ("requester_jwk", |b| b.requester_jwk.kty = "EC".into()),
         ("requester_jwk", |b| b.requester_jwk.crv = "X25519".into()),
         ("requester_jwk", |b| b.requester_jwk.x = "B".repeat(43)),
@@ -1510,9 +1523,10 @@ fn validate_refuses_requests_no_valid_lease_body_can_carry() {
     assert_eq!(validate(&request(None, None)), Err(Error::NoTimeout));
     assert_eq!(validate(&request(Some(10), None)), Ok(()));
     assert_eq!(validate(&request(Some(7200), Some(64))), Ok(()));
+    assert_eq!(validate(&request(Some(21600), Some(64))), Ok(()));
     for (timeout, weight, field) in [
         (9, None, "timeout_s"),
-        (7201, None, "timeout_s"),
+        (21601, None, "timeout_s"),
         (30, Some(0), "vcpus"),
         (30, Some(65), "vcpus"),
     ] {

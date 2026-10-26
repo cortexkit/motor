@@ -29,6 +29,9 @@ pub(crate) fn eligible(config: &Config, request: &RunRequest, direct: bool, retu
             None | Some(motor_protocol::Platform::Linux)
         )
         && request.weight_hint.unwrap_or(2) <= 8
+        && request
+            .timeout
+            .is_some_and(|s| s <= crate::hosted::BOAT_MAX_TIMEOUT_S)
         && crate::hosted::validate(request).is_ok()
 }
 
@@ -452,9 +455,8 @@ mod tests {
         config.spill_avoid_host = None;
         assert!(!eligible(&config, &request, false, false));
     }
-    /// A job whose lease the broker would refuse with 400 `bad_request` is
-    /// never shadowed: CLOUD takes `timeout_s` only in 10..=7200 and `vcpus`
-    /// only in 1..=64.
+    /// Shadow jobs need a Boat-compatible timeout; longer host leases and
+    /// invalid resource requests are not best-effort comparisons.
     #[test]
     fn shadow_skips_jobs_whose_lease_body_the_broker_would_refuse() {
         let config = config();

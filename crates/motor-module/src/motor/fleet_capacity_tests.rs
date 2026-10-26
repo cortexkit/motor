@@ -486,7 +486,7 @@ async fn oversized_fleet_jobs_are_refused_before_start_naming_both_routes_limits
     for (claim, timeout, stub_without_max, long_detail, leases, suffix) in [
         (22, 600, false, false, 1, Some("; hosted max_vcpus 21")),
         (22, 600, true, false, 1, Some("; hosted max_vcpus unknown")),
-        (17, 7201, false, false, 0, None),
+        (17, 21601, false, false, 0, None),
         (22, 600, false, true, 1, Some("; hosted max_vcpus 21")),
     ] {
         let h = Harness::new(Behavior::CompleteRun).await;

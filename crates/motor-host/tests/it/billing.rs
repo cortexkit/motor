@@ -449,6 +449,36 @@ impl tracing::Subscriber for Logs {
 }
 
 #[test]
+fn replaced_job_usage_conflict_is_final_and_logged_as_expected_once() {
+    let logs = Logs::default();
+    let captured = logs.0.clone();
+    tracing::subscriber::with_default(logs, || {
+        let mut h = host();
+        started(&mut h, JOB, 1);
+        end(&mut h, JOB, 3, MS + 3000, terminal(JOB, "exit"));
+        h.terminal_delivered(JOB, MS + 3000).unwrap();
+        let request = h.snapshot.outbox[0].clone();
+        assert!(h
+            .finish_request(&request, 409, &json!({"error":"job_conflict"}))
+            .unwrap());
+        assert!(h.snapshot.outbox.is_empty());
+        h.billing_tick(MS + 4000).unwrap();
+        assert!(h.snapshot.outbox.is_empty());
+    });
+    let captured = captured.lock().unwrap();
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|s| s.contains("usage_ignored_after_replace"))
+            .count(),
+        1
+    );
+    assert!(!captured.iter().any(
+        |s| s.contains("usage_billing_diverged") || s.contains("usage_reconciliation_required")
+    ));
+}
+
+#[test]
 fn differing_settlement_and_final_409_log_divergence_but_never_change_caller_figure() {
     let logs = Logs::default();
     let captured = logs.0.clone();

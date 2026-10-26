@@ -153,7 +153,8 @@ request and reply bytes.
 | 503 | `no_capacity`, `unavailable`; both include `Retry-After`, 5 seconds unless a Boat refusal or the tenant's Boat start limit names a longer wait |
 
 Clients treat `usage_conflict`, `job_settled` and `job_unknown` as final for that report, not
-retryable transport failures. `sandbox_lost` is final for that job: its Boat sandbox stopped or
+retryable transport failures; so are a usage report's `job_conflict` (the job was replaced away
+from that host) and a replace's 409 refusals. `sandbox_lost` is final for that job: its Boat sandbox stopped or
 failed under the lease, and ck-motor must start a new `job_id`. `no_host_fits` is final for that
 lease body: retrying it never succeeds while the registry is unchanged, so the client routes the
 job elsewhere or asks for at most `max_vcpus`. `account_closed` is final for that account: it was
@@ -192,18 +193,47 @@ value (`true` and `false` hash differently). `shadow` stays last and is included
 JSON string hashed, for clients to byte-compare. A re-request must repeat the same `allow_spill`
 value or receive 409 `job_conflict` wherever a differing lease hash conflicts.
 
-`vcpus` is 1–64 and `timeout_s` 10–7200. `net` is boolean. There is no client `mem_mib` field:
+`vcpus` is 1–64 and `timeout_s` 10–21600 (6 hours). A Boat sandbox takes only a lease whose
+`timeout_s` is at most `BOAT_MAX_TIMEOUT_S` (7200 unless the operator lowers it); a longer lease
+runs only on a registered host (see [Boat placements](#boat-placements)). `net` is boolean. There is no client `mem_mib` field:
 the broker derives memory as `max(16384, 3584 × vcpus)` MiB for placement and the token.
 `placement_hint` is JSON `null` or exactly `{host, vm}`, both strings following the common name
 grammar, except that `host` may also carry the `boat:` prefix of a Boat placement, so a client can
 send back the placement it was last given. A matching selectable warm placement is preferred; an
-unusable hint, including any `boat:` hint, falls back to normal placement. Other strings and the requester key follow the grammar table under "Common wire rules" above.
+unusable hint, including any `boat:` hint, falls back to normal placement, except for the binding
+explicit-only rule below. Other strings and the requester key follow the grammar table under "Common wire rules" above.
+
+The operator-set D1 `hosts.explicit_only` flag defaults to false. Ordinary placement never uses
+an explicit-only host, including warm/affinity matching and fallback, and excludes its ceilings
+from `no_host_fits`. The only opt-in is a `placement_hint.host` equal to that host's registered
+id. That hint is **binding**, even if its VM is missing or cold: only the named host may be used,
+with the usual freshness, health, current-generation, free-capacity and `avoid_host` checks.
+Warm selection stays within that host; without a warm match the reply has `vm: null`.
+No other host or Boat is allowed, even with `allow_spill: true`.
+
+Binding refusals apply in this order:
+
+1. A binding host on the wrong platform, or a shadow lease naming an explicit-only host (shadows
+   can run only on Boat), is **422** `{"error":"no_host_fits","max_vcpus":0}`.
+2. A retired or avoided binding host gives the existing retryable **503**
+   `{"error":"no_capacity"}` with `Retry-After: 5`.
+3. For any other active binding host whose recorded ceilings cannot ever fit the lease, the reply
+   is **422** `no_host_fits`, with `max_vcpus` computed from that host alone and no `Retry-After`,
+   even if its snapshot is full or stale. Unknown ceilings cannot establish a permanent refusal.
+4. Otherwise, a full, stale, unhealthy, wrong-generation or missing snapshot gives **503**
+   `no_capacity` with `Retry-After: 5`.
+
+Binding policy is resolved even for retired or wrong-platform registry rows. Ordinary-host and
+unknown-host hints retain their non-binding meaning. Existing jobs and Boat provisioning records
+keep their replay semantics after a flag change; the flag governs fresh placement, not revocation.
+The real-route vector
+`test-vectors/runners/explicit-only-leases.json` pins successful opt-in and full-host refusal bytes.
 
 `avoid_host` is required: JSON `null`, or a host id string matching
 `^[A-Za-z0-9._-]{1,64}$` (no `boat:` prefix; a Boat sandbox is not a host). A body without the
 key, or with any other value, is 400 `bad_request`. The named host is not selectable for this
-lease, even when `placement_hint` names it; placement proceeds through the other hosts and then
-Boat spill exactly as if that host had failed selection. ck-motor sends the host it is spilling
+lease, even when `placement_hint` names it; unless the hint is binding, placement proceeds through
+the other hosts and then Boat spill exactly as if that host had failed selection. ck-motor sends the host it is spilling
 away from, so a job leaving a busy machine is never placed back on it. Because the host stays
 registered, a platform served only by the avoided host answers `no_capacity` (or spills), not
 `platform_unsupported`. A value naming no registered host, and `null`, change nothing. The lease
@@ -226,17 +256,20 @@ After authentication and schema validation, checks proceed in this order:
    [retention rule](runners.md#retention), a lease whose `job_id` (UUIDv7) time falls at or before
    that tenant's deleted period is refused 404 `job_unknown`, so a deleted job id is never accepted
    again. The D1 claim from step 1 remains, as for any refusal.
-3. Ask for placement. If no active host has the requested platform, return 400
+3. Ask for placement. Binding explicit-only hints follow the rule above, without fallback.
+   Otherwise, if no active host has the requested platform, return 400
    `platform_unsupported`. If active hosts have it but none is selectable, return 503
    `no_capacity`, unless no candidate host could ever fit the lease (below), which is 422
    `no_host_fits`. Before returning a refusal, repeat the existing-job check so a concurrent
    successful lease wins over that refusal. When `allow_spill` is `true`, Boat spill is
-   enabled and the platform equals `BOAT_PLATFORM`, either 400 or 503 refusal is replaced by the
+   enabled, the platform equals `BOAT_PLATFORM` and `timeout_s` is at most `BOAT_MAX_TIMEOUT_S`,
+   either 400 or 503 refusal is replaced by the
    spill path in [Boat placements](#boat-placements), and so is `no_host_fits` when a Boat size
    fits the lease.
 
    **Never fits (`no_host_fits`).** The candidates are every `status = 'active'` host of the
-   lease's platform except the one `avoid_host` names. Health, heartbeat age, generation and free
+   lease's platform except explicit-only hosts and the one `avoid_host` names. Health, heartbeat
+   age, generation and free
    capacity are ignored: they are temporary, so a host that could fit when idle and healthy
    keeps the answer at `no_capacity`. A candidate can fit when its registry per-job ceilings are
    both recorded and `max_job_vcpus ≥ vcpus` and `max_job_mem_mib ≥ max(16384, 3584 × vcpus)`.
@@ -244,8 +277,10 @@ After authentication and schema validation, checks proceed in this order:
    answers exactly as without this rule. With at least one candidate, all ceilings recorded and
    none able to fit, the reply is **422** `{"error":"no_host_fits","max_vcpus":N}` with no
    `Retry-After`. Without any candidate (no active host has the platform, or only the avoided host
-   does) the codes above apply unchanged. When the lease allows spill, Boat is available for its
-   platform (enabled, configured, with a current image) and a Boat size fits, the lease spills
+   does, or all are explicit-only without a binding hint) the codes above apply unchanged. When
+   the lease allows spill, Boat is available for its
+   platform (enabled, configured, with a current image, and `timeout_s` at most
+   `BOAT_MAX_TIMEOUT_S`) and a Boat size fits, the lease spills
    instead. `N` is the largest vCPU count that could be placed: for each candidate, the largest
    `v` whose `v` and `max(16384, 3584 × v)` both fit its ceilings (0 if none), maximized over
    candidates; when the lease allows spill and Boat is available for its platform, also the
@@ -266,7 +301,9 @@ After authentication and schema validation, checks proceed in this order:
 Thus reservations cannot exceed remaining budget. Each stored `max_s` equals its token's limit;
 separately, each stored reservation equals `vcpus × max_s × 1000`. For example, allowance 25000
 with no totals, 2 vCPUs and timeout 100 gives `max_s: 12`, reservation 24000; 20000 gives 10;
-19999 refuses. Unlimited, 64 vCPUs and 7200 seconds reserves 460800000.
+19999 refuses. Unlimited, 64 vCPUs and 7200 seconds reserves 460800000; unlimited, 64 vCPUs and
+21600 seconds reserves 1382400000. `test-vectors/runners/long-lease.json` pins a 21600-second
+lease granted in full and the 400 `bad_request` (`field: "timeout_s"`) for 21601.
 
 Placement and budget refusals leave no `TenantDO` job row and unchanged totals, but retain the D1
 claim. The same tenant can retry after capacity returns or allowance increases; another tenant
@@ -287,13 +324,19 @@ and `endpoint_spki_sha256` are the placed host's registry values. `job_token` ha
 
 A re-request may change only `requester_jwk`, retaining the same lease id, placement, endpoint,
 SPKI hash, run limit and reservation. The new token has a fresh issue time and 300-second life.
-If a token is expired before connecting, re-request before admission or use reattach; never
+The broker remembers the requester key of the job's latest run token; a
+[replace](#post-v1leasesjob_idreplace) signs for that key. If a token is expired before
+connecting, re-request before admission or use reattach; never
 connect with a token whose `token_expires_at_ms` is not after the client's current time. Neither
-refresh path extends the original host-lost deadline or starts another execution.
+refresh path, nor a replace, extends the original host-lost deadline or starts another execution.
 
-Placement is not a capacity lock. On a full host, a new placement needs a new `job_id`; retrying
-the same lease keeps the same placement. The host releases the unused first reservation with a
+Placement is not a capacity lock. On a full host, retrying the same lease keeps the same
+placement; a job no host has admitted yet can be moved to another registered host with
+[replace](#post-v1leasesjob_idreplace). The host releases the unused first reservation with a
 zero-duration usage report, or it remains until the host-lost alarm settles proved elapsed time.
+
+Gate priority is not a lease member: it travels only in the Run frame between ck-motor and the
+tenant's runner, so the broker never sees it and placement ignores it.
 
 ### POST /v1/leases/{job_id}/reattach
 
@@ -358,6 +401,64 @@ that host reporting `admitted` or `started` before `release_at_ms`. If those hea
 arrive in time, for example because the host can't reach the broker, the alarm settles the job at
 zero and its later usage report gets `job_settled`. Hosts narrow the window by refusing to admit a
 job whose run token has expired, which leaves at least 60 seconds for the heartbeat.
+
+### POST /v1/leases/{job_id}/replace
+
+Moves a registered-host job that no host has admitted yet to another registered host, keeping the
+same job, lease id, run limit and reservation. ck-motor uses it, for example, when the placed host can't start the job soon.
+
+Authentication, path validation and the D1 claim check are exactly release's, and the body is
+exactly `{}` with JSON Content-Type. Unknown, claim-only or another tenant's jobs return 404
+`job_unknown`. For a known job, in this order:
+
+1. A release marker: 409 `job_released`.
+2. A settled job: 409 `job_finished`.
+3. A job any heartbeat from its current host has reported `admitted` or `started`: 409
+   `job_admitted`. A Boat job is admitted at booking, so it is never replaced.
+4. Otherwise the job is placed again, under the rules of
+   [Placement, deadlines and metering](#placement-deadlines-and-metering), with the original
+   lease's platform, vCPUs, memory, workspace, `placement_hint` and `avoid_host`, and with every
+   host the job has already been placed on excluded as `avoid_host` is. Only registered hosts are
+   considered: replace never spills to Boat, whatever `allow_spill` said. A binding explicit-only
+   hint stays binding, so such a job has no other host to move to.
+5. If no host is selectable, the answer is **503** `{"error":"no_capacity"}` with
+   `Retry-After: 5`, whatever placement's refusal was, and the job stays on its current placement
+   unchanged. So is a job recorded before the broker stored what a replace needs (its requester
+   key and lease placement inputs).
+
+Success is **201** with exactly the lease reply fields, for the new host:
+
+```text
+{lease_id, job_id, placement:{host,vm}, endpoint, endpoint_spki_sha256,
+ job_token, token_expires_at_ms, max_s, reserved_vcpu_ms}
+```
+
+`lease_id`, `max_s` and `reserved_vcpu_ms` are unchanged. `placement`, `endpoint` and
+`endpoint_spki_sha256` are the new host's. `job_token` is a fresh `run` token for the new host,
+bound to the requester key of the job's latest run token (the original lease's key, or the key of
+the latest re-request). The reservation and totals don't change, and the host-lost deadline stays
+the original lease's. Release afterwards still waits for the latest run token the broker issued,
+for either host, to expire.
+
+From then on the job belongs to the new host only, and the host it left must not run it:
+
+- The old host's heartbeats that name the job list it in `ignored` and change nothing, whatever
+  state they report. A host must stop, or never admit, a job its heartbeat reply lists in
+  `ignored` (see the heartbeat endpoint).
+- The old host's usage report for the job is refused 409 `job_conflict` and settles nothing.
+- Only the new host's heartbeats advance `last_elapsed_ms` or mark the job admitted, so a
+  host-lost settlement uses only the new host's proved elapsed time.
+
+**If the old host admitted the job anyway**, typically because ck-motor connected with a run
+token issued before the replace and the host admitted it before its next heartbeat, that run is
+not billed: its usage report is refused, and the tenant pays only what the new host reports, or
+what the host-lost alarm settles from the new host's elapsed time. The broker detects it when the
+old host's heartbeat reports the job `admitted` or `started`: the job is listed in `ignored`, and
+the broker logs `replaced_job_admitted_by_old_host` with the job id, that host and the current
+host. The old host learns from `ignored` that it must stop the run. ck-motor calls replace only
+after giving up on starting the job on the old host, so this needs a race with an in-flight
+connection. `test-vectors/runners/replace-lease.json` pins a replace, the old host's heartbeat
+reply listing the job in `ignored` and the refusal of its usage report.
 
 ### POST /v1/leases/{job_id}/finish
 
@@ -479,17 +580,21 @@ machine that runs its jobs:
   sample (older than 30,000 ms, or a failed probe) reports 0.
 - A host with several tenants reports, for each field independently, the maximum over its tenants.
 
-The broker doesn't subtract a placed lease from a snapshot, so several leases placed within one
-heartbeat interval can all pass against the same values. The host's own admission is the real
-limit: a lease it can't take is refused before Run with a fast `hosted_host_full`, which clients
-retry like `no_capacity`.
+The broker subtracts every job it placed on a host, until the host's own figures count it, from
+that host's reported free capacity before comparing (see the in-flight ledger under
+[Placement, deadlines and metering](#placement-deadlines-and-metering)), so several leases placed
+within one heartbeat interval don't all pass against the same values. The figures are still a
+snapshot, not a lock: the host's own admission is the real limit, and a lease it can't take is
+refused before Run with a fast `hosted_host_full`, which clients retry like `no_capacity`.
 
 Running entries are processed in order. An unknown, claim-only or other-host job is listed in
-`ignored` without failing siblings or writing `TenantDO` storage. A settled job placed on this
+`ignored` without failing siblings or writing `TenantDO` storage. That includes a job
+[replaced](#post-v1leasesjob_idreplace) away from this host. A host must stop a job its reply
+lists in `ignored`, and must never admit it. A settled job placed on this
 host has no effect. A reserved job on this host updates
 `last_elapsed_ms = max(last_elapsed_ms, min(elapsed_ms, max_s × 1000))`. States `admitted` and
 `started` permanently mark it admitted; later `reserved` does not clear that flag. This prevents
-lease re-request, but not reattach.
+lease re-request and replace, but not reattach.
 
 Success is **200** with exactly `{"ignored":[<job_id>…],"closed_subjects":[<subject>…]}`, in that
 member order and with no other member. `ignored` lists strings in entry order.
@@ -522,7 +627,9 @@ settlement at the reservation even if the host over-reports.
 After authentication and schema checks, precedence is:
 
 1. Unknown, claim-only or other-host job: 404 `job_unknown`. The signing host's counter is
-   consumed; the job's host and totals are unchanged.
+   consumed; the job's host and totals are unchanged. A job [replaced](#post-v1leasesjob_idreplace)
+   away from the signing host is instead 409 `job_conflict`, with the same effect: that host
+   must not have run it, and its report is never billed.
 2. Settled job: after a host-lost or release settlement, 409 `job_settled`. After a reported
    settlement, an identical canonical usage hash returns the original 200 reply; any other body gives 409
    `usage_conflict`. These replies do not settle again.
@@ -542,11 +649,45 @@ identical: authentication consumes the counter before settlement idempotency is 
 ## Placement, deadlines and metering
 
 Selectable hosts are active, platform-matching, healthy, no more than 60000 ms since heartbeat,
-have a snapshot for their current registry generation, and have sufficient free vCPUs and memory.
-Prefer the placement hint if it names a selectable warm entry matching tenant and
-`workspace_key_hash`. Otherwise prefer any matching warm entry, then bytewise host id and VM id.
-Without a warm match, choose the lowest selectable host id with `vm: null`.
-`repo_hash`, `net` and `queued` do not affect placement.
+have a snapshot for their current registry generation, and have sufficient **effective** free
+vCPUs and memory (below). Explicit-only hosts are excluded unless named by the binding hint
+described under [POST /v1/leases](#post-v1leases); a binding hint restricts every selection step
+to that one host. Selectable hosts are ordered by most effective free vCPUs, then most effective
+free memory, then bytewise host id. Prefer the placement hint if it names a selectable warm entry
+matching tenant and `workspace_key_hash`. Otherwise take the first host in that order holding a
+matching warm entry, with its bytewise lowest matching VM id. Without a warm match, take the first
+selectable host in that order with `vm: null`. `repo_hash`, `net` and `queued` do not affect
+placement.
+
+**In-flight ledger.** A heartbeat's free figures don't count a job placed on the host since that
+sample. So that a burst of placements inside one heartbeat interval spreads over hosts instead of
+filling one, the placement object keeps a ledger: when it answers a placement a lease will use
+(a new lease, or a replace) with host H, it records `{job_id, host: H, vcpus, mem_mib}` in the
+same storage transaction as the decision. A host's effective free vCPUs and memory are its last
+heartbeat's `free_vcpus` and `free_mem_mib` minus the `vcpus` and `mem_mib` of its live entries;
+the fit check and the ordering both use them. A shadow lease, which never uses a host, records
+nothing. An entry is removed on any of these events (the 1024-entry cap below can also evict one):
+
+- on the first heartbeat from H whose `running` list shows the job `admitted` or `started`, the
+  point from which the host's own `free_vcpus` counts it. A heartbeat that shows the job
+  `reserved`, or doesn't list it, keeps the entry;
+- when the job settles (usage report or alarm), is released, or is replaced away from H, and
+  when the lease that asked for the placement doesn't commit it (the job already existed, or the
+  budget ran out while the token was signed);
+- when the job's latest run token expires without such a heartbeat: a host refuses an expired
+  token, so the job can no longer be admitted. When a re-signed run token's refresh reaches the
+  placement object, it moves the entry's expiry to the new token's, and brings the entry back if
+  it had expired, unless the host's latest heartbeat already shows the job admitted or started.
+
+Consistency: placement decisions and ledger writes are serialized in the one placement object and
+survive its eviction. Releases on settlement, release, replace and re-sign are sent by the job's
+tenant object after its own state change commits; a failed message is logged and not retried. A
+lost release leaves an entry until its stored expiry, so its host looks fuller than it is for up to
+300 seconds. A lost refresh can leave an entry expiring before the newest token does, so that host
+can look freer than it is. The ledger holds at most 1024 entries: before inserting into a full
+ledger, the broker drops the existing entry with the earliest expiry. Effective figures are
+estimates, not a lock: the host's own admission remains the real limit.
+
 Capacity snapshots do not lock hosts or VMs.
 
 The original lease fixes the host-lost deadline at
@@ -567,8 +708,23 @@ the broker's reservation authority. Allowances are lifetime vCPU-ms; a missing r
 When no registered host fits a lease, the broker can spill it to a Boat (boat.dev) sandbox that it
 drives through Boat's API. Spill is off unless `BOAT_ENABLED` is `"true"` and every Boat setting
 is configured; with it off no lease spills, while sandboxes that already exist are still stopped
-and cleaned up. Each tenant has a pool of at most `BOAT_MAX_SANDBOXES` sandboxes, and **a sandbox
-serves at most one live lease**. Placement hints never select a sandbox.
+and cleaned up. Each tenant may have at most `BOAT_MAX_SANDBOXES` sandboxes whose machines may be running
+(stopped sandboxes kept for reuse do not count), and **a sandbox serves at most one live lease**. Placement hints never select a sandbox.
+
+**Stuck stops.** An idle sandbox is normally archived for reuse; a retired or unhealthy sandbox
+is stopped for deletion. If either stop is still unconfirmed after 10 minutes, the broker reads
+Boat's state again. With neither a provisioning claim nor a live lease, a delete-bound stop goes
+directly to deletion if the fresh state is anything other than `running` or `starting`, without
+waiting for stop or snapshot completion. An archive-bound stop uses the same fallback to abandon
+reuse, except that ended states (`archived`, `error` or `cancelled`) keep their normal handling.
+A fresh `running` or `starting` read may reflect a lost resume: on either path the stop is resent,
+never bypassed for deletion. A claim or live lease appearing during the fresh read blocks the fallback.
+The switch logs
+`boat_stop_stuck_deleted` with only the tenant slot and sandbox id, alongside `boat_stop_stuck`.
+Deletion uses the ordinary cleanup path: the request is recorded before sending, and 404 means
+deleted. A sandbox in `deleting` no longer counts toward the cap. The separate cap exemption for
+a stopping sandbox is unchanged: it needs a stuck report and a post-deadline Boat read whose
+latest state is `archiving` or an ended state.
 
 **Per-lease spill policy.** The required `allow_spill` member is strictly a JSON boolean; a body
 without it, or with any other value, is 400 `bad_request` before any job claim or Boat call.
@@ -584,11 +740,17 @@ It does not override the Boat enablement, platform, size or budget gates. `shado
 `allow_spill: false` is contradictory and returns 400 `bad_request` during schema validation,
 before shadow permission or any job claim is checked.
 
-**Eligibility.** The lease's platform equals `BOAT_PLATFORM` (`linux-x64`), and `BOAT_SIZES`
+**Eligibility.** The lease's platform equals `BOAT_PLATFORM` (`linux-x64`), its `timeout_s` is at
+most `BOAT_MAX_TIMEOUT_S` (default 7200; the deploy preflight requires 10 to 7200, because Boat's
+own auto-stop is capped at three hours and must outlast the run and its deadline grace), and
+`BOAT_SIZES`
 (the usable `{type, vcpus, mem_mib}` measured inside each Boat size) has a size with
 `vcpus ≥ job.vcpus`; the smallest such size is used. Memory does not decide eligibility. No
 fitting size is 503 `no_capacity`, or 422 `no_host_fits` when no registered host could ever fit
-the lease either (see step 3 of the lease order).
+the lease either (see step 3 of the lease order). A lease above `BOAT_MAX_TIMEOUT_S` never goes to
+Boat, real or shadow: it gets the registered-host answer unchanged, 503 `no_capacity` when no host
+has room now, or 422 `no_host_fits` with `max_vcpus` counting registered hosts only when no host's
+ceiling could ever fit it. A shadow above it is 503 `no_capacity`.
 
 **Order.** The budget candidate is computed first, exactly as for hosts; below 10 seconds the
 lease is 402 `budget_exhausted` and no Boat call is made. While the shared Boat breaker is open
@@ -701,7 +863,8 @@ A re-request must repeat it. Any other value is 400 `bad_request`.
 - A shadow is placed on Boat only, never on a registered host, and only while `BOAT_SHADOW_ENABLED`
   is `"true"`, independently of `BOAT_ENABLED` (which governs ordinary spill). With shadows off,
   Boat unavailable, or the tenant at `BOAT_MAX_SHADOWS` concurrent shadows (default 2), the answer
-  is 503 `no_capacity`; the client skips that shadow and never falls back.
+  is 503 `no_capacity`; the client skips that shadow and never falls back. A fresh shadow with a
+  binding explicit-only hint instead gets 422 `no_host_fits` with `max_vcpus: 0`, as described above.
 - A shadow counts toward the pool's sandbox cap, the hourly and daily Boat start limits and the
   daily start count, like any Boat lease.
 - A shadow is never charged to the tenant's allowance and never counted in the account usage
@@ -721,8 +884,14 @@ A re-request must repeat it. Any other value is 400 `bad_request`.
   cat /etc/motor/tenant/id` and requires the printed id back. The runner reads it, refuses all
   connections while it is missing, and checks the token's `aud` equals `boat:<id>`.
 - **Compile-cache provisioning.** The broker installs the sandbox's compile-cache provisioning
-  after every create or resume, once Boat reports the sandbox hydrated. A guest reboot the broker
-  does not see clears `/run`; the cache is then unavailable until the next create or resume.
+  after every create or resume, once Boat reports the sandbox hydrated. Running ready sandboxes,
+  including those serving a job, are brought up to the tenant's current key version without a
+  restart: the alarm schedules a best-effort check every 60 seconds, and convergence may take
+  longer, subject to the attempts below. For already-running sandboxes this refresh does not hold
+  up booking, reserve a start, or count against an hourly or daily start limit. The runner re-checks the files on every admission. A stop, retire,
+  cycle or recovery supersedes an in-flight install; its completion cannot revive the sandbox.
+  A guest reboot the broker does not see clears `/run`; an unchanged recorded version cannot
+  detect that loss, so the cache is then unavailable until the next create or resume.
   - **Paths and modes.** `/run/motor/cache/` is a root-owned (`root:root`) `0700` directory on
     tmpfs. It holds two root-owned files: `/run/motor/cache/read-key`, mode `0400`, and
     `/run/motor/cache/config.json`, mode `0444` (plus, only during a write, its temporary file).
@@ -749,14 +918,28 @@ A re-request must repeat it. Any other value is 400 `bad_request`.
     when both files parse and share one `generation`. A mixed set leaves the previous complete
     generation active, and a reused `generation` with changed contents makes the cache
     unavailable.
+    The broker records the attempted and verified installed version per sandbox incarnation,
+    comparing the pair (`generation`, `enabled`). The same version is not rewritten on later
+    passes, including after its install attempts fail; a changed version gets its own attempts.
+    A failed read of the tenant's desired cache state logs `boat_cache_key_install_failed` but
+    changes neither installed files nor the recorded version. The broker claims no version for
+    a failed read, so the next cleanup pass retries the read.
+  - **Disable and removal.** A disabled tenant key is delivered with `enabled: false` under the
+    same generation, disabling cache use without removing the credential. A deleted or missing key,
+    or a closed account, removes both files and their temporary files, including on a running
+    sandbox; the broker records the no-key state so later passes do not repeat the removal.
+    `CACHE_KEYS_ENABLED` other than `"true"` does neither installation nor removal and preserves
+    existing files. Turning delivery back on compares the current tenant state again.
   - **Atomic writes, key first.** Each file is written to a temporary file in
     `/run/motor/cache/` with its final owner and mode, then renamed over its final name. The
     broker renames `read-key` before `config.json`.
   - **Read-back.** After both renames, the broker runs
     `sudo sha256sum /run/motor/cache/read-key /run/motor/cache/config.json` through Boat's exec
-    API and requires each printed digest to equal the SHA-256 of the bytes it wrote. Otherwise it
-    repeats the whole write, at most 3 attempts per start; after that it logs
-    `boat_cache_key_install_failed` and the cache stays unavailable.
+    API and requires each printed digest to equal the SHA-256 of the bytes it wrote. For a
+    retryable failure it repeats the whole write, at most 3 attempts per version mismatch per
+    incarnation; an unanswered Boat call or a 404 ends retries early. After that it logs `boat_cache_key_install_failed` and attempts to remove the files. Staging directories whose
+    cleanup failed are retained for removal in a later pool step of the same incarnation. Neither
+    installation nor cleanup failure blocks jobs.
   - **Cache tenant versus sandbox.** The runner takes the cache-tenant id only from `tenant` in
     `/run/motor/cache/config.json`, never from `/etc/motor/tenant/id`, which keeps holding the
     sandbox id for the admission audience `boat:<id>`. Two sandboxes with different ids can share
@@ -827,9 +1010,18 @@ entries for that closed account and for an open one, with the exact reply bytes
 `{"ignored":[],"closed_subjects":["acct:<closed account>"]}`. A third, closed account the host
 does not report stays out of the reply.
 
+`test-vectors/runners/replace-lease.json` pins a replace of the lease vector's job onto a second
+host (the 201 reply and its `run` token for that host), the old host's signed heartbeat that still
+reports the job `started` with the reply `{"ignored":["<job_id>"],"closed_subjects":[]}`, the old
+host's signed usage report refused with 409 `job_conflict`, and the tenant read showing the job on
+the new host. `test-vectors/runners/long-lease.json` pins a 21600-second lease granted in full on
+an unlimited allowance and the same body at 21601 refused with 400 `bad_request`, `field:
+"timeout_s"`.
+
 `workers/runners/test/vectors.test.ts` and `workers/runners/test/boat-vectors.test.ts` compare real
 implementation output to those committed bytes. `workers/runners/test/job-token.test.ts`, `workers/runners/test/jwks.test.ts`,
 `workers/runners/test/host-auth.test.ts`, `workers/runners/test/usage.test.ts`,
-`workers/runners/test/rerequest.test.ts` and `workers/runners/test/lease-concurrency.test.ts`
+`workers/runners/test/rerequest.test.ts`, `workers/runners/test/replace.test.ts`,
+`workers/runners/test/placement.test.ts` and `workers/runners/test/lease-concurrency.test.ts`
 exercise the corresponding credentials, state transitions and accounting invariants. See
 [runners.md](runners.md#tests-and-wire-vectors) for the full explicit test file list.

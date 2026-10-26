@@ -5,14 +5,14 @@
   "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
   "cases": [
     {
-      "name": "timeout_s over 7200",
+      "name": "timeout_s over 21600",
       "request": {
         "method": "POST",
         "pathname": "/v1/leases",
         "headers": {
           "Content-Type": "application/json"
         },
-        "body": "{\"job_id\":\"019e4567-89ab-7cde-8012-3456789abcde\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":{\"host\":\"host-a\",\"vm\":\"warm-vm-1\"},\"avoid_host\":null,\"timeout_s\":7201,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":true}"
+        "body": "{\"job_id\":\"019e4567-89ab-7cde-8012-3456789abcde\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":{\"host\":\"host-a\",\"vm\":\"warm-vm-1\"},\"avoid_host\":null,\"timeout_s\":21601,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":true}"
       },
       "reply": {
         "status": 400,

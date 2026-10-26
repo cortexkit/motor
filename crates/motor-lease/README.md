@@ -19,13 +19,11 @@ host can also call `Nonces::prune` explicitly.
 ## Contract fixtures
 
 The broker repository, `cortexkit-cloud`, owns `docs/runners-contract.md` and
-`test-vectors/runners/`. `contracts/cloud/` mirrors thirteen canonical files
-verbatim: the contract and `bad-request.json` at commit `df12dca`,
-`account-closure.json` at `e961a71`, `lease.json`, `boat-lease.json`,
-`shadow-lease.json` and `settled-reattach.json` at `e483f20`, `no-host-fits-lease.json` at
-`916347e`, `no-spill-lease.json` at `95fd2d1`, `explicit-only-leases.json` at
-`54042e7`, and the other vectors at
-`00e688e`. `contracts/digest-manifest.json` records source paths,
+`test-vectors/runners/`. `contracts/cloud/` mirrors fifteen canonical files
+verbatim at commit `5d25d34`, including the six-hour `long-lease.json` and
+same-reservation `replace-lease.json` exchanges. `bad-request.json` now refuses
+`timeout_s: 21601`; registered hosts accept up to 21600, while Boat keeps 7200.
+`contracts/digest-manifest.json` records source paths,
 revision and SHA-256 values. The digest test checks every file and inventory
 completeness. The conformance tests compare tokens, signing bytes, request bodies
 and settlement replies directly to these external vectors; they never regenerate

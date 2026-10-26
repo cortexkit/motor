@@ -17,6 +17,9 @@ pub(crate) fn eligible(
             None | Some(motor_protocol::Platform::Linux)
         )
         && request.weight_hint.unwrap_or(2) <= config.spill_max_vcpus
+        && request
+            .timeout
+            .is_some_and(|s| s <= crate::hosted::BOAT_MAX_TIMEOUT_S)
         && crate::hosted::validate(request).is_ok()
 }
 
@@ -123,9 +126,8 @@ mod tests {
         request.weight_hint = Some(9);
         assert!(!eligible(&config, &request, false, false));
     }
-    /// A job whose lease the broker would refuse with 400 `bad_request`
-    /// never spills; it stays queued on the build server. CLOUD takes
-    /// `timeout_s` only in 10..=7200 and `vcpus` only in 1..=64.
+    /// Spill needs a Boat-compatible timeout even though registered hosts
+    /// accept longer leases. Invalid resource requests also stay queued.
     #[test]
     fn spill_skips_jobs_whose_lease_body_the_broker_would_refuse() {
         let config = crate::Config {

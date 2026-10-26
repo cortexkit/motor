@@ -75,6 +75,8 @@ fn cloud_final_files_match_their_manifest_digests() {
         "cloud/settled-reattach.json",
         "cloud/shadow-lease.json",
         "cloud/account-closure.json",
+        "cloud/long-lease.json",
+        "cloud/replace-lease.json",
     ] {
         let entry = manifest
             .files
@@ -92,16 +94,16 @@ fn cloud_final_files_match_their_manifest_digests() {
 #[test]
 fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("contracts/cloud");
-    // These published digests are independent of the editable manifest. Adding
-    // a policy vector must not change the existing cloud vectors' pinned bytes.
+    // These digests are independent of the editable manifest, so updating a
+    // canonical contract or vector requires an explicit change to both pins.
     for (path, digest) in [
         (
             "runners-contract.md",
-            "d9d8fe4b654cc6f856deb6da232df86ebef12436eeb08347fcf15ab4aa5d346a",
+            "3f5147fd97cb22203776f3cba82eb3d9a7ec6567a54aff2a8b51035c52cb896d",
         ),
         (
             "bad-request.json",
-            "92bc738250dc962214b60b9c4da205922eae18dc6c6618b2a2eb6c74256f1c62",
+            "4f2d775a85a89d7024fd65186162b53bed696ccf0ad02ce839efc5949ffd1fbc",
         ),
         (
             "no-host-fits-lease.json",
@@ -146,6 +148,14 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         (
             "account-closure.json",
             "8e3ce5eae03d06e985194f02bd817b7b45a0340e65a4bda8193969cbb3b0569e",
+        ),
+        (
+            "long-lease.json",
+            "a0fb260259ccf90b00ecf8d08af5b06aa649564ba0f898ebac8987c0eaab2b4c",
+        ),
+        (
+            "replace-lease.json",
+            "96c5abfae5898ac7756847152f6e7f9aca6791d94880b29b5758ff1d5ce077d6",
         ),
     ] {
         assert_eq!(
