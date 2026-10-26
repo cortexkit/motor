@@ -367,6 +367,45 @@ async fn refused_key_survives_restart_and_different_request_still_mismatches() {
     );
 }
 
+#[tokio::test]
+async fn runner_acceptance_is_remembered_before_network_echo_refusal() {
+    let scratch = ScratchDir::new("key-accepted-network-refusal");
+    let repo = fixture_repo(scratch.path());
+    let peer = ResubmitPeer::new();
+    let log = peer.log.clone();
+    let motor = Motor::with_connector(
+        Config {
+            runner_instance: "test".into(),
+            network_routing: true,
+            ..Config::default()
+        },
+        &scratch.join("state"),
+        Arc::new(peer),
+    )
+    .unwrap();
+    let request = request(&repo).with_network(motor_protocol::Network::Outbound);
+    let stream = motor
+        .submit_agent(request.clone(), None, PRINCIPAL)
+        .await
+        .unwrap();
+    let id = stream.job_id;
+    let original = records(stream).await;
+    assert!(
+        matches!(original.last(), Some(StreamRecord::Terminal(t)) if t.outcome == Outcome::RefusedBeforeStart { reason: RefusalReason::NetworkUnsupported })
+    );
+    assert!(motor
+        .storage
+        .job(id)
+        .unwrap()
+        .submission
+        .unwrap()
+        .accepted
+        .is_some());
+    let replay = records(motor.submit_agent(request, None, PRINCIPAL).await.unwrap()).await;
+    attached(&replay, id);
+    assert_eq!(log.lock().unwrap().runs.len(), 1);
+}
+
 struct DurabilityPeer {
     inner: ResubmitPeer,
     root: PathBuf,

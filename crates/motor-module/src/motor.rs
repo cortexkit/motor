@@ -1314,6 +1314,15 @@ impl Motor {
         let admission = channel.next().await;
         match admission {
             Ok(Incoming::Frame(Frame::Accepted(mut accepted))) => {
+                accepted.attached = false;
+                let mut caller_accepted = accepted
+                    .clone()
+                    .with_env_not_forwarded(env_not_forwarded.clone());
+                caller_accepted.job_id = id;
+                if request.network.is_none() {
+                    caller_accepted.network = None;
+                }
+                self.storage.submission_accepted(id, caller_accepted)?;
                 if hosted {
                     tracing::info!(job_id = %id, step = "admission", cause = "runner accepted Run", "hosted Run accepted");
                     if spilled {
@@ -1349,11 +1358,7 @@ impl Motor {
                 if request.network.is_none() {
                     accepted.network = None;
                 }
-                accepted.attached = false;
                 let accepted = accepted.with_env_not_forwarded(env_not_forwarded);
-                let mut caller_accepted = accepted.clone();
-                caller_accepted.job_id = id;
-                self.storage.submission_accepted(id, caller_accepted)?;
                 if wrong_platform {
                     self.log_hosted_failure(id, "admission", "accepted platform mismatch");
                     self.cancel(CancelRequest::new(id)).await?;

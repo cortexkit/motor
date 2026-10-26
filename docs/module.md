@@ -421,6 +421,7 @@ Source: `src/motor/submission_key.rs` and `src/storage.rs` under
 `restart_after_run_with_lost_ack_reattaches_runner_record`,
 `run_fence_without_runner_admission_uses_attach_tombstone`,
 `refused_key_survives_restart_and_different_request_still_mismatches`,
+`runner_acceptance_is_remembered_before_network_echo_refusal`,
 `concurrent_resubmits_start_one_job`,
 `unknown_key_with_cursor_starts_a_fresh_submission`,
 `keyed_spill_return_keeps_one_logical_job_across_restart`,
