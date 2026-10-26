@@ -119,7 +119,7 @@ pub fn mount_all(entries: &[Mount], system: &mut impl System) -> io::Result<()> 
     for entry in entries {
         let matches: Vec<_> = observed
             .iter()
-            .filter(|o| o.destination == entry.destination)
+            .filter(|o| reported_at(&o.destination, &entry.destination))
             .collect();
         if matches.len() != 1
             || matches[0].tag != entry.tag
@@ -130,7 +130,9 @@ pub fn mount_all(entries: &[Mount], system: &mut impl System) -> io::Result<()> 
         {
             return Err(entry_error(
                 entry,
-                "mounted filesystem, tag or access mode does not match metadata",
+                format!(
+                    "mounted filesystem, tag or access mode does not match metadata; observed at this destination: {matches:?}"
+                ),
             ));
         }
     }
@@ -143,6 +145,16 @@ pub fn mount_all(entries: &[Mount], system: &mut impl System) -> io::Result<()> 
         return Err(invalid("unexpected virtiofs mount outside boot map"));
     }
     Ok(())
+}
+
+/// macOS reports a mount under a firmlinked Data-volume directory (such as
+/// /Users) at its Data-volume path, `/System/Volumes/Data/Users/...`, so a
+/// mount made at the caller's path is matched at either spelling.
+fn reported_at(reported: &Path, destination: &Path) -> bool {
+    reported == destination
+        || destination
+            .strip_prefix("/")
+            .is_ok_and(|relative| reported == Path::new("/System/Volumes/Data").join(relative))
 }
 
 /// Walk from a retained directory descriptor, refusing links in every component.
@@ -398,6 +410,15 @@ mod tests {
                 }),
                 6 => out[0].nosuid = false,
                 7 => out[0].nodev = false,
+                // macOS reports /Users mounts at their Data-volume path.
+                8 => {
+                    for o in &mut out {
+                        if let Ok(rest) = o.destination.strip_prefix("/Users") {
+                            o.destination = Path::new("/System/Volumes/Data/Users").join(rest);
+                        }
+                    }
+                }
+                9 => out[0].destination = "/System/Volumes/Data/Users/test/other".into(),
                 _ => {}
             }
             Ok(out)
@@ -415,6 +436,16 @@ mod tests {
             };
             assert!(mount_all(&map(), &mut fake).is_err());
         }
+        let mut firmlinked = Fake {
+            corrupt: 8,
+            ..Fake::default()
+        };
+        mount_all(&map(), &mut firmlinked).unwrap();
+        let mut elsewhere = Fake {
+            corrupt: 9,
+            ..Fake::default()
+        };
+        assert!(mount_all(&map(), &mut elsewhere).is_err());
         let mut bad = map();
         bad[0].destination = "relative".into();
         let mut fake = Fake::default();
