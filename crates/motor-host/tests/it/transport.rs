@@ -1910,6 +1910,92 @@ async fn client_heartbeats_reach_guest_during_ready_output_burst() {
     runtime.host.lock().unwrap().guest_unready("tenant");
 }
 
+/// A burst the guest has already delivered goes out behind one durable
+/// watermark store, not one per frame. Paid per frame, a busy host forwarded
+/// about one frame a second, so the output after a cancel never reached its
+/// terminal before the client gave up and the job ended as outcome unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_output_burst_is_forwarded_behind_one_watermark_store() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let (runtime, fake, broker, requester, c) = fixture();
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let mut guest = started_relay(
+        &runtime,
+        &fake,
+        &broker,
+        &requester,
+        &c,
+        &mut client,
+        unix_ms(),
+    )
+    .await;
+    let start = Arc::new(WatermarkGate::default());
+    let release = ReleaseWatermark(start.clone());
+    let inner = MemoryJournal::default();
+    let stored = inner.0.clone();
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .replace_journal(Box::new(SlowWatermarkJournal {
+            inner,
+            start: Some(start.clone()),
+            last_seq: 0,
+        }));
+    // The first frame's store is held until the rest of the burst is queued,
+    // so at most the first frame is forwarded on its own.
+    use std::io::Write;
+    write_json(
+        &mut guest,
+        &json!({"type":"output","job_id":JOB,"seq":1,"data":""}),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(2), start.entered.notified())
+        .await
+        .unwrap();
+    let mut burst = Vec::new();
+    for seq in 2..=64 {
+        write_json(
+            &mut burst,
+            &json!({"type":"output","job_id":JOB,"seq":seq,"data":""}),
+        )
+        .unwrap();
+    }
+    guest.write_all(&burst).unwrap();
+    drop(release);
+    guest.set_nonblocking(true).unwrap();
+    let guest = tokio::net::UnixStream::from_std(guest).unwrap();
+    let mut ordered = true;
+    for seq in 1..=64 {
+        let frame = timeout(Duration::from_secs(5), read_frame(&mut client))
+            .await
+            .unwrap()
+            .unwrap();
+        ordered &= frame["seq"] == seq;
+    }
+    let mut stores: Vec<u64> = stored
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|snapshot| snapshot.leases[JOB].highest_seq)
+        .collect();
+    stores.dedup();
+    drop(client);
+    let cleanup = timeout(Duration::from_secs(2), task).await;
+    drop(guest);
+
+    assert!(ordered, "output order was lost");
+    // Seq 1 alone, then the queued remainder in one batch. A per-frame store
+    // would record 64 distinct watermarks.
+    assert!(stores.len() <= 3, "watermark stores per frame: {stores:?}");
+    assert_eq!(stores.last(), Some(&64));
+    cleanup.unwrap().unwrap().unwrap();
+    runtime.host.lock().unwrap().guest_unready("tenant");
+}
+
 fn exit_terminal() -> Value {
     json!({"type":"terminal","job_id":JOB,"outcome":{"type":"exit","code":0},"wall_ms":3000,"queue_wait_ms":0,"bundle_bytes":0,"ran":"remote","tree_hash":null,"workspace_changes":null})
 }

@@ -1324,7 +1324,10 @@ where
         // Split a borrow, not the stream itself: once the relay ends, `serve`
         // still needs the client stream to close it gracefully.
         let (mut cr, mut cw) = tokio::io::split(&mut client);
-        let (mut gr, mut gw) = guest.split();
+        let (gr, mut gw) = guest.split();
+        // Buffered, so the output pump can tell which frames have already
+        // arrived in full and take them as one batch.
+        let mut gr = tokio::io::BufReader::with_capacity(RELAY_READ_BUFFER, gr);
         // This connection owns the reverse drain after decoding Terminal or
         // selecting host-settled final frames; ownership is not client delivery.
         let draining_terminal = AtomicBool::new(false);
@@ -1376,26 +1379,56 @@ where
             let mut cursor: u64 = 0;
             loop {
                 // Ready sockets and fast state replies must not monopolise the
-                // shared task. Each turn handles at most one guest frame
-                // before yielding; slow state work also yields while awaited.
+                // shared task. Each turn handles at most one batch of guest
+                // frames before yielding; slow state work also yields while awaited.
                 tokio::task::yield_now().await;
-                let read = read_frame(&mut gr);
-                tokio::pin!(read);
-                let frame = loop {
-                    tokio::select! {
-                        result = &mut read => { break Some(result); },
-                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                            let frames = relay_state(&runtime, &claims.jti, move |host, jti| host.host_settled_frames(jti, cursor.saturating_add(1))).await?;
-                            if let Some(frames) = frames {
-                                draining_terminal.store(true, Ordering::Release);
-                                for frame in frames { relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?; }
-                                terminal_written.store(true, Ordering::Release);
-                                break None;
+                // The pending read borrows the guest reader, so it lives only in
+                // this block; the batch below reads the reader's buffer.
+                let first = {
+                    let read = read_frame(&mut gr);
+                    tokio::pin!(read);
+                    loop {
+                        tokio::select! {
+                            result = &mut read => { break Some(result); },
+                            // Each check takes the Host mutex, and every open relay
+                            // runs one, so a short period here is itself a large
+                            // source of mutex contention on a busy host.
+                            _ = tokio::time::sleep(SETTLED_POLL) => {
+                                let frames = relay_state(&runtime, &claims.jti, move |host, jti| host.host_settled_frames(jti, cursor.saturating_add(1))).await?;
+                                if let Some(frames) = frames {
+                                    draining_terminal.store(true, Ordering::Release);
+                                    for frame in frames { relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?; }
+                                    terminal_written.store(true, Ordering::Release);
+                                    break None;
+                                }
                             }
                         }
                     }
                 };
-                let Some(frame) = frame else { return Ok::<(),anyhow::Error>(()); };
+                let Some(first) = first else { return Ok::<(),anyhow::Error>(()); };
+                // Frames the guest has already delivered in full go out as one
+                // batch behind one host-state round trip. Recording the output
+                // watermark is a durable snapshot write that waits for the Host
+                // mutex; paid per frame, it held a busy tenant to about one frame
+                // a second, so a replay or the burst after a cancel never reached
+                // its terminal before the client gave up. Only complete buffered
+                // frames join, so the batch never waits on the guest.
+                let mut batch = Vec::new();
+                let mut read_error = None;
+                match first {
+                    Ok(frame) => batch.push(frame),
+                    Err(error) => read_error = Some(error),
+                }
+                while read_error.is_none()
+                    && batch.len() < RELAY_BATCH_FRAMES
+                    && batch.last().is_some_and(|frame| frame["type"] != "terminal")
+                    && buffered_frame_ready(gr.buffer())
+                {
+                    match read_frame(&mut gr).await {
+                        Ok(frame) => batch.push(frame),
+                        Err(error) => read_error = Some(error),
+                    }
+                }
                 let settled = relay_state(&runtime, &claims.jti, move |host, jti| host.host_settled_frames(jti, cursor.saturating_add(1))).await?;
                 if let Some(frames) = settled {
                     draining_terminal.store(true, Ordering::Release);
@@ -1404,11 +1437,14 @@ where
                     terminal_written.store(true, Ordering::Release);
                     return Ok::<(),anyhow::Error>(());
                 }
-                let frame = frame.at(Side::Guest, "relay")?;
-                if let Some(seq) = frame["seq"].as_u64() {
+                // The batch's highest sequence is durable before any of its
+                // frames is visible, so the watermark stays at or above all
+                // output the client may have seen.
+                if let Some(seq) = batch.iter().filter_map(|frame| frame["seq"].as_u64()).max() {
                     relay_state(&runtime, &claims.jti, move |host, jti| host.watermark(jti, seq)).await?.at(Side::Host, "relay")?;
                     cursor = cursor.max(seq);
                 }
+                for frame in batch {
                 if frame["type"] == "terminal" {
                     // The guest may close its input as soon as it emits Terminal.
                     // Client heartbeats must not cancel Terminal/hosted_terminal
@@ -1439,6 +1475,10 @@ where
                     return Ok::<(),anyhow::Error>(());
                 }
                 relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
+                }
+                if let Some(error) = read_error {
+                    return Err(error).at(Side::Guest, "relay");
+                }
             }
             #[allow(unreachable_code)]
             Ok::<(), anyhow::Error>(())
@@ -1657,6 +1697,36 @@ async fn connection_ended(
             changed = updates.changed() => { if changed.is_err() { return; } },
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if before_admission && deadline.is_some() => return,
         }
+    }
+}
+
+/// Most guest frames one relay batch forwards behind a single host-state round trip.
+const RELAY_BATCH_FRAMES: usize = 256;
+/// Read buffer for the guest side of a relay, large enough to hold a burst of frames.
+const RELAY_READ_BUFFER: usize = 256 * 1024;
+/// How often a relay waiting for guest output checks whether the host settled its job.
+const SETTLED_POLL: Duration = Duration::from_millis(500);
+
+/// Whether `buffer` already holds one whole length-prefixed frame, so
+/// `read_frame` returns it without waiting on the socket.
+fn buffered_frame_ready(buffer: &[u8]) -> bool {
+    match buffer {
+        [a, b, c, d, rest @ ..] => rest.len() >= u32::from_be_bytes([*a, *b, *c, *d]) as usize,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod buffered_frame_tests {
+    use super::buffered_frame_ready;
+
+    #[test]
+    fn needs_the_length_prefix_and_the_whole_body() {
+        assert!(!buffered_frame_ready(&[]));
+        assert!(!buffered_frame_ready(&[0, 0, 0]));
+        assert!(buffered_frame_ready(&[0, 0, 0, 0]));
+        assert!(!buffered_frame_ready(&[0, 0, 0, 2, b'{']));
+        assert!(buffered_frame_ready(&[0, 0, 0, 2, b'{', b'}', 0]));
     }
 }
 
