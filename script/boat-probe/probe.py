@@ -1175,8 +1175,8 @@ def main(report_stream=None):
     parser.add_argument('--acknowledge-tenant-one-private-cache', action='store_true',
                         help='required for runner-host: seed/image contain private fleet dependencies, never for customers')
     parser.add_argument('--cache-inputs', type=Path,
-                        help='runner-host only: directory holding config.json, read-key and a Cargo seed bundle '
-                             'for the live remote-sccache check; omit it to record that check as not run')
+                        help='runner-host only: directory holding config.json and read-key for the live remote-sccache '
+                             'check, which uses the image Cargo seed; omit it to record that check as not run')
     args = parser.parse_args()
     if args.quota_stop_wait_s is not None:
         if not args.runner_host:

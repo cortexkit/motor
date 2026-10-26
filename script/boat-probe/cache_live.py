@@ -17,6 +17,7 @@ installed or staged copy is removed before the check ends.
 from __future__ import annotations
 
 import json
+import shlex
 
 # Boat's own /tmp is never saved in a snapshot, which is why the contract's
 # staging area lives there and not under /etc.
@@ -24,12 +25,6 @@ STAGING = '/tmp/ck-motor-cache'
 DIRECTORY = '/run/motor/cache'
 READ_KEY = DIRECTORY + '/read-key'
 CONFIG = DIRECTORY + '/config.json'
-SEED = 'cargo-seed.tar.gz'
-SEED_MANIFEST = 'cargo-seed.json'
-# The account every probe job runs as.
-JOB_ACCOUNT = 'motor-job'
-WORKSPACE = '/Users/boat-cache-live'
-APP = WORKSPACE + '/app'
 # What the contract installs, checked after the install and never assumed.
 MODES = {'directory': '700', 'read-key': '400', 'config.json': '444'}
 # The members of each file, exactly as the contract lists them. Unknown members
@@ -39,9 +34,12 @@ CONFIG_MEMBERS = ('bucket', 'enabled', 'endpoint', 'generation', 'prefix', 'regi
                   'storage_class', 'tenant')
 # Least a real Rust job can fetch: one compile unit or more from the store.
 MINIMUM_REMOTE_HITS = 1
+# The runner polls provisioning metadata every second and fully rereads it at
+# least every ten seconds. Observe admission without restarting the runner.
+ADMISSION_SECONDS = 15
 
 # A Cargo package with real compile units. Every dependency is resolved offline
-# from the operator's seed, so the job neither reaches the network nor writes the
+# from the prepared image's seed, so the job neither reaches the network nor writes the
 # store; the job's cache mode is read-only in any case.
 CRATE_TOML = '''[package]
 name = "boat-cache-live"
@@ -122,42 +120,82 @@ def absent_command():
                                                         f'{STAGING}/config.json'))
 
 
-def stage_command():
-    """The shell that writes the job's package and Cargo home owned by the job
-    account. Its standard input is the package files followed by the operator's
-    seed, so no cache credential is part of the staged material a snapshot could
-    keep."""
-    return ' && '.join([
-        f'install -d -m 0755 {APP}/src {WORKSPACE}/cargo {WORKSPACE}/target',
-        f'cat > {APP}/Cargo.toml',
-        f'cat > {APP}/src/main.rs',
-        f'sudo -n chown -R {JOB_ACCOUNT}:{JOB_ACCOUNT} {WORKSPACE}',
-        f'cat > {STAGING}/{SEED}',
-    ])
+def admission_command():
+    """A cheap real job observes the cache environment the watcher admitted."""
+    source = '''
+import json, os
+from pathlib import Path
+mounts = [line.split()[4] for line in Path('/proc/self/mountinfo').read_text().splitlines()]
+print(json.dumps(dict(wrapper=os.environ.get('RUSTC_WRAPPER'), rw_mode=os.environ.get('SCCACHE_S3_RW_MODE'),
+                     recache='SCCACHE_RECACHE' in os.environ,
+                     tools_mounted='/motor-tools' in mounts, gateway_mounted='/motor-gateway' in mounts)))
+'''
+    return 'python3 -c ' + shlex.quote(source)
+
+
+def admitted(report):
+    return (isinstance(report, dict) and report.get('wrapper') == '/motor-tools/sccache'
+            and report.get('rw_mode') == 'READ_ONLY' and report.get('recache') is False
+            and report.get('tools_mounted') is True and report.get('gateway_mounted') is True)
 
 
 def job_command():
-    """The job's command, run with its package directory as the cwd.
+    """Build in the Motor workspace with the image's canonical, seeded Cargo home.
 
-    It builds offline from the job's own Cargo home, then prints the statistics
-    of the wrapper the runner installed. Asking the same wrapper is what makes
-    the numbers the job's own: a second sccache would start its own server and
-    report a build that never ran."""
-    return 'cargo build --offline --locked && "$RUSTC_WRAPPER" --show-stats --stats-format=json'
+    A different Cargo home changes cache keys. Ask the runner's own wrapper for
+    statistics, not a second sccache server that never saw the build. Cargo's
+    chatter goes to stderr so stdout contains exactly one evidence object.
+    """
+    source = f'''
+import json, os, subprocess, sys
+from pathlib import Path
+package = Path('boat-cache-live')
+(package / 'src').mkdir(parents=True, exist_ok=True)
+(package / 'Cargo.toml').write_text({CRATE_TOML!r})
+(package / 'src/main.rs').write_text({CRATE_MAIN!r})
+for command in (['cargo', 'generate-lockfile', '--offline'], ['cargo', 'build', '--offline', '--locked']):
+    subprocess.run(command, cwd=package, stdout=sys.stderr, check=True)
+wrapper = os.environ['RUSTC_WRAPPER']
+stats = json.loads(subprocess.check_output([wrapper, '--show-stats', '--stats-format=json']))
+mounts = [line.split()[4] for line in Path('/proc/self/mountinfo').read_text().splitlines()]
+print(json.dumps(dict(wrapper=wrapper, rw_mode=os.environ.get('SCCACHE_S3_RW_MODE'),
+                     recache='SCCACHE_RECACHE' in os.environ,
+                     tools_mounted='/motor-tools' in mounts, gateway_mounted='/motor-gateway' in mounts,
+                     stats=stats)))
+'''
+    return 'python3 -c ' + shlex.quote(source)
 
 
-def remote_hits(stats):
-    """Compiles the store answered, or None when no remote counter is reported.
+def remote_hits(server_info):
+    """Count S3 hits in sccache 0.18's ServerInfo, never local disk hits.
 
-    sccache names its storage levels (`s3_hits`, and the legacy
-    `s3_<storage>_hits`). A build with the cache off reports no such counter at
-    all, which is why a job that never saw the cache cannot pass as a miss."""
-    if not isinstance(stats, dict):
+    Boat uses a single S3 backend. Its hit counts have two alternate breakdowns;
+    count the language totals once, only after verifying the backend location.
+    A multilevel configuration instead needs the S3 level's own hit counter.
+    """
+    if not isinstance(server_info, dict) or not isinstance(server_info.get('stats'), dict):
         return None
-    counters = [count for name, count in stats.items()
-                if isinstance(count, int) and not isinstance(count, bool)
-                and (name == 's3_hits' or (name.startswith('s3_') and name.endswith('_hits')))]
-    return sum(counters) if counters else None
+    stats = server_info['stats']
+    levels = stats.get('multi_level')
+    if isinstance(levels, list):
+        counters = [level.get('hits') for level in levels if isinstance(level, dict)
+                    and isinstance(level.get('location'), str) and level['location'].startswith('s3,')]
+        if not counters:
+            return None
+    elif levels is None and str(server_info.get('cache_location', '')).startswith('s3,'):
+        hits = stats.get('cache_hits')
+        counts = hits.get('counts') if isinstance(hits, dict) else None
+        if not isinstance(counts, dict):
+            return None
+        counters = list(counts.values())
+    else:
+        return None
+    total = 0
+    for count in counters:
+        if type(count) is not int or count < 0:
+            return None
+        total += count
+    return total
 
 
 def passed(installed_modes, report, hits, removed):

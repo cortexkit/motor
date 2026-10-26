@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TEST_FILES = [
     "script/boat-probe/test_probe.py",
     "script/boat-probe/test_cache_bench.py",
+    "script/boat-probe/test_cache_live.py",
     "script/boat-probe/test_runner_prerequisites.py",
     "script/boat-probe/test_runner_host.py",
     "script/boat-probe/test_resources.py",
