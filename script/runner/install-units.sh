@@ -10,6 +10,31 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 dest=$HOME/.config/systemd/user
 changed=0
+check_instance() {
+  local instance=$1 binary override refusal arg flagged=false
+  local -a command options
+  # The effective ExecStart selects each instance's binary, not the template's binary.
+  mapfile -d '' -t command < <(
+    python3 "$here/deploy_canary.py" --repository-unit-command "$here/units" "$instance")
+  [ "${#command[@]}" -gt 0 ] || { echo "skipped $rel: cannot extract $instance serve arguments" >&2; return 1; }
+  options=("${command[@]:1}")
+  for arg in "${options[@]}"; do
+    case "$arg" in --caller-root|--caller-root=*) flagged=true;; esac
+  done
+  override=RUNNER_BINARY_$instance
+  binary=${!override:-${command[0]}}
+  if [ ! -x "$binary" ]; then
+    [ "$flagged" = false ] && return 0 # Preserve first installation of unflagged units.
+    refusal="binary is absent or not executable: $binary"
+  elif refusal=$("$binary" check-options "${options[@]}" 2>&1); then
+    return 0
+  elif [[ "$refusal" = *'usage: motor-runner '* && "$refusal" != *check-options* ]]; then
+    [ "$flagged" = false ] && return 0
+    refusal="binary $binary lacks check-options: $refusal"
+  fi
+  printf 'skipped %s: %s check-options refusal: %s\n' "$rel" "$instance" "$refusal" >&2
+  return 1
+}
 # The file list comes in on fd 3, so the y/N prompt below reads the operator's
 # own stdin instead of consuming the next file name.
 while IFS= read -r -d '' -u 3 file; do
@@ -27,6 +52,18 @@ while IFS= read -r -d '' -u 3 file; do
   if [ -f "$target" ] && cmp -s "$file" "$target"; then
     continue
   fi
+  instances=()
+  case "$rel" in
+    motor-runner.service|motor-runner.service.d/*.conf) instances=(main) ;;
+    motor-runner@.service|motor-runner@.service.d/*.conf) instances=(e2e windows) ;;
+    motor-runner@*.service.d/*.conf)
+      name=${rel#motor-runner@}; instances=("${name%%.service.d/*}") ;;
+  esac
+  allowed=true
+  for instance in "${instances[@]}"; do
+    check_instance "$instance" || allowed=false
+  done
+  [ "$allowed" = true ] || continue
   echo "== $rel"
   if [ -f "$target" ]; then
     diff -u "$target" "$file" || true

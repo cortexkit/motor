@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import select
+import shlex
 import signal
 import socket
 import struct
@@ -30,6 +31,28 @@ class CanaryDeadline(CanaryError):
 
 INCONCLUSIVE = 75
 CAPACITY_REASONS = {'runner_full', 'queue_wait_exceeded', 'runner_draining'}
+
+
+def unit_command(text, instance):
+    """Read systemctl cat output (or concatenated unit files), not a shell command."""
+    command = None
+    for line in text.replace('\\\n', ' ').splitlines():
+        key, separator, value = line.strip().partition('=')
+        if separator and key == 'ExecStart' and value.strip():
+            command = shlex.split(value.replace('%i', instance))
+    if not command or 'serve' not in command:
+        raise ValueError('effective unit has no non-empty ExecStart containing serve')
+    return [command[0], *command[command.index('serve') + 1:]]
+
+
+def repository_unit_command(units, instance):
+    base = 'motor-runner.service' if instance == 'main' else 'motor-runner@.service'
+    dropins = {path.name: path for path in (units / (base + '.d')).glob('*.conf')}
+    if instance != 'main':
+        dropins.update({path.name: path for path in
+                        (units / f'motor-runner@{instance}.service.d').glob('*.conf')})
+    files = [units / base, *(dropins[name] for name in sorted(dropins))]
+    return unit_command('\n'.join(path.read_text() for path in files), instance)
 
 
 class Progress:
@@ -128,7 +151,8 @@ def check_refusal(frame, job, started=False):
     raise CanaryError(f'canary refused: {frame}')
 
 
-def attempt(state_root, instance, workspace, repository, commit, tree, bundle, queue_wait, progress):
+def attempt(state_root, instance, workspace, repository, commit, tree, bundle, queue_wait, progress,
+            home_compile_check=False):
     job = str(uuid.uuid4())
     with connect(state_root / instance / 'runner.sock') as sock:
         heartbeats = Heartbeats(sock)
@@ -138,7 +162,8 @@ def attempt(state_root, instance, workspace, repository, commit, tree, bundle, q
             raise CanaryError('runner did not negotiate canary protocol')
         send(sock, dict(type='run', job_id=job, workspace_key=workspace,
                         repository_root=repository, cwd=workspace,
-                        command='test "$(id -un)" = motor-job', env={},
+                        command=('test "$(id -un)" = motor-job' +
+                                 (' && rustc "$PWD/canary.rs"' if home_compile_check else '')), env={},
                         weight_hint=1, timeout=5, queue_wait_limit_s=queue_wait,
                         snapshot_commit=commit, tree_hash=tree, integration_tip=commit,
                         siblings=[], bundles=[dict(index=0, repository=repository,
@@ -152,6 +177,7 @@ def attempt(state_root, instance, workspace, repository, commit, tree, bundle, q
                         data=base64.b64encode(bundle).decode()))
         progress.state = 'queued'
         started = False
+        stderr = bytearray()
         while True:
             frame = receive(sock, heartbeats)
             if frame['type'] == 'heartbeat':
@@ -161,19 +187,27 @@ def attempt(state_root, instance, workspace, repository, commit, tree, bundle, q
                     heartbeats.observe_queue_wait(job, queue_wait, frame.get('queue_wait_ms'))
                 continue
             check_refusal(frame, job, started)
+            if home_compile_check and frame['type'] == 'output' and frame.get('stream') == 'stderr':
+                stderr.extend(base64.b64decode(frame['bytes'], validate=True))
             if frame['type'] == 'started' and frame.get('job_id') == job:
                 started = True
                 progress.state = 'started'
                 heartbeats.queue_deadline = None
             if frame['type'] == 'terminal':
                 if (frame.get('job_id') != job or not started or
-                        frame.get('outcome') != dict(type='exit', code=0)):
-                    raise CanaryError(f'canary did not start and exit 0: {frame}')
-                print(f'isolated deployment canary {job}: started and exited 0')
+                        frame.get('outcome') != dict(type='exit', code=1 if home_compile_check else 0)):
+                    raise CanaryError(f'canary did not start and exit {1 if home_compile_check else 0}: {frame}')
+                if home_compile_check:
+                    if (f'--> {workspace}/canary.rs:'.encode() not in stderr or
+                            b'error[E0308]' not in stderr):
+                        raise CanaryError('canary rustc error did not name the caller /home source file')
+                    print(f'isolated deployment canary {job}: /home compile-check passed')
+                else:
+                    print(f'isolated deployment canary {job}: started and exited 0')
                 return
 
 
-def run(state_root, instance, workspace_root, deadline, progress):
+def run(state_root, instance, workspace_root, deadline, progress, home_compile_check=False):
     workspace = str(workspace_root / instance / 'workspace')
     repository = workspace + '-source'
     with tempfile.TemporaryDirectory(prefix='motor-deploy-canary-') as tmp:
@@ -181,6 +215,9 @@ def run(state_root, instance, workspace_root, deadline, progress):
             return subprocess.check_output(
                 ['git', '-C', tmp, *args], stderr=subprocess.PIPE).decode().strip()
         git('init', '--quiet')
+        if home_compile_check:
+            (Path(tmp) / 'canary.rs').write_text('fn main() { let _: () = 1; }\n')
+            git('add', 'canary.rs')
         git('-c', 'user.name=Motor canary', '-c', 'user.email=canary@example.invalid',
             '-c', 'commit.gpgsign=false', 'commit', '--quiet', '--allow-empty', '-m', 'canary')
         commit = git('rev-parse', 'HEAD')
@@ -198,7 +235,8 @@ def run(state_root, instance, workspace_root, deadline, progress):
         try:
             # Leave time for a queue refusal to arrive before the overall alarm.
             queue_wait = max(1, min(10, int(remaining / 2)))
-            attempt(state_root, instance, workspace, repository, commit, tree, bundle, queue_wait, progress)
+            attempt(state_root, instance, workspace, repository, commit, tree, bundle, queue_wait,
+                    progress, home_compile_check)
             return 0
         except CapacityRefusal as error:
             progress.state = 'capacity'
@@ -207,14 +245,28 @@ def run(state_root, instance, workspace_root, deadline, progress):
 
 
 def main():
+    # Both shell entry points use the same extraction, including Boat's wrapper.
+    if (len(sys.argv) == 3 and sys.argv[1] == '--unit-command' or
+            len(sys.argv) == 4 and sys.argv[1] == '--repository-unit-command'):
+        try:
+            command = (unit_command(sys.stdin.read(), sys.argv[2]) if len(sys.argv) == 3 else
+                       repository_unit_command(Path(sys.argv[2]), sys.argv[3]))
+        except (OSError, ValueError) as error:
+            print(error, file=sys.stderr)
+            return 1
+        sys.stdout.buffer.write(b'\0'.join(word.encode() for word in command) + b'\0')
+        return 0
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--state-root', type=Path, required=True)
     parser.add_argument('--instance', required=True)
     parser.add_argument('--workspace-root', type=Path, default=Path('/Users/motor-deploy-canary'))
     parser.add_argument('--timeout-s', type=int, default=120)
+    parser.add_argument('--home-compile-check', action='store_true')
     args = parser.parse_args()
     if not 1 <= args.timeout_s <= 3600:
         parser.error('--timeout-s must be between 1 and 3600')
+    if args.home_compile_check:
+        args.workspace_root = Path('/home/motor-deploy-canary')
 
     def timeout(_signum, _frame):
         raise CanaryDeadline('deployment canary deadline exceeded without a terminal result')
@@ -223,7 +275,7 @@ def main():
     progress = Progress()
     try:
         result = run(args.state_root, args.instance, args.workspace_root,
-                     time.monotonic() + args.timeout_s, progress)
+                      time.monotonic() + args.timeout_s, progress, args.home_compile_check)
     except CanaryDeadline as error:
         # Only a queued job or a capacity refusal can excuse a deadline. A
         # failed handshake, upload, or a started job without a result cannot.
