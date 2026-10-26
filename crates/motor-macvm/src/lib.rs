@@ -1102,7 +1102,9 @@ pub mod process {
                 responsible_pid,
             }));
         }
-        select_service(helper, observations)
+        // Under a launchd agent, macOS attributes the helper, and the VM service
+        // it starts, to the agent's own process rather than to the helper.
+        select_service(helper, responsible_pid(helper.pid)?, observations)
     }
     /// Call only after the helper has exited and cannot open more descriptors.
     /// Failure means cleanup and slot reuse must remain blocked. Qualification
@@ -1281,8 +1283,14 @@ pub struct ServiceObservation {
 
 /// Observations must cover every same-UID Virtualization service candidate.
 /// An unreadable candidate is an error, not an absent match.
+///
+/// A service holding the boot disk must be attributed either to the helper
+/// itself or to the process the helper is attributed to. Which one macOS picks
+/// depends on how the helper was launched; the clone vnode match above is what
+/// ties the service to this job either way.
 pub fn select_service(
     helper: ProcessIdentity,
+    helper_responsible: Option<i32>,
     observations: impl IntoIterator<Item = io::Result<ServiceObservation>>,
 ) -> io::Result<ProcessIdentity> {
     let mut matches = Vec::new();
@@ -1291,10 +1299,12 @@ pub fn select_service(
         if observation.holds_boot_disk {
             if let Some(responsible) = observation.responsible_pid
                 && responsible != helper.pid
+                && Some(responsible) != helper_responsible
             {
-                return Err(io::Error::other(
-                    "VM service responsibility does not match helper",
-                ));
+                return Err(io::Error::other(format!(
+                    "VM service responsibility does not match helper: service is attributed to pid {responsible}, helper pid {} is attributed to {helper_responsible:?}",
+                    helper.pid
+                )));
             }
             matches.push(observation.identity);
         }
@@ -1328,10 +1338,14 @@ mod service_tests {
             holds_boot_disk: true,
             responsible_pid: Some(helper.pid),
         };
-        assert_eq!(select_service(helper, [Ok(matching)]).unwrap(), service);
+        assert_eq!(
+            select_service(helper, None, [Ok(matching)]).unwrap(),
+            service
+        );
         assert_eq!(
             select_service(
                 helper,
+                None,
                 [Ok(ServiceObservation {
                     responsible_pid: None,
                     ..matching
@@ -1340,10 +1354,11 @@ mod service_tests {
             .unwrap(),
             service
         );
-        assert!(select_service(helper, [Ok(matching), Ok(matching)]).is_err());
+        assert!(select_service(helper, None, [Ok(matching), Ok(matching)]).is_err());
         assert!(
             select_service(
                 helper,
+                None,
                 [Ok(ServiceObservation {
                     holds_boot_disk: false,
                     ..matching
@@ -1354,6 +1369,7 @@ mod service_tests {
         assert!(
             select_service(
                 helper,
+                None,
                 [Ok(ServiceObservation {
                     responsible_pid: Some(999),
                     ..matching
@@ -1361,9 +1377,21 @@ mod service_tests {
             )
             .is_err()
         );
+        // A service attributed to the process the helper is attributed to
+        // (a launchd agent) is the helper's own service.
+        let agent = ServiceObservation {
+            responsible_pid: Some(50),
+            ..matching
+        };
+        assert_eq!(
+            select_service(helper, Some(50), [Ok(agent)]).unwrap(),
+            service
+        );
+        assert!(select_service(helper, Some(51), [Ok(agent)]).is_err());
         assert!(
             select_service(
                 helper,
+                None,
                 [
                     Ok(matching),
                     Err(io::Error::new(
