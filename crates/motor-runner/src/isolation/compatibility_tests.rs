@@ -1,6 +1,63 @@
 //! Pins sandbox argv and bind planning for unchanged caller paths.
 use super::*;
 
+// Keep the original capture's shared Cargo home equal to the sandbox's private
+// Cargo home. Both sides of each registry/git bind must retain that spelling.
+const CAPTURE_CARGO_HOME: &str = "/motor-home/cargo";
+const CAPTURE_RUSTUP_HOME: &str = "/fixture-rustup";
+
+fn with_capture_host<T>(f: impl FnOnce() -> T) -> T {
+    use std::os::unix::process::ExitStatusExt;
+    let inputs = host_inputs::fixture::Inputs {
+        environment: BTreeMap::from([
+            ("CARGO_HOME", CAPTURE_CARGO_HOME.into()),
+            ("RUSTUP_HOME", CAPTURE_RUSTUP_HOME.into()),
+        ]),
+        existing: [
+            "/usr",
+            "/bin",
+            "/lib",
+            "/lib64",
+            "/etc/ld.so.cache",
+            "/etc/passwd",
+            "/etc/group",
+            "/etc/nsswitch.conf",
+            "/etc/alternatives",
+            "/etc/ssl/certs",
+            "/etc/ssl/openssl.cnf",
+        ]
+        .into_iter()
+        .map(|path| (PathBuf::from(path), true))
+        .collect(),
+        directories: [
+            "/home/ubuntu/.bun/bin",
+            "/motor-home/cargo/registry",
+            "/motor-home/cargo/git",
+        ]
+        .into_iter()
+        .map(|path| (PathBuf::from(path), true))
+        .collect(),
+    };
+    host_inputs::fixture::with(inputs, || {
+        crate::systemd::with_process_hook(
+            Box::new(|command| {
+                // Dependency fetching is not mount planning. Do not run the
+                // machine's Cargo against the fixture's synthetic toolchains.
+                if command.get_program() == "cargo" {
+                    assert!(command.get_args().any(|arg| arg == "fetch"));
+                    return Ok(std::process::Output {
+                        status: std::process::ExitStatus::from_raw(0),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    });
+                }
+                fake_privileged_output(command).unwrap_or_else(|| command.output())
+            }),
+            f,
+        )
+    })
+}
+
 fn assert_golden(actual: &str, expected: &str) {
     assert_eq!(actual, expected, "identity sandbox changed:\n{actual}");
 }
@@ -109,56 +166,51 @@ fn identity_prepared_bind_list_matches_pre_mapping_bytes() {
         tree_hash: sibling_tree,
         base_commit: None,
     }];
-    crate::systemd::with_process_hook(
-        Box::new(|command| fake_privileged_output(command).unwrap_or_else(|| command.output())),
-        || {
-            let sandbox = Sandbox::prepare_role(
-                Uuid::now_v7(),
-                &f.state,
-                &f.workspace,
-                &target,
-                &siblings,
-                None,
-                &f.state.join("slots"),
-                1,
-                &BTreeMap::new(),
-                &tree,
-                f.workspace.to_str().unwrap(),
-                false,
-                false,
-                false,
-                None,
-                &JavascriptTools::for_role(ToolchainRole::BuildServer),
-                None,
-            )
-            .unwrap();
-            let cargo = std::env::var("CARGO_HOME").unwrap();
-            let rustup = std::env::var("RUSTUP_HOME").unwrap();
-            let normalize = |text: &str| {
-                text.replace(sandbox.runtime.0.to_str().unwrap(), "<RUNTIME>")
-                    .replace(f.scratch.to_str().unwrap(), "<SCRATCH>")
-                    .replace(&cargo, "<CARGO_HOME>")
-                    .replace(&rustup, "<RUSTUP_HOME>")
-            };
-            let mut rendered = String::new();
-            for (name, mounts) in [
-                ("read-only", &sandbox.read_only),
-                ("read-write", &sandbox.read_write),
-            ] {
-                rendered.push_str(&format!("== {name}\n"));
-                for mount in mounts {
-                    rendered.push_str(&normalize(mount));
-                    rendered.push('\n');
-                }
+    with_capture_host(|| {
+        let sandbox = Sandbox::prepare_role(
+            Uuid::now_v7(),
+            &f.state,
+            &f.workspace,
+            &target,
+            &siblings,
+            None,
+            &f.state.join("slots"),
+            1,
+            &BTreeMap::new(),
+            &tree,
+            f.workspace.to_str().unwrap(),
+            false,
+            false,
+            false,
+            None,
+            &JavascriptTools::for_role(ToolchainRole::BuildServer),
+            None,
+        )
+        .unwrap();
+        let normalize = |text: &str| {
+            text.replace(sandbox.runtime.0.to_str().unwrap(), "<RUNTIME>")
+                .replace(f.scratch.to_str().unwrap(), "<SCRATCH>")
+                .replace(CAPTURE_CARGO_HOME, "<CARGO_HOME>")
+                .replace(CAPTURE_RUSTUP_HOME, "<RUSTUP_HOME>")
+        };
+        let mut rendered = String::new();
+        for (name, mounts) in [
+            ("read-only", &sandbox.read_only),
+            ("read-write", &sandbox.read_write),
+        ] {
+            rendered.push_str(&format!("== {name}\n"));
+            for mount in mounts {
+                rendered.push_str(&normalize(mount));
+                rendered.push('\n');
             }
-            rendered.push_str("== gitconfig\n");
-            rendered.push_str(&normalize(
-                &fs::read_to_string(sandbox.runtime.0.join("home/.gitconfig")).unwrap(),
-            ));
-            assert_golden(
-                &rendered,
-                include_str!("../../test-fixtures/compatibility/identity-bind-list.txt"),
-            );
-        },
-    );
+        }
+        rendered.push_str("== gitconfig\n");
+        rendered.push_str(&normalize(
+            &fs::read_to_string(sandbox.runtime.0.join("home/.gitconfig")).unwrap(),
+        ));
+        assert_golden(
+            &rendered,
+            include_str!("../../test-fixtures/compatibility/identity-bind-list.txt"),
+        );
+    });
 }
