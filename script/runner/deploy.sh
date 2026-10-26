@@ -30,6 +30,35 @@ else
     *) printf '%s\n' "$helper_api" >&2; echo 'Candidate helper capability probe failed' >&2; exit 1;;
   esac
 fi
+# Query the installed unit, never a repository unit that may not be installed yet.
+unit_text=$(systemctl --user cat "$unit")
+mapfile -d '' -t unit_command < <(printf '%s\n' "$unit_text" |
+  python3 "$script_dir/deploy_canary.py" --unit-command "$instance")
+[ "${#unit_command[@]}" -gt 0 ] || { echo "Cannot extract serve arguments for $unit" >&2; exit 1; }
+serve_options=("${unit_command[@]:1}")
+caller_roots=false
+for ((i=0; i<${#serve_options[@]}; i++)); do
+  case "${serve_options[i]}" in
+    --caller-root|--caller-root=*) caller_roots=true ;;
+    --state-root)
+      if [ "$((i+1))" -ge "${#serve_options[@]}" ]; then
+        echo "Deploy aborted: $unit has --state-root without a value" >&2; exit 1
+      fi
+      state_root=${serve_options[i+1]} ;;
+    --state-root=*) state_root=${serve_options[i]#--state-root=} ;;
+  esac
+done
+if options_check=$("$candidate" check-options "${serve_options[@]}" 2>&1); then
+  :
+elif [[ "$options_check" = *'usage: motor-runner '* && "$options_check" != *check-options* ]]; then
+  if [ "$caller_roots" = true ] || [ -e "$state_root/$instance/caller-roots-ever-enabled" ]; then
+    printf 'Deploy aborted: candidate %s lacks check-options; downgrade to a pre-mapping binary is unsupported after caller roots were enabled or with --caller-root.\n%s\n' "$candidate" "$options_check" >&2
+    exit 1
+  fi
+else
+  printf 'Deploy aborted: candidate %s check-options refused installed arguments:\n%s\n' "$candidate" "$options_check" >&2
+  exit 1
+fi
 # Stage without touching the executable inode of the currently serving daemon.
 install -m 755 "$candidate" "$live.new"
 admission_held=false
@@ -50,6 +79,9 @@ cleanup() {
   result=$?
   trap - EXIT
   if [ "$result" -ne 0 ] && [ "$stopped" = true ]; then
+    if [ "$caller_roots" = true ]; then
+      echo 'Executable rollback does not remove --caller-root. For flag-off rollback: stop the instance; run forget-caller-root with its flagged serve arguments; install the unflagged unit with install-units.sh; systemctl --user start the instance; then deploy.sh with a copy of the installed binary. See docs/runner-install.md.' >&2
+    fi
     # Stop the failed candidate, including a daemon that started but failed its
     # job canary. Replace by rename, never write a running executable's inode.
     if systemctl --user stop "$unit" && cp -p "$rollback" "$live.new" &&
@@ -111,18 +143,24 @@ systemctl --user is-active "$unit"
 if [ "$instance" = windows ]; then
   echo 'Post-swap isolated canary explicitly skipped for windows (requires a qualified Windows VM).' >&2
 else
-  if python3 "$script_dir/deploy_canary.py" --state-root "$state_root" --instance "$instance" \
-      --timeout-s "${RUNNER_CANARY_TIMEOUT_S:-120}"; then
-    :
-  else
-    canary_status=$?
-    if [ "$canary_status" -eq 75 ]; then
-      echo 'canary inconclusive: no free permit; keeping the new runner (isolation not verified).' >&2
+  canary_modes=(/Users)
+  [ "$caller_roots" = false ] || canary_modes+=(/home)
+  for mode in "${canary_modes[@]}"; do
+    canary_options=()
+    [ "$mode" != /home ] || canary_options+=(--home-compile-check)
+    if python3 "$script_dir/deploy_canary.py" --state-root "$state_root" --instance "$instance" \
+        --timeout-s "${RUNNER_CANARY_TIMEOUT_S:-120}" "${canary_options[@]}"; then
+      :
     else
-      echo 'Post-swap isolated canary failed; rolling back the runner.' >&2
-      exit 1
+      canary_status=$?
+      if [ "$canary_status" -eq 75 ]; then
+        echo "canary inconclusive: no free permit; keeping the new runner (isolation not verified). Mode: $mode" >&2
+      else
+        echo "Post-swap isolated canary failed; rolling back the runner. Mode: $mode" >&2
+        exit 1
+      fi
     fi
-  fi
+  done
 fi
 stopped=false
 admission_held=false

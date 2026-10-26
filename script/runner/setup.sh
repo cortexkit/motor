@@ -146,6 +146,7 @@ node --version
 npm --version
 pnpm --version
 REMOTE
+ssh -o BatchMode=yes -o ForwardAgent=no "$host" bash -s < "$script_dir/setup-caller-roots.sh"
 # Reject additional firewall exceptions and non-loopback service listeners.
 # Local DNS/NTP and the DHCP client are OS plumbing, not inbound services.
 # The one named exception is a hosted-runners host agent's TLS port (IPv4 TCP,
