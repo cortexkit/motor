@@ -71,8 +71,10 @@ pub struct Motor {
     /// Attach must not follow a withdrawn runner while its submission owner can
     /// still move the command to another runner. Closing a watch opens the fence.
     submissions: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, watch::Sender<()>>>>,
+    keyed_admissions: Arc<std::sync::Mutex<()>>,
 }
 mod agent_run;
+pub(crate) mod submission_key;
 
 struct Submission {
     motor: Motor,
@@ -137,6 +139,7 @@ impl Motor {
             windows_slots,
             cancels_in_flight: Arc::default(),
             submissions: Arc::default(),
+            keyed_admissions: Arc::default(),
         })
     }
     pub fn with_account_tokens(mut self, tokens: Arc<crate::AccountTokens>) -> Self {
@@ -266,12 +269,33 @@ impl Motor {
     }
     fn run_classified(
         &self,
+        request: RunRequest,
+        identity: (Option<JobAttribution>, Option<[u8; 32]>),
+        gate_job: bool,
+        allow_gate_spill: bool,
+        hosted_test: bool,
+        returns: crate::ReturnOptions,
+    ) -> io::Result<JobStream> {
+        self.run_classified_keyed(
+            request,
+            identity,
+            gate_job,
+            allow_gate_spill,
+            hosted_test,
+            returns,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn run_classified_keyed(
+        &self,
         mut request: RunRequest,
         identity: (Option<JobAttribution>, Option<[u8; 32]>),
         gate_job: bool,
         allow_gate_spill: bool,
         hosted_test: bool,
         returns: crate::ReturnOptions,
+        key: Option<submission_key::KeyRecord>,
     ) -> io::Result<JobStream> {
         let (attribution, secret_hash) = identity;
         let macos_not_hosted = hosted_test && request.platform == Some(Platform::Macos);
@@ -319,6 +343,9 @@ impl Motor {
             .map(|t| t.instance);
         self.storage
             .create_authorized(id, wait, attribution, instance, gate_job, secret_hash)?;
+        if let Some(key) = key {
+            self.storage.record_submission(id, key)?;
+        }
         if request.platform == Some(Platform::Windows) {
             if let Some(runner) = self.config.windows_runners.first() {
                 self.storage.bind_windows(id, runner.clone())?;
@@ -1265,11 +1292,9 @@ impl Motor {
         // Never resubmit or invent a before-start outcome after attempting run.
         // The hosted route records that durably first: it is what stops a
         // spilled job from returning to the build server once it may have run.
-        if hosted {
-            self.storage
-                .hosted_update(id, |state| state.run_sent = true)
-                .inspect_err(|error| self.log_hosted_failure(id, "persist_run", error))?;
-        }
+        self.storage
+            .run_sent(id)
+            .inspect_err(|error| self.log_hosted_failure(id, "persist_run", error))?;
         let shadow_run = shadow_request.map(|request| (request, run.clone()));
         if let Err(error) = channel.send(Frame::Run(run)).await {
             self.log_hosted_failure(id, "run_send", &error);
@@ -1324,7 +1349,11 @@ impl Motor {
                 if request.network.is_none() {
                     accepted.network = None;
                 }
+                accepted.attached = false;
                 let accepted = accepted.with_env_not_forwarded(env_not_forwarded);
+                let mut caller_accepted = accepted.clone();
+                caller_accepted.job_id = id;
+                self.storage.submission_accepted(id, caller_accepted)?;
                 if wrong_platform {
                     self.log_hosted_failure(id, "admission", "accepted platform mismatch");
                     self.cancel(CancelRequest::new(id)).await?;

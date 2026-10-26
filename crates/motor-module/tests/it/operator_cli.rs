@@ -31,6 +31,131 @@ const DIRECT_CHANNEL: u16 = 7;
 const OTHER_DIRECT_CHANNEL: u16 = 8;
 const AFT_CHANNEL: u16 = 9;
 
+#[tokio::test]
+async fn direct_submission_key_requires_an_attested_caller() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    daemon.bind(DIRECT_CHANNEL, direct()).await;
+    let mut request = timed(&f, "exit 7", 30);
+    request.submission_key = Some("caller:submission-0001".into());
+    let mut previous = None;
+    for hosted in [false, true] {
+        let mut params = serde_json::to_value(&request).unwrap();
+        params["hosted"] = json!(hosted);
+        let mut frames = daemon
+            .send(DIRECT_CHANNEL, json!({"op":"exec.run", "params":params}))
+            .await;
+        let result = next(&mut frames).await;
+        assert_eq!(result.header.ty, FrameType::StreamData);
+        let value: Value = serde_json::from_slice(&result.body).unwrap();
+        let id: Uuid = serde_json::from_value(value["direct_job"]["job_id"].clone()).unwrap();
+        let StreamRecord::Terminal(terminal) = serde_json::from_slice(&result.body).unwrap() else {
+            panic!("direct key was accepted")
+        };
+        assert_eq!(terminal.job_id, id);
+        assert_ne!(previous, Some(id));
+        assert_eq!(
+            terminal.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: motor_protocol::RefusalReason::RequestRejected
+            }
+        );
+        assert_eq!(
+            terminal.refusal_detail.as_deref(),
+            Some("submission_key_requires_attested_caller")
+        );
+        previous = Some(id);
+        assert_eq!(next(&mut frames).await.header.ty, FrameType::StreamEnd);
+    }
+}
+
+#[tokio::test]
+async fn malformed_submission_fields_are_invalid_params_on_both_routes() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    daemon.bind(DIRECT_CHANNEL, direct()).await;
+    daemon.bind(AFT_CHANNEL, aft()).await;
+    for channel in [DIRECT_CHANNEL, AFT_CHANNEL] {
+        for invalid in [
+            json!({"submission_key":"short"}),
+            json!({"submission_key":"bad key with spaces"}),
+            json!({"submission_key":"éééééééé"}),
+            json!({"submission_key":"x".repeat(129)}),
+            json!({"resume_from_seq":0}),
+        ] {
+            let field = invalid.as_object().unwrap().keys().next().unwrap().clone();
+            let mut request = serde_json::to_value(timed(&f, "exit 7", 30)).unwrap();
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(invalid.as_object().unwrap().clone());
+            let reply = daemon.request(channel, "exec.run", request).await;
+            assert_eq!(error(&reply)["code"], "invalid_params");
+            assert!(error(&reply)["message"].as_str().unwrap().contains(&field));
+        }
+    }
+}
+
+#[tokio::test]
+async fn aft_head_route_can_resume_worker_submission_after_route_rebind() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    daemon.bind(AFT_CHANNEL, aft()).await;
+    let mut request = timed(
+        &f,
+        "printf worker-output; printf artifact > result; exit 7",
+        30,
+    )
+    .with_return_paths(vec!["result".into()]);
+    request.submission_key = Some("worker:submission-0001".into());
+    let mut worker = daemon
+        .send(AFT_CHANNEL, json!({"op":"exec.run","params":request}))
+        .await;
+    let original = collect_frames(&mut worker).await;
+    let StreamRecord::Accepted(accepted) = serde_json::from_slice(&original[0].body).unwrap()
+    else {
+        panic!("worker not accepted")
+    };
+    daemon.bind(OTHER_DIRECT_CHANNEL, aft()).await;
+    let mut head = daemon
+        .send(
+            OTHER_DIRECT_CHANNEL,
+            json!({"op":"exec.run","params":request}),
+        )
+        .await;
+    let replay = collect_frames(&mut head).await;
+    let StreamRecord::Accepted(attached) = serde_json::from_slice(&replay[0].body).unwrap() else {
+        panic!("head not attached")
+    };
+    assert!(attached.attached);
+    assert_eq!(attached.job_id, accepted.job_id);
+    assert!(replay.iter().any(|frame| matches!(serde_json::from_slice::<StreamRecord>(&frame.body).unwrap(), StreamRecord::Output(output) if output.bytes.0 == b"worker-output")));
+    let returned = replay
+        .iter()
+        .find_map(
+            |frame| match serde_json::from_slice::<StreamRecord>(&frame.body).unwrap() {
+                StreamRecord::ReturnResult(result) => Some(result),
+                _ => None,
+            },
+        )
+        .expect("head replay omitted returned files");
+    for cursor in [returned.seq, u64::MAX] {
+        request.resume_from_seq = Some(cursor);
+        let mut resumed = daemon
+            .send(
+                OTHER_DIRECT_CHANNEL,
+                json!({"op":"exec.run","params":request}),
+            )
+            .await;
+        let replay = collect_frames(&mut resumed).await;
+        assert_eq!(
+            replay.len(),
+            2,
+            "only attached acceptance and terminal remain after the return cursor"
+        );
+    }
+}
+
 type Waiters = Arc<Mutex<HashMap<(u16, u64), mpsc::UnboundedSender<Frame>>>>;
 
 /// The daemon's side of one module connection. Replies are matched to their

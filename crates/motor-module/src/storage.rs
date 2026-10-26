@@ -3,6 +3,8 @@ mod journal;
 #[cfg(test)]
 mod journal_tests;
 #[cfg(test)]
+mod submission_tests;
+#[cfg(test)]
 pub(crate) use journal::durable_value;
 
 use fs2::FileExt;
@@ -42,6 +44,8 @@ fn now_ms() -> u64 {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Job {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<crate::motor::submission_key::KeyRecord>,
     #[serde(skip)]
     pub(crate) legacy_shape: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,6 +113,7 @@ pub(crate) struct Job {
 impl PartialEq for Job {
     fn eq(&self, other: &Self) -> bool {
         let Self {
+            submission,
             legacy_shape: _,
             hosted,
             return_result,
@@ -130,7 +135,8 @@ impl PartialEq for Job {
             routed_direct_reason,
             routed_direct_hosted_max_vcpus,
         } = self;
-        hosted == &other.hosted
+        submission == &other.submission
+            && hosted == &other.hosted
             && return_result == &other.return_result
             && return_cwd == &other.return_cwd
             && return_requested == &other.return_requested
@@ -743,6 +749,54 @@ impl Storage {
 
     pub fn job(&self, id: Uuid) -> Option<Job> {
         self.state.lock().unwrap().jobs.get(&id).cloned()
+    }
+    pub(crate) fn keyed_job(&self, principal: &str, key: &str) -> io::Result<Option<(Uuid, Job)>> {
+        self.update(|_| {})?;
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .jobs
+            .iter()
+            .find_map(|(id, job)| {
+                job.submission
+                    .as_ref()
+                    .filter(|record| record.principal == principal && record.key == key)
+                    .map(|_| (*id, job.clone()))
+            }))
+    }
+    pub(crate) fn record_submission(
+        &self,
+        id: Uuid,
+        record: crate::motor::submission_key::KeyRecord,
+    ) -> io::Result<()> {
+        self.update(|state| state.jobs.entry(id).or_default().submission = Some(record))
+    }
+    pub(crate) fn run_sent(&self, id: Uuid) -> io::Result<()> {
+        self.update(|state| {
+            let job = state.jobs.entry(id).or_default();
+            if let Some(route) = job.hosted.as_mut() {
+                route.run_sent = true;
+            }
+            if let Some(record) = job.submission.as_mut() {
+                record.run_sent = true;
+            }
+        })
+    }
+    pub(crate) fn submission_accepted(
+        &self,
+        id: Uuid,
+        accepted: motor_protocol::Accepted,
+    ) -> io::Result<()> {
+        self.update(|state| {
+            if let Some(record) = state
+                .jobs
+                .get_mut(&id)
+                .and_then(|job| job.submission.as_mut())
+            {
+                record.accepted = Some(accepted);
+            }
+        })
     }
     #[cfg(test)]
     pub fn set_direct_secret_hash(&self, id: Uuid, hash: [u8; 32]) -> io::Result<()> {

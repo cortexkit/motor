@@ -15,16 +15,40 @@ impl Motor {
         attribution: Option<JobAttribution>,
         returns: Option<crate::agent_route::ReturnRequest>,
     ) -> io::Result<JobStream> {
+        self.run_agent_recorded(request, attribution, returns, None)
+    }
+    pub(super) fn run_agent_recorded(
+        &self,
+        request: RunRequest,
+        attribution: Option<JobAttribution>,
+        returns: Option<crate::agent_route::ReturnRequest>,
+        key: Option<super::submission_key::KeyRecord>,
+    ) -> io::Result<JobStream> {
         let Some(crate::agent_route::ReturnRequest {
             options,
             cwd,
             requested,
         }) = returns
         else {
-            return self.run_attributed(request, attribution);
+            return self.run_classified_keyed(
+                request,
+                (attribution, None),
+                false,
+                false,
+                false,
+                crate::ReturnOptions::default(),
+                key,
+            );
         };
-        let stream =
-            self.run_classified(request, (attribution, None), false, false, false, options)?;
+        let stream = self.run_classified_keyed(
+            request,
+            (attribution, None),
+            false,
+            false,
+            false,
+            options,
+            key,
+        )?;
         if let Some(requested) = requested {
             self.storage.return_requested(stream.job_id, requested)?;
         }
