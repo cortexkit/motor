@@ -3,10 +3,9 @@
 use super::{startup, CallerRoot};
 use crate::{storage::invalid, Config};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs, io,
-    path::{Path, PathBuf},
-};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::{fs, io, path::PathBuf};
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Owner {
