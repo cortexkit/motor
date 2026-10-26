@@ -9,6 +9,19 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_prefix("/home")
+    }
+
+    /// Tests that build identity paths from the checkout need a mapped prefix
+    /// the checkout can't sit under: CI checkouts live under /home, so with
+    /// the default prefix an "identity" path would itself be a mapped one.
+    fn outside_checkout() -> Self {
+        let fixture = Self::with_prefix("/mcaller");
+        assert!(!fixture.identity.starts_with("/mcaller"));
+        fixture
+    }
+
+    fn with_prefix(prefix: &str) -> Self {
         let scratch = cortexkit_test_support::ScratchDir::new("motor-caller-authorization");
         let host = scratch.join("mapped");
         // Identity callers must stay outside sandbox-reserved /tmp and
@@ -23,7 +36,7 @@ impl Fixture {
         fs::create_dir_all(&identity).unwrap();
         let mut config = crate::Config::new(scratch.join("state"), "main");
         config.caller_roots = vec![CallerRoot {
-            caller_prefix: "/home".into(),
+            caller_prefix: prefix.into(),
             host_root: host,
         }];
         config.owned_workspace_roots = vec![identity.clone()];
@@ -104,7 +117,7 @@ fn mapped_authorization_reserved_names_and_fill_exemption() {
 
 #[test]
 fn mapped_authorization_rejects_namespace_crossings_and_symlinks() {
-    let f = Fixture::new();
+    let f = Fixture::outside_checkout();
     symlink(&f.config.caller_roots[0].host_root, f.identity.join("link")).unwrap();
     let error = authorize(
         &f.config,
@@ -118,12 +131,12 @@ fn mapped_authorization_rejects_namespace_crossings_and_symlinks() {
         "{error}"
     );
     symlink(f.identity.clone(), f.scratch.join("mapped/link")).unwrap();
-    assert!(authorize(&f.config, "/home/link/repo", false)
+    assert!(authorize(&f.config, "/mcaller/link/repo", false)
         .unwrap_err()
         .to_string()
         .contains("symlink in mapped destination"));
     symlink("missing", f.scratch.join("mapped/dangling")).unwrap();
-    assert!(authorize(&f.config, "/home/dangling/repo", false).is_err());
+    assert!(authorize(&f.config, "/mcaller/dangling/repo", false).is_err());
 }
 
 fn sibling(path: &str) -> SiblingSnapshot {
@@ -137,19 +150,19 @@ fn sibling(path: &str) -> SiblingSnapshot {
 
 #[test]
 fn mapped_alias_node_table_never_resolves_caller_targets() {
-    let f = Fixture::new();
+    let f = Fixture::outside_checkout();
     let identity_workspace = f.identity.join("main").to_string_lossy().into_owned();
     let identity_sibling = f.identity.join("sibling").to_string_lossy().into_owned();
     for mapped_parent in [false, true] {
         let workspace = if mapped_parent {
-            "/home/u/main"
+            "/mcaller/u/main"
         } else {
             &identity_workspace
         };
         let sibling = sibling(if mapped_parent {
             &identity_sibling
         } else {
-            "/home/u/sibling"
+            "/mcaller/u/sibling"
         });
         let parent = if mapped_parent {
             f.scratch.join("mapped/u")
@@ -168,7 +181,7 @@ fn mapped_alias_node_table_never_resolves_caller_targets() {
             !mapped_parent
         );
         fs::remove_file(&node).unwrap();
-        symlink("/home/u/./sibling", &node).unwrap();
+        symlink("/mcaller/u/./sibling", &node).unwrap();
         assert!(aliases(&f.config, workspace, std::slice::from_ref(&sibling)).is_err());
         fs::remove_file(&node).unwrap();
     }
