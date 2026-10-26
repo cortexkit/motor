@@ -53,7 +53,7 @@ must be the record's `sub`, and its `prefix` must be `tenant/<sub with each ':'
 replaced by '-'>/`. The store policy limits the keys to that prefix. With a
 `write-key`, the tenant runner fills its own cache from default-branch tips.
 Without one, its jobs read the cache and the runner logs once that it does not
-fill. The record key and the directory are both required or both absent;
+fill. The record's `remote_cache` field and the directory are both required or both absent;
 anything else is refused before any write. Error messages name a file, never
 its contents.
 
