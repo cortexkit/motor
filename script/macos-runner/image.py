@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 from download import fetch
 import parity
@@ -27,6 +28,18 @@ TCC_SERVICES = ("kTCCServiceSystemPolicyNetworkVolumes", "kTCCServiceSystemPolic
 
 def run(*args, **kwargs):
     return subprocess.run([str(arg) for arg in args], check=True, **kwargs)
+
+
+def unmount(mount, attempts=10):
+    # Right after codesign or a file copy, macOS can report the volume busy for
+    # a moment while background services close their handles. Retry briefly
+    # before failing; never force it, because a forced unmount of a writable
+    # image could drop writes.
+    for _ in range(attempts - 1):
+        if subprocess.run(["/sbin/umount", str(mount)], capture_output=True).returncode == 0:
+            return
+        time.sleep(1)
+    run("/sbin/umount", mount)
 
 
 @contextmanager
@@ -50,7 +63,7 @@ def mounted_data(disk, *, writable=False):
         try:
             yield mount
         finally:
-            run("/sbin/umount", mount)
+            unmount(mount)
     finally:
         try:
             run("/usr/bin/hdiutil", "detach", device)

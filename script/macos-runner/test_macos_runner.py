@@ -863,6 +863,21 @@ class OfflineImageTests(unittest.TestCase):
         self.assertIn("requirement differs from sealed TCC grant", " ".join(install.image_errors(self.bundle, manifest_sha)))
         self.assertFalse(any(args[0] == "/usr/bin/sqlite3" for args in self.commands))
 
+    def test_briefly_busy_unmount_is_retried(self):
+        busy = [2]
+
+        def busy_then_free(args, **kwargs):
+            if args[0] == "/sbin/umount" and busy[0]:
+                busy[0] -= 1
+                self.commands.append(args)
+                return subprocess.CompletedProcess(args, 1, b"", b"Resource busy")
+            return self.command(args, **kwargs)
+        with patch.object(image.subprocess, "run", side_effect=busy_then_free), patch.object(image.time, "sleep"):
+            with image.mounted_data(self.disk) as mount:
+                self.assertTrue(mount.is_dir())
+        self.assertEqual(sum(args[0] == "/sbin/umount" for args in self.commands), 3)
+        self.assertEqual(self.commands[-1], ["/usr/bin/hdiutil", "detach", "/dev/disk42"])
+
     def test_failed_unmount_and_detach_never_recursively_delete_guest_data(self):
         def fail_cleanup(args, **kwargs):
             if args[0] == "/sbin/umount" or args[:2] == ["/usr/bin/hdiutil", "detach"]:
