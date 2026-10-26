@@ -164,7 +164,9 @@ fn macos_home_refusal_keeps_pre_mapping_detail() {
 
 #[tokio::test]
 async fn users_runner_hello_matches_pre_mapping_bytes() {
-    for snapshot_siblings in [false, true] {
+    for (snapshot_siblings, caller_roots) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
         let f = Fixture::new();
         let mut config = if snapshot_siblings {
             super::sibling_snapshots::snapshot_config(&f).0
@@ -173,6 +175,15 @@ async fn users_runner_hello_matches_pre_mapping_bytes() {
         };
         config.manual_tick = true;
         config.disable_warm_builds = true;
+        if caller_roots {
+            let host = f.scratch.join("callers/home");
+            fs::create_dir_all(&host).unwrap();
+            config.caller_roots.push(crate::CallerRoot {
+                caller_prefix: "/home".into(),
+                host_root: host,
+            });
+            config.test_allow_unisolated_caller_roots = true;
+        }
         // Hello does not expose compiler versions. Supply a fixed version via
         // the existing toolchain-config seam to skip the startup rustc probe;
         // the backend remains Host, so all Hello capabilities stay unchanged.

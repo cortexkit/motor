@@ -255,13 +255,13 @@ pub(crate) fn prepare_siblings(
         .map(|sibling| {
             let caller = sibling.base_commit.clone().unwrap_or_else(|| {
                 workspace::resolve_caller_commit(
-                    &trees.mirror(&sibling.canonical_path),
+                    &trees.mirror(crate::caller_path::sibling(sibling).caller.text()),
                     &sibling.commit,
                     &sibling.tree_hash,
                 )
             });
             let key = SnapshotKey::new(
-                &sibling.canonical_path,
+                crate::caller_path::sibling(sibling).caller.text(),
                 &sibling.commit,
                 &caller,
                 environment,
@@ -273,7 +273,7 @@ pub(crate) fn prepare_siblings(
                 trees,
                 prior,
                 started,
-                &sibling.canonical_path,
+                crate::caller_path::sibling(sibling).caller.text(),
                 &snapshot,
                 &sibling.tree_hash,
             )

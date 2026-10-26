@@ -332,7 +332,7 @@ fn path_is_directory_without_following(path: &Path) -> io::Result<bool> {
 }
 
 fn grant_read_only_tree_as(path: &Path, inherit: bool, user: &str) -> io::Result<()> {
-    let _access = crate::tree_access::lock(path);
+    let _access = crate::tree_access::lock(crate::caller_path::host(path));
     if !path_is_directory_without_following(path)? {
         return Err(io::Error::other(format!(
             "shared read-only directory is missing: {}",
@@ -778,8 +778,8 @@ fn prepare_javascript_checkouts(
     prepare(workspace, repository, tree)?;
     for sibling in siblings {
         prepare(
-            Path::new(&sibling.canonical_path),
-            &sibling.canonical_path,
+            crate::caller_path::sibling(sibling).host.as_path(),
+            crate::caller_path::sibling(sibling).caller.text(),
             &sibling.tree_hash,
         )?;
     }
@@ -1902,7 +1902,7 @@ pub(crate) fn restore_runner_checkout_root(path: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn reclaim_runtime(path: &Path) -> io::Result<()> {
-    let _access = crate::tree_access::lock(path);
+    let _access = crate::tree_access::lock(crate::caller_path::host(path));
     // Boat uses bounded, descriptor-relative private GC even after a crash has
     // removed its lease. Recursive permission helpers cannot handle every legal
     // job-created path and must not strand its private data during recovery.
@@ -1925,7 +1925,7 @@ pub(crate) fn reclaim_runtime(path: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn restore_runner_access(path: &Path) -> io::Result<()> {
-    let _access = crate::tree_access::lock(path);
+    let _access = crate::tree_access::lock(crate::caller_path::host(path));
     #[cfg(test)]
     crate::test_cleanup::record_checkout_work("restore_runner_access", path);
     // Rust/Cargo create some cache files with mode 0600 and directories with
@@ -1989,7 +1989,7 @@ fn prepare_writer_trees(paths: &[&Path], account: WriterAccount) -> io::Result<(
     guard_paths.dedup();
     let _access: Vec<_> = guard_paths
         .iter()
-        .map(|path| crate::tree_access::lock(path))
+        .map(|path| crate::tree_access::lock(crate::caller_path::host(path)))
         .collect();
     #[cfg(test)]
     for path in paths {
@@ -2100,7 +2100,7 @@ impl Drop for RuntimeDir {
         // Stop serving the unit's cache sockets and remove them before the
         // directory holding them is reclaimed.
         drop(self.2.take());
-        let _access = crate::tree_access::lock(&self.0);
+        let _access = crate::tree_access::lock(crate::caller_path::host(&self.0));
         // A job can create mode-0700 temporary directories. Reclaim its private
         // home/tmp only after the last launch handle (and its cgroup) is gone.
         // Disk-pressure eviction may already have removed a dead job's tree
@@ -2485,7 +2485,7 @@ fn sibling_mounts(
 ) -> io::Result<Vec<(String, PathBuf)>> {
     let mut mounts = Vec::new();
     for sibling in siblings {
-        let path = Path::new(&sibling.canonical_path);
+        let path = crate::caller_path::sibling(sibling).host.as_path();
         let source = match snapshots {
             Some(snapshots) => snapshots
                 .siblings
@@ -2745,7 +2745,7 @@ impl Sandbox {
         for path in std::iter::once(workspace.to_path_buf()).chain(
             in_place_siblings
                 .iter()
-                .map(|s| PathBuf::from(&s.canonical_path)),
+                .map(|s| crate::caller_path::sibling(s).host.as_path().to_path_buf()),
         ) {
             if path.join(".git/objects/info/alternates").is_file() {
                 crate::setup_log::phase("dissociate checkout", || {
@@ -2821,21 +2821,7 @@ impl Sandbox {
                 .ok_or_else(|| io::Error::other("RUSTUP_HOME unset"))?,
         );
         let mut read_only = Vec::new();
-        for path in [
-            "/usr",
-            "/bin",
-            "/lib",
-            "/lib64",
-            "/etc/ld.so.cache",
-            "/etc/passwd",
-            "/etc/group",
-            "/etc/nsswitch.conf",
-            "/etc/alternatives",
-            "/etc/ssl/certs",
-            // OpenSSL's default config, /usr/lib/ssl/openssl.cnf, is a symlink
-            // to this file; without it TLS clients and the openssl CLI fail.
-            "/etc/ssl/openssl.cnf",
-        ] {
+        for path in SYSTEM_READ_PATHS {
             if host_inputs::exists(Path::new(path)) {
                 read_only.push(word(Path::new(path))?);
                 mount_destinations.push(PathBuf::from(path));
@@ -3698,4 +3684,32 @@ fn prepare_embedded_tool(state: &Path, name: &str, source: &str) -> io::Result<P
         fs::rename(temporary, &output)?;
     }
     Ok(output)
+}
+const SYSTEM_READ_PATHS: [&str; 11] = [
+    "/usr",
+    "/bin",
+    "/lib",
+    "/lib64",
+    "/etc/ld.so.cache",
+    "/etc/passwd",
+    "/etc/group",
+    "/etc/nsswitch.conf",
+    "/etc/alternatives",
+    "/etc/ssl/certs",
+    // OpenSSL's default config under /usr/lib/ssl points here.
+    "/etc/ssl/openssl.cnf",
+];
+
+/// Host sources shared by job, writer and snapshot-helper sandboxes.
+pub(crate) fn reserved_bind_sources(config: &crate::Config) -> Vec<PathBuf> {
+    let mut sources: Vec<_> = SYSTEM_READ_PATHS.into_iter().map(PathBuf::from).collect();
+    if let Some(cargo) = host_inputs::environment("CARGO_HOME") {
+        let cargo = PathBuf::from(cargo);
+        sources.extend([cargo.join("bin"), cargo.join("registry"), cargo.join("git")]);
+    }
+    if let Some(rustup) = host_inputs::environment("RUSTUP_HOME") {
+        sources.push(rustup.into());
+    }
+    sources.push(JavascriptTools::for_config(config).bun_dir().into());
+    sources
 }
