@@ -156,7 +156,7 @@ mod guest {
             }
             let socket = Self(AsyncFd::new(fd)?);
             if result != 0 {
-                let mut ready = socket.0.writable().await?;
+                let ready = socket.0.writable().await?;
                 let mut error: libc::c_int = 0;
                 let mut length = std::mem::size_of_val(&error) as libc::socklen_t;
                 if unsafe {
@@ -174,7 +174,10 @@ mod guest {
                 if error != 0 {
                     return Err(io::Error::from_raw_os_error(error));
                 }
-                ready.clear_ready();
+                // Keep the write readiness: the connected socket is writable,
+                // and with edge-triggered kqueue no new event arrives while it
+                // stays writable, so clearing it here stalled the first write.
+                drop(ready);
             }
             Ok(socket)
         }
