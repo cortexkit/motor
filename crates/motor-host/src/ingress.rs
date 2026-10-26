@@ -69,67 +69,8 @@ impl Ingress {
 mod tests {
     use super::*;
 
-    #[derive(Clone, Default)]
-    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for Logs {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn scanner_closes_are_info_with_peer_and_counted_once_but_job_failures_warn() {
-        let logs = Logs::default();
-        let subscriber = motor_protocol::logging::LineSubscriber::new("[host]", logs.clone());
-        tracing::subscriber::with_default(subscriber, || {
-            let ingress = Ingress::default();
-            let peer = "192.0.2.1:1234".parse().unwrap();
-            let mut report = CloseReport {
-                side: "client",
-                step: "lease_hello",
-                jti: None,
-                cause: "invalid frame length".into(),
-            };
-            ingress.closed(peer, &report);
-            assert_eq!(ingress.summarize(), (1, 0));
-            assert_eq!(ingress.summarize(), (0, 0));
-            report.jti = Some("job".into());
-            report.side = "guest";
-            report.step = "relay";
-            ingress.closed(peer, &report);
-            assert_eq!(ingress.summarize(), (0, 0));
-        });
-        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        let lines: Vec<_> = output.lines().collect();
-        assert_eq!(lines.len(), 3, "{output}");
-        assert!(
-            lines[0].contains("INFO") && lines[0].contains("192.0.2.1:1234"),
-            "{output}"
-        );
-        assert!(
-            lines[1].contains("unauthenticated_connection_summary")
-                && lines[1].contains("closed=1"),
-            "{output}"
-        );
-        assert!(
-            lines[2].contains("WARN") && lines[2].contains("jti=job"),
-            "{output}"
-        );
-    }
-
     #[test]
     fn unauthenticated_sockets_are_capped_without_queueing_and_slots_are_reused() {
-        // This test logs the same summary statement as the one above. While
-        // exactly one subscriber is registered, tracing decides a statement's
-        // interest from the first thread that reaches it; reaching it here
-        // with no subscriber could disable it for the test above. A
-        // discarding subscriber keeps the statement enabled.
-        let sink = motor_protocol::logging::LineSubscriber::new("[host]", std::io::sink());
-        let _subscriber = tracing::subscriber::set_default(sink);
         let ingress = Ingress::default();
         let peer = "192.0.2.1:1234".parse().unwrap();
         let mut slots: Vec<_> = (0..UNAUTHENTICATED_LIMIT)

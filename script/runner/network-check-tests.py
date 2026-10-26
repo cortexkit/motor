@@ -241,38 +241,6 @@ def load_script(name):
     return module
 
 
-class ProofGradingTests(unittest.TestCase):
-    def setUp(self):
-        self.proof = load_script('prove-job-network.py')
-        self.expected = 'isolation::tests::isolated_net_input_rejects_host_and_gateway'
-
-    def test_duplicate_fail_rows_still_grade_one_failure_with_public_pass(self):
-        output = f'FAIL [0.10s] (1/2) motor-runner {self.expected}\nPASS [0.20s] (2/2) motor-runner {self.proof.PUBLIC_CONTROL}\nSummary [0.30s] 2 tests run: 1 passed, 1 failed\nFAIL [0.10s] motor-runner {self.expected}\n'
-        outcome, captured = self.proof.grade(output, self.expected, 100)
-        self.assertEqual(outcome, 'reddened')
-        self.assertEqual(captured.count(self.expected), 1)
-        self.assertIn(self.proof.PUBLIC_CONTROL, captured)
-
-    def test_fail_fast_missing_public_control_is_not_reached_not_reddened(self):
-        output = f'FAIL [0.10s] motor-runner {self.expected}\nSummary [0.10s] 1/2 tests run: 0 passed, 1 failed\nFAIL [0.10s] motor-runner {self.expected}\n'
-        self.assertEqual(self.proof.grade(output, self.expected, 100)[0], 'not_reached')
-
-    def test_other_failure_or_two_passes_cannot_be_graded_reddened(self):
-        both_failed = f'FAIL [0.10s] motor-runner {self.expected}\nFAIL [0.20s] motor-runner {self.proof.PUBLIC_CONTROL}\n'
-        self.assertEqual(self.proof.grade(both_failed, self.expected, 100)[0], 'not_reached')
-        both_passed = both_failed.replace('FAIL', 'PASS')
-        self.assertEqual(self.proof.grade(both_passed, self.expected, 0)[0], 'undefended')
-
-    def test_second_control_runs_and_both_records_survive_first_failure(self):
-        first = {'outcome': 'not_reached'}
-        second = {'outcome': 'reddened'}
-        with tempfile.TemporaryDirectory() as directory, patch.object(self.proof, 'control', side_effect=[(first, True), (second, True)]) as control:
-            result = pathlib.Path(directory)
-            self.assertFalse(self.proof.run_controls(result))
-            self.assertEqual(control.call_count, 2)
-            self.assertEqual(json.loads((result / 'mutation-evidence.json').read_text()), [first, second])
-
-
 class NetworkFixtureTests(unittest.TestCase):
     def test_large_public_fixture_is_pinned_and_registry_only(self):
         root = pathlib.Path(__file__).parent / 'network-fixture'

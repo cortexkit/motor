@@ -396,9 +396,6 @@ runner checks the table and prerequisites; when they fail it keeps running but
 refuses network requests with `network_unsupported`. Prove the isolation with
 the operator tests named in [job-isolation.md](job-isolation.md#6-network).
 
-`script/runner/prove-job-network.py` deliberately weakens the rules to show the
-network tests can fail. Run it only on dedicated test infrastructure.
-
 To remove networking, drop `--job-network veth` from the unit and redeploy;
 then stop `motor-net-rules.service` and delete the files the installer wrote.
 

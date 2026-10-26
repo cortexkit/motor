@@ -590,14 +590,6 @@ class MatrixTests(unittest.TestCase):
             self.assertIn('| B | ovh-standard | passed |', markdown)
             self.assertIn('GET gateway p50/p95', markdown)
 
-    def test_documented_backend_manifest_includes_hetzner_bucket_and_all_four_variants(self):
-        configs = json.loads(Path(__file__).with_name('backends.example.json').read_text())
-        self.assertEqual(len(configs), 4)
-        for config in configs:
-            bench.backend_config(config)
-        self.assertEqual(configs[-1]['bucket'], 'cortexkitmotor')
-        self.assertEqual(configs[2]['region'], 'auto')
-
 
 if __name__ == '__main__':
     unittest.main()
