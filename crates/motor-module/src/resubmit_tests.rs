@@ -72,7 +72,8 @@ fn start_spill(motor: &Motor, repo: &Path, wait: u64) -> JobStream {
         .create(id, wait, None, Some("test".into()), false)
         .unwrap();
     let path = repo.to_str().unwrap();
-    let request = RunRequest::new(path, path, path, "exit 7").with_timeout(30);
+    let mut request = RunRequest::new(path, path, path, "exit 7").with_timeout(30);
+    request.queue_wait_limit_s = Some(wait);
     let (stream, tx, wake) = motor.stream(id);
     let job = motor.clone();
     let submission = motor.submission(id);
@@ -500,7 +501,10 @@ async fn configured_hosted_no_capacity_keeps_typed_refusal() {
             .count(),
         3
     );
-    assert!(!motor.return_spill(id, error.code(), started).await.unwrap());
+    assert!(!motor
+        .return_spill(id, error.code(), started, None)
+        .await
+        .unwrap());
     let (tx, mut rx) = mpsc::channel(4);
     motor
         .refused_with_retry(
@@ -674,7 +678,7 @@ async fn restart_between_resubmit_and_run_attaches_build_server_id() {
             motor.storage.hosted_route(id, route).unwrap();
             motor
                 .storage
-                .resubmitted(id, build_server_id, "hosted_capacity")
+                .resubmitted(id, build_server_id, "hosted_capacity", None)
                 .unwrap();
         }
     }

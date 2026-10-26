@@ -153,6 +153,21 @@ budget, regardless of the request's queue limit or execution timeout. The
 resolved budget is stored per job in the checkpoint/journal and reused after a
 module restart.
 
+If a spill fails with `hosted_capacity` or `hosted_provisioning` before a hosted
+runner receives the job, an ordinary job using the default queue budget returns
+to the build server with the non-spill budget: 30 minutes from its original
+submission, capped by its execution timeout. Time already spent queuing and
+trying hosted capacity is deducted, rather than starting a fresh 30 minutes.
+The remaining seconds are stored with the new build-server ID in the existing
+`queue_wait_limit_s` field, so a restart (including an older module reading the
+store) retains that budget. The job cannot spill again on that attempt. A
+caller-set budget is not extended, and gate jobs keep their fixed budget.
+Refusals still include `spill_attempted=<code>` as described below. Tests:
+`failed_spill_default_budget_waits_past_five_minutes_and_starts`,
+`failed_spill_caller_budget_is_not_extended`,
+`failed_spill_default_budget_is_capped_by_timeout`,
+`failed_spill_budget_from_original_submission_survives_restart`.
+
 Source: `crates/motor-module/src/config.rs`.
 
 ## Who may call it

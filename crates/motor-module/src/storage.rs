@@ -972,14 +972,26 @@ impl Storage {
     /// Durably record the build-server ID of a resubmitted spill before its
     /// Run frame is sent, so a restart attaches to that submission instead of
     /// submitting again or reporting the withdrawn first submission.
+    /// A replacement default budget is measured from the original UUID's mint
+    /// time. Store only its remaining seconds in the existing budget field so
+    /// older clients enforce the same deadline after a restart.
     pub(crate) fn resubmitted(
         &self,
         id: Uuid,
         build_server_job_id: Uuid,
         hosted_code: &str,
+        queue_budget_s: Option<u64>,
     ) -> io::Result<()> {
         self.update(|s| {
             let job = s.jobs.entry(id).or_default();
+            if let Some(budget) = queue_budget_s.filter(|_| !job.gate_job) {
+                let submitted_ms = id.get_timestamp().map_or_else(now_ms, |stamp| {
+                    let (seconds, nanos) = stamp.to_unix();
+                    seconds.saturating_mul(1000) + u64::from(nanos) / 1_000_000
+                });
+                let spent_s = now_ms().saturating_sub(submitted_ms).div_ceil(1000);
+                job.queue_wait_limit_s = budget.saturating_sub(spent_s);
+            }
             job.build_server_job_id = Some(build_server_job_id);
             if let Some(route) = job.hosted.as_mut() {
                 route.hosted_code = Some(hosted_code.into());
@@ -1385,7 +1397,7 @@ mod retention_renewal_tests {
             .is_err());
         assert!(storage.cancel(id, true).is_err());
         assert!(storage
-            .resubmitted(id, Uuid::now_v7(), "unreachable")
+            .resubmitted(id, Uuid::now_v7(), "unreachable", None)
             .is_err());
         assert_eq!(storage.write_count.load(Ordering::SeqCst), before);
         let job = storage.job(id).unwrap();
