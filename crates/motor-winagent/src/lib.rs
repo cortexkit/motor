@@ -752,19 +752,35 @@ fn local_git_file_url(path: &std::path::Path) -> io::Result<String> {
 fn git_rewrite_environment(cargo_home: &std::path::Path) -> io::Result<BTreeMap<String, String>> {
     safe_directory(cargo_home)?;
     let path = cargo_home.join("git-rewrites.json");
-    let manifest_metadata = std::fs::symlink_metadata(&path)?;
-    if !manifest_metadata.is_file() || is_reparse(&manifest_metadata) {
-        return Err(invalid("job Git rewrite manifest is not a regular file"));
-    }
-    let manifest: GitRewriteManifest = serde_json::from_slice(&std::fs::read(&path)?)
-        .map_err(|error| invalid(error.to_string()))?;
+    let manifest_metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let manifest: GitRewriteManifest = if let Some(metadata) = &manifest_metadata {
+        if !metadata.is_file() || is_reparse(metadata) {
+            return Err(invalid("job Git rewrite manifest is not a regular file"));
+        }
+        serde_json::from_slice(&std::fs::read(&path)?)
+            .map_err(|error| invalid(error.to_string()))?
+    } else {
+        // A non-Cargo snapshot has no packaged dependency routes.
+        GitRewriteManifest {
+            schema: 1,
+            routes: Vec::new(),
+        }
+    };
     if manifest.schema != 1 {
         return Err(invalid("unsupported job Git rewrite manifest schema"));
     }
     let global = cargo_home.join("gitconfig");
-    let global_metadata = std::fs::symlink_metadata(&global)?;
-    if !global_metadata.is_file() || is_reparse(&global_metadata) {
-        return Err(invalid("job Git config is not a regular file"));
+    match std::fs::symlink_metadata(&global) {
+        Ok(metadata) if metadata.is_file() && !is_reparse(&metadata) => {}
+        // Git accepts a missing global config. Keep its path pinned to the job
+        // home instead of inheriting the service account's configuration.
+        Err(error) if manifest_metadata.is_none() && error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+        Ok(_) => return Err(invalid("job Git config is not a regular file")),
     }
     let mut env = BTreeMap::from([
         (
@@ -822,6 +838,45 @@ fn git_rewrite_environment(cargo_home: &std::path::Path) -> io::Result<BTreeMap<
         env.insert(format!("GIT_CONFIG_VALUE_{index}"), route.url);
     }
     Ok(env)
+}
+
+/// Populate Cargo's own Git cache from the shipped mirrors before an offline
+/// command. Cargo's offline switch refuses even a file-only Git rewrite when
+/// its `git/db` is empty, so only these fetches temporarily lift that switch.
+/// They run inside the job's networkless VM, with Git restricted to file URLs,
+/// under the same unprivileged token and process bounds as the caller command.
+#[cfg(any(windows, test))]
+pub fn command_with_git_cache(
+    command: &str,
+    cargo_home: &std::path::Path,
+    source_root: &std::path::Path,
+    files: &Inventory,
+) -> io::Result<String> {
+    if git_rewrite_environment(cargo_home)?["GIT_CONFIG_COUNT"] == "0" {
+        return Ok(command.to_owned());
+    }
+    let mut script = String::new();
+    for lock in files.keys().filter(|name| name.ends_with("/Cargo.lock")) {
+        let manifest = format!("{}Cargo.toml", lock.strip_suffix("Cargo.lock").unwrap());
+        if !files.contains_key(&manifest) {
+            continue;
+        }
+        let path = source_root.join(
+            manifest
+                .strip_prefix("m/")
+                .ok_or_else(|| invalid("manifest outside source root"))?,
+        );
+        let path = path
+            .to_str()
+            .ok_or_else(|| invalid("manifest path is not UTF-8"))?
+            .replace('\\', "/")
+            .replace('\'', "'\\''");
+        // Nested manifests are best-effort, as on the QEMU preparation path.
+        // The caller's offline command still fails if a needed source is absent.
+        script.push_str(&format!("CARGO_NET_OFFLINE=false cargo fetch --locked --manifest-path '{path}' || printf '%s\\n' 'warning: Git cache preparation failed' >&2;\n"));
+    }
+    script.push_str(command);
+    Ok(script)
 }
 
 /// Preflight the complete archive before writing any files. Directory prefixes
@@ -1002,7 +1057,12 @@ pub fn unpack_tree(
 pub fn rewrite_local_registry_config(cargo_home: &std::path::Path) -> io::Result<()> {
     safe_directory(cargo_home)?;
     let config_path = cargo_home.join("config.toml");
-    let metadata = std::fs::symlink_metadata(&config_path)?;
+    let metadata = match std::fs::symlink_metadata(&config_path) {
+        Ok(metadata) => metadata,
+        // Non-Cargo snapshots have no dependency configuration to relocate.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
     if !metadata.is_file() || is_reparse(&metadata) {
         return Err(invalid(format!(
             "job Cargo config is not a regular file: {}",
@@ -1199,6 +1259,54 @@ mod macos_profile_tests;
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn non_cargo_workspace_needs_no_local_registry_config() {
+        let scratch = Scratch::new();
+        let cargo_home = scratch.0.join("profile/.cargo");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        let source_root = scratch.0.join("sources");
+        let mut archive = tar::Builder::new(Vec::new());
+        let script = b"printf started\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(script.len() as u64);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "m/workspace/run.sh", &script[..])
+            .unwrap();
+        let bytes = archive.into_inner().unwrap();
+        unpack_tree(&mut Cursor::new(bytes), &source_root, &cargo_home).unwrap();
+
+        rewrite_local_registry_config(&cargo_home).unwrap();
+
+        let env = git_rewrite_environment(&cargo_home).unwrap();
+        assert_eq!(env["GIT_CONFIG_COUNT"], "0");
+        assert_eq!(env["GIT_ALLOW_PROTOCOL"], "file");
+        assert_eq!(
+            env["GIT_CONFIG_GLOBAL"],
+            cargo_home.join("gitconfig").to_str().unwrap()
+        );
+        assert_eq!(
+            command_with_git_cache(
+                "sh run.sh",
+                &cargo_home,
+                &source_root,
+                &inventory(&source_root).unwrap()
+            )
+            .unwrap(),
+            "sh run.sh"
+        );
+        assert_eq!(
+            std::fs::read(source_root.join("workspace/run.sh")).unwrap(),
+            script
+        );
+
+        assert!(!cargo_home.join("config.toml").exists());
+        // Absence is optional; an existing non-file is still invalid.
+        std::fs::create_dir(cargo_home.join("config.toml")).unwrap();
+        assert!(rewrite_local_registry_config(&cargo_home).is_err());
+    }
 
     #[test]
     fn local_registry_config_is_rewritten_to_absolute_guest_cargo_home() {
@@ -1966,6 +2074,117 @@ mod tests {
             fs::read_to_string(checkout.join("dependency.txt")).unwrap(),
             "from bundled git source\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tagged_git_mirror_reaches_cargo_build_offline_locked() {
+        use std::{fs, process::Command as ProcessCommand};
+
+        let scratch = Scratch::new();
+        let source = scratch.0.join("dependency");
+        fs::create_dir_all(source.join("src")).unwrap();
+        fs::write(
+            source.join("Cargo.toml"),
+            "[package]\nname='tagged-dep'\nversion='1.0.11'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(source.join("src/lib.rs"), "pub fn value() -> u8 { 11 }\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = ProcessCommand::new("git")
+                .current_dir(&source)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@invalid",
+            "commit",
+            "-qm",
+            "dependency",
+        ]);
+        git(&["tag", "1.0.11"]);
+        let rev = git(&["rev-parse", "HEAD"]);
+        let cargo_home = scratch.0.join("cargo-home");
+        fs::create_dir_all(cargo_home.join("git-mirrors")).unwrap();
+        let mirror = cargo_home.join("git-mirrors/0");
+        git(&[
+            "clone",
+            "--bare",
+            "--no-local",
+            source.to_str().unwrap(),
+            mirror.to_str().unwrap(),
+        ]);
+        fs::write(cargo_home.join("gitconfig"), "[core]\nsymlinks=false\n").unwrap();
+        fs::write(
+            cargo_home.join("config.toml"),
+            "[net]\ngit-fetch-with-cli=true\n",
+        )
+        .unwrap();
+        let url = "https://dep.invalid/tagged-dep";
+        fs::write(
+            cargo_home.join("git-rewrites.json"),
+            serde_json::to_vec(
+                &serde_json::json!({"schema":1,"routes":[{"url":url,"mirror":"git-mirrors/0"}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let sources = scratch.0.join("sources with ' quote");
+        let workspace = sources.join("workspace");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(workspace.join("Cargo.toml"), format!("[package]\nname='offline-root'\nversion='0.1.0'\nedition='2021'\n[dependencies]\ntagged-dep={{git='{url}',tag='1.0.11'}}\n")).unwrap();
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn value() -> u8 { tagged_dep::value() }\n",
+        )
+        .unwrap();
+        let lock = format!(
+            "version=4\n[[package]]\nname='offline-root'\nversion='0.1.0'\ndependencies=['tagged-dep']\n[[package]]\nname='tagged-dep'\nversion='1.0.11'\nsource='git+{url}?tag=1.0.11#{rev}'\n"
+        );
+        fs::write(workspace.join("Cargo.lock"), &lock).unwrap();
+        assert!(!cargo_home.join("git/db").exists());
+        let script = command_with_git_cache(
+            "test \"$CARGO_NET_OFFLINE\" = true && cargo build --offline --locked",
+            &cargo_home,
+            &sources,
+            &inventory(&sources).unwrap(),
+        )
+        .unwrap();
+        let output = ProcessCommand::new("bash")
+            .arg("-c")
+            .arg(script)
+            .current_dir(&workspace)
+            .envs(git_rewrite_environment(&cargo_home).unwrap())
+            .env("CARGO_HOME", &cargo_home)
+            .env("CARGO_NET_OFFLINE", "true")
+            .env("CARGO_TARGET_DIR", scratch.0.join("target"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "offline build: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("Cargo.lock")).unwrap(),
+            lock
+        );
+        assert!(cargo_home.join("git/db").is_dir());
+        assert!(cargo_home.join("git/checkouts").is_dir());
     }
 
     #[test]

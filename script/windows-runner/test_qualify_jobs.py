@@ -305,6 +305,57 @@ class QualificationReadinessTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "gate failed"):
                 JOBS.require_gate_success({"outcome": outcome})
 
+    def test_preparation_cases_submit_tagged_dependency_and_run_sh_only_snapshot(self):
+        def git(repo, *args):
+            return subprocess.check_output(["git", "-C", str(repo), *args], stderr=subprocess.STDOUT).decode().strip()
+
+        channels = [Mock(), Mock()]
+        for channel in channels:
+            channel.until.return_value = {"outcome": {"type": "windows_exit", "code": 0}}
+        with patch.object(JOBS, "git", side_effect=git), patch.object(JOBS, "Channel", side_effect=channels):
+            JOBS.qualify_preparation_cases(self.root, self.runner, self.root)
+        requests = [channel.send.call_args_list[0].args[0] for channel in channels]
+        tagged, no_lock = requests
+        self.assertIn("cargo build --offline --locked", tagged["command"])
+        dep = tagged["git_dependencies"][0]
+        self.assertEqual(dep["url"], JOBS.GIT_DEP_URL)
+        self.assertEqual(dep["bundle"], tagged["bundles"][1])
+        self.assertEqual(dep["bundle"]["repository"], JOBS.GIT_DEP_URL)
+        dep_commit = dep["commits"][0]
+        lock = (self.root / "git-tag-fixture/Cargo.lock").read_text()
+        self.assertIn(f"git+{JOBS.GIT_DEP_URL}?tag=1.0.11#{dep_commit}", lock)
+        self.assertEqual(git(self.root / "git-tag-dependency", "rev-parse", "1.0.11"), dep_commit)
+        bundle = self.root / "git-tag-offline-dependency.bundle"
+        self.assertEqual(git(self.root / "git-tag-dependency", "bundle", "list-heads", str(bundle)),
+                         f"{dep_commit} refs/ck-motor/dep/{dep_commit}")
+        for channel, request in zip(channels, requests):
+            self.assertTrue(request["command"].startswith(JOBS.BUN_VERSION_CHECK + " || exit $?; "))
+            chunks = [call.args[0] for call in channel.send.call_args_list[1:]]
+            for manifest in request["bundles"]:
+                data = b"".join(JOBS.base64.b64decode(chunk["data"]) for chunk in chunks if chunk["index"] == manifest["index"])
+                self.assertEqual(len(data), manifest["length"])
+                self.assertEqual(JOBS.hashlib.sha256(data).hexdigest(), manifest["sha256"])
+            channel.close.assert_called_once()
+        self.assertIn("sh run.sh", no_lock["command"])
+        self.assertEqual(no_lock["git_dependencies"], [])
+        self.assertEqual(len(no_lock["bundles"]), 1)
+        self.assertEqual(git(self.root / "no-lockfile-fixture", "ls-tree", "--name-only", "HEAD"), "run.sh")
+
+    def test_preparation_case_rejects_nonzero_guest_exit(self):
+        channel = Mock()
+        channel.until.return_value = {"outcome": {"type": "windows_exit", "code": 101}}
+        with patch.object(JOBS, "fixture_bundle", side_effect=lambda repo, bundle, commit: bundle.write_bytes(b"bundle")), patch.object(JOBS, "Channel", return_value=channel):
+            with self.assertRaisesRegex(RuntimeError, "gate failed"):
+                JOBS.run_preparation_case(self.root, self.runner, self.root, "failed", self.root, "commit", "tree", "sh run.sh")
+        channel.close.assert_called_once()
+
+    def test_preparation_only_cli_submits_only_the_two_preparation_cases(self):
+        evidence = self.root / "preparation-evidence"
+        with patch.object(JOBS, "qualify_preparation_cases") as cases, patch.object(JOBS, "run") as full:
+            JOBS.main(["--root", str(self.root), "--evidence", str(evidence), "--preparation-only"])
+        cases.assert_called_once_with(self.root, self.runner, evidence)
+        full.assert_not_called()
+
     def test_fixture_bundle_refs_match_snapshot_transport_and_import_commits(self):
         def git(repo, *args):
             return subprocess.check_output(["git", "-C", str(repo), *args], stderr=subprocess.STDOUT).decode().strip()

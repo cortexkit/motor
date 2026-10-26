@@ -329,6 +329,9 @@ SYSTEM local-registry cache and the job VM's offline Cargo fetch/build; a delibe
 partial agent frame and the guest's matching EOF byte count; native loopback and
 foreign-VM rejection while the target guest agent's listener is still active (a
 connect failure alone cannot pass); five full runner jobs with multi-frame trees,
+plus two single-job preparation cases in `qualify-jobs.py`: a bundled Git
+dependency pinned by tag built with `cargo build --offline --locked`, and a
+repository containing only `run.sh` with no Cargo manifest or lockfile;
 cold then warm registry/cache paths, large stdout and source-output collection,
 the non-admin `motor-job` guest account, and that host cache bytes do not leak into
 the guest's unrelated paths. Every real job first requires `bun --version` to
@@ -338,6 +341,21 @@ return exactly `1.4.2`, including jobs using a custom gate command. The configur
 logs. Any failure stops the service and does not count as a skip. Return the complete
 external evidence directory, plus provisioning logs and `sealed.json`, before
 enabling routing.
+
+To run just the two preparation cases once each, use a SYSTEM PowerShell session
+(not an ordinary administrator shell). Set `$python` in that session to the
+absolute interpreter path resolved as the operator above, then run:
+
+```powershell
+& $python C:\ProgramData\MotorRunner\bin\qualify-jobs.py `
+  --preparation-only --root C:\ProgramData\MotorRunner `
+  --evidence C:\motor-runner-evidence\preparation-only
+if ($LASTEXITCODE -ne 0) { throw 'Preparation checks failed; preserve their evidence' }
+```
+
+The evidence directory must not exist yet, even as an empty directory. This is
+a direct SYSTEM invocation; `run-system.ps1` still runs the full qualification.
+The default qualification also runs both cases, before the five cache-reuse jobs.
 
 ## Diagnose an agent connection failure
 

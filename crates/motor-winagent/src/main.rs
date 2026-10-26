@@ -1495,7 +1495,7 @@ mod guest {
             .create_new(true)
             .open(temp.join("motor-tree.tar"))?;
         diagnostic!("staging archive opened");
-        let command = loop {
+        let mut command = loop {
             match receive(protocol, rx, &port.stop)? {
                 Frame::ReceiveTree { bytes } => {
                     diagnostic!("staging ReceiveTree bytes={}", bytes.len());
@@ -1511,6 +1511,12 @@ mod guest {
         // absolute local-registry path under the guest user's CARGO_HOME.
         motor_winagent::rewrite_local_registry_config(&home)?;
         let before = inventory(Path::new(SOURCE_ROOT))?;
+        command.command = motor_winagent::command_with_git_cache(
+            &command.command,
+            &home,
+            Path::new(SOURCE_ROOT),
+            &before,
+        )?;
         let cwd = PathBuf::from(mapped_cwd(&command.cwd)?);
         if !cwd.is_dir() {
             return Err(invalid("command cwd is not in the transferred tree"));
