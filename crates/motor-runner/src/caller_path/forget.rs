@@ -204,21 +204,47 @@ fn check_live_units(config: &Config) -> io::Result<()> {
     if !config.isolate_jobs {
         return Ok(());
     }
-    // Job units exist only under the Linux system manager.
-    #[cfg(target_os = "linux")]
-    {
-        let live = crate::backend::live_job_units(config)?;
-        if !live.is_empty() {
-            let mut names: Vec<_> = live.into_iter().collect();
-            names.sort();
-            return Err(invalid(format!(
-                "forget-caller-root refuses while {} live job units exist: {}",
-                names.len(),
-                names.join(", ")
-            )));
-        }
+    let live = crate::backend::live_job_units(config)?;
+    // Unit names carry no instance, so other runners' units share the
+    // listing. Only a live unit for a job this instance's state records
+    // blocks forget: the unit named by each record's own `process.unit`
+    // (which can differ from the job UUID) and the unit for every job ID
+    // present under this instance's jobs/ directory.
+    let owned = instance_units(&config.state_dir());
+    let ours: Vec<_> = live.intersection(&owned).cloned().collect();
+    if !ours.is_empty() {
+        return Err(invalid(format!(
+            "forget-caller-root refuses while {} live job units exist: {}",
+            ours.len(),
+            ours.join(", ")
+        )));
     }
     Ok(())
+}
+
+fn instance_units(state: &Path) -> BTreeSet<String> {
+    let mut owned = BTreeSet::new();
+    let Ok(entries) = fs::read_dir(state.join("jobs")) else {
+        return owned;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        owned.insert(format!("motor-job-{name}.service"));
+        if let Ok(bytes) = fs::read(entry.path().join("record.json")) {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let Some(unit) = value
+                    .pointer("/process/unit")
+                    .and_then(|unit| unit.as_str())
+                {
+                    owned.insert(format!("motor-job-{unit}.service"));
+                }
+            }
+        }
+    }
+    owned
 }
 
 #[cfg(target_os = "linux")]

@@ -405,7 +405,7 @@ fn forget_sweeps_home_keeps_dual_keys_and_leaves_data_byte_identical() {
     drop(runner);
 }
 
-fn minimal_home_pin(f: &Fixture, c: &Config) -> (String, PathBuf) {
+fn minimal_home_pin(f: &Fixture, c: &Config) -> (String, PathBuf, uuid::Uuid) {
     let runner = Runner::open(c.clone()).unwrap();
     let key = "/home/u/proj";
     let host = home_host(c).join("u/proj");
@@ -430,9 +430,10 @@ fn minimal_home_pin(f: &Fixture, c: &Config) -> (String, PathBuf) {
     request.cwd = key.into();
     request.siblings.clear();
     let job = Job::new(uuid::Uuid::now_v7(), Some(request), now, 1, 1);
+    let id = job.id;
     runner.save(&job).unwrap();
     drop(runner);
-    (key.into(), host)
+    (key.into(), host, id)
 }
 
 #[test]
@@ -440,7 +441,7 @@ fn forget_with_flagged_serve_args_reaches_the_same_end_state() {
     let f = Fixture::new();
     let c = two_prefix_config(&f);
     let home = home_host(&c);
-    let (key, host) = minimal_home_pin(&f, &c);
+    let (key, host, _) = minimal_home_pin(&f, &c);
     // This test calls forget with the `/home` mapping still supplied in the
     // serve configuration (as when forget runs before the unflagged unit is
     // installed, still carrying `--caller-root /home=H`).
@@ -463,7 +464,7 @@ fn forget_with_mismatched_flagged_host_refuses_naming_both_and_changes_nothing()
     let f = Fixture::new();
     let c = two_prefix_config(&f);
     let home = home_host(&c);
-    let (key, host) = minimal_home_pin(&f, &c);
+    let (key, host, _) = minimal_home_pin(&f, &c);
     let before = snapshot(&c);
     let other = f.scratch.join("other-home");
     fs::create_dir_all(&other).unwrap();
@@ -641,7 +642,7 @@ fn forget_refuses_while_daemon_lock_is_held_and_changes_nothing() {
     use fs2::FileExt;
     let f = Fixture::new();
     let c = two_prefix_config(&f);
-    let (_key, host) = minimal_home_pin(&f, &c);
+    let (_key, host, _) = minimal_home_pin(&f, &c);
     let before = snapshot(&c);
     fs::create_dir_all(c.state_dir()).unwrap();
     let lock = fs::OpenOptions::new()
@@ -665,8 +666,10 @@ fn forget_refuses_while_daemon_lock_is_held_and_changes_nothing() {
 fn forget_refuses_while_a_live_job_unit_exists_with_the_same_list_units_query() {
     let f = Fixture::new();
     let mut c = two_prefix_config(&f);
-    let (_key, host) = minimal_home_pin(&f, &c);
+    let (_key, host, id) = minimal_home_pin(&f, &c);
     let before = snapshot(&c);
+    let owned = format!("motor-job-{id}.service");
+    let listed = owned.clone();
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let recorded = seen.clone();
     c.systemd_command = Some(std::sync::Arc::new(move |args: &[&str]| {
@@ -676,14 +679,14 @@ fn forget_refuses_while_a_live_job_unit_exists_with_the_same_list_units_query() 
             .push(args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         Ok(std::process::Output {
             status: std::os::unix::process::ExitStatusExt::from_raw(0),
-            stdout: b"motor-job-abc.service loaded active running test\n".to_vec(),
+            stdout: format!("{listed} loaded active running test\n").into_bytes(),
             stderr: vec![],
         })
     }));
     let error = forget::forget_caller_root(&c, "/home")
         .unwrap_err()
         .to_string();
-    assert!(error.contains("motor-job-abc.service"), "{error}");
+    assert!(error.contains(&owned), "{error}");
     // The live-unit query is the same list-units invocation serve issues.
     let queries = seen.lock().unwrap().clone();
     assert_eq!(queries.len(), 1);
@@ -718,7 +721,7 @@ fn forget_refuses_a_swapped_trash_and_leaves_the_sentinel() {
     let f = Fixture::new();
     let c = two_prefix_config(&f);
     let home = home_host(&c);
-    let (_key, host) = minimal_home_pin(&f, &c);
+    let (_key, host, _) = minimal_home_pin(&f, &c);
     let before = snapshot(&c);
     let outside = f.scratch.join("outside");
     fs::create_dir_all(&outside).unwrap();
@@ -747,22 +750,80 @@ fn forget_fence_with_a_live_unit_changes_neither_tree_nor_record() {
     // alive: forget must refuse before any mutation.
     let f = Fixture::new();
     let mut c = two_prefix_config(&f);
-    let (key, host) = minimal_home_pin(&f, &c);
+    let (key, host, id) = minimal_home_pin(&f, &c);
     let before = snapshot(&c);
-    c.systemd_command = Some(std::sync::Arc::new(|_: &[&str]| {
+    let owned = format!("motor-job-{id}.service");
+    let listed = owned.clone();
+    c.systemd_command = Some(std::sync::Arc::new(move |_: &[&str]| {
         Ok(std::process::Output {
             status: std::os::unix::process::ExitStatusExt::from_raw(0),
-            stdout: b"motor-job-survivor.service loaded active running job\n".to_vec(),
+            stdout: format!("{listed} loaded active running job\n").into_bytes(),
             stderr: vec![],
         })
     }));
     let error = forget::forget_caller_root(&c, "/home")
         .unwrap_err()
         .to_string();
-    assert!(error.contains("motor-job-survivor.service"), "{error}");
+    assert!(error.contains(&owned), "{error}");
     assert_eq!(snapshot(&c), before);
     assert!(host.join("secret").exists());
     assert!(Split::read(&c.state_dir())
+        .unwrap()
+        .caller
+        .workspaces
+        .contains_key(&key));
+}
+
+#[test]
+fn forget_proceeds_with_only_unrelated_live_units() {
+    let f = Fixture::new();
+    let mut c = two_prefix_config(&f);
+    let (key, host, id) = minimal_home_pin(&f, &c);
+    // Give the instance job a surviving unit name that differs from its job
+    // ID, as a reattached record does. A live listing for that unit blocks
+    // forget even though no unit matches the job ID itself.
+    let other = uuid::Uuid::now_v7();
+    let record_path = c
+        .state_dir()
+        .join("jobs")
+        .join(id.to_string())
+        .join("record.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    record["process"] = serde_json::json!({"pid": 1, "start": 0, "unit": other.to_string()});
+    fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let before = snapshot(&c);
+    let owned = format!("motor-job-{other}.service");
+    let listed = owned.clone();
+    c.systemd_command = Some(std::sync::Arc::new(move |_: &[&str]| {
+        Ok(std::process::Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(0),
+            stdout: format!("{listed} loaded active running other\n").into_bytes(),
+            stderr: vec![],
+        })
+    }));
+    let error = forget::forget_caller_root(&c, "/home")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&owned), "{error}");
+    assert_eq!(snapshot(&c), before);
+    assert!(host.join("secret").exists());
+    // A live unit no job of this instance records does not block forget:
+    // other runners' units share the host-wide listing.
+    let mut foreign = c.clone();
+    foreign.systemd_command = Some(std::sync::Arc::new(|_: &[&str]| {
+        let unrelated = uuid::Uuid::now_v7();
+        Ok(std::process::Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(0),
+            stdout: format!("motor-job-{unrelated}.service loaded active running other\n")
+                .into_bytes(),
+            stderr: vec![],
+        })
+    }));
+    let removed = forget::forget_caller_root(&foreign, "/home").unwrap();
+    assert!(removed.iter().any(|line| line.contains(&key)));
+    assert!(!host.exists());
+    assert!(!Split::read(&c.state_dir())
         .unwrap()
         .caller
         .workspaces
