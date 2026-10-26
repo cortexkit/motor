@@ -166,7 +166,12 @@ problems=0 skipped=0
         place = functions[0].replace('local kind=$1 src=$2 dest=$3 owner=$4 mode=$5',
             'local kind=$1 src=$2 original=$3 dest=$FIXTURE$3 owner=$4 mode=$5')
         place = place.replace('"$src" "$dest"\n', '"$src" "$original"\n')
-        return place + functions[1] + '\nhost_configs\n'
+        # `place` routes the network settings file to its own renderer by
+        # comparing against this global, so the extracted functions need it.
+        network = re.search(r'\nNETWORK_CONFIG=[^\n]*\n', script)
+        self.assertIsNotNone(network)
+        assert network is not None
+        return network[0] + place + functions[1] + '\nhost_configs\n'
 
     def test_hosted_installs_both_configs_and_applies_them(self):
         calls = self.shell(self.hosted_functions(), answers='y\ny\n')

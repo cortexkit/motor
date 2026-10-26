@@ -212,6 +212,8 @@ pub struct Config {
     /// Outbound networking is opt-in; readiness is re-probed per net admission.
     pub job_network: Option<crate::network::JobNetwork>,
     pub(crate) job_network_unavailable: String,
+    /// Job networking (and its cleanup) exists only on Linux.
+    #[cfg(target_os = "linux")]
     pub(crate) network_cleanup_pending: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     pub(crate) job_network_hook: Option<crate::network::Hook>,
@@ -499,6 +501,7 @@ impl Config {
             remote_cache_error: None,
             job_network: None,
             job_network_unavailable: "--job-network veth is not enabled".into(),
+            #[cfg(target_os = "linux")]
             network_cleanup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             job_network_hook: None,
