@@ -110,7 +110,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let result = tokio::select! {
         result = async {
-            let (_, serving) = subc_client_rs::serve_with_handle(&connection, manifest, handler.clone()).await?;
+            let (handle, serving) = subc_client_rs::serve_with_handle(&connection, manifest, handler.clone()).await?;
+            handler.set_module_handle(handle);
             serving.await
         } => result,
         _ = terminate.recv() => Ok(()),
