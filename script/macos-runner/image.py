@@ -237,8 +237,11 @@ def sealed_source(directory):
             raise ValueError("source sealed image digest differs: " + name)
     if (directory / "agent.sha256").read_text() != pin["agent"]["sha256"] + "\n":
         raise ValueError("source agent digest record differs")
-    if (pin["tcc"]["services"] != list(TCC_SERVICES) or not pin["tcc"]["requirement"].strip()):
-        raise ValueError("source has no sealed TCC grant")
+    # Images sealed before offline TCC grants existed carry no record; the swap
+    # grants the replacement agent either way. A record that is present must be valid.
+    if "tcc" in pin and (pin["tcc"]["services"] != list(TCC_SERVICES)
+                         or not pin["tcc"]["requirement"].strip()):
+        raise ValueError("source TCC grant record is malformed")
     require_stopped(directory)
     return pin
 
@@ -336,7 +339,7 @@ def swap_guest(mount, args, manifest, source):
         raise ValueError("source installed agent digest differs")
     if agent_marker.read_text() != source["agent"]["sha256"] + "\n":
         raise ValueError("source guest agent digest record differs")
-    if agent_requirement(mount) != source["tcc"]["requirement"]:
+    if "tcc" in source and agent_requirement(mount) != source["tcc"]["requirement"]:
         raise ValueError("source installed requirement differs from sealed TCC grant")
     receipt = json.loads(seal_receipt.read_text())
     if receipt != {"manifest_sha256": source["manifest_sha256"], "agent_sha256": source["agent"]["sha256"], "remote_login": "Off"}:

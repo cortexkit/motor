@@ -949,6 +949,20 @@ class OfflineImageTests(unittest.TestCase):
         self.assertEqual([args[2] for args in self.commands if args[:2] == ["/usr/bin/hdiutil", "attach"]], ["-nomount", "-nomount"])
         self.assertFalse(self.mount.exists())
 
+    def test_agent_swap_grants_a_source_sealed_before_tcc_records(self):
+        manifest = self.swap_inputs()
+        record = self.bundle / "image.json"
+        self.bundle.chmod(0o755)
+        record.chmod(0o644)
+        legacy = json.loads(record.read_text())
+        del legacy["tcc"]
+        record.write_text(json.dumps(legacy, indent=2) + "\n")
+        record.chmod(0o444)
+        self.bundle.chmod(0o555)
+        self.swap(manifest)
+        pin = json.loads((self.swap_args.destination / "image.json").read_text())
+        self.assertEqual(pin["tcc"], {"services": list(image.TCC_SERVICES), "requirement": self.swap_requirement})
+
     def test_agent_swap_rejects_bad_binary_and_unsealed_or_corrupt_source_before_attach(self):
         manifest = self.swap_inputs()
         self.swap_args.agent.write_bytes(b"not the reviewed binary")
