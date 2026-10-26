@@ -129,23 +129,19 @@ async fn keyed_tenant_vm_schedules_a_fill_and_reports_its_permits() {
     base_done(&runner).await;
     assert_eq!(writer_count(&runner), 1);
     assert_eq!(runner.runner_status().health.unwrap().fill_permits, Some(0));
-}
-
-#[derive(Clone, Default)]
-struct LogBytes(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for LogBytes {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+    assert_eq!(
+        runner
+            .core
+            .tenant_fills_off_logs
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
 }
 
 /// A tenant VM without a write key runs no fill and says why once, however
-/// often a fill is considered; its jobs are unaffected.
+/// often a fill is considered; its jobs are unaffected. The count is read from
+/// the runner rather than from captured output: a test-scoped log subscriber
+/// does not reliably see this line while other tests run in parallel.
 #[tokio::test]
 async fn keyless_tenant_vm_logs_once_and_runs_no_fill() {
     let f = Fixture::new();
@@ -153,29 +149,22 @@ async fn keyless_tenant_vm_logs_once_and_runs_no_fill() {
     config.manual_tick = true;
     config.tenant_vm = true;
     config.tenant_write_key = Some(false);
-    let bytes = LogBytes::default();
-    let runner = tracing::subscriber::with_default(
-        motor_protocol::logging::LineSubscriber::new("[runner]", bytes.clone()),
-        || {
-            let runner = Runner::open(config).unwrap();
-            let (request, bytes) = f.run("true");
-            let upload = f.spool(&runner, &request, &bytes);
-            let mut prepare = prepare_for(&request);
-            prepare.bundles = request.bundles.clone();
-            runner.fetch_prepare(&prepare, &upload.directory).unwrap();
-            for _ in 0..2 {
-                runner.prepare(&prepare, true).unwrap();
-                runner.tick().unwrap();
-            }
-            runner
-        },
-    );
-    let log = String::from_utf8(bytes.0.lock().unwrap().clone()).unwrap();
+    let runner = Runner::open(config).unwrap();
+    let (request, bytes) = f.run("true");
+    let upload = f.spool(&runner, &request, &bytes);
+    let mut prepare = prepare_for(&request);
+    prepare.bundles = request.bundles.clone();
+    runner.fetch_prepare(&prepare, &upload.directory).unwrap();
+    for _ in 0..2 {
+        runner.prepare(&prepare, true).unwrap();
+        runner.tick().unwrap();
+    }
     assert_eq!(
-        log.matches("no remote cache write key is provisioned")
-            .count(),
-        1,
-        "{log}"
+        runner
+            .core
+            .tenant_fills_off_logs
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
     );
     assert!(runner.core.inner.lock().unwrap().writer.is_none());
     assert_eq!(writer_count(&runner), 0);

@@ -1391,6 +1391,10 @@ struct Core {
     /// Set while a tenant VM queues no fills for want of a write key, so the
     /// reason is logged once when that starts rather than at every tick.
     tenant_fills_off_logged: std::sync::atomic::AtomicBool,
+    /// How many times that reason was logged. Tests read it, because a log
+    /// line is captured only on the thread whose subscriber is installed.
+    #[cfg(test)]
+    tenant_fills_off_logs: std::sync::atomic::AtomicUsize,
     draining: std::sync::atomic::AtomicBool,
     /// Separate from the fsync/state lock so a slow persistence operation cannot
     /// prevent the server from observing its shutdown deadline.
@@ -2435,6 +2439,8 @@ impl Runner {
                 publishing: Mutex::new(publishing_state),
                 tenant_events,
                 tenant_fills_off_logged: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                tenant_fills_off_logs: std::sync::atomic::AtomicUsize::new(0),
                 draining: std::sync::atomic::AtomicBool::new(false),
                 drain_control: Mutex::new(None),
                 background_deletes: config.background_deletes.clone(),
@@ -4396,6 +4402,10 @@ impl Runner {
             .tenant_fills_off_logged
             .swap(off, std::sync::atomic::Ordering::Relaxed);
         if off && !was_off {
+            #[cfg(test)]
+            self.core
+                .tenant_fills_off_logs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
                 "tenant cache fills off: no remote cache write key is provisioned; jobs run without filling the cache"
             );
