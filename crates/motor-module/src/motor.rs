@@ -75,6 +75,7 @@ pub struct Motor {
     #[cfg(test)]
     hosted_connector: Option<Arc<dyn Connector>>,
     keyed_admissions: Arc<std::sync::Mutex<()>>,
+    wsl: crate::wsl::Checks,
 }
 mod agent_run;
 pub(crate) mod submission_key;
@@ -148,6 +149,7 @@ impl Motor {
             #[cfg(test)]
             hosted_connector: None,
             keyed_admissions: Arc::default(),
+            wsl: crate::wsl::Checks::default(),
         })
     }
     pub fn with_account_tokens(mut self, tokens: Arc<crate::AccountTokens>) -> Self {
@@ -304,6 +306,16 @@ impl Motor {
         key: Option<submission_key::KeyRecord>,
     ) -> io::Result<JobStream> {
         let (attribution, secret_hash) = identity;
+        let wsl_refusal = self.wsl.refusal(
+            [
+                &request.workspace_key,
+                &request.repository_root,
+                &request.cwd,
+            ]
+            .into_iter()
+            .chain(request.siblings.iter())
+            .map(Path::new),
+        );
         let macos_not_hosted = hosted_test && request.platform == Some(Platform::Macos);
         let mut env_not_forwarded: Vec<_> = request
             .env
@@ -318,7 +330,8 @@ impl Motor {
         let id = Uuid::now_v7();
         // repository_root is resolved by the caller from Git's common directory,
         // not the workspace key, which changes for each linked worktree.
-        let repository_routed = !hosted_test
+        let repository_routed = wsl_refusal.is_none()
+            && !hosted_test
             && matches!(request.platform, None | Some(Platform::Linux))
             && std::fs::canonicalize(&request.repository_root).is_ok_and(|root| {
                 self.config
@@ -326,7 +339,8 @@ impl Motor {
                     .iter()
                     .any(|listed| std::fs::canonicalize(listed).is_ok_and(|listed| listed == root))
             });
-        let spill_eligible = !hosted_test
+        let spill_eligible = wsl_refusal.is_none()
+            && !hosted_test
             && !repository_routed
             && crate::spill::eligible(&self.config, &request, gate_job, allow_gate_spill);
         let wait = if gate_job {
@@ -357,7 +371,7 @@ impl Motor {
                 self.storage.bind_windows(id, runner.clone())?;
             }
         }
-        if hosted_test && !macos_not_hosted {
+        if wsl_refusal.is_none() && hosted_test && !macos_not_hosted {
             let mut route = crate::HostedJobState::new(&self.config);
             route.hosted_test = true;
             self.storage.hosted_route(id, route)?;
@@ -370,7 +384,8 @@ impl Motor {
             self.storage.hosted_route(id, route)?;
             tracing::info!(job_id = %id, repo = %request.repository_root,
                 "routed to hosted (hosted_repositories)");
-        } else if self.config.hosted_runners
+        } else if wsl_refusal.is_none()
+            && self.config.hosted_runners
             && matches!(request.platform, None | Some(Platform::Linux))
             && (!self.config.hosted_fleet_routing
                 || (!gate_job && crate::hosted::validate(&request).is_ok()))
@@ -392,6 +407,21 @@ impl Motor {
         let submission = self.submission(id);
         tokio::spawn(async move {
             let _submission = submission;
+            if let Some(message) = wsl_refusal {
+                let result = motor
+                    .refused(
+                        id,
+                        RefusalReason::WorkspaceKeyRejected,
+                        None,
+                        Some(message),
+                        &tx,
+                    )
+                    .await;
+                if let Err(error) = result {
+                    let _ = tx.send(Err(error)).await;
+                }
+                return;
+            }
             if macos_not_hosted {
                 let result = motor
                     .refused(
@@ -2609,6 +2639,15 @@ impl Motor {
     }
     pub async fn prepare(&self, request: PrepareRequest) -> io::Result<PrepareReply> {
         let id = Uuid::now_v7();
+        if let Some(message) = self.wsl.refusal(
+            [&request.workspace_key, &request.repository_root]
+                .into_iter()
+                .chain(request.siblings.iter())
+                .map(Path::new),
+        ) {
+            return Ok(prepare_refused(id, RefusalReason::WorkspaceKeyRejected)
+                .with_refusal_detail(message));
+        }
         if self.config.hosted_runners {
             self.storage
                 .hosted_route(id, crate::HostedJobState::new(&self.config))?;
@@ -2936,6 +2975,8 @@ mod fleet_capacity_tests;
 mod fleet_routing_tests;
 #[cfg(test)]
 mod repository_routing_tests;
+#[cfg(test)]
+mod wsl_tests;
 
 #[cfg(test)]
 mod outcome_unknown_tests;
