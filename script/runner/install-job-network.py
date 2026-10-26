@@ -50,26 +50,24 @@ def permissions():
     print('PASS: sudo -n accepts all 18 network command forms (permission queries only)')
 
 
-def prerequisites(allow_fenced=False, locked=False):
+def prerequisites(allow_fenced=False, locked=False, host_only=False):
     assert os.geteuid() == 0, 'run full network --check as root'
     settings = tenant_policy.read_settings()
     uplink = settings['uplink']
     with contextlib.nullcontext() if locked else tenant_policy.network_lock():
         actual = check_ruleset(json.loads(sudo('/usr/sbin/nft', '-j', 'list', 'table', 'inet', 'motor_net').stdout), uplink=uplink)
-        source = (HERE / 'motor-net.nft').read_text()
-        document = tenant_policy.table('inet', 'motor_tenant')
-        try:
-            taps, closed = tenant_policy.tenant_snapshot(document, source, uplink=uplink)
-        except (AssertionError, KeyError, TypeError, ValueError):
-            if not allow_fenced:
-                raise
-            assert not actual, 'unsupported tenant policy must have no delegation'
-            print('FENCED: base policy installed; update helper and run mandatory --check before tenant traffic')
-        else:
-            owned, ready = tenant_policy.inspect_ufw(uplink=uplink)
-            if allow_fenced and document is None and not actual:
-                print('FENCED: no helper policy yet; persistent tenant grants confer no delegation')
+        if not host_only:
+            source = (HERE / 'motor-net.nft').read_text()
+            document = tenant_policy.table('inet', 'motor_tenant')
+            try:
+                taps, closed = tenant_policy.tenant_snapshot(document, source, uplink=uplink)
+            except (AssertionError, KeyError, TypeError, ValueError):
+                if not allow_fenced:
+                    raise
+                assert not actual, 'unsupported tenant policy must have no delegation'
+                print('FENCED: base policy installed; inspect tenant policy separately')
             else:
+                owned, ready = tenant_policy.inspect_ufw(uplink=uplink)
                 assert not closed and actual == taps == owned == ready, 'tenant delegation/UFW state is closed, stale or incomplete'
     route = sudo('/usr/sbin/ufw', 'status').stdout
     assert any('mnet-+' in line and uplink in line and 'ALLOW FWD' in line for line in route.splitlines()), 'narrow ufw route allowance missing'
@@ -78,7 +76,7 @@ def prerequisites(allow_fenced=False, locked=False):
     if not locked:
         tenant_policy.readiness.require_ready()
     permissions()
-    print('PASS: motor_net loaded and IPv4 forwarding enabled')
+    print('PASS: motor_net base loaded and IPv4 forwarding enabled' + (' (host-only; tenant health independent)' if host_only else ''))
 
 
 def check_ruleset(document, tenant_taps=None, *, uplink):
@@ -221,13 +219,16 @@ def main():
     mode.add_argument('--dry-run', '--diff', action='store_true')
     parser.add_argument('--uplink', help='explicit host uplink; required except with --check')
     parser.add_argument('--public-ip', help='public IPv4 carried by the uplink')
+    parser.add_argument('--host-only', action='store_true', help='with --check, verify host job networking independently of tenant health')
     args = parser.parse_args()
     print('motor_net host tooling v2')
     if args.check:
         if args.uplink is not None or args.public_ip is not None:
             parser.error('--check reads the installed network settings')
-        prerequisites()
+        prerequisites(host_only=args.host_only)
         return
+    if args.host_only:
+        parser.error('--host-only is a --check option')
     if args.apply:
         assert os.geteuid() == 0, 'run network --apply as root'
     if args.uplink is None or args.public_ip is None:
@@ -260,7 +261,7 @@ def main():
         return
     install_policy(desired, settings)
     sudo('/usr/bin/systemctl', 'enable', '--now', 'motor-net-rules.service')
-    prerequisites(allow_fenced=True)
+    prerequisites(host_only=True)
     print('Persistent rules/sysctl installed; run --check after helper reconciliation. UFW input rules unchanged.')
 
 
@@ -280,7 +281,7 @@ def install_policy(desired, settings):
             sudo('/usr/sbin/sysctl', '-q', '-w', 'net.ipv4.ip_forward=1')
             sudo('/usr/sbin/ufw', 'route', 'allow', 'in', 'on', 'mnet-+', 'out', 'on', settings['uplink'])
             loaded = tenant_policy.load_locked(publish=False)
-            prerequisites(allow_fenced=True, locked=True)
+            prerequisites(locked=True, host_only=True)
             tenant_policy.validate_uplink(settings)
             tenant_policy.readiness.publish()
         except BaseException:

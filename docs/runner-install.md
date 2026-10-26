@@ -315,11 +315,53 @@ together under the network lock. A stale source for another uplink is refused
 before any nftables or UFW call; installation holds the same lock while writing.
 
 Every mutating policy load first removes `/run/motor-net-ready`. Only complete
-success publishes a new root-owned generation there. The runner requires that
-generation at startup and both before and after attachment, so an old kernel
-table left by a failed reload cannot authorize a new job. Host, Boat and tenant
+base-policy and uplink success publishes a new root-owned generation there.
+Tenant policy/UFW failures fence the affected tenant, not the host's own jobs;
+`--check --host-only` checks that independent host readiness. The runner re-probes
+the generation for each `net` admission and both before and after attachment,
+so a failed startup probe never latches networking off. A missing generation
+refuses that request with `NetworkUnsupported`; producer recovery lets the next
+`net` request succeed without restarting the process. Non-net requests do not
+probe networking. An old kernel table left by a failed reload cannot authorize
+a new attachment. Host, Boat and tenant
 guest policy producers all implement this protocol; old images without it fail
 closed and must be rebuilt, not given a table-only compatibility fallback.
+
+Attachment is authorized under the generation its final probe validated.
+Publication/withdrawal is not synchronized with the later command-gate byte:
+a later fence affects new jobs and tenant gates, and does not revoke an already
+validated attachment. There is intentionally no extra gate-release probe.
+
+### Deploy the producer before the consumer
+
+The build-server runner is a **user** unit; `Before=motor-runner.service` in a
+system producer unit does not order it. Correctness comes from per-request
+re-probing, not cross-manager boot ordering. Use this rollout order:
+
+1. Quiesce new net work while mixing an old table-only consumer with the new
+   protocol. Check that `/etc/motor-network.json` agrees with the helper's
+   explicit uplink/public IPv4 settings, and that the link is UP.
+2. As the trusted runner account, run the network installer's read-only diff
+   with `--uplink <uplink> --public-ip <public IPv4>` to check its sudo grants.
+   Then apply it as root and run `--check --host-only`. This installs the
+   producer first and requires a genuine root-published generation; never create
+   a marker by hand to bypass a failure. The build server explicitly uses enp6s0.
+3. Upgrade/restart the helper using the hosted-host procedure. Tenant faults
+   may leave individual TAPs fenced without withdrawing host-job readiness.
+   Inspect tenant health separately with the full network `--check`.
+4. Deploy the new runner last, using the user-unit deployment procedure. Run a
+   net canary and a non-net canary through the normal client. If a producer
+   reload is unfinished or fails, that net request is refused; rerun the real
+   producer after fixing it, then retry the canary in the **same runner**.
+5. Resume net admissions only after the canaries pass. Producer-first minimizes
+   mixed-version windows even though boot-time recovery no longer needs a
+   runner restart.
+
+For **Boat**, rebuild and roll the whole image containing the runner, producer
+and marker helper together. Do not swap a new runner into an old image. For
+**tenant VMs**, build a new tenant image with the matching runner, guest network
+unit and marker helper, inventory/qualify it, then use the offline image-switch
+procedure with the host/helper stopped. New consumers on old images fail closed.
 Run the default read-only diff as the trusted runner account to verify its
 non-root `sudo` grants. Running `--check` as root skips verification of that
 account's non-root `sudo` grants.

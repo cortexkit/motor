@@ -304,6 +304,74 @@ def reconcile_ufw(desired, prior, *, uplink):
     return state
 
 
+def reconcile_ufw_taps(desired, prior, *, uplink):
+    """A failed tenant grant must not disable other tenants or host jobs."""
+    owned, ready = prior
+    failed = {}
+    for tap in sorted(owned - desired):
+        try:
+            command('/usr/sbin/ufw', *ufw_arguments(tap, True, uplink=uplink))
+        except (OSError, RuntimeError, ValueError) as error:
+            failed[tap] = str(error)
+    for tap in sorted(desired - ready):
+        try:
+            if tap in owned:
+                command('/usr/sbin/ufw', *ufw_arguments(tap, True, uplink=uplink))
+            command('/usr/sbin/ufw', *ufw_arguments(tap, uplink=uplink))
+        except (OSError, RuntimeError, ValueError) as error:
+            failed[tap] = str(error)
+    try:
+        observed_owned, observed_ready = inspect_ufw(uplink=uplink)
+        healthy = desired & observed_owned & observed_ready
+    except (AssertionError, OSError, RuntimeError, ValueError) as error:
+        # Only previously verified grants we did not change may survive an
+        # unreadable post-update snapshot. New grants remain fenced.
+        healthy = desired & ready
+        for tap in desired - healthy:
+            failed.setdefault(tap, str(error))
+    healthy -= set(failed)
+    for tap in desired - healthy:
+        failed.setdefault(tap, 'tenant grant is not ready')
+    return healthy, failed
+
+
+def tenant_health(document, source, *, uplink):
+    """Validate each registered tenant without making it host-wide readiness."""
+    if document is None:
+        return set(), set(), set(), {}, False
+    try:
+        taps, closed = tenant_snapshot(document, source, uplink=uplink)
+        return taps, closed, taps.copy(), {}, True
+    except (AssertionError, KeyError, TypeError, ValueError) as original:
+        try:
+            sets = [entry['set'] for entry in document['nftables'] if 'set' in entry]
+            taps = exact_taps(next(value for value in sets if value['name'] == 'tenant_taps'))
+            closed = exact_taps(next(value for value in sets if value['name'] == 'closed_taps'))
+            if not closed <= taps:
+                raise ValueError('closed TAP not registered')
+        except (AssertionError, KeyError, TypeError, ValueError, StopIteration):
+            return set(), set(), set(), {'tenant-policy': str(original)}, False
+        good, errors = set(), {}
+        for tap in taps:
+            projected = json.loads(json.dumps(document))
+            entries = []
+            for entry in projected['nftables']:
+                item = next(iter(entry.values()))
+                if 'set' in entry and item['name'] in {'tenant_taps', 'closed_taps'}:
+                    item['elem'] = [tap] if tap in (taps if item['name'] == 'tenant_taps' else closed) else []
+                name = item.get('chain', item.get('name', '')) if isinstance(item, dict) else ''
+                if any(name.startswith(f'tenant_{other}_') for other in taps - {tap}):
+                    continue
+                entries.append(entry)
+            projected['nftables'] = entries
+            try:
+                tenant_snapshot(projected, source, uplink=uplink)
+                good.add(tap)
+            except (AssertionError, KeyError, TypeError, ValueError) as error:
+                errors[tap] = str(error)
+        return taps, closed, good, errors, True
+
+
 def tenant_snapshot(document, source, *, uplink):
     if document is None:
         return set(), set()
@@ -396,6 +464,15 @@ def checked_source(settings):
     return expected
 
 
+def tenant_input_guard(document):
+    if document is None:
+        return ''
+    present = any(entry.get('chain', {}).get('name') == 'tenant_guard_input' for entry in document['nftables'])
+    text = ('flush chain inet motor_tenant tenant_guard_input\ndelete chain inet motor_tenant tenant_guard_input\n') if present else ''
+    return text + ('add chain inet motor_tenant tenant_guard_input { type filter hook input priority -20; policy accept; }\n'
+                   'add rule inet motor_tenant tenant_guard_input iifname "mtap*" counter drop\n')
+
+
 def load():
     """Reload owned policy without restarting the helper or any tenant VM."""
     with network_lock(mutate=True):
@@ -403,65 +480,88 @@ def load():
 
 
 def load_locked(publish=True):
-    """Called only while holding the exclusive network mutation lock."""
+    """Host readiness describes the base job policy, not tenant health."""
     readiness.invalidate()
-    opened = False
-    taps = set()
     try:
         settings = read_settings(check_link=False)
         uplink = settings['uplink']
         source = checked_source(settings)
         document = table('inet', 'motor_tenant')
-        policy_error = None
-        try:
-            taps, closed = tenant_snapshot(document, source, uplink=uplink)
-        except (AssertionError, KeyError, TypeError, ValueError) as error:
-            policy_error, taps, closed = error, set(), set()
+        taps, closed, good, issues, has_sets = tenant_health(document, source, uplink=uplink)
         net_document = table('inet', 'motor_net')
+        base_loaded = False
+
+        def fence_all():
+            text = members('motor_tenant', 'closed_taps', taps) if has_sets else ''
+            if base_loaded or net_document is not None:
+                text += members('motor_net', 'tenant_taps', set())
+            if text:
+                apply(text)
+
         try:
             validate_uplink(settings)
         except (OSError, RuntimeError, ValueError):
-            fence = members('motor_tenant', 'closed_taps', taps) if document is not None and policy_error is None else ''
-            if net_document is not None:
-                fence += members('motor_net', 'tenant_taps', set())
-            if fence:
-                apply(fence)
+            fence_all()
             raise
-        ufw_error = None
         try:
-            prior = inspect_ufw(uplink=uplink) if document is not None and policy_error is None else (set(), set())
+            prior = inspect_ufw(uplink=uplink) if good else (set(), set())
+            inspected = True
         except (AssertionError, OSError, RuntimeError, ValueError) as error:
-            ufw_error, prior = error, (set(), set())
-        ready = (taps - closed) & prior[1]
-        transaction = ''
-        if document is not None and policy_error is None:
-            transaction += members('motor_tenant', 'closed_taps', closed | (taps - ready))
+            prior, inspected = (set(), set()), False
+            issues.update({tap: str(error) for tap in good})
+        ready = (good - closed) & prior[1]
+        # Tenant-policy errors must not remove the unconditional host-input
+        # boundary while their forwarding delegation is withheld.
+        transaction = tenant_input_guard(document)
+        transaction += members('motor_tenant', 'closed_taps', taps - ready) if has_sets else ''
         if net_document is not None:
             transaction += 'delete table inet motor_net\n'
         transaction += source + '\n' + members('motor_net', 'tenant_taps', ready)
         apply(transaction)
-        if policy_error is not None:
-            raise RuntimeError(f'FENCED: unsupported tenant policy; update helper and run --check: {policy_error}')
-        if ufw_error is not None:
-            raise RuntimeError(f'tenant UFW policy is fenced/unready: {ufw_error}')
-        if document is not None:
-            try:
-                reconcile_ufw(taps, prior, uplink=uplink)
-                # Rules match interface names, so a same-name replacement inherits
-                # them. Only root can rename interfaces; that case is out of scope.
-                validate_uplink(settings)
-            except (AssertionError, OSError, RuntimeError, ValueError):
-                apply(members('motor_tenant', 'closed_taps', taps) + members('motor_net', 'tenant_taps', set()))
-                raise
-            apply(members('motor_tenant', 'closed_taps', set()) + members('motor_net', 'tenant_taps', taps))
-            opened = True
-        if publish:
+        base_loaded = True
+        try:
             validate_uplink(settings)
-            readiness.publish()
-        print('PASS: motor_net loaded with guarded exact tenant delegation')
-        return settings, taps
+        except (OSError, RuntimeError, ValueError):
+            fence_all()
+            raise
     except BaseException:
         readiness.invalidate()
-        if opened:
-            apply(members('motor_tenant', 'closed_taps', taps) + members('motor_net', 'tenant_taps', set()))
         raise
+
+    # The base table and uplink are now valid. Tenant repair can fail without
+    # revoking outbound networking for this host's own mnet-* jobs.
+    if publish:
+        readiness.publish()
+    if good and inspected:
+        try:
+            healthy, failures = reconcile_ufw_taps(good, prior, uplink=uplink)
+            issues.update(failures)
+        except (AssertionError, OSError, RuntimeError, ValueError) as error:
+            healthy = ready
+            issues['tenant-policy'] = str(error)
+    else:
+        healthy = set()
+    try:
+        # Rules match names; root-only same-name replacement is out of scope.
+        # This is the last tenant-gate validation, not another host-job latch.
+        validate_uplink(settings)
+    except (OSError, RuntimeError, ValueError):
+        readiness.invalidate()
+        fence_all()
+        raise
+    if has_sets:
+        try:
+            apply(members('motor_tenant', 'closed_taps', taps - healthy)
+                  + members('motor_net', 'tenant_taps', healthy))
+        except (OSError, RuntimeError, ValueError) as error:
+            # The tenant transaction is isolated from the already loaded base.
+            # On an indeterminate tenant write, fence its affected scope only.
+            try:
+                fence_all()
+            except (OSError, RuntimeError, ValueError) as fence_error:
+                issues['tenant-fence'] = str(fence_error)
+            issues['tenant-policy'] = str(error)
+    for tenant, error in sorted(issues.items()):
+        print(f'FENCED tenant {tenant}: {error}')
+    print('PASS: motor_net base loaded; host job networking ready independently of tenant health')
+    return settings, taps

@@ -439,14 +439,11 @@ class TenantDelegationTests(unittest.TestCase):
                 patch.object(self.policy, 'TEMPLATE', source), \
                 patch.object(self.policy, 'table', side_effect=lambda family, name: tenant if name == 'motor_tenant' else net), \
                 patch.object(self.policy, 'apply', side_effect=writes.append), patch.object(self.policy, 'inspect_ufw', return_value=prior, side_effect=RuntimeError('UFW failure') if inspect_failure else None) as inspect, \
-                patch.object(self.policy, 'reconcile_ufw', side_effect=RuntimeError('UFW failure') if failure else None):
+                patch.object(self.policy, 'reconcile_ufw_taps', return_value=(set(), {'mtap1': 'UFW failure'}) if failure else ({'mtap1'}, {})):
             if late_failure or initial_failure:
                 error = ValueError('uplink disappeared before final gate')
-                self.validation.side_effect = [error] if initial_failure else [dict(uplink='enp6s0', public_ipv4='8.8.8.8'), error]
+                self.validation.side_effect = [error] if initial_failure else [dict(uplink='enp6s0', public_ipv4='8.8.8.8'), dict(uplink='enp6s0', public_ipv4='8.8.8.8'), error]
                 with self.assertRaisesRegex(ValueError, 'before final gate'):
-                    self.policy.load()
-            elif failure or inspect_failure:
-                with self.assertRaisesRegex(RuntimeError, 'UFW failure'):
                     self.policy.load()
             else:
                 self.policy.load()
@@ -497,19 +494,53 @@ class TenantDelegationTests(unittest.TestCase):
         reboot, _ = self.load_plan(None, None)
         self.assertNotIn('add element inet motor_net tenant_taps', ''.join(reboot))
         legacy = json.loads((self.root / 'test-fixtures/nft-motor-tenant-v1-capture.json').read_text())
-        with self.assertRaisesRegex(RuntimeError, 'unsupported tenant policy'):
-            self.load_plan(legacy, self.net)
-        self.assertFalse(self.policy.readiness.READY.exists())
+        fenced, _ = self.load_plan(legacy, self.net)
+        self.assertNotIn('add element inet motor_net tenant_taps', ''.join(fenced))
+        self.assertTrue(self.policy.readiness.READY.exists(), 'tenant policy failure must not strand host net jobs')
 
     def test_loader_ufw_failure_closes_tap_and_removes_delegation(self):
         writes, _ = self.load_plan(self.tenant, self.net, failure=True)
         self.assertEqual(writes[-1], 'flush set inet motor_tenant closed_taps\nadd element inet motor_tenant closed_taps { "mtap1" }\nflush set inet motor_net tenant_taps\n')
+        self.assertTrue(self.policy.readiness.READY.exists())
+
+    def test_tenant_ufw_failure_keeps_host_generation_and_other_tenant_working(self):
+        tenant = copy.deepcopy(self.tenant)
+        for entry in self.tenant['nftables']:
+            item = next(iter(entry.values()))
+            name = item.get('chain', item.get('name', '')) if isinstance(item, dict) else ''
+            if name.startswith('tenant_mtap1_'):
+                tenant['nftables'].append(json.loads(json.dumps(entry).replace('mtap1', 'mtap2').replace('10.200.1.2', '10.200.2.2')))
+        for entry in tenant['nftables']:
+            if entry.get('set', {}).get('name') == 'tenant_taps':
+                entry['set']['elem'] = ['mtap1', 'mtap2']
+            if entry.get('set', {}).get('name') == 'closed_taps':
+                entry['set']['elem'] = []
+        source = SimpleNamespace(read_text=lambda: self.source, lstat=lambda: SimpleNamespace(st_mode=0o100644, st_uid=0))
+        writes = []
+        def command(*args, **kwargs):
+            self.assertEqual(args[0], '/usr/sbin/ufw')
+            self.assertIn('mtap1', args)
+            raise RuntimeError('tenant mtap1 grant failed')
+        with patch.object(self.policy, 'network_lock', return_value=contextlib.nullcontext()), \
+                patch.object(self.policy, 'SOURCE', source), patch.object(self.policy, 'TEMPLATE', source), \
+                patch.object(self.policy, 'table', side_effect=lambda family, name: tenant if name == 'motor_tenant' else self.net), \
+                patch.object(self.policy, 'apply', side_effect=writes.append), \
+                patch.object(self.policy, 'inspect_ufw', return_value=({'mtap2'}, {'mtap2'})), \
+                patch.object(self.policy, 'command', side_effect=command):
+            self.policy.load()
+        self.assertTrue(self.policy.readiness.READY.exists(), 'base job readiness must survive tenant UFW failure')
+        self.assertIn('table inet motor_net', writes[0])
+        self.assertIn('iifname "mnet-*" oifname "enp6s0"', writes[0])
+        self.assertIn('closed_taps { "mtap1" }', writes[-1])
+        self.assertIn('add element inet motor_net tenant_taps { "mtap2" }', writes[-1])
+        self.assertNotIn('add element inet motor_net tenant_taps { "mtap1" }', writes[-1])
 
     def test_loader_cannot_open_tenant_when_ufw_inspection_fails(self):
         writes, _ = self.load_plan(self.tenant, self.net, inspect_failure=True)
-        self.assertEqual(len(writes), 1)
+        self.assertEqual(len(writes), 2)
         self.assertIn('add element inet motor_tenant closed_taps { "mtap1" }', writes[0])
         self.assertNotIn('add element inet motor_net tenant_taps', writes[0])
+        self.assertTrue(self.policy.readiness.READY.exists())
 
     def test_unknown_ufw_status_and_widened_return_state_are_not_assumed_safe(self):
         with patch.object(self.policy, 'read_owned', return_value=''), patch.object(self.policy, 'command', return_value='unavailable'):
