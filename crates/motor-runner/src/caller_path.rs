@@ -7,6 +7,8 @@ use motor_protocol::{Prepare, Run, SiblingSnapshot};
 use std::path::Path;
 use std::{fs, io, path::PathBuf};
 pub(crate) mod catalog;
+// Caller roots are only mapped on Linux, so only Linux runners forget them.
+#[cfg(target_os = "linux")]
 pub(crate) mod forget;
 pub(crate) mod owner;
 pub(crate) mod startup;

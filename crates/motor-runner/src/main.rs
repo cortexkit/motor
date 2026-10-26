@@ -373,7 +373,15 @@ fn forget_caller_root_args(args: Vec<String>) -> io::Result<()> {
     config.isolate_jobs = cfg!(target_os = "linux");
     config.build_slot_root = data.join("cortexkit/motor-build-slots");
     let _ = configure_options(&mut config, serve.into_iter())?;
-    motor_runner::forget_caller_root(&config, &prefix).map(|_| ())
+    #[cfg(target_os = "linux")]
+    return motor_runner::forget_caller_root(&config, &prefix).map(|_| ());
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (config, prefix);
+        Err(io::Error::other(
+            "forget-caller-root is only supported on Linux runners, where caller roots are mapped",
+        ))
+    }
 }
 
 /// `check-javascript-setup --scratch DIR [--tenant-vm] [--boat-profile]`:

@@ -204,15 +204,19 @@ fn check_live_units(config: &Config) -> io::Result<()> {
     if !config.isolate_jobs {
         return Ok(());
     }
-    let live = crate::backend::live_job_units(config)?;
-    if !live.is_empty() {
-        let mut names: Vec<_> = live.into_iter().collect();
-        names.sort();
-        return Err(invalid(format!(
-            "forget-caller-root refuses while {} live job units exist: {}",
-            names.len(),
-            names.join(", ")
-        )));
+    // Job units exist only under the Linux system manager.
+    #[cfg(target_os = "linux")]
+    {
+        let live = crate::backend::live_job_units(config)?;
+        if !live.is_empty() {
+            let mut names: Vec<_> = live.into_iter().collect();
+            names.sort();
+            return Err(invalid(format!(
+                "forget-caller-root refuses while {} live job units exist: {}",
+                names.len(),
+                names.join(", ")
+            )));
+        }
     }
     Ok(())
 }
