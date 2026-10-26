@@ -14,6 +14,12 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = 'script/runner/journald/60-motor-retention.conf'
 DEST = '/etc/systemd/journald.conf.d/60-motor-retention.conf'
+# The build server and tenant images install 60-motor-retention.conf. Boat's
+# base image (the provider's Ubuntu image) ships a journald drop-in that sorts
+# after that name and sets a shorter retention, so the prepared Boat image
+# installs the same 60-motor-retention.conf contents as zz-motor-retention.conf,
+# which sorts after names starting with a digit or a lowercase letter.
+BOAT_DEST = '/etc/systemd/journald.conf.d/zz-motor-retention.conf'
 INOTIFY = '/etc/sysctl.d/60-motor-inotify.conf'
 
 
@@ -50,7 +56,7 @@ class JournalRetentionTests(unittest.TestCase):
     def install(self, *args, **kwargs):
         if args[0] == 'install':
             self.assertEqual(('install', '-D', '-o', 'root', '-g', 'root', '-m', '0644',
-                              str(ROOT / SOURCE), DEST), args)
+                              str(ROOT / SOURCE), getattr(self, 'dest', DEST)), args)
             # Assert the deployment ownership above, but keep fixture files owned
             # by the test user so these tests need no root privileges.
             subprocess.run(['install', '-D', '-m', '0644', args[-2],
@@ -70,20 +76,23 @@ class JournalRetentionTests(unittest.TestCase):
 
     def test_boat_installs_restarts_and_checks_effective_retention(self):
         boat = module('retention_boat', 'script/boat-image/install.py')
+        self.dest = BOAT_DEST
+        self.assertEqual(BOAT_DEST, boat.JOURNAL_RETENTION_DROP_IN)
         self.config = '# /etc/systemd/journald.conf\n[Journal]\nMaxRetentionSec=30day\n' + (ROOT / SOURCE).read_text()
         with patch.object(boat, 'run', side_effect=self.install) as run:
             boat.install_journal_retention()
-        self.assertEqual([('install', '-D', '-o', 'root', '-g', 'root', '-m', '0644', str(ROOT / SOURCE), DEST),
+        self.assertEqual([('install', '-D', '-o', 'root', '-g', 'root', '-m', '0644', str(ROOT / SOURCE), BOAT_DEST),
                           ('systemctl', 'restart', 'systemd-journald'),
                           ('systemd-analyze', 'cat-config', 'systemd/journald.conf')],
                          [call.args for call in run.call_args_list])
         self.assertTrue(run.call_args.kwargs['capture'])
-        self.assert_installed()
+        self.assert_installed(dest=BOAT_DEST)
         main = (ROOT / 'script/boat-image/install.py').read_text().split('def main():', 1)[1]
         self.assertLess(main.index('    install_journal_retention()'), main.index('parity.check('))
 
     def test_boat_refuses_missing_retention_and_later_overrides(self):
         boat = module('retention_boat_invalid', 'script/boat-image/install.py')
+        self.dest = BOAT_DEST
         for config in ('[Journal]\n', '[Journal]\n# MaxRetentionSec=14day\n',
                        '[Other]\nMaxRetentionSec=14day\n',
                        '[Journal]\nMaxRetentionSec=14day\nMaxRetentionSec=30day\n',

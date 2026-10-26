@@ -1303,6 +1303,34 @@ class AptInstallTests(unittest.TestCase):
                 self.assertIn(package, command)
 
 
+class JournalRetentionTests(unittest.TestCase):
+    """journald reads drop-ins from all its configuration directories sorted
+    together by file name, and the file sorted last sets a single-value option.
+    Boat's base image ships a drop-in setting MaxRetentionSec=7day, so the
+    installer must name the file that wins and refuse a later override."""
+
+    BASE = "# /etc/systemd/journald.conf\n[Journal]\n#MaxRetentionSec=0\n\n"
+
+    def test_a_later_drop_in_overrides_and_is_named(self):
+        config = (self.BASE + "# /etc/systemd/journald.conf.d/60-motor-retention.conf\n[Journal]\n"
+                  "MaxRetentionSec=14day\n\n# /usr/lib/systemd/journald.conf.d/boat.conf\n[Journal]\nMaxRetentionSec=7day\n")
+        self.assertEqual(install.effective_journal_retention(config),
+                         ("7day", "/usr/lib/systemd/journald.conf.d/boat.conf"))
+        with patch.object(install, "run", side_effect=lambda *c, **k: config if c[:1] == ("systemd-analyze",) else ""):
+            with self.assertRaisesRegex(ValueError, "observed '7day' set by /usr/lib/systemd/journald.conf.d/boat.conf"):
+                install.install_journal_retention()
+
+    def test_the_motor_drop_in_sorts_after_base_image_drop_ins(self):
+        name = Path(install.JOURNAL_RETENTION_DROP_IN).name
+        for base in ("boat.conf", "99-boat.conf", "60-motor-retention.conf", "syslog.conf"):
+            self.assertGreater(name, base)
+        config = (self.BASE + "# /usr/lib/systemd/journald.conf.d/boat.conf\n[Journal]\nMaxRetentionSec=7day\n\n"
+                  f"# {install.JOURNAL_RETENTION_DROP_IN}\n[Journal]\nMaxRetentionSec=14day\n")
+        with patch.object(install, "run", side_effect=lambda *c, **k: config if c[:1] == ("systemd-analyze",) else "") as run:
+            install.install_journal_retention()
+        self.assertIn(install.JOURNAL_RETENTION_DROP_IN, run.call_args_list[0].args)
+
+
 class PnpmInstallTests(unittest.TestCase):
     """pnpm is installed from its pinned registry release by the shared npm
     global tree installer, not by `npm install --global`: npm creates the tree
