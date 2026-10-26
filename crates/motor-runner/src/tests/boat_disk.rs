@@ -552,7 +552,7 @@ fn boat_workspace_trash_uses_workspace_mount_not_state_mount() {
     assert!(runner.boat_workspace_trash(&f.scratch).is_err());
     assert!(crate::writer::validate_paths(
         runner.config(),
-        text(&trash.join("job")),
+        crate::caller_path::host(&trash.join("job")),
         None,
         &[],
         &[],

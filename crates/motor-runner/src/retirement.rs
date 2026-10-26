@@ -118,7 +118,10 @@ impl Runner {
             }
         };
         let siblings = |siblings: &[SiblingSnapshot]| -> Vec<String> {
-            siblings.iter().map(|s| s.canonical_path.clone()).collect()
+            siblings
+                .iter()
+                .map(|s| crate::caller_path::sibling(s).caller.text().clone())
+                .collect()
         };
         // A retained job (finished within the 24-hour retention, or still
         // queued, fetching or running) may still read the mirror: a rerun,
@@ -132,8 +135,13 @@ impl Runner {
                 .flatten()
                 .max()
                 .unwrap_or(0);
-            for repository in
-                std::iter::once(request.repository_root.clone()).chain(siblings(&request.siblings))
+            for repository in std::iter::once(
+                crate::caller_path::request(request)
+                    .caller_repository_root
+                    .text()
+                    .clone(),
+            )
+            .chain(siblings(&request.siblings))
             {
                 touch(&repository, at, Some("retained job"));
             }
@@ -141,8 +149,10 @@ impl Runner {
         // Checkouts are `git clone --shared`: their objects/info/alternates
         // points into the mirror. A Head workspace is retired with its
         // repository; any other workspace keeps the mirror until it expires.
-        for (key, w) in &inner.catalog.workspaces {
-            let blocked = if Self::deleting(inner, key, &[]) {
+        for (key, w) in crate::caller_path::entries(&inner.catalog.workspaces)
+            .map(|(path, record)| (path.caller.text(), record))
+        {
+            let blocked = if Self::deleting(inner, crate::caller_path::host_str(key), &[]) {
                 Some("workspace being dropped")
             } else if w.kind == WorkspaceKind::Head {
                 None
@@ -168,8 +178,13 @@ impl Runner {
             }
         }
         for p in inner.preparing.values() {
-            for repository in
-                std::iter::once(p.repository_root.clone()).chain(siblings(&p.siblings))
+            for repository in std::iter::once(
+                crate::caller_path::request(p)
+                    .caller_repository_root
+                    .text()
+                    .clone(),
+            )
+            .chain(siblings(&p.siblings))
             {
                 touch(&repository, now, Some("prepare"));
             }
@@ -180,8 +195,13 @@ impl Runner {
             }
         }
         for r in inner.admitting.values() {
-            for repository in
-                std::iter::once(r.repository_root.clone()).chain(siblings(&r.siblings))
+            for repository in std::iter::once(
+                crate::caller_path::request(r)
+                    .caller_repository_root
+                    .text()
+                    .clone(),
+            )
+            .chain(siblings(&r.siblings))
             {
                 touch(&repository, now, Some("admission"));
             }
@@ -191,7 +211,9 @@ impl Runner {
         }
         // A warm-build record retires with its repository unless a fill is
         // running; its unfinished base job is a retained job above.
-        for (root, record) in &inner.catalog.repositories {
+        for (root, record) in crate::caller_path::entries(&inner.catalog.repositories)
+            .map(|(path, record)| (path.caller.text(), record))
+        {
             let building = record.result.as_ref() == Some(&RebuildResult::Building);
             touch(
                 root,
@@ -206,8 +228,10 @@ impl Runner {
         // flight. The repository's own Head workspaces retire with it.
         let claims = (!inner.catalog.sibling_commits.is_empty())
             .then(|| sibling_eviction::PathClaims::of(inner));
-        for path in inner.catalog.sibling_commits.keys() {
-            let checkout = sibling_eviction::Spelled::new(path);
+        for path in
+            crate::caller_path::keys(&inner.catalog.sibling_commits).map(|path| path.caller.text())
+        {
+            let checkout = sibling_eviction::Spelled::new(crate::caller_path::host_str(path));
             let held = claims.as_ref().is_some_and(|claims| {
                 checkout.unresolved()
                     || claims.live_overlaps(&checkout)
@@ -255,20 +279,22 @@ impl Runner {
         let mut removed = Vec::new();
         let mut discarded = BTreeSet::new();
         for repository in repositories {
-            let heads: Vec<_> = inner
-                .catalog
-                .workspaces
-                .iter()
+            let heads: Vec<_> = crate::caller_path::entries(&inner.catalog.workspaces)
                 .filter(|(_, w)| w.kind == WorkspaceKind::Head && &w.repository == repository)
-                .map(|(key, _)| key.clone())
+                .map(|(key, _)| (key.caller.text().clone(), key.host.as_path().to_path_buf()))
                 .collect();
-            for key in heads {
-                self.discard_dependent(&key, "head workspace", &mut discarded, &mut removed)?;
+            for (key, host) in heads {
+                self.discard_dependent(
+                    crate::caller_path::host(&host),
+                    "head workspace",
+                    &mut discarded,
+                    &mut removed,
+                )?;
                 inner.catalog.workspaces.remove(&key);
             }
             if inner.catalog.sibling_commits.contains_key(repository) {
                 self.discard_dependent(
-                    repository,
+                    crate::caller_path::identity(repository).host,
                     "sibling checkout",
                     &mut discarded,
                     &mut removed,
@@ -277,18 +303,20 @@ impl Runner {
             }
             if let Some(record) = inner.catalog.repositories.get(repository) {
                 // The warm build's own checkout, derived as `queue_base` does.
-                if let Some(parent) = record
-                    .desired
-                    .as_ref()
-                    .and_then(|d| Path::new(&d.workspace).parent().map(Path::to_path_buf))
-                {
+                if let Some(parent) = record.desired.as_ref().and_then(|d| {
+                    crate::caller_path::base(d)
+                        .host
+                        .as_path()
+                        .parent()
+                        .map(Path::to_path_buf)
+                }) {
                     let checkout = parent.join(format!(
                         ".motor-base-{}-{}",
                         self.core.config.instance,
                         workspace::name(repository)
                     ));
                     self.discard_dependent(
-                        &checkout.to_string_lossy(),
+                        crate::caller_path::host(&checkout),
                         "warm-build checkout",
                         &mut discarded,
                         &mut removed,
@@ -351,17 +379,19 @@ impl Runner {
     /// after checking it lies under the owned workspace roots.
     fn discard_dependent(
         &self,
-        path: &str,
+        path: crate::caller_path::HostPath<'_>,
         what: &str,
         discarded: &mut BTreeSet<String>,
         removed: &mut Vec<String>,
     ) -> io::Result<()> {
-        if !discarded.insert(path.to_owned()) || fs::symlink_metadata(path).is_err() {
+        let spelling = path.as_path().to_string_lossy();
+        if !discarded.insert(spelling.to_string()) || fs::symlink_metadata(path.as_path()).is_err()
+        {
             return Ok(());
         }
         self.validate_destinations(path, None, &[])?;
-        self.discard(Path::new(path))?;
-        removed.push(format!("{what} {path}"));
+        self.discard(path.as_path())?;
+        removed.push(format!("{what} {spelling}"));
         Ok(())
     }
 }

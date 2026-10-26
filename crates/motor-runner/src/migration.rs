@@ -18,15 +18,20 @@ pub(super) fn identify_legacy_checkouts(
     {
         if let Some(request) = &job.request {
             catalog.legacy_checkouts.insert(
-                request.cwd.clone(),
+                crate::caller_path::run(request).caller_cwd.text().clone(),
                 LegacyCheckout {
-                    repository: request.repository_root.clone(),
+                    repository: crate::caller_path::request(request)
+                        .caller_repository_root
+                        .text()
+                        .clone(),
                     tip: Some(request.integration_tip.clone()).filter(|tip| !tip.is_empty()),
                 },
             );
         }
     }
-    for (root, repository) in &mut catalog.repositories {
+    for (root, repository) in crate::caller_path::entries_mut(&mut catalog.repositories)
+        .map(|(path, record)| (path.caller.text(), record))
+    {
         if repository.requested_descriptor.is_some() {
             continue;
         }
@@ -44,9 +49,8 @@ pub(super) fn identify_legacy_checkouts(
                 checkout.tip = tip.clone();
             }
         }
-        let workspaces = catalog
-            .workspaces
-            .iter()
+        let workspaces = crate::caller_path::entries(&catalog.workspaces)
+            .map(|(path, record)| (path.caller.text(), record))
             .filter(|(_, workspace)| workspace.repository == *root)
             .map(|(path, _)| path.as_str())
             .chain(
@@ -88,8 +92,9 @@ impl Runner {
             .catalog
             .legacy_checkouts
             .clone();
-        for path in pending.keys() {
-            match self.retire_legacy_path(Path::new(path)) {
+        for plan in crate::caller_path::keys(&pending) {
+            let path = plan.caller.text();
+            match self.retire_legacy_path(plan.host.as_path()) {
                 Ok(()) => {
                     let mut inner = self.core.inner.lock().unwrap();
                     inner.catalog.legacy_checkouts.remove(path);

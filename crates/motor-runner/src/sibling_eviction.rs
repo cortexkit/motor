@@ -57,7 +57,9 @@ impl SnapshotReferences {
         let mut add = |siblings: &[SiblingSnapshot]| {
             for sibling in siblings {
                 commits
-                    .entry(workspace::name(&sibling.canonical_path))
+                    .entry(workspace::name(
+                        crate::caller_path::sibling(sibling).caller.text(),
+                    ))
                     .or_default()
                     .insert(sibling.commit.clone());
             }
@@ -190,7 +192,11 @@ impl Runner {
         let root = self.core.config.sibling_snapshots_dir();
         let repositories: BTreeSet<_> = siblings
             .iter()
-            .map(|sibling| root.join(workspace::name(&sibling.canonical_path)))
+            .map(|sibling| {
+                root.join(workspace::name(
+                    crate::caller_path::sibling(sibling).caller.text(),
+                ))
+            })
             .collect();
         for repository in repositories {
             self.trim_sibling_snapshots(&repository, None);
@@ -280,12 +286,15 @@ impl Runner {
             .filter(|job| Self::legacy_sibling_user(&inner, job))
             .filter_map(|job| job.request.as_ref())
             .flat_map(|request| &request.siblings)
-            .map(|sibling| Spelled::new(&sibling.canonical_path))
+            .map(|sibling| Spelled::new(crate::caller_path::sibling(sibling).host))
             .collect();
-        let paths: Vec<String> = inner.catalog.sibling_commits.keys().cloned().collect();
+        let paths: Vec<String> = crate::caller_path::keys(&inner.catalog.sibling_commits)
+            .map(|path| path.caller.text())
+            .cloned()
+            .collect();
         let mut changed = false;
         for path in paths {
-            let checkout = Spelled::new(&path);
+            let checkout = Spelled::new(crate::caller_path::host_str(&path));
             if checkout.unresolved() {
                 // The path cannot be resolved, so a workspace might be
                 // there under another spelling: keep it.
@@ -310,7 +319,9 @@ impl Runner {
                 // Discarding it would take a nested workspace with it.
                 continue;
             }
-            if let Err(error) = self.validate_destinations(&path, None, &[]) {
+            if let Err(error) =
+                self.validate_destinations(crate::caller_path::host_str(&path), None, &[])
+            {
                 tracing::warn!(path, %error, "legacy sibling checkout is not under an owned workspace root; leaving it in place");
                 inner.catalog.sibling_commits.remove(&path);
                 changed = true;
@@ -349,10 +360,10 @@ pub(super) struct Spelled {
 }
 
 impl Spelled {
-    pub(super) fn new(path: &str) -> Self {
+    pub(super) fn new(path: crate::caller_path::HostPath<'_>) -> Self {
         Self {
-            lexical: PathBuf::from(path),
-            resolved: workspace::destination(Path::new(path)).ok(),
+            lexical: path.as_path().to_path_buf(),
+            resolved: workspace::destination(path.as_path()).ok(),
         }
     }
 
@@ -386,37 +397,54 @@ pub(super) struct PathClaims {
 
 impl PathClaims {
     pub(super) fn of(inner: &Inner) -> Self {
-        let workspaces = inner
-            .catalog
-            .workspaces
-            .iter()
+        let workspaces = crate::caller_path::entries(&inner.catalog.workspaces)
             .map(|(key, workspace)| {
                 (
-                    Spelled::new(key),
-                    workspace.repository.clone(),
+                    Spelled::new(key.host),
+                    crate::caller_path::workspace_record(workspace)
+                        .repository
+                        .caller
+                        .text()
+                        .clone(),
                     workspace.kind,
                 )
             })
             .collect();
-        let mut live: Vec<&str> = Vec::new();
+        let mut live = Vec::new();
         for job in inner.jobs.values() {
             if let (true, Some(request)) = (SnapshotReferences::live(inner, job), &job.request) {
-                live.push(&request.workspace_key);
-                live.push(&request.cwd);
+                let plan = crate::caller_path::request(request);
+                if workspace::absolute(plan.caller_workspace_key.text()) {
+                    live.push(plan.host_workspace);
+                }
+                live.push(crate::caller_path::run(request).host_cwd);
             }
         }
-        live.extend(inner.reserved.keys().map(String::as_str));
+        live.extend(crate::caller_path::keys(&inner.reserved).map(|path| path.host));
         for request in inner.admitting.values() {
-            live.push(&request.workspace_key);
-            live.push(&request.cwd);
+            let plan = crate::caller_path::request(request);
+            if workspace::absolute(plan.caller_workspace_key.text()) {
+                live.push(plan.host_workspace);
+            }
+            live.push(crate::caller_path::run(request).host_cwd);
         }
-        live.extend(inner.preparing.values().map(|r| r.workspace_key.as_str()));
-        live.extend(inner.dropping.iter().map(String::as_str));
+        live.extend(
+            inner
+                .preparing
+                .values()
+                .map(|r| crate::caller_path::request(r).host_workspace),
+        );
+        live.extend(
+            inner
+                .dropping
+                .iter()
+                .map(|path| crate::caller_path::identity(path).host),
+        );
         let live = live
             .into_iter()
             // Warm-build keys (`base:<root>`) and requests without a
             // workspace name no host path.
-            .filter(|path| workspace::absolute(path))
+            .filter(|path| workspace::absolute(&path.as_path().to_string_lossy()))
             .map(Spelled::new)
             .collect();
         Self { workspaces, live }
