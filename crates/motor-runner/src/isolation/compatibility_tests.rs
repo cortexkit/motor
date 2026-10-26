@@ -1,5 +1,6 @@
 //! Pins sandbox argv and bind planning for unchanged caller paths.
 use super::*;
+use crate::compatibility_config::{assert_identity, configure, modes};
 
 // Keep the original capture's shared Cargo home equal to the sandbox's private
 // Cargo home. Both sides of each registry/git bind must retain that spelling.
@@ -64,9 +65,22 @@ fn assert_golden(actual: &str, expected: &str) {
 
 #[test]
 fn users_sandbox_argv_matches_pre_mapping_bytes() {
+    for &enabled in modes() {
+        users_sandbox_argv_case(enabled);
+    }
+}
+
+fn users_sandbox_argv_case(enabled: bool) {
     let f = Fixture::new();
-    let workspace = Path::new("/Users/u/repo");
+    let mut config = crate::Config::new("/state-root", "main");
+    configure(&mut config, &f.scratch, enabled);
+    let spelling = "/Users/u/repo".to_string();
+    let plan = crate::caller_path::identity(&spelling);
+    assert_identity(&config, plan);
+    let workspace = plan.host.as_path();
     let mut sandbox = f.command_sandbox();
+    sandbox.tenant_vm = config.tenant_vm;
+    sandbox.boat_profile = config.boat_profile;
     sandbox.read_only = vec![
         "/usr".into(),
         "/etc/passwd".into(),
@@ -101,15 +115,26 @@ fn users_sandbox_argv_matches_pre_mapping_bytes() {
 
 #[test]
 fn users_sibling_bind_list_matches_pre_mapping_bytes() {
+    for &enabled in modes() {
+        users_sibling_bind_list_case(enabled);
+    }
+}
+
+fn users_sibling_bind_list_case(enabled: bool) {
     let f = Fixture::new();
-    let config = crate::engine::Config::new("/state-root", "main");
-    let workspace = Path::new("/Users/u/repo");
+    let mut config = crate::engine::Config::new("/state-root", "main");
+    configure(&mut config, &f.scratch, enabled);
+    let spelling = "/Users/u/repo".to_string();
+    let plan = crate::caller_path::identity(&spelling);
+    assert_identity(&config, plan);
+    let workspace = plan.host.as_path();
     let siblings = [SiblingSnapshot {
         canonical_path: "/Users/u/libraries/library".into(),
         commit: "1111111111111111111111111111111111111111".into(),
         tree_hash: "2222222222222222222222222222222222222222".into(),
         base_commit: None,
     }];
+    assert_identity(&config, crate::caller_path::sibling(&siblings[0]));
     let snapshots = SnapshotSiblings {
         config: &config,
         siblings: vec![(
@@ -136,7 +161,22 @@ fn users_sibling_bind_list_matches_pre_mapping_bytes() {
 
 #[test]
 fn identity_prepared_bind_list_matches_pre_mapping_bytes() {
+    for &enabled in modes() {
+        identity_prepared_bind_list_case(enabled);
+    }
+}
+
+fn identity_prepared_bind_list_case(enabled: bool) {
     let f = Fixture::new();
+    let mut config = crate::Config::new(
+        f.state.parent().unwrap(),
+        f.state.file_name().unwrap().to_str().unwrap(),
+    );
+    config.build_slot_root = f.state.join("slots");
+    configure(&mut config, &f.scratch, enabled);
+    let spelling = f.workspace.to_str().unwrap().to_string();
+    let plan = crate::caller_path::identity(&spelling);
+    assert_identity(&config, plan);
     fs::create_dir_all(f.workspace.join("src")).unwrap();
     fs::write(f.workspace.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
     fs::write(
@@ -169,21 +209,21 @@ fn identity_prepared_bind_list_matches_pre_mapping_bytes() {
     with_capture_host(|| {
         let sandbox = Sandbox::prepare_role(
             Uuid::now_v7(),
-            &f.state,
-            &f.workspace,
+            &config.state_dir(),
+            plan.host.as_path(),
             &target,
             &siblings,
             None,
-            &f.state.join("slots"),
+            &config.build_slot_root,
             1,
             &BTreeMap::new(),
             &tree,
-            f.workspace.to_str().unwrap(),
+            plan.caller.text(),
             false,
-            false,
+            config.tenant_vm,
             false,
             None,
-            &JavascriptTools::for_role(ToolchainRole::BuildServer),
+            &JavascriptTools::for_config(&config),
             None,
         )
         .unwrap();

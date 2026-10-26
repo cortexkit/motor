@@ -171,7 +171,11 @@ fn terminal_writer_without_checkout_does_not_fence_its_parent_workspace() {
         .insert(job.id, job.clone());
     assert!(!Path::new(&request.cwd).exists());
     runner
-        .validate_writer_paths(&f.key, Some(&f.key), &[])
+        .validate_writer_paths(
+            crate::caller_path::host_str(&f.key),
+            Some(&f.key).map(|p| crate::caller_path::host_str(p)),
+            &[],
+        )
         .unwrap();
     job.terminal = None;
     runner
@@ -182,12 +186,20 @@ fn terminal_writer_without_checkout_does_not_fence_its_parent_workspace() {
         .jobs
         .insert(job.id, job.clone());
     assert!(runner
-        .validate_writer_paths(&f.key, Some(&f.key), &[])
+        .validate_writer_paths(
+            crate::caller_path::host_str(&f.key),
+            Some(crate::caller_path::host_str(&f.key)),
+            &[]
+        )
         .is_err());
     job.terminal(Outcome::OutcomeUnknown, runner.now());
     runner.core.inner.lock().unwrap().jobs.insert(job.id, job);
     fs::create_dir_all(&request.cwd).unwrap();
     assert!(runner
-        .validate_writer_paths(&f.key, Some(&f.key), &[])
+        .validate_writer_paths(
+            crate::caller_path::host_str(&f.key),
+            Some(crate::caller_path::host_str(&f.key)),
+            &[]
+        )
         .is_err());
 }

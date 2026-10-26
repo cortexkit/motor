@@ -95,8 +95,8 @@ fn contains_base_checkout(path: &Path, prefix: &str) -> io::Result<bool> {
 
 pub(crate) fn validate_paths(
     config: &Config,
-    workspace: &str,
-    cwd: Option<&str>,
+    workspace: crate::caller_path::HostPath<'_>,
+    cwd: Option<crate::caller_path::HostPath<'_>>,
     siblings: &[SiblingSnapshot],
     known_checkouts: &[PathBuf],
 ) -> io::Result<()> {
@@ -105,12 +105,12 @@ pub(crate) fn validate_paths(
         known_checkouts,
         std::iter::once(workspace)
             .chain(cwd)
-            .chain(siblings.iter().map(|s| s.canonical_path.as_str()))
+            .chain(siblings.iter().map(|s| crate::caller_path::sibling(s).host))
             .map(|path| {
-                let canonical = canonical_future(Path::new(path)).map_err(|error| {
-                    Unreadable::wrap(Path::new(path), "resolving symlinks in the path", error)
+                let canonical = canonical_future(path.as_path()).map_err(|error| {
+                    Unreadable::wrap(path.as_path(), "resolving symlinks in the path", error)
                 })?;
-                Ok((PathBuf::from(path), canonical))
+                Ok((path.as_path().to_path_buf(), canonical))
             }),
     )
 }

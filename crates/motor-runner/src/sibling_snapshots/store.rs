@@ -480,7 +480,7 @@ impl SnapshotStore {
         // files keep the predecessor's mtimes; otherwise it clones the mirror.
         trees.sync_workspace(
             &key.repository,
-            temporary,
+            crate::caller_path::host(temporary),
             &key.commit,
             tree_hash,
             &key.caller,

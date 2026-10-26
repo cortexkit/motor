@@ -5,7 +5,10 @@ mod backend;
 mod boat_quota;
 #[cfg(target_os = "linux")]
 mod boat_quota_events;
+mod caller_path;
 mod cleanup;
+#[cfg(all(test, unix))]
+mod compatibility_config;
 #[cfg(any(target_os = "linux", test))]
 mod compile_cache;
 mod cpu;
@@ -77,6 +80,7 @@ mod writer;
 pub use writer::CacheFill;
 
 pub use backend::BackendKind;
+pub use caller_path::CallerRoot;
 pub use engine::{Config, Runner, BOAT_DISK_RESERVE_BYTES, DEFAULT_FREE_SPACE_FLOOR_BYTES};
 #[cfg(target_os = "linux")]
 pub use privilege::run_helpers_directly_as_root;

@@ -159,9 +159,8 @@ impl Runner {
                 )),
             }));
         }
-        workspace::validate(
-            &r.workspace_key,
-            &r.repository_root,
+        workspace::validate_request(
+            crate::caller_path::request(r),
             &r.siblings,
             self.core.config.sibling_snapshot_mode(),
         )?;
@@ -179,8 +178,7 @@ impl Runner {
         };
         if let Some(detail) = nested_workspace_detail(
             &self.core.inner.lock().unwrap(),
-            &r.workspace_key,
-            &r.repository_root,
+            crate::caller_path::request(r),
             &r.siblings,
         ) {
             return Ok(Err(refusal(
@@ -189,7 +187,11 @@ impl Runner {
                 detail,
             )));
         }
-        if let Err(error) = self.validate_writer_paths(&r.workspace_key, None, &r.siblings) {
+        if let Err(error) = self.validate_writer_paths(
+            crate::caller_path::request(r).host_workspace,
+            None,
+            &r.siblings,
+        ) {
             return Ok(Err(refusal(
                 RefusalReason::WorkspaceKeyRejected,
                 None,
@@ -220,7 +222,7 @@ impl Runner {
         }
         let mut inner = self.core.inner.lock().unwrap();
         if let Some(detail) =
-            nested_workspace_detail(&inner, &r.workspace_key, &r.repository_root, &r.siblings)
+            nested_workspace_detail(&inner, crate::caller_path::request(r), &r.siblings)
         {
             return Ok(Err(refusal(
                 RefusalReason::WorkspaceSetupFailed,
@@ -235,8 +237,11 @@ impl Runner {
                 "runner_draining".into(),
             )));
         }
-        if Self::deleting(&inner, &r.workspace_key, &r.siblings)
-            || self.dependencies_evicting(&inner, &r.git_dependencies)
+        if Self::deleting(
+            &inner,
+            crate::caller_path::request(r).host_workspace,
+            &r.siblings,
+        ) || self.dependencies_evicting(&inner, &r.git_dependencies)
             || inner.transfers.contains(&r.transfer_id)
         {
             return Ok(Err(refusal(
@@ -369,22 +374,30 @@ impl Runner {
         ];
         // Source/sibling paths remain protected for task cleanup. A recorded head
         // owns its checkout in both roles, so only active ownership protects it.
-        let mut passive: Vec<_> = inner
-            .catalog
-            .repositories
-            .keys()
-            .map(PathBuf::from)
-            .chain(inner.catalog.sibling_commits.keys().map(PathBuf::from))
+        let mut passive: Vec<_> = crate::caller_path::keys(&inner.catalog.repositories)
+            .chain(crate::caller_path::keys(&inner.catalog.sibling_commits))
+            .map(|path| path.host.as_path().to_path_buf())
             .collect();
         passive.extend(passive.clone().iter().filter_map(|p| p.canonicalize().ok()));
         for job in inner.jobs.values() {
             if let Some(r) = &job.request {
                 if job.base {
-                    protected.push(PathBuf::from(&r.cwd));
+                    protected.push(crate::caller_path::run(r).host_cwd.as_path().to_path_buf());
                 }
                 if job.terminal.is_none() || inner.starting.contains(&job.id) {
-                    protected.push(PathBuf::from(&r.workspace_key));
-                    protected.extend(r.siblings.iter().map(|s| PathBuf::from(&s.canonical_path)));
+                    if !job.base {
+                        protected.push(
+                            crate::caller_path::request(r)
+                                .host_workspace
+                                .as_path()
+                                .to_path_buf(),
+                        );
+                    }
+                    protected.extend(
+                        r.siblings
+                            .iter()
+                            .map(|s| crate::caller_path::sibling(s).host.as_path().to_path_buf()),
+                    );
                 }
                 if job.terminal.is_none()
                     || inner.starting.contains(&job.id)
@@ -398,13 +411,28 @@ impl Runner {
                 }
             }
         }
-        for (key, r) in &inner.reserved {
-            protected.push(PathBuf::from(key));
-            protected.extend(r.siblings.iter().map(|s| PathBuf::from(&s.canonical_path)));
+        for (key, r) in crate::caller_path::entries(&inner.reserved) {
+            if workspace::absolute(key.caller.text()) {
+                protected.push(key.host.as_path().to_path_buf());
+            }
+            protected.extend(
+                r.siblings
+                    .iter()
+                    .map(|s| crate::caller_path::sibling(s).host.as_path().to_path_buf()),
+            );
         }
         for r in inner.admitting.values() {
-            protected.push(PathBuf::from(&r.workspace_key));
-            protected.extend(r.siblings.iter().map(|s| PathBuf::from(&s.canonical_path)));
+            protected.push(
+                crate::caller_path::request(r)
+                    .host_workspace
+                    .as_path()
+                    .to_path_buf(),
+            );
+            protected.extend(
+                r.siblings
+                    .iter()
+                    .map(|s| crate::caller_path::sibling(s).host.as_path().to_path_buf()),
+            );
             dependency_roots.extend(
                 r.git_dependencies
                     .iter()
@@ -417,10 +445,24 @@ impl Runner {
                     .iter()
                     .map(|d| self.core.trees.dependency_mirror(&d.url)),
             );
-            protected.push(PathBuf::from(&r.workspace_key));
-            protected.extend(r.siblings.iter().map(|s| PathBuf::from(&s.canonical_path)));
+            protected.push(
+                crate::caller_path::request(r)
+                    .host_workspace
+                    .as_path()
+                    .to_path_buf(),
+            );
+            protected.extend(
+                r.siblings
+                    .iter()
+                    .map(|s| crate::caller_path::sibling(s).host.as_path().to_path_buf()),
+            );
         }
-        protected.extend(inner.dropping.iter().map(PathBuf::from));
+        protected.extend(inner.dropping.iter().map(|path| {
+            crate::caller_path::identity(path)
+                .host
+                .as_path()
+                .to_path_buf()
+        }));
         // Include canonical aliases: an allowed root cannot turn a symlink into
         // permission to delete a protected path under another spelling.
         protected.extend(
@@ -439,13 +481,13 @@ impl Runner {
             .filter_map(|p| p.canonicalize().ok())
             .collect();
         let mut candidates = Vec::new();
-        for (key, workspace) in &inner.catalog.workspaces {
-            let path = PathBuf::from(key);
+        for (key, workspace) in crate::caller_path::entries(&inner.catalog.workspaces) {
+            let path = key.host.as_path().to_path_buf();
             let Ok(canonical) = path.canonicalize() else {
                 continue;
             };
-            if !workspace::absolute(key)
-                || self.validate_destinations(key, None, &[]).is_err()
+            if !workspace::absolute(key.caller.text())
+                || self.validate_destinations(key.host, None, &[]).is_err()
                 || path.symlink_metadata()?.file_type().is_symlink()
                 || (workspace.kind != WorkspaceKind::Head
                     && (!roots
@@ -465,7 +507,7 @@ impl Runner {
             }
             candidates.push(Candidate {
                 path,
-                workspace: Some(key.clone()),
+                workspace: Some(key.caller.text().clone()),
                 last_used_ms: workspace.used_ms,
                 cache_disk: false,
                 snapshot: false,
@@ -753,7 +795,7 @@ impl Runner {
             .filter(|j| j.terminal.is_none() || inner.starting.contains(&j.id))
             .filter_map(|j| j.request.as_ref())
             .chain(inner.admitting.values())
-            .map(|r| caches.disk(&r.workspace_key))
+            .map(|r| caches.disk(crate::caller_path::request(r).caller_workspace_key.text()))
             .collect()
     }
 
@@ -934,7 +976,7 @@ impl Runner {
     #[cfg(target_os = "linux")]
     fn remove_boat_candidate(&self, candidate: &Candidate) -> io::Result<u64> {
         if let Some(key) = &candidate.workspace {
-            self.validate_destinations(key, None, &[])?;
+            self.validate_destinations(crate::caller_path::host_str(key), None, &[])?;
         }
         let bytes = crate::boat_quota::cached_bytes(&candidate.path).unwrap_or_else(|error| {
             tracing::warn!(path = %candidate.path.display(), %error, "Boat eviction size unknown; deletion must not depend on a complete walk");
@@ -967,7 +1009,9 @@ impl Runner {
 
     #[cfg(target_os = "linux")]
     pub(super) fn evict_boat_setup_workspace(&self, setup: &Setup) -> io::Result<()> {
-        let key = &setup.request.workspace_key;
+        let key = crate::caller_path::request(&setup.request)
+            .caller_workspace_key
+            .text();
         let _pressure = self.core.disk.lock().unwrap();
         let used = {
             let mut inner = self.core.inner.lock().unwrap();
@@ -975,7 +1019,7 @@ impl Runner {
                 || setup.base
                 || !inner.starting.contains(&setup.id)
                 || !inner.reserved.contains_key(key)
-                || inner.jobs[&setup.id].key() != key.as_str()
+                || crate::caller_path::job_key(&inner.jobs[&setup.id]) != key.as_str()
             {
                 return Err(io::Error::other(
                     "cold eviction does not own the active Boat setup reservation",
@@ -989,13 +1033,16 @@ impl Runner {
                 .map_or(self.now(), |workspace| workspace.used_ms)
         };
         let candidate = Candidate {
-            path: PathBuf::from(key),
+            path: crate::caller_path::request(&setup.request)
+                .host_workspace
+                .as_path()
+                .to_path_buf(),
             workspace: Some(key.clone()),
             last_used_ms: used,
             cache_disk: false,
             snapshot: false,
         };
-        let _tree = crate::tree_access::lock(&candidate.path);
+        let _tree = crate::tree_access::lock(crate::caller_path::host(&candidate.path));
         let deleted = self.remove_boat_candidate(&candidate);
         let result = deleted
             .as_ref()
@@ -1220,7 +1267,9 @@ impl Runner {
             } else {
                 None
             };
-            let Some(_tree_access) = crate::tree_access::try_lock(&candidate.path) else {
+            let Some(_tree_access) =
+                crate::tree_access::try_lock(crate::caller_path::host(&candidate.path))
+            else {
                 let mut inner = self.core.inner.lock().unwrap();
                 inner.evicting_dependencies.remove(&candidate.path);
                 inner.evicting_caches.remove(&candidate.path);
@@ -1230,10 +1279,9 @@ impl Runner {
                 continue;
             };
             self.long_work("disk_remove");
-            let authorization = candidate
-                .workspace
-                .as_ref()
-                .map_or(Ok(()), |key| self.validate_destinations(key, None, &[]));
+            let authorization = candidate.workspace.as_ref().map_or(Ok(()), |key| {
+                self.validate_destinations(crate::caller_path::host_str(key), None, &[])
+            });
             #[cfg(target_os = "linux")]
             let access = authorization.and_then(|()| {
                 if self.boat_private_candidate(&candidate) {

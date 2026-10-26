@@ -1,6 +1,7 @@
 //! Execution-specific work lives here; scheduling, persistence and transport
 //! remain in the engine. A backend must never fall back to host execution.
 use crate::{
+    caller_path as paths,
     engine::Config,
     platform,
     storage::*,
@@ -111,7 +112,7 @@ pub(crate) struct Setup {
 }
 
 pub(crate) struct Prepared {
-    pub cwd: PathBuf,
+    pub host_cwd: PathBuf,
     pub target: PathBuf,
     #[cfg_attr(not(unix), allow(dead_code))]
     pub wrapper: Option<PathBuf>,
@@ -532,22 +533,26 @@ impl Backend for HostBackend {
         let validate = || -> io::Result<()> {
             workspace::validate_destinations(
                 &config.owned_workspace_roots,
-                if s.base { &r.cwd } else { &r.workspace_key },
-                Some(&r.cwd),
+                crate::caller_path::host_str(if s.base {
+                    paths::run(r).caller_cwd.text()
+                } else {
+                    paths::request(r).caller_workspace_key.text()
+                }),
+                Some(paths::run(r).host_cwd),
                 &r.siblings,
             )?;
             if config.sibling_snapshot_mode() && !s.base {
-                workspace::validate(&r.workspace_key, &r.repository_root, &r.siblings, true)?;
+                workspace::validate_request(paths::request(r), &r.siblings, true)?;
                 workspace::validate_alias_destinations(
                     &config.owned_workspace_roots,
-                    &workspace::sibling_aliases(&r.workspace_key, &r.siblings)?,
+                    &workspace::sibling_aliases(paths::request(r).host_workspace, &r.siblings)?,
                 )?;
             }
             if !s.base {
                 crate::writer::validate_paths(
                     config,
-                    &r.workspace_key,
-                    Some(&r.cwd),
+                    paths::request(r).host_workspace,
+                    Some(paths::run(r).host_cwd),
                     &r.siblings,
                     &[],
                 )?;
@@ -565,12 +570,18 @@ impl Backend for HostBackend {
             // of it (see `workspace_access`).
             crate::workspace_access::validate_with_repair(
                 config,
-                &r.workspace_key,
+                paths::request(r).host_workspace,
                 &r.siblings,
                 validate,
             )?;
         }
-        let path = PathBuf::from(if s.base { &r.cwd } else { &r.workspace_key });
+        let path = if s.base {
+            paths::run(r).host_cwd
+        } else {
+            paths::request(r).host_workspace
+        }
+        .as_path()
+        .to_path_buf();
         #[cfg(target_os = "linux")]
         if config.boat_profile && path.exists() {
             // Bound hostile cached trees before permission repair or checkout
@@ -618,7 +629,7 @@ impl Backend for HostBackend {
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && s.snapshots.is_none() {
             for sibling in &r.siblings {
-                let sibling = std::path::Path::new(&sibling.canonical_path);
+                let sibling = paths::sibling(sibling).host.as_path();
                 if !sibling.is_dir() {
                     continue;
                 }
@@ -640,8 +651,8 @@ impl Backend for HostBackend {
             setup_step(
                 "checkout workspace",
                 trees.sync_workspace(
-                    &r.repository_root,
-                    &path,
+                    paths::request(r).caller_repository_root.text(),
+                    crate::caller_path::host(&path),
                     &r.snapshot_commit,
                     &r.tree_hash,
                     &r.snapshot_commit,
@@ -650,7 +661,7 @@ impl Backend for HostBackend {
         } else {
             let caller_commit = r.base_commit.clone().unwrap_or_else(|| {
                 workspace::resolve_caller_commit(
-                    &trees.mirror(&r.repository_root),
+                    &trees.mirror(paths::request(r).caller_repository_root.text()),
                     &r.snapshot_commit,
                     &r.tree_hash,
                 )
@@ -662,15 +673,15 @@ impl Backend for HostBackend {
                     // sibling's path by the sandbox: only the main workspace
                     // is checked out on the host.
                     Some(_) => trees.populate_main(
-                        &r.workspace_key,
-                        &r.repository_root,
+                        paths::request(r).host_workspace,
+                        paths::request(r).caller_repository_root.text(),
                         &r.snapshot_commit,
                         &r.tree_hash,
                         &caller_commit,
                     ),
                     None => trees.populate(
-                        &r.workspace_key,
-                        &r.repository_root,
+                        paths::request(r).host_workspace,
+                        paths::request(r).caller_repository_root.text(),
                         &r.snapshot_commit,
                         &r.siblings,
                         &s.recorded,
@@ -687,7 +698,10 @@ impl Backend for HostBackend {
         if computed != r.tree_hash {
             return Err(Trees::tree_hash_mismatch(&path, &r.tree_hash, &computed));
         }
-        let cwd = setup_step("resolve job cwd", fs::canonicalize(&r.cwd))?;
+        let cwd = setup_step(
+            "resolve job cwd",
+            fs::canonicalize(paths::run(r).host_cwd.as_path()),
+        )?;
         if !cwd.starts_with(setup_step(
             "resolve workspace path",
             fs::canonicalize(&path),
@@ -758,7 +772,7 @@ impl Backend for HostBackend {
         #[cfg(target_os = "linux")]
         let sandbox = if config.isolate_jobs {
             let lockfile = workspace::git(
-                &trees.mirror(&r.repository_root),
+                &trees.mirror(paths::request(r).caller_repository_root.text()),
                 &["show", &format!("{}:Cargo.lock", r.snapshot_commit)],
             )
             .unwrap_or_default();
@@ -795,7 +809,7 @@ impl Backend for HostBackend {
                 let cargo = path.join("Cargo.toml").is_file();
                 let declaration = if s.base && config.base_commands.is_empty() {
                     crate::writer::declaration::read(
-                        &trees.mirror(&r.repository_root),
+                        &trees.mirror(paths::request(r).caller_repository_root.text()),
                         &r.snapshot_commit,
                     )
                     .ok()
@@ -860,7 +874,7 @@ impl Backend for HostBackend {
                             config.rustc_slots,
                             &routes,
                             &r.tree_hash,
-                            &r.repository_root,
+                            paths::request(r).caller_repository_root.text(),
                             config.tenant_vm,
                             config.shared_compile_cache(),
                             snapshots.as_ref(),
@@ -937,7 +951,7 @@ impl Backend for HostBackend {
             None
         };
         Ok(Prepared {
-            cwd,
+            host_cwd: cwd,
             target,
             wrapper,
             sandbox,
@@ -957,12 +971,17 @@ impl Backend for HostBackend {
         if config.boat_profile && config.isolate_jobs {
             setup_step(
                 "verify Boat storage",
-                verify_boat_storage(Path::new("/Users"), &config.state_dir(), &prepared.cwd),
+                verify_boat_storage(Path::new("/Users"), &config.state_dir(), &prepared.host_cwd),
             )?;
         }
         #[cfg(target_os = "linux")]
         if config.boat_profile {
-            let workspace = Path::new(if s.base { &r.cwd } else { &r.workspace_key });
+            let workspace = if s.base {
+                paths::run(r).host_cwd
+            } else {
+                paths::request(r).host_workspace
+            }
+            .as_path();
             setup_step(
                 "verify Boat quota lease",
                 crate::boat_quota::validate_for_launch(
@@ -1025,7 +1044,7 @@ impl Backend for HostBackend {
         }
         let caller_commit = r.base_commit.clone().unwrap_or_else(|| {
             workspace::resolve_caller_commit(
-                &trees.mirror(&r.repository_root),
+                &trees.mirror(paths::request(r).caller_repository_root.text()),
                 &r.snapshot_commit,
                 &r.tree_hash,
             )
@@ -1042,10 +1061,16 @@ impl Backend for HostBackend {
                 .sandbox
                 .as_ref()
                 .ok_or_else(|| io::Error::other("isolated job has no prepared sandbox"))?;
-            sandbox.launch(&s.request.command, &prepared.cwd, &env, &s.cpus, weight)
+            sandbox.launch(
+                &s.request.command,
+                &prepared.host_cwd,
+                &env,
+                &s.cpus,
+                weight,
+            )
         } else {
             // The non-isolated host backend is development-only and does not pin CPUs.
-            platform::launch(&s.request.command, &prepared.cwd, &env)
+            platform::launch(&s.request.command, &prepared.host_cwd, &env)
         }?;
         #[cfg(target_os = "linux")]
         let cache_ledgers = launch.cache_ledgers();
@@ -1128,7 +1153,7 @@ impl Backend for HostBackend {
     }
 
     fn collect_changes(&self, trees: &Trees, job: &Job) -> io::Result<Option<Vec<String>>> {
-        Ok((!job.base).then(|| trees.changes(std::path::Path::new(job.key()))))
+        Ok((!job.base).then(|| trees.changes(paths::job_workspace(job).as_path())))
     }
 
     fn reconcile(&self, config: &Config, interrupted: &[Job]) -> io::Result<Vec<Uuid>> {
@@ -1231,8 +1256,8 @@ fn compile_cache_environment(
         if prepared.wrapper.is_none()
             && (setup.base
                 || !crate::compile_cache::configured_wrapper(
-                    Path::new(&setup.request.workspace_key),
-                    &prepared.cwd,
+                    paths::request(&setup.request).host_workspace.as_path(),
+                    &prepared.host_cwd,
                 )?)
         {
             env.insert("RUSTC_WRAPPER".into(), "sccache".into());
@@ -1264,7 +1289,9 @@ fn compile_cache_environment(
 #[cfg(target_os = "linux")]
 fn rust_job(setup: &Setup) -> bool {
     setup.base
-        || Path::new(&setup.request.workspace_key)
+        || paths::request(&setup.request)
+            .host_workspace
+            .as_path()
             .join("Cargo.toml")
             .is_file()
 }
@@ -1343,9 +1370,9 @@ fn remote_cache_environment(
         generation,
         setup.base,
         if setup.base {
-            &setup.request.cwd
+            paths::run(&setup.request).caller_cwd.text()
         } else {
-            &setup.request.workspace_key
+            paths::request(&setup.request).caller_workspace_key.text()
         },
         env,
     );

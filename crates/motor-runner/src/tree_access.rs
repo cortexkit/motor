@@ -22,8 +22,11 @@ pub(crate) struct TreeAccess {
 fn overlaps(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
-fn acquire(path: &Path, wait: bool) -> Option<TreeAccess> {
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+fn acquire(path: crate::caller_path::HostPath<'_>, wait: bool) -> Option<TreeAccess> {
+    let path = path
+        .as_path()
+        .canonicalize()
+        .unwrap_or_else(|_| path.as_path().to_path_buf());
     let owner = std::thread::current().id();
     let (lock, wake) = ACCESS.get_or_init(|| (Mutex::new(State::default()), Condvar::new()));
     let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -45,10 +48,10 @@ fn acquire(path: &Path, wait: bool) -> Option<TreeAccess> {
         _thread_bound: PhantomData,
     })
 }
-pub(crate) fn lock(path: &Path) -> TreeAccess {
+pub(crate) fn lock(path: crate::caller_path::HostPath<'_>) -> TreeAccess {
     crate::setup_log::lock_wait("tree_access", || acquire(path, true).unwrap())
 }
-pub(crate) fn try_lock(path: &Path) -> Option<TreeAccess> {
+pub(crate) fn try_lock(path: crate::caller_path::HostPath<'_>) -> Option<TreeAccess> {
     acquire(path, false)
 }
 impl Drop for TreeAccess {
@@ -75,25 +78,25 @@ mod tests {
         let thread = std::thread::spawn({
             let child = child.clone();
             move || {
-                let _access = lock(&child);
+                let _access = lock(crate::caller_path::host(&child));
                 held_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 std::fs::remove_dir_all(child).unwrap();
             }
         });
         held_rx.recv().unwrap();
-        assert!(try_lock(&root.join("retired")).is_none());
-        assert!(try_lock(&root.join("unrelated")).is_some());
+        assert!(try_lock(crate::caller_path::host(&root.join("retired"))).is_none());
+        assert!(try_lock(crate::caller_path::host(&root.join("unrelated"))).is_some());
         release_tx.send(()).unwrap();
         thread.join().unwrap();
-        let _access = lock(&root.join("retired"));
+        let _access = lock(crate::caller_path::host(&root.join("retired")));
         assert!(!child.exists());
     }
     #[test]
     fn same_thread_nested_helpers_do_not_deadlock() {
         let root = cortexkit_test_support::ScratchDir::new("tree-access-nested");
-        let _outer = lock(&root);
-        let _inner = lock(&root);
-        assert!(try_lock(&root.join("child")).is_some());
+        let _outer = lock(crate::caller_path::host(&root));
+        let _inner = lock(crate::caller_path::host(&root));
+        assert!(try_lock(crate::caller_path::host(&root.join("child"))).is_some());
     }
 }

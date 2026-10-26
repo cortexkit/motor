@@ -641,7 +641,7 @@ pub(super) fn materialize(config: &Config, trees: &Trees, setup: &Setup) -> io::
                 // The failed attempt has joined and discarded its cache before
                 // returning this error. No execution gate has been opened.
                 let cache = config.windows.as_ref().unwrap().caches();
-                tracing::warn!(job_id = %setup.id, workspace_hash = %cache.key(&setup.request.workspace_key),
+                tracing::warn!(job_id = %setup.id, workspace_hash = %cache.key(crate::caller_path::request(&setup.request).caller_workspace_key.text()),
                     "cache_grant_missing: discarded Windows cache; retrying once with a fresh disk");
                 control.abandoned.store(false, Ordering::Release);
                 control.done.store(false, Ordering::Release);
@@ -652,8 +652,16 @@ pub(super) fn materialize(config: &Config, trees: &Trees, setup: &Setup) -> io::
     };
     handle._registration = Some(registration);
     Ok(Prepared {
-        cwd: PathBuf::from(&setup.request.cwd),
-        target: PathBuf::from(&setup.request.workspace_key).join("target"),
+        host_cwd: crate::caller_path::run(&setup.request)
+            .host_cwd
+            .as_path()
+            .to_path_buf(),
+        target: PathBuf::from(
+            crate::caller_path::request(&setup.request)
+                .caller_workspace_key
+                .text(),
+        )
+        .join("target"),
         wrapper: None,
         sandbox: None,
         vm: Some(Mutex::new(Some(Box::new(handle)))),
@@ -678,7 +686,9 @@ fn materialize_attempt(
         config,
         staging.clone(),
         setup.id,
-        &setup.request.workspace_key,
+        crate::caller_path::request(&setup.request)
+            .caller_workspace_key
+            .text(),
     )
     .map_err(|error| super::vm::path_error("prepare job staging", &staging, error))?;
     let tar = super::prep::prepare(config, trees, setup, &resources.staging).map_err(|error| {
@@ -711,8 +721,14 @@ fn materialize_attempt(
     let (stderr_tx, stderr_rx) = mpsc::sync_channel(32);
     let command = motor_winagent::Command {
         command: setup.request.command.clone(),
-        cwd: setup.request.cwd.clone(),
-        workspace: setup.request.workspace_key.clone(),
+        cwd: crate::caller_path::run(&setup.request)
+            .caller_cwd
+            .text()
+            .clone(),
+        workspace: crate::caller_path::request(&setup.request)
+            .caller_workspace_key
+            .text()
+            .clone(),
         source_commit: setup.request.snapshot_commit.clone(),
         env: setup
             .request

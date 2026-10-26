@@ -42,7 +42,7 @@ fn path_validation_does_not_descend_into_private_retained_targets() {
     fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
     let result = validate_paths(
         &Config::new(scratch.join("state"), "main"),
-        workspace.to_str().unwrap(),
+        crate::caller_path::host_str(workspace.to_str().unwrap()),
         None,
         &[],
         &[],
@@ -51,7 +51,7 @@ fn path_validation_does_not_descend_into_private_retained_targets() {
     result.unwrap();
     validate_paths(
         &Config::new("unused-writer-state", "main"),
-        workspace.to_str().unwrap(),
+        crate::caller_path::host_str(workspace.to_str().unwrap()),
         None,
         &[],
         &[],

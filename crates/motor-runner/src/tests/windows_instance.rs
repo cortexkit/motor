@@ -238,7 +238,7 @@ impl Backend for InProcessWindows {
         fs::create_dir_all(&cwd)?;
         Ok(Prepared {
             target: cwd.join("target"),
-            cwd,
+            host_cwd: cwd,
             wrapper: None,
             sandbox: None,
             vm: None,
@@ -253,7 +253,7 @@ impl Backend for InProcessWindows {
         weight: u32,
     ) -> io::Result<backend::Launch> {
         assert_eq!(weight, 4);
-        fs::remove_dir_all(&prepared.cwd)?;
+        fs::remove_dir_all(&prepared.host_cwd)?;
         Ok(backend::Launch {
             process: None,
             durable_output: false,

@@ -344,10 +344,7 @@ impl Job {
         }
     }
     pub fn key(&self) -> &str {
-        self.request
-            .as_ref()
-            .map(|r| r.workspace_key.as_str())
-            .unwrap_or("")
+        crate::caller_path::job_key(self)
     }
     pub fn terminal(&mut self, outcome: Outcome, now: u64) {
         let queue_wait_ms = self.queue_wait_ms(now);

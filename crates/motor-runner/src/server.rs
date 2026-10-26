@@ -760,7 +760,7 @@ async fn session(
                     Ok(upload) => {
                         tracing::info!(
                             transfer_id = %request.transfer_id,
-                            workspace = %request.workspace_key,
+                            workspace = %crate::caller_path::request(&request).caller_workspace_key.text(),
                             bytes = manifests.iter().map(|b| b.length).sum::<u64>(),
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "prepare upload complete"
@@ -927,7 +927,13 @@ async fn session(
             Frame::Drop(request) => {
                 send(
                     tx,
-                    Frame::DropReply(runner.drop_workspace(&request.workspace_key).await?),
+                    Frame::DropReply(
+                        runner
+                            .drop_workspace(
+                                crate::caller_path::drop_request(&request).caller.text(),
+                            )
+                            .await?,
+                    ),
                 )
                 .await?;
                 return Ok(());

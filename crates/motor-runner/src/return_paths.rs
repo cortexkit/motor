@@ -177,11 +177,19 @@ fn collect_after_measure(request: &Run, seq: u64, before_read: impl FnOnce()) ->
     };
     let mut measured = 0u64;
     let collected = (|| -> Result<Vec<ReturnedFile>, Cause> {
-        let (directory, root) = open_directory(Path::new(&request.workspace_key))?;
+        let (directory, root) = open_directory(
+            crate::caller_path::request(request)
+                .host_workspace
+                .as_path(),
+        )?;
         let mut files = Vec::new();
-        for path in &request.return_paths {
+        for path in crate::caller_path::run(request).caller_return_paths {
             let relative = Path::new(path)
-                .strip_prefix(&request.workspace_key)
+                .strip_prefix(
+                    crate::caller_path::request(request)
+                        .caller_workspace_key
+                        .text(),
+                )
                 .map_err(|_| Cause::Escape)?;
             let file = open_file(&root, &directory, relative)?;
             measured = measured.saturating_add(file.metadata().map_err(|_| Cause::Missing)?.len());
@@ -193,7 +201,11 @@ fn collect_after_measure(request: &Run, seq: u64, before_read: impl FnOnce()) ->
         before_read();
         let mut returned = Vec::new();
         let mut read_bytes = 0u64;
-        for (path, mut file) in request.return_paths.iter().zip(&files) {
+        for (path, mut file) in crate::caller_path::run(request)
+            .caller_return_paths
+            .iter()
+            .zip(&files)
+        {
             let mut bytes = Vec::new();
             (&mut file)
                 .take(request.return_max_bytes - read_bytes)
@@ -316,20 +328,33 @@ fn collect_chunked_before_read(
 ) -> ChunkedCollection {
     let cap = request.return_max_bytes;
     let directory = format!("{RETURNED_DIRECTORY_PREFIX}{}", Uuid::now_v7());
-    let mut outcomes: Vec<Option<ReturnManifestOutcome>> = vec![None; request.return_paths.len()];
+    let mut outcomes: Vec<Option<ReturnManifestOutcome>> =
+        vec![None; crate::caller_path::run(request).caller_return_paths.len()];
     let fail = |cause, size| ReturnManifestOutcome::Failed { cause, size };
     let mut admitted = Vec::new();
     let mut total = 0u64;
-    match open_directory(Path::new(&request.workspace_key)) {
+    match open_directory(
+        crate::caller_path::request(request)
+            .host_workspace
+            .as_path(),
+    ) {
         Err(cause) => {
             for outcome in &mut outcomes {
                 *outcome = Some(fail(shared_cause(cause), None));
             }
         }
         Ok((root_directory, root)) => {
-            for (index, path) in request.return_paths.iter().enumerate() {
+            for (index, path) in crate::caller_path::run(request)
+                .caller_return_paths
+                .iter()
+                .enumerate()
+            {
                 let opened = Path::new(path)
-                    .strip_prefix(&request.workspace_key)
+                    .strip_prefix(
+                        crate::caller_path::request(request)
+                            .caller_workspace_key
+                            .text(),
+                    )
                     .map_err(|_| Cause::Escape)
                     .and_then(|relative| {
                         let file = open_file(&root, &root_directory, relative)?;
@@ -411,8 +436,8 @@ fn finish(
     outcomes: Vec<Option<ReturnManifestOutcome>>,
     total_bytes: u64,
 ) -> ChunkedCollection {
-    let files = request
-        .return_paths
+    let files = crate::caller_path::run(request)
+        .caller_return_paths
         .iter()
         .zip(outcomes)
         .map(
@@ -782,7 +807,10 @@ mod tests {
         let returned = collection.commit(run.job_id, &mut next_seq);
         assert_eq!(next_seq, 5 + returned.chunks.len() as u64 + 1);
         assert_eq!(returned.manifest.seq, next_seq - 1);
-        let mut assembler = ReturnAssembler::new(&run.return_paths, run.return_max_bytes);
+        let mut assembler = ReturnAssembler::new(
+            crate::caller_path::run(run).caller_return_paths,
+            run.return_max_bytes,
+        );
         let mut bytes = vec![Vec::new(); run.return_paths.len()];
         for (position, chunk) in returned.chunks.iter().enumerate() {
             let data = fs::read(returned.chunk_path(job_directory, position)).unwrap();

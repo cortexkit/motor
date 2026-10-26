@@ -369,7 +369,7 @@ fn boat_job_environment(f: &Fixture, config: &Config, phase: &str) -> BTreeMap<S
         snapshots: None,
     };
     let prepared = Prepared {
-        cwd: f.main.clone(),
+        host_cwd: f.main.clone(),
         target: f.scratch.join("boat-cache-target"),
         wrapper: None,
         sandbox: Some(Box::new(UncachedIsolationLauncher {
@@ -423,7 +423,7 @@ fn assert_uncached_job_starts(f: &Fixture, config: &Config, phase: &str) {
         compacting: Arc::default(),
     };
     let prepared = Prepared {
-        cwd: f.main.clone(),
+        host_cwd: f.main.clone(),
         target: f.scratch.join("uncached-target"),
         wrapper: None,
         sandbox: Some(Box::new(UncachedIsolationLauncher {

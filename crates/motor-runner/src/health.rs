@@ -168,7 +168,7 @@ impl RepositoryUsage {
             self.active.insert(
                 job.id,
                 (
-                    RunningJob::new(job.id, job.key(), job.weight),
+                    RunningJob::new(job.id, crate::caller_path::job_key(job), job.weight),
                     job.pending(),
                 ),
             );
@@ -183,7 +183,7 @@ impl RepositoryUsage {
                     job.id,
                     HealthUnderusedReservation {
                         job_id: job.id,
-                        workspace_key: job.key().to_owned(),
+                        workspace_key: crate::caller_path::job_key(job).to_owned(),
                         vcpus: job.weight,
                         usage: usage.clone(),
                     },
@@ -200,10 +200,13 @@ impl RepositoryUsage {
         let Some(request) = &job.request else {
             return;
         };
-        let Some(repository) = Path::new(&request.repository_root)
-            .file_name()
-            .and_then(|name| name.to_str())
-        else {
+        let Some(repository) = Path::new(
+            crate::caller_path::request(request)
+                .caller_repository_root
+                .text(),
+        )
+        .file_name()
+        .and_then(|name| name.to_str()) else {
             return;
         };
         let queue_wait_refusal = job.terminal.as_ref().is_some_and(|terminal| {
