@@ -2643,14 +2643,22 @@ impl Runner {
             .store(true, std::sync::atomic::Ordering::Release);
         waiter
     }
-    pub(crate) fn drain_retry_after_ms(&self) -> Option<u64> {
-        let waiter = self.core.drain_control.lock().unwrap().clone()?;
-        let deadline = waiter.0.lock().unwrap().deadline;
-        Some(
-            deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .as_millis() as u64,
-        )
+    pub(crate) fn drain_retry_after_ms(&self) -> u64 {
+        let waiter = self.core.drain_control.lock().unwrap().clone();
+        let remaining_ms = waiter
+            .map(|waiter| {
+                waiter
+                    .0
+                    .lock()
+                    .unwrap()
+                    .deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis()
+            })
+            .unwrap_or(0);
+        // Admission stays closed after the deadline, until resume or restart.
+        // Keep callers from hot-looping even when no deadline remains.
+        remaining_ms.clamp(5_000, u128::from(u64::MAX)) as u64
     }
     pub fn drain_should_exit(&self) -> bool {
         let drain_control = self.core.drain_control.lock().unwrap();
@@ -3212,7 +3220,7 @@ impl Runner {
                 reason.clone(),
                 error,
                 detail,
-                None,
+                (*reason == RefusalReason::RunnerDraining).then(|| self.drain_retry_after_ms()),
                 self.now(),
             );
             job.state = JobState::Tombstone;
@@ -6310,7 +6318,7 @@ impl Runner {
                     RefusalReason::RunnerDraining,
                     "runner draining before queued command started",
                     Some("runner draining before queued command started".into()),
-                    None,
+                    Some(self.drain_retry_after_ms()),
                     self.now(),
                 );
                 self.save(&job)?;

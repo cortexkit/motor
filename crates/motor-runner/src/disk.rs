@@ -167,7 +167,7 @@ impl Runner {
         )?;
         let refusal = |reason: RefusalReason, disk_full, detail: String| Refusal {
             retry_after_ms: if reason == RefusalReason::RunnerDraining {
-                self.drain_retry_after_ms()
+                Some(self.drain_retry_after_ms())
             } else {
                 None
             },

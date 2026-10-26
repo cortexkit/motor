@@ -270,6 +270,7 @@ async fn shadow_runner_refusal_reason_and_detail_survive_admission_and_terminal_
         *boat.run_refusal.lock().unwrap() = Some(crate::hosted::boat_tests::RunRefusal {
             reason: RefusalReason::WorkspaceSetupFailed,
             detail: "workspace setup: C cache is read-only".into(),
+            retry_after_ms: None,
             after_accept,
         });
         let dir = ScratchDir::new("shadow-runner-refusal");
