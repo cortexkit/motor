@@ -27,11 +27,6 @@ impl Drop for OperatorGenerationGuard {
 }
 #[cfg(test)]
 pub(crate) fn operator_generation_path(path: PathBuf) -> OperatorGenerationGuard {
-    assert_eq!(
-        unsafe { libc::geteuid() },
-        0,
-        "operator generation tests require root"
-    );
     OperatorGenerationGuard(OPERATOR_GENERATION.lock().unwrap().replace(path))
 }
 
@@ -408,6 +403,16 @@ pub(crate) fn attach(id: Uuid) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn operator_generation_override_is_unprivileged_and_restores_the_previous_path() {
+        let previous = super::generation_path();
+        let private = std::env::temp_dir().join("operator-private-generation");
+        let guard = super::operator_generation_path(private.clone());
+        assert_eq!(super::generation_path(), private);
+        drop(guard);
+        assert_eq!(super::generation_path(), previous);
+    }
+
     #[test]
     fn existing_table_after_failed_reload_does_not_authorize_attach() {
         use super::*;

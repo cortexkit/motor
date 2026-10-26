@@ -362,6 +362,14 @@ and marker helper together. Do not swap a new runner into an old image. For
 **tenant VMs**, build a new tenant image with the matching runner, guest network
 unit and marker helper, inventory/qualify it, then use the offline image-switch
 procedure with the host/helper stopped. New consumers on old images fail closed.
+
+The generation operator tests, like the other `isolated_net_*` cases, run as the
+trusted **operator account**, not with `sudo cargo`, `sudo nextest` or a root test
+binary. They use `sudo -n` only for private root-owned producer inputs,
+publication/reload/cleanup and the existing privileged network helpers. This
+keeps the shared operator-test lock owned and opened by the same account under
+`fs.protected_regular`; do not chmod/chown/delete that host lock or change the
+sysctl to run a test. The production marker is never withdrawn by these cases.
 Run the default read-only diff as the trusted runner account to verify its
 non-root `sudo` grants. Running `--check` as root skips verification of that
 account's non-root `sudo` grants.

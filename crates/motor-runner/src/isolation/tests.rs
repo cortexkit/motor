@@ -2473,15 +2473,25 @@ fn net_operator_lock() -> File {
 }
 
 #[tokio::test]
-#[ignore = "operator only: root, provisioned motor_net and trusted host isolation"]
+#[ignore = "operator only: non-root account with sudo -n, provisioned motor_net and trusted host isolation"]
 async fn isolated_net_generation_appears_after_runner_start_without_restart() {
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "run generation operator tests as the operator account, not via sudo"
+    );
     let _guard = net_operator_lock();
     crate::engine::net_operator_case("generation-recovery").await;
 }
 
 #[tokio::test]
-#[ignore = "operator only: root, provisioned motor_net and trusted host isolation"]
+#[ignore = "operator only: non-root account with sudo -n, provisioned motor_net and trusted host isolation"]
 async fn isolated_net_failed_reload_refuses_new_jobs() {
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "run generation operator tests as the operator account, not via sudo"
+    );
     let _guard = net_operator_lock();
     crate::engine::net_operator_case("generation-reload").await;
 }

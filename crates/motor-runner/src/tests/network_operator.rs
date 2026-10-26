@@ -211,16 +211,53 @@ pub(crate) async fn case(mode: &str) {
     }
 }
 
-pub(crate) async fn generation(mode: &str) {
+fn generation_root_step(script: &str) -> Command {
+    let mut command = Command::new("/usr/bin/sudo");
+    command.args(["-n", "/usr/bin/python3", "-I", "-c", script]);
+    command
+}
+
+struct GenerationProducerCleanup(PathBuf);
+impl Drop for GenerationProducerCleanup {
+    fn drop(&mut self) {
+        let result = generation_root_step("import pathlib,shutil,sys; p=pathlib.Path(sys.argv[1])/'lockdir'; shutil.rmtree(p) if p.exists() else None")
+            .arg(&self.0).output();
+        if !matches!(result, Ok(ref output) if output.status.success()) {
+            eprintln!("private generation lock cleanup failed: {result:?}");
+        }
+    }
+}
+
+#[test]
+fn generation_privileged_steps_use_noninteractive_sudo_not_a_root_test_process() {
+    let command = generation_root_step("publish-private-generation");
+    assert_eq!(command.get_program(), "/usr/bin/sudo");
+    let args: Vec<_> = command.get_args().collect();
     assert_eq!(
+        args,
+        [
+            "-n",
+            "/usr/bin/python3",
+            "-I",
+            "-c",
+            "publish-private-generation"
+        ]
+    );
+}
+
+pub(crate) async fn generation(mode: &str) {
+    assert_ne!(
         unsafe { libc::geteuid() },
         0,
-        "generation operator tests require root"
+        "run generation tests as the operator account; only private producer steps use sudo -n"
     );
     let f = Fixture::new();
     install_probe(&f);
     let producer = f.scratch.path().join("generation-producer");
     fs::create_dir_all(&producer).unwrap();
+    // Keep the parent operator-owned so ordinary fixture teardown can unlink
+    // root-owned leaf files. Only the loader's private lock directory needs sudo.
+    let _producer_cleanup = GenerationProducerCleanup(producer.clone());
     let marker = producer.join("ready");
     // Exercise real root-owned publication and consumer reads without withdrawing
     // the production host's generation. Kernel policy and sandbox setup are real.
@@ -250,9 +287,21 @@ pub(crate) async fn generation(mode: &str) {
         r#"{"uplink":"enp6s0","public_ipv4":"8.8.8.8"}"#,
     )
     .unwrap();
+    let prepare = generation_root_step(r#"import os,pathlib,stat,sys
+p=pathlib.Path(sys.argv[1])
+for name in ('motor_network_ready.py','motor_network_policy.py','template.nft','stale.nft','settings.json'):
+ f=p/name
+ if not stat.S_ISREG(f.lstat().st_mode): raise RuntimeError('fixture input must be a regular file')
+ os.chown(f,0,0); os.chmod(f,0o644)
+"#).arg(&producer).output().unwrap();
+    assert!(
+        prepare.status.success(),
+        "root-owned private fixture inputs: {}",
+        String::from_utf8_lossy(&prepare.stderr)
+    );
     let publish = || {
-        let result = Command::new("python3").args(["-c", r#"import pathlib,runpy,sys
-ns=runpy.run_path(sys.argv[1]); ns['publish'].__globals__['READY']=pathlib.Path(sys.argv[2]); ns['publish']()"#])
+        let result = generation_root_step(r#"import pathlib,runpy,sys
+ns=runpy.run_path(sys.argv[1]); ns['publish'].__globals__['READY']=pathlib.Path(sys.argv[2]); ns['publish']()"#)
             .arg(producer.join("motor_network_ready.py")).arg(&marker).output().unwrap();
         assert!(
             result.status.success(),
@@ -282,13 +331,21 @@ ns=runpy.run_path(sys.argv[1]); ns['publish'].__globals__['READY']=pathlib.Path(
         first.network = Some(Network::Outbound);
         f.submit(&runner, &first, &bytes);
         assert_success(&runner, &first).await;
-        let result = Command::new("python3").args(["-c", r#"import pathlib,runpy,sys
+        let result = generation_root_step(r#"import pathlib,runpy,shutil,sys
 p=pathlib.Path(sys.argv[1]); ns=runpy.run_path(str(p/'motor_network_policy.py')); g=ns['load'].__globals__
 g['SETTINGS']=p/'settings.json'; g['TEMPLATE']=p/'template.nft'; g['SOURCE']=p/'stale.nft'; g['LOCK']=p/'lockdir'/'lock'
-g['readiness'].READY=p/'ready'; ns['load']()"#]).arg(&producer).output().unwrap();
+g['readiness'].READY=p/'ready'
+try: ns['load']()
+finally:
+ if (p/'lockdir').exists(): shutil.rmtree(p/'lockdir')"#).arg(&producer).output().unwrap();
         assert!(
             !result.status.success(),
             "the stale-source reload must fail"
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("source does not match uplink"),
+            "reload must reach the binding guard, not fail fixture permissions: {}",
+            String::from_utf8_lossy(&result.stderr)
         );
         assert!(!marker.exists());
         assert!(
