@@ -654,6 +654,97 @@ fn windows_backend_recovery_notice_describes_only_automatic_retry_policy() {
 }
 
 #[tokio::test]
+async fn windows_backend_without_lockfile_starts_without_preparing_local_registry() {
+    registry_job(false).await;
+}
+
+#[tokio::test]
+async fn windows_backend_with_lockfile_prepares_local_registry_before_start() {
+    registry_job(true).await;
+}
+
+async fn registry_job(has_lockfile: bool) {
+    let f = Fixture::new();
+    source(&f);
+    if !has_lockfile {
+        git(&f.main, &["rm", "Cargo.lock", "Cargo.toml"]);
+        git(&f.main, &["commit", "-m", "non-Cargo job"]);
+    } else {
+        fs::write(
+            f.main.join("Cargo.lock"),
+            format!("version = 3\n[[package]]\nname='test'\nversion='0.1.0'\n[[package]]\nname='registry-dependency'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{}'\n", "a".repeat(64)),
+        ).unwrap();
+        git(&f.main, &["add", "Cargo.lock"]);
+        git(&f.main, &["commit", "-m", "locked registry dependency"]);
+    }
+    let (mut c, a) = configure(&f, Fault::None, 0);
+    let original = c.windows_command.take().unwrap();
+    let registry_calls = Arc::new(AtomicU64::new(0));
+    let captured = registry_calls.clone();
+    // Intercept windows-prepare and run execute_with_registry directly. Keep
+    // the other mocked host commands and the guest's Started exchange shared.
+    c.windows_command = Some(Arc::new(move |program, args| {
+        if args.iter().any(|arg| arg == "windows-prepare") {
+            let prepared = prep::execute_with_registry(
+                Path::new(args.last().unwrap()),
+                |staging, workspace, lockfile, routes| {
+                    captured.fetch_add(1, Ordering::SeqCst);
+                    assert!(workspace.join("Cargo.lock").is_file());
+                    assert!(routes.is_empty());
+                    let parsed: toml::Value = toml::from_str(lockfile).unwrap();
+                    assert_eq!(parsed["package"][0]["name"].as_str(), Some("test"));
+                    assert_eq!(
+                        parsed["package"][1]["name"].as_str(),
+                        Some("registry-dependency")
+                    );
+                    assert_eq!(
+                        parsed["package"][1]["checksum"].as_str(),
+                        Some("a".repeat(64).as_str())
+                    );
+                    let registry = staging.join("cargo-home/local-registry");
+                    fs::create_dir_all(&registry)?;
+                    fs::write(registry.join("prepared"), b"registry fixture")
+                },
+            );
+            return Ok(match prepared {
+                Ok(()) => output(0, Vec::new(), Vec::new()),
+                Err(error) => output(
+                    1,
+                    Vec::new(),
+                    format!("{}\n", crate::windows::prep_error::error_line(&error)).into_bytes(),
+                ),
+            });
+        }
+        original(program, args)
+    }));
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let (r, bytes) = request(&f);
+    f.submit(&runner, &r, &bytes);
+    let t = terminal(&runner, r.job_id).await;
+    assert_eq!(t.outcome, Outcome::WindowsExit { code: 0 });
+    assert!(matches!(
+        runner.replay(r.job_id, 0).unwrap()[0],
+        Frame::Started { .. }
+    ));
+    assert_eq!(a.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        registry_calls.load(Ordering::SeqCst),
+        u64::from(has_lockfile)
+    );
+    let tree = a.tree.lock().unwrap();
+    let members: Vec<_> = tar::Archive::new(io::Cursor::new(&*tree))
+        .entries()
+        .unwrap()
+        .map(|entry| entry.unwrap().path().unwrap().into_owned())
+        .collect();
+    assert_eq!(
+        members.contains(&PathBuf::from("cargo-home/local-registry/prepared")),
+        has_lockfile
+    );
+    cleaned(runner.config(), r.job_id, &a);
+}
+
+#[tokio::test]
 async fn windows_backend_streams_collects_and_preserves_full_width_status_at_wire_seam() {
     for code in [0, 256, 0x7FFF_FFFF, 0xFFFF_FFFF, 0xC000_0005] {
         let f = Fixture::new();
@@ -1876,9 +1967,9 @@ async fn windows_backend_every_invalid_path_refuses_before_start_and_a_symlink_n
 
 #[tokio::test]
 async fn windows_backend_rejects_unsupported_manifests_but_accepts_cargo_config() {
-    for (file,body,offender) in [("Cargo.lock","","Cargo.lock"),("Cargo.toml","[dependencies]\noutside={path='../../../../outside'}\n","outside"),("Cargo.toml","[dependencies]\nremote={git='ssh://private/repo'}\n","ssh://private/repo"),("Cargo.lock","version=3\n[[package]]\nname='bad'\nversion='0.1.0'\nsource='registry+https://other.example/index'\n","https://other.example/index")] {
+    for (file,body,offender) in [("Cargo.toml","[dependencies]\noutside={path='../../../../outside'}\n","outside"),("Cargo.toml","[dependencies]\nremote={git='ssh://private/repo'}\n","ssh://private/repo"),("Cargo.lock","version=3\n[[package]]\nname='bad'\nversion='0.1.0'\nsource='registry+https://other.example/index'\n","https://other.example/index")] {
         let f = Fixture::new(); source(&f);
-        if body.is_empty() { fs::remove_file(f.main.join(file)).unwrap(); } else { fs::write(f.main.join(file),body).unwrap(); }
+        fs::write(f.main.join(file),body).unwrap();
         git(&f.main,&["add","."]); git(&f.main,&["commit","-m","refusal"]);
         let (c,a) = configure(&f,Fault::None,0); let runner = Runner::open_with_backend(c,Box::new(FakeHost)).unwrap();
         let (r,bytes) = request(&f); f.submit(&runner,&r,&bytes); let t = terminal(&runner,r.job_id).await;

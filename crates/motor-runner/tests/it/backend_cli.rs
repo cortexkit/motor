@@ -23,7 +23,7 @@ fn vm_without_configuration_exits_with_an_actionable_message() {
 fn windows_prepare_process_emits_a_structured_step_failure() {
     let scratch = ScratchDir::new("windows-prep-cli");
     let staging = scratch.join("staging");
-    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::create_dir_all(staging.join("m/repository/Cargo.lock")).unwrap();
     let plan = staging.join("prepare.json");
     std::fs::write(
         &plan,
@@ -50,7 +50,7 @@ fn windows_prepare_process_emits_a_structured_step_failure() {
     assert_eq!(failure["step"], "validate manifests");
     assert_eq!(
         failure["reason"],
-        "snapshot has no Cargo.lock: [redacted path or source]"
+        "root Cargo.lock is not a tracked regular file"
     );
     assert!(!line.contains(staging.to_str().unwrap()), "{line}");
 }

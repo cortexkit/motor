@@ -269,8 +269,10 @@ fetch/build then runs only inside the offline VM. Tests:
 `windows_backend_rejects_unsupported_manifests_but_accepts_cargo_config`, the
 local-registry cache tests, and the operator-only `-LocalRegistryOnly` proof.
 
-5.2. The workspace must have a Cargo.lock. Crates.io registry packages must have
-a locked checksum. Git dependencies must be present in the job's uploaded bundles
+5.2. A workspace without a root Cargo.lock skips local-registry preparation and
+can start a job without Cargo dependencies. When a lockfile is present, crates.io
+registry packages must have a locked checksum. Git dependencies must be present
+in the job's uploaded bundles
 and are rewritten to their local mirror inside the VM. Path dependencies must
 resolve inside the transferred snapshots. An alternate registry, undeclared Git
 source, or outside path dependency is refused before VM start with its source
@@ -279,7 +281,12 @@ has higher precedence than the runner's Cargo-home source replacement, so a repo
 may use its own vendored or replacement source. Cargo remains offline, and
 `--locked` keeps Cargo.lock unchanged and verifies package checksums. Test:
 `windows_backend_rejects_unsupported_manifests_but_accepts_cargo_config` and the
-operator-only local-registry qualification.
+operator-only local-registry qualification. Tests
+`windows_backend_without_lockfile_starts_without_preparing_local_registry` and
+`windows_backend_with_lockfile_prepares_local_registry_before_start` cover the
+optional-lockfile dispatch through job start. When preparing a root lockfile,
+nested Cargo.lock files are eligible only when both the lockfile and its
+Cargo.toml are tracked regular files; malformed nested locks are still skipped.
 
 5.3. Only the snapshot (`m/`) and selected Cargo-home members (`config.toml`,
 `local-registry/`, bundled `git-mirrors/` and its rewrite manifest) enter the VM,

@@ -13,6 +13,31 @@ LOCAL_USER_DESCRIPTION_MAX = 48
 
 
 class InstallScriptTests(unittest.TestCase):
+    def test_ssh_key_is_profile_independent_and_validated_before_restart(self):
+        install = (HERE / "install.ps1").read_text()
+        accounts = (HERE / "accounts.ps1").read_text()
+        fixture = (HERE / "test_scripts.ps1").read_text()
+        self.assertIn('Set-RunnerSshAuthorizedKey -Directory "$Root\\ssh" -KeyLine $keyLine', install)
+        self.assertIn('AuthorizedKeysFile __PROGRAMDATA__/MotorRunner/ssh/authorized_keys', install)
+        for profile_dependency in ('CreateProfile', 'ProfileList', '$sshHome', '.ssh/authorized_keys'):
+            self.assertNotIn(profile_dependency, install)
+        self.assertLess(install.index('Set-RunnerSshConfigBlock -ConfigPath $sshdConfig'),
+                        install.index('Restart-Service sshd'))
+        config_writer = accounts.split('function Set-RunnerSshConfigBlock', 1)[1].split('function Remove-RunnerSshConfigBlock', 1)[0]
+        self.assertIn("$SshdArguments = @('-t', '-f', $ConfigPath)", config_writer)
+        self.assertIn('[IO.File]::WriteAllText($ConfigPath, $before,', config_writer)
+        key_writer = accounts.split('function Set-RunnerSshAuthorizedKey', 1)[1].split('function Set-RunnerSshConfigBlock', 1)[0]
+        self.assertIn("'O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)'", key_writer)
+        self.assertIn("'O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)'", key_writer)
+        self.assertIn('Set-Acl -LiteralPath $Directory -AclObject $directoryAcl', key_writer)
+        self.assertIn('Set-Acl -LiteralPath $keyPath -AclObject $fileAcl', key_writer)
+        cleanup = accounts.split('function Remove-RunnerSshInstallState', 1)[1]
+        self.assertIn("$sshDirectory = Join-Path $Installation.root 'ssh'", cleanup)
+        self.assertIn('Remove-Item -LiteralPath $sshDirectory -Recurse -Force', cleanup)
+        self.assertIn('ssh-key-fixed-directory-exact-private-acl-and-idempotent-repair', fixture)
+        self.assertIn('ssh-config-validation-restores-original-and-accepts-valid-block', fixture)
+        self.assertIn('ssh-cleanup-old-hand-fixed-and-profile-free-layouts-is-idempotent', fixture)
+
     def test_installer_rejects_system_before_modifying_host(self):
         script = (HERE / "install.ps1").read_text()
         reject_system = script.index("if ($identity.User.Value -eq 'S-1-5-18')")

@@ -20,12 +20,25 @@ the host.
 - `motor-ssh` is a dedicated non-admin account with exactly one supplied vault
   Ed25519 public key. An owned OpenSSH `Match User` block forces the bridge and
   disables password authentication, PTY, agent/TCP/X11 forwarding. Installation
-  checks `sshd` syntax and verifies effective public-key-only authentication,
+  stores the key at `C:\ProgramData\MotorRunner\ssh\authorized_keys`; the file
+  and directory are Administrators-owned, with protected ACLs granting only
+  SYSTEM and Administrators. The Match block uses
+  `__PROGRAMDATA__/MotorRunner/ssh/authorized_keys`, so a temporary Windows
+  logon profile cannot change key lookup. No installer step needs a `motor-ssh`
+  profile: the forced command, binary access, pipe ACL and service-status grant
+  use absolute paths or the account SID. Uninstall removes the key directory
+  and still cleans recorded profiles from older installations.
+  `ssh-key-fixed-directory-exact-private-acl-and-idempotent-repair` and
+  `ssh-cleanup-old-hand-fixed-and-profile-free-layouts-is-idempotent` in
+  `test_scripts.ps1` exercise both layouts. Installation checks `sshd` syntax
+  before restart, restores the original configuration on validation failure,
+  and verifies effective public-key-only authentication,
   password, TCP/agent forwarding, PTY and forced-command settings. It also
   configures X11 forwarding off where Windows OpenSSH supports that option. It
   prints sshd's public host key for the client pin. No ambient client SSH configuration is required.
  - VM management is a boot-start SCM service running as SYSTEM. Production preparation
-   does not run Cargo or Rustup on the Ally host. The runner reads the copied Cargo.lock,
+   does not run Cargo or Rustup on the Ally host. Without a root `Cargo.lock`,
+   jobs skip local-registry preparation. Otherwise the runner reads the copied Cargo.lock,
    downloads only allowlisted crates.io index records and `.crate` archives, verifies
    each locked checksum before publication, and maintains a SYSTEM/Administrators-only
    local-registry cache. Git sources are assembled from the job's validated bundles.

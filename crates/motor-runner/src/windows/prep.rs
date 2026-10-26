@@ -56,16 +56,28 @@ pub(super) fn prepare(
     if !Path::new(&request.cwd).starts_with(&request.workspace_key) {
         return Err(invalid(format!("cwd outside snapshot: {}", request.cwd)));
     }
-    let lockfile = crate::workspace::git(
-        &trees.mirror(&request.repository_root),
-        &["show", &format!("{}:Cargo.lock", request.snapshot_commit)],
-    )
-    .map_err(|_| {
-        invalid(format!(
-            "snapshot has no Cargo.lock: {}",
-            request.workspace_key
-        ))
-    })?;
+    let mirror = trees.mirror(&request.repository_root);
+    // An absent lockfile is valid for non-Cargo jobs. Check the tree first so
+    // a corrupt mirror or unreadable lockfile is not mistaken for absence.
+    let lockfile = if crate::workspace::git(
+        &mirror,
+        &[
+            "ls-tree",
+            "--name-only",
+            &request.snapshot_commit,
+            "--",
+            "Cargo.lock",
+        ],
+    )?
+    .is_empty()
+    {
+        String::new()
+    } else {
+        crate::workspace::git(
+            &mirror,
+            &["show", &format!("{}:Cargo.lock", request.snapshot_commit)],
+        )?
+    };
     let (routes, missing) = trees.dependency_fetch_routes(&request.git_dependencies, &lockfile)?;
     if !missing.is_empty() {
         return Err(invalid(missing.join("; ")));
@@ -545,13 +557,11 @@ fn validate_staged_manifests(
     let root_lockfile = format!("{}/Cargo.lock", mapped(&plan.workspace)?.display());
     #[cfg(windows)]
     let root_lockfile = root_lockfile.replace('\\', "/");
-    if !workspace.join("Cargo.lock").is_file()
-        || (!plan.snapshots.is_empty() && !regular_files.contains(&root_lockfile))
+    if workspace.join("Cargo.lock").exists()
+        && (!workspace.join("Cargo.lock").is_file()
+            || (!plan.snapshots.is_empty() && !regular_files.contains(&root_lockfile)))
     {
-        return Err(invalid(format!(
-            "snapshot has no Cargo.lock: {}",
-            plan.workspace
-        )));
+        return Err(invalid("root Cargo.lock is not a tracked regular file"));
     }
     for root in roots {
         validate_manifests(root, roots, &plan.routes)?;
@@ -575,9 +585,11 @@ pub(crate) fn execute_with_fetch(
     let workspace = super::prep_error::step("validate manifests", &plan.staging, || {
         validate_staged_manifests(&plan, &roots, &regular_files)
     })?;
-    super::prep_error::step("fetch dependencies", &plan.staging, || {
-        fetch_manifest(&plan, &workspace.join("Cargo.toml"), &mut fetch)
-    })?;
+    if workspace.join("Cargo.lock").is_file() {
+        super::prep_error::step("fetch dependencies", &plan.staging, || {
+            fetch_manifest(&plan, &workspace.join("Cargo.toml"), &mut fetch)
+        })?;
+    }
     let root_lockfile = format!("{}/Cargo.lock", mapped(&plan.workspace)?.display());
     #[cfg(windows)]
     let root_lockfile = root_lockfile.replace('\\', "/");
@@ -724,8 +736,10 @@ pub(crate) fn execute_with_registry(
         Ok(workspace)
     })?;
     super::prep_error::step("stage dependencies", &plan.staging, || {
-        let lockfile = combined_registry_lockfile(&plan, &members, &regular_files)?;
-        prepare_registry(&plan.staging, &workspace, &lockfile, &plan.routes)?;
+        if workspace.join("Cargo.lock").is_file() {
+            let lockfile = combined_registry_lockfile(&plan, &members, &regular_files)?;
+            prepare_registry(&plan.staging, &workspace, &lockfile, &plan.routes)?;
+        }
         build_tar(&plan.staging)
     })
 }
