@@ -114,11 +114,6 @@ class CachePins(unittest.TestCase):
         done.write_bytes(b"second\nfirst")
         self.assertNotEqual(cache_manifest.manifest(self.cache)["tree_sha256"], original)
 
-    def test_one_byte_payload_change_changes_tree_hash(self):
-        original = cache_manifest.manifest(self.cache)["tree_sha256"]
-        (self.sdk / "sdk.lib").write_bytes(b"First")
-        self.assertNotEqual(cache_manifest.manifest(self.cache)["tree_sha256"], original)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

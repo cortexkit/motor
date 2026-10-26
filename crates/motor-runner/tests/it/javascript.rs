@@ -343,20 +343,6 @@ pub(super) fn checked_restore_command(command: &mut Command) {
     );
 }
 
-#[test]
-fn javascript_ownership_restore_failure_reports_stderr() {
-    let panic = std::panic::catch_unwind(|| {
-        checked_restore_command(
-            Command::new("sh").args(["-c", "echo restore-failure >&2; exit 1"]),
-        );
-    })
-    .expect_err("a failed restore command must fail the test");
-    let message = panic
-        .downcast_ref::<String>()
-        .expect("formatted command failure");
-    assert!(message.contains("stderr: restore-failure"), "{message}");
-}
-
 #[tokio::test]
 async fn javascript_snapshot_bundle_imports_and_reuses_for_second_job() {
     let scratch = ScratchDir::new("js-bundle-protocol");

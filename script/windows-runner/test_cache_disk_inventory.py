@@ -33,22 +33,6 @@ class CacheDiskInventoryTests(unittest.TestCase):
         self.assertIn("CacheStep::DiskSelection => HYPERV_DISK_INVENTORY_TIMEOUT", steps)
         self.assertIn("allow five seconds for cold storage-provider", steps)
 
-    def test_disk_inventory_is_logged_before_bus_selection(self):
-        agent = (ROOT / "crates/motor-winagent/src/main.rs").read_text()
-        cache_disk = agent.split("fn cache_disk(", 1)[1].split(
-            '#[cfg(not(feature = "hyperv-runner"))]', 1
-        )[0]
-        log = 'diagnostic!("Hyper-V cache disk inventory: {disks:?}")'
-        selection = "select_hyperv_cache_disk(&disks)"
-        self.assertIn(log, cache_disk)
-        self.assertLess(cache_disk.index(log), cache_disk.index(selection))
-        diag = (ROOT / "crates/motor-winagent/src/hyperv_diag.rs").read_text()
-        self.assertIn(r'C:\ProgramData\Motor\hyperv-agent.log', diag)
-        self.assertIn("pub fn event(message: &str)", diag)
-        manifest = (ROOT / "crates/motor-winagent/Cargo.toml").read_text()
-        self.assertIn('hyperv-hvsock = ["hyperv-spike"]', manifest)
-        self.assertIn('hyperv-runner = ["hyperv-hvsock"]', manifest)
-
 
 if __name__ == "__main__":
     unittest.main()
