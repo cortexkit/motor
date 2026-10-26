@@ -197,9 +197,10 @@ pub struct Config {
     #[cfg(unix)]
     pub(crate) remote_cache_runtime: Option<Arc<crate::remote_cache::runtime::Runtime>>,
     pub(crate) remote_cache_error: Option<String>,
-    /// Outbound networking is opt-in and requires a probed isolated host backend.
+    /// Outbound networking is opt-in; readiness is re-probed per net admission.
     pub job_network: Option<crate::network::JobNetwork>,
     pub(crate) job_network_unavailable: String,
+    pub(crate) network_cleanup_pending: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     pub(crate) job_network_hook: Option<crate::network::Hook>,
     pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
@@ -481,6 +482,7 @@ impl Config {
             remote_cache_error: None,
             job_network: None,
             job_network_unavailable: "--job-network veth is not enabled".into(),
+            network_cleanup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             job_network_hook: None,
             clock: Arc::new(|| {

@@ -2473,6 +2473,20 @@ fn net_operator_lock() -> File {
 }
 
 #[tokio::test]
+#[ignore = "operator only: root, provisioned motor_net and trusted host isolation"]
+async fn isolated_net_generation_appears_after_runner_start_without_restart() {
+    let _guard = net_operator_lock();
+    crate::engine::net_operator_case("generation-recovery").await;
+}
+
+#[tokio::test]
+#[ignore = "operator only: root, provisioned motor_net and trusted host isolation"]
+async fn isolated_net_failed_reload_refuses_new_jobs() {
+    let _guard = net_operator_lock();
+    crate::engine::net_operator_case("generation-reload").await;
+}
+
+#[tokio::test]
 #[ignore = "operator only: requires provisioned motor_net and trusted host isolation"]
 async fn isolated_net_public_https_dns_read_only_resolver() {
     let _guard = net_operator_lock();

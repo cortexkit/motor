@@ -6,13 +6,48 @@ use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{self, Read},
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     time::Instant,
 };
 
 const IP: &str = "/usr/sbin/ip";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
+
+#[cfg(test)]
+static OPERATOR_GENERATION: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) struct OperatorGenerationGuard(Option<PathBuf>);
+#[cfg(test)]
+impl Drop for OperatorGenerationGuard {
+    fn drop(&mut self) {
+        *OPERATOR_GENERATION.lock().unwrap() = self.0.take();
+    }
+}
+#[cfg(test)]
+pub(crate) fn operator_generation_path(path: PathBuf) -> OperatorGenerationGuard {
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "operator generation tests require root"
+    );
+    OperatorGenerationGuard(OPERATOR_GENERATION.lock().unwrap().replace(path))
+}
+
+fn generation_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = OPERATOR_GENERATION.lock().unwrap().clone() {
+        return path;
+    }
+    PathBuf::from("/run/motor-net-ready")
+}
+
+/// A failed readiness check rejects only this admission, never future jobs.
+/// Full permissions/kernel checks are repeated by attachment before it succeeds.
+pub(crate) fn admission_probe() -> io::Result<()> {
+    read_success_generation(&generation_path(), 0).map(|_| ())
+}
 
 fn sudo(path: &str, args: &[&str]) -> io::Result<String> {
     let output = crate::privilege::command(path).args(args).output()?;
@@ -30,7 +65,7 @@ fn sudo(path: &str, args: &[&str]) -> io::Result<String> {
 pub(crate) fn probe() -> io::Result<()> {
     probe_policy(
         sudo,
-        || read_success_generation(Path::new("/run/motor-net-ready"), 0),
+        || read_success_generation(&generation_path(), 0),
         || fs::read_to_string("/proc/sys/net/ipv4/ip_forward"),
     )?;
     // Permission queries never execute the mutating probe commands. Keep the
@@ -353,8 +388,9 @@ pub(crate) fn attach(id: Uuid) -> io::Result<()> {
         namespace(pid, IP, &["link", "set", "dev", "eth0", "up"])?;
         sudo(IP, &["link", "set", "dev", &name, "up"])?;
         namespace(pid, IP, &["route", "add", "default", "via", &gateway])?;
-        // Keep the command gate closed if a policy load began or failed while
-        // links were being created. The error path removes the unstarted veth.
+        // Attachment is authorized under the generation this final probe reads.
+        // A later withdrawal affects new jobs and tenant gates, not this accepted
+        // attachment; command-gate release is intentionally not another probe.
         probe()?;
         Ok(())
     })();

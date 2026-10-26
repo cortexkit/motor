@@ -211,6 +211,106 @@ pub(crate) async fn case(mode: &str) {
     }
 }
 
+pub(crate) async fn generation(mode: &str) {
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "generation operator tests require root"
+    );
+    let f = Fixture::new();
+    install_probe(&f);
+    let producer = f.scratch.path().join("generation-producer");
+    fs::create_dir_all(&producer).unwrap();
+    let marker = producer.join("ready");
+    // Exercise real root-owned publication and consumer reads without withdrawing
+    // the production host's generation. Kernel policy and sandbox setup are real.
+    let _generation = crate::network::linux::operator_generation_path(marker.clone());
+    fs::write(
+        producer.join("motor_network_ready.py"),
+        include_str!("../../../../script/runner/motor_network_ready.py"),
+    )
+    .unwrap();
+    fs::write(
+        producer.join("motor_network_policy.py"),
+        include_str!("../../../../script/runner/motor_network_policy.py"),
+    )
+    .unwrap();
+    fs::write(
+        producer.join("template.nft"),
+        include_str!("../../../../script/runner/motor-net.nft"),
+    )
+    .unwrap();
+    fs::write(
+        producer.join("stale.nft"),
+        "# stale source intentionally disagrees with the settings\n",
+    )
+    .unwrap();
+    fs::write(
+        producer.join("settings.json"),
+        r#"{"uplink":"enp6s0","public_ipv4":"8.8.8.8"}"#,
+    )
+    .unwrap();
+    let publish = || {
+        let result = Command::new("python3").args(["-c", r#"import pathlib,runpy,sys
+ns=runpy.run_path(sys.argv[1]); ns['publish'].__globals__['READY']=pathlib.Path(sys.argv[2]); ns['publish']()"#])
+            .arg(producer.join("motor_network_ready.py")).arg(&marker).output().unwrap();
+        assert!(
+            result.status.success(),
+            "publisher: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    if mode == "generation-reload" {
+        publish();
+    }
+    let runner = Runner::open(config(&f)).unwrap();
+    let refuse = |runner: &Runner| {
+        let (mut request, _) = f.run("touch generation-job-must-not-run");
+        request.network = Some(Network::Outbound);
+        let admission = runner.accept(request.clone()).unwrap();
+        assert!(
+            matches!(
+                admission,
+                Admission::Refused(RefusalReason::NetworkUnsupported)
+            ),
+            "missing generation must refuse this net request before upload"
+        );
+        assert!(!runner.spool_dir(request.job_id).exists());
+    };
+    if mode == "generation-reload" {
+        let (mut first, bytes) = f.run("python3 network-check.py public");
+        first.network = Some(Network::Outbound);
+        f.submit(&runner, &first, &bytes);
+        assert_success(&runner, &first).await;
+        let result = Command::new("python3").args(["-c", r#"import pathlib,runpy,sys
+p=pathlib.Path(sys.argv[1]); ns=runpy.run_path(str(p/'motor_network_policy.py')); g=ns['load'].__globals__
+g['SETTINGS']=p/'settings.json'; g['TEMPLATE']=p/'template.nft'; g['SOURCE']=p/'stale.nft'; g['LOCK']=p/'lockdir'/'lock'
+g['readiness'].READY=p/'ready'; ns['load']()"#]).arg(&producer).output().unwrap();
+        assert!(
+            !result.status.success(),
+            "the stale-source reload must fail"
+        );
+        assert!(!marker.exists());
+        assert!(
+            crate::privilege::command("/usr/sbin/nft")
+                .args(["list", "table", "inet", "motor_net"])
+                .status()
+                .unwrap()
+                .success(),
+            "old kernel table must still exist in the failed-reload regression"
+        );
+    }
+    refuse(&runner);
+    let (offline, bytes) = f.run("true");
+    f.submit(&runner, &offline, &bytes);
+    assert_success(&runner, &offline).await;
+    publish();
+    let (mut recovered, bytes) = f.run("python3 network-check.py public");
+    recovered.network = Some(Network::Outbound);
+    f.submit(&runner, &recovered, &bytes);
+    assert_success(&runner, &recovered).await;
+}
+
 #[test]
 #[ignore = "child process for isolated_net_restart_survives_and_cleans_up"]
 fn restart_child() {

@@ -7,6 +7,10 @@ mod operator;
 
 #[cfg(target_os = "linux")]
 pub(crate) async fn operator_case(mode: &str) {
+    if matches!(mode, "generation-recovery" | "generation-reload") {
+        operator::generation(mode).await;
+        return;
+    }
     if mode == "restart" {
         operator::restart().await;
     } else if mode == "measurement" {
@@ -105,6 +109,58 @@ async fn network_admission_refuses_before_upload_with_missing_prerequisite() {
             .exists());
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn network_admission_recovers_after_missing_generation_without_runner_restart() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.disable_warm_builds = true;
+    config.job_network = Some(JobNetwork::Veth);
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = ready.clone();
+    config.job_network_hook = Some(Arc::new(move |phase| {
+        if matches!(phase, Phase::Probe) && !observed.load(std::sync::atomic::Ordering::Acquire) {
+            Err(io::Error::other("network success generation missing"))
+        } else {
+            Ok(())
+        }
+    }));
+    let runner = Runner::open(config).unwrap();
+    let (socket, server) = listener(&f, &runner);
+    for (net, available, accepted) in [
+        (true, false, false),
+        (false, false, true),
+        (true, true, true),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        ready.store(available, std::sync::atomic::Ordering::Release);
+        let (mut request, bytes) = f.run("true");
+        request.network = net.then_some(Network::Outbound);
+        let mut stream = connect(&socket).await;
+        write_frame_async(&mut stream, &Frame::Run(request.clone()))
+            .await
+            .unwrap();
+        let response = read_next(&mut stream).await;
+        if accepted {
+            assert!(
+                matches!(response, Frame::Accepted(_)),
+                "must recover in the same process: {response:?}"
+            );
+            chunks(&mut stream, &bytes).await;
+            assert_eq!(
+                wire_terminal(&mut stream).await.outcome,
+                Outcome::Exit { code: 0 }
+            );
+        } else {
+            assert!(
+                matches!(response, Frame::Refusal(ref refusal) if refusal.reason == RefusalReason::NetworkUnsupported)
+            );
+            assert!(!runner.spool_dir(request.job_id).exists());
+        }
+    }
+    server.abort();
 }
 
 #[tokio::test]
