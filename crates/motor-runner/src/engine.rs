@@ -947,11 +947,23 @@ struct Inner {
 
 fn nested_workspace_detail(
     inner: &Inner,
+    config: &Config,
     plan: paths::RequestPlan<'_>,
     siblings: &[SiblingSnapshot],
 ) -> Option<String> {
     let workspace = plan.caller_workspace_key.text().as_str();
     let repository = plan.caller_repository_root.text().as_str();
+    for candidate in [workspace, repository].into_iter().chain(
+        siblings
+            .iter()
+            .map(|s| paths::sibling(s).caller.text().as_str()),
+    ) {
+        if paths::mapped_root(config, candidate).is_some() {
+            if let Some(detail) = mapped_nested_detail(inner, config, candidate, false) {
+                return Some(detail);
+            }
+        }
+    }
     if inner.sibling_fences == crate::sibling_snapshots::SiblingFences::Legacy {
         // Snapshot mounts must not hide a subtree of another checkout, even
         // when an existing symlink gives the two paths different spellings.
@@ -990,6 +1002,9 @@ fn nested_workspace_detail(
             known.extend(request.siblings.iter().map(paths::sibling));
         }
         for candidate in candidates {
+            if paths::mapped_root(config, candidate.caller.text()).is_some() {
+                continue;
+            }
             let path = match workspace::destination(candidate.host.as_path()) {
                 Ok(path) => path,
                 Err(error) => {
@@ -1000,6 +1015,9 @@ fn nested_workspace_detail(
                 }
             };
             for known in &known {
+                if paths::mapped_root(config, known.caller.text()).is_some() {
+                    continue;
+                }
                 let other = match workspace::destination(known.host.as_path()) {
                     Ok(path) => path,
                     Err(error) => {
@@ -1036,6 +1054,76 @@ fn nested_workspace_detail(
                 )
             })
         })
+    })
+}
+
+fn mapped_nested_detail(
+    inner: &Inner,
+    config: &Config,
+    candidate: &str,
+    fill: bool,
+) -> Option<String> {
+    let mut known: Vec<(String, bool)> = Vec::new();
+    for (key, record) in paths::entries(&inner.catalog.workspaces) {
+        known.push((key.caller.text().clone(), false));
+        known.extend(
+            record
+                .siblings
+                .iter()
+                .map(|s| (paths::sibling(s).caller.text().clone(), false)),
+        );
+    }
+    for request in inner
+        .jobs
+        .values()
+        .filter(|job| job.terminal.is_none() || inner.starting.contains(&job.id))
+        .filter_map(|job| job.request.as_ref())
+        .chain(inner.admitting.values())
+    {
+        let checkout = paths::run(request).workspace;
+        known.push((
+            checkout.checkout().caller.text().clone(),
+            matches!(checkout, paths::WorkspacePlan::Fill { .. }),
+        ));
+        known.extend(
+            request
+                .siblings
+                .iter()
+                .map(|s| (paths::sibling(s).caller.text().clone(), false)),
+        );
+    }
+    for request in inner.preparing.values() {
+        known.push((
+            paths::request(request).caller_workspace_key.text().clone(),
+            false,
+        ));
+        known.extend(
+            request
+                .siblings
+                .iter()
+                .map(|s| (paths::sibling(s).caller.text().clone(), false)),
+        );
+    }
+    for (repository, record) in paths::entries(&inner.catalog.repositories) {
+        if let Some(desired) = &record.desired {
+            if let Ok(checkout) = paths::fill_checkout(
+                config,
+                paths::base(desired).caller.text(),
+                repository.caller.text(),
+            ) {
+                known.push((checkout.to_string_lossy().into_owned(), true));
+            }
+        }
+    }
+    let candidate_path = Path::new(candidate);
+    known.into_iter().find_map(|(other, other_fill)| {
+        if paths::mapped_root(config, &other).is_none() || (fill && other_fill && candidate_path == Path::new(&other)) {
+            return None;
+        }
+        ((candidate_path != Path::new(&other) || fill || other_fill)
+            && paths::overlaps(candidate_path, Path::new(&other))).then(|| format!(
+                "path {candidate} overlaps runner workspace or sibling {other}; nested workspaces aren't supported"
+            ))
     })
 }
 
@@ -2661,6 +2749,12 @@ impl Runner {
         environment_values: impl IntoIterator<Item = String>,
     ) -> String {
         let mut detail = text.to_string();
+        for root in &self.core.config.caller_roots {
+            detail = detail.replace(
+                root.host_root.to_string_lossy().as_ref(),
+                &root.caller_prefix,
+            );
+        }
         // Short values such as "0" or "true" aren't secrets, and replacing them
         // would mangle every number and word in the detail.
         let mut environment_values: Vec<_> = environment_values
@@ -3222,7 +3316,11 @@ impl Runner {
                 siblings,
                 self.now(),
             );
-        } else if plan.host.as_path().exists() {
+        } else if if paths::mapped_root(&self.core.config, key).is_some() {
+            paths::authorize(&self.core.config, key, false).is_ok_and(|host| host.exists())
+        } else {
+            plan.host.as_path().exists()
+        } {
             workspace::record_workspace(&mut inner.catalog, key, root, commit, &[], self.now());
             if let Some(w) = inner.catalog.workspaces.get_mut(key) {
                 w.siblings = siblings.to_vec();
@@ -3538,6 +3636,24 @@ impl Runner {
                 "return_paths_unsupported".into(),
             ));
         }
+        if !self.core.config.caller_roots.is_empty() {
+            if let Some(detail) = nested_workspace_detail(
+                inner,
+                &self.core.config,
+                paths::request(request),
+                &request.siblings,
+            ) {
+                return Some((RefusalReason::WorkspaceSetupFailed, detail));
+            }
+            if let Err(error) = paths::authorize_request(
+                &self.core.config,
+                paths::request(request),
+                Some(paths::run(request).caller_cwd),
+                &request.siblings,
+            ) {
+                return Some((RefusalReason::WorkspaceKeyRejected, error.to_string()));
+            }
+        }
         if let Err(error) = self.ensure_admission_ownership() {
             return Some((RefusalReason::WorkspaceSetupFailed, error.to_string()));
         }
@@ -3574,7 +3690,7 @@ impl Runner {
         } else if inner.drain_deadline.is_some() {
             Some((RefusalReason::RunnerDraining, "runner is draining".into()))
         } else if (!self.core.config.windows_instance()
-            && Self::deleting(
+            && self.deleting(
                 inner,
                 paths::request(request).host_workspace,
                 &request.siblings,
@@ -3599,11 +3715,15 @@ impl Runner {
                     self.core.config.max_queue_depth
                 ),
             ))
-        } else if let Err(error) = workspace::validate_request(
-            paths::request(request),
-            &request.siblings,
-            self.core.config.sibling_snapshot_mode(),
-        ) {
+        } else if let Err(error) = if self.core.config.caller_roots.is_empty() {
+            workspace::validate_request(
+                paths::request(request),
+                &request.siblings,
+                self.core.config.sibling_snapshot_mode(),
+            )
+        } else {
+            Ok(())
+        } {
             Some((RefusalReason::WorkspaceKeyRejected, error.to_string()))
         } else if !workspace::absolute(paths::run(request).caller_cwd.text())
             || !paths::run(request)
@@ -3618,14 +3738,17 @@ impl Runner {
                     paths::run(request).caller_cwd.text()
                 ),
             ))
-        } else if let Some(detail) =
-            nested_workspace_detail(inner, paths::request(request), &request.siblings)
-        {
-            Some((RefusalReason::WorkspaceSetupFailed, detail))
-        } else if let Err(error) = self.validate_writer_paths_with_catalog(
+        } else if let Some(detail) = nested_workspace_detail(
             inner,
-            paths::request(request).host_workspace,
-            Some(paths::run(request).host_cwd),
+            &self.core.config,
+            paths::request(request),
+            &request.siblings,
+        ) {
+            Some((RefusalReason::WorkspaceSetupFailed, detail))
+        } else if let Err(error) = self.validate_request_writer_paths_with_catalog(
+            inner,
+            paths::request(request),
+            Some(paths::run(request).caller_cwd),
             &request.siblings,
         ) {
             Some((RefusalReason::WorkspaceKeyRejected, access.describe(&error)))
@@ -3636,12 +3759,74 @@ impl Runner {
         }
     }
 
+    fn validate_request_writer_paths_with_catalog(
+        &self,
+        inner: &Inner,
+        plan: paths::RequestPlan<'_>,
+        cwd: Option<paths::CallerPath<'_>>,
+        siblings: &[SiblingSnapshot],
+    ) -> io::Result<()> {
+        if self.core.config.caller_roots.is_empty() {
+            return self.validate_writer_paths_with_catalog(
+                inner,
+                plan.host_workspace,
+                cwd.map(|cwd| paths::host_str(cwd.text())),
+                siblings,
+            );
+        }
+        let authorized = paths::authorize_request(&self.core.config, plan, cwd, siblings)?;
+        self.validate_writer_paths_with_catalog(
+            inner,
+            paths::host(&authorized.host_workspace),
+            authorized.host_cwd.as_deref().map(paths::host),
+            &authorized.host_siblings,
+        )
+    }
+
+    fn validate_request_writer_paths(
+        &self,
+        plan: paths::RequestPlan<'_>,
+        cwd: Option<paths::CallerPath<'_>>,
+        siblings: &[SiblingSnapshot],
+    ) -> io::Result<()> {
+        if self.core.config.caller_roots.is_empty() {
+            return self.validate_writer_paths(
+                plan.host_workspace,
+                cwd.map(|cwd| paths::host_str(cwd.text())),
+                siblings,
+            );
+        }
+        self.validate_request_writer_paths_with_catalog(
+            &self.core.inner.lock().unwrap(),
+            plan,
+            cwd,
+            siblings,
+        )
+    }
+
     fn validate_writer_paths(
         &self,
         workspace: paths::HostPath<'_>,
         cwd: Option<paths::HostPath<'_>>,
         siblings: &[SiblingSnapshot],
     ) -> io::Result<()> {
+        if !self.core.config.caller_roots.is_empty() {
+            paths::validate_host_destinations(&self.core.config, workspace, cwd, siblings)?;
+            if self
+                .core
+                .config
+                .caller_roots
+                .iter()
+                .any(|root| workspace.as_path().starts_with(&root.host_root))
+            {
+                return self.validate_writer_paths_with_catalog(
+                    &self.core.inner.lock().unwrap(),
+                    workspace,
+                    cwd,
+                    siblings,
+                );
+            }
+        }
         // The state lock is taken for each attempt and released before a
         // repair runs, so a slow repair holds up no other request.
         crate::workspace_access::validate_with_repair(
@@ -3667,6 +3852,27 @@ impl Runner {
     /// storage, not checkouts a job owned.
     fn reclaim_workspace_access(&self, request: &Run) -> crate::workspace_access::Repairs {
         let mut repairs = crate::workspace_access::Repairs::default();
+        // Mapping refusals are not access failures. Never repair an unchecked
+        // caller path (in particular a runner-private or symlinked path).
+        if !self.core.config.caller_roots.is_empty()
+            && (paths::authorize_request(
+                &self.core.config,
+                paths::request(request),
+                Some(paths::run(request).caller_cwd),
+                &request.siblings,
+            )
+            .is_err()
+                || paths::mapped_root(
+                    &self.core.config,
+                    paths::request(request).caller_workspace_key.text(),
+                )
+                .is_some()
+                || request.siblings.iter().any(|s| {
+                    paths::mapped_root(&self.core.config, paths::sibling(s).caller.text()).is_some()
+                }))
+        {
+            return repairs;
+        }
         if self.core.config.vm_instance()
             || !workspace::absolute(paths::request(request).caller_workspace_key.text())
         {
@@ -3697,6 +3903,10 @@ impl Runner {
         siblings: &[SiblingSnapshot],
     ) -> io::Result<()> {
         if self.core.config.vm_instance() {
+            return Ok(());
+        }
+        if !self.core.config.caller_roots.is_empty() {
+            paths::validate_host_destinations(&self.core.config, key, cwd, siblings)?;
             return Ok(());
         }
         if self.core.config.sibling_snapshot_mode() {
@@ -3737,14 +3947,29 @@ impl Runner {
         };
         for (workspace, record) in paths::entries(&inner.catalog.workspaces) {
             derive(
-                workspace.host,
+                paths::host(&paths::host_path(
+                    &self.core.config,
+                    workspace.caller.text(),
+                )),
                 paths::workspace_record(record).repository.caller.text(),
             );
         }
         for (repository, record) in paths::entries(&inner.catalog.repositories) {
-            derive(repository.host, repository.caller.text());
+            derive(
+                paths::host(&paths::host_path(
+                    &self.core.config,
+                    repository.caller.text(),
+                )),
+                repository.caller.text(),
+            );
             if let Some(desired) = &record.desired {
-                derive(paths::base(desired).host, repository.caller.text());
+                derive(
+                    paths::host(&paths::host_path(
+                        &self.core.config,
+                        paths::base(desired).caller.text(),
+                    )),
+                    repository.caller.text(),
+                );
             }
         }
         for request in inner
@@ -3753,14 +3978,27 @@ impl Runner {
             .filter(|job| {
                 job.base
                     && (job.terminal.is_none()
-                        || job
-                            .request
-                            .as_ref()
-                            .is_some_and(|r| paths::run(r).host_cwd.as_path().exists()))
+                        || job.request.as_ref().is_some_and(|r| {
+                            paths::host_path(&self.core.config, paths::run(r).caller_cwd.text())
+                                .exists()
+                        }))
             })
             .filter_map(|job| job.request.as_ref())
         {
-            known.push(paths::run(request).host_cwd.as_path().to_path_buf());
+            known.push(paths::host_path(
+                &self.core.config,
+                paths::run(request).caller_cwd.text(),
+            ));
+        }
+        if !self.core.config.caller_roots.is_empty() {
+            paths::validate_host_destinations(&self.core.config, workspace, cwd, siblings)?;
+            crate::writer::validate_paths(&self.core.config, workspace, cwd, siblings, &known)?;
+            crate::writer::validate_alias_paths(
+                &self.core.config,
+                &paths::host_aliases(&self.core.config, workspace, siblings)?,
+                &known,
+            )?;
+            return Ok(());
         }
         crate::writer::validate_paths(&self.core.config, workspace, cwd, siblings, &known)?;
         if self.core.config.sibling_snapshot_mode() {
@@ -3773,7 +4011,12 @@ impl Runner {
         self.validate_destinations(workspace, cwd, siblings)
     }
 
-    fn deleting(inner: &Inner, key: paths::HostPath<'_>, siblings: &[SiblingSnapshot]) -> bool {
+    fn deleting(
+        &self,
+        inner: &Inner,
+        key: paths::HostPath<'_>,
+        siblings: &[SiblingSnapshot],
+    ) -> bool {
         // Without any drop in progress nothing overlaps; return before the
         // canonicalization below, which touches the filesystem with the state
         // lock held, for every queue head on every dispatch pass.
@@ -3788,19 +4031,22 @@ impl Runner {
         } else {
             &[]
         };
-        let paths: Vec<_> = std::iter::once(key.as_path().to_path_buf())
-            .chain(
-                siblings
-                    .iter()
-                    .map(|s| paths::sibling(s).host.as_path().to_path_buf()),
-            )
-            .flat_map(|p| {
-                let canonical = p.canonicalize().ok();
-                std::iter::once(p).chain(canonical)
-            })
-            .collect();
+        let paths: Vec<_> = std::iter::once(paths::host_path(
+            &self.core.config,
+            &key.as_path().to_string_lossy(),
+        ))
+        .chain(
+            siblings
+                .iter()
+                .map(|s| paths::host_path(&self.core.config, paths::sibling(s).caller.text())),
+        )
+        .flat_map(|p| {
+            let canonical = p.canonicalize().ok();
+            std::iter::once(p).chain(canonical)
+        })
+        .collect();
         inner.dropping.iter().any(|dropping| {
-            let path = paths::identity(dropping).host.as_path().to_path_buf();
+            let path = paths::host_path(&self.core.config, dropping);
             std::iter::once(path.clone())
                 .chain(path.canonicalize().ok())
                 .any(|d| paths.iter().any(|p| p.starts_with(&d) || d.starts_with(p)))
@@ -3873,9 +4119,9 @@ impl Runner {
         self.long_work("fetch");
         let trees = &self.core.trees;
         let fetched = self
-            .validate_writer_paths(
-                paths::request(request).host_workspace,
-                Some(paths::run(request).host_cwd),
+            .validate_request_writer_paths(
+                paths::request(request),
+                Some(paths::run(request).caller_cwd),
                 &request.siblings,
             )
             .and_then(|()| trees.validate_dependency_bundles(directory, &request.git_dependencies))
@@ -3999,11 +4245,7 @@ impl Runner {
     }
     pub(crate) fn fetch_prepare(&self, request: &Prepare, directory: &Path) -> io::Result<()> {
         self.allow_prepare()?;
-        self.validate_writer_paths(
-            paths::request(request).host_workspace,
-            None,
-            &request.siblings,
-        )?;
+        self.validate_request_writer_paths(paths::request(request), None, &request.siblings)?;
         self.core
             .trees
             .validate_dependency_bundles(directory, &request.git_dependencies)?;
@@ -4084,17 +4326,31 @@ impl Runner {
     /// of prepares cannot hold up transfers and job starts.
     pub(crate) fn prepare(&self, r: &Prepare, default_branch_tip: bool) -> io::Result<()> {
         self.allow_prepare()?;
-        workspace::validate_request(
-            paths::request(r),
-            &r.siblings,
-            self.core.config.sibling_snapshot_mode(),
-        )?;
-        self.validate_writer_paths(paths::request(r).host_workspace, None, &r.siblings)?;
+        let authorized = if self.core.config.caller_roots.is_empty() {
+            workspace::validate_request(
+                paths::request(r),
+                &r.siblings,
+                self.core.config.sibling_snapshot_mode(),
+            )?;
+            None
+        } else {
+            Some(paths::authorize_request(
+                &self.core.config,
+                paths::request(r),
+                None,
+                &r.siblings,
+            )?)
+        };
+        let host_workspace = authorized
+            .as_ref()
+            .map(|plan| paths::host(&plan.host_workspace))
+            .unwrap_or(paths::request(r).host_workspace);
+        self.validate_request_writer_paths(paths::request(r), None, &r.siblings)?;
         let snapshot_mode = self.core.config.sibling_snapshot_mode();
         let (recorded, prior) = {
             let _restore = self.reserve_restore_barrier();
             let mut inner = self.core.inner.lock().unwrap();
-            if Self::deleting(&inner, paths::request(r).host_workspace, &r.siblings)
+            if self.deleting(&inner, host_workspace, &r.siblings)
                 || Self::occupied(&inner, paths::request(r).caller_workspace_key.text())
                 || Self::siblings_blocked(&inner, &r.siblings)
             {
@@ -4131,10 +4387,14 @@ impl Runner {
         });
         let started = std::time::Instant::now();
         self.long_work("materialize");
-        self.validate_destinations(paths::request(r).host_workspace, None, &r.siblings)?;
+        if self.core.config.caller_roots.is_empty() {
+            self.validate_destinations(host_workspace, None, &r.siblings)?;
+        } else {
+            paths::authorize_request(&self.core.config, paths::request(r), None, &r.siblings)?;
+        }
         #[cfg(target_os = "linux")]
         if self.core.config.isolate_jobs {
-            let workspace_path = paths::request(r).host_workspace.as_path();
+            let workspace_path = host_workspace.as_path();
             if workspace_path.exists() {
                 setup_step(
                     "restore runner access before workspace prepare",
@@ -4164,7 +4424,7 @@ impl Runner {
                 self.core
                     .trees
                     .populate_main(
-                        paths::request(r).host_workspace,
+                        host_workspace,
                         paths::request(r).caller_repository_root.text(),
                         &r.base_commit,
                         &tree_hash,
@@ -4189,7 +4449,7 @@ impl Runner {
                 self.core
                     .trees
                     .populate(
-                        paths::request(r).host_workspace,
+                        host_workspace,
                         paths::request(r).caller_repository_root.text(),
                         &r.base_commit,
                         &r.siblings,
@@ -4207,14 +4467,12 @@ impl Runner {
                     "prepare workspace target",
                     crate::isolation::prepare_job_writable_target(
                         &self.core.trees.state,
-                        &paths::request(r).host_workspace.as_path().join("target"),
+                        &host_workspace.as_path().join("target"),
                     ),
                 )?;
                 setup_step(
                     "prepare workspace checkout root",
-                    crate::isolation::prepare_job_checkout_root(
-                        paths::request(r).host_workspace.as_path(),
-                    ),
+                    crate::isolation::prepare_job_checkout_root(host_workspace.as_path()),
                 )?;
                 Ok(freshness)
             })
@@ -4454,6 +4712,28 @@ impl Runner {
         if inner.drain_deadline.is_some() {
             return Ok(false);
         }
+        let checkout = paths::fill_checkout(&self.core.config, workspace, root)?;
+        if !self.core.config.caller_roots.is_empty() {
+            for (value, fill) in [
+                (root, false),
+                (workspace, false),
+                (
+                    checkout
+                        .to_str()
+                        .ok_or_else(|| invalid("fill checkout encoding"))?,
+                    true,
+                ),
+            ] {
+                if let Err(error) = paths::authorize(&self.core.config, value, fill) {
+                    tracing::warn!(%root, %error, "dependency writer skips unauthorized fill");
+                    return Ok(false);
+                }
+            }
+        }
+        let nested_fill = paths::mapped_root(&self.core.config, &checkout.to_string_lossy())
+            .and_then(|_| {
+                mapped_nested_detail(inner, &self.core.config, &checkout.to_string_lossy(), true)
+            });
         let settling = Self::base_settlement_pending(inner, root);
         let BasePlan {
             tip,
@@ -4476,6 +4756,10 @@ impl Runner {
             git_dependencies: vec![],
             command: Some(command.clone()),
         });
+        if let Some(detail) = nested_fill {
+            tracing::warn!(%root, %detail, "dependency writer skips nested fill; retrying next rebuild pass");
+            return Ok(true);
+        }
         let descriptor = match descriptor {
             Ok(descriptor) => descriptor,
             Err(error) => {
@@ -4603,14 +4887,7 @@ impl Runner {
             return Ok(true);
         }
         let id = Uuid::now_v7();
-        let cwd = Path::new(workspace)
-            .parent()
-            .ok_or_else(|| invalid("workspace parent"))?
-            .join(format!(
-                ".motor-base-{}-{}",
-                self.core.config.instance,
-                workspace::name(root)
-            ));
+        let cwd = checkout;
         let FillInputs {
             git_dependencies,
             tree,
@@ -5517,7 +5794,7 @@ impl Runner {
                         .fold(0u32, |sum, weight| sum.saturating_add(*weight));
                     let blocked_by_head = blockers.get(&id).is_some_and(Option::is_some);
                     !blocked_by_head
-                        && !Self::deleting(inner, paths::host_str(crate::caller_path::job_key(job)), &request.siblings)
+                        && !self.deleting(inner, paths::host_str(crate::caller_path::job_key(job)), &request.siblings)
                         && job.weight <= self.core.config.max_weight
                         && index
                             .weight
@@ -5652,10 +5929,14 @@ impl Runner {
     /// pool: this is called from a connection's async task, and an async
     /// worker parked on the lock stops the runner answering other connections.
     pub async fn drop_workspace(&self, key: &str) -> io::Result<DropReply> {
-        self.ensure_reconciled()?;
         let key = key.to_string();
-        let host = paths::identity(&key).host.as_path().to_path_buf();
-        self.validate_destinations(paths::host(&host), None, &[])?;
+        if self.core.config.caller_roots.is_empty() {
+            self.validate_destinations(paths::host_str(&key), None, &[])?;
+        } else {
+            paths::authorize(&self.core.config, &key, false)?;
+        }
+        self.ensure_reconciled()?;
+        let host = paths::host_path(&self.core.config, &key);
         let (guard, mut ids, admitting) = self
             .off_runtime({
                 let key = key.clone();
@@ -5969,7 +6250,7 @@ impl Runner {
                         preparing.starts_with(key.host.as_path())
                             || key.host.as_path().starts_with(preparing)
                     })
-                    && !Self::deleting(&inner, key.host, &[])
+                    && !self.deleting(&inner, key.host, &[])
                     && !inner
                         .admission_saves
                         .values()
@@ -6706,7 +6987,7 @@ impl Runner {
                     continue;
                 }
                 if (!self.core.config.windows_instance()
-                    && Self::deleting(
+                    && self.deleting(
                         inner,
                         paths::host_str(crate::caller_path::job_key(job)),
                         &request.siblings,
@@ -8419,14 +8700,20 @@ impl Runner {
             .filter(|r| !paths::run(r).caller_return_paths.is_empty() && !r.return_chunked)
             .map(|request| {
                 let seq = self.core.inner.lock().unwrap().jobs[&id].next_seq;
-                crate::return_paths::collect(request, seq)
+                crate::return_paths::collect_authorized(&self.core.config, request, seq)
             });
         let job_directory = self.record_path(id).parent().unwrap().to_owned();
         let returned = job
             .request
             .as_ref()
             .filter(|r| !paths::run(r).caller_return_paths.is_empty() && r.return_chunked)
-            .map(|request| crate::return_paths::collect_chunked(request, &job_directory));
+            .map(|request| {
+                crate::return_paths::collect_chunked_authorized(
+                    &self.core.config,
+                    request,
+                    &job_directory,
+                )
+            });
         self.finish_step(id, &job.kill, "returned files collected", finish_started);
         let log = self.job_log(id);
         // The last persistence error, logged at WARN only when it changes.

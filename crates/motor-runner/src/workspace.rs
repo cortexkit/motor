@@ -229,7 +229,7 @@ pub(crate) fn validate_request(
     })
 }
 
-fn validate_names(
+pub(crate) fn validate_names(
     workspace: &str,
     repository: &str,
     siblings: &[SiblingSnapshot],
