@@ -16,6 +16,8 @@ pub const AUXILIARY_STORAGE: &str = "auxiliary-storage";
 pub const HARDWARE_MODEL: &str = "hardware-model";
 pub const MACHINE_IDENTIFIER: &str = "machine-identifier";
 pub const VSOCK_PORT: u32 = 5000;
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod disk_release;
 mod nonce;
 pub use nonce::{
     BootConfig, Mount, NONCE_DISK_SIZE, NONCE_HEADER, create_nonce_disk, decode_boot_config,
@@ -1008,6 +1010,19 @@ pub mod process {
             inode: info.vnode.vip_vi.vi_stat.vst_ino,
         })
     }
+    fn inspect_descriptor(pid: i32, fd: i32, port: bool) -> io::Result<Option<Vnode>> {
+        match fd_key(pid, fd, port) {
+            Ok(key) => Ok(Some(key)),
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
+                if disk_release::skip_denied_descriptor(&executable(pid)?, &e) {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
     fn open_files(pid: i32) -> io::Result<Vec<Vnode>> {
         let identity = process_identity(pid)?;
         let fds: Vec<libc::proc_fdinfo> = list(|buffer, size| unsafe {
@@ -1018,13 +1033,17 @@ pub mod process {
         })?;
         let mut keys = Vec::new();
         for fd in fds {
-            if fd.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32 {
-                keys.push(fd_key(pid, fd.proc_fd, false)?);
+            if fd.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32
+                && let Some(key) = inspect_descriptor(pid, fd.proc_fd, false)?
+            {
+                keys.push(key);
             }
         }
         for port in ports {
-            if port.kind == libc::PROX_FDTYPE_VNODE as u32 {
-                keys.push(fd_key(pid, port.port as i32, true)?);
+            if port.kind == libc::PROX_FDTYPE_VNODE as u32
+                && let Some(key) = inspect_descriptor(pid, port.port as i32, true)?
+            {
+                keys.push(key);
             }
         }
         if process_identity(pid)? != identity {
