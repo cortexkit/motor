@@ -107,7 +107,10 @@ class SetupCallerRootsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             users = root / 'Users'
-            users.mkdir(mode=0o751)
+            users.mkdir()
+            # Set the mode explicitly: mkdir's mode is filtered by the umask,
+            # which differs between test runners.
+            users.chmod(0o751)
             body = body.replace('/srv/build', str(root))
             opened = []
             real_open = os.open
