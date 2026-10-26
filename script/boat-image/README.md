@@ -911,17 +911,20 @@ The `core` phase also runs the fleet compile cache end to end, in its own
 never installs `/run/motor/cache` there; the check writes the same provisioning
 itself from a directory the operator passes with `--cache-inputs`: `config.json`
 and `read-key` in the exact shapes and members of
-`crates/motor-lease/contracts/cloud/runners-contract.md`, plus `cargo-seed.tar.gz`,
-the same operator seed the image was built from. The key goes up over the pinned
+`crates/motor-lease/contracts/cloud/runners-contract.md`. No seed archive is
+needed in this directory: the job uses the seed already installed in the image.
+The key goes up over the pinned
 SSH route on stdin, is installed root-owned at the contract's modes (0700
 directory, 0444 `config.json`, 0400 `read-key`), and both it and the staged copy
 are deleted before the check ends. Neither the key nor any copy of it is written
 to `results.json`, and the section refuses a config member, a mode or a
 generation pair the contract does not allow.
 
-A real Cargo job then builds a small package offline from that seed and prints
-the statistics of the runner-installed sccache wrapper. The check passes only
-with at least one compile the store answered (`s3_hits`), the job's read-only
+A real Motor job then generates a lockfile offline, builds a small package
+offline/locked using the canonical seeded job Cargo home, and prints the
+statistics of the runner-installed sccache wrapper. The check passes only
+with at least one compile the S3 store answered (sccache 0.18's single-S3 backend
+language counts or S3 multilevel counter, never disk hits), the job's read-only
 cache mode, no `SCCACHE_RECACHE`, and both the cache tool and gateway mounts
 present: a job without the cache has no remote counter at all, so the zero-hit
 result CLOUD saw cannot pass. Without `--cache-inputs` the section is recorded

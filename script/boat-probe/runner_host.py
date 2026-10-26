@@ -1636,9 +1636,10 @@ class RunnerHost:
         # Checked before any sandbox exists, so a malformed or incomplete pair
         # cannot cost a billable run; only the shape and the generation match
         # are read here, and nothing is written down.
-        if getattr(self.probe, 'cache_config', None) or getattr(self.probe, 'cache_read_key', None):
+        inputs = getattr(self.probe, 'cache_inputs', None)
+        if isinstance(inputs, Path):
             try:
-                cache_live.read_inputs(self.probe.cache_config, self.probe.cache_read_key)
+                cache_live.read_inputs(inputs / 'config.json', inputs / 'read-key')
                 self.data['cache_provisioning'] = {'inputs_valid': True}
             except ValueError as error:
                 self.data['cache_provisioning'] = {'inputs_valid': False, 'error': str(error)}
@@ -1762,29 +1763,35 @@ class RunnerHost:
         # Validated before the sandbox is touched: a malformed pair must not
         # leave provisioning half installed.
         cache_live.read_inputs(inputs / 'config.json', inputs / 'read-key')
-        report = {'not_run': 'staging failed before any job ran'}
+        report = {'not_run': 'cache build did not run'}
         record = self.data['cache_live'] = {'installed': None, 'jobs': {}, 'removed': False,
                                             'installed_modes': None,
                                             'inputs': cache_live.describe(inputs / 'config.json')}
         with self.section('cache_live'), self.phase_evidence(sid, record):
             try:
-                installed = self.install_cache_provisioning(sid, directory, public, inputs)
+                with self.section('provision'):
+                    installed = self.install_cache_provisioning(sid, directory, public, inputs)
                 record['installed'] = {'modes': installed['modes']}
                 record['installed_modes'] = installed['modes']
                 self.check('cache_live.provisioning_installed', installed['modes'] == cache_live.MODES,
                            record['installed'],
                            reason=f"installed cache modes {installed['modes']}, expected {cache_live.MODES}")
-                self.stage_cache_job(sid, directory, public, inputs)
-                # The job's own client call can fail; that is a failed check,
-                # not a phase error, and the key still has to be removed.
-                record['jobs']['read'] = self.cached_job(sid, directory, public, client, cache_live.job_command())
-                try:
-                    report = job_result(record['jobs']['read'].get('stdout') or '{}')
-                except (KeyError, TypeError, ValueError) as error:
-                    report = {'unreadable_report': type(error).__name__}
+                if self.wait_cache_admission(sid, directory, public, repository, client):
+                    # A stats query must not hide a failed build or terminal
+                    # outcome. Cleanup also runs on client transport errors.
+                    record['jobs']['read'] = self.cached_job(sid, directory, public, repository, client, cache_live.job_command())
+                    parsed = record['jobs']['read']['result']
+                    self.check_job('cache_live.job', parsed, 0)
+                    try:
+                        report = json.loads(parsed.get('stdout') or '{}')
+                        if not isinstance(report, dict):
+                            raise ValueError('cache report is not an object')
+                    except (KeyError, TypeError, ValueError) as error:
+                        report = {'unreadable_report': type(error).__name__}
                 record['report'] = report
             finally:
-                record['removed'] = self.remove_cache_provisioning(sid, directory, public)
+                with self.section('cleanup'):
+                    record['removed'] = self.remove_cache_provisioning(sid, directory, public)
                 self.probe.checkpoint()
         hits = cache_live.remote_hits(report.get('stats'))
         record['remote_hits'] = hits
@@ -1792,26 +1799,45 @@ class RunnerHost:
         self.check('cache_live.remote_hits', not problems, record,
                    reason=('live remote compile-cache check: ' + '; '.join(problems)) if problems else None)
 
-    def stage_cache_job(self, sid, directory, public, inputs):
-        """The job's Cargo package and its own Cargo home, owned by the job
-        account, plus the operator's seed as its offline source of crates."""
-        record = self.data['cache_live']
-        route = self.route(sid, directory, public)
-        upload = cache_live.stage_command()
-        with (inputs / cache_live.SEED).open('rb') as seed:
-            sent = subprocess.run(route + [upload],
-                                  input=(cache_live.CRATE_TOML + cache_live.CRATE_MAIN).encode() + seed.read(),
-                                  capture_output=True, text=True, timeout=600)
-        if sent.returncode:
-            raise ValueError('cache job workspace or seed upload failed: ' + (sent.stderr or '')[:300])
-        result = self.execute(
-            sid,
-            f'sudo -n -u {cache_live.JOB_ACCOUNT} tar -xzf {cache_live.STAGING}/{cache_live.SEED} '
-            f'-C {cache_live.WORKSPACE}/cargo && '
-            f'sudo -n sha256sum {cache_live.WORKSPACE}/cargo/{cache_live.SEED_MANIFEST}')
-        # The seed manifest digest names the capture the run read; it is image
-        # metadata, never key material.
-        record['seed_manifest_sha256'] = (result.get('stdout') or '').split(' ')[0]
+    def wait_cache_admission(self, sid, directory, public, repository, client):
+        """Wait for the running runner's asynchronous provisioning watcher, not a restart."""
+        record = self.data['cache_live']['admission'] = {'attempts': []}
+        deadline = min(self.probe.deadline, time.monotonic() + cache_live.ADMISSION_SECONDS)
+        with self.section('admission'):
+            while time.monotonic() < deadline:
+                result = self.cached_job(sid, directory, public, repository, client, cache_live.admission_command(),
+                                         deadline=deadline)
+                record['attempts'].append(result)
+                parsed = result['result']
+                if lifecycle_failure(parsed, 0) is not None:
+                    break
+                try:
+                    report = json.loads(parsed.get('stdout') or '{}')
+                except (TypeError, ValueError):
+                    break
+                if cache_live.admitted(report):
+                    self.check('cache_live.cache_admitted', True, record)
+                    return True
+                time.sleep(min(1, max(0, deadline - time.monotonic())))
+        self.check('cache_live.cache_admitted', False, record,
+                   reason='runner did not admit the read-only cache provisioning before the bounded watcher wait ended')
+        return False
+
+    def cached_job(self, sid, directory, public, repository, client, command, *, deadline=None):
+        """Use the same real Motor client, workspace snapshot and seeded job home as core."""
+        record = self.data.setdefault('cache_live', {})
+        effective_deadline = min(self.probe.deadline, deadline) if deadline is not None else self.probe.deadline
+        vcpus = int(self.execute(sid, 'nproc', timeout=min(120, max(1, int(effective_deadline - time.monotonic()))))['stdout'].strip())
+        argv = self.route(sid, directory, public)
+        with self.section('job read'), tunnel(argv, directory, effective_deadline, record.setdefault('tunnel', {})) as address:
+            with tempfile.TemporaryDirectory(prefix='motor-boat-client-') as storage:
+                result = process([str(client), address, str(repository), storage, command, str(vcpus)],
+                                 timeout=min(150, max(1, int(effective_deadline - time.monotonic()))))
+        if result.get('exit_code') != 0:
+            self.client_failure_diagnostics(sid, record)
+            raise ValueError('cache Motor client failed: ' + json.dumps(result))
+        result['result'] = job_result(result['stdout'])
+        return result
 
     def install_cache_provisioning(self, sid, directory, public, inputs):
         """Write both files where CLOUD's contract puts them, at its modes.
@@ -1820,16 +1846,20 @@ class RunnerHost:
         command would land in Boat's exec log, and one in a file upload would be
         kept by the sandbox."""
         route = self.route(sid, directory, public)
+        # Remove stale read-only files before redirecting as the SSH user. The
+        # staging directory is private and ephemeral, never part of the image.
+        self.execute(sid, f'sudo -n rm -rf -- {cache_live.STAGING} && '
+                          f'install -d -m 0700 {cache_live.STAGING}')
         for source, name in ((inputs / 'config.json', 'config.json'), (inputs / 'read-key', 'read-key')):
             with source.open('rb') as stream:
                 sent = subprocess.run(route + [f'umask 077; cat > {cache_live.STAGING}/{name}'],
                                       stdin=stream, capture_output=True, timeout=300)
             if sent.returncode:
-                raise ValueError(f'cache provisioning upload failed for {name}')
+                raise ValueError(f'cache provisioning upload failed for {name}: '
+                                 + sent.stderr.decode(errors='replace')[:500])
         result = self.execute(
             sid,
-            f'sudo -n install -d -m 0700 -o root -g root {cache_live.DIRECTORY} && '
-            + cache_live.install_command(cache_live.STAGING) + ' && '
+            cache_live.install_command() + ' && '
             f'sudo -n stat -c "%a %n" {cache_live.DIRECTORY} {cache_live.READ_KEY} {cache_live.CONFIG}')
         modes = {}
         for line in (result.get('stdout') or '').splitlines():
