@@ -7,7 +7,8 @@ use std::{
 mod lock;
 mod ufw;
 
-fn validate_uplink(config: &crate::config::Config) -> Result<()> {
+pub(super) fn validate_uplink(config: &crate::config::Config) -> Result<()> {
+    config.validate_network()?;
     use std::os::unix::fs::MetadataExt;
     let path = std::path::Path::new("/etc/motor-network.json");
     let metadata = std::fs::symlink_metadata(path)?;
@@ -458,7 +459,32 @@ fn managed_tap(name: &str, suffix: &str) -> Option<String> {
     (index > 0 && index < 255 && digits == index.to_string()).then(|| format!("mtap{index}"))
 }
 
+#[derive(Debug)]
+pub(crate) enum NetworkReadiness {
+    Ready,
+    FencedUplink(String),
+}
+
+impl NetworkReadiness {
+    pub(crate) fn serve_cleanup(self) {
+        if let Self::FencedUplink(problem) = self {
+            eprintln!("tenant networking unavailable; cleanup remains available: {problem}");
+        }
+    }
+
+    fn require_ready(self) -> Result<()> {
+        match self {
+            Self::Ready => Ok(()),
+            Self::FencedUplink(problem) => Err(Error(problem)),
+        }
+    }
+}
+
 pub fn install(registries: &[Registry], config: &crate::config::Config) -> Result<()> {
+    install_startup(registries, config)?.require_ready()
+}
+
+pub(crate) fn install_startup(registries: &[Registry], config: &crate::config::Config) -> Result<NetworkReadiness> {
     let _lock = lock::acquire()?;
     let mut commands = NetworkCommands {
         config: Some(config),
@@ -470,7 +496,7 @@ pub fn install(registries: &[Registry], config: &crate::config::Config) -> Resul
     } else {
         ufw::inspect(uplink)
     };
-    reconcile_policy(
+    reconcile_policy_state(
         uplink,
         registries,
         existing.as_ref(),
@@ -668,6 +694,7 @@ struct ReconcileIo<Apply, ReconcileUfw, ValidateUplink> {
     validate_uplink: ValidateUplink,
 }
 
+#[cfg(test)]
 fn reconcile_policy(
     uplink: &str,
     registries: &[Registry],
@@ -679,6 +706,16 @@ fn reconcile_policy(
         impl FnMut() -> Result<()>,
     >,
 ) -> Result<()> {
+    reconcile_policy_state(uplink, registries, existing, motor_net, io)?.require_ready()
+}
+
+fn reconcile_policy_state(
+    uplink: &str,
+    registries: &[Registry],
+    existing: Option<&serde_json::Value>,
+    motor_net: Option<&serde_json::Value>,
+    io: ReconcileIo<impl FnMut(&str) -> Result<()>, impl FnOnce(&ufw::State) -> Result<()>, impl FnMut() -> Result<()>>,
+) -> Result<NetworkReadiness> {
     let ReconcileIo {
         inspected,
         mut apply,
@@ -693,7 +730,7 @@ fn reconcile_policy(
         if !revoke.is_empty() {
             apply(&revoke)?;
         }
-        return Err(error);
+        return Ok(NetworkReadiness::FencedUplink(format!("uplink {uplink}: {error}")));
     }
     let previously_closed = match tap_members(existing, "closed_taps") {
         Ok(members) => members.unwrap_or_default(),
@@ -745,11 +782,12 @@ fn reconcile_policy(
         let mut fence = set_members("motor_tenant", "closed_taps", &desired);
         fence.push_str(&motor_net_members(motor_net, &BTreeSet::new())?);
         apply(&fence)?;
-        return Err(error);
+        return Ok(NetworkReadiness::FencedUplink(format!("uplink {uplink}: {error}")));
     }
     let mut open = set_members("motor_tenant", "closed_taps", &BTreeSet::new());
     open.push_str(&motor_net_members(motor_net, &desired)?);
-    apply(&open)
+    apply(&open)?;
+    Ok(NetworkReadiness::Ready)
 }
 
 fn motor_net_members(

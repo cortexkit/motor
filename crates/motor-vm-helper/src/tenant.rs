@@ -159,6 +159,9 @@ pub struct SnapshotKey {
 /// Platform methods keep the destructive boundary small. In particular, load
 /// leaves the guest paused; consume must durably unlink before resume is called.
 pub trait Backend {
+    fn check_network(&mut self, _tenant: &str) -> std::result::Result<(), StartRefusal> {
+        Ok(())
+    }
     /// Start-only policy checks must not prevent stopping or inspecting a VM.
     fn check_start(&mut self, _tenant: &str) -> std::result::Result<(), StartRefusal> {
         Ok(())
@@ -257,6 +260,7 @@ pub(crate) const SNAPSHOT_CREATE_UNCERTAIN: &str = "suspend_create_uncertain";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartRefusalCase {
+    Uplink,
     CapacityJson,
     Fit,
     LiveCap,
@@ -312,6 +316,11 @@ impl<B: Backend> Controller<B> {
         }
         if let Operation::Remove = op {
             return self.remove(tenant);
+        }
+        if matches!(op, Operation::Ensure | Operation::Restore | Operation::PrepareStart | Operation::Egress) {
+            if let Err(refusal) = self.0.check_network(tenant) {
+                return Ok(refused_response(refusal));
+            }
         }
         if matches!(
             op,
@@ -414,7 +423,11 @@ impl<B: Backend> Controller<B> {
             }
             Operation::AttachDisk => self.0.drive(tenant, &r)?,
             Operation::Cpu(vcpus) => self.0.cpu(tenant, &r.cpu_max(vcpus)?)?,
-            Operation::Egress => self.0.egress(tenant, &r)?,
+            Operation::Egress => {
+                if let Err(error) = self.0.egress(tenant, &r) {
+                    return Ok(refused_response(start_refused(StartRefusalCase::Uplink, error)));
+                }
+            }
             Operation::Adopt => {}
             Operation::Remove => unreachable!("removal returns before the registry is read"),
             Operation::RecoveryComplete => self.0.recovery_complete(tenant, &r)?,
@@ -648,7 +661,7 @@ impl<B: Backend> Controller<B> {
                 .flatten()
                 .is_some_and(|saved| saved == key)
             && !self.0.unclean(r)?;
-        self.0.egress(tenant, r)?;
+        self.0.egress(tenant, r).map_err(|error| StartError::Refused(start_refused(StartRefusalCase::Uplink, error)))?;
         if saved {
             let result = self
                 .0

@@ -28,6 +28,7 @@ use std::{
 /// (time to undo a mistaken removal) plus the host's wait for the tenant's
 /// last job to drain (about a day) stays well inside that promise.
 pub const QUARANTINE_S: u64 = 7 * 24 * 60 * 60;
+const COMPLETE: &str = "complete";
 
 /// Where a tenant's data and records live. Production uses `live()`; tests
 /// point every path into a scratch directory.
@@ -124,12 +125,6 @@ pub fn lock(paths: &Paths) -> Result<File> {
     Ok(file)
 }
 
-/// Keep helper construction, reconciliation and socket publication exclusive
-/// with provisioning/offline removal. Release before serving requests.
-pub fn startup_with<T>(paths: &Paths, initialize: impl FnOnce() -> Result<T>) -> Result<T> {
-    let _lock = lock(paths)?;
-    initialize()
-}
 
 /// Creates the quarantine folder and saves copies of the tenant's records in
 /// it, so an operator can undo the removal. Nothing is deleted yet.
@@ -212,6 +207,11 @@ pub fn finish(paths: &Paths, tenant: &str, quarantine: &Path) -> Result<()> {
         }
         false
     };
+    if !present {
+        // A successful removal with no home must not revive when the same
+        // tenant name is provisioned again later.
+        durable_write(&quarantine.join(COMPLETE), b"1\n", 0o600)?;
+    }
     let bindings = read_bindings(paths)?;
     if bindings.values().any(|entry| entry["tenant"] == tenant) {
         let kept: serde_json::Map<_, _> = bindings
@@ -245,6 +245,7 @@ pub fn finish(paths: &Paths, tenant: &str, quarantine: &Path) -> Result<()> {
         home_parent.sync_all()?;
         destination.sync_all()?;
     }
+    durable_write(&quarantine.join(COMPLETE), b"1\n", 0o600)?;
     Ok(())
 }
 
@@ -334,41 +335,6 @@ pub fn refuse_reassigned_tap(
     Ok(())
 }
 
-/// Offline administrative removal uses the same journal and cleanup order,
-/// without constructing a helper or loading an uplink configuration.
-pub fn offline_with(
-    paths: &Paths,
-    tenant: &str,
-    resume_only: bool,
-    unix_s: u64,
-    mut read_registry: impl FnMut(&Path) -> Result<crate::tenant::Registry>,
-    mut stopped: impl FnMut(&crate::tenant::Registry) -> Result<()>,
-    cleanup: impl FnOnce(&crate::tenant::Registry) -> Result<()>,
-) -> Result<PathBuf> {
-    crate::tenant::validate_name(tenant)?;
-    let _lock = lock(paths)?;
-    let has_registry = paths.registry_file(tenant).try_exists()?;
-    let quarantine = if has_registry {
-        if resume_only {
-            return Err(Error("registry still exists; use --remove-tenant".into()));
-        }
-        let registry = read_registry(&paths.registry_file(tenant))?;
-        registry.validate(tenant)?;
-        refuse_reassigned_tap(paths, tenant, &registry, true, &mut read_registry)?;
-        stopped(&registry)?;
-        begin(paths, tenant, unix_s)?
-    } else {
-        pending(paths, tenant)?
-            .ok_or_else(|| Error("unknown tenant or no interrupted removal".into()))?
-    };
-    // The production reader checks root ownership and all saved-record ancestors.
-    let saved = read_registry(&quarantine.join("records/registry.json"))?;
-    saved.validate(tenant)?;
-    refuse_reassigned_tap(paths, tenant, &saved, has_registry, &mut read_registry)?;
-    stopped(&saved)?;
-    finish_with_network(paths, tenant, &quarantine, cleanup)?;
-    Ok(quarantine)
-}
 
 /// A removal whose records are already gone but whose home was not yet moved:
 /// the newest quarantine folder for this tenant that has saved records and
@@ -381,6 +347,7 @@ pub fn pending(paths: &Paths, tenant: &str) -> Result<Option<PathBuf>> {
     let mut newest: Option<(u64, PathBuf)> = None;
     for (path, name, unix_s) in quarantined(paths)? {
         if name == tenant
+            && !path.join(COMPLETE).exists()
             && path.join("records").is_dir()
             && !path.join("home").exists()
             && newest.as_ref().is_none_or(|(at, _)| unix_s > *at)
@@ -401,7 +368,7 @@ pub fn purge(paths: &Paths, now_s: u64) -> Result<Vec<PathBuf>> {
         if now_s.saturating_sub(unix_s) < QUARANTINE_S {
             continue;
         }
-        if !path.join("home").exists() && paths.home(&tenant).exists() {
+        if !path.join(COMPLETE).exists() && !path.join("home").exists() && paths.home(&tenant).exists() {
             eprintln!(
                 "tenant {tenant}: removal at {unix_s} never moved its home; data is still at {}",
                 paths.home(&tenant).display()

@@ -29,7 +29,9 @@ pub struct UidRange {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
     pub uplink: String,
+    #[serde(default)]
     pub public_ipv4: Ipv4Addr,
     pub allowed_uids: Vec<u32>,
     pub socket_gid: u32,
@@ -53,12 +55,21 @@ fn default_uid_base() -> u32 {
 }
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        self.validate_resources()?;
+        self.validate_network()
+    }
+
+    pub(crate) fn validate_network(&self) -> Result<()> {
         if !valid_uplink(&self.uplink) || !public_ipv4(self.public_ipv4) {
             return Err(Error(format!(
                 "invalid uplink {} or public IPv4 address",
-                self.uplink
+                if self.uplink.is_empty() { "<missing>" } else { &self.uplink }
             )));
         }
+        Ok(())
+    }
+
+    pub(crate) fn validate_resources(&self) -> Result<()> {
         let count = u32::try_from(self.slots.len()).map_err(|_| Error("too many slots".into()))?;
         let end = self
             .uid_base

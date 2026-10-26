@@ -39,52 +39,24 @@ pub fn peer(stream: &UnixStream) -> Result<Peer> {
         gid: credential.gid,
     })
 }
-/// Offline cleanup is selected before config loading and helper reconciliation.
-pub fn dispatch(
-    args: impl IntoIterator<Item = std::ffi::OsString>,
-    serve_config: impl FnOnce(&Path) -> Result<()>,
-    offline_remove: impl FnOnce(&str, bool) -> Result<()>,
-) -> Result<()> {
-    let mut args = args.into_iter();
-    let mode = args
-        .next()
-        .ok_or_else(|| Error("expected --config, --remove-tenant or --resume-removal".into()))?;
-    let value = args
-        .next()
-        .ok_or_else(|| Error("missing command argument".into()))?;
-    if args.next().is_some() {
-        return Err(Error("unexpected arguments".into()));
-    }
-    if mode == "--config" {
-        return serve_config(Path::new(&value));
-    }
-    let resume = match mode.to_str() {
-        Some("--remove-tenant") => false,
-        Some("--resume-removal") => true,
-        _ => {
-            return Err(Error(
-                "expected --config, --remove-tenant or --resume-removal".into(),
-            ))
-        }
-    };
-    let tenant = value
-        .to_str()
-        .ok_or_else(|| Error("tenant must be UTF-8".into()))?;
-    crate::tenant::validate_name(tenant)?;
-    offline_remove(tenant, resume)
+
+pub(crate) fn initialize_helper<M: crate::Machine>(machine: M, count: usize, allowed: Vec<u32>) -> Result<Helper<M>> {
+    // Qualification deliberately holds provision.lock while starting a helper.
+    // Startup must not acquire it; the helper mutex serializes online removal.
+    Helper::new(machine, count, allowed)
 }
 
 pub fn serve(config: crate::config::Config) -> Result<()> {
-    let (signals, helper, listener) =
-        crate::removal::startup_with(&crate::removal::Paths::live(), || {
             let count = config.slots.len();
             let allowed = config.allowed_uids.clone();
             let socket_gid = config.socket_gid;
             let machine = LinuxMachine::new(config)?;
             // Before any thread exists, so every thread inherits the blocked mask.
             let signals = crate::signals::StopSignals::block()?;
-            let helper = Arc::new(Mutex::new(Helper::new(machine, count, allowed)?));
-            // Only the reconciled helper publishes a listener. Refuse non-socket state,
+            let helper = Arc::new(Mutex::new(initialize_helper(machine, count, allowed)?));
+            // Non-network cleanup/trust barriers still precede the listener. A fenced
+            // uplink is a serving-but-unready state, not a construction failure.
+            // Refuse non-socket state,
             // rather than unlinking an arbitrary file on a privileged path.
             match std::fs::symlink_metadata(SOCKET) {
                 Ok(m) if m.file_type().is_socket() => std::fs::remove_file(SOCKET)?,
@@ -98,8 +70,6 @@ pub fn serve(config: crate::config::Config) -> Result<()> {
                 return Err(std::io::Error::last_os_error().into());
             }
             std::fs::set_permissions(SOCKET, std::fs::Permissions::from_mode(0o660))?;
-            Ok((signals, helper, listener))
-        })?;
     let maintenance = helper.clone();
     std::thread::spawn(move || loop {
         std::thread::park_timeout(Duration::from_millis(100));
@@ -242,6 +212,6 @@ pub fn load_config(path: &Path) -> Result<crate::config::Config> {
     let file: File = fs::trusted_file(path)?;
     let config: crate::config::Config =
         serde_json::from_reader(file).map_err(|e| Error(e.to_string()))?;
-    config.validate()?;
+    config.validate_resources()?;
     Ok(config)
 }

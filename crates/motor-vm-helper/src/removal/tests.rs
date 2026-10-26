@@ -57,47 +57,6 @@ fn scratch() -> Scratch {
     }
 }
 
-#[test]
-fn helper_startup_and_offline_removal_are_mutually_exclusive() {
-    let s = scratch();
-    let p = &s.paths;
-    let offline = lock(p).unwrap();
-    let mut started = false;
-    let result = startup_with(p, || {
-        started = true;
-        Ok(())
-    });
-    assert!(result
-        .unwrap_err()
-        .0
-        .contains("provisioning is in progress"));
-    assert!(
-        !started,
-        "no construction, reconcile or bind while offline removal owns the lock"
-    );
-    drop(offline);
-    startup_with(p, || {
-        let result = offline_with(
-            p,
-            "a",
-            false,
-            1000,
-            |_| panic!("must not read tenant state during helper startup"),
-            |_| panic!("must not check stopped state during helper startup"),
-            |_| panic!("must not mutate network during helper startup"),
-        );
-        assert!(result
-            .unwrap_err()
-            .0
-            .contains("provisioning is in progress"));
-        Ok(())
-    })
-    .unwrap();
-    assert!(
-        lock(p).is_ok(),
-        "startup guard must not remain held while serving requests"
-    );
-}
 
 #[test]
 fn removal_rejects_symlinked_home_parent_before_records_or_quarantine_mutation() {
@@ -124,119 +83,31 @@ fn removal_rejects_symlinked_home_parent_before_records_or_quarantine_mutation()
 }
 
 #[test]
-fn offline_resume_refuses_reassigned_index_before_any_tenant_mutation() {
-    for resume_only in [false, true] {
-        let s = scratch();
-        let p = &s.paths;
-        let quarantine = begin(p, "a", 1000).unwrap();
-        fs::remove_file(p.registry_file("a")).unwrap();
-        let mut new_owner = crate::tenant::tests::registry("b");
-        new_owner.tap_index = 1;
-        let new_record = serde_json::to_vec(&new_owner).unwrap();
-        fs::write(p.registry_file("b"), &new_record).unwrap();
-        let before_binding = fs::read(&p.bindings).unwrap();
-        let mut stopped = false;
-        let result = offline_with(
-            p,
-            "a",
-            resume_only,
-            1100,
-            |path| serde_json::from_slice(&fs::read(path)?).map_err(|e| Error(e.to_string())),
-            |_| {
-                stopped = true;
-                Ok(())
-            },
-            |_| panic!("must not delete B's chains, membership, UFW grant or TAP"),
-        );
-        assert!(result.unwrap_err().0.contains("reassigned to b"));
-        assert!(
-            !stopped,
-            "reassignment must be detected before liveness checks or mutation"
-        );
-        assert_eq!(fs::read(p.registry_file("b")).unwrap(), new_record);
-        assert_eq!(fs::read(&p.bindings).unwrap(), before_binding);
-        assert!(p.home("a").exists());
-        assert!(p.home("b").exists());
-        assert!(!quarantine.join("home").exists());
-    }
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-fn offline_cli_removes_and_resumes_without_loading_broken_uplink_config() {
-    for resume in [false, true] {
-        let s = scratch();
-        let p = &s.paths;
-        let registry = crate::tenant::tests::registry("a");
-        fs::write(p.registry_file("a"), serde_json::to_vec(&registry).unwrap()).unwrap();
-        if resume {
-            begin(p, "a", 1200).unwrap();
-            fs::remove_file(p.registry_file("a")).unwrap();
-        }
-        let mut cleaned = false;
-        crate::linux::server::dispatch(
-            [
-                std::ffi::OsString::from(if resume {
-                    "--resume-removal"
-                } else {
-                    "--remove-tenant"
-                }),
-                "a".into(),
-            ],
-            |_| {
-                Err(Error(
-                    "uplink invalid: helper cannot reconcile or serve".into(),
-                ))
-            },
-            |tenant, resume_only| {
-                offline_with(
-                    p,
-                    tenant,
-                    resume_only,
-                    1300,
-                    |path| {
-                        serde_json::from_slice(&fs::read(path)?).map_err(|e| Error(e.to_string()))
-                    },
-                    |_| Ok(()),
-                    |saved| {
-                        assert_eq!(saved.tap_index, 1);
-                        cleaned = true;
-                        Ok(())
-                    },
-                )?;
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert!(cleaned);
-        assert!(!p.home("a").exists());
-        assert!(p.home("b").exists());
-    }
-}
-
-#[test]
-fn offline_removal_refuses_live_service_or_process_before_any_quarantine() {
+fn resume_refuses_reassigned_index_before_any_tenant_mutation() {
     let s = scratch();
     let p = &s.paths;
-    fs::write(
-        p.registry_file("a"),
-        serde_json::to_vec(&crate::tenant::tests::registry("a")).unwrap(),
-    )
-    .unwrap();
-    let result = offline_with(
-        p,
-        "a",
-        false,
-        1300,
-        |path| serde_json::from_slice(&fs::read(path)?).map_err(|e| Error(e.to_string())),
-        |_| Err(Error("tenant still has a live process".into())),
-        |_| panic!("must not clean a live VM"),
-    );
-    assert!(result.unwrap_err().0.contains("live process"));
-    assert!(!p.removed().exists());
-    assert!(p.registry_file("a").exists());
+    let quarantine = begin(p, "a", 1000).unwrap();
+    fs::remove_file(p.registry_file("a")).unwrap();
+    let mut new_owner = crate::tenant::tests::registry("b");
+    new_owner.tap_index = 1;
+    let new_record = serde_json::to_vec(&new_owner).unwrap();
+    fs::write(p.registry_file("b"), &new_record).unwrap();
+    let before_binding = fs::read(&p.bindings).unwrap();
+    let _lock = lock(p).unwrap();
+    let result = finish_with_network(p, "a", &quarantine, |saved| {
+        refuse_reassigned_tap(p, "a", saved, false,
+            |path| serde_json::from_slice(&fs::read(path)?).map_err(|e| Error(e.to_string())))?;
+        panic!("must not delete B's chains, membership, UFW grant or TAP")
+    });
+    assert!(result.unwrap_err().0.contains("reassigned to b"));
+    assert_eq!(fs::read(p.registry_file("b")).unwrap(), new_record);
+    assert_eq!(fs::read(&p.bindings).unwrap(), before_binding);
     assert!(p.home("a").exists());
+    assert!(p.home("b").exists());
+    assert!(!quarantine.join("home").exists());
 }
+
+
 
 #[test]
 fn interrupted_removal_replays_network_before_finishing_saved_records() {

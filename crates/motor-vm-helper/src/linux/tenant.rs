@@ -93,8 +93,7 @@ impl LinuxTenants {
         // A disk may still have its jail uid after a helper crash. All registry
         // ancestors remain root-controlled; restore ownership only after kill.
         let registries = self.registries()?;
-        tenant_network::install(&registries, &self.config)?;
-        for r in registries {
+        for r in &registries {
             for ancestor in r.disk.parent().unwrap().ancestors() {
                 fs::trusted(ancestor, &std::fs::symlink_metadata(ancestor)?)?;
             }
@@ -107,6 +106,10 @@ impl LinuxTenants {
             }
             fs::chown(&file, 0)?;
         }
+        // Network admission is not a prerequisite for serving cleanup/status.
+        // Only a successfully applied uplink fence is a non-fatal startup state;
+        // filesystem, identity and cgroup failures above remain fatal.
+        tenant_network::install_startup(&registries, &self.config)?.serve_cleanup();
         Ok(())
     }
     fn registries(&mut self) -> Result<Vec<Registry>> {
@@ -189,6 +192,18 @@ fn read_deadline(
     Ok(())
 }
 impl Backend for LinuxTenants {
+    fn check_network(&mut self, _: &str) -> std::result::Result<(), StartRefusal> {
+        if let Err(problem) = tenant_network::validate_uplink(&self.config) {
+            let registries = self.registries().map_err(|e| crate::tenant::start_refused(StartRefusalCase::Uplink, e))?;
+            // Reuse the normal failure path so an unavailable link also revokes
+            // every gate before the typed refusal is returned.
+            tenant_network::install(&registries, &self.config).map_err(|e|
+                crate::tenant::start_refused(StartRefusalCase::Uplink, e))?;
+            return Err(crate::tenant::start_refused(StartRefusalCase::Uplink,
+                format!("uplink {}: {problem}", self.config.uplink)));
+        }
+        Ok(())
+    }
     fn check_start(&mut self, tenant: &str) -> std::result::Result<(), StartRefusal> {
         capacity::check_journal(&Path::new(crate::tenant::TENANTS).join(tenant))?;
         let capacity = capacity::read_capacity(Path::new(capacity::CONFIG))?;

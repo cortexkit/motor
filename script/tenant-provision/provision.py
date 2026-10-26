@@ -788,6 +788,8 @@ def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, ex
         if has_tap(tap):
             require_owned_tap(tap, tap_index, tap_info(tap))
             execute("ip", "link", "delete", "dev", tap)
+        if not home.exists():
+            atomic(quarantine / 'complete', '1\n')
         if binding:
             kept = {vm: entry for vm, entry in bindings.items() if vm not in binding}
             atomic(BINDINGS, json.dumps(kept, indent=2) + "\n")
@@ -802,6 +804,7 @@ def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, ex
             os.rename(home, quarantine / "home")
             sync_dir(home.parent)
             sync_dir(quarantine)
+        atomic(quarantine / 'complete', '1\n')
         if purge_now:
             shutil.rmtree(quarantine)
             sync_dir(removed)
@@ -1232,46 +1235,6 @@ def build_base(c, image, base, console=None, diagnostics=None):
     sync_dir(base.parent)
 
 
-def pending_removal_taps():
-    """Saved records reserve indexes until the old home reaches quarantine."""
-    removed = ROOT / 'removed'
-    if not removed.exists():
-        if removed.is_symlink():
-            raise ValueError('unsafe removed-tenant directory')
-        return {}
-    if removed.is_symlink() or not removed.is_dir():
-        raise ValueError('unsafe removed-tenant directory')
-    reserved = {}
-    for quarantine in removed.iterdir():
-        tenant, separator, stamp = quarantine.name.rpartition('-')
-        if not separator or not stamp.isdecimal():
-            continue
-        try:
-            component(tenant)
-        except ValueError:
-            continue
-        if quarantine.is_symlink() or not quarantine.is_dir():
-            raise ValueError(f'unsafe pending removal: {quarantine}')
-        moved = quarantine / 'home'
-        if moved.is_symlink():
-            raise ValueError(f'unsafe quarantined home: {moved}')
-        if moved.is_dir():
-            continue
-        old_home = ROOT / 'tenants' / tenant
-        if not old_home.exists() and not old_home.is_symlink():
-            continue
-        record = quarantine / 'records' / 'registry.json'
-        if record.parent.is_symlink() or record.is_symlink():
-            raise ValueError(f'unsafe pending removal record: {record}')
-        try:
-            saved = json.loads(record.read_text())
-            index = saved['tap_index']
-        except (OSError, ValueError, KeyError, TypeError) as error:
-            raise ValueError(f'unreadable pending removal reservation: {record}') from error
-        if type(index) is not int or not 1 <= index <= 254:
-            raise ValueError(f'invalid pending removal tap index: {record}')
-        reserved[index] = quarantine
-    return reserved
 
 
 def provision(c, make_base=build_base, execute=run, stage=None, runners=None):
@@ -1292,8 +1255,6 @@ def provision(c, make_base=build_base, execute=run, stage=None, runners=None):
     for entry in REGISTRY.glob("*.json"):
         if json.loads(entry.read_text())["tap_index"] == c["tap_index"]:
             raise ValueError("tap index already assigned")
-    if c['tap_index'] in pending_removal_taps():
-        raise ValueError('tap index reserved by a pending tenant removal; finish or recover it first')
     memory_fit(capacity, replacement=c)
     verify_jobs_slice(capacity)
     manifest = json.loads((image / "manifest.json").read_text())

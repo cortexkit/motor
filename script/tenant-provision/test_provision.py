@@ -756,32 +756,7 @@ class ProvisionTests(unittest.TestCase):
             p.provision(config())
         self.assertEqual((home / "disk.img").read_bytes(), b"keep")
 
-    def test_pending_removal_reserves_tap_index_until_home_is_quarantined(self):
-        c = config()
-        old_home = p.ROOT / 'tenants/old'
-        old_home.mkdir()
-        quarantine = p.ROOT / 'removed/old-1000'
-        (quarantine / 'records').mkdir(parents=True)
-        (quarantine / 'records/registry.json').write_text(json.dumps({'tap_index': c['tap_index']}))
-        before = self.snapshot_tree()
-        allocate, base = mock.Mock(), mock.Mock(side_effect=AssertionError('pending index reached allocation'))
-        with mock.patch.object(p.shutil, 'disk_usage', return_value=mock.Mock(free=1 << 60)), \
-                self.assertRaisesRegex(ValueError, 'tap index reserved by a pending tenant removal'):
-            p.provision(c, make_base=base, execute=allocate)
-        allocate.assert_not_called()
-        base.assert_not_called()
-        self.assertEqual(self.snapshot_tree(), before)
-        self.assertIn(c['tap_index'], p.pending_removal_taps())
-        old_home.rename(quarantine / 'home')
-        self.assertNotIn(c['tap_index'], p.pending_removal_taps())
 
-    def test_corrupt_pending_removal_record_refuses_unknown_reservation(self):
-        (p.ROOT / 'tenants/old').mkdir()
-        records = p.ROOT / 'removed/old-1000/records'
-        records.mkdir(parents=True)
-        (records / 'registry.json').write_text('{')
-        with self.assertRaisesRegex(ValueError, 'pending removal reservation'):
-            p.provision(config(), make_base=lambda *_: self.fail('must not allocate'))
 
     def test_duplicate_tap_and_binding_are_rejected(self):
         (p.REGISTRY / "b.json").write_text('{"tap_index":1}')
