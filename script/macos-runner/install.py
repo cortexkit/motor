@@ -92,7 +92,12 @@ def entitlement(binary):
 
 
 def internal_volume(path):
-    info = plistlib.loads(subprocess.run(["/usr/sbin/diskutil", "info", "-plist", str(path)],
+    # diskutil accepts a device or a mount point, not an arbitrary path such as
+    # /Users (a firmlink into the data volume), so ask stat for the device the
+    # path lives on first.
+    device = subprocess.run(["/usr/bin/stat", "-f", "%Sd", str(path)],
+                            check=True, capture_output=True, text=True).stdout.strip()
+    info = plistlib.loads(subprocess.run(["/usr/sbin/diskutil", "info", "-plist", device],
                                         check=True, capture_output=True).stdout)
     return info.get("Internal") is True and info.get("FilesystemType") == "apfs"
 
