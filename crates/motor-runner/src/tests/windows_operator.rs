@@ -1544,21 +1544,35 @@ fn main() {{ assert_eq!(commons::helper(), 42); assert_eq!(private::helper(), 42
     }];
     f.submit(&runner, &missing, &bytes);
     assert_operator_refusal(&runner, missing.job_id).await;
-    for missing_lock in [true, false] {
-        let bad = Fixture::new();
-        source(&bad);
-        if missing_lock {
-            fs::remove_file(bad.main.join("Cargo.lock")).unwrap();
-        } else {
-            fs::write(bad.main.join("Cargo.toml"), "[package]\nname='motor-qualification'\nversion='0.1.0'\n[dependencies]\noutside={path='../../../../outside'}\n").unwrap();
-        }
-        git(&bad.main, &["add", "."]);
-        git(&bad.main, &["commit", "-m", "qualification refusal"]);
-        let (mut request, bytes) = bad.run("touch must-not-run");
-        request.platform = Some(Platform::Windows);
-        bad.submit(&runner, &request, &bytes);
-        assert_operator_refusal(&runner, request.job_id).await;
-    }
+    // A dependency path outside the checkout is still refused before start.
+    let bad = Fixture::new();
+    source(&bad);
+    fs::write(bad.main.join("Cargo.toml"), "[package]\nname='motor-qualification'\nversion='0.1.0'\n[dependencies]\noutside={path='../../../../outside'}\n").unwrap();
+    git(&bad.main, &["add", "."]);
+    git(&bad.main, &["commit", "-m", "qualification refusal"]);
+    let (mut request, bytes) = bad.run("touch must-not-run");
+    request.platform = Some(Platform::Windows);
+    bad.submit(&runner, &request, &bytes);
+    assert_operator_refusal(&runner, request.job_id).await;
+    // A checkout without Cargo.lock is not a Rust job and runs normally.
+    let unlocked = Fixture::new();
+    source(&unlocked);
+    fs::remove_file(unlocked.main.join("Cargo.lock")).unwrap();
+    git(&unlocked.main, &["add", "."]);
+    git(
+        &unlocked.main,
+        &["commit", "-m", "qualification without lockfile"],
+    );
+    let (mut request, bytes) = unlocked.run("echo unlocked-ran");
+    request.platform = Some(Platform::Windows);
+    unlocked.submit(&runner, &request, &bytes);
+    let terminal = operator_terminal(&runner, request.job_id).await;
+    assert!(
+        matches!(terminal.outcome, Outcome::WindowsExit { code: 0 }),
+        "{:?}",
+        terminal.outcome
+    );
+    assert!(replay_stdout(&runner, request.job_id).contains("unlocked-ran"));
     no_units(&runner);
 }
 
