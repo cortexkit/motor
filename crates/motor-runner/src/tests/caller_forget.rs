@@ -816,8 +816,20 @@ async fn isolated_forget_mapped_job_and_warm_build_converges() {
         .collect();
     assert_eq!(fills.len(), 1);
     drop(runner);
-    // The daemon is stopped; forget retires the prefix.
-    let removed = forget::forget_caller_root(&config, "/home").unwrap();
+    // The daemon is stopped; forget retires the prefix. Background helpers of
+    // the dropped runner may hold the daemon lock briefly, as `reopen` allows.
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    let removed = loop {
+        match forget::forget_caller_root(&config, "/home") {
+            Err(error)
+                if error.to_string().contains("daemon.lock is held")
+                    && std::time::Instant::now() < end =>
+            {
+                std::thread::park_timeout(Duration::from_millis(5))
+            }
+            result => break result.unwrap(),
+        }
+    };
     assert!(removed.iter().any(|line| line.contains(&workspace)));
     let mut remaining: Vec<_> = fs::read_dir(&host)
         .unwrap()
