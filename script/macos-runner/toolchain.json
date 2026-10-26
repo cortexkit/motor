@@ -48,7 +48,7 @@
         "rustfmt-aarch64-apple-darwin"
       ],
       "rustc_verbose": "rustc 1.91.0 (f8297e351 2025-10-28)\nbinary: rustc\ncommit-hash: f8297e351a40c1439a467bbbb6879088047f50b3\ncommit-date: 2025-10-28\nhost: aarch64-apple-darwin\nrelease: 1.91.0\nLLVM version: 21.1.2",
-      "sha256": "ce3ad616769bc0a472afe101cf0dc5be94cbb106e0dbe814cc77c0b9439a0044"
+      "sha256": "80f92943f33b6bc2a0bc58148438abbc26d18837ce6b56779f5fce1dfd0cdcff"
     },
     "1.96.0-aarch64-apple-darwin": {
       "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
@@ -125,6 +125,10 @@
     "ckdev-mutate-5d005f45": {
       "version": "ckdev-mutate 0.12.7",
       "sha256": "34995b6112d397524bafbd1f0cc18b65e3fcd68441582a7b430b1150a3850c64"
+    },
+    "ckdev-mutate-73af60d1": {
+      "version": "ckdev-mutate 0.12.10",
+      "sha256": "c20868dfdb96bb57dada99bb8c1ca78501a28d67cb41fc47b8346a7b74117e69"
     },
     "ckdev-mutate-73c7e661": {
       "version": "ckdev-mutate 0.9.5",
@@ -358,6 +362,18 @@
         "url": "https://github.com/cortexkit/commons/archive/5d005f453c892a09147ffb5e991c06966ff9b4a2.tar.gz",
         "sha256": "f320958a1787d1aebee57f98466b40407a8cd9ba7d0362f46c10dc90227f835f"
       }
+    },
+    {
+      "bins": [
+        "ckdev-mutate"
+      ],
+      "crate": "cortexkit-mutate",
+      "git": "https://github.com/cortexkit/commons",
+      "rev": "73af60d143d64fe874606ce73f22e02cb356a4bb",
+      "source": {
+        "url": "https://github.com/cortexkit/commons/archive/73af60d143d64fe874606ce73f22e02cb356a4bb.tar.gz",
+        "sha256": "856a83c0caa9014e4544aa46577b603f8452e0947bf006e389f67b7d2a0923d8"
+      }
     }
   ],
   "sources": {
@@ -388,16 +404,16 @@
     "git": {
       "path": "/opt/motor/bin/git",
       "version": "git version 2.53.0",
-      "sha256": "db415fb9493d3ff9dcab36716b279e8cbaf0a16b63d944fbd2dafd5fb681ca75"
+      "sha256": "5693dbcb924373eb31af47e732db2d1f7a5922884ea89d43bb1dc2752a388f02"
     },
     "bash": {
       "path": "/opt/motor/bin/bash",
       "version": "GNU bash, version 5.2.37(1)-release (aarch64-apple-darwin27.0.0)",
-      "sha256": "dd32ab76e77f8c2ab4552b9dd3a5b66bb90ec5b8433b257969e4eede8711138f"
+      "sha256": "4044f2f7b64e8c84b9fdf1a313f27dbee99cd00ffc6f2ca45f4fe75056391d82"
     }
   },
   "agent": {
-    "commit": "da38ce00910169fd425c32f2116e43fa192d8b5b",
+    "commit": "27b3c6cecc2d4f1b439434d246fc41d6a6249804",
     "sha256": "845760c031bbc1869e5ae6c3b561c72d1070bdb19117390b947059d463712d67"
   },
   "prep_tools": {
@@ -415,7 +431,7 @@
     },
     "git": {
       "path": "bin/git",
-      "sha256": "db415fb9493d3ff9dcab36716b279e8cbaf0a16b63d944fbd2dafd5fb681ca75"
+      "sha256": "5693dbcb924373eb31af47e732db2d1f7a5922884ea89d43bb1dc2752a388f02"
     }
   },
   "job_environment_by_role": {

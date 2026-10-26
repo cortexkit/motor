@@ -10,7 +10,7 @@ import parity
 
 HERE = Path(__file__).resolve().parent
 PENDING = "pending measurement"
-AGENT_COMMIT = "311f411cc2f12baba058dd356be80c066f0b0aba"
+AGENT_COMMIT = "27b3c6cecc2d4f1b439434d246fc41d6a6249804"
 
 
 def seed(server):
