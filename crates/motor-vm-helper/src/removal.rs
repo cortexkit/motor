@@ -12,8 +12,14 @@ use crate::{Error, Result};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{
+            ffi::OsStrExt,
+            fs::{OpenOptionsExt, PermissionsExt},
+        },
+    },
+    path::{Component, Path, PathBuf},
 };
 
 /// How long a removed tenant's data waits in quarantine before it is deleted.
@@ -118,10 +124,18 @@ pub fn lock(paths: &Paths) -> Result<File> {
     Ok(file)
 }
 
+/// Keep helper construction, reconciliation and socket publication exclusive
+/// with provisioning/offline removal. Release before serving requests.
+pub fn startup_with<T>(paths: &Paths, initialize: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _lock = lock(paths)?;
+    initialize()
+}
+
 /// Creates the quarantine folder and saves copies of the tenant's records in
 /// it, so an operator can undo the removal. Nothing is deleted yet.
 pub fn begin(paths: &Paths, tenant: &str, unix_s: u64) -> Result<PathBuf> {
     crate::tenant::validate_name(tenant)?;
+    let _home_parent = directory_no_symlinks(&paths.root.join("tenants"))?;
     let removed = paths.removed();
     match fs::symlink_metadata(&removed) {
         Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
@@ -171,6 +185,33 @@ pub fn begin(paths: &Paths, tenant: &str, unix_s: u64) -> Result<PathBuf> {
 /// `pending` finds the quarantine folder and a retry completes it.
 pub fn finish(paths: &Paths, tenant: &str, quarantine: &Path) -> Result<()> {
     crate::tenant::validate_name(tenant)?;
+    // Pin both parents before deleting records. renameat never resolves an
+    // intermediate symlink, even if a spelling is changed after these opens.
+    let home_parent = directory_no_symlinks(&paths.root.join("tenants"))?;
+    let destination = directory_no_symlinks(quarantine)?;
+    let name = std::ffi::CString::new(tenant).map_err(|e| Error(e.to_string()))?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let present = if unsafe {
+        libc::fstatat(
+            home_parent.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0
+    {
+        let metadata = unsafe { metadata.assume_init() };
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(Error("tenant home is not a directory".into()));
+        }
+        true
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error.into());
+        }
+        false
+    };
     let bindings = read_bindings(paths)?;
     if bindings.values().any(|entry| entry["tenant"] == tenant) {
         let kept: serde_json::Map<_, _> = bindings
@@ -189,18 +230,53 @@ pub fn finish(paths: &Paths, tenant: &str, quarantine: &Path) -> Result<()> {
             Err(e) => return Err(e.into()),
         }
     }
-    let home = paths.home(tenant);
-    match fs::symlink_metadata(&home) {
-        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
-            fs::rename(&home, quarantine.join("home"))?;
-            sync_dir(home.parent().unwrap())?;
-            sync_dir(quarantine)?;
+    if present {
+        if unsafe {
+            libc::renameat(
+                home_parent.as_raw_fd(),
+                name.as_ptr(),
+                destination.as_raw_fd(),
+                c"home".as_ptr(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
         }
-        Ok(_) => return Err(Error("tenant home is not a directory".into())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+        home_parent.sync_all()?;
+        destination.sync_all()?;
     }
     Ok(())
+}
+
+fn directory_no_symlinks(path: &Path) -> Result<File> {
+    if !path.is_absolute() {
+        return Err(Error("removal directory must be absolute".into()));
+    }
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")?;
+    for component in path.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => {
+                std::ffi::CString::new(name.as_bytes()).map_err(|e| Error(e.to_string()))?
+            }
+            _ => return Err(Error("invalid removal directory component".into())),
+        };
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        directory = unsafe { File::from_raw_fd(fd) };
+    }
+    Ok(directory)
 }
 
 /// Replay network cleanup from the saved registry before finishing either a
@@ -219,6 +295,45 @@ pub fn finish_with_network(
     finish(paths, tenant, quarantine)
 }
 
+/// An index identifies host network objects and the uid, not an incarnation.
+/// Saved records must never authorize deletion after another tenant reused it.
+pub fn refuse_reassigned_tap(
+    paths: &Paths,
+    tenant: &str,
+    saved: &crate::tenant::Registry,
+    allow_current: bool,
+    mut read_registry: impl FnMut(&Path) -> Result<crate::tenant::Registry>,
+) -> Result<()> {
+    let entries = match fs::read_dir(&paths.registry) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension() != Some(std::ffi::OsStr::new("json")) {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error("invalid registry filename".into()))?;
+        crate::tenant::validate_name(name)?;
+        if allow_current && name == tenant {
+            continue;
+        }
+        let current = read_registry(&path)?;
+        current.validate(name)?;
+        if current.tap_index == saved.tap_index {
+            return Err(Error(format!(
+                "cannot replay removal: tenant TAP index has been reassigned to {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Offline administrative removal uses the same journal and cleanup order,
 /// without constructing a helper or loading an uplink configuration.
 pub fn offline_with(
@@ -232,12 +347,14 @@ pub fn offline_with(
 ) -> Result<PathBuf> {
     crate::tenant::validate_name(tenant)?;
     let _lock = lock(paths)?;
-    let quarantine = if paths.registry_file(tenant).try_exists()? {
+    let has_registry = paths.registry_file(tenant).try_exists()?;
+    let quarantine = if has_registry {
         if resume_only {
             return Err(Error("registry still exists; use --remove-tenant".into()));
         }
         let registry = read_registry(&paths.registry_file(tenant))?;
         registry.validate(tenant)?;
+        refuse_reassigned_tap(paths, tenant, &registry, true, &mut read_registry)?;
         stopped(&registry)?;
         begin(paths, tenant, unix_s)?
     } else {
@@ -247,6 +364,7 @@ pub fn offline_with(
     // The production reader checks root ownership and all saved-record ancestors.
     let saved = read_registry(&quarantine.join("records/registry.json"))?;
     saved.validate(tenant)?;
+    refuse_reassigned_tap(paths, tenant, &saved, has_registry, &mut read_registry)?;
     stopped(&saved)?;
     finish_with_network(paths, tenant, &quarantine, cleanup)?;
     Ok(quarantine)

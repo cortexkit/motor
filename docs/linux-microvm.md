@@ -122,6 +122,14 @@ any process with the reserved tenant uid. It checks root-owned state and saved
 records and never starts a VM, helper, agent or broker connection. This is a
 smaller safety change than weakening generic startup cleanup, trust or cgroup
 barriers merely to expose a removal RPC; ordinary helper startup remains strict.
+Helper construction/reconciliation and socket publication hold that same
+provisioning lock, so a concurrent start cannot race the offline stopped check.
+Resume rechecks live TAP-index ownership from trusted registries before any
+tenant mutation; an index already assigned to another tenant is refused.
+Pending quarantine records reserve their index until the old home is moved.
+Tenant-home and quarantine parents are checked and opened component-by-component
+without symlinks; home movement uses descriptor-relative rename rather than
+following a changed parent spelling.
 
 The socket is `/run/motor-vm-helper.sock`, `root:<socket_gid>`, mode `0660`.
 Only uids listed in the config are admitted, checked with `SO_PEERCRED`.

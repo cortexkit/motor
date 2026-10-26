@@ -9,6 +9,19 @@ use std::{
 };
 
 fn stopped_units() -> Result<()> {
+    match std::os::unix::net::UnixStream::connect("/run/motor-vm-helper.sock") {
+        Ok(_) => {
+            return Err(Error(
+                "helper socket is serving; stop the helper before offline removal".into(),
+            ))
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) => {}
+        Err(error) => return Err(error.into()),
+    }
     for unit in ["motor-host.service", "motor-vm-helper.service"] {
         let output = Command::new("/usr/bin/timeout")
             .args([
@@ -84,8 +97,12 @@ fn stopped_tenant(tenant: &str, registry: &Registry) -> Result<()> {
 }
 
 fn trusted_state(paths: &removal::Paths) -> Result<()> {
+    let homes = paths.root.join("tenants");
+    let removed = paths.removed();
     for path in [
         &paths.root,
+        &homes,
+        &removed,
         &paths.registry,
         &paths.provision,
         &paths.bindings,

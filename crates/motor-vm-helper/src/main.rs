@@ -1,14 +1,11 @@
 #[cfg(target_os = "linux")]
 fn main() {
-    use motor_vm_helper::linux::{offline, server, LinuxMachine};
+    use motor_vm_helper::linux::{offline, server};
     let result = server::dispatch(
         std::env::args_os().skip(1),
         |path| {
             let config = server::load_config(path)?;
-            let count = config.slots.len();
-            let allowed = config.allowed_uids.clone();
-            let gid = config.socket_gid;
-            server::serve(LinuxMachine::new(config)?, count, allowed, gid)
+            server::serve(config)
         },
         |tenant, resume| {
             let quarantine = offline::remove(tenant, resume)?;

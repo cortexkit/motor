@@ -37,9 +37,11 @@ fn scratch() -> Scratch {
         fs::create_dir_all(home.join("suspend.stale-v0-1")).unwrap();
         fs::write(home.join("disk.img"), tenant).unwrap();
         fs::write(home.join("suspend/suspend.memory"), tenant).unwrap();
+        let mut registry = crate::tenant::tests::registry(tenant);
+        registry.tap_index = tap;
         fs::write(
             paths.registry.join(format!("{tenant}.json")),
-            format!("{{\"tap_index\":{tap}}}"),
+            serde_json::to_vec(&registry).unwrap(),
         )
         .unwrap();
         fs::write(paths.provision.join(format!("{tenant}.json")), tenant).unwrap();
@@ -52,6 +54,110 @@ fn scratch() -> Scratch {
     Scratch {
         _dir: TempRoot(dir),
         paths,
+    }
+}
+
+#[test]
+fn helper_startup_and_offline_removal_are_mutually_exclusive() {
+    let s = scratch();
+    let p = &s.paths;
+    let offline = lock(p).unwrap();
+    let mut started = false;
+    let result = startup_with(p, || {
+        started = true;
+        Ok(())
+    });
+    assert!(result
+        .unwrap_err()
+        .0
+        .contains("provisioning is in progress"));
+    assert!(
+        !started,
+        "no construction, reconcile or bind while offline removal owns the lock"
+    );
+    drop(offline);
+    startup_with(p, || {
+        let result = offline_with(
+            p,
+            "a",
+            false,
+            1000,
+            |_| panic!("must not read tenant state during helper startup"),
+            |_| panic!("must not check stopped state during helper startup"),
+            |_| panic!("must not mutate network during helper startup"),
+        );
+        assert!(result
+            .unwrap_err()
+            .0
+            .contains("provisioning is in progress"));
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        lock(p).is_ok(),
+        "startup guard must not remain held while serving requests"
+    );
+}
+
+#[test]
+fn removal_rejects_symlinked_home_parent_before_records_or_quarantine_mutation() {
+    use std::os::unix::fs::symlink;
+    let s = scratch();
+    let p = &s.paths;
+    let homes = p.root.join("tenants");
+    let real = p.root.join("real-tenants");
+    fs::rename(&homes, &real).unwrap();
+    symlink(&real, &homes).unwrap();
+    assert!(begin(p, "a", 1000).is_err());
+    assert!(!p.removed().exists());
+    fs::remove_file(&homes).unwrap();
+    fs::rename(&real, &homes).unwrap();
+    let quarantine = begin(p, "a", 1000).unwrap();
+    fs::rename(&homes, &real).unwrap();
+    symlink(&real, &homes).unwrap();
+    let bindings = fs::read(&p.bindings).unwrap();
+    assert!(finish(p, "a", &quarantine).is_err());
+    assert!(p.registry_file("a").exists());
+    assert_eq!(fs::read(&p.bindings).unwrap(), bindings);
+    assert!(real.join("a/disk.img").exists());
+    assert!(!quarantine.join("home").exists());
+}
+
+#[test]
+fn offline_resume_refuses_reassigned_index_before_any_tenant_mutation() {
+    for resume_only in [false, true] {
+        let s = scratch();
+        let p = &s.paths;
+        let quarantine = begin(p, "a", 1000).unwrap();
+        fs::remove_file(p.registry_file("a")).unwrap();
+        let mut new_owner = crate::tenant::tests::registry("b");
+        new_owner.tap_index = 1;
+        let new_record = serde_json::to_vec(&new_owner).unwrap();
+        fs::write(p.registry_file("b"), &new_record).unwrap();
+        let before_binding = fs::read(&p.bindings).unwrap();
+        let mut stopped = false;
+        let result = offline_with(
+            p,
+            "a",
+            resume_only,
+            1100,
+            |path| serde_json::from_slice(&fs::read(path)?).map_err(|e| Error(e.to_string())),
+            |_| {
+                stopped = true;
+                Ok(())
+            },
+            |_| panic!("must not delete B's chains, membership, UFW grant or TAP"),
+        );
+        assert!(result.unwrap_err().0.contains("reassigned to b"));
+        assert!(
+            !stopped,
+            "reassignment must be detected before liveness checks or mutation"
+        );
+        assert_eq!(fs::read(p.registry_file("b")).unwrap(), new_record);
+        assert_eq!(fs::read(&p.bindings).unwrap(), before_binding);
+        assert!(p.home("a").exists());
+        assert!(p.home("b").exists());
+        assert!(!quarantine.join("home").exists());
     }
 }
 

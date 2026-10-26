@@ -74,29 +74,32 @@ pub fn dispatch(
     offline_remove(tenant, resume)
 }
 
-pub fn serve(
-    machine: LinuxMachine,
-    count: usize,
-    allowed: Vec<u32>,
-    socket_gid: u32,
-) -> Result<()> {
-    // Before any thread exists, so every thread inherits the blocked mask.
-    let signals = crate::signals::StopSignals::block()?;
-    let helper = Arc::new(Mutex::new(Helper::new(machine, count, allowed)?));
-    // Only the reconciled helper publishes a listener. Refuse non-socket state,
-    // rather than unlinking an arbitrary file on a privileged path.
-    match std::fs::symlink_metadata(SOCKET) {
-        Ok(m) if m.file_type().is_socket() => std::fs::remove_file(SOCKET)?,
-        Ok(_) => return Err(Error("helper socket path is not a socket".into())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
-    let listener = UnixListener::bind(SOCKET)?;
-    let path = c"/run/motor-vm-helper.sock";
-    if unsafe { libc::chown(path.as_ptr(), 0, socket_gid) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    std::fs::set_permissions(SOCKET, std::fs::Permissions::from_mode(0o660))?;
+pub fn serve(config: crate::config::Config) -> Result<()> {
+    let (signals, helper, listener) =
+        crate::removal::startup_with(&crate::removal::Paths::live(), || {
+            let count = config.slots.len();
+            let allowed = config.allowed_uids.clone();
+            let socket_gid = config.socket_gid;
+            let machine = LinuxMachine::new(config)?;
+            // Before any thread exists, so every thread inherits the blocked mask.
+            let signals = crate::signals::StopSignals::block()?;
+            let helper = Arc::new(Mutex::new(Helper::new(machine, count, allowed)?));
+            // Only the reconciled helper publishes a listener. Refuse non-socket state,
+            // rather than unlinking an arbitrary file on a privileged path.
+            match std::fs::symlink_metadata(SOCKET) {
+                Ok(m) if m.file_type().is_socket() => std::fs::remove_file(SOCKET)?,
+                Ok(_) => return Err(Error("helper socket path is not a socket".into())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            let listener = UnixListener::bind(SOCKET)?;
+            let path = c"/run/motor-vm-helper.sock";
+            if unsafe { libc::chown(path.as_ptr(), 0, socket_gid) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            std::fs::set_permissions(SOCKET, std::fs::Permissions::from_mode(0o660))?;
+            Ok((signals, helper, listener))
+        })?;
     let maintenance = helper.clone();
     std::thread::spawn(move || loop {
         std::thread::park_timeout(Duration::from_millis(100));

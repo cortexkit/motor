@@ -726,15 +726,9 @@ impl Backend for LinuxTenants {
             return Ok(None);
         };
         crate::removal::finish_with_network(&paths, tenant, &quarantine, |registry| {
-            if self
-                .registries()?
-                .iter()
-                .any(|current| current.tap_index == registry.tap_index)
-            {
-                return Err(Error(
-                    "cannot replay removal: tenant TAP index has been reassigned".into(),
-                ));
-            }
+            crate::removal::refuse_reassigned_tap(&paths, tenant, registry, false, |path| {
+                serde_json::from_reader(fs::trusted_file(path)?).map_err(|e| Error(e.to_string()))
+            })?;
             tenant_network::remove(registry)
         })?;
         eprintln!(
