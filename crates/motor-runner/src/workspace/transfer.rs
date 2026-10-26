@@ -1,6 +1,7 @@
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
+    collections::VecDeque,
     io::{self, Read},
     path::Path,
     process::{Command, Stdio},
@@ -9,6 +10,61 @@ use std::{
 };
 
 pub(crate) const STALL: Duration = Duration::from_secs(60);
+const DIAGNOSTIC_PART: usize = 8192;
+const ELISION: &str = "\n...[git stderr omitted]...\n";
+
+#[derive(Default)]
+struct Diagnostic {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    seen: usize,
+}
+
+impl Diagnostic {
+    fn observe(&mut self, bytes: &[u8]) {
+        self.seen = self.seen.saturating_add(bytes.len());
+        self.head
+            .extend_from_slice(&bytes[..bytes.len().min(DIAGNOSTIC_PART - self.head.len())]);
+        if bytes.len() >= DIAGNOSTIC_PART {
+            self.tail.clear();
+            self.tail.extend(&bytes[bytes.len() - DIAGNOSTIC_PART..]);
+        } else {
+            let discard = (self.tail.len() + bytes.len()).saturating_sub(DIAGNOSTIC_PART);
+            self.tail.drain(..discard);
+            self.tail.extend(bytes);
+        }
+    }
+
+    fn text(&self) -> String {
+        let tail: Vec<_> = self.tail.iter().copied().collect();
+        let mut bytes = self.head.clone();
+        if self.seen > DIAGNOSTIC_PART * 2 {
+            bytes.extend_from_slice(ELISION.as_bytes());
+        }
+        let overlap = (self.head.len() + tail.len()).saturating_sub(self.seen);
+        bytes.extend_from_slice(&tail[overlap..]);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+/// Bound the redacted wire detail without losing Git's final fatal diagnostic.
+pub(crate) fn bounded_fetch_detail(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.into();
+    }
+    let marker = if limit >= ELISION.len() { ELISION } else { "" };
+    let head_budget = (limit - marker.len()) / 3;
+    let tail_budget = limit - marker.len() - head_budget;
+    let mut head = head_budget;
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len() - tail_budget;
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}{}{}", &text[..head], marker, &text[tail..])
+}
 
 /// Git's forced progress reports byte/object counts while indexing a local
 /// bundle. Identical repeated lines and unrelated diagnostics are not progress.
@@ -66,9 +122,12 @@ pub(crate) fn fetch(path: &Path, args: &[&str]) -> io::Result<()> {
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_CONFIG_COUNT")
         .env_remove("GIT_CONFIG_KEY_0")
-        .env_remove("GIT_CONFIG_VALUE_0")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .env_remove("GIT_CONFIG_VALUE_0");
+    run(command)
+}
+
+fn run(mut command: Command) -> io::Result<()> {
+    command.stdout(Stdio::null()).stderr(Stdio::piped());
     #[cfg(unix)]
     command.process_group(0);
     #[cfg(unix)]
@@ -86,19 +145,10 @@ pub(crate) fn fetch(path: &Path, args: &[&str]) -> io::Result<()> {
         }
     });
     let mut progress = Progress::new(Instant::now());
-    let mut diagnostic = Vec::new();
+    let mut diagnostic = Diagnostic::default();
     let result = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                break if status.success() {
-                    Ok(())
-                } else {
-                    Err(io::Error::other(format!(
-                        "git fetch {status}: {}",
-                        String::from_utf8_lossy(&diagnostic)
-                    )))
-                }
-            }
+            Ok(Some(status)) => break Ok(status),
             Err(error) => break Err(error),
             Ok(None) => {}
         }
@@ -112,9 +162,7 @@ pub(crate) fn fetch(path: &Path, args: &[&str]) -> io::Result<()> {
         match rx.recv_timeout(remaining.min(Duration::from_millis(25))) {
             Ok(bytes) => {
                 progress.observe(&bytes, Instant::now());
-                diagnostic.extend_from_slice(
-                    &bytes[..bytes.len().min(8192usize.saturating_sub(diagnostic.len()))],
-                );
+                diagnostic.observe(&bytes);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 std::thread::park_timeout(Duration::from_millis(25))
@@ -122,7 +170,7 @@ pub(crate) fn fetch(path: &Path, args: &[&str]) -> io::Result<()> {
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     };
-    if result.is_err() {
+    if !matches!(&result, Ok(status) if status.success()) {
         // index-pack is a child of git; killing only git can leave it writing
         // the mirror and keep the progress-reader pipe open indefinitely.
         #[cfg(unix)]
@@ -132,9 +180,22 @@ pub(crate) fn fetch(path: &Path, args: &[&str]) -> io::Result<()> {
         let _ = child.kill();
     }
     let _ = child.wait();
-    drop(rx);
+    // Exit status can arrive before the reader has delivered the last stderr
+    // chunks. Drain through EOF before formatting the error, not just until exit.
+    for bytes in rx {
+        diagnostic.observe(&bytes);
+    }
     let _ = reader.join();
-    result
+    result.and_then(|status| {
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "git fetch {status}: {}",
+                diagnostic.text()
+            )))
+        }
+    })
 }
 
 #[cfg(test)]
@@ -171,5 +232,85 @@ mod tests {
             );
         }
         assert!(progress.remaining(start + STALL).is_zero());
+    }
+
+    #[test]
+    fn diagnostic_capture_is_bounded_and_wire_truncation_keeps_both_ends() {
+        let across_boundary = format!("{}é", "x".repeat(DIAGNOSTIC_PART - 1));
+        let mut complete = Diagnostic::default();
+        complete.observe(across_boundary.as_bytes());
+        assert_eq!(complete.text(), across_boundary);
+        let mut diagnostic = Diagnostic::default();
+        diagnostic.observe(b"head marker\n");
+        for _ in 0..100 {
+            diagnostic.observe(&[b'x'; 4096]);
+        }
+        diagnostic.observe("\nfatal: final error é\n".as_bytes());
+        assert_eq!(diagnostic.head.len(), DIAGNOSTIC_PART);
+        assert_eq!(diagnostic.tail.len(), DIAGNOSTIC_PART);
+        let text = diagnostic.text();
+        assert!(text.starts_with("head marker"));
+        assert!(text.ends_with("fatal: final error é\n"));
+        for limit in [0, 1, 20, 1024] {
+            let bounded = bounded_fetch_detail(&text, limit);
+            assert!(bounded.len() <= limit);
+            if limit == 1024 {
+                assert!(bounded.starts_with("head marker"));
+                assert!(bounded.ends_with("fatal: final error é\n"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_stderr_child() {
+        use std::io::Write;
+        let Some(mode) = std::env::var_os("MOTOR_TEST_FETCH_STDERR_CHILD") else {
+            return;
+        };
+        let mut stderr = std::io::stderr().lock();
+        if mode == "long" {
+            stderr.write_all(b"git diagnostic head\n").unwrap();
+            stderr.write_all(&vec![b'p'; 128 * 1024]).unwrap();
+        }
+        stderr
+            .write_all(b"\nfatal: final-error-sentinel sensitive-value\n")
+            .unwrap();
+        stderr.flush().unwrap();
+        std::process::exit(128);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_fetch_drains_stderr_and_keeps_final_error_in_refusal_detail() {
+        let scratch = cortexkit_test_support::ScratchDir::new("fetch-diagnostic");
+        let mut config = crate::Config::new(scratch.join("state"), "fetch-diagnostic");
+        config.free_space_floor_bytes = 0;
+        config.manual_tick = true;
+        config.owned_workspace_roots = vec![scratch.path().to_path_buf()];
+        let runner = crate::Runner::open(config).unwrap();
+        for mode in ["short", "long"] {
+            // Use the same process/pipe handling as Git without replacing PATH
+            // or relying on a particular Git release's progress formatting.
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "workspace::transfer::tests::fetch_stderr_child",
+                    "--nocapture",
+                ])
+                .env("MOTOR_TEST_FETCH_STDERR_CHILD", mode);
+            let error = run(command).unwrap_err();
+            let raw = error.to_string();
+            assert!(raw.contains("fatal: final-error-sentinel"), "{raw}");
+            assert!(raw.len() <= DIAGNOSTIC_PART * 2 + ELISION.len() + 128);
+            let detail = runner.safe_refusal_detail(error, ["sensitive-value".to_owned()]);
+            assert!(detail.len() <= motor_protocol::REFUSAL_DETAIL_MAX_BYTES);
+            assert!(detail.contains("fatal: final-error-sentinel"), "{detail}");
+            assert!(!detail.contains("sensitive-value"), "{detail}");
+            if mode == "long" {
+                assert!(detail.contains("git diagnostic head"), "{detail}");
+            }
+        }
     }
 }

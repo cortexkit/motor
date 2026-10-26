@@ -17,6 +17,7 @@ use std::{
 pub(crate) mod dependencies;
 mod transfer;
 pub(crate) use dependencies::validate_dependencies;
+pub(crate) use transfer::bounded_fetch_detail;
 
 /// A file in each JavaScript install and manager cache entry naming the
 /// mirror (`name` of the repository root) whose installs created it, so the
