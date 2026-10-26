@@ -260,14 +260,15 @@ def check_storage():
     geometry = subprocess.check_output(['/usr/sbin/xfs_info', str(STATE)], text=True)
     if not re.search(r'\breflink=1\b', geometry):
         raise RuntimeError(f'{STATE} does not have XFS reflink enabled')
-    with tempfile.TemporaryFile(dir=STATE) as source, tempfile.TemporaryFile(dir=USERS) as target:
-        source.write(os.urandom(4096))
-        source.flush()
-        fcntl.ioctl(target.fileno(), 0x40049409, source.fileno())
-        target.seek(0)
-        source.seek(0)
-        if target.read() != source.read():
-            raise RuntimeError('storage FICLONE content mismatch')
+    for directory in (USERS, STATE / 'state/callers/home'):
+        with tempfile.TemporaryFile(dir=STATE) as source, tempfile.TemporaryFile(dir=directory) as target:
+            source.write(os.urandom(4096))
+            source.flush()
+            fcntl.ioctl(target.fileno(), 0x40049409, source.fileno())
+            target.seek(0)
+            source.seek(0)
+            if target.read() != source.read():
+                raise RuntimeError('storage FICLONE content mismatch')
     return {'state': state, 'users': users, 'reflink': True}
 
 
@@ -293,7 +294,7 @@ def prepare_storage():
     subprocess.run(['/usr/bin/systemctl', 'daemon-reload'], check=True)
     subprocess.run(['/usr/bin/systemctl', 'start', r'var-lib-motor\x2dboat.mount'], check=True)
     state_mount(mounts())
-    for directory in ('state', 'state/workspaces', 'home', 'tmp'):
+    for directory in ('state', 'state/workspaces', 'state/callers/home', 'home', 'tmp'):
         (STATE / directory).mkdir(parents=True, exist_ok=True)
     subprocess.run(['/usr/bin/systemctl', 'start', 'Users.mount'], check=True)
     subprocess.run(['/usr/bin/systemctl', 'is-active', '--quiet', r'var-lib-motor\x2dboat.mount', 'Users.mount'], check=True)
