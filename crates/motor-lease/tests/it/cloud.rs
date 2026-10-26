@@ -69,6 +69,49 @@ fn derived_non_null_placement_hint_matches_the_cross_check_hash() {
 }
 
 #[test]
+fn cloud_long_lease_token_accepts_six_hours_but_boat_keeps_two() {
+    let v = vector("long-lease.json");
+    let key = seed(v["test_only_job_seed_hex"].as_str().unwrap());
+    let kid = v["key_id"].as_str().unwrap();
+    let mut keys = KeySet::default();
+    keys.refresh(Ok(Jwks {
+        keys: vec![JwksKey::from_key(kid, &key.verifying_key())],
+    }))
+    .unwrap();
+    let reply = &v["lease"]["reply"]["body"];
+    let now = v["clock_ms"].as_u64().unwrap() / 1000;
+    let mut claims = verify_token(
+        reply["job_token"].as_str().unwrap(),
+        &keys,
+        "host-a",
+        None,
+        Purpose::Run,
+        now,
+    )
+    .unwrap();
+    assert_eq!(claims.max_s, 21600);
+    assert_eq!(reply["reserved_vcpu_ms"], 43_200_000);
+    claims.max_s = 21601;
+    let token = sign_token(&claims, kid, &key).unwrap();
+    assert_eq!(
+        check_token(&token, &keys, "host-a", None, Purpose::Run, now)
+            .unwrap_err()
+            .check,
+        "max_s"
+    );
+    claims.aud = "boat:sandbox-1".into();
+    claims.placement.host = claims.aud.clone();
+    for (max_s, accepted) in [(7200, true), (7201, false)] {
+        claims.max_s = max_s;
+        let token = sign_token(&claims, kid, &key).unwrap();
+        assert_eq!(
+            verify_token(&token, &keys, &claims.aud, None, Purpose::Run, now).is_ok(),
+            accepted
+        );
+    }
+}
+
+#[test]
 fn cloud_job_tokens_and_requester_thumbprint_match_code_for_both_purposes() {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     let v = vector("job-tokens.json");

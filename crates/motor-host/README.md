@@ -151,6 +151,16 @@ The host closes only tenants its binding map binds to a listed subject,
 refuses their new jobs, and removes the tenant through the helper once its
 last job has drained; see `docs/hosted-host.md`.
 
+A job in a heartbeat reply's `ignored` list no longer belongs to this host.
+The host records its revocation before acknowledging the heartbeat, refuses
+the old run token with `auth`, and queues a durable cancel for the tenant
+runner. The revocation survives restarts and in-flight delivery. A later usage
+report refused with `409 job_conflict` is expected after a replacement: the
+host logs it once and removes the report from the outbox instead of retrying.
+`heartbeat_ignored_running_job_is_cancelled_even_after_restart` and
+`heartbeat_ignored_reserved_job_refuses_old_token_and_inflight_delivery` cover
+the two races.
+
 The read-only `tenant_metrics` helper operation samples the VM's
 `memory.current` and its own nftables forward-rule byte counter at start, end and
 periodic heartbeats. VM-lifetime `memory.peak` cannot be scoped to one lease

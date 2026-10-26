@@ -84,6 +84,7 @@ pub const SETTLED_EXIT_CODE: i32 = 41;
 pub const SETTLED_OUTPUT: [&[u8]; 2] = [b"before the drop\n", b"after the drop\n"];
 
 type LeaseReplies = Arc<Mutex<VecDeque<(u16, serde_json::Value, &'static str)>>>;
+type ReplacementHosts = Arc<Mutex<VecDeque<Arc<Mutex<FakeBroker>>>>>;
 
 pub struct Harness {
     pub route: HostedJobState,
@@ -91,6 +92,8 @@ pub struct Harness {
     pub requests: Arc<Mutex<Vec<String>>>,
     pub lease_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
     pub lease_replies: LeaseReplies,
+    pub replacement_hosts: ReplacementHosts,
+    pub replace_replies: LeaseReplies,
     pub tokens: Arc<AtomicUsize>,
     pub iats: Arc<Mutex<Vec<u64>>>,
     pub runs: Arc<AtomicUsize>,
@@ -124,6 +127,9 @@ impl Drop for Harness {
 }
 impl Harness {
     pub async fn new(behavior: Behavior) -> Self {
+        Self::with_host(behavior, "test-host").await
+    }
+    pub async fn with_host(behavior: Behavior, host_id: &'static str) -> Self {
         // A deliberately self-signed certificate for an unrelated DNS name.
         let rcgen::CertifiedKey { cert, key_pair } =
             rcgen::generate_simple_self_signed(vec!["not-the-host.invalid".into()]).unwrap();
@@ -167,7 +173,7 @@ impl Harness {
                     worker_bearer: "hosted-test-bearer".into(),
                     subject: "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
                     placement: Placement {
-                        host: "test-host".into(),
+                        host: host_id.into(),
                         vm: Some("test-vm".into()),
                     },
                     endpoint,
@@ -181,7 +187,7 @@ impl Harness {
         ));
         std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
         broker.lock().unwrap().register_host(
-            "test-host".into(),
+            host_id.into(),
             SigningKey::from_bytes(&HOST_MACHINE_SEED).verifying_key(),
         );
         let tokens = Arc::new(AtomicUsize::new(0));
@@ -241,15 +247,14 @@ impl Harness {
                             Purpose::Attach
                         };
                         let claims =
-                            verify_token(&token, &keys, "test-host", None, purpose, now_s())
-                                .unwrap();
+                            verify_token(&token, &keys, host_id, None, purpose, now_s()).unwrap();
                         iats.lock().unwrap().push(claims.iat);
                         let challenge = Challenge {
                             nonce: "a".repeat(64),
                             host_id: if matches!(behavior, Behavior::WrongHost) {
                                 "wrong-host"
                             } else {
-                                "test-host"
+                                host_id
                             }
                             .into(),
                             ts: now_s(),
@@ -418,7 +423,7 @@ impl Harness {
                                             Frame::Terminal(terminal),
                                             Frame::HostedTerminal(HostedTerminal {
                                                 job_id: id,
-                                                placement: "first_party/test-host".into(),
+                                                placement: format!("first_party/{host_id}"),
                                                 billed_vcpu_ms: 6001,
                                                 max_runtime_s: claims.max_s,
                                             }),
@@ -504,7 +509,7 @@ impl Harness {
                                         &mut tls,
                                         &Frame::HostedTerminal(HostedTerminal {
                                             job_id: id,
-                                            placement: "first_party/test-host".into(),
+                                            placement: format!("first_party/{host_id}"),
                                             billed_vcpu_ms: 6001,
                                             max_runtime_s: claims.max_s,
                                         }),
@@ -527,6 +532,8 @@ impl Harness {
         let lease_replies = Arc::new(Mutex::new(
             VecDeque::<(u16, serde_json::Value, &'static str)>::new(),
         ));
+        let replacement_hosts = ReplacementHosts::default();
+        let replace_replies = LeaseReplies::default();
         let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let drop_lease = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release_admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -537,6 +544,8 @@ impl Harness {
             let requests = requests.clone();
             let lease_bodies = lease_bodies.clone();
             let lease_replies = lease_replies.clone();
+            let replacement_hosts = replacement_hosts.clone();
+            let replace_replies = replace_replies.clone();
             let finished = finished.clone();
             let drop_lease = drop_lease.clone();
             let release_admitted = release_admitted.clone();
@@ -545,6 +554,10 @@ impl Harness {
                 // Connections of unanswered requests, kept open until the
                 // harness is dropped and aborts this task.
                 let mut unanswered = Vec::new();
+                let mut placements = std::collections::BTreeMap::new();
+                let mut reservations =
+                    std::collections::BTreeMap::<String, serde_json::Value>::new();
+                let mut lease_requests = std::collections::BTreeMap::<String, Vec<u8>>::new();
                 while let Ok((mut socket, _)) = http.accept().await {
                     let mut bytes = Vec::new();
                     loop {
@@ -624,7 +637,7 @@ impl Harness {
                         None
                     };
                     let mut retry_after = "";
-                    let reply = if let Some((status, body, delay)) = stub {
+                    let mut reply = if let Some((status, body, delay)) = stub {
                         retry_after = delay;
                         motor_lease::fake::BrokerReply { status, body }
                     } else if release_admitted.load(Ordering::SeqCst) && path.ends_with("/release")
@@ -632,8 +645,41 @@ impl Harness {
                         motor_lease::fake::BrokerReply::error(409, "job_admitted")
                     } else if finished.load(Ordering::SeqCst) && path.ends_with("/reattach") {
                         motor_lease::fake::BrokerReply::error(409, "job_finished")
+                    } else if path.ends_with("/replace") {
+                        assert_eq!(body, b"{}");
+                        if let Some((status, body, delay)) =
+                            replace_replies.lock().unwrap().pop_front()
+                        {
+                            retry_after = delay;
+                            motor_lease::fake::BrokerReply { status, body }
+                        } else if let Some(next) = replacement_hosts.lock().unwrap().pop_front() {
+                            let job = path.split('/').nth(3).unwrap();
+                            let reply = next.lock().unwrap().handle(
+                                BrokerRequest {
+                                    content_type: Some("application/json"),
+                                    method: "POST",
+                                    path: "/v1/leases",
+                                    bearer: bearer.as_deref(),
+                                    host_headers: None,
+                                    body: &lease_requests[job],
+                                },
+                                now_s() * 1000,
+                            );
+                            assert_eq!(reply.status, 201);
+                            placements.insert(job.to_owned(), next);
+                            reply
+                        } else {
+                            motor_lease::fake::BrokerReply::error(503, "no_capacity")
+                        }
                     } else {
-                        broker.lock().unwrap().handle(
+                        let job = serde_json::from_slice::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|v| v["job_id"].as_str().map(str::to_owned));
+                        let selected = job
+                            .as_ref()
+                            .and_then(|j| placements.get(j))
+                            .unwrap_or(&broker);
+                        selected.lock().unwrap().handle(
                             BrokerRequest {
                                 content_type: Some("application/json"),
                                 method: "POST",
@@ -645,6 +691,17 @@ impl Harness {
                             now_s() * 1000,
                         )
                     };
+                    if path == "/v1/leases" && reply.status == 201 {
+                        let job = reply.body["job_id"].as_str().unwrap().to_owned();
+                        lease_requests.insert(job.clone(), body.clone());
+                        let lease_id = reservations
+                            .entry(job)
+                            .or_insert_with(|| reply.body["lease_id"].clone());
+                        reply.body["lease_id"] = lease_id.clone();
+                    } else if path.ends_with("/replace") && reply.status == 201 {
+                        let job = reply.body["job_id"].as_str().unwrap();
+                        reply.body["lease_id"] = reservations[job].clone();
+                    }
                     if path == "/v1/leases" && drop_lease.swap(false, Ordering::SeqCst) {
                         continue;
                     }
@@ -665,6 +722,8 @@ impl Harness {
             requests,
             lease_bodies,
             lease_replies,
+            replacement_hosts,
+            replace_replies,
             tokens,
             iats,
             runs,

@@ -324,7 +324,10 @@ pub fn check_token(
             claims.iat > MAX_SAFE_INTEGER || claims.exp > MAX_SAFE_INTEGER,
         ),
         ("mem_mib", !memory_ok),
-        ("max_s", claims.max_s == 0 || claims.max_s > 7200),
+        (
+            "max_s",
+            claims.max_s == 0 || claims.max_s > if boat { 7200 } else { 21600 },
+        ),
         ("platform", !valid_name(&claims.platform)),
         ("cnf", decode::<32>(&claims.cnf.jkt).is_err()),
     ]

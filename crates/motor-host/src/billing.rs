@@ -1,5 +1,5 @@
 //! Host observations, durable settlement records and the serialized broker outbox.
-use crate::state::{Error, Host, LeaseState, Snapshot};
+use crate::state::{Error, Host, LeaseState, Refusal, Snapshot};
 use motor_lease::{Heartbeat, HostHeaders, JobState, RunningJob, Usage, UsageOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -453,7 +453,8 @@ impl Host {
         }
         let final_error = matches!(
             (status, reply["error"].as_str()),
-            (409, Some("usage_conflict" | "job_settled")) | (404, Some("job_unknown"))
+            (409, Some("usage_conflict" | "job_settled" | "job_conflict"))
+                | (404, Some("job_unknown"))
         );
         if !(200..300).contains(&status) && !final_error {
             return Ok(false);
@@ -465,7 +466,10 @@ impl Host {
                 .get(job)
                 .and_then(|b| b.hosted_terminal.as_ref())
                 .and_then(|h| h["billed_vcpu_ms"].as_u64());
-            if status == 409
+            let moved = status == 409 && reply["error"] == "job_conflict";
+            if moved {
+                tracing::info!(job_id = job, "usage_ignored_after_replace");
+            } else if status == 409
                 || ((200..300).contains(&status) && local != reply["settled_vcpu_ms"].as_u64())
             {
                 tracing::error!(
@@ -475,7 +479,7 @@ impl Host {
                     "usage_billing_diverged"
                 );
             }
-            if final_error {
+            if final_error && !moved {
                 tracing::warn!(
                     job_id = job,
                     status,
@@ -485,6 +489,24 @@ impl Host {
             }
         }
         let mut next = self.snapshot.clone();
+        if (200..300).contains(&status) && request.path.ends_with("/heartbeat") {
+            for job in reply["ignored"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                if let Some(lease) = next.leases.get_mut(job) {
+                    // Keep the revocation with the lease, beyond the run token's
+                    // lifetime, so a restart cannot admit the old placement.
+                    lease.refusal = Some(Refusal::Auth);
+                    if lease.state != LeaseState::Ended {
+                        next.pending_cancels
+                            .insert(job.to_owned(), lease.tenant.clone());
+                    }
+                }
+            }
+        }
         if let Some(index) = next
             .outbox
             .iter()

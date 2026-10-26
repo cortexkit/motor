@@ -1,0 +1,96 @@
+{
+  "note": "TEST-ONLY bytes produced by the broker: a 6-hour lease (timeout_s 21600) granted in full on an unlimited allowance, and timeout_s 21601 refused; seeds reproduce the keys.",
+  "key_id": "runner_2026_10",
+  "test_only_job_seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+  "test_only_requester_seed_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "test_only_machine_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "clock_ms": 1792195200123,
+  "lease_id": "12345678-1234-4321-8765-123456789abc",
+  "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "allowance": "unlimited",
+  "host": {
+    "host_id": "host-a",
+    "public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+    "endpoint": "runner.example:7443",
+    "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "platform": "linux-x64"
+  },
+  "lease": {
+    "request": {
+      "method": "POST",
+      "pathname": "/v1/leases",
+      "body": {
+        "job_id": "019e4567-89ab-7cde-8012-3456789abcdf",
+        "vcpus": 2,
+        "platform": "linux-x64",
+        "net": true,
+        "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4",
+        "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+        "placement_hint": {
+          "host": "host-a",
+          "vm": "warm-vm-1"
+        },
+        "avoid_host": null,
+        "timeout_s": 21600,
+        "requester_jwk": {
+          "kty": "OKP",
+          "crv": "Ed25519",
+          "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+        },
+        "allow_spill": true
+      }
+    },
+    "reply": {
+      "status": 201,
+      "retry_after": null,
+      "body": {
+        "lease_id": "12345678-1234-4321-8765-123456789abc",
+        "job_id": "019e4567-89ab-7cde-8012-3456789abcdf",
+        "placement": {
+          "host": "host-a",
+          "vm": "warm-vm-1"
+        },
+        "endpoint": "runner.example:7443",
+        "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZiIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6MiwibWVtX21pYiI6MTYzODQsInBsYXRmb3JtIjoibGludXgteDY0IiwibmV0Ijp0cnVlLCJwbGFjZW1lbnQiOnsiaG9zdCI6Imhvc3QtYSIsInZtIjoid2FybS12bS0xIn0sIm1heF9zIjoyMTYwMCwiY25mIjp7ImprdCI6IkFrWElaRnpvbmI1OVptR3d5S2dpM0gzQndNaTZhbWV2cWRLUWlMWmhkdGMifSwicHVycG9zZSI6InJ1biJ9.IE_mAqyKJdDvSwWH__dzH3gm1fajZL7CaUu-4yqXNeMrC4WKASZ53LN2xSlltPx7insFJ74fVAWJKODRaeI3AQ",
+        "token_expires_at_ms": 1792195500000,
+        "max_s": 21600,
+        "reserved_vcpu_ms": 43200000
+      }
+    }
+  },
+  "refused": {
+    "request": {
+      "method": "POST",
+      "pathname": "/v1/leases",
+      "body": {
+        "job_id": "019e4567-89ab-7cde-8012-3456789abce0",
+        "vcpus": 2,
+        "platform": "linux-x64",
+        "net": true,
+        "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4",
+        "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+        "placement_hint": {
+          "host": "host-a",
+          "vm": "warm-vm-1"
+        },
+        "avoid_host": null,
+        "timeout_s": 21601,
+        "requester_jwk": {
+          "kty": "OKP",
+          "crv": "Ed25519",
+          "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+        },
+        "allow_spill": true
+      }
+    },
+    "reply": {
+      "status": 400,
+      "retry_after": null,
+      "body": {
+        "error": "bad_request",
+        "field": "timeout_s"
+      }
+    }
+  }
+}

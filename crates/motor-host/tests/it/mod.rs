@@ -7,6 +7,7 @@ mod capacity;
 mod closure;
 mod enroll;
 mod helper;
+mod replacement;
 mod resize;
 #[cfg(target_os = "linux")]
 mod resize_operator;

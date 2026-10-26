@@ -224,7 +224,7 @@ impl FakeBroker {
             || request.requester_jwk.verifying_key().is_err()
             || !valid_job_id(&request.job_id)
             || !(1..=64).contains(&request.vcpus)
-            || !(10..=7200).contains(&request.timeout_s)
+            || !(10..=21600).contains(&request.timeout_s)
             || !valid_name(&request.platform)
             || request.placement_hint.as_ref().is_some_and(|p| {
                 !valid_name(&p.host) || p.vm.as_deref().is_none_or(|vm| !valid_name(vm))
