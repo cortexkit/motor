@@ -146,6 +146,13 @@ pub fn begin(paths: &Paths, tenant: &str, unix_s: u64) -> Result<PathBuf> {
     fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o700))?;
     let records = quarantine.join("records");
     fs::create_dir(&records)?;
+    let name = std::ffi::CString::new(tenant).map_err(|e| Error(e.to_string()))?;
+    durable_write(
+        &records.join("home-identity.json"),
+        &serde_json::to_vec(&home_identity(&_home_parent, &name)?)
+            .map_err(|e| Error(e.to_string()))?,
+        0o600,
+    )?;
     for (source, saved) in [
         (paths.registry_file(tenant), "registry.json"),
         (paths.provision_file(tenant), "provision.json"),
@@ -184,28 +191,9 @@ pub fn finish(paths: &Paths, tenant: &str, quarantine: &Path) -> Result<()> {
     let home_parent = directory_no_symlinks(&paths.root.join("tenants"))?;
     let destination = directory_no_symlinks(quarantine)?;
     let name = std::ffi::CString::new(tenant).map_err(|e| Error(e.to_string()))?;
-    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let present = if unsafe {
-        libc::fstatat(
-            home_parent.as_raw_fd(),
-            name.as_ptr(),
-            metadata.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } == 0
-    {
-        let metadata = unsafe { metadata.assume_init() };
-        if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR {
-            return Err(Error("tenant home is not a directory".into()));
-        }
-        true
-    } else {
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::NotFound {
-            return Err(error.into());
-        }
-        false
-    };
+    let identity = home_identity(&home_parent, &name)?;
+    check_home_identity(quarantine, &identity)?;
+    let present = !identity.is_null();
     if !present {
         // A successful removal with no home must not revive when the same
         // tenant name is provisioned again later.
@@ -245,6 +233,46 @@ pub fn finish(paths: &Paths, tenant: &str, quarantine: &Path) -> Result<()> {
         destination.sync_all()?;
     }
     durable_write(&quarantine.join(COMPLETE), b"1\n", 0o600)?;
+    Ok(())
+}
+
+fn home_identity(parent: &File, name: &std::ffi::CStr) -> Result<serde_json::Value> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(serde_json::Value::Null)
+        } else {
+            Err(error.into())
+        };
+    }
+    let metadata = unsafe { metadata.assume_init() };
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(Error("tenant home is not a directory".into()));
+    }
+    Ok(serde_json::json!({"dev":metadata.st_dev,"ino":metadata.st_ino}))
+}
+
+fn check_home_identity(quarantine: &Path, current: &serde_json::Value) -> Result<()> {
+    if current.is_null() {
+        return Ok(());
+    }
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(quarantine.join("records/home-identity.json"))?)
+            .map_err(|e| Error(e.to_string()))?;
+    if &saved != current {
+        return Err(Error(
+            "tenant home no longer matches removal journal; manual recovery required".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -309,8 +337,14 @@ pub fn resume_with_network(
     };
     let saved = read_registry(&quarantine.join("records/registry.json"))?;
     saved.validate(tenant)?;
-    refuse_reassigned_tap(paths, tenant, &saved, false, &mut read_registry)?;
-    cleanup(&saved)?;
+    let parent = directory_no_symlinks(&paths.root.join("tenants"))?;
+    let name = std::ffi::CString::new(tenant).map_err(|e| Error(e.to_string()))?;
+    check_home_identity(&quarantine, &home_identity(&parent, &name)?)?;
+    if let Some(owner) = reassigned_tap_owner(paths, tenant, &saved, false, &mut read_registry)? {
+        eprintln!("tenant {tenant}: network cleanup refused because TAP index belongs to {owner}; completing data only");
+    } else {
+        cleanup(&saved)?;
+    }
     finish(paths, tenant, &quarantine)?;
     Ok(Some(quarantine))
 }
@@ -324,11 +358,29 @@ pub fn refuse_reassigned_tap(
     allow_current: bool,
     mut read_registry: impl FnMut(&Path) -> Result<crate::tenant::Registry>,
 ) -> Result<()> {
+    if let Some(name) =
+        reassigned_tap_owner(paths, tenant, saved, allow_current, &mut read_registry)?
+    {
+        return Err(Error(format!(
+            "cannot replay removal: tenant TAP index has been reassigned to {name}"
+        )));
+    }
+    Ok(())
+}
+
+fn reassigned_tap_owner(
+    paths: &Paths,
+    tenant: &str,
+    saved: &crate::tenant::Registry,
+    allow_current: bool,
+    mut read_registry: impl FnMut(&Path) -> Result<crate::tenant::Registry>,
+) -> Result<Option<String>> {
     let entries = match fs::read_dir(&paths.registry) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    let mut owner = None;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
@@ -346,12 +398,13 @@ pub fn refuse_reassigned_tap(
         let current = read_registry(&path)?;
         current.validate(name)?;
         if current.tap_index == saved.tap_index {
-            return Err(Error(format!(
-                "cannot replay removal: tenant TAP index has been reassigned to {name}"
-            )));
+            if name == tenant {
+                return Err(Error("tenant registry reappeared during removal".into()));
+            }
+            owner = Some(name.to_owned());
         }
     }
-    Ok(())
+    Ok(owner)
 }
 
 /// A removal whose records are already gone but whose home was not yet moved:

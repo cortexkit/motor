@@ -488,8 +488,10 @@ class ResizeTests(unittest.TestCase):
                 self.assertEqual(self.tree(), before)
         self.assertEqual(self.commands, [])
         # remove-tenant still runs, and so do the journaled tenant's abort and resume.
-        p.remove_tenant("b", purge_now=True, check_service=lambda _unit: "inactive", execute=self.record_command,
-                        has_tap=lambda _tap: False, now=lambda: 1000, output=self.output.append)
+        with mock.patch.object(p, 'reset_egress_counter') as reset_counter:
+            p.remove_tenant("b", purge_now=True, check_service=lambda _unit: "inactive", execute=self.record_command,
+                            has_tap=lambda _tap: False, now=lambda: 1000, output=self.output.append)
+        reset_counter.assert_called_once_with(2)
         self.assertFalse((p.REGISTRY / "b.json").exists())
         self.abort()
         self.assertFalse(p.resize_journal_path("a").exists())

@@ -62,6 +62,7 @@ class ProvisionTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
+        self.reset_counter = mock.Mock()
         # runner_processes would read this machine's real /proc; tests that need
         # a runner pass one explicitly.
         self.patch = mock.patch.multiple(p, ROOT=self.root, REGISTRY=self.root / "registry", PROVISION=self.root / "provision",
@@ -75,7 +76,7 @@ class ProvisionTests(unittest.TestCase):
                                                                  "tenant_memory_reserve_bytes": 2 * 1024**3},
                                           memtotal_bytes=lambda: 128 * 1024**3,
                                           slice_properties=lambda _names: {"LoadState": "loaded", "MemoryMax": "42949672960"},
-                                          runner_processes=lambda: [])
+                                          runner_processes=lambda: [], reset_egress_counter=self.reset_counter)
         self.patch.start()
         p.JOBS_DROP_IN.write_text("[Slice]\nMemoryMax=42949672960\nMemoryHigh=35791394134\n")
         for directory in [p.REGISTRY, p.PROVISION, p.BINDINGS.parent, p.ROOT / "tenants"]:
@@ -831,6 +832,28 @@ class ProvisionTests(unittest.TestCase):
         self.assertLess(events.index("mount"), events.index("stage"))
         self.assertLess(events.index("stage"), events.index("umount"))
         self.assertEqual((p.REGISTRY / "a.json").stat().st_mode & 0o777, 0o644)
+
+    def test_index_reuse_resets_egress_on_removal_and_before_replacement_publication(self):
+        self.removal_records()
+        counters = {1: 12345, 2: 987}
+        def reset(index):
+            self.assertFalse((p.REGISTRY / 'c.json').exists())
+            counters[index] = 0
+        self.reset_counter.side_effect = reset
+        p.remove_tenant('a', check_service=lambda _: 'inactive', execute=mock.Mock(),
+                        has_tap=lambda _: False, now=lambda: 1000, output=lambda _: None)
+        self.assertEqual(counters, {1: 0, 2: 987})
+        counters[1] = 45678  # Deferred state from an older removal implementation.
+        replacement = config()
+        replacement.update(tenant='c', vm='vm-c')
+        def execute(*args):
+            if args[0] == 'fallocate':
+                args[-1].touch()
+        with mock.patch.object(p.shutil, 'disk_usage', return_value=type('Usage', (), {'free': 2**63})):
+            p.provision(replacement, lambda _c, _i, base: base.mkdir(parents=True), execute)
+        self.assertEqual(self.reset_counter.call_args_list, [mock.call(1), mock.call(1)])
+        self.assertEqual(counters, {1: 0, 2: 987})
+        self.assertTrue((p.REGISTRY / 'c.json').is_file())
 
     def agent_server(self, handler):
         listener = socket.socket(socket.AF_UNIX)

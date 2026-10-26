@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import traceback
+import types
 import uuid
 
 ROOT = Path("/var/lib/motor-vm")
@@ -52,6 +53,14 @@ SCHEMA = schema_module.SCHEMA
 
 def run(*args):
     return subprocess.run([str(a) for a in args], check=True, capture_output=True, text=True, timeout=300)
+
+
+def reset_egress_counter(index):
+    path = Path(__file__).resolve().parents[1] / 'runner/motor_network_policy.py'
+    policy = types.ModuleType('tenant_network_policy')
+    policy.__file__ = str(path)
+    exec(compile(path.read_bytes(), str(path), 'exec'), policy.__dict__)
+    policy.reset_tenant_counter(index)
 
 
 def u64(value, name):
@@ -714,7 +723,8 @@ def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, ex
     quarantine folder, deletes the tap, drops the binding, provisioning record
     and registry entry, and moves the tenant's home (disk, generation, suspend
     snapshots, set-aside stale snapshots and stop markers) into the folder.
-    The helper deletes the folder after QUARANTINE_S; --purge-now deletes it
+    The egress counter is reset before the index is released. The helper deletes
+    the folder after QUARANTINE_S; --purge-now deletes it
     at once. The firewall exemption and UFW route grant are dropped by the
     helper's startup reconciliation, which keeps only registered tenants.
     The shared size base under the image is not per tenant and is kept.
@@ -763,7 +773,8 @@ def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, ex
             plan.append(f"delete: tap {tap}")
         plan += [f"dropped at the next helper start: {name}" for name in (
             f"nft chain tenant_{tap}_input", f"nft chain tenant_{tap}_forward", f"nft chain tenant_{tap}_nat",
-            f"nft counter tenant_{tap}_egress", f"ufw route motor-tenant-{tap}")]
+            f"ufw route motor-tenant-{tap}")]
+        plan.append(f"reset: nft counter tenant_{tap}_egress")
         if dry_run:
             for line in plan:
                 output(f"would {line}")
@@ -779,6 +790,15 @@ def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, ex
             sync_dir(ROOT)
         quarantine.mkdir(mode=0o700)
         (quarantine / "records").mkdir(mode=0o700)
+        try:
+            metadata = home.lstat()
+        except FileNotFoundError:
+            identity = None
+        else:
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ValueError('tenant home is not a directory')
+            identity = {'dev': metadata.st_dev, 'ino': metadata.st_ino}
+        atomic(quarantine / 'records/home-identity.json', json.dumps(identity))
         for source, saved in ((registry_path, "registry.json"), (provision_path, "provision.json")):
             if source.exists():
                 atomic(quarantine / "records" / saved, source.read_text())
@@ -788,6 +808,7 @@ def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, ex
         if has_tap(tap):
             require_owned_tap(tap, tap_index, tap_info(tap))
             execute("ip", "link", "delete", "dev", tap)
+        reset_egress_counter(tap_index)
         if not home.exists():
             atomic(quarantine / 'complete', '1\n')
         if binding:
@@ -1318,6 +1339,9 @@ def provision(c, make_base=build_base, execute=run, stage=None, runners=None):
     atomic(home / "generation", "0\n")
     record = {k: v for k, v in c.items() if k not in {"tenant", "sub", "vm", "resolvers"}}
     record.update(disk=str(disk), generation=str(home / "generation"), suspend=str(home / "suspend"))
+    # Only an unallocated, stopped index reaches publication. Reset legacy
+    # deferred counters before a replacement registry can expose old usage.
+    reset_egress_counter(c["tap_index"])
     atomic(registry, json.dumps(record, indent=2) + "\n")
     registry.chmod(0o644)
     bindings[c["vm"]] = {"tenant": c["tenant"], "sub": c["sub"]}

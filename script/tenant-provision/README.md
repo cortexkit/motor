@@ -119,10 +119,18 @@ MemoryHigh=35791394134
 
 Only live registry records reserve `tap_index` during provisioning. Quarantine
 records do not: a tenant name and home existence cannot distinguish an old
-removal from a replacement tenant. Online helper resume independently rejects an
-index claimed by a different live tenant before replaying network cleanup. Both
+removal from a replacement tenant. Online helper resume refuses network cleanup
+for an index claimed by another trusted live tenant, but can finish the departed
+tenant's data-only quarantine after checking its saved home identity. Both
 removal implementations write a durable `complete` marker, including when the
 old home is already absent, so completed records cannot revive after name reuse.
+
+Removal saves the original home's device/inode in the quarantine record; a
+different same-name directory cannot be moved by an old interrupted journal.
+Provisioning resets any existing named egress counter for the chosen index
+before registry publication. Python removal resets that counter before deleting
+the registry; Rust removal deletes it. Reset failures retain the allocation or
+refuse publication rather than exposing a previous tenant's absolute usage.
 
 Provisioning checks **bytes** before allocating anything for the tenant, against
 the same storage rule motor-host applies on every admission and heartbeat:

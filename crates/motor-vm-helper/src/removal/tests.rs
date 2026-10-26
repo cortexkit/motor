@@ -82,7 +82,7 @@ fn removal_rejects_symlinked_home_parent_before_records_or_quarantine_mutation()
 }
 
 #[test]
-fn resume_refuses_reassigned_index_before_any_tenant_mutation() {
+fn reassigned_resume_completes_only_original_data_without_touching_replacement_network() {
     let s = scratch();
     let p = &s.paths;
     let quarantine = begin(p, "a", 1000).unwrap();
@@ -92,17 +92,74 @@ fn resume_refuses_reassigned_index_before_any_tenant_mutation() {
     let new_record = serde_json::to_vec(&new_owner).unwrap();
     fs::write(p.registry_file("b"), &new_record).unwrap();
     let before_binding = fs::read(&p.bindings).unwrap();
+    let saved = crate::tenant::tests::registry("a");
+    assert!(
+        refuse_reassigned_tap(p, "a", &saved, false, |path| serde_json::from_slice(
+            &fs::read(path)?
+        )
+        .map_err(|e| Error(e.to_string())))
+        .unwrap_err()
+        .0
+        .contains("reassigned to b")
+    );
     let result = resume_with_network(
         p,
         "a",
         |path| serde_json::from_slice(&fs::read(path)?).map_err(|e| Error(e.to_string())),
         |_| panic!("must not delete B's chains, membership, UFW grant or TAP"),
     );
-    assert!(result.unwrap_err().0.contains("reassigned to b"));
+    assert_eq!(result.unwrap(), Some(quarantine.clone()));
     assert_eq!(fs::read(p.registry_file("b")).unwrap(), new_record);
-    assert_eq!(fs::read(&p.bindings).unwrap(), before_binding);
-    assert!(p.home("a").exists());
+    assert_ne!(fs::read(&p.bindings).unwrap(), before_binding);
+    let bindings: serde_json::Value =
+        serde_json::from_slice(&fs::read(&p.bindings).unwrap()).unwrap();
+    assert_eq!(
+        bindings,
+        serde_json::json!({"vm-b":{"tenant":"b","sub":"acct:B"}})
+    );
+    assert!(!p.home("a").exists());
     assert!(p.home("b").exists());
+    assert!(quarantine.join("home/disk.img").exists());
+    assert_eq!(purge(p, 1000 + QUARANTINE_S).unwrap(), vec![quarantine]);
+    assert!(p.home("b").join("disk.img").exists());
+}
+
+#[test]
+fn pending_removal_rejects_replacement_home_before_network_or_data_mutation() {
+    let s = scratch();
+    let p = &s.paths;
+    let quarantine = begin(p, "a", 1000).unwrap();
+    fs::rename(p.home("a"), p.root.join("original-a")).unwrap();
+    fs::create_dir(p.home("a")).unwrap();
+    fs::write(p.home("a").join("replacement"), "keep").unwrap();
+    fs::remove_file(p.registry_file("a")).unwrap();
+    let error = resume_with_network(
+        p,
+        "a",
+        |path| serde_json::from_slice(&fs::read(path)?).map_err(|e| Error(e.to_string())),
+        |_| panic!("old records cannot authorize replacement network cleanup"),
+    )
+    .unwrap_err();
+    assert!(error.0.contains("home no longer matches"));
+    assert!(p.home("a").join("replacement").exists());
+    assert!(!quarantine.join("home").exists());
+}
+
+#[test]
+fn unreadable_registry_blocks_even_data_only_resume() {
+    let s = scratch();
+    let p = &s.paths;
+    let quarantine = begin(p, "a", 1000).unwrap();
+    fs::remove_file(p.registry_file("a")).unwrap();
+    fs::write(p.registry_file("b"), "bad json").unwrap();
+    assert!(resume_with_network(
+        p,
+        "a",
+        |path| serde_json::from_slice(&fs::read(path)?).map_err(|e| Error(e.to_string())),
+        |_| panic!("untrusted ownership must prevent cleanup")
+    )
+    .is_err());
+    assert!(p.home("a").exists());
     assert!(!quarantine.join("home").exists());
 }
 

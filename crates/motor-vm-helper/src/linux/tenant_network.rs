@@ -280,6 +280,14 @@ fn prelude(
     if desired.len() != registries.len() || !closed.is_subset(&desired) {
         return Err(Error("duplicate or invalid tenant tap set".into()));
     }
+    gate_prelude(&desired, existing, closed)
+}
+
+fn gate_prelude(
+    desired: &std::collections::BTreeSet<String>,
+    existing: Option<&serde_json::Value>,
+    closed: &std::collections::BTreeSet<String>,
+) -> Result<String> {
     let sets = object_names(existing, "set")?;
     let chains = object_names(existing, "chain")?;
     let mut text = String::new();
@@ -293,7 +301,7 @@ fn prelude(
             ));
         }
     }
-    text.push_str(&set_members("motor_tenant", "tenant_taps", &desired));
+    text.push_str(&set_members("motor_tenant", "tenant_taps", desired));
     text.push_str(&set_members("motor_tenant", "closed_taps", closed));
     if !sets.contains("non_public_v4") {
         text.push_str(
@@ -486,23 +494,72 @@ pub fn install(registries: &[Registry], config: &crate::config::Config) -> Resul
 
 pub(super) fn fence(registries: &[Registry]) -> Result<()> {
     let _lock = lock::acquire()?;
-    let (existing, motor_net) = NetworkCommands { config: None }.tables()?;
-    fence_policy(registries, existing.as_ref(), motor_net.as_ref(), apply)
+    let tables = nft_json(&["-j", "list", "tables"])?;
+    let existing = nft_table(&tables, "motor_tenant")?;
+    fence_tenant_gates(registries, existing.as_ref(), apply)?;
+    // Host policy may be corrupt or unreadable. Never let its inspection
+    // prevent the independent tenant deny from reaching the kernel first.
+    let motor_net = nft_table(&tables, "motor_net")?;
+    let revoke = motor_net_members(motor_net.as_ref(), &std::collections::BTreeSet::new())?;
+    if !revoke.is_empty() {
+        apply(&revoke)?;
+    }
+    Ok(())
 }
 
-fn fence_policy(
+fn fence_tenant_gates(
+    registries: &[Registry],
+    existing: Option<&serde_json::Value>,
+    mut apply: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let mut taps: std::collections::BTreeSet<_> = registries.iter().map(Registry::tap).collect();
+    if let Some(items) = existing.and_then(|table| table["nftables"].as_array()) {
+        for item in items {
+            for kind in ["chain", "counter"] {
+                if let Some(name) = item[kind]["name"].as_str() {
+                    for suffix in ["_input", "_forward", "_nat", "_egress"] {
+                        if let Some(tap) = managed_tap(name, suffix) {
+                            taps.insert(tap);
+                        }
+                    }
+                }
+            }
+            if let Some(set) = item.get("set") {
+                if ["tenant_taps", "closed_taps"]
+                    .contains(&set["name"].as_str().unwrap_or_default())
+                {
+                    for tap in set["elem"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|v| v.as_str())
+                    {
+                        if managed_tap(&format!("tenant_{tap}_egress"), "_egress").as_deref()
+                            == Some(tap)
+                        {
+                            taps.insert(tap.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Unknown mtap interfaces are also denied by the prelude's wildcard guard.
+    apply(&gate_prelude(&taps, existing, &taps)?)
+}
+
+pub(super) fn fence_policy(
     registries: &[Registry],
     existing: Option<&serde_json::Value>,
     motor_net: Option<&serde_json::Value>,
     mut apply: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
-    let desired = registries.iter().map(Registry::tap).collect();
-    let mut text = prelude(registries, existing, &desired)?;
-    text.push_str(&motor_net_members(
-        motor_net,
-        &std::collections::BTreeSet::new(),
-    )?);
-    apply(&text)
+    fence_tenant_gates(registries, existing, &mut apply)?;
+    let text = motor_net_members(motor_net, &std::collections::BTreeSet::new())?;
+    if !text.is_empty() {
+        apply(&text)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn install_startup(
@@ -560,19 +617,10 @@ impl NetworkAccess for NetworkCommands<'_> {
     }
     fn tables(&mut self) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>)> {
         let tables = nft_json(&["-j", "list", "tables"])?;
-        let table = |name: &str| -> Result<Option<serde_json::Value>> {
-            let exists = tables["nftables"]
-                .as_array()
-                .ok_or_else(|| Error("missing nft tables".into()))?
-                .iter()
-                .any(|item| item["table"]["family"] == "inet" && item["table"]["name"] == name);
-            if exists {
-                Ok(Some(nft_json(&["-j", "list", "table", "inet", name])?))
-            } else {
-                Ok(None)
-            }
-        };
-        Ok((table("motor_tenant")?, table("motor_net")?))
+        Ok((
+            nft_table(&tables, "motor_tenant")?,
+            nft_table(&tables, "motor_net")?,
+        ))
     }
     fn apply(&mut self, text: &str) -> Result<()> {
         apply(text)
@@ -918,6 +966,19 @@ pub fn egress_bytes(registry: &Registry) -> Result<u64> {
     let counter = format!("tenant_{}_egress", registry.tap());
     let value = nft_json(&["-j", "list", "counter", "inet", "motor_tenant", &counter])?;
     forward_bytes(&value, &registry.tap())
+}
+
+fn nft_table(tables: &serde_json::Value, name: &str) -> Result<Option<serde_json::Value>> {
+    let exists = tables["nftables"]
+        .as_array()
+        .ok_or_else(|| Error("missing nft tables".into()))?
+        .iter()
+        .any(|item| item["table"]["family"] == "inet" && item["table"]["name"] == name);
+    if exists {
+        Ok(Some(nft_json(&["-j", "list", "table", "inet", name])?))
+    } else {
+        Ok(None)
+    }
 }
 
 fn nft_json(args: &[&str]) -> Result<serde_json::Value> {
@@ -1401,6 +1462,28 @@ mod cleanup_tests {
 pub(super) mod reconciliation_tests {
     use super::*;
 
+    #[test]
+    fn malformed_host_delegation_cannot_prevent_tenant_fence() {
+        let existing = serde_json::json!({"nftables":[
+            {"set":{"name":"tenant_taps","type":"ifname","elem":["mtap1","mtap2"]}},
+            {"set":{"name":"closed_taps","type":"ifname","elem":[]}}
+        ]});
+        let broken_host = serde_json::json!({"nftables":[
+            {"set":{"name":"tenant_taps","type":"ipv4_addr"}}
+        ]});
+        let mut writes = Vec::new();
+        let error = fence_policy(&[], Some(&existing), Some(&broken_host), |text| {
+            writes.push(text.to_owned());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.0.contains("motor_net"));
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].contains("closed_taps { \"mtap1\", \"mtap2\" }"));
+        assert!(writes[0].contains("iifname @closed_taps counter drop"));
+        assert!(writes[0].contains("oifname @closed_taps counter drop"));
+    }
+
     pub(in crate::linux) fn fenced_startup(
         config: &crate::config::Config,
     ) -> Result<NetworkReadiness> {
@@ -1430,10 +1513,10 @@ pub(super) mod reconciliation_tests {
         assert!(
             matches!(&state, NetworkReadiness::FencedUplink(problem) if problem.contains("uplink"))
         );
-        assert_eq!(writes.len(), 1);
+        assert_eq!(writes.len(), 2);
         assert!(writes[0].contains("closed_taps { \"mtap1\", \"mtap2\" }"));
-        assert!(writes[0].contains("flush set inet motor_net tenant_taps\n"));
-        assert!(!writes[0].contains("add element inet motor_net tenant_taps"));
+        assert!(writes[1].contains("flush set inet motor_net tenant_taps\n"));
+        assert!(!writes[1].contains("add element inet motor_net tenant_taps"));
         Ok(state)
     }
     #[test]

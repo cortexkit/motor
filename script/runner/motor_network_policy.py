@@ -434,6 +434,23 @@ def tenant_snapshot(document, source, *, uplink):
     return taps, closed
 
 
+def reset_tenant_counter(index):
+    """Start a new index incarnation at zero; never reset on policy reload."""
+    tap = f'mtap{index}'
+    tap_index(tap)
+    name = f'tenant_{tap}_egress'
+    with network_lock(mutate=True):
+        document = table('inet', 'motor_tenant')
+        if document is None:
+            return
+        counters = [entry['counter'] for entry in document['nftables']
+                    if entry.get('counter', {}).get('name') == name]
+        assert len(counters) <= 1, 'duplicate tenant egress counter'
+        if counters:
+            assert counters[0]['family'] == 'inet' and counters[0]['table'] == 'motor_tenant', 'foreign tenant counter'
+            command('/usr/sbin/nft', 'reset', 'counter', 'inet', 'motor_tenant', name)
+
+
 def table(family, name):
     tables = json.loads(command('/usr/sbin/nft', '-j', 'list', 'tables'))['nftables']
     if not any(item.get('table', {}).get('family') == family and item.get('table', {}).get('name') == name for item in tables):
@@ -549,6 +566,9 @@ def load_locked(publish=True):
         readiness.invalidate()
         fence_all()
         raise
+    # Only the helper may release an existing tenant fence after validating its
+    # configuration. A producer reload may tighten gates, never reopen them.
+    healthy -= closed
     if has_sets:
         try:
             apply(members('motor_tenant', 'closed_taps', taps - healthy)

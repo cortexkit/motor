@@ -115,9 +115,14 @@ a failed fence is not evidence that serving is safe.
 
 Startup does not acquire `provision.lock`: image qualification holds that lock
 while launching its helper. Removal and resume acquire it within the helper's
-request serialization. Resume rechecks live TAP-index ownership from trusted
-registries before any tenant mutation; an index already assigned to another
-tenant is refused. Quarantine records do not reserve indexes during provisioning:
+request serialization. Resume checks the saved home device/inode and live
+TAP-index ownership before mutation. If another trusted tenant owns the index,
+network cleanup is refused but the departed tenant's original records and home
+are completed data-only, allowing seven-day purge without touching the new
+owner. Unreadable ownership records or a different home refuse completion.
+Older journals without a saved home identity need explicit manual recovery;
+the helper must not guess which same-name directory they describe.
+Quarantine records do not reserve indexes during provisioning:
 tenant names and home existence do not identify an incarnation. A durable
 `complete` marker prevents a finished removal with no home from being replayed
 against a later same-name tenant, and permits normal seven-day purge.
@@ -128,10 +133,28 @@ following a changed parent spelling.
 Portable regressions are
 `invalid_or_missing_uplink_binds_fences_and_serves_cleanup_but_refuses_opening`,
 `qualification_lock_allows_helper_startup_and_reproduces_legacy_lock_failure`,
-`resume_refuses_reassigned_index_before_any_tenant_mutation` and
+`reassigned_resume_completes_only_original_data_without_touching_replacement_network` and
 `completed_homeless_removal_never_revives_for_a_replacement_and_can_be_purged`.
 These use real sockets/flocks and injected network commands, not privileged
 kernel/UFW or VM qualification.
+
+The tenant deny is applied before parsing or withdrawing host delegation. If
+the registry is unreadable, the helper recovers TAP names from the live tenant
+table and closes those gates; the wildcard guard also denies unknown TAPs. If
+network containment fails, it hard-stops the running VMMs instead of relying on
+a refused admission to contain existing traffic. If that containment also fails,
+the helper exits so systemd tears down its delegated service cgroup; it must not
+continue serving with uncontained VMMs. Producer reloads retain every
+pre-existing `closed_taps` member: only a helper reconciliation with fresh uplink
+and UFW validation can release a fence. The helper and producer serialize those
+policy changes on the same network lock.
+
+`TenantMetrics.egress_bytes` is an absolute per-tenant-incarnation byte counter.
+Provisioning resets an existing per-index counter before publishing a new
+registry, and Python removal resets it before releasing that allocation. Rust
+removal deletes it; routine reconciliation never resets a live tenant's counter.
+Motor-host records a fresh per-job baseline and reports a saturating delta, so
+index reuse cannot inherit the former tenant's bytes or produce a negative bill.
 
 The socket is `/run/motor-vm-helper.sock`, `root:<socket_gid>`, mode `0660`.
 Only uids listed in the config are admitted, checked with `SO_PEERCRED`.

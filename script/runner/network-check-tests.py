@@ -114,6 +114,23 @@ class HostAddressTests(unittest.TestCase):
 
 
 class NetworkForwardPolicyTests(unittest.TestCase):
+    def test_counter_reset_is_index_scoped_and_absent_state_is_not_an_error(self):
+        policy = load_script('install-job-network.py').tenant_policy
+        document = {'nftables': [{'counter': {'family': 'inet', 'table': 'motor_tenant',
+            'name': 'tenant_mtap1_egress', 'bytes': 12345}}, {'counter': {'family': 'inet',
+            'table': 'motor_tenant', 'name': 'tenant_mtap2_egress', 'bytes': 987}}]}
+        with patch.object(policy, 'network_lock', side_effect=lambda **_: contextlib.nullcontext()), \
+                patch.object(policy, 'table', return_value=document) as table, \
+                patch.object(policy, 'command') as command:
+            policy.reset_tenant_counter(1)
+            command.assert_called_once_with('/usr/sbin/nft', 'reset', 'counter', 'inet', 'motor_tenant', 'tenant_mtap1_egress')
+            command.reset_mock()
+            policy.reset_tenant_counter(3)
+            command.assert_not_called()
+            table.return_value = None
+            policy.reset_tenant_counter(1)
+            command.assert_not_called()
+
     def test_live_check_uses_canonical_policy_without_writes_or_readiness(self):
         installer = load_script('install-job-network.py')
         policy = installer.tenant_policy
@@ -512,6 +529,13 @@ class TenantDelegationTests(unittest.TestCase):
         self.validation.reset_mock()
         writes, _ = self.load_plan(tenant, self.net, prior=(set(), set()))
         self.assertIn('add element inet motor_tenant closed_taps { "mtap1" }', writes[0])
+
+    def test_producer_reload_never_reopens_a_helper_closed_gate(self):
+        tenant = copy.deepcopy(self.tenant)
+        next(e['set'] for e in tenant['nftables'] if e.get('set', {}).get('name') == 'closed_taps')['elem'] = ['mtap1']
+        writes, _ = self.load_plan(tenant, self.net, prior=({'mtap1'}, {'mtap1'}))
+        self.assertIn('add element inet motor_tenant closed_taps { "mtap1" }', writes[-1])
+        self.assertNotIn('add element inet motor_net tenant_taps', ''.join(writes))
 
     def test_completed_load_publishes_a_fresh_success_generation(self):
         self.policy.readiness.publish()

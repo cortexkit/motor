@@ -112,6 +112,63 @@ impl LinuxTenants {
         tenant_network::install_startup(&registries, &self.config)?.serve_cleanup();
         Ok(())
     }
+    fn check_network_with(
+        &mut self,
+        validate: impl FnOnce() -> Result<()>,
+        registries: impl FnOnce(&mut Self) -> Result<Vec<Registry>>,
+        fence: impl FnOnce(&[Registry]) -> Result<()>,
+        contain: impl FnOnce(&mut Self) -> Result<()>,
+        fatal: impl FnOnce(&str),
+    ) -> std::result::Result<(), StartRefusal> {
+        let Err(problem) = validate() else {
+            return Ok(());
+        };
+        let mut message = format!("uplink {}: {problem}", self.config.uplink);
+        let records = registries(self);
+        if let Err(error) = &records {
+            message.push_str(&format!("; registry unreadable: {error}"));
+        }
+        // An unreadable registry is not permission to leave old gates open.
+        // The fence can recover TAP identities from the live tenant table.
+        if let Err(error) = fence(records.as_deref().unwrap_or(&[])) {
+            message.push_str(&format!("; fencing failed: {error}; stopping tenant VMs"));
+            if let Err(error) = contain(self) {
+                message.push_str(&format!("; VM containment failed: {error}"));
+                // Production exits here so systemd tears down the delegated
+                // service cgroup; never keep serving with uncontained VMMs.
+                fatal(&message);
+            }
+        }
+        // Do not revalidate here: recovery during a failed admission must not
+        // turn the refusal's fence into a gate-opening operation.
+        Err(crate::tenant::start_refused(
+            StartRefusalCase::Uplink,
+            message,
+        ))
+    }
+
+    fn contain_network_failure(&mut self) -> Result<()> {
+        let mut errors = Vec::new();
+        for (name, vm) in &mut self.running {
+            // Attempt both containment mechanisms even if one fails, and do
+            // not let one tenant's error prevent killing the remaining VMMs.
+            let _ = std::fs::write(vm.group.join("cgroup.kill"), "1");
+            let _ = vm.child.kill();
+            if let Err(error) = vm
+                .child
+                .wait()
+                .and_then(|_| wait_empty(&vm.group).map_err(|e| std::io::Error::other(e.0)))
+            {
+                errors.push(format!("{name}: {error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(Error(errors.join("; ")))
+        }
+    }
+
     fn registries(&mut self) -> Result<Vec<Registry>> {
         let mut values = Vec::new();
         let entries = match std::fs::read_dir(REGISTRY) {
@@ -193,24 +250,17 @@ fn read_deadline(
 }
 impl Backend for LinuxTenants {
     fn check_network(&mut self, _: &str) -> std::result::Result<(), StartRefusal> {
-        if let Err(problem) = tenant_network::validate_uplink(&self.config) {
-            let registries = self
-                .registries()
-                .map_err(|e| crate::tenant::start_refused(StartRefusalCase::Uplink, e))?;
-            // Do not revalidate and accidentally reopen gates if the link
-            // recovers between the failed admission check and fencing.
-            tenant_network::fence(&registries).map_err(|e| {
-                crate::tenant::start_refused(
-                    StartRefusalCase::Uplink,
-                    format!("{problem}; fencing failed: {e}"),
-                )
-            })?;
-            return Err(crate::tenant::start_refused(
-                StartRefusalCase::Uplink,
-                format!("uplink {}: {problem}", self.config.uplink),
-            ));
-        }
-        Ok(())
+        let config = self.config.clone();
+        self.check_network_with(
+            || tenant_network::validate_uplink(&config),
+            Self::registries,
+            tenant_network::fence,
+            Self::contain_network_failure,
+            |message| {
+                eprintln!("motor-vm-helper: cannot contain tenant networking: {message}");
+                std::process::exit(1);
+            },
+        )
     }
     fn check_start(&mut self, tenant: &str) -> std::result::Result<(), StartRefusal> {
         capacity::check_journal(&Path::new(crate::tenant::TENANTS).join(tenant))?;
