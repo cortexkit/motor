@@ -3216,6 +3216,23 @@ impl Runner {
     /// (hundreds of thousands of files) takes minutes, and holding the lock
     /// that long stalls every other job, transfer and status request.
     fn discard(&self, path: &Path) -> io::Result<()> {
+        if let Some(root) = paths::trash::mapped_root(&self.core.config, paths::host(path)) {
+            self.long_work("mapped-detach");
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(retired) =
+                    paths::trash::detach(&self.core.config, root, paths::host(path))?
+                {
+                    self.purge_mapped(retired);
+                }
+                return Ok(());
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = root;
+                return Err(invalid("caller roots require Linux"));
+            }
+        }
         if path.symlink_metadata().is_err() {
             return Ok(());
         }
@@ -3259,6 +3276,26 @@ impl Runner {
             }
             if let Err(error) = fs::remove_dir_all(&path) {
                 tracing::error!(path = %path.display(), %error, "deleting a discarded directory failed");
+            }
+        });
+    }
+    #[cfg(target_os = "linux")]
+    fn purge_mapped(&self, retired: paths::trash::Retired) {
+        #[cfg(test)]
+        let hook = self.core.config.long_work.clone();
+        let isolate_jobs = self.core.config.isolate_jobs;
+        let boat_profile = self.core.config.boat_profile;
+        let deletion = crate::cleanup::BackgroundDelete::new(self.core.background_deletes.clone());
+        std::thread::spawn(move || {
+            let _deletion = deletion;
+            #[cfg(test)]
+            if let Some(hook) = &hook {
+                hook("remove");
+            }
+            let path = retired.path();
+            let _tree_access = crate::tree_access::lock(paths::host(&path));
+            if let Err(error) = retired.remove(isolate_jobs, boat_profile) {
+                tracing::error!(path = %retired.path().display(), %error, "deleting a mapped discarded tree failed; trash inventory retained");
             }
         });
     }
@@ -6325,15 +6362,18 @@ impl Runner {
         }
         let idle: Vec<_> = crate::caller_path::entries(&inner.catalog.workspaces)
             .filter(|(key, w)| {
+                let host = paths::host_path(&self.core.config, key.caller.text());
                 w.kind != WorkspaceKind::Head
                     && self.now().saturating_sub(w.used_ms) >= RETENTION_MS
                     && !inner.reserved.contains_key(key.caller.text())
                     && !inner.preparing.values().any(|p| {
-                        let preparing = paths::request(p).host_workspace.as_path();
-                        preparing.starts_with(key.host.as_path())
-                            || key.host.as_path().starts_with(preparing)
+                        let preparing = paths::host_path(
+                            &self.core.config,
+                            paths::request(p).caller_workspace_key.text(),
+                        );
+                        preparing.starts_with(&host) || host.starts_with(&preparing)
                     })
-                    && !self.deleting(&inner, key.host, &[])
+                    && !self.deleting(&inner, paths::host(&host), &[])
                     && !inner
                         .admission_saves
                         .values()
@@ -6342,7 +6382,12 @@ impl Runner {
                         crate::caller_path::job_key(j) == key.caller.text() && j.terminal.is_none()
                     })
             })
-            .map(|(key, _)| (key.caller.text().clone(), key.host.as_path().to_path_buf()))
+            .map(|(key, _)| {
+                (
+                    key.caller.text().clone(),
+                    paths::host_path(&self.core.config, key.caller.text()),
+                )
+            })
             .collect();
         for (key, host) in idle {
             let host_path = paths::host(&host);

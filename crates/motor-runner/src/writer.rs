@@ -172,7 +172,11 @@ fn validate_resolved_paths(
         canonical_runner_path(&config.state_dir().join("sccache"))?,
         canonical_runner_path(&config.writer_scratch_dir())?,
     ];
-    for trash in config.boat_workspace_trash_roots() {
+    for trash in config
+        .boat_workspace_trash_roots()
+        .into_iter()
+        .chain(crate::caller_path::trash::roots(config))
+    {
         protected.push(canonical_runner_path(&trash)?);
     }
     for checkout in known_checkouts {

@@ -20,6 +20,9 @@ mod caller_authorization;
 #[cfg(target_os = "linux")]
 #[path = "tests/caller_persistence.rs"]
 mod caller_persistence;
+#[cfg(target_os = "linux")]
+#[path = "tests/caller_trash.rs"]
+mod caller_trash;
 #[path = "tests/cancellation.rs"]
 mod cancellation;
 #[path = "tests/compatibility.rs"]

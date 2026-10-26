@@ -495,27 +495,38 @@ impl Runner {
         );
         let active_protected = protected.clone();
         protected.extend(self.core.config.boat_workspace_trash_roots());
+        protected.extend(crate::caller_path::trash::roots(&self.core.config));
         let roots: Vec<_> = self
             .core
             .config
             .workspace_roots
             .iter()
+            .chain(
+                self.core
+                    .config
+                    .caller_roots
+                    .iter()
+                    .map(|root| &root.host_root),
+            )
             .filter_map(|p| p.canonicalize().ok())
             .collect();
         let mut candidates = Vec::new();
         for (key, workspace) in crate::caller_path::entries(&inner.catalog.workspaces) {
-            // A mapped workspace's caller key names no host file; resolving it
-            // here could reach an unrelated tree. Mapped trees are not
-            // eviction candidates from this list.
-            if crate::caller_path::mapped_root(&self.core.config, key.caller.text()).is_some() {
+            let path = host(key.caller.text());
+            if crate::caller_path::mapped_root(&self.core.config, key.caller.text()).is_some()
+                && self
+                    .validate_destinations(crate::caller_path::host(&path), None, &[])
+                    .is_err()
+            {
                 continue;
             }
-            let path = key.host.as_path().to_path_buf();
             let Ok(canonical) = path.canonicalize() else {
                 continue;
             };
             if !workspace::absolute(key.caller.text())
-                || self.validate_destinations(key.host, None, &[]).is_err()
+                || self
+                    .validate_destinations(crate::caller_path::host(&path), None, &[])
+                    .is_err()
                 || path.symlink_metadata()?.file_type().is_symlink()
                 || (workspace.kind != WorkspaceKind::Head
                     && (!roots
@@ -560,11 +571,31 @@ impl Runner {
             .boat_workspace_trash_roots()
             .into_iter()
             .map(|root| ("boat-workspace-trash", root));
-        for (kind, root) in state_roots.chain(workspace_trash) {
+        let caller_trash = crate::caller_path::trash::roots(&self.core.config)
+            .map(|root| ("caller-root-trash", root));
+        for (kind, root) in state_roots.chain(workspace_trash).chain(caller_trash) {
             if kind == "boat-quarantine" && !self.core.config.boat_profile {
                 continue;
             }
-            let Ok(entries) = fs::read_dir(&root) else {
+            #[cfg(target_os = "linux")]
+            let caller_directory = if kind == "caller-root-trash" {
+                let directory = crate::caller_path::owner::directory(&root)?;
+                crate::caller_path::trash::validate(&directory)?;
+                Some(directory)
+            } else {
+                None
+            };
+            #[cfg(target_os = "linux")]
+            let scan = {
+                use std::os::fd::AsRawFd;
+                caller_directory.as_ref().map_or_else(
+                    || root.clone(),
+                    |directory| PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())),
+                )
+            };
+            #[cfg(not(target_os = "linux"))]
+            let scan = root.clone();
+            let Ok(entries) = fs::read_dir(scan) else {
                 continue;
             };
             #[cfg(target_os = "linux")]
@@ -576,13 +607,15 @@ impl Runner {
             }
             let canonical_root = root.canonicalize()?;
             let canonical_state = self.core.trees.state.canonicalize()?;
-            if kind != "boat-workspace-trash" && !canonical_root.starts_with(&canonical_state) {
+            if !matches!(kind, "boat-workspace-trash" | "caller-root-trash")
+                && !canonical_root.starts_with(&canonical_state)
+            {
                 continue;
             }
             for entry in entries {
                 let entry = entry?;
-                let path = entry.path();
-                let metadata = match fs::symlink_metadata(&path) {
+                let path = root.join(entry.file_name());
+                let metadata = match fs::symlink_metadata(entry.path()) {
                     Err(error)
                         if matches!(kind, "js-installs" | "js-manager-caches")
                             && error.kind() == io::ErrorKind::NotFound =>
@@ -591,7 +624,7 @@ impl Runner {
                     }
                     result => result?,
                 };
-                if !metadata.is_dir() {
+                if !metadata.is_dir() && kind != "caller-root-trash" {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -599,7 +632,7 @@ impl Runner {
                     javascript_entry_lock(&self.core.trees.state, &path)?.is_none()
                 } else if kind == "git-deps" {
                     dependency_roots.contains(&path) || inner.evicting_dependencies.contains(&path)
-                } else if kind == "boat-workspace-trash" {
+                } else if matches!(kind, "boat-workspace-trash" | "caller-root-trash") {
                     active_protected.iter().any(|owned| overlaps(&path, owned))
                 } else if matches!(kind, "trash" | "boat-quarantine") {
                     false
@@ -969,6 +1002,33 @@ impl Runner {
             .any(|root| path.parent() == Some(root.as_path()))
     }
 
+    fn remove_mapped_candidate(&self, candidate: &Candidate, device: u64) -> io::Result<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            let config = &self.core.config;
+            let host = crate::caller_path::host(&candidate.path);
+            if candidate.workspace.is_some() {
+                let root = crate::caller_path::trash::mapped_root(config, host).unwrap();
+                let Some(retired) = crate::caller_path::trash::detach(config, root, host)? else {
+                    return Ok(0);
+                };
+                let bytes = allocated_bytes(&retired.path(), device).unwrap_or(0);
+                self.purge_mapped(retired);
+                Ok(bytes)
+            } else {
+                let retired = crate::caller_path::trash::garbage(config, host)?;
+                let bytes = allocated_bytes(&retired.path(), device).unwrap_or(0);
+                retired.remove(config.isolate_jobs, config.boat_profile)?;
+                Ok(bytes)
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (candidate, device);
+            Err(io::Error::other("caller roots require Linux"))
+        }
+    }
+
     #[cfg(target_os = "linux")]
     pub(super) fn boat_workspace_trash(&self, path: &Path) -> io::Result<PathBuf> {
         // /Users is a bind mount. Even on the same XFS device, renaming from
@@ -1187,7 +1247,9 @@ impl Runner {
                             || (self.core.config.boat_profile
                                 && parent == self.core.trees.state.join("boat-quarantine"))
                             || staging.as_deref() == Some(parent)
-                    }) || self.boat_workspace_garbage(&c.path);
+                    }) || self.boat_workspace_garbage(&c.path)
+                        || crate::caller_path::trash::roots(&self.core.config)
+                            .any(|root| c.path.parent() == Some(root.as_path()));
                     if (c.cache_disk
                         && now.saturating_sub(c.last_used_ms) <= SOFT_PRESSURE_MIN_AGE_MS)
                         || (!garbage
@@ -1308,11 +1370,18 @@ impl Runner {
             };
             self.long_work("disk_remove");
             let authorization = candidate.workspace.as_ref().map_or(Ok(()), |key| {
-                self.validate_destinations(crate::caller_path::host_str(key), None, &[])
+                let host = crate::caller_path::host_path(&self.core.config, key);
+                self.validate_destinations(crate::caller_path::host(&host), None, &[])
             });
             #[cfg(target_os = "linux")]
             let access = authorization.and_then(|()| {
-                if self.boat_private_candidate(&candidate) {
+                if self.boat_private_candidate(&candidate)
+                    || crate::caller_path::trash::mapped_root(
+                        &self.core.config,
+                        crate::caller_path::host(&candidate.path),
+                    )
+                    .is_some()
+                {
                     return Ok(());
                 }
                 if self.core.config.isolate_jobs {
@@ -1331,6 +1400,14 @@ impl Runner {
             let access: io::Result<()> = authorization;
             let mut cache_cleared = false;
             let deleted = access.and_then(|()| {
+                if crate::caller_path::trash::mapped_root(
+                    &self.core.config,
+                    crate::caller_path::host(&candidate.path),
+                )
+                .is_some()
+                {
+                    return self.remove_mapped_candidate(&candidate, device);
+                }
                 #[cfg(target_os = "linux")]
                 if self.boat_private_candidate(&candidate) {
                     return self.remove_boat_candidate(&candidate);

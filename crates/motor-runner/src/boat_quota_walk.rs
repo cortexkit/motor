@@ -269,8 +269,12 @@ pub(super) fn remove_private(path: &Path, container: &Path) -> io::Result<()> {
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::other("missing retired tree name"))?;
+    let parent = physical_root(container, &Budget::default())?;
+    remove_private_at(&parent, name)
+}
+
+pub(super) fn remove_private_at(parent: &File, name: &std::ffi::OsStr) -> io::Result<()> {
     let mut budget = Budget::default();
-    let parent = physical_root(container, &budget)?;
     let root = match open_at(parent.as_raw_fd(), name, false) {
         Ok(root) => root,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),

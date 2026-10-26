@@ -94,7 +94,8 @@ impl Runner {
             .clone();
         for plan in crate::caller_path::keys(&pending) {
             let path = plan.caller.text();
-            match self.retire_legacy_path(plan.host.as_path()) {
+            let host = crate::caller_path::host_path(&self.core.config, path);
+            match self.retire_legacy_path(&host) {
                 Ok(()) => {
                     let mut inner = self.core.inner.lock().unwrap();
                     inner.catalog.legacy_checkouts.remove(path);
@@ -131,6 +132,11 @@ impl Runner {
     /// Startup only detaches old storage. Recursive deletion runs in the purge
     /// thread, and a later writer materializes its own checkout from a fresh tip.
     fn retire_legacy_path(&self, path: &Path) -> io::Result<()> {
+        let host = crate::caller_path::host(path);
+        if crate::caller_path::trash::mapped_root(&self.core.config, host).is_some() {
+            self.validate_destinations(host, None, &[])?;
+            return self.discard(path);
+        }
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),

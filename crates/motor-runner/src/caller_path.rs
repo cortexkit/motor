@@ -9,6 +9,7 @@ use std::{fs, io, path::PathBuf};
 pub(crate) mod catalog;
 pub(crate) mod owner;
 pub(crate) mod startup;
+pub(crate) mod trash;
 pub use startup::CallerRoot;
 #[cfg(all(test, target_os = "linux"))]
 mod authorization_tests;
