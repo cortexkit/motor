@@ -92,6 +92,15 @@ pub struct HostedJobState {
     /// the lease, the job provably never ran; afterwards it may have.
     #[serde(default)]
     pub(crate) run_sent: bool,
+    /// Conservative Boat host-lost deadline: the broker allows ten minutes
+    /// beyond max_s for startup. Reattach must not extend the original bound;
+    /// token expiry only limits authentication, not runtime.
+    #[serde(default)]
+    pub(crate) host_deadline_s: Option<u64>,
+    /// Settlement outlives the submission task, including a failed release of
+    /// a spill that has already gone back to the build server.
+    #[serde(default)]
+    pub(crate) cleanup_pending: bool,
     pub(crate) broker_url: String,
     pub(crate) token_source: BrokerTokenSource,
 }
@@ -137,8 +146,16 @@ impl HostedJobState {
         );
         self.endpoint_spki_sha256 = Some(lease.endpoint_spki_sha256.clone());
         self.max_runtime_s = Some(lease.max_s);
+        if lease.ssh.is_some() || lease.placement.host.starts_with("boat:") {
+            self.host_deadline_s.get_or_insert_with(|| {
+                now_s()
+                    .saturating_add(lease.max_s)
+                    .saturating_add(HOST_LOST_GRACE_S)
+            });
+        }
     }
     pub(crate) fn settled(&mut self, terminal: HostedTerminal) {
+        self.cleanup_pending = false;
         self.billed_vcpu_ms = Some(terminal.billed_vcpu_ms);
         self.max_runtime_s = Some(terminal.max_runtime_s);
         self.billing = BillingStatus::Available;
@@ -160,6 +177,7 @@ impl HostedJobState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Error {
+    Shutdown,
     Auth,
     Expired,
     Spki,
@@ -247,6 +265,7 @@ const MAX_PROVISIONING_RETRY_MS: u64 = 30_000;
 /// slots free as soon as a running job ends, so this is shorter than the
 /// broker's usual 5-second `no_capacity` wait.
 const HOST_FULL_RETRY_MS: u64 = 2_000;
+pub(crate) const HOST_LOST_GRACE_S: u64 = 600;
 fn bounded_provisioning_retry_ms(ms: u64) -> u64 {
     ms.clamp(MIN_PROVISIONING_RETRY_MS, MAX_PROVISIONING_RETRY_MS)
 }
@@ -259,6 +278,7 @@ struct ProvisioningReply {
 impl Error {
     pub(crate) fn code(self) -> &'static str {
         match self {
+            Self::Shutdown => "hosted_shutdown",
             Self::Auth => "hosted_auth",
             Self::Expired => "hosted_expired",
             Self::Spki => "hosted_spki_mismatch",
@@ -639,6 +659,9 @@ pub(crate) struct Client {
     /// was not a success, so a lease refusal can be logged with its body.
     broker_status: std::sync::Mutex<Option<u16>>,
     broker_failure: std::sync::Mutex<Option<String>>,
+    booking_open: Option<Arc<std::sync::Mutex<bool>>>,
+    #[cfg(test)]
+    connector: Option<Arc<dyn crate::transport::Connector>>,
 }
 impl Client {
     pub(crate) fn new(route: HostedJobState) -> Self {
@@ -653,6 +676,9 @@ impl Client {
             broker_code: std::sync::Mutex::new(None),
             broker_status: std::sync::Mutex::new(None),
             broker_failure: std::sync::Mutex::new(None),
+            booking_open: None,
+            #[cfg(test)]
+            connector: None,
         }
     }
     /// The `error` code of the broker's last refusal seen by this client.
@@ -671,6 +697,18 @@ impl Client {
         tokens: Option<Arc<account::AccountTokens>>,
     ) -> Self {
         self.account_tokens = tokens;
+        self
+    }
+    pub(crate) fn with_booking_gate(mut self, gate: Arc<std::sync::Mutex<bool>>) -> Self {
+        self.booking_open = Some(gate);
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn with_connector(
+        mut self,
+        connector: Option<Arc<dyn crate::transport::Connector>>,
+    ) -> Self {
+        self.connector = connector;
         self
     }
     async fn post<T: Serialize, R: serde::de::DeserializeOwned>(
@@ -1004,13 +1042,19 @@ impl Client {
             // Even if the lease response is lost, the broker may have issued a
             // token. Wait past its possible issue second before requesting another:
             // the host accepts a replacement run token only with a greater iat.
-            storage
-                .hosted_update(id, |state| {
-                    state.lease_attempted = true;
-                    state.placement_attempts += 1;
-                    state.retry_iat = Some(now_s());
-                })
-                .map_err(|_| Error::Broker)?;
+            {
+                let gate = self.booking_open.as_ref().map(|gate| gate.lock().unwrap());
+                if gate.as_ref().is_some_and(|open| !**open) {
+                    return Err(Error::Shutdown);
+                }
+                storage
+                    .hosted_update(id, |state| {
+                        state.lease_attempted = true;
+                        state.placement_attempts += 1;
+                        state.retry_iat = Some(now_s());
+                    })
+                    .map_err(|_| Error::Broker)?;
+            }
             tracing::info!(job_id = %id, attempt, vcpus = body.vcpus, platform = %body.platform,
                 spilled, "hosted lease requested");
             let lease: Lease = match self
@@ -1263,6 +1307,16 @@ impl Client {
         key: &SigningKey,
         purpose: motor_lease::Purpose,
     ) -> Result<Channel, tls::ConnectFailure> {
+        #[cfg(test)]
+        if let Some(connector) = &self.connector {
+            let pipe = connector
+                .connect(id)
+                .await
+                .map_err(|_| tls::ConnectFailure::at("test transport", Error::Connect))?;
+            return Channel::from_hosted(pipe)
+                .await
+                .map_err(|_| tls::ConnectFailure::at("test hello", Error::Connect));
+        }
         if lease.ssh.is_some() {
             let claims = tls::claims(id, lease, key, purpose)
                 .map_err(|e| tls::ConnectFailure::at("claims", e))?;
