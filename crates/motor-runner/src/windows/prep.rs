@@ -64,12 +64,31 @@ pub(super) fn prepare(
     #[cfg(windows)]
     super::ensure_parent_guard(config)?;
     let request = &setup.request;
-    mapped(&request.workspace_key)?;
-    mapped(&request.cwd)?;
-    if !Path::new(&request.cwd).starts_with(&request.workspace_key) {
-        return Err(invalid(format!("cwd outside snapshot: {}", request.cwd)));
+    mapped(
+        crate::caller_path::request(request)
+            .caller_workspace_key
+            .text(),
+    )?;
+    mapped(crate::caller_path::run(request).caller_cwd.text())?;
+    if !crate::caller_path::run(request)
+        .host_cwd
+        .as_path()
+        .starts_with(
+            crate::caller_path::request(request)
+                .caller_workspace_key
+                .text(),
+        )
+    {
+        return Err(invalid(format!(
+            "cwd outside snapshot: {}",
+            crate::caller_path::run(request).caller_cwd.text()
+        )));
     }
-    let mirror = trees.mirror(&request.repository_root);
+    let mirror = trees.mirror(
+        crate::caller_path::request(request)
+            .caller_repository_root
+            .text(),
+    );
     // An absent lockfile is valid for non-Cargo jobs. Check the tree first so
     // a corrupt mirror or unreadable lockfile is not mistaken for absence.
     let lockfile = if crate::workspace::git(
@@ -103,16 +122,23 @@ pub(super) fn prepare(
     let _guards: Vec<_> = locks.iter().map(|lock| lock.lock().unwrap()).collect();
     trees.refresh_dependency_aliases(&lockfile, &routes)?;
     let mut snapshots = vec![Snapshot {
-        mirror: trees.mirror(&request.repository_root),
+        mirror: trees.mirror(
+            crate::caller_path::request(request)
+                .caller_repository_root
+                .text(),
+        ),
         commit: request.snapshot_commit.clone(),
-        destination: request.workspace_key.clone(),
+        destination: crate::caller_path::request(request)
+            .caller_workspace_key
+            .text()
+            .clone(),
     }];
     for sibling in &request.siblings {
-        mapped(&sibling.canonical_path)?;
+        mapped(crate::caller_path::sibling(sibling).caller.text())?;
         snapshots.push(Snapshot {
-            mirror: trees.mirror(&sibling.canonical_path),
+            mirror: trees.mirror(crate::caller_path::sibling(sibling).caller.text()),
             commit: sibling.commit.clone(),
-            destination: sibling.canonical_path.clone(),
+            destination: crate::caller_path::sibling(sibling).caller.text().clone(),
         });
     }
     #[cfg(unix)]
@@ -151,7 +177,10 @@ pub(super) fn prepare(
         staging: staging.into(),
         snapshots,
         routes,
-        workspace: request.workspace_key.clone(),
+        workspace: crate::caller_path::request(request)
+            .caller_workspace_key
+            .text()
+            .clone(),
         tree_hash: request.tree_hash.clone(),
         cargo: "/opt/motor-prep-toolchain/bin/cargo".into(),
         rustup: "/opt/motor-prep-toolchain".into(),
@@ -172,7 +201,10 @@ pub(super) fn prepare(
             staging: staging.into(),
             snapshots,
             routes,
-            workspace: request.workspace_key.clone(),
+            workspace: crate::caller_path::request(&request)
+                .caller_workspace_key
+                .text()
+                .clone(),
             tree_hash: request.tree_hash.clone(),
             #[cfg(test)]
             cargo: toolchain.join("bin/cargo.exe"),

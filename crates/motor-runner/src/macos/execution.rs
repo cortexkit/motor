@@ -438,7 +438,7 @@ fn start_io(
         })?;
     match ready_rx.recv() {
         Ok(Ok(())) => Ok(Prepared {
-            cwd: setup.request.cwd.clone().into(),
+            host_cwd: setup.request.cwd.clone().into(),
             target: staged_target(&setup.request.workspace_key),
             wrapper: None,
             sandbox: None,

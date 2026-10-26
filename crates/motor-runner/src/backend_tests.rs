@@ -39,7 +39,7 @@ fn boat_backend_refuses_storage_before_dispatch() {
     config.isolate_jobs = true;
     let setup = setup(&scratch);
     let prepared = Prepared {
-        cwd: scratch.join("missing-workspace"),
+        host_cwd: scratch.join("missing-workspace"),
         target: scratch.join("target"),
         sandbox: None,
         wrapper: None,
@@ -63,7 +63,7 @@ fn boat_launch_without_a_quota_lease_never_starts_even_without_isolation() {
     let mut setup = setup(scratch.path());
     setup.request.base_commit = Some("source".into());
     let prepared = Prepared {
-        cwd: scratch.path().to_owned(),
+        host_cwd: scratch.path().to_owned(),
         target: scratch.join("target"),
         sandbox: None,
         wrapper: None,
@@ -246,7 +246,7 @@ fn host_backend_launch_uses_isolation_launcher() {
     let setup = setup(scratch.path());
     let observed = Arc::new(Mutex::new(None));
     let prepared = Prepared {
-        cwd: scratch.path().into(),
+        host_cwd: scratch.path().into(),
         target: scratch.join("target"),
         wrapper: Some("/motor-tools/prefrontal-build-slot".into()),
         sandbox: Some(Box::new(ObservedIsolationLauncher(observed.clone()))),
@@ -280,7 +280,7 @@ fn host_backend_refuses_isolated_launch_without_prepared_sandbox() {
     let mut config = Config::new(scratch.join("state"), "main");
     config.isolate_jobs = true;
     let prepared = Prepared {
-        cwd: scratch.path().into(),
+        host_cwd: scratch.path().into(),
         target: scratch.join("target"),
         wrapper: None,
         sandbox: None,
@@ -323,7 +323,7 @@ fn isolated_host_backend_launch_runs_in_motor_job_service_with_022_umask() {
     )
     .unwrap();
     let prepared = Prepared {
-        cwd: workspace,
+        host_cwd: workspace,
         target,
         wrapper: None,
         sandbox: Some(Box::new(sandbox)),
@@ -388,7 +388,7 @@ fn tenant_rust_launch_builds_in_fixed_target_without_compile_cache() {
         .insert("SCCACHE_DIR".into(), "/submitted".into());
     let observed = Arc::new(Mutex::new(None));
     let prepared = Prepared {
-        cwd: scratch.path().into(),
+        host_cwd: scratch.path().into(),
         target: scratch.join("target"),
         wrapper: None,
         sandbox: Some(Box::new(ObservedIsolationLauncher(observed.clone()))),
@@ -424,7 +424,7 @@ fn hosted_cache_case(
     let mut setup = setup(scratch.path());
     setup.base = writer;
     let prepared = Prepared {
-        cwd: scratch.path().into(),
+        host_cwd: scratch.path().into(),
         target: scratch.join("target"),
         wrapper: supervisor.then(|| "/motor-tools/prefrontal-build-slot".into()),
         sandbox: None,
@@ -554,7 +554,7 @@ fn isolated_launch_cache_environment_preserves_wrapper_precedence() {
                     .insert("CARGO_NET_OFFLINE".into(), "false".into());
                 let observed = Arc::new(Mutex::new(None));
                 let prepared = Prepared {
-                    cwd: scratch.path().into(),
+                    host_cwd: scratch.path().into(),
                     target: scratch.join("target"),
                     wrapper: supervisor.then(|| "/motor-tools/prefrontal-build-slot".into()),
                     sandbox: Some(Box::new(ObservedIsolationLauncher(observed.clone()))),
@@ -674,7 +674,7 @@ fn switched_off_environments_match_the_base_runner_for_every_role_and_kind() {
         let mut setup = setup(scratch.path());
         setup.base = fill;
         let prepared = Prepared {
-            cwd: scratch.path().into(),
+            host_cwd: scratch.path().into(),
             target: scratch.join("target"),
             wrapper: None,
             sandbox: None,
@@ -732,7 +732,7 @@ fn inherited_sccache_and_aws_settings_follow_the_switch_state() {
         let mut setup = setup(scratch.path());
         setup.base = fill;
         let prepared = Prepared {
-            cwd: scratch.path().into(),
+            host_cwd: scratch.path().into(),
             target: scratch.join("target"),
             wrapper: None,
             sandbox: None,
