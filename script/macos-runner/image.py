@@ -321,7 +321,51 @@ def replace_agent(mount, binary, sha256):
         staged.unlink(missing_ok=True)
 
 
+def disable_build_account(mount):
+    """Disable a build account left by an older seal, in the swap's writable clone.
+
+    Older seals set a non-login shell and the '*' password marker but kept the
+    account's password hash, its enabled ShadowHash authority and its admin group
+    membership. The account then still works for su and sudo with the password
+    chosen in Setup Assistant. Deleting a local account offline could break
+    volume ownership, so the account stays and every way in is removed instead.
+    The swap runs this only on its staged clone; the source image is never written.
+    """
+    node = "private/var/db/dslocal/nodes/Default/"
+    account = guest_path(mount, node + "users/motorbuild.plist")
+    if not account.exists():
+        return
+
+    def rewrite(path, change):
+        data = path.read_bytes()
+        form = plistlib.FMT_BINARY if data.startswith(b"bplist") else plistlib.FMT_XML
+        value = plistlib.loads(data)
+        change(value)
+        # Write in place to keep the file's owner and mode.
+        path.write_bytes(plistlib.dumps(value, fmt=form))
+
+    uids = []
+
+    def lock(user):
+        uids.extend(user.get("generateduid", []))
+        user["authentication_authority"] = [";DisabledUser;"]
+        user.pop("ShadowHashData", None)
+        user["passwd"] = ["*"]
+        user["shell"] = ["/usr/bin/false"]
+
+    rewrite(account, lock)
+    group = guest_path(mount, node + "groups/admin.plist")
+    if group.exists():
+        def leave(admin):
+            admin["users"] = [name for name in admin.get("users", []) if name != "motorbuild"]
+            admin["groupmembers"] = [uid for uid in admin.get("groupmembers", []) if uid not in uids]
+        rewrite(group, leave)
+    print("Disabled the legacy motorbuild account in the new image and removed its admin membership")
+
+
 def swap_guest(mount, args, manifest, source):
+    if getattr(args, "disable_legacy_build_account", False):
+        disable_build_account(mount)
     require_locked_build_account(mount)
     prefix = guest_path(mount, "opt/motor")
     lock = guest_path(mount, "opt/motor/toolchain.json")
@@ -404,6 +448,8 @@ def main():
     parser.add_argument("--known-hosts", type=Path)
     parser.add_argument("--clt-label")
     parser.add_argument("--measure", action="store_true")
+    parser.add_argument("--disable-legacy-build-account", action="store_true",
+                        help="agent-swap only: disable an older seal's build account in the new image")
     args = parser.parse_args()
     if sys.platform != "darwin":
         parser.error("image operations require a dedicated macOS VM host")

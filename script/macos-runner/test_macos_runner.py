@@ -1047,6 +1047,21 @@ class OfflineImageTests(unittest.TestCase):
         self.assertFalse(any(args[0] == "/usr/bin/sqlite3" for args in self.commands))
         self.assertEqual(self.commands[-1], ["/usr/bin/hdiutil", "detach", "/dev/disk42"])
 
+    def test_agent_swap_disables_legacy_build_account_only_when_asked(self):
+        manifest = self.swap_inputs()
+        account = self.build_account(authentication_authority=[";ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2>"],
+                                     ShadowHashData=[b"usable password material"])
+        self.swap_args.disable_legacy_build_account = True
+        self.swap(manifest)
+        user = plistlib.loads(account.read_bytes())
+        self.assertEqual(user["authentication_authority"], [";DisabledUser;"])
+        self.assertNotIn("ShadowHashData", user)
+        assert self.guest_data is not None
+        admin = plistlib.loads((self.guest_data / "private/var/db/dslocal/nodes/Default/groups/admin.plist").read_bytes())
+        self.assertNotIn("motorbuild", admin.get("users", []))
+        self.assertFalse(set(user.get("generateduid", [])) & set(admin.get("groupmembers", [])))
+        self.assertTrue(self.swap_args.destination.exists())
+
     def test_build_account_lock_checks_reject_ambiguous_credentials_and_any_ssh_files(self):
         self.swap_inputs()
         assert self.guest_data is not None
