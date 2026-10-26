@@ -259,8 +259,8 @@ pub fn is_volume_guid_path(path: &str) -> bool {
 pub struct DiskIdentity {
     /// Serial number the device reports, empty when the device reports none.
     pub serial: String,
-    /// `IOCTL_DISK_GET_DRIVE_GEOMETRY_EX` length in bytes: the reported disk
-    /// size plus partition-table information.
+    /// `DiskSize` from `IOCTL_DISK_GET_DRIVE_GEOMETRY_EX`, not the length of
+    /// its variable-sized partition-information buffer.
     pub length_bytes: u64,
     /// `IOCTL_STORAGE_GET_DEVICE_NUMBER`: the disk number Windows assigned and
     /// the media type of the device behind it.
@@ -308,13 +308,31 @@ pub fn disk_identity_log(identity: &DiskIdentity) -> String {
         None => "not-scsi".to_owned(),
     };
     format!(
-        "Hyper-V cache disk identity: serial={:?} length_bytes={} device_number={} device_type={} scsi={}",
+        "cache disk identity: serial={:?} length_bytes={} device_number={} device_type={} scsi={}",
         clean(&identity.serial),
         identity.length_bytes,
         identity.device_number,
         identity.device_type,
         scsi,
     )
+}
+
+/// The identity rule established by disk selection, not inferred from disk
+/// fields: QEMU's virtio disk can report a SCSI address too. Serial selection
+/// pins only the serial; Hyper-V topology selection pins the entire identity
+/// read through the held handle, even when the disk reports no serial.
+pub enum CacheIdentity<'a> {
+    Serial(&'a str),
+    Hyperv(&'a DiskIdentity),
+}
+
+impl CacheIdentity<'_> {
+    pub fn difference(&self, actual: &DiskIdentity) -> Option<&'static str> {
+        match self {
+            Self::Serial(serial) => (actual.serial != *serial).then_some("serial"),
+            Self::Hyperv(expected) => difference(expected, actual),
+        }
+    }
 }
 
 /// The first field that differs, so a refusal can name it. Every field is
@@ -439,10 +457,10 @@ pub fn wait_for_volumes<T>(
 fn check_disk(
     storage: &mut impl CacheStorage,
     number: u32,
-    expected: &DiskIdentity,
+    expected: &CacheIdentity<'_>,
 ) -> io::Result<DiskLayout> {
     let actual = storage.identity()?;
-    if let Some(field) = difference(expected, &actual) {
+    if let Some(field) = expected.difference(&actual) {
         return Err(io::Error::other(format!(
             "cache disk identity changed: {field} differs; {}",
             disk_identity_log(&actual)
@@ -494,11 +512,7 @@ pub fn prepare_cache_with_serial(
     if serial.trim().is_empty() || serial.len() > 256 {
         return Err(io::Error::other("cache disk lacks a bounded stable serial"));
     }
-    let identity = DiskIdentity {
-        serial: serial.to_owned(),
-        ..DiskIdentity::default()
-    };
-    prepare_cache_with(storage, number, &identity)
+    prepare_cache_with_identity(storage, number, &CacheIdentity::Serial(serial))
 }
 
 /// `expected` is what pins the disk between selection and every later write:
@@ -510,6 +524,14 @@ pub fn prepare_cache_with(
     storage: &mut impl CacheStorage,
     number: u32,
     expected: &DiskIdentity,
+) -> io::Result<PreparedCache> {
+    prepare_cache_with_identity(storage, number, &CacheIdentity::Hyperv(expected))
+}
+
+fn prepare_cache_with_identity(
+    storage: &mut impl CacheStorage,
+    number: u32,
+    expected: &CacheIdentity<'_>,
 ) -> io::Result<PreparedCache> {
     let raw = matches!(check_disk(storage, number, expected)?, DiskLayout::Raw);
     let started = Instant::now();
@@ -773,6 +795,56 @@ mod tests {
             }
         }
     }
+
+    fn qemu_identity() -> DiskIdentity {
+        DiskIdentity {
+            serial: CACHE_DISK_SERIAL.into(),
+            length_bytes: 42_949_672_960,
+            device_number: 1,
+            device_type: 7,
+            scsi: Some(ScsiAddress {
+                port: 3,
+                path_id: 0,
+                target_id: 0,
+                lun: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn qemu_cache_identity_checks_only_the_selected_virtio_serial() {
+        for layout in [
+            DiskLayout::Raw,
+            DiskLayout::Gpt(vec![PartitionKind::Reserved, PartitionKind::BasicData]),
+        ] {
+            let mut storage = FakeStorage {
+                identity: qemu_identity(),
+                layout,
+                ..Default::default()
+            };
+            storage.volumes[0].disks = vec![1];
+            let prepared = prepare_cache(&mut storage, 1).unwrap();
+            assert_eq!(prepared.volume, "\\\\?\\Volume{cache}\\");
+            assert_eq!(storage.mutations, 1);
+            assert_eq!(storage.formats, usize::from(prepared.freshly_formatted));
+        }
+    }
+
+    #[test]
+    fn changed_qemu_serial_is_refused_before_any_cache_write() {
+        let mut storage = FakeStorage {
+            identity: DiskIdentity {
+                serial: "other-disk".into(),
+                ..qemu_identity()
+            },
+            ..Default::default()
+        };
+        let error = prepare_cache(&mut storage, 1).err().unwrap();
+        assert!(error.to_string().contains("serial differs"), "{error}");
+        assert_eq!(storage.mutations, 0);
+        assert_eq!(storage.formats, 0);
+    }
+
     #[test]
     fn captured_hyperv_serial_is_rechecked_before_any_cache_write() {
         let mut storage = FakeStorage {
@@ -807,6 +879,51 @@ mod tests {
                 lun: 1,
             }),
         }
+    }
+
+    #[test]
+    fn ally_sas_cache_with_no_serial_keeps_the_full_identity_rule() {
+        let number = select_hyperv_cache_disk(&[
+            HypervDisk {
+                number: 0,
+                lun: 0,
+                bus_type: HYPERV_SAS_BUS_TYPE,
+                boot: true,
+                system: true,
+            },
+            HypervDisk {
+                number: 1,
+                lun: 1,
+                bus_type: HYPERV_SAS_BUS_TYPE,
+                boot: false,
+                system: false,
+            },
+        ])
+        .unwrap();
+        let identity = DiskIdentity {
+            device_number: number,
+            device_type: 7,
+            ..nameless_hyperv_identity()
+        };
+        assert!(identity.has_no_serial());
+        let mut storage = FakeStorage {
+            serial: String::new(),
+            identity: identity.clone(),
+            ..Default::default()
+        };
+        storage.volumes[0].disks = vec![number];
+        assert!(prepare_cache_with(&mut storage, number, &identity).is_ok());
+        assert_eq!(storage.mutations, 1);
+        storage.identity.length_bytes += 4096;
+        let error = prepare_cache_with(&mut storage, number, &identity)
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("length_bytes differs"),
+            "{error}"
+        );
+        assert_eq!(storage.mutations, 1);
+        assert_eq!(storage.formats, 0);
     }
 
     /// An error shaped the way Windows reports one: `io::Error::from_raw_os_error`
@@ -1028,7 +1145,7 @@ mod tests {
         let line = disk_identity_log(&nameless_hyperv_identity());
         assert_eq!(
             line,
-            "Hyper-V cache disk identity: serial=\"\" length_bytes=42949672960 \
+            "cache disk identity: serial=\"\" length_bytes=42949672960 \
              device_number=7 device_type=0 scsi=port=0 path=0 target=0 lun=1"
         );
         assert!(

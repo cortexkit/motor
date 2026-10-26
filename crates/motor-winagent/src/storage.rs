@@ -401,11 +401,15 @@ impl WindowsStorage {
     fn identity_unchanged(&self, actual: &DiskIdentity) -> bool {
         #[cfg(feature = "hyperv-runner")]
         {
-            *actual == self.expected_identity
+            motor_winagent::cache::CacheIdentity::Hyperv(&self.expected_identity)
+                .difference(actual)
+                .is_none()
         }
         #[cfg(not(feature = "hyperv-runner"))]
         {
-            actual.serial == motor_winagent::cache::CACHE_DISK_SERIAL
+            motor_winagent::cache::CacheIdentity::Serial(motor_winagent::cache::CACHE_DISK_SERIAL)
+                .difference(actual)
+                .is_none()
         }
     }
     fn attributes(&self) -> io::Result<u64> {
