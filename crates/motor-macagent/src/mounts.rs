@@ -195,16 +195,24 @@ fn prepare_at(root: &Path, destination: &Path) -> io::Result<()> {
         };
         let name = c(name)?;
         let mut next = open(dir.as_raw_fd(), &name);
+        let mut created = false;
         if next < 0 && io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
             if unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o755) } != 0 {
                 return Err(io::Error::last_os_error());
             }
+            created = true;
             next = open(dir.as_raw_fd(), &name);
         }
         if next < 0 {
             return Err(io::Error::last_os_error());
         }
         dir = unsafe { File::from_raw_fd(next) };
+        // The agent runs with a restrictive umask, which would leave a new
+        // parent root-only, so the unprivileged job user couldn't reach the
+        // mount below it. Set the traversal mode explicitly.
+        if created && unsafe { libc::fchmod(dir.as_raw_fd(), 0o755) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(())
 }
@@ -362,6 +370,23 @@ mod tests {
         assert!(prepare_at(&scratch.join(""), Path::new("/file")).is_err());
         prepare_at(&scratch.join(""), Path::new("/real/child")).unwrap();
         assert!(scratch.join("real/child").is_dir());
+    }
+    #[test]
+    fn created_parents_stay_traversable_under_a_restrictive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = cortexkit_test_support::ScratchDir::new("mount-umask");
+        // The guest agent's launchd job sets umask 077.
+        let previous = unsafe { libc::umask(0o077) };
+        let result = prepare_at(&scratch.join(""), Path::new("/home/user/repo"));
+        unsafe { libc::umask(previous) };
+        result.unwrap();
+        for created in ["home", "home/user", "home/user/repo"] {
+            let mode = std::fs::metadata(scratch.join(created))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755, "{created}");
+        }
     }
     #[derive(Default)]
     struct Fake {
