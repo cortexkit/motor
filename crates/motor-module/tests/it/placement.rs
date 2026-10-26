@@ -1716,8 +1716,11 @@ mod request_pools {
             .await;
         }
         tokio::time::timeout(Duration::from_secs(90), async {
+            // Snapshotting and durable job creation belong to the admission
+            // batch budget. Control replies below have separate five-second
+            // deadlines in reply_on, independent of this batch's progress.
             while runs.len() < 80 {
-                let frame = receive(&mut rig.daemon).await;
+                let frame = read_frame(&mut rig.daemon).await.unwrap().unwrap();
                 assert_eq!(
                     frame.header.ty,
                     FrameType::StreamData,
@@ -1783,7 +1786,12 @@ mod request_pools {
         )
         .await;
         let health = reply_on(&mut rig, 201).await;
-        assert_eq!(health.header.ty, FrameType::Response);
+        assert_eq!(
+            health.header.ty,
+            FrameType::Response,
+            "runner.health error: {}",
+            String::from_utf8_lossy(&health.body)
+        );
         let health: Value = serde_json::from_slice(&health.body).unwrap();
         assert_eq!(health["request_pools"]["long_held"]["in_use"], 80);
         assert_eq!(health["request_pools"]["long_held"]["limit"], 256);
