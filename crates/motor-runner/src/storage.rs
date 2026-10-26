@@ -152,6 +152,8 @@ pub(crate) fn queue_clock_at(entry: &AtomicU64, elapsed: &AtomicU64, now: u64) -
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Job {
     pub id: Uuid,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mappings: Vec<crate::caller_path::CallerRoot>,
     pub request: Option<Run>,
     pub state: JobState,
     pub accepted_ms: u64,
@@ -294,6 +296,7 @@ impl Job {
     pub fn new(id: Uuid, request: Option<Run>, now: u64, order: u64, weight: u32) -> Self {
         Self {
             id,
+            mappings: vec![],
             request,
             state: JobState::AwaitingBundles,
             accepted_ms: now,
@@ -589,7 +592,7 @@ fn pending_legacy_generations() -> bool {
     true
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Catalog {
     pub workspaces: BTreeMap<String, Workspace>,
     pub repositories: BTreeMap<String, Repository>,
