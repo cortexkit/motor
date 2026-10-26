@@ -117,6 +117,13 @@ MemoryHigh=35791394134
 
 ## Tenant allocation
 
+An unfinished removal also reserves its saved `tap_index`: a quarantine with
+saved records, no moved `home`, and the original tenant home still present must
+be completed or recovered before that index can be reused. An unreadable pending
+reservation refuses provisioning rather than guessing that the index is free.
+The helper and offline resume paths independently reject any index already
+claimed by a different live tenant before replaying network cleanup.
+
 Provisioning checks **bytes** before allocating anything for the tenant, against
 the same storage rule motor-host applies on every admission and heartbeat:
 

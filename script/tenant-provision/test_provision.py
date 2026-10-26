@@ -54,6 +54,11 @@ def config():
 
 
 class ProvisionTests(unittest.TestCase):
+    @staticmethod
+    def owned_tap(tap):
+        return {'ifname': tap, 'linkinfo': {'info_kind': 'tun', 'info_data': {
+            'type': 'tap', 'persist': True, 'user': 400000 + int(tap.removeprefix('mtap'))}}}
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
@@ -160,7 +165,7 @@ class ProvisionTests(unittest.TestCase):
         lines = []
         execute = mock.Mock()
         p.remove_tenant("a", dry_run=True, check_service=lambda _unit: "inactive", execute=execute,
-                        has_tap=lambda tap: tap == "mtap1", now=lambda: 1000, output=lines.append)
+                        has_tap=lambda tap: tap == "mtap1", now=lambda: 1000, output=lines.append, tap_info=self.owned_tap)
         execute.assert_not_called()
         self.assertEqual(self.snapshot_tree(), before)
         listed = "\n".join(lines)
@@ -182,7 +187,7 @@ class ProvisionTests(unittest.TestCase):
         execute = mock.Mock()
         messages = []
         p.remove_tenant("a", check_service=lambda _unit: "inactive", execute=execute,
-                        has_tap=lambda tap: tap in ("mtap1", "mtap2"), now=lambda: 1000, output=messages.append)
+                        has_tap=lambda tap: tap in ("mtap1", "mtap2"), now=lambda: 1000, output=messages.append, tap_info=self.owned_tap)
         execute.assert_called_once_with("ip", "link", "delete", "dev", "mtap1")
         quarantine = p.ROOT / "removed/a-1000"
         self.assertFalse((p.ROOT / "tenants/a").exists())
@@ -214,6 +219,25 @@ class ProvisionTests(unittest.TestCase):
                         has_tap=lambda _tap: False, now=lambda: 1000, output=lambda _line: None)
         self.assertFalse((p.ROOT / "tenants/a").exists())
         self.assertEqual(list((p.ROOT / "removed").iterdir()), [])
+
+    def test_remove_tenant_refuses_foreign_tap_before_any_mutation(self):
+        self.removal_records()
+        before = self.snapshot_tree()
+        for field, value in [('user', 400002), ('type', 'tun'), ('persist', False)]:
+            with self.subTest(field=field):
+                link = self.owned_tap('mtap1')
+                link['linkinfo']['info_data'][field] = value
+                execute = mock.Mock()
+                with self.assertRaisesRegex(ValueError, 'foreign interface mtap1'):
+                    p.remove_tenant('a', check_service=lambda _: 'inactive', execute=execute,
+                                    has_tap=lambda _: True, tap_info=lambda _: link, output=lambda _: None)
+                execute.assert_not_called()
+                self.assertEqual(self.snapshot_tree(), before)
+        link = self.owned_tap('mtap1')
+        link['linkinfo']['info_kind'] = 'dummy'
+        with self.assertRaisesRegex(ValueError, 'foreign interface mtap1'):
+            p.remove_tenant('a', check_service=lambda _: 'inactive', has_tap=lambda _: True,
+                            tap_info=lambda _: link, execute=lambda *_: self.fail('foreign delete'))
         self.assertEqual((p.ROOT / "tenants/b/disk.img").read_bytes(), b"b")
 
     def test_switch_image_refuses_when_either_service_is_running(self):
@@ -731,6 +755,33 @@ class ProvisionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already exists"):
             p.provision(config())
         self.assertEqual((home / "disk.img").read_bytes(), b"keep")
+
+    def test_pending_removal_reserves_tap_index_until_home_is_quarantined(self):
+        c = config()
+        old_home = p.ROOT / 'tenants/old'
+        old_home.mkdir()
+        quarantine = p.ROOT / 'removed/old-1000'
+        (quarantine / 'records').mkdir(parents=True)
+        (quarantine / 'records/registry.json').write_text(json.dumps({'tap_index': c['tap_index']}))
+        before = self.snapshot_tree()
+        allocate, base = mock.Mock(), mock.Mock(side_effect=AssertionError('pending index reached allocation'))
+        with mock.patch.object(p.shutil, 'disk_usage', return_value=mock.Mock(free=1 << 60)), \
+                self.assertRaisesRegex(ValueError, 'tap index reserved by a pending tenant removal'):
+            p.provision(c, make_base=base, execute=allocate)
+        allocate.assert_not_called()
+        base.assert_not_called()
+        self.assertEqual(self.snapshot_tree(), before)
+        self.assertIn(c['tap_index'], p.pending_removal_taps())
+        old_home.rename(quarantine / 'home')
+        self.assertNotIn(c['tap_index'], p.pending_removal_taps())
+
+    def test_corrupt_pending_removal_record_refuses_unknown_reservation(self):
+        (p.ROOT / 'tenants/old').mkdir()
+        records = p.ROOT / 'removed/old-1000/records'
+        records.mkdir(parents=True)
+        (records / 'registry.json').write_text('{')
+        with self.assertRaisesRegex(ValueError, 'pending removal reservation'):
+            p.provision(config(), make_base=lambda *_: self.fail('must not allocate'))
 
     def test_duplicate_tap_and_binding_are_rejected(self):
         (p.REGISTRY / "b.json").write_text('{"tap_index":1}')

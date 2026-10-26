@@ -681,8 +681,30 @@ def tap_exists(tap):
     return subprocess.run(["ip", "link", "show", "dev", tap], capture_output=True).returncode == 0
 
 
+def tap_metadata(tap):
+    result = subprocess.run(['ip', '-j', '-d', 'link', 'show', 'dev', tap], check=True,
+                            capture_output=True, text=True, env={**os.environ, 'LC_ALL': 'C'})
+    if len(result.stdout) > 65536:
+        raise ValueError('tenant TAP metadata exceeds read bound')
+    links = json.loads(result.stdout)
+    if not isinstance(links, list) or len(links) != 1:
+        raise ValueError('ambiguous tenant TAP metadata')
+    return links[0]
+
+
+def require_owned_tap(tap, tap_index, link):
+    if not isinstance(link, dict):
+        raise ValueError(f'refusing to delete foreign interface {tap}')
+    info = link.get('linkinfo', {})
+    data = info.get('info_data', {})
+    if (link.get('ifname') != tap or info.get('info_kind') != 'tun' or data.get('type') != 'tap'
+            or data.get('persist') is not True or type(data.get('user')) is not int
+            or data['user'] != 400000 + tap_index):
+        raise ValueError(f'refusing to delete foreign interface {tap}')
+
+
 def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, execute=run, has_tap=None,
-                  now=time.time, output=print):
+                  now=time.time, output=print, tap_info=None):
     """Remove a departed customer's tenant from this host.
 
     Refuses unless motor-host.service and motor-vm-helper.service are both
@@ -701,6 +723,7 @@ def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, ex
     tenant = component(tenant)
     check_service = systemd_active_state if check_service is None else check_service
     has_tap = tap_exists if has_tap is None else has_tap
+    tap_info = tap_metadata if tap_info is None else tap_info
     with (ROOT / "provision.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         for unit in ("motor-host.service", "motor-vm-helper.service"):
@@ -736,6 +759,7 @@ def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, ex
         plan += [f"{destination}: {path}" for path in (registry_path, provision_path) if path.exists()]
         plan += [f"{destination}: binding {vm} in {BINDINGS}" for vm in sorted(binding)]
         if has_tap(tap):
+            require_owned_tap(tap, tap_index, tap_info(tap))
             plan.append(f"delete: tap {tap}")
         plan += [f"dropped at the next helper start: {name}" for name in (
             f"nft chain tenant_{tap}_input", f"nft chain tenant_{tap}_forward", f"nft chain tenant_{tap}_nat",
@@ -762,6 +786,7 @@ def remove_tenant(tenant, dry_run=False, purge_now=False, check_service=None, ex
             atomic(quarantine / "records" / "binding.json", json.dumps(binding, indent=2))
         sync_dir(removed)
         if has_tap(tap):
+            require_owned_tap(tap, tap_index, tap_info(tap))
             execute("ip", "link", "delete", "dev", tap)
         if binding:
             kept = {vm: entry for vm, entry in bindings.items() if vm not in binding}
@@ -1207,6 +1232,48 @@ def build_base(c, image, base, console=None, diagnostics=None):
     sync_dir(base.parent)
 
 
+def pending_removal_taps():
+    """Saved records reserve indexes until the old home reaches quarantine."""
+    removed = ROOT / 'removed'
+    if not removed.exists():
+        if removed.is_symlink():
+            raise ValueError('unsafe removed-tenant directory')
+        return {}
+    if removed.is_symlink() or not removed.is_dir():
+        raise ValueError('unsafe removed-tenant directory')
+    reserved = {}
+    for quarantine in removed.iterdir():
+        tenant, separator, stamp = quarantine.name.rpartition('-')
+        if not separator or not stamp.isdecimal():
+            continue
+        try:
+            component(tenant)
+        except ValueError:
+            continue
+        if quarantine.is_symlink() or not quarantine.is_dir():
+            raise ValueError(f'unsafe pending removal: {quarantine}')
+        moved = quarantine / 'home'
+        if moved.is_symlink():
+            raise ValueError(f'unsafe quarantined home: {moved}')
+        if moved.is_dir():
+            continue
+        old_home = ROOT / 'tenants' / tenant
+        if not old_home.exists() and not old_home.is_symlink():
+            continue
+        record = quarantine / 'records' / 'registry.json'
+        if record.parent.is_symlink() or record.is_symlink():
+            raise ValueError(f'unsafe pending removal record: {record}')
+        try:
+            saved = json.loads(record.read_text())
+            index = saved['tap_index']
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise ValueError(f'unreadable pending removal reservation: {record}') from error
+        if type(index) is not int or not 1 <= index <= 254:
+            raise ValueError(f'invalid pending removal tap index: {record}')
+        reserved[index] = quarantine
+    return reserved
+
+
 def provision(c, make_base=build_base, execute=run, stage=None, runners=None):
     capacity = read_capacity()
     # An unfinished resize holds host sizing fixed until it is resumed or aborted.
@@ -1225,6 +1292,8 @@ def provision(c, make_base=build_base, execute=run, stage=None, runners=None):
     for entry in REGISTRY.glob("*.json"):
         if json.loads(entry.read_text())["tap_index"] == c["tap_index"]:
             raise ValueError("tap index already assigned")
+    if c['tap_index'] in pending_removal_taps():
+        raise ValueError('tap index reserved by a pending tenant removal; finish or recover it first')
     memory_fit(capacity, replacement=c)
     verify_jobs_slice(capacity)
     manifest = json.loads((image / "manifest.json").read_text())
