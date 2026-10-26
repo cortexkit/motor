@@ -265,6 +265,8 @@ fn mapped_source_only_writer_binds_existing_scratch_at_fixed_target() {
             &tree,
             &JavascriptTools::for_role(ToolchainRole::BuildServer),
             false,
+            false,
+            true,
             None,
         )
         .unwrap();
