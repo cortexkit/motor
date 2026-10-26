@@ -1278,7 +1278,7 @@ where
             .await
             .at(Side::Client, "first_frame")?
             .at(Side::Client, "first_frame")?;
-        let stored = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, 0).is_some();
+        let stored = relay_state(&runtime, &claims.jti, |host, jti| host.host_settled_frames(jti, 0).is_some()).await?;
         if stored {
             streamed.store(true, Ordering::Release);
             return serve_stored(&runtime, &claims.jti, &first, &mut client, &terminal_written).await;
@@ -1338,6 +1338,8 @@ where
         let to_guest = async {
             let mut buffer = vec![0; 16384];
             loop {
+                // Bound each input turn, including the discard-only terminal drain.
+                tokio::task::yield_now().await;
                 let n = cr.read(&mut buffer).await.at(Side::Client, "relay")?;
                 if n == 0 {
                     tracing::info!(jti = claims.jti, side = "client", step = "relay", cause = "eof", "connection_closed");
@@ -1373,13 +1375,17 @@ where
         let to_client = async {
             let mut cursor: u64 = 0;
             loop {
+                // Ready sockets and fast state replies must not monopolise the
+                // shared task. Each turn handles at most one guest frame
+                // before yielding; slow state work also yields while awaited.
+                tokio::task::yield_now().await;
                 let read = read_frame(&mut gr);
                 tokio::pin!(read);
                 let frame = loop {
                     tokio::select! {
                         result = &mut read => { break Some(result); },
                         _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                            let frames = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, cursor.saturating_add(1));
+                            let frames = relay_state(&runtime, &claims.jti, move |host, jti| host.host_settled_frames(jti, cursor.saturating_add(1))).await?;
                             if let Some(frames) = frames {
                                 draining_terminal.store(true, Ordering::Release);
                                 for frame in frames { relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?; }
@@ -1390,7 +1396,7 @@ where
                     }
                 };
                 let Some(frame) = frame else { return Ok::<(),anyhow::Error>(()); };
-                let settled = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, cursor.saturating_add(1));
+                let settled = relay_state(&runtime, &claims.jti, move |host, jti| host.host_settled_frames(jti, cursor.saturating_add(1))).await?;
                 if let Some(frames) = settled {
                     draining_terminal.store(true, Ordering::Release);
                     tracing::warn!(jti=claims.jti, "host_settled_runner_frame_ignored");
@@ -1400,11 +1406,7 @@ where
                 }
                 let frame = frame.at(Side::Guest, "relay")?;
                 if let Some(seq) = frame["seq"].as_u64() {
-                    runtime
-                        .host
-                        .lock()
-                        .expect("host lock")
-                        .watermark(&claims.jti, seq).at(Side::Host, "relay")?;
+                    relay_state(&runtime, &claims.jti, move |host, jti| host.watermark(jti, seq)).await?.at(Side::Host, "relay")?;
                     cursor = cursor.max(seq);
                 }
                 if frame["type"] == "terminal" {
@@ -1418,15 +1420,15 @@ where
                         return Ok::<(),anyhow::Error>(());
                     }
                     let control = runtime.control.clone();
-                    let tenant = runtime.host.lock().expect("host lock").snapshot.leases[&claims.jti].tenant.clone();
+                    let tenant = relay_state(&runtime, &claims.jti, |host, jti| host.snapshot.leases[jti].tenant.clone()).await?;
                     let sample = tokio::task::spawn_blocking(move || control.metrics(&tenant).map(|s|(tenant,s))).await.at(Side::Host, "relay")?;
-                    {
-                        let mut host = runtime.host.lock().expect("host lock");
+                    let terminal = frame.clone();
+                    relay_state(&runtime, &claims.jti, move |host, jti| {
                         if let Ok((tenant,sample)) = sample { host.sample(&tenant,sample).at(Side::Host, "relay")?; }
-                        host.receive_terminal(&claims.jti, frame.clone(), unix_ms()).at(Side::Host, "relay")?;
-                    }
+                        host.receive_terminal(jti, terminal, unix_ms()).at(Side::Host, "relay")
+                    }).await??;
                     let hosted = loop {
-                        let value = runtime.host.lock().expect("host lock").snapshot.billing.get(&claims.jti).and_then(|b| b.hosted_terminal.clone());
+                        let value = relay_state(&runtime, &claims.jti, |host, jti| host.snapshot.billing.get(jti).and_then(|b| b.hosted_terminal.clone())).await?;
                         if let Some(value) = value { break value; }
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     };
@@ -1450,7 +1452,7 @@ where
         // stays in place until this drain ends; `connection.finish()` runs after.
         let clean = close_client(&mut client, &claims.jti).await;
         if clean && terminal_written.load(Ordering::Acquire) {
-            runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms()).at(Side::Host, "terminal_delivered")?;
+            relay_state(&runtime, &claims.jti, |host, jti| host.terminal_delivered(jti, unix_ms())).await?.at(Side::Host, "terminal_delivered")?;
             tracing::debug!(jti = claims.jti, "connection_terminal_delivered");
         }
     }
@@ -1459,6 +1461,23 @@ where
     .map_err(|error| error.context(ConnectionJob(claims.jti.clone())));
     connection.finish().await;
     outcome
+}
+
+// The output pump awaits each reply before submitting more state work: it has
+// at most one outstanding request, including when the Host mutex or disk stalls.
+// The mutex and durable journal writes never run on the relay's async worker.
+async fn relay_state<T: Send + 'static>(
+    runtime: &Arc<Runtime>,
+    jti: &str,
+    operation: impl FnOnce(&mut Host, &str) -> T + Send + 'static,
+) -> Result<T> {
+    let runtime = runtime.clone();
+    let jti = jti.to_owned();
+    tokio::task::spawn_blocking(move || {
+        operation(&mut runtime.host.lock().expect("host lock"), &jti)
+    })
+    .await
+    .at(Side::Host, "relay")
 }
 
 async fn serve_stored(
