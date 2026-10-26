@@ -495,6 +495,26 @@ Rust job builds in the same fixed folder as on the build server:
 `./target` and `/run/motor/target` are one directory. The live Rust job runs its
 binary from `$CARGO_TARGET_DIR`, and the isolation job checks both facts.
 
+### Remote compile cache
+
+`motor-boat.service` starts the runner with `--remote-cache true`. That switch is
+all the image has to supply: everything else is CLOUD's side of the pinned
+contract in `crates/motor-lease/contracts/cloud/runners-contract.md`. The broker
+installs `/run/motor/cache/` (root 0700 on tmpfs) with `read-key` (root 0400, the
+sandbox tenant's read-only store credential) and `config.json` (root 0444) after
+every create and resume; the runner reads them there because `--boat-profile`
+selects the Boat provisioning layout, owned by root and re-read at least every
+ten seconds, so files that arrive after startup are picked up without a restart.
+A key or config that is missing, unreadable, the wrong mode or owner, or from
+another generation leaves the cache unavailable: the runner logs
+`cache_unavailable`, never delays `/run/motor/endpoint-ready` and never refuses a
+job, which then builds uncached. Boat only ever reads: the job environment is a
+read-only store client (`SCCACHE_S3_RW_MODE=READ_ONLY`, `RUSTC_WRAPPER` is the
+runner's trusted sccache), and the fill path stays refused for `--boat-profile`,
+so no job or unit can write the cache. The image ships sccache in the shared
+Cargo bin and the runner drops a keyless loopback forwarder into the job's
+`/motor-tools`; neither needs an image-side configuration change.
+
 The daemon's weight and rustc slots use `nproc`, measured by the start wrapper on every start. Its `--job-network veth` allows
 network **only for explicit outbound requests**, through the existing private
 network/veth machinery. A root pre-start reapplies only motor's nftables table
@@ -883,6 +903,35 @@ reported `not_run`, never passed. That run's verdict covers the named phase alon
 `verdict.image_qualified` stays false; separate runs are not combined, so the operator
 qualifies the image from one passing run of each phase. `--max-minutes` applies to
 each phase's sandbox separately.
+
+### Live remote compile-cache check
+
+The `core` phase also runs the fleet compile cache end to end, in its own
+`cache_live` section. Verify sandboxes are not broker-created, so CLOUD's broker
+never installs `/run/motor/cache` there; the check writes the same provisioning
+itself from a directory the operator passes with `--cache-inputs`: `config.json`
+and `read-key` in the exact shapes and members of
+`crates/motor-lease/contracts/cloud/runners-contract.md`, plus `cargo-seed.tar.gz`,
+the same operator seed the image was built from. The key goes up over the pinned
+SSH route on stdin, is installed root-owned at the contract's modes (0700
+directory, 0444 `config.json`, 0400 `read-key`), and both it and the staged copy
+are deleted before the check ends. Neither the key nor any copy of it is written
+to `results.json`, and the section refuses a config member, a mode or a
+generation pair the contract does not allow.
+
+A real Cargo job then builds a small package offline from that seed and prints
+the statistics of the runner-installed sccache wrapper. The check passes only
+with at least one compile the store answered (`s3_hits`), the job's read-only
+cache mode, no `SCCACHE_RECACHE`, and both the cache tool and gateway mounts
+present: a job without the cache has no remote counter at all, so the zero-hit
+result CLOUD saw cannot pass. Without `--cache-inputs` the section is recorded
+`INCONCLUSIVE` and named in `verdict.inconclusive`; an absent check is never a
+pass.
+
+The key is read-only and confined to the cache tenant's prefix, the same one
+CLOUD delivers to every fleet sandbox; never use an operator or production
+write key here. The store has to be warm for the seed's crates, which the fleet
+build server's own fills provide.
 
 Core's required plain control is recorded under `runner_host.core_stop_resume`,
 including accepted-response-to-completed timing and pre-stop disk allocation.

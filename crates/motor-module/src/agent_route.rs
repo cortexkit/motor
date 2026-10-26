@@ -251,12 +251,32 @@ pub(crate) fn agent_records(
 
 /// Forward an agent job's stream to its caller until the terminal record.
 pub(crate) async fn pump(ctx: &RequestCtx, stream: JobStream, from_seq: u64) -> io::Result<()> {
+    pump_inner(ctx, stream, from_seq, None).await
+}
+
+pub(crate) async fn pump_after(
+    ctx: &RequestCtx,
+    stream: JobStream,
+    cursor: Option<u64>,
+) -> io::Result<()> {
+    pump_inner(ctx, stream, 0, cursor).await
+}
+
+async fn pump_inner(
+    ctx: &RequestCtx,
+    stream: JobStream,
+    from_seq: u64,
+    cursor: Option<u64>,
+) -> io::Result<()> {
     let id = stream.job_id;
     let storage = stream.storage();
     forward(ctx.cancelled(), stream, |record| {
         let records = agent_records(&storage, id, from_seq, record);
         async move {
             for record in records {
+                if !crate::motor::submission_key::after_cursor(&record, cursor) {
+                    continue;
+                }
                 ctx.emit(serde_json::to_vec(&record).map_err(io::Error::other)?)
                     .await
                     .map_err(io::Error::other)?;

@@ -8,7 +8,10 @@ use std::{
     collections::HashMap,
     io,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
 };
 use subc_client_rs::{
     async_trait, BindDecision, ConnectionEnd, HandlerOutcome, HealthReport, HealthStatus,
@@ -68,14 +71,57 @@ fn request_class(body: &[u8]) -> RequestClass {
     } else {
         head.strip_prefix(b"{").unwrap_or_default()
     };
-    if op.starts_with(br#""op":"exec.run""#) || op.starts_with(br#""method":"exec.run""#) {
-        RequestClass::long_held().with_op("exec.run")
-    } else if op.starts_with(br#""op":"exec.attach""#)
-        || op.starts_with(br#""method":"exec.attach""#)
-    {
-        RequestClass::long_held().with_op("exec.attach")
-    } else {
-        RequestClass::default_pool()
+    for (prefix, label) in [
+        (br#""op":"exec.run""#.as_slice(), "exec.run"),
+        (br#""method":"exec.run""#.as_slice(), "exec.run"),
+        (br#""op":"exec.attach""#.as_slice(), "exec.attach"),
+        (br#""method":"exec.attach""#.as_slice(), "exec.attach"),
+    ] {
+        if op
+            .strip_prefix(prefix)
+            .is_some_and(|rest| matches!(rest.first(), Some(b',' | b'}')))
+        {
+            return RequestClass::long_held().with_op(label);
+        }
+    }
+    RequestClass::default_pool()
+}
+
+fn first_envelope_key(body: &[u8]) -> String {
+    let head = body[..body.len().min(256)].trim_ascii_start();
+    let Some(head) = head.strip_prefix(b"{") else {
+        return "<unavailable>".into();
+    };
+    String::deserialize(&mut serde_json::Deserializer::from_slice(
+        head.trim_ascii_start(),
+    ))
+    .map(|key| key.chars().take(64).collect())
+    .unwrap_or_else(|_| "<unavailable>".into())
+}
+
+#[derive(Default)]
+struct PoolFallbacks {
+    total: AtomicU64,
+    last_warning: Mutex<Option<std::time::Instant>>,
+}
+
+impl PoolFallbacks {
+    fn record(&self, op: &'static str, body: &[u8], now: std::time::Instant) {
+        let total = self.total.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut last = self.last_warning.lock().unwrap();
+        if last.is_some_and(|last| {
+            now.saturating_duration_since(last) < std::time::Duration::from_secs(60)
+        }) {
+            return;
+        }
+        *last = Some(now);
+        drop(last);
+        tracing::warn!(
+            op,
+            first_key = ?first_envelope_key(body),
+            total,
+            "long-held request used default pool"
+        );
     }
 }
 pub const OPERATIONS: &[&str] = &[
@@ -132,6 +178,7 @@ pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest 
         FLOW_SCOPES_CAPABILITY.into(),
         RETURN_CAPABILITY.into(),
         RETURN_CHUNKED_CAPABILITY.into(),
+        motor_protocol::SUBMISSION_KEY_CAPABILITY.into(),
     ];
     if !config.windows_runners.is_empty()
         || (config.windows_runner_instance.is_some() && config.windows_runner_state_root.is_some())
@@ -285,6 +332,7 @@ pub struct Handler {
     /// prove access with the per-job secret whose hash is in storage.
     direct_jobs: Arc<Mutex<HashMap<Uuid, RouteHandle>>>,
     module_handle: Arc<Mutex<Option<ModuleHandle>>>,
+    pool_fallbacks: Arc<PoolFallbacks>,
     startup_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     startup_error: Arc<Mutex<Option<String>>>,
     storage_state: Arc<tokio::sync::watch::Sender<StorageState>>,
@@ -325,11 +373,15 @@ impl Handler {
     }
 
     fn pool_metrics(&self) -> Value {
+        let mut pools = serde_json::Map::new();
+        pools.insert(
+            "long_held_fallbacks_total".into(),
+            json!(self.pool_fallbacks.total.load(Ordering::Relaxed)),
+        );
         let handle = self.module_handle.lock().unwrap();
         let Some(handle) = handle.as_ref() else {
-            return Value::Null;
+            return Value::Object(pools);
         };
-        let mut pools = serde_json::Map::new();
         for snapshot in handle.request_pool_snapshots() {
             let name = match snapshot.pool {
                 RequestPool::Default => "default",
@@ -348,6 +400,21 @@ impl Handler {
         Value::Object(pools)
     }
 
+    fn record_pool_fallback(&self, op: &str, body: &[u8]) {
+        let op = match op {
+            "exec.run" => "exec.run",
+            "exec.attach" => "exec.attach",
+            _ => return,
+        };
+        // Reuse the frame reader's deterministic classifier after decoding the
+        // operation here, so unexpected envelope order is visible without
+        // adding JSON decoding to the frame reader.
+        if request_class(body).pool == RequestPool::Default {
+            self.pool_fallbacks
+                .record(op, body, std::time::Instant::now());
+        }
+    }
+
     pub fn new(config: Config) -> Self {
         Self {
             config,
@@ -359,6 +426,7 @@ impl Handler {
             routes: Arc::new(Mutex::new(HashMap::new())),
             direct_jobs: Arc::new(Mutex::new(HashMap::new())),
             module_handle: Arc::new(Mutex::new(None)),
+            pool_fallbacks: Arc::new(PoolFallbacks::default()),
             startup_task: Arc::new(Mutex::new(None)),
             startup_error: Arc::new(Mutex::new(None)),
             storage_state: Arc::new(tokio::sync::watch::Sender::new(StorageState::NotStarted)),
@@ -694,6 +762,27 @@ impl Handler {
                     hosted: bool,
                 }
                 let spill: SpillOptions = parse(envelope.params.clone())?;
+                let returns: crate::ReturnOptions = parse(envelope.params.clone())?;
+                let request: RunRequest = match serde_json::from_value(envelope.params) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return Ok(HandlerOutcome::Error {
+                            code: "invalid_params".into(),
+                            message: error.to_string(),
+                        })
+                    }
+                };
+                let motor = self.initialized()?;
+                let secret = crate::direct_secret::DirectSecret::mint()?;
+                if request.submission_key.is_some() {
+                    let stream = motor.refuse_authorized(
+                        RefusalReason::RequestRejected,
+                        Some("submission_key_requires_attested_caller".into()),
+                        Some(secret.hash()),
+                    )?;
+                    pump_direct_secret(&ctx, stream, Some(secret)).await?;
+                    return Ok(HandlerOutcome::Streamed);
+                }
                 if spill.hosted {
                     if let Some(message) = self.hosted_test_unavailable() {
                         return Ok(HandlerOutcome::Error {
@@ -702,10 +791,6 @@ impl Handler {
                         });
                     }
                 }
-                let returns: crate::ReturnOptions = parse(envelope.params.clone())?;
-                let request: RunRequest = parse(envelope.params)?;
-                let motor = self.initialized()?;
-                let secret = crate::direct_secret::DirectSecret::mint()?;
                 if let Some(detail) = direct_timeout_refusal(
                     request.timeout,
                     self.config.direct_exec_max_timeout_secs,
@@ -1017,6 +1102,7 @@ impl ModuleHandler for Handler {
                 // the check is repeated so a route bound under another
                 // configuration can't act.
                 Some(Principal::Direct) if self.config.admit_direct_exec => {
+                    self.record_pool_fallback(&envelope.op, &body);
                     return self.handle_direct(ctx, envelope).await;
                 }
                 _ => {
@@ -1042,11 +1128,42 @@ impl ModuleHandler for Handler {
                     message: format!("{} refuses {} for reserved:{module_id}", self.module_id, envelope.op),
                 });
             }
+            self.record_pool_fallback(&envelope.op, &body);
             let motor = self.ready().await?;
-            let parse = |p| serde_json::from_value(p).map_err(io::Error::other);
+            let principal = format!("reserved:{module_id}");
+            if matches!(envelope.op.as_str(), "exec.attach" | "exec.cancel" | "exec.status") {
+                if let Some(id) = envelope.params.get("job_id")
+                    .and_then(Value::as_str).and_then(|id| id.parse().ok()) {
+                    if !motor.submission_owned(id, &principal) {
+                        return Ok(HandlerOutcome::Error {
+                            code: "motor_job_not_found".into(),
+                            message: "job not found".into(),
+                        });
+                    }
+                }
+            }
             match envelope.op.as_str() {
                 "exec.run" => {
-                    let mut request: RunRequest = parse(envelope.params)?;
+                    let mut request: RunRequest = match serde_json::from_value(envelope.params) {
+                        Ok(request) => request,
+                        Err(error) => return Ok(HandlerOutcome::Error {
+                            code: "invalid_params".into(),
+                            message: error.to_string(),
+                        }),
+                    };
+                    if request.submission_key.is_some() {
+                        let cursor = request.resume_from_seq;
+                        let stream = tokio::select! {
+                            stream = motor.submit_agent(
+                                request,
+                                self.attribution(ctx.route_handle(), envelope.preset),
+                                &principal,
+                            ) => stream?,
+                            _ = ctx.cancelled() => return Ok(HandlerOutcome::Streamed),
+                        };
+                        crate::agent_route::pump_after(&ctx, stream, cursor).await?;
+                        return Ok(HandlerOutcome::Streamed);
+                    }
                     let returns = match crate::agent_route::take_return_request(&mut request) {
                         Ok(returns) => returns,
                         Err(crate::agent_route::ReturnRequestError::InvalidParams(message)) => {
@@ -1121,7 +1238,9 @@ impl ModuleHandler for Handler {
         match result {
             Ok(outcome) => outcome,
             Err(e) => HandlerOutcome::Error {
-                code: if e.kind() == io::ErrorKind::NotConnected && self.motor.get().is_none() {
+                code: if e.kind() == io::ErrorKind::InvalidInput {
+                    "invalid_params"
+                } else if e.kind() == io::ErrorKind::NotConnected && self.motor.get().is_none() {
                     "motor_unavailable"
                 } else {
                     "exec_remote_error"
@@ -1602,5 +1721,81 @@ mod pool_classifier_tests {
             request_class(&vec![b'x'; 1024 * 1024]).pool,
             RequestPool::Default
         );
+    }
+
+    #[test]
+    fn aft_method_envelopes_and_keyed_resubmits_use_long_held_pool() {
+        let run = serde_json::to_vec(&json!({"method":"exec.run", "params":{
+            "submission_key":"caller:submission-0001", "resume_from_seq":7,
+            "command":"echo hello"
+        }}))
+        .unwrap();
+        let attach = serde_json::to_vec(&json!({"method":"exec.attach", "params":{
+            "job_id":"00000000-0000-0000-0000-000000000001", "from_seq":0
+        }}))
+        .unwrap();
+        assert!(run.starts_with(br#"{"method":"exec.run","params":{"#));
+        assert!(attach.starts_with(br#"{"method":"exec.attach","params":{"#));
+        assert_eq!(request_class(&run).pool, RequestPool::LongHeld);
+        assert_eq!(request_class(&attach).pool, RequestPool::LongHeld);
+        for body in [
+            br#"{"method":"exec.run_x","params":{}}"#.as_slice(),
+            br#"{"op":"exec.attachment","params":{}}"#.as_slice(),
+            br#"{"method":"exec.run"x}"#.as_slice(),
+        ] {
+            assert_eq!(request_class(body).pool, RequestPool::Default);
+        }
+        assert_eq!(
+            request_class(br#"{"method":"exec.run"}"#).pool,
+            RequestPool::LongHeld
+        );
+    }
+
+    #[test]
+    fn fallback_counter_counts_every_dispatch_but_warns_once_per_minute() {
+        let logs = crate::logging::Captured::default();
+        let _guard = crate::logging::scoped(logs.clone());
+        let fallbacks = PoolFallbacks::default();
+        let now = std::time::Instant::now();
+        fallbacks.record("exec.run", br#"{"params":{},"method":"exec.run"}"#, now);
+        fallbacks.record(
+            "exec.attach",
+            br#"{"params":{},"method":"exec.attach"}"#,
+            now + std::time::Duration::from_secs(10),
+        );
+        assert_eq!(fallbacks.total.load(Ordering::Relaxed), 2);
+        let first = logs.text();
+        assert_eq!(
+            first.matches("long-held request used default pool").count(),
+            1
+        );
+        assert!(
+            first.contains("WARN")
+                && first.contains("op=exec.run")
+                && first.contains("first_key=\"params\""),
+            "{first}"
+        );
+        fallbacks.record(
+            "exec.attach",
+            br#"{ "preset":"dev","method":"exec.attach"}"#,
+            now + std::time::Duration::from_secs(60),
+        );
+        let reopened = logs.text();
+        assert_eq!(fallbacks.total.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            reopened
+                .matches("long-held request used default pool")
+                .count(),
+            2
+        );
+        assert!(
+            reopened.contains("op=exec.attach") && reopened.contains("first_key=\"preset\""),
+            "{reopened}"
+        );
+        assert_eq!(
+            first_envelope_key(b" \n { \"params\":{},\"method\":\"exec.run\"}"),
+            "params"
+        );
+        assert_eq!(first_envelope_key(&vec![b' '; 512]), "<unavailable>");
     }
 }

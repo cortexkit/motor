@@ -74,8 +74,11 @@ pub struct Motor {
     hosted_cleanup: Arc<hosted_cleanup::Cleanup>,
     #[cfg(test)]
     hosted_connector: Option<Arc<dyn Connector>>,
+    keyed_admissions: Arc<std::sync::Mutex<()>>,
+    wsl: crate::wsl::Checks,
 }
 mod agent_run;
+pub(crate) mod submission_key;
 
 struct Submission {
     motor: Motor,
@@ -145,6 +148,8 @@ impl Motor {
             hosted_cleanup: Arc::default(),
             #[cfg(test)]
             hosted_connector: None,
+            keyed_admissions: Arc::default(),
+            wsl: crate::wsl::Checks::default(),
         })
     }
     pub fn with_account_tokens(mut self, tokens: Arc<crate::AccountTokens>) -> Self {
@@ -272,14 +277,45 @@ impl Motor {
     }
     fn run_classified(
         &self,
-        mut request: RunRequest,
+        request: RunRequest,
         identity: (Option<JobAttribution>, Option<[u8; 32]>),
         gate_job: bool,
         allow_gate_spill: bool,
         hosted_test: bool,
         returns: crate::ReturnOptions,
     ) -> io::Result<JobStream> {
+        self.run_classified_keyed(
+            request,
+            identity,
+            gate_job,
+            allow_gate_spill,
+            hosted_test,
+            returns,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn run_classified_keyed(
+        &self,
+        mut request: RunRequest,
+        identity: (Option<JobAttribution>, Option<[u8; 32]>),
+        gate_job: bool,
+        allow_gate_spill: bool,
+        hosted_test: bool,
+        returns: crate::ReturnOptions,
+        key: Option<submission_key::KeyRecord>,
+    ) -> io::Result<JobStream> {
         let (attribution, secret_hash) = identity;
+        let wsl_refusal = self.wsl.refusal(
+            [
+                &request.workspace_key,
+                &request.repository_root,
+                &request.cwd,
+            ]
+            .into_iter()
+            .chain(request.siblings.iter())
+            .map(Path::new),
+        );
         let macos_not_hosted = hosted_test && request.platform == Some(Platform::Macos);
         let mut env_not_forwarded: Vec<_> = request
             .env
@@ -294,7 +330,8 @@ impl Motor {
         let id = Uuid::now_v7();
         // repository_root is resolved by the caller from Git's common directory,
         // not the workspace key, which changes for each linked worktree.
-        let repository_routed = !hosted_test
+        let repository_routed = wsl_refusal.is_none()
+            && !hosted_test
             && matches!(request.platform, None | Some(Platform::Linux))
             && std::fs::canonicalize(&request.repository_root).is_ok_and(|root| {
                 self.config
@@ -302,7 +339,8 @@ impl Motor {
                     .iter()
                     .any(|listed| std::fs::canonicalize(listed).is_ok_and(|listed| listed == root))
             });
-        let spill_eligible = !hosted_test
+        let spill_eligible = wsl_refusal.is_none()
+            && !hosted_test
             && !repository_routed
             && crate::spill::eligible(&self.config, &request, gate_job, allow_gate_spill);
         let wait = if gate_job {
@@ -325,12 +363,15 @@ impl Motor {
             .map(|t| t.instance);
         self.storage
             .create_authorized(id, wait, attribution, instance, gate_job, secret_hash)?;
+        if let Some(key) = key {
+            self.storage.record_submission(id, key)?;
+        }
         if request.platform == Some(Platform::Windows) {
             if let Some(runner) = self.config.windows_runners.first() {
                 self.storage.bind_windows(id, runner.clone())?;
             }
         }
-        if hosted_test && !macos_not_hosted {
+        if wsl_refusal.is_none() && hosted_test && !macos_not_hosted {
             let mut route = crate::HostedJobState::new(&self.config);
             route.hosted_test = true;
             self.storage.hosted_route(id, route)?;
@@ -343,7 +384,8 @@ impl Motor {
             self.storage.hosted_route(id, route)?;
             tracing::info!(job_id = %id, repo = %request.repository_root,
                 "routed to hosted (hosted_repositories)");
-        } else if self.config.hosted_runners
+        } else if wsl_refusal.is_none()
+            && self.config.hosted_runners
             && matches!(request.platform, None | Some(Platform::Linux))
             && (!self.config.hosted_fleet_routing
                 || (!gate_job && crate::hosted::validate(&request).is_ok()))
@@ -365,6 +407,21 @@ impl Motor {
         let submission = self.submission(id);
         tokio::spawn(async move {
             let _submission = submission;
+            if let Some(message) = wsl_refusal {
+                let result = motor
+                    .refused(
+                        id,
+                        RefusalReason::WorkspaceKeyRejected,
+                        None,
+                        Some(message),
+                        &tx,
+                    )
+                    .await;
+                if let Err(error) = result {
+                    let _ = tx.send(Err(error)).await;
+                }
+                return;
+            }
             if macos_not_hosted {
                 let result = motor
                     .refused(
@@ -1284,15 +1341,21 @@ impl Motor {
         // Never resubmit or invent a before-start outcome after attempting run.
         // The hosted route records that durably first: it is what stops a
         // spilled job from returning to the build server once it may have run.
-        if hosted {
+        // A hosted Run is also fenced against shutdown, so the shutdown
+        // inventory cannot miss a booking whose Run is about to be sent.
+        let _booking_open = if hosted {
             let open = self.hosted_cleanup.booking_open.lock().unwrap();
             if !*open {
                 return Err(io::Error::other("hosted Run stopped during shutdown"));
             }
-            self.storage
-                .hosted_update(id, |state| state.run_sent = true)
-                .inspect_err(|error| self.log_hosted_failure(id, "persist_run", error))?;
-        }
+            Some(open)
+        } else {
+            None
+        };
+        self.storage
+            .run_sent(id, hosted)
+            .inspect_err(|error| self.log_hosted_failure(id, "persist_run", error))?;
+        drop(_booking_open);
         let shadow_run = shadow_request.map(|request| (request, run.clone()));
         if let Err(error) = channel.send(Frame::Run(run)).await {
             self.log_hosted_failure(id, "run_send", &error);
@@ -1312,6 +1375,15 @@ impl Motor {
         let admission = channel.next().await;
         match admission {
             Ok(Incoming::Frame(Frame::Accepted(mut accepted))) => {
+                accepted.attached = false;
+                let mut caller_accepted = accepted
+                    .clone()
+                    .with_env_not_forwarded(env_not_forwarded.clone());
+                caller_accepted.job_id = id;
+                if request.network.is_none() {
+                    caller_accepted.network = None;
+                }
+                self.storage.submission_accepted(id, caller_accepted)?;
                 if hosted {
                     tracing::info!(job_id = %id, step = "admission", cause = "runner accepted Run", "hosted Run accepted");
                     if spilled {
@@ -2564,6 +2636,15 @@ impl Motor {
     }
     pub async fn prepare(&self, request: PrepareRequest) -> io::Result<PrepareReply> {
         let id = Uuid::now_v7();
+        if let Some(message) = self.wsl.refusal(
+            [&request.workspace_key, &request.repository_root]
+                .into_iter()
+                .chain(request.siblings.iter())
+                .map(Path::new),
+        ) {
+            return Ok(prepare_refused(id, RefusalReason::WorkspaceKeyRejected)
+                .with_refusal_detail(message));
+        }
         if self.config.hosted_runners {
             self.storage
                 .hosted_route(id, crate::HostedJobState::new(&self.config))?;
@@ -2891,6 +2972,8 @@ mod fleet_capacity_tests;
 mod fleet_routing_tests;
 #[cfg(test)]
 mod repository_routing_tests;
+#[cfg(test)]
+mod wsl_tests;
 
 #[cfg(test)]
 mod outcome_unknown_tests;

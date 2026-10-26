@@ -1549,6 +1549,24 @@ mod request_pools {
         request
     }
 
+    fn aft_body(method: &str, params: impl serde::Serialize) -> Vec<u8> {
+        serde_json::to_vec(&json!({"method":method, "params":params})).unwrap()
+    }
+
+    async fn send_body(daemon: &mut TcpStream, corr: u64, body: Vec<u8>) {
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Passive, false),
+            7,
+            1,
+            corr,
+            body,
+        )
+        .unwrap();
+        write_frame(daemon, &frame).await.unwrap();
+        daemon.flush().await.unwrap();
+    }
+
     async fn reply_on(rig: &mut Rig, corr: u64) -> Frame {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -1560,6 +1578,118 @@ mod request_pools {
         })
         .await
         .unwrap_or_else(|_| panic!("request {corr} did not answer within five seconds"))
+    }
+
+    #[tokio::test]
+    async fn keyed_aft_resubmits_keep_both_streams_in_long_held_pool() {
+        let f = Fixture::new(Cut::None, 1).await;
+        let motor = f.motor();
+        let handler = Handler::new(f.config.clone()).with_motor(motor.clone());
+        let mut rig = Rig::start(handler, "ck-motor").await;
+        assert_eq!(
+            rig.bind(aft(), Value::Null).await.header.ty,
+            FrameType::Response
+        );
+        let mut request = pool_request(&f);
+        request.submission_key = Some("pool:submission-0001".into());
+        let body = aft_body("exec.run", &request);
+        assert!(body.starts_with(br#"{"method":"exec.run","params":{"#));
+        send_body(&mut rig.daemon, 100, body.clone()).await;
+        send_body(&mut rig.daemon, 101, body).await;
+        let mut accepted = HashMap::new();
+        while accepted.len() < 2 {
+            let frame = receive(&mut rig.daemon).await;
+            assert_eq!(frame.header.ty, FrameType::StreamData);
+            if let StreamRecord::Accepted(record) = serde_json::from_slice(&frame.body).unwrap() {
+                accepted.insert(frame.header.corr, record);
+            }
+        }
+        let id = accepted[&100].job_id;
+        assert_eq!(id, accepted[&101].job_id);
+        assert_eq!(
+            accepted.values().filter(|record| record.attached).count(),
+            1
+        );
+        assert_eq!(
+            f.proxy
+                .frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|frame| matches!(frame, motor_protocol::Frame::Run(_)))
+                .count(),
+            1
+        );
+        let metrics = rig.handler.health().await.metrics.unwrap();
+        assert_eq!(metrics["request_pools"]["long_held"]["in_use"], 2);
+        assert_eq!(metrics["request_pools"]["default"]["in_use"], 0);
+        assert_eq!(metrics["request_pools"]["long_held_fallbacks_total"], 0);
+        motor
+            .cancel(motor_protocol::CancelRequest::new(id))
+            .await
+            .unwrap();
+        rig.stop().await;
+    }
+
+    #[tokio::test]
+    async fn reordered_stream_envelopes_increment_health_counter_and_warn_once() {
+        let logs = crate::logging::Captured::default();
+        let _guard = crate::logging::scoped(logs.clone());
+        let f = Fixture::new(Cut::None, 1).await;
+        let motor = f.motor();
+        let handler = Handler::new(f.config.clone()).with_motor(motor.clone());
+        let mut rig = Rig::start(handler, "ck-motor").await;
+        assert_eq!(
+            rig.bind(aft(), Value::Null).await.header.ty,
+            FrameType::Response
+        );
+        // Deliberately put params before method, unlike AFT's compact envelope.
+        let body = format!(
+            r#"{{"params":{},"method":"exec.run"}}"#,
+            serde_json::to_string(&pool_request(&f)).unwrap()
+        )
+        .into_bytes();
+        send_body(&mut rig.daemon, 100, body).await;
+        let first = reply_on(&mut rig, 100).await;
+        let StreamRecord::Accepted(accepted) = serde_json::from_slice(&first.body).unwrap() else {
+            panic!("expected acceptance: {first:?}")
+        };
+        let id = accepted.job_id;
+        let body =
+            format!(r#"{{"params":{{"job_id":"{id}","from_seq":0}},"method":"exec.attach"}}"#)
+                .into_bytes();
+        send_body(&mut rig.daemon, 101, body).await;
+        assert_eq!(
+            reply_on(&mut rig, 101).await.header.ty,
+            FrameType::StreamData
+        );
+        let metrics = rig.handler.health().await.metrics.unwrap();
+        assert_eq!(metrics["request_pools"]["long_held_fallbacks_total"], 2);
+        assert_eq!(metrics["request_pools"]["default"]["in_use"], 2);
+        assert_eq!(metrics["request_pools"]["long_held"]["in_use"], 0);
+        send_body(&mut rig.daemon, 102, aft_body("runner.health", json!({}))).await;
+        let health = reply_on(&mut rig, 102).await;
+        assert_eq!(health.header.ty, FrameType::Response);
+        let health: Value = serde_json::from_slice(&health.body).unwrap();
+        assert_eq!(health["request_pools"]["long_held_fallbacks_total"], 2);
+        let text = logs.text();
+        let warnings: Vec<_> = text
+            .lines()
+            .filter(|line| line.contains("long-held request used default pool"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{text}");
+        assert!(
+            warnings[0].contains("WARN")
+                && warnings[0].contains("op=exec.run")
+                && warnings[0].contains("first_key=\"params\""),
+            "{text}"
+        );
+        assert!(!warnings[0].contains("echo pool-ready"));
+        motor
+            .cancel(motor_protocol::CancelRequest::new(id))
+            .await
+            .unwrap();
+        rig.stop().await;
     }
 
     #[tokio::test]
@@ -1578,12 +1708,10 @@ mod request_pools {
         let mut runs = HashMap::new();
         let mut output_corr = None;
         for corr in 100..180 {
-            send(
+            send_body(
                 &mut rig.daemon,
-                FrameType::Request,
-                7,
                 corr,
-                json!({"op":"exec.run", "params":pool_request(&f)}),
+                aft_body("exec.run", pool_request(&f)),
             )
             .await;
         }
@@ -1660,13 +1788,12 @@ mod request_pools {
         assert_eq!(health["request_pools"]["long_held"]["in_use"], 80);
         assert_eq!(health["request_pools"]["long_held"]["limit"], 256);
         assert_eq!(health["request_pools"]["default"]["limit"], 64);
+        assert_eq!(health["request_pools"]["long_held_fallbacks_total"], 0);
 
-        send(
+        send_body(
             &mut rig.daemon,
-            FrameType::Request,
-            7,
             202,
-            json!({"op":"exec.attach", "params":{"job_id":id,"from_seq":0}}),
+            aft_body("exec.attach", json!({"job_id":id,"from_seq":0})),
         )
         .await;
         let attached = reply_on(&mut rig, 202).await;
@@ -1728,14 +1855,7 @@ mod request_pools {
                 rig.bind(aft(), Value::Null).await.header.ty,
                 FrameType::Response
             );
-            send(
-                &mut rig.daemon,
-                FrameType::Request,
-                7,
-                100,
-                json!({"op":"exec.run", "params":pool_request(&f)}),
-            )
-            .await;
+            send_body(&mut rig.daemon, 100, aft_body("exec.run", pool_request(&f))).await;
             let id = if learn_id {
                 let frame = reply_on(&mut rig, 100).await;
                 let StreamRecord::Accepted(accepted) = serde_json::from_slice(&frame.body).unwrap()
@@ -1751,10 +1871,10 @@ mod request_pools {
             // (before acceptance).
             send(&mut rig.daemon, FrameType::Cancel, 7, 100, Value::Null).await;
             let followup = match id {
-                Some(id) => json!({"op":"exec.attach", "params":{"job_id":id,"from_seq":0}}),
-                None => json!({"op":"exec.status", "params":{}}),
+                Some(id) => aft_body("exec.attach", json!({"job_id":id,"from_seq":0})),
+                None => aft_body("exec.status", json!({})),
             };
-            send(&mut rig.daemon, FrameType::Request, 7, 101, followup).await;
+            send_body(&mut rig.daemon, 101, followup).await;
             let mut detached = false;
             let mut answered = false;
             let mut skipped_handler = false;

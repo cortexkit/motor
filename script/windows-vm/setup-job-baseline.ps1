@@ -24,6 +24,41 @@ New-Item $motor -ItemType Directory -Force | Out-Null
 & icacls $motor /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'
 if ($LASTEXITCODE -ne 0) { throw 'Motor directory ACL setup failed' }
 
+# Jobs are offline and cannot use the provisioning administrator's per-user Bun.
+# SHA-256 source: https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/SHASUMS256.txt
+$bunVersion = '1.4.2'
+$bunSha256 = 'ce4c17497b2f29712a99d3d53f028de28cd42e3bacb8589599e7f000e49b6405'
+$bunArchive = Join-Path $motor 'bun-windows-x64.zip'
+$bunInstall = 'C:\Program Files\Bun'
+try {
+    Invoke-WebRequest 'https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-windows-x64.zip' -OutFile $bunArchive -UseBasicParsing
+    if ((Get-FileHash -LiteralPath $bunArchive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $bunSha256) {
+        throw 'Bun archive SHA-256 mismatch'
+    }
+    if (Test-Path -LiteralPath $bunInstall) { throw 'Bun destination already exists; use a fresh provisioning image' }
+    New-Item $bunInstall -ItemType Directory | Out-Null
+    # Protect the root before extraction; reset descendants to inherit its policy.
+    & icacls $bunInstall /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'
+    if ($LASTEXITCODE -ne 0) { throw 'Bun root ACL setup failed' }
+    Expand-Archive -LiteralPath $bunArchive -DestinationPath $bunInstall
+    Move-Item -LiteralPath "$bunInstall\bun-windows-x64\bun.exe" -Destination "$bunInstall\bun.exe"
+    Remove-Item -LiteralPath "$bunInstall\bun-windows-x64" -Recurse -Force
+    & icacls "$bunInstall\*" /reset /T /C /L /Q
+    if ($LASTEXITCODE -ne 0) { throw 'Bun ACL inheritance reset failed' }
+    & icacls $bunInstall /setowner '*S-1-5-32-544' /T /C /L /Q
+    if ($LASTEXITCODE -ne 0) { throw 'Bun ownership setup failed' }
+} finally {
+    Remove-Item -LiteralPath $bunArchive -Force -ErrorAction SilentlyContinue
+}
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+if (($machinePath -split ';' | ForEach-Object { $_.TrimEnd('\') }) -notcontains $bunInstall) {
+    [Environment]::SetEnvironmentVariable('Path', "$bunInstall;$machinePath", 'Machine')
+}
+$env:Path = "$bunInstall;" + $env:Path
+$installedBunVersion = & "$bunInstall\bun.exe" --version
+if ($LASTEXITCODE -ne 0 -or $installedBunVersion -cne $bunVersion) { throw 'Machine-wide Bun version verification failed' }
+Write-Host "Verified machine-wide Bun $installedBunVersion with protected user read/execute access"
+
 $bytes = New-Object byte[] 48
 $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
 $rng.GetBytes($bytes)

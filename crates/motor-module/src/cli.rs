@@ -36,6 +36,8 @@ mod records;
 #[cfg(test)]
 mod return_tests;
 mod returned_files;
+#[cfg(test)]
+mod wsl_tests;
 
 /// Nothing ran: the request was refused before the command started (by
 /// ck-motor, the runner or the daemon), or it could not be submitted.
@@ -159,6 +161,10 @@ pub struct RunArgs {
 /// Parse the words after `ck motor run`. An option takes its value as the
 /// next word or after `=`. The command starts after a mandatory `--`.
 pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
+    parse_args_checked(args, &crate::wsl::Checks::default())
+}
+
+fn parse_args_checked(args: &[String], wsl: &crate::wsl::Checks) -> Result<Invocation, String> {
     let mut parsed = RunArgs {
         timeout: DEFAULT_TIMEOUT_SECS,
         ..RunArgs::default()
@@ -180,7 +186,12 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
                     "--platform macos cannot be combined with --hosted or --allow-spill".into(),
                 );
             }
-            validate_return_args(&parsed)?;
+            // Return-path validation canonicalizes Git paths. Defer it for a
+            // WSL drive checkout so build_request reports the checkout refusal
+            // before any path is canonicalized by return-path validation.
+            if parsed.return_paths.is_empty() || supplied_wsl_refusal(&parsed, wsl).is_none() {
+                validate_return_args(&parsed)?;
+            }
             return Ok(Invocation::Run(parsed));
         }
         if word == "-h" || word == "--help" {
@@ -577,6 +588,22 @@ pub fn command_line(words: &[String]) -> String {
 /// contains the working directory and the repository root is that checkout's
 /// main checkout, as AFT keys them; ck-motor validates both again.
 pub fn build_request(args: &RunArgs) -> Result<RunRequest, String> {
+    build_request_checked(args, &crate::wsl::Checks::default())
+}
+
+fn supplied_wsl_refusal(args: &RunArgs, wsl: &crate::wsl::Checks) -> Option<String> {
+    let cwd = args.cwd.clone().or_else(|| std::env::current_dir().ok());
+    wsl.refusal(
+        cwd.iter()
+            .chain(args.siblings.iter())
+            .map(|path| path.as_path()),
+    )
+}
+
+fn build_request_checked(args: &RunArgs, wsl: &crate::wsl::Checks) -> Result<RunRequest, String> {
+    if let Some(message) = supplied_wsl_refusal(args, wsl) {
+        return Err(message);
+    }
     validate_return_args(args)?;
     let cwd = match &args.cwd {
         Some(cwd) => cwd.clone(),
@@ -1587,7 +1614,11 @@ impl RecordStream for QueuedStream {
 
 /// `ck-motor run ...`: parse, connect, run, and return the exit status.
 pub async fn main(args: &[String]) -> u8 {
-    let args = match parse_args(args) {
+    main_checked(args, &crate::wsl::Checks::default()).await
+}
+
+async fn main_checked(args: &[String], wsl: &crate::wsl::Checks) -> u8 {
+    let args = match parse_args_checked(args, wsl) {
         Ok(Invocation::Help) => {
             println!("{HELP}");
             return 0;
@@ -1606,7 +1637,7 @@ pub async fn main(args: &[String]) -> u8 {
         eprintln!("ck motor run: refused before start: {message}");
         return EXIT_REFUSED;
     }
-    let request = match build_request(&args) {
+    let request = match build_request_checked(&args, wsl) {
         Ok(request) => request,
         Err(message) => {
             eprintln!("ck motor run: refused before start: {message}");

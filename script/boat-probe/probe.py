@@ -964,7 +964,8 @@ def verify_phase_section(runner, outcome):
     qualified = all(status == 'passed' for status in phases.values()) and outcome.get('passed') is True
     not_run = [name for name in VERIFY_PHASES if phases[name] == 'not_run']
     lines = ["## Verify phases", "",
-             "Each phase restores the prepared image into its own sandbox. A phase not run is never a pass.", "",
+             "Each phase restores the prepared image into its own sandbox. A phase not run is never a pass, "
+             "and the core phase's live remote compile-cache section runs only with `--cache-inputs`.", "",
              f"Image qualified by this run: **{'yes' if qualified else 'no'}**"
              + (f" (not run: {', '.join(not_run)})" if not_run else "") + ".", "",
              "| Phase | Requested | Status | Sandbox | Seconds | Checks | Error |", "| --- | --- | --- | --- | --- | --- | --- |"]
@@ -1173,6 +1174,9 @@ def main(report_stream=None):
     parser.add_argument('--cargo-seed-archive', type=Path, help='tenant-1 private seed; required when applying the recipe')
     parser.add_argument('--acknowledge-tenant-one-private-cache', action='store_true',
                         help='required for runner-host: seed/image contain private fleet dependencies, never for customers')
+    parser.add_argument('--cache-inputs', type=Path,
+                        help='runner-host only: directory holding config.json, read-key and a Cargo seed bundle '
+                             'for the live remote-sccache check; omit it to record that check as not run')
     args = parser.parse_args()
     if args.quota_stop_wait_s is not None:
         if not args.runner_host:
@@ -1195,6 +1199,8 @@ def main(report_stream=None):
             parser.error('invalid prepared named-snapshot handle')
     if args.verify_phase and not args.verify_prepared_image:
         parser.error('--verify-phase requires --verify-prepared-image')
+    if args.cache_inputs and not args.runner_host:
+        parser.error('--cache-inputs requires --runner-host')
     if args.delete_retained_images and not args.cleanup:
         parser.error('--delete-retained-images requires --cleanup')
     if args.runner_host and not args.cleanup and not args.render:
@@ -1239,6 +1245,7 @@ def main(report_stream=None):
             runner.cargo_seed_manifest = args.cargo_seed_manifest
             runner.cargo_seed_sha256 = args.cargo_seed_sha256
             runner.cargo_seed_archive = args.cargo_seed_archive
+            runner.cache_inputs = args.cache_inputs
             if args.cache_bench:
                 from cache_bench import run
                 run(runner, args)

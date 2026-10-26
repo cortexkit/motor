@@ -21,6 +21,7 @@ mod spill;
 mod storage;
 pub use return_paths::ReturnOptions;
 mod transport;
+mod wsl;
 
 pub use config::{BrokerTokenSource, Config, MacosRunner, ShadowConfig, WindowsRunner};
 pub use hosted::account::AccountTokens;

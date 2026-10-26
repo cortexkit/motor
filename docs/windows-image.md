@@ -96,11 +96,17 @@ lock and exits with status 75 if another VM holds it, naming the holder.
 The SYSTEM bootstrap task disables the built-in
 administrator, randomizes local passwords and runs, in order:
 
-1. `setup-guest.ps1 -JobBaseline`: Git, Bun and MSVC Build Tools.
+1. `setup-guest.ps1 -JobBaseline`: Git and MSVC Build Tools. Per-user Bun and Rust
+   installation is reserved for standing builders, not job images.
 2. `setup-job-baseline.ps1`: PowerShell 7.6.7 installed natively by the elevated
    `install-powershell.ps1` at `C:\Program Files\PowerShell\7`, protected with
    SYSTEM/Administrators full control and Users read/execute and added to machine
-   `PATH` so native tools rebuilding their environment also find it; the standard
+   `PATH` so native tools rebuilding their environment also find it; Bun 1.4.2
+   downloaded during provisioning from the official `bun-windows-x64.zip` release,
+   verified against the SHA-256 from that release's `SHASUMS256.txt` (pins and
+   source URL in `setup-job-baseline.ps1`), and installed at
+   `C:\Program Files\Bun\bun.exe`, owned by Administrators with Users read/execute
+   and on machine `PATH` for offline Git Bash jobs; the standard
    `motor-job` user and its batch-logon
    right and `SeCreateSymbolicLinkPrivilege`, a machine-wide Rust toolchain for `x86_64-pc-windows-msvc` under
    `C:\rust` (read-only to the job user), the virtio-serial driver, and the

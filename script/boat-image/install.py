@@ -678,22 +678,47 @@ def accounts():
                 "--shell", "/usr/sbin/nologin", account)
 
 
-def install_journal_retention():
-    run("install", "-D", "-o", "root", "-g", "root", "-m", "0644",
-        str(ROOT / "script/runner/journald/60-motor-retention.conf"),
-        "/etc/systemd/journald.conf.d/60-motor-retention.conf")
-    run("systemctl", "restart", "systemd-journald")
-    config = run("systemd-analyze", "cat-config", "systemd/journald.conf", capture=True)
+# Boat's base image (the provider's Ubuntu image the prepared image is built
+# on) ships a journald drop-in that sets MaxRetentionSec=7day; a build on
+# 26 Oct 2026 observed that value overriding ours. journald reads drop-ins from
+# /etc, /run, /usr/local/lib and /usr/lib sorted together by file name, and for
+# a single-value option the file sorted last wins. The motor file is therefore
+# named zz-motor-retention.conf, which sorts after names starting with a digit
+# or a lowercase letter. The check below does not rely on that: it refuses the
+# image if any later file still overrides the value, and names that file.
+JOURNAL_RETENTION_DROP_IN = "/etc/systemd/journald.conf.d/zz-motor-retention.conf"
+
+
+def effective_journal_retention(config):
+    """The MaxRetentionSec journald applies, and the file that sets it, from
+    `systemd-analyze cat-config` output, which prints each file under a
+    `# <path>` header in the order journald reads them."""
+    source = None
     section = None
     retention = None
     for line in config.splitlines():
         line = line.strip()
-        if line.startswith("["):
+        if line.startswith("# /"):
+            source = line[2:]
+            section = None
+        elif line.startswith("["):
             section = line
         elif section == "[Journal]" and re.match(r"MaxRetentionSec\s*=", line):
-            retention = line.split("=", 1)[1].strip()
-    if retention != "14day":
-        raise ValueError("journald MaxRetentionSec: expected 14day, observed " + repr(retention))
+            retention = (line.split("=", 1)[1].strip(), source)
+    return retention
+
+
+def install_journal_retention():
+    run("install", "-D", "-o", "root", "-g", "root", "-m", "0644",
+        str(ROOT / "script/runner/journald/60-motor-retention.conf"),
+        JOURNAL_RETENTION_DROP_IN)
+    run("systemctl", "restart", "systemd-journald")
+    config = run("systemd-analyze", "cat-config", "systemd/journald.conf", capture=True)
+    retention = effective_journal_retention(config)
+    if retention is None or retention[0] != "14day":
+        value, source = retention or (None, None)
+        raise ValueError(f"journald MaxRetentionSec: expected 14day, observed {value!r}"
+                         f" set by {source or 'no file'}")
 
 
 def configure(pins, revision):

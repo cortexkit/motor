@@ -130,6 +130,7 @@ try {
         foreach ($right in @('SeBatchLogonRight','SeCreateSymbolicLinkPrivilege')) {
             Assert-Spike ($bootstrap -match "Verified $right for motor-job SID S-1-") 'verified-effective-job-right' $right
         }
+        Assert-Spike ($bootstrap -match 'Verified machine-wide Bun 1\.4\.2 with protected user read/execute access') 'verified-machine-bun-version' '1.4.2'
         $agent = [IO.Path]::Combine($volume, 'ProgramData\Motor\motor-winagent.exe')
         $expected = (([IO.File]::ReadAllText([IO.Path]::Combine($provision, 'winagent.sha256'))) -split '\s+')[0]
         Assert-Spike ((Get-SpikeFileSha256 $agent) -eq $expected) 'installed-agent-hash' $expected

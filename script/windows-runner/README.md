@@ -331,7 +331,8 @@ foreign-VM rejection while the target guest agent's listener is still active (a
 connect failure alone cannot pass); five full runner jobs with multi-frame trees,
 cold then warm registry/cache paths, large stdout and source-output collection,
 the non-admin `motor-job` guest account, and that host cache bytes do not leak into
-the guest's unrelated paths. The configured default commands are `cargo test
+the guest's unrelated paths. Every real job first requires `bun --version` to
+return exactly `1.4.2`, including jobs using a custom gate command. The configured default commands are `cargo test
 --locked --offline -- --nocapture` and `cargo clippy --all-targets --locked --offline --
 -D warnings`. It retains host VM-lifecycle samples, startup hash timing, and guest
 logs. Any failure stops the service and does not count as a skip. Return the complete

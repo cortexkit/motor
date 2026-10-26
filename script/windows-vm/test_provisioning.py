@@ -7,6 +7,7 @@ boots only while no job VM holds the lock and names the holder when one does.
 """
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -205,6 +206,52 @@ class BaselineInputsTests(unittest.TestCase):
                          "SetEnvironmentVariable('RUSTUP_HOME', $env:RUSTUP_HOME, 'Machine')",
                          "'C:\\rust' /inheritance:r", ':(OI)(CI)RX'):
             self.assertIn(expected, source)
+
+    def test_baseline_installs_checksum_pinned_bun_before_use(self):
+        source = (HERE / "setup-job-baseline.ps1").read_text()
+        version = json.loads((HERE.parent / "runner/toolchain.json").read_text())["tools"]["bun"]["version"]
+        self.assertEqual(version, "1.4.2")
+        for expected in (f"$bunVersion = '{version}'",
+                         "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/SHASUMS256.txt",
+                         "$bunSha256 = 'ce4c17497b2f29712a99d3d53f028de28cd42e3bacb8589599e7f000e49b6405'",
+                         "Invoke-WebRequest 'https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-windows-x64.zip' -OutFile $bunArchive",
+                         "if ((Get-FileHash -LiteralPath $bunArchive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $bunSha256) {\n        throw 'Bun archive SHA-256 mismatch'\n    }"):
+            self.assertIn(expected, source)
+        self.assertLess(source.index("Invoke-WebRequest 'https://github.com/oven-sh/bun/"), source.index("Get-FileHash -LiteralPath $bunArchive"))
+        self.assertLess(source.index("throw 'Bun archive SHA-256 mismatch'"), source.index("Expand-Archive -LiteralPath $bunArchive"))
+        self.assertLess(source.index("Expand-Archive -LiteralPath $bunArchive"), source.index('& "$bunInstall\\bun.exe" --version'))
+
+    def test_baseline_bun_is_protected_and_on_machine_path(self):
+        source = (HERE / "setup-job-baseline.ps1").read_text()
+        for expected in ("$bunInstall = 'C:\\Program Files\\Bun'",
+                         "& icacls $bunInstall /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'",
+                         '& icacls "$bunInstall\\*" /reset /T /C /L /Q',
+                         "& icacls $bunInstall /setowner '*S-1-5-32-544' /T /C /L /Q",
+                         "[Environment]::SetEnvironmentVariable('Path', \"$bunInstall;$machinePath\", 'Machine')",
+                         '$env:Path = "$bunInstall;" + $env:Path',
+                         'if ($LASTEXITCODE -ne 0 -or $installedBunVersion -cne $bunVersion) { throw'):
+            self.assertIn(expected, source)
+        self.assertLess(source.index("& icacls $bunInstall /inheritance:r"), source.index("Expand-Archive -LiteralPath $bunArchive"))
+        self.assertLess(source.index("& icacls $bunInstall /setowner"), source.index('& "$bunInstall\\bun.exe" --version'))
+
+    def test_job_baseline_owns_bun_for_both_guest_install_paths(self):
+        guest = (HERE / "setup-guest.ps1").read_text()
+        self.assertIn("if ($JobBaseline) {\n    Write-Host 'Job baseline: machine-wide pinned Bun is installed by setup-job-baseline.ps1.'\n} elseif ($null -eq (Get-Command bun", guest)
+        self.assertIn("$verifyTools = if ($JobBaseline) { @('git') }", guest)
+        bootstrap = (HERE / "bootstrap.ps1").read_text()
+        self.assertIn('setup-guest.ps1 -JobBaseline:$JobBaseline', bootstrap)
+        self.assertIn('setup-job-baseline.ps1 -HyperVSpike:$HyperVSpike', bootstrap)
+        baseline = (HERE / "setup-job-baseline.ps1").read_text().split("$bunVersion = ", 1)[1].split("$bytes = ", 1)[0]
+        self.assertNotIn("$HasWinget", baseline)
+        self.assertNotIn("$HyperVSpike", baseline)
+
+    def test_windows_image_qualification_requires_bun_version(self):
+        root = HERE.parent.parent
+        operator = (root / "crates/motor-runner/src/tests/windows_operator.rs").read_text()
+        self.assertIn('git --version; bun --version; pwsh', operator)
+        self.assertIn('output.lines().any(|line| line.trim() == "1.4.2")', operator)
+        provision = (HERE.parent / "hyperv-spike/provision.ps1").read_text()
+        self.assertIn("Assert-Spike ($bootstrap -match 'Verified machine-wide Bun 1\\.4\\.2 with protected user read/execute access')", provision)
 
     def test_baseline_installs_and_verifies_rustfmt_and_clippy_for_all_images(self):
         source = (HERE / "setup-job-baseline.ps1").read_text()

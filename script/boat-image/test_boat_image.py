@@ -236,6 +236,9 @@ class RecipeTests(unittest.TestCase):
         self.assertNotIn("--max-weight", unit)
         self.assertNotIn("--rustc-slots", unit)
         self.assertNotIn("@VCPUS@", unit)
+        # CLOUD's broker installs /run/motor/cache on every create and resume;
+        # the runner reads it only when its own switch is on.
+        self.assertIn("--remote-cache true", unit)
         self.assertIn("--job-network veth", unit)
         self.assertIn("User=root", unit)
         self.assertIn('--tenant-vm --tenant-socket-dir /run/motor-tenant', unit)
@@ -1052,6 +1055,17 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(start.sized_runner_args(['serve', '--max-weight', '8', '--rustc-slots', '8', '--job-network', 'veth'], 4),
                          ['serve', '--job-network', 'veth', '--max-weight', '4', '--rustc-slots', '4'])
         self.assertEqual(start.sized_runner_args(['serve'], 2), ['serve', '--max-weight', '2', '--rustc-slots', '2'])
+
+    def test_remote_cache_switch_is_always_passed_once_and_not_duplicated(self):
+        # The runner ignores provisioning unless its switch is on, so every Boat
+        # start must carry --remote-cache true exactly once, whatever an older
+        # unit file still says.
+        self.assertEqual(start.boat_runner_args(['serve', '--job-network', 'veth']),
+                         ['serve', '--job-network', 'veth', '--remote-cache', 'true'])
+        self.assertEqual(start.boat_runner_args(['serve', '--remote-cache', 'false', '--job-network', 'veth']),
+                         ['serve', '--job-network', 'veth', '--remote-cache', 'true'])
+        unit = (HERE / 'motor-boat.service').read_text()
+        self.assertEqual(unit.count('--remote-cache'), 1)
         with tempfile.TemporaryDirectory() as tmp:
             source, sized = Path(tmp, 'sandbox.json'), Path(tmp, 'sized.json')
             source.write_text(json.dumps({'vcpu_ceiling': 8, 'ready_marker': '/run/motor/endpoint-ready'}))
@@ -1072,9 +1086,13 @@ class RecipeTests(unittest.TestCase):
              patch.object(start, 'sandbox_cpus', return_value=4), patch.object(start.subprocess, 'Popen', popen), \
              self.assertRaises(Stop):
             start.main()
-        self.assertEqual(launched[0][:6], ['/usr/local/bin/motor-runner', 'serve', '--boat-profile',
-                                           '--max-weight', '4', '--rustc-slots'])
-        self.assertEqual(launched[0][6], '4')
+        # The cache switch and the measured CPU counts are all that matter; the
+        # order between them is not a contract.
+        self.assertEqual(launched[0][:3], ['/usr/local/bin/motor-runner', 'serve', '--boat-profile'])
+        self.assertEqual(launched[0][launched[0].index('--max-weight') + 1], '4')
+        self.assertEqual(launched[0][launched[0].index('--rustc-slots') + 1], '4')
+        self.assertIn('--remote-cache', launched[0])
+        self.assertEqual(launched[0][launched[0].index('--remote-cache') + 1], 'true')
 
     def test_network_preflight_uses_absolute_admin_paths_and_never_applies_rules(self):
         calls = []
@@ -1283,6 +1301,34 @@ class AptInstallTests(unittest.TestCase):
         for package in manifest['apt_packages']['required']:
             if package != 'openssh-server':
                 self.assertIn(package, command)
+
+
+class JournalRetentionTests(unittest.TestCase):
+    """journald reads drop-ins from all its configuration directories sorted
+    together by file name, and the file sorted last sets a single-value option.
+    Boat's base image ships a drop-in setting MaxRetentionSec=7day, so the
+    installer must name the file that wins and refuse a later override."""
+
+    BASE = "# /etc/systemd/journald.conf\n[Journal]\n#MaxRetentionSec=0\n\n"
+
+    def test_a_later_drop_in_overrides_and_is_named(self):
+        config = (self.BASE + "# /etc/systemd/journald.conf.d/60-motor-retention.conf\n[Journal]\n"
+                  "MaxRetentionSec=14day\n\n# /usr/lib/systemd/journald.conf.d/boat.conf\n[Journal]\nMaxRetentionSec=7day\n")
+        self.assertEqual(install.effective_journal_retention(config),
+                         ("7day", "/usr/lib/systemd/journald.conf.d/boat.conf"))
+        with patch.object(install, "run", side_effect=lambda *c, **k: config if c[:1] == ("systemd-analyze",) else ""):
+            with self.assertRaisesRegex(ValueError, "observed '7day' set by /usr/lib/systemd/journald.conf.d/boat.conf"):
+                install.install_journal_retention()
+
+    def test_the_motor_drop_in_sorts_after_base_image_drop_ins(self):
+        name = Path(install.JOURNAL_RETENTION_DROP_IN).name
+        for base in ("boat.conf", "99-boat.conf", "60-motor-retention.conf", "syslog.conf"):
+            self.assertGreater(name, base)
+        config = (self.BASE + "# /usr/lib/systemd/journald.conf.d/boat.conf\n[Journal]\nMaxRetentionSec=7day\n\n"
+                  f"# {install.JOURNAL_RETENTION_DROP_IN}\n[Journal]\nMaxRetentionSec=14day\n")
+        with patch.object(install, "run", side_effect=lambda *c, **k: config if c[:1] == ("systemd-analyze",) else "") as run:
+            install.install_journal_retention()
+        self.assertIn(install.JOURNAL_RETENTION_DROP_IN, run.call_args_list[0].args)
 
 
 class PnpmInstallTests(unittest.TestCase):

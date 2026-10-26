@@ -182,9 +182,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-exec-remote-types"
-version = "0.2.13"
+version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15e25657c2655e2d1e3a5a744d98efcb2560990c2fd649cf938b10e2b229c4bd"
+checksum = "3fc11cc28c2ead337d3a70e27ba1b7b6a1b70ad169ee04172186c41c5e04c2ba"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -1022,6 +1022,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "sha2",
  "ssh-key",
  "subc-client-rs",
