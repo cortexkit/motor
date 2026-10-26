@@ -45,12 +45,14 @@ pub(crate) fn host_str(value: &str) -> HostPath<'_> {
 
 /// A tree the runner stores at `host` and a job sees at `caller`: one sandbox
 /// bind's source and destination. Identity trees use one path for both.
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct JobTree<'a> {
     pub(crate) host: HostPath<'a>,
     pub(crate) caller: &'a Path,
 }
 
+#[cfg(target_os = "linux")]
 impl<'a> JobTree<'a> {
     pub(crate) fn new(host: &'a Path, caller: &'a Path) -> Self {
         Self {
@@ -71,12 +73,14 @@ impl<'a> JobTree<'a> {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl<'a> From<&'a Path> for JobTree<'a> {
     fn from(path: &'a Path) -> Self {
         Self::new(path, path)
     }
 }
 
+#[cfg(target_os = "linux")]
 impl<'a> From<&'a PathBuf> for JobTree<'a> {
     fn from(path: &'a PathBuf) -> Self {
         Self::new(path, path)
@@ -733,7 +737,8 @@ pub(crate) fn host_run(config: &crate::Config, request: &Run) -> HostRun {
 }
 
 /// The caller-form checkout a Run's job sees: its workspace, or a fill's
-/// checkout.
+/// checkout. Used only to plan Linux sandbox binds.
+#[cfg(target_os = "linux")]
 pub(crate) fn caller_checkout(request: &Run) -> &Path {
     Path::new(run(request).workspace.checkout().caller.text())
 }
