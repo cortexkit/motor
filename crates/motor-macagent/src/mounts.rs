@@ -119,11 +119,11 @@ pub fn mount_all(entries: &[Mount], system: &mut impl System) -> io::Result<()> 
     for entry in entries {
         let matches: Vec<_> = observed
             .iter()
-            .filter(|o| reported_at(&o.destination, &entry.destination))
+            .filter(|o| o.destination == entry.destination)
             .collect();
         if matches.len() != 1
-            || matches[0].tag != entry.tag
-            || matches[0].filesystem != "virtiofs"
+            || matches[0].tag != VIRTIOFS_SOURCE
+            || matches[0].filesystem != VIRTIOFS_TYPE
             || matches[0].read_only != entry.read_only
             || !matches[0].nosuid
             || !matches[0].nodev
@@ -131,14 +131,14 @@ pub fn mount_all(entries: &[Mount], system: &mut impl System) -> io::Result<()> 
             return Err(entry_error(
                 entry,
                 format!(
-                    "mounted filesystem, tag or access mode does not match metadata; observed at this destination: {matches:?}"
+                    "mounted filesystem or access mode does not match metadata; observed at this destination: {matches:?}"
                 ),
             ));
         }
     }
     if observed
         .iter()
-        .filter(|o| o.filesystem == "virtiofs")
+        .filter(|o| o.filesystem == VIRTIOFS_TYPE)
         .count()
         != entries.len()
     {
@@ -147,15 +147,13 @@ pub fn mount_all(entries: &[Mount], system: &mut impl System) -> io::Result<()> 
     Ok(())
 }
 
-/// macOS reports a mount under a firmlinked Data-volume directory (such as
-/// /Users) at its Data-volume path, `/System/Volumes/Data/Users/...`, so a
-/// mount made at the caller's path is matched at either spelling.
-fn reported_at(reported: &Path, destination: &Path) -> bool {
-    reported == destination
-        || destination
-            .strip_prefix("/")
-            .is_ok_and(|relative| reported == Path::new("/System/Volumes/Data").join(relative))
-}
+/// macOS reports every virtiofs mount with this file-system type and the same
+/// generic source name, never the share's tag, so the tag cannot be read back.
+/// The checks above still bind each tag to its destination: `mount_virtiofs`
+/// mounted that tag there, exactly one virtio mount sits at each destination,
+/// and no virtio mount exists outside the boot map.
+const VIRTIOFS_TYPE: &str = "AppleVirtIOFS";
+const VIRTIOFS_SOURCE: &str = "virtio-fs";
 
 /// Walk from a retained directory descriptor, refusing links in every component.
 /// Newly created directories are root-owned when used by the root guest daemon.
@@ -381,44 +379,38 @@ mod tests {
             Ok(())
         }
         fn observations(&mut self) -> io::Result<Vec<Observation>> {
+            // Exactly what macOS reports for a virtiofs mount: a generic source
+            // name and Apple's file-system type, never the share's tag.
             let mut out: Vec<_> = self
                 .entries
                 .iter()
                 .map(|e| Observation {
-                    tag: e.tag.clone(),
+                    tag: VIRTIOFS_SOURCE.into(),
                     destination: e.destination.clone(),
                     read_only: e.read_only,
                     nosuid: true,
                     nodev: true,
-                    filesystem: "virtiofs".into(),
+                    filesystem: VIRTIOFS_TYPE.into(),
                 })
                 .collect();
             match self.corrupt {
-                1 => out[0].tag = "wrong".into(),
+                1 => out[0].tag = "/dev/disk3s1".into(),
                 2 => out[0].read_only = true,
                 3 => out[0].filesystem = "apfs".into(),
                 4 => {
                     out.pop();
                 }
                 5 => out.push(Observation {
-                    tag: "unexpected".into(),
+                    tag: VIRTIOFS_SOURCE.into(),
                     destination: "/Users/other".into(),
                     read_only: false,
                     nosuid: true,
                     nodev: true,
-                    filesystem: "virtiofs".into(),
+                    filesystem: VIRTIOFS_TYPE.into(),
                 }),
                 6 => out[0].nosuid = false,
                 7 => out[0].nodev = false,
-                // macOS reports /Users mounts at their Data-volume path.
-                8 => {
-                    for o in &mut out {
-                        if let Ok(rest) = o.destination.strip_prefix("/Users") {
-                            o.destination = Path::new("/System/Volumes/Data/Users").join(rest);
-                        }
-                    }
-                }
-                9 => out[0].destination = "/System/Volumes/Data/Users/test/other".into(),
+                8 => out[0].destination = "/Users/test/other".into(),
                 _ => {}
             }
             Ok(out)
@@ -429,23 +421,16 @@ mod tests {
         let mut fake = Fake::default();
         mount_all(&map(), &mut fake).unwrap();
         assert_eq!(fake.prepared, 3);
-        for corrupt in 1..=7 {
+        for corrupt in 1..=8 {
             let mut fake = Fake {
                 corrupt,
                 ..Fake::default()
             };
-            assert!(mount_all(&map(), &mut fake).is_err());
+            assert!(
+                mount_all(&map(), &mut fake).is_err(),
+                "corruption {corrupt}"
+            );
         }
-        let mut firmlinked = Fake {
-            corrupt: 8,
-            ..Fake::default()
-        };
-        mount_all(&map(), &mut firmlinked).unwrap();
-        let mut elsewhere = Fake {
-            corrupt: 9,
-            ..Fake::default()
-        };
-        assert!(mount_all(&map(), &mut elsewhere).is_err());
         let mut bad = map();
         bad[0].destination = "relative".into();
         let mut fake = Fake::default();
