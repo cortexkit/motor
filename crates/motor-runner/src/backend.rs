@@ -538,6 +538,11 @@ impl Backend for HostBackend {
         // A mapped job's trees live under a host root; every filesystem step
         // below uses their host forms, and only the sandbox sees caller paths.
         let mapped = paths::mapped_run(config, r);
+        // In-place population and repair use caller-spelled sibling paths.
+        // Mapped non-base jobs with siblings must resolve snapshots first.
+        if mapped && !s.base && !r.siblings.is_empty() && s.snapshots.is_none() {
+            return Err(invalid("mapped siblings require resolved snapshots"));
+        }
         let host = paths::host_run(config, r);
         let host_siblings = paths::host_siblings(config, &r.siblings);
         let validate = || -> io::Result<()> {
@@ -642,9 +647,10 @@ impl Backend for HostBackend {
         // workspace yet while its siblings can already exist. Admission never
         // lets a sibling be prepared while a job is running in it, so no job is
         // affected. A job that mounts its siblings from snapshots never reads
-        // or writes their host paths, so it leaves them alone.
+        // or writes their host paths, so it leaves them alone. Writer sandboxes
+        // mount no siblings, so base builds need no sibling repair either.
         #[cfg(target_os = "linux")]
-        if config.isolate_jobs && s.snapshots.is_none() {
+        if config.isolate_jobs && !s.base && s.snapshots.is_none() {
             for sibling in &r.siblings {
                 let sibling = paths::sibling(sibling).host.as_path();
                 if !sibling.is_dir() {

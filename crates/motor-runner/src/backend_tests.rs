@@ -149,6 +149,101 @@ fn trees(config: &Config) -> Trees {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn mapped_base_materialize_leaves_unrelated_caller_sibling_untouched() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let scratch = ScratchDir::new("mapped-base-sibling-repair");
+    let caller_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/scratch")
+        .join(format!("caller-sibling-{}", Uuid::now_v7()));
+    let sibling = caller_root.join("user/source/commons");
+    fs::create_dir_all(&sibling).unwrap();
+    fs::write(sibling.join("unrelated"), "host data, not a job checkout").unwrap();
+    fs::set_permissions(&sibling, fs::Permissions::from_mode(0o700)).unwrap();
+    let before = fs::metadata(&sibling).unwrap();
+    let host_root = scratch.join("mapped");
+    fs::create_dir_all(host_root.join("user/source/commons")).unwrap();
+    let mut config = Config::new(scratch.join("state"), "main");
+    config.isolate_jobs = true;
+    config.writer_account = Some(crate::isolation::WriterAccount {
+        uid: unsafe { libc::geteuid() },
+    });
+    config.caller_roots = vec![crate::CallerRoot {
+        caller_prefix: caller_root.to_string_lossy().into_owned(),
+        host_root,
+    }];
+    let mut setup = setup(&caller_root.join("user/worktrees/main"));
+    setup.base = true;
+    setup.request.siblings = vec![motor_protocol::SiblingSnapshot {
+        canonical_path: sibling.to_string_lossy().into_owned(),
+        commit: "a".repeat(40),
+        tree_hash: "b".repeat(40),
+        base_commit: None,
+    }];
+    // Intercept every privileged subprocess so this regression is safe without
+    // root and cannot repair the unrelated tree even on a broken runner.
+    crate::systemd::with_process_hook(
+        Box::new(|command| panic!("unexpected privileged sibling repair: {command:?}")),
+        || {
+            let error = HostBackend
+                .materialize(&config, &trees(&config), &setup)
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("checkout workspace"), "{error}");
+        },
+    );
+    let after = fs::metadata(&sibling).unwrap();
+    assert_eq!(
+        (after.uid(), after.gid(), after.mode()),
+        (before.uid(), before.gid(), before.mode())
+    );
+    assert_eq!(
+        fs::read_to_string(sibling.join("unrelated")).unwrap(),
+        "host data, not a job checkout"
+    );
+    fs::remove_dir_all(caller_root).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mapped_materialize_refuses_siblings_without_snapshots_before_repair() {
+    let scratch = ScratchDir::new("mapped-siblings-without-snapshots");
+    let caller_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/scratch")
+        .join(format!("caller-no-snapshots-{}", Uuid::now_v7()));
+    let mut config = Config::new(scratch.join("state"), "main");
+    config.isolate_jobs = true;
+    config.caller_roots = vec![crate::CallerRoot {
+        caller_prefix: caller_root.to_string_lossy().into_owned(),
+        host_root: scratch.join("mapped"),
+    }];
+    let mut setup = setup(&caller_root.join("user/worktrees/main"));
+    setup.request.siblings = vec![motor_protocol::SiblingSnapshot {
+        canonical_path: caller_root
+            .join("user/source/commons")
+            .to_string_lossy()
+            .into_owned(),
+        commit: "a".repeat(40),
+        tree_hash: "b".repeat(40),
+        base_commit: None,
+    }];
+    crate::systemd::with_process_hook(
+        Box::new(|command| panic!("privileged repair before mapped-sibling refusal: {command:?}")),
+        || {
+            let error = HostBackend
+                .materialize(&config, &trees(&config), &setup)
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.to_string(),
+                "mapped siblings require resolved snapshots"
+            );
+        },
+    );
+}
+
 fn setup(cwd: &Path) -> Setup {
     let cwd = cwd.to_string_lossy().into_owned();
     let id = Uuid::now_v7();

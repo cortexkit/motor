@@ -11,26 +11,44 @@ here=$(cd "$(dirname "$0")" && pwd)
 dest=$HOME/.config/systemd/user
 changed=0
 check_instance() {
-  local instance=$1 binary override refusal arg flagged=false
+  local instance=$1 binary override refusal state_root i flagged=false ever_enabled=false
   local -a command options
   # The effective ExecStart selects each instance's binary, not the template's binary.
   mapfile -d '' -t command < <(
     python3 "$here/deploy_canary.py" --repository-unit-command "$here/units" "$instance")
   [ "${#command[@]}" -gt 0 ] || { echo "skipped $rel: cannot extract $instance serve arguments" >&2; return 1; }
   options=("${command[@]:1}")
-  for arg in "${options[@]}"; do
-    case "$arg" in --caller-root|--caller-root=*) flagged=true;; esac
+  state_root=${RUNNER_STATE_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/motor-runner}
+  if [ "$instance" = windows ]; then
+    state_root=${RUNNER_STATE_ROOT:-/srv/build/motor-windows/windows/state}
+  fi
+  for ((i=0; i<${#options[@]}; i++)); do
+    case "${options[i]}" in
+      --caller-root|--caller-root=*) flagged=true ;;
+      --state-root)
+        if [ "$((i+1))" -ge "${#options[@]}" ]; then
+          echo "skipped $rel: $instance has --state-root without a value" >&2; return 1
+        fi
+        state_root=${options[i+1]} ;;
+      --state-root=*) state_root=${options[i]#--state-root=} ;;
+    esac
   done
+  # Removing the flag does not erase mapping history: later starts must still
+  # use a binary that understands the persistent caller-root state.
+  [ ! -e "$state_root/$instance/caller-roots-ever-enabled" ] || ever_enabled=true
   override=RUNNER_BINARY_$instance
   binary=${!override:-${command[0]}}
   if [ ! -x "$binary" ]; then
-    [ "$flagged" = false ] && return 0 # Preserve first installation of unflagged units.
-    refusal="binary is absent or not executable: $binary"
+    [ "$flagged" = false ] && [ "$ever_enabled" = false ] && return 0 # Allow unflagged units with no mapping history.
+    refusal="binary is absent or not executable: $binary; cannot verify caller-root compatibility"
   elif refusal=$("$binary" check-options "${options[@]}" 2>&1); then
     return 0
   elif [[ "$refusal" = *'usage: motor-runner '* && "$refusal" != *check-options* ]]; then
-    [ "$flagged" = false ] && return 0
+    [ "$flagged" = false ] && [ "$ever_enabled" = false ] && return 0
     refusal="binary $binary lacks check-options: $refusal"
+  fi
+  if [ "$ever_enabled" = true ]; then
+    refusal="$refusal; caller roots were enabled for $instance; a pre-mapping binary is unsupported"
   fi
   printf 'skipped %s: %s check-options refusal: %s\n' "$rel" "$instance" "$refusal" >&2
   return 1
