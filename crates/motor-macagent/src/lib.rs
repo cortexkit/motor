@@ -186,51 +186,25 @@ mod execution {
             match self {
                 Self::User(user) => {
                     let user = validate_user(*user)?;
-                    // A non-root kill(-1) reaches all processes of the job uid,
-                    // including descendants that escaped the shell's process group.
-                    // The root agent must never issue that syscall as root.
-                    unsafe {
-                        let pid = libc::fork();
-                        if pid == -1 {
-                            return Err(io::Error::last_os_error());
-                        }
-                        if pid == 0 {
-                            // Exit codes 1-3 name the failed credential step;
-                            // 100 + errno reports a failed kill.
-                            if libc::setgroups(0, std::ptr::null()) != 0 {
-                                libc::_exit(1);
-                            }
-                            if libc::setgid(user.gid) != 0 {
-                                libc::_exit(2);
-                            }
-                            if libc::setuid(user.uid) != 0 {
-                                libc::_exit(3);
-                            }
-                            if libc::kill(-1, libc::SIGKILL) == 0 {
-                                libc::_exit(0);
-                            }
-                            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                            libc::_exit(if errno == libc::ESRCH {
-                                0
-                            } else {
-                                100 + errno.min(155)
-                            });
-                        }
-                        let mut status = 0;
-                        loop {
-                            if libc::waitpid(pid, &mut status, 0) != -1 {
-                                break;
-                            }
-                            let error = io::Error::last_os_error();
-                            if error.kind() != io::ErrorKind::Interrupted {
-                                return Err(error);
-                            }
-                        }
-                        if status != 0 {
+                    // A helper that dies from SIGKILL may have killed itself:
+                    // macOS includes the sender in a non-root kill(-1). So the
+                    // proof of success is that no job-uid process remains,
+                    // not how the helper ended; repeat to catch late forks.
+                    for _ in 0..KILL_SWEEPS {
+                        let status = uid_kill_helper(user)?;
+                        let self_killed =
+                            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL;
+                        if status != 0 && !self_killed {
                             return Err(io::Error::other(kill_child_failure(status)));
                         }
+                        if uid_processes(user.uid)? == 0 {
+                            return Ok(());
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
                     }
-                    Ok(())
+                    Err(io::Error::other(format!(
+                        "motorjob processes remain after {KILL_SWEEPS} SIGKILL sweeps"
+                    )))
                 }
                 #[cfg(test)]
                 Self::ProcessGroup {
@@ -253,6 +227,94 @@ mod execution {
                 }
             }
         }
+    }
+
+    const KILL_SWEEPS: usize = 10;
+
+    /// Fork a child that drops to the job uid and sends a non-root kill(-1),
+    /// which reaches every job-uid process, including descendants that left
+    /// the shell's process group. The root agent never issues kill(-1) as root.
+    /// Returns the child's wait status.
+    fn uid_kill_helper(user: User) -> io::Result<libc::c_int> {
+        unsafe {
+            let pid = libc::fork();
+            if pid == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if pid == 0 {
+                // Exit codes 1-3 name the failed credential step;
+                // 100 + errno reports a failed kill.
+                if libc::setgroups(0, std::ptr::null()) != 0 {
+                    libc::_exit(1);
+                }
+                if libc::setgid(user.gid) != 0 {
+                    libc::_exit(2);
+                }
+                if libc::setuid(user.uid) != 0 {
+                    libc::_exit(3);
+                }
+                if libc::kill(-1, libc::SIGKILL) == 0 {
+                    libc::_exit(0);
+                }
+                let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                libc::_exit(if errno == libc::ESRCH {
+                    0
+                } else {
+                    100 + errno.min(155)
+                });
+            }
+            let mut status = 0;
+            loop {
+                if libc::waitpid(pid, &mut status, 0) != -1 {
+                    return Ok(status);
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Count live processes whose real uid is `uid`.
+    #[cfg(target_os = "macos")]
+    fn uid_processes(uid: libc::uid_t) -> io::Result<usize> {
+        // PROC_UID_ONLY from <sys/proc_info.h>; not exported by the libc crate.
+        const PROC_UID_ONLY: u32 = 4;
+        let mut pids = vec![0 as libc::pid_t; 4096];
+        let bytes = unsafe {
+            libc::proc_listpids(
+                PROC_UID_ONLY,
+                uid,
+                pids.as_mut_ptr().cast(),
+                (pids.len() * std::mem::size_of::<libc::pid_t>()) as i32,
+            )
+        };
+        if bytes < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let count = bytes as usize / std::mem::size_of::<libc::pid_t>();
+        Ok(pids[..count].iter().filter(|pid| **pid > 0).count())
+    }
+
+    /// Count live processes owned by `uid` (portable fallback for builds
+    /// that aren't the macOS guest).
+    #[cfg(not(target_os = "macos"))]
+    fn uid_processes(uid: libc::uid_t) -> io::Result<usize> {
+        use std::os::unix::fs::MetadataExt;
+        let mut count = 0;
+        for entry in std::fs::read_dir("/proc")? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
+                && entry.metadata().is_ok_and(|m| m.uid() == uid)
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// Describe how the uid-scoped kill helper ended, for the agent's error.
