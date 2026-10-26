@@ -23,6 +23,27 @@ const SHADOW_RETRY_DELAYS: [Duration; 6] = [
 ];
 
 impl Client {
+    pub(crate) async fn release_stored(&self, id: Uuid, storage: &Storage) -> Result<(), Error> {
+        let _finish = storage.lock_finish(id).await;
+        if storage
+            .job(id)
+            .and_then(|j| j.hosted)
+            .is_some_and(|s| s.finish_done)
+        {
+            return Ok(());
+        }
+        let result = self.release(id).await;
+        if result.is_ok() || matches!(result, Err(Error::Released | Error::Finished)) {
+            storage
+                .hosted_update(id, |s| {
+                    s.finish_done = true;
+                    s.cleanup_pending = false;
+                })
+                .map_err(|_| Error::Broker)?;
+        }
+        result
+    }
+
     /// Retry settlement within a fixed budget without persisting shadow state.
     /// A lost lease response can hide a booked sandbox. Probe release by job ID
     /// even without a response, and finish if the broker says it was admitted.
@@ -113,6 +134,9 @@ impl Client {
         terminal: Option<&TerminalRecord>,
         storage: &Storage,
     ) -> std::io::Result<bool> {
+        // Normal completion, cancellation recovery and shutdown can meet here.
+        // Serialize the request as well as the state updates, not just the body.
+        let _finish = storage.lock_finish(id).await;
         let Some(state) = storage.job(id).and_then(|j| j.hosted) else {
             return Ok(false);
         };
@@ -154,6 +178,7 @@ impl Client {
                     storage.hosted_update(id, |s| {
                         s.pending_finish = None;
                         s.finish_done = true;
+                        s.cleanup_pending = false;
                         s.billed_vcpu_ms = Some(settled);
                         s.billing = super::BillingStatus::Available;
                     })?;
@@ -164,6 +189,7 @@ impl Client {
                     storage.hosted_update(id, |s| {
                         s.pending_finish = None;
                         s.finish_done = true;
+                        s.cleanup_pending = false;
                         s.billing = super::BillingStatus::Unavailable;
                         if lost {
                             s.hosted_code = Some("hosted_sandbox_lost".into());
