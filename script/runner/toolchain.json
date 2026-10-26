@@ -502,6 +502,18 @@
         "cargo_home": "/tenant/cargo-home",
         "rustup_home": "/usr/local/lib/motor/rustup"
       }
+    },
+    "boat": {
+      "host": {
+        "host_files": {
+          "/etc/systemd/journald.conf.d/zz-motor-retention.conf": {
+            "sha256": "d2d5e434880b56858792a23d03ad7ba58b157066d7d5f319cc6b6c3d7805cc89",
+            "uid": 0,
+            "gid": 0,
+            "mode": 420
+          }
+        }
+      }
     }
   },
   "rust_default": "1.99.0-x86_64-unknown-linux-gnu",

@@ -403,7 +403,8 @@ class ParityTests(unittest.TestCase):
                 'apt_packages': {name: 'distro-version' for name in manifest['apt_packages']['required']
                                  + manifest['apt_packages']['by_role'][role] + ['coreutils', 'gnu-coreutils']},
                 'sccache_inputs_sha256': manifest['sccache']['inputs_sha256'],
-                'host_files': {} if job else copy.deepcopy(manifest['host_files']),
+                'host_files': {} if job else copy.deepcopy(
+                    parity.role_manifest(self.manifest, role)['host_files']),
                 'job_environment': {**manifest['job_environment'], **manifest['job_environment_by_role'][role]},
                 'runtime': {'proc': {name: True for name in ('self/mountinfo', 'cpuinfo', 'meminfo')},
                             'inotify': {'max_user_instances': 8192}, 'dev_shm_writable': True,
@@ -455,18 +456,22 @@ class ParityTests(unittest.TestCase):
                           'uid': 0, 'gid': 0, 'mode': 0o644}, self.manifest['host_files'][path])
         for role in ('build-server', 'boat', 'tenant'):
             with self.subTest(role=role):
+                # Boat installs the same file under a later-sorting name.
+                [role_path] = parity.role_manifest(self.manifest, role)['host_files']
                 actual = self.observed(role)
                 if role in ('boat', 'tenant'):
-                    actual.update(self.manifest['layout_by_role'].get(role, {}).get('host', {}))
+                    actual.update({key: value for key, value in
+                                   self.manifest['layout_by_role'].get(role, {}).get('host', {}).items()
+                                   if key != 'host_files'})
                     actual['sccache_artifacts'] = {
                         'inputs_sha256': self.manifest['sccache']['inputs_sha256'],
                         'binaries': {name: actual['cargo_binaries'][name]['sha256']
                                      for name in self.manifest['sccache']['build_server_sha256']}}
                 self.assertEqual([], parity.differences(self.manifest, actual, role=role))
-                del actual['host_files'][path]
+                del actual['host_files'][role_path]
                 errors = parity.differences(self.manifest, actual, role=role)
                 self.assertEqual(1, len(errors))
-                self.assertIn('host file ' + path, errors[0])
+                self.assertIn('host file ' + role_path, errors[0])
                 job_actual = self.observed(role, job=True)
                 job_actual['host_files'] = {}
                 self.assertTrue(self.report(job_actual, role=role, job=True)['passed'])
@@ -1060,6 +1065,25 @@ class ParityTests(unittest.TestCase):
                 manifest['tools']['git'].update(change)
                 with self.assertRaisesRegex(ValueError, 'git'):
                     parity.validate(manifest)
+
+
+class JournalRetentionHostFileTests(unittest.TestCase):
+    """The Boat image installs the shared journald retention file under
+    zz-motor-retention.conf so it sorts after the drop-in Boat's base image
+    ships; the build server and tenant keep 60-motor-retention.conf. Each role
+    must check the name it actually installs, with identical contents."""
+
+    def test_each_role_checks_the_retention_file_it_installs(self):
+        manifest = json.loads(parity.MANIFEST.read_text())
+        shared = '/etc/systemd/journald.conf.d/60-motor-retention.conf'
+        boat = '/etc/systemd/journald.conf.d/zz-motor-retention.conf'
+        for role in ('build-server', 'tenant'):
+            self.assertEqual([shared], list(parity.role_manifest(manifest, role)['host_files']))
+        boat_files = parity.role_manifest(manifest, 'boat')['host_files']
+        self.assertEqual([boat], list(boat_files))
+        self.assertEqual(manifest['host_files'][shared], boat_files[boat])
+        install = (parity.HERE.parent / 'boat-image' / 'install.py').read_text()
+        self.assertIn(f'JOURNAL_RETENTION_DROP_IN = "{boat}"', install)
 
 
 class InstallerTests(unittest.TestCase):
