@@ -536,9 +536,7 @@ fn prepare_default_secret_directory() -> std::io::Result<PathBuf> {
 }
 
 /// Create and check the default secret directory under `data_root`.
-pub fn prepare_default_secret_directory_under(
-    data_root: &Path,
-) -> std::io::Result<PathBuf> {
+pub fn prepare_default_secret_directory_under(data_root: &Path) -> std::io::Result<PathBuf> {
     fs::create_dir_all(data_root)?;
     let directory = data_root.join(DEFAULT_SECRET_DIRECTORY);
     match fs::DirBuilder::new().mode(0o700).create(&directory) {
@@ -961,7 +959,16 @@ pub async fn drive_attach_with_stdin<C: ExecClient + ?Sized>(
 ) -> u8 {
     let found = local_reattach_secret(args.job_id, args.secret_file.as_deref(), stdin);
     let default_secret_file = found.default_file.clone();
-    drive_attach_inner(client, args, found, default_secret_file, out, err, interrupts).await
+    drive_attach_inner(
+        client,
+        args,
+        found,
+        default_secret_file,
+        out,
+        err,
+        interrupts,
+    )
+    .await
 }
 
 pub async fn drive_attach<C: ExecClient + ?Sized>(
@@ -1157,7 +1164,12 @@ async fn cancel_line<C: ExecClient + ?Sized>(
     };
     if ended.is_none() {
         if let Err(error) = wait_for_motor(
-            || async { client.cancel(job_id, Some(secret)).await.map_err(SubmitError::NotSent) },
+            || async {
+                client
+                    .cancel(job_id, Some(secret))
+                    .await
+                    .map_err(SubmitError::NotSent)
+            },
             err,
         )
         .await

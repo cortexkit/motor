@@ -2087,19 +2087,12 @@ fn reattach_secret(
 
 /// The default secret file `ck motor run` saves for a job, found the way
 /// `ck motor attach` and `ck motor cancel` find it.
-fn saved_secret(
-    job_id: Uuid,
-    secret: &str,
-    directory: &std::path::Path,
-) -> cli::ReattachSecret {
+fn saved_secret(job_id: Uuid, secret: &str, directory: &std::path::Path) -> cli::ReattachSecret {
     let mut file = cli::SecretFile::create_default(directory, job_id).unwrap();
     file.write(secret).unwrap();
     drop(file);
     let found = reattach_secret(job_id, Some(directory), "");
-    assert_eq!(
-        found.default_file,
-        Some(directory.join(job_id.to_string()))
-    );
+    assert_eq!(found.default_file, Some(directory.join(job_id.to_string())));
     found
 }
 
@@ -2135,19 +2128,24 @@ async fn cli_cancel_ends_a_running_job_with_killed_cancel() {
     assert!(!out.contains(&secret) && !err.contains(&secret));
     let terminal = loop {
         let frame = next(&mut original).await;
-        if let StreamRecord::Terminal(terminal) =
-            serde_json::from_slice(&frame.body).unwrap()
-        {
+        if let StreamRecord::Terminal(terminal) = serde_json::from_slice(&frame.body).unwrap() {
             break terminal;
         }
     };
-    assert_eq!(terminal.killed, Some(motor_protocol::Killed::Cancel), "{terminal:?}");
+    assert_eq!(
+        terminal.killed,
+        Some(motor_protocol::Killed::Cancel),
+        "{terminal:?}"
+    );
     assert_eq!(cli::exit_code(&terminal), cli::EXIT_CANCELLED);
     // The saved file is what tells `ck motor cancel` the job was still
     // running: it answers `cancelled` exactly when a saved file it read for
     // the job is still on disk. The job's own stop racing the cancel does not
     // change that.
-    assert!(saved_path.is_some(), "the cancel read the saved secret file");
+    assert!(
+        saved_path.is_some(),
+        "the cancel read the saved secret file"
+    );
 }
 
 #[tokio::test]
@@ -2156,13 +2154,10 @@ async fn cli_cancel_reports_a_finished_job_and_exits_zero() {
     let daemon = Daemon::start(&f, direct_config(&f)).await;
     daemon.bind(DIRECT_CHANNEL, direct()).await;
     daemon.bind(OTHER_DIRECT_CHANNEL, direct()).await;
-    let (id, secret, mut frames) =
-        direct_submission(&daemon, timed(&f, "exit 17", 60)).await;
+    let (id, secret, mut frames) = direct_submission(&daemon, timed(&f, "exit 17", 60)).await;
     let ended = collect_frames(&mut frames).await;
     let last = ended.last().unwrap();
-    let StreamRecord::Terminal(terminal) =
-        serde_json::from_slice(&last.body).unwrap()
-    else {
+    let StreamRecord::Terminal(terminal) = serde_json::from_slice(&last.body).unwrap() else {
         panic!("the run must end with a terminal");
     };
     assert_eq!(terminal.outcome, Outcome::Exit { code: 17 });
@@ -2218,7 +2213,12 @@ async fn cli_cancel_of_an_unknown_job_fails_without_runner_io() {
     let cancelled = daemon
         .request(DIRECT_CHANNEL, "exec.cancel", json!(CancelRequest::new(id)))
         .await;
-    assert_eq!(cancelled.header.ty, FrameType::Response, "{}", body(&cancelled));
+    assert_eq!(
+        cancelled.header.ty,
+        FrameType::Response,
+        "{}",
+        body(&cancelled)
+    );
 }
 
 #[tokio::test]
@@ -2254,5 +2254,10 @@ async fn cli_cancel_with_a_wrong_secret_is_refused_like_an_unknown_job() {
     let cancelled = daemon
         .request(DIRECT_CHANNEL, "exec.cancel", json!(CancelRequest::new(id)))
         .await;
-    assert_eq!(cancelled.header.ty, FrameType::Response, "{}", body(&cancelled));
+    assert_eq!(
+        cancelled.header.ty,
+        FrameType::Response,
+        "{}",
+        body(&cancelled)
+    );
 }
