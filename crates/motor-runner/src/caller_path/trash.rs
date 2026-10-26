@@ -38,6 +38,7 @@ pub(crate) fn validate(directory: &fs::File) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 pub(crate) struct Retired {
     directory: Arc<fs::File>,
+    host_directory: PathBuf,
     name: std::ffi::OsString,
 }
 
@@ -68,9 +69,24 @@ impl Retired {
             return fs::remove_file(path);
         }
         if isolate_jobs {
-            crate::isolation::reclaim_runtime(&path)?;
+            // Permission repair walks physical paths without following links;
+            // a /proc fd alias is deliberately rejected by that helper.
+            crate::isolation::reclaim_runtime(&self.reclaim_path()?)?;
         }
         fs::remove_dir_all(path)
+    }
+
+    fn reclaim_path(&self) -> io::Result<PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+        validate(&self.directory)?;
+        let physical = owner::directory(&self.host_directory)?;
+        validate(&physical)?;
+        let pinned = self.directory.metadata()?;
+        let current = physical.metadata()?;
+        if pinned.dev() != current.dev() || pinned.ino() != current.ino() {
+            return Err(io::Error::other("caller-root trash directory changed"));
+        }
+        Ok(self.host_directory.join(&self.name))
     }
 }
 
@@ -84,6 +100,7 @@ pub(crate) fn entries(config: &Config) -> io::Result<Vec<Retired>> {
         for entry in fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
             entries.push(Retired {
                 directory: directory.clone(),
+                host_directory: root.clone(),
                 name: entry?.file_name(),
             });
         }
@@ -101,6 +118,7 @@ pub(crate) fn garbage(config: &Config, path: HostPath<'_>) -> io::Result<Retired
     validate(&directory)?;
     Ok(Retired {
         directory: Arc::new(directory),
+        host_directory: trash,
         name: path.file_name().unwrap().to_owned(),
     })
 }
@@ -226,6 +244,7 @@ pub(crate) fn detach(
     parent.sync_all()?;
     Ok(Some(Retired {
         directory: Arc::new(directory),
+        host_directory: root.host_root.join(trash),
         name: name_in_trash.into(),
     }))
 }

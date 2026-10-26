@@ -666,3 +666,120 @@ fn mapped_detach_refuses_source_replacement_during_root_repair() {
     fs::remove_file(&host).unwrap();
     fs::rename(held, host).unwrap();
 }
+
+#[test]
+fn mapped_trash_repair_uses_physical_host_paths_for_every_inventory() {
+    use std::{cell::RefCell, os::unix::process::ExitStatusExt, rc::Rc};
+    for inventory in ["detach", "startup", "pressure"] {
+        let f = Fixture::new();
+        let config = configured(&f);
+        let runner = Runner::open(config.clone()).unwrap();
+        let key = "/home/motor-trash-fixture/repair";
+        let host = plant(&runner, key);
+        let detached = paths::trash::detach(&config, &config.caller_roots[0], paths::host(&host))
+            .unwrap()
+            .unwrap();
+        let physical = fs::read_dir(trash(&config))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let retired = match inventory {
+            "detach" => detached,
+            "startup" => {
+                drop(detached);
+                paths::trash::entries(&config).unwrap().pop().unwrap()
+            }
+            "pressure" => {
+                drop(detached);
+                paths::trash::garbage(&config, paths::host(&physical)).unwrap()
+            }
+            _ => unreachable!(),
+        };
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let observed = commands.clone();
+        let expected = physical.clone();
+        crate::systemd::with_process_hook(
+            Box::new(move |command| {
+                let args: Vec<_> = command.get_args().map(|arg| arg.to_os_string()).collect();
+                assert_eq!(Path::new(args.last().unwrap()), expected);
+                assert!(!args.last().unwrap().to_string_lossy().starts_with("/proc/"));
+                observed.borrow_mut().push(args);
+                Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: vec![],
+                    stderr: vec![],
+                })
+            }),
+            || retired.remove(true, false).unwrap(),
+        );
+        assert!(commands.borrow().len() >= 2);
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(commands
+                .borrow()
+                .iter()
+                .any(|args| args.iter().any(|arg| arg == "physical-chmod")));
+        }
+        assert!(!physical.exists(), "{inventory}");
+        assert!(!retired.path().exists(), "{inventory}");
+        assert!(fs::read_dir(trash(&config)).unwrap().next().is_none());
+    }
+}
+
+#[test]
+fn mapped_trash_repair_refuses_changed_physical_trash_before_privileged_commands() {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    for symlink in [false, true] {
+        let f = Fixture::new();
+        let config = configured(&f);
+        let runner = Runner::open(config.clone()).unwrap();
+        let key = "/home/motor-trash-fixture/repair";
+        let host = plant(&runner, key);
+        let retired = paths::trash::detach(&config, &config.caller_roots[0], paths::host(&host))
+            .unwrap()
+            .unwrap();
+        let name = retired.path().file_name().unwrap().to_owned();
+        let outside = f.scratch.join("outside");
+        fs::create_dir_all(outside.join(&name)).unwrap();
+        fs::write(outside.join(&name).join("secret"), "sentinel").unwrap();
+        let before = fs::metadata(outside.join(&name)).unwrap();
+        let held = config.caller_roots[0].host_root.join("held-trash");
+        fs::rename(trash(&config), &held).unwrap();
+        if symlink {
+            std::os::unix::fs::symlink(&outside, trash(&config)).unwrap();
+        } else {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(trash(&config))
+                .unwrap();
+        }
+        crate::systemd::with_process_hook(
+            Box::new(|command| {
+                panic!("changed trash must refuse before privilege repair: {command:?}")
+            }),
+            || assert!(retired.remove(true, false).is_err()),
+        );
+        assert_eq!(
+            fs::read(outside.join(&name).join("secret")).unwrap(),
+            b"sentinel"
+        );
+        let after = fs::metadata(outside.join(&name)).unwrap();
+        assert_eq!(
+            (after.uid(), after.gid(), after.mode()),
+            (before.uid(), before.gid(), before.mode())
+        );
+        assert_eq!(
+            fs::read_to_string(retired.path().join("secret")).unwrap(),
+            key
+        );
+        retired.remove(false, false).unwrap();
+        assert!(fs::read_dir(&held).unwrap().next().is_none());
+        if symlink {
+            fs::remove_file(trash(&config)).unwrap();
+        } else {
+            fs::remove_dir(trash(&config)).unwrap();
+        }
+        fs::rename(held, trash(&config)).unwrap();
+    }
+}
