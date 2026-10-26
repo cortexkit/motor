@@ -44,6 +44,9 @@ struct RoutingPeer {
     fail_cancel_once: Arc<AtomicBool>,
     fail_windows: AtomicBool,
     ally_behavior: AtomicUsize,
+    last_behavior: AtomicUsize,
+    queued: Arc<tokio::sync::Notify>,
+    queue_release: Arc<tokio::sync::Semaphore>,
     endpoints: Mutex<Vec<crate::WindowsRunner>>,
 }
 
@@ -66,6 +69,9 @@ impl RoutingPeer {
             fail_cancel_once: Arc::new(AtomicBool::new(false)),
             fail_windows: AtomicBool::new(false),
             ally_behavior: AtomicUsize::new(0),
+            last_behavior: AtomicUsize::new(0),
+            queued: Arc::new(tokio::sync::Notify::new()),
+            queue_release: Arc::new(tokio::sync::Semaphore::new(0)),
             endpoints: Mutex::new(Vec::new()),
         })
     }
@@ -124,8 +130,10 @@ impl Connector for RoutingPeer {
             root: root.map(str::to_owned),
             at: tokio::time::Instant::now(),
         });
-        let ally_behavior = if instance == "ally-windows" {
+        let behavior = if instance == "ally-windows" {
             self.ally_behavior.load(Ordering::SeqCst)
+        } else if instance == "windows" {
+            self.last_behavior.load(Ordering::SeqCst)
         } else {
             0
         };
@@ -151,8 +159,10 @@ impl Connector for RoutingPeer {
         let instance = instance.to_owned();
         let cut_attaches = self.cut_attaches.clone();
         let fail_cancel = self.fail_cancel_once.clone();
+        let queued = self.queued.clone();
+        let queue_release = self.queue_release.clone();
         Box::pin(async move {
-            if ally_behavior == 1 {
+            if behavior == 1 {
                 return std::future::pending().await;
             }
             if offline {
@@ -204,7 +214,7 @@ impl Connector for RoutingPeer {
                                 "binding must be durable before Run"
                             );
                             assert_eq!(run.platform, windows.then_some(Platform::Windows));
-                            if ally_behavior == 2 {
+                            if behavior == 2 {
                                 let _ = write_frame_async(
                                     &mut peer,
                                     &Frame::Refusal(Refusal {
@@ -219,13 +229,13 @@ impl Connector for RoutingPeer {
                                 .await;
                                 return;
                             }
-                            if ally_behavior == 3 {
+                            if behavior == 3 {
                                 return;
                             }
                             let mut accepted = Accepted::new(id, 3);
                             accepted.platform = echo;
                             let _ = write_frame_async(&mut peer, &Frame::Accepted(accepted)).await;
-                            if ally_behavior == 4 {
+                            if behavior == 4 {
                                 let _ = write_frame_async(
                                     &mut peer,
                                     &Frame::Started {
@@ -241,7 +251,41 @@ impl Connector for RoutingPeer {
                             return;
                         }
                         Frame::Attach(request) => {
-                            if ally_behavior == 6 {
+                            if behavior == 7 {
+                                let _ = write_frame_async(
+                                    &mut peer,
+                                    &Frame::Heartbeat {
+                                        queue_wait_ms: Some(1_000),
+                                    },
+                                )
+                                .await;
+                                queued.notify_one();
+                                queue_release.acquire().await.unwrap().forget();
+                                let _ = write_frame_async(
+                                    &mut peer,
+                                    &Frame::Started {
+                                        job_id: id,
+                                        seq: 0,
+                                        queue_wait_ms: 1_000,
+                                        started_at_ms: 1,
+                                        path_mapping: None,
+                                    },
+                                )
+                                .await;
+                                let _ = write_frame_async(
+                                    &mut peer,
+                                    &Frame::Terminal(TerminalRecord::new(
+                                        id,
+                                        Outcome::Exit { code: 0 },
+                                        0,
+                                        0,
+                                        0,
+                                    )),
+                                )
+                                .await;
+                                return;
+                            }
+                            if behavior == 6 {
                                 std::future::pending::<()>().await;
                             }
                             if cut_attaches
@@ -296,7 +340,7 @@ impl Connector for RoutingPeer {
                         }
                         Frame::Status => {
                             let mut status = status;
-                            if ally_behavior == 5 {
+                            if matches!(behavior, 5 | 7) {
                                 status.status.queue_depth = 1;
                                 status.health.as_mut().unwrap().queue_depth = 1;
                             }
@@ -417,10 +461,11 @@ async fn ordered_windows_unreachable_handshake_falls_through_within_three_second
 }
 
 #[tokio::test]
-async fn ordered_windows_local_slot_reservation_falls_through_without_queueing() {
+async fn ordered_windows_local_slot_reservation_falls_through_and_last_runner_queues() {
     let f = Fixture::new(Cut::None, 28).await;
     let peer = RoutingPeer::new(&f);
     peer.ally_behavior.store(6, Ordering::SeqCst);
+    peer.last_behavior.store(7, Ordering::SeqCst);
     let motor = peer.motor(ordered(f.config.clone()));
     let mut first = motor
         .run(f.request("true").with_platform(Platform::Windows))
@@ -429,19 +474,120 @@ async fn ordered_windows_local_slot_reservation_falls_through_without_queueing()
         first.records.recv().await.unwrap().unwrap(),
         StreamRecord::Accepted(_)
     ));
-    let second = motor
-        .run(f.request("true").with_platform(Platform::Windows))
-        .unwrap();
-    let second_id = second.job_id;
-    collect(second).await;
-    assert!(peer
-        .visits
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|v| v.id == second_id)
-        .all(|v| v.instance == "windows"));
+    let mut queued = Vec::new();
+    for _ in 0..2 {
+        let mut stream = motor
+            .run(f.request("true").with_platform(Platform::Windows))
+            .unwrap();
+        assert_windows_queued(&peer, &mut stream).await;
+        let visits = peer.visits.lock().unwrap();
+        let visits: Vec<_> = visits.iter().filter(|v| v.id == stream.job_id).collect();
+        assert!(!visits.is_empty());
+        assert!(visits.iter().all(|v| v.instance == "windows"));
+        queued.push(stream);
+    }
+    peer.queue_release.add_permits(2);
+    for stream in queued {
+        assert_windows_queue_completes(stream).await;
+    }
     drop(first);
+}
+
+async fn assert_windows_queued(peer: &RoutingPeer, stream: &mut crate::JobStream) {
+    let records = &mut stream.records;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        assert!(matches!(
+            records.recv().await.unwrap().unwrap(),
+            StreamRecord::Accepted(_)
+        ));
+        peer.queued.notified().await;
+        assert!(matches!(
+            records.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    })
+    .await
+    .expect("Windows job should be admitted and queue on the runner");
+}
+
+async fn assert_windows_queue_completes(stream: crate::JobStream) {
+    let records = collect(stream).await;
+    assert!(records.iter().any(|record| matches!(
+        record,
+        StreamRecord::Started(started) if started.queue_wait_ms == 1_000
+    )));
+    assert!(matches!(
+        records.last(),
+        Some(StreamRecord::Terminal(TerminalRecord {
+            outcome: Outcome::Exit { code: 0 },
+            ..
+        }))
+    ));
+}
+
+#[tokio::test]
+async fn ordered_windows_both_busy_queue_on_last_runner_with_non_spill_budget() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    peer.ally_behavior.store(5, Ordering::SeqCst);
+    peer.last_behavior.store(7, Ordering::SeqCst);
+    let motor = peer.motor(ordered(f.config.clone()));
+    let mut request = f.request("true").with_platform(Platform::Windows);
+    request.timeout = Some(3_600);
+    request.queue_wait_limit_s = None;
+    let mut stream = motor.run(request).unwrap();
+    assert_windows_queued(&peer, &mut stream).await;
+    {
+        let visits = peer.visits.lock().unwrap();
+        assert_eq!(visits[0].instance, "ally-windows");
+        assert!(visits.iter().skip(1).all(|v| v.instance == "windows"));
+        let frames = peer.frames.lock().unwrap();
+        let runs: Vec<_> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::Run(run) => Some(run),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].queue_wait_limit_s, 1_800);
+        assert_eq!(runs[0].job_id, stream.job_id);
+    }
+    peer.queue_release.add_permits(1);
+    assert_windows_queue_completes(stream).await;
+}
+
+#[tokio::test]
+async fn ordered_windows_last_runner_admission_full_still_refuses() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    peer.ally_behavior.store(5, Ordering::SeqCst);
+    peer.last_behavior.store(2, Ordering::SeqCst);
+    let motor = peer.motor(ordered(f.config.clone()));
+    let records = collect(
+        motor
+            .run(f.request("true").with_platform(Platform::Windows))
+            .unwrap(),
+    )
+    .await;
+    assert!(matches!(
+        records.last(),
+        Some(StreamRecord::Terminal(TerminalRecord {
+            outcome: Outcome::RefusedBeforeStart {
+                reason: RefusalReason::RunnerFull
+            },
+            ..
+        }))
+    ));
+    assert_eq!(
+        peer.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|frame| matches!(frame, Frame::Run(_)))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

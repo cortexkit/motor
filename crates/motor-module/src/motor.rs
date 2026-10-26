@@ -828,41 +828,39 @@ impl Motor {
             Some(self.connector_for_job(id)?)
         };
         let explicit_windows = windows && !self.config.windows_runners.is_empty();
-        // Reserve locally before probing remote capacity so concurrent callers
-        // cannot all observe the same free slot. The runner remains authoritative.
-        let _windows_slot = if explicit_windows {
+        let windows_runner_index = if explicit_windows {
             let runner = self
                 .storage
                 .job(id)
                 .and_then(|j| j.windows_runner)
                 .expect("Windows binding exists");
-            let index = self
-                .config
-                .windows_runners
-                .iter()
-                .position(|r| r.name == runner.name)
-                .expect("configured Windows runner");
-            match self.windows_slots[index].clone().try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(_) => {
-                    if self.next_windows_runner(id)? {
-                        return Ok(true);
-                    }
-                    return self
-                        .refused(
-                            id,
-                            RefusalReason::RunnerFull,
-                            None,
-                            Some("windows_slots_busy".into()),
-                            tx,
-                        )
-                        .await
-                        .map(|_| false);
-                }
-            }
+            Some(
+                self.config
+                    .windows_runners
+                    .iter()
+                    .position(|r| r.name == runner.name)
+                    .expect("configured Windows runner"),
+            )
         } else {
             None
         };
+        let probe_windows_capacity =
+            windows_runner_index.is_some_and(|index| index + 1 < self.config.windows_runners.len());
+        // Reserve earlier runners before probing so callers cannot all observe
+        // the same free slot. The last runner owns the queue: do not reserve a
+        // local permit across its queue wait or reject it based on a busy probe.
+        let _windows_slot =
+            if let Some(index) = windows_runner_index.filter(|_| probe_windows_capacity) {
+                match self.windows_slots[index].clone().try_acquire_owned() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        self.next_windows_runner(id)?;
+                        return Ok(true);
+                    }
+                }
+            } else {
+                None
+            };
         // Measures how long a spilled job spent on its hosted route.
         let spill_started = tokio::time::Instant::now();
         let (mut channel, held) = loop {
@@ -952,7 +950,7 @@ impl Motor {
                     let mut channel =
                         open_for_request(connector.as_ref().unwrap().as_ref(), build_server_id)
                             .await?;
-                    if explicit_windows {
+                    if probe_windows_capacity {
                         channel
                             .send(Frame::Status)
                             .await

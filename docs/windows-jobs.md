@@ -69,15 +69,23 @@ ck-motor. The legacy build-server SSH path is unchanged. Tests:
 and checks explicit-endpoint authentication and a wrong host-key refusal too).
 
 The explicit endpoint's handshake, status probe and job-channel handshake share
-a three-second bound. Unreachable, full, and locally reserved runners fall
-through to the next entry. A positive `runner_full` admission refusal may also
-fall through; a lost Run acknowledgement or any acceptance never moves a job.
-Snapshot upload is reused across attempts. `ck health motor` includes each
-runner's sampled reachability and busy state; a busy runner is not itself a
-module failure. Tests:
+a three-second bound. Earlier entries that are unreachable, busy, or locally
+reserved fall through to the next entry. The last entry is the queueing target:
+`ck-motor` skips its busy probe and takes no local slot permit, so a queued job
+holds no module-side capacity reservation. The runner owns admission and queueing
+within the job's non-spill queue budget (30 minutes by default, capped by the
+job timeout, unless explicitly overridden); Windows jobs cannot spill.
+A received `runner_full` admission refusal may fall through from an earlier
+entry, but is final at the last entry. A lost Run acknowledgement or any
+acceptance never falls through to the next entry. Snapshot upload is reused
+across attempts.
+`ck health motor` includes each runner's sampled reachability and busy state;
+a busy runner is not itself a module failure. Tests:
 `ordered_windows_unreachable_handshake_falls_through_within_three_seconds`,
 `ordered_windows_busy_refusal_resubmits_but_lost_ack_and_started_never_move`,
-`ordered_windows_local_slot_reservation_falls_through_without_queueing`,
+`ordered_windows_local_slot_reservation_falls_through_and_last_runner_queues`,
+`ordered_windows_both_busy_queue_on_last_runner_with_non_spill_budget`,
+`ordered_windows_last_runner_admission_full_still_refuses`,
 `ordered_windows_health_reports_each_runner_reachability_and_busy_state`.
 
 1.3. A runner lists the platforms it serves in its `hello` (`platforms:
