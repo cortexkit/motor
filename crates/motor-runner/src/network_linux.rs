@@ -433,7 +433,8 @@ mod tests {
     fn readiness_refusal_names_missing_unsafe_and_unreadable_generation() {
         use super::*;
         use std::os::unix::fs::PermissionsExt;
-        let root = cortexkit_test_support::scratch_root().join(format!("motor-ready-diagnostic-{}", Uuid::now_v7()));
+        let root = cortexkit_test_support::scratch_root()
+            .join(format!("motor-ready-diagnostic-{}", Uuid::now_v7()));
         fs::create_dir(&root).unwrap();
         let marker = root.join("motor-net-ready");
         let owner = unsafe { libc::geteuid() };
@@ -480,7 +481,8 @@ mod tests {
     #[test]
     fn existing_table_after_failed_reload_does_not_authorize_attach() {
         use super::*;
-        let root = cortexkit_test_support::scratch_root().join(format!("motor-policy-ready-{}", Uuid::now_v7()));
+        let root = cortexkit_test_support::scratch_root()
+            .join(format!("motor-policy-ready-{}", Uuid::now_v7()));
         fs::create_dir(&root).unwrap();
         let marker = root.join("ready");
         let generation = Uuid::parse_str("c61f406a-764b-4df3-ae85-52b43aa520b9").unwrap();
@@ -513,7 +515,8 @@ mod tests {
     fn policy_success_generation_requires_safe_owner_mode_and_canonical_record() {
         use super::*;
         use std::os::unix::fs::{symlink, PermissionsExt};
-        let root = cortexkit_test_support::scratch_root().join(format!("motor-policy-marker-{}", Uuid::now_v7()));
+        let root = cortexkit_test_support::scratch_root()
+            .join(format!("motor-policy-marker-{}", Uuid::now_v7()));
         fs::create_dir(&root).unwrap();
         let marker = root.join("ready");
         let owner = unsafe { libc::geteuid() };
