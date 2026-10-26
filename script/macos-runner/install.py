@@ -26,6 +26,7 @@ BEGIN = "# BEGIN motor macos runner"
 END = "# END motor macos runner"
 FLOOR = 20 * 1024 ** 3
 ENTITLEMENT = "com.apple.security.virtualization"
+SSH_ACCESS_GROUP = "com.apple.access_ssh"
 
 
 def run(*args):
@@ -203,6 +204,9 @@ def create_account():
         raise ValueError("motor must be a dedicated non-admin account")
     Path("/Users/motor").mkdir(exist_ok=True)
     os.chown("/Users/motor", account.pw_uid, account.pw_gid)
+    # When Remote Login is limited to listed users, PAM refuses any account
+    # outside com.apple.access_ssh before key authentication is considered.
+    run("/usr/sbin/dseditgroup", "-o", "edit", "-a", "motor", "-t", "user", SSH_ACCESS_GROUP)
     return account
 
 
