@@ -276,6 +276,14 @@ pub(crate) fn filesystem(config: &Config) -> io::Result<()> {
 }
 
 pub(super) fn filesystem_with_mountinfo(config: &Config, table: &str) -> io::Result<()> {
+    filesystem_with_probe(config, table, probe)
+}
+
+pub(super) fn filesystem_with_probe(
+    config: &Config,
+    table: &str,
+    probe_root: impl Fn(&Config, &CallerRoot) -> io::Result<()>,
+) -> io::Result<()> {
     options(config)?;
     let table = mounts(table)?;
     let mut reserved = vec![config.state_dir(), config.build_slot_root.clone()];
@@ -317,7 +325,7 @@ pub(super) fn filesystem_with_mountinfo(config: &Config, table: &str) -> io::Res
         }
     }
     for root in &config.caller_roots {
-        probe(config, root).map_err(|error| {
+        probe_root(config, root).map_err(|error| {
             refusal(
                 root.host_root.display(),
                 config.state_dir().display(),

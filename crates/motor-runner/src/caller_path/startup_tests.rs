@@ -144,3 +144,32 @@ fn startup_reflink_probe_leaves_no_directory_entries() {
     );
     assert!(!c.state_dir().exists());
 }
+
+#[test]
+fn startup_device_and_reflink_probe_failures_preserve_host_and_state() {
+    let scratch = cortexkit_test_support::ScratchDir::new("motor-caller-probe-failure");
+    let mut c = config();
+    c.state_root = scratch.join("state");
+    c.build_slot_root = scratch.join("slots");
+    c.caller_roots[0].host_root = scratch.join("home");
+    let host = &c.caller_roots[0].host_root;
+    fs::create_dir(host).unwrap();
+    fs::write(host.join("sentinel"), "unchanged").unwrap();
+    for failure in ["st_dev failed", "FICLONE failed"] {
+        let error = filesystem_with_probe(&c, "", |_, _| Err(std::io::Error::other(failure)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(host.to_str().unwrap())
+                && error.contains(c.state_dir().to_str().unwrap())
+                && error.contains(failure),
+            "{error}"
+        );
+        assert!(!c.state_dir().exists());
+        assert_eq!(fs::read_dir(host).unwrap().count(), 1);
+        assert_eq!(
+            fs::read_to_string(host.join("sentinel")).unwrap(),
+            "unchanged"
+        );
+    }
+}
