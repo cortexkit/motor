@@ -136,6 +136,7 @@ pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest 
         FLOW_SCOPES_CAPABILITY.into(),
         RETURN_CAPABILITY.into(),
         RETURN_CHUNKED_CAPABILITY.into(),
+        motor_protocol::SUBMISSION_KEY_CAPABILITY.into(),
     ];
     if !config.windows_runners.is_empty()
         || (config.windows_runner_instance.is_some() && config.windows_runner_state_root.is_some())
@@ -670,6 +671,27 @@ impl Handler {
                     hosted: bool,
                 }
                 let spill: SpillOptions = parse(envelope.params.clone())?;
+                let returns: crate::ReturnOptions = parse(envelope.params.clone())?;
+                let request: RunRequest = match serde_json::from_value(envelope.params) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return Ok(HandlerOutcome::Error {
+                            code: "invalid_params".into(),
+                            message: error.to_string(),
+                        })
+                    }
+                };
+                let motor = self.initialized()?;
+                let secret = crate::direct_secret::DirectSecret::mint()?;
+                if request.submission_key.is_some() {
+                    let stream = motor.refuse_authorized(
+                        RefusalReason::RequestRejected,
+                        Some("submission_key_requires_attested_caller".into()),
+                        Some(secret.hash()),
+                    )?;
+                    pump_direct_secret(&ctx, stream, Some(secret)).await?;
+                    return Ok(HandlerOutcome::Streamed);
+                }
                 if spill.hosted {
                     if let Some(message) = self.hosted_test_unavailable() {
                         return Ok(HandlerOutcome::Error {
@@ -678,10 +700,6 @@ impl Handler {
                         });
                     }
                 }
-                let returns: crate::ReturnOptions = parse(envelope.params.clone())?;
-                let request: RunRequest = parse(envelope.params)?;
-                let motor = self.initialized()?;
-                let secret = crate::direct_secret::DirectSecret::mint()?;
                 if let Some(detail) = direct_timeout_refusal(
                     request.timeout,
                     self.config.direct_exec_max_timeout_secs,
@@ -1021,17 +1039,51 @@ impl ModuleHandler for Handler {
                 });
             }
             let motor = self.ready().await?;
-            let parse = |p| serde_json::from_value(p).map_err(io::Error::other);
+            let principal = format!("reserved:{module_id}");
+            if matches!(envelope.op.as_str(), "exec.attach" | "exec.cancel" | "exec.status") {
+                if let Some(id) = envelope.params.get("job_id")
+                    .and_then(Value::as_str).and_then(|id| id.parse().ok()) {
+                    if !motor.submission_owned(id, &principal) {
+                        return Ok(HandlerOutcome::Error {
+                            code: "motor_job_not_found".into(),
+                            message: "job not found".into(),
+                        });
+                    }
+                }
+            }
             match envelope.op.as_str() {
                 "exec.run" => {
-                    let _permit = match RunPermit::acquire(&self.run_count) {
-                        Some(permit) => permit,
-                        None => {
-                            pump(&ctx, motor.refuse_capacity()?, 0).await?;
-                            return Ok(HandlerOutcome::Streamed);
+                    let mut request: RunRequest = match serde_json::from_value(envelope.params) {
+                        Ok(request) => request,
+                        Err(error) => return Ok(HandlerOutcome::Error {
+                            code: "invalid_params".into(),
+                            message: error.to_string(),
+                        }),
+                    };
+                    let _permit = if motor.has_submission(&principal, &request)? {
+                        None
+                    } else {
+                        match RunPermit::acquire(&self.run_count) {
+                            Some(permit) => Some(permit),
+                            None => {
+                                pump(&ctx, motor.refuse_capacity()?, 0).await?;
+                                return Ok(HandlerOutcome::Streamed);
+                            }
                         }
                     };
-                    let mut request: RunRequest = parse(envelope.params)?;
+                    if request.submission_key.is_some() {
+                        let cursor = request.resume_from_seq;
+                        let stream = tokio::select! {
+                            stream = motor.submit_agent(
+                                request,
+                                self.attribution(ctx.route_handle(), envelope.preset),
+                                &principal,
+                            ) => stream?,
+                            _ = ctx.cancelled() => return Ok(HandlerOutcome::Streamed),
+                        };
+                        crate::agent_route::pump_after(&ctx, stream, cursor).await?;
+                        return Ok(HandlerOutcome::Streamed);
+                    }
                     let returns = match crate::agent_route::take_return_request(&mut request) {
                         Ok(returns) => returns,
                         Err(crate::agent_route::ReturnRequestError::InvalidParams(message)) => {
@@ -1097,7 +1149,9 @@ impl ModuleHandler for Handler {
         match result {
             Ok(outcome) => outcome,
             Err(e) => HandlerOutcome::Error {
-                code: if e.kind() == io::ErrorKind::NotConnected && self.motor.get().is_none() {
+                code: if e.kind() == io::ErrorKind::InvalidInput {
+                    "invalid_params"
+                } else if e.kind() == io::ErrorKind::NotConnected && self.motor.get().is_none() {
                     "motor_unavailable"
                 } else {
                     "exec_remote_error"

@@ -74,8 +74,10 @@ pub struct Motor {
     hosted_cleanup: Arc<hosted_cleanup::Cleanup>,
     #[cfg(test)]
     hosted_connector: Option<Arc<dyn Connector>>,
+    keyed_admissions: Arc<std::sync::Mutex<()>>,
 }
 mod agent_run;
+pub(crate) mod submission_key;
 
 struct Submission {
     motor: Motor,
@@ -145,6 +147,7 @@ impl Motor {
             hosted_cleanup: Arc::default(),
             #[cfg(test)]
             hosted_connector: None,
+            keyed_admissions: Arc::default(),
         })
     }
     pub fn with_account_tokens(mut self, tokens: Arc<crate::AccountTokens>) -> Self {
@@ -272,12 +275,33 @@ impl Motor {
     }
     fn run_classified(
         &self,
+        request: RunRequest,
+        identity: (Option<JobAttribution>, Option<[u8; 32]>),
+        gate_job: bool,
+        allow_gate_spill: bool,
+        hosted_test: bool,
+        returns: crate::ReturnOptions,
+    ) -> io::Result<JobStream> {
+        self.run_classified_keyed(
+            request,
+            identity,
+            gate_job,
+            allow_gate_spill,
+            hosted_test,
+            returns,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn run_classified_keyed(
+        &self,
         mut request: RunRequest,
         identity: (Option<JobAttribution>, Option<[u8; 32]>),
         gate_job: bool,
         allow_gate_spill: bool,
         hosted_test: bool,
         returns: crate::ReturnOptions,
+        key: Option<submission_key::KeyRecord>,
     ) -> io::Result<JobStream> {
         let (attribution, secret_hash) = identity;
         let macos_not_hosted = hosted_test && request.platform == Some(Platform::Macos);
@@ -325,6 +349,9 @@ impl Motor {
             .map(|t| t.instance);
         self.storage
             .create_authorized(id, wait, attribution, instance, gate_job, secret_hash)?;
+        if let Some(key) = key {
+            self.storage.record_submission(id, key)?;
+        }
         if request.platform == Some(Platform::Windows) {
             if let Some(runner) = self.config.windows_runners.first() {
                 self.storage.bind_windows(id, runner.clone())?;
@@ -1287,15 +1314,21 @@ impl Motor {
         // Never resubmit or invent a before-start outcome after attempting run.
         // The hosted route records that durably first: it is what stops a
         // spilled job from returning to the build server once it may have run.
-        if hosted {
+        // A hosted Run is also fenced against shutdown, so the shutdown
+        // inventory cannot miss a booking whose Run is about to be sent.
+        let _booking_open = if hosted {
             let open = self.hosted_cleanup.booking_open.lock().unwrap();
             if !*open {
                 return Err(io::Error::other("hosted Run stopped during shutdown"));
             }
-            self.storage
-                .hosted_update(id, |state| state.run_sent = true)
-                .inspect_err(|error| self.log_hosted_failure(id, "persist_run", error))?;
-        }
+            Some(open)
+        } else {
+            None
+        };
+        self.storage
+            .run_sent(id)
+            .inspect_err(|error| self.log_hosted_failure(id, "persist_run", error))?;
+        drop(_booking_open);
         let shadow_run = shadow_request.map(|request| (request, run.clone()));
         if let Err(error) = channel.send(Frame::Run(run)).await {
             self.log_hosted_failure(id, "run_send", &error);
@@ -1315,6 +1348,15 @@ impl Motor {
         let admission = channel.next().await;
         match admission {
             Ok(Incoming::Frame(Frame::Accepted(mut accepted))) => {
+                accepted.attached = false;
+                let mut caller_accepted = accepted
+                    .clone()
+                    .with_env_not_forwarded(env_not_forwarded.clone());
+                caller_accepted.job_id = id;
+                if request.network.is_none() {
+                    caller_accepted.network = None;
+                }
+                self.storage.submission_accepted(id, caller_accepted)?;
                 if hosted {
                     tracing::info!(job_id = %id, step = "admission", cause = "runner accepted Run", "hosted Run accepted");
                     if spilled {

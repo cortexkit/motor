@@ -358,10 +358,87 @@ master before stopping the agent, and removes its runtime directory. A force-kil
 skips that cleanup: stop any
 orphaned SSH master before reusing a crashed installation's storage root.
 
+## Caller submission keys
+
+ck-motor advertises `exec-remote-submission-key/v1` and implements the caller
+contract in `cortexkit-exec-remote-types` 0.2.14. A caller must check this
+capability before sending `submission_key` or `resume_from_seq`: older executors
+ignore those fields and could start the command twice.
+
+An attested module caller may send an opaque `submission_key` of 16 to 128
+printable ASCII bytes (`0x21` through `0x7e`, no whitespace). Invalid keys and a
+`resume_from_seq` without a key are `invalid_params`, naming the offending field.
+Keys are scoped to the daemon-attested module principal, never to a route,
+session or connection. The principal/key, request digest and logical job ID live
+in the job's durable journal record before any runner submission, including
+hosted and Boat submissions. They expire together with the job, no earlier than
+the job's 24-hour retention horizon. An unknown or expired key starts a fresh
+submission; forgetting a key is not proof that an old request never ran.
+A rollback to a ck-motor that predates keys rewrites its store without the key
+records, so after rolling forward again, a key recorded before the rollback is
+unknown and a resubmit with it starts a fresh job. The older ck-motor doesn't
+advertise the capability, so callers send no keys while it runs.
+
+Resubmitting the same request with a known key attaches to its existing logical
+job and sends `Accepted` with `attached: true` and the existing job ID. A fresh
+admission omits `attached`. An absent replay cursor starts at the beginning;
+`resume_from_seq` is exclusive, unlike the inclusive `exec.attach.from_seq`.
+Returned-byte expiration and outcome-unknown rules remain those of ordinary
+attach. A spill that returns to the build server still has one key and one
+caller-visible job ID, even though its runner-side ID changes.
+
+The SHA-256 digest uses RFC 8785 canonical JSON of the caller request, before
+snapshotting or converting return paths, with the key and replay cursor removed
+and disallowed environment entries filtered out. It covers command, cwd,
+workspace and repository paths, siblings, platform, weight hint, network,
+timeout, queue-wait limit, forwarded environment and return options. JSON field
+order and a newly captured checkout do not change the request. A changed request
+is refused with `request_rejected` and detail `submission_key_mismatch`.
+
+A recorded submission that provably never reached runner admission returns the
+final refusal `submission_never_accepted`; the caller can choose a new key.
+After a Run attempt, ck-motor uses the existing attach machinery to recover
+runner records, not another Run. A missing recent build-server job is fenced by
+the runner's durable attach tombstone. An unavailable runner is not evidence
+that nothing ran. Every keyed refusal has its own job ID, never the earlier
+job's; a mismatch does not alter the earlier job.
+
+Only attested module principals can use keys today. subc's `Principal::Direct`
+has no stable caller identity, and its bind identity is caller-supplied. A keyed
+direct `exec.run` is refused before recording a key, as `request_rejected` with
+detail `submission_key_requires_attested_caller`. `ck motor run` continues to
+use its existing per-job secret files for reattach. Direct submission keys need
+subc to attest a stable direct caller identity across reconnects; neither a
+route handle nor a claimed session name can supply that boundary.
+
+AFT heads and workers share `reserved:aft`. A head that knows a worker's key and
+original request can therefore resume its detached job, as it can attach by a
+known job ID. There is no new job enumeration or head/worker delegation API.
+
+Source: `src/motor/submission_key.rs` and `src/storage.rs` under
+`crates/motor-module`. Rules are covered by `known_key_replays_exclusively_and_does_not_recapture_checkout`,
+`digest_is_canonical_and_covers_all_caller_execution_fields`,
+`digest_mismatch_refuses_under_its_own_id_without_changing_job`,
+`two_principals_have_separate_namespaces_and_stream_authority`,
+`durability_before_runner_submission`,
+`restart_between_key_record_and_submit_is_final_never_accepted`,
+`restart_after_run_with_lost_ack_reattaches_runner_record`,
+`run_fence_without_runner_admission_uses_attach_tombstone`,
+`refused_key_survives_restart_and_different_request_still_mismatches`,
+`runner_acceptance_is_remembered_before_network_echo_refusal`,
+`concurrent_resubmits_start_one_job`,
+`unknown_key_with_cursor_starts_a_fresh_submission`,
+`keyed_spill_return_keeps_one_logical_job_across_restart`,
+`keyed_hosted_route_reattaches_without_second_run`,
+`submission_key_retention_matches_job_and_expired_key_is_unknown`,
+`direct_submission_key_requires_an_attested_caller`,
+`malformed_submission_fields_are_invalid_params_on_both_routes` and
+`aft_head_route_can_resume_worker_submission_after_route_rebind`.
+
 ## Agent runs: hosted usage and returned files
 
 These additions to AFT's `exec.run`, `exec.attach` and `exec.status` follow
-`cortexkit-exec-remote-types` 0.2.10. Source: `crates/motor-module/src/agent_route.rs`.
+`cortexkit-exec-remote-types` 0.2.14. Source: `crates/motor-module/src/agent_route.rs`.
 
 **Hosted usage.** A job whose Run frame went to a hosted runner (first-party or
 Boat) has `hosted` on its terminal record. It holds `placement`, the lease's
