@@ -467,10 +467,13 @@ Caller roots ship in two steps and never in one:
 The edits that add the flag to `script/runner/units/motor-runner.service`,
 `script/runner/units/motor-runner@e2e.service.d/binary.conf` and
 `script/boat-image/motor-boat.service` are one separate change. It merges only
-at step two, after its own security audit and after `setup-caller-roots.sh` has
-run on the build server. Until then the repository units stay unflagged, so a
-routine `install-units.sh` run installs nothing flagged, and tests that need
-flagged arguments use fixture copies of the units.
+at step two, after it has been reviewed on its own: it is the change that puts
+the flag into what the build server and Boat actually run, so a reviewer checks
+those unit files against the final flag configuration before anyone installs
+them. It also merges only after `setup-caller-roots.sh` has run on the build
+server. Until then the repository units stay unflagged, so a routine
+`install-units.sh` run installs nothing flagged, and tests that need flagged
+arguments use fixture copies of the units.
 
 A downgrade to a binary that predates mapping, once caller roots were enabled on
 an instance, is not supported. Two gates enforce that: `deploy.sh` before any
