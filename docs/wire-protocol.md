@@ -170,6 +170,21 @@ The record also carries:
 - Optional `pipestatus`, `refusal_detail` (at most 1024 bytes, for display,
   never for parsing), and `retry_after_ms`.
 
+Git bundle-fetch failures retain bounded stderr context from both ends (up to
+8 KiB each), including bytes still queued when Git exits. The runner redacts
+that context before fitting both its head and tail into the 1024-byte refusal
+detail. Long progress output therefore does not displace Git's final `fatal:`
+line. Test: `failed_fetch_drains_stderr_and_keeps_final_error_in_refusal_detail`
+(`crates/motor-runner/src/workspace/transfer.rs`).
+
+Main and sibling bundle imports take a per-mirror lock across initialization
+and Git fetch. Background mirror repacking takes the same lock. The runner
+does not hold its global job-state lock during these operations, and different
+repository mirrors can fetch in parallel. Tests:
+`concurrent_fetches_into_one_mirror_all_succeed_under_its_lock` and
+`different_repository_fetches_make_progress_in_parallel`
+(`crates/motor-runner/src/workspace/fetch_tests.rs`).
+
 ## 5. Refusals and the no-start proof
 
 5.1. Only `refused_before_start` proves that the command did not start. Every

@@ -29,11 +29,96 @@ components. They do not ship in this repository.
   is configured and `exec-remote-net/v1` when `network_routing` is on.
 - Operations: `exec.run`, `exec.attach`, `exec.cancel`, `exec.status`,
   `workspace.prepare`, `workspace.drop`, and the read-only `runner.health` report.
+- Requires SubC daemon **0.36.35 or newer**. The module uses subc-client-rs
+  0.32.4 with subc-protocol 0.33.0, subc-transport 0.14.0 and subc-os 0.1.19.
+  Install through the ck-motor card placed by SubC; replacing the binary does
+  not upgrade an older daemon's protocol support.
 
 `ck-motor --ck-domain` prints one line for the `ck` launcher, and
 `ck motor run` (`ck-motor run`) submits one job from a script,
 `ck motor attach JOB_ID` reconnects to it, and `ck motor cancel JOB_ID` stops it;
 see [Direct runs](#direct-runs).
+
+### Dispatch capacity and route ordering
+
+The SDK has two independent handler pools: 256 long-held slots for `exec.run`
+(both agent and direct calls) and `exec.attach`, and 64 default slots for short
+operations such as status and cancel. Attach replays records and then follows
+the job through its terminal record, so it belongs in the long-held pool too.
+The classifier peeks at the compact JSON envelope's `op` or `method` prefix;
+the direct CLI's secret-first attach envelope is also recognized. It never
+decodes command parameters on the connection's frame reader. AFT serializes
+`serde_json::to_vec(&json!({"method": method, "params": params}))`, so its run
+and attach operation names precede params, including on keyed resubmissions.
+The closing quote and following comma or object end delimit the operation;
+names such as `exec.run_x` and `exec.attachment` use the default pool.
+
+The former fleet-wide 56-run admission cap and eight-slot control reservation
+are gone. The 256 slots are a dispatch budget, not a job-capacity refusal:
+runners and hosted tenants make the actual admission decision. They cover a
+96-permit runner plus a 64-slot tenant with room for additional streams,
+including attach. Above 256 open streams the SDK waits in the long-held pool,
+not the default pool; sustained multiple attaches per job can consume that
+headroom. The SDK warns after two seconds waiting and immediately answers a
+request cancelled while waiting. Local Windows pre-admission refusals retain
+`windows_slots_busy` detail; hosted capacity refusals retain their `hosted_*`
+cause. Runner-originated refusals keep the runner's detail.
+
+The management surface declares `stateless_parallel`, allowing 1024 in-flight
+requests per route instead of `module_managed`'s 32. **There is no FIFO
+submission or completion guarantee within a route.** Job-specific follow-ups
+use an explicit job ID; run mints it and registers the job before publishing
+acceptance.
+Callers learn the ID from the stream, not from submission order. Attach waits
+for submission to settle; explicit `exec.cancel` persists cancellation intent
+even while the runner is admitting the job. Workspace prepare/drop sequencing
+is the caller's responsibility: await prepare before a dependent run.
+
+AFT, the agent tool, currently uses one connection and one route per remote job
+(at most two or three calls in flight). Its live cancellation sends a Cancel
+frame on the run subscription and immediately follows with attach, or status
+before it knows the job ID, on the same route. That Cancel detaches the stream, not the job;
+the follow-up does not depend on executing first or last. Restart cancellation
+uses explicit `exec.cancel {job_id}` on a fresh connection. Neither pattern
+needs FIFO, and `stateless_parallel` avoids a latent bottleneck for other
+callers that multiplex jobs.
+
+`ck health motor` (verbose metrics) and `runner.health` include compact
+`request_pools.default` and `request_pools.long_held` objects with `in_use`,
+`limit`, `waiting`, and nullable `oldest_wait_ms`. These are live in-memory
+snapshots, not runner probes or per-request lists; they add only a few hundred
+bytes to the module's bounded health cache (16 KiB maximum). The SDK separately
+degrades health when a full pool has waited more than two seconds.
+
+If an authorized run or attach handler sees a long-held operation that the
+prefix classifier put in the default pool, it increments
+`request_pools.long_held_fallbacks_total` (since module start). This catches
+unexpected serialization, such as params appearing before method. A WARN
+names the operation and first envelope key, at most once per minute across
+the module; every fallback still increments the counter. The key is decoded
+only in the handler, bounded to a small envelope head and 64 characters, and
+the warning never includes parameter values. A rising counter calls for fixing
+the caller's envelope order or extending the classifier, not increasing runner
+capacity.
+
+The SDK upgrade does not change motor's handler/HELLO_ACK signatures or bind
+authorization. `on_hello_ack` still runs before frame reading starts, so storage
+opening remains a background task and storage-dependent requests wait for it.
+Unknown bind `call_mode` values are refused as `motor_call_mode_unsupported`;
+known modes do not grant authority. Motor continues using the daemon's
+principal and scope and does not advertise `call-modes/v1`. The SDK
+now treats post-ACK resets as clean connection ends, including while that hook
+is pending, and handler panics fail serving rather than silently losing replies.
+
+Tests: `canonical_agent_and_direct_stream_envelopes_use_long_held_pool`,
+`eighty_run_streams_leave_status_cancel_and_attach_responsive`, and
+`same_route_stream_cancel_and_immediate_followup_do_not_cancel_jobs`.
+Bind compatibility: `unknown_call_mode_is_refused_without_breaking_known_binds`.
+Envelope and telemetry coverage:
+`aft_method_envelopes_and_keyed_resubmits_use_long_held_pool`,
+`keyed_aft_resubmits_keep_both_streams_in_long_held_pool`,
+`reordered_stream_envelopes_increment_health_counter_and_warn_once`, and
+`fallback_counter_counts_every_dispatch_but_warns_once_per_minute`.
 
 ## Configuration
 

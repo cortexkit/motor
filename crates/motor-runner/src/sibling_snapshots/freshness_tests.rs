@@ -96,7 +96,7 @@ impl Fixture {
         let state = config.state_dir();
         fs::create_dir_all(&state).unwrap();
         let trees = Trees {
-            dependency_locks: Mutex::new(BTreeMap::new()),
+            mirror_locks: Mutex::new(BTreeMap::new()),
             mirrors: state.join("mirrors"),
             state,
             compacting: Arc::default(),

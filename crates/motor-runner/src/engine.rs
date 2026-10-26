@@ -1946,7 +1946,7 @@ impl Runner {
             lock.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
         let trees = Trees {
-            dependency_locks: Mutex::new(BTreeMap::new()),
+            mirror_locks: Mutex::new(BTreeMap::new()),
             mirrors: state.join("mirrors"),
             state: state.clone(),
             compacting: Arc::default(),
@@ -2618,6 +2618,9 @@ impl Runner {
             if !path.is_empty() {
                 detail = detail.replace(&path, "runner state");
             }
+        }
+        if detail.starts_with("git fetch ") {
+            return workspace::bounded_fetch_detail(&detail, REFUSAL_DETAIL_MAX_BYTES);
         }
         let mut end = detail.len().min(REFUSAL_DETAIL_MAX_BYTES);
         while !detail.is_char_boundary(end) {

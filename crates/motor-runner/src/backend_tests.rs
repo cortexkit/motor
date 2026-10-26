@@ -142,7 +142,7 @@ fn boat_cached_long_names_request_cold_eviction_before_path_based_helpers() {
 
 fn trees(config: &Config) -> Trees {
     Trees {
-        dependency_locks: Mutex::new(BTreeMap::new()),
+        mirror_locks: Mutex::new(BTreeMap::new()),
         mirrors: config.state_dir().join("mirrors"),
         state: config.state_dir(),
         compacting: Arc::default(),
