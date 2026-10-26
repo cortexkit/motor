@@ -247,6 +247,15 @@ pub(super) fn mounts(table: &str) -> io::Result<Vec<Mount>> {
 }
 
 fn bind_sources(root: &Path, table: &[Mount]) -> Vec<PathBuf> {
+    let join = |base: &Path, suffix: &Path| {
+        // Joining an empty suffix adds a slash, which makes a mounted file
+        // such as ld.so.cache look like a directory to canonicalize().
+        if suffix.as_os_str().is_empty() {
+            base.to_path_buf()
+        } else {
+            base.join(suffix)
+        }
+    };
     let Some(mount) = table
         .iter()
         .filter(|m| root.starts_with(&m.mountpoint))
@@ -254,14 +263,50 @@ fn bind_sources(root: &Path, table: &[Mount]) -> Vec<PathBuf> {
     else {
         return Vec::new();
     };
-    let offset = mount
-        .root
-        .join(root.strip_prefix(&mount.mountpoint).unwrap());
+    let offset = join(&mount.root, root.strip_prefix(&mount.mountpoint).unwrap());
     table
         .iter()
         .filter(|m| m.device == mount.device && offset.starts_with(&m.root))
-        .map(|m| m.mountpoint.join(offset.strip_prefix(&m.root).unwrap()))
+        .map(|m| join(&m.mountpoint, offset.strip_prefix(&m.root).unwrap()))
         .collect()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod mounted_file_tests {
+    use super::*;
+
+    #[test]
+    fn mounted_file_bind_sources_remain_files_and_still_protect_their_parent() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-mounted-file-source");
+        let mounted = scratch.join("cache");
+        let backing = scratch.join("backing-cache");
+        let host = scratch.join("callers/home");
+        fs::write(&mounted, "cache").unwrap();
+        fs::write(&backing, "cache").unwrap();
+        fs::create_dir_all(&host).unwrap();
+        let encode = |path: &Path| {
+            path.to_str()
+                .unwrap()
+                .replace('\\', "\\134")
+                .replace(' ', "\\040")
+                .replace('\t', "\\011")
+                .replace('\n', "\\012")
+        };
+        let table = mounts(&format!(
+            "1 0 8:1 / / rw - xfs /dev/root rw\n2 1 8:1 {} {} rw - xfs /dev/root rw\n",
+            encode(&backing),
+            encode(&mounted)
+        ))
+        .unwrap();
+        let sources = bind_sources(&mounted, &table);
+        assert_eq!(sources.len(), 2);
+        assert!(sources.iter().any(|p| p.as_os_str() == mounted.as_os_str()));
+        assert!(sources.iter().any(|p| p.as_os_str() == backing.as_os_str()));
+        for source in sources {
+            assert!(!same_or_nested(&host, &source).unwrap());
+            assert!(same_or_nested(&scratch, &source).unwrap());
+        }
+    }
 }
 
 pub(crate) fn filesystem(config: &Config) -> io::Result<()> {
