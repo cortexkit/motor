@@ -2911,7 +2911,11 @@ impl Sandbox {
             use std::os::unix::fs::PermissionsExt;
             fs::create_dir_all(&tools)?;
             fs::set_permissions(&tools, fs::Permissions::from_mode(0o755))?;
-            if cached_rust {
+            // Remote-only hosts need the same fallback wrapper as hosts with a
+            // shared disk cache; the remote environment names this executable.
+            if cached_rust
+                || remote.is_some_and(|r| r.has_tool(crate::remote_cache::gateway::Tool::Sccache))
+            {
                 let cache_wrapper = tools.join("sccache");
                 fs::copy(
                     prepare_cache_readiness_probe(state)?,
