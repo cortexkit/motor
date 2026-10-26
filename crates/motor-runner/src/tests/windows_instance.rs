@@ -271,8 +271,13 @@ impl Backend for InProcessWindows {
     ) -> io::Result<Option<bool>> {
         WindowsBackend.unit_alive(config, process)
     }
-    fn collect_changes(&self, trees: &Trees, job: &Job) -> io::Result<Option<Vec<String>>> {
-        WindowsBackend.collect_changes(trees, job)
+    fn collect_changes(
+        &self,
+        config: &Config,
+        trees: &Trees,
+        job: &Job,
+    ) -> io::Result<Option<Vec<String>>> {
+        WindowsBackend.collect_changes(config, trees, job)
     }
     fn reconcile(&self, config: &Config, jobs: &[Job]) -> io::Result<Vec<Uuid>> {
         WindowsBackend.reconcile(config, jobs)

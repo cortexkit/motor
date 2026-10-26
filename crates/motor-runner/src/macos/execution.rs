@@ -104,7 +104,12 @@ impl Backend for MacosBackend {
                 .is_some_and(|e| !e.owned.lock().unwrap().record.stop_proven)
         }))
     }
-    fn collect_changes(&self, _trees: &Trees, _job: &Job) -> io::Result<Option<Vec<String>>> {
+    fn collect_changes(
+        &self,
+        _config: &Config,
+        _trees: &Trees,
+        _job: &Job,
+    ) -> io::Result<Option<Vec<String>>> {
         Ok(None)
     }
     fn reconcile(&self, config: &Config, _interrupted: &[Job]) -> io::Result<Vec<Uuid>> {

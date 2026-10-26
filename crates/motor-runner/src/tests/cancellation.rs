@@ -41,7 +41,12 @@ impl Backend for CancellationBackend {
         Ok(self.exited.load(Ordering::SeqCst).then_some(false))
     }
 
-    fn collect_changes(&self, _: &Trees, _: &Job) -> io::Result<Option<Vec<String>>> {
+    fn collect_changes(
+        &self,
+        _config: &Config,
+        _: &Trees,
+        _: &Job,
+    ) -> io::Result<Option<Vec<String>>> {
         self.events.lock().unwrap().push("collect_changes");
         self.collect.hook()("collect_changes");
         Ok(Some(Vec::new()))

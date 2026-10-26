@@ -1588,6 +1588,16 @@ fn bind(source: &Path, destination: &Path) -> io::Result<String> {
     Ok(format!("{}:{}", word(source)?, word(destination)?))
 }
 
+/// A bind of `source` at `destination`, spelled as a single path when the two
+/// are the same, as every identity job's workspace, target and `.git` are.
+fn mount(source: &Path, destination: &Path) -> io::Result<String> {
+    if source == destination {
+        word(source)
+    } else {
+        bind(source, destination)
+    }
+}
+
 /// The read-only mount that shows the runner's Bun directory to jobs at
 /// [`JOB_BUN_DIR`], where every role's job PATH expects Bun, together with
 /// that destination. On the build server and Boat the two paths are the same;
@@ -2361,17 +2371,19 @@ fn prefetch_cargo_in(
 /// With `snapshots`, every fetch runs in a helper unit that shows the job's
 /// sibling snapshots at the siblings' paths.
 #[allow(clippy::too_many_arguments)]
-fn prefetch_cargo_dependencies(
+fn prefetch_cargo_dependencies<'a>(
     writer: bool,
     tenant_vm: bool,
     state: &Path,
-    workspace: &Path,
+    job_tree: impl Into<crate::caller_path::JobTree<'a>>,
     tree: &str,
     dependency_routes: &BTreeMap<String, PathBuf>,
     cargo: &Path,
     rustup: &Path,
     snapshots: Option<&SnapshotSiblings<'_>>,
 ) -> io::Result<()> {
+    let job_tree = job_tree.into();
+    let workspace = job_tree.host.as_path();
     let stage = if writer {
         "fetch integration-tip dependencies (Cargo.lock)"
     } else {
@@ -2379,15 +2391,18 @@ fn prefetch_cargo_dependencies(
     };
     let view = snapshots
         .map(|snapshots| {
-            crate::sibling_snapshots::helper::View::prefetch(workspace, &snapshots.siblings).map(
-                |view| {
-                    let mut view = view.keep(cargo, true).keep(rustup, false);
-                    for mirror in dependency_routes.values() {
-                        view = view.keep(mirror, false);
-                    }
-                    view
-                },
+            crate::sibling_snapshots::helper::View::prefetch_tree(
+                workspace,
+                job_tree.caller,
+                &snapshots.siblings,
             )
+            .map(|view| {
+                let mut view = view.keep(cargo, true).keep(rustup, false);
+                for mirror in dependency_routes.values() {
+                    view = view.keep(mirror, false);
+                }
+                view
+            })
         })
         .transpose()?;
     crate::setup_log::phase("fetch cargo dependencies", || {
@@ -2397,9 +2412,17 @@ fn prefetch_cargo_dependencies(
             tenant_vm,
             NESTED_CARGO_FETCH_TIMEOUT,
             |directory| {
+                // A helper unit sees the workspace only at its caller path, so
+                // its manifest argument names that path; a fetch run directly
+                // on the host reads the host checkout.
+                let directory = if view.is_some() {
+                    job_tree.caller_form(directory)
+                } else {
+                    directory.to_path_buf()
+                };
                 let mut command = workspace::dependencies::fetch_command(
                     state,
-                    directory,
+                    &directory,
                     dependency_routes,
                     cargo,
                     rustup,
@@ -2485,7 +2508,11 @@ fn sibling_mounts(
 ) -> io::Result<Vec<(String, PathBuf)>> {
     let mut mounts = Vec::new();
     for sibling in siblings {
-        let path = crate::caller_path::sibling(sibling).host.as_path();
+        // The job sees each sibling at its caller path. Only an in-place
+        // sibling is read from the host, and in-place siblings are identity
+        // paths: a mapped sibling is always mounted from its snapshot.
+        let plan = crate::caller_path::sibling(sibling);
+        let path = Path::new(plan.caller.text());
         let source = match snapshots {
             Some(snapshots) => snapshots
                 .siblings
@@ -2498,7 +2525,7 @@ fn sibling_mounts(
                         path.display()
                     ))
                 })?,
-            None => path,
+            None => plan.host.as_path(),
         };
         mounts.push((
             if source == path {
@@ -2583,10 +2610,10 @@ impl Sandbox {
     /// sibling's snapshot at the sibling's path, and so does the Cargo
     /// prefetch.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn prepare_with_dependencies(
+    pub(crate) fn prepare_with_dependencies<'a>(
         id: Uuid,
         state: &Path,
-        workspace: &Path,
+        workspace: impl Into<crate::caller_path::JobTree<'a>>,
         target: &Path,
         siblings: &[SiblingSnapshot],
         wrapper: Option<&Path>,
@@ -2623,10 +2650,10 @@ impl Sandbox {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn prepare_writer(
+    pub(crate) fn prepare_writer<'a>(
         id: Uuid,
         state: &Path,
-        workspace: &Path,
+        workspace: impl Into<crate::caller_path::JobTree<'a>>,
         target: &Path,
         wrapper: Option<&Path>,
         slots: &Path,
@@ -2637,6 +2664,7 @@ impl Sandbox {
         boat_profile: bool,
         remote: Option<&Transport>,
     ) -> io::Result<Self> {
+        let workspace = workspace.into();
         Self::prepare_role(
             id,
             state,
@@ -2648,7 +2676,7 @@ impl Sandbox {
             limit,
             dependency_routes,
             tree,
-            &workspace.to_string_lossy(),
+            &workspace.host.as_path().to_string_lossy(),
             true,
             false,
             true,
@@ -2660,10 +2688,10 @@ impl Sandbox {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn prepare_role(
+    fn prepare_role<'a>(
         id: Uuid,
         state: &Path,
-        workspace: &Path,
+        workspace: impl Into<crate::caller_path::JobTree<'a>>,
         target: &Path,
         siblings: &[SiblingSnapshot],
         wrapper: Option<&Path>,
@@ -2679,6 +2707,11 @@ impl Sandbox {
         javascript: &JavascriptTools,
         remote: Option<&Transport>,
     ) -> io::Result<Self> {
+        // Every filesystem step uses the host checkout; bind destinations,
+        // safe.directory entries and the prefetch view use the caller path.
+        let job_tree = workspace.into();
+        let workspace = job_tree.host.as_path();
+        let caller_workspace = job_tree.caller;
         let declared_hosts = hosts::from_tree(workspace, tree)?;
         validate_account()?;
         let writer_account = if writer {
@@ -2705,7 +2738,7 @@ impl Sandbox {
                 writer,
                 tenant_vm,
                 state,
-                workspace,
+                job_tree,
                 tree,
                 dependency_routes,
                 &cargo,
@@ -2798,19 +2831,20 @@ impl Sandbox {
         let cargo = home.join("cargo");
         let cached_rust = shared_compile_cache && workspace.join("Cargo.toml").is_file();
         let wrapper = wrapper.filter(|_| shared_compile_cache);
+        let job_target = job_tree.caller_form(target);
         let mut mount_destinations = vec![
-            workspace.to_path_buf(),
-            target.to_path_buf(),
+            caller_workspace.to_path_buf(),
+            job_target.clone(),
             home.clone(),
             PathBuf::from("/tmp"),
         ];
         fs::create_dir_all(host_home.join("tmp"))?;
         fs::create_dir_all(host_home.join("cargo/registry"))?;
         fs::create_dir_all(host_home.join("cargo/git"))?;
-        let sibling_mounts = sibling_mounts(workspace, siblings, snapshots)?;
+        let sibling_mounts = sibling_mounts(caller_workspace, siblings, snapshots)?;
         write_safe_directories(
             &host_home.join(".gitconfig"),
-            &safe_directories(workspace, &sibling_mounts),
+            &safe_directories(caller_workspace, &sibling_mounts),
         )?;
         prepare_job_home(&host_home)?;
         let shared_cargo = PathBuf::from(
@@ -2848,15 +2882,15 @@ impl Sandbox {
             }
         }
         let mut read_write = vec![
-            word(workspace)?,
-            word(target)?,
+            mount(workspace, caller_workspace)?,
+            mount(target, &job_target)?,
             bind(&host_home, &home)?,
             bind(&tmp, &runner_binds.private["tmp"])?,
         ];
         if cached_rust && writer {
             fs::create_dir_all(workspace.join("target"))?;
-            read_write.push(bind(target, &workspace.join("target"))?);
-            mount_destinations.push(workspace.join("target"));
+            read_write.push(bind(target, &caller_workspace.join("target"))?);
+            mount_destinations.push(caller_workspace.join("target"));
         }
         compile_cache_mounts(
             state,
@@ -2879,8 +2913,9 @@ impl Sandbox {
         }
         if workspace.join(".git").is_dir() {
             let git = workspace.join(".git");
-            read_only.push(word(&git)?);
-            mount_destinations.push(git);
+            let destination = caller_workspace.join(".git");
+            read_only.push(mount(&git, &destination)?);
+            mount_destinations.push(destination);
         }
         for (mount, destination) in sibling_mounts {
             read_only.push(mount);

@@ -602,3 +602,207 @@ async fn mapped_writer_refusal_details_name_the_caller_not_host_storage() {
         "{json}"
     );
 }
+
+/// A Run for the mapped workspace `/home/u/proj` built from the fixture's main
+/// repository, without siblings (the test-only configuration refuses mapped
+/// siblings).
+fn mapped_job(f: &Fixture, command: &str, returns: &[&str]) -> (Run, Vec<Vec<u8>>) {
+    let (mut request, mut bytes) = f.run(command);
+    request.workspace_key = "/home/u/proj".into();
+    request.repository_root = request.workspace_key.clone();
+    request.cwd = request.workspace_key.clone();
+    request.siblings.clear();
+    request.bundles.truncate(1);
+    request.bundles[0].repository = request.repository_root.clone();
+    bytes.truncate(1);
+    request.return_paths = returns
+        .iter()
+        .map(|name| format!("/home/u/proj/{name}"))
+        .collect();
+    (request, bytes)
+}
+
+/// The command leaves one file and four links in the job's checkout: a
+/// relative link, an absolute link whose literal target is inside the caller
+/// workspace, one outside it, and one whose target is the host form (the
+/// test-only configuration runs a mapped job at its host cwd, so `$PWD` is H's
+/// form). It also prints its working directory, which must reach the caller
+/// unchanged even though it names H.
+const LINKS: &str = "printf mapped > out; ln -s out relative; ln -s /home/u/proj/out absolute; \
+                     ln -s /home/other/secret outside; ln -s \"$PWD/out\" hostform; printf %s \"$PWD\"";
+
+#[tokio::test]
+async fn mapped_run_executes_in_the_host_checkout_and_returns_files_at_caller_paths() {
+    let f = Fixture::new();
+    let config = mapped_config(&f);
+    let host_root = config.caller_roots[0].host_root.clone();
+    let host = host_root.join("u/proj");
+    let runner = Runner::open(config.clone()).unwrap();
+    let (request, bytes) = mapped_job(&f, LINKS, &["out", "relative", "absolute"]);
+    f.submit(&runner, &request, &bytes);
+    let t = terminal(&runner, request.job_id).await;
+    assert_eq!(t.outcome, Outcome::Exit { code: 0 });
+    // The checkout and every file the job wrote are in the host tree.
+    assert_eq!(fs::read_to_string(host.join("source")).unwrap(), "first\n");
+    assert_eq!(fs::read_to_string(host.join("out")).unwrap(), "mapped");
+    let changes = t.workspace_changes.clone().unwrap();
+    for name in ["absolute", "hostform", "out", "outside", "relative"] {
+        assert!(changes.iter().any(|change| change == name), "{changes:?}");
+    }
+    // Runner-written caller-visible records name caller paths only.
+    let record = serde_json::to_string(&t).unwrap();
+    assert!(!record.contains(host_root.to_str().unwrap()), "{record}");
+    let frames = runner.replay(request.job_id, 0).unwrap();
+    let stdout: Vec<u8> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Output(o) if o.stream == OutputStream::Stdout => Some(o.bytes.0.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    // Command output is never rewritten, even where it names H.
+    assert_eq!(stdout, host.to_str().unwrap().as_bytes());
+    let result = frames
+        .iter()
+        .find_map(|frame| match frame {
+            Frame::ReturnResult(result) => Some(result.clone()),
+            _ => None,
+        })
+        .expect("return result");
+    assert_eq!(result.return_paths_failed, None);
+    let returned = result.returned_files.unwrap();
+    assert_eq!(
+        returned
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>(),
+        request.return_paths
+    );
+    assert!(returned.iter().all(|file| file.data == "bWFwcGVk"));
+    // Replay after a same-configuration restart serves the same frames.
+    drop(runner);
+    let runner = reopen(config);
+    assert_eq!(runner.replay(request.job_id, 0).unwrap(), frames);
+}
+
+#[tokio::test]
+async fn mapped_chunked_returns_refuse_outside_and_host_form_links() {
+    let f = Fixture::new();
+    let config = mapped_config(&f);
+    let host_root = config.caller_roots[0].host_root.clone();
+    let runner = Runner::open(config.clone()).unwrap();
+    let names = ["out", "relative", "absolute", "outside", "hostform"];
+    let (mut request, bytes) = mapped_job(&f, LINKS, &names);
+    request.return_max_bytes = RETURN_CHUNKED_MAX_BYTES_CAP;
+    request.return_chunked = true;
+    f.submit(&runner, &request, &bytes);
+    assert_eq!(
+        terminal(&runner, request.job_id).await.outcome,
+        Outcome::Exit { code: 0 }
+    );
+    let check = |frames: &[Frame]| {
+        let manifest = frames
+            .iter()
+            .find_map(|frame| match frame {
+                Frame::ReturnManifest(manifest) => Some(manifest.clone()),
+                _ => None,
+            })
+            .expect("chunked request replays its manifest");
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(!json.contains(host_root.to_str().unwrap()), "{json}");
+        for (entry, (name, path)) in manifest
+            .files
+            .iter()
+            .zip(names.iter().zip(&request.return_paths))
+        {
+            assert_eq!(entry.path(), path.as_str());
+            let expected = match *name {
+                "outside" | "hostform" => Some(&ReturnPathsFailureCause::Escape),
+                _ => None,
+            };
+            assert_eq!(entry.cause(), expected, "{name}");
+        }
+    };
+    let frames = runner.replay(request.job_id, 0).unwrap();
+    check(&frames);
+    drop(runner);
+    let runner = reopen(config);
+    check(&runner.replay(request.job_id, 0).unwrap());
+}
+
+/// A caller prefix that exists on this host, holding a symlink into the
+/// fixture's identity workspace tree, with different content in H. Every check
+/// on the mapped path uses H; none resolves the caller form, which would
+/// reach the identity workspace instead.
+#[test]
+fn scratch_caller_prefix_symlink_never_steers_mapped_checks_into_an_unrelated_tree() {
+    use std::os::unix::fs::symlink;
+    let f = Fixture::new();
+    let mut config = mapped_config(&f);
+    let prefix = f.scratch.join("caller-prefix");
+    let host_root = f.scratch.join("caller-host");
+    let identity = PathBuf::from(&f.key);
+    let name = identity.file_name().unwrap().to_owned();
+    fs::create_dir_all(&prefix).unwrap();
+    fs::create_dir_all(&identity).unwrap();
+    symlink(identity.parent().unwrap(), prefix.join("u")).unwrap();
+    fs::write(identity.join("out"), "identity tree").unwrap();
+    let host = host_root.join("u").join(&name);
+    fs::create_dir_all(&host).unwrap();
+    fs::write(host.join("out"), "host tree").unwrap();
+    config.caller_roots = vec![crate::CallerRoot {
+        caller_prefix: text(&prefix).into(),
+        host_root: host_root.clone(),
+    }];
+    let runner = Runner::open(config.clone()).unwrap();
+    let caller = text(&prefix.join("u").join(&name)).to_owned();
+    // Through the caller prefix's symlink, the caller form resolves to the
+    // identity workspace.
+    assert_eq!(
+        fs::canonicalize(&caller).unwrap(),
+        fs::canonicalize(&identity).unwrap()
+    );
+    let mut request = run(&f, &caller);
+    request.return_paths = vec![format!("{caller}/out")];
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        workspace::record_workspace_entry(&mut inner.catalog, &f.key, &f.key, "tip", &[], 0);
+        inner.dropping.insert(f.key.clone());
+    }
+    // Admission: neither the nested-workspace fence nor the deletion fence
+    // sees the catalogued, dropping identity workspace.
+    assert_eq!(admission(&runner, &request), None);
+    let authorized = crate::caller_path::authorize_request(
+        &config,
+        crate::caller_path::request(&request),
+        Some(crate::caller_path::run(&request).caller_cwd),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(authorized.host_workspace, host);
+    let host_plan = crate::caller_path::host(&authorized.host_workspace);
+    {
+        let inner = runner.core.inner.lock().unwrap();
+        assert!(!runner.deleting(&inner, crate::caller_path::host_str(&caller), &[]));
+        runner
+            .validate_writer_paths_with_catalog(&inner, host_plan, Some(host_plan), &[])
+            .unwrap();
+    }
+    crate::writer::validate_paths(&config, host_plan, Some(host_plan), &[], &[]).unwrap();
+    crate::writer::validate_alias_paths(&config, &[], &[]).unwrap();
+    // Returned files are read from H.
+    let result = crate::return_paths::collect_authorized(&config, &request, 1);
+    assert_eq!(result.returned_files.unwrap()[0].data, "aG9zdCB0cmVl");
+    // Legacy-checkout claims compare host forms: an admitted mapped job claims
+    // H's tree, not the identity workspace its caller form resolves to.
+    let mut inner = runner.core.inner.lock().unwrap();
+    inner.dropping.clear();
+    inner.catalog.workspaces.clear();
+    inner.admitting.insert(request.job_id, request.clone());
+    let claims = crate::engine::sibling_eviction::PathClaims::of(&inner, &config);
+    let spelled =
+        |path: &Path| crate::engine::sibling_eviction::Spelled::new(crate::caller_path::host(path));
+    assert!(!claims.live_overlaps(&spelled(&identity)));
+    assert!(claims.live_overlaps(&spelled(&host)));
+}

@@ -291,6 +291,83 @@ fn snapshot_prefetch_helper_binds_snapshots_at_sibling_paths_and_hides_neighbour
 }
 
 #[test]
+fn mapped_prefetch_helper_binds_the_host_checkout_at_the_caller_path() {
+    let scratch = ScratchDir::new("mapped-prefetch-helper");
+    let launched: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+    let config = fake(
+        &scratch,
+        Arc::default(),
+        SUCCEEDED,
+        UNLOADED,
+        launched.clone(),
+    );
+    let host_root = scratch.join("callers/home");
+    let host = host_root.join("u/proj");
+    let caller = Path::new("/home/u/proj");
+    let sibling = PathBuf::from("/home/v/library");
+    let snapshot = config.sibling_snapshots_dir().join("library/1234");
+    for path in [&host, &snapshot] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let view = View::prefetch_tree(&host, caller, &[(snapshot.clone(), sibling.clone())]).unwrap();
+    let mut command = shell(&config.state_dir());
+    // The prefetch names the manifest by the path the helper sees.
+    command.arg(caller.join("Cargo.toml"));
+    run(
+        &config,
+        Helper::CargoPrefetch,
+        Helper::CargoPrefetch.limit(&config),
+        &command,
+        &view,
+    )
+    .unwrap();
+    let launched = launched.lock().unwrap();
+    let arguments = &launched[0];
+    let w = |path: &Path| word(path).unwrap();
+    for expected in [
+        format!(
+            "--property=TemporaryFileSystem={}:ro",
+            w(Path::new("/home/u"))
+        ),
+        format!(
+            "--property=TemporaryFileSystem={}:ro",
+            w(Path::new("/home/v"))
+        ),
+        format!(
+            "--property=BindReadOnlyPaths={} {} {}",
+            bind(&host, caller).unwrap(),
+            bind(&snapshot, &sibling).unwrap(),
+            bind(&snapshot, Path::new("/home/u/library")).unwrap(),
+        ),
+    ] {
+        assert!(
+            arguments.contains(&expected),
+            "{expected} missing from {arguments:?}"
+        );
+    }
+    // H is a bind source only: no destination, hidden directory, working
+    // directory or argument names it.
+    let h = w(&host_root);
+    for argument in arguments {
+        let mounts = argument
+            .strip_prefix("--property=BindReadOnlyPaths=")
+            .or_else(|| argument.strip_prefix("--property=BindPaths="));
+        match mounts {
+            Some(mounts) => {
+                for mount in mounts.split_whitespace() {
+                    let destination = mount.split_once(':').map_or(mount, |(_, d)| d);
+                    assert!(!destination.starts_with(&h), "{mount}");
+                }
+            }
+            None => assert!(
+                !argument.contains(host_root.to_str().unwrap()),
+                "{argument}"
+            ),
+        }
+    }
+}
+
+#[test]
 fn snapshot_javascript_helper_runs_in_the_snapshot_at_the_sibling_path() {
     let scratch = ScratchDir::new("snapshot-helper-javascript");
     let launched: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();

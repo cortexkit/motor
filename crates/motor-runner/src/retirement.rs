@@ -227,7 +227,7 @@ impl Runner {
         // under any spelling, a workspace of another repository or work in
         // flight. The repository's own Head workspaces retire with it.
         let claims = (!inner.catalog.sibling_commits.is_empty())
-            .then(|| sibling_eviction::PathClaims::of(inner));
+            .then(|| sibling_eviction::PathClaims::of(inner, &self.core.config));
         for path in
             crate::caller_path::keys(&inner.catalog.sibling_commits).map(|path| path.caller.text())
         {

@@ -43,6 +43,46 @@ pub(crate) fn host_str(value: &str) -> HostPath<'_> {
     HostPath(Path::new(value))
 }
 
+/// A tree the runner stores at `host` and a job sees at `caller`: one sandbox
+/// bind's source and destination. Identity trees use one path for both.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct JobTree<'a> {
+    pub(crate) host: HostPath<'a>,
+    pub(crate) caller: &'a Path,
+}
+
+impl<'a> JobTree<'a> {
+    pub(crate) fn new(host: &'a Path, caller: &'a Path) -> Self {
+        Self {
+            host: HostPath(host),
+            caller,
+        }
+    }
+
+    /// Where the job sees `path`, a host path at or beneath this tree's host
+    /// form. Any other path, such as a writer's scratch target in the runner
+    /// state, is bound at its own location and comes back unchanged.
+    pub(crate) fn caller_form(self, path: &Path) -> PathBuf {
+        match path.strip_prefix(self.host.0) {
+            Ok(rest) if rest.as_os_str().is_empty() => self.caller.to_path_buf(),
+            Ok(rest) => self.caller.join(rest),
+            Err(_) => path.to_path_buf(),
+        }
+    }
+}
+
+impl<'a> From<&'a Path> for JobTree<'a> {
+    fn from(path: &'a Path) -> Self {
+        Self::new(path, path)
+    }
+}
+
+impl<'a> From<&'a PathBuf> for JobTree<'a> {
+    fn from(path: &'a PathBuf) -> Self {
+        Self::new(path, path)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PathPlan<'a> {
     pub(crate) caller: CallerPath<'a>,
@@ -201,11 +241,19 @@ pub(crate) fn job_key(job: &Job) -> &str {
     }
 }
 
-pub(crate) fn job_workspace(job: &Job) -> HostPath<'_> {
+/// The path whose volume a job's terminal evidence reports: the job's key in
+/// host form. A fill's key is its opaque scheduling identifier, which names
+/// no file and so reports no volume, as it always has.
+pub(crate) fn evidence_volume(config: &crate::Config, job: &Job) -> PathBuf {
+    host_path(config, job_key(job))
+}
+
+/// The host checkout of a job's workspace (a fill's checkout for a fill).
+pub(crate) fn job_workspace(config: &crate::Config, job: &Job) -> PathBuf {
     job.request
         .as_ref()
-        .map(|r| request(r).host_workspace)
-        .unwrap_or_else(|| host_str(""))
+        .map(|r| host_run(config, r).workspace)
+        .unwrap_or_default()
 }
 
 pub(crate) struct RecordPlan<'a> {
@@ -639,16 +687,122 @@ pub(crate) fn authorize_request(
     })
 }
 
-fn caller_from_host(config: &crate::Config, host: &Path) -> String {
+/// The path a job sees for host path `host`: its caller form when it lies
+/// beneath a configured host root, otherwise `host` itself. Identity paths
+/// never lie beneath a host root, so they come back unchanged.
+pub(crate) fn caller_form(config: &crate::Config, host: &Path) -> PathBuf {
     for root in &config.caller_roots {
         if let Ok(relative) = host.strip_prefix(&root.host_root) {
-            return Path::new(&root.caller_prefix)
-                .join(relative)
-                .to_string_lossy()
-                .into_owned();
+            return Path::new(&root.caller_prefix).join(relative);
         }
     }
-    host.to_string_lossy().into_owned()
+    host.to_path_buf()
+}
+
+fn caller_from_host(config: &crate::Config, host: &Path) -> String {
+    caller_form(config, host).to_string_lossy().into_owned()
+}
+
+/// Whether any tree a Run names (its workspace, repository, cwd, a fill's
+/// checkout or a sibling) lies beneath a caller prefix.
+pub(crate) fn mapped_run(config: &crate::Config, request: &Run) -> bool {
+    [
+        &request.workspace_key,
+        &request.repository_root,
+        &request.cwd,
+    ]
+    .into_iter()
+    .chain(request.siblings.iter().map(|s| &s.canonical_path))
+    .any(|value| mapped_root(config, value).is_some())
+}
+
+/// The host trees a Run's job uses: the checkout it runs in (its workspace,
+/// or a fill's checkout) and its cwd. Admission and setup authorize them
+/// first; identity runs keep their caller spelling exactly.
+pub(crate) struct HostRun {
+    pub(crate) workspace: PathBuf,
+    pub(crate) cwd: PathBuf,
+}
+
+pub(crate) fn host_run(config: &crate::Config, request: &Run) -> HostRun {
+    let plan = run(request);
+    HostRun {
+        workspace: host_path(config, plan.workspace.checkout().caller.text()),
+        cwd: host_path(config, plan.caller_cwd.text()),
+    }
+}
+
+/// The caller-form checkout a Run's job sees: its workspace, or a fill's
+/// checkout.
+pub(crate) fn caller_checkout(request: &Run) -> &Path {
+    Path::new(run(request).workspace.checkout().caller.text())
+}
+
+/// Siblings with each canonical path in host form, for host-side access
+/// repair. Identity siblings are unchanged.
+pub(crate) fn host_siblings(
+    config: &crate::Config,
+    siblings: &[SiblingSnapshot],
+) -> Vec<SiblingSnapshot> {
+    siblings
+        .iter()
+        .cloned()
+        .map(|mut sibling| {
+            sibling.canonical_path = host_path(config, &sibling.canonical_path)
+                .to_string_lossy()
+                .into_owned();
+            sibling
+        })
+        .collect()
+}
+
+/// Authorizes a Run's trees again at setup, as admission did, and returns
+/// their host forms. A fill's checkout is runner-derived, so it may carry the
+/// `.motor-base-` name that caller-supplied paths may not.
+pub(crate) fn authorize_run(
+    config: &crate::Config,
+    request: &Run,
+    fill: bool,
+) -> io::Result<AuthorizedRequest> {
+    if !fill {
+        return authorize_request(
+            config,
+            self::request(request),
+            Some(run(request).caller_cwd),
+            &request.siblings,
+        );
+    }
+    let checkout = authorize(config, run(request).caller_cwd.text(), true)?;
+    let mut host_siblings = Vec::new();
+    for sibling in &request.siblings {
+        let mut sibling = sibling.clone();
+        sibling.canonical_path = authorize(config, &sibling.canonical_path, false)?
+            .to_string_lossy()
+            .into_owned();
+        host_siblings.push(sibling);
+    }
+    Ok(AuthorizedRequest {
+        host_workspace: checkout.clone(),
+        host_cwd: Some(checkout),
+        host_siblings,
+    })
+}
+
+/// Setup's destination check for a mapped Run: authorization, then the
+/// no-follow host checks on the authorized host forms.
+pub(crate) fn validate_mapped_run(
+    config: &crate::Config,
+    request: &Run,
+    fill: bool,
+) -> io::Result<AuthorizedRequest> {
+    let authorized = authorize_run(config, request, fill)?;
+    validate_host_destinations(
+        config,
+        host(&authorized.host_workspace),
+        authorized.host_cwd.as_deref().map(host),
+        &authorized.host_siblings,
+    )?;
+    Ok(authorized)
 }
 
 pub(crate) fn host_aliases(

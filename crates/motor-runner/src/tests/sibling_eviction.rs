@@ -212,7 +212,12 @@ impl backend::Backend for Reattaching {
     ) -> io::Result<Option<bool>> {
         Ok(Some(false))
     }
-    fn collect_changes(&self, _: &Trees, _: &Job) -> io::Result<Option<Vec<String>>> {
+    fn collect_changes(
+        &self,
+        _config: &Config,
+        _: &Trees,
+        _: &Job,
+    ) -> io::Result<Option<Vec<String>>> {
         Ok(None)
     }
     fn reconcile(&self, _: &Config, jobs: &[Job]) -> io::Result<Vec<Uuid>> {

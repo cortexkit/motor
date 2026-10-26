@@ -887,7 +887,12 @@ impl Backend for EnumeratingBackend {
     ) -> io::Result<Option<bool>> {
         Ok(None)
     }
-    fn collect_changes(&self, _: &Trees, _: &Job) -> io::Result<Option<Vec<String>>> {
+    fn collect_changes(
+        &self,
+        _config: &Config,
+        _: &Trees,
+        _: &Job,
+    ) -> io::Result<Option<Vec<String>>> {
         Ok(None)
     }
     fn reconcile(&self, _: &Config, _: &[Job]) -> io::Result<Vec<Uuid>> {

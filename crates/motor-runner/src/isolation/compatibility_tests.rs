@@ -7,7 +7,7 @@ use crate::compatibility_config::{assert_identity, configure, modes};
 const CAPTURE_CARGO_HOME: &str = "/motor-home/cargo";
 const CAPTURE_RUSTUP_HOME: &str = "/fixture-rustup";
 
-fn with_capture_host<T>(f: impl FnOnce() -> T) -> T {
+pub(super) fn with_capture_host<T>(f: impl FnOnce() -> T) -> T {
     use std::os::unix::process::ExitStatusExt;
     let inputs = host_inputs::fixture::Inputs {
         environment: BTreeMap::from([

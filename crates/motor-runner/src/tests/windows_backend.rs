@@ -36,8 +36,13 @@ impl Backend for FakeHost {
     ) -> io::Result<Option<bool>> {
         WindowsBackend.unit_alive(c, p)
     }
-    fn collect_changes(&self, t: &Trees, j: &Job) -> io::Result<Option<Vec<String>>> {
-        WindowsBackend.collect_changes(t, j)
+    fn collect_changes(
+        &self,
+        config: &Config,
+        t: &Trees,
+        j: &Job,
+    ) -> io::Result<Option<Vec<String>>> {
+        WindowsBackend.collect_changes(config, t, j)
     }
     fn reconcile(&self, c: &Config, j: &[Job]) -> io::Result<Vec<Uuid>> {
         WindowsBackend.reconcile(c, j)
@@ -875,7 +880,7 @@ fn windows_backend_reports_workspace_changes_relative_to_checkout_root() {
         let job = Job::new(id, Some(r), 0, 0, 4);
         assert_eq!(
             WindowsBackend
-                .collect_changes(&runner.core.trees, &job)
+                .collect_changes(runner.config(), &runner.core.trees, &job)
                 .unwrap()
                 .unwrap(),
             ["a.txt", "gone.txt", "sub/b.txt"],

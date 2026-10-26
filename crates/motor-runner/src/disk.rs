@@ -392,29 +392,29 @@ impl Runner {
         ];
         // Source/sibling paths remain protected for task cleanup. A recorded head
         // owns its checkout in both roles, so only active ownership protects it.
+        // Every claim is in host form: a mapped caller path names no host
+        // file, and resolving it on the host could land in an unrelated tree.
+        let host = |caller: &str| crate::caller_path::host_path(&self.core.config, caller);
         let mut passive: Vec<_> = crate::caller_path::keys(&inner.catalog.repositories)
             .chain(crate::caller_path::keys(&inner.catalog.sibling_commits))
-            .map(|path| path.host.as_path().to_path_buf())
+            .map(|path| host(path.caller.text()))
             .collect();
         passive.extend(passive.clone().iter().filter_map(|p| p.canonicalize().ok()));
         for job in inner.jobs.values() {
             if let Some(r) = &job.request {
                 if job.base {
-                    protected.push(crate::caller_path::run(r).host_cwd.as_path().to_path_buf());
+                    protected.push(host(crate::caller_path::run(r).caller_cwd.text()));
                 }
                 if job.terminal.is_none() || inner.starting.contains(&job.id) {
                     if !job.base {
-                        protected.push(
-                            crate::caller_path::request(r)
-                                .host_workspace
-                                .as_path()
-                                .to_path_buf(),
-                        );
+                        protected.push(host(
+                            crate::caller_path::request(r).caller_workspace_key.text(),
+                        ));
                     }
                     protected.extend(
                         r.siblings
                             .iter()
-                            .map(|s| crate::caller_path::sibling(s).host.as_path().to_path_buf()),
+                            .map(|s| host(crate::caller_path::sibling(s).caller.text())),
                     );
                 }
                 if job.terminal.is_none()
@@ -431,25 +431,22 @@ impl Runner {
         }
         for (key, r) in crate::caller_path::entries(&inner.reserved) {
             if workspace::absolute(key.caller.text()) {
-                protected.push(key.host.as_path().to_path_buf());
+                protected.push(host(key.caller.text()));
             }
             protected.extend(
                 r.siblings
                     .iter()
-                    .map(|s| crate::caller_path::sibling(s).host.as_path().to_path_buf()),
+                    .map(|s| host(crate::caller_path::sibling(s).caller.text())),
             );
         }
         for r in inner.admitting.values() {
-            protected.push(
-                crate::caller_path::request(r)
-                    .host_workspace
-                    .as_path()
-                    .to_path_buf(),
-            );
+            protected.push(host(
+                crate::caller_path::request(r).caller_workspace_key.text(),
+            ));
             protected.extend(
                 r.siblings
                     .iter()
-                    .map(|s| crate::caller_path::sibling(s).host.as_path().to_path_buf()),
+                    .map(|s| host(crate::caller_path::sibling(s).caller.text())),
             );
             dependency_roots.extend(
                 r.git_dependencies
@@ -463,24 +460,16 @@ impl Runner {
                     .iter()
                     .map(|d| self.core.trees.dependency_mirror(&d.url)),
             );
-            protected.push(
-                crate::caller_path::request(r)
-                    .host_workspace
-                    .as_path()
-                    .to_path_buf(),
-            );
+            protected.push(host(
+                crate::caller_path::request(r).caller_workspace_key.text(),
+            ));
             protected.extend(
                 r.siblings
                     .iter()
-                    .map(|s| crate::caller_path::sibling(s).host.as_path().to_path_buf()),
+                    .map(|s| host(crate::caller_path::sibling(s).caller.text())),
             );
         }
-        protected.extend(inner.dropping.iter().map(|path| {
-            crate::caller_path::identity(path)
-                .host
-                .as_path()
-                .to_path_buf()
-        }));
+        protected.extend(inner.dropping.iter().map(|path| host(path)));
         // Include canonical aliases: an allowed root cannot turn a symlink into
         // permission to delete a protected path under another spelling.
         protected.extend(
@@ -500,6 +489,12 @@ impl Runner {
             .collect();
         let mut candidates = Vec::new();
         for (key, workspace) in crate::caller_path::entries(&inner.catalog.workspaces) {
+            // A mapped workspace's caller key names no host file; resolving it
+            // here could reach an unrelated tree. Mapped trees are not
+            // eviction candidates from this list.
+            if crate::caller_path::mapped_root(&self.core.config, key.caller.text()).is_some() {
+                continue;
+            }
             let path = key.host.as_path().to_path_buf();
             let Ok(canonical) = path.canonicalize() else {
                 continue;

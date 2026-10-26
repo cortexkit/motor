@@ -349,7 +349,12 @@ impl Backend for WindowsBackend {
         let _ = (config, process);
         Ok(None)
     }
-    fn collect_changes(&self, trees: &Trees, job: &Job) -> io::Result<Option<Vec<String>>> {
+    fn collect_changes(
+        &self,
+        _config: &Config,
+        trees: &Trees,
+        job: &Job,
+    ) -> io::Result<Option<Vec<String>>> {
         let path = trees
             .state
             .join("jobs")
