@@ -438,7 +438,7 @@ impl Heartbeats {
             // A failed probe leaves the previous fill sample to go stale, so
             // it stops counting rather than lingering.
             if let Ok(sample) = sample {
-                host.record_fill(tenant, now_ms, sample.fill_permits)?;
+                host.record_fill(tenant, now_ms, sample.fill_permits);
             }
         }
         Ok(())

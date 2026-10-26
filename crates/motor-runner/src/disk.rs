@@ -276,8 +276,9 @@ impl Runner {
                 .filter(|(id, (_, pending))| !pending || inner.starting.contains(id))
                 .map(|(_, (job, _))| job.weight)
                 .sum();
-            // Only a tenant VM reports its fill: its host counts these permits
-            // as claimed, so the broker places new jobs elsewhere meanwhile.
+            // Only a tenant VM reports its fill: its host subtracts these
+            // permits from the capacity it advertises, so the broker places
+            // new jobs elsewhere meanwhile.
             let fill_permits = self.core.config.tenant_vm.then(|| {
                 inner
                     .writer

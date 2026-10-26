@@ -323,14 +323,15 @@ fn overlap_makes_both_metrics_null_and_missing_metrics_are_not_fabricated_zero()
     assert!(h.snapshot.billing[JOB].usage.is_none());
 }
 
-/// A tenant's own cache fill is never billed: a fill alone yields no usage
-/// record at all. A job that runs while a fill runs, whether the fill started
-/// before or after it, is billed for its own claim only and reports no memory
-/// peak or egress, since both are measured for the whole VM.
+/// A tenant's own cache fill produces no usage record of its own. A job that
+/// runs beside its tenant's fill, whether the fill started before or after it,
+/// keeps its memory peak and egress in settlement: those VM-wide figures
+/// include the fill, which is that tenant's real usage on its own VM. Only a
+/// second job of the same tenant marks a job as overlapping.
 #[test]
-fn a_tenant_fill_is_never_billed_and_withholds_the_metrics_of_jobs_it_overlaps() {
+fn a_job_beside_its_tenants_fill_keeps_its_memory_and_egress() {
     let mut h = host();
-    h.record_fill("tenant", MS, 4).unwrap();
+    h.record_fill("tenant", MS, 4);
     h.billing_tick(MS + 120_000).unwrap();
     assert!(h.snapshot.billing.is_empty());
     assert!(h.snapshot.outbox.is_empty());
@@ -338,19 +339,20 @@ fn a_tenant_fill_is_never_billed_and_withholds_the_metrics_of_jobs_it_overlaps()
     for fill_first in [true, false] {
         let mut h = host();
         if fill_first {
-            h.record_fill("tenant", MS, 4).unwrap();
+            h.record_fill("tenant", MS, 4);
         }
         started(&mut h, JOB, 1);
         if !fill_first {
-            h.record_fill("tenant", MS + 1000, 4).unwrap();
+            h.record_fill("tenant", MS + 1000, 4);
         }
         end(&mut h, JOB, 3, MS + 3000, terminal(JOB, "exit"));
         let b = &h.snapshot.billing[JOB];
+        assert!(!b.overlapping, "{fill_first}");
         let usage = b.usage.as_ref().unwrap();
         assert_eq!(usage.vcpus, claims(JOB).vcpus, "{fill_first}");
         assert_eq!(
             (usage.mem_peak_mib, usage.egress_bytes),
-            (None, None),
+            (Some(13), Some(45)),
             "{fill_first}"
         );
         assert_eq!(
@@ -358,17 +360,59 @@ fn a_tenant_fill_is_never_billed_and_withholds_the_metrics_of_jobs_it_overlaps()
             u64::from(claims(JOB).vcpus) * 3000
         );
     }
-
-    // A probe that finds no fill running leaves a job's metrics alone.
-    let mut h = host();
-    h.record_fill("tenant", MS, 0).unwrap();
-    started(&mut h, JOB, 1);
-    end(&mut h, JOB, 3, MS + 3000, terminal(JOB, "exit"));
-    let usage = h.snapshot.billing[JOB].usage.as_ref().unwrap();
+}
+/// The guest is root-controlled, so its fill report is tenant input: it may
+/// only lower what the host offers that tenant. A report of u32::MAX fill
+/// permits leaves the VM's CPU quota and every billing figure exactly as an
+/// honest runner's, and lowers only that tenant's advertised `free_vcpus`, to
+/// no lower than 0.
+#[test]
+fn a_forged_fill_report_grants_no_cpu_waives_no_usage_and_lowers_only_its_own_capacity() {
+    let run = |report: Option<u32>| {
+        let mut h = host();
+        h.guest_ready("tenant", 1).unwrap();
+        started(&mut h, JOB, 1);
+        if let Some(permits) = report {
+            h.record_fill("tenant", MS + 1000, permits);
+        }
+        let quota = h.quota("tenant", MS + 1000);
+        let free = h.heartbeat(MS + 1000, 0, true).free_vcpus;
+        end(&mut h, JOB, 3, MS + 3000, terminal(JOB, "exit"));
+        let b = &h.snapshot.billing[JOB];
+        (
+            quota,
+            free,
+            b.usage.clone().unwrap(),
+            b.hosted_terminal.clone().unwrap(),
+        )
+    };
+    let (honest_quota, honest_free, honest_usage, honest_terminal) = run(None);
+    let (quota, free, usage, terminal) = run(Some(u32::MAX));
+    assert_eq!((honest_quota, honest_free), (1, 1));
+    assert_eq!(quota, honest_quota);
+    assert_eq!(usage, honest_usage);
     assert_eq!(
         (usage.mem_peak_mib, usage.egress_bytes),
         (Some(13), Some(45))
     );
+    assert_eq!(terminal, honest_terminal);
+    assert_eq!(free, 0);
+
+    // Another tenant on the same host keeps its whole advertised capacity.
+    let mut tenants = tenants();
+    let mut other = tenants["vm"].clone();
+    other.tenant = "other".into();
+    other.sub = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAW".into();
+    tenants.insert("vm-2".into(), other);
+    let mut h = Host::new(
+        tenants,
+        Snapshot::default(),
+        Box::<MemoryJournal>::default(),
+    );
+    h.guest_ready("tenant", 1).unwrap();
+    h.record_fill("tenant", MS, u32::MAX);
+    assert_eq!(h.heartbeat(MS, 0, true).free_vcpus, 2);
+    assert_eq!(h.quota("tenant", MS), 1);
 }
 
 #[test]

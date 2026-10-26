@@ -248,40 +248,22 @@ impl Host {
         }
     }
     /// Records the permits a running tenant's own cache fill holds, from the
-    /// same runner probe as its memory. While they are counted they lower
-    /// the tenant's advertised `free_vcpus` and raise its VM's CPU quota, and
-    /// any job of that tenant running meanwhile reports no memory peak or
-    /// egress, since those are measured for the whole VM.
-    pub fn record_fill(
-        &mut self,
-        tenant: &str,
-        now_ms: u64,
-        permits: u32,
-    ) -> Result<(), super::Error> {
+    /// same runner probe as its memory. The guest is root-controlled, so this
+    /// report is tenant input: it only lowers the `free_vcpus` the host
+    /// advertises for that tenant, so the broker places new jobs elsewhere.
+    /// It never raises the VM's CPU quota and never changes any usage or
+    /// billing figure; a fill runs within the CPU the tenant's leases already
+    /// hold, or on the idle quota of one vCPU.
+    pub fn record_fill(&mut self, tenant: &str, now_ms: u64, permits: u32) {
         self.advert.entry(tenant.to_owned()).or_default().fill = Some(FillSample {
             at_ms: now_ms,
             permits,
         });
-        if permits > 0 {
-            // Saving runs the overlap marking against the fill just recorded.
-            self.save(self.snapshot.clone())?;
-        }
-        Ok(())
     }
-    /// Tenants whose latest probe found their own cache fill running. A job of
-    /// such a tenant that runs meanwhile shares the VM's measured memory and
-    /// egress with the fill, so it is treated like a job overlapping another.
-    pub(super) fn filling_tenants(&self) -> std::collections::BTreeSet<String> {
-        self.advert
-            .iter()
-            .filter(|(_, advert)| advert.fill.as_ref().is_some_and(|fill| fill.permits > 0))
-            .map(|(tenant, _)| tenant.clone())
-            .collect()
-    }
-    /// The permits of a tenant's own cache fill that count as claimed now: the
-    /// latest probe's, while it is fresh. A probe that stops answering lets the
-    /// count lapse after [`MEMORY_FRESH_MS`], so a fill is never counted
-    /// forever.
+    /// The permits of a tenant's own cache fill that lower its advertised
+    /// capacity now: the latest probe's, while it is fresh. A probe that stops
+    /// answering lets the count lapse after [`MEMORY_FRESH_MS`], so a report
+    /// never holds capacity down forever.
     pub fn fill_claim(&self, tenant: &str, now_ms: u64) -> u32 {
         self.advert
             .get(tenant)
@@ -320,7 +302,8 @@ impl Host {
     /// The heartbeat's `free_vcpus` term for one tenant: its permit budget
     /// minus the counted claims and the permits of its own running cache
     /// fill, whether the VM is running, stopped, or suspended; 0 while a wake
-    /// is pending or start-refused.
+    /// is pending or start-refused. Saturating at 0, a fill report of any size
+    /// can take away only this tenant's own budget.
     pub(crate) fn tenant_free_vcpus(&self, tenant: &Tenant, now_ms: u64) -> u64 {
         if self.start_fenced(&tenant.tenant) {
             return 0;

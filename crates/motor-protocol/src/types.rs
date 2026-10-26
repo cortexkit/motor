@@ -232,9 +232,9 @@ pub struct RunnerHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permits_cap: Option<u32>,
     /// Permits held by the cache fill running now, reported by a tenant VM's
-    /// runner only. The fill is the runner's own work, not a placed job, so
-    /// the host adds these to the tenant's claimed vCPUs when it advertises
-    /// free capacity and sets the VM's CPU quota, and bills nobody for them.
+    /// runner only. The host only subtracts these from the free capacity it
+    /// advertises for that tenant; being guest-reported, they never raise
+    /// the VM's CPU quota or change usage and billing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill_permits: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

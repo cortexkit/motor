@@ -539,11 +539,12 @@ fn heartbeats_continue_while_latched_and_carry_the_probed_guest_memory() {
 
 /// A tenant runner's own cache fill is reported as `fill_permits` in its
 /// status health. While the sample is fresh those permits come off the
-/// advertised `free_vcpus` and go onto the VM's CPU quota; they stop counting
-/// when the fill ends, when the guest restarts, or when the probe stops
-/// answering, so no fill is counted forever.
+/// advertised `free_vcpus`, and the VM's CPU quota stays at what its leases
+/// claim; the report stops counting when the fill ends, when the guest
+/// restarts, or when the probe stops answering, so a stale report never
+/// holds capacity down.
 #[test]
-fn a_tenant_fill_lowers_free_vcpus_and_raises_the_quota_only_while_it_runs() {
+fn a_tenant_fill_report_lowers_only_its_free_vcpus_and_only_while_fresh() {
     let probe = Arc::new(Probe::default());
     let runtime = Runtime::new(
         "host".into(),
@@ -579,7 +580,7 @@ fn a_tenant_fill_lowers_free_vcpus_and_raises_the_quota_only_while_it_runs() {
     // A fill of 8 permits starts and later ends.
     *probe.status.lock().unwrap() = reply(Some(8));
     publisher.step(t0).unwrap();
-    assert_eq!(advertised(t0), (56, 8));
+    assert_eq!(advertised(t0), (56, 1));
     *probe.status.lock().unwrap() = reply(Some(0));
     publisher.step(t0 + 15_000).unwrap();
     assert_eq!(advertised(t0 + 15_000), (64, 1));
@@ -589,7 +590,7 @@ fn a_tenant_fill_lowers_free_vcpus_and_raises_the_quota_only_while_it_runs() {
     // reports no fill at its first probe.
     *probe.status.lock().unwrap() = reply(Some(8));
     publisher.step(t0 + 30_000).unwrap();
-    assert_eq!(advertised(t0 + 30_000), (56, 8));
+    assert_eq!(advertised(t0 + 30_000), (56, 1));
     {
         let mut host = runtime.host.lock().unwrap();
         host.guest_unready("tenant");
@@ -605,10 +606,10 @@ fn a_tenant_fill_lowers_free_vcpus_and_raises_the_quota_only_while_it_runs() {
     // freshness bound instead of holding the permits.
     *probe.status.lock().unwrap() = reply(Some(8));
     publisher.step(t0 + 45_001).unwrap();
-    assert_eq!(advertised(t0 + 45_001), (56, 8));
+    assert_eq!(advertised(t0 + 45_001), (56, 1));
     *probe.status.lock().unwrap() = None;
     publisher.step(t0 + 60_001).unwrap();
-    assert_eq!(advertised(t0 + 60_001), (56, 8));
+    assert_eq!(advertised(t0 + 60_001), (56, 1));
     publisher.step(t0 + 75_002).unwrap();
     assert_eq!(advertised(t0 + 75_002), (64, 1));
     runtime.host.lock().unwrap().guest_unready("tenant");

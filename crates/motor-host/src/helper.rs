@@ -54,8 +54,8 @@ pub trait Control: Send + Sync {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RunnerSample {
     pub mem_available_bytes: Option<u64>,
-    /// Permits held by the tenant's own cache fill; such a fill is never a
-    /// placed job and is never billed.
+    /// Permits held by the tenant's own cache fill. Guest-reported, so they
+    /// only lower that tenant's advertised capacity.
     pub fill_permits: u32,
 }
 

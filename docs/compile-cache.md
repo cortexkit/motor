@@ -20,9 +20,12 @@ hold a setup lock when the next job arrives. Boat avoids that because it only
 reads the cache. A tenant VM given a write key accepts the delay: it fills its
 own cache with its own capacity, as the build server does, one fill at a time
 and only on unallocated permits. Its runner reports the running fill's permits
-as `fill_permits` in health, and motor-host counts them as claimed in the
-advertised `free_vcpus` and in the VM's CPU quota, so the broker places new
-jobs elsewhere meanwhile. A tenant without a write key logs once that it does
+as `fill_permits` in health, and motor-host subtracts them from that tenant's
+advertised `free_vcpus` while the report is fresh, so the broker places new
+jobs elsewhere meanwhile. The report is tenant input, so it never raises the
+VM's CPU quota or changes usage and billing: a fill runs within the CPU its
+tenant's leases already hold, or on the idle quota of one vCPU. A tenant
+without a write key logs once that it does
 not fill. Existing cache entries remain readable, and foreground jobs compile
 misses themselves. Restart still stops old writer processes, but does not
 requeue their saved requests in a mode that may not fill. Tests:
@@ -32,8 +35,11 @@ requeue their saved requests in a mode that may not fill. Tests:
 `keyed_tenant_vm_schedules_a_fill_and_reports_its_permits`,
 `keyless_tenant_vm_logs_once_and_runs_no_fill`
 (`crates/motor-runner/src/tests/dependency_writer.rs`) and
-`a_tenant_fill_lowers_free_vcpus_and_raises_the_quota_only_while_it_runs`
-(`crates/motor-host/tests/it/capacity.rs`).
+`a_tenant_fill_report_lowers_only_its_free_vcpus_and_only_while_fresh`
+(`crates/motor-host/tests/it/capacity.rs`),
+`a_forged_fill_report_grants_no_cpu_waives_no_usage_and_lowers_only_its_own_capacity`
+and `a_job_beside_its_tenants_fill_keeps_its_memory_and_egress`
+(`crates/motor-host/tests/it/billing.rs`).
 
 ck-motor offers default-branch tips only where the runner may fill. Hosted
 channels to a registered host's tenant runner (a `first_party` placement)

@@ -708,9 +708,10 @@ impl Config {
         // A tenant VM fills only when its tenant was given a write key. A
         // keyed tenant accepts the delay an idle-started fill can cause a job
         // placed after it, because it fills its own cache with its own
-        // capacity, as the build server does. The fill's permits are reported
-        // in health, so the host advertises less free capacity while it runs
-        // and the broker places new jobs elsewhere.
+        // capacity, as the build server does: within the CPU its leases
+        // already hold, or the idle quota of one vCPU. The fill's permits are
+        // reported in health, so the host advertises less free capacity while
+        // it runs and the broker places new jobs elsewhere.
         if self.tenant_vm && !self.tenant_fills() {
             return false;
         }
