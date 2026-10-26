@@ -987,3 +987,21 @@ fn controller_and_proven_slot_locks_release_while_child_is_still_before_exec() {
     drop(restarted);
     drop(forked);
 }
+
+/// macOS lists system accounts such as nobody with negative uids; the first
+/// live macOS job failed to start because one such row didn't parse.
+#[test]
+fn vm_service_rows_accept_negative_system_uids() {
+    assert_eq!(
+        super::vm_service_row("45958    -2 /usr/libexec/dhcp6d").unwrap(),
+        None
+    );
+    assert_eq!(
+        super::vm_service_row(
+            "  812   501 /System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine"
+        )
+        .unwrap(),
+        Some((812, 501))
+    );
+    assert!(super::vm_service_row("812 x /bin/sh").is_err());
+}

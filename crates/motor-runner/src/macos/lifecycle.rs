@@ -200,6 +200,27 @@ fn signal_if_current(
     }
     signal()
 }
+/// Parses one `ps -o pid=,uid=,comm=` row and returns its pid and uid when the
+/// process is Virtualization.framework's VM service. macOS prints some system
+/// accounts' uids as negative numbers (nobody is -2), so the uid is signed; no
+/// such uid is ever the runner's own.
+#[cfg(any(target_os = "macos", test))]
+fn vm_service_row(line: &str) -> io::Result<Option<(i32, i64)>> {
+    let mut fields = line.split_whitespace();
+    let pid = fields
+        .next()
+        .ok_or_else(|| invalid("missing process pid"))?
+        .parse()
+        .map_err(invalid)?;
+    let uid = fields
+        .next()
+        .ok_or_else(|| invalid("missing process uid"))?
+        .parse()
+        .map_err(invalid)?;
+    let vm = fields.collect::<Vec<_>>().join(" ").rsplit('/').next()
+        == Some("com.apple.Virtualization.VirtualMachine");
+    Ok(vm.then_some((pid, uid)))
+}
 impl Host for Native {
     fn services(&self) -> io::Result<Vec<Service>> {
         #[cfg(target_os = "macos")]
@@ -214,24 +235,11 @@ impl Host for Native {
             let text = std::str::from_utf8(&output.stdout).map_err(invalid)?;
             let mut services = Vec::new();
             for line in text.lines() {
-                let mut fields = line.split_whitespace();
-                let pid = fields
-                    .next()
-                    .ok_or_else(|| invalid("missing process pid"))?
-                    .parse()
-                    .map_err(invalid)?;
-                let uid: u32 = fields
-                    .next()
-                    .ok_or_else(|| invalid("missing process uid"))?
-                    .parse()
-                    .map_err(invalid)?;
-                if fields.collect::<Vec<_>>().join(" ").rsplit('/').next()
-                    == Some("com.apple.Virtualization.VirtualMachine")
-                {
+                if let Some((pid, uid)) = vm_service_row(line)? {
                     match motor_macvm::process_identity(pid) {
                         Ok(identity) => services.push(Service {
                             identity,
-                            owned: uid == unsafe { libc::geteuid() },
+                            owned: uid == i64::from(unsafe { libc::geteuid() }),
                         }),
                         Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {}
                         Err(e) => return Err(e),
