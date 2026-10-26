@@ -817,7 +817,9 @@ async fn unlisted_spill_eligible_job_still_withdraws_and_sends_allow_spill_true(
     let mut config = config(&h, &listed);
     config.hosted_repositories_placement_hint = Some(control_placement());
     let motor = Motor::with_connector(config, &scratch.0.join("state"), Arc::new(peer)).unwrap();
-    let stream = motor.run(request(&repo)).unwrap();
+    let mut request = request(&repo);
+    request.queue_wait_limit_s = Some(300);
+    let stream = motor.run(request).unwrap();
     let id = stream.job_id;
     let (_, terminal) = records(stream).await;
     assert!(matches!(terminal.outcome, Outcome::Exit { .. }));

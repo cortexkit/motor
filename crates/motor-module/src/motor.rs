@@ -857,11 +857,14 @@ impl Motor {
         wake: watch::Receiver<bool>,
     ) -> io::Result<bool> {
         let (mut request, mut returns) = submission;
-        // After a repository or fleet route gets no_host_fits, run on the build
-        // server with only the remaining queue-wait budget; see
-        // `Storage::routed_direct_no_host_fits`.
+        // Routing back to the build server can change the stored queue budget.
+        // Use the remaining budget saved with that routing decision.
         let wait = match self.storage.job(id) {
-            Some(job) if job.routed_direct_reason.is_some() => job.queue_wait_limit_s,
+            Some(job)
+                if job.routed_direct_reason.is_some() || job.build_server_job_id.is_some() =>
+            {
+                job.queue_wait_limit_s
+            }
             _ => wait,
         };
         let shadow_request = (self.hosted_state(id).is_none()
@@ -880,8 +883,7 @@ impl Motor {
         let windows = request.platform == Some(Platform::Windows);
         let macos = request.platform == Some(Platform::Macos);
         let build_server_id = self.build_server_id(id);
-        // A resubmitted spill gets one spill attempt only, and its queue-wait
-        // budget starts again: the first wait only proved the build server full.
+        // A resubmitted spill gets one spill attempt only.
         let resubmitted = build_server_id != id;
         let spilled = self
             .hosted_state(id)
@@ -981,7 +983,17 @@ impl Motor {
                             crate::hosted::Error::AccountClosed
                                 | crate::hosted::Error::Rejected
                                 | crate::hosted::Error::Platform
-                        ) && self.return_spill(id, error.code(), spill_started).await?
+                        ) && self
+                            .return_spill(
+                                id,
+                                error.code(),
+                                spill_started,
+                                request
+                                    .queue_wait_limit_s
+                                    .is_none()
+                                    .then(|| (30 * 60).min(request.timeout.unwrap_or(30 * 60))),
+                            )
+                            .await?
                         {
                             return Ok(true);
                         }
@@ -1098,7 +1110,7 @@ impl Motor {
             }
             if !returns.return_paths.is_empty() && !channel.return_paths {
                 if self
-                    .return_spill(id, "return_paths_unsupported", spill_started)
+                    .return_spill(id, "return_paths_unsupported", spill_started, None)
                     .await?
                 {
                     return Ok(true);
@@ -1134,7 +1146,7 @@ impl Motor {
             if returns.return_chunked && !returns.return_paths.is_empty() && !channel.return_chunked
             {
                 if self
-                    .return_spill(id, "return_chunked_unsupported", spill_started)
+                    .return_spill(id, "return_chunked_unsupported", spill_started, None)
                     .await?
                 {
                     return Ok(true);
@@ -1161,7 +1173,7 @@ impl Motor {
                     return Ok(true);
                 }
                 if self
-                    .return_spill(id, "hosted_platform_unsupported", spill_started)
+                    .return_spill(id, "hosted_platform_unsupported", spill_started, None)
                     .await?
                 {
                     return Ok(true);
@@ -1194,7 +1206,7 @@ impl Motor {
                 Err(_) if self.spill_returnable(id) => {
                     drop(channel);
                     if self
-                        .return_spill(id, "hosted_connect_failed", spill_started)
+                        .return_spill(id, "hosted_connect_failed", spill_started, None)
                         .await?
                     {
                         return Ok(true);
@@ -1253,7 +1265,7 @@ impl Motor {
                 // build server instead of failing for the caller.
                 drop(channel);
                 if self
-                    .return_spill(id, "hosted_transfer_bundles_failed", spill_started)
+                    .return_spill(id, "hosted_transfer_bundles_failed", spill_started, None)
                     .await?
                 {
                     return Ok(true);
@@ -1270,7 +1282,7 @@ impl Motor {
                 self.log_hosted_failure(id, "workspace_kind", &error);
                 drop(channel);
                 if self
-                    .return_spill(id, "hosted_workspace_kind_failed", spill_started)
+                    .return_spill(id, "hosted_workspace_kind_failed", spill_started, None)
                     .await?
                 {
                     return Ok(true);
@@ -1365,7 +1377,7 @@ impl Motor {
             drop(channel);
             drop(snapshots);
             if self
-                .return_spill(id, "hosted_run_unacknowledged", spill_started)
+                .return_spill(id, "hosted_run_unacknowledged", spill_started, None)
                 .await?
             {
                 return Ok(true);
@@ -1490,7 +1502,7 @@ impl Motor {
                 drop(channel);
                 drop(snapshots);
                 if self
-                    .return_spill(id, "hosted_run_unacknowledged", spill_started)
+                    .return_spill(id, "hosted_run_unacknowledged", spill_started, None)
                     .await?
                 {
                     return Ok(true);
@@ -1748,6 +1760,7 @@ impl Motor {
         id: Uuid,
         cause: &str,
         started: tokio::time::Instant,
+        default_queue_budget_s: Option<u64>,
     ) -> io::Result<bool> {
         if !self.spill_returnable(id) {
             if self
@@ -1780,7 +1793,10 @@ impl Motor {
             }
         }
         let build_server_id = Uuid::now_v7();
-        self.storage.resubmitted(id, build_server_id, cause)?;
+        let queue_budget_s = default_queue_budget_s
+            .filter(|_| matches!(cause, "hosted_capacity" | "hosted_provisioning"));
+        self.storage
+            .resubmitted(id, build_server_id, cause, queue_budget_s)?;
         self.recover_hosted(id);
         let spill_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         tracing::info!(

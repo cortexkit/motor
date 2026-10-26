@@ -771,6 +771,8 @@ pub(crate) enum ResubmitEnd {
     /// It is refused at admission as runner_full, with the refusal detail
     /// `ADMISSION_REFUSAL_DETAIL`.
     AdmissionRefused,
+    /// It observes this much queue wait before trying to start.
+    QueuedFor(u64),
 }
 pub(crate) const QUEUE_REFUSAL_DETAIL: &str =
     "waiting_on=gate job ahead; blocked_by=job=01a16f1d-0000-7000-8000-000000000000 permits=12";
@@ -786,12 +788,17 @@ impl ResubmitPeer {
         }
     }
 }
-async fn resubmitted_result<W: tokio::io::AsyncWrite + Unpin>(peer: &mut W, id: Uuid, from: u64) {
+async fn resubmitted_result<W: tokio::io::AsyncWrite + Unpin>(
+    peer: &mut W,
+    id: Uuid,
+    from: u64,
+    queue_wait_ms: u64,
+) {
     if from == 0 {
         let started = Frame::Started {
             job_id: id,
             seq: 0,
-            queue_wait_ms: 300,
+            queue_wait_ms,
             started_at_ms: 1_730_000_000_300,
             path_mapping: None,
         };
@@ -807,8 +814,8 @@ async fn resubmitted_result<W: tokio::io::AsyncWrite + Unpin>(peer: &mut W, id: 
             .await
             .unwrap();
     }
-    let terminal =
-        TerminalRecord::new(id, Outcome::Exit { code: 7 }, 2, 300, 0).with_ran(Ran::Remote);
+    let terminal = TerminalRecord::new(id, Outcome::Exit { code: 7 }, 2, queue_wait_ms, 0)
+        .with_ran(Ran::Remote);
     write_frame_async(peer, &Frame::Terminal(terminal))
         .await
         .unwrap();
@@ -828,6 +835,10 @@ impl Connector for ResubmitPeer {
     ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + '_>> {
         let log = self.log.clone();
         let end = self.end;
+        let queue_wait_ms = match end {
+            ResubmitEnd::QueuedFor(ms) => ms,
+            _ => 300,
+        };
         Box::pin(async move {
             let (client, mut peer) = tokio::io::duplex(65536);
             tokio::spawn(async move {
@@ -875,13 +886,19 @@ impl Connector for ResubmitPeer {
                             log.lock().unwrap().admitted.insert(id);
                             write_frame_async(&mut peer, &accepted).await.unwrap();
                             let waiting = Frame::Heartbeat {
-                                queue_wait_ms: Some(0),
+                                queue_wait_ms: Some(match end {
+                                    ResubmitEnd::QueuedFor(ms) if run.queue_wait_limit_s != 0 => ms,
+                                    _ => 0,
+                                }),
                             };
                             write_frame_async(&mut peer, &waiting).await.unwrap();
                             if run.queue_wait_limit_s == 0 {
                                 continue;
                             }
-                            if end == ResubmitEnd::QueueRefused {
+                            if end == ResubmitEnd::QueueRefused
+                                || matches!(end, ResubmitEnd::QueuedFor(ms)
+                                    if ms >= run.queue_wait_limit_s.saturating_mul(1000))
+                            {
                                 let terminal = TerminalRecord::new(
                                     id,
                                     Outcome::RefusedBeforeStart {
@@ -927,7 +944,7 @@ impl Connector for ResubmitPeer {
                             if cancelled {
                                 cancelled_result(&mut peer, id).await;
                             } else {
-                                resubmitted_result(&mut peer, id, 0).await;
+                                resubmitted_result(&mut peer, id, 0, queue_wait_ms).await;
                             }
                             return;
                         }
@@ -968,7 +985,13 @@ impl Connector for ResubmitPeer {
                                 if cancelled {
                                     cancelled_result(&mut peer, id).await;
                                 } else {
-                                    resubmitted_result(&mut peer, id, request.from_seq).await;
+                                    resubmitted_result(
+                                        &mut peer,
+                                        id,
+                                        request.from_seq,
+                                        queue_wait_ms,
+                                    )
+                                    .await;
                                 }
                             } else {
                                 let tombstone = TerminalRecord::new(
@@ -1160,7 +1183,8 @@ async fn run_job_records(
         .create(id, wait, None, Some("test".into()), false)
         .unwrap();
     let path = repo.to_str().unwrap();
-    let request = RunRequest::new(path, path, path, "true").with_timeout(timeout);
+    let mut request = RunRequest::new(path, path, path, "true").with_timeout(timeout);
+    request.queue_wait_limit_s = Some(wait);
     let (tx, mut rx) = mpsc::channel(32);
     let (_wake, wake) = watch::channel(false);
     let job = motor.clone();
@@ -1234,14 +1258,17 @@ pub(crate) fn assert_one_build_server_job(id: Uuid, records: &[StreamRecord]) {
 }
 
 /// The build server saw the withdrawn first submission and exactly one
-/// resubmission under a new ID with the job's full queue-wait limit, and the
+/// resubmission under a new ID with the stored queue-wait limit, and the
 /// resubmission was never withdrawn again.
 pub(crate) fn assert_resubmitted_once(id: Uuid, log: &BuildServerLog, wait: u64) -> Uuid {
     assert_eq!(log.runs.len(), 2, "{:?}", log.runs);
     assert_eq!(log.runs[0], (id, 0));
     let (resubmitted, limit) = log.runs[1];
     assert_ne!(resubmitted, id);
-    assert_eq!(limit, wait, "queue-wait budget restarts at resubmission");
+    assert_eq!(
+        limit, wait,
+        "resubmission uses the stored queue-wait budget"
+    );
     assert_eq!(log.withdraws, vec![id], "a resubmission never spills again");
     resubmitted
 }
@@ -1265,6 +1292,221 @@ fn lease_requests(requests: &crate::hosted::test_http::Requests) -> usize {
         .iter()
         .filter(|(path, _)| path == "/v1/leases")
         .count()
+}
+
+async fn failed_spill_queue_budget(
+    provisioning: bool,
+    explicit_budget: Option<u64>,
+    timeout: u64,
+) -> (u64, Vec<StreamRecord>) {
+    let broker = crate::hosted::test_http::Http::new(move |path, _| {
+        if path == "/v1/leases" {
+            if provisioning {
+                (
+                    202,
+                    serde_json::json!({"status": "provisioning", "retry_after_ms": 5000}),
+                )
+            } else {
+                (503, serde_json::json!({"error": "no_capacity"}))
+            }
+        } else {
+            (404, serde_json::json!({"error": "job_unknown"}))
+        }
+    })
+    .await;
+    let scratch = ScratchDir::new("motor-failed-spill-queue-budget");
+    let repo = fixture_repo(&scratch);
+    let peer = ResubmitPeer::ending(ResubmitEnd::QueuedFor(360_000));
+    let log = peer.log.clone();
+    let mut config = spill_config(&broker.url);
+    if provisioning {
+        // Exhaust provisioning quickly without changing the request's default-budget status.
+        config.queue_wait_limit_s = 1;
+    }
+    let initial_wait = explicit_budget.unwrap_or(config.queue_wait_limit_s);
+    let motor = Motor::with_connector(config, &scratch.join("state"), Arc::new(peer)).unwrap();
+    let path = repo.to_str().unwrap();
+    let mut request = RunRequest::new(path, path, path, "true").with_timeout(timeout);
+    request.queue_wait_limit_s = explicit_budget;
+    // Exercise the spill flow directly: Linux scratch paths need not be under
+    // the /home or /Users prefixes required for ordinary spill admission.
+    let id = Uuid::now_v7();
+    motor
+        .storage
+        .create(id, initial_wait, None, Some("test".into()), false)
+        .unwrap();
+    let (tx, mut rx) = mpsc::channel(32);
+    let (_wake, wake) = watch::channel(false);
+    let job = motor.clone();
+    let task = tokio::spawn(async move {
+        job.run_job(
+            id,
+            (request, crate::ReturnOptions::default()),
+            Vec::new(),
+            (initial_wait, true),
+            &tx,
+            wake,
+        )
+        .await
+    });
+    let records = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut records = Vec::new();
+        loop {
+            let record = rx.recv().await.unwrap().unwrap();
+            let terminal = matches!(record, StreamRecord::Terminal(_));
+            records.push(record);
+            if terminal {
+                break records;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    task.await.unwrap().unwrap();
+    let stored = motor.storage.job(id).unwrap();
+    let wait = stored.queue_wait_limit_s;
+    let cause = if provisioning {
+        "hosted_provisioning"
+    } else {
+        "hosted_capacity"
+    };
+    assert_eq!(
+        stored.hosted.as_ref().unwrap().hosted_code.as_deref(),
+        Some(cause)
+    );
+    assert_resubmitted_once(id, &log.lock().unwrap(), wait);
+    assert!(motor.hosted_state(id).is_none());
+    if !provisioning {
+        assert_eq!(lease_requests(&broker.requests), 1);
+    }
+
+    motor.close().await;
+    let reopened = crate::storage::Storage::open(&scratch.join("state")).unwrap();
+    let recovered = reopened.job(id).unwrap();
+    assert_eq!(recovered.queue_wait_limit_s, wait);
+    assert_eq!(recovered.build_server_job_id, stored.build_server_job_id);
+    assert_eq!(
+        recovered.hosted.unwrap().hosted_code.as_deref(),
+        Some(cause)
+    );
+    (wait, records)
+}
+
+#[tokio::test]
+async fn failed_spill_default_budget_waits_past_five_minutes_and_starts() {
+    for provisioning in [false, true] {
+        let (wait, records) = failed_spill_queue_budget(provisioning, None, 3600).await;
+        assert!((1790..=1800).contains(&wait), "remaining budget: {wait}");
+        let id = match &records[0] {
+            StreamRecord::Accepted(accepted) => accepted.job_id,
+            other => panic!("expected acceptance, got {other:?}"),
+        };
+        assert_one_build_server_job(id, &records);
+        assert!(records.iter().any(|record| matches!(record, StreamRecord::Started(started) if started.queue_wait_ms == 360_000)));
+    }
+}
+
+#[tokio::test]
+async fn failed_spill_caller_budget_is_not_extended() {
+    // An explicit budget equal to the ordinary default must not be mistaken for a default.
+    let (wait, records) = failed_spill_queue_budget(false, Some(300), 3600).await;
+    assert_eq!(wait, 300);
+    let Some(StreamRecord::Terminal(terminal)) = records.last() else {
+        panic!("missing terminal: {records:?}");
+    };
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::QueueWaitExceeded
+        }
+    );
+    assert_eq!(
+        terminal.refusal_detail.as_deref(),
+        Some(format!("{QUEUE_REFUSAL_DETAIL}; spill_attempted=hosted_capacity").as_str())
+    );
+}
+
+#[tokio::test]
+async fn failed_spill_default_budget_is_capped_by_timeout() {
+    let (wait, records) = failed_spill_queue_budget(false, None, 600).await;
+    assert!((590..=600).contains(&wait), "remaining budget: {wait}");
+    assert!(
+        matches!(records.last(), Some(StreamRecord::Terminal(t)) if t.outcome == Outcome::Exit { code: 7 })
+    );
+}
+
+#[tokio::test]
+async fn failed_spill_budget_from_original_submission_survives_restart() {
+    for cause in ["hosted_capacity", "hosted_provisioning"] {
+        for (timeout, explicit, gate, expected) in [
+            (3600, None, false, 1680_u64),
+            (600, None, false, 480),
+            (60, None, false, 0),
+            (3600, Some(300), false, 300),
+            (3600, Some(2400), false, 2400),
+            (600, None, true, 1800),
+        ] {
+            let scratch = ScratchDir::new("motor-spill-budget-restart");
+            let config = spill_config("http://127.0.0.1:1");
+            let motor =
+                Motor::with_connector(config.clone(), &scratch, Arc::new(ResubmitPeer::new()))
+                    .unwrap();
+            // Include the initial queue wait and provisioning in the total budget.
+            let (seconds, nanos) = Uuid::now_v7().get_timestamp().unwrap().to_unix();
+            let id = Uuid::new_v7(uuid::Timestamp::from_unix(
+                uuid::NoContext,
+                seconds - 120,
+                nanos,
+            ));
+            motor
+                .storage
+                .create(
+                    id,
+                    if gate { 1800 } else { explicit.unwrap_or(300) },
+                    None,
+                    None,
+                    gate,
+                )
+                .unwrap();
+            let mut route = crate::HostedJobState::new(&config);
+            route.spill_wait_ms = Some(45_000);
+            motor.storage.hosted_route(id, route).unwrap();
+            assert!(motor
+                .return_spill(
+                    id,
+                    cause,
+                    tokio::time::Instant::now(),
+                    explicit.is_none().then_some(1800.min(timeout))
+                )
+                .await
+                .unwrap());
+            let stored = motor.storage.job(id).unwrap();
+            assert!(
+                (expected.saturating_sub(2)..=expected).contains(&stored.queue_wait_limit_s),
+                "{cause}: expected {expected}, got {}",
+                stored.queue_wait_limit_s
+            );
+            let build_server_id = stored.build_server_job_id.unwrap();
+            motor.close().await;
+
+            let reopened =
+                Motor::with_connector(config, &scratch, Arc::new(ResubmitPeer::new())).unwrap();
+            assert_eq!(
+                reopened.storage.job(id).unwrap().queue_wait_limit_s,
+                stored.queue_wait_limit_s
+            );
+            assert_eq!(reopened.build_server_id(id), build_server_id);
+            assert!(
+                reopened.hosted_state(id).is_none(),
+                "a returned spill must not book again"
+            );
+            assert_eq!(
+                reopened.with_spill_attempt(id, None).as_deref(),
+                Some(format!("spill_attempted={cause}").as_str())
+            );
+            reopened.close().await;
+        }
+    }
 }
 
 #[tokio::test]
@@ -1920,7 +2162,7 @@ async fn spill_attempt_note_keeps_within_the_refusal_detail_limit() {
     }
     motor
         .storage
-        .resubmitted(resubmitted, Uuid::now_v7(), "hosted_provisioning")
+        .resubmitted(resubmitted, Uuid::now_v7(), "hosted_provisioning", None)
         .unwrap();
     let note = "; spill_attempted=hosted_provisioning";
 
