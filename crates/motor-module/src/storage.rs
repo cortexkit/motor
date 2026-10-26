@@ -790,10 +790,14 @@ impl Storage {
     ) -> io::Result<()> {
         self.update(|state| state.jobs.entry(id).or_default().submission = Some(record))
     }
-    pub(crate) fn run_sent(&self, id: Uuid) -> io::Result<()> {
+    /// Records that a Run frame is about to be sent. `hosted` says whether it
+    /// goes to the job's hosted route: a spilled job that came back to the build
+    /// server keeps its hosted record, and marking that record as sent would make
+    /// hosted settlement treat the build-server run as a hosted one.
+    pub(crate) fn run_sent(&self, id: Uuid, hosted: bool) -> io::Result<()> {
         self.update(|state| {
             let job = state.jobs.entry(id).or_default();
-            if let Some(route) = job.hosted.as_mut() {
+            if let Some(route) = job.hosted.as_mut().filter(|_| hosted) {
                 route.run_sent = true;
             }
             if let Some(record) = job.submission.as_mut() {

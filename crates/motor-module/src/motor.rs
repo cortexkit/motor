@@ -1326,7 +1326,7 @@ impl Motor {
             None
         };
         self.storage
-            .run_sent(id)
+            .run_sent(id, hosted)
             .inspect_err(|error| self.log_hosted_failure(id, "persist_run", error))?;
         drop(_booking_open);
         let shadow_run = shadow_request.map(|request| (request, run.clone()));
