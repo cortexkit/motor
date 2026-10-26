@@ -833,12 +833,14 @@ mod tests {
     #[test]
     fn changed_qemu_serial_is_refused_before_any_cache_write() {
         let mut storage = FakeStorage {
+            serial: "other-disk".into(),
             identity: DiskIdentity {
                 serial: "other-disk".into(),
                 ..qemu_identity()
             },
             ..Default::default()
         };
+        storage.volumes[0].disks = vec![1];
         let error = prepare_cache(&mut storage, 1).err().unwrap();
         assert!(error.to_string().contains("serial differs"), "{error}");
         assert_eq!(storage.mutations, 0);
