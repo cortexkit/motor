@@ -44,6 +44,66 @@ class InstallUnitsTests(unittest.TestCase):
                                  (HERE / 'units' / name).read_bytes())
             self.assertFalse((home / '.config/systemd/user/system').exists())
 
+    def test_unflagged_unit_respects_ever_enabled_history(self):
+        for instance, spelling in (('main', 'default'), ('e2e', 'default'),
+                                   ('main', 'separate'), ('e2e', 'equals'), ('windows', 'separate')):
+            for capability in ('absent', 'legacy', 'pass'):
+                for ever_enabled in (False, True):
+                    with self.subTest(instance=instance, spelling=spelling, capability=capability,
+                                      ever_enabled=ever_enabled), tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        source = root / 'runner'
+                        shutil.copytree(HERE / 'units', source / 'units')
+                        for name in ('install-units.sh', 'deploy_canary.py'):
+                            shutil.copyfile(HERE / name, source / name)
+                        relative = {'main': 'motor-runner.service',
+                                    'e2e': 'motor-runner@e2e.service.d/binary.conf',
+                                    'windows': 'motor-runner@windows.service.d/windows.conf'}[instance]
+                        unit = source / 'units' / relative
+                        state_root = (root / 'data/cortexkit/motor-runner' if spelling == 'default'
+                                      else root / 'explicit-state')
+                        if spelling != 'default':
+                            text = unit.read_text().replace(
+                                ' --state-root /srv/build/motor-windows/windows/state', '')
+                            option = ' --state-root' + ('=' if spelling == 'equals' else ' ') + str(state_root)
+                            unit.write_text('\n'.join(line + option if line.startswith('ExecStart=') and
+                                                      ' serve ' in line else line for line in text.splitlines()) + '\n')
+                        if ever_enabled:
+                            state = state_root / instance
+                            state.mkdir(parents=True)
+                            (state / 'caller-roots-ever-enabled').touch()
+                        tools = root / 'bin'
+                        tools.mkdir()
+                        for name in ('sudo', 'systemctl'):
+                            tool = tools / name
+                            tool.write_text('#!/bin/sh\nexit 0\n')
+                            tool.chmod(0o755)
+                        env = dict(os.environ, HOME=str(root / 'home'), XDG_DATA_HOME=str(root / 'data'),
+                                   PATH=str(tools) + ':' + os.environ['PATH'])
+                        env.pop('RUNNER_STATE_ROOT', None)
+                        if spelling != 'default':
+                            env['RUNNER_STATE_ROOT'] = str(root / 'wrong-state')
+                        for name in ('main', 'e2e', 'windows'):
+                            binary = root / ('binary-' + name)
+                            env['RUNNER_BINARY_' + name] = str(binary)
+                            if name == instance and capability == 'absent':
+                                continue
+                            binary.write_text('#!/bin/sh\n' + (
+                                "echo 'usage: motor-runner serve|connect' >&2\nexit 1\n"
+                                if name == instance and capability == 'legacy' else 'exit 0\n'))
+                            binary.chmod(0o755)
+                        result = subprocess.run(['bash', str(source / 'install-units.sh')],
+                                                input='y\n' * 20, text=True, capture_output=True, env=env)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        dest = root / 'home/.config/systemd/user'
+                        refused = ever_enabled and capability != 'pass'
+                        self.assertEqual((dest / relative).exists(), not refused, result.stderr)
+                        if refused:
+                            self.assertIn('caller roots were enabled for ' + instance, result.stderr)
+                            other = ('motor-runner@e2e.service.d/binary.conf' if instance == 'main'
+                                     else 'motor-runner.service')
+                            self.assertTrue((dest / other).exists())
+
     def test_flagged_unit_uses_its_own_binary_and_refusals_leave_other_units_installable(self):
         for instance in ('main', 'e2e'):
             for capability in ('absent', 'legacy', 'refuse', 'pass'):

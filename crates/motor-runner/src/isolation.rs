@@ -2522,11 +2522,18 @@ fn write_safe_directories(config: &Path, directories: &[PathBuf]) -> io::Result<
 /// `<workspace parent>/<name>` that `../<name>` resolves to. The source of
 /// both is the sibling's snapshot when `snapshots` is given, otherwise the
 /// in-place checkout at P.
-fn sibling_mounts(
-    workspace: &Path,
+fn sibling_mounts<'a>(
+    workspace: impl Into<crate::caller_path::JobTree<'a>>,
     siblings: &[SiblingSnapshot],
     snapshots: Option<&SnapshotSiblings<'_>>,
 ) -> io::Result<Vec<(String, PathBuf)>> {
+    let job_tree = workspace.into();
+    if job_tree.host.as_path() != job_tree.caller && !siblings.is_empty() && snapshots.is_none() {
+        return Err(io::Error::other(
+            "mapped siblings require resolved snapshots",
+        ));
+    }
+    let workspace = job_tree.caller;
     let mut mounts = Vec::new();
     for sibling in siblings {
         // The job sees each sibling at its caller path. Only an in-place
@@ -2739,6 +2746,9 @@ impl Sandbox {
         let job_tree = workspace.into();
         let workspace = job_tree.host.as_path();
         let caller_workspace = job_tree.caller;
+        // Refuse an unresolved mapped sibling before any preparation can read
+        // or modify the unrelated host tree at its caller-spelled path.
+        let sibling_mounts = sibling_mounts(job_tree, siblings, snapshots)?;
         let declared_hosts = hosts::from_tree(workspace, tree)?;
         validate_account()?;
         let writer_account = if writer {
@@ -2868,7 +2878,6 @@ impl Sandbox {
         fs::create_dir_all(host_home.join("tmp"))?;
         fs::create_dir_all(host_home.join("cargo/registry"))?;
         fs::create_dir_all(host_home.join("cargo/git"))?;
-        let sibling_mounts = sibling_mounts(caller_workspace, siblings, snapshots)?;
         write_safe_directories(
             &host_home.join(".gitconfig"),
             &safe_directories(caller_workspace, &sibling_mounts),

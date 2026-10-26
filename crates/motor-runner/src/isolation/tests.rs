@@ -2860,6 +2860,49 @@ fn sibling_mounts_bind_the_snapshot_at_the_sibling_path_and_its_alias() {
     assert!(sibling_mounts(worktree, &[sibling("/w/source/other")], Some(&snapshots)).is_err());
 }
 
+#[test]
+fn mapped_sibling_mounts_refuse_missing_snapshots() {
+    let config = crate::engine::Config::new("/state-root", "main");
+    let caller = Path::new("/home/caller/worktrees/main");
+    let host = Path::new("/runner/callers/home/caller/worktrees/main");
+    let workspace = crate::caller_path::JobTree::new(host, caller);
+    let siblings = [SiblingSnapshot {
+        canonical_path: "/home/caller/source/commons".into(),
+        commit: "a".repeat(40),
+        tree_hash: "b".repeat(40),
+        base_commit: None,
+    }];
+    assert_eq!(
+        sibling_mounts(workspace, &siblings, None)
+            .unwrap_err()
+            .to_string(),
+        "mapped siblings require resolved snapshots"
+    );
+    // Writer sandboxes have no siblings and therefore need no snapshots.
+    assert!(sibling_mounts(workspace, &[], None).unwrap().is_empty());
+    let snapshot = PathBuf::from("/state-root/main/sibling-snapshots/commons/s1");
+    let snapshots = SnapshotSiblings {
+        config: &config,
+        siblings: vec![(snapshot.clone(), PathBuf::from(&siblings[0].canonical_path))],
+    };
+    let mounts = sibling_mounts(workspace, &siblings, Some(&snapshots)).unwrap();
+    assert_eq!(mounts.len(), 2);
+    assert_eq!(
+        mounts[0],
+        (
+            format!("{}:/home/caller/source/commons", snapshot.display()),
+            PathBuf::from("/home/caller/source/commons")
+        )
+    );
+    assert_eq!(
+        mounts[1],
+        (
+            format!("{}:/home/caller/worktrees/commons", snapshot.display()),
+            PathBuf::from("/home/caller/worktrees/commons")
+        )
+    );
+}
+
 /// The job's Git config names the workspace and every place a sibling is
 /// mounted, the canonical path and the `../<name>` alias, exactly and without
 /// a wildcard.
