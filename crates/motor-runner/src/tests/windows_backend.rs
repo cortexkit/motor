@@ -1429,31 +1429,68 @@ async fn windows_backend_silent_commands_have_no_agent_deadline_and_cancel_never
     for fault in [Fault::Silent, Fault::Start] {
         let f = Fixture::new();
         source(&f);
-        let (c, a) = configure(&f, fault, 0);
+        let (mut c, a) = configure(&f, fault, 0);
+        c.manual_tick = true;
+        let (running_tx, running_rx) = std::sync::mpsc::channel();
+        let phase_hook = c.windows_phase.take().unwrap();
+        c.windows_phase = Some(Arc::new(move |phase| {
+            phase_hook(phase);
+            if phase == motor_winagent::Phase::Running {
+                running_tx.send(()).unwrap();
+            }
+        }));
+        let (pause, entered) = super::monitoring::IoPause::new();
+        let clock_pause = pause.clone();
+        let clock = a.clone();
+        let advanced_checks = AtomicU64::new(0);
+        c.windows_clock = Some(Arc::new(move || {
+            let now = clock.clock.load(Ordering::SeqCst);
+            let blocked = match fault {
+                Fault::Silent => {
+                    // Park on the second read of 600_000: the previous
+                    // Transport::check already accepted that timestamp.
+                    now == 600_000 && advanced_checks.fetch_add(1, Ordering::SeqCst) == 1
+                }
+                Fault::Start => clock.phase.load(Ordering::SeqCst) == 4,
+                _ => unreachable!(),
+            };
+            if blocked {
+                clock_pause.block();
+            }
+            now
+        }));
         let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+        let release = super::monitoring::ReleaseIo(pause);
         let (r, bytes) = request(&f);
         f.submit(&runner, &r, &bytes);
-        phase(&a, if fault == Fault::Silent { 5 } else { 4 }).await;
+        runner.tick().unwrap();
         if fault == Fault::Silent {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while a.host_phase.load(Ordering::SeqCst) != 5 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
+            running_rx.recv_timeout(Duration::from_secs(15)).unwrap();
             a.clock.store(600_000, Ordering::SeqCst);
-            for _ in 0..100 {
-                tokio::task::yield_now().await;
-            }
-            assert!(runner.job_status(r.job_id).unwrap().terminal.is_none());
         }
-        let began = std::time::Instant::now();
-        runner.cancel(r.job_id).unwrap();
-        assert!(began.elapsed() < Duration::from_secs(1));
+        entered
+            .recv_timeout(Duration::from_secs(15))
+            .expect("agent I/O did not reach the clock rendezvous");
+        assert!(runner.job_status(r.job_id).unwrap().terminal.is_none());
+        // The clock hook stays blocked until ReleaseIo is dropped below.
+        // Receiving cancel's result first proves cancel does not wait for
+        // the parked I/O thread to make progress.
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+        let cancelling = runner.clone();
+        let id = r.job_id;
+        let cancel = std::thread::spawn(move || {
+            let _ = cancel_tx.send(cancelling.cancel(id));
+        });
+        cancel_rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("cancel waited for the parked agent I/O thread")
+            .unwrap();
+        cancel.join().unwrap();
+        assert_eq!(a.stops.load(Ordering::SeqCst), 0);
         assert!(runner.job_status(r.job_id).unwrap().terminal.is_none());
         f.clock.fetch_add(2_000, Ordering::SeqCst);
         runner.tick().unwrap();
+        drop(release);
         let t = terminal(&runner, r.job_id).await;
         assert_eq!(t.outcome, Outcome::OutcomeUnknown);
         assert_eq!(t.killed, Some(Killed::Cancel));
