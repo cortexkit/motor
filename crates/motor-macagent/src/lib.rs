@@ -152,15 +152,21 @@ mod execution {
         process.as_std_mut().gid(user.gid).uid(user.uid);
         Ok(())
     }
+    /// After clearing, the group list must hold no supplementary group. macOS
+    /// keeps the effective gid as the list's first entry even after
+    /// setgroups(0, NULL), so a list of exactly [egid] counts as cleared; the
+    /// child's own setgid replaces that entry before it runs.
     fn require_empty_groups(
         clear: impl FnOnce() -> io::Result<()>,
-        count: impl FnOnce() -> io::Result<i32>,
+        groups: impl FnOnce() -> io::Result<Vec<libc::gid_t>>,
+        egid: libc::gid_t,
     ) -> io::Result<()> {
         clear()?;
-        if count()? != 0 {
-            return Err(io::Error::other(
-                "guest supplementary groups were not cleared",
-            ));
+        let groups = groups()?;
+        if !(groups.is_empty() || groups == [egid]) {
+            return Err(io::Error::other(format!(
+                "guest supplementary groups were not cleared: {groups:?} (egid {egid})"
+            )));
         }
         Ok(())
     }
@@ -284,13 +290,15 @@ mod execution {
                 }
             },
             || {
-                let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+                let mut groups = vec![0 as libc::gid_t; 64];
+                let count = unsafe { libc::getgroups(groups.len() as i32, groups.as_mut_ptr()) };
                 if count < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(count)
+                    return Err(io::Error::last_os_error());
                 }
+                groups.truncate(count as usize);
+                Ok(groups)
             },
+            unsafe { libc::getegid() },
         )?;
         // Copy the passwd fields before another libc lookup can reuse its storage.
         let user = unsafe {
@@ -571,11 +579,18 @@ mod execution {
         #[test]
         fn supplementary_group_clear_failure_is_fatal() {
             assert!(
-                require_empty_groups(|| Err(io::Error::from_raw_os_error(libc::EPERM)), || Ok(0))
-                    .is_err()
+                require_empty_groups(
+                    || Err(io::Error::from_raw_os_error(libc::EPERM)),
+                    || Ok(vec![]),
+                    0
+                )
+                .is_err()
             );
-            assert!(require_empty_groups(|| Ok(()), || Ok(1)).is_err());
-            assert!(require_empty_groups(|| Ok(()), || Ok(0)).is_ok());
+            assert!(require_empty_groups(|| Ok(()), || Ok(vec![]), 0).is_ok());
+            // Measured on macOS 27 as root: setgroups(0, NULL) leaves [egid].
+            assert!(require_empty_groups(|| Ok(()), || Ok(vec![0]), 0).is_ok());
+            assert!(require_empty_groups(|| Ok(()), || Ok(vec![0, 80]), 0).is_err());
+            assert!(require_empty_groups(|| Ok(()), || Ok(vec![80]), 0).is_err());
         }
         #[cfg(target_os = "macos")]
         #[tokio::test]
