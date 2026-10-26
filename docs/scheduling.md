@@ -215,6 +215,12 @@ is permanently reserved. Tests: `capped_head_allows_backfill_only_until_its_grac
 The runner checks free space on the filesystem holding its state before it
 accepts an upload, and again before setup.
 
+A workspace served through a caller root is checked and evicted on the
+filesystem its host directory lives on, not on the caller's `/home`, which the
+runner never writes. Admission and eviction decisions are otherwise identical,
+and the catalog keeps the caller's `/home` path. See
+[job-isolation.md](job-isolation.md#38-caller-root-mapping).
+
 - The hard floor is `serve --free-space-floor-bytes N`, default 128 GiB
   (137438953472 bytes); 0 disables the check. The soft goal defaults to twice the
   floor; `--free-space-eviction-bytes N` explicitly sets a reclaim goal above it.
@@ -233,11 +239,21 @@ accepts an upload, and again before setup.
   (`crates/motor-module/tests/it/recovery.rs`).
 - Cleanup never touches running or reserved workspaces, the workspace the
   incoming job needs, or its siblings. It removes only catalogued workspaces
-  under the allowed roots (default `/Users`; add with `--workspace-root`). It
-  does not follow symlinks or cross mounts. Tests:
+  under the allowed roots (default `/Users`; add with `--workspace-root`, and a
+  `--caller-root` adds its host directory too). It does not follow symlinks or
+  cross mounts. Tests:
   `disk_eviction_skips_reserved_and_running_workspaces`,
   `disk_admission_preserves_incoming_ordinary_workspace_and_sibling`,
   `disk_admission_protects_canonical_alias_through_job_insertion`.
+- A workspace served through a caller root counts like any other. Disk
+  accounting, the free-space floor and the LRU order all use the host directory
+  that actually holds the trees, while the catalog keeps the caller's `/home`
+  path. Eviction renames such a tree into the host directory's own trash, never
+  the state directory's. Tests:
+  `mapped_expiry_and_pressure_use_host_paths_and_private_trash`,
+  `mapped_pressure_protects_active_host_claims_and_collects_fresh_trash_garbage`
+  (`crates/motor-runner/src/tests/caller_trash.rs`); see
+  [job-isolation.md](job-isolation.md#38-caller-root-mapping).
 - The compile cache is evicted as a whole, and not while a fill is running;
   single entries are never deleted.
 

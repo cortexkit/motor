@@ -25,6 +25,9 @@ const FRAME_CASES: &[&str] = &[
     "prepare-git-dependencies-transcript",
     "run",
     "run-network-outbound",
+    "run-home",
+    "run-home-transcript",
+    "prepare-home",
     "run-workspace-kind-head",
     "run-workspace-kind-task",
     "run-queue-wait-override",
@@ -258,7 +261,32 @@ fn golden_vectors_are_complete_and_canonical() {
             count += 1;
         }
     }
-    assert_eq!(count, 136);
+    assert_eq!(count, 139);
+}
+
+#[test]
+fn home_caller_vectors_are_plain_paths_the_runner_maps() {
+    // The wire carries the caller's `/home` spelling unchanged; a runner that
+    // maps it binds the stored checkout there and reports paths in that form.
+    for name in ["run-home", "run-home-transcript"] {
+        let Frame::Run(run) = frames(&vector("frames", name)).remove(0) else {
+            panic!("run vector {name}")
+        };
+        assert_eq!(run.workspace_key, "/home/example/worktrees/task");
+        assert_eq!(run.repository_root, "/home/example/src/prefrontal");
+        assert_eq!(run.cwd, "/home/example/worktrees/task");
+        assert_eq!(run.siblings[0].canonical_path, "/home/example/src/commons");
+        assert_eq!(run.bundles[0].repository, "/home/example/src/prefrontal");
+    }
+    let Frame::Prepare(prepare) = frames(&vector("frames", "prepare-home")).remove(0) else {
+        panic!("prepare vector")
+    };
+    assert_eq!(prepare.workspace_key, "/home/example/worktrees/task");
+    assert_eq!(prepare.repository_root, "/home/example/src/prefrontal");
+    assert_eq!(
+        prepare.siblings[0].canonical_path,
+        "/home/example/src/commons"
+    );
 }
 
 #[test]

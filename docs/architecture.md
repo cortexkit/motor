@@ -18,6 +18,7 @@ them. Each part's details live in the linked documents.
 | Windows guest agent | `crates/motor-winagent` | Inside the Windows VM | Receives the tree, runs the command as the guest's `motor-job`, reports its exit code. |
 | Compile cache | `crates/motor-runner/src/compile_cache.rs`, `writer/` | Build server | Shared read-only sccache for jobs, filled by `motor-cache` from the default branch. [compile-cache.md](compile-cache.md) |
 | vCPU allocator and scheduler | `crates/motor-runner/src/cpu.rs`, `engine.rs` | Build server | Exact vCPU claims, CPU pinning, queue order, disk admission. [scheduling.md](scheduling.md) |
+| Caller-root mapping | `crates/motor-runner/src/caller_path.rs`, `caller_path/` | Build server | Stores a `/home` caller's checkout in a runner-owned directory and presents it at the caller's path. [job-isolation.md](job-isolation.md#38-caller-root-mapping) |
 | Build-slot supervisor | `crates/prefrontal-build-slot` | Inside Linux jobs | Limits concurrent compiler processes across all jobs on the host. |
 | Linux microVM components | `crates/motor-vm-helper`, `motor-vm-guest`, `motor-vm-loader` | Build server | Firecracker slot pool, UFFD loader and guest supervisor. Not used by any runner backend in this build. [linux-microvm.md](linux-microvm.md) |
 
@@ -48,7 +49,10 @@ them. Each part's details live in the linked documents.
    [scheduling.md](scheduling.md)
 7. **Set up.** The runner checks the snapshot out at the caller's absolute path
    (Linux) or stages it as a tar for the VM (Windows), verifies the tree hash,
-   and prepares dependencies as a trusted step.
+   and prepares dependencies as a trusted step. "The caller's absolute path"
+   means `/Users/...` on hosts that store callers' checkouts there, and
+   `/home/...` on a host configured with a caller root, which stores the
+   checkout elsewhere and binds it back at that path.
 8. **Start.** The runner records the job as started on disk, sends `started`,
    then releases the command: a one-byte gate on the systemd service's stdin on
    Linux, a `Start` frame to the guest agent on Windows. A crash before the
@@ -84,9 +88,15 @@ An instance's own state lives under `<state-root>/<instance>/`: the job table
 (one record per job), retained output, Git mirrors, the workspace catalog,
 sandbox runtime directories, and the compile cache (`sccache/fleet`).
 Workspaces themselves live at the callers' paths under the owned workspace
-roots (default `/Users`), on the same reflink-capable filesystem. Instances on
-one host are independent apart from machine-wide resources: CPUs, the
-build-slot limit, and the Windows VM slot.
+roots (default `/Users`), on the same reflink-capable filesystem. A caller root
+is the exception: a `/home` caller's checkout is stored under the instance's own
+host directory (for example `/srv/build/callers/main/home`) and only presented
+at the `/home` path inside the job, while the catalogs keep caller spelling. The
+catalogued records that name a mapped path live in `<state-dir>/caller-catalog.json`;
+`catalog.json` keeps identity records and its bytes are unchanged for them.
+Instances on one host are independent apart from machine-wide resources: CPUs,
+the build-slot limit, and the Windows VM slot. Each caller root belongs to one
+instance.
 
 ## Rules that bite
 
@@ -107,6 +117,10 @@ checked only by the operator tests in the [server gate](server-gate.md).
 - **Fail closed on isolation.** A missing account, ACL tool, `sudo` rule,
   firewall table or Windows layout check refuses startup or the job; nothing
   falls back to running as the runner's account or with weaker isolation.
+- **A caller root is fixed once it has records.** A start whose catalog or job
+  records name a caller prefix the runner is not configured with refuses to
+  start rather than guess; retiring a mapping is the explicit
+  `forget-caller-root` command.
 - **Trusted steps never run caller code.** Dependency fetches, JavaScript
   installs, compile-cache fills and Windows preparation use locked inputs from
   the default branch or the lockfile, offline where possible, and never run

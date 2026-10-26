@@ -571,6 +571,11 @@ its capabilities, and a caller sends paths only to a module that lists it.
 Callers built before 0.2.9 cannot send the field, so they never receive the
 record.
 
+The record reports returned paths in caller spelling: a `/home/...` request
+gets `/home/...` back, on delivery, on attach and on replay, from a runner that
+stores the checkout elsewhere
+([job-isolation.md](job-isolation.md#38-caller-root-mapping)).
+
 **Chunked returned files.** A request that also sets `return_chunked` gets up
 to 10 MiB of files (64 paths at most) instead of 256 KiB. `return_max_bytes`
 then defaults to, and may be at most, 10,485,760; above 262,144 bytes it is
@@ -667,6 +672,26 @@ agent jobs; see [scheduling.md](scheduling.md). Source:
 server, as the operator's test of the hosted path; without a configured broker
 it exits 204 and submits nothing. See
 [hosted-cutover.md](hosted-cutover.md#smoke-test-the-hosted-path).
+
+### Checkouts and WSL
+
+`/Users/...` and `/home/...` checkouts are both ordinary inputs. On Linux and
+on Boat the runner serves a `/home` checkout at the caller's own path (see
+[job-isolation.md](job-isolation.md#38-caller-root-mapping)); where a runner is
+not configured for it, the request is refused before the job starts, and a
+direct run prints the reason and exits 200.
+
+Windows callers are supported only through WSL2, with the checkout in the WSL
+filesystem. A checkout on a Windows drive (`/mnt/c`, `/mnt/C/x`, or a symlink
+that resolves into one) is refused before any snapshot or runner contact, with
+the message
+`ck-motor: this checkout is on a Windows drive (<path>). Under WSL, move it into the WSL filesystem (for example under ~/) and run ck motor there.`
+The check covers `workspace_key`, `repository_root`, `cwd` and each sibling, at
+the supplied spelling and again after resolving symlinks, and it is applied by
+agent `exec.run`, `workspace.prepare` and `ck motor run` alike. `/mnt/data`,
+`/mnt/cc` and `/mnt/c2` are not Windows drives and are never refused. Drives
+under a custom `[automount]` root (for example `/c/...`) are not detected.
+Source: `crates/motor-module/src/wsl.rs`.
 
 ### Reattaching after a disconnect
 
