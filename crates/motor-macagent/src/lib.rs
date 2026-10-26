@@ -195,16 +195,26 @@ mod execution {
                             return Err(io::Error::last_os_error());
                         }
                         if pid == 0 {
-                            if libc::setgroups(0, std::ptr::null()) != 0
-                                || libc::setgid(user.gid) != 0
-                                || libc::setuid(user.uid) != 0
-                            {
+                            // Exit codes 1-3 name the failed credential step;
+                            // 100 + errno reports a failed kill.
+                            if libc::setgroups(0, std::ptr::null()) != 0 {
                                 libc::_exit(1);
                             }
-                            let result = libc::kill(-1, libc::SIGKILL);
-                            let absent =
-                                io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-                            libc::_exit(if result == 0 || absent { 0 } else { 1 });
+                            if libc::setgid(user.gid) != 0 {
+                                libc::_exit(2);
+                            }
+                            if libc::setuid(user.uid) != 0 {
+                                libc::_exit(3);
+                            }
+                            if libc::kill(-1, libc::SIGKILL) == 0 {
+                                libc::_exit(0);
+                            }
+                            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                            libc::_exit(if errno == libc::ESRCH {
+                                0
+                            } else {
+                                100 + errno.min(155)
+                            });
                         }
                         let mut status = 0;
                         loop {
@@ -217,7 +227,7 @@ mod execution {
                             }
                         }
                         if status != 0 {
-                            return Err(io::Error::other("motorjob SIGKILL failed"));
+                            return Err(io::Error::other(kill_child_failure(status)));
                         }
                     }
                     Ok(())
@@ -242,6 +252,26 @@ mod execution {
                     Ok(())
                 }
             }
+        }
+    }
+
+    /// Describe how the uid-scoped kill helper ended, for the agent's error.
+    fn kill_child_failure(status: libc::c_int) -> String {
+        if libc::WIFSIGNALED(status) {
+            return format!(
+                "motorjob SIGKILL helper died from signal {}",
+                libc::WTERMSIG(status)
+            );
+        }
+        match libc::WEXITSTATUS(status) {
+            1 => "motorjob SIGKILL helper could not clear groups".into(),
+            2 => "motorjob SIGKILL helper could not set gid".into(),
+            3 => "motorjob SIGKILL helper could not set uid".into(),
+            code if code >= 100 => format!(
+                "motorjob SIGKILL failed: {}",
+                io::Error::from_raw_os_error(code - 100)
+            ),
+            code => format!("motorjob SIGKILL helper exited with status {code}"),
         }
     }
 
