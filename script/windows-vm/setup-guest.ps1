@@ -64,9 +64,11 @@ Write-Host ""
 
 
 # -----------------------------------------------------------------------------
-# Bun (PowerShell installer is the official path)
+# Standing builders use the official per-user installer; job images pin Bun separately.
 # -----------------------------------------------------------------------------
-if ($null -eq (Get-Command bun -ErrorAction SilentlyContinue)) {
+if ($JobBaseline) {
+    Write-Host 'Job baseline: machine-wide pinned Bun is installed by setup-job-baseline.ps1.'
+} elseif ($null -eq (Get-Command bun -ErrorAction SilentlyContinue)) {
     Write-Host "-- Installing Bun --"
     Invoke-RestMethod -Uri "https://bun.sh/install.ps1" -OutFile "$env:TEMP\install-bun.ps1"
     & powershell -ExecutionPolicy Bypass -File "$env:TEMP\install-bun.ps1"
@@ -200,7 +202,7 @@ if ($JobBaseline) {
 Write-Host ""
 
 # Verify the actual binaries rather than treating installer success as proof.
-$verifyTools = if ($JobBaseline) { @('git', 'bun') } else { @('git', 'bun', 'cargo') }
+$verifyTools = if ($JobBaseline) { @('git') } else { @('git', 'bun', 'cargo') }
 foreach ($tool in $verifyTools) {
     & $tool --version
     if ($LASTEXITCODE -ne 0) { throw "$tool verification failed" }
