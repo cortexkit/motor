@@ -201,7 +201,7 @@ pub(super) fn prepare(
             staging: staging.into(),
             snapshots,
             routes,
-            workspace: crate::caller_path::request(&request)
+            workspace: crate::caller_path::request(request)
                 .caller_workspace_key
                 .text()
                 .clone(),
