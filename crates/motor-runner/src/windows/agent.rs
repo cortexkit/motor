@@ -685,6 +685,8 @@ fn materialize_attempt(
         if super::prep_error::is_reported(&error) {
             error
         } else {
+            #[cfg(windows)]
+            tracing::error!(job_id = %setup.id, %error, "Windows materialization failed before guest start");
             super::vm::path_error("materialize job staging", &resources.staging, error)
         }
     })?;

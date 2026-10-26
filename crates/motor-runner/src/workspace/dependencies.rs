@@ -494,8 +494,7 @@ impl Trees {
             for reference in refs.lines() {
                 git(mirror, &["update-ref", "-d", reference])?;
             }
-            fs::File::open(mirror)?
-                .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now()))?;
+            crate::filesystem::set_directory_modified(mirror, std::time::SystemTime::now())?;
         }
         for ((url, alias), commit) in aliases {
             let mirror = &routes[&url];

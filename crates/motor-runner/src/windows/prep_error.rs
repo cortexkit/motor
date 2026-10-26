@@ -24,6 +24,10 @@ pub(super) fn step<T>(
     run: impl FnOnce() -> io::Result<T>,
 ) -> io::Result<T> {
     run().map_err(|error| {
+        // The local service log keeps full paths for host diagnosis. The peer
+        // still receives the bounded, staging-relative diagnostic below.
+        #[cfg(windows)]
+        tracing::error!(step, staging = %staging.display(), %error, "Windows preparation failed");
         // Only runner-authored errors and OS reasons belong in this record.
         // Subprocess stderr can contain credentials and is never passed here.
         let reason = error
