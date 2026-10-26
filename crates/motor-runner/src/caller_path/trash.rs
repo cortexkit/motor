@@ -4,6 +4,8 @@
 use super::{owner, startup};
 use super::{CallerRoot, HostPath};
 use crate::Config;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::{fs, io, sync::Arc};
@@ -121,6 +123,97 @@ pub(crate) fn garbage(config: &Config, path: HostPath<'_>) -> io::Result<Retired
         host_directory: trash,
         name: path.file_name().unwrap().to_owned(),
     })
+}
+
+/// Rename every direct child of the host root except the trash and marker
+/// into the trash. Trees go through detach, reusing its checkout-root
+/// reclaim for job-owned directories; a link is moved without following it,
+/// and an entry that vanished is done. Every step tolerates work already
+/// done, so a rerun after a kill converges.
+#[cfg(target_os = "linux")]
+pub(crate) fn sweep(config: &Config, root: &CallerRoot) -> io::Result<()> {
+    use std::{
+        ffi::CString,
+        os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    };
+    let host = match owner::directory(&root.host_root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        result => result?,
+    };
+    let trash_dir = owner::ensure_trash(root, &config.instance)?;
+    let trash_name = format!(".motor-trash-{}", config.instance);
+    let mut renamed = false;
+    for entry in fs::read_dir(format!("/proc/self/fd/{}", host.as_raw_fd()))? {
+        let name = entry?.file_name();
+        if name == trash_name.as_str() || name == ".motor-owner" {
+            continue;
+        }
+        let path = root.host_root.join(&name);
+        match detach(config, root, super::host(&path)) {
+            Ok(_) => renamed = true,
+            Err(error) => {
+                // A link is moved, never followed; an entry that vanished
+                // is done. Anything else is a real failure.
+                match fs::symlink_metadata(&path) {
+                    Err(gone) if gone.kind() == io::ErrorKind::NotFound => {}
+                    Ok(meta) if meta.is_symlink() => {
+                        let source = CString::new(name.as_bytes())
+                            .map_err(|_| io::Error::other("non-UTF8 entry in caller root"))?;
+                        let destination = CString::new(uuid::Uuid::now_v7().to_string())?;
+                        if unsafe {
+                            libc::renameat(
+                                host.as_raw_fd(),
+                                source.as_ptr(),
+                                trash_dir.as_raw_fd(),
+                                destination.as_ptr(),
+                            )
+                        } != 0
+                        {
+                            let error = io::Error::last_os_error();
+                            if error.kind() != io::ErrorKind::NotFound {
+                                return Err(error);
+                            }
+                        } else {
+                            renamed = true;
+                        }
+                    }
+                    _ => return Err(error),
+                }
+            }
+        }
+    }
+    if renamed {
+        trash_dir.sync_all()?;
+        host.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Purge one caller-root trash synchronously through its pinned descriptor,
+/// reusing the retired-entry removal (physical-path reclaim, boat handling).
+#[cfg(target_os = "linux")]
+pub(crate) fn purge_dir(config: &Config, trash: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let directory = match owner::directory(trash) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        result => result?,
+    };
+    validate(&directory)?;
+    let directory = Arc::new(directory);
+    let mut names = Vec::new();
+    for entry in fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
+        names.push(entry?.file_name());
+    }
+    for name in names {
+        Retired {
+            directory: directory.clone(),
+            host_directory: trash.to_path_buf(),
+            name,
+        }
+        .remove(config.isolate_jobs, config.boat_profile)?;
+    }
+    directory.sync_all()?;
+    Ok(())
 }
 
 /// The caller selects the mapped branch before calling this function. An absent

@@ -164,7 +164,9 @@ pub(crate) fn claim(config: &Config) -> io::Result<()> {
     for root in &config.caller_roots {
         let owner = expected(config)?;
         claim_inner(root, &owner, |_| Ok(())).map_err(|e| refusal(root, &owner, e))?;
-        trash(root, &config.instance).map_err(|e| refusal(root, &owner, e))?;
+        ensure_trash(root, &config.instance)
+            .map(|_| ())
+            .map_err(|e| refusal(root, &owner, e))?;
     }
     Ok(())
 }
@@ -187,7 +189,7 @@ pub(crate) fn purge_trash(config: &Config) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn trash(root: &CallerRoot, instance: &str) -> io::Result<()> {
+pub(crate) fn ensure_trash(root: &CallerRoot, instance: &str) -> io::Result<fs::File> {
     use std::{
         ffi::CString,
         os::fd::{AsRawFd, FromRawFd},
@@ -211,11 +213,12 @@ fn trash(root: &CallerRoot, instance: &str) -> io::Result<()> {
     }
     let trash = unsafe { fs::File::from_raw_fd(fd) };
     super::trash::validate(&trash)?;
-    directory.sync_all()
+    directory.sync_all()?;
+    Ok(trash)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn trash(_: &CallerRoot, _: &str) -> io::Result<()> {
+pub(crate) fn ensure_trash(_: &CallerRoot, _: &str) -> io::Result<fs::File> {
     Err(invalid("caller roots require Linux"))
 }
 

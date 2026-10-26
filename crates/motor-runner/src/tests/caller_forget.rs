@@ -768,3 +768,87 @@ fn forget_fence_with_a_live_unit_changes_neither_tree_nor_record() {
         .workspaces
         .contains_key(&key));
 }
+
+const ISOLATED_USER: &str = "motor-forget-fixture";
+
+/// Root-only end state for the forget path: a real isolated mapped job plus
+/// its warm build leave job-owned trees, and forget must move and purge them
+/// with the same descriptor-relative, reclaim-before-rename deletion the
+/// mapped lifecycle uses.
+#[tokio::test]
+#[ignore = "requires host system manager, sudo and motor-job account"]
+async fn isolated_forget_mapped_job_and_warm_build_converges() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.isolate_jobs = true;
+    let host = f.scratch.join("callers/home");
+    fs::create_dir_all(&host).unwrap();
+    config.caller_roots = vec![crate::CallerRoot {
+        caller_prefix: "/home".into(),
+        host_root: host.clone(),
+    }];
+    // A depth-one workspace: the job-owned checkout root is a direct child
+    // of the host root, so the sweep must reclaim it before the rename, as
+    // mapped deletions do.
+    let workspace = format!("/home/{ISOLATED_USER}");
+    let (mut request, mut bytes) = f.run("echo hi > marker");
+    request.workspace_key = workspace.clone();
+    request.repository_root = workspace.clone();
+    request.cwd = workspace.clone();
+    request.siblings.clear();
+    request.bundles.truncate(1);
+    request.bundles[0].repository = workspace.clone();
+    bytes.truncate(1);
+    let runner = Runner::open(config.clone()).unwrap();
+    f.submit(&runner, &request, &bytes);
+    assert_eq!(
+        terminal(&runner, request.job_id).await.outcome,
+        Outcome::Exit { code: 0 }
+    );
+    base_done(&runner).await;
+    let checkout = host.join(ISOLATED_USER);
+    assert_eq!(fs::read_to_string(checkout.join("marker")).unwrap(), "hi\n");
+    // The warm fill leaves its own job-owned checkout beside the workspace.
+    let fills: Vec<_> = fs::read_dir(&host)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".motor-base-"))
+        .collect();
+    assert_eq!(fills.len(), 1);
+    drop(runner);
+    // The daemon is stopped; forget retires the prefix.
+    let removed = forget::forget_caller_root(&config, "/home").unwrap();
+    assert!(removed.iter().any(|line| line.contains(&workspace)));
+    let mut remaining: Vec<_> = fs::read_dir(&host)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    remaining.sort();
+    assert_eq!(
+        remaining,
+        vec![
+            std::ffi::OsString::from(".motor-owner"),
+            std::ffi::OsString::from(format!(".motor-trash-{}", config.instance)),
+        ]
+    );
+    assert_eq!(
+        fs::read_dir(host.join(format!(".motor-trash-{}", config.instance)))
+            .unwrap()
+            .count(),
+        0
+    );
+    let disk = Split::read(&config.state_dir()).unwrap();
+    assert!(!disk.caller.workspaces.values().any(|entry| entry
+        .mappings
+        .iter()
+        .any(|mapping| mapping.caller_prefix == "/home")));
+    assert!(fs::read_dir(config.state_dir().join("jobs"))
+        .unwrap()
+        .next()
+        .is_none());
+    // An unflagged start succeeds with the mapping gone.
+    let mut unflagged = config.clone();
+    unflagged.caller_roots.clear();
+    let runner = Runner::open(unflagged).unwrap();
+    drop(runner);
+}

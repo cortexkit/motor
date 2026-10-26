@@ -223,79 +223,17 @@ fn trash_name(config: &Config) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_trash(host: &Path, instance: &str) -> io::Result<fs::File> {
-    use std::{ffi::CString, os::fd::FromRawFd};
-    let directory = owner::directory(host)?;
-    let name = CString::new(format!(".motor-trash-{instance}"))?;
-    unsafe {
-        if libc::mkdirat(
-            std::os::fd::AsRawFd::as_raw_fd(&directory),
-            name.as_ptr(),
-            0o700,
-        ) != 0
-            && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let fd = libc::openat(
-            std::os::fd::AsRawFd::as_raw_fd(&directory),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        );
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let trash = fs::File::from_raw_fd(fd);
-        trash::validate(&trash)?;
-        Ok(trash)
-    }
-}
-
-#[cfg(target_os = "linux")]
 pub(crate) fn step_one(config: &Config, plan: &Plan) -> io::Result<()> {
-    use std::{
-        ffi::CString,
-        os::{fd::AsRawFd, unix::ffi::OsStrExt},
-    };
-    let host = &plan.host;
-    let host_dir = match owner::directory(host) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        result => result?,
-    };
-    let trash = ensure_trash(host, &config.instance)?;
-    let trash_name = trash_name(config);
-    let mut renamed = false;
-    for entry in fs::read_dir(format!("/proc/self/fd/{}", host_dir.as_raw_fd()))? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name == trash_name.as_str() || name == ".motor-owner" {
-            continue;
-        }
-        let source =
-            CString::new(name.as_bytes()).map_err(|_| invalid("non-UTF8 entry in caller root"))?;
-        let destination = CString::new(uuid::Uuid::now_v7().to_string())?;
-        if unsafe {
-            libc::renameat(
-                host_dir.as_raw_fd(),
-                source.as_ptr(),
-                trash.as_raw_fd(),
-                destination.as_ptr(),
-            )
-        } != 0
-        {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::NotFound {
-                continue;
-            }
-            return Err(error);
-        }
-        renamed = true;
-    }
-    if renamed {
-        trash.sync_all()?;
-        host_dir.sync_all()?;
-    }
-    Ok(())
+    // The sweep reuses the mapped-deletion path: detach reclaims a job-owned
+    // checkout root before moving it across parents, and the trash stays
+    // pinned throughout the purge.
+    trash::sweep(
+        config,
+        &CallerRoot {
+            caller_prefix: plan.prefix.clone(),
+            host_root: plan.host.clone(),
+        },
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -445,56 +383,14 @@ fn remove_identity_tree(config: &Config, path: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn purge_one(config: &Config, trash: &Path) -> io::Result<()> {
-    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
-    let directory = match owner::directory(trash) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        result => result?,
-    };
-    trash::validate(&directory)?;
-    let mut names = Vec::new();
-    for entry in fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
-        names.push(entry?.file_name());
-    }
-    for name in names {
-        if config.boat_profile {
-            crate::boat_quota::remove_retired_entry(&directory, &name)?;
-            continue;
-        }
-        // Remove through the pinned trash descriptor so a symlink swapped in
-        // for the entry between the check and the removal cannot redirect a
-        // recursive delete outside the trash. Permission repair still needs
-        // the physical host path, which never follows links.
-        let pinned = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(&name);
-        let metadata = match fs::symlink_metadata(&pinned) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            result => result?,
-        };
-        if !metadata.is_dir() {
-            if fs::remove_file(&pinned).is_err() {
-                let _ = fs::remove_dir_all(&pinned);
-            }
-            continue;
-        }
-        if config.isolate_jobs {
-            let _ = crate::isolation::reclaim_runtime(&trash.join(&name));
-        }
-        if fs::remove_dir_all(&pinned).is_err() {
-            let _ = fs::remove_file(&pinned);
-        }
-        let _ = name.as_bytes();
-    }
-    directory.sync_all()?;
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
 pub(crate) fn step_three(config: &Config, plan: &Plan) -> io::Result<()> {
-    purge_one(config, &plan.host.join(trash_name(config)))?;
+    // The purge reuses the retired-entry removal: physical-path reclaim for
+    // the privileged helper, boat handling, and descriptor-pinned removal.
+    trash::purge_dir(config, &plan.host.join(trash_name(config)))?;
     let mut purged = BTreeSet::new();
     for host in plan.others.values() {
         if purged.insert(host.clone()) {
-            purge_one(config, &host.join(trash_name(config)))?;
+            trash::purge_dir(config, &host.join(trash_name(config)))?;
         }
     }
     Ok(())
