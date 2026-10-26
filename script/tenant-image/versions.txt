@@ -30,7 +30,7 @@
     "script/runner/patches/sccache-0.18.0-read-only-hits.patch": "e37a753c4fb04a37b118b9f49431740cd82a6c5e2ef93d9d01838e11a3242870",
     "script/runner/build-git.sh": "f6bcd8e8d3ec7681063a589b551ece670122f35f8955b315db62ad8079380940",
     "script/runner/install-binaryen.py": "dfd4a8741fe70f2334cfaf63681710f6271f15067a9f3b1012fd82d22416ab6d",
-    "script/runner/toolchain-parity.py": "e6647d760fc57067d5bd98d58142381eb845c1a83aaee5560d651f55019f0eca",
+    "script/runner/toolchain-parity.py": "aafa20bf4a68cb0f98856dfe7682e304d4139aff2d866c175b7be689df8773d7",
     "script/runner/syscall-surface.py": "930fb7373920f92ae4b876b7635d586f9dabb4d44e26fc4c9db045b18cbe0368",
     "script/runner/cargo-seed.py": "6759e7b26778d7bb62a5c081bac8162e1ed1ee1b67eca28bec3927e9ee07f485",
     "script/runner/job-account.py": "21f185ddc868150a8bbfe94aa8eac18a50485b87bf8fa043944348dac77ef4ca",

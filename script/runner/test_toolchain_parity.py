@@ -214,6 +214,42 @@ class CaptureTests(unittest.TestCase):
             link.symlink_to(path)
             self.assertIsNone(parity.host_file(link))
 
+    def test_ipv6_loopback_probe_binds_and_connects(self):
+        observed = parity.ipv6_loopback_capture()
+        self.assertTrue(observed['connected'], observed)
+        self.assertEqual(('complete', 0), (observed['step'], observed['errno']))
+
+    def test_ipv6_loopback_probe_records_namespace_diagnostics(self):
+        import socket
+        values = {'/proc/cmdline': 'test-kernel ipv6.disable=1',
+                  '/proc/sys/net/ipv6/conf/all/disable_ipv6': '1',
+                  '/proc/sys/net/ipv6/conf/default/disable_ipv6': '1',
+                  '/proc/sys/net/ipv6/conf/lo/disable_ipv6': '0'}
+        with patch.object(parity, 'optional_text', side_effect=values.get), \
+             patch.object(Path, 'exists', return_value=False) as exists, \
+             patch.object(socket, 'socket', side_effect=OSError(errno.EAFNOSUPPORT, 'family refused')):
+            observed = parity.ipv6_loopback_capture()
+        self.assertEqual('test-kernel ipv6.disable=1', observed['cmdline'])
+        self.assertFalse(observed['if_inet6_present'])
+        exists.assert_called_once_with()
+        self.assertEqual({'all': '1', 'default': '1', 'lo': '0'}, observed['disable_ipv6'])
+
+    def test_ipv6_loopback_probe_records_socket_and_bind_failures(self):
+        import socket
+        for failure in ('socket', 'bind', 'connect'):
+            with self.subTest(failure=failure), patch.object(socket, 'socket') as create:
+                if failure == 'socket':
+                    create.side_effect = OSError(errno.EAFNOSUPPORT, 'family refused')
+                else:
+                    endpoint = create.return_value.__enter__.return_value
+                    getattr(endpoint, failure).side_effect = OSError(errno.EADDRNOTAVAIL, 'no loopback')
+                observed = parity.ipv6_loopback_capture()
+                self.assertFalse(observed['connected'])
+                self.assertEqual(errno.EAFNOSUPPORT if failure == 'socket' else errno.EADDRNOTAVAIL,
+                                 observed['errno'])
+                self.assertEqual({'socket': 'socket(AF_INET6) listener', 'bind': 'bind ::1',
+                                  'connect': 'connect ::1'}[failure], observed['step'])
+
     def test_job_identity_is_the_process_not_a_host_account_lookup(self):
         with patch.object(parity.os, 'getuid', return_value=997), patch.object(parity.os, 'getgid', return_value=996):
             self.assertEqual({'uid': 997, 'gid': 996}, parity.job_identity(True))
@@ -408,7 +444,8 @@ class ParityTests(unittest.TestCase):
                 'job_environment': {**manifest['job_environment'], **manifest['job_environment_by_role'][role]},
                 'runtime': {'proc': {name: True for name in ('self/mountinfo', 'cpuinfo', 'meminfo')},
                             'inotify': {'max_user_instances': 8192}, 'dev_shm_writable': True,
-                            'tmpdir_exec': True, 'sshd_executable': True},
+                            'tmpdir_exec': True, 'sshd_executable': True,
+                            'ipv6_loopback': {'connected': True, 'errno': 0}},
                 'job_identity': ({'uid': 998, 'gid': 985, 'uid_min': 1000,
                                   'primary_group': 'motor-job', 'shell': '/usr/sbin/nologin'}
                                  if role == 'boat' else dict(manifest['job_identity_by_role'][role])),
@@ -553,6 +590,17 @@ class ParityTests(unittest.TestCase):
                 drift = copy.deepcopy(actual)
                 drift['job_environment'][name] = value
                 self.assertTrue(self.report(drift, job=True, role='tenant')['errors'])
+
+    def test_every_linux_job_requires_ipv6_loopback(self):
+        for role in ('build-server', 'tenant', 'boat'):
+            for observed in ({}, {'connected': False, 'errno': errno.EAFNOSUPPORT},
+                             {'connected': False, 'errno': errno.EADDRNOTAVAIL}):
+                with self.subTest(role=role, observed=observed):
+                    actual = self.observed(role, job=True)
+                    actual['runtime']['ipv6_loopback'] = observed
+                    self.assertEqual([
+                        f'job IPv6 loopback bind/connect: expected success, observed {observed!r}'
+                    ], self.report(actual, job=True, role=role)['errors'])
 
     def test_tenant_job_requires_sshd_and_runtime_capabilities(self):
         for name in ('dev_shm_writable', 'tmpdir_exec', 'sshd_executable'):

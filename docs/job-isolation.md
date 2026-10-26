@@ -300,6 +300,13 @@ interface (`PrivateNetwork=yes`). It can bind any port, including low ports, on
 its own loopback, and reach nothing else. Tests:
 `isolated_job_binds_low_ports_on_its_own_loopback_only`,
 `isolated_net_offline_job_control`.
+Linux job toolchain qualification also binds and connects `::1` in the job's
+namespace, exchanges TCP data, and fails if IPv6 loopback is unavailable.
+Its runtime report records the failing operation and errno, kernel command line,
+IPv6 proc-file presence and namespace IPv6-disable settings. Tests:
+`test_ipv6_loopback_probe_binds_and_connects`,
+`test_every_linux_job_requires_ipv6_loopback`
+(`script/runner/test_toolchain_parity.py`).
 
 6.2. Outbound access is opt-in on both sides. The caller requests
 `network: "outbound"`; `ck-motor` forwards the request only when its
@@ -318,9 +325,9 @@ before upload with
 
 6.3. A job granted outbound access gets a veth pair into its namespace (its
 side is `eth0`, IPv4 only) and reaches the internet through NAT. The runner
-turns IPv6 off on `eth0`; on a kernel with no IPv6 at all (the tenant VM image
-boots with `ipv6.disable=1`, so its namespaces have no `/proc/sys/net/ipv6`)
-there is nothing to turn off and the step is skipped. Any other failure of that
+turns IPv6 off on `eth0`; on a kernel with no IPv6 at all (and hence no
+`/proc/sys/net/ipv6`) there is nothing to turn off and the step is skipped.
+Such a kernel cannot pass the job IPv6-loopback qualification. Any other failure of that
 step, including a failed write while IPv6 exists, fails the attach. Test:
 `eth0_ipv6_disable_is_skipped_only_when_the_namespace_has_no_ipv6`
 (`crates/motor-runner/src/network_linux.rs`). The runner

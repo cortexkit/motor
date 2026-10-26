@@ -5,6 +5,9 @@ Before=motor-tenant-agent.service
 
 [Service]
 Type=oneshot
+# Keep IPv6 available for private job loopback, never for guest or veth egress.
+# A failed sysctl stops this unit and its dependent tenant agent before any job.
+ExecStartPre=/usr/sbin/sysctl -q -w net.core.devconf_inherit_init_net=0 net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 net.ipv6.conf.lo.disable_ipv6=0
 ExecStart=/usr/sbin/nft -f /etc/nftables.d/motor-net.nft
 StandardOutput=journal+console
 StandardError=journal+console
