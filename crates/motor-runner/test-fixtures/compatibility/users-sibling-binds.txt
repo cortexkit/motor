@@ -1,0 +1,14 @@
+== in-place
+/Users/u/libraries/library -> /Users/u/libraries/library
+/Users/u/libraries/library:/Users/u/library -> /Users/u/library
+[safe]
+	directory = /Users/u/repo
+	directory = /Users/u/libraries/library
+	directory = /Users/u/library
+== snapshot
+/state-root/main/sibling-snapshots/library/s1:/Users/u/libraries/library -> /Users/u/libraries/library
+/state-root/main/sibling-snapshots/library/s1:/Users/u/library -> /Users/u/library
+[safe]
+	directory = /Users/u/repo
+	directory = /Users/u/libraries/library
+	directory = /Users/u/library
