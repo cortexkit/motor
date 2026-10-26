@@ -752,15 +752,19 @@ fn scratch_caller_prefix_symlink_never_steers_mapped_checks_into_an_unrelated_tr
     // in the first writable base outside them.
     let reserved = crate::isolation::reserved_destinations(&config);
     let unique = format!("motor-caller-{}", Uuid::now_v7());
-    let base = [f.scratch.to_path_buf(), "/var/tmp".into(), "/dev/shm".into()]
-        .into_iter()
-        .find(|base| {
-            !reserved
-                .iter()
-                .any(|other| crate::caller_path::overlaps(base, other))
-                && fs::create_dir_all(base.join(&unique)).is_ok()
-        })
-        .expect("a writable directory outside the reserved destinations");
+    let base = [
+        f.scratch.to_path_buf(),
+        "/var/tmp".into(),
+        "/dev/shm".into(),
+    ]
+    .into_iter()
+    .find(|base| {
+        !reserved
+            .iter()
+            .any(|other| crate::caller_path::overlaps(base, other))
+            && fs::create_dir_all(base.join(&unique)).is_ok()
+    })
+    .expect("a writable directory outside the reserved destinations");
     let prefix = base.join(&unique).join("prefix");
     struct Remove(PathBuf);
     impl Drop for Remove {
