@@ -2663,10 +2663,10 @@ fn isolated_net_startup_reconciles_leftovers_but_preserves_live_unit() {
     config.job_network = Some(crate::network::JobNetwork::Veth);
     config.build_slot_root = root;
     crate::network::initialize(&mut config);
-    assert!(
-        config.job_network.is_some(),
-        "{}",
-        config.job_network_unavailable
+    assert_eq!(
+        crate::network::unsupported(&config),
+        None,
+        "startup must leave actual net admission ready, not merely configured"
     );
     let exists = |name: &str| {
         Command::new("/usr/bin/sudo")

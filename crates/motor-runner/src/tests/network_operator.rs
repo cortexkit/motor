@@ -110,10 +110,10 @@ pub(crate) async fn case(mode: &str) {
     let f = Fixture::new();
     install_probe(&f);
     let runner = Runner::open(config(&f)).unwrap();
-    assert!(
-        runner.config().job_network.is_some(),
-        "{}",
-        runner.config().job_network_unavailable
+    assert_eq!(
+        crate::network::unsupported(runner.config()),
+        None,
+        "operator fixture requires a currently valid generation and net admission"
     );
     if mode == "forward" {
         forward_drops(&f, &runner).await;
