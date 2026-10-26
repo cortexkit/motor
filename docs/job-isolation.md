@@ -304,6 +304,7 @@ understands `--caller-root` but serves no caller root, then the units that carry
 the flag. No binary that predates mapping may run against mapped state. The
 operator procedure is in
 [runner-install.md](runner-install.md#9-optional-caller-roots-for-home-checkouts).
+
 ## 4. Processes
 
 4.1. A job has a private PID namespace and cannot see or signal processes
