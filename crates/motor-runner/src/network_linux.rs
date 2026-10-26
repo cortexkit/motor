@@ -334,7 +334,8 @@ mod tests {
     #[test]
     fn eth0_ipv6_disable_is_skipped_only_when_the_namespace_has_no_ipv6() {
         use std::cell::Cell;
-        // IPv6 present and the write succeeds (the build server): no check runs.
+        // IPv6 present and the write succeeds (every current host type): no
+        // check runs.
         let checked = Cell::new(false);
         disable_eth0_ipv6(
             || Ok(()),
@@ -351,7 +352,8 @@ mod tests {
                 "sysctl: cannot stat /proc/sys/net/ipv6/conf/eth0/disable_ipv6: No such file or directory",
             ))
         };
-        // The tenant kernel: no IPv6 in the namespace, so the step is skipped.
+        // A kernel built or booted without IPv6: nothing to disable, so the
+        // step is skipped.
         disable_eth0_ipv6(missing, || true).unwrap();
         // IPv6 exists (or its absence is unproven) but the write failed: the
         // attach still fails closed with the write's error.
