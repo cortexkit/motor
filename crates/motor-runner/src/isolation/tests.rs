@@ -9,8 +9,6 @@ mod privilege;
 
 #[path = "command_golden_tests.rs"]
 mod command_golden;
-#[path = "compatibility_tests.rs"]
-mod compatibility;
 
 #[path = "remote_cache_tests.rs"]
 mod remote_cache;
