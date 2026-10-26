@@ -442,7 +442,9 @@ fn probe(config: &Config, root: &CallerRoot) -> io::Result<()> {
     if unsafe {
         libc::ioctl(
             target.as_raw_fd(),
-            0x40049409 as libc::c_ulong,
+            // FICLONE. libc's ioctl request type differs between glibc
+            // (c_ulong) and musl (c_int); `libc::Ioctl` names the right one.
+            0x40049409_u32 as libc::Ioctl,
             source.as_raw_fd(),
         )
     } != 0
