@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -202,8 +202,115 @@ fn deferred_volume_key_read(path: &str, tokens: &[Token], index: usize) -> bool 
     false
 }
 
-fn production_tokens(source: &str, path: &Path) -> (Vec<Token>, Vec<PathBuf>) {
+fn normalized_module_path(path: PathBuf) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => (),
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            other => result.push(other.as_os_str()),
+        }
+    }
+    result
+}
+
+fn module_directory(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap();
+    if matches!(
+        path.file_stem().and_then(|s| s.to_str()),
+        Some("lib" | "main" | "mod")
+    ) {
+        parent.to_path_buf()
+    } else {
+        parent.join(path.file_stem().unwrap())
+    }
+}
+
+fn module_start(input: &[Token], mut index: usize) -> Option<usize> {
+    if input.get(index).is_some_and(|t| t.text == "pub") {
+        index += 1;
+        if input.get(index).is_some_and(|t| t.text == "(") {
+            index = close(input, index, "(", ")") + 1;
+        }
+    }
+    input
+        .get(index)
+        .is_some_and(|t| t.text == "mod")
+        .then_some(index)
+}
+
+fn module_file(
+    directory: &Path,
+    attribute_directory: &Path,
+    name: &str,
+    explicit_path: Option<&str>,
+) -> PathBuf {
+    let path = if let Some(explicit) = explicit_path {
+        attribute_directory.join(explicit)
+    } else {
+        let file = directory.join(format!("{name}.rs"));
+        if file.exists() {
+            file
+        } else {
+            directory.join(name).join("mod.rs")
+        }
+    };
+    normalized_module_path(path)
+}
+
+fn module_files(input: &[Token], directory: &Path, attribute_directory: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut i = 0;
+    while i < input.len() {
+        let first = i;
+        let mut explicit_path = None;
+        while input.get(i).is_some_and(|t| t.text == "#")
+            && input.get(i + 1).is_some_and(|t| t.text == "[")
+        {
+            let end = close(input, i + 1, "[", "]");
+            let attr: Vec<_> = input[i + 2..end].iter().map(|t| t.text.as_str()).collect();
+            if attr.starts_with(&["path", "="]) {
+                explicit_path = attr
+                    .get(2)
+                    .and_then(|s| s.strip_prefix("literal:"))
+                    .map(String::from);
+            }
+            i = end + 1;
+        }
+        if let Some(item) = module_start(input, i) {
+            let name = &input[item + 1].text;
+            match input.get(item + 2).map(|t| t.text.as_str()) {
+                Some(";") => {
+                    files.push(module_file(
+                        directory,
+                        attribute_directory,
+                        name,
+                        explicit_path.as_deref(),
+                    ));
+                    i = item + 3;
+                    continue;
+                }
+                Some("{") => {
+                    let end = close(input, item + 2, "{", "}");
+                    let nested = directory.join(explicit_path.as_deref().unwrap_or(name));
+                    files.extend(module_files(&input[item + 3..end], &nested, &nested));
+                    i = end + 1;
+                    continue;
+                }
+                _ => (),
+            }
+        }
+        i = i.max(first + 1);
+    }
+    files
+}
+
+fn production_tokens(source: &str, path: &Path) -> (Vec<Token>, Vec<PathBuf>, Vec<PathBuf>) {
     let input = tokens(source);
+    let directory = module_directory(path);
+    let children = module_files(&input, &directory, path.parent().unwrap());
     let mut output = Vec::new();
     let mut test_files = Vec::new();
     let mut i = 0;
@@ -246,33 +353,26 @@ fn production_tokens(source: &str, path: &Path) -> (Vec<Token>, Vec<PathBuf>) {
             .find(|j| matches!(input[*j].text.as_str(), ";" | "{"))
             .expect("test item body");
         if input[end].text == ";" {
-            if input.get(i).is_some_and(|t| t.text == "mod") {
-                let name = &input[i + 1].text;
-                let parent = path.parent().unwrap();
-                let file = explicit_path.map(|p| parent.join(p)).unwrap_or_else(|| {
-                    let directory = if matches!(
-                        path.file_stem().and_then(|s| s.to_str()),
-                        Some("lib" | "main" | "mod")
-                    ) {
-                        parent.to_path_buf()
-                    } else {
-                        parent.join(path.file_stem().unwrap())
-                    };
-                    let file = directory.join(format!("{name}.rs"));
-                    if file.exists() {
-                        file
-                    } else {
-                        directory.join(name).join("mod.rs")
-                    }
-                });
-                test_files.push(file);
+            if let Some(item) = module_start(&input, i) {
+                test_files.push(module_file(
+                    &directory,
+                    path.parent().unwrap(),
+                    &input[item + 1].text,
+                    explicit_path.as_deref(),
+                ));
             }
             i = end + 1;
         } else {
-            i = close(&input, end, "{", "}") + 1;
+            let body_end = close(&input, end, "{", "}");
+            let nested = module_start(&input, i).map_or_else(
+                || directory.clone(),
+                |item| directory.join(explicit_path.as_deref().unwrap_or(&input[item + 1].text)),
+            );
+            test_files.extend(module_files(&input[end + 1..body_end], &nested, &nested));
+            i = body_end + 1;
         }
     }
-    (output, test_files)
+    (output, test_files, children)
 }
 
 fn source_files(directory: &Path, output: &mut Vec<PathBuf>) {
@@ -287,6 +387,8 @@ fn source_files(directory: &Path, output: &mut Vec<PathBuf>) {
 }
 
 fn scan(root: &Path, allowlist: &[&str]) -> Result<(), String> {
+    let normalized_root = normalized_module_path(root.to_path_buf());
+    let root = normalized_root.as_path();
     let mut fixed: BTreeSet<String> = ["windows.rs", "macos.rs", "tenant_agent.rs"]
         .map(String::from)
         .into_iter()
@@ -307,12 +409,56 @@ fn scan(root: &Path, allowlist: &[&str]) -> Result<(), String> {
     let mut files = Vec::new();
     source_files(root, &mut files);
     let mut excluded = BTreeSet::new();
+    let mut modules = BTreeMap::new();
+    let mut production_modules = BTreeMap::new();
     let mut sources = Vec::new();
     for path in files {
-        let (tokens, tests) = production_tokens(&fs::read_to_string(&path).unwrap(), &path);
+        let (tokens, tests, children) =
+            production_tokens(&fs::read_to_string(&path).unwrap(), &path);
         excluded.extend(tests);
+        let relative = path.strip_prefix(root).unwrap();
+        if relative == Path::new("tests.rs") || relative.starts_with("tests") {
+            excluded.insert(path.clone());
+        }
+        modules.insert(path.clone(), children);
+        production_modules.insert(
+            path.clone(),
+            module_files(&tokens, &module_directory(&path), path.parent().unwrap()),
+        );
         sources.push((path, tokens));
     }
+    // A module reached only through a test module is also test-only, even
+    // when its own declaration has no cfg(test) attribute.
+    let mut pending: Vec<_> = excluded.iter().cloned().collect();
+    while let Some(path) = pending.pop() {
+        if let Some(children) = modules.get(&path) {
+            for child in children {
+                if excluded.insert(child.clone()) {
+                    pending.push(child.clone());
+                }
+            }
+        }
+    }
+    // A shared source reached by production as well as by tests must still be
+    // scanned; a test-module reference must not hide a production consumer.
+    let mut production = BTreeSet::new();
+    let mut pending: Vec<_> = sources
+        .iter()
+        .filter(|(path, _)| !excluded.contains(path))
+        .map(|(path, _)| path.clone())
+        .collect();
+    while let Some(path) = pending.pop() {
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        if relative == Path::new("tests.rs") || relative.starts_with("tests") {
+            continue;
+        }
+        if production.insert(path.clone()) {
+            if let Some(children) = production_modules.get(&path) {
+                pending.extend(children.iter().cloned());
+            }
+        }
+    }
+    excluded.retain(|path| !production.contains(path));
     let mut hits = Vec::new();
     for (path, tokens) in sources {
         let relative = path.strip_prefix(root).unwrap().to_str().unwrap();
@@ -325,6 +471,8 @@ fn scan(root: &Path, allowlist: &[&str]) -> Result<(), String> {
             continue;
         }
         for (index, pair) in tokens.windows(2).enumerate() {
+            // Job::key() takes no arguments. CacheDisks::key(workspace) and
+            // credential-key helpers are different APIs, not job-record reads.
             if pair[0].text == "."
                 && matches!(
                     pair[1].text.as_str(),
@@ -333,6 +481,7 @@ fn scan(root: &Path, allowlist: &[&str]) -> Result<(), String> {
                 || (pair[0].text == "."
                     && pair[1].text == "key"
                     && tokens.get(index + 2).is_some_and(|t| t.text == "(")
+                    && tokens.get(index + 3).is_some_and(|t| t.text == ")")
                     && !deferred_volume_key_read(relative, &tokens, index))
             {
                 hits.push(format!("{relative}:{} .{}", pair[1].line, pair[1].text));
@@ -374,6 +523,50 @@ fn scan(root: &Path, allowlist: &[&str]) -> Result<(), String> {
     }
 }
 
+fn check_test_module_graph() {
+    let scratch = cortexkit_test_support::ScratchDir::new("motor-path-backstop-modules");
+    for file in ALLOWLIST {
+        let path = scratch.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "").unwrap();
+    }
+    fs::create_dir_all(scratch.join("support/nested")).unwrap();
+    fs::create_dir_all(scratch.join("inline")).unwrap();
+    let root = "#[cfg(test)] #[path = \"support/test_root.rs\"] pub(crate) mod tests;\n#[cfg(test)] mod inline { #[path = \"child.rs\"] pub mod child; }\nfn production() { cache.key(workspace); }\n";
+    fs::write(scratch.join("lib.rs"), root).unwrap();
+    fs::write(
+        scratch.join("support/test_root.rs"),
+        "#[path = \"nested/child.rs\"] pub mod child; #[path = \"nested/shared.rs\"] mod shared;",
+    )
+    .unwrap();
+    fs::write(
+        scratch.join("support/nested/child.rs"),
+        "fn test() { request.cwd; }",
+    )
+    .unwrap();
+    fs::write(
+        scratch.join("support/nested/shared.rs"),
+        "fn test() { request.repository_root; }",
+    )
+    .unwrap();
+    fs::write(
+        scratch.join("inline/child.rs"),
+        "fn test() { sibling.canonical_path; }",
+    )
+    .unwrap();
+    scan(&scratch, ALLOWLIST).unwrap();
+    fs::write(
+        scratch.join("lib.rs"),
+        format!("{root}#[path = \"support/nested/shared.rs\"] mod production_shared;\n"),
+    )
+    .unwrap();
+    let error = scan(&scratch, ALLOWLIST).unwrap_err();
+    assert!(
+        error.contains("support/nested/shared.rs") && error.contains(".repository_root"),
+        "{error}"
+    );
+}
+
 #[test]
 fn production_path_reads_use_the_typed_boundary() {
     scan(
@@ -385,6 +578,7 @@ fn production_path_reads_use_the_typed_boundary() {
 
 #[test]
 fn backstop_rejects_planted_reads_and_allowlist_drift_but_accepts_test_reads() {
+    check_test_module_graph();
     let scratch = cortexkit_test_support::ScratchDir::new("motor-path-backstop");
     for file in ALLOWLIST {
         let path = scratch.join(file);
