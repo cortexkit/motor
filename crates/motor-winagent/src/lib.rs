@@ -1059,7 +1059,8 @@ pub fn rewrite_local_registry_config(cargo_home: &std::path::Path) -> io::Result
     let config_path = cargo_home.join("config.toml");
     let metadata = match std::fs::symlink_metadata(&config_path) {
         Ok(metadata) => metadata,
-        // Non-Cargo snapshots have no dependency configuration to relocate.
+        // QEMU archives and non-Cargo snapshots need not include a generated
+        // Cargo config. Only relocate the native preparer's config when present.
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
