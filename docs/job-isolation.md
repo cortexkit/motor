@@ -155,7 +155,23 @@ directory the runner owns, `PREFIX=HOST` for short, for example
 checkout under the host directory and binds it, read-write, at the caller's
 `/home` path. Every path in the job, its output, `pwd`, `$PWD`, git's
 `safe.directory` entries, `WorkingDirectory` and its compiler diagnostics reads
-`/home/...`; nothing names the host directory.
+`/home/...`.
+
+The guarantee is that the job cannot reach the host directory, not that it
+cannot learn its name. A job can read its own mount table in
+`/proc/self/mountinfo`. Its root field names the bound tree's source within the
+backing filesystem, so it can reveal the host directory's path. The host
+directory itself is not mounted into the job; only the job's checkout, target
+and declared siblings from under it are exposed, at their caller paths. When a
+refusal or error detail contains the configured host directory's spelling, the
+runner replaces it with the caller prefix.
+
+Jobs are the untrusted party. Host-side mutations of mapped trees (setup,
+permission repair, reclaim, `forget-caller-root`) are safe against them: a job
+runs only after setup, and the root-owned directories leading to its mount points
+keep it from replacing any host directory above the mapped trees. Accounts with
+write access to the host directory's parents are trusted operators. These
+mutations don't defend against them.
 
 This section states the contract a caller root hands the job. The operator side
 (directories, unit flags, rollout and rollback) is in
