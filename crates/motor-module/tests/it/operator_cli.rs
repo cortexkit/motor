@@ -2143,10 +2143,11 @@ async fn cli_cancel_ends_a_running_job_with_killed_cancel() {
     };
     assert_eq!(terminal.killed, Some(motor_protocol::Killed::Cancel), "{terminal:?}");
     assert_eq!(cli::exit_code(&terminal), cli::EXIT_CANCELLED);
-    // The saved file proved the job was still running when the cancel looked,
-    // so the answer is `cancelled` even though the job's own stop raced the
-    // cancel; the CLI leaves no file behind for a job it found finished.
-    assert!(saved_path.is_some());
+    // The saved file is what tells `ck motor cancel` the job was still
+    // running: it answers `cancelled` exactly when a saved file it read for
+    // the job is still on disk. The job's own stop racing the cancel does not
+    // change that.
+    assert!(saved_path.is_some(), "the cancel read the saved secret file");
 }
 
 #[tokio::test]
