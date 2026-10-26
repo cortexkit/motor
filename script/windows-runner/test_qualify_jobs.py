@@ -319,7 +319,10 @@ class QualificationReadinessTests(unittest.TestCase):
         self.assertIn("cargo build --offline --locked", tagged["command"])
         dep = tagged["git_dependencies"][0]
         self.assertEqual(dep["url"], JOBS.GIT_DEP_URL)
-        self.assertEqual(dep["bundle"], tagged["bundles"][1])
+        # The runner uploads `bundles` then each dependency's bundle, and needs
+        # consecutive indexes, so the dependency must not also be in `bundles`.
+        uploads = tagged["bundles"] + [d["bundle"] for d in tagged["git_dependencies"]]
+        self.assertEqual([u["index"] for u in uploads], list(range(len(uploads))))
         self.assertEqual(dep["bundle"]["repository"], JOBS.GIT_DEP_URL)
         dep_commit = dep["commits"][0]
         lock = (self.root / "git-tag-fixture/Cargo.lock").read_text()
@@ -331,7 +334,7 @@ class QualificationReadinessTests(unittest.TestCase):
         for channel, request in zip(channels, requests):
             self.assertTrue(request["command"].startswith(JOBS.BUN_VERSION_CHECK + " || exit $?; "))
             chunks = [call.args[0] for call in channel.send.call_args_list[1:]]
-            for manifest in request["bundles"]:
+            for manifest in request["bundles"] + [d["bundle"] for d in request["git_dependencies"]]:
                 data = b"".join(JOBS.base64.b64decode(chunk["data"]) for chunk in chunks if chunk["index"] == manifest["index"])
                 self.assertEqual(len(data), manifest["length"])
                 self.assertEqual(JOBS.hashlib.sha256(data).hexdigest(), manifest["sha256"])

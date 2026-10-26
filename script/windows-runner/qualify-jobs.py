@@ -329,8 +329,10 @@ def run_preparation_case(root, runner, evidence, name, repo, commit, tree, comma
         dep_bundle = evidence / f"{name}-dependency.bundle"
         dependency_bundle(dep_repo, dep_bundle, dep_commit)
         payloads.append(dep_bundle.read_bytes())
-        manifests.append(dict(index=1, repository=GIT_DEP_URL, length=len(payloads[1]), sha256=hashlib.sha256(payloads[1]).hexdigest()))
-        dependencies.append(dict(url=GIT_DEP_URL, commits=[dep_commit], bundle=manifests[1]))
+        # A dependency's bundle travels only in its own entry. The runner
+        # uploads the run's `bundles` followed by each dependency's bundle, so
+        # listing it in `bundles` too would number it twice.
+        dependencies.append(dict(url=GIT_DEP_URL, commits=[dep_commit], bundle=dict(index=1, repository=GIT_DEP_URL, length=len(payloads[1]), sha256=hashlib.sha256(payloads[1]).hexdigest())))
     job = str(uuid.uuid4())
     channel = Channel(runner, root, evidence / f"bridge-{name}.log")
     try:
