@@ -287,7 +287,7 @@ impl Harness {
                             }
                         }
                         // The tenant's admission gate. An admitted job's claim
-                        // is held until this connection ends, however it ends.
+                        // lasts until the job completes or its connection ends.
                         let _claim = if purpose == Purpose::Run {
                             let admitted = capacity
                                 .lock()
@@ -433,6 +433,18 @@ impl Harness {
                                             motor_protocol::write_frame_async(&mut tls, &frame)
                                                 .await
                                                 .unwrap();
+                                        }
+                                        if matches!(behavior, Behavior::CompleteRun) {
+                                            // The job has ended, so free its capacity before
+                                            // waiting for the client to consume its final frames.
+                                            drop(_claim);
+                                            // Closing with unread client traffic can reset the
+                                            // socket and race admission or terminal delivery.
+                                            // Drain until the client closes after those frames.
+                                            while motor_protocol::read_frame_async(&mut tls)
+                                                .await
+                                                .is_ok_and(|frame| frame.is_some())
+                                            {}
                                         }
                                         return;
                                     }
@@ -692,7 +704,7 @@ impl Harness {
 /// `HostedTerminal` bills the same amount.
 pub const SETTLED_RUNTIME_MS: u64 = 3000;
 
-/// A job's claim on the harness tenant, released when its run connection ends.
+/// A job's claim on the harness tenant, released at completion or disconnect.
 struct HeldClaim(Arc<Mutex<Option<TenantCapacity>>>, String);
 impl Drop for HeldClaim {
     fn drop(&mut self) {
