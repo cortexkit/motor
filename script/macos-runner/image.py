@@ -164,7 +164,13 @@ def main():
         run("/usr/bin/codesign", "--force", "--sign", "-", "--entitlements", HERE / "virtualization.entitlements", args.vm_helper)
         if args.operation == "restore":
             verify_ipsw(args.ipsw, manifest["ipsw"])
-            run("/usr/bin/swift", HERE / "prepare-image.swift", args.ipsw, args.image)
+            # Loading a restore image talks to the Virtualization installation
+            # service, which refuses a process without the virtualization
+            # entitlement, so the interpreted `swift script` can't do it.
+            prepare = args.work / "prepare-image"
+            run("/usr/bin/swiftc", "-O", HERE / "prepare-image.swift", "-o", prepare)
+            run("/usr/bin/codesign", "--force", "--sign", "-", "--entitlements", HERE / "virtualization.entitlements", prepare)
+            run(prepare, args.ipsw, args.image)
         run(args.vm_helper, "image-build", args.image, *([args.ipsw] if args.operation == "restore" else []))
     elif args.operation == "finalize":
         if not args.image:
