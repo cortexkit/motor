@@ -928,7 +928,7 @@ impl Rig {
             );
         }
         self.report.data.lock().unwrap()["caller_detach_observation"] = json!({"job_id":id,"health":health,"stderr_delta":delta,
-            "stream_end_producer":"subc-client-rs 0.26.1 lib.rs send_handler_outcome(Streamed):1957-1960; late emit drop:1299-1320; Cancel token:1964-1975",
+            "stream_end_producer":"subc-client-rs 0.32.4 send_handler_outcome(Streamed); request Cancel token detaches the handler",
             "status_evidence":"job absent from running_jobs; terminal obtained by exec.attach"});
         self.report.save();
     }
@@ -1783,7 +1783,8 @@ async fn refusals(rig: &Rig) {
     assert_eq!(replay.terminal(), result.terminal());
     marker_absent(rig, &key, "queue-marker").await;
     let mut queued = Vec::new();
-    let queue_limit = motor_module::module::RUN_ADMISSION_LIMIT - 1;
+    // The runner's default queue bound, independent of SDK dispatch capacity.
+    let queue_limit = 64;
     for batch in (0..queue_limit).step_by(8) {
         let mut jobs = tokio::task::JoinSet::new();
         for _ in batch..(batch + 8).min(queue_limit) {
@@ -1797,7 +1798,7 @@ async fn refusals(rig: &Rig) {
     }
     let full_status = timeout(Duration::from_secs(30), rig.bus.status())
         .await
-        .expect("status_while_full must retain SDK control headroom");
+        .expect("status_while_full must use the separate default pool");
     assert_eq!(full_status["queue_depth"], json!(queue_limit));
     assert_no_base(&full_status);
     let health = rig
@@ -1807,8 +1808,8 @@ async fn refusals(rig: &Rig) {
         health["status"], "ok",
         "full runner queue must not saturate provider dispatch: {health}"
     );
-    rig.report.data.lock().unwrap()["admission_capacity"] = json!({"sdk":motor_module::module::SDK_HANDLER_CAPACITY,
-        "reserved_controls":motor_module::module::CONTROL_HEADROOM,"runs":motor_module::module::RUN_ADMISSION_LIMIT,"full_status":full_status,"health":health});
+    rig.report.data.lock().unwrap()["admission_capacity"] = json!({"long_held_limit":motor_module::module::LONG_HELD_LIMIT,
+        "runner_queue_limit":queue_limit,"full_status":full_status,"health":health});
     rig.report.save();
     let result = rig.run(&key, "echo forbidden > full-marker").await;
     result.refusal(RefusalReason::RunnerFull, false);
@@ -1816,7 +1817,7 @@ async fn refusals(rig: &Rig) {
     for call in queued {
         timeout(Duration::from_secs(30), rig.bus.cancel(call.id()))
             .await
-            .expect("cancel_while_full must retain SDK control headroom");
+            .expect("cancel_while_full must use the separate default pool");
         call.finish().await;
     }
     rig.bus.cancel(blocker.id()).await;

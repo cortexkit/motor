@@ -33,12 +33,6 @@ fn digest(request: &RunRequest) -> io::Result<String> {
 }
 
 impl Motor {
-    pub(crate) fn has_submission(&self, principal: &str, request: &RunRequest) -> io::Result<bool> {
-        match request.submission_key.as_deref() {
-            Some(key) => Ok(self.storage.keyed_job(principal, key)?.is_some()),
-            None => Ok(false),
-        }
-    }
     /// Compare the caller request's digest to the stored digest before
     /// take_return_request translates paths or run_job snapshots the checkout.
     /// keyed_admissions serializes lookup through record_submission's durable
