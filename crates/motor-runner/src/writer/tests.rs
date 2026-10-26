@@ -13,9 +13,148 @@ fn canonical_future_resolves_existing_ancestors_and_refuses_dangling_links() {
         fs::canonicalize(&real).unwrap().join("absent/child")
     );
     symlink(scratch.join("absent"), scratch.join("dangling")).unwrap();
-    assert!(canonical_future(&scratch.join("dangling/child")).is_err());
+    let dangling = scratch.join("dangling/child");
+    for (error, step) in [
+        (
+            canonical_future(&dangling).unwrap_err(),
+            "resolve writer path",
+        ),
+        (
+            workspace::destination(&dangling).unwrap_err(),
+            "resolve destination",
+        ),
+    ] {
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let detail = error.to_string();
+        assert!(detail.contains(step), "{detail}");
+        assert!(detail.contains(dangling.to_str().unwrap()), "{detail}");
+        assert!(detail.contains("No such file or directory"), "{detail}");
+    }
     assert!(canonical_future(Path::new("relative")).is_err());
     assert!(canonical_future(&real.join("../escape")).is_err());
+}
+
+#[test]
+fn validation_survives_a_sibling_checkout_retiring_between_metadata_and_listing() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    };
+    use std::time::Duration;
+
+    let scratch = ScratchDir::new("writer-retiring-sibling");
+    let workspace = scratch.join("absent-workspace");
+    let sibling = scratch.join("sibling");
+    let retired = scratch.join("retired");
+    fs::create_dir_all(sibling.join(".motor-base-main-fixture")).unwrap();
+    let siblings = [SiblingSnapshot {
+        canonical_path: sibling.to_str().unwrap().to_owned(),
+        commit: String::new(),
+        tree_hash: String::new(),
+        base_commit: None,
+    }];
+    let (observed, metadata_read) = mpsc::sync_channel(0);
+    let (resume, retired_path) = mpsc::sync_channel(0);
+    let retired_path = Mutex::new(retired_path);
+    let first = AtomicBool::new(true);
+    let mut config = Config::new(scratch.join("state"), "main");
+    config.long_work = Some(Arc::new(move |label| {
+        if label == "writer_base_checkout_metadata" && first.swap(false, Ordering::SeqCst) {
+            observed.send(()).unwrap();
+            retired_path
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        }
+    }));
+
+    std::thread::scope(|scope| {
+        let validation = scope.spawn(|| {
+            validate_paths(
+                &config,
+                crate::caller_path::host(&workspace),
+                None,
+                &siblings,
+                &[],
+            )
+        });
+        metadata_read.recv_timeout(Duration::from_secs(10)).unwrap();
+        // Discard retires a checkout by renaming it before background deletion.
+        // Order that rename after metadata and before the directory is opened.
+        let renamed = fs::rename(&sibling, &retired);
+        resume.send(()).unwrap();
+        renamed.unwrap();
+        validation.join().unwrap().unwrap();
+    });
+
+    let error =
+        validate_paths(&config, crate::caller_path::host(&retired), None, &[], &[]).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("caller path overlaps writer-owned storage"));
+    assert!(error.to_string().contains(retired.to_str().unwrap()));
+}
+
+#[test]
+fn writer_validation_errors_identify_paths_in_every_role() {
+    let scratch = ScratchDir::new("writer-path-errors");
+    let dangling = scratch.join("dangling");
+    symlink(scratch.join("absent"), &dangling).unwrap();
+    let workspace = scratch.join("workspace");
+    let config = Config::new(scratch.join("state"), "main");
+    let siblings = [SiblingSnapshot {
+        canonical_path: dangling.to_str().unwrap().to_owned(),
+        commit: String::new(),
+        tree_hash: String::new(),
+        base_commit: None,
+    }];
+    for error in [
+        validate_paths(&config, crate::caller_path::host(&dangling), None, &[], &[]).unwrap_err(),
+        validate_paths(
+            &config,
+            crate::caller_path::host(&workspace),
+            Some(crate::caller_path::host(&dangling)),
+            &[],
+            &[],
+        )
+        .unwrap_err(),
+        validate_paths(
+            &config,
+            crate::caller_path::host(&workspace),
+            None,
+            &siblings,
+            &[],
+        )
+        .unwrap_err(),
+        validate_paths(
+            &config,
+            crate::caller_path::host(&workspace),
+            None,
+            &[],
+            std::slice::from_ref(&dangling),
+        )
+        .unwrap_err(),
+    ] {
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let detail = error.to_string();
+        assert!(detail.contains("resolve writer path"), "{detail}");
+        assert!(detail.contains(dangling.to_str().unwrap()), "{detail}");
+    }
+    fs::create_dir_all(config.state_dir()).unwrap();
+    let cache = config.state_dir().join("sccache");
+    symlink(scratch.join("absent"), &cache).unwrap();
+    let detail = validate_paths(
+        &config,
+        crate::caller_path::host(&workspace),
+        None,
+        &[],
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(detail.contains("resolve writer path"), "{detail}");
+    assert!(detail.contains(cache.to_str().unwrap()), "{detail}");
 }
 
 #[test]

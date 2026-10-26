@@ -208,13 +208,22 @@ pub(crate) fn validate_request(
         plan.caller_repository_root.text(),
         siblings,
         snapshot_paths,
-    )?;
-    validate_host_overlap(
-        plan.host_workspace,
-        plan.host_repository_root,
-        siblings,
-        snapshot_paths,
     )
+    .and_then(|()| {
+        validate_host_overlap(
+            plan.host_workspace,
+            plan.host_repository_root,
+            siblings,
+            snapshot_paths,
+        )
+    })
+    .map_err(|error| {
+        crate::workspace_access::Unreadable::wrap(
+            plan.host_workspace.as_path(),
+            "validate workspace paths",
+            error,
+        )
+    })
 }
 
 fn validate_names(
@@ -277,6 +286,12 @@ fn validate_host_overlap(
 /// Resolve existing ancestors as well as future destinations. A missing suffix
 /// must not hide an existing symlink pointing outside an authorized root.
 pub(crate) fn destination(path: &Path) -> io::Result<PathBuf> {
+    resolve_destination(path).map_err(|error| {
+        crate::workspace_access::Unreadable::wrap(path, "resolve destination", error)
+    })
+}
+
+fn resolve_destination(path: &Path) -> io::Result<PathBuf> {
     match fs::canonicalize(path) {
         Ok(path) => Ok(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -293,7 +308,7 @@ pub(crate) fn destination(path: &Path) -> io::Result<PathBuf> {
             let parent = path
                 .parent()
                 .ok_or_else(|| invalid("destination has no parent"))?;
-            Ok(destination(parent)?.join(
+            Ok(resolve_destination(parent)?.join(
                 path.file_name()
                     .ok_or_else(|| invalid("destination has no name"))?,
             ))
@@ -435,7 +450,13 @@ pub(crate) fn sibling_aliases(
                     let parent = path
                         .parent()
                         .ok_or_else(|| invalid("alias has no parent"))?;
-                    let target = parent.join(fs::read_link(&path)?);
+                    let target = parent.join(fs::read_link(&path).map_err(|error| {
+                        crate::workspace_access::Unreadable::wrap(
+                            &path,
+                            "read sibling alias",
+                            error,
+                        )
+                    })?);
                     if destination(&target)? != destination(paths::sibling(sibling).host.as_path())?
                     {
                         return Err(error);
@@ -452,7 +473,14 @@ pub(crate) fn sibling_aliases(
             };
             Ok(SiblingAlias { path, canonical })
         })
-        .collect()
+        .collect::<io::Result<Vec<_>>>()
+        .map_err(|error| {
+            crate::workspace_access::Unreadable::wrap(
+                key.as_path(),
+                "resolve sibling aliases",
+                error,
+            )
+        })
 }
 
 pub(crate) struct Trees {
