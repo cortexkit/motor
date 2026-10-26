@@ -1521,6 +1521,63 @@ mod nested_lockfile_tests {
 }
 
 #[cfg(test)]
+mod transfer_compatibility_tests {
+    use super::*;
+    use cortexkit_test_support::ScratchDir;
+
+    #[test]
+    fn qemu_cargo_archive_without_native_registry_config_stages_in_guest() {
+        let scratch = ScratchDir::new("windows-qemu-transfer-config");
+        let staging = scratch.join("staging");
+        let workspace = staging.join("m/workspace");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::create_dir_all(staging.join("cargo-home")).unwrap();
+        let files = [
+            (
+                "Cargo.toml",
+                "[package]\nname='transfer-fixture'\nversion='0.1.0'\nedition='2021'\n",
+            ),
+            (
+                "Cargo.lock",
+                "version=3\n[[package]]\nname='transfer-fixture'\nversion='0.1.0'\n",
+            ),
+            ("src/main.rs", "fn main() {}\n"),
+        ];
+        for (name, content) in files {
+            fs::write(workspace.join(name), content).unwrap();
+        }
+
+        // QEMU preparation can fetch Cargo dependencies without generating the
+        // native Windows preparer's local-registry config. Build the actual
+        // transfer archive, then unpack it and run the guest's config rewrite.
+        build_tar(&staging).unwrap();
+        let source_root = scratch.join("guest/sources");
+        let cargo_home = scratch.join("guest/profile/.cargo");
+        fs::create_dir_all(&cargo_home).unwrap();
+        motor_winagent::unpack_tree(
+            &mut File::open(staging.join("tree.tar")).unwrap(),
+            &source_root,
+            &cargo_home,
+        )
+        .unwrap();
+        assert!(!cargo_home.join("config.toml").exists());
+
+        motor_winagent::rewrite_local_registry_config(&cargo_home).unwrap();
+
+        let inventory = motor_winagent::inventory(&source_root).unwrap();
+        assert_eq!(inventory.len(), files.len());
+        for (name, content) in files {
+            assert!(inventory.contains_key(&format!("m/workspace/{name}")));
+            assert_eq!(
+                fs::read_to_string(source_root.join("workspace").join(name)).unwrap(),
+                content
+            );
+        }
+        assert!(!cargo_home.join("config.toml").exists());
+    }
+}
+
+#[cfg(test)]
 mod path_error_tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
