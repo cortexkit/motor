@@ -91,6 +91,8 @@ impl Default for Fake {
     }
 }
 
+/// Only the Linux server tests use this fixture.
+#[cfg(target_os = "linux")]
 pub(crate) fn degraded_service_fixture(problem: &'static str) -> Controller<Fake> {
     Controller(Fake {
         network_problem: Some(problem),
