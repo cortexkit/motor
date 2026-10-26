@@ -21,6 +21,11 @@ UNKNOWN = "0192a64a-1234-7000-8000-000000000003"
 REPO = "/Users/example/src/prefrontal"
 WORKSPACE = "/Users/example/worktrees/task"
 SIBLING = "/Users/example/src/commons"
+# Linux callers keep checkouts under /home; runners store them elsewhere and
+# present this spelling to the caller and inside the job.
+HOME_REPO = "/home/example/src/prefrontal"
+HOME_WORKSPACE = "/home/example/worktrees/task"
+HOME_SIBLING = "/home/example/src/commons"
 COMMIT = "1" * 40
 TIP = "2" * 40
 TREE = "3" * 40
@@ -114,6 +119,14 @@ def upload(start, accepted, end):
 
 
 def main():
+    home_bundles = [
+        {**manifest, "repository": repository}
+        for manifest, repository in zip(BUNDLES, [HOME_REPO, HOME_SIBLING])
+    ]
+    home_run = {**RUN, "workspace_key": HOME_WORKSPACE,
+                "repository_root": HOME_REPO, "cwd": HOME_WORKSPACE,
+                "siblings": [{**SIBLINGS[0], "canonical_path": HOME_SIBLING}],
+                "bundles": home_bundles}
     frames = {
         "hello": {"type": "hello", "protocol_version": 1},
         "hello-started": {"type": "hello", "protocol_version": 1, "started": True},
@@ -130,6 +143,11 @@ def main():
         "run": RUN,
         "run-gate-job": {**RUN, "gate_job": True, "queue_wait_limit_s": 1800},
         "run-network-outbound": {**RUN, "network": "outbound"},
+        "run-home": home_run,
+        "prepare-home": {**PREPARE, "workspace_key": HOME_WORKSPACE,
+                         "repository_root": HOME_REPO,
+                         "siblings": home_run["siblings"],
+                         "bundles": home_bundles},
         "run-workspace-kind-head": {**RUN, "workspace_key": REPO, "cwd": REPO,
                                     "workspace_kind": "head"},
         "run-workspace-kind-task": {**RUN, "workspace_kind": "task"},
@@ -259,6 +277,8 @@ def main():
         emit("frames", name + "-git-dependencies-transcript", [
             new_have, new_reply, upgraded, accepted, *CHUNKS, dep_chunk, end])
     emit("frames", "run-two-bundle-transcript", upload(RUN, ACCEPTED, frames["terminal"]))
+    emit("frames", "run-home-transcript", [home_run, ACCEPTED, *CHUNKS,
+         HEARTBEAT, frames["output"], frames["terminal"]])
     emit("frames", "run-queue-state-transcript", [RUN, ACCEPTED, *CHUNKS,
          frames["heartbeat-queue-entered"], frames["heartbeat-queued"],
          HEARTBEAT, frames["output"], frames["terminal"]])
