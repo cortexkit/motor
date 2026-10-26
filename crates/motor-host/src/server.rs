@@ -1716,20 +1716,6 @@ fn buffered_frame_ready(buffer: &[u8]) -> bool {
     }
 }
 
-#[cfg(test)]
-mod buffered_frame_tests {
-    use super::buffered_frame_ready;
-
-    #[test]
-    fn needs_the_length_prefix_and_the_whole_body() {
-        assert!(!buffered_frame_ready(&[]));
-        assert!(!buffered_frame_ready(&[0, 0, 0]));
-        assert!(buffered_frame_ready(&[0, 0, 0, 0]));
-        assert!(!buffered_frame_ready(&[0, 0, 0, 2, b'{']));
-        assert!(buffered_frame_ready(&[0, 0, 0, 2, b'{', b'}', 0]));
-    }
-}
-
 pub async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Result<Value> {
     let n = reader.read_u32().await? as usize;
     ensure!(n > 0 && n <= FRAME_LIMIT, "invalid frame length");
@@ -1784,5 +1770,19 @@ pub async fn admin_socket(runtime: Arc<Runtime>, path: &std::path::Path) -> Resu
                     write_frame(&mut stream, &json!({"ok":false,"error":"admin_refused"})).await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod buffered_frame_tests {
+    use super::buffered_frame_ready;
+
+    #[test]
+    fn needs_the_length_prefix_and_the_whole_body() {
+        assert!(!buffered_frame_ready(&[]));
+        assert!(!buffered_frame_ready(&[0, 0, 0]));
+        assert!(buffered_frame_ready(&[0, 0, 0, 0]));
+        assert!(!buffered_frame_ready(&[0, 0, 0, 2, b'{']));
+        assert!(buffered_frame_ready(&[0, 0, 0, 2, b'{', b'}', 0]));
     }
 }
