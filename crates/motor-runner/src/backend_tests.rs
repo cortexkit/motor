@@ -362,10 +362,6 @@ fn hosted_jobs_bypass_shared_compile_cache_but_keep_the_fixed_target_folder() {
         for (boat, tenant) in [(false, false), (true, false), (false, true), (true, true)] {
             for supervisor in [false, true] {
                 for writer in [false, true] {
-                    // Writers always fill a Rust workspace.
-                    if writer && !rust {
-                        continue;
-                    }
                     hosted_cache_case(&scratch, rust, boat, tenant, supervisor, writer);
                 }
             }
@@ -449,11 +445,10 @@ fn hosted_cache_case(
         &mut destinations,
     )
     .unwrap();
-    // An isolated Rust job builds in /run/motor/target on every Linux runner, whether or
-    // not it has the shared compile cache: that folder is bound to the job's
-    // own target folder, so `./target` and CARGO_TARGET_DIR are one directory.
+    // Isolated Rust jobs and warm-build commands use /run/motor/target on
+    // every Linux runner, even when the warm checkout has no Cargo manifest.
     let fixed_target = format!("{}:/run/motor/target", prepared.target.display());
-    if rust {
+    if rust || writer {
         assert_eq!(env["CARGO_TARGET_DIR"], "/run/motor/target", "{case}");
         assert!(read_write.contains(&fixed_target), "{case}: {read_write:?}");
         assert!(
@@ -490,7 +485,7 @@ fn hosted_cache_case(
             !destinations.contains(&PathBuf::from("/motor-cache")),
             "{case}"
         );
-    } else if rust {
+    } else if rust || writer {
         assert_eq!(
             env["RUSTC_WRAPPER"],
             if supervisor {
