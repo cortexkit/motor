@@ -1,5 +1,6 @@
 //! Pins serialized records and wire payloads that keep caller paths unchanged.
 use super::*;
+use crate::compatibility_config::{assert_identity, configure, modes};
 use crate::storage::{
     BaseRequest, Catalog, LegacyCheckout, Repository, RetainedTransfer, Workspace,
 };
@@ -52,6 +53,15 @@ fn assert_bytes(actual: &[u8], expected: &[u8]) {
 
 #[test]
 fn users_catalog_matches_pre_mapping_bytes() {
+    for &enabled in modes() {
+        users_catalog_case(enabled);
+    }
+}
+
+fn users_catalog_case(enabled: bool) {
+    let scratch = ScratchDir::new("motor-compat-catalog");
+    let mut config = Config::new(scratch.join("state"), "main");
+    configure(&mut config, &scratch, enabled);
     let run = request();
     let mut catalog = Catalog::default();
     catalog.workspaces.insert(
@@ -99,7 +109,13 @@ fn users_catalog_matches_pre_mapping_bytes() {
     );
     catalog.mirror_used_ms.insert("mirror".into(), 150);
     catalog.compile_cache_used_ms = Some(200);
-    let scratch = ScratchDir::new("motor-compat-catalog");
+    for plan in crate::caller_path::keys(&catalog.workspaces)
+        .chain(crate::caller_path::keys(&catalog.repositories))
+        .chain(crate::caller_path::keys(&catalog.legacy_checkouts))
+        .chain(crate::caller_path::keys(&catalog.sibling_commits))
+    {
+        assert_identity(&config, plan);
+    }
     let path = scratch.join("catalog.json");
     atomic_json(&path, &catalog).unwrap();
     let bytes = fs::read(&path).unwrap();
@@ -113,7 +129,19 @@ fn users_catalog_matches_pre_mapping_bytes() {
 
 #[test]
 fn users_job_record_matches_pre_mapping_bytes() {
+    for &enabled in modes() {
+        users_job_record_case(enabled);
+    }
+}
+
+fn users_job_record_case(enabled: bool) {
+    let scratch = ScratchDir::new("motor-compat-job");
+    let mut config = Config::new(scratch.join("state"), "main");
+    configure(&mut config, &scratch, enabled);
     let run = request();
+    assert_identity(&config, crate::caller_path::request(&run).workspace_path());
+    assert_identity(&config, crate::caller_path::request(&run).repository_path());
+    assert_identity(&config, crate::caller_path::identity(&run.cwd));
     let mut job = Job::new(run.job_id, Some(run), 100, 1, 2);
     job.queued_ms = Some(110);
     job.setup_ms = Some(120);
@@ -122,7 +150,6 @@ fn users_job_record_matches_pre_mapping_bytes() {
     job.next_seq = 1;
     job.cpus = vec![1, 2];
     job.terminal_ended(Outcome::Exit { code: 0 }, 200);
-    let scratch = ScratchDir::new("motor-compat-job");
     fs::create_dir_all(scratch.join("jobs")).unwrap();
     let path = scratch.join("jobs").join(ID).join("record.json");
     crate::storage::atomic_job_json(&path, &job).unwrap();
@@ -164,9 +191,11 @@ fn macos_home_refusal_keeps_pre_mapping_detail() {
 
 #[tokio::test]
 async fn users_runner_hello_matches_pre_mapping_bytes() {
-    for (snapshot_siblings, caller_roots) in
-        [(false, false), (true, false), (false, true), (true, true)]
-    {
+    for (snapshot_siblings, caller_roots) in modes().iter().flat_map(|&roots| {
+        [false, true]
+            .into_iter()
+            .map(move |snapshots| (snapshots, roots))
+    }) {
         let f = Fixture::new();
         let mut config = if snapshot_siblings {
             super::sibling_snapshots::snapshot_config(&f).0
@@ -175,15 +204,7 @@ async fn users_runner_hello_matches_pre_mapping_bytes() {
         };
         config.manual_tick = true;
         config.disable_warm_builds = true;
-        if caller_roots {
-            let host = f.scratch.join("callers/home");
-            fs::create_dir_all(&host).unwrap();
-            config.caller_roots.push(crate::CallerRoot {
-                caller_prefix: "/home".into(),
-                host_root: host,
-            });
-            config.test_allow_unisolated_caller_roots = true;
-        }
+        configure(&mut config, &f.scratch, caller_roots);
         // Hello does not expose compiler versions. Supply a fixed version via
         // the existing toolchain-config seam to skip the startup rustc probe;
         // the backend remains Host, so all Hello capabilities stay unchanged.
@@ -230,11 +251,20 @@ async fn users_runner_hello_matches_pre_mapping_bytes() {
 
 #[test]
 fn identity_non_chunked_return_name_matches_pre_mapping_bytes() {
+    for &enabled in modes() {
+        identity_non_chunked_return_case(enabled);
+    }
+}
+
+fn identity_non_chunked_return_case(enabled: bool) {
     let scratch = ScratchDir::new("motor-compat-return");
+    let mut config = Config::new(scratch.join("state"), "main");
+    configure(&mut config, &scratch, enabled);
     fs::write(scratch.join("out"), b"x").unwrap();
     let mut run = request();
     run.workspace_key = scratch.to_str().unwrap().into();
     run.return_paths = vec![scratch.join("out").to_str().unwrap().into()];
+    assert_identity(&config, crate::caller_path::request(&run).workspace_path());
     let result = crate::return_paths::collect(&run, 1);
     let rendered = serde_json::to_string(&Frame::ReturnResult(result))
         .unwrap()

@@ -7,6 +7,8 @@ mod boat_quota;
 mod boat_quota_events;
 mod caller_path;
 mod cleanup;
+#[cfg(all(test, unix))]
+mod compatibility_config;
 #[cfg(any(target_os = "linux", test))]
 mod compile_cache;
 mod cpu;
