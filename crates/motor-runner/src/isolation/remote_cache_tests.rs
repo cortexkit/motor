@@ -271,6 +271,15 @@ fn cargo_fixture(workspace: &Path) -> String {
 /// A job unit as a Boat or tenant VM prepares it (no shared compile cache,
 /// no compiler supervisor), with or without a remote cache.
 fn prepare_job(f: &Fixture, tree: &str, remote: Option<&Transport>) -> Sandbox {
+    prepare_job_with_shared_cache(f, tree, false, remote)
+}
+
+fn prepare_job_with_shared_cache(
+    f: &Fixture,
+    tree: &str,
+    shared_compile_cache: bool,
+    remote: Option<&Transport>,
+) -> Sandbox {
     let target = f.scratch.join("job-target");
     fs::create_dir_all(&target).unwrap();
     Sandbox::prepare_role(
@@ -287,7 +296,7 @@ fn prepare_job(f: &Fixture, tree: &str, remote: Option<&Transport>) -> Sandbox {
         f.workspace.to_str().unwrap(),
         false,
         false,
-        false,
+        shared_compile_cache,
         None,
         &JavascriptTools::for_role(ToolchainRole::BuildServer),
         remote,
@@ -462,6 +471,142 @@ fn ccache_stats_capture_preserves_the_build_exit_code_even_if_stats_fail() {
         .starts_with("7\n"));
 }
 
+fn assert_hosted_remote_sccache(role: crate::remote_cache::provisioning::HostRole) {
+    use crate::remote_cache::provisioning::HostRole;
+
+    let f = Fixture::new();
+    let tree = cargo_fixture(&f.workspace);
+    let mut config = crate::engine::Config::new(&f.state, "hosted-cache");
+    config.isolate_jobs = true;
+    config.remote_cache = true;
+    config.boat_profile = role == HostRole::Boat;
+    config.tenant_vm = role == HostRole::TenantVm;
+    assert!(!config.shared_compile_cache());
+    assert!(config.remote_cache_available(false).is_some());
+    assert!(config.remote_cache_available(true).is_none());
+    let cache = FakeCache::new();
+    let port = free_port();
+    let remote = cache.transport(&[(Tool::Sccache, port)]);
+    crate::systemd::with_process_hook(
+        Box::new(|command| fake_privileged_output(command).unwrap_or_else(|| command.output())),
+        || {
+            let job = prepare_job_with_shared_cache(
+                &f,
+                &tree,
+                config.shared_compile_cache(),
+                Some(&remote),
+            )
+            .in_tenant_vm(config.tenant_vm)
+            .with_boat_profile(config.boat_profile, true, None);
+            let tools = job.runtime.0.join("tools");
+            assert!(job
+                .read_only
+                .contains(&bind(&tools, Path::new("/motor-tools")).unwrap()));
+            assert_eq!(
+                fs::read_to_string(tools.join("sccache")).unwrap(),
+                include_str!("../sccache-wrapper.sh")
+            );
+            for executable in ["sccache", "sccache.ready", "cache-forwarder"] {
+                assert_eq!(
+                    fs::metadata(tools.join(executable))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o755,
+                    "{executable}"
+                );
+            }
+            let cargo = PathBuf::from(host_inputs::environment("CARGO_HOME").unwrap());
+            assert_eq!(
+                fs::read_to_string(tools.join("sccache.backend")).unwrap(),
+                cargo.join("bin/sccache").to_str().unwrap()
+            );
+            assert!(job.path.starts_with("/motor-tools:"));
+            assert_eq!(job.cache_forwarders, [Forwarder::new(Tool::Sccache, port)]);
+            assert_eq!(
+                job.runtime.2.get().unwrap().listeners()[0]
+                    .binding()
+                    .endpoint(),
+                Endpoint::Read
+            );
+
+            let env = crate::remote_cache::environment::delta(
+                role,
+                &job.cache_forwarders,
+                "fleet-bucket",
+                "gra",
+            );
+            assert_eq!(env["RUSTC_WRAPPER"], "/motor-tools/sccache");
+            assert_eq!(env["SCCACHE_ENDPOINT"], format!("http://127.0.0.1:{port}"));
+            assert_eq!(env["SCCACHE_S3_RW_MODE"], "READ_ONLY");
+            for local in [
+                "SCCACHE_DIR",
+                "SCCACHE_LOCAL_RW_MODE",
+                "SCCACHE_MULTILEVEL_CHAIN",
+            ] {
+                assert!(!env.contains_key(local), "{local}: {env:?}");
+            }
+            assert!(!job
+                .read_only
+                .iter()
+                .chain(&job.read_write)
+                .any(|mount| mount.contains("/motor-cache")));
+            assert!(!f.state.join("sccache").exists());
+        },
+    );
+}
+
+#[test]
+fn boat_remote_cache_installs_sccache_without_a_local_level() {
+    assert_hosted_remote_sccache(crate::remote_cache::provisioning::HostRole::Boat);
+}
+
+#[test]
+fn tenant_remote_cache_installs_sccache_without_a_local_level() {
+    assert_hosted_remote_sccache(crate::remote_cache::provisioning::HostRole::TenantVm);
+}
+
+#[test]
+fn build_server_sccache_files_path_and_local_mount_are_unchanged_by_remote_cache() {
+    let f = Fixture::new();
+    let tree = cargo_fixture(&f.workspace);
+    let config = crate::engine::Config::new(&f.state, "build-server-cache");
+    assert!(config.shared_compile_cache());
+    let cache = FakeCache::new();
+    let remote = cache.transport(&[(Tool::Sccache, free_port())]);
+    crate::systemd::with_process_hook(
+        Box::new(|command| fake_privileged_output(command).unwrap_or_else(|| command.output())),
+        || {
+            let prepare = |remote| {
+                prepare_job_with_shared_cache(&f, &tree, config.shared_compile_cache(), remote)
+            };
+            let plain = prepare(None);
+            let job = prepare(Some(&remote));
+            for name in ["sccache", "sccache.ready", "sccache.backend"] {
+                let installed = job.runtime.0.join("tools").join(name);
+                let baseline = plain.runtime.0.join("tools").join(name);
+                assert_eq!(fs::read(&installed).unwrap(), fs::read(&baseline).unwrap());
+                assert_eq!(
+                    fs::metadata(installed).unwrap().permissions().mode(),
+                    fs::metadata(baseline).unwrap().permissions().mode()
+                );
+            }
+            assert_eq!(job.path, plain.path);
+            let (mut read_only, read_write) = mounts(&job);
+            let gateway = bind(&job.runtime.0.join("gateway"), Path::new("/motor-gateway"))
+                .unwrap()
+                .replace(&word(&job.runtime.0).unwrap(), "<RUNTIME>");
+            assert!(read_only.contains(&gateway));
+            read_only.retain(|mount| *mount != gateway);
+            assert!(read_only
+                .iter()
+                .any(|mount| mount.ends_with(":/motor-cache")));
+            assert_eq!((read_only, read_write), mounts(&plain));
+        },
+    );
+}
+
 #[test]
 fn prepared_units_get_only_their_own_sockets_and_the_forwarder() {
     let f = Fixture::new();
@@ -511,7 +656,7 @@ fn prepared_units_get_only_their_own_sockets_and_the_forwarder() {
                 *mount != neutral(&gateway_mount) && *mount != neutral(&tools_mount)
             });
             assert_eq!((read_only, read_write), mounts(&plain));
-            assert_eq!(job.path, plain.path);
+            assert_eq!(job.path, format!("/motor-tools:{}", plain.path));
             assert!(plain.cache_forwarders.is_empty());
             assert!(plain.runtime.2.get().is_none());
             assert!(!plain.runtime.0.join("gateway").exists());
