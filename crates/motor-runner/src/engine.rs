@@ -2,6 +2,7 @@
 use crate::remote_cache::publication;
 use crate::{
     backend::{self, setup_step, Backend, BackendKind, Prepared, Setup},
+    caller_path as paths,
     cpu::CpuTopology,
     platform,
     storage::*,
@@ -106,6 +107,11 @@ pub struct Config {
     /// Root-private tenant channels instead of vsock, only when explicitly set.
     pub tenant_socket_dir: Option<PathBuf>,
     pub instance: String,
+    /// Operator-owned caller-prefix roots. Caller and host paths still use the
+    /// same spelling when executing jobs.
+    pub caller_roots: Vec<crate::CallerRoot>,
+    #[cfg(test)]
+    pub(crate) test_allow_unisolated_caller_roots: bool,
     pub state_root: PathBuf,
     pub build_slot_root: PathBuf,
     pub max_queue_depth: usize,
@@ -425,6 +431,9 @@ impl Config {
             pid_init: None,
             tenant_socket_dir: None,
             instance: instance.into(),
+            caller_roots: Vec::new(),
+            #[cfg(test)]
+            test_allow_unisolated_caller_roots: false,
             build_slot_root: state_root.join("build-slots"),
             state_root,
             max_queue_depth: 64,
@@ -548,6 +557,11 @@ impl Config {
     }
     pub fn state_dir(&self) -> PathBuf {
         self.state_root.join(&self.instance)
+    }
+
+    /// Validate serve options without opening the state directory or taking locks.
+    pub fn check_options(&self) -> io::Result<()> {
+        paths::startup::options(self)
     }
     pub fn sccache_dir(&self) -> PathBuf {
         self.state_dir().join("sccache/fleet")
@@ -1698,6 +1712,7 @@ impl Runner {
         Self::open_with_backend(config, backend)
     }
     fn open_with_backend(mut config: Config, backend: Box<dyn Backend>) -> io::Result<Self> {
+        paths::startup::filesystem(&config)?;
         #[cfg(target_os = "linux")]
         if config.boat_profile {
             config.free_space_floor_bytes = config

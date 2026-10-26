@@ -114,6 +114,7 @@ async fn run(args: Vec<String>) -> io::Result<()> {
     config.build_slot_root = data.join("cortexkit/motor-build-slots");
     let (job, drain_timeout_s, exit_after) = configure_options(&mut config, args)?;
     match operation.as_str() {
+        "check-options" => Ok(()),
         #[cfg(windows)]
         "qualify-prep" => motor_runner::hyperv_qualify_prep(config),
         #[cfg(windows)]
@@ -407,6 +408,9 @@ fn configure_options(
                     .insert(tool.into(), port.parse().map_err(io::Error::other)?);
             }
             "--state-root" => config.state_root = value.into(),
+            "--caller-root" => config
+                .caller_roots
+                .push(motor_runner::CallerRoot::parse(&value)?),
             "--tenant-socket-dir" => config.tenant_socket_dir = Some(value.into()),
             "--build-slot-root" => config.build_slot_root = value.into(),
             "--max-weight" => config.max_weight = value.parse().map_err(io::Error::other)?,
@@ -482,6 +486,7 @@ fn configure_options(
             "--boat-profile requires the Linux host backend; tenant mode must use root-private local sockets",
         ));
     }
+    config.check_options()?;
     Ok((job, drain_timeout_s, exit_after))
 }
 
@@ -617,6 +622,63 @@ fn binary_version() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn check_options_accepts_installed_units_with_and_without_caller_roots_without_state() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-check-options");
+        let units = [
+            include_str!("../../../script/runner/units/motor-runner.service"),
+            include_str!("../../../script/runner/units/motor-runner@e2e.service.d/binary.conf"),
+            include_str!("../../../script/boat-image/motor-boat.service"),
+        ];
+        for unit in units {
+            let exec = unit
+                .lines()
+                .filter_map(|line| line.strip_prefix("ExecStart="))
+                .rfind(|line| !line.is_empty())
+                .unwrap();
+            let options: Vec<String> = exec
+                .split_whitespace()
+                .skip_while(|word| *word != "serve")
+                .skip(1)
+                .map(|word| word.replace("%i", "e2e"))
+                .collect();
+            for flagged in [false, true] {
+                let mut args = vec!["check-options".to_string()];
+                args.extend(options.clone());
+                args.extend([
+                    "--state-root".into(),
+                    scratch.join("absent-state").to_str().unwrap().into(),
+                ]);
+                if flagged {
+                    args.extend([
+                        "--caller-root".into(),
+                        "/home=/var/lib/motor-boat/state/callers/home".into(),
+                    ]);
+                }
+                super::run(args).await.unwrap();
+                assert!(!scratch.join("absent-state").exists());
+            }
+        }
+        let args = [
+            "check-options",
+            "--state-root",
+            scratch.join("absent-state").to_str().unwrap(),
+            "--caller-root",
+            "/home=/callers/home",
+            "--caller-root",
+            "/home/u=/callers/u",
+        ]
+        .map(String::from)
+        .to_vec();
+        let error = super::run(args).await.unwrap_err().to_string();
+        assert!(
+            error.contains("/home") && error.contains("/home/u"),
+            "{error}"
+        );
+        assert!(!scratch.join("absent-state").exists());
+    }
+
     use super::{configure_options, drain_transport_timeout, Config};
     use motor_runner::BackendKind;
 

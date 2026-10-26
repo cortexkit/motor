@@ -6,6 +6,10 @@
 use crate::storage::{BaseRequest, Job, LegacyCheckout, RetainedTransfer, Workspace};
 use motor_protocol::{Prepare, Run, SiblingSnapshot};
 use std::path::Path;
+pub(crate) mod startup;
+pub use startup::CallerRoot;
+#[cfg(all(test, target_os = "linux"))]
+mod startup_tests;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CallerPath<'a>(&'a String);
@@ -25,6 +29,14 @@ impl<'a> HostPath<'a> {
     }
 }
 
+pub(crate) fn host(path: &Path) -> HostPath<'_> {
+    HostPath(path)
+}
+
+pub(crate) fn host_str(value: &str) -> HostPath<'_> {
+    HostPath(Path::new(value))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PathPlan<'a> {
     pub(crate) caller: CallerPath<'a>,
@@ -36,6 +48,26 @@ pub(crate) fn identity(value: &String) -> PathPlan<'_> {
         caller: CallerPath(value),
         host: HostPath(Path::new(value)),
     }
+}
+
+pub(crate) fn entries<T>(
+    records: &std::collections::BTreeMap<String, T>,
+) -> impl Iterator<Item = (PathPlan<'_>, &T)> {
+    records.iter().map(|(key, record)| (identity(key), record))
+}
+
+pub(crate) fn keys<T>(
+    records: &std::collections::BTreeMap<String, T>,
+) -> impl Iterator<Item = PathPlan<'_>> {
+    records.keys().map(identity)
+}
+
+pub(crate) fn entries_mut<T>(
+    records: &mut std::collections::BTreeMap<String, T>,
+) -> impl Iterator<Item = (PathPlan<'_>, &mut T)> {
+    records
+        .iter_mut()
+        .map(|(key, record)| (identity(key), record))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -88,22 +120,43 @@ pub(crate) struct RequestPlan<'a> {
     pub(crate) host_repository_root: HostPath<'a>,
 }
 
-pub(crate) trait Request {
-    fn paths(&self) -> RequestPlan<'_>;
-}
-
-pub(crate) fn request(value: &impl Request) -> RequestPlan<'_> {
-    value.paths()
-}
-
-impl<T: Request> Request for &T {
-    fn paths(&self) -> RequestPlan<'_> {
-        (**self).paths()
+impl<'a> RequestPlan<'a> {
+    pub(crate) fn workspace_path(self) -> PathPlan<'a> {
+        PathPlan {
+            caller: self.caller_workspace_key,
+            host: self.host_workspace,
+        }
+    }
+    pub(crate) fn repository_path(self) -> PathPlan<'a> {
+        PathPlan {
+            caller: self.caller_repository_root,
+            host: self.host_repository_root,
+        }
     }
 }
 
-impl Request for Prepare {
-    fn paths(&self) -> RequestPlan<'_> {
+pub(crate) trait Request<'a> {
+    fn paths(self) -> RequestPlan<'a>;
+}
+
+pub(crate) fn request<'a>(value: impl Request<'a>) -> RequestPlan<'a> {
+    value.paths()
+}
+
+impl<'a> Request<'a> for &&'a Run {
+    fn paths(self) -> RequestPlan<'a> {
+        (*self).paths()
+    }
+}
+
+impl<'a> Request<'a> for &&'a Prepare {
+    fn paths(self) -> RequestPlan<'a> {
+        (*self).paths()
+    }
+}
+
+impl<'a> Request<'a> for &'a Prepare {
+    fn paths(self) -> RequestPlan<'a> {
         RequestPlan {
             caller_workspace_key: CallerPath(&self.workspace_key),
             host_workspace: HostPath(Path::new(&self.workspace_key)),
@@ -113,8 +166,8 @@ impl Request for Prepare {
     }
 }
 
-impl Request for Run {
-    fn paths(&self) -> RequestPlan<'_> {
+impl<'a> Request<'a> for &'a Run {
+    fn paths(self) -> RequestPlan<'a> {
         RequestPlan {
             caller_workspace_key: CallerPath(&self.workspace_key),
             host_workspace: run(self).workspace.checkout().host,
@@ -128,33 +181,43 @@ pub(crate) fn sibling(sibling: &SiblingSnapshot) -> PathPlan<'_> {
     identity(&sibling.canonical_path)
 }
 
-pub(crate) fn set_run_key(request: &mut Run, value: String) {
-    request.workspace_key = value;
+pub(crate) fn drop_request(request: &motor_protocol::DropRequest) -> PathPlan<'_> {
+    identity(&request.workspace_key)
 }
 
 pub(crate) fn job_key(job: &Job) -> &str {
+    match job.request.as_ref() {
+        Some(request) => match run(request).workspace {
+            WorkspacePlan::Fill { identifier, .. } => identifier,
+            WorkspacePlan::Workspace(path) => path.caller.text(),
+        },
+        None => "",
+    }
+}
+
+pub(crate) fn job_workspace(job: &Job) -> HostPath<'_> {
     job.request
         .as_ref()
-        .map(|r| r.workspace_key.as_str())
-        .unwrap_or("")
+        .map(|r| request(r).host_workspace)
+        .unwrap_or_else(|| host_str(""))
 }
 
 pub(crate) struct RecordPlan<'a> {
     pub(crate) repository: PathPlan<'a>,
-    pub(crate) siblings: Vec<PathPlan<'a>>,
+    pub(crate) caller_siblings: &'a [SiblingSnapshot],
 }
 
 pub(crate) fn workspace_record(record: &Workspace) -> RecordPlan<'_> {
     RecordPlan {
         repository: identity(&record.repository),
-        siblings: record.siblings.iter().map(sibling).collect(),
+        caller_siblings: &record.siblings,
     }
 }
 
 pub(crate) fn retained_transfer(record: &RetainedTransfer) -> RecordPlan<'_> {
     RecordPlan {
         repository: identity(&record.repository),
-        siblings: record.siblings.iter().map(sibling).collect(),
+        caller_siblings: &record.siblings,
     }
 }
 
@@ -177,6 +240,36 @@ mod tests {
             let plan = identity(&value);
             assert_eq!(plan.caller.text(), text);
             assert_eq!(plan.host.as_path().as_os_str(), text);
+        }
+    }
+
+    #[test]
+    fn fill_identifiers_never_become_checkout_paths() {
+        let job: Job = serde_json::from_str(include_str!(
+            "../test-fixtures/compatibility/job-record.json"
+        ))
+        .unwrap();
+        let mut wire = job.request.unwrap();
+        for (repository, checkout) in [
+            ("/home/repo", "/home/.motor-base-main-repo"),
+            ("/home/u/repo", "/home/u/.motor-base-main-repo"),
+        ] {
+            wire.repository_root = repository.into();
+            wire.workspace_key = format!("base:{repository}");
+            wire.cwd = checkout.into();
+            let plan = run(&wire);
+            match plan.workspace {
+                WorkspacePlan::Fill {
+                    identifier,
+                    checkout: path,
+                } => {
+                    assert_eq!(identifier, format!("base:{repository}"));
+                    assert_eq!(path.caller.text(), checkout);
+                    assert_eq!(path.host.as_path(), Path::new(checkout));
+                }
+                WorkspacePlan::Workspace(_) => panic!("fill identifier became a workspace path"),
+            }
+            assert_eq!(request(&wire).host_workspace.as_path(), Path::new(checkout));
         }
     }
 }

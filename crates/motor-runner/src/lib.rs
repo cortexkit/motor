@@ -78,6 +78,7 @@ mod writer;
 pub use writer::CacheFill;
 
 pub use backend::BackendKind;
+pub use caller_path::CallerRoot;
 pub use engine::{Config, Runner, BOAT_DISK_RESERVE_BYTES, DEFAULT_FREE_SPACE_FLOOR_BYTES};
 #[cfg(target_os = "linux")]
 pub use privilege::run_helpers_directly_as_root;
