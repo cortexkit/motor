@@ -119,11 +119,18 @@ inside the checkout, for example `target/scratch/macos-image`.
    closed and requires operator investigation; it is not counted as success.
 
 6. After the image-build helper has exited, finalize. Every disk must be closed
-   (`lsof` must prove this). This hashes the bundle, records the agent hash and
-   makes the directory/files read-only:
+   (`lsof` must prove this). Finalization mounts only the stopped image's APFS Data
+   volume, grants the installed guest agent macOS TCC access to network volumes
+   and all files, then unmounts and detaches before hashing the bundle. The grants
+   use the installed agent's code-signing requirement, not a build output: macOS
+   treats virtiofs workspaces as network volumes and otherwise denies reads and
+   directory listings, including for the agent's job children. The system TCC
+   database is SIP-protected while the guest runs, so these grants are written
+   offline. `image.json` records both services and the requirement, and the
+   directory/files become read-only:
 
    ```sh
-   python3 script/macos-runner/image.py finalize \
+   sudo python3 script/macos-runner/image.py finalize \
      --work target/scratch/macos-image --image "$IMAGE"
    tar -xf target/scratch/macos-image/tools.tar -C target/scratch/macos-image
    ```
@@ -171,8 +178,9 @@ keychain in `/var/root/motor-autologin-backup.plist` (root-only, 0600).
 On first setup it recreates motor's `~/Library/Keychains/login.keychain-db` with
 the account password and selects it as the user's default keychain. Updates reuse
 the saved password and preserve that keychain, including VM Secure Enclave keys.
-No keychain-unlock workaround is installed. Do not delete the password or backup
-while the installation is active.
+Every install/update unlocks that keychain as motor and disables idle-timeout and
+sleep locking, so VM Secure Enclave signing still works after quiet periods. Do
+not delete the password or backup while the installation is active.
 
 Apple's Virtualization framework creates a Secure Enclave key at VM start and
 requires a logged-in Aqua session. A system LaunchDaemon with `UserName = motor`
@@ -207,7 +215,9 @@ the motor login session. Repeated uninstall is safe.
 `--check` refuses external/non-APFS state or image volumes, missing entitlement,
 wrong effective SSH CA/principals, a non-motor or non-0600 socket, changed tool
 bytes, less than 20 GiB free, or a plist without the VM backend/with a development
-flag. It also verifies the sealed-image inventory and installed lock. A missing
+flag. It also verifies the sealed-image inventory and installed lock, mounts the
+image read-only to compare the agent's current code-signing requirement with its
+recorded TCC grant, and requires the login keychain's `no-timeout` setting. A missing
 file or failed native probe is a refusal, not a skipped check. It verifies the
 exact LaunchAgent configuration, auto-login user, FileVault-off status and a
 running job in `gui/<uid>`. Before motor's Aqua session exists it fails with a

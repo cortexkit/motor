@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 
+import image as image_recipe
 import parity
 import pinlock
 
@@ -180,6 +181,9 @@ def configure_login(account):
         run(*as_motor("/usr/bin/security", "default-keychain", "-d", "user", "-s", keychain))
         backup["keychain_ready"] = True
         private_write(BACKUP, plistlib.dumps(backup))
+    # Virtualization signs with a Secure Enclave key at VM start, even after idle periods.
+    secret_run(*as_motor("/usr/bin/security", "unlock-keychain", "-p", password, keychain))
+    run(*as_motor("/usr/bin/security", "set-keychain-settings", keychain))
     private_write(KCPASSWORD, kcpassword(password))
     run("/usr/bin/defaults", "write", LOGINWINDOW, "autoLoginUser", "-string", "motor")
     return previous != "motor"
@@ -325,6 +329,14 @@ def image_errors(image, manifest_sha256):
         errors.append("sealed image inventory is incomplete")
     if image.stat().st_mode & 0o222:
         errors.append("sealed image directory is writable")
+    grant = image_pin.get("tcc", {})
+    if (not isinstance(grant, dict) or grant.get("services") != list(image_recipe.TCC_SERVICES)
+            or not isinstance(grant.get("requirement"), str) or not grant["requirement"].strip()):
+        errors.append("sealed image is missing the guest agent TCC grant record")
+    elif not errors:
+        with image_recipe.mounted_data(image / "disk.img") as mount:
+            if image_recipe.agent_requirement(mount) != grant["requirement"]:
+                errors.append("guest agent code-signing requirement differs from sealed TCC grant")
     return errors
 
 
@@ -340,6 +352,15 @@ def ssh_errors(text, effective, keys):
     return errors
 
 
+def keychain_errors():
+    keychain = HOME / "Library/Keychains/login.keychain-db"
+    result = subprocess.run([str(arg) for arg in as_motor("/usr/bin/security", "show-keychain-info", keychain)],
+                            capture_output=True, text=True)
+    if result.returncode or "no-timeout" not in result.stdout + result.stderr:
+        return ["runner login keychain must have no-timeout; rerun install"]
+    return []
+
+
 def check_install(state_root, image, instance, manifest, config=CONFIG, plist_path=PLIST,
                   sshd=SSHD, ssh_root=SSH_ROOT):
     errors = []
@@ -350,6 +371,7 @@ def check_install(state_root, image, instance, manifest, config=CONFIG, plist_pa
         errors.append(str(error))
     if auto_login_user() != "motor":
         errors.append("autoLoginUser must be motor; rerun install and restart")
+    errors.extend(keychain_errors())
     if not has_gui_session(account):
         errors.append("motor has no Aqua login session (" + gui_domain(account) + "); restart for auto-login before --check")
     else:
@@ -530,7 +552,7 @@ def main():
     parity.validate(manifest, json.loads((HERE.parent / "runner/toolchain.json").read_text()))
     if args.check:
         errors = check_install(args.state_root, args.image, args.instance, manifest)
-        print(json.dumps({"passed": not errors, "checks": 13, "errors": errors}, indent=2))
+        print(json.dumps({"passed": not errors, "checks": 15, "errors": errors}, indent=2))
         return int(bool(errors))
     if os.environ.get("SUDO_USER") != "rentamac":
         parser.error("first install and updates must be invoked by rentamac using sudo")

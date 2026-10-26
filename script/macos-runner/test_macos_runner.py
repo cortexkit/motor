@@ -2,6 +2,7 @@
 """Portable contract tests for the macOS image, installer and parity boundary."""
 
 import copy
+from contextlib import nullcontext
 import hashlib
 import importlib.util
 import io
@@ -224,7 +225,10 @@ class InstallerTests(unittest.TestCase):
         for name in (*image.IMAGE_FILES, "agent.sha256"):
             (self.image / name).write_bytes(name.encode())
             files[name] = parity.digest(self.image / name)
-        (self.image / "image.json").write_text(json.dumps({"manifest_sha256": installed["manifest_sha256"], "files": files}))
+        self.requirement = 'cdhash H"0123456789abcdef0123456789abcdef01234567"'
+        (self.image / "image.json").write_text(json.dumps({"manifest_sha256": installed["manifest_sha256"], "files": files,
+            "tcc": {"services": ["kTCCServiceSystemPolicyNetworkVolumes", "kTCCServiceSystemPolicyAllFiles"],
+                    "requirement": self.requirement}}))
         for path in self.image.iterdir():
             path.chmod(0o444)
         self.image.chmod(0o555)
@@ -244,8 +248,11 @@ class InstallerTests(unittest.TestCase):
                         patch.object(install, "tool_errors", return_value=[]),
                         patch.object(install.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(100, 50, install.FLOOR)),
                         patch.object(install.pwd, "getpwnam", return_value=type("Account", (), {"pw_uid": os.getuid()})),
-                        patch.object(install, "LEGACY_PLIST", self.root / "legacy.plist"),
-                        patch.object(install, "run", side_effect=self.command)]
+                         patch.object(install, "LEGACY_PLIST", self.root / "legacy.plist"),
+                         patch.object(image, "mounted_data", return_value=nullcontext(self.image)),
+                         patch.object(image, "agent_requirement", return_value=self.requirement),
+                         patch.object(install.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "no-timeout")),
+                         patch.object(install, "run", side_effect=self.command)]
         for item in self.patches:
             item.start()
             self.addCleanup(item.stop)
@@ -278,6 +285,28 @@ class InstallerTests(unittest.TestCase):
             self.assertIn("autoLoginUser must be motor", " ".join(self.check()))
         with patch.object(install, "run", side_effect=lambda *args: "FileVault is On." if args[0] == "/usr/bin/fdesetup" else self.command(*args)):
             self.assertIn("FileVault must be off", " ".join(self.check()))
+
+    def test_keychain_timeout_or_failed_probe_is_refused(self):
+        for result in (subprocess.CompletedProcess([], 0, "", "timeout=300s"),
+                       subprocess.CompletedProcess([], 1, "", "no-timeout")):
+            with self.subTest(result=result), patch.object(install.subprocess, "run", return_value=result):
+                self.assertIn("keychain must have no-timeout", " ".join(self.check()))
+
+    def test_changed_agent_requirement_is_refused(self):
+        with patch.object(image, "agent_requirement", return_value='cdhash H"different"'):
+            self.assertIn("requirement differs from sealed TCC grant", " ".join(self.check()))
+
+    def test_incomplete_tcc_record_is_refused(self):
+        path = self.image / "image.json"
+        pin = json.loads(path.read_text())
+        for grant in (None, {}, {"services": ["kTCCServiceSystemPolicyAllFiles"], "requirement": self.requirement},
+                      {"services": list(image.TCC_SERVICES), "requirement": ""}):
+            path.chmod(0o644)
+            path.write_text(json.dumps(dict(pin, tcc=grant)))
+            path.chmod(0o444)
+            with self.subTest(grant=grant), patch.object(image, "mounted_data") as mount:
+                self.assertIn("missing the guest agent TCC grant record", " ".join(self.check()))
+                mount.assert_not_called()
 
     def test_agent_must_be_running_in_gui_domain(self):
         target = f"gui/{os.getuid()}/{install.LABEL}"
@@ -450,6 +479,8 @@ class AutoLoginTests(unittest.TestCase):
         elif args[:2] == ("/usr/bin/defaults", "delete"):
             self.user = None
         elif args[:5] == install.as_motor("/usr/bin/security"):
+            if args[5:] == ("set-keychain-settings", self.keychain):
+                return ""
             self.assertEqual(args[5:8], ("default-keychain", "-d", "user"))
             if len(args) == 8:
                 return '"' + self.default_keychain + '"'
@@ -467,6 +498,10 @@ class AutoLoginTests(unittest.TestCase):
         elif args[:6] == list(install.as_motor("/usr/bin/security", "create-keychain")):
             self.assertEqual(args[6], "-p")
             Path(args[-1]).write_bytes(b"new keychain")
+        elif args[:6] == list(install.as_motor("/usr/bin/security", "unlock-keychain")):
+            self.assertEqual(args[6:], ["-p", self.password.read_text().strip(), str(self.keychain)])
+        elif args == [str(arg) for arg in install.as_motor("/usr/bin/security", "show-keychain-info", self.keychain)]:
+            return subprocess.CompletedProcess(args, 0, "", "Keychain: no-timeout")
         elif args[:2] == ["/bin/launchctl", "bootout"]:
             pass
         else:
@@ -500,8 +535,35 @@ class AutoLoginTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertTrue(self.fchown.called)
         self.assertTrue(all(call.args[1:] == (0, 0) for call in self.fchown.call_args_list))
-        self.assertFalse(any("unlock-keychain" in str(call) or "login-keychain" in str(call)
-                             for call in self.run.call_args_list + self.native.call_args_list))
+
+    def test_login_keychain_is_unlocked_without_auto_lock_on_setup_and_update(self):
+        for _ in range(2):
+            self.native.reset_mock()
+            self.run.reset_mock()
+            install.configure_login(self.account)
+            unlock = [call.args[0] for call in self.native.call_args_list if "unlock-keychain" in call.args[0]]
+            self.assertEqual(len(unlock), 1)
+            self.assertEqual(unlock, [[str(arg) for arg in install.as_motor(
+                "/usr/bin/security", "unlock-keychain", "-p", self.password.read_text().strip(), self.keychain)]])
+            self.run.assert_any_call(*install.as_motor("/usr/bin/security", "set-keychain-settings", self.keychain))
+            self.assertEqual(install.keychain_errors(), [])
+            self.assertEqual(self.native.call_args.args[0], [str(arg) for arg in install.as_motor(
+                "/usr/bin/security", "show-keychain-info", self.keychain)])
+
+    def test_failed_unlock_does_not_expose_password_and_can_be_retried(self):
+        def fail_unlock(args, **kwargs):
+            if "unlock-keychain" in args:
+                return subprocess.CompletedProcess(args, 1)
+            return self.native_command(args, **kwargs)
+        with patch.object(install.subprocess, "run", side_effect=fail_unlock) as failed_run:
+            with self.assertRaisesRegex(ValueError, "setup failed") as caught:
+                install.configure_login(self.account)
+        self.assertNotIn(self.password.read_text().strip(), str(caught.exception))
+        self.assertTrue(plistlib.loads(self.backup.read_bytes())["keychain_ready"])
+        self.assertEqual(len([call for call in failed_run.call_args_list if "create-keychain" in call.args[0]]), 1)
+        self.native.reset_mock()
+        install.configure_login(self.account)
+        self.assertFalse(any("create-keychain" in call.args[0] for call in self.native.call_args_list))
 
     def test_uninstall_restores_login_files_and_stops_both_jobs_idempotently(self):
         self.default_keychain = str(self.root / "other.keychain-db")
@@ -629,6 +691,176 @@ class AutoLoginTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "could not stop launchd job"):
                 install.stop_jobs(self.account)
         self.assertTrue(self.legacy.exists())
+
+
+class OfflineImageTests(unittest.TestCase):
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.bundle = self.root / "image"
+        self.bundle.mkdir()
+        for name in image.IMAGE_FILES:
+            (self.bundle / name).write_bytes(b"ungranted disk")
+        self.disk = self.bundle / "disk.img"
+        self.requirement = 'cdhash H"0123456789abcdef0123456789abcdef01234567"'
+        self.failure = None
+        self.data_roles = ["Data"]
+        self.commands = []
+        native = patch.object(image.subprocess, "run", side_effect=self.command)
+        native.start()
+        self.addCleanup(native.stop)
+
+    def command(self, args, **kwargs):
+        self.commands.append(args)
+        step = Path(args[0]).name
+        if step == "hdiutil":
+            step = args[1]
+        if step == self.failure:
+            raise subprocess.CalledProcessError(1, args)
+        output = b""
+        if step == "attach":
+            self.assertIn("-nomount", args)
+            self.assertEqual(args[-1], str(self.disk))
+            output = plistlib.dumps({"system-entities": [{"dev-entry": "/dev/disk42"}, {"dev-entry": "/dev/disk42s2"}]})
+        elif step == "diskutil":
+            self.assertEqual(args[1:], ["apfs", "list", "-plist"])
+            output = plistlib.dumps({"Containers": [
+                {"PhysicalStores": [{"DeviceIdentifier": "disk0s2"}],
+                 "Volumes": [{"DeviceIdentifier": "disk1s1", "Roles": ["Data"]}]},
+                {"PhysicalStores": [{"DeviceIdentifier": "disk42s2"}],
+                 "Volumes": [{"DeviceIdentifier": "disk43s1", "Roles": ["System"]},
+                             {"DeviceIdentifier": "disk43s5", "Roles": self.data_roles}]}]})
+        elif step == "mount_apfs":
+            self.assertEqual(args[-2], "/dev/disk43s5")
+            self.mount = Path(args[-1])
+            agent = self.mount / "opt/motor/bin/motor-macagent"
+            agent.parent.mkdir(parents=True)
+            agent.write_bytes(b"installed agent, not build output")
+            database = self.mount / "Library/Application Support/com.apple.TCC/TCC.db"
+            database.parent.mkdir(parents=True)
+            database.write_bytes(b"system TCC database")
+        elif step == "codesign":
+            self.assertEqual(args, ["/usr/bin/codesign", "-d", "-r-", str(self.mount / "opt/motor/bin/motor-macagent")])
+            self.assertEqual(kwargs["stderr"], subprocess.STDOUT)
+            output = "Executable=installed agent\n# designated => " + self.requirement + "\n"
+        elif step == "csreq":
+            self.assertEqual(args[1::2], ["-r", "-b"])
+            self.assertEqual(Path(args[2]).read_text(), self.requirement + "\n")
+            Path(args[4]).write_bytes(bytes.fromhex("fade0c000102"))
+        elif step == "sqlite3":
+            self.assertEqual(args[1], "-bail")
+            self.assertEqual(Path(args[2]), self.mount / "Library/Application Support/com.apple.TCC/TCC.db")
+            self.disk.write_bytes(b"granted disk")
+        elif step == "detach":
+            self.assertEqual(args, ["/usr/bin/hdiutil", "detach", "/dev/disk42"])
+            if hasattr(self, "mount") and self.mount.exists():
+                shutil.rmtree(self.mount)
+                self.mount.mkdir()
+        elif step == "umount":
+            self.assertEqual(args, ["/sbin/umount", str(self.mount)])
+            shutil.rmtree(self.mount)
+            self.mount.mkdir()
+        elif step == "lsof":
+            return subprocess.CompletedProcess(args, 1, b"", b"")
+        elif step != "sync":
+            self.fail("unexpected native command: " + str(args))
+        return subprocess.CompletedProcess(args, 0, output, b"")
+
+    def test_offline_grants_use_installed_signature_and_both_services(self):
+        record = image.grant_agent_access(self.disk)
+        self.assertEqual(record, {"services": ["kTCCServiceSystemPolicyNetworkVolumes", "kTCCServiceSystemPolicyAllFiles"],
+                                  "requirement": self.requirement})
+        self.assertIn("-readwrite", self.commands[0])
+        self.assertEqual(next(args[1:3] for args in self.commands if args[0] == "/sbin/mount_apfs"), ["-o", "nobrowse"])
+        sql = next(args[-1] for args in self.commands if args[0] == "/usr/bin/sqlite3")
+        expected = "BEGIN IMMEDIATE;\n"
+        for service in ("kTCCServiceSystemPolicyNetworkVolumes", "kTCCServiceSystemPolicyAllFiles"):
+            expected += ("INSERT OR REPLACE INTO access "
+                         "(service, client, client_type, auth_value, auth_reason, auth_version, csreq, flags, last_modified) "
+                         f"VALUES ('{service}', '/opt/motor/bin/motor-macagent', 1, 2, 4, 1, X'fade0c000102', 0, "
+                         "CAST(strftime('%s','now') AS INTEGER));\n")
+        self.assertEqual(sql, expected + "COMMIT;")
+        self.assertEqual([Path(args[0]).name for args in self.commands[-3:]], ["sync", "umount", "hdiutil"])
+        self.assertFalse(self.mount.exists())
+
+    def test_readonly_inspection_never_writes_the_disk(self):
+        with image.mounted_data(self.disk) as mount:
+            self.assertEqual(image.agent_requirement(mount), self.requirement)
+        self.assertIn("-readonly", self.commands[0])
+        self.assertEqual(next(args[2] for args in self.commands if args[0] == "/sbin/mount_apfs"), "nobrowse,rdonly")
+        self.assertEqual(self.disk.read_bytes(), b"ungranted disk")
+        self.assertFalse(any(Path(args[0]).name in ("sqlite3", "csreq") for args in self.commands))
+
+    def test_every_post_attach_failure_detaches_and_never_returns_a_grant(self):
+        for failure in ("diskutil", "mount_apfs", "codesign", "csreq", "sqlite3", "sync", "umount", "detach"):
+            self.failure = failure
+            self.commands.clear()
+            with self.subTest(step=failure), self.assertRaises(subprocess.CalledProcessError):
+                image.grant_agent_access(self.disk)
+            self.assertEqual(self.commands[-1], ["/usr/bin/hdiutil", "detach", "/dev/disk42"])
+            if failure in ("codesign", "csreq", "sqlite3", "sync"):
+                self.assertEqual(self.commands[-2], ["/sbin/umount", str(self.mount)])
+
+    def test_missing_data_volume_or_requirement_fails_closed_and_detaches(self):
+        self.data_roles = ["System"]
+        with self.assertRaisesRegex(ValueError, "exactly one APFS Data"):
+            image.grant_agent_access(self.disk)
+        self.assertEqual(self.commands[-1], ["/usr/bin/hdiutil", "detach", "/dev/disk42"])
+        self.data_roles = ["Data"]
+        self.requirement = ""
+        with self.assertRaisesRegex(ValueError, "no designated"):
+            image.grant_agent_access(self.disk)
+        self.assertEqual(self.commands[-1], ["/usr/bin/hdiutil", "detach", "/dev/disk42"])
+        self.assertFalse(any(args[0] == "/usr/bin/sqlite3" for args in self.commands))
+
+    def finalize(self):
+        manifest = ready()
+        path = self.root / "toolchain.json"
+        path.write_text(json.dumps(manifest))
+        (self.root / "guest-sealed.json").write_text(json.dumps({"manifest_sha256": parity.digest(path), "remote_login": "Off"}))
+        args = SimpleNamespace(work=self.root, image=self.bundle, manifest=path)
+        with patch.object(image, "require_committed"), patch("sys.stdout", io.StringIO()):
+            image.finalize(args, manifest)
+
+    def test_finalize_hashes_the_granted_disk_and_records_requirement(self):
+        self.finalize()
+        pin = json.loads((self.bundle / "image.json").read_text())
+        self.assertEqual(pin["files"]["disk.img"], hashlib.sha256(b"granted disk").hexdigest())
+        self.assertEqual(pin["tcc"], {"services": ["kTCCServiceSystemPolicyNetworkVolumes", "kTCCServiceSystemPolicyAllFiles"],
+                                     "requirement": self.requirement})
+        self.assertEqual([Path(args[0]).name for args in self.commands[-5:]], ["hdiutil", "lsof", "lsof", "lsof", "lsof"])
+        self.assertEqual((self.bundle / "disk.img").stat().st_mode & 0o222, 0)
+
+    def test_failed_grant_does_not_finalize_the_image(self):
+        self.failure = "sqlite3"
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.finalize()
+        self.assertFalse((self.bundle / "image.json").exists())
+        self.assertNotEqual(self.disk.stat().st_mode & 0o222, 0)
+
+    def test_image_check_compares_current_installed_requirement_readonly(self):
+        self.finalize()
+        self.commands.clear()
+        manifest_sha = parity.digest(self.root / "toolchain.json")
+        self.assertEqual(install.image_errors(self.bundle, manifest_sha), [])
+        self.assertIn("-readonly", self.commands[0])
+        self.requirement = 'cdhash H"changed"'
+        self.assertIn("requirement differs from sealed TCC grant", " ".join(install.image_errors(self.bundle, manifest_sha)))
+        self.assertFalse(any(args[0] == "/usr/bin/sqlite3" for args in self.commands))
+
+    def test_failed_unmount_and_detach_never_recursively_delete_guest_data(self):
+        def fail_cleanup(args, **kwargs):
+            if args[0] == "/sbin/umount" or args[:2] == ["/usr/bin/hdiutil", "detach"]:
+                self.commands.append(args)
+                raise subprocess.CalledProcessError(1, args)
+            return self.command(args, **kwargs)
+        with patch.object(image.subprocess, "run", side_effect=fail_cleanup):
+            with self.assertRaises(OSError):
+                image.grant_agent_access(self.disk)
+        self.assertEqual(self.commands[-1], ["/usr/bin/hdiutil", "detach", "/dev/disk42"])
+        self.assertEqual((self.mount / "opt/motor/bin/motor-macagent").read_bytes(), b"installed agent, not build output")
+        shutil.rmtree(self.mount)
 
 
 class ImageTests(unittest.TestCase):

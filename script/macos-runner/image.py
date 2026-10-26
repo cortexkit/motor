@@ -2,13 +2,16 @@
 """Restore, provision, measure and seal a macOS image using our VM helper."""
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 from download import fetch
 import parity
@@ -18,10 +21,79 @@ HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parent.parent
 REMOTE = "/Users/motorbuild/motor-image-build"
 IMAGE_FILES = ("disk.img", "auxiliary-storage", "hardware-model", "machine-identifier")
+AGENT = "/opt/motor/bin/motor-macagent"
+TCC_SERVICES = ("kTCCServiceSystemPolicyNetworkVolumes", "kTCCServiceSystemPolicyAllFiles")
 
 
 def run(*args, **kwargs):
     return subprocess.run([str(arg) for arg in args], check=True, **kwargs)
+
+
+@contextmanager
+def mounted_data(disk, *, writable=False):
+    attached = plistlib.loads(run("/usr/bin/hdiutil", "attach", "-nomount",
+                                 "-readwrite" if writable else "-readonly", "-plist", disk,
+                                 capture_output=True).stdout)
+    devices = [row["dev-entry"] for row in attached["system-entities"] if "dev-entry" in row]
+    device = next((value for value in devices if re.fullmatch(r"/dev/disk[0-9]+", value)), devices[0])
+    mount = None
+    try:
+        apfs = plistlib.loads(run("/usr/sbin/diskutil", "apfs", "list", "-plist", capture_output=True).stdout)
+        volumes = [volume["DeviceIdentifier"] for container in apfs["Containers"]
+                   if container["PhysicalStores"] and all("/dev/" + store["DeviceIdentifier"] in devices
+                                                         for store in container["PhysicalStores"])
+                   for volume in container["Volumes"] if "Data" in volume.get("Roles", [])]
+        if len(volumes) != 1:
+            raise ValueError("sealed image must have exactly one APFS Data volume")
+        mount = Path(tempfile.mkdtemp(prefix="motor-image-data-"))
+        run("/sbin/mount_apfs", "-o", "nobrowse" if writable else "nobrowse,rdonly", "/dev/" + volumes[0], mount)
+        try:
+            yield mount
+        finally:
+            run("/sbin/umount", mount)
+    finally:
+        try:
+            run("/usr/bin/hdiutil", "detach", device)
+        finally:
+            if mount is not None:
+                # Never recursively clean a mount point: a failed detach may leave guest data there.
+                mount.rmdir()
+
+
+def agent_requirement(mount):
+    result = run("/usr/bin/codesign", "-d", "-r-", mount / AGENT.lstrip("/"),
+                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    requirements = re.findall(r"^#* *designated => (.+)$", result.stdout, re.MULTILINE)
+    if len(requirements) != 1 or not requirements[0].strip():
+        raise ValueError("installed guest agent has no designated code-signing requirement")
+    return requirements[0].strip()
+
+
+def grant_agent_access(disk):
+    # macOS treats virtiofs as a network volume. Without TCC grants, file reads
+    # and directory listings fail for the agent and its job children, even as root.
+    # SIP protects TCC.db in a running guest, so bind offline grants to the installed signature.
+    with mounted_data(disk, writable=True) as mount:
+        requirement = agent_requirement(mount)
+        database = mount / "Library/Application Support/com.apple.TCC/TCC.db"
+        if not database.is_file():
+            raise ValueError("sealed image has no system TCC database")
+        with tempfile.TemporaryDirectory(prefix="motor-agent-requirement-") as directory:
+            source, binary = Path(directory) / "agent.req", Path(directory) / "agent.csreq"
+            source.write_text(requirement + "\n")
+            run("/usr/bin/csreq", "-r", source, "-b", binary)
+            blob = binary.read_bytes()
+            if not blob:
+                raise ValueError("installed guest agent has an empty compiled requirement")
+        sql = "BEGIN IMMEDIATE;\n"
+        for service in TCC_SERVICES:
+            sql += ("INSERT OR REPLACE INTO access "
+                    "(service, client, client_type, auth_value, auth_reason, auth_version, csreq, flags, last_modified) "
+                    f"VALUES ('{service}', '{AGENT}', 1, 2, 4, 1, X'{blob.hex()}', 0, "
+                    "CAST(strftime('%s','now') AS INTEGER));\n")
+        run("/usr/bin/sqlite3", "-bail", database, sql + "COMMIT;")
+        run("/bin/sync")
+    return {"services": list(TCC_SERVICES), "requirement": requirement}
 
 
 def verify_ipsw(path, pin):
@@ -119,18 +191,22 @@ def finalize(args, manifest):
     receipt = json.loads((args.work / "guest-sealed.json").read_text())
     if receipt != {"manifest_sha256": parity.digest(args.manifest), "remote_login": "Off"} or (args.work / "build_key").exists():
         raise ValueError("missing guest seal acknowledgement or build key still exists")
-    for name in IMAGE_FILES:
-        path = args.image / name
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("image must contain four regular files")
-        result = subprocess.run(["/usr/sbin/lsof", "-t", "--", str(path)], capture_output=True)
-        if result.returncode != 1 or result.stdout or result.stderr:
-            raise ValueError("image still open, or lsof could not prove it stopped")
+    def require_stopped():
+        for name in IMAGE_FILES:
+            path = args.image / name
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("image must contain four regular files")
+            result = subprocess.run(["/usr/sbin/lsof", "-t", "--", str(path)], capture_output=True)
+            if result.returncode != 1 or result.stdout or result.stderr:
+                raise ValueError("image still open, or lsof could not prove it stopped")
+    require_stopped()
+    tcc = grant_agent_access(args.image / "disk.img")
+    require_stopped()
     (args.image / "agent.sha256").write_text(manifest["agent"]["sha256"] + "\n")
     files = {name: parity.digest(args.image / name) for name in (*IMAGE_FILES, "agent.sha256")}
     (args.image / "image.json").write_text(json.dumps({"manifest_sha256": parity.digest(args.manifest),
                                                        "ipsw": manifest["ipsw"], "agent": manifest["agent"],
-                                                       "files": files}, indent=2) + "\n")
+                                                        "tcc": tcc, "files": files}, indent=2) + "\n")
     for path in args.image.iterdir():
         path.chmod(0o444)
     args.image.chmod(0o555)
