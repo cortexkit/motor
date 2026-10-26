@@ -11,6 +11,17 @@ WINDOWS = SRC / "windows"
 
 
 class TrustedPrepDiagnosticTests(unittest.TestCase):
+    def test_git_mirror_timestamp_uses_a_windows_directory_handle(self):
+        filesystem = (SRC / 'filesystem.rs').read_text()
+        dependencies = (SRC / 'workspace/dependencies.rs').read_text()
+        touch = filesystem.split('pub(crate) fn set_directory_modified(', 1)[1].split('#[cfg(test)]', 1)[0]
+        self.assertCodeIn('.access_mode(FILE_WRITE_ATTRIBUTES)', touch)
+        self.assertCodeIn('.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)', touch)
+        self.assertCodeIn('crate::filesystem::set_directory_modified(mirror, std::time::SystemTime::now())?', dependencies)
+        self.assertNotIn('fs::File::open(mirror)', dependencies)
+        self.assertIn('open directory for timestamp', touch)
+        self.assertIn('set directory timestamp', touch)
+
     def assertCodeIn(self, fragment, source):
         def normalize(text):
             return re.sub(r",(?=[)\]])", "", "".join(text.split()))

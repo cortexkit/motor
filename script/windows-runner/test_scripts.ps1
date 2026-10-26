@@ -120,12 +120,52 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         Write-Host 'PASS protect-runner-path-sets-administrators-owner'
         $count++
 
+        $sshDirectory = Join-Path $nativeFixtureRoot 'ssh'
+        $keyLine = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixture fixture'
+        Set-RunnerSshAuthorizedKey -Directory $sshDirectory -KeyLine $keyLine
+        foreach ($pass in 1..2) {
+            foreach ($path in @($sshDirectory, (Join-Path $sshDirectory 'authorized_keys'))) {
+                $acl = Get-Acl -LiteralPath $path
+                $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+                $trustees = @($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object)
+                if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne 'S-1-5-32-544' -or -not $acl.AreAccessRulesProtected -or ($trustees -join ',') -cne 'S-1-5-18,S-1-5-32-544' -or @($rules | Where-Object { $_.IsInherited -or $_.AccessControlType -ne 'Allow' -or $_.FileSystemRights -ne 'FullControl' }).Count) {
+                    throw "FAIL ssh-key-exact-private-acl pass=$pass path=$path"
+                }
+                if ($pass -eq 1) {
+                    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-32-545'), 'Read', 'Allow'))
+                    Set-Acl -LiteralPath $path -AclObject $acl
+                }
+            }
+            if ([IO.File]::ReadAllText((Join-Path $sshDirectory 'authorized_keys')) -cne ($keyLine + "`r`n")) { throw 'FAIL ssh-key-content' }
+            Set-RunnerSshAuthorizedKey -Directory $sshDirectory -KeyLine $keyLine
+        }
+        Write-Host 'PASS ssh-key-fixed-directory-exact-private-acl-and-idempotent-repair'
+        $count++
+
+        $installText = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'install.ps1'))
+        $sshBlock = [regex]::Match($installText, '(?ms)^# BEGIN MOTOR RUNNER\r?\n.*?^# END MOTOR RUNNER').Value
+        if (-not $sshBlock.Contains('AuthorizedKeysFile __PROGRAMDATA__/MotorRunner/ssh/authorized_keys')) { throw 'FAIL ssh-key-fixed-config-path' }
+        $configFixture = Join-Path $nativeFixtureRoot 'sshd_config'
+        $originalConfig = "Port 22`r`n# unrelated configuration`r`n"
+        [IO.File]::WriteAllText($configFixture, $originalConfig, [Text.UTF8Encoding]::new($false))
+        $rejectScript = Join-Path $nativeFixtureRoot 'sshd-reject.cmd'
+        [IO.File]::WriteAllText($rejectScript, "@echo off`r`nexit /b 1`r`n", [Text.Encoding]::ASCII)
+        $configRejected = $false
+        try {
+            Set-RunnerSshConfigBlock -ConfigPath $configFixture -Block $sshBlock -LogPath $nativeLog -SshdPath "$env:SystemRoot\System32\cmd.exe" -SshdArguments @('/d', '/c', $rejectScript)
+        } catch { $configRejected = $true }
+        if (-not $configRejected -or [IO.File]::ReadAllText($configFixture) -cne $originalConfig) { throw 'FAIL ssh-config-validation-restores-original' }
+        Set-RunnerSshConfigBlock -ConfigPath $configFixture -Block $sshBlock -LogPath $nativeLog -SshdPath "$env:SystemRoot\System32\cmd.exe" -SshdArguments @('/d', '/c', $nativeScript)
+        if (-not [IO.File]::ReadAllText($configFixture).Contains($sshBlock)) { throw 'FAIL ssh-config-validated-block-installed' }
+        Write-Host 'PASS ssh-config-validation-restores-original-and-accepts-valid-block'
+        $count++
+
         $partialRoot = Join-Path $nativeFixtureRoot 'partial-install'
         New-Item -ItemType Directory -Path $partialRoot | Out-Null
         $partialSid = 'S-1-5-21-111-222-333-1001'
         $sshHomeFixture = "C:\Users\motor-ssh.test-$([Guid]::NewGuid().ToString('N'))"
         if (Test-Path -LiteralPath $sshHomeFixture) { throw 'FAIL partial-install-test-profile-path-not-fresh' }
-        $partialRecord = @{schema=1; accounts=@{'motor-ssh'=$partialSid}; ssh_home=$sshHomeFixture}
+        $partialRecord = @{schema=1; root=$partialRoot; accounts=@{'motor-ssh'=$partialSid}; ssh_home=$sshHomeFixture}
         $partialRecordPath = Join-Path $partialRoot 'installation.json'
         [IO.File]::WriteAllText($partialRecordPath, (ConvertTo-Json -InputObject $partialRecord -Compress), [Text.UTF8Encoding]::new($false))
         $originalSshd = "Port 22`r`n"
@@ -140,7 +180,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         function global:Get-LocalUser {
             [CmdletBinding()]
             param([string]$Name)
-            if ($Name -eq 'motor-ssh') { return [pscustomobject]@{SID=[pscustomobject]@{Value=$global:partialSshSid}} }
+            if ($Name -eq 'motor-ssh' -and -not $global:partialSshAccountRemoved) { return [pscustomobject]@{SID=[pscustomobject]@{Value=$global:partialSshSid}} }
             return $null
         }
         function global:Remove-LocalUser {
@@ -153,13 +193,26 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
             if ($Name -eq 'sshd') { $global:partialSshdRestarted = $true }
         }
         try {
+            New-Item -Path "$sshHomeFixture\.ssh" -ItemType Directory -Force | Out-Null
+            Set-Content -LiteralPath "$sshHomeFixture\.ssh\authorized_keys" -Value $keyLine
+            Set-RunnerSshAuthorizedKey -Directory (Join-Path $partialRoot 'ssh') -KeyLine $keyLine
             $removedSshState = Remove-RunnerSshInstallState -Installation $partialRecordRead -SshdConfig $sshdConfig -LogPath $nativeLog -SshdPath "$env:SystemRoot\System32\cmd.exe" -SshdArguments @('/d', '/c', $nativeScript)
             if (-not $removedSshState -or [IO.File]::ReadAllText($sshdConfig) -cne $originalSshd -or -not $global:partialSshAccountRemoved -or -not $global:partialSshdRestarted) {
                 throw 'FAIL partial-install-ssh-account-and-block-cleanup'
             }
+            if ((Test-Path -LiteralPath $sshHomeFixture) -or (Test-Path -LiteralPath (Join-Path $partialRoot 'ssh'))) { throw 'FAIL ssh-cleanup-removes-old-and-hand-fixed-key-layouts' }
+            $removedAgain = Remove-RunnerSshInstallState -Installation $partialRecordRead -SshdConfig $sshdConfig -LogPath $nativeLog -SshdPath "$env:SystemRoot\System32\cmd.exe" -SshdArguments @('/d', '/c', $nativeScript)
+            if ($removedAgain -or [IO.File]::ReadAllText($sshdConfig) -cne $originalSshd) { throw 'FAIL ssh-cleanup-idempotent' }
+            $freshRecord = [pscustomobject]@{schema=1; root=$partialRoot; accounts=[pscustomobject]@{}}
+            Set-RunnerSshAuthorizedKey -Directory (Join-Path $partialRoot 'ssh') -KeyLine $keyLine
+            $null = Remove-RunnerSshInstallState -Installation $freshRecord -SshdConfig $sshdConfig -LogPath $nativeLog
+            if (Test-Path -LiteralPath (Join-Path $partialRoot 'ssh')) { throw 'FAIL ssh-cleanup-without-profile-record' }
+            Write-Host 'PASS ssh-cleanup-old-hand-fixed-and-profile-free-layouts-is-idempotent'
+            $count++
         } finally {
             Remove-Item Function:\Get-LocalUser,Function:\Remove-LocalUser,Function:\Get-CimInstance,Function:\Restart-Service
             Remove-Variable -Name partialSshAccountRemoved,partialSshdRestarted,partialSshSid -Scope Global -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $sshHomeFixture) { Remove-Item -LiteralPath $sshHomeFixture -Recurse -Force }
         }
         Write-Host 'PASS partial-install-ssh-account-and-block-cleanup-without-ssh-block-record'
         $count++

@@ -33,12 +33,25 @@ fn mapped(path: &str) -> io::Result<PathBuf> {
     Ok(PathBuf::from("m").join(path.trim_start_matches('/')))
 }
 
-/// Only the Windows trusted-preparation code reports errors by path.
-#[cfg(any(windows, test))]
+/// Keep the failed operation and path when an OS error leaves preparation.
 pub(crate) fn error_at_path(operation: &str, path: &Path, error: io::Error) -> io::Error {
     io::Error::new(
         error.kind(),
         format!("{operation} {}: {error}", path.display()),
+    )
+}
+
+fn snapshot_error(
+    snapshot: &Snapshot,
+    entry: &str,
+    operation: &str,
+    path: &Path,
+    error: io::Error,
+) -> io::Error {
+    error_at_path(
+        &format!("{operation} snapshot={} entry={entry} at", snapshot.commit),
+        path,
+        error,
     )
 }
 
@@ -56,16 +69,28 @@ pub(super) fn prepare(
     if !Path::new(&request.cwd).starts_with(&request.workspace_key) {
         return Err(invalid(format!("cwd outside snapshot: {}", request.cwd)));
     }
-    let lockfile = crate::workspace::git(
-        &trees.mirror(&request.repository_root),
-        &["show", &format!("{}:Cargo.lock", request.snapshot_commit)],
-    )
-    .map_err(|_| {
-        invalid(format!(
-            "snapshot has no Cargo.lock: {}",
-            request.workspace_key
-        ))
-    })?;
+    let mirror = trees.mirror(&request.repository_root);
+    // An absent lockfile is valid for non-Cargo jobs. Check the tree first so
+    // a corrupt mirror or unreadable lockfile is not mistaken for absence.
+    let lockfile = if crate::workspace::git(
+        &mirror,
+        &[
+            "ls-tree",
+            "--name-only",
+            &request.snapshot_commit,
+            "--",
+            "Cargo.lock",
+        ],
+    )?
+    .is_empty()
+    {
+        String::new()
+    } else {
+        crate::workspace::git(
+            &mirror,
+            &["show", &format!("{}:Cargo.lock", request.snapshot_commit)],
+        )?
+    };
     let (routes, missing) = trees.dependency_fetch_routes(&request.git_dependencies, &lockfile)?;
     if !missing.is_empty() {
         return Err(invalid(missing.join("; ")));
@@ -475,7 +500,8 @@ fn stage_snapshots(plan: &Plan) -> io::Result<(Vec<PathBuf>, BTreeSet<String>, B
                 ));
             }
         }
-        fs::create_dir_all(&root)?;
+        fs::create_dir_all(&root)
+            .map_err(|error| snapshot_error(snapshot, ".", "create directory", &root, error))?;
         let archive = git(
             snapshot,
             &[
@@ -510,13 +536,21 @@ fn stage_snapshots(plan: &Plan) -> io::Result<(Vec<PathBuf>, BTreeSet<String>, B
                     .into_owned();
                 let path = root.join(&name);
                 if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
+                    fs::create_dir_all(parent).map_err(|error| {
+                        snapshot_error(snapshot, &name, "create parent directory", parent, error)
+                    })?;
                 }
                 OpenOptions::new()
                     .write(true)
                     .create_new(true)
-                    .open(&path)?
-                    .write_all(&target)?;
+                    .open(&path)
+                    .map_err(|error| {
+                        snapshot_error(snapshot, &name, "create symlink-text file", &path, error)
+                    })?
+                    .write_all(&target)
+                    .map_err(|error| {
+                        snapshot_error(snapshot, &name, "write symlink-text file", &path, error)
+                    })?;
                 continue;
             }
             if !kind.is_file() && !kind.is_dir() {
@@ -528,7 +562,55 @@ fn stage_snapshots(plan: &Plan) -> io::Result<(Vec<PathBuf>, BTreeSet<String>, B
             if kind.is_file() {
                 regular_files.insert(transferred);
             }
-            entry.unpack_in(&root)?;
+            let path = root.join(&name);
+            if kind.is_dir() {
+                fs::create_dir_all(&path).map_err(|error| {
+                    snapshot_error(snapshot, &name, "create directory", &path, error)
+                })?;
+            } else {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|error| {
+                        snapshot_error(snapshot, &name, "create parent directory", parent, error)
+                    })?;
+                }
+                // Entries were checked for traversal, collisions and special files.
+                // Create new files explicitly so a denial identifies the exact
+                // operation, rather than disappearing inside tar's unpack helper.
+                // Preserve file mtimes and Unix modes; directory times follow
+                // child creation in this fresh tree, not the archive timestamp.
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .map_err(|error| {
+                        snapshot_error(snapshot, &name, "create file", &path, error)
+                    })?;
+                io::copy(&mut entry, &mut file)
+                    .map_err(|error| snapshot_error(snapshot, &name, "write file", &path, error))?;
+                let modified = std::time::UNIX_EPOCH
+                    .checked_add(std::time::Duration::from_secs(entry.header().mtime()?))
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "snapshot={} entry={name}: timestamp out of range",
+                            snapshot.commit
+                        ))
+                    })?;
+                file.set_times(fs::FileTimes::new().set_modified(modified))
+                    .map_err(|error| {
+                        snapshot_error(snapshot, &name, "set file timestamp", &path, error)
+                    })?;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(
+                    &path,
+                    fs::Permissions::from_mode(entry.header().mode()? & 0o777),
+                )
+                .map_err(|error| {
+                    snapshot_error(snapshot, &name, "set permissions", &path, error)
+                })?;
+            }
         }
         roots.push(root);
     }
@@ -545,20 +627,20 @@ fn validate_staged_manifests(
     let root_lockfile = format!("{}/Cargo.lock", mapped(&plan.workspace)?.display());
     #[cfg(windows)]
     let root_lockfile = root_lockfile.replace('\\', "/");
-    if !workspace.join("Cargo.lock").is_file()
-        || (!plan.snapshots.is_empty() && !regular_files.contains(&root_lockfile))
+    if workspace.join("Cargo.lock").exists()
+        && (!workspace.join("Cargo.lock").is_file()
+            || (!plan.snapshots.is_empty() && !regular_files.contains(&root_lockfile)))
     {
-        return Err(invalid(format!(
-            "snapshot has no Cargo.lock: {}",
-            plan.workspace
-        )));
+        return Err(invalid("root Cargo.lock is not a tracked regular file"));
     }
     for root in roots {
         validate_manifests(root, roots, &plan.routes)?;
     }
-    fs::create_dir_all(plan.staging.join("cargo-home"))?;
-    fs::create_dir_all(plan.staging.join("home"))?;
-    fs::create_dir_all(plan.staging.join("fetch-temp"))?;
+    for name in ["cargo-home", "home", "fetch-temp"] {
+        let path = plan.staging.join(name);
+        fs::create_dir_all(&path)
+            .map_err(|error| error_at_path("create preparation directory", &path, error))?;
+    }
     Ok(workspace)
 }
 
@@ -575,9 +657,11 @@ pub(crate) fn execute_with_fetch(
     let workspace = super::prep_error::step("validate manifests", &plan.staging, || {
         validate_staged_manifests(&plan, &roots, &regular_files)
     })?;
-    super::prep_error::step("fetch dependencies", &plan.staging, || {
-        fetch_manifest(&plan, &workspace.join("Cargo.toml"), &mut fetch)
-    })?;
+    if workspace.join("Cargo.lock").is_file() {
+        super::prep_error::step("fetch dependencies", &plan.staging, || {
+            fetch_manifest(&plan, &workspace.join("Cargo.toml"), &mut fetch)
+        })?;
+    }
     let root_lockfile = format!("{}/Cargo.lock", mapped(&plan.workspace)?.display());
     #[cfg(windows)]
     let root_lockfile = root_lockfile.replace('\\', "/");
@@ -724,8 +808,10 @@ pub(crate) fn execute_with_registry(
         Ok(workspace)
     })?;
     super::prep_error::step("stage dependencies", &plan.staging, || {
-        let lockfile = combined_registry_lockfile(&plan, &members, &regular_files)?;
-        prepare_registry(&plan.staging, &workspace, &lockfile, &plan.routes)?;
+        if workspace.join("Cargo.lock").is_file() {
+            let lockfile = combined_registry_lockfile(&plan, &members, &regular_files)?;
+            prepare_registry(&plan.staging, &workspace, &lockfile, &plan.routes)?;
+        }
         build_tar(&plan.staging)
     })
 }
@@ -932,7 +1018,11 @@ fn replace_links(directory: &Path) -> io::Result<()> {
 }
 
 pub(super) fn build_tar(staging: &Path) -> io::Result<()> {
-    let mut builder = tar::Builder::new(File::create(staging.join("tree.tar"))?);
+    let archive = staging.join("tree.tar");
+    let mut builder = tar::Builder::new(
+        File::create(&archive)
+            .map_err(|error| error_at_path("create transfer archive", &archive, error))?,
+    );
     let mut seen = BTreeSet::new();
     append(&mut builder, staging, &staging.join("m"), &mut seen)?;
     for name in [
@@ -951,9 +1041,15 @@ pub(super) fn build_tar(staging: &Path) -> io::Result<()> {
             append(&mut builder, staging, &path, &mut seen)?;
         }
     }
-    builder.finish()?;
+    builder
+        .finish()
+        .map_err(|error| error_at_path("finish writing transfer archive", &archive, error))?;
     drop(builder);
-    motor_winagent::validate_tree(&mut File::open(staging.join("tree.tar"))?)
+    motor_winagent::validate_tree(
+        &mut File::open(&archive).map_err(|error| {
+            error_at_path("open transfer archive for validation", &archive, error)
+        })?,
+    )
 }
 fn append(
     builder: &mut tar::Builder<File>,
@@ -973,7 +1069,8 @@ fn append(
     if !seen.insert(name.to_lowercase()) {
         return Err(invalid(format!("case collision: {name}")));
     }
-    let metadata = fs::symlink_metadata(path)?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| error_at_path("read staged entry metadata", path, error))?;
     // The archive is built on the host, so a link here would mean the host
     // resolved one. Dependency checkouts happen inside the VM with
     // `core.symlinks=false`, so a link can only come from an unexpected
@@ -982,16 +1079,24 @@ fn append(
         return Err(invalid(format!("link in staged tree: {name}")));
     }
     if metadata.is_dir() {
-        builder.append_dir(relative, path)?;
-        let mut entries = fs::read_dir(path)?
+        builder.append_dir(relative, path).map_err(|error| {
+            error_at_path("append directory to transfer archive from", path, error)
+        })?;
+        let mut entries = fs::read_dir(path)
+            .map_err(|error| error_at_path("open staged directory", path, error))?
             .map(|e| e.map(|e| e.path()))
-            .collect::<io::Result<Vec<_>>>()?;
+            .collect::<io::Result<Vec<_>>>()
+            .map_err(|error| error_at_path("read staged directory entry", path, error))?;
         entries.sort();
         for entry in entries {
             append(builder, staging, &entry, seen)?;
         }
     } else if metadata.is_file() {
-        builder.append_file(relative, &mut File::open(path)?)?;
+        let mut file = File::open(path)
+            .map_err(|error| error_at_path("open staged file for transfer", path, error))?;
+        builder
+            .append_file(relative, &mut file)
+            .map_err(|error| error_at_path("append file to transfer archive from", path, error))?;
     } else {
         return Err(invalid(format!("special file: {name}")));
     }

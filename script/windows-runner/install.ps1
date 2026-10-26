@@ -124,31 +124,9 @@ Set-Content "$Root\ssh-sid.txt" $sshSid -Encoding ascii
 # Only the dedicated SSH entry can open the pipe. It can read the bridge binary,
 # but the forced command cannot launch a shell or read service state/secrets.
 $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\icacls.exe" -ArgumentList @("$Root\bin", '/grant:r', "*${sshSid}:(OI)(CI)RX", '/Q') -Operation 'grant bridge binary read access' -LogPath $nativeLogPath
-$profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sshSid"
-if (-not (Test-Path -LiteralPath $profileKey)) {
-    Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-public static class MotorSshProfile {
-    [DllImport("userenv.dll", CharSet = CharSet.Unicode)]
-    public static extern int CreateProfile(string sid, string user, StringBuilder path, uint length);
-}
-'@
-    $buffer = New-Object Text.StringBuilder 260
-    $result = [MotorSshProfile]::CreateProfile($sshSid, 'motor-ssh', $buffer, 260)
-    if ($result -ne 0) { throw "Creating the dedicated SSH profile failed: $result" }
-}
-$sshHome = [Environment]::ExpandEnvironmentVariables((Get-ItemProperty -LiteralPath $profileKey).ProfileImagePath)
-if ($sshHome -notmatch '^C:\\Users\\motor-ssh(?:\.[^\\]+)?$') { throw 'Unexpected SSH profile path; preserving it for review' }
-$installation.ssh_home = $sshHome
-Save-Installation
-$null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\icacls.exe" -ArgumentList @($sshHome, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', "*${sshSid}:(OI)(CI)RX", '/Q') -Operation 'protect SSH home' -LogPath $nativeLogPath
-$null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\icacls.exe" -ArgumentList @($sshHome, '/setowner', '*S-1-5-18', '/Q') -Operation 'set SSH home owner' -LogPath $nativeLogPath
-if (Test-Path -LiteralPath "$sshHome\.ssh") { throw 'Unexpected SSH state in the newly created profile; preserving it for review' }
-New-Item "$sshHome\.ssh" -ItemType Directory | Out-Null
-[IO.File]::WriteAllText("$sshHome\.ssh\authorized_keys", $keyLine + "`r`n", [Text.UTF8Encoding]::new($false))
-$null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\icacls.exe" -ArgumentList @("$sshHome\.ssh", '/setowner', '*S-1-5-18', '/T', '/L', '/Q') -Operation 'set SSH key directory owner' -LogPath $nativeLogPath
+# OpenSSH may select a temporary profile for the account. Neither the key nor
+# the absolute forced command depends on a user profile being registered.
+Set-RunnerSshAuthorizedKey -Directory "$Root\ssh" -KeyLine $keyLine
 $sshdConfig = 'C:\ProgramData\ssh\sshd_config'
 $before = [IO.File]::ReadAllText($sshdConfig)
 if ($before -match '(?m)^# BEGIN MOTOR RUNNER') { throw 'Existing Motor SSH block requires removal first' }
@@ -159,7 +137,7 @@ Match User motor-ssh
     AuthenticationMethods publickey
     PasswordAuthentication no
     PubkeyAuthentication yes
-    AuthorizedKeysFile .ssh/authorized_keys
+    AuthorizedKeysFile __PROGRAMDATA__/MotorRunner/ssh/authorized_keys
     AllowTcpForwarding no
     AllowAgentForwarding no
     X11Forwarding no
@@ -168,13 +146,7 @@ Match User motor-ssh
 Match all
 # END MOTOR RUNNER
 '@
-[IO.File]::WriteAllText($sshdConfig, $before.TrimEnd() + "`r`n" + $block + "`r`n", [Text.UTF8Encoding]::new($false))
-try {
-    $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\OpenSSH\sshd.exe" -ArgumentList @('-t', '-f', $sshdConfig) -Operation 'validate SSH configuration' -LogPath $nativeLogPath
-} catch {
-    [IO.File]::WriteAllText($sshdConfig, $before, [Text.UTF8Encoding]::new($false))
-    throw "OpenSSH rejected the restricted entry configuration; original restored: $_"
-}
+Set-RunnerSshConfigBlock -ConfigPath $sshdConfig -Block $block -LogPath $nativeLogPath
 try {
     $effectiveOutput = Invoke-RunnerSshPolicyAsSystem $sshdConfig
     $effective = @($effectiveOutput -split '\r?\n' | Where-Object { $_ })

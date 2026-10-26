@@ -75,22 +75,58 @@ pub(super) fn remove_staging(_config: &Config, path: &Path) -> io::Result<()> {
 
 fn copy_tree(source: &Path, target: &Path) -> io::Result<()> {
     use std::os::windows::fs::MetadataExt;
-    let metadata = fs::symlink_metadata(source)?;
-    if metadata.file_attributes() & 0x400 != 0
-        || fs::symlink_metadata(target)
-            .is_ok_and(|metadata| metadata.file_attributes() & 0x400 != 0)
-    {
-        return Err(invalid("reparse point in trusted preparation cache"));
+    let metadata = fs::symlink_metadata(source).map_err(|error| {
+        super::prep::error_at_path("read Git-mirror source metadata", source, error)
+    })?;
+    if metadata.file_attributes() & 0x400 != 0 {
+        return Err(super::prep::error_at_path(
+            "reject reparse Git-mirror source",
+            source,
+            invalid("reparse point in trusted preparation cache"),
+        ));
     }
-    crate::filesystem::identity(source)?;
+    let target_metadata = match fs::symlink_metadata(target) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(super::prep::error_at_path(
+                "read Git-mirror destination metadata",
+                target,
+                error,
+            ))
+        }
+    };
+    if target_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_attributes() & 0x400 != 0)
+    {
+        return Err(super::prep::error_at_path(
+            "reject reparse Git-mirror destination",
+            target,
+            invalid("reparse point in trusted preparation cache"),
+        ));
+    }
+    crate::filesystem::identity(source).map_err(|error| {
+        super::prep::error_at_path("open Git-mirror source identity", source, error)
+    })?;
     if metadata.is_dir() {
-        fs::create_dir_all(target)?;
-        for entry in fs::read_dir(source)? {
-            let entry = entry?;
+        fs::create_dir_all(target).map_err(|error| {
+            super::prep::error_at_path(
+                &format!("create Git-mirror directory from {}", source.display()),
+                target,
+                error,
+            )
+        })?;
+        for entry in fs::read_dir(source).map_err(|error| {
+            super::prep::error_at_path("open Git-mirror source directory", source, error)
+        })? {
+            let entry = entry.map_err(|error| {
+                super::prep::error_at_path("read Git-mirror source entry", source, error)
+            })?;
             copy_tree(&entry.path(), &target.join(entry.file_name()))?;
         }
     } else if metadata.is_file() {
-        if let Ok(existing) = fs::metadata(target) {
+        if let Some(existing) = target_metadata {
             if existing.permissions().readonly() {
                 let attributes = existing.file_attributes()
                     & !windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
@@ -103,10 +139,23 @@ fn copy_tree(source: &Path, target: &Path) -> io::Result<()> {
                             attributes
                         },
                     )
+                })
+                .map_err(|error| {
+                    super::prep::error_at_path(
+                        "clear read-only Git-mirror destination",
+                        target,
+                        error,
+                    )
                 })?;
             }
         }
-        fs::copy(source, target)?;
+        fs::copy(source, target).map_err(|error| {
+            super::prep::error_at_path(
+                &format!("copy Git-mirror file from {} to", source.display()),
+                target,
+                error,
+            )
+        })?;
     } else {
         return Err(invalid("special file in trusted preparation input"));
     }
@@ -118,7 +167,9 @@ pub(super) fn copy_routes(
 ) -> io::Result<BTreeMap<String, PathBuf>> {
     let mut result = BTreeMap::new();
     let destination = staging.join("cargo-home/git-mirrors");
-    fs::create_dir_all(&destination)?;
+    fs::create_dir_all(&destination).map_err(|error| {
+        super::prep::error_at_path("create Git-mirror staging directory", &destination, error)
+    })?;
     for (index, (url, mirror)) in routes.iter().enumerate() {
         let copy = destination.join(index.to_string());
         copy_tree(mirror, &copy)?;

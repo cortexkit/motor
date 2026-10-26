@@ -166,6 +166,46 @@ function Invoke-RunnerNative {
     return [pscustomobject]@{ exit_code=$exitCode; stdout=$stdout; stderr=$stderr }
 }
 
+function Set-RunnerSshAuthorizedKey {
+    param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][string]$KeyLine)
+    $keyPath = Join-Path $Directory 'authorized_keys'
+    foreach ($path in @($Directory, $keyPath)) {
+        if ((Test-Path -LiteralPath $path) -and ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Refusing reparse SSH key state' }
+    }
+    New-Item -Path $Directory -ItemType Directory -Force | Out-Null
+    # Replace the entire DACL, not just named grants: a reused key must not
+    # retain explicit access for the SSH account or any other local user.
+    $directoryAcl = [Security.AccessControl.DirectorySecurity]::new()
+    $directoryAcl.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)')
+    Set-Acl -LiteralPath $Directory -AclObject $directoryAcl
+    if (-not (Test-Path -LiteralPath $keyPath)) { New-Item -Path $keyPath -ItemType File | Out-Null }
+    $fileAcl = [Security.AccessControl.FileSecurity]::new()
+    $fileAcl.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)')
+    Set-Acl -LiteralPath $keyPath -AclObject $fileAcl
+    [IO.File]::WriteAllText($keyPath, $KeyLine + "`r`n", [Text.UTF8Encoding]::new($false))
+}
+
+function Set-RunnerSshConfigBlock {
+    param(
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [Parameter(Mandatory)][string]$Block,
+        [Parameter(Mandatory)][string]$LogPath,
+        [string]$SshdPath,
+        [string[]]$SshdArguments
+    )
+    $before = [IO.File]::ReadAllText($ConfigPath)
+    if ($before -match '(?m)^# BEGIN MOTOR RUNNER') { throw 'Existing Motor SSH block requires removal first' }
+    [IO.File]::WriteAllText($ConfigPath, $before.TrimEnd() + "`r`n" + $Block + "`r`n", [Text.UTF8Encoding]::new($false))
+    if (-not $SshdPath) { $SshdPath = "$env:SystemRoot\System32\OpenSSH\sshd.exe" }
+    if (-not $PSBoundParameters.ContainsKey('SshdArguments')) { $SshdArguments = @('-t', '-f', $ConfigPath) }
+    try {
+        $null = Invoke-RunnerNative -FilePath $SshdPath -ArgumentList $SshdArguments -Operation 'validate SSH configuration' -LogPath $LogPath
+    } catch {
+        [IO.File]::WriteAllText($ConfigPath, $before, [Text.UTF8Encoding]::new($false))
+        throw "OpenSSH rejected the restricted entry configuration; original restored: $_"
+    }
+}
+
 function Remove-RunnerSshConfigBlock {
     param(
         [Parameter(Mandatory)][string]$ConfigPath,
@@ -205,6 +245,13 @@ function Remove-RunnerSshInstallState {
     if ($PSBoundParameters.ContainsKey('SshdArguments')) { $sshValidation.SshdArguments = $SshdArguments }
     $removedBlock = Remove-RunnerSshConfigBlock @sshValidation
     if ($removedBlock) { Restart-Service sshd }
+    # The directory is owned by the marked runner root, including installations
+    # repaired before the installer recorded a separate SSH key directory.
+    $sshDirectory = Join-Path $Installation.root 'ssh'
+    if (Test-Path -LiteralPath $sshDirectory) {
+        if ((Get-Item -LiteralPath $sshDirectory -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing a reparse SSH key directory' }
+        Remove-Item -LiteralPath $sshDirectory -Recurse -Force
+    }
     if ($Installation.PSObject.Properties['ssh_home']) {
         if ($Installation.ssh_home -notmatch '^C:\\Users\\motor-ssh(?:\.[^\\]+)?$') { throw 'Unexpected SSH home path' }
         $sidRecord = $Installation.accounts.PSObject.Properties['motor-ssh']

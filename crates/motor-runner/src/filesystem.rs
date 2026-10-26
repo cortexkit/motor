@@ -1,5 +1,4 @@
 //! Host filesystem operations whose Unix and Windows durability APIs differ.
-#[cfg(unix)]
 use std::fs;
 use std::{
     fs::{File, OpenOptions},
@@ -84,6 +83,99 @@ pub(crate) fn identity(path: &Path) -> io::Result<(u64, u64, u64)> {
 }
 pub(crate) fn device(path: &Path) -> io::Result<u64> {
     Ok(identity(path)?.0)
+}
+
+/// Updating a directory's timestamp requires a directory handle on Windows;
+/// File::open uses ordinary file semantics there and returns access denied.
+pub(crate) fn set_directory_modified(
+    path: &Path,
+    modified: std::time::SystemTime,
+) -> io::Result<()> {
+    let context = |operation: &str, error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!("{operation} {}: {error}", path.display()),
+        )
+    };
+    #[cfg(unix)]
+    let directory =
+        File::open(path).map_err(|error| context("open directory for timestamp", error))?;
+    #[cfg(windows)]
+    let directory = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_WRITE_ATTRIBUTES,
+        };
+        OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|error| context("open directory for timestamp", error))?
+    };
+    let metadata = directory
+        .metadata()
+        .map_err(|error| context("read directory timestamp metadata", error))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "reparse directory refused during timestamp update: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "not a directory during timestamp update: {}",
+                path.display()
+            ),
+        ));
+    }
+    directory
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .map_err(|error| context("set directory timestamp", error))
+}
+
+#[cfg(test)]
+mod directory_timestamp_tests {
+    use super::*;
+    use cortexkit_test_support::ScratchDir;
+
+    #[test]
+    fn directory_timestamp_update_preserves_files_and_reports_the_failed_path() {
+        let scratch = ScratchDir::new("directory-timestamp");
+        let directory = scratch.join("mirror");
+        fs::create_dir(&directory).unwrap();
+        let head = directory.join("HEAD");
+        fs::write(&head, b"ref: refs/heads/main\n").unwrap();
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        set_directory_modified(&directory, modified).unwrap();
+        assert_eq!(
+            fs::metadata(&directory).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(fs::read(&head).unwrap(), b"ref: refs/heads/main\n");
+        let missing = scratch.join("absent-mirror");
+        let error = set_directory_modified(&missing, modified).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            error.to_string().contains("open directory for timestamp"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains(&missing.display().to_string()),
+            "{error}"
+        );
+    }
 }
 
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
