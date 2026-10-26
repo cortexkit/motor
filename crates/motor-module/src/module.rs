@@ -12,7 +12,8 @@ use std::{
 };
 use subc_client_rs::{
     async_trait, BindDecision, ConnectionEnd, HandlerOutcome, HealthReport, HealthStatus,
-    ModuleHandler, RequestCtx, RouteBindRequest, RouteHandle,
+    ModuleHandle, ModuleHandler, RequestClass, RequestCtx, RequestPool, RequestPools,
+    RouteBindRequest, RouteHandle,
 };
 use subc_protocol::{
     manifest::{
@@ -26,12 +27,9 @@ use subc_protocol::{
 
 pub const CAPABILITY: &str = "exec-remote/v1";
 pub const DEFAULT_MODULE_ID: &str = "ck-motor";
-// subc-client-rs 0.26.1 lib.rs:86 fixes provider handler capacity at 64.
-pub const SDK_HANDLER_CAPACITY: usize = 64;
-// Reserve slots for status, cancel and attach when long-lived run streams fill
-// the provider. These control operations must remain usable under saturation.
-pub const CONTROL_HEADROOM: usize = 8;
-pub const RUN_ADMISSION_LIMIT: usize = SDK_HANDLER_CAPACITY - CONTROL_HEADROOM;
+// Dispatch capacity, not job admission: runners and hosted tenants decide
+// whether a job fits. Attach also holds a slot until the job's terminal record.
+pub const LONG_HELD_LIMIT: usize = 256;
 /// How long a request that needs module storage waits for startup to open it
 /// before it is refused as `motor_unavailable`.
 ///
@@ -57,29 +55,27 @@ enum StorageState {
     /// Startup gave up; `startup_error` says why.
     Failed,
 }
-struct RunPermit(Arc<std::sync::atomic::AtomicUsize>);
-impl RunPermit {
-    fn acquire(count: &Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
-        let mut current = count.load(std::sync::atomic::Ordering::Acquire);
-        loop {
-            if current >= RUN_ADMISSION_LIMIT {
-                return None;
-            }
-            match count.compare_exchange_weak(
-                current,
-                current + 1,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(Self(count.clone())),
-                Err(observed) => current = observed,
-            }
-        }
-    }
-}
-impl Drop for RunPermit {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+fn request_class(body: &[u8]) -> RequestClass {
+    // Callers serialize the operation first. The direct CLI's sorted JSON puts
+    // its reattach secret first instead; peek only at that small envelope head,
+    // never at params or at an unbounded command/payload on the frame reader.
+    let head = &body[..body.len().min(256)];
+    let op = if head.starts_with(br#"{"direct_secret":""#) {
+        head.windows(3)
+            .position(|window| window == br#"",""#)
+            .map(|offset| &head[offset + 2..])
+            .unwrap_or_default()
+    } else {
+        head.strip_prefix(b"{").unwrap_or_default()
+    };
+    if op.starts_with(br#""op":"exec.run""#) || op.starts_with(br#""method":"exec.run""#) {
+        RequestClass::long_held().with_op("exec.run")
+    } else if op.starts_with(br#""op":"exec.attach""#)
+        || op.starts_with(br#""method":"exec.attach""#)
+    {
+        RequestClass::long_held().with_op("exec.attach")
+    } else {
+        RequestClass::default_pool()
     }
 }
 pub const OPERATIONS: &[&str] = &[
@@ -171,7 +167,7 @@ pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest 
             },
         }))
         .provides(vec![ProviderRole::ManagementSurface {
-            concurrency: Concurrency::ModuleManaged,
+            concurrency: Concurrency::StatelessParallel,
             operations: OPERATIONS
                 .iter()
                 .map(|name| ManagementOperation {
@@ -288,7 +284,7 @@ pub struct Handler {
     /// connection. This fast path needs no secret; other direct routes must
     /// prove access with the per-job secret whose hash is in storage.
     direct_jobs: Arc<Mutex<HashMap<Uuid, RouteHandle>>>,
-    run_count: Arc<std::sync::atomic::AtomicUsize>,
+    module_handle: Arc<Mutex<Option<ModuleHandle>>>,
     startup_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     startup_error: Arc<Mutex<Option<String>>>,
     storage_state: Arc<tokio::sync::watch::Sender<StorageState>>,
@@ -324,6 +320,34 @@ fn module_data_dir_for(
 }
 
 impl Handler {
+    pub fn set_module_handle(&self, handle: ModuleHandle) {
+        *self.module_handle.lock().unwrap() = Some(handle);
+    }
+
+    fn pool_metrics(&self) -> Value {
+        let handle = self.module_handle.lock().unwrap();
+        let Some(handle) = handle.as_ref() else {
+            return Value::Null;
+        };
+        let mut pools = serde_json::Map::new();
+        for snapshot in handle.request_pool_snapshots() {
+            let name = match snapshot.pool {
+                RequestPool::Default => "default",
+                RequestPool::LongHeld => "long_held",
+                _ => continue,
+            };
+            pools.insert(
+                name.into(),
+                json!({
+                    "in_use": snapshot.in_use, "limit": snapshot.limit,
+                    "waiting": snapshot.waiting,
+                    "oldest_wait_ms": snapshot.oldest_wait.map(|age| age.as_millis() as u64),
+                }),
+            );
+        }
+        Value::Object(pools)
+    }
+
     pub fn new(config: Config) -> Self {
         Self {
             config,
@@ -334,7 +358,7 @@ impl Handler {
             account_tokens: None,
             routes: Arc::new(Mutex::new(HashMap::new())),
             direct_jobs: Arc::new(Mutex::new(HashMap::new())),
-            run_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            module_handle: Arc::new(Mutex::new(None)),
             startup_task: Arc::new(Mutex::new(None)),
             startup_error: Arc::new(Mutex::new(None)),
             storage_state: Arc::new(tokio::sync::watch::Sender::new(StorageState::NotStarted)),
@@ -695,19 +719,6 @@ impl Handler {
                     pump_direct_secret(&ctx, stream, Some(secret)).await?;
                     return Ok(HandlerOutcome::Streamed);
                 }
-                let _permit = match RunPermit::acquire(&self.run_count) {
-                    Some(permit) => permit,
-                    None => {
-                        let stream = motor.refuse_authorized(
-                            RefusalReason::RunnerFull,
-                            None,
-                            Some(secret.hash()),
-                        )?;
-
-                        pump_direct_secret(&ctx, stream, Some(secret)).await?;
-                        return Ok(HandlerOutcome::Streamed);
-                    }
-                };
                 let stream = motor.run_direct_authorized(
                     request,
                     self.attribution(route, envelope.preset),
@@ -861,6 +872,10 @@ struct Envelope {
 }
 #[async_trait]
 impl ModuleHandler for Handler {
+    fn request_pools(&self) -> RequestPools {
+        RequestPools::new().with_long_held(LONG_HELD_LIMIT, request_class)
+    }
+
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
         if self.motor.get().is_some() {
             return;
@@ -889,6 +904,12 @@ impl ModuleHandler for Handler {
         }));
     }
     async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
+        if matches!(&request.call_mode, subc_client_rs::CallMode::Unknown(_)) {
+            return BindDecision::reject(
+                "motor_call_mode_unsupported",
+                format!("{} refuses an unknown call mode", self.module_id),
+            );
+        }
         match request.principal.as_ref() {
             Some(Principal::Reserved { module_id })
                 if module_id == "aft" || module_id == "prefrontal-core" => {}
@@ -963,6 +984,7 @@ impl ModuleHandler for Handler {
         // The detail line stays one sentence; the refusal counters are
         // diagnostics, shown with `ck health ck-motor --verbose`.
         if let Some(serde_json::Value::Object(metrics)) = report.metrics.as_mut() {
+            metrics.insert("request_pools".into(), self.pool_metrics());
             metrics.insert(
                 "unreachable_refusals_since_boot".into(),
                 crate::diagnostics::health_metrics(),
@@ -1024,13 +1046,6 @@ impl ModuleHandler for Handler {
             let parse = |p| serde_json::from_value(p).map_err(io::Error::other);
             match envelope.op.as_str() {
                 "exec.run" => {
-                    let _permit = match RunPermit::acquire(&self.run_count) {
-                        Some(permit) => permit,
-                        None => {
-                            pump(&ctx, motor.refuse_capacity()?, 0).await?;
-                            return Ok(HandlerOutcome::Streamed);
-                        }
-                    };
                     let mut request: RunRequest = parse(envelope.params)?;
                     let returns = match crate::agent_route::take_return_request(&mut request) {
                         Ok(returns) => returns,
@@ -1077,7 +1092,16 @@ impl ModuleHandler for Handler {
                 "exec.status" => {
                     status_reply(motor, &envelope.params).await
                 },
-                "runner.health" => runner_health_reply_for(motor, &envelope.params).await,
+                "runner.health" => {
+                    let outcome = runner_health_reply_for(motor, &envelope.params).await?;
+                    if let HandlerOutcome::Response(body) = outcome {
+                        let mut health: Value = serde_json::from_slice(&body).map_err(io::Error::other)?;
+                        health["request_pools"] = self.pool_metrics();
+                        response(health)
+                    } else {
+                        Ok(outcome)
+                    }
+                },
                 "workspace.prepare" => response(
                     motor
                         .prepare(serde_json::from_value(envelope.params).map_err(io::Error::other)?)
@@ -1286,24 +1310,6 @@ where
                 None => return Err(io::Error::other("stream ended without terminal record")),
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod admission_tests {
-    use super::*;
-    #[test]
-    fn run_permits_enforce_capacity_and_release_on_drop() {
-        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut permits: Vec<_> = (0..RUN_ADMISSION_LIMIT)
-            .map(|_| RunPermit::acquire(&count).unwrap())
-            .collect();
-        assert!(RunPermit::acquire(&count).is_none());
-        permits.pop();
-        let replacement = RunPermit::acquire(&count).expect("a finished stream releases admission");
-        drop(replacement);
-        drop(permits);
-        assert_eq!(count.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 }
 
@@ -1547,5 +1553,54 @@ mod startup_tests {
             .unwrap();
         assert_eq!(refusal.kind(), io::ErrorKind::NotConnected);
         assert!(refusal.to_string().contains("invalid_storage_descriptor"));
+    }
+}
+
+#[cfg(test)]
+mod pool_classifier_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_agent_and_direct_stream_envelopes_use_long_held_pool() {
+        for key in ["op", "method"] {
+            for op in ["exec.run", "exec.attach"] {
+                for secret in [None, Some("a".repeat(64))] {
+                    let mut envelope =
+                        json!({key:op, "params":{"command":"payload"}, "preset":"dev"});
+                    if let Some(secret) = secret {
+                        envelope["direct_secret"] = json!(secret);
+                    }
+                    let body = serde_json::to_vec(&envelope).unwrap();
+                    let class = request_class(&body);
+                    assert_eq!(
+                        class.pool,
+                        RequestPool::LongHeld,
+                        "{}",
+                        String::from_utf8_lossy(&body)
+                    );
+                    assert_eq!(class.op, Some(op));
+                }
+            }
+        }
+        for op in [
+            "exec.status",
+            "exec.cancel",
+            "runner.health",
+            "exec.runner",
+            "exec.runaway",
+        ] {
+            let body = serde_json::to_vec(&json!({"op":op,"params":{"op":"exec.run"}})).unwrap();
+            assert_eq!(request_class(&body).pool, RequestPool::Default);
+        }
+        // The reader inspects only the envelope head, even with an invalid or
+        // enormous payload. Deserialization remains the handler's job.
+        assert_eq!(
+            request_class(br#"{"op":"exec.run","params":invalid"#).pool,
+            RequestPool::LongHeld
+        );
+        assert_eq!(
+            request_class(&vec![b'x'; 1024 * 1024]).pool,
+            RequestPool::Default
+        );
     }
 }

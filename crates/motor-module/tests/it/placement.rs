@@ -303,12 +303,13 @@ impl Rig {
         // `on_hello_ack`, has returned. Running both halves in one task lets a
         // test send frames before that and see whether they are answered.
         let serving = tokio::spawn(async move {
-            let (_, serving) = subc_client_rs::serve_with_handle(
+            let (handle, serving) = subc_client_rs::serve_with_handle(
                 &path,
                 crate::module::manifest(&manifest_module_id),
-                h,
+                h.clone(),
             )
             .await?;
+            h.set_module_handle(handle);
             serving.await
         });
         let (mut daemon, _) = listener.accept().await.unwrap();
@@ -434,7 +435,7 @@ async fn send(daemon: &mut TcpStream, ty: FrameType, channel: u16, corr: u64, bo
         channel,
         if channel == 0 { 0 } else { 1 },
         corr,
-        if ty == FrameType::Goodbye {
+        if matches!(ty, FrameType::Goodbye | FrameType::Cancel) {
             Vec::new()
         } else {
             serde_json::to_vec(&body).unwrap()
@@ -467,6 +468,34 @@ async fn aft_bind_is_admitted() {
     );
     rig.stop().await;
 }
+
+#[tokio::test]
+async fn unknown_call_mode_is_refused_without_breaking_known_binds() {
+    let mut rig = Rig::new(CredentialErrorClass::CredentialAbsent).await;
+    send(
+        &mut rig.daemon,
+        FrameType::Request,
+        0,
+        2,
+        json!({
+            "op":"route.bind", "route_channel":7, "epoch":1,
+            "target":{"kind":"management_surface", "module_id":"ck-motor"},
+            "identity":{"project_root":"/repo", "harness":"aft", "session":"session-42"},
+            "principal":aft(), "call_mode":"future_mode"
+        }),
+    )
+    .await;
+    let refusal = receive(&mut rig.daemon).await;
+    assert_eq!(refusal.header.ty, FrameType::Error);
+    let error: Value = serde_json::from_slice(&refusal.body).unwrap();
+    assert_eq!(error["code"], "motor_call_mode_unsupported", "{error}");
+    assert_eq!(
+        rig.bind(aft(), Value::Null).await.header.ty,
+        FrameType::Response
+    );
+    rig.stop().await;
+}
+
 #[tokio::test]
 async fn direct_bind_is_refused_by_name_even_when_harness_claims_aft() {
     let mut rig = Rig::new(CredentialErrorClass::CredentialAbsent).await;
@@ -1507,4 +1536,289 @@ async fn agent_rejects_foreign_key_flags_and_malformed_requests_without_signing(
     assert_eq!(vault.signs.load(Ordering::SeqCst), 0);
     assert_eq!(agent.refusal(), None);
     agent.shutdown().await;
+}
+
+mod request_pools {
+    use super::super::recovery::{collect, terminal, Cut, Fixture};
+    use super::*;
+    use std::collections::HashMap;
+
+    fn pool_request(f: &Fixture) -> RunRequest {
+        let mut request = f.request("echo pool-ready; sleep 600");
+        request.weight_hint = Some(1);
+        request
+    }
+
+    async fn reply_on(rig: &mut Rig, corr: u64) -> Frame {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame = read_frame(&mut rig.daemon).await.unwrap().unwrap();
+                if frame.header.corr == corr {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("request {corr} did not answer within five seconds"))
+    }
+
+    #[tokio::test]
+    async fn eighty_run_streams_leave_status_cancel_and_attach_responsive() {
+        let f = Fixture::with_runner_config(Cut::None, 1, None, |config| {
+            config.max_queue_depth = 128;
+        })
+        .await;
+        let motor = f.motor();
+        let handler = Handler::new(f.config.clone()).with_motor(motor.clone());
+        let mut rig = Rig::start(handler, "ck-motor").await;
+        assert_eq!(
+            rig.bind(aft(), Value::Null).await.header.ty,
+            FrameType::Response
+        );
+        let mut runs = HashMap::new();
+        let mut output_corr = None;
+        for corr in 100..180 {
+            send(
+                &mut rig.daemon,
+                FrameType::Request,
+                7,
+                corr,
+                json!({"op":"exec.run", "params":pool_request(&f)}),
+            )
+            .await;
+        }
+        tokio::time::timeout(Duration::from_secs(90), async {
+            while runs.len() < 80 {
+                let frame = receive(&mut rig.daemon).await;
+                assert_eq!(
+                    frame.header.ty,
+                    FrameType::StreamData,
+                    "run ended before acceptance: {frame:?}"
+                );
+                let record: StreamRecord = serde_json::from_slice(&frame.body).unwrap();
+                match record {
+                    StreamRecord::Accepted(accepted) => {
+                        runs.insert(frame.header.corr, accepted.job_id);
+                    }
+                    StreamRecord::Terminal(terminal) => panic!("run refused: {terminal:?}"),
+                    StreamRecord::Output(_) => output_corr = Some(frame.header.corr),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("80 streams must be admitted, not queued behind the default 64 slots");
+        assert_eq!(
+            runs.values()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            80
+        );
+
+        // A queued attach has no output to replay yet. Pick the run that has
+        // produced output, so attach responsiveness is observable on the wire.
+        let output_corr = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(corr) = output_corr {
+                    break corr;
+                }
+                let frame = read_frame(&mut rig.daemon).await.unwrap().unwrap();
+                if frame.header.ty == FrameType::StreamData
+                    && matches!(
+                        serde_json::from_slice::<StreamRecord>(&frame.body).unwrap(),
+                        StreamRecord::Output(_)
+                    )
+                {
+                    output_corr = Some(frame.header.corr);
+                }
+            }
+        })
+        .await
+        .expect("one admitted job must produce its ready marker");
+        let id = runs[&output_corr];
+
+        send(
+            &mut rig.daemon,
+            FrameType::Request,
+            7,
+            200,
+            json!({"op":"exec.status", "params":{}}),
+        )
+        .await;
+        assert_eq!(reply_on(&mut rig, 200).await.header.ty, FrameType::Response);
+        send(
+            &mut rig.daemon,
+            FrameType::Request,
+            7,
+            201,
+            json!({"op":"runner.health", "params":{}}),
+        )
+        .await;
+        let health = reply_on(&mut rig, 201).await;
+        assert_eq!(health.header.ty, FrameType::Response);
+        let health: Value = serde_json::from_slice(&health.body).unwrap();
+        assert_eq!(health["request_pools"]["long_held"]["in_use"], 80);
+        assert_eq!(health["request_pools"]["long_held"]["limit"], 256);
+        assert_eq!(health["request_pools"]["default"]["limit"], 64);
+
+        send(
+            &mut rig.daemon,
+            FrameType::Request,
+            7,
+            202,
+            json!({"op":"exec.attach", "params":{"job_id":id,"from_seq":0}}),
+        )
+        .await;
+        let attached = reply_on(&mut rig, 202).await;
+        assert_eq!(
+            attached.header.ty,
+            FrameType::StreamData,
+            "attach must answer while runs stay open"
+        );
+        let report = rig.handler.health().await;
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["request_pools"]["long_held"]["in_use"], 81);
+        assert!(serde_json::to_vec(&metrics).unwrap().len() < 16 * 1024);
+
+        send(
+            &mut rig.daemon,
+            FrameType::Request,
+            7,
+            203,
+            json!({"op":"exec.cancel", "params":{"job_id":id}}),
+        )
+        .await;
+        let cancelled = reply_on(&mut rig, 203).await;
+        assert_eq!(cancelled.header.ty, FrameType::Response);
+        let reply: motor_protocol::CancelReply = serde_json::from_slice(&cancelled.body).unwrap();
+        assert_eq!(reply.job_id, id);
+        let replay = collect(
+            motor
+                .attach(motor_protocol::AttachRequest::new(id, 0))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(terminal(&replay).job_id, id);
+        assert_eq!(
+            terminal(&replay).outcome,
+            Outcome::Signal {
+                signal: libc::SIGTERM
+            }
+        );
+        for other in runs.values().filter(|other| **other != id) {
+            assert!(!motor.pending(*other), "cancel must not target another job");
+        }
+        for id in runs.values() {
+            motor
+                .cancel(motor_protocol::CancelRequest::new(*id))
+                .await
+                .unwrap();
+        }
+        rig.stop().await;
+    }
+
+    #[tokio::test]
+    async fn same_route_stream_cancel_and_immediate_followup_do_not_cancel_jobs() {
+        for learn_id in [false, true] {
+            let f = Fixture::new(Cut::None, 1).await;
+            let motor = f.motor();
+            let handler = Handler::new(f.config.clone()).with_motor(motor.clone());
+            let mut rig = Rig::start(handler, "ck-motor").await;
+            assert_eq!(
+                rig.bind(aft(), Value::Null).await.header.ty,
+                FrameType::Response
+            );
+            send(
+                &mut rig.daemon,
+                FrameType::Request,
+                7,
+                100,
+                json!({"op":"exec.run", "params":pool_request(&f)}),
+            )
+            .await;
+            let id = if learn_id {
+                let frame = reply_on(&mut rig, 100).await;
+                let StreamRecord::Accepted(accepted) = serde_json::from_slice(&frame.body).unwrap()
+                else {
+                    panic!("expected accepted record: {frame:?}")
+                };
+                Some(accepted.job_id)
+            } else {
+                None
+            };
+            // The agent tool (AFT) detaches the subscription, then keeps the
+            // same route alive with attach (if it knows the id) or status
+            // (before acceptance).
+            send(&mut rig.daemon, FrameType::Cancel, 7, 100, Value::Null).await;
+            let followup = match id {
+                Some(id) => json!({"op":"exec.attach", "params":{"job_id":id,"from_seq":0}}),
+                None => json!({"op":"exec.status", "params":{}}),
+            };
+            send(&mut rig.daemon, FrameType::Request, 7, 101, followup).await;
+            let mut detached = false;
+            let mut answered = false;
+            let mut skipped_handler = false;
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !detached || !answered {
+                    let frame = read_frame(&mut rig.daemon).await.unwrap().unwrap();
+                    if frame.header.corr == 100 {
+                        if frame.header.ty == FrameType::Error {
+                            let error: Value = serde_json::from_slice(&frame.body).unwrap();
+                            assert_eq!(error["code"], "cancelled");
+                            skipped_handler = true;
+                        }
+                        detached |= frame.header.ty == FrameType::StreamEnd
+                            || frame.header.ty == FrameType::Error;
+                    } else if frame.header.corr == 101 {
+                        if id.is_some() {
+                            assert_eq!(frame.header.ty, FrameType::StreamData);
+                            match serde_json::from_slice(&frame.body).unwrap() {
+                                StreamRecord::Started(_) => {}
+                                StreamRecord::Output(output) => {
+                                    assert!(output.bytes.0.starts_with(b"pool-ready"));
+                                    answered = true;
+                                }
+                                other => panic!("attach must follow the detached job: {other:?}"),
+                            }
+                        } else {
+                            assert_eq!(frame.header.ty, FrameType::Response);
+                            answered = true;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("detach and its same-route follow-up must both settle");
+            // A Cancel frame can reach the SDK before or after the run handler
+            // starts. In either case detaching must not record a job cancellation.
+            if !skipped_handler {
+                let id = tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        let id = f.proxy.frames.lock().unwrap().iter().find_map(|frame| {
+                            if let motor_protocol::Frame::Run(run) = frame {
+                                Some(run.job_id)
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(id) = id {
+                            break id;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("detached run must still reach the runner");
+                assert!(
+                    !motor.pending(id),
+                    "subscription Cancel is detach, not exec.cancel"
+                );
+                motor
+                    .cancel(motor_protocol::CancelRequest::new(id))
+                    .await
+                    .unwrap();
+            }
+            rig.stop().await;
+        }
+    }
 }

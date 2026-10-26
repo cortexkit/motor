@@ -457,9 +457,6 @@ impl Motor {
         }
         true
     }
-    pub(crate) fn refuse_capacity(&self) -> io::Result<JobStream> {
-        self.refuse_before_start(RefusalReason::RunnerFull, None)
-    }
     /// A stream whose only record is a before-start refusal under a fresh job
     /// ID. Nothing is snapshotted, uploaded or sent to the runner.
     pub(crate) fn refuse_before_start(
@@ -3056,7 +3053,9 @@ mod delivery_tests {
     async fn terminal_delivery_is_durable_only_after_successful_forwarding() {
         let scratch = ScratchDir::new("motor-terminal-delivery");
         let motor = Motor::open(Config::default(), &scratch).unwrap();
-        let stream = motor.refuse_capacity().unwrap();
+        let stream = motor
+            .refuse_before_start(RefusalReason::RunnerFull, Some("test_capacity".into()))
+            .unwrap();
         let id = stream.job_id;
         let result = crate::module::forward(std::future::pending(), stream, |_| async {
             Err(io::Error::other("caller disconnected"))
