@@ -174,6 +174,12 @@ def configure_login(account):
     private_write(PASSWORD, password.encode() + b"\n")
     secret_run("/usr/bin/dscl", ".", "-passwd", "/Users/motor", password)
     if not backup["keychain_ready"]:
+        # A logged-in session keeps its login keychain open in securityd, which
+        # writes that copy back over a replaced file, so the new keychain would
+        # silently keep the old password.
+        if has_gui_session(account):
+            raise ValueError("motor is logged in; log it out (launchctl bootout " + gui_domain(account)
+                             + ") before the first install creates its keychain")
         keychain.parent.mkdir(parents=True, exist_ok=True)
         os.chown(keychain.parent, account.pw_uid, account.pw_gid)
         keychain.unlink(missing_ok=True)

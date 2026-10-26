@@ -488,6 +488,9 @@ class AutoLoginTests(unittest.TestCase):
             self.default_keychain = str(args[9]) if len(args) == 10 else ""
         elif args[:2] == ("/usr/sbin/sshd", "-t"):
             pass
+        elif args[:2] == ("/bin/launchctl", "print"):
+            if not getattr(self, "gui_session", False):
+                raise subprocess.CalledProcessError(113, args)
         else:
             self.fail("unexpected command: " + str(args))
         return ""
@@ -517,6 +520,12 @@ class AutoLoginTests(unittest.TestCase):
             decoded = bytes(value ^ key[index % 11] for index, value in enumerate(encoded))
             self.assertEqual(decoded, password.encode() + b"\0" * (len(encoded) - len(password)))
             self.assertGreater(len(encoded), len(password))
+
+    def test_first_keychain_is_not_created_under_a_live_session(self):
+        self.gui_session = True
+        with self.assertRaisesRegex(ValueError, "motor is logged in"):
+            install.configure_login(self.account)
+        self.assertFalse(any("create-keychain" in call.args[0] for call in self.native.call_args_list))
 
     def test_login_setup_reuses_password_and_preserves_original_backup_on_update(self):
         self.assertTrue(install.configure_login(self.account))
