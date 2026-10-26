@@ -124,28 +124,28 @@ impl Repairs {
     fn attempt(
         &mut self,
         config: &Config,
-        workspace: &str,
+        workspace: crate::caller_path::HostPath<'_>,
         siblings: &[SiblingSnapshot],
         path: &Path,
     ) -> bool {
         let Some(root) = checkout_root(workspace, siblings, path) else {
             return false;
         };
-        if self.0.contains_key(Path::new(root)) {
+        if self.0.contains_key(root.as_path()) {
             return false;
         }
         let repair = repair(config, root);
         let restored = repair == Repair::Restored;
         match &repair {
             Repair::Restored => {
-                tracing::warn!(root, path = %path.display(), "restored runner access to an unreadable checkout")
+                tracing::warn!(root = %root.as_path().display(), path = %path.display(), "restored runner access to an unreadable checkout")
             }
             Repair::Failed(error) => {
-                tracing::warn!(root, path = %path.display(), error, "runner access repair failed")
+                tracing::warn!(root = %root.as_path().display(), path = %path.display(), error, "runner access repair failed")
             }
             Repair::NotAttempted(_) => {}
         }
-        self.0.insert(PathBuf::from(root), repair);
+        self.0.insert(root.as_path().to_path_buf(), repair);
         restored
     }
 
@@ -201,7 +201,7 @@ impl Repairs {
 /// final error describes what was tried (see [`Repairs::describe`]).
 pub(crate) fn validate_with_repair<T>(
     config: &Config,
-    workspace: &str,
+    workspace: crate::caller_path::HostPath<'_>,
     siblings: &[SiblingSnapshot],
     validate: impl FnMut() -> io::Result<T>,
 ) -> io::Result<T> {
@@ -215,7 +215,7 @@ pub(crate) fn validate_with_repair<T>(
 /// later and describes that result.
 pub(crate) fn validate_with_repairs<T>(
     config: &Config,
-    workspace: &str,
+    workspace: crate::caller_path::HostPath<'_>,
     siblings: &[SiblingSnapshot],
     repairs: &mut Repairs,
     mut validate: impl FnMut() -> io::Result<T>,
@@ -239,25 +239,25 @@ pub(crate) fn validate_with_repairs<T>(
 /// The checkout the request names that holds `path`: the workspace or a
 /// sibling, the deepest one if they nest.
 fn checkout_root<'a>(
-    workspace: &'a str,
+    workspace: crate::caller_path::HostPath<'a>,
     siblings: &'a [SiblingSnapshot],
     path: &Path,
-) -> Option<&'a str> {
+) -> Option<crate::caller_path::HostPath<'a>> {
     std::iter::once(workspace)
         .chain(
             siblings
                 .iter()
-                .map(|sibling| sibling.canonical_path.as_str()),
+                .map(|sibling| crate::caller_path::sibling(sibling).host),
         )
-        .filter(|root| path.starts_with(root))
-        .max_by_key(|root| root.len())
+        .filter(|root| path.starts_with(root.as_path()))
+        .max_by_key(|root| root.as_path().as_os_str().len())
 }
 
-fn repair(config: &Config, root: &str) -> Repair {
+fn repair(config: &Config, root: crate::caller_path::HostPath<'_>) -> Repair {
     // The runner owns a checkout by contract only beneath its owned
     // workspace roots, resolved; its writer storage lives there too, under
     // `.motor-base-` names, and caller paths must never reach it.
-    if Path::new(root).components().any(|component| {
+    if root.as_path().components().any(|component| {
         component
             .as_os_str()
             .to_string_lossy()
@@ -274,11 +274,11 @@ fn repair(config: &Config, root: &str) -> Repair {
     }
     #[cfg(test)]
     if let Some(hook) = &config.workspace_access_repair {
-        return outcome(hook(Path::new(root)));
+        return outcome(hook(root.as_path()));
     }
     #[cfg(target_os = "linux")]
     if config.isolate_jobs {
-        return outcome(crate::isolation::restore_workspace_access(Path::new(root)));
+        return outcome(crate::isolation::restore_workspace_access(root.as_path()));
     }
     Repair::NotAttempted("this runner does not isolate jobs, so it holds no access repair")
 }
@@ -358,10 +358,15 @@ mod tests {
         }
         let mut failures = vec![denied(&commons), denied(&format!("{workspace}/src"))];
         let mut calls = 0;
-        validate_with_repair(&config, &workspace, &[sibling(&commons)], || {
-            calls += 1;
-            failures.pop().map_or(Ok(()), Err)
-        })
+        validate_with_repair(
+            &config,
+            crate::caller_path::host_str(&workspace),
+            &[sibling(&commons)],
+            || {
+                calls += 1;
+                failures.pop().map_or(Ok(()), Err)
+            },
+        )
         .unwrap();
         assert_eq!(calls, 3);
         assert_eq!(
@@ -386,9 +391,12 @@ mod tests {
         ] {
             fs::create_dir_all(&workspace).unwrap();
             let workspace = text(workspace);
-            let error = validate_with_repair(&config, &workspace, &[], || {
-                Err::<(), _>(denied(&workspace))
-            })
+            let error = validate_with_repair(
+                &config,
+                crate::caller_path::host_str(&workspace),
+                &[],
+                || Err::<(), _>(denied(&workspace)),
+            )
             .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
             let detail = error.to_string();
@@ -404,11 +412,16 @@ mod tests {
         let scratch = ScratchDir::new("workspace-access");
         let (config, repaired) = config(&scratch);
         let workspace = text(scratch.join("remote/worktrees/a"));
-        let error = validate_with_repair(&config, &workspace, &[], || {
-            Err::<(), _>(io::Error::other(
-                "caller path overlaps writer-owned storage",
-            ))
-        })
+        let error = validate_with_repair(
+            &config,
+            crate::caller_path::host_str(&workspace),
+            &[],
+            || {
+                Err::<(), _>(io::Error::other(
+                    "caller path overlaps writer-owned storage",
+                ))
+            },
+        )
         .unwrap_err();
         assert_eq!(
             error.to_string(),
@@ -416,9 +429,12 @@ mod tests {
         );
         // A permission failure from anywhere but a caller-path read carries no
         // path, so it is not repaired either.
-        let error = validate_with_repair(&config, &workspace, &[], || {
-            Err::<(), _>(io::Error::from_raw_os_error(libc::EACCES))
-        })
+        let error = validate_with_repair(
+            &config,
+            crate::caller_path::host_str(&workspace),
+            &[],
+            || Err::<(), _>(io::Error::from_raw_os_error(libc::EACCES)),
+        )
         .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EACCES));
         assert!(repaired.lock().unwrap().is_empty());

@@ -1,3 +1,4 @@
+use crate::caller_path as paths;
 #[cfg(test)]
 use crate::storage::atomic_json;
 use crate::storage::{invalid, Catalog, Workspace};
@@ -181,7 +182,42 @@ pub(crate) fn absolute(path: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn validate(
+    workspace: &str,
+    repository: &str,
+    siblings: &[SiblingSnapshot],
+    snapshot_paths: bool,
+) -> io::Result<()> {
+    validate_names(workspace, repository, siblings, snapshot_paths)?;
+    validate_host_overlap(
+        paths::host_str(workspace),
+        paths::host_str(repository),
+        siblings,
+        snapshot_paths,
+    )
+}
+
+pub(crate) fn validate_request(
+    plan: paths::RequestPlan<'_>,
+    siblings: &[SiblingSnapshot],
+    snapshot_paths: bool,
+) -> io::Result<()> {
+    validate_names(
+        plan.caller_workspace_key.text(),
+        plan.caller_repository_root.text(),
+        siblings,
+        snapshot_paths,
+    )?;
+    validate_host_overlap(
+        plan.host_workspace,
+        plan.host_repository_root,
+        siblings,
+        snapshot_paths,
+    )
+}
+
+fn validate_names(
     workspace: &str,
     repository: &str,
     siblings: &[SiblingSnapshot],
@@ -194,22 +230,32 @@ pub(crate) fn validate(
         return Err(invalid("invalid workspace path"));
     }
     for s in siblings {
-        if !absolute(&s.canonical_path)
+        if !absolute(paths::sibling(s).caller.text())
             || (!snapshot_paths
-                && Path::new(&s.canonical_path).parent() != Path::new(repository).parent())
-            || s.canonical_path == repository
-            || Path::new(workspace).starts_with(&s.canonical_path)
+                && Path::new(paths::sibling(s).caller.text()).parent()
+                    != Path::new(repository).parent())
+            || paths::sibling(s).caller.text() == repository
+            || Path::new(workspace).starts_with(paths::sibling(s).caller.text())
         {
             return Err(invalid("invalid sibling path"));
         }
     }
+    Ok(())
+}
+
+fn validate_host_overlap(
+    workspace: paths::HostPath<'_>,
+    repository: paths::HostPath<'_>,
+    siblings: &[SiblingSnapshot],
+    snapshot_paths: bool,
+) -> io::Result<()> {
     if snapshot_paths {
         let mut paths = vec![
-            destination(Path::new(workspace))?,
-            destination(Path::new(repository))?,
+            destination(workspace.as_path())?,
+            destination(repository.as_path())?,
         ];
         for (sibling, alias) in siblings.iter().zip(sibling_aliases(workspace, siblings)?) {
-            let path = destination(Path::new(&sibling.canonical_path))?;
+            let path = destination(paths::sibling(sibling).host.as_path())?;
             let alias = alias.canonical;
             for mount in [&path, &alias] {
                 if paths
@@ -258,21 +304,30 @@ pub(crate) fn destination(path: &Path) -> io::Result<PathBuf> {
 
 pub(crate) fn validate_destinations(
     roots: &[PathBuf],
-    key: &str,
-    cwd: Option<&str>,
+    key: paths::HostPath<'_>,
+    cwd: Option<paths::HostPath<'_>>,
     siblings: &[SiblingSnapshot],
 ) -> io::Result<()> {
     let allowed = allowed_roots(roots)?;
-    let resolve =
-        |path: &str| authorize_destination(roots, &allowed, path, destination(Path::new(path)));
+    let resolve = |path: paths::HostPath<'_>| {
+        authorize_destination(
+            roots,
+            &allowed,
+            &path.as_path().to_string_lossy(),
+            destination(path.as_path()),
+        )
+    };
     let workspace = resolve(key)?;
     if let Some(cwd) = cwd {
         if !resolve(cwd)?.starts_with(&workspace) {
-            return Err(invalid(format!("cwd outside workspace: {cwd}")));
+            return Err(invalid(format!(
+                "cwd outside workspace: {}",
+                cwd.as_path().display()
+            )));
         }
     }
     for sibling in siblings {
-        resolve(&sibling.canonical_path)?;
+        resolve(paths::sibling(sibling).host)?;
     }
     Ok(())
 }
@@ -354,17 +409,20 @@ pub(crate) fn validate_alias_destinations(
 }
 
 pub(crate) fn sibling_aliases(
-    key: &str,
+    key: paths::HostPath<'_>,
     siblings: &[SiblingSnapshot],
 ) -> io::Result<Vec<SiblingAlias>> {
     siblings
         .iter()
         .map(|sibling| {
-            let path = Path::new(key)
+            let path = key
+                .as_path()
                 .parent()
                 .ok_or_else(|| invalid("workspace has no parent"))?
                 .join(
-                    Path::new(&sibling.canonical_path)
+                    paths::sibling(sibling)
+                        .host
+                        .as_path()
                         .file_name()
                         .ok_or_else(|| invalid("sibling path has no name"))?,
                 );
@@ -378,7 +436,8 @@ pub(crate) fn sibling_aliases(
                         .parent()
                         .ok_or_else(|| invalid("alias has no parent"))?;
                     let target = parent.join(fs::read_link(&path)?);
-                    if destination(&target)? != destination(Path::new(&sibling.canonical_path))? {
+                    if destination(&target)? != destination(paths::sibling(sibling).host.as_path())?
+                    {
                         return Err(error);
                     }
                     // Retiring an in-place sibling leaves its worktree alias dangling.
@@ -605,7 +664,7 @@ pub(crate) fn record_siblings(catalog: &mut Catalog, siblings: &[SiblingSnapshot
     for s in siblings {
         catalog
             .sibling_commits
-            .insert(s.canonical_path.clone(), s.commit.clone());
+            .insert(paths::sibling(s).caller.text().clone(), s.commit.clone());
     }
 }
 
@@ -754,7 +813,11 @@ impl Trees {
         siblings: &[SiblingSnapshot],
     ) -> io::Result<()> {
         for b in bundles {
-            if b.repository != root && !siblings.iter().any(|s| s.canonical_path == b.repository) {
+            if b.repository != root
+                && !siblings
+                    .iter()
+                    .any(|s| paths::sibling(s).caller.text() == &b.repository)
+            {
                 return Err(invalid("undeclared bundle repository"));
             }
         }
@@ -792,7 +855,7 @@ impl Trees {
         for (repository, snapshot) in std::iter::once((root, commit)).chain(
             siblings
                 .iter()
-                .map(|s| (s.canonical_path.as_str(), s.commit.as_str())),
+                .map(|s| (paths::sibling(s).caller.text().as_str(), s.commit.as_str())),
         ) {
             git(
                 &self.ensure_mirror(repository)?,
@@ -817,7 +880,7 @@ impl Trees {
         for (repository, snapshot) in std::iter::once((root, commit)).chain(
             siblings
                 .iter()
-                .map(|s| (s.canonical_path.as_str(), s.commit.as_str())),
+                .map(|s| (paths::sibling(s).caller.text().as_str(), s.commit.as_str())),
         ) {
             git(
                 &self.mirror(repository),
@@ -961,11 +1024,12 @@ impl Trees {
     pub(crate) fn sync_workspace(
         &self,
         repository: &str,
-        path: &Path,
+        path: paths::HostPath<'_>,
         snapshot_commit: &str,
         tree_hash: &str,
         caller_commit: &str,
     ) -> io::Result<()> {
+        let path = path.as_path();
         #[cfg(test)]
         crate::test_cleanup::record_checkout_work("sync_workspace", path);
         let mirror = self.mirror(repository);
@@ -1089,9 +1153,13 @@ impl Trees {
                 .ok_or_else(|| invalid("workspace parent"))?,
         )?;
         for s in siblings {
-            let path = Path::new(&s.canonical_path);
+            let path = paths::sibling(s).host.as_path();
             let caller_commit = s.base_commit.clone().unwrap_or_else(|| {
-                resolve_caller_commit(&self.mirror(&s.canonical_path), &s.commit, &s.tree_hash)
+                resolve_caller_commit(
+                    &self.mirror(paths::sibling(s).caller.text()),
+                    &s.commit,
+                    &s.tree_hash,
+                )
             });
             // Catalog entries survive harness teardown and external deletion.
             // A recorded commit is not proof that its checkout still exists or
@@ -1100,10 +1168,11 @@ impl Trees {
                 && path.join(".git").exists()
                 && git(path, &["rev-parse", "HEAD"]).ok().as_deref() == Some(&caller_commit)
                 && self.tree_hash(path).ok().as_deref() == Some(s.tree_hash.as_str());
-            if recorded.get(&s.canonical_path) != Some(&s.commit) || !checkout_matches {
+            if recorded.get(paths::sibling(s).caller.text()) != Some(&s.commit) || !checkout_matches
+            {
                 self.sync_workspace(
-                    &s.canonical_path,
-                    path,
+                    paths::sibling(s).caller.text(),
+                    crate::caller_path::host(path),
                     &s.commit,
                     &s.tree_hash,
                     &caller_commit,
@@ -1141,7 +1210,7 @@ impl Trees {
     #[allow(clippy::too_many_arguments)]
     pub fn populate(
         &self,
-        key: &str,
+        key: paths::HostPath<'_>,
         root: &str,
         commit: &str,
         siblings: &[SiblingSnapshot],
@@ -1149,7 +1218,7 @@ impl Trees {
         tree_hash: &str,
         caller_commit: &str,
     ) -> io::Result<()> {
-        self.siblings(Path::new(key), siblings, recorded)?;
+        self.siblings(key.as_path(), siblings, recorded)?;
         self.populate_main(key, root, commit, tree_hash, caller_commit)
     }
     /// The main-workspace part of `populate`: check out the source,
@@ -1158,14 +1227,20 @@ impl Trees {
     /// sibling's host path.
     pub(crate) fn populate_main(
         &self,
-        key: &str,
+        key: paths::HostPath<'_>,
         root: &str,
         commit: &str,
         tree_hash: &str,
         caller_commit: &str,
     ) -> io::Result<()> {
-        let path = Path::new(key);
-        self.sync_workspace(root, path, commit, tree_hash, caller_commit)?;
+        let path = key.as_path();
+        self.sync_workspace(
+            root,
+            crate::caller_path::host(path),
+            commit,
+            tree_hash,
+            caller_commit,
+        )?;
         let target = path.join("target");
         if !target.exists() {
             fs::create_dir_all(&target)?;
@@ -1189,7 +1264,7 @@ impl Trees {
             &["rev-parse", &format!("{commit}^{{tree}}")],
         )?;
         self.populate(
-            key,
+            crate::caller_path::host_str(key),
             root,
             commit,
             siblings,

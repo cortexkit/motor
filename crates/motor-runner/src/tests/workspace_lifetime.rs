@@ -417,22 +417,42 @@ fn destination_roots_check_future_paths_symlink_cwd_and_heads() {
     use std::os::unix::fs::symlink;
     let f = Fixture::new();
     let roots = [f.scratch.join("remote")];
-    assert!(workspace::validate_destinations(&roots, text(&roots[0]), None, &[]).is_err());
-    workspace::validate_destinations(&roots, &f.root, Some(&f.root), &[]).unwrap();
+    assert!(workspace::validate_destinations(
+        &roots,
+        crate::caller_path::host(&roots[0]),
+        None,
+        &[]
+    )
+    .is_err());
+    workspace::validate_destinations(
+        &roots,
+        crate::caller_path::host_str(&f.root),
+        Some(&f.root).map(|p| crate::caller_path::host_str(p)),
+        &[],
+    )
+    .unwrap();
     let key = Path::new(&f.key);
     fs::create_dir_all(key).unwrap();
     fs::create_dir_all(&f.canonical).unwrap();
     symlink(&f.canonical, key.join("cwd-alias")).unwrap();
     assert!(workspace::validate_destinations(
         &roots,
-        &f.key,
-        Some(text(&key.join("cwd-alias/future"))),
+        crate::caller_path::host_str(&f.key),
+        Some(crate::caller_path::host(&key.join("cwd-alias/future"))),
         &[]
     )
     .is_err());
-    workspace::validate_destinations(&roots, &f.key, Some(text(&key.join("future/nested"))), &[])
-        .unwrap();
-    assert!(workspace::validate_destinations(&[], &f.key, None, &[]).is_err());
+    workspace::validate_destinations(
+        &roots,
+        crate::caller_path::host_str(&f.key),
+        Some(text(&key.join("future/nested"))).map(|p| crate::caller_path::host_str(p)),
+        &[],
+    )
+    .unwrap();
+    assert!(
+        workspace::validate_destinations(&[], crate::caller_path::host_str(&f.key), None, &[])
+            .is_err()
+    );
 }
 
 #[test]
@@ -446,18 +466,23 @@ fn destination_roots_accept_a_root_reached_through_a_symlinked_prefix() {
     let alias = f.scratch.join("alias-root");
     symlink(&real, &alias).unwrap();
     let canonical = fs::canonicalize(real.join("workspace")).unwrap();
-    workspace::validate_destinations(std::slice::from_ref(&alias), text(&canonical), None, &[])
-        .unwrap();
+    workspace::validate_destinations(
+        std::slice::from_ref(&alias),
+        crate::caller_path::host_str(text(&canonical)),
+        None,
+        &[],
+    )
+    .unwrap();
     workspace::validate_destinations(
         &[fs::canonicalize(&real).unwrap()],
-        text(&alias.join("workspace")),
+        crate::caller_path::host_str(text(&alias.join("workspace"))),
         None,
         &[],
     )
     .unwrap();
     assert!(workspace::validate_destinations(
         &[alias],
-        text(&f.scratch.join("elsewhere")),
+        crate::caller_path::host(&f.scratch.join("elsewhere")),
         None,
         &[]
     )

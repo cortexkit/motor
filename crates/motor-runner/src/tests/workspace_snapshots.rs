@@ -162,11 +162,23 @@ fn sync_stages_ignored_snapshot_inputs(reuse: bool) {
     let path = Path::new(&f.key);
     if reuse {
         trees
-            .sync_workspace(&f.root, path, &head, &head_tree, &head)
+            .sync_workspace(
+                &f.root,
+                crate::caller_path::host(path),
+                &head,
+                &head_tree,
+                &head,
+            )
             .unwrap();
     }
     trees
-        .sync_workspace(&f.root, path, &snapshot, &tree, &head)
+        .sync_workspace(
+            &f.root,
+            crate::caller_path::host(path),
+            &snapshot,
+            &tree,
+            &head,
+        )
         .unwrap();
     assert_eq!(git(path, &["rev-parse", "HEAD"]), head);
     let staged = git(path, &["diff", "--cached", "--name-only", "-z"]);
@@ -178,7 +190,13 @@ fn sync_stages_ignored_snapshot_inputs(reuse: bool) {
     assert_eq!(trees.tree_hash(path).unwrap(), tree);
     // A later run must retain staged inputs even when no checkout is needed.
     trees
-        .sync_workspace(&f.root, path, &snapshot, &tree, &head)
+        .sync_workspace(
+            &f.root,
+            crate::caller_path::host(path),
+            &snapshot,
+            &tree,
+            &head,
+        )
         .unwrap();
     assert_eq!(
         git(path, &["diff", "--cached", "--name-only", "-z"]),
