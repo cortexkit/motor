@@ -1278,7 +1278,7 @@ where
             .await
             .at(Side::Client, "first_frame")?
             .at(Side::Client, "first_frame")?;
-        let stored = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, 0).is_some();
+        let stored = relay_state(&runtime, &claims.jti, |host, jti| host.host_settled_frames(jti, 0).is_some()).await?;
         if stored {
             streamed.store(true, Ordering::Release);
             return serve_stored(&runtime, &claims.jti, &first, &mut client, &terminal_written).await;
@@ -1324,7 +1324,10 @@ where
         // Split a borrow, not the stream itself: once the relay ends, `serve`
         // still needs the client stream to close it gracefully.
         let (mut cr, mut cw) = tokio::io::split(&mut client);
-        let (mut gr, mut gw) = guest.split();
+        let (gr, mut gw) = guest.split();
+        // Buffered, so the output pump can tell which frames have already
+        // arrived in full and take them as one batch.
+        let mut gr = tokio::io::BufReader::with_capacity(RELAY_READ_BUFFER, gr);
         // This connection owns the reverse drain after decoding Terminal or
         // selecting host-settled final frames; ownership is not client delivery.
         let draining_terminal = AtomicBool::new(false);
@@ -1338,6 +1341,8 @@ where
         let to_guest = async {
             let mut buffer = vec![0; 16384];
             loop {
+                // Bound each input turn, including the discard-only terminal drain.
+                tokio::task::yield_now().await;
                 let n = cr.read(&mut buffer).await.at(Side::Client, "relay")?;
                 if n == 0 {
                     tracing::info!(jti = claims.jti, side = "client", step = "relay", cause = "eof", "connection_closed");
@@ -1373,24 +1378,58 @@ where
         let to_client = async {
             let mut cursor: u64 = 0;
             loop {
-                let read = read_frame(&mut gr);
-                tokio::pin!(read);
-                let frame = loop {
-                    tokio::select! {
-                        result = &mut read => { break Some(result); },
-                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                            let frames = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, cursor.saturating_add(1));
-                            if let Some(frames) = frames {
-                                draining_terminal.store(true, Ordering::Release);
-                                for frame in frames { relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?; }
-                                terminal_written.store(true, Ordering::Release);
-                                break None;
+                // Ready sockets and fast state replies must not monopolise the
+                // shared task. Each turn handles at most one batch of guest
+                // frames before yielding; slow state work also yields while awaited.
+                tokio::task::yield_now().await;
+                // The pending read borrows the guest reader, so it lives only in
+                // this block; the batch below reads the reader's buffer.
+                let first = {
+                    let read = read_frame(&mut gr);
+                    tokio::pin!(read);
+                    loop {
+                        tokio::select! {
+                            result = &mut read => { break Some(result); },
+                            // Each check takes the Host mutex, and every open relay
+                            // runs one, so a short period here is itself a large
+                            // source of mutex contention on a busy host.
+                            _ = tokio::time::sleep(SETTLED_POLL) => {
+                                let frames = relay_state(&runtime, &claims.jti, move |host, jti| host.host_settled_frames(jti, cursor.saturating_add(1))).await?;
+                                if let Some(frames) = frames {
+                                    draining_terminal.store(true, Ordering::Release);
+                                    for frame in frames { relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?; }
+                                    terminal_written.store(true, Ordering::Release);
+                                    break None;
+                                }
                             }
                         }
                     }
                 };
-                let Some(frame) = frame else { return Ok::<(),anyhow::Error>(()); };
-                let settled = runtime.host.lock().expect("host lock").host_settled_frames(&claims.jti, cursor.saturating_add(1));
+                let Some(first) = first else { return Ok::<(),anyhow::Error>(()); };
+                // Frames the guest has already delivered in full go out as one
+                // batch behind one host-state round trip. Recording the output
+                // watermark is a durable snapshot write that waits for the Host
+                // mutex; paid per frame, it held a busy tenant to about one frame
+                // a second, so a replay or the burst after a cancel never reached
+                // its terminal before the client gave up. Only complete buffered
+                // frames join, so the batch never waits on the guest.
+                let mut batch = Vec::new();
+                let mut read_error = None;
+                match first {
+                    Ok(frame) => batch.push(frame),
+                    Err(error) => read_error = Some(error),
+                }
+                while read_error.is_none()
+                    && batch.len() < RELAY_BATCH_FRAMES
+                    && batch.last().is_some_and(|frame| frame["type"] != "terminal")
+                    && buffered_frame_ready(gr.buffer())
+                {
+                    match read_frame(&mut gr).await {
+                        Ok(frame) => batch.push(frame),
+                        Err(error) => read_error = Some(error),
+                    }
+                }
+                let settled = relay_state(&runtime, &claims.jti, move |host, jti| host.host_settled_frames(jti, cursor.saturating_add(1))).await?;
                 if let Some(frames) = settled {
                     draining_terminal.store(true, Ordering::Release);
                     tracing::warn!(jti=claims.jti, "host_settled_runner_frame_ignored");
@@ -1398,15 +1437,14 @@ where
                     terminal_written.store(true, Ordering::Release);
                     return Ok::<(),anyhow::Error>(());
                 }
-                let frame = frame.at(Side::Guest, "relay")?;
-                if let Some(seq) = frame["seq"].as_u64() {
-                    runtime
-                        .host
-                        .lock()
-                        .expect("host lock")
-                        .watermark(&claims.jti, seq).at(Side::Host, "relay")?;
+                // The batch's highest sequence is durable before any of its
+                // frames is visible, so the watermark stays at or above all
+                // output the client may have seen.
+                if let Some(seq) = batch.iter().filter_map(|frame| frame["seq"].as_u64()).max() {
+                    relay_state(&runtime, &claims.jti, move |host, jti| host.watermark(jti, seq)).await?.at(Side::Host, "relay")?;
                     cursor = cursor.max(seq);
                 }
+                for frame in batch {
                 if frame["type"] == "terminal" {
                     // The guest may close its input as soon as it emits Terminal.
                     // Client heartbeats must not cancel Terminal/hosted_terminal
@@ -1418,15 +1456,15 @@ where
                         return Ok::<(),anyhow::Error>(());
                     }
                     let control = runtime.control.clone();
-                    let tenant = runtime.host.lock().expect("host lock").snapshot.leases[&claims.jti].tenant.clone();
+                    let tenant = relay_state(&runtime, &claims.jti, |host, jti| host.snapshot.leases[jti].tenant.clone()).await?;
                     let sample = tokio::task::spawn_blocking(move || control.metrics(&tenant).map(|s|(tenant,s))).await.at(Side::Host, "relay")?;
-                    {
-                        let mut host = runtime.host.lock().expect("host lock");
+                    let terminal = frame.clone();
+                    relay_state(&runtime, &claims.jti, move |host, jti| {
                         if let Ok((tenant,sample)) = sample { host.sample(&tenant,sample).at(Side::Host, "relay")?; }
-                        host.receive_terminal(&claims.jti, frame.clone(), unix_ms()).at(Side::Host, "relay")?;
-                    }
+                        host.receive_terminal(jti, terminal, unix_ms()).at(Side::Host, "relay")
+                    }).await??;
                     let hosted = loop {
-                        let value = runtime.host.lock().expect("host lock").snapshot.billing.get(&claims.jti).and_then(|b| b.hosted_terminal.clone());
+                        let value = relay_state(&runtime, &claims.jti, |host, jti| host.snapshot.billing.get(jti).and_then(|b| b.hosted_terminal.clone())).await?;
                         if let Some(value) = value { break value; }
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     };
@@ -1437,6 +1475,10 @@ where
                     return Ok::<(),anyhow::Error>(());
                 }
                 relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
+                }
+                if let Some(error) = read_error {
+                    return Err(error).at(Side::Guest, "relay");
+                }
             }
             #[allow(unreachable_code)]
             Ok::<(), anyhow::Error>(())
@@ -1450,7 +1492,7 @@ where
         // stays in place until this drain ends; `connection.finish()` runs after.
         let clean = close_client(&mut client, &claims.jti).await;
         if clean && terminal_written.load(Ordering::Acquire) {
-            runtime.host.lock().expect("host lock").terminal_delivered(&claims.jti, unix_ms()).at(Side::Host, "terminal_delivered")?;
+            relay_state(&runtime, &claims.jti, |host, jti| host.terminal_delivered(jti, unix_ms())).await?.at(Side::Host, "terminal_delivered")?;
             tracing::debug!(jti = claims.jti, "connection_terminal_delivered");
         }
     }
@@ -1459,6 +1501,23 @@ where
     .map_err(|error| error.context(ConnectionJob(claims.jti.clone())));
     connection.finish().await;
     outcome
+}
+
+// The output pump awaits each reply before submitting more state work: it has
+// at most one outstanding request, including when the Host mutex or disk stalls.
+// The mutex and durable journal writes never run on the relay's async worker.
+async fn relay_state<T: Send + 'static>(
+    runtime: &Arc<Runtime>,
+    jti: &str,
+    operation: impl FnOnce(&mut Host, &str) -> T + Send + 'static,
+) -> Result<T> {
+    let runtime = runtime.clone();
+    let jti = jti.to_owned();
+    tokio::task::spawn_blocking(move || {
+        operation(&mut runtime.host.lock().expect("host lock"), &jti)
+    })
+    .await
+    .at(Side::Host, "relay")
 }
 
 async fn serve_stored(
@@ -1641,6 +1700,22 @@ async fn connection_ended(
     }
 }
 
+/// Most guest frames one relay batch forwards behind a single host-state round trip.
+const RELAY_BATCH_FRAMES: usize = 256;
+/// Read buffer for the guest side of a relay, large enough to hold a burst of frames.
+const RELAY_READ_BUFFER: usize = 256 * 1024;
+/// How often a relay waiting for guest output checks whether the host settled its job.
+const SETTLED_POLL: Duration = Duration::from_millis(500);
+
+/// Whether `buffer` already holds one whole length-prefixed frame, so
+/// `read_frame` returns it without waiting on the socket.
+fn buffered_frame_ready(buffer: &[u8]) -> bool {
+    match buffer {
+        [a, b, c, d, rest @ ..] => rest.len() >= u32::from_be_bytes([*a, *b, *c, *d]) as usize,
+        _ => false,
+    }
+}
+
 pub async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Result<Value> {
     let n = reader.read_u32().await? as usize;
     ensure!(n > 0 && n <= FRAME_LIMIT, "invalid frame length");
@@ -1695,5 +1770,19 @@ pub async fn admin_socket(runtime: Arc<Runtime>, path: &std::path::Path) -> Resu
                     write_frame(&mut stream, &json!({"ok":false,"error":"admin_refused"})).await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod buffered_frame_tests {
+    use super::buffered_frame_ready;
+
+    #[test]
+    fn needs_the_length_prefix_and_the_whole_body() {
+        assert!(!buffered_frame_ready(&[]));
+        assert!(!buffered_frame_ready(&[0, 0, 0]));
+        assert!(buffered_frame_ready(&[0, 0, 0, 0]));
+        assert!(!buffered_frame_ready(&[0, 0, 0, 2, b'{']));
+        assert!(buffered_frame_ready(&[0, 0, 0, 2, b'{', b'}', 0]));
     }
 }
