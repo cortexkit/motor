@@ -444,7 +444,8 @@ impl Harness {
                                             while motor_protocol::read_frame_async(&mut tls)
                                                 .await
                                                 .is_ok_and(|frame| frame.is_some())
-                                            {}
+                                            {
+                                            }
                                         }
                                         return;
                                     }
