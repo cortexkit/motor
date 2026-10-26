@@ -475,15 +475,17 @@ pub fn install(registries: &[Registry], config: &crate::config::Config) -> Resul
         registries,
         existing.as_ref(),
         motor_net.as_ref(),
-        inspected,
-        apply,
-        |prior| {
-            if !registries.is_empty() || std::path::Path::new("/usr/sbin/ufw").exists() {
-                ufw::reconcile(registries, prior, uplink)?;
-            }
-            Ok(())
+        ReconcileIo {
+            inspected,
+            apply,
+            reconcile_ufw: |prior: &ufw::State| {
+                if !registries.is_empty() || std::path::Path::new("/usr/sbin/ufw").exists() {
+                    ufw::reconcile(registries, prior, uplink)?;
+                }
+                Ok(())
+            },
+            validate_uplink: || commands.validate_uplink(),
         },
-        || commands.validate_uplink(),
     )
 }
 
@@ -659,16 +661,30 @@ fn tap_members(
     Ok(Some(members))
 }
 
+struct ReconcileIo<Apply, ReconcileUfw, ValidateUplink> {
+    inspected: Result<ufw::State>,
+    apply: Apply,
+    reconcile_ufw: ReconcileUfw,
+    validate_uplink: ValidateUplink,
+}
+
 fn reconcile_policy(
     uplink: &str,
     registries: &[Registry],
     existing: Option<&serde_json::Value>,
     motor_net: Option<&serde_json::Value>,
-    inspected: Result<ufw::State>,
-    mut apply: impl FnMut(&str) -> Result<()>,
-    reconcile_ufw: impl FnOnce(&ufw::State) -> Result<()>,
-    mut validate_uplink: impl FnMut() -> Result<()>,
+    io: ReconcileIo<
+        impl FnMut(&str) -> Result<()>,
+        impl FnOnce(&ufw::State) -> Result<()>,
+        impl FnMut() -> Result<()>,
+    >,
 ) -> Result<()> {
+    let ReconcileIo {
+        inspected,
+        mut apply,
+        reconcile_ufw,
+        mut validate_uplink,
+    } = io;
     use std::collections::BTreeSet;
     let desired: BTreeSet<_> = registries.iter().map(Registry::tap).collect();
     if let Err(error) = validate_uplink() {
@@ -917,7 +933,7 @@ mod tests {
         let registry = crate::tenant::tests::registry("a");
         let closed = std::collections::BTreeSet::new();
         assert_eq!(
-            policy_rules("enp6s0", &[registry.clone()], None, &closed).unwrap(),
+            policy_rules("enp6s0", std::slice::from_ref(&registry), None, &closed).unwrap(),
             expected
         );
         assert_eq!(
@@ -1346,25 +1362,27 @@ mod reconciliation_tests {
                 &[crate::tenant::tests::registry("a")],
                 Some(&existing),
                 Some(&net),
-                Ok(ufw::State {
-                    owned: [1].into(),
-                    ready: [1].into(),
-                }),
-                |text| {
-                    writes.borrow_mut().push(text.into());
-                    Ok(())
-                },
-                |_| {
-                    assert!(writes.borrow()[0].contains("closed_taps { \"mtap1\" }"));
-                    Ok(())
-                },
-                || {
-                    validations += 1;
-                    if validations == 2 && !final_ok {
-                        Err(Error("uplink disappeared".into()))
-                    } else {
+                ReconcileIo {
+                    inspected: Ok(ufw::State {
+                        owned: [1].into(),
+                        ready: [1].into(),
+                    }),
+                    apply: |text: &str| {
+                        writes.borrow_mut().push(text.into());
                         Ok(())
-                    }
+                    },
+                    reconcile_ufw: |_: &ufw::State| {
+                        assert!(writes.borrow()[0].contains("closed_taps { \"mtap1\" }"));
+                        Ok(())
+                    },
+                    validate_uplink: || {
+                        validations += 1;
+                        if validations == 2 && !final_ok {
+                            Err(Error("uplink disappeared".into()))
+                        } else {
+                            Ok(())
+                        }
+                    },
                 },
             );
             assert_eq!(result.is_ok(), final_ok);
@@ -1396,22 +1414,24 @@ mod reconciliation_tests {
             &[registry],
             None,
             None,
-            Ok(ufw::State {
-                owned: [1].into(),
-                ready: [1].into(),
-            }),
-            |text| {
-                writes.push(text.into());
-                Ok(())
-            },
-            |_| Ok(()),
-            || {
-                validations += 1;
-                if validations == 1 {
+            ReconcileIo {
+                inspected: Ok(ufw::State {
+                    owned: [1].into(),
+                    ready: [1].into(),
+                }),
+                apply: |text: &str| {
+                    writes.push(text.into());
                     Ok(())
-                } else {
-                    Err(Error("uplink eno1 disappeared".into()))
-                }
+                },
+                reconcile_ufw: |_: &ufw::State| Ok(()),
+                validate_uplink: || {
+                    validations += 1;
+                    if validations == 1 {
+                        Ok(())
+                    } else {
+                        Err(Error("uplink eno1 disappeared".into()))
+                    }
+                },
             },
         );
         assert!(result.unwrap_err().0.contains("uplink eno1 disappeared"));
@@ -1429,16 +1449,18 @@ mod reconciliation_tests {
             &[registry],
             None,
             None,
-            Ok(ufw::State {
-                owned: [1].into(),
-                ready: [1].into(),
-            }),
-            |text| {
-                writes.push(text.into());
-                Ok(())
+            ReconcileIo {
+                inspected: Ok(ufw::State {
+                    owned: [1].into(),
+                    ready: [1].into(),
+                }),
+                apply: |text: &str| {
+                    writes.push(text.into());
+                    Ok(())
+                },
+                reconcile_ufw: |_: &ufw::State| panic!("must not open UFW while uplink is missing"),
+                validate_uplink: || Err(Error("uplink eno1 missing".into())),
             },
-            |_| panic!("must not open UFW while uplink is missing"),
-            || Err(Error("uplink eno1 missing".into())),
         );
         assert!(result.unwrap_err().0.contains("uplink eno1 missing"));
         assert_eq!(writes.len(), 1);
@@ -1455,16 +1477,18 @@ mod reconciliation_tests {
             &[first, second],
             None,
             None,
-            Ok(ufw::State {
-                owned: [1].into(),
-                ready: [1].into(),
-            }),
-            |text| {
-                writes.push(text.into());
-                Ok(())
+            ReconcileIo {
+                inspected: Ok(ufw::State {
+                    owned: [1].into(),
+                    ready: [1].into(),
+                }),
+                apply: |text: &str| {
+                    writes.push(text.into());
+                    Ok(())
+                },
+                reconcile_ufw: |_: &ufw::State| Ok(()),
+                validate_uplink: || Ok(()),
             },
-            |_| Ok(()),
-            || Ok(()),
         )
         .unwrap();
         assert!(writes[0].contains("closed_taps { \"mtap2\" }"));
@@ -1480,17 +1504,19 @@ mod reconciliation_tests {
             &[registry],
             None,
             None,
-            Ok(ufw::State::default()),
-            |text| {
-                writes.borrow_mut().push(text.into());
-                Ok(())
+            ReconcileIo {
+                inspected: Ok(ufw::State::default()),
+                apply: |text: &str| {
+                    writes.borrow_mut().push(text.into());
+                    Ok(())
+                },
+                reconcile_ufw: |_: &ufw::State| {
+                    assert!(writes.borrow()[0]
+                        .contains("add element inet motor_tenant closed_taps { \"mtap1\" }"));
+                    Err(Error("simulated UFW failure".into()))
+                },
+                validate_uplink: || Ok(()),
             },
-            |_| {
-                assert!(writes.borrow()[0]
-                    .contains("add element inet motor_tenant closed_taps { \"mtap1\" }"));
-                Err(Error("simulated UFW failure".into()))
-            },
-            || Ok(()),
         )
         .unwrap_err();
         assert!(error.to_string().contains("simulated UFW failure"));
@@ -1509,17 +1535,19 @@ mod reconciliation_tests {
             &[registry],
             None,
             None,
-            Ok(ufw::State::default()),
-            |text| {
-                writes.borrow_mut().push(text.into());
-                Ok(())
+            ReconcileIo {
+                inspected: Ok(ufw::State::default()),
+                apply: |text: &str| {
+                    writes.borrow_mut().push(text.into());
+                    Ok(())
+                },
+                reconcile_ufw: |_: &ufw::State| {
+                    assert!(writes.borrow()[0].contains("closed_taps { \"mtap1\" }"));
+                    assert!(writes.borrow()[0].contains("tenant_unmatched"));
+                    Ok(())
+                },
+                validate_uplink: || Ok(()),
             },
-            |_| {
-                assert!(writes.borrow()[0].contains("closed_taps { \"mtap1\" }"));
-                assert!(writes.borrow()[0].contains("tenant_unmatched"));
-                Ok(())
-            },
-            || Ok(()),
         )
         .unwrap();
         assert_eq!(writes.borrow().len(), 2);
@@ -1546,13 +1574,15 @@ mod ufw_failure_fence_tests {
             &[registry],
             None,
             None,
-            Ok(state),
-            |text| {
-                writes.push(text.into());
-                Ok(())
+            ReconcileIo {
+                inspected: Ok(state),
+                apply: |text: &str| {
+                    writes.push(text.into());
+                    Ok(())
+                },
+                reconcile_ufw: |_: &ufw::State| Err(Error("UFW failure".into())),
+                validate_uplink: || Ok(()),
             },
-            |_| Err(Error("UFW failure".into())),
-            || Ok(()),
         )
         .is_err());
         assert_eq!(writes.len(), 2);
