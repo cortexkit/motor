@@ -63,8 +63,13 @@ impl backend::Backend for SchedulerFixtureBackend {
     ) -> io::Result<Option<bool>> {
         backend::HostBackend.unit_alive(config, process)
     }
-    fn collect_changes(&self, trees: &Trees, job: &Job) -> io::Result<Option<Vec<String>>> {
-        backend::HostBackend.collect_changes(trees, job)
+    fn collect_changes(
+        &self,
+        config: &Config,
+        trees: &Trees,
+        job: &Job,
+    ) -> io::Result<Option<Vec<String>>> {
+        backend::HostBackend.collect_changes(config, trees, job)
     }
     fn reconcile(&self, config: &Config, interrupted: &[Job]) -> io::Result<Vec<Uuid>> {
         backend::HostBackend.reconcile(config, interrupted)

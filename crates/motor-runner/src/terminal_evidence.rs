@@ -151,7 +151,8 @@ impl Runner {
                 }
             }
         }
-        evidence.workspace = VolumeEvidence::read(Path::new(job.key()));
+        evidence.workspace =
+            VolumeEvidence::read(&crate::caller_path::evidence_volume(&self.core.config, job));
         evidence.state = VolumeEvidence::read(&self.core.trees.state);
         evidence
     }

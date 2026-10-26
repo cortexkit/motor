@@ -4371,6 +4371,9 @@ async fn live_isolated_runner_wire_smoke() {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "tests/isolated_caller_roots.rs"]
+mod isolated_caller_roots;
+#[cfg(target_os = "linux")]
 #[path = "tests/isolated_shm.rs"]
 mod isolated_shm;
 #[cfg(target_os = "linux")]
@@ -5291,7 +5294,12 @@ impl Backend for RecordingBackend {
     ) -> io::Result<Option<bool>> {
         backend::HostBackend.unit_alive(config, process)
     }
-    fn collect_changes(&self, _trees: &Trees, job: &Job) -> io::Result<Option<Vec<String>>> {
+    fn collect_changes(
+        &self,
+        _config: &Config,
+        _trees: &Trees,
+        job: &Job,
+    ) -> io::Result<Option<Vec<String>>> {
         self.0.lock().unwrap().push((job.id, "collect_changes"));
         Ok((!job.base).then(|| vec!["backend-collected".into()]))
     }

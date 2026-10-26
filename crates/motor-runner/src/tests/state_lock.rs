@@ -49,7 +49,12 @@ impl Backend for HeldBackend {
         Ok(stopped.then_some(false))
     }
 
-    fn collect_changes(&self, _: &Trees, job: &Job) -> io::Result<Option<Vec<String>>> {
+    fn collect_changes(
+        &self,
+        _config: &Config,
+        _: &Trees,
+        job: &Job,
+    ) -> io::Result<Option<Vec<String>>> {
         self.events.lock().unwrap().push(("collect", job.id));
         Ok(Some(Vec::new()))
     }

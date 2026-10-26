@@ -279,7 +279,7 @@ impl Runner {
         {
             return;
         }
-        let claims = PathClaims::of(&inner);
+        let claims = PathClaims::of(&inner, &self.core.config);
         let legacy_siblings: Vec<_> = inner
             .jobs
             .values()
@@ -399,11 +399,15 @@ pub(super) struct PathClaims {
 }
 
 impl PathClaims {
-    pub(super) fn of(inner: &Inner) -> Self {
+    pub(super) fn of(inner: &Inner, config: &crate::Config) -> Self {
+        // Each claim is compared in host form. A mapped caller path is never
+        // resolved on the host's own filesystem, where whatever happens to sit
+        // at that spelling could make it look like an unrelated tree.
+        let host = |caller: &str| crate::caller_path::host_path(config, caller);
         let workspaces = crate::caller_path::entries(&inner.catalog.workspaces)
             .map(|(key, workspace)| {
                 (
-                    Spelled::new(key.host),
+                    Spelled::new(crate::caller_path::host(&host(key.caller.text()))),
                     crate::caller_path::workspace_record(workspace)
                         .repository
                         .caller
@@ -418,37 +422,32 @@ impl PathClaims {
             if let (true, Some(request)) = (SnapshotReferences::live(inner, job), &job.request) {
                 let plan = crate::caller_path::request(request);
                 if workspace::absolute(plan.caller_workspace_key.text()) {
-                    live.push(plan.host_workspace);
+                    live.push(host(plan.caller_workspace_key.text()));
                 }
-                live.push(crate::caller_path::run(request).host_cwd);
+                live.push(host(crate::caller_path::run(request).caller_cwd.text()));
             }
         }
-        live.extend(crate::caller_path::keys(&inner.reserved).map(|path| path.host));
+        live.extend(crate::caller_path::keys(&inner.reserved).map(|path| host(path.caller.text())));
         for request in inner.admitting.values() {
             let plan = crate::caller_path::request(request);
             if workspace::absolute(plan.caller_workspace_key.text()) {
-                live.push(plan.host_workspace);
+                live.push(host(plan.caller_workspace_key.text()));
             }
-            live.push(crate::caller_path::run(request).host_cwd);
+            live.push(host(crate::caller_path::run(request).caller_cwd.text()));
         }
         live.extend(
             inner
                 .preparing
                 .values()
-                .map(|r| crate::caller_path::request(r).host_workspace),
+                .map(|r| host(crate::caller_path::request(r).caller_workspace_key.text())),
         );
-        live.extend(
-            inner
-                .dropping
-                .iter()
-                .map(|path| crate::caller_path::identity(path).host),
-        );
+        live.extend(inner.dropping.iter().map(|path| host(path)));
         let live = live
             .into_iter()
             // Warm-build keys (`base:<root>`) and requests without a
             // workspace name no host path.
-            .filter(|path| workspace::absolute(&path.as_path().to_string_lossy()))
-            .map(Spelled::new)
+            .filter(|path| workspace::absolute(&path.to_string_lossy()))
+            .map(|path| Spelled::new(crate::caller_path::host(&path)))
             .collect();
         Self { workspaces, live }
     }

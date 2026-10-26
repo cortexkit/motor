@@ -306,7 +306,12 @@ pub(crate) trait Backend: Send + Sync {
     ) -> io::Result<Option<std::process::ExitStatus>> {
         Ok(None)
     }
-    fn collect_changes(&self, trees: &Trees, job: &Job) -> io::Result<Option<Vec<String>>>;
+    fn collect_changes(
+        &self,
+        config: &Config,
+        trees: &Trees,
+        job: &Job,
+    ) -> io::Result<Option<Vec<String>>>;
     /// Called under the exclusive instance lock before serving jobs. Returns
     /// the ids whose execution or durable output can be monitored after restart.
     fn reconcile(&self, config: &Config, interrupted: &[Job]) -> io::Result<Vec<Uuid>>;
@@ -530,7 +535,25 @@ impl Backend for HostBackend {
     }
     fn materialize(&self, config: &Config, trees: &Trees, s: &Setup) -> io::Result<Prepared> {
         let r = &s.request;
+        // A mapped job's trees live under a host root; every filesystem step
+        // below uses their host forms, and only the sandbox sees caller paths.
+        let mapped = paths::mapped_run(config, r);
+        let host = paths::host_run(config, r);
+        let host_siblings = paths::host_siblings(config, &r.siblings);
         let validate = || -> io::Result<()> {
+            if mapped {
+                let authorized = paths::validate_mapped_run(config, r, s.base)?;
+                if !s.base {
+                    crate::writer::validate_paths(
+                        config,
+                        paths::host(&authorized.host_workspace),
+                        authorized.host_cwd.as_deref().map(paths::host),
+                        &authorized.host_siblings,
+                        &[],
+                    )?;
+                }
+                return Ok(());
+            }
             workspace::validate_destinations(
                 &config.owned_workspace_roots,
                 crate::caller_path::host_str(if s.base {
@@ -570,18 +593,12 @@ impl Backend for HostBackend {
             // of it (see `workspace_access`).
             crate::workspace_access::validate_with_repair(
                 config,
-                paths::request(r).host_workspace,
-                &r.siblings,
+                paths::host(&host.host_workspace),
+                &host_siblings,
                 validate,
             )?;
         }
-        let path = if s.base {
-            paths::run(r).host_cwd
-        } else {
-            paths::request(r).host_workspace
-        }
-        .as_path()
-        .to_path_buf();
+        let path = host.host_workspace.clone();
         #[cfg(target_os = "linux")]
         if config.boat_profile && path.exists() {
             // Bound hostile cached trees before permission repair or checkout
@@ -673,14 +690,14 @@ impl Backend for HostBackend {
                     // sibling's path by the sandbox: only the main workspace
                     // is checked out on the host.
                     Some(_) => trees.populate_main(
-                        paths::request(r).host_workspace,
+                        paths::host(&path),
                         paths::request(r).caller_repository_root.text(),
                         &r.snapshot_commit,
                         &r.tree_hash,
                         &caller_commit,
                     ),
                     None => trees.populate(
-                        paths::request(r).host_workspace,
+                        paths::host(&path),
                         paths::request(r).caller_repository_root.text(),
                         &r.snapshot_commit,
                         &r.siblings,
@@ -698,15 +715,18 @@ impl Backend for HostBackend {
         if computed != r.tree_hash {
             return Err(Trees::tree_hash_mismatch(&path, &r.tree_hash, &computed));
         }
-        let cwd = setup_step(
-            "resolve job cwd",
-            fs::canonicalize(paths::run(r).host_cwd.as_path()),
-        )?;
+        let cwd = setup_step("resolve job cwd", fs::canonicalize(&host.host_cwd))?;
         if !cwd.starts_with(setup_step(
             "resolve workspace path",
             fs::canonicalize(&path),
         )?) {
             return Err(invalid("cwd outside workspace"));
+        }
+        // A mapped job sees its cwd at the caller form of this host path, and
+        // that form is derived from the configured host root's spelling. The
+        // no-symlink checks above make the resolved path that same spelling.
+        if mapped && cwd != host.host_cwd {
+            return Err(invalid("mapped cwd does not resolve to its host path"));
         }
         let target = if s.base {
             let target = config.writer_scratch_dir().join(s.id.to_string());
@@ -851,7 +871,7 @@ impl Backend for HostBackend {
                         crate::isolation::Sandbox::prepare_writer(
                             s.id,
                             &trees.state,
-                            &path,
+                            paths::JobTree::new(&path, paths::caller_checkout(r)),
                             &target,
                             wrapper.as_deref(),
                             &config.build_slot_root,
@@ -866,7 +886,7 @@ impl Backend for HostBackend {
                         crate::isolation::Sandbox::prepare_with_dependencies(
                             s.id,
                             &trees.state,
-                            &path,
+                            paths::JobTree::new(&path, paths::caller_checkout(r)),
                             &target,
                             &r.siblings,
                             wrapper.as_deref(),
@@ -976,19 +996,14 @@ impl Backend for HostBackend {
         }
         #[cfg(target_os = "linux")]
         if config.boat_profile {
-            let workspace = if s.base {
-                paths::run(r).host_cwd
-            } else {
-                paths::request(r).host_workspace
-            }
-            .as_path();
+            let workspace = paths::host_run(config, r).host_workspace;
             setup_step(
                 "verify Boat quota lease",
                 crate::boat_quota::validate_for_launch(
                     &trees.state,
                     s.id,
                     &crate::boat_quota::job_roots(
-                        workspace,
+                        &workspace,
                         &prepared.target,
                         &trees.state.join("sandboxes").join(s.id.to_string()),
                         &trees.state.join("spools").join(s.id.to_string()),
@@ -1050,9 +1065,18 @@ impl Backend for HostBackend {
             )
         });
         env.insert("CK_REMOTE_SOURCE_COMMIT".to_string(), caller_commit);
+        // An isolated job sees its trees at caller paths; only the test-only
+        // unisolated configuration runs a mapped job at its host paths.
+        let job_path = |host: &std::path::Path| {
+            if config.isolate_jobs {
+                paths::caller_form(config, host)
+            } else {
+                host.to_path_buf()
+            }
+        };
         env.insert(
             "CARGO_TARGET_DIR".to_string(),
-            prepared.target.to_string_lossy().to_string(),
+            job_path(&prepared.target).to_string_lossy().to_string(),
         );
         compile_cache_environment(config, s, prepared, &mut env)?;
         let env = env.into_iter().collect::<Vec<_>>();
@@ -1063,7 +1087,7 @@ impl Backend for HostBackend {
                 .ok_or_else(|| io::Error::other("isolated job has no prepared sandbox"))?;
             sandbox.launch(
                 &s.request.command,
-                &prepared.host_cwd,
+                &job_path(&prepared.host_cwd),
                 &env,
                 &s.cpus,
                 weight,
@@ -1152,8 +1176,13 @@ impl Backend for HostBackend {
         Ok(None)
     }
 
-    fn collect_changes(&self, trees: &Trees, job: &Job) -> io::Result<Option<Vec<String>>> {
-        Ok((!job.base).then(|| trees.changes(paths::job_workspace(job).as_path())))
+    fn collect_changes(
+        &self,
+        config: &Config,
+        trees: &Trees,
+        job: &Job,
+    ) -> io::Result<Option<Vec<String>>> {
+        Ok((!job.base).then(|| trees.changes(&paths::job_workspace(config, job))))
     }
 
     fn reconcile(&self, config: &Config, interrupted: &[Job]) -> io::Result<Vec<Uuid>> {
@@ -1223,7 +1252,7 @@ fn compile_cache_environment(
         // folder as on the build server; the sandbox binds it to the job's own
         // target folder (`compile_cache_mounts`).
         #[cfg(target_os = "linux")]
-        if config.isolate_jobs && rust_job(setup) {
+        if config.isolate_jobs && rust_job(config, setup) {
             env.insert(
                 "CARGO_TARGET_DIR".into(),
                 crate::compile_cache::TARGET.into(),
@@ -1243,7 +1272,7 @@ fn compile_cache_environment(
         env.remove("RUSTC_WRAPPER");
     }
     #[cfg(target_os = "linux")]
-    if config.isolate_jobs && rust_job(setup) {
+    if config.isolate_jobs && rust_job(config, setup) {
         crate::compile_cache::reader_environment(env, config.sccache_size_gib);
         if setup.base {
             env.insert("SCCACHE_LOCAL_RW_MODE".into(), "READ_WRITE".into());
@@ -1256,7 +1285,7 @@ fn compile_cache_environment(
         if prepared.wrapper.is_none()
             && (setup.base
                 || !crate::compile_cache::configured_wrapper(
-                    paths::request(&setup.request).host_workspace.as_path(),
+                    &paths::host_run(config, &setup.request).host_workspace,
                     &prepared.host_cwd,
                 )?)
         {
@@ -1287,11 +1316,10 @@ fn compile_cache_environment(
 
 /// A cache fill, or a job whose workspace root is a Cargo workspace.
 #[cfg(target_os = "linux")]
-fn rust_job(setup: &Setup) -> bool {
+fn rust_job(config: &Config, setup: &Setup) -> bool {
     setup.base
-        || paths::request(&setup.request)
+        || paths::host_run(config, &setup.request)
             .host_workspace
-            .as_path()
             .join("Cargo.toml")
             .is_file()
 }
@@ -1321,7 +1349,7 @@ pub(crate) fn scrub_inherited_cache_environment(
     // Declared C/C++ fills and jobs need not contain a Cargo manifest.
     env.retain(|key, _| !key.starts_with("CCACHE_"));
     #[cfg(target_os = "linux")]
-    if !(setup.base || rust_job(setup)) {
+    if !(setup.base || rust_job(config, setup)) {
         return;
     }
     #[cfg(not(target_os = "linux"))]

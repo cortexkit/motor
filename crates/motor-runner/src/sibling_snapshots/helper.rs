@@ -132,10 +132,21 @@ impl View {
     /// parent is not P's parent, at the alias `<parent of W>/<name of P>`
     /// where a job sees it too. All read-only.
     pub(crate) fn prefetch(workspace: &Path, siblings: &[(PathBuf, PathBuf)]) -> io::Result<Self> {
+        Self::prefetch_tree(workspace, workspace, siblings)
+    }
+
+    /// [`Self::prefetch`] for a workspace stored at host path `source` and
+    /// seen by its jobs at `workspace`: the view binds `source` there, and
+    /// sibling aliases sit beside `workspace`, as in the job's own unit.
+    pub(crate) fn prefetch_tree(
+        source: &Path,
+        workspace: &Path,
+        siblings: &[(PathBuf, PathBuf)],
+    ) -> io::Result<Self> {
         let parent = workspace
             .parent()
             .ok_or_else(|| io::Error::other("workspace has no parent directory"))?;
-        let mut view = Self::default().read_only(workspace, workspace);
+        let mut view = Self::default().read_only(source, workspace);
         for (snapshot, path) in siblings {
             view = view.read_only(snapshot, path);
             let alias = parent.join(

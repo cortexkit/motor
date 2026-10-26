@@ -178,30 +178,6 @@ fn requires_test(attr: &[&str]) -> bool {
     false
 }
 
-fn deferred_volume_key_read(path: &str, tokens: &[Token], index: usize) -> bool {
-    // The terminal-volume probe historically stats a fill's scheduling key.
-    // Selecting its checkout instead changes persisted evidence, so only this
-    // named legacy consumer may read the opaque key directly.
-    if path != "terminal_evidence.rs" {
-        return false;
-    }
-    for start in 0..index {
-        if tokens[start].text == "fn"
-            && tokens
-                .get(start + 1)
-                .is_some_and(|t| t.text == "execution_evidence")
-        {
-            let body = (start..tokens.len())
-                .find(|i| tokens[*i].text == "{")
-                .unwrap();
-            if (body..=close(tokens, body, "{", "}")).contains(&index) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 fn normalized_module_path(path: PathBuf) -> PathBuf {
     let mut result = PathBuf::new();
     for component in path.components() {
@@ -481,8 +457,7 @@ fn scan(root: &Path, allowlist: &[&str]) -> Result<(), String> {
                 || (pair[0].text == "."
                     && pair[1].text == "key"
                     && tokens.get(index + 2).is_some_and(|t| t.text == "(")
-                    && tokens.get(index + 3).is_some_and(|t| t.text == ")")
-                    && !deferred_volume_key_read(relative, &tokens, index))
+                    && tokens.get(index + 3).is_some_and(|t| t.text == ")"))
             {
                 hits.push(format!("{relative}:{} .{}", pair[1].line, pair[1].text));
             }
@@ -620,19 +595,16 @@ fn backstop_rejects_planted_reads_and_allowlist_drift_but_accepts_test_reads() {
         assert!(scan(&scratch, ALLOWLIST).is_err(), "{source}");
     }
     fs::write(scratch.join("production.rs"), "").unwrap();
-    fs::write(
-        scratch.join("terminal_evidence.rs"),
-        "fn execution_evidence() { job.key(); }",
-    )
-    .unwrap();
-    scan(&scratch, ALLOWLIST).unwrap();
+    // Terminal evidence once had its own exception for a fill's key; it now
+    // reads the probed path through caller_path like every other consumer.
     for source in [
-        "fn other() { job.key(); }",
+        "fn execution_evidence() { job.key(); }",
         "fn execution_evidence() { request.cwd; }",
     ] {
         fs::write(scratch.join("terminal_evidence.rs"), source).unwrap();
         assert!(scan(&scratch, ALLOWLIST).is_err(), "{source}");
     }
+    fs::remove_file(scratch.join("terminal_evidence.rs")).unwrap();
     assert!(scan(&scratch, &ALLOWLIST[1..])
         .unwrap_err()
         .contains("fixed file set"));

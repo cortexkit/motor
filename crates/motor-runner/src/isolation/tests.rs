@@ -11,6 +11,8 @@ mod privilege;
 mod command_golden;
 #[path = "compatibility_tests.rs"]
 mod compatibility;
+#[path = "mapped_tests.rs"]
+mod mapped;
 
 #[path = "remote_cache_tests.rs"]
 mod remote_cache;

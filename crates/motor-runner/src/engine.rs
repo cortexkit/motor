@@ -7303,12 +7303,16 @@ impl Runner {
             if let Some(snapshots) = &mut s.snapshots {
                 let r = &s.request;
                 // Validated before a sibling's mirror is read for it.
-                workspace::validate_destinations(
-                    &self.core.config.owned_workspace_roots,
-                    paths::request(r).host_workspace,
-                    Some(paths::run(r).host_cwd),
-                    &r.siblings,
-                )?;
+                if paths::mapped_run(&self.core.config, r) {
+                    paths::validate_mapped_run(&self.core.config, r, false)?;
+                } else {
+                    workspace::validate_destinations(
+                        &self.core.config.owned_workspace_roots,
+                        paths::request(r).host_workspace,
+                        Some(paths::run(r).host_cwd),
+                        &r.siblings,
+                    )?;
+                }
                 let resolved = setup_step(
                     "prepare sibling snapshots",
                     crate::setup_log::phase("prepare sibling snapshots", || {
@@ -8559,20 +8563,26 @@ impl Runner {
         // reclaims the rest of the tree. A failure here only loses the scan.
         #[cfg(target_os = "linux")]
         if self.core.config.isolate_jobs && !job.base && !self.core.config.vm_instance() {
-            let root = paths::job_workspace(&job).as_path();
+            let root = paths::job_workspace(&self.core.config, &job);
+            let root = root.as_path();
             if fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_dir()) {
                 if let Err(error) = crate::isolation::restore_runner_root_access(root) {
                     tracing::warn!(job_id = %id, workspace = %root.display(), %error, "cannot restore runner access to the workspace root after the job");
                 }
             }
         }
-        let changes = match self.core.backend.collect_changes(&self.core.trees, &job) {
-            Ok(changes) => changes,
-            Err(error) => {
-                tracing::warn!(job_id = %id, %error, "scan_failed");
-                None
-            }
-        };
+        let changes =
+            match self
+                .core
+                .backend
+                .collect_changes(&self.core.config, &self.core.trees, &job)
+            {
+                Ok(changes) => changes,
+                Err(error) => {
+                    tracing::warn!(job_id = %id, %error, "scan_failed");
+                    None
+                }
+            };
         self.finish_step(id, &job.kill, "workspace changes collected", finish_started);
         let lost_status = status.as_ref().err().map(ToString::to_string);
         let mut status = status;
@@ -8587,10 +8597,11 @@ impl Runner {
         }
         let lock_check = if job.base {
             let r = job.request.as_ref().unwrap();
+            let checkout = paths::host_run(&self.core.config, r).host_cwd;
             (|| -> io::Result<()> {
                 #[cfg(target_os = "linux")]
                 if self.core.config.isolate_jobs {
-                    crate::isolation::restore_runner_access(paths::run(r).host_cwd.as_path())?;
+                    crate::isolation::restore_runner_access(&checkout)?;
                 }
                 for (path, bytes) in crate::writer::fill::lockfiles(
                     &self
@@ -8598,7 +8609,7 @@ impl Runner {
                         .trees
                         .mirror(paths::request(r).caller_repository_root.text()),
                     &r.snapshot_commit,
-                    paths::run(r).host_cwd.as_path(),
+                    &checkout,
                 )? {
                     let original = workspace::blob(
                         &self

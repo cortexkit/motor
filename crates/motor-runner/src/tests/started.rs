@@ -380,11 +380,16 @@ impl Backend for FaultBackend {
     ) -> io::Result<Option<bool>> {
         backend::HostBackend.unit_alive(c, p)
     }
-    fn collect_changes(&self, t: &Trees, j: &Job) -> io::Result<Option<Vec<String>>> {
+    fn collect_changes(
+        &self,
+        config: &Config,
+        t: &Trees,
+        j: &Job,
+    ) -> io::Result<Option<Vec<String>>> {
         if self.stage == "collect" {
             Err(io::Error::other("injected change collection failure"))
         } else {
-            backend::HostBackend.collect_changes(t, j)
+            backend::HostBackend.collect_changes(config, t, j)
         }
     }
     fn reconcile(&self, c: &Config, jobs: &[Job]) -> io::Result<Vec<Uuid>> {
