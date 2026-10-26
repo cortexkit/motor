@@ -131,13 +131,14 @@ inside the checkout, for example `target/scratch/macos-image`.
 ## Host installation and update
 
 Run once as the provider's `rentamac` account using sudo; the same command updates
-an installation. Supply the vault's **public** CA, never its private key:
+an installation. Supply ck-motor's SSH public key: the `identity.pub` its vault
+agent publishes for the vault's Ed25519 runner key (a plain key, not a CA):
 
 ```sh
 sudo python3 script/macos-runner/install.py install \
   --image "$IMAGE" --state-root /Users/motor/.motor --instance macos \
   --runner "$RUNNER" --vm-helper "$MACVM" \
-  --tool-bundle target/scratch/macos-image/tools --vault-ca "$VAULT_CA_PUBLIC_KEY"
+  --tool-bundle target/scratch/macos-image/tools --runner-key "$CK_MOTOR_IDENTITY_PUB"
 sudo python3 script/macos-runner/install.py --check \
   --image "$IMAGE" --state-root /Users/motor/.motor --instance macos
 ```
@@ -152,8 +153,9 @@ copy. The root-owned LaunchDaemon runs as `motor` and explicitly selects
 runner's existing schema, with absolute image/helper paths and four pinned prep
 tools; no image provenance fields are added to that schema.
 
-The marked sshd block applies only to `motor`, trusts the installed vault CA and
-requires the `motor` authorized principal. `sshd -t` validates edits; `--check`
+The marked sshd block applies only to `motor` and accepts only the pinned key in
+the root-owned `/etc/ssh/motor/authorized_keys`, with no user CA. When the vault
+key is rotated, rerun the install with the new public key. `sshd -t` validates edits; `--check`
 also checks `sshd -T -C user=motor,...`, not merely a matching comment. Existing
 provider SSH settings are preserved. `install.py uninstall` removes **only** the
 marked block, preserving unrelated sshd content, accounts, service and data.

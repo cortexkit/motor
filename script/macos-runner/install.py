@@ -46,10 +46,12 @@ def remove_block(text):
     return text[:start - 1] + text[end + 1:]
 
 
-def ssh_block(ca=SSH_ROOT / "vault-ca.pub", principals=SSH_ROOT / "principals"):
+# ck-motor signs with one plain Ed25519 key held in the credential vault (no
+# CA, no certificates), so sshd pins exactly that public key for `motor`, in a
+# root-owned file the account cannot edit.
+def ssh_block(keys=SSH_ROOT / "authorized_keys"):
     return (f"\n{BEGIN}\nMatch all\nMatch User motor\n"
-            f"    TrustedUserCAKeys {ca}\n    AuthorizedPrincipalsFile {principals}\n"
-            "    AuthorizedKeysFile none\n    PubkeyAuthentication yes\nMatch all\n" + END + "\n")
+            f"    AuthorizedKeysFile {keys}\n    PubkeyAuthentication yes\nMatch all\n" + END + "\n")
 
 
 def daemon(runner, state_root, instance, vm_config):
@@ -133,15 +135,15 @@ def image_errors(image, manifest_sha256):
     return errors
 
 
-def ssh_errors(text, effective, ca, principals):
+def ssh_errors(text, effective, keys):
     errors = []
-    if ssh_block(ca, principals) not in text:
+    if ssh_block(keys) not in text:
         errors.append("managed sshd Match User motor block is missing or changed")
     values = dict(line.split(None, 1) for line in effective.splitlines() if " " in line)
-    if values.get("trustedusercakeys") != str(ca) or values.get("authorizedprincipalsfile") != str(principals):
-        errors.append("sshd does not trust the vault CA/principals for motor")
-    if values.get("authorizedkeysfile") != "none":
-        errors.append("sshd still accepts unmanaged motor authorized keys")
+    if values.get("authorizedkeysfile") != str(keys):
+        errors.append("sshd does not pin the runner key file for motor")
+    if values.get("trustedusercakeys", "none") != "none":
+        errors.append("sshd trusts a user CA for motor")
     return errors
 
 
@@ -171,11 +173,11 @@ def check_install(state_root, image, instance, manifest, config=CONFIG, plist_pa
     if not stat.S_ISSOCK(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != pwd.getpwnam("motor").pw_uid:
         errors.append("runner socket must be motor-owned mode 0600")
     errors.extend(tool_errors(state_root / "tools", manifest))
-    ca, principals = ssh_root / "vault-ca.pub", ssh_root / "principals"
-    if parity.digest(ca) != installed["vault_ca_sha256"] or parity.digest(principals) != installed["principals_sha256"]:
-        errors.append("vault CA or authorized principals changed")
+    keys = ssh_root / "authorized_keys"
+    if parity.digest(keys) != installed["authorized_keys_sha256"]:
+        errors.append("pinned runner key changed")
     effective = run("/usr/sbin/sshd", "-T", "-f", sshd, "-C", "user=motor,host=localhost,addr=127.0.0.1")
-    errors.extend(ssh_errors(sshd.read_text(), effective, ca, principals))
+    errors.extend(ssh_errors(sshd.read_text(), effective, keys))
     errors.extend(image_errors(image, parity.digest(config / "toolchain.json")))
     return errors
 
@@ -216,8 +218,9 @@ def install(args, manifest):
     errors = image_errors(args.image, parity.digest(args.manifest))
     if errors:
         raise ValueError("; ".join(errors))
-    if not args.vault_ca.read_text().startswith("ssh-ed25519 "):
-        raise ValueError("vault CA must be an OpenSSH ed25519 public key")
+    runner_key = args.runner_key.read_text()
+    if len(runner_key.splitlines()) != 1 or len(runner_key.split()) != 2 or not runner_key.startswith("ssh-ed25519 "):
+        raise ValueError("runner key must be one bare OpenSSH ed25519 public key line")
     account = create_account()
     args.state_root.mkdir(parents=True, exist_ok=True)
     os.chown(args.state_root, account.pw_uid, account.pw_gid)
@@ -247,10 +250,10 @@ def install(args, manifest):
     shutil.copyfile(args.manifest, CONFIG / "toolchain.json")
     (CONFIG / "vm.toml").write_text(vm_configuration(args.image, CONFIG / "motor-macvm", tools, manifest))
     SSH_ROOT.mkdir(mode=0o755, exist_ok=True)
-    shutil.copyfile(args.vault_ca, SSH_ROOT / "vault-ca.pub")
-    (SSH_ROOT / "principals").write_text("motor\n")
-    for path in (SSH_ROOT / "vault-ca.pub", SSH_ROOT / "principals"):
-        path.chmod(0o644)
+    keys = SSH_ROOT / "authorized_keys"
+    keys.write_text(runner_key.strip() + "\n")
+    os.chown(keys, 0, 0)
+    keys.chmod(0o644)
     original = SSHD.read_text()
     SSHD.write_text(remove_block(original) + ssh_block())
     try:
@@ -260,8 +263,7 @@ def install(args, manifest):
         raise
     installed = {"runner": str(CONFIG / "motor-runner"), "helper": str(CONFIG / "motor-macvm"),
                  "manifest_sha256": parity.digest(CONFIG / "toolchain.json"),
-                 "vault_ca_sha256": parity.digest(SSH_ROOT / "vault-ca.pub"),
-                 "principals_sha256": parity.digest(SSH_ROOT / "principals")}
+                 "authorized_keys_sha256": parity.digest(SSH_ROOT / "authorized_keys")}
     (CONFIG / "install.json").write_text(json.dumps(installed, indent=2) + "\n")
     PLIST.write_bytes(plistlib.dumps(daemon(CONFIG / "motor-runner", args.state_root, args.instance, CONFIG / "vm.toml")))
     PLIST.chmod(0o644)
@@ -280,7 +282,8 @@ def main():
     parser.add_argument("--runner", type=Path)
     parser.add_argument("--vm-helper", type=Path)
     parser.add_argument("--tool-bundle", type=Path)
-    parser.add_argument("--vault-ca", type=Path)
+    parser.add_argument("--runner-key", type=Path,
+                        help="ck-motor's vault SSH public key line (its agent's identity.pub)")
     args = parser.parse_args()
     if sys.platform != "darwin" or os.geteuid() != 0:
         parser.error("run on the VM host with sudo from rentamac")
@@ -303,7 +306,7 @@ def main():
         return int(bool(errors))
     if os.environ.get("SUDO_USER") != "rentamac":
         parser.error("first install and updates must be invoked by rentamac using sudo")
-    for name in ("runner", "vm_helper", "tool_bundle", "vault_ca"):
+    for name in ("runner", "vm_helper", "tool_bundle", "runner_key"):
         if getattr(args, name) is None:
             parser.error("install requires --" + name.replace("_", "-"))
     install(args, manifest)

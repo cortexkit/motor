@@ -1790,7 +1790,7 @@ async fn spilled_bad_request_reply(status: u16, body: String) {
 }
 
 /// A spilled job whose timeout no lease body can carry (CLOUD takes 10 to
-/// 7200 seconds) is never sent to the broker: it goes straight back to the
+/// 21600 seconds) is never sent to the broker: it goes straight back to the
 /// build-server queue, and a warning names the job, the member and the
 /// body's non-secret members.
 #[tokio::test]
@@ -1814,7 +1814,7 @@ async fn spilled_job_with_an_unsendable_timeout_returns_without_a_lease_request(
     let _log = crate::logging::scoped(captured.clone());
     let id = Uuid::now_v7();
     let records =
-        run_spilled_with_timeout(&motor, id, &repo, 30, Duration::from_secs(30), 10_800).await;
+        run_spilled_with_timeout(&motor, id, &repo, 30, Duration::from_secs(30), 21_601).await;
     assert_one_build_server_job(id, &records);
     assert_resubmitted_once(id, &log.lock().unwrap(), 30);
     assert!(broker.requests.lock().unwrap().is_empty());
@@ -1829,9 +1829,10 @@ async fn spilled_job_with_an_unsendable_timeout_returns_without_a_lease_request(
         "WARN".to_owned(),
         format!("job_id={id}"),
         "field=timeout_s".into(),
-        "timeout_s=10800".into(),
+        "timeout_s=21601".into(),
         "vcpus=2".into(),
-        "allow_spill=true".into(),
+        // Over Boat's 2-hour limit, a lease never asks to spill.
+        "allow_spill=false".into(),
     ] {
         assert!(invalid[0].contains(&field), "{field}: {text}");
     }

@@ -210,14 +210,12 @@ class InstallerTests(unittest.TestCase):
         (self.config / "toolchain.json").write_text(json.dumps(self.manifest))
         self.ssh = self.root / "ssh"
         self.ssh.mkdir()
-        for name in ("vault-ca.pub", "principals"):
-            (self.ssh / name).write_text(name)
+        (self.ssh / "authorized_keys").write_text("ssh-ed25519 AAAA\n")
         self.sshd = self.root / "sshd_config"
-        self.sshd.write_text("Port 22\n" + install.ssh_block(self.ssh / "vault-ca.pub", self.ssh / "principals"))
+        self.sshd.write_text("Port 22\n" + install.ssh_block(self.ssh / "authorized_keys"))
         installed = {"manifest_sha256": parity.digest(self.config / "toolchain.json"),
                      "helper": str(self.config / "motor-macvm"), "runner": str(self.config / "motor-runner"),
-                     "vault_ca_sha256": parity.digest(self.ssh / "vault-ca.pub"),
-                     "principals_sha256": parity.digest(self.ssh / "principals")}
+                     "authorized_keys_sha256": parity.digest(self.ssh / "authorized_keys")}
         (self.config / "install.json").write_text(json.dumps(installed))
         (self.config / "vm.toml").write_text(install.vm_configuration(self.image, Path(installed["helper"]), self.state / "tools", self.manifest))
         self.plist = self.root / "daemon.plist"
@@ -246,7 +244,7 @@ class InstallerTests(unittest.TestCase):
                         patch.object(install, "tool_errors", return_value=[]),
                         patch.object(install.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(100, 50, install.FLOOR)),
                         patch.object(install.pwd, "getpwnam", return_value=type("Account", (), {"pw_uid": os.getuid()})),
-                        patch.object(install, "run", return_value=f"trustedusercakeys {self.ssh}/vault-ca.pub\nauthorizedprincipalsfile {self.ssh}/principals\nauthorizedkeysfile none")]
+                        patch.object(install, "run", return_value=f"trustedusercakeys none\nauthorizedkeysfile {self.ssh}/authorized_keys")]
         for item in self.patches:
             item.start()
             self.addCleanup(item.stop)
@@ -266,9 +264,16 @@ class InstallerTests(unittest.TestCase):
         with patch.object(install, "entitlement", return_value=False):
             self.assertIn("lacks virtualization entitlement", " ".join(self.check()))
 
-    def test_untrusted_effective_sshd_ca_is_refused(self):
-        with patch.object(install, "run", return_value="trustedusercakeys none\nauthorizedprincipalsfile none\nauthorizedkeysfile none"):
-            self.assertIn("does not trust the vault CA", " ".join(self.check()))
+    def test_unpinned_or_ca_trusting_effective_sshd_is_refused(self):
+        cases = {"authorizedkeysfile .ssh/authorized_keys": "does not pin the runner key file",
+                 f"trustedusercakeys /etc/ca.pub\nauthorizedkeysfile {self.ssh}/authorized_keys": "trusts a user CA"}
+        for effective, expected in cases.items():
+            with self.subTest(effective=effective), patch.object(install, "run", return_value=effective):
+                self.assertIn(expected, " ".join(self.check()))
+
+    def test_changed_pinned_runner_key_is_refused(self):
+        (self.ssh / "authorized_keys").write_text("ssh-ed25519 BBBB\n")
+        self.assertIn("pinned runner key changed", self.check())
 
     def test_world_readable_runner_socket_is_refused(self):
         self.socket_path.chmod(0o666)
@@ -315,10 +320,10 @@ class InstallerTests(unittest.TestCase):
         runner, helper = self.root / "runner", self.root / "helper"
         runner.write_bytes(b"runner")
         helper.write_bytes(b"helper")
-        ca = self.ssh / "vault-ca-source.pub"
-        ca.write_text("ssh-ed25519 AAAA vault\n")
+        key = self.root / "identity.pub"
+        key.write_text("ssh-ed25519 AAAA\n")
         args = SimpleNamespace(state_root=self.state, image=self.image, tool_bundle=bundle, manifest=manifest_path,
-                               runner=runner, vm_helper=helper, vault_ca=ca, instance="macos")
+                               runner=runner, vm_helper=helper, runner_key=key, instance="macos")
         account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
         with patch.multiple(install, CONFIG=self.config, PLIST=self.plist, SSHD=self.sshd, SSH_ROOT=self.ssh), \
                 patch.object(install, "create_account", return_value=account), patch.object(install.os, "chown"), \

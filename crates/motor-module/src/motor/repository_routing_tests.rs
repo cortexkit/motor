@@ -397,7 +397,7 @@ async fn stage1_validation_and_lease_refusals_name_the_route_and_never_fall_back
 #[tokio::test]
 async fn stage1_invalid_lease_bodies_are_typed_refusals_not_lease_mismatch() {
     for (timeout, broker_refusal, detail) in [
-        (10_800, false, "hosted_request_invalid: timeout_s"),
+        (21_601, false, "hosted_request_invalid: timeout_s"),
         (5, false, "hosted_request_invalid: timeout_s"),
         (30, true, "hosted_request_invalid"),
     ] {
