@@ -112,6 +112,9 @@ async fn run(args: Vec<String>) -> io::Result<()> {
     // Never silently fall back to the runner's administrative account on Linux.
     config.isolate_jobs = cfg!(target_os = "linux");
     config.build_slot_root = data.join("cortexkit/motor-build-slots");
+    if operation == "forget-caller-root" {
+        return forget_caller_root_args(args.collect());
+    }
     let (job, drain_timeout_s, exit_after) = configure_options(&mut config, args)?;
     match operation.as_str() {
         "check-options" => Ok(()),
@@ -331,9 +334,46 @@ async fn run(args: Vec<String>) -> io::Result<()> {
             Ok(())
         }
         _ => Err(io::Error::other(
-              "usage: motor-runner serve|connect|drain|resume|tenant-agent [--instance NAME] [--drain-timeout-s SECONDS] [--backend host|vm|windows-vm|macos-vm] [--tenant-vm] [--vm-config FILE] [--development-allow-host-backend] [--remote-cache true|false]",
+              "usage: motor-runner serve|connect|drain|resume|tenant-agent|forget-caller-root --prefix PREFIX [--instance NAME] [--drain-timeout-s SECONDS] [--backend host|vm|windows-vm|macos-vm] [--tenant-vm] [--vm-config FILE] [--development-allow-host-backend] [--remote-cache true|false]",
         )),
     }
+}
+
+/// `forget-caller-root --prefix P <serve options>`: retire one mapping with
+/// the runner stopped. Serve options are parsed exactly as `check-options`
+/// parses them, so instance, state root, boat profile and owned roots match
+/// the serve process. A `--caller-root` entry for the forgotten prefix must
+/// use the recorded host root; entries for other prefixes are parsed and
+/// ignored.
+fn forget_caller_root_args(args: Vec<String>) -> io::Result<()> {
+    let mut prefix = None;
+    let mut serve = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--prefix" {
+            prefix =
+                Some(args.next().ok_or_else(|| {
+                    io::Error::other("forget-caller-root requires --prefix PREFIX")
+                })?);
+        } else {
+            serve.push(arg);
+        }
+    }
+    let prefix =
+        prefix.ok_or_else(|| io::Error::other("forget-caller-root requires --prefix PREFIX"))?;
+    let home = PathBuf::from(
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .ok_or_else(|| io::Error::other("HOME/USERPROFILE is unset"))?,
+    );
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"));
+    let mut config = Config::new(data.join("cortexkit/motor-runner"), "main");
+    config.isolate_jobs = cfg!(target_os = "linux");
+    config.build_slot_root = data.join("cortexkit/motor-build-slots");
+    let _ = configure_options(&mut config, serve.into_iter())?;
+    motor_runner::forget_caller_root(&config, &prefix).map(|_| ())
 }
 
 /// `check-javascript-setup --scratch DIR [--tenant-vm] [--boat-profile]`:

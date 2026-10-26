@@ -7,6 +7,7 @@ use motor_protocol::{Prepare, Run, SiblingSnapshot};
 use std::path::Path;
 use std::{fs, io, path::PathBuf};
 pub(crate) mod catalog;
+pub(crate) mod forget;
 pub(crate) mod owner;
 pub(crate) mod startup;
 pub(crate) mod trash;

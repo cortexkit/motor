@@ -18,6 +18,9 @@ mod boat_disk;
 #[path = "tests/caller_authorization.rs"]
 mod caller_authorization;
 #[cfg(target_os = "linux")]
+#[path = "tests/caller_forget.rs"]
+mod caller_forget;
+#[cfg(target_os = "linux")]
 #[path = "tests/caller_persistence.rs"]
 mod caller_persistence;
 #[cfg(target_os = "linux")]

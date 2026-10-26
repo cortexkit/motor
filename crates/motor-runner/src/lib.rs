@@ -80,6 +80,7 @@ mod writer;
 pub use writer::CacheFill;
 
 pub use backend::BackendKind;
+pub use caller_path::forget::forget_caller_root;
 pub use caller_path::CallerRoot;
 pub use engine::{Config, Runner, BOAT_DISK_RESERVE_BYTES, DEFAULT_FREE_SPACE_FLOOR_BYTES};
 #[cfg(target_os = "linux")]
