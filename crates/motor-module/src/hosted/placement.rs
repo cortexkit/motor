@@ -106,6 +106,13 @@ pub(crate) fn terminal_placement(placement: &motor_lease::Placement) -> String {
     }
 }
 
+/// Whether the runner a lease places the job on fills its own remote compile
+/// cache, and so should be offered default-branch tips. A registered host's
+/// tenant runner does, with its own capacity; a Boat sandbox only reads.
+pub(crate) fn fills_cache(placement: &motor_lease::Placement) -> bool {
+    !placement.host.starts_with("boat:")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Finish {
     pub outcome: String,

@@ -6,6 +6,8 @@
 //! key file per key (mode 0400), each a JSON object carrying the same
 //! `generation`. They live in `cache-provisioning/` under the runner's state
 //! directory (created 0700 by the runner), or in `/run/motor/cache/` on Boat.
+//! The build server always has a `write-key`; a tenant VM has one only when
+//! its tenant fills its own cache, and Boat never has one.
 //! Every file must be a regular file owned by the runner's account; a key file
 //! must be readable by that account alone, so the job account (`motor-job`) and
 //! the fill account (`motor-cache`) cannot open it.
@@ -55,7 +57,9 @@ pub(crate) const WATCH_POLL: Duration = Duration::from_secs(1);
 pub(crate) enum HostRole {
     /// Holds the read-only key for jobs and the read-write key for fills.
     BuildServer,
-    /// Holds only the read-only key; it never writes the cache.
+    /// Holds the read-only key, and may also hold a read-write key for its
+    /// own fills. The store policy confines that key to this tenant's prefix.
+    /// Without it the tenant never fills, but its jobs still read the cache.
     TenantVm,
     /// Holds only the read-only key, delivered by CLOUD's broker.
     Boat,
@@ -71,10 +75,21 @@ impl HostRole {
             Self::BuildServer
         }
     }
+    /// The keys a complete generation must hold on this host.
     pub(crate) fn keys(self) -> &'static [KeyRole] {
         match self {
             Self::BuildServer => &[KeyRole::Read, KeyRole::Write],
             Self::TenantVm | Self::Boat => &[KeyRole::Read],
+        }
+    }
+    /// Keys this host may hold but can run without. A missing optional key
+    /// file is not part of the generation at all. A present one must parse and
+    /// carry the generation's `generation`, just like a required key, so a
+    /// half-written rotation still keeps the previous generation.
+    pub(crate) fn optional_keys(self) -> &'static [KeyRole] {
+        match self {
+            Self::TenantVm => &[KeyRole::Write],
+            Self::BuildServer | Self::Boat => &[],
         }
     }
 }
@@ -228,18 +243,28 @@ impl Layout {
         }
         let config = read_file(&self.config_path(), CONFIG_MODE, self.owner)
             .and_then(|bytes| parse_config(&bytes));
-        let keys = self
+        let read_key = |key: KeyRole| {
+            read_file(&self.key_path(key), KEY_MODE, self.owner).and_then(|bytes| {
+                parse_key(&bytes).map_err(|e| format!("{}: {e}", key.file_name()))
+            })
+        };
+        let mut keys: Vec<_> = self
             .role
             .keys()
             .iter()
-            .map(|key| {
-                let parsed =
-                    read_file(&self.key_path(*key), KEY_MODE, self.owner).and_then(|bytes| {
-                        parse_key(&bytes).map_err(|e| format!("{}: {e}", key.file_name()))
-                    });
-                (*key, parsed)
-            })
+            .map(|key| (*key, read_key(*key)))
             .collect();
+        for key in self.role.optional_keys() {
+            // Only a file that does not exist at all leaves the key out; any
+            // other problem with it makes the set incomplete.
+            let absent = matches!(
+                fs::symlink_metadata(self.key_path(*key)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound
+            );
+            if !absent {
+                keys.push((*key, read_key(*key)));
+            }
+        }
         FileSet { config, keys }
     }
 
@@ -247,7 +272,13 @@ impl Layout {
     /// watcher notices a rename, rewrite or chmod without parsing anything.
     fn fingerprint(&self) -> Vec<Option<[i64; 8]>> {
         let mut paths = vec![self.directory.clone(), self.config_path()];
-        paths.extend(self.role.keys().iter().map(|key| self.key_path(*key)));
+        paths.extend(
+            self.role
+                .keys()
+                .iter()
+                .chain(self.role.optional_keys())
+                .map(|key| self.key_path(*key)),
+        );
         paths
             .iter()
             .map(|path| {
@@ -554,7 +585,8 @@ pub(crate) struct ActiveGeneration {
     pub(crate) prefix: String,
     pub(crate) storage_class: String,
     pub(crate) read_key: Credential,
-    /// Only the build server holds the read-write key.
+    /// The build server always holds the read-write key; a tenant VM holds it
+    /// only when its provisioning delivered one; Boat never does.
     pub(crate) write_key: Option<Credential>,
 }
 

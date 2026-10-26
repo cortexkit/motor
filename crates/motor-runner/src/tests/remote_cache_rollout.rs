@@ -156,9 +156,51 @@ fn all_four_remote_cache_switch_combinations_use_real_gateway_and_transport() {
                 hosted.boat_profile = boat;
                 hosted.tenant_vm = tenant;
                 assert!(hosted.unit_remote_cache(false).is_some());
-                assert!(hosted.unit_remote_cache(true).is_none());
+                // A tenant VM may fill its own cache; Boat only ever reads.
+                assert_eq!(hosted.unit_remote_cache(true).is_some(), tenant);
             }
         }
+    }
+}
+
+#[test]
+fn only_a_tenant_whose_provisioning_holds_a_write_key_may_fill() {
+    for keyed in [false, true] {
+        let f = Fixture::new();
+        let mut config = f.config();
+        config.isolate_jobs = true;
+        config.remote_cache = true;
+        config.tenant_vm = true;
+        let layout = Layout::new(f.scratch.join("provisioning"), HostRole::TenantVm);
+        layout.prepare().unwrap();
+        provision(&layout, true);
+        if !keyed {
+            fs::remove_file(layout.key_path(crate::remote_cache::provisioning::KeyRole::Write))
+                .unwrap();
+        }
+        let runtime = runtime(&layout);
+        runtime.watch.reread();
+        config.remote_cache_runtime = Some(runtime);
+        // Jobs read the cache either way.
+        assert!(config.unit_remote_cache(false).is_some(), "{keyed}");
+        assert_eq!(config.tenant_write_key_held(), keyed);
+        // The account check is the last gate, so set it aside here: the
+        // portable fixture has no `motor-cache` account.
+        #[cfg(target_os = "linux")]
+        {
+            config.writer_account = Some(crate::isolation::WriterAccount { uid: 1 });
+        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(config.writer_enabled(), keyed);
+        #[cfg(not(target_os = "linux"))]
+        assert!(!config.writer_enabled());
+
+        // Boat never fills, even with a write key in its files.
+        let mut boat = config.clone();
+        boat.tenant_vm = false;
+        boat.boat_profile = true;
+        assert!(!boat.writer_enabled());
+        assert!(boat.unit_remote_cache(true).is_none());
     }
 }
 

@@ -19,7 +19,9 @@ one check of the installed state, which install.sh --check and --start run:
                                     the installed tenant record, its helper
                                     registry entry, the helper config, the host
                                     capacity inputs and the jobs slice agree,
-                                    and no resize is pending
+                                    and no resize is pending; it also names
+                                    the remote cache files install put on the
+                                    tenant disk (names and modes only)
 
 and one operator query, which reads motor-host's admin socket as root:
 
@@ -235,6 +237,34 @@ def registry_disagreements(record: dict, registry: dict, provision) -> list[str]
                   if registry.get(name, missing) != expected.get(name, missing))
 
 
+def remote_cache_report(record: dict, provision) -> str:
+    """Which of the tenant runner's remote compile cache files provision.py
+    installed, with their modes; never their contents, which hold the keys.
+
+    The files live on the tenant disk, which the host never mounts after
+    install, so this reads the manifest install wrote beside the disk. Image
+    switches and resizes keep the disk, and so the files. Raises ValueError
+    when the record turns the cache on but the manifest is missing or names
+    other files or modes than the runner requires."""
+    if not record.get("remote_cache"):
+        return "remote cache: off"
+    path = provision.ROOT / "tenants" / provision.component(record["tenant"]) / provision.REMOTE_CACHE_MANIFEST
+    try:
+        manifest = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        raise ValueError(f"the record turns the remote cache on, but {path} cannot be read: {error}") from error
+    expected = {name: f"{mode:04o}" for name, mode in provision.REMOTE_CACHE_FILES.items()}
+    if (not isinstance(manifest, dict) or set(manifest) - set(expected)
+            or not provision.REMOTE_CACHE_REQUIRED <= set(manifest)
+            or any(manifest[name] != expected[name] for name in manifest)):
+        raise ValueError(f"{path} does not list config.json and read-key (and at most write-key) "
+                         "with the runner's modes")
+    write = (f"write-key {manifest['write-key']}, so the tenant fills its own cache" if "write-key" in manifest
+             else "no write-key, so the tenant reads the cache and never fills it")
+    return (f"remote cache: config.json {manifest['config.json']}, read-key {manifest['read-key']}, {write}; "
+            "installed on the tenant disk at provisioning and kept by switch-image and resize")
+
+
 def check_installed(uid: int, gid: int, record_path: Path = TENANT_RECORD, helper_path: Path = HELPER_CONFIG,
                     provision=None) -> list[str]:
     """Every problem with the installed tenant state; empty when it is sound.
@@ -276,6 +306,7 @@ def check_installed(uid: int, gid: int, record_path: Path = TENANT_RECORD, helpe
                 raise ValueError(f"the installed record and {path} differ at {', '.join(differ)}")
 
         check("helper registry", registry)
+        check("remote cache", lambda: remote_cache_report(record, provision))
 
         def helper():
             installed = json.loads(helper_path.read_text())
@@ -454,6 +485,7 @@ def main() -> int:
                 return 1
             print(f"installed tenant state agrees: {TENANT_RECORD}, its helper registry entry, {HELPER_CONFIG}, "
                   "capacity.json, the memory fit and the jobs slice; no resize is pending")
+            print(remote_cache_report(read_record(TENANT_RECORD), load_provision()))
             return 0
         if args.command == "host":
             value = host_config(args.host_id, args.port)

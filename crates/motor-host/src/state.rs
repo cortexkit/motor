@@ -375,6 +375,9 @@ impl Host {
             .map(|l| l.claims.vcpus)
             .try_fold(0u32, u32::checked_add)
     }
+    /// The VM's CPU quota in vCPUs, from its counted lease claims, capped at
+    /// the tenant's ceiling and never below one. A guest's fill report does
+    /// not affect it.
     pub fn quota(&self, tenant: &str, now_ms: u64) -> u32 {
         if !self.live.get(tenant).is_some_and(|v| v.ready) {
             1

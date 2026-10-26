@@ -52,6 +52,13 @@ pub(crate) struct TenantAdvert {
     memory_case: Option<MemoryCase>,
     start_refused: Option<StartRefusal>,
     wake_pending: bool,
+    /// The permits the tenant runner's own cache fill held at the last probe.
+    fill: Option<FillSample>,
+}
+
+struct FillSample {
+    at_ms: u64,
+    permits: u32,
 }
 
 struct MemorySample {
@@ -235,7 +242,34 @@ impl Host {
         if let Some(advert) = self.advert.get_mut(tenant) {
             advert.memory = None;
             advert.ready_seen_ms = None;
+            // A fill dies with the guest run it belonged to; a restarted
+            // guest reports its own fill, if any, at its first probe.
+            advert.fill = None;
         }
+    }
+    /// Records the permits a running tenant's own cache fill holds, from the
+    /// same runner probe as its memory. The guest is root-controlled, so this
+    /// report is tenant input: it only lowers the `free_vcpus` the host
+    /// advertises for that tenant, so the broker places new jobs elsewhere.
+    /// It never raises the VM's CPU quota and never changes any usage or
+    /// billing figure; a fill runs within the CPU the tenant's leases already
+    /// hold, or on the idle quota of one vCPU.
+    pub fn record_fill(&mut self, tenant: &str, now_ms: u64, permits: u32) {
+        self.advert.entry(tenant.to_owned()).or_default().fill = Some(FillSample {
+            at_ms: now_ms,
+            permits,
+        });
+    }
+    /// The permits of a tenant's own cache fill that lower its advertised
+    /// capacity now: the latest probe's, while it is fresh. A probe that stops
+    /// answering lets the count lapse after [`MEMORY_FRESH_MS`], so a report
+    /// never holds capacity down forever.
+    pub fn fill_claim(&self, tenant: &str, now_ms: u64) -> u32 {
+        self.advert
+            .get(tenant)
+            .and_then(|advert| advert.fill.as_ref())
+            .filter(|fill| now_ms.saturating_sub(fill.at_ms) <= MEMORY_FRESH_MS)
+            .map_or(0, |fill| fill.permits)
     }
     pub(super) fn start_succeeded(&mut self, tenant: &str) {
         if let Some(advert) = self.advert.get_mut(tenant) {
@@ -266,16 +300,19 @@ impl Host {
     }
 
     /// The heartbeat's `free_vcpus` term for one tenant: its permit budget
-    /// minus the counted claims, whether the VM is running, stopped,
-    /// or suspended; 0 while a wake is pending or start-refused.
+    /// minus the counted claims and the permits of its own running cache
+    /// fill, whether the VM is running, stopped, or suspended; 0 while a wake
+    /// is pending or start-refused. Saturating at 0, a fill report of any size
+    /// can take away only this tenant's own budget.
     pub(crate) fn tenant_free_vcpus(&self, tenant: &Tenant, now_ms: u64) -> u64 {
         if self.start_fenced(&tenant.tenant) {
             return 0;
         }
         u64::from(
-            tenant
-                .budget()
-                .saturating_sub(self.share(&tenant.tenant, now_ms)),
+            tenant.budget().saturating_sub(
+                self.share(&tenant.tenant, now_ms)
+                    .saturating_add(self.fill_claim(&tenant.tenant, now_ms)),
+            ),
         )
     }
     /// The heartbeat's `free_mem_mib`: the largest per-tenant value. A

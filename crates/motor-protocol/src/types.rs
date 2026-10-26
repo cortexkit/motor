@@ -231,6 +231,12 @@ pub struct RunnerHealth {
     pub permits_held: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permits_cap: Option<u32>,
+    /// Permits held by the cache fill running now, reported by a tenant VM's
+    /// runner only. The host only subtracts these from the free capacity it
+    /// advertises for that tenant; being guest-reported, they never raise
+    /// the VM's CPU quota or change usage and billing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_permits: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_wait_1h: Option<HealthQueueWait>,
     /// Reports the sealed image's guest-agent hash and whether it matches the release.

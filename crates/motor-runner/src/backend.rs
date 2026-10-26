@@ -880,6 +880,8 @@ impl Backend for HostBackend {
                             &r.tree_hash,
                             &crate::isolation::JavascriptTools::for_config(config),
                             config.boat_profile,
+                            config.tenant_vm,
+                            config.shared_compile_cache(),
                             remote.as_ref(),
                         )
                     } else {

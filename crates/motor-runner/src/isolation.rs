@@ -2662,8 +2662,14 @@ impl Sandbox {
         tree: &str,
         javascript: &JavascriptTools,
         boat_profile: bool,
+        tenant_vm: bool,
+        shared_compile_cache: bool,
         remote: Option<&Transport>,
     ) -> io::Result<Self> {
+        // On a tenant VM the caller sets `tenant_vm`, so the fill fetches
+        // dependencies the way tenant jobs do, and clears
+        // `shared_compile_cache`: tenant jobs have no local compile cache to
+        // read, so a tenant fill writes only the remote cache.
         let workspace = workspace.into();
         Self::prepare_role(
             id,
@@ -2678,8 +2684,8 @@ impl Sandbox {
             tree,
             &workspace.host.as_path().to_string_lossy(),
             true,
-            false,
-            true,
+            tenant_vm,
+            shared_compile_cache,
             None,
             javascript,
             remote,

@@ -244,6 +244,11 @@ pub struct Config {
     pub(crate) manual_tick: bool,
     #[cfg(test)]
     pub(crate) writer_unavailable: bool,
+    /// Stands in for whether a tenant VM's provisioning holds a write key.
+    /// Portable fixtures run without job isolation, so they never start the
+    /// remote cache runtime that reads the real provisioning files.
+    #[cfg(test)]
+    pub(crate) tenant_write_key: Option<bool>,
     #[cfg(test)]
     pub(crate) before_gate: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
@@ -523,6 +528,8 @@ impl Config {
             #[cfg(test)]
             writer_unavailable: false,
             #[cfg(test)]
+            tenant_write_key: None,
+            #[cfg(test)]
             before_gate: None,
             #[cfg(test)]
             fail_materialize: false,
@@ -628,22 +635,49 @@ impl Config {
     }
     /// Whether the remote compile cache can be on for a job or a fill of this
     /// runner at all, before provisioning is read: the runner switch must be
-    /// set, that switch must be honoured (which needs job isolation), and only
-    /// the build server may write the cache, so no other role can ever have a
-    /// fill with it on.
+    /// set, that switch must be honoured (which needs job isolation), and the
+    /// role must be one that may write. The build server and a tenant VM may
+    /// fill; Boat only ever reads, so no Boat unit can have a fill with it on.
     ///
-    /// This is about the role, not about whether a writer account exists right
-    /// now: a role that may write is a role whose unit gets the cache
-    /// environment, and a missing account fails the fill itself later.
+    /// This is about the role, not about whether a writer account or a write
+    /// key exists right now: a role that may write is a role whose unit gets
+    /// the cache environment. A missing account fails the fill itself later,
+    /// and a tenant without a write key never queues one (see
+    /// [`Config::writer_enabled`]).
     #[cfg(unix)]
     pub(crate) fn remote_cache_available(&self, fill: bool) -> Option<()> {
         if !self.remote_cache || !self.isolate_jobs || self.vm_instance() {
             return None;
         }
-        if fill && (self.boat_profile || self.tenant_vm) {
+        if fill && self.boat_profile {
             return None;
         }
         Some(())
+    }
+    /// Whether a tenant VM's provisioning holds a read-write key that a fill
+    /// admitted now would sign with. The store policy confines that key to the
+    /// tenant's own prefix, so the runner needs nothing beyond the configured
+    /// prefix to keep a fill inside it.
+    #[cfg(unix)]
+    pub(crate) fn tenant_write_key_held(&self) -> bool {
+        #[cfg(test)]
+        if let Some(held) = self.tenant_write_key {
+            return held;
+        }
+        self.remote_cache_available(true).is_some()
+            && self.remote_cache_runtime.as_ref().is_some_and(|runtime| {
+                runtime
+                    .watch
+                    .admit()
+                    .is_some_and(|generation| generation.write_key.is_some())
+            })
+    }
+    /// Whether a tenant VM may queue fills now: only with a write key.
+    pub(crate) fn tenant_fills(&self) -> bool {
+        #[cfg(unix)]
+        return self.tenant_write_key_held();
+        #[cfg(not(unix))]
+        false
     }
     /// Endpoint for one trusted Linux build that populates the compiler cache,
     /// independent of the runner's state paths.
@@ -670,9 +704,20 @@ impl Config {
         if self.windows_instance() {
             return false;
         }
-        // These runners spend leased CPU time. Even an idle-started fill can
-        // consume the next job's quota or hold a setup lock after it arrives.
-        if self.tenant_vm || self.boat_profile {
+        // Boat spends leased CPU time on a single job: even an idle-started
+        // fill can consume the next job's quota or hold a setup lock after it
+        // arrives, and Boat only ever reads the cache.
+        if self.boat_profile {
+            return false;
+        }
+        // A tenant VM fills only when its tenant was given a write key. A
+        // keyed tenant accepts the delay an idle-started fill can cause a job
+        // placed after it, because it fills its own cache with its own
+        // capacity, as the build server does: within the CPU its leases
+        // already hold, or the idle quota of one vCPU. The fill's permits are
+        // reported in health, so the host advertises less free capacity while
+        // it runs and the broker places new jobs elsewhere.
+        if self.tenant_vm && !self.tenant_fills() {
             return false;
         }
         #[cfg(test)]
@@ -1437,6 +1482,13 @@ struct Core {
     /// Admission/prepare take this before claiming state, never while holding inner.
     reserve_restore: Mutex<()>,
     tenant_events: Option<Arc<crate::tenant::EventLog>>,
+    /// Set while a tenant VM queues no fills for want of a write key, so the
+    /// reason is logged once when that starts rather than at every tick.
+    tenant_fills_off_logged: std::sync::atomic::AtomicBool,
+    /// How many times that reason was logged. Tests read it, because a log
+    /// line is captured only on the thread whose subscriber is installed.
+    #[cfg(test)]
+    tenant_fills_off_logs: std::sync::atomic::AtomicUsize,
     draining: std::sync::atomic::AtomicBool,
     /// Separate from the fsync/state lock so a slow persistence operation cannot
     /// prevent the server from observing its shutdown deadline.
@@ -2436,12 +2488,13 @@ impl Runner {
             None
         };
         let sibling_fences = config.sibling_fences();
-        // The switch is honoured only with job isolation, and only the build
-        // server ever writes the cache.
+        // The switch is honoured only with job isolation, and only on roles
+        // that may write the cache: the build server and a tenant VM. A tenant
+        // without a write key queues no fills, so publishing changes nothing
+        // there until a key arrives.
         let publishing_switch = config.remote_cache
             && config.isolate_jobs
             && !config.boat_profile
-            && !config.tenant_vm
             && !config.vm_instance();
         // A configuration flipped while the runner was stopped is still a
         // transition, not a first read: the switch state the previous run
@@ -2479,6 +2532,9 @@ impl Runner {
                 #[cfg(unix)]
                 publishing: Mutex::new(publishing_state),
                 tenant_events,
+                tenant_fills_off_logged: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                tenant_fills_off_logs: std::sync::atomic::AtomicUsize::new(0),
                 draining: std::sync::atomic::AtomicBool::new(false),
                 drain_control: Mutex::new(None),
                 background_deletes: config.background_deletes.clone(),
@@ -4592,10 +4648,32 @@ impl Runner {
         if self.core.config.disable_warm_builds {
             return false;
         }
+        if self.core.config.tenant_vm && !self.core.config.boat_profile && !tip.is_empty() {
+            self.note_tenant_fill_key();
+        }
         !tip.is_empty()
             && !self.core.config.vm_instance()
             && self.core.config.writer_enabled()
             && self.core.quarantined.is_empty()
+    }
+    /// Logs, once each time it starts, that a tenant VM queues no fills
+    /// because its provisioning holds no remote cache write key. Its jobs
+    /// still read the cache when a read key is provisioned.
+    fn note_tenant_fill_key(&self) {
+        let off = !self.core.config.tenant_fills();
+        let was_off = self
+            .core
+            .tenant_fills_off_logged
+            .swap(off, std::sync::atomic::Ordering::Relaxed);
+        if off && !was_off {
+            #[cfg(test)]
+            self.core
+                .tenant_fills_off_logs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                "tenant cache fills off: no remote cache write key is provisioned; jobs run without filling the cache"
+            );
+        }
     }
     /// Read what `queue_base_planned` needs from the repository's mirror.
     /// Each read runs git, which is slow on a loaded host, so callers do this
@@ -6811,7 +6889,13 @@ impl Runner {
             .collect();
         #[cfg(unix)]
         if refresh_due {
-            for (root, desired) in self.refresh_bases(&inner, &policy, now) {
+            // A refresh is a fill like any other: a runner that may not fill
+            // now (a tenant whose write key was withdrawn) queues none.
+            for (root, desired) in self
+                .refresh_bases(&inner, &policy, now)
+                .into_iter()
+                .filter(|_| self.core.config.writer_enabled())
+            {
                 if !wanted.iter().any(|(queued, _)| *queued == root) {
                     wanted.push((root, desired));
                 }

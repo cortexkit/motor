@@ -1396,7 +1396,7 @@ impl Client {
                 .connect(id)
                 .await
                 .map_err(|_| tls::ConnectFailure::at("test transport", Error::Connect))?;
-            return Channel::from_hosted(pipe)
+            return Channel::from_hosted(pipe, placement::fills_cache(&lease.placement))
                 .await
                 .map_err(|_| tls::ConnectFailure::at("test hello", Error::Connect));
         }

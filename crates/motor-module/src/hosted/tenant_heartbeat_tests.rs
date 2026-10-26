@@ -110,7 +110,7 @@ async fn hosted_channel_heartbeats_keep_a_tenant_job_streaming_to_its_terminal()
     write_frame_async(&mut host, &Frame::VerifiedLease(lease))
         .await
         .unwrap();
-    let mut channel = Channel::from_hosted(Box::new(host)).await.unwrap();
+    let mut channel = Channel::from_hosted(Box::new(host), false).await.unwrap();
     channel.send(Frame::Run(run)).await.unwrap();
     assert!(matches!(
         channel.next().await.unwrap(),

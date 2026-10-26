@@ -1316,9 +1316,10 @@ impl Motor {
             } else {
                 hash
             },
-            // Omit the fill tip so hosted runners cannot queue background cache
-            // fills on leased CPUs, even when the snapshot resolved a tip.
-            integration_tip: if hosted {
+            // A hosted runner gets the fill tip only when its channel offered
+            // fill tips: a registered host's tenant runner fills its own cache
+            // with its own capacity, while Boat only reads the cache.
+            integration_tip: if hosted && !channel.fill_tips {
                 String::new()
             } else {
                 snapshots.main.tip.clone().unwrap_or_default()

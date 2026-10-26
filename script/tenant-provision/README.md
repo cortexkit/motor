@@ -40,6 +40,34 @@ compare old records unchanged. When set, it is a positive integer of at most
 is refused before any write. Both runner arguments, `--max-weight` and
 `--rustc-slots`, carry the budget and stay equal for the guest's own check.
 
+### Remote compile cache files
+
+`remote_cache: true` in the record, together with
+`--remote-cache-dir /absolute/root-only-dir` on the provisioning command line,
+turns the tenant runner's remote compile cache on. The directory holds
+`config.json` and `read-key`, and optionally `write-key` (the files and fields
+the runner reads; see `crates/motor-runner/src/remote_cache/provisioning.rs`).
+The directory and its files must be root-owned and not writable by others, and
+the key files must be readable by their owner alone. `config.json`'s `tenant`
+must be the record's `sub`, and its `prefix` must be `tenant/<sub with each ':'
+replaced by '-'>/`. The store policy limits the keys to that prefix. With a
+`write-key`, the tenant runner fills its own cache from default-branch tips.
+Without one, its jobs read the cache and the runner logs once that it does not
+fill. The record's `remote_cache` field and the directory are both required or both absent;
+anything else is refused before any write. Error messages name a file, never
+its contents.
+
+The files are written once, into the new tenant disk at its single host mount,
+as `state/main/cache-provisioning/` (directory 0700, `config.json` 0444, keys
+0400, all root-owned, as the guest runner requires). The host keeps only
+`/var/lib/motor-vm/tenants/<tenant>/remote-cache.json`, which lists the file
+names and modes. `hosted-host/hosted_host.py check-installed` reads that list,
+never the keys. `switch-image` and `resize` keep the disk and its files.
+`remote_cache` stays out of the helper registry, and resize renders
+`--remote-cache true` again from the record. Replacing the files (a key
+rotation, or adding or withdrawing a write key) currently needs a reinstall of
+the tenant: there is not yet a channel that delivers them to an existing guest.
+
 Choose a cpuset excluding the host runner's reserved Windows CPUs. Each tap
 index must be unique and reserves a dedicated no-login uid `400000 + index`;
 the helper refuses overlaps with job accounts, slot accounts and allowed peers.

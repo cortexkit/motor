@@ -279,7 +279,7 @@ impl Runner {
     pub fn runner_status(&self) -> RunnerStatusReply {
         let now = self.now();
         // Keep retained job history out of the state-lock path of each probe.
-        let (status, permits_held) = {
+        let (status, permits_held, fill_permits) = {
             let inner = self.core.inner.lock().unwrap();
             let usage = self.core.repository_usage.lock().unwrap();
             let active = &usage.active;
@@ -294,7 +294,21 @@ impl Runner {
                 .filter(|(id, (_, pending))| !pending || inner.starting.contains(id))
                 .map(|(_, (job, _))| job.weight)
                 .sum();
-            (self.status_with_jobs(&inner, queue_depth, running), permits)
+            // Only a tenant VM reports its fill: its host subtracts these
+            // permits from the capacity it advertises, so the broker places
+            // new jobs elsewhere meanwhile.
+            let fill_permits = self.core.config.tenant_vm.then(|| {
+                inner
+                    .writer
+                    .and_then(|id| inner.jobs.get(&id))
+                    .filter(|job| job.terminal.is_none())
+                    .map_or(0, |job| job.weight)
+            });
+            (
+                self.status_with_jobs(&inner, queue_depth, running),
+                permits,
+                fill_permits,
+            )
         };
         let (repository_usage, underused_reservations) = {
             let mut usage = self.core.repository_usage.lock().unwrap();
@@ -365,6 +379,7 @@ impl Runner {
                 mem_available_bytes,
                 permits_held: Some(permits_held),
                 permits_cap: Some(self.core.config.max_weight),
+                fill_permits,
                 queue_wait_1h: Some(counters.queue_wait(now)),
                 windows_guest_agent: self.core.config.windows_runtime.guest_agent_readiness(),
                 remote_cache,

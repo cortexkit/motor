@@ -920,6 +920,10 @@ pub(crate) struct Channel {
     pub gate_jobs: bool,
     pub sibling_paths: bool,
     pub platforms: Vec<String>,
+    /// This client's Hello advertised default-branch tips, so a Run on this
+    /// channel carries the resolved integration tip and the runner may fill
+    /// its cache from it. Boat never gets them: it only reads the cache.
+    pub fill_tips: bool,
     tx: mpsc::Sender<WriteRequest>,
     rx: mpsc::Receiver<io::Result<Incoming>>,
     heartbeat_enabled: watch::Sender<bool>,
@@ -937,7 +941,12 @@ impl Channel {
     /// Exchange hello once on a TLS connection already authenticated by its lease.
     /// Preserve explicit host refusals before starting the generic frame reader;
     /// retryable transport failures need a fresh lease, never SSH's retry loop.
-    pub(crate) async fn from_hosted(mut pipe: Box<dyn Duplex>) -> io::Result<Self> {
+    /// `fill_tips` is true for a registered host's tenant runner, which fills
+    /// its own cache from default-branch tips, and false for Boat.
+    pub(crate) async fn from_hosted(
+        mut pipe: Box<dyn Duplex>,
+        fill_tips: bool,
+    ) -> io::Result<Self> {
         write_frame_async(
             &mut pipe,
             &Frame::Hello {
@@ -946,7 +955,7 @@ impl Channel {
                 sibling_paths: false,
                 protocol_version: PROTOCOL_VERSION,
                 started: true,
-                default_branch_tip: false,
+                default_branch_tip: fill_tips,
                 gate_jobs: true,
                 platforms: Vec::new(),
             },
@@ -988,6 +997,7 @@ impl Channel {
                     channel.return_paths = return_paths;
                     channel.return_chunked = return_chunked;
                     channel.sibling_paths = sibling_paths;
+                    channel.fill_tips = fill_tips;
                     channel.enable_heartbeats();
                     return Ok(channel);
                 }
@@ -1075,6 +1085,7 @@ impl Channel {
                             channel.return_paths = return_paths;
                             channel.return_chunked = return_chunked;
                             channel.sibling_paths = sibling_paths;
+                            channel.fill_tips = true;
                             channel.enable_heartbeats();
                             tracing::info!(job_or_workspace_id = %id, elapsed_ms = started.elapsed().as_millis() as u64, "runner handshake complete");
                             Ok(channel)
@@ -1227,6 +1238,7 @@ impl Channel {
             return_chunked: false,
             sibling_paths: false,
             platforms: Vec::new(),
+            fill_tips: false,
             tx,
             rx,
             heartbeat_enabled,
@@ -1285,36 +1297,44 @@ mod hello_tests {
         }
     }
 
+    /// Boat only reads the cache, so its Hello offers no default-branch tips;
+    /// a registered host's tenant runner fills its own cache, so its Hello
+    /// offers them.
     #[tokio::test]
-    async fn hosted_hello_does_not_advertise_background_fill_support() {
-        let (client, mut peer) = tokio::io::duplex(4096);
-        let server = async {
-            let hello = read_frame_async(&mut peer).await.unwrap().unwrap();
-            assert!(matches!(
-                hello,
-                Frame::Hello {
-                    default_branch_tip: false,
-                    ..
-                }
-            ));
-            write_frame_async(
-                &mut peer,
-                &Frame::Hello {
-                    protocol_version: PROTOCOL_VERSION,
-                    started: true,
-                    default_branch_tip: true,
-                    gate_jobs: true,
-                    return_paths: false,
-                    return_chunked: false,
-                    sibling_paths: true,
-                    platforms: vec!["linux".into()],
-                },
-            )
-            .await
-            .unwrap();
-        };
-        let (channel, ()) = tokio::join!(Channel::from_hosted(Box::new(client)), server);
-        assert!(channel.unwrap().sibling_paths);
+    async fn hosted_hello_advertises_fill_support_only_to_registered_host_tenants() {
+        for fill_tips in [false, true] {
+            let (client, mut peer) = tokio::io::duplex(4096);
+            let server = async {
+                let hello = read_frame_async(&mut peer).await.unwrap().unwrap();
+                assert!(
+                    matches!(
+                        hello,
+                        Frame::Hello { default_branch_tip, .. } if default_branch_tip == fill_tips
+                    ),
+                    "{fill_tips}"
+                );
+                write_frame_async(
+                    &mut peer,
+                    &Frame::Hello {
+                        protocol_version: PROTOCOL_VERSION,
+                        started: true,
+                        default_branch_tip: true,
+                        gate_jobs: true,
+                        return_paths: false,
+                        return_chunked: false,
+                        sibling_paths: true,
+                        platforms: vec!["linux".into()],
+                    },
+                )
+                .await
+                .unwrap();
+            };
+            let (channel, ()) =
+                tokio::join!(Channel::from_hosted(Box::new(client), fill_tips), server);
+            let channel = channel.unwrap();
+            assert!(channel.sibling_paths);
+            assert_eq!(channel.fill_tips, fill_tips);
+        }
     }
 
     #[tokio::test]

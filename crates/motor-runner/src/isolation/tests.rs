@@ -483,6 +483,8 @@ fn with_prepared_boat_sandbox(writer: bool, inspect: impl FnOnce(&Fixture, Sandb
                     &tree,
                     &javascript,
                     true,
+                    false,
+                    true,
                     None,
                 )
             } else {
