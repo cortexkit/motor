@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 from credential_audit import SOURCE
 from pid_namespace import PID_SOURCE, TEARDOWN_SOURCE, bootstrap_checks, control_identity_command, lifecycle_failure, outside_control_passes, pid_checks, pid_failure_reason, reference_command, teardown_checks, teardown_job
+import cache_live
 from probe import VERIFY_PHASES, provider_sizing_matches, sandbox_lifecycle, sizing_error, verify_phase_records, verify_phase_status
 from ssh_reach import endpoint, pin_host, process, ssh_argv
 
@@ -43,6 +44,8 @@ CARGO_OFFLINE_PROBE = ROOT / 'script/runner/cargo-offline-probe.py'
 GIT_PUSHURL_PROBE = ROOT / 'script/runner/git-pushurl-probe.py'
 WASM_OPT_PROBE = ROOT / 'script/runner/wasm-opt-probe.py'
 ROOT_PATHS_SCRIPT = ROOT / 'script/tenant-image/guest/root_paths.py'
+# The live remote compile-cache check installs cache_live.MODES and reads the
+# job's own sccache statistics; the store is never the judge of itself.
 
 
 def upload_seed_input(argv, source, name):
@@ -1630,6 +1633,16 @@ class RunnerHost:
 
     def run(self):
         self.directory = None
+        # Checked before any sandbox exists, so a malformed or incomplete pair
+        # cannot cost a billable run; only the shape and the generation match
+        # are read here, and nothing is written down.
+        if getattr(self.probe, 'cache_config', None) or getattr(self.probe, 'cache_read_key', None):
+            try:
+                cache_live.read_inputs(self.probe.cache_config, self.probe.cache_read_key)
+                self.data['cache_provisioning'] = {'inputs_valid': True}
+            except ValueError as error:
+                self.data['cache_provisioning'] = {'inputs_valid': False, 'error': str(error)}
+                raise
         if isinstance(getattr(self.probe, 'verify_prepared_image', None), str):
             # Listed before any work, so a run that stops early still reports
             # every phase it did not run as not run.
@@ -1701,6 +1714,7 @@ class RunnerHost:
                 if phase == 'core':
                     self.phase(sid, 'prepared_clone', directory, public, repository, client,
                                first_started=started, idle=False)
+                    self.verify_cache_live(sid, directory, public, repository, client)
                     self.verify_core_resume(sid, directory, public, repository, client)
                 elif phase == 'idle':
                     self.verify_idle(sid, directory, public, repository, client)
@@ -1727,6 +1741,110 @@ class RunnerHost:
         if record.get('sandbox'):
             self.release_sandbox(phase, record)
         return record.get('error')
+
+    def verify_cache_live(self, sid, directory, public, repository, client):
+        """A real Rust job reading the fleet's remote compile cache.
+
+        Verify sandboxes are not broker-created, so this installs the
+        provisioning CLOUD would install, in the contract's own paths and modes,
+        and runs a real Cargo build that prints the job's own sccache statistics.
+        The check passes only with compiles the store answered, the read-only
+        job cache mode and no writer switch. The key goes up over SSH stdin, is
+        removed from the guest whatever the outcome, and is never recorded.
+        Without the operator's files the section is recorded as not run, never
+        as a pass."""
+        inputs = getattr(self.probe, 'cache_inputs', None)
+        if not inputs or not isinstance(inputs, Path):
+            self.check('cache_live.provisioning_supplied', False, {'supplied': False}, status='INCONCLUSIVE',
+                       reason='--cache-inputs was not supplied, so the live remote compile-cache check did '
+                              'not run; its absence is not a pass')
+            return
+        # Validated before the sandbox is touched: a malformed pair must not
+        # leave provisioning half installed.
+        cache_live.read_inputs(inputs / 'config.json', inputs / 'read-key')
+        report = {'not_run': 'staging failed before any job ran'}
+        record = self.data['cache_live'] = {'installed': None, 'jobs': {}, 'removed': False,
+                                            'installed_modes': None,
+                                            'inputs': cache_live.describe(inputs / 'config.json')}
+        with self.section('cache_live'), self.phase_evidence(sid, record):
+            try:
+                installed = self.install_cache_provisioning(sid, directory, public, inputs)
+                record['installed'] = {'modes': installed['modes']}
+                record['installed_modes'] = installed['modes']
+                self.check('cache_live.provisioning_installed', installed['modes'] == cache_live.MODES,
+                           record['installed'],
+                           reason=f"installed cache modes {installed['modes']}, expected {cache_live.MODES}")
+                self.stage_cache_job(sid, directory, public, inputs)
+                # The job's own client call can fail; that is a failed check,
+                # not a phase error, and the key still has to be removed.
+                record['jobs']['read'] = self.cached_job(sid, directory, public, client, cache_live.job_command())
+                try:
+                    report = job_result(record['jobs']['read'].get('stdout') or '{}')
+                except (KeyError, TypeError, ValueError) as error:
+                    report = {'unreadable_report': type(error).__name__}
+                record['report'] = report
+            finally:
+                record['removed'] = self.remove_cache_provisioning(sid, directory, public)
+                self.probe.checkpoint()
+        hits = cache_live.remote_hits(report.get('stats'))
+        record['remote_hits'] = hits
+        problems = cache_live.passed(record['installed_modes'], report, hits, record['removed'])
+        self.check('cache_live.remote_hits', not problems, record,
+                   reason=('live remote compile-cache check: ' + '; '.join(problems)) if problems else None)
+
+    def stage_cache_job(self, sid, directory, public, inputs):
+        """The job's Cargo package and its own Cargo home, owned by the job
+        account, plus the operator's seed as its offline source of crates."""
+        record = self.data['cache_live']
+        route = self.route(sid, directory, public)
+        upload = cache_live.stage_command()
+        with (inputs / cache_live.SEED).open('rb') as seed:
+            sent = subprocess.run(route + [upload],
+                                  input=(cache_live.CRATE_TOML + cache_live.CRATE_MAIN).encode() + seed.read(),
+                                  capture_output=True, text=True, timeout=600)
+        if sent.returncode:
+            raise ValueError('cache job workspace or seed upload failed: ' + (sent.stderr or '')[:300])
+        result = self.execute(
+            sid,
+            f'sudo -n -u {cache_live.JOB_ACCOUNT} tar -xzf {cache_live.STAGING}/{cache_live.SEED} '
+            f'-C {cache_live.WORKSPACE}/cargo && '
+            f'sudo -n sha256sum {cache_live.WORKSPACE}/cargo/{cache_live.SEED_MANIFEST}')
+        # The seed manifest digest names the capture the run read; it is image
+        # metadata, never key material.
+        record['seed_manifest_sha256'] = (result.get('stdout') or '').split(' ')[0]
+
+    def install_cache_provisioning(self, sid, directory, public, inputs):
+        """Write both files where CLOUD's contract puts them, at its modes.
+
+        The key goes up over the pinned SSH route on stdin: a key in an API
+        command would land in Boat's exec log, and one in a file upload would be
+        kept by the sandbox."""
+        route = self.route(sid, directory, public)
+        for source, name in ((inputs / 'config.json', 'config.json'), (inputs / 'read-key', 'read-key')):
+            with source.open('rb') as stream:
+                sent = subprocess.run(route + [f'umask 077; cat > {cache_live.STAGING}/{name}'],
+                                      stdin=stream, capture_output=True, timeout=300)
+            if sent.returncode:
+                raise ValueError(f'cache provisioning upload failed for {name}')
+        result = self.execute(
+            sid,
+            f'sudo -n install -d -m 0700 -o root -g root {cache_live.DIRECTORY} && '
+            + cache_live.install_command(cache_live.STAGING) + ' && '
+            f'sudo -n stat -c "%a %n" {cache_live.DIRECTORY} {cache_live.READ_KEY} {cache_live.CONFIG}')
+        modes = {}
+        for line in (result.get('stdout') or '').splitlines():
+            mode, _, path = line.partition(' ')
+            modes['directory' if path.rstrip('/') == cache_live.DIRECTORY else Path(path).name] = mode
+        return {'modes': modes, 'route': route}
+
+    def remove_cache_provisioning(self, sid, directory, public):
+        """Delete the installed and staged copies; True when a later read finds
+        none of them. This runs before any stop, snapshot or image save."""
+        self.probe.execute(sid, cache_live.remove_command())
+        staged = subprocess.run(self.route(sid, directory, public) + [cache_live.absent_command()],
+                                capture_output=True, timeout=300)
+        result = self.probe.execute(sid, cache_live.absent_command())
+        return staged.returncode == 0 and result.get('exitCode') == 0
 
     def verify_clone(self, name, record, started):
         """Create a sandbox of the requested size from `name` and wait for full hydration."""

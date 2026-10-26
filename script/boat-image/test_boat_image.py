@@ -236,6 +236,9 @@ class RecipeTests(unittest.TestCase):
         self.assertNotIn("--max-weight", unit)
         self.assertNotIn("--rustc-slots", unit)
         self.assertNotIn("@VCPUS@", unit)
+        # CLOUD's broker installs /run/motor/cache on every create and resume;
+        # the runner reads it only when its own switch is on.
+        self.assertIn("--remote-cache true", unit)
         self.assertIn("--job-network veth", unit)
         self.assertIn("User=root", unit)
         self.assertIn('--tenant-vm --tenant-socket-dir /run/motor-tenant', unit)
@@ -1052,6 +1055,17 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(start.sized_runner_args(['serve', '--max-weight', '8', '--rustc-slots', '8', '--job-network', 'veth'], 4),
                          ['serve', '--job-network', 'veth', '--max-weight', '4', '--rustc-slots', '4'])
         self.assertEqual(start.sized_runner_args(['serve'], 2), ['serve', '--max-weight', '2', '--rustc-slots', '2'])
+
+    def test_remote_cache_switch_is_always_passed_once_and_not_duplicated(self):
+        # The runner ignores provisioning unless its switch is on, so every Boat
+        # start must carry --remote-cache true exactly once, whatever an older
+        # unit file still says.
+        self.assertEqual(start.boat_runner_args(['serve', '--job-network', 'veth']),
+                         ['serve', '--job-network', 'veth', '--remote-cache', 'true'])
+        self.assertEqual(start.boat_runner_args(['serve', '--remote-cache', 'false', '--job-network', 'veth']),
+                         ['serve', '--job-network', 'veth', '--remote-cache', 'true'])
+        unit = (HERE / 'motor-boat.service').read_text()
+        self.assertEqual(unit.count('--remote-cache'), 1)
         with tempfile.TemporaryDirectory() as tmp:
             source, sized = Path(tmp, 'sandbox.json'), Path(tmp, 'sized.json')
             source.write_text(json.dumps({'vcpu_ceiling': 8, 'ready_marker': '/run/motor/endpoint-ready'}))
@@ -1072,9 +1086,13 @@ class RecipeTests(unittest.TestCase):
              patch.object(start, 'sandbox_cpus', return_value=4), patch.object(start.subprocess, 'Popen', popen), \
              self.assertRaises(Stop):
             start.main()
-        self.assertEqual(launched[0][:6], ['/usr/local/bin/motor-runner', 'serve', '--boat-profile',
-                                           '--max-weight', '4', '--rustc-slots'])
-        self.assertEqual(launched[0][6], '4')
+        # The cache switch and the measured CPU counts are all that matter; the
+        # order between them is not a contract.
+        self.assertEqual(launched[0][:3], ['/usr/local/bin/motor-runner', 'serve', '--boat-profile'])
+        self.assertEqual(launched[0][launched[0].index('--max-weight') + 1], '4')
+        self.assertEqual(launched[0][launched[0].index('--rustc-slots') + 1], '4')
+        self.assertIn('--remote-cache', launched[0])
+        self.assertEqual(launched[0][launched[0].index('--remote-cache') + 1], 'true')
 
     def test_network_preflight_uses_absolute_admin_paths_and_never_applies_rules(self):
         calls = []

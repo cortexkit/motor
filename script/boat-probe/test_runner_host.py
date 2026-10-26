@@ -949,6 +949,10 @@ class VerifyPhaseTests(unittest.TestCase):
         probe = Mock()
         probe.data = {}
         probe.size = 'default'
+        # These tests exercise phase sequencing only. The live remote compile
+        # cache section is a separate operator check with its own tests, so no
+        # input directory is supplied here.
+        probe.cache_inputs = None
         probe.request.return_value = {'snapshot':{'name':'prepared','status':'ready','snapshotId':'id','sizeBytes':1}}
         sandboxes = iter(['bx_core', 'bx_quota', 'bx_idle'])
         order = []
@@ -971,6 +975,12 @@ class VerifyPhaseTests(unittest.TestCase):
                                                       'terminal': {'outcome': {'type': 'exit', 'code': 0}}}}}
         runner.phase = Mock(side_effect=phase)
         runner.verify_core_resume = Mock(side_effect=lambda sid, *args: step('core_stop_resume', sid))
+        # The live remote compile cache has its own tests; here it records that
+        # it ran inside the core phase's sandbox and supplies no extra probes.
+        def cache_live(sid, *args):
+            step('cache_live', sid)
+            runner.data.setdefault('cache_live', {})
+        runner.verify_cache_live = Mock(side_effect=cache_live)
         runner.clone_ready = Mock(side_effect=lambda sid, label, *args: step(label, sid))
         def disk_quota(sid, *args):
             step('disk_quota', sid)
@@ -1000,14 +1010,16 @@ class VerifyPhaseTests(unittest.TestCase):
         self.verify(runner)
         self.assertEqual(order, [
             ('create', 'prepared', 'bx_core'), ('hydrated', 'bx_core'), ('prepared_clone', 'bx_core'),
-            ('idle_wait_in_phase', False), ('core_stop_resume', 'bx_core'), ('released', 'bx_core'),
+            ('idle_wait_in_phase', False), ('cache_live', 'bx_core'), ('core_stop_resume', 'bx_core'),
+            ('released', 'bx_core'),
             ('create', 'prepared', 'bx_quota'), ('hydrated', 'bx_quota'), ('disk_quota_clone', 'bx_quota'),
             ('disk_quota', 'bx_quota'), ('hydrated', 'bx_quota'), ('release_retained_job', 'bx_quota'),
             ('resumed', 'bx_quota'), ('idle_wait_in_phase', True),
             ('cleanup_replay', 'bx_quota'), ('released', 'bx_quota'),
             ('create', 'prepared', 'bx_idle'), ('hydrated', 'bx_idle'), ('idle', 'bx_idle'), ('released', 'bx_idle')])
         self.assertEqual(self.statuses(runner), {'core': 'passed', 'disk-quota': 'passed', 'idle': 'passed'})
-        self.assertEqual(runner.data['verify_phases']['core']['check_names'], ['prepared_clone.ran', 'core_stop_resume.ran'])
+        self.assertEqual(runner.data['verify_phases']['core']['check_names'],
+                         ['prepared_clone.ran', 'cache_live.ran', 'core_stop_resume.ran'])
         self.assertIn('disk_quota.normal_job_after_stop_resume', runner.data['verify_phases']['disk-quota']['check_names'])
         runner.execute.assert_not_called()
         # The control method is mocked here; separate tests use mocked provider/client calls to exercise its sequence.
@@ -1027,6 +1039,9 @@ class VerifyPhaseTests(unittest.TestCase):
                 self.verify(runner, (phase,))
                 self.assertEqual(probe.create.call_count, 1)
                 self.assertEqual(runner.verify_core_resume.call_count, int(phase == 'core'))
+                # The live remote compile-cache section belongs to the core
+                # phase's sandbox and is a no-op without --cache-inputs.
+                self.assertEqual(runner.verify_cache_live.call_count, int(phase == 'core'))
                 if phase == 'core':
                     runner.disk_quota.assert_not_called()
                 statuses = self.statuses(runner)
