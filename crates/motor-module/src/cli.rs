@@ -64,6 +64,7 @@ pub const HEADLINE: &str = "run a command on the remote build server (ck motor r
 pub const TOP_HELP: &str = "\
 usage: ck motor run [OPTIONS] -- COMMAND...
        ck motor attach JOB_ID [--secret-file PATH] [--status]
+       ck motor cancel JOB_ID [--secret-file PATH]
         ck motor hosted-check
         ck motor shadow-report [--since UNIX_SECONDS|Nh|Nm|Ns]
         ck-motor store-checkpoint --root STORE_DIR
@@ -138,6 +139,59 @@ workspace at a time.";
 pub enum Invocation {
     Help,
     Run(RunArgs),
+}
+
+pub const CANCEL_HELP: &str = "\
+usage: ck motor cancel JOB_ID [--secret-file PATH]
+
+Uses the saved default secret for JOB_ID when available, otherwise reads one
+line of stdin; --secret-file PATH selects an explicit secret file. Secrets are
+never accepted as arguments or from environment variables.
+
+Asks ck-motor to stop the job. Its acknowledgement means the cancel is durable;
+it does not wait for the job to end. The result is printed as one line:
+  cancelled
+  already finished: OUTCOME
+  refused: REASON
+Exit status: 0 when the job is cancelled or had already ended (including
+refused before start), 201 when the cancel may not have reached ck-motor and the
+job's fate is unknown, 200 when the cancel is refused (an unknown job ID and a
+wrong secret look the same), 204 for bad arguments.
+
+The job's reattach secret file is kept, so `ck motor attach JOB_ID` can still
+read the job's final output.";
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct CancelArgs {
+    pub job_id: Uuid,
+    pub secret_file: Option<PathBuf>,
+}
+
+pub fn parse_cancel_args(args: &[String]) -> Result<Option<CancelArgs>, String> {
+    if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
+        return Ok(None);
+    }
+    let mut parsed = CancelArgs {
+        job_id: args
+            .first()
+            .and_then(|id| id.parse().ok())
+            .ok_or("cancel needs a job ID")?,
+        secret_file: None,
+    };
+    let mut words = args[1..].iter();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--secret-file" if parsed.secret_file.is_none() => {
+                parsed.secret_file = Some(words.next().ok_or("--secret-file needs a path")?.into());
+            }
+            _ if word.starts_with("--secret-file=") && parsed.secret_file.is_none() => {
+                parsed.secret_file = Some(word[14..].into());
+            }
+            // Do not echo an unrecognized word: it might be a misplaced secret.
+            _ => return Err("cancel accepts only JOB_ID and --secret-file PATH".into()),
+        }
+    }
+    Ok(Some(parsed))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -361,6 +415,7 @@ usage: ck motor attach JOB_ID [--secret-file PATH] [--status]
 Uses the saved default secret for JOB_ID when available, otherwise reads one
 line of stdin; --secret-file PATH selects an explicit secret file.
 Secrets are never accepted as arguments or from environment variables.
+`ck motor cancel JOB_ID` uses the same lookup to stop a job that is still running.
 Replays output from the start, then streams until the job ends. --status prints
 the current state and outcome as JSON without streaming (exit 0 while running).
 Both wait up to 60 seconds for ck-motor if its capability is temporarily absent.
@@ -402,6 +457,7 @@ pub fn parse_attach_args(args: &[String]) -> Result<Option<AttachArgs>, String> 
     Ok(Some(parsed))
 }
 
+#[derive(Debug)]
 pub struct SecretFile {
     file: fs::File,
     path: PathBuf,
@@ -423,7 +479,23 @@ impl SecretFile {
         })
     }
 
-    fn create_default(directory: &Path, job_id: Uuid) -> std::io::Result<Self> {
+    /// The default file for `job_id` under `directory`, when one exists and is
+    /// a regular file (a symlink is refused).
+    pub fn open_default(directory: &Path, job_id: Uuid) -> Option<Self> {
+        let path = default_secret_path(directory, job_id);
+        let file = open_default_secret(&path).ok()?;
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        Some(Self {
+            file,
+            path,
+            remove_on_terminal: true,
+        })
+    }
+
+    /// Create the default file for `job_id` under `directory`.
+    pub fn create_default(directory: &Path, job_id: Uuid) -> std::io::Result<Self> {
         let path = default_secret_path(directory, job_id);
         let file = fs::OpenOptions::new()
             .write(true)
@@ -441,6 +513,11 @@ impl SecretFile {
     fn save(&mut self, secret: &str) -> std::io::Result<()> {
         writeln!(self.file, "{secret}")?;
         self.file.sync_all()
+    }
+
+    /// Write `secret` and flush it to disk.
+    pub fn write(&mut self, secret: &str) -> std::io::Result<()> {
+        self.save(secret)
     }
 
     fn remove_after_terminal(&self) -> std::io::Result<()> {
@@ -469,7 +546,8 @@ fn prepare_default_secret_directory() -> std::io::Result<PathBuf> {
     prepare_default_secret_directory_under(&data_root)
 }
 
-fn prepare_default_secret_directory_under(data_root: &Path) -> std::io::Result<PathBuf> {
+/// Create and check the default secret directory under `data_root`.
+pub fn prepare_default_secret_directory_under(data_root: &Path) -> std::io::Result<PathBuf> {
     fs::create_dir_all(data_root)?;
     let directory = data_root.join(DEFAULT_SECRET_DIRECTORY);
     match fs::DirBuilder::new().mode(0o700).create(&directory) {
@@ -873,6 +951,7 @@ async fn drive_run_with_secret_directory<C: ExecClient + ?Sized>(
             secret: None,
             secret_file: files.0,
             records: files.1,
+            secret_for_attach: None,
             default_secret_directory,
             default_secret_file: None,
         },
@@ -889,8 +968,34 @@ struct Session {
     job_id: Option<Uuid>,
     secret: Option<String>,
     secret_file: Option<SecretFile>,
+    /// The secret from the attach stream's `direct_job_secret` record. Only a
+    /// reattach stream carries it, and it supersedes a typed-in secret.
+    secret_for_attach: Option<String>,
     default_secret_directory: Option<PathBuf>,
     default_secret_file: Option<PathBuf>,
+}
+
+/// Reattach, typing in the secret through `stdin` when no default file exists.
+pub async fn drive_attach_with_stdin<C: ExecClient + ?Sized>(
+    client: &C,
+    args: &AttachArgs,
+    stdin: impl Read,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    interrupts: &mut mpsc::Receiver<()>,
+) -> u8 {
+    let found = local_reattach_secret(args.job_id, args.secret_file.as_deref(), stdin);
+    let default_secret_file = found.default_file.clone();
+    drive_attach_inner(
+        client,
+        args,
+        found,
+        default_secret_file,
+        out,
+        err,
+        interrupts,
+    )
+    .await
 }
 
 pub async fn drive_attach<C: ExecClient + ?Sized>(
@@ -901,20 +1006,78 @@ pub async fn drive_attach<C: ExecClient + ?Sized>(
     err: &mut dyn Write,
     interrupts: &mut mpsc::Receiver<()>,
 ) -> u8 {
-    drive_attach_inner(client, args, secret, None, out, err, interrupts).await
+    let found = ReattachSecret {
+        secret: secret.into(),
+        default_file: None,
+        saved_file: None,
+    };
+    drive_attach_inner(client, args, found, None, out, err, interrupts).await
+}
+
+/// The lookup `ck motor attach` and `ck motor cancel` share: the file an
+/// attach finds for a job (the default one named by the job ID, or the explicit
+/// `--secret-file`), and the default file path that a terminal outcome removes.
+#[derive(Debug)]
+pub struct ReattachSecret {
+    pub secret: String,
+    pub default_file: Option<PathBuf>,
+    /// The file `ck motor run` saved for this job, so a cancel can delete it.
+    pub saved_file: Option<SecretFile>,
+}
+
+/// Find or read the secret for `job_id`. `open_default` supplies the default
+/// file (production: ck-motor's data directory); tests pass another. Without a
+/// usable default file the secret is read from `stdin`.
+pub fn reattach_secret(
+    job_id: Uuid,
+    secret_file: Option<&Path>,
+    stdin: impl Read,
+    open_default: impl FnOnce(Uuid) -> Option<SecretFile>,
+) -> ReattachSecret {
+    if let Some(path) = secret_file {
+        return ReattachSecret {
+            secret: fs::File::open(path).map(read_secret).unwrap_or_default(),
+            default_file: None,
+            saved_file: None,
+        };
+    }
+    match open_default(job_id) {
+        Some(default) => ReattachSecret {
+            secret: read_secret(&default.file),
+            default_file: Some(default.path.clone()),
+            saved_file: Some(default),
+        },
+        None => ReattachSecret {
+            secret: read_secret(stdin),
+            default_file: None,
+            saved_file: None,
+        },
+    }
+}
+
+/// The secret for an attach or cancel, from ck-motor's own data directory.
+fn local_reattach_secret(
+    job_id: Uuid,
+    secret_file: Option<&Path>,
+    stdin: impl Read,
+) -> ReattachSecret {
+    let directory = existing_default_secret_directory().ok().flatten();
+    reattach_secret(job_id, secret_file, stdin, |id| {
+        directory.and_then(|directory| SecretFile::open_default(&directory, id))
+    })
 }
 
 async fn drive_attach_inner<C: ExecClient + ?Sized>(
     client: &C,
     args: &AttachArgs,
-    secret: &str,
+    found: ReattachSecret,
     default_secret_file: Option<PathBuf>,
     out: &mut dyn Write,
     err: &mut dyn Write,
     interrupts: &mut mpsc::Receiver<()>,
 ) -> u8 {
     if args.status {
-        return match wait_for_motor(|| client.status(args.job_id, secret), err).await {
+        return match wait_for_motor(|| client.status(args.job_id, &found.secret), err).await {
             Ok(status) => {
                 let _ = writeln!(
                     out,
@@ -928,12 +1091,12 @@ async fn drive_attach_inner<C: ExecClient + ?Sized>(
                 }
                 status.terminal.as_ref().map_or(0, exit_code)
             }
-            Err(failure) => attach_failure(failure, err),
+            Err(failure) => attach_failure(failure, "attach", err),
         };
     }
-    let stream = match wait_for_motor(|| client.attach(args.job_id, secret), err).await {
+    let stream = match wait_for_motor(|| client.attach(args.job_id, &found.secret), err).await {
         Ok(stream) => stream,
-        Err(failure) => return attach_failure(failure, err),
+        Err(failure) => return attach_failure(failure, "attach", err),
     };
     consume(
         client,
@@ -949,8 +1112,11 @@ async fn drive_attach_inner<C: ExecClient + ?Sized>(
                 cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP,
             ),
             job_id: Some(args.job_id),
-            secret: Some(secret.into()),
-            secret_file: None,
+            // A typed-in secret cannot be adopted: the plaintext would then
+            // override what the caller proved it knows.
+            secret: found.default_file.is_none().then(|| found.secret.clone()),
+            secret_file: found.saved_file,
+            secret_for_attach: None,
             default_secret_directory: None,
             default_secret_file,
         },
@@ -961,15 +1127,141 @@ async fn drive_attach_inner<C: ExecClient + ?Sized>(
     .await
 }
 
-fn attach_failure(failure: SubmitError, err: &mut dyn Write) -> u8 {
+/// Report a failed reattach or cancel under `name` (`attach` or `cancel`).
+fn attach_failure(failure: SubmitError, name: &str, err: &mut dyn Write) -> u8 {
     let (message, code) = match failure {
         SubmitError::NotSent(message) | SubmitError::CapabilityUnavailable(message) => {
             (message, EXIT_REFUSED)
         }
         SubmitError::Unknown(message) => (message, EXIT_UNKNOWN),
     };
-    let _ = writeln!(err, "ck motor attach: {message}");
+    let _ = writeln!(err, "ck motor {name}: {message}");
     code
+}
+
+/// `ck motor cancel JOB_ID`: ask ck-motor to stop a direct job found through its
+/// reattach secret, then report the job's state as one line on `out`. Only the
+/// caller that started the job, or one holding its secret, is admitted; a wrong
+/// secret is refused exactly like an unknown job ID.
+pub async fn drive_cancel<C: ExecClient + ?Sized>(
+    client: &C,
+    args: &CancelArgs,
+    secret: &str,
+    saved_file: Option<SecretFile>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    cancel_before_eof(client, args.job_id, secret, saved_file, true, out, err).await
+}
+
+/// [`drive_cancel`], passing its one line through verbatim. `out` in the CLI is
+/// line-buffered, so a reader that filters the line still sees a whole line.
+async fn cancel_before_eof<C: ExecClient + ?Sized>(
+    client: &C,
+    job_id: Uuid,
+    secret: &str,
+    saved_file: Option<SecretFile>,
+    flush: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let mut line = Vec::new();
+    let code = cancel_line(client, job_id, secret, saved_file, &mut line, err).await;
+    let _ = out.write_all(&line);
+    if flush {
+        let _ = out.flush();
+    }
+    code
+}
+
+async fn cancel_line<C: ExecClient + ?Sized>(
+    client: &C,
+    job_id: Uuid,
+    secret: &str,
+    saved_file: Option<SecretFile>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    // A cancel on a job that already ended is a no-op, but reporting its
+    // outcome needs one status read. The read is best effort: a cancel asking
+    // only for the job to stop must not depend on the runner answering.
+    let mut ended = match wait_for_motor(|| client.status(job_id, secret), err).await {
+        Ok(status) => status.terminal,
+        Err(_) => None,
+    };
+    if ended.is_none() {
+        if let Err(error) = wait_for_motor(
+            || async {
+                client
+                    .cancel(job_id, Some(secret))
+                    .await
+                    .map_err(SubmitError::NotSent)
+            },
+            err,
+        )
+        .await
+        {
+            // The cancel is idempotent, so a call that may not have been sent
+            // is a refusal: connect again and run it again.
+            return attach_failure(error, "cancel", err);
+        }
+        // The acknowledgement means the cancel is durable, not that the job
+        // stopped. Read the state once to name a job that ended in the meantime.
+        ended = wait_for_motor(|| client.status(job_id, secret), err)
+            .await
+            .ok()
+            .and_then(|status| status.terminal);
+    }
+    let Some(terminal) = ended else {
+        let _ = writeln!(out, "cancelled");
+        return 0;
+    };
+    // A cancel is acknowledged before the job's terminal, so a wait that began
+    // while the job was running returns without one. A saved secret file then
+    // settles it: `ck motor run` deletes the file once the running job ends,
+    // so a file still on disk means the job had not ended. A job that started
+    // or was refused before start kept its file, and a job whose terminal
+    // `run` already handled has none left.
+    let ended = match saved_file {
+        Some(saved_file) => saved_file.remove_after_terminal().is_err(),
+        None => true,
+    };
+    if ended {
+        let _ = writeln!(out, "already finished: {}", describe_outcome(&terminal));
+    } else {
+        let _ = writeln!(out, "cancelled");
+    }
+    0
+}
+
+/// A job outcome in a few words for `ck motor cancel`'s one-line report.
+fn describe_outcome(terminal: &TerminalRecord) -> String {
+    let id = terminal.job_id;
+    if let Some(killed) = &terminal.killed {
+        let reason = match killed {
+            Killed::Cancel => "cancelled".to_string(),
+            Killed::Deadline => "reached its timeout".to_string(),
+            other => format!("{other:?}"),
+        };
+        return format!("{reason} (job_id={id})");
+    }
+    let detail = terminal
+        .refusal_detail
+        .as_deref()
+        .map(|detail| format!(": {detail}"))
+        .unwrap_or_default();
+    let outcome = match &terminal.outcome {
+        Outcome::Exit { code } => format!("exit {code}"),
+        Outcome::WindowsExit { code } => format!("exit {code}"),
+        Outcome::Signal { signal } => format!("killed by signal {signal}"),
+        Outcome::Cancelled => "cancelled".into(),
+        Outcome::RefusedBeforeStart { reason } => {
+            format!("refused before start: {reason:?}{detail}")
+        }
+        Outcome::OutcomeUnknown => "outcome unknown".into(),
+        other => format!("{other:?}"),
+    };
+    format!("{outcome} (job_id={id})")
 }
 
 async fn consume<C: ExecClient + ?Sized>(
@@ -1029,12 +1321,12 @@ async fn consume<C: ExecClient + ?Sized>(
                         Some("outcome_unknown" | "route_closed")
                     )
                 {
-                    attach_failure(SubmitError::NotSent(failure.message), err);
+                    attach_failure(SubmitError::NotSent(failure.message), "attach", err);
                     reattach_hint(job_id, session.secret_file.as_ref(), err);
                     return EXIT_UNKNOWN;
                 }
                 if !received && failure.code.as_deref() == Some("motor_job_not_found") {
-                    return attach_failure(SubmitError::NotSent(failure.message), err);
+                    return attach_failure(SubmitError::NotSent(failure.message), "attach", err);
                 }
                 if !received
                     && failure
@@ -1089,7 +1381,7 @@ async fn consume<C: ExecClient + ?Sized>(
                                 continue;
                             }
                             Err(failure) => {
-                                attach_failure(failure, err);
+                                attach_failure(failure, "attach", err);
                                 reattach_hint(job_id, session.secret_file.as_ref(), err);
                                 return EXIT_UNKNOWN;
                             }
@@ -1116,11 +1408,21 @@ async fn consume<C: ExecClient + ?Sized>(
                 continue;
             }
         };
+        // Echoed on the attach stream: the other record that carries it is
+        // the run stream's first, which probe_direct_job already copied.
+        if let Some(secret) = value.get("direct_job_secret").and_then(|s| s.as_str()) {
+            session.secret_for_attach = Some(secret.into());
+        }
         if let Some(direct_job) = value
             .as_object_mut()
             .and_then(|record| record.remove("direct_job"))
         {
-            if session.secret.is_none() {
+            if session.secret_for_attach.is_some() {
+                let _ = writeln!(
+                    err,
+                    "ck motor {name}: ignored a direct_job record on an attach stream"
+                );
+            } else if session.secret.is_none() {
                 if let (Some(id), Some(secret)) = (
                     direct_job["job_id"].as_str().and_then(|id| id.parse().ok()),
                     direct_job["secret"].as_str(),
@@ -1758,35 +2060,6 @@ pub async fn hosted_check_main(args: &[String]) -> u8 {
         }
     }
 }
-
-fn attach_secret(args: &AttachArgs, stdin: impl Read) -> (String, Option<PathBuf>) {
-    let default_directory = existing_default_secret_directory().ok().flatten();
-    attach_secret_from_directory(args, stdin, default_directory)
-}
-
-fn attach_secret_from_directory(
-    args: &AttachArgs,
-    stdin: impl Read,
-    default_directory: Option<PathBuf>,
-) -> (String, Option<PathBuf>) {
-    if let Some(path) = &args.secret_file {
-        return (
-            fs::File::open(path).map(read_secret).unwrap_or_default(),
-            None,
-        );
-    }
-    let default_file =
-        default_directory.map(|directory| default_secret_path(&directory, args.job_id));
-    if let Some(path) = default_file {
-        match open_default_secret(&path) {
-            Ok(file) => return (read_secret(file), Some(path)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return (String::new(), None),
-        }
-    }
-    (read_secret(stdin), None)
-}
-
 pub async fn attach_main(args: &[String]) -> u8 {
     let args = match parse_attach_args(args) {
         Ok(Some(args)) => args,
@@ -1799,7 +2072,12 @@ pub async fn attach_main(args: &[String]) -> u8 {
             return EXIT_USAGE;
         }
     };
-    let (secret, default_secret_file) = attach_secret(&args, std::io::stdin().lock());
+    let found = local_reattach_secret(
+        args.job_id,
+        args.secret_file.as_deref(),
+        std::io::stdin().lock(),
+    );
+    let default_secret_file = found.default_file.clone();
     let workspace = match std::env::current_dir() {
         Ok(path) => path,
         Err(_) => {
@@ -1816,16 +2094,55 @@ pub async fn attach_main(args: &[String]) -> u8 {
     };
     let client = match SubcClient::connect_for_attach(&workspace).await {
         Ok(client) => client,
-        Err(failure) => return attach_failure(failure, &mut std::io::stderr()),
+        Err(failure) => return attach_failure(failure, "attach", &mut std::io::stderr()),
     };
     drive_attach_inner(
         &client,
         &args,
-        &secret,
+        found,
         default_secret_file,
         &mut std::io::stdout(),
         &mut std::io::stderr(),
         &mut interrupts,
+    )
+    .await
+}
+
+pub async fn cancel_main(args: &[String]) -> u8 {
+    let args = match parse_cancel_args(args) {
+        Ok(Some(args)) => args,
+        Ok(None) => {
+            println!("{CANCEL_HELP}");
+            return 0;
+        }
+        Err(message) => {
+            eprintln!("ck motor cancel: {message}\n\n{CANCEL_HELP}");
+            return EXIT_USAGE;
+        }
+    };
+    let found = local_reattach_secret(
+        args.job_id,
+        args.secret_file.as_deref(),
+        std::io::stdin().lock(),
+    );
+    let workspace = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(_) => {
+            eprintln!("ck motor cancel: current directory unavailable");
+            return EXIT_USAGE;
+        }
+    };
+    let client = match SubcClient::connect_for_attach(&workspace).await {
+        Ok(client) => client,
+        Err(failure) => return attach_failure(failure, "cancel", &mut std::io::stderr()),
+    };
+    drive_cancel(
+        &client,
+        &args,
+        &found.secret,
+        found.saved_file,
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr(),
     )
     .await
 }
@@ -1949,15 +2266,14 @@ mod tests {
             0o600
         );
 
-        let args = super::AttachArgs {
-            job_id,
-            secret_file: None,
-            status: false,
-        };
-        let (loaded, path) =
-            super::attach_secret_from_directory(&args, &b""[..], Some(directory.clone()));
-        assert_eq!(loaded, secret);
-        assert_eq!(path, Some(file.path.clone()));
+        // `ck motor attach` and `ck motor cancel` without --secret-file find
+        // this file by the job ID.
+        let found = super::reattach_secret(job_id, None, &b""[..], |id| {
+            super::SecretFile::open_default(&directory, id)
+        });
+        assert_eq!(found.secret, secret);
+        assert_eq!(found.default_file, Some(file.path.clone()));
+        assert!(found.saved_file.is_some());
 
         let linked_id = motor_protocol::Uuid::now_v7();
         let link = super::default_secret_path(&directory, linked_id);
@@ -2012,6 +2328,68 @@ mod tests {
         assert_eq!(super::read_secret(format!("{secret}\n").as_bytes()), secret);
         assert_eq!(super::read_secret(&b""[..]), "");
     }
+    #[test]
+    fn cancel_never_accepts_an_argv_secret_or_echoes_it() {
+        let id = Uuid::now_v7().to_string();
+        let secret = "b".repeat(64);
+        for args in [
+            vec![id.clone(), secret.clone()],
+            vec![id.clone(), "--secret".into(), secret.clone()],
+            vec![id.clone(), format!("--secret={secret}")],
+        ] {
+            let error = parse_cancel_args(&args).unwrap_err();
+            assert!(!error.contains(&secret));
+        }
+        let words = |values: &[&str]| values.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(parse_cancel_args(&words(&[])).is_err());
+        assert!(parse_cancel_args(&words(&["not-a-job-id"])).is_err());
+        assert!(parse_cancel_args(&words(&["--help"])).unwrap().is_none());
+        let args = parse_cancel_args(&words(&[&id, "--secret-file=key"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(args.secret_file.unwrap(), Path::new("key"));
+        // The usage ck prints must list every verb, cancel included.
+        for verb in ["run", "attach JOB_ID", "cancel JOB_ID", "hosted-check"] {
+            assert!(
+                format!(" {TOP_HELP}").contains(&format!(" ck motor {verb}")),
+                "TOP_HELP is missing {verb}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_line_names_each_way_a_job_can_have_ended() {
+        let id = Uuid::now_v7();
+        let terminal = |outcome, killed| {
+            let mut terminal = TerminalRecord::new(id, outcome, 0, 0, 0);
+            terminal.killed = killed;
+            terminal
+        };
+        assert_eq!(
+            describe_outcome(&terminal(Outcome::Exit { code: 17 }, None)),
+            format!("exit 17 (job_id={id})")
+        );
+        assert_eq!(
+            describe_outcome(&terminal(Outcome::Signal { signal: 9 }, None)),
+            format!("killed by signal 9 (job_id={id})")
+        );
+        assert_eq!(
+            describe_outcome(&terminal(Outcome::Exit { code: 1 }, Some(Killed::Deadline))),
+            format!("reached its timeout (job_id={id})")
+        );
+        assert_eq!(
+            describe_outcome(&terminal(Outcome::Cancelled, None)),
+            format!("cancelled (job_id={id})")
+        );
+        assert!(describe_outcome(&terminal(
+            Outcome::RefusedBeforeStart {
+                reason: motor_protocol::RefusalReason::RequestRejected
+            },
+            None
+        ))
+        .starts_with("refused before start: RequestRejected"));
+    }
+
     #[test]
     fn run_accepts_secret_file_without_putting_secret_in_arguments() {
         let words: Vec<String> = ["--secret-file", "job.key", "--", "true"]
@@ -2530,6 +2908,7 @@ mod hosted_cli_tests {
                     job_id: Some(id),
                     secret: None,
                     secret_file: None,
+                    secret_for_attach: None,
                     default_secret_directory: None,
                     default_secret_file: None,
                 },
@@ -2655,19 +3034,25 @@ mod hosted_cli_tests {
             secret_file: None,
             status: false,
         };
-        let (loaded_secret, default_file) =
-            attach_secret_from_directory(&args, &b""[..], Some(directory.clone()));
-        assert_eq!(loaded_secret, attach_secret);
+        let found = reattach_secret(attach_id, None, &b""[..], |id| {
+            SecretFile::open_default(&directory, id)
+        });
+        assert_eq!(found.secret, attach_secret);
+        assert_eq!(
+            found.default_file,
+            Some(default_secret_path(&directory, attach_id))
+        );
         let client = SecretCheckingClient {
             expected_secret: attach_secret,
         };
         let (_, mut interrupts) = mpsc::channel(1);
         let mut out = Vec::new();
         let mut err = Vec::new();
+        let default_file = found.default_file.clone();
         let code = drive_attach_inner(
             &client,
             &args,
-            &loaded_secret,
+            found,
             default_file,
             &mut out,
             &mut err,

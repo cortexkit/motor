@@ -31,9 +31,9 @@ components. They do not ship in this repository.
   `workspace.prepare`, `workspace.drop`, and the read-only `runner.health` report.
 
 `ck-motor --ck-domain` prints one line for the `ck` launcher, and
-`ck motor run` (`ck-motor run`) submits one job from a script, and
-`ck motor attach JOB_ID` reconnects to it; see
-[Direct runs](#direct-runs).
+`ck motor run` (`ck-motor run`) submits one job from a script,
+`ck motor attach JOB_ID` reconnects to it, and `ck motor cancel JOB_ID` stops it;
+see [Direct runs](#direct-runs).
 
 ## Configuration
 
@@ -597,6 +597,7 @@ automatically. For scripts that need a caller-selected path, use:
 ck motor run --secret-file /private/job.key -- 'cargo test'
 ck motor attach JOB_ID --secret-file /private/job.key
 ck motor attach JOB_ID --secret-file /private/job.key --status
+ck motor cancel JOB_ID --secret-file /private/job.key
 ```
 
 `--secret-file` on `run` creates a new file with mode `0600`, refuses an existing
@@ -606,6 +607,27 @@ received, and swept once they exceed the 24-hour job retention. If no default
 file exists, `attach` reads one line from stdin; `--secret-file PATH` selects an
 explicit file. Never place the secret in argv or an environment variable; neither
 is an accepted input channel. Do not enable shell tracing while handling it.
+
+`cancel JOB_ID` stops a job whose `ck motor run` process is gone, for example
+after it was killed, without resubmitting anything. It finds the secret exactly
+as `attach` does: the default file named by the job ID, an explicit
+`--secret-file`, or one line on stdin. It sends the direct `exec.cancel`, which
+ck-motor admits only for the route that started the job or a caller holding the
+job's secret; there is no other fallback, and the secret is never printed. The
+result is one line on stdout:
+
+- `cancelled` — the cancel is durable and the job had not ended yet.
+- `already finished: OUTCOME (job_id=ID)` — the job had ended; `OUTCOME` is its
+  exit code, signal, timeout, cancellation or refusal.
+- Nothing on stdout when the cancel is refused, with the reason on stderr,
+  under the same wording an unknown job produces.
+
+The exit status is 0 when the job is cancelled or had already ended, 200 when
+the cancel is refused (an unknown job ID and a wrong secret get the same
+refusal), 201
+when the cancel may not have reached ck-motor, and 204 for bad arguments. The
+command does not wait for the job to end; `attach JOB_ID` then shows its final
+output. A saved default secret file is kept, so `attach` can still read it.
 
 `attach` replays output from the start in order, then follows a still-running
 job to its terminal outcome. It has the same exit-code contract as `run`.
@@ -633,8 +655,14 @@ refusal equivalence (`crates/motor-module/tests/it/operator_cli.rs`):
 `attached_cli_cancels_with_secret_and_status_is_read_only`,
 `direct_secret_grants_only_its_job_and_no_additional_operations`,
 `cli_attach_refusals_are_byte_identical_and_secret_file_hides_the_secret`.
-CLI unit tests: `secret_file_is_private_new_and_never_overwrites`,
-`attach_never_accepts_an_argv_secret_or_echoes_it`.
+`ck motor cancel` is covered by `cli_cancel_ends_a_running_job_with_killed_cancel`,
+`cli_cancel_reports_a_finished_job_and_exits_zero`,
+`cli_cancel_of_an_unknown_job_fails_without_runner_io` and
+`cli_cancel_with_a_wrong_secret_is_refused_like_an_unknown_job` in the same
+file. CLI unit tests: `secret_file_is_private_new_and_never_overwrites`,
+`attach_never_accepts_an_argv_secret_or_echoes_it`,
+`cancel_never_accepts_an_argv_secret_or_echoes_it`,
+`cancel_line_names_each_way_a_job_can_have_ended`.
 
 ## Hosted repository routing
 

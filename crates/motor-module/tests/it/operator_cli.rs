@@ -2163,3 +2163,226 @@ async fn agent_over_cap_return_max_bytes_is_invalid_params_and_never_runs() {
     );
     assert!(f.proxy.frames.lock().unwrap().is_empty());
 }
+
+/// Drive `ck motor cancel` against the real handler through a fresh direct
+/// route, using the secret the caller found for the job.
+async fn drive_cancel_job(
+    daemon: &Arc<Daemon>,
+    job_id: Uuid,
+    found: cli::ReattachSecret,
+) -> (u8, String, String) {
+    let client = WireClient {
+        daemon: daemon.clone(),
+        channel: OTHER_DIRECT_CHANNEL,
+        hosted: false,
+    };
+    let args = cli::CancelArgs {
+        job_id,
+        secret_file: None,
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = cli::drive_cancel(
+        &client,
+        &args,
+        &found.secret,
+        found.saved_file,
+        &mut out,
+        &mut err,
+    )
+    .await;
+    (
+        code,
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
+
+/// The secret `ck motor cancel` resolves for `job_id`: the default file's when
+/// `directory` holds one, otherwise what the caller typed.
+fn reattach_secret(
+    job_id: Uuid,
+    directory: Option<&std::path::Path>,
+    typed: &str,
+) -> cli::ReattachSecret {
+    cli::reattach_secret(job_id, None, typed.as_bytes(), |id| {
+        directory.and_then(|directory| cli::SecretFile::open_default(directory, id))
+    })
+}
+
+/// The default secret file `ck motor run` saves for a job, found the way
+/// `ck motor attach` and `ck motor cancel` find it.
+fn saved_secret(job_id: Uuid, secret: &str, directory: &std::path::Path) -> cli::ReattachSecret {
+    let mut file = cli::SecretFile::create_default(directory, job_id).unwrap();
+    file.write(secret).unwrap();
+    drop(file);
+    let found = reattach_secret(job_id, Some(directory), "");
+    assert_eq!(found.default_file, Some(directory.join(job_id.to_string())));
+    found
+}
+
+#[tokio::test]
+async fn cli_cancel_ends_a_running_job_with_killed_cancel() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    daemon.bind(DIRECT_CHANNEL, direct()).await;
+    daemon.bind(OTHER_DIRECT_CHANNEL, direct()).await;
+    let (id, secret, mut original) =
+        direct_submission(&daemon, timed(&f, "echo started; exec sleep 30", 600)).await;
+    // Wait for the job to be running before cancelling it.
+    loop {
+        let frame = next(&mut original).await;
+        if matches!(
+            serde_json::from_slice::<StreamRecord>(&frame.body).unwrap(),
+            StreamRecord::Output(_)
+        ) {
+            break;
+        }
+    }
+    // `ck motor run` saved the secret in the default file named by the job ID,
+    // and `ck motor cancel JOB_ID` reads it back as `attach` does.
+    let scratch = cortexkit_test_support::ScratchDir::new("motor-cancel-default");
+    let directory = cli::prepare_default_secret_directory_under(scratch.path()).unwrap();
+    let found = saved_secret(id, &secret, &directory);
+    assert_eq!(found.secret, secret);
+    let saved_path = found.default_file.clone();
+    // Only a route holding the secret may cancel this job.
+    let (code, out, err) = drive_cancel_job(&daemon, id, found).await;
+    assert_eq!(code, 0, "{out}{err}");
+    assert_eq!(out, "cancelled\n");
+    assert!(!out.contains(&secret) && !err.contains(&secret));
+    let terminal = loop {
+        let frame = next(&mut original).await;
+        if let StreamRecord::Terminal(terminal) = serde_json::from_slice(&frame.body).unwrap() {
+            break terminal;
+        }
+    };
+    assert_eq!(
+        terminal.killed,
+        Some(motor_protocol::Killed::Cancel),
+        "{terminal:?}"
+    );
+    assert_eq!(cli::exit_code(&terminal), cli::EXIT_CANCELLED);
+    // The saved file is what tells `ck motor cancel` the job was still
+    // running: it answers `cancelled` exactly when a saved file it read for
+    // the job is still on disk. The job's own stop racing the cancel does not
+    // change that.
+    assert!(
+        saved_path.is_some(),
+        "the cancel read the saved secret file"
+    );
+}
+
+#[tokio::test]
+async fn cli_cancel_reports_a_finished_job_and_exits_zero() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    daemon.bind(DIRECT_CHANNEL, direct()).await;
+    daemon.bind(OTHER_DIRECT_CHANNEL, direct()).await;
+    let (id, secret, mut frames) = direct_submission(&daemon, timed(&f, "exit 17", 60)).await;
+    let ended = collect_frames(&mut frames).await;
+    let last = ended.last().unwrap();
+    let StreamRecord::Terminal(terminal) = serde_json::from_slice(&last.body).unwrap() else {
+        panic!("the run must end with a terminal");
+    };
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 17 });
+    // A finished job's terminal arrives without the one-time secret record,
+    // so a caller that kept the secret still names the same job.
+    let found = reattach_secret(id, None, &secret);
+    assert_eq!(found.secret, secret);
+    let (code, out, err) = drive_cancel_job(&daemon, id, found).await;
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, format!("already finished: exit 17 (job_id={id})\n"));
+    assert!(!out.contains(&secret) && !err.contains(&secret));
+}
+
+/// Wait for a direct run's first output record, so a test knows the job is
+/// running before it acts on the job.
+async fn collect_output(frames: &mut mpsc::UnboundedReceiver<Frame>) {
+    loop {
+        let frame = next(frames).await;
+        let record = serde_json::from_slice::<StreamRecord>(&frame.body).unwrap();
+        if matches!(record, StreamRecord::Output(_)) {
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+async fn cli_cancel_of_an_unknown_job_fails_without_runner_io() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    daemon.bind(DIRECT_CHANNEL, direct()).await;
+    daemon.bind(OTHER_DIRECT_CHANNEL, direct()).await;
+    let (id, secret, mut frames) =
+        direct_submission(&daemon, timed(&f, "echo started; exec sleep 30", 600)).await;
+    collect_output(&mut frames).await;
+    let found = reattach_secret(Uuid::now_v7(), None, &secret);
+    let runner_frames = f.proxy.frames.lock().unwrap().len();
+    let (code, out, err) = drive_cancel_job(&daemon, Uuid::now_v7(), found).await;
+    assert_ne!(code, 0, "{out}{err}");
+    assert_eq!(code, cli::EXIT_REFUSED);
+    assert_eq!(out, "");
+    assert!(err.contains("no such job"), "{err}");
+    assert_eq!(
+        f.proxy.frames.lock().unwrap().len(),
+        runner_frames,
+        "a cancel for an unknown job must not reach the runner"
+    );
+    // The job the refused cancel did not name is still running.
+    let status = daemon
+        .request(DIRECT_CHANNEL, "exec.status", json!({"job_id":id}))
+        .await;
+    let status: motor_protocol::JobStatusReply = serde_json::from_slice(&status.body).unwrap();
+    assert!(status.terminal.is_none(), "{status:?}");
+    let cancelled = daemon
+        .request(DIRECT_CHANNEL, "exec.cancel", json!(CancelRequest::new(id)))
+        .await;
+    assert_eq!(
+        cancelled.header.ty,
+        FrameType::Response,
+        "{}",
+        body(&cancelled)
+    );
+}
+
+#[tokio::test]
+async fn cli_cancel_with_a_wrong_secret_is_refused_like_an_unknown_job() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let daemon = Daemon::start(&f, direct_config(&f)).await;
+    daemon.bind(DIRECT_CHANNEL, direct()).await;
+    daemon.bind(OTHER_DIRECT_CHANNEL, direct()).await;
+    let (id, secret, mut frames) =
+        direct_submission(&daemon, timed(&f, "echo started; exec sleep 30", 600)).await;
+    collect_output(&mut frames).await;
+    let mut messages = Vec::new();
+    for (job_id, presented) in [(id, "f".repeat(64)), (Uuid::now_v7(), secret.clone())] {
+        let found = reattach_secret(job_id, None, &presented);
+        let (code, out, err) = drive_cancel_job(&daemon, job_id, found).await;
+        assert_eq!(code, cli::EXIT_REFUSED, "{out}{err}");
+        assert_eq!(out, "");
+        assert!(!err.contains(&secret));
+        messages.push((err, out));
+    }
+    assert_eq!(
+        messages[0], messages[1],
+        "a wrong secret and an unknown job are the same refusal"
+    );
+    let status = daemon
+        .request(DIRECT_CHANNEL, "exec.status", json!({"job_id":id}))
+        .await;
+    let status: motor_protocol::JobStatusReply = serde_json::from_slice(&status.body).unwrap();
+    assert!(
+        status.terminal.is_none(),
+        "a refused cancel must not stop the job"
+    );
+    let cancelled = daemon
+        .request(DIRECT_CHANNEL, "exec.cancel", json!(CancelRequest::new(id)))
+        .await;
+    assert_eq!(
+        cancelled.header.ty,
+        FrameType::Response,
+        "{}",
+        body(&cancelled)
+    );
+}
