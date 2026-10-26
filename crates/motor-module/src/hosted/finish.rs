@@ -37,7 +37,6 @@ impl Client {
             storage
                 .hosted_update(id, |s| {
                     s.finish_done = true;
-                    s.cleanup_pending = false;
                 })
                 .map_err(|_| Error::Broker)?;
         }
@@ -178,7 +177,6 @@ impl Client {
                     storage.hosted_update(id, |s| {
                         s.pending_finish = None;
                         s.finish_done = true;
-                        s.cleanup_pending = false;
                         s.billed_vcpu_ms = Some(settled);
                         s.billing = super::BillingStatus::Available;
                     })?;
@@ -189,7 +187,6 @@ impl Client {
                     storage.hosted_update(id, |s| {
                         s.pending_finish = None;
                         s.finish_done = true;
-                        s.cleanup_pending = false;
                         s.billing = super::BillingStatus::Unavailable;
                         if lost {
                             s.hosted_code = Some("hosted_sandbox_lost".into());

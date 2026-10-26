@@ -553,7 +553,7 @@ impl Motor {
             terminal = terminal.with_tree_hash(hash);
         }
         let detail = if self.hosted_state(id).is_some() {
-            if let Some(state) = self.hosted_state(id).filter(|s| s.lease_attempted) {
+            if let Some(state) = self.hosted_state(id).filter(|s| s.booked_or_attempted()) {
                 let boat = state
                     .placement
                     .as_ref()
@@ -1276,7 +1276,10 @@ impl Motor {
                 .inspect_err(|error| self.log_hosted_failure(id, "cancel_before_run", error))?;
         }
         if self.storage.job(id).is_some_and(|job| {
-            job.local_terminal.is_some() || job.hosted.is_some_and(|route| route.terminal.is_some())
+            job.local_terminal.is_some()
+                || job.hosted.is_some_and(|route| {
+                    route.terminal.is_some() && !route.awaiting_cancel_terminal()
+                })
         }) {
             return Err(io::Error::other("job already terminal before Run"));
         }
@@ -1496,7 +1499,7 @@ impl Motor {
                     let mut delay = 1;
                     while self.pending(id) {
                         if self.hosted_state(id).is_some_and(|s| {
-                            s.host_deadline_s
+                            s.host_deadline_s()
                                 .is_some_and(|deadline| crate::hosted::now_s() >= deadline)
                         }) {
                             return Err(io::Error::other(
@@ -1547,7 +1550,7 @@ impl Motor {
         match channel.next().await? {
             Incoming::Frame(Frame::CancelReply(reply)) if reply.job_id == build_server_id => {
                 tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "runner acknowledged cancel");
-                self.storage.cancel(id, false)
+                self.storage.cancel_acknowledged(id)
             }
             _ => Err(io::Error::other("expected cancel_reply")),
         }
@@ -1694,7 +1697,7 @@ impl Motor {
             .is_some_and(|p| p.host.starts_with("boat:"));
         if boat {
             client.finish_never_ran(id, &self.storage).await?;
-        } else if route.lease_attempted {
+        } else if route.booked_or_attempted() {
             let released = client.release_stored(id, &self.storage).await;
             tracing::info!(job_id = %id, result = released.err().map_or("released", |e| e.code()),
                 "hosted release");
@@ -1772,7 +1775,7 @@ impl Motor {
         // caller without a terminal. Retain and retry unconfirmed cancellation.
         let mut cancel_unconfirmed = false;
         let host_expired = state
-            .host_deadline_s
+            .host_deadline_s()
             .is_some_and(|d| crate::hosted::now_s() >= d);
         if matches!(terminal.outcome, Outcome::OutcomeUnknown)
             && state.run_sent
@@ -1917,13 +1920,13 @@ impl Motor {
         let mut wake_open = true;
         let mut reattaches = 0;
         let mut hosted_terminal_deadline = None;
-        let host_deadline = self
-            .hosted_state(id)
-            .and_then(|s| s.host_deadline_s)
-            .map(|deadline| {
-                tokio::time::Instant::now()
-                    + Duration::from_secs(deadline.saturating_sub(crate::hosted::now_s()))
-            });
+        let host_deadline =
+            self.hosted_state(id)
+                .and_then(|s| s.host_deadline_s())
+                .map(|deadline| {
+                    tokio::time::Instant::now()
+                        + Duration::from_secs(deadline.saturating_sub(crate::hosted::now_s()))
+                });
         loop {
             if tx.is_closed() {
                 self.log_hosted_failure(id, "follow", "caller detached");
@@ -2276,7 +2279,7 @@ impl Motor {
                 Ok(Incoming::Frame(Frame::WithdrawReply { .. })) => {}
                 Ok(Incoming::Frame(Frame::CancelReply(reply))) if hosted && reply.job_id == id => {
                     tracing::info!(job_id = %id, step = "cancel", cause = "runner acknowledged cancellation", "hosted cancellation acknowledged");
-                    self.storage.cancel(id, false)?;
+                    self.storage.cancel_acknowledged(id)?;
                 }
                 other => {
                     if hosted {

@@ -453,7 +453,7 @@ async fn connection_lost_after_run_and_cancel_finishes_lost_at_host_deadline() {
         } else {
             job.motor
                 .storage
-                .hosted_update(id, |s| s.host_deadline_s = Some(0))
+                .hosted_update(id, |s| s.retry_iat = Some(0))
                 .unwrap();
             assert!(job.motor.cleanup_hosted_once(id, false).await.unwrap());
         }
@@ -461,5 +461,112 @@ async fn connection_lost_after_run_and_cancel_finishes_lost_at_host_deadline() {
         assert_eq!(h.runner.runs.load(Ordering::SeqCst), 1);
         assert_eq!(job.motor.storage.job(id).unwrap().build_server_job_id, None);
         assert_settled(&h, &job.motor, id, "lost", 0);
+    }
+}
+
+#[tokio::test]
+#[ignore = "run scripts/mixed-version.py with the real rollback client"]
+async fn rollback_222d833_preserves_recovery_and_uncancelled_detach() {
+    let helper = std::env::var_os("MOTOR_ROLLBACK_CLIENT")
+        .expect("run python3 scripts/mixed-version.py for the real 222d833 client");
+    for case in [
+        "never_run",
+        "cancel_pending",
+        "cancel_acknowledged",
+        "detached",
+    ] {
+        let h = Harness::new(Branch::Lost).await;
+        let scratch = ScratchDir::new("rollback-boat-recovery");
+        let root = scratch.join("state");
+        let config = Config {
+            runner_instance: "test".into(),
+            broker_token_source: crate::BrokerTokenSource::Fake,
+            broker_url: Some(h.broker.url.clone()),
+            ..Config::default()
+        };
+        let storage = Storage::open(&root).unwrap();
+        let id = Uuid::now_v7();
+        storage.create(id, 300, None, None, false).unwrap();
+        let mut route = crate::HostedJobState::new(&config);
+        route.placement = Some(motor_lease::Placement {
+            host: "boat:test".into(),
+            vm: Some("test".into()),
+        });
+        route.max_runtime_s = Some(7200);
+        route.retry_iat = Some(0);
+        route.run_sent = case != "never_run";
+        storage.hosted_route(id, route).unwrap();
+        if case == "cancel_pending" || case == "cancel_acknowledged" {
+            storage.cancel(id, true).unwrap();
+        }
+        if case == "cancel_acknowledged" {
+            storage.cancel_acknowledged(id).unwrap();
+        }
+        storage.shutdown().unwrap();
+        drop(storage);
+        let expected: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("state.json")).unwrap()).unwrap();
+        let config_path = scratch.join("config.json");
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let old_root = root.clone();
+        let helper = helper.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(helper)
+                .env_remove("MOTOR_FAKE_BROKER_TOKEN")
+                .args([
+                    "127.0.0.1:1",
+                    config_path.to_str().unwrap(),
+                    old_root.to_str().unwrap(),
+                    "store",
+                    &id.to_string(),
+                ])
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rewritten: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            rewritten.get("_journal").is_none(),
+            "the real old writer must rewrite the store"
+        );
+        let mut actual_job = rewritten["jobs"][id.to_string()].clone();
+        let mut expected_job = expected["jobs"][id.to_string()].clone();
+        actual_job
+            .as_object_mut()
+            .unwrap()
+            .remove("retain_until_ms");
+        expected_job
+            .as_object_mut()
+            .unwrap()
+            .remove("retain_until_ms");
+        assert_eq!(
+            actual_job, expected_job,
+            "old reader/writer must retain every recovery transition: {case}"
+        );
+        assert!(actual_job["hosted"].get("cleanup_pending").is_none());
+        assert!(actual_job["hosted"].get("host_deadline_s").is_none());
+
+        let mut motor =
+            Motor::with_connector(config, &root, Arc::new(ResubmitPeer::new())).unwrap();
+        motor.hosted_connector = Some(h.runner.clone());
+        motor.resume_finishes().await;
+        motor.wait_hosted_cleanup(id).await;
+        if case == "detached" {
+            assert!(
+                h.broker.requests.lock().unwrap().is_empty(),
+                "rollback must not turn a detach into cancellation"
+            );
+            assert!(!motor.hosted_state(id).unwrap().finish_done);
+        } else {
+            assert_settled(&h, &motor, id, "lost", 0);
+            assert!(!motor.pending(id));
+        }
+        assert_eq!(h.runner.runs.load(Ordering::SeqCst), 0);
     }
 }

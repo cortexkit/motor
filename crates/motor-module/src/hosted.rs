@@ -92,15 +92,6 @@ pub struct HostedJobState {
     /// the lease, the job provably never ran; afterwards it may have.
     #[serde(default)]
     pub(crate) run_sent: bool,
-    /// Conservative Boat host-lost deadline: the broker allows ten minutes
-    /// beyond max_s for startup. Reattach must not extend the original bound;
-    /// token expiry only limits authentication, not runtime.
-    #[serde(default)]
-    pub(crate) host_deadline_s: Option<u64>,
-    /// Settlement outlives the submission task, including a failed release of
-    /// a spill that has already gone back to the build server.
-    #[serde(default)]
-    pub(crate) cleanup_pending: bool,
     pub(crate) broker_url: String,
     pub(crate) token_source: BrokerTokenSource,
 }
@@ -123,6 +114,50 @@ fn stored_lease_request<'de, D: serde::Deserializer<'de>>(
         .map_err(serde::de::Error::custom)
 }
 impl HostedJobState {
+    pub(crate) fn awaiting_cancel_terminal(&self) -> bool {
+        self.terminal.as_ref().is_some_and(|t| {
+            matches!(t.outcome, motor_protocol::Outcome::OutcomeUnknown)
+                && t.refusal_detail.as_deref() == Some(CANCEL_ACKNOWLEDGED)
+        })
+    }
+    pub(crate) fn booked_or_attempted(&self) -> bool {
+        self.lease_attempted
+            || self.placement.is_some()
+            || self.placement_attempts > 0
+            || self.retry_iat.is_some()
+            || self.run_sent
+            || self.pending_finish.is_some()
+    }
+
+    pub(crate) fn host_deadline_s(&self) -> Option<u64> {
+        if !self.run_sent || !self.placement.as_ref()?.host.starts_with("boat:") {
+            return None;
+        }
+        // Run is recorded only after its token's issue time is durable.
+        // Attach refreshes neither that time nor the original request limit.
+        // The requested limit is conservative if the broker granted less time.
+        Some(
+            self.retry_iat?
+                .saturating_add(
+                    self.lease_request
+                        .as_ref()
+                        .map(|r| r.timeout_s)
+                        .or(self.max_runtime_s)?,
+                )
+                .saturating_add(HOST_LOST_GRACE_S),
+        )
+    }
+
+    pub(crate) fn needs_cleanup(&self) -> bool {
+        !self.finish_done
+            && (self.pending_finish.is_some()
+                || (self.booked_or_attempted() && !self.run_sent)
+                || (self
+                    .placement
+                    .as_ref()
+                    .is_some_and(|p| p.host.starts_with("boat:"))
+                    && self.terminal.is_some()))
+    }
     pub(crate) fn capacity_routed(&self) -> bool {
         self.repository_routed || self.fleet_routed
     }
@@ -146,16 +181,8 @@ impl HostedJobState {
         );
         self.endpoint_spki_sha256 = Some(lease.endpoint_spki_sha256.clone());
         self.max_runtime_s = Some(lease.max_s);
-        if lease.ssh.is_some() || lease.placement.host.starts_with("boat:") {
-            self.host_deadline_s.get_or_insert_with(|| {
-                now_s()
-                    .saturating_add(lease.max_s)
-                    .saturating_add(HOST_LOST_GRACE_S)
-            });
-        }
     }
     pub(crate) fn settled(&mut self, terminal: HostedTerminal) {
-        self.cleanup_pending = false;
         self.billed_vcpu_ms = Some(terminal.billed_vcpu_ms);
         self.max_runtime_s = Some(terminal.max_runtime_s);
         self.billing = BillingStatus::Available;
@@ -266,6 +293,7 @@ const MAX_PROVISIONING_RETRY_MS: u64 = 30_000;
 /// broker's usual 5-second `no_capacity` wait.
 const HOST_FULL_RETRY_MS: u64 = 2_000;
 pub(crate) const HOST_LOST_GRACE_S: u64 = 600;
+pub(crate) const CANCEL_ACKNOWLEDGED: &str = "hosted_cancel_acknowledged: awaiting runner terminal";
 fn bounded_provisioning_retry_ms(ms: u64) -> u64 {
     ms.clamp(MIN_PROVISIONING_RETRY_MS, MAX_PROVISIONING_RETRY_MS)
 }

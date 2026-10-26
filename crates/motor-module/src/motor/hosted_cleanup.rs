@@ -47,17 +47,14 @@ impl Motor {
         // running job attachable; only cancellation or settlement owns cleanup.
         if state.run_sent
             && !job.pending_cancel
-            && !state.cleanup_pending
-            && state.terminal.is_none()
-            && state.pending_finish.is_none()
+            && !state.needs_cleanup()
             && !*self.hosted_cleanup.shutdown.borrow()
         {
             return;
         }
         if state.finish_done
-            || (!state.lease_attempted
+            || (!state.booked_or_attempted()
                 && state.pending_finish.is_none()
-                && !state.cleanup_pending
                 && !(state.terminal.is_some()
                     && state
                         .placement
@@ -83,10 +80,6 @@ impl Motor {
         if tasks.get(&id).is_some_and(|task| !task.is_finished()) {
             return;
         }
-        if let Err(error) = self.storage.hosted_update(id, |s| s.cleanup_pending = true) {
-            self.log_hosted_failure(id, "persist_settlement_recovery", error);
-            return;
-        }
         let motor = self.clone();
         tasks.insert(
             id,
@@ -110,7 +103,7 @@ impl Motor {
                     .storage
                     .job(id)
                     .and_then(|j| j.hosted)
-                    .and_then(|s| s.host_deadline_s)
+                    .and_then(|s| s.host_deadline_s())
                     .is_some_and(|d| crate::hosted::now_s() >= d);
                 if expired {
                     break;
@@ -123,9 +116,20 @@ impl Motor {
             }
         }
         let mut backoff = 1;
+        // Legacy records without an issued-token time get one conservative
+        // process-local window. Older clients rewrite the store using only the
+        // fields they know, so a new persisted deadline would disappear there.
+        let legacy_deadline = self.storage.job(id).and_then(|j| j.hosted).map(|s| {
+            crate::hosted::now_s()
+                .saturating_add(s.max_runtime_s.unwrap_or(0))
+                .saturating_add(crate::hosted::HOST_LOST_GRACE_S)
+        });
         loop {
             let stopping = *shutdown.borrow();
-            match self.cleanup_hosted_once(id, stopping).await {
+            match self
+                .cleanup_hosted_once_with_deadline(id, stopping, legacy_deadline)
+                .await
+            {
                 Ok(true) => return,
                 Ok(false) => {}
                 Err(error) => self.log_hosted_failure(id, "settlement_recovery", error),
@@ -142,7 +146,18 @@ impl Motor {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn cleanup_hosted_once(&self, id: Uuid, stopping: bool) -> io::Result<bool> {
+        self.cleanup_hosted_once_with_deadline(id, stopping, None)
+            .await
+    }
+
+    async fn cleanup_hosted_once_with_deadline(
+        &self,
+        id: Uuid,
+        stopping: bool,
+        legacy_deadline: Option<u64>,
+    ) -> io::Result<bool> {
         let Some(state) = self.storage.job(id).and_then(|job| job.hosted) else {
             return Ok(true);
         };
@@ -186,17 +201,14 @@ impl Motor {
             });
             let unknown = matches!(terminal.outcome, Outcome::OutcomeUnknown);
             if unknown && state.pending_finish.is_none() {
-                // Old stores lack a deadline. A fresh bounded recovery window
-                // is conservative; never use a refreshed attach token's expiry.
-                let deadline = state.host_deadline_s.unwrap_or_else(|| {
-                    crate::hosted::now_s()
-                        .saturating_add(state.max_runtime_s.unwrap_or(0))
-                        .saturating_add(crate::hosted::HOST_LOST_GRACE_S)
-                });
-                if state.host_deadline_s.is_none() {
-                    self.storage
-                        .hosted_update(id, |s| s.host_deadline_s = Some(deadline))?;
-                }
+                let deadline = state
+                    .host_deadline_s()
+                    .or(legacy_deadline)
+                    .unwrap_or_else(|| {
+                        crate::hosted::now_s()
+                            .saturating_add(state.max_runtime_s.unwrap_or(0))
+                            .saturating_add(crate::hosted::HOST_LOST_GRACE_S)
+                    });
                 let expired = crate::hosted::now_s() >= deadline;
                 if !stopping && !expired {
                     self.storage.cancel(id, true)?;
@@ -215,8 +227,6 @@ impl Motor {
             .and_then(|j| j.hosted)
             .is_none_or(|s| s.finish_done);
         if done {
-            self.storage
-                .hosted_update(id, |s| s.cleanup_pending = false)?;
             // An archived spill may now be cancelling its build-server ID.
             // Settling the old booking must not consume that newer intent.
             if self

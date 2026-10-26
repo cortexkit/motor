@@ -132,7 +132,7 @@ def main():
     print(f"Testing unchanged modules at {REVISION} and {ROLLBACK_REVISION}", flush=True)
     subprocess.run(["cargo", "nextest", "run", "-p", "motor-module", "--lib",
                     "--locked", "--run-ignored", "only", "--no-tests", "fail",
-                    "-E", "test(tests::compatibility::) | test(storage::journal_tests::rollback_)"],
+                    "-E", "test(tests::compatibility::) | test(storage::journal_tests::rollback_) | test(motor::late_grant_tests::rollback_)"],
                    check=True, cwd=ROOT, env=test_env)
 
 

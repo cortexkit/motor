@@ -309,9 +309,7 @@ impl State {
         self.jobs.retain(|id, job| {
             self.active_jobs.contains_key(id)
                 || job.pending_cancel
-                || job.hosted.as_ref().is_some_and(|s| {
-                    s.pending_finish.is_some() || s.cleanup_pending && !s.finish_done
-                })
+                || job.hosted.as_ref().is_some_and(|s| s.needs_cleanup())
                 || (!job.legacy_expired(*id, now)
                     && (job.terminal_observed_at_ms.is_none()
                         || job.terminal_delivered_at_ms.is_none()
@@ -418,7 +416,7 @@ impl Storage {
             .filter_map(|(id, job)| {
                 job.hosted
                     .as_ref()
-                    .filter(|s| s.lease_attempted && !s.finish_done)
+                    .filter(|s| s.booked_or_attempted() && !s.finish_done)
                     .map(|_| *id)
             })
             .collect()
@@ -457,15 +455,7 @@ impl Storage {
             .iter()
             .filter_map(|(id, job)| {
                 let state = job.hosted.as_ref()?;
-                if state.finish_done
-                    || (!state.cleanup_pending
-                        && state.pending_finish.is_none()
-                        && (state.terminal.is_none()
-                            || state
-                                .placement
-                                .as_ref()
-                                .is_none_or(|p| !p.host.starts_with("boat:"))))
-                {
+                if state.finish_done || !state.needs_cleanup() {
                     return None;
                 }
                 Some((*id, state.clone()))
@@ -510,7 +500,7 @@ impl Storage {
             .values()
             .rev()
             .filter_map(|j| j.hosted.clone())
-            .find(|h| h.lease_attempted)
+            .find(|h| h.booked_or_attempted())
     }
     pub(crate) fn hosted_routed_jobs_1h(&self) -> usize {
         self.hosted_routed_jobs_1h_at(now_ms())
@@ -887,16 +877,32 @@ impl Storage {
             });
         })
     }
+    pub(crate) fn cancel_acknowledged(&self, id: Uuid) -> io::Result<()> {
+        self.update(|s| {
+            let job = s.jobs.entry(id).or_default();
+            if job.build_server_job_id.is_none() {
+                if let Some(hosted) = job.hosted.as_mut() {
+                    if !hosted.finish_done && hosted.terminal.is_none() {
+                        // Acknowledgement proves delivery, not the final outcome.
+                        // Keep that uncertainty in a terminal the rollback client
+                        // already preserves, until the runner supplies its result.
+                        hosted.terminal = Some(
+                            TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
+                                .with_ran(Ran::Unknown("maybe".into()))
+                                .with_refusal_detail(crate::hosted::CANCEL_ACKNOWLEDGED),
+                        );
+                    }
+                }
+            }
+            job.pending_cancel = false;
+        })
+    }
+
     pub fn cancel(&self, id: Uuid, pending: bool) -> io::Result<()> {
         self.update(|s| {
             let job = s.jobs.entry(id).or_default();
             job.pending_cancel = pending;
             if pending {
-                if job.build_server_job_id.is_none() {
-                    if let Some(hosted) = job.hosted.as_mut() {
-                        hosted.cleanup_pending = true;
-                    }
-                }
                 job.retain_until_ms = Some(
                     job.retain_until_ms
                         .unwrap_or_default()
