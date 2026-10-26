@@ -152,7 +152,7 @@ impl Runner {
         for (key, w) in crate::caller_path::entries(&inner.catalog.workspaces)
             .map(|(path, record)| (path.caller.text(), record))
         {
-            let blocked = if Self::deleting(inner, crate::caller_path::host_str(key), &[]) {
+            let blocked = if self.deleting(inner, crate::caller_path::host_str(key), &[]) {
                 Some("workspace being dropped")
             } else if w.kind == WorkspaceKind::Head {
                 None

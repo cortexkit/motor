@@ -2767,7 +2767,8 @@ impl Sandbox {
         let host_home = runtime.0.join("home");
         let tmp = runtime.0.join("tmp");
         fs::create_dir_all(&tmp)?;
-        let home = PathBuf::from("/motor-home");
+        let runner_binds = RunnerBindPlan::new(javascript);
+        let home = runner_binds.private["home"].clone();
         // Only existing output inodes are writable, never the directory. A job
         // must not replace a log with a symlink that the trusted reader follows.
         let output = runtime.0.join("output");
@@ -2821,25 +2822,20 @@ impl Sandbox {
                 .ok_or_else(|| io::Error::other("RUSTUP_HOME unset"))?,
         );
         let mut read_only = Vec::new();
-        for path in SYSTEM_READ_PATHS {
-            if host_inputs::exists(Path::new(path)) {
-                read_only.push(word(Path::new(path))?);
-                mount_destinations.push(PathBuf::from(path));
-            }
+        for (source, destination) in &runner_binds.read_only {
+            read_only.push(if source == destination {
+                word(source)?
+            } else {
+                bind(source, destination)?
+            });
+            mount_destinations.push(destination.clone());
         }
-        read_only.push(word(&rustup)?);
-        mount_destinations.push(rustup.clone());
-        let cargo_bin = shared_cargo.join("bin");
-        read_only.push(word(&cargo_bin)?);
-        mount_destinations.push(cargo_bin);
         let mut path = format!(
             "{}:/usr/local/bin:/usr/bin:/bin",
             shared_cargo.join("bin").display()
         );
-        if let Some((mount, destination)) = job_bun_mount(javascript)? {
-            read_only.push(mount);
+        if let Some((_, destination)) = job_bun_mount(javascript)? {
             path = format!("{}:{path}", destination.display());
-            mount_destinations.push(destination);
         }
         // The shared source/index trees are immutable. Cargo's locks and cache
         // bookkeeping live in the job's private CARGO_HOME, not the shared one.
@@ -2855,7 +2851,7 @@ impl Sandbox {
             word(workspace)?,
             word(target)?,
             bind(&host_home, &home)?,
-            bind(&tmp, Path::new("/tmp"))?,
+            bind(&tmp, &runner_binds.private["tmp"])?,
         ];
         if cached_rust && writer {
             fs::create_dir_all(workspace.join("target"))?;
@@ -2872,10 +2868,10 @@ impl Sandbox {
             &mut read_write,
             &mut mount_destinations,
         )?;
-        read_only.push(bind(&hosts, Path::new("/etc/hosts"))?);
-        mount_destinations.push(PathBuf::from("/etc/hosts"));
-        read_only.push(bind(&output, Path::new("/motor-output"))?);
-        mount_destinations.push(PathBuf::from("/motor-output"));
+        read_only.push(bind(&hosts, &runner_binds.private["hosts"])?);
+        mount_destinations.push(runner_binds.private["hosts"].clone());
+        read_only.push(bind(&output, &runner_binds.private["output"])?);
+        mount_destinations.push(runner_binds.private["output"].clone());
         for name in &output_names {
             let destination = Path::new("/motor-output").join(name);
             read_write.push(bind(&output.join(name), &destination)?);
@@ -2953,8 +2949,8 @@ impl Sandbox {
                     remote = None;
                 }
             }
-            read_only.push(bind(&tools, Path::new("/motor-tools"))?);
-            mount_destinations.push(PathBuf::from("/motor-tools"));
+            read_only.push(bind(&tools, &runner_binds.private["tools"])?);
+            mount_destinations.push(runner_binds.private["tools"].clone());
         }
         let mut cache_forwarders = Vec::new();
         if let Some(remote) = remote {
@@ -2973,10 +2969,10 @@ impl Sandbox {
             // unit's account gets it, and the directory is bound into this
             // unit's sandbox alone.
             match sockets {
-                Ok(sockets) => match bind(&directory, Path::new(transport::SANDBOX_SOCKETS)) {
+                Ok(sockets) => match bind(&directory, &runner_binds.private["gateway"]) {
                     Ok(mount) => {
                         read_only.push(mount);
-                        mount_destinations.push(PathBuf::from(transport::SANDBOX_SOCKETS));
+                        mount_destinations.push(runner_binds.private["gateway"].clone());
                         cache_forwarders = sockets.forwarders().to_vec();
                         let _ = runtime.2.set(sockets);
                         remote.ready();
@@ -3003,8 +2999,8 @@ impl Sandbox {
                 .to_string_lossy()
                 .as_bytes(),
             )?;
-            read_only.push(bind(slots, Path::new("/motor-slots"))?);
-            mount_destinations.push(PathBuf::from("/motor-slots"));
+            read_only.push(bind(slots, &runner_binds.private["slots"])?);
+            mount_destinations.push(runner_binds.private["slots"].clone());
             for name in std::iter::once("queue.lock".to_string())
                 .chain((0..limit).map(|i| format!("{i}.lock")))
             {
@@ -3703,6 +3699,68 @@ const SYSTEM_READ_PATHS: [&str; 11] = [
     // OpenSSL's default config under /usr/lib/ssl points here.
     "/etc/ssl/openssl.cnf",
 ];
+
+/// Runner-owned mounts, independent of workspace, target-folder and sibling
+/// binds. Admission reserves destinations across all job and writer variants,
+/// including optional tools and compile-cache mounts, not their host sources.
+struct RunnerBindPlan {
+    read_only: Vec<(PathBuf, PathBuf)>,
+    private: BTreeMap<&'static str, PathBuf>,
+}
+
+impl RunnerBindPlan {
+    fn new(javascript: &JavascriptTools) -> Self {
+        let mut read_only: Vec<_> = SYSTEM_READ_PATHS
+            .into_iter()
+            .filter(|path| host_inputs::exists(Path::new(path)))
+            .map(|path| (PathBuf::from(path), PathBuf::from(path)))
+            .collect();
+        if let Some(rustup) = host_inputs::environment("RUSTUP_HOME") {
+            read_only.push((PathBuf::from(&rustup), PathBuf::from(rustup)));
+        }
+        if let Some(cargo) = host_inputs::environment("CARGO_HOME") {
+            let bin = PathBuf::from(cargo).join("bin");
+            read_only.push((bin.clone(), bin));
+        }
+        if host_inputs::is_dir(javascript.bun_dir()) {
+            read_only.push((javascript.bun_dir().into(), JOB_BUN_DIR.into()));
+        }
+        #[cfg(test)]
+        EXTRA_RUNNER_BINDS.with(|extra| read_only.extend(extra.borrow().iter().cloned()));
+        let private = [
+            ("home", "/motor-home"),
+            ("tmp", "/tmp"),
+            ("hosts", "/etc/hosts"),
+            ("output", "/motor-output"),
+            ("tools", "/motor-tools"),
+            ("slots", "/motor-slots"),
+            ("target", crate::compile_cache::TARGET),
+            ("cache", crate::compile_cache::CACHE),
+            ("gateway", transport::SANDBOX_SOCKETS),
+        ]
+        .into_iter()
+        .map(|(key, path)| (key, PathBuf::from(path)))
+        .collect();
+        Self { read_only, private }
+    }
+
+    fn destinations(self) -> Vec<PathBuf> {
+        self.read_only
+            .into_iter()
+            .map(|(_, destination)| destination)
+            .chain(self.private.into_values())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static EXTRA_RUNNER_BINDS: std::cell::RefCell<Vec<(PathBuf, PathBuf)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn reserved_destinations(config: &crate::Config) -> Vec<PathBuf> {
+    RunnerBindPlan::new(&JavascriptTools::for_config(config)).destinations()
+}
 
 /// Host sources shared by job, writer and snapshot-helper sandboxes.
 pub(crate) fn reserved_bind_sources(config: &crate::Config) -> Vec<PathBuf> {

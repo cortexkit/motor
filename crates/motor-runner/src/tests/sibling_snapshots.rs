@@ -830,13 +830,13 @@ fn snapshot_mode_fences_workspaces_only_apart_from_legacy_sibling_users() {
         runner.core.config.max_weight,
     );
     inner.dropping.insert("/shared/running".into());
-    let deleting_user = Runner::deleting(
+    let deleting_user = runner.deleting(
         &inner,
         crate::caller_path::host_str("/other/workspace"),
         &[sibling("/shared/running", "old")],
     );
     let deleting_workspace =
-        Runner::deleting(&inner, crate::caller_path::host_str("/shared/running"), &[]);
+        runner.deleting(&inner, crate::caller_path::host_str("/shared/running"), &[]);
     inner.dropping.clear();
     for id in ids {
         inner.jobs.remove(&id);

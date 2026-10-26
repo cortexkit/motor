@@ -15,6 +15,9 @@ use tokio::net::{UnixListener, UnixStream};
 #[path = "tests/boat_disk.rs"]
 mod boat_disk;
 #[cfg(target_os = "linux")]
+#[path = "tests/caller_authorization.rs"]
+mod caller_authorization;
+#[cfg(target_os = "linux")]
 #[path = "tests/caller_persistence.rs"]
 mod caller_persistence;
 #[path = "tests/cancellation.rs"]

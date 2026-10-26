@@ -28,7 +28,7 @@ impl CallerRoot {
     }
 }
 
-fn canonical_spelling(value: &str) -> bool {
+pub(super) fn canonical_spelling(value: &str) -> bool {
     value.starts_with('/')
         && (value == "/"
             || (!value.ends_with('/')

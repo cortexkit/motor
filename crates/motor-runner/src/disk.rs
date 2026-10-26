@@ -159,11 +159,13 @@ impl Runner {
                 )),
             }));
         }
-        workspace::validate_request(
-            crate::caller_path::request(r),
-            &r.siblings,
-            self.core.config.sibling_snapshot_mode(),
-        )?;
+        if self.core.config.caller_roots.is_empty() {
+            workspace::validate_request(
+                crate::caller_path::request(r),
+                &r.siblings,
+                self.core.config.sibling_snapshot_mode(),
+            )?;
+        }
         let refusal = |reason: RefusalReason, disk_full, detail: String| Refusal {
             retry_after_ms: if reason == RefusalReason::RunnerDraining {
                 Some(self.drain_retry_after_ms())
@@ -178,6 +180,7 @@ impl Runner {
         };
         if let Some(detail) = nested_workspace_detail(
             &self.core.inner.lock().unwrap(),
+            &self.core.config,
             crate::caller_path::request(r),
             &r.siblings,
         ) {
@@ -187,11 +190,23 @@ impl Runner {
                 detail,
             )));
         }
-        if let Err(error) = self.validate_writer_paths(
-            crate::caller_path::request(r).host_workspace,
-            None,
-            &r.siblings,
-        ) {
+        if !self.core.config.caller_roots.is_empty() {
+            if let Err(error) = crate::caller_path::authorize_request(
+                &self.core.config,
+                crate::caller_path::request(r),
+                None,
+                &r.siblings,
+            ) {
+                return Ok(Err(refusal(
+                    RefusalReason::WorkspaceKeyRejected,
+                    None,
+                    error.to_string(),
+                )));
+            }
+        }
+        if let Err(error) =
+            self.validate_request_writer_paths(crate::caller_path::request(r), None, &r.siblings)
+        {
             return Ok(Err(refusal(
                 RefusalReason::WorkspaceKeyRejected,
                 None,
@@ -221,9 +236,12 @@ impl Runner {
             )));
         }
         let mut inner = self.core.inner.lock().unwrap();
-        if let Some(detail) =
-            nested_workspace_detail(&inner, crate::caller_path::request(r), &r.siblings)
-        {
+        if let Some(detail) = nested_workspace_detail(
+            &inner,
+            &self.core.config,
+            crate::caller_path::request(r),
+            &r.siblings,
+        ) {
             return Ok(Err(refusal(
                 RefusalReason::WorkspaceSetupFailed,
                 None,
@@ -237,7 +255,7 @@ impl Runner {
                 "runner_draining".into(),
             )));
         }
-        if Self::deleting(
+        if self.deleting(
             &inner,
             crate::caller_path::request(r).host_workspace,
             &r.siblings,

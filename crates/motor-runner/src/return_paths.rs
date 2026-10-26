@@ -140,8 +140,59 @@ fn open_directory(_: &Path) -> Result<(File, PathBuf), Cause> {
     Err(Cause::Escape)
 }
 
+#[cfg(test)]
 pub(crate) fn collect(request: &Run, seq: u64) -> ReturnResult {
     collect_after_measure(request, seq, || {})
+}
+
+pub(crate) fn collect_authorized(config: &crate::Config, request: &Run, seq: u64) -> ReturnResult {
+    collect_with_root(request, seq, collection_root(Some(config), request), || {})
+}
+
+fn collection_root(
+    config: Option<&crate::Config>,
+    request: &Run,
+) -> Result<(File, PathBuf), Cause> {
+    let caller = crate::caller_path::request(request)
+        .caller_workspace_key
+        .text();
+    if let Some(config) = config.filter(|config| !config.caller_roots.is_empty()) {
+        let host =
+            crate::caller_path::authorize(config, caller, false).map_err(|_| Cause::Escape)?;
+        if crate::caller_path::mapped_root(config, caller).is_some() {
+            return open_mapped_directory(&host).map(|file| (file, PathBuf::from(caller)));
+        }
+    }
+    open_directory(
+        crate::caller_path::request(request)
+            .host_workspace
+            .as_path(),
+    )
+}
+
+#[cfg(unix)]
+fn open_mapped_directory(host: &Path) -> Result<File, Cause> {
+    let mut directory = File::open("/").map_err(|_| Cause::Escape)?;
+    for component in host.components().skip(1) {
+        let name = CString::new(component.as_os_str().as_bytes()).map_err(|_| Cause::Escape)?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+            )
+        };
+        if fd < 0 {
+            return Err(Cause::Escape);
+        }
+        directory = unsafe { File::from_raw_fd(fd) };
+    }
+    Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn open_mapped_directory(_: &Path) -> Result<File, Cause> {
+    Err(Cause::Escape)
 }
 
 pub(crate) fn set_seq(result: &mut ReturnResult, seq: u64, cap: u64) {
@@ -168,7 +219,17 @@ pub(crate) fn set_seq(result: &mut ReturnResult, seq: u64, cap: u64) {
     }
 }
 
+#[cfg(test)]
 fn collect_after_measure(request: &Run, seq: u64, before_read: impl FnOnce()) -> ReturnResult {
+    collect_with_root(request, seq, collection_root(None, request), before_read)
+}
+
+fn collect_with_root(
+    request: &Run,
+    seq: u64,
+    root: Result<(File, PathBuf), Cause>,
+    before_read: impl FnOnce(),
+) -> ReturnResult {
     let mut result = ReturnResult {
         job_id: request.job_id,
         seq,
@@ -177,11 +238,7 @@ fn collect_after_measure(request: &Run, seq: u64, before_read: impl FnOnce()) ->
     };
     let mut measured = 0u64;
     let collected = (|| -> Result<Vec<ReturnedFile>, Cause> {
-        let (directory, root) = open_directory(
-            crate::caller_path::request(request)
-                .host_workspace
-                .as_path(),
-        )?;
+        let (directory, root) = root?;
         let mut files = Vec::new();
         for path in crate::caller_path::run(request).caller_return_paths {
             let relative = Path::new(path)
@@ -317,13 +374,42 @@ enum Read {
 /// to detect growth. Growth, shrinking, or its path naming a different file
 /// once read (for example after being replaced by a symlink) make it
 /// `read_error`, and its chunks are dropped.
+#[cfg(test)]
 pub(crate) fn collect_chunked(request: &Run, job_directory: &Path) -> ChunkedCollection {
     collect_chunked_before_read(request, job_directory, |_| {})
 }
 
+pub(crate) fn collect_chunked_authorized(
+    config: &crate::Config,
+    request: &Run,
+    job_directory: &Path,
+) -> ChunkedCollection {
+    collect_chunked_with_root(
+        request,
+        job_directory,
+        collection_root(Some(config), request),
+        |_| {},
+    )
+}
+
+#[cfg(test)]
 fn collect_chunked_before_read(
     request: &Run,
     job_directory: &Path,
+    before_read: impl FnMut(usize),
+) -> ChunkedCollection {
+    collect_chunked_with_root(
+        request,
+        job_directory,
+        collection_root(None, request),
+        before_read,
+    )
+}
+
+fn collect_chunked_with_root(
+    request: &Run,
+    job_directory: &Path,
+    root: Result<(File, PathBuf), Cause>,
     mut before_read: impl FnMut(usize),
 ) -> ChunkedCollection {
     let cap = request.return_max_bytes;
@@ -333,11 +419,7 @@ fn collect_chunked_before_read(
     let fail = |cause, size| ReturnManifestOutcome::Failed { cause, size };
     let mut admitted = Vec::new();
     let mut total = 0u64;
-    match open_directory(
-        crate::caller_path::request(request)
-            .host_workspace
-            .as_path(),
-    ) {
+    match root {
         Err(cause) => {
             for outcome in &mut outcomes {
                 *outcome = Some(fail(shared_cause(cause), None));
