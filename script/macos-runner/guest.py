@@ -52,10 +52,10 @@ def account():
     except KeyError:
         used = {entry.pw_uid for entry in pwd.getpwall()}
         uid = next(value for value in range(501, 1000) if value not in used)
-        run("/usr/sbin/dscl", ".", "-create", "/Users/motorjob")
+        run("/usr/bin/dscl", ".", "-create", "/Users/motorjob")
         for key, value in {"UniqueID": str(uid), "PrimaryGroupID": "20", "NFSHomeDirectory": "/Users/motorjob",
                            "UserShell": "/usr/bin/false", "Password": "*", "RealName": "Motor guest job"}.items():
-            run("/usr/sbin/dscl", ".", "-create", "/Users/motorjob", key, value)
+            run("/usr/bin/dscl", ".", "-create", "/Users/motorjob", key, value)
         job = pwd.getpwnam("motorjob")
     groups = subprocess.check_output(["/usr/bin/id", "-Gn", "motorjob"], text=True).split()
     if job.pw_uid == 0 or job.pw_gid == 0 or "admin" in groups:
@@ -66,7 +66,7 @@ def account():
 
 def clt_verify():
     # softwareupdate authenticates the package; check the installed Apple code too.
-    run("/usr/bin/codesign", "--verify", "--strict", "-R", "anchor apple", "/Library/Developer/CommandLineTools/usr/bin/clang")
+    run("/usr/bin/codesign", "--verify", "--strict", "-R", "=anchor apple", "/Library/Developer/CommandLineTools/usr/bin/clang")
     receipt = subprocess.check_output(["/usr/sbin/pkgutil", "--pkg-info-plist", "com.apple.pkg.CLTools_Executables"])
     return plistlib.loads(receipt)["pkg-version"]
 
@@ -90,7 +90,10 @@ def provision(manifest, scratch, measure):
         if parity.sha256(spec["sha256"]) and value != spec["sha256"]:
             raise ValueError("source SHA-256 differs: " + name)
         sources[name] = value
-    init = archives / "rustup"
+    # rustup picks its mode from the name it runs under: only as rustup-init
+    # does it install. The download is stored under its source name.
+    init = archives / "rustup-init"
+    shutil.copyfile(archives / "rustup", init)
     init.chmod(0o755)
     run(init, "-y", "--no-modify-path", "--profile", manifest["rust_profile"], "--default-toolchain", "none", env=env)
     rustup = PREFIX / "cargo/bin/rustup"
@@ -208,8 +211,8 @@ def drop_build_access(build_user, home, sudoers=Path("/etc/sudoers.d/motorbuild"
         raise ValueError("build account .ssh is a symlink")
     if (home / ".ssh").exists():
         shutil.rmtree(home / ".ssh")
-    run("/usr/sbin/dscl", ".", "-create", "/Users/" + build_user, "UserShell", "/usr/bin/false")
-    run("/usr/sbin/dscl", ".", "-create", "/Users/" + build_user, "Password", "*")
+    run("/usr/bin/dscl", ".", "-create", "/Users/" + build_user, "UserShell", "/usr/bin/false")
+    run("/usr/bin/dscl", ".", "-create", "/Users/" + build_user, "Password", "*")
     sudoers.unlink(missing_ok=True)
 
 

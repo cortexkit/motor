@@ -16,10 +16,14 @@ def fetch(url, destination, expected, measure=False):
     temporary = destination.with_name(destination.name + ".download")
     try:
         if "github.com/" in url or "githubusercontent.com/" in url:
-            parallel_ranges(url, temporary)
+            try:
+                parallel_ranges(url, temporary)
+            except RangeUnsupported:
+                # Parallel ranges only speed the download up; the SHA-256 check
+                # below still decides whether the bytes are accepted.
+                stream_to(url, temporary)
         else:
-            with urllib.request.urlopen(url, timeout=60) as response, temporary.open("wb") as stream:
-                shutil.copyfileobj(response, stream, 1024 * 1024)
+            stream_to(url, temporary)
         actual = digest(temporary)
         if sha256(expected) and actual != expected:
             raise ValueError("download SHA-256 differs: " + url)
@@ -29,11 +33,22 @@ def fetch(url, destination, expected, measure=False):
         temporary.unlink(missing_ok=True)
 
 
+class RangeUnsupported(Exception):
+    """The server can't serve this download in byte ranges."""
+
+
+def stream_to(url, destination):
+    with urllib.request.urlopen(url, timeout=120) as response, Path(destination).open("wb") as stream:
+        shutil.copyfileobj(response, stream, 1024 * 1024)
+
+
 def parallel_ranges(url, destination, workers=6):
     with urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=60) as response:
         size = int(response.headers.get("Content-Length", "0"))
     if size <= 0:
-        raise ValueError("GitHub download has no content length; use a hash-identical mirror")
+        # Source archives are generated on demand and sent chunked, without a
+        # length to split into ranges.
+        raise RangeUnsupported(url)
     workers = min(workers, size)
     parts = [destination.with_name(destination.name + f".part-{index}") for index in range(workers)]
 
@@ -42,7 +57,7 @@ def parallel_ranges(url, destination, workers=6):
         request = urllib.request.Request(url, headers={"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"})
         with urllib.request.urlopen(request, timeout=120) as response, parts[index].open("wb") as stream:
             if response.status != 206 or response.headers.get("Content-Range") != f"bytes {start}-{end}/{size}":
-                raise ValueError("server ignored range request; use a hash-identical mirror")
+                raise RangeUnsupported(url)
             shutil.copyfileobj(response, stream, 1024 * 1024)
         if parts[index].stat().st_size != end - start + 1:
             raise ValueError("incomplete range download")

@@ -186,10 +186,10 @@ def create_account():
     except KeyError:
         used = {entry.pw_uid for entry in pwd.getpwall()}
         uid = next(value for value in range(501, 1000) if value not in used)
-        run("/usr/sbin/dscl", ".", "-create", "/Users/motor")
+        run("/usr/bin/dscl", ".", "-create", "/Users/motor")
         for key, value in {"UniqueID": str(uid), "PrimaryGroupID": "20", "NFSHomeDirectory": "/Users/motor",
                            "UserShell": "/bin/sh", "RealName": "Motor VM runner", "Password": "*"}.items():
-            run("/usr/sbin/dscl", ".", "-create", "/Users/motor", key, value)
+            run("/usr/bin/dscl", ".", "-create", "/Users/motor", key, value)
         account = pwd.getpwnam("motor")
     groups = run("/usr/bin/id", "-Gn", "motor").split()
     if account.pw_uid == 0 or "admin" in groups:

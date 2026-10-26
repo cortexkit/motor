@@ -2,6 +2,7 @@
 """Portable contract tests for the macOS image, installer and parity boundary."""
 
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -350,7 +351,7 @@ class ImageTests(unittest.TestCase):
             self.assertFalse((home / ".ssh").exists())
             self.assertFalse(sudoers.exists())
             run.assert_any_call("/usr/sbin/systemsetup", "-f", "-setremotelogin", "off")
-            run.assert_any_call("/usr/sbin/dscl", ".", "-create", "/Users/motorbuild", "UserShell", "/usr/bin/false")
+            run.assert_any_call("/usr/bin/dscl", ".", "-create", "/Users/motorbuild", "UserShell", "/usr/bin/false")
 
     def test_sealing_refuses_if_remote_login_stays_on(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -419,15 +420,23 @@ class ImageTests(unittest.TestCase):
             self.assertEqual(len([item for item in requests if item.get_method() == "GET"]), 6)
             self.assertEqual(list(Path(directory).iterdir()), [destination])
 
-    def test_range_server_cannot_fall_back_to_serial_download(self):
+    def test_server_without_ranges_falls_back_to_one_hash_checked_stream(self):
+        payload = b"whole archive"
+
         class Response(io.BytesIO):
             status = 200
-            headers = {"Content-Length": "12"}
+            headers = {"Content-Length": str(len(payload))}
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(download.urllib.request, "urlopen", side_effect=lambda *args, **kwargs: Response(b"not a range")):
-                with self.assertRaisesRegex(ValueError, "ignored range request"):
-                    download.parallel_ranges("https://github.com/example/archive", Path(directory) / "archive")
-            self.assertEqual(list(Path(directory).iterdir()), [])
+            with patch.object(download.urllib.request, "urlopen", side_effect=lambda *args, **kwargs: Response(payload)):
+                with self.assertRaises(download.RangeUnsupported):
+                    download.parallel_ranges("https://github.com/example/archive", Path(directory) / "part")
+                destination = Path(directory) / "archive"
+                expected = hashlib.sha256(payload).hexdigest()
+                self.assertEqual(download.fetch("https://github.com/example/archive", destination, expected), expected)
+                self.assertEqual(destination.read_bytes(), payload)
+                with self.assertRaisesRegex(ValueError, "SHA-256 differs"):
+                    download.fetch("https://github.com/example/archive", Path(directory) / "bad", "0" * 64)
+            self.assertEqual(sorted(path.name for path in Path(directory).iterdir()), ["archive"])
 
     def test_all_image_seal_entrypoints_reject_pending_lock(self):
         manifest = pending()
