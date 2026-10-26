@@ -865,12 +865,7 @@ async fn capacity_refusal_is_durable_without_snapshot_or_transport() {
     let f = Fixture::new(Cut::None, 28).await;
     f.proxy.unavailable.store(true, Ordering::SeqCst);
     let motor = f.motor();
-    let records = collect(
-        motor
-            .refuse_before_start(RefusalReason::RunnerFull, Some("test_capacity".into()))
-            .unwrap(),
-    )
-    .await;
+    let records = collect(motor.refuse_capacity().unwrap()).await;
     assert_eq!(records.len(), 1);
     let terminal = terminal(&records).clone();
     assert_eq!(
@@ -1248,7 +1243,6 @@ async fn channel_decodes_resume_and_future_frames_with_the_shared_decoder() {
 #[test]
 fn manifest_advertises_exact_capability_and_all_operations() {
     let value = serde_json::to_value(crate::module::manifest("ck-motor")).unwrap();
-    assert_eq!(value["provides"][0]["concurrency"], "stateless_parallel");
     assert_eq!(
         value["capabilities"]["provides"],
         serde_json::json!([

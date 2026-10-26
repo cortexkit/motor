@@ -8,15 +8,11 @@ use std::{
     collections::HashMap,
     io,
     path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex, OnceLock,
-    },
+    sync::{Arc, Mutex, OnceLock},
 };
 use subc_client_rs::{
     async_trait, BindDecision, ConnectionEnd, HandlerOutcome, HealthReport, HealthStatus,
-    ModuleHandle, ModuleHandler, RequestClass, RequestCtx, RequestPool, RequestPools,
-    RouteBindRequest, RouteHandle,
+    ModuleHandler, RequestCtx, RouteBindRequest, RouteHandle,
 };
 use subc_protocol::{
     manifest::{
@@ -30,9 +26,12 @@ use subc_protocol::{
 
 pub const CAPABILITY: &str = "exec-remote/v1";
 pub const DEFAULT_MODULE_ID: &str = "ck-motor";
-// Dispatch capacity, not job admission: runners and hosted tenants decide
-// whether a job fits. Attach also holds a slot until the job's terminal record.
-pub const LONG_HELD_LIMIT: usize = 256;
+// subc-client-rs 0.26.1 lib.rs:86 fixes provider handler capacity at 64.
+pub const SDK_HANDLER_CAPACITY: usize = 64;
+// Reserve slots for status, cancel and attach when long-lived run streams fill
+// the provider. These control operations must remain usable under saturation.
+pub const CONTROL_HEADROOM: usize = 8;
+pub const RUN_ADMISSION_LIMIT: usize = SDK_HANDLER_CAPACITY - CONTROL_HEADROOM;
 /// How long a request that needs module storage waits for startup to open it
 /// before it is refused as `motor_unavailable`.
 ///
@@ -58,70 +57,29 @@ enum StorageState {
     /// Startup gave up; `startup_error` says why.
     Failed,
 }
-fn request_class(body: &[u8]) -> RequestClass {
-    // Callers serialize the operation first. The direct CLI's sorted JSON puts
-    // its reattach secret first instead; peek only at that small envelope head,
-    // never at params or at an unbounded command/payload on the frame reader.
-    let head = &body[..body.len().min(256)];
-    let op = if head.starts_with(br#"{"direct_secret":""#) {
-        head.windows(3)
-            .position(|window| window == br#"",""#)
-            .map(|offset| &head[offset + 2..])
-            .unwrap_or_default()
-    } else {
-        head.strip_prefix(b"{").unwrap_or_default()
-    };
-    for (prefix, label) in [
-        (br#""op":"exec.run""#.as_slice(), "exec.run"),
-        (br#""method":"exec.run""#.as_slice(), "exec.run"),
-        (br#""op":"exec.attach""#.as_slice(), "exec.attach"),
-        (br#""method":"exec.attach""#.as_slice(), "exec.attach"),
-    ] {
-        if op
-            .strip_prefix(prefix)
-            .is_some_and(|rest| matches!(rest.first(), Some(b',' | b'}')))
-        {
-            return RequestClass::long_held().with_op(label);
+struct RunPermit(Arc<std::sync::atomic::AtomicUsize>);
+impl RunPermit {
+    fn acquire(count: &Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        let mut current = count.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            if current >= RUN_ADMISSION_LIMIT {
+                return None;
+            }
+            match count.compare_exchange_weak(
+                current,
+                current + 1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self(count.clone())),
+                Err(observed) => current = observed,
+            }
         }
     }
-    RequestClass::default_pool()
 }
-
-fn first_envelope_key(body: &[u8]) -> String {
-    let head = body[..body.len().min(256)].trim_ascii_start();
-    let Some(head) = head.strip_prefix(b"{") else {
-        return "<unavailable>".into();
-    };
-    String::deserialize(&mut serde_json::Deserializer::from_slice(
-        head.trim_ascii_start(),
-    ))
-    .map(|key| key.chars().take(64).collect())
-    .unwrap_or_else(|_| "<unavailable>".into())
-}
-
-#[derive(Default)]
-struct PoolFallbacks {
-    total: AtomicU64,
-    last_warning: Mutex<Option<std::time::Instant>>,
-}
-
-impl PoolFallbacks {
-    fn record(&self, op: &'static str, body: &[u8], now: std::time::Instant) {
-        let total = self.total.fetch_add(1, Ordering::Relaxed) + 1;
-        let mut last = self.last_warning.lock().unwrap();
-        if last.is_some_and(|last| {
-            now.saturating_duration_since(last) < std::time::Duration::from_secs(60)
-        }) {
-            return;
-        }
-        *last = Some(now);
-        drop(last);
-        tracing::warn!(
-            op,
-            first_key = ?first_envelope_key(body),
-            total,
-            "long-held request used default pool"
-        );
+impl Drop for RunPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 pub const OPERATIONS: &[&str] = &[
@@ -214,7 +172,7 @@ pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest 
             },
         }))
         .provides(vec![ProviderRole::ManagementSurface {
-            concurrency: Concurrency::StatelessParallel,
+            concurrency: Concurrency::ModuleManaged,
             operations: OPERATIONS
                 .iter()
                 .map(|name| ManagementOperation {
@@ -331,8 +289,7 @@ pub struct Handler {
     /// connection. This fast path needs no secret; other direct routes must
     /// prove access with the per-job secret whose hash is in storage.
     direct_jobs: Arc<Mutex<HashMap<Uuid, RouteHandle>>>,
-    module_handle: Arc<Mutex<Option<ModuleHandle>>>,
-    pool_fallbacks: Arc<PoolFallbacks>,
+    run_count: Arc<std::sync::atomic::AtomicUsize>,
     startup_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     startup_error: Arc<Mutex<Option<String>>>,
     storage_state: Arc<tokio::sync::watch::Sender<StorageState>>,
@@ -368,53 +325,6 @@ fn module_data_dir_for(
 }
 
 impl Handler {
-    pub fn set_module_handle(&self, handle: ModuleHandle) {
-        *self.module_handle.lock().unwrap() = Some(handle);
-    }
-
-    fn pool_metrics(&self) -> Value {
-        let mut pools = serde_json::Map::new();
-        pools.insert(
-            "long_held_fallbacks_total".into(),
-            json!(self.pool_fallbacks.total.load(Ordering::Relaxed)),
-        );
-        let handle = self.module_handle.lock().unwrap();
-        let Some(handle) = handle.as_ref() else {
-            return Value::Object(pools);
-        };
-        for snapshot in handle.request_pool_snapshots() {
-            let name = match snapshot.pool {
-                RequestPool::Default => "default",
-                RequestPool::LongHeld => "long_held",
-                _ => continue,
-            };
-            pools.insert(
-                name.into(),
-                json!({
-                    "in_use": snapshot.in_use, "limit": snapshot.limit,
-                    "waiting": snapshot.waiting,
-                    "oldest_wait_ms": snapshot.oldest_wait.map(|age| age.as_millis() as u64),
-                }),
-            );
-        }
-        Value::Object(pools)
-    }
-
-    fn record_pool_fallback(&self, op: &str, body: &[u8]) {
-        let op = match op {
-            "exec.run" => "exec.run",
-            "exec.attach" => "exec.attach",
-            _ => return,
-        };
-        // Reuse the frame reader's deterministic classifier after decoding the
-        // operation here, so unexpected envelope order is visible without
-        // adding JSON decoding to the frame reader.
-        if request_class(body).pool == RequestPool::Default {
-            self.pool_fallbacks
-                .record(op, body, std::time::Instant::now());
-        }
-    }
-
     pub fn new(config: Config) -> Self {
         Self {
             config,
@@ -425,8 +335,7 @@ impl Handler {
             account_tokens: None,
             routes: Arc::new(Mutex::new(HashMap::new())),
             direct_jobs: Arc::new(Mutex::new(HashMap::new())),
-            module_handle: Arc::new(Mutex::new(None)),
-            pool_fallbacks: Arc::new(PoolFallbacks::default()),
+            run_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             startup_task: Arc::new(Mutex::new(None)),
             startup_error: Arc::new(Mutex::new(None)),
             storage_state: Arc::new(tokio::sync::watch::Sender::new(StorageState::NotStarted)),
@@ -804,6 +713,19 @@ impl Handler {
                     pump_direct_secret(&ctx, stream, Some(secret)).await?;
                     return Ok(HandlerOutcome::Streamed);
                 }
+                let _permit = match RunPermit::acquire(&self.run_count) {
+                    Some(permit) => permit,
+                    None => {
+                        let stream = motor.refuse_authorized(
+                            RefusalReason::RunnerFull,
+                            None,
+                            Some(secret.hash()),
+                        )?;
+
+                        pump_direct_secret(&ctx, stream, Some(secret)).await?;
+                        return Ok(HandlerOutcome::Streamed);
+                    }
+                };
                 let stream = motor.run_direct_authorized(
                     request,
                     self.attribution(route, envelope.preset),
@@ -957,10 +879,6 @@ struct Envelope {
 }
 #[async_trait]
 impl ModuleHandler for Handler {
-    fn request_pools(&self) -> RequestPools {
-        RequestPools::new().with_long_held(LONG_HELD_LIMIT, request_class)
-    }
-
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
         if self.motor.get().is_some() {
             return;
@@ -989,12 +907,6 @@ impl ModuleHandler for Handler {
         }));
     }
     async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
-        if matches!(&request.call_mode, subc_client_rs::CallMode::Unknown(_)) {
-            return BindDecision::reject(
-                "motor_call_mode_unsupported",
-                format!("{} refuses an unknown call mode", self.module_id),
-            );
-        }
         match request.principal.as_ref() {
             Some(Principal::Reserved { module_id })
                 if module_id == "aft" || module_id == "prefrontal-core" => {}
@@ -1069,7 +981,6 @@ impl ModuleHandler for Handler {
         // The detail line stays one sentence; the refusal counters are
         // diagnostics, shown with `ck health ck-motor --verbose`.
         if let Some(serde_json::Value::Object(metrics)) = report.metrics.as_mut() {
-            metrics.insert("request_pools".into(), self.pool_metrics());
             metrics.insert(
                 "unreachable_refusals_since_boot".into(),
                 crate::diagnostics::health_metrics(),
@@ -1102,7 +1013,6 @@ impl ModuleHandler for Handler {
                 // the check is repeated so a route bound under another
                 // configuration can't act.
                 Some(Principal::Direct) if self.config.admit_direct_exec => {
-                    self.record_pool_fallback(&envelope.op, &body);
                     return self.handle_direct(ctx, envelope).await;
                 }
                 _ => {
@@ -1128,7 +1038,6 @@ impl ModuleHandler for Handler {
                     message: format!("{} refuses {} for reserved:{module_id}", self.module_id, envelope.op),
                 });
             }
-            self.record_pool_fallback(&envelope.op, &body);
             let motor = self.ready().await?;
             let principal = format!("reserved:{module_id}");
             if matches!(envelope.op.as_str(), "exec.attach" | "exec.cancel" | "exec.status") {
@@ -1150,6 +1059,17 @@ impl ModuleHandler for Handler {
                             code: "invalid_params".into(),
                             message: error.to_string(),
                         }),
+                    };
+                    let _permit = if motor.has_submission(&principal, &request)? {
+                        None
+                    } else {
+                        match RunPermit::acquire(&self.run_count) {
+                            Some(permit) => Some(permit),
+                            None => {
+                                pump(&ctx, motor.refuse_capacity()?, 0).await?;
+                                return Ok(HandlerOutcome::Streamed);
+                            }
+                        }
                     };
                     if request.submission_key.is_some() {
                         let cursor = request.resume_from_seq;
@@ -1209,16 +1129,7 @@ impl ModuleHandler for Handler {
                 "exec.status" => {
                     status_reply(motor, &envelope.params).await
                 },
-                "runner.health" => {
-                    let outcome = runner_health_reply_for(motor, &envelope.params).await?;
-                    if let HandlerOutcome::Response(body) = outcome {
-                        let mut health: Value = serde_json::from_slice(&body).map_err(io::Error::other)?;
-                        health["request_pools"] = self.pool_metrics();
-                        response(health)
-                    } else {
-                        Ok(outcome)
-                    }
-                },
+                "runner.health" => runner_health_reply_for(motor, &envelope.params).await,
                 "workspace.prepare" => response(
                     motor
                         .prepare(serde_json::from_value(envelope.params).map_err(io::Error::other)?)
@@ -1429,6 +1340,24 @@ where
                 None => return Err(io::Error::other("stream ended without terminal record")),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn run_permits_enforce_capacity_and_release_on_drop() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut permits: Vec<_> = (0..RUN_ADMISSION_LIMIT)
+            .map(|_| RunPermit::acquire(&count).unwrap())
+            .collect();
+        assert!(RunPermit::acquire(&count).is_none());
+        permits.pop();
+        let replacement = RunPermit::acquire(&count).expect("a finished stream releases admission");
+        drop(replacement);
+        drop(permits);
+        assert_eq!(count.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 }
 
@@ -1672,130 +1601,5 @@ mod startup_tests {
             .unwrap();
         assert_eq!(refusal.kind(), io::ErrorKind::NotConnected);
         assert!(refusal.to_string().contains("invalid_storage_descriptor"));
-    }
-}
-
-#[cfg(test)]
-mod pool_classifier_tests {
-    use super::*;
-
-    #[test]
-    fn canonical_agent_and_direct_stream_envelopes_use_long_held_pool() {
-        for key in ["op", "method"] {
-            for op in ["exec.run", "exec.attach"] {
-                for secret in [None, Some("a".repeat(64))] {
-                    let mut envelope =
-                        json!({key:op, "params":{"command":"payload"}, "preset":"dev"});
-                    if let Some(secret) = secret {
-                        envelope["direct_secret"] = json!(secret);
-                    }
-                    let body = serde_json::to_vec(&envelope).unwrap();
-                    let class = request_class(&body);
-                    assert_eq!(
-                        class.pool,
-                        RequestPool::LongHeld,
-                        "{}",
-                        String::from_utf8_lossy(&body)
-                    );
-                    assert_eq!(class.op, Some(op));
-                }
-            }
-        }
-        for op in [
-            "exec.status",
-            "exec.cancel",
-            "runner.health",
-            "exec.runner",
-            "exec.runaway",
-        ] {
-            let body = serde_json::to_vec(&json!({"op":op,"params":{"op":"exec.run"}})).unwrap();
-            assert_eq!(request_class(&body).pool, RequestPool::Default);
-        }
-        // The reader inspects only the envelope head, even with an invalid or
-        // enormous payload. Deserialization remains the handler's job.
-        assert_eq!(
-            request_class(br#"{"op":"exec.run","params":invalid"#).pool,
-            RequestPool::LongHeld
-        );
-        assert_eq!(
-            request_class(&vec![b'x'; 1024 * 1024]).pool,
-            RequestPool::Default
-        );
-    }
-
-    #[test]
-    fn aft_method_envelopes_and_keyed_resubmits_use_long_held_pool() {
-        let run = serde_json::to_vec(&json!({"method":"exec.run", "params":{
-            "submission_key":"caller:submission-0001", "resume_from_seq":7,
-            "command":"echo hello"
-        }}))
-        .unwrap();
-        let attach = serde_json::to_vec(&json!({"method":"exec.attach", "params":{
-            "job_id":"00000000-0000-0000-0000-000000000001", "from_seq":0
-        }}))
-        .unwrap();
-        assert!(run.starts_with(br#"{"method":"exec.run","params":{"#));
-        assert!(attach.starts_with(br#"{"method":"exec.attach","params":{"#));
-        assert_eq!(request_class(&run).pool, RequestPool::LongHeld);
-        assert_eq!(request_class(&attach).pool, RequestPool::LongHeld);
-        for body in [
-            br#"{"method":"exec.run_x","params":{}}"#.as_slice(),
-            br#"{"op":"exec.attachment","params":{}}"#.as_slice(),
-            br#"{"method":"exec.run"x}"#.as_slice(),
-        ] {
-            assert_eq!(request_class(body).pool, RequestPool::Default);
-        }
-        assert_eq!(
-            request_class(br#"{"method":"exec.run"}"#).pool,
-            RequestPool::LongHeld
-        );
-    }
-
-    #[test]
-    fn fallback_counter_counts_every_dispatch_but_warns_once_per_minute() {
-        let logs = crate::logging::Captured::default();
-        let _guard = crate::logging::scoped(logs.clone());
-        let fallbacks = PoolFallbacks::default();
-        let now = std::time::Instant::now();
-        fallbacks.record("exec.run", br#"{"params":{},"method":"exec.run"}"#, now);
-        fallbacks.record(
-            "exec.attach",
-            br#"{"params":{},"method":"exec.attach"}"#,
-            now + std::time::Duration::from_secs(10),
-        );
-        assert_eq!(fallbacks.total.load(Ordering::Relaxed), 2);
-        let first = logs.text();
-        assert_eq!(
-            first.matches("long-held request used default pool").count(),
-            1
-        );
-        assert!(
-            first.contains("WARN")
-                && first.contains("op=exec.run")
-                && first.contains("first_key=\"params\""),
-            "{first}"
-        );
-        fallbacks.record(
-            "exec.attach",
-            br#"{ "preset":"dev","method":"exec.attach"}"#,
-            now + std::time::Duration::from_secs(60),
-        );
-        let reopened = logs.text();
-        assert_eq!(fallbacks.total.load(Ordering::Relaxed), 3);
-        assert_eq!(
-            reopened
-                .matches("long-held request used default pool")
-                .count(),
-            2
-        );
-        assert!(
-            reopened.contains("op=exec.attach") && reopened.contains("first_key=\"preset\""),
-            "{reopened}"
-        );
-        assert_eq!(
-            first_envelope_key(b" \n { \"params\":{},\"method\":\"exec.run\"}"),
-            "params"
-        );
-        assert_eq!(first_envelope_key(&vec![b' '; 512]), "<unavailable>");
     }
 }
