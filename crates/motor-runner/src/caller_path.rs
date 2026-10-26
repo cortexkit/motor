@@ -8,6 +8,8 @@ use motor_protocol::{Prepare, Run, SiblingSnapshot};
 use std::path::Path;
 pub(crate) mod startup;
 pub use startup::CallerRoot;
+#[cfg(test)]
+mod backstop_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod startup_tests;
 
