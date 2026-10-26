@@ -519,3 +519,53 @@ async fn destination_alias_is_rechecked_before_population() {
     );
     assert!(!victim.join(".git").exists());
 }
+
+#[test]
+fn partial_setup_records_the_caller_key_only_when_the_host_checkout_exists() {
+    use crate::caller_path::{host, identity, PathPlan};
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.manual_tick = true;
+    config.disable_warm_builds = true;
+    let runner = Runner::open(config).unwrap();
+    for (name, caller_exists, host_exists) in
+        [("host-only", false, true), ("caller-only", true, false)]
+    {
+        let caller = f.scratch.join(format!("{name}-caller"));
+        let checkout = f.scratch.join(format!("{name}-host"));
+        if caller_exists {
+            fs::create_dir_all(&caller).unwrap();
+        }
+        if host_exists {
+            fs::create_dir_all(&checkout).unwrap();
+        }
+        let caller = caller.to_str().unwrap().to_string();
+        let plan = PathPlan {
+            caller: identity(&caller).caller,
+            host: host(&checkout),
+        };
+        let mut inner = runner.core.inner.lock().unwrap();
+        runner.note_workspace(
+            &mut inner,
+            plan,
+            &f.root,
+            "1111111111111111111111111111111111111111",
+            &[],
+            false,
+            false,
+            None,
+        );
+        assert_eq!(
+            inner.catalog.workspaces.contains_key(&caller),
+            host_exists,
+            "{name}"
+        );
+        assert!(
+            !inner
+                .catalog
+                .workspaces
+                .contains_key(checkout.to_str().unwrap()),
+            "host path must not become a catalog key"
+        );
+    }
+}

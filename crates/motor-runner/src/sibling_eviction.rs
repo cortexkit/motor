@@ -288,13 +288,18 @@ impl Runner {
             .flat_map(|request| &request.siblings)
             .map(|sibling| Spelled::new(crate::caller_path::sibling(sibling).host))
             .collect();
-        let paths: Vec<String> = crate::caller_path::keys(&inner.catalog.sibling_commits)
-            .map(|path| path.caller.text())
-            .cloned()
+        let paths: Vec<_> = crate::caller_path::keys(&inner.catalog.sibling_commits)
+            .map(|path| {
+                (
+                    path.caller.text().clone(),
+                    path.host.as_path().to_path_buf(),
+                )
+            })
             .collect();
         let mut changed = false;
-        for path in paths {
-            let checkout = Spelled::new(crate::caller_path::host_str(&path));
+        for (path, host) in paths {
+            let host_path = crate::caller_path::host(&host);
+            let checkout = Spelled::new(host_path);
             if checkout.unresolved() {
                 // The path cannot be resolved, so a workspace might be
                 // there under another spelling: keep it.
@@ -319,15 +324,13 @@ impl Runner {
                 // Discarding it would take a nested workspace with it.
                 continue;
             }
-            if let Err(error) =
-                self.validate_destinations(crate::caller_path::host_str(&path), None, &[])
-            {
+            if let Err(error) = self.validate_destinations(host_path, None, &[]) {
                 tracing::warn!(path, %error, "legacy sibling checkout is not under an owned workspace root; leaving it in place");
                 inner.catalog.sibling_commits.remove(&path);
                 changed = true;
                 continue;
             }
-            match self.discard(Path::new(&path)) {
+            match self.discard(host_path.as_path()) {
                 Ok(()) => {
                     tracing::info!(path, "discarded unused legacy sibling checkout");
                     inner.catalog.sibling_commits.remove(&path);

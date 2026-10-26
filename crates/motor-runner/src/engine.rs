@@ -3098,7 +3098,7 @@ impl Runner {
     fn note_workspace(
         &self,
         inner: &mut Inner,
-        key: &str,
+        plan: paths::PathPlan<'_>,
         root: &str,
         commit: &str,
         siblings: &[SiblingSnapshot],
@@ -3106,6 +3106,7 @@ impl Runner {
         sibling_checkouts: bool,
         kind: Option<WorkspaceKind>,
     ) {
+        let key = plan.caller.text().as_str();
         if self.core.config.vm_instance() {
             return;
         }
@@ -3127,7 +3128,7 @@ impl Runner {
                 siblings,
                 self.now(),
             );
-        } else if Path::new(key).exists() {
+        } else if plan.host.as_path().exists() {
             workspace::record_workspace(&mut inner.catalog, key, root, commit, &[], self.now());
             if let Some(w) = inner.catalog.workspaces.get_mut(key) {
                 w.siblings = siblings.to_vec();
@@ -4146,7 +4147,7 @@ impl Runner {
         let mut inner = self.core.inner.lock().unwrap();
         self.note_workspace(
             &mut inner,
-            paths::request(r).caller_workspace_key.text(),
+            paths::request(r).workspace_path(),
             paths::request(r).caller_repository_root.text(),
             &r.base_commit,
             &r.siblings,
@@ -5558,8 +5559,9 @@ impl Runner {
     /// worker parked on the lock stops the runner answering other connections.
     pub async fn drop_workspace(&self, key: &str) -> io::Result<DropReply> {
         self.ensure_reconciled()?;
-        self.validate_destinations(crate::caller_path::host_str(key), None, &[])?;
         let key = key.to_string();
+        let host = paths::identity(&key).host.as_path().to_path_buf();
+        self.validate_destinations(paths::host(&host), None, &[])?;
         let (guard, mut ids, admitting) = self
             .off_runtime({
                 let key = key.clone();
@@ -5634,11 +5636,12 @@ impl Runner {
             // disconnects. Only this operation may remove its marker.
             let _guard = guard;
             let _pressure = runner.core.disk.lock().unwrap();
-            runner.validate_destinations(crate::caller_path::host_str(&key), None, &[])?;
+            let host_path = paths::host(&host);
+            runner.validate_destinations(host_path, None, &[])?;
             let mut inner = runner.core.inner.lock().unwrap();
             let dropped = inner.catalog.workspaces.contains_key(&key);
             let catalog = if dropped {
-                runner.discard(Path::new(&key))?;
+                runner.discard(host_path.as_path())?;
                 inner.catalog.workspaces.remove(&key);
                 Some(runner.catalog_snapshot(&inner)?)
             } else {
@@ -5863,36 +5866,33 @@ impl Runner {
             return Ok(false);
         }
         let idle: Vec<_> = crate::caller_path::entries(&inner.catalog.workspaces)
-            .map(|(path, record)| (path.caller.text(), record))
             .filter(|(key, w)| {
                 w.kind != WorkspaceKind::Head
                     && self.now().saturating_sub(w.used_ms) >= RETENTION_MS
-                    && !inner.reserved.contains_key(*key)
+                    && !inner.reserved.contains_key(key.caller.text())
                     && !inner.preparing.values().any(|p| {
-                        paths::request(p).host_workspace.as_path().starts_with(key)
-                            || Path::new(key)
-                                .starts_with(paths::request(p).caller_workspace_key.text())
+                        let preparing = paths::request(p).host_workspace.as_path();
+                        preparing.starts_with(key.host.as_path())
+                            || key.host.as_path().starts_with(preparing)
                     })
-                    && !Self::deleting(&inner, paths::host_str(key), &[])
+                    && !Self::deleting(&inner, key.host, &[])
                     && !inner
                         .admission_saves
                         .values()
-                        .any(|workspace| workspace == *key)
-                    && !inner
-                        .jobs
-                        .values()
-                        .any(|j| crate::caller_path::job_key(j) == *key && j.terminal.is_none())
+                        .any(|workspace| workspace == key.caller.text())
+                    && !inner.jobs.values().any(|j| {
+                        crate::caller_path::job_key(j) == key.caller.text() && j.terminal.is_none()
+                    })
             })
-            .map(|(k, _)| k.clone())
+            .map(|(key, _)| (key.caller.text().clone(), key.host.as_path().to_path_buf()))
             .collect();
-        for key in idle {
-            if let Err(error) =
-                self.validate_destinations(crate::caller_path::host_str(&key), None, &[])
-            {
+        for (key, host) in idle {
+            let host_path = paths::host(&host);
+            if let Err(error) = self.validate_destinations(host_path, None, &[]) {
                 tracing::warn!(workspace = %key, %error, "workspace expiry refused outside owned roots");
                 continue;
             }
-            if let Err(error) = self.discard(Path::new(&key)) {
+            if let Err(error) = self.discard(host_path.as_path()) {
                 tracing::warn!(workspace = %key, %error, "expired workspace deletion failed; retaining ownership and continuing maintenance");
                 continue;
             }
@@ -7048,7 +7048,7 @@ impl Runner {
         } else {
             self.note_workspace(
                 &mut inner,
-                paths::request(&r).caller_workspace_key.text(),
+                paths::request(&r).workspace_path(),
                 paths::request(&r).caller_repository_root.text(),
                 &r.snapshot_commit,
                 &r.siblings,
