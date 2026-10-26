@@ -56,6 +56,27 @@ def sandbox_cpus():
     return len(os.sched_getaffinity(0))
 
 
+def boat_runner_args(args):
+    """The runner's arguments for this Boat sandbox.
+
+    `--remote-cache true` lets the runner read the compile-cache provisioning
+    CLOUD's broker installs at /run/motor/cache on every create and resume. The
+    runner switches the cache on only while those files parse and `enabled` is
+    true, and it never fills on Boat: a missing or broken provisioning set
+    leaves jobs uncached, never refused. The flag must be present before the
+    broker starts delivering the files, because a runner reads provisioning
+    only when this switch is on.
+    """
+    kept = []
+    words = iter(args)
+    for word in words:
+        if word == '--remote-cache':
+            next(words, None)
+            continue
+        kept.append(word)
+    return [*kept, '--remote-cache', 'true']
+
+
 def sized_runner_args(args, cpus):
     """The runner's arguments with its job capacity and rustc slots set to `cpus`.
     Any count already present (an older unit file) is replaced, never trusted."""
@@ -487,7 +508,7 @@ def main():
     check_storage()
     baseline = json.loads(Path('/run/motor-boat-memory.json').read_text())
     available = baseline['mem_available_bytes']
-    command = ['/usr/local/bin/motor-runner', *sized_runner_args(sys.argv[1:], sandbox_cpus())]
+    command = ['/usr/local/bin/motor-runner', *sized_runner_args(boat_runner_args(sys.argv[1:]), sandbox_cpus())]
     child = subprocess.Popen([*command, '--boat-memory-max-bytes', str(budget(available, 0))])
     try:
         until = time.monotonic() + BOOTSTRAP_DEADLINE_S

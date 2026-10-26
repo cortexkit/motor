@@ -290,8 +290,22 @@ fn cache_startup_errors_and_bind_failure_are_uncached_not_job_refusals() {
 }
 
 /// Substitute only the privileged systemd launch, after the real backend has
-/// decided whether a cache failure permits the job to start and built its env.
-struct UncachedIsolationLauncher;
+/// decided whether a cache failure permits the job to start and built its
+/// environment.
+struct UncachedIsolationLauncher {
+    /// Set for a Boat job: the runner's state directory. The real launcher
+    /// rejects a workspace that is not on the sandbox's state disk, and a
+    /// portable fixture checks the same thing here because the privileged
+    /// launch is what it substitutes.
+    boat_disk: Option<PathBuf>,
+    /// The environment the backend built for this job, when the test wants to
+    /// read it instead of running the job.
+    captured: Option<CapturedEnvironment>,
+}
+
+/// Where a launch records the environment it was given, for a test that reads
+/// the launch's output instead of running the job.
+type CapturedEnvironment = Arc<Mutex<Option<BTreeMap<String, String>>>>;
 
 impl crate::backend::IsolationLauncher for UncachedIsolationLauncher {
     fn launch(
@@ -302,6 +316,25 @@ impl crate::backend::IsolationLauncher for UncachedIsolationLauncher {
         _cpus: &[u32],
         _requested_vcpus: u32,
     ) -> io::Result<crate::platform::Launch> {
+        if let Some(state) = &self.boat_disk {
+            use std::os::unix::fs::MetadataExt;
+            let device = fs::metadata(state)?.dev();
+            let workspace = fs::metadata(cwd)?;
+            assert!(
+                workspace.is_dir() && workspace.dev() == device,
+                "workspace {} is not on the Boat state disk",
+                cwd.display()
+            );
+        }
+        if let Some(captured) = &self.captured {
+            *captured.lock().unwrap() = Some(env.iter().cloned().collect());
+            // The environment is what this test reads; the privileged launch
+            // that would run it is not available to a portable test.
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "isolation launcher observed",
+            ));
+        }
         for key in [
             "SCCACHE_ENDPOINT",
             "SCCACHE_BUCKET",
@@ -313,7 +346,18 @@ impl crate::backend::IsolationLauncher for UncachedIsolationLauncher {
     }
 }
 
-fn assert_uncached_job_starts(f: &Fixture, config: &Config, phase: &str) {
+/// The environment a Boat job launches with, in whatever cache state `config`
+/// carries. Anything that refuses the job appears as the panic this test makes
+/// visible, not as a missing variable.
+fn boat_job_environment(f: &Fixture, config: &Config, phase: &str) -> BTreeMap<String, String> {
+    // The Boat profile also refuses a job whose workspace is not on the
+    // sandbox's mounted, project-quota disk. A portable scratch directory is
+    // neither, and those two refusals are covered by their own tests, so clear
+    // them here to reach the environment the launch builds.
+    let mut config = config.clone();
+    config.boat_profile = false;
+    config.boat_cold_materialization = false;
+    let captured = Arc::new(Mutex::new(None));
     let (mut request, _) = f.run("exit 23");
     request.base_commit = Some("f".repeat(40));
     let setup = Setup {
@@ -326,9 +370,12 @@ fn assert_uncached_job_starts(f: &Fixture, config: &Config, phase: &str) {
     };
     let prepared = Prepared {
         cwd: f.main.clone(),
-        target: f.scratch.join("uncached-target"),
+        target: f.scratch.join("boat-cache-target"),
         wrapper: None,
-        sandbox: Some(Box::new(UncachedIsolationLauncher)),
+        sandbox: Some(Box::new(UncachedIsolationLauncher {
+            boat_disk: None,
+            captured: Some(captured.clone()),
+        })),
         vm: None,
     };
     let trees = Trees {
@@ -337,8 +384,56 @@ fn assert_uncached_job_starts(f: &Fixture, config: &Config, phase: &str) {
         state: config.state_dir(),
         compacting: Arc::default(),
     };
+    match crate::backend::HostBackend.launch(&config, &trees, &setup, &prepared, 1) {
+        Ok(_) => {}
+        // The substituted launcher records the environment instead of starting
+        // a systemd unit a portable test cannot run.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(error) => panic!("{phase} must not refuse a job: {error}"),
+    }
+    let env = captured.lock().unwrap().clone();
+    drop(prepared);
+    env.unwrap_or_else(|| panic!("{phase}: the job launch built no environment"))
+}
+
+fn assert_uncached_job_starts(f: &Fixture, config: &Config, phase: &str) {
+    let boat_disk = config.boat_profile.then(|| config.state_dir());
+    // A Boat job is refused unless its workspace sits on the sandbox's mounted,
+    // project-quota disk; a portable scratch directory is not on one. That
+    // refusal has its own test, so the launch runs without the profile flag and
+    // the cache decision under test is the only thing that can fail here.
+    let mut config = config.clone();
+    config.boat_profile = false;
+    config.boat_cold_materialization = false;
+
+    let (mut request, _) = f.run("exit 23");
+    request.base_commit = Some("f".repeat(40));
+    let setup = Setup {
+        id: request.job_id,
+        request,
+        cpus: vec![1],
+        base: false,
+        recorded: BTreeMap::new(),
+        snapshots: None,
+    };
+    let trees = Trees {
+        dependency_locks: Mutex::new(BTreeMap::new()),
+        mirrors: config.state_dir().join("mirrors"),
+        state: config.state_dir(),
+        compacting: Arc::default(),
+    };
+    let prepared = Prepared {
+        cwd: f.main.clone(),
+        target: f.scratch.join("uncached-target"),
+        wrapper: None,
+        sandbox: Some(Box::new(UncachedIsolationLauncher {
+            boat_disk,
+            captured: None,
+        })),
+        vm: None,
+    };
     let mut launch = crate::backend::HostBackend
-        .launch(config, &trees, &setup, &prepared, 1)
+        .launch(&config, &trees, &setup, &prepared, 1)
         .unwrap_or_else(|error| panic!("{phase} must not refuse an uncached job: {error}"));
     if let Some(process) = launch.process {
         f.cleanup.0.lock().unwrap().register(process);
@@ -484,4 +579,177 @@ async fn production_watcher_connects_health_and_publishing_to_late_provisioning(
             .publishing_seen
             .publishing
     );
+}
+
+/// CLOUD's broker owns `/run/motor/cache` on Boat, so a test writes the same
+/// files and modes into a scratch directory and gives the layout that role.
+fn boat_layout(directory: &Path) -> Layout {
+    fs::create_dir(directory).unwrap();
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    Layout::new(directory.to_path_buf(), HostRole::Boat)
+}
+
+/// The read-only provisioning set CLOUD installs: `read-key` at 0400 and
+/// `config.json` at 0444, both owned by the runner's account.
+fn provision_reader(layout: &Layout, enabled: bool) {
+    let generation = generation("9", TENANT);
+    let key = serde_json::json!({"generation":"9", "access_key_id":generation.read_key.access_key_id,
+        "secret_access_key":generation.read_key.secret_access_key});
+    let path = layout.key_path(crate::remote_cache::provisioning::KeyRole::Read);
+    let temporary = layout.directory().join(".read-key-new");
+    fs::write(&temporary, key.to_string()).unwrap();
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o400)).unwrap();
+    fs::rename(temporary, path).unwrap();
+    let value = serde_json::json!({"generation":"9", "tenant":TENANT,
+        "endpoint":generation.endpoint, "region":generation.region, "bucket":generation.bucket,
+        "prefix":generation.prefix, "storage_class":generation.storage_class, "enabled":enabled});
+    let path = layout.config_path();
+    let temporary = layout.directory().join(".config-new");
+    fs::write(&temporary, value.to_string()).unwrap();
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o444)).unwrap();
+    fs::rename(temporary, path).unwrap();
+}
+
+#[test]
+fn boat_runner_switch_reads_provisioning_and_never_fills() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.boat_profile = true;
+    config.tenant_vm = true;
+    config.isolate_jobs = true;
+    config.remote_cache = true;
+    let snapshot = |config: &Config| {
+        super::super::remote_cache_engine::snapshot(config, &Catalog::default(), 0)
+    };
+    // A job's environment with the cache on: the read-only store client the
+    // gateway signs for, through the job's own keyless loopback forwarder.
+    let enabled = |config: &Config| {
+        assert_eq!(snapshot(config).state, RemoteCacheState::Available);
+        let (generation, forwarders) = config.unit_remote_cache(false).unwrap();
+        // The active generation is CLOUD's own file, and each job reaches
+        // the gateway only through its own sccache read socket.
+        assert_eq!(generation.generation.0, "9");
+        assert_eq!(generation.tenant, TENANT);
+        assert!(forwarders
+            .iter()
+            .any(|forwarder| forwarder.tool() == Tool::Sccache));
+    };
+    // Cached jobs need no cache variables at all: no store endpoint, no
+    // wrapper, and, above all, nothing that would make the job fill.
+    let uncached = |config: &Config, phase: &str| {
+        let env = boat_job_environment(&f, config, phase);
+        for name in [
+            "SCCACHE_ENDPOINT",
+            "SCCACHE_BUCKET",
+            "SCCACHE_REGION",
+            "SCCACHE_S3_RW_MODE",
+            "SCCACHE_RECACHE",
+            "RUSTC_WRAPPER",
+        ] {
+            assert!(
+                !env.contains_key(name),
+                "{phase}: a Boat job was given {name}"
+            );
+        }
+    };
+
+    // A Boat start reads /run/motor/cache, which CLOUD owns. Starting the
+    // runtime must leave that directory alone rather than create or repair it
+    // for its root-owned parent to replace under the running runner.
+    let directory = f.scratch.join("run-motor-cache");
+    let layout = boat_layout(&directory);
+    let runtime = runtime(&layout);
+    assert_eq!(layout.directory(), directory);
+    assert!(directory.is_dir());
+    assert!(!layout.directory().join("cache-provisioning").exists());
+    assert!(!config
+        .state_dir()
+        .join(crate::remote_cache::provisioning::STATE_DIRECTORY)
+        .exists());
+    config.remote_cache_runtime = Some(runtime.clone());
+
+    // The flag alone is not enough: until CLOUD's files arrive the runner is
+    // uncached, and a job must still start.
+    runtime.watch.reread();
+    assert!(config.unit_remote_cache(false).is_none());
+    assert_eq!(snapshot(&config).state, RemoteCacheState::CacheUnavailable);
+    uncached(&config, "boat before provisioning");
+
+    // CLOUD installs the files after every create and resume, which can be
+    // long after the runner started; the watcher's re-read must pick them up.
+    provision_reader(&layout, true);
+    runtime.watch.reread();
+    enabled(&config);
+    // Boat never fills, whatever the switch and the provisioning say: the fill
+    // path is refused before provisioning is read.
+    assert!(config.remote_cache_available(true).is_none());
+    assert!(config.unit_remote_cache(true).is_none());
+
+    // The tenant's switch turns jobs uncached again, and back on.
+    provision_reader(&layout, false);
+    runtime.watch.reread();
+    assert_eq!(snapshot(&config).state, RemoteCacheState::Off);
+    provision_reader(&layout, true);
+    runtime.watch.reread();
+    enabled(&config);
+
+    // CLOUD never installs a read-write key on Boat. A stray one must not
+    // reach a job either: Boat reads only the read-only key, so an extra file
+    // neither grants writes nor takes the working read key away.
+    let write_key = layout.key_path(crate::remote_cache::provisioning::KeyRole::Write);
+    fs::write(
+        &write_key,
+        serde_json::json!({"generation":"9", "access_key_id":"read-write", "secret_access_key":"s"})
+            .to_string(),
+    )
+    .unwrap();
+    fs::set_permissions(&write_key, fs::Permissions::from_mode(0o400)).unwrap();
+    runtime.watch.reread();
+    assert_eq!(snapshot(&config).state, RemoteCacheState::Available);
+    assert_eq!(
+        crate::remote_cache::provisioning::HostRole::Boat.keys(),
+        &[crate::remote_cache::provisioning::KeyRole::Read]
+    );
+    fs::remove_file(&write_key).unwrap();
+
+    // A file whose mode differs from the contract is not read: the read-only
+    // key's mode is what keeps that credential from other accounts. The last
+    // complete generation stays active, so one drifted file does not drop the
+    // cache out from under running jobs.
+    let drifted = layout.key_path(crate::remote_cache::provisioning::KeyRole::Read);
+    fs::set_permissions(&drifted, fs::Permissions::from_mode(0o444)).unwrap();
+    runtime.watch.reread();
+    assert_eq!(snapshot(&config).state, RemoteCacheState::Available);
+    enabled(&config);
+
+    // A new generation with the key back at the contract's mode replaces the
+    // drifted set without a restart, which is how a broker reinstall recovers
+    // from a write that landed with the wrong mode.
+    fs::set_permissions(&drifted, fs::Permissions::from_mode(0o400)).unwrap();
+    provision_reader(&layout, true);
+    runtime.watch.reread();
+    enabled(&config);
+
+    // Neither the cache nor any of its states gives Boat a way to write: the
+    // fill path is refused before provisioning is read.
+    assert!(config.remote_cache_available(true).is_none());
+    assert!(config.unit_remote_cache(true).is_none());
+}
+
+#[test]
+fn boat_manifest_switch_turns_the_cache_on_without_a_runtime() {
+    // The switch decides whether the runner even reads provisioning, so it has
+    // to be on from the first start, before CLOUD's files exist.
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.boat_profile = true;
+    config.tenant_vm = true;
+    config.isolate_jobs = true;
+    assert!(config.remote_cache_available(false).is_none());
+    config.remote_cache = true;
+    assert!(config.remote_cache_available(false).is_some());
+    assert!(config.remote_cache_available(true).is_none());
+    // Without job isolation the switch is ignored on every host type.
+    config.isolate_jobs = false;
+    assert!(config.remote_cache_available(false).is_none());
 }

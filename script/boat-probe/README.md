@@ -323,6 +323,48 @@ networking follows [Public URLs / raw TCP](https://docs.boat.dev/hosting) and
 [Firewall](https://docs.boat.dev/hosting/firewall): guest root rules, not an
 invented provider firewall API. No live provider assertion follows from these
 portable tests.
+
+## Live remote compile-cache check
+
+The `core` verify phase ends with a `cache_live` section that proves a real Rust
+job is answered by the fleet's remote sccache store. Pass the provisioning
+CLOUD's broker would install, in a directory alongside the operator's seed:
+
+```sh
+set -o pipefail
+<key reader> | python3 script/boat-probe/probe.py --key-stdin --runner-host \
+  --verify-prepared-image <prepared-image> --verify-phase core \
+  --cache-inputs /secure-input/boat-cache \
+  --cargo-seed-manifest /secure-input/cargo-seed.json \
+  --cargo-seed-sha256 "$CARGO_SEED_SHA256" --acknowledge-tenant-one-private-cache \
+  --max-minutes 30 --output .cortexkit/internal-docs/research/boat-cache-live
+```
+
+`/secure-input/boat-cache` holds `config.json`, `read-key` and
+`cargo-seed.tar.gz`. The two provisioning files use exactly the members in
+`crates/motor-lease/contracts/cloud/runners-contract.md`; a missing member, an
+extra one or two files from different generations is refused before any sandbox
+is created. The read key must be the read-only, prefix-confined credential CLOUD
+delivers to fleet sandboxes, because that is the key whose behaviour the check
+qualifies; a read-write credential is never installed on a fleet sandbox, so it
+would prove nothing about the fleet.
+
+The section installs the pair at the contract's paths and modes (root-owned 0700
+directory, 0444 `config.json`, 0400 `read-key`), stages the operator's seed and a
+small Cargo package for the job account, and runs one real job that builds
+offline and prints its own wrapper's `sccache --show-stats`. It passes only with
+at least one `s3_hits` compile, the job's `READ_ONLY` cache mode, no
+`SCCACHE_RECACHE`, and `/motor-tools` plus `/motor-gateway` mounted in the job. A
+job that never received the cache reports no remote counter and fails. The key is
+the only part of the pair sent over SSH standard input; both the installed and
+staged copies are removed in a `finally` block, before any stop, snapshot or
+save, and the report keeps only the non-secret config members and the seed
+manifest digest.
+
+Without `--cache-inputs` the section records `cache_live.provisioning_supplied`
+as `INCONCLUSIVE` and appears in `verdict.inconclusive`: a missing check is never
+a pass, and `verdict.image_qualified` stays false for that run.
+
 ## Plain stop/resume control
 
 The prepared-image `core` phase runs its normal checks and jobs in a fresh
