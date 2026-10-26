@@ -277,8 +277,92 @@ def require_gate_success(terminal):
 BUN_VERSION_CHECK = "bun_version=$(bun --version) && test \"${bun_version%$'\\r'}\" = \"1.4.2\""
 
 
+GIT_DEP_URL = "https://dep.invalid/itoa-fixture"
+
+
+def commit_fixture(path):
+    git(path, "init", "-b", "main")
+    git(path, "add", ".")
+    git(path, "-c", "user.name=Qualification", "-c", "user.email=qualification@invalid", "commit", "-m", "qualification fixture")
+    return git(path, "rev-parse", "HEAD"), git(path, "rev-parse", "HEAD^{tree}")
+
+
+def dependency_fixture(path, dependency):
+    dependency.mkdir()
+    (dependency / "src").mkdir()
+    (dependency / "Cargo.toml").write_text('[package]\nname="itoa-fixture"\nversion="1.0.11"\nedition="2021"\n')
+    (dependency / "src/lib.rs").write_text('pub fn value() -> u32 { 11 }\n')
+    dep_commit, _ = commit_fixture(dependency)
+    git(dependency, "tag", "1.0.11")
+    path.mkdir()
+    (path / "src").mkdir()
+    (path / "Cargo.toml").write_text(f'[package]\nname="git-tag-qualification"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nitoa-fixture = {{ git = "{GIT_DEP_URL}", tag = "1.0.11" }}\n')
+    (path / "src/lib.rs").write_text('pub fn value() -> u32 { itoa_fixture::value() }\n')
+    (path / "Cargo.lock").write_text(f'version = 4\n\n[[package]]\nname = "git-tag-qualification"\nversion = "0.1.0"\ndependencies = ["itoa-fixture"]\n\n[[package]]\nname = "itoa-fixture"\nversion = "1.0.11"\nsource = "git+{GIT_DEP_URL}?tag=1.0.11#{dep_commit}"\n')
+    return (*commit_fixture(path), dep_commit)
+
+
+def no_lockfile_fixture(path):
+    path.mkdir()
+    (path / "run.sh").write_text('set -eu\ntest ! -e Cargo.lock\ntest ! -e Cargo.toml\nprintf "no-lockfile-started\\n"\n')
+    return commit_fixture(path)
+
+
+def dependency_bundle(repo, bundle, commit):
+    ref = f"refs/ck-motor/dep/{commit}"
+    git(repo, "update-ref", ref, commit)
+    try:
+        git(repo, "bundle", "create", str(bundle), ref)
+    finally:
+        git(repo, "update-ref", "-d", ref)
+
+
+def run_preparation_case(root, runner, evidence, name, repo, commit, tree, command, dependency=None):
+    bundle = evidence / f"{name}.bundle"
+    fixture_bundle(repo, bundle, commit)
+    payloads = [bundle.read_bytes()]
+    workspace = f"/qualification/{name}"
+    manifests = [dict(index=0, repository=workspace, length=len(payloads[0]), sha256=hashlib.sha256(payloads[0]).hexdigest())]
+    dependencies = []
+    if dependency is not None:
+        dep_repo, dep_commit = dependency
+        dep_bundle = evidence / f"{name}-dependency.bundle"
+        dependency_bundle(dep_repo, dep_bundle, dep_commit)
+        payloads.append(dep_bundle.read_bytes())
+        manifests.append(dict(index=1, repository=GIT_DEP_URL, length=len(payloads[1]), sha256=hashlib.sha256(payloads[1]).hexdigest()))
+        dependencies.append(dict(url=GIT_DEP_URL, commits=[dep_commit], bundle=manifests[1]))
+    job = str(uuid.uuid4())
+    channel = Channel(runner, root, evidence / f"bridge-{name}.log")
+    try:
+        channel.send(dict(type="run", job_id=job, gate_job=True, platform="windows", workspace_key=workspace, repository_root=workspace, cwd=workspace, command=BUN_VERSION_CHECK + " || exit $?; " + command, env={}, weight_hint=4, timeout=600, queue_wait_limit_s=60, snapshot_commit=commit, tree_hash=tree, integration_tip=commit, siblings=[], git_dependencies=dependencies, bundles=manifests))
+        channel.until("accepted")
+        for index, data in enumerate(payloads):
+            for offset in range(0, len(data), 65536):
+                channel.send(dict(type="bundle_chunk", index=index, offset=offset, data=base64.b64encode(data[offset:offset+65536]).decode()))
+        output = bytearray()
+        terminal = channel.until("terminal", output)
+        (evidence / f"terminal-{name}.json").write_text(json.dumps(terminal, indent=2))
+        (evidence / f"output-{name}.bin").write_bytes(output)
+        require_gate_success(terminal)
+        print(f"PASS {name} job={job}", flush=True)
+    finally:
+        channel.close()
+
+
+def qualify_preparation_cases(root, runner, evidence):
+    repo = evidence / "git-tag-fixture"
+    dependency = evidence / "git-tag-dependency"
+    commit, tree, dep_commit = dependency_fixture(repo, dependency)
+    run_preparation_case(root, runner, evidence, "git-tag-offline", repo, commit, tree,
+                         "cargo build --offline --locked", (dependency, dep_commit))
+    repo = evidence / "no-lockfile-fixture"
+    commit, tree = no_lockfile_fixture(repo)
+    run_preparation_case(root, runner, evidence, "no-lockfile", repo, commit, tree, "sh run.sh")
+
+
 def run(root, runner, evidence, gate):
     require_runner_service()
+    qualify_preparation_cases(root, runner, evidence)
     repo = evidence / "fixture"
     commit, tree = fixture(repo)
     bundle = evidence / "fixture.bundle"
@@ -336,11 +420,15 @@ def main(argv=None):
     parser.add_argument("--root", type=Path, default=Path(r"C:\ProgramData\MotorRunner"))
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--gate-command", default="cargo test --locked --offline -- --nocapture && cargo clippy --all-targets --locked --offline -- -D warnings")
-    parser.add_argument("--wait-ready", action="store_true", help="Wait for service Running and a validated Windows Hello after parent verification")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--wait-ready", action="store_true", help="Wait for service Running and a validated Windows Hello after parent verification")
+    mode.add_argument("--preparation-only", action="store_true", help="Run only the tagged offline Git and no-lockfile jobs once each")
     args = parser.parse_args(argv)
     args.evidence.mkdir(parents=True, exist_ok=False)
     if args.wait_ready:
         wait_for_service_ready(args.root, args.root / "bin/motor-runner.exe", args.evidence)
+    elif args.preparation_only:
+        qualify_preparation_cases(args.root, args.root / "bin/motor-runner.exe", args.evidence)
     else:
         run(args.root, args.root / "bin/motor-runner.exe", args.evidence, args.gate_command)
 

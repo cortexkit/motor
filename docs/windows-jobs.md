@@ -281,12 +281,20 @@ local-registry cache tests, and the operator-only `-LocalRegistryOnly` proof.
 can start a job without Cargo dependencies. When a lockfile is present, crates.io
 registry packages must have a locked checksum. Git dependencies must be present
 in the job's uploaded bundles
-and are rewritten to their local mirror inside the VM. Path dependencies must
+and are rewritten to their local mirror inside the VM. Before the caller command,
+the unprivileged guest job runs locked Cargo fetches for transferred workspaces
+with lockfiles, using only file-protocol Git rewrites and the staged local
+registry. These fetches temporarily disable Cargo's offline switch: Cargo refuses
+even a local Git rewrite until its own `git/db` has the locked commit. The VM
+still has no network adapter. Nested fetch failures warn without suppressing the
+caller command; any missing required dependency then fails that offline command.
+The caller command retains `CARGO_NET_OFFLINE=true`. Test:
+`tagged_git_mirror_reaches_cargo_build_offline_locked`. Path dependencies must
 resolve inside the transferred snapshots. An alternate registry, undeclared Git
 source, or outside path dependency is refused before VM start with its source
 named. A repository's own `.cargo/config.toml` is allowed: Cargo's project config
 has higher precedence than the runner's Cargo-home source replacement, so a repo
-may use its own vendored or replacement source. Cargo remains offline, and
+may use its own vendored or replacement source. Caller Cargo commands remain offline, and
 `--locked` keeps Cargo.lock unchanged and verifies package checksums. Test:
 `windows_backend_rejects_unsupported_manifests_but_accepts_cargo_config` and the
 operator-only local-registry qualification. Tests
@@ -295,6 +303,9 @@ operator-only local-registry qualification. Tests
 optional-lockfile dispatch through job start. When preparing a root lockfile,
 nested Cargo.lock files are eligible only when both the lockfile and its
 Cargo.toml are tracked regular files; malformed nested locks are still skipped.
+The guest accepts absent runner Cargo/Git configuration for non-Cargo snapshots
+without inheriting service Git configuration. Test:
+`non_cargo_workspace_needs_no_local_registry_config`.
 
 5.3. Only the snapshot (`m/`) and selected Cargo-home members (`config.toml`,
 `local-registry/`, bundled `git-mirrors/` and its rewrite manifest) enter the VM,
