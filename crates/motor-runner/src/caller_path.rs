@@ -252,7 +252,7 @@ pub(crate) fn evidence_volume(config: &crate::Config, job: &Job) -> PathBuf {
 pub(crate) fn job_workspace(config: &crate::Config, job: &Job) -> PathBuf {
     job.request
         .as_ref()
-        .map(|r| host_run(config, r).workspace)
+        .map(|r| host_run(config, r).host_workspace)
         .unwrap_or_default()
 }
 
@@ -720,15 +720,15 @@ pub(crate) fn mapped_run(config: &crate::Config, request: &Run) -> bool {
 /// or a fill's checkout) and its cwd. Admission and setup authorize them
 /// first; identity runs keep their caller spelling exactly.
 pub(crate) struct HostRun {
-    pub(crate) workspace: PathBuf,
-    pub(crate) cwd: PathBuf,
+    pub(crate) host_workspace: PathBuf,
+    pub(crate) host_cwd: PathBuf,
 }
 
 pub(crate) fn host_run(config: &crate::Config, request: &Run) -> HostRun {
     let plan = run(request);
     HostRun {
-        workspace: host_path(config, plan.workspace.checkout().caller.text()),
-        cwd: host_path(config, plan.caller_cwd.text()),
+        host_workspace: host_path(config, plan.workspace.checkout().caller.text()),
+        host_cwd: host_path(config, plan.caller_cwd.text()),
     }
 }
 

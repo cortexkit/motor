@@ -121,7 +121,7 @@ fn host_home() -> Vec<(String, Option<SystemTime>)> {
     entries
 }
 
-/// Unit properties naming paths the job is shown: none may name H.
+/// Unit properties naming paths the job is shown.
 fn unit_properties(unit: &str) -> String {
     let output = Command::new("systemctl")
         .args([
@@ -201,10 +201,26 @@ async fn isolated_mapped_job_sees_caller_paths_and_never_learns_h() {
         assert!(ended.is_none(), "{ended:?}");
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    // Argv: the running unit's paths, environment and command never name H.
+    // Argv: the running unit's bind destinations, working directory,
+    // environment and command never name H; H is only ever a bind source.
     let unit = runner.job_status(request.job_id).unwrap().unit.unwrap();
     let properties = unit_properties(&unit);
-    assert!(!properties.contains(&h_text), "{properties}");
+    for property in properties.lines() {
+        let mounts = property
+            .strip_prefix("BindPaths=")
+            .or_else(|| property.strip_prefix("BindReadOnlyPaths="));
+        match mounts {
+            Some(mounts) => {
+                for mount in mounts.split_whitespace() {
+                    let mut parts = mount.trim_start_matches('-').split(':');
+                    let source = parts.next().unwrap();
+                    let destination = parts.next().unwrap_or(source);
+                    assert!(!destination.starts_with(&h_text), "{mount}");
+                }
+            }
+            None => assert!(!property.contains(&h_text), "{property}"),
+        }
+    }
     assert!(
         properties.contains(&format!("WorkingDirectory={workspace}")),
         "{properties}"

@@ -593,12 +593,12 @@ impl Backend for HostBackend {
             // of it (see `workspace_access`).
             crate::workspace_access::validate_with_repair(
                 config,
-                paths::host(&host.workspace),
+                paths::host(&host.host_workspace),
                 &host_siblings,
                 validate,
             )?;
         }
-        let path = host.workspace.clone();
+        let path = host.host_workspace.clone();
         #[cfg(target_os = "linux")]
         if config.boat_profile && path.exists() {
             // Bound hostile cached trees before permission repair or checkout
@@ -715,7 +715,7 @@ impl Backend for HostBackend {
         if computed != r.tree_hash {
             return Err(Trees::tree_hash_mismatch(&path, &r.tree_hash, &computed));
         }
-        let cwd = setup_step("resolve job cwd", fs::canonicalize(&host.cwd))?;
+        let cwd = setup_step("resolve job cwd", fs::canonicalize(&host.host_cwd))?;
         if !cwd.starts_with(setup_step(
             "resolve workspace path",
             fs::canonicalize(&path),
@@ -725,7 +725,7 @@ impl Backend for HostBackend {
         // A mapped job sees its cwd at the caller form of this host path, and
         // that form is derived from the configured host root's spelling. The
         // no-symlink checks above make the resolved path that same spelling.
-        if mapped && cwd != host.cwd {
+        if mapped && cwd != host.host_cwd {
             return Err(invalid("mapped cwd does not resolve to its host path"));
         }
         let target = if s.base {
@@ -996,7 +996,7 @@ impl Backend for HostBackend {
         }
         #[cfg(target_os = "linux")]
         if config.boat_profile {
-            let workspace = paths::host_run(config, r).workspace;
+            let workspace = paths::host_run(config, r).host_workspace;
             setup_step(
                 "verify Boat quota lease",
                 crate::boat_quota::validate_for_launch(
@@ -1285,7 +1285,7 @@ fn compile_cache_environment(
         if prepared.wrapper.is_none()
             && (setup.base
                 || !crate::compile_cache::configured_wrapper(
-                    &paths::host_run(config, &setup.request).workspace,
+                    &paths::host_run(config, &setup.request).host_workspace,
                     &prepared.host_cwd,
                 )?)
         {
@@ -1319,7 +1319,7 @@ fn compile_cache_environment(
 fn rust_job(config: &Config, setup: &Setup) -> bool {
     setup.base
         || paths::host_run(config, &setup.request)
-            .workspace
+            .host_workspace
             .join("Cargo.toml")
             .is_file()
 }

@@ -55,6 +55,30 @@ fn unit_argv(sandbox: &Sandbox, cwd: &Path, env: &[(String, String)]) -> Vec<Str
         .collect()
 }
 
+/// H may appear in the argv only as a bind source: never as a destination,
+/// the working directory, an environment value or anywhere else.
+fn assert_argv_hides_h(argv: &[String], host_root: &Path) {
+    let h = host_root.to_str().unwrap();
+    for arg in argv {
+        let mounts = arg
+            .strip_prefix("--property=BindReadOnlyPaths=")
+            .or_else(|| arg.strip_prefix("--property=BindPaths="));
+        match mounts {
+            Some(mounts) => {
+                for mount in mounts.split_whitespace() {
+                    assert!(!destination(mount).starts_with(h), "{mount}");
+                    // A bind whose source is under H is paired with a
+                    // destination of its own.
+                    if mount.trim_start_matches('-').starts_with(h) {
+                        assert!(mount.contains(':'), "{mount}");
+                    }
+                }
+            }
+            None => assert!(!arg.contains(h), "{arg}"),
+        }
+    }
+}
+
 #[test]
 fn mapped_job_binds_host_trees_at_caller_paths_and_never_names_h() {
     let f = Fixture::new();
@@ -157,9 +181,7 @@ fn mapped_job_binds_host_trees_at_caller_paths_and_never_names_h() {
             argv.contains(&format!("--property=WorkingDirectory={}", w(&cwd))),
             "{argv:?}"
         );
-        for arg in &argv {
-            assert!(!arg.contains(host_root.to_str().unwrap()), "{arg}");
-        }
+        assert_argv_hides_h(&argv, &host_root);
     });
 }
 
@@ -209,9 +231,7 @@ fn mapped_writer_fill_binds_its_target_inside_the_caller_checkout() {
             !gitconfig.contains(host_root.to_str().unwrap()),
             "{gitconfig}"
         );
-        for arg in unit_argv(&sandbox, caller, &[]) {
-            assert!(!arg.contains(host_root.to_str().unwrap()), "{arg}");
-        }
+        assert_argv_hides_h(&unit_argv(&sandbox, caller, &[]), &host_root);
     });
 }
 

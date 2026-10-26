@@ -603,6 +603,13 @@ async fn mapped_writer_refusal_details_name_the_caller_not_host_storage() {
     );
 }
 
+/// `mapped_config` with the scheduler running on its own, so a submitted job
+/// starts without a manual tick.
+fn scheduled(mut config: Config) -> Config {
+    config.manual_tick = false;
+    config
+}
+
 /// A Run for the mapped workspace `/home/u/proj` built from the fixture's main
 /// repository, without siblings (the test-only configuration refuses mapped
 /// siblings).
@@ -634,7 +641,7 @@ const LINKS: &str = "printf mapped > out; ln -s out relative; ln -s /home/u/proj
 #[tokio::test]
 async fn mapped_run_executes_in_the_host_checkout_and_returns_files_at_caller_paths() {
     let f = Fixture::new();
-    let config = mapped_config(&f);
+    let config = scheduled(mapped_config(&f));
     let host_root = config.caller_roots[0].host_root.clone();
     let host = host_root.join("u/proj");
     let runner = Runner::open(config.clone()).unwrap();
@@ -689,7 +696,7 @@ async fn mapped_run_executes_in_the_host_checkout_and_returns_files_at_caller_pa
 #[tokio::test]
 async fn mapped_chunked_returns_refuse_outside_and_host_form_links() {
     let f = Fixture::new();
-    let config = mapped_config(&f);
+    let config = scheduled(mapped_config(&f));
     let host_root = config.caller_roots[0].host_root.clone();
     let runner = Runner::open(config.clone()).unwrap();
     let names = ["out", "relative", "absolute", "outside", "hostform"];
@@ -740,7 +747,28 @@ fn scratch_caller_prefix_symlink_never_steers_mapped_checks_into_an_unrelated_tr
     use std::os::unix::fs::symlink;
     let f = Fixture::new();
     let mut config = mapped_config(&f);
-    let prefix = f.scratch.join("caller-prefix");
+    // The caller prefix must not overlap a runner-owned sandbox destination
+    // (the scratch root can sit under one, such as the job home), so it lives
+    // in the first writable base outside them.
+    let reserved = crate::isolation::reserved_destinations(&config);
+    let unique = format!("motor-caller-{}", Uuid::now_v7());
+    let base = [f.scratch.to_path_buf(), "/var/tmp".into(), "/dev/shm".into()]
+        .into_iter()
+        .find(|base| {
+            !reserved
+                .iter()
+                .any(|other| crate::caller_path::overlaps(base, other))
+                && fs::create_dir_all(base.join(&unique)).is_ok()
+        })
+        .expect("a writable directory outside the reserved destinations");
+    let prefix = base.join(&unique).join("prefix");
+    struct Remove(PathBuf);
+    impl Drop for Remove {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+    let _remove = Remove(prefix.clone());
     let host_root = f.scratch.join("caller-host");
     let identity = PathBuf::from(&f.key);
     let name = identity.file_name().unwrap().to_owned();
@@ -748,14 +776,16 @@ fn scratch_caller_prefix_symlink_never_steers_mapped_checks_into_an_unrelated_tr
     fs::create_dir_all(&identity).unwrap();
     symlink(identity.parent().unwrap(), prefix.join("u")).unwrap();
     fs::write(identity.join("out"), "identity tree").unwrap();
-    let host = host_root.join("u").join(&name);
-    fs::create_dir_all(&host).unwrap();
-    fs::write(host.join("out"), "host tree").unwrap();
+    fs::create_dir_all(&host_root).unwrap();
     config.caller_roots = vec![crate::CallerRoot {
         caller_prefix: text(&prefix).into(),
         host_root: host_root.clone(),
     }];
+    // The runner claims the empty H at start; the mapped tree comes after.
     let runner = Runner::open(config.clone()).unwrap();
+    let host = host_root.join("u").join(&name);
+    fs::create_dir_all(&host).unwrap();
+    fs::write(host.join("out"), "host tree").unwrap();
     let caller = text(&prefix.join("u").join(&name)).to_owned();
     // Through the caller prefix's symlink, the caller form resolves to the
     // identity workspace.

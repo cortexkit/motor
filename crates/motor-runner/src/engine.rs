@@ -8592,7 +8592,7 @@ impl Runner {
         }
         let lock_check = if job.base {
             let r = job.request.as_ref().unwrap();
-            let checkout = paths::host_run(&self.core.config, r).cwd;
+            let checkout = paths::host_run(&self.core.config, r).host_cwd;
             (|| -> io::Result<()> {
                 #[cfg(target_os = "linux")]
                 if self.core.config.isolate_jobs {
