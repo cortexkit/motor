@@ -208,6 +208,8 @@ fn mapped_writer_fill_binds_its_target_inside_the_caller_checkout() {
             &tree,
             &JavascriptTools::for_role(ToolchainRole::BuildServer),
             false,
+            false,
+            true,
             None,
         )
         .unwrap();
