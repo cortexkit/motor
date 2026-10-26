@@ -281,7 +281,12 @@ impl Runner {
         for repository in repositories {
             let heads: Vec<_> = crate::caller_path::entries(&inner.catalog.workspaces)
                 .filter(|(_, w)| w.kind == WorkspaceKind::Head && &w.repository == repository)
-                .map(|(key, _)| (key.caller.text().clone(), key.host.as_path().to_path_buf()))
+                .map(|(key, _)| {
+                    (
+                        key.caller.text().clone(),
+                        crate::caller_path::host_path(&self.core.config, key.caller.text()),
+                    )
+                })
                 .collect();
             for (key, host) in heads {
                 self.discard_dependent(
@@ -293,8 +298,9 @@ impl Runner {
                 inner.catalog.workspaces.remove(&key);
             }
             if inner.catalog.sibling_commits.contains_key(repository) {
+                let host = crate::caller_path::host_path(&self.core.config, repository);
                 self.discard_dependent(
-                    crate::caller_path::identity(repository).host,
+                    crate::caller_path::host(&host),
                     "sibling checkout",
                     &mut discarded,
                     &mut removed,
@@ -304,11 +310,12 @@ impl Runner {
             if let Some(record) = inner.catalog.repositories.get(repository) {
                 // The warm build's own checkout, derived as `queue_base` does.
                 if let Some(parent) = record.desired.as_ref().and_then(|d| {
-                    crate::caller_path::base(d)
-                        .host
-                        .as_path()
-                        .parent()
-                        .map(Path::to_path_buf)
+                    crate::caller_path::host_path(
+                        &self.core.config,
+                        crate::caller_path::base(d).caller.text(),
+                    )
+                    .parent()
+                    .map(Path::to_path_buf)
                 }) {
                     let checkout = parent.join(format!(
                         ".motor-base-{}-{}",

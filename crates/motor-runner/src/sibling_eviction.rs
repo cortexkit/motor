@@ -286,13 +286,19 @@ impl Runner {
             .filter(|job| Self::legacy_sibling_user(&inner, job))
             .filter_map(|job| job.request.as_ref())
             .flat_map(|request| &request.siblings)
-            .map(|sibling| Spelled::new(crate::caller_path::sibling(sibling).host))
+            .map(|sibling| {
+                let host = crate::caller_path::host_path(
+                    &self.core.config,
+                    crate::caller_path::sibling(sibling).caller.text(),
+                );
+                Spelled::new(crate::caller_path::host(&host))
+            })
             .collect();
         let paths: Vec<_> = crate::caller_path::keys(&inner.catalog.sibling_commits)
             .map(|path| {
                 (
                     path.caller.text().clone(),
-                    path.host.as_path().to_path_buf(),
+                    crate::caller_path::host_path(&self.core.config, path.caller.text()),
                 )
             })
             .collect();

@@ -45,12 +45,33 @@ pub(crate) fn check_root(config: &Config, root: &CallerRoot) -> io::Result<()> {
     ))?;
     let owner = expected(config)?;
     check_inner(root, &owner)
-        .map(|_| ())
+        .and_then(|directory| {
+            #[cfg(target_os = "linux")]
+            if let Some(directory) = directory {
+                let name = PathBuf::from(format!(".motor-trash-{}", config.instance));
+                match directory_at(&directory, &name) {
+                    Ok(trash) => super::trash::validate(&trash)?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = directory;
+            Ok(())
+        })
         .map_err(|e| refusal(root, &owner, e))
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn directory(path: &Path) -> io::Result<fs::File> {
+pub(crate) fn directory(path: &Path) -> io::Result<fs::File> {
+    directory_at(
+        &fs::File::open("/")?,
+        path.strip_prefix("/").map_err(io::Error::other)?,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn directory_at(root: &fs::File, path: &Path) -> io::Result<fs::File> {
     use std::{
         ffi::CString,
         os::{
@@ -58,8 +79,11 @@ pub(super) fn directory(path: &Path) -> io::Result<fs::File> {
             unix::ffi::OsStrExt,
         },
     };
-    let mut directory = fs::File::open("/")?;
-    for component in path.components().skip(1) {
+    let mut directory = root.try_clone()?;
+    for component in path.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(invalid("expected a relative directory path"));
+        }
         let name = CString::new(component.as_os_str().as_bytes())?;
         let fd = unsafe {
             libc::openat(
@@ -144,21 +168,8 @@ pub(crate) fn claim(config: &Config) -> io::Result<()> {
 pub(crate) fn purge_trash(config: &Config) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        use std::os::fd::AsRawFd;
-        for root in &config.caller_roots {
-            let trash = root
-                .host_root
-                .join(format!(".motor-trash-{}", config.instance));
-            let directory = directory(&trash)?;
-            for entry in fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    fs::remove_dir_all(entry.path())?;
-                } else {
-                    fs::remove_file(entry.path())?;
-                }
-            }
-            directory.sync_all()?;
+        for entry in super::trash::entries(config)? {
+            entry.remove(config.isolate_jobs, config.boat_profile)?;
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -191,7 +202,8 @@ fn trash(root: &CallerRoot, instance: &str) -> io::Result<()> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    let _trash = unsafe { fs::File::from_raw_fd(fd) };
+    let trash = unsafe { fs::File::from_raw_fd(fd) };
+    super::trash::validate(&trash)?;
     directory.sync_all()
 }
 

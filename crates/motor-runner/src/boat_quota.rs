@@ -520,6 +520,10 @@ pub(crate) fn remove_retired_tree(path: &Path) -> io::Result<()> {
     })
 }
 
+pub(crate) fn remove_retired_entry(parent: &File, name: &std::ffi::OsStr) -> io::Result<()> {
+    walk::remove_private_at(parent, name)
+}
+
 pub(crate) fn validate_for_launch(state: &Path, id: Uuid, roots: &[PathBuf]) -> io::Result<()> {
     validate_for_launch_with(&System, state, id, roots)
 }
