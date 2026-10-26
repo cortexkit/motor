@@ -235,7 +235,14 @@ allocating. The reserve keeps an idle suspend possible at the threshold.
 
 Heartbeat `free_vcpus` is, per tenant, the permit budget (`max_weight`, or
 `vcpu_ceiling` without it) minus the counted claims, whether the VM is running,
-stopped, suspended or waking. `free_mem_mib` is, per tenant, memory the guest
+stopped, suspended or waking. A tenant runner that fills its own remote compile
+cache reports the fill's permits as `fill_permits` in the same `status` health
+reply; while that sample is fresh (30 seconds), those permits are also
+subtracted and added to the VM's CPU quota. Admission itself counts only lease
+claims, so a fill never refuses a job the broker already placed. A fill is
+never billed. A job that runs during a fill reports no memory peak or egress,
+the same as a job that overlaps another job, because both are measured for the
+whole VM. A wake or stop discards the fill sample. `free_mem_mib` is, per tenant, memory the guest
 can give a job, not the host's: a tenant that is not running advertises its guest
 RAM, so the broker can place the lease that wakes it; a running tenant
 advertises the `mem_available_bytes` its runner reports in the `status` health

@@ -259,7 +259,7 @@ impl Host {
     }
     pub(crate) fn save(&mut self, mut next: Snapshot) -> Result<(), Error> {
         if !self.provider_managed {
-            crate::billing::mark_overlap(&mut next);
+            crate::billing::mark_overlap(&mut next, &self.filling_tenants());
         }
         self.journal.store(&next)?;
         self.snapshot = next;
@@ -366,6 +366,8 @@ impl Host {
             .map(|l| l.claims.vcpus)
             .try_fold(0u32, u32::checked_add)
     }
+    /// The VM's CPU quota in vCPUs: its counted lease claims plus the permits
+    /// of its own running cache fill, so a fill gets the CPUs it holds.
     pub fn quota(&self, tenant: &str, now_ms: u64) -> u32 {
         if !self.live.get(tenant).is_some_and(|v| v.ready) {
             1
@@ -375,7 +377,10 @@ impl Host {
                 .values()
                 .find(|t| t.tenant == tenant)
                 .map_or(1, |t| t.vcpu_ceiling);
-            self.share(tenant, now_ms).min(ceiling).max(1)
+            self.share(tenant, now_ms)
+                .saturating_add(self.fill_claim(tenant, now_ms))
+                .min(ceiling)
+                .max(1)
         }
     }
     pub fn is_ready(&self, tenant: &str) -> bool {

@@ -323,6 +323,54 @@ fn overlap_makes_both_metrics_null_and_missing_metrics_are_not_fabricated_zero()
     assert!(h.snapshot.billing[JOB].usage.is_none());
 }
 
+/// A tenant's own cache fill is never billed: a fill alone yields no usage
+/// record at all. A job that runs while a fill runs, whether the fill started
+/// before or after it, is billed for its own claim only and reports no memory
+/// peak or egress, since both are measured for the whole VM.
+#[test]
+fn a_tenant_fill_is_never_billed_and_withholds_the_metrics_of_jobs_it_overlaps() {
+    let mut h = host();
+    h.record_fill("tenant", MS, 4).unwrap();
+    h.billing_tick(MS + 120_000).unwrap();
+    assert!(h.snapshot.billing.is_empty());
+    assert!(h.snapshot.outbox.is_empty());
+
+    for fill_first in [true, false] {
+        let mut h = host();
+        if fill_first {
+            h.record_fill("tenant", MS, 4).unwrap();
+        }
+        started(&mut h, JOB, 1);
+        if !fill_first {
+            h.record_fill("tenant", MS + 1000, 4).unwrap();
+        }
+        end(&mut h, JOB, 3, MS + 3000, terminal(JOB, "exit"));
+        let b = &h.snapshot.billing[JOB];
+        let usage = b.usage.as_ref().unwrap();
+        assert_eq!(usage.vcpus, claims(JOB).vcpus, "{fill_first}");
+        assert_eq!(
+            (usage.mem_peak_mib, usage.egress_bytes),
+            (None, None),
+            "{fill_first}"
+        );
+        assert_eq!(
+            b.hosted_terminal.as_ref().unwrap()["billed_vcpu_ms"],
+            u64::from(claims(JOB).vcpus) * 3000
+        );
+    }
+
+    // A probe that finds no fill running leaves a job's metrics alone.
+    let mut h = host();
+    h.record_fill("tenant", MS, 0).unwrap();
+    started(&mut h, JOB, 1);
+    end(&mut h, JOB, 3, MS + 3000, terminal(JOB, "exit"));
+    let usage = h.snapshot.billing[JOB].usage.as_ref().unwrap();
+    assert_eq!(
+        (usage.mem_peak_mib, usage.egress_bytes),
+        (Some(13), Some(45))
+    );
+}
+
 #[test]
 fn heartbeat_uses_pinned_interim_values_and_released_is_reserved() {
     let mut h = host();

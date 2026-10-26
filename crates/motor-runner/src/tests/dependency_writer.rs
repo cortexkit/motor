@@ -22,6 +22,9 @@ async fn leased_job_is_not_delayed_by_fill(tenant_vm: bool, boat_profile: bool) 
     let mut config = f.config();
     config.tenant_vm = tenant_vm;
     config.boat_profile = boat_profile;
+    // The tenant has no write key. Boat is given one, which changes nothing:
+    // Boat never fills.
+    config.tenant_write_key = Some(boat_profile);
     config.boat_memory_max_bytes = boat_profile.then_some(2 << 30);
     if boat_profile {
         config.free_space_probe = Arc::new(|_| Ok(63 << 30));
@@ -61,7 +64,8 @@ async fn leased_job_is_not_delayed_by_fill(tenant_vm: bool, boat_profile: bool) 
         .await;
     }
     // The old scheduler starts a four-permit fill while idle and cannot admit
-    // this two-permit job until that fill finishes. Leased modes must not fill.
+    // this two-permit job until that fill finishes. A tenant without a write
+    // key and Boat must not fill at all.
     let (mut job, bytes) = job_at(&f, "leased-job", "true");
     job.weight_hint = Some(2);
     f.submit(&runner, &job, &bytes);
@@ -76,13 +80,106 @@ async fn leased_job_is_not_delayed_by_fill(tenant_vm: bool, boat_profile: bool) 
 }
 
 #[tokio::test]
-async fn tenant_vm_fill_cannot_delay_a_leased_job() {
+async fn keyless_tenant_vm_fill_cannot_delay_a_leased_job() {
     leased_job_is_not_delayed_by_fill(true, false).await;
 }
 
 #[tokio::test]
-async fn boat_fill_cannot_delay_a_leased_job() {
+async fn boat_fill_cannot_delay_a_leased_job_even_with_a_write_key() {
     leased_job_is_not_delayed_by_fill(false, true).await;
+}
+
+/// A tenant VM whose provisioning holds a write key fills its own cache from
+/// the default-branch tip, as the build server does, and reports the fill's
+/// permits in health so its host counts them as claimed while it runs.
+#[tokio::test]
+async fn keyed_tenant_vm_schedules_a_fill_and_reports_its_permits() {
+    let f = Fixture::new();
+    let release = f.scratch.join("release-fill");
+    let mut config = f.config();
+    config.tenant_vm = true;
+    config.tenant_write_key = Some(true);
+    config.base_commands = vec![format!(
+        "while test ! -e '{}'; do sleep .02; done",
+        release.display()
+    )];
+    let runner = Runner::open(config).unwrap();
+    let (request, bytes) = f.run("true");
+    let upload = f.spool(&runner, &request, &bytes);
+    let mut prepare = prepare_for(&request);
+    prepare.bundles = request.bundles.clone();
+    runner.fetch_prepare(&prepare, &upload.directory).unwrap();
+    runner.prepare(&prepare, true).unwrap();
+    runner.tick().unwrap();
+    until(|| runner.core.inner.lock().unwrap().writer.is_some()).await;
+    let fill = runner.core.inner.lock().unwrap().writer.unwrap();
+    until(|| {
+        runner.core.inner.lock().unwrap().jobs[&fill]
+            .started_ms
+            .is_some()
+    })
+    .await;
+    let weight = runner.core.inner.lock().unwrap().jobs[&fill].weight;
+    assert!(weight > 0);
+    assert_eq!(
+        runner.runner_status().health.unwrap().fill_permits,
+        Some(weight)
+    );
+    fs::write(&release, "").unwrap();
+    base_done(&runner).await;
+    assert_eq!(writer_count(&runner), 1);
+    assert_eq!(runner.runner_status().health.unwrap().fill_permits, Some(0));
+}
+
+#[derive(Clone, Default)]
+struct LogBytes(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A tenant VM without a write key runs no fill and says why once, however
+/// often a fill is considered; its jobs are unaffected.
+#[tokio::test]
+async fn keyless_tenant_vm_logs_once_and_runs_no_fill() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.manual_tick = true;
+    config.tenant_vm = true;
+    config.tenant_write_key = Some(false);
+    let bytes = LogBytes::default();
+    let runner = tracing::subscriber::with_default(
+        motor_protocol::logging::LineSubscriber::new("[runner]", bytes.clone()),
+        || {
+            let runner = Runner::open(config).unwrap();
+            let (request, bytes) = f.run("true");
+            let upload = f.spool(&runner, &request, &bytes);
+            let mut prepare = prepare_for(&request);
+            prepare.bundles = request.bundles.clone();
+            runner.fetch_prepare(&prepare, &upload.directory).unwrap();
+            for _ in 0..2 {
+                runner.prepare(&prepare, true).unwrap();
+                runner.tick().unwrap();
+            }
+            runner
+        },
+    );
+    let log = String::from_utf8(bytes.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        log.matches("no remote cache write key is provisioned")
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(runner.core.inner.lock().unwrap().writer.is_none());
+    assert_eq!(writer_count(&runner), 0);
+    assert_eq!(runner.runner_status().health.unwrap().fill_permits, Some(0));
 }
 
 #[tokio::test]
@@ -103,6 +200,8 @@ async fn leased_modes_do_not_requeue_persisted_fills() {
         drop(runner);
         config.tenant_vm = tenant_vm;
         config.boat_profile = boat_profile;
+        // Neither mode has a write key, so neither may fill.
+        config.tenant_write_key = Some(false);
         config.boat_memory_max_bytes = boat_profile.then_some(2 << 30);
         let runner = reopen(config);
         runner.tick().unwrap();

@@ -137,17 +137,21 @@ pub(crate) fn finalize_ready(next: &mut Snapshot, now_ms: u64) {
     }
 }
 
-pub(crate) fn mark_overlap(next: &mut Snapshot) {
+/// Marks every started job that shares its tenant's VM with other work, whose
+/// VM-wide memory and egress measurements therefore cannot be its own: another
+/// placed job of the tenant, or the tenant's own cache fill (`filling`).
+pub(crate) fn mark_overlap(next: &mut Snapshot, filling: &std::collections::BTreeSet<String>) {
     for (job, lease) in &next.leases {
         if lease.state == LeaseState::Started
-            && next.leases.iter().any(|(other, l)| {
-                other != job
-                    && l.tenant == lease.tenant
-                    && matches!(
-                        l.state,
-                        LeaseState::Reserved | LeaseState::Admitted | LeaseState::Started
-                    )
-            })
+            && (filling.contains(&lease.tenant)
+                || next.leases.iter().any(|(other, l)| {
+                    other != job
+                        && l.tenant == lease.tenant
+                        && matches!(
+                            l.state,
+                            LeaseState::Reserved | LeaseState::Admitted | LeaseState::Started
+                        )
+                }))
         {
             next.billing.entry(job.clone()).or_default().overlapping = true;
         }

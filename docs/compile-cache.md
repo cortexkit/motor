@@ -13,21 +13,37 @@ The Windows backend has its own per-workspace cache disks, described in
 
 ## Leased runners
 
-Tenant-VM and Boat profiles never queue background cache fills or warm builds.
-An idle-started fill could outlive the idle period, compete for leased CPU time,
-or hold a setup lock when the next job arrives. Existing cache entries remain
-readable; foreground jobs compile misses themselves. Restart still stops old
-writer processes, but does not requeue their saved requests in these profiles.
-Tests: `tenant_vm_fill_cannot_delay_a_leased_job`,
-`boat_fill_cannot_delay_a_leased_job`, `leased_modes_do_not_requeue_persisted_fills`
-(`crates/motor-runner/src/tests/dependency_writer.rs`).
+Boat profiles never queue background cache fills or warm builds, and a tenant
+VM queues none unless its provisioning holds a remote cache write key. An
+idle-started fill can outlive the idle period, compete for leased CPU time, or
+hold a setup lock when the next job arrives. Boat avoids that because it only
+reads the cache. A tenant VM given a write key accepts the delay: it fills its
+own cache with its own capacity, as the build server does, one fill at a time
+and only on unallocated permits. Its runner reports the running fill's permits
+as `fill_permits` in health, and motor-host counts them as claimed in the
+advertised `free_vcpus` and in the VM's CPU quota, so the broker places new
+jobs elsewhere meanwhile. A tenant without a write key logs once that it does
+not fill. Existing cache entries remain readable, and foreground jobs compile
+misses themselves. Restart still stops old writer processes, but does not
+requeue their saved requests in a mode that may not fill. Tests:
+`keyless_tenant_vm_fill_cannot_delay_a_leased_job`,
+`boat_fill_cannot_delay_a_leased_job_even_with_a_write_key`,
+`leased_modes_do_not_requeue_persisted_fills`,
+`keyed_tenant_vm_schedules_a_fill_and_reports_its_permits`,
+`keyless_tenant_vm_logs_once_and_runs_no_fill`
+(`crates/motor-runner/src/tests/dependency_writer.rs`) and
+`a_tenant_fill_lowers_free_vcpus_and_raises_the_quota_only_while_it_runs`
+(`crates/motor-host/tests/it/capacity.rs`).
 
-ck-motor's hosted channels, including spills to Boat, omit the default-branch
-fill capability and send an empty integration tip even when the snapshot has a
-resolved default branch. Ordinary build-server channels retain fills. Tests:
-`hosted_hello_does_not_advertise_background_fill_support`,
+ck-motor offers default-branch tips only where the runner may fill. Hosted
+channels to a registered host's tenant runner (a `first_party` placement)
+advertise the fill capability in Hello and send the resolved integration tip.
+Boat spills omit both, as before. Ordinary build-server channels retain fills.
+Tests:
+`hosted_hello_advertises_fill_support_only_to_registered_host_tenants`,
 `hello_advertises_default_branch_tip_on_the_wire`,
-`direct_hosted_submission_omits_a_resolved_fill_tip`,
+`direct_boat_submission_omits_a_resolved_fill_tip`,
+`direct_first_party_submission_sends_the_resolved_fill_tip`,
 `spill_after_permit_wait_preserves_original_stream_output_and_exit`
 (`crates/motor-module/src/transport.rs`, `crates/motor-module/src/queue_tests.rs`).
 

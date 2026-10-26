@@ -327,6 +327,8 @@ fn prepare_fill(f: &Fixture, remote: Option<&Transport>) -> (Sandbox, PathBuf) {
         &tree,
         &JavascriptTools::for_role(ToolchainRole::BuildServer),
         false,
+        false,
+        true,
         remote,
     )
     .unwrap_or_else(|error| panic!("prepare fill sandbox: {error}"));
@@ -483,7 +485,11 @@ fn assert_hosted_remote_sccache(role: crate::remote_cache::provisioning::HostRol
     config.tenant_vm = role == HostRole::TenantVm;
     assert!(!config.shared_compile_cache());
     assert!(config.remote_cache_available(false).is_some());
-    assert!(config.remote_cache_available(true).is_none());
+    // A tenant VM may fill its own cache; Boat only ever reads.
+    assert_eq!(
+        config.remote_cache_available(true).is_some(),
+        role == HostRole::TenantVm
+    );
     let cache = FakeCache::new();
     let port = free_port();
     let remote = cache.transport(&[(Tool::Sccache, port)]);

@@ -123,7 +123,7 @@ fn hosted_motor(scratch: &Path) -> (Motor, Uuid) {
 
 async fn connected_channel() -> (Channel, tokio::io::DuplexStream) {
     let (client, mut peer) = tokio::io::duplex(65536);
-    let (channel, peer) = tokio::join!(Channel::from_hosted(Box::new(client)), async move {
+    let (channel, peer) = tokio::join!(Channel::from_hosted(Box::new(client), false), async move {
         assert!(matches!(
             read_frame_async(&mut peer).await.unwrap(),
             Some(Frame::Hello { .. })

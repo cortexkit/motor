@@ -950,6 +950,172 @@ class ProvisionTests(unittest.TestCase):
         proc.kill.assert_not_called()
         api.assert_not_called()
 
+    # Remote compile cache files for the tenant runner. The secrets below are
+    # recognizable so a test can show they never appear in an error.
+    def cache_dir(self, write_key=True, generation="g1"):
+        directory = self.root / "cache-input"
+        directory.mkdir(exist_ok=True)
+        files = {
+            "config.json": {"generation": generation, "tenant": SUB, "endpoint": "https://s3.example",
+                            "region": "gra", "bucket": "motor-cache",
+                            "prefix": "tenant/" + SUB.replace(":", "-") + "/", "storage_class": "STANDARD",
+                            "enabled": True},
+            "read-key": {"generation": generation, "access_key_id": "read-id", "secret_access_key": "READ-SECRET"},
+        }
+        if write_key:
+            files["write-key"] = {"generation": generation, "access_key_id": "write-id",
+                                  "secret_access_key": "WRITE-SECRET"}
+        for name, value in files.items():
+            path = directory / name
+            path.write_text(json.dumps(value))
+            path.chmod(0o444 if name == "config.json" else 0o400)
+        return directory
+
+    def provision_with_cache(self, write_key=True):
+        """Provision tenant a with cache files; returns what the new disk held
+        under state/main/cache-provisioning as {name: (mode, bytes)}, and the
+        directory modes on the way there."""
+        c = p.checked({**config(), "remote_cache": True})
+        files = p.read_remote_cache(self.cache_dir(write_key), c["sub"])
+        seen = {}
+        def execute(*args):
+            if args[0] == "fallocate":
+                args[-1].touch()
+        def stage(mount):
+            directory = mount
+            for name, _mode in p.REMOTE_CACHE_DIRECTORIES:
+                directory = directory / name
+                seen[name] = stat.S_IMODE(directory.stat().st_mode)
+            for path in directory.iterdir():
+                seen[path.name] = (stat.S_IMODE(path.stat().st_mode), path.read_bytes())
+            seen["runner-args"] = (mount / "runner-args").read_text()
+        with mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": 2**63})):
+            p.provision(c, lambda _c, _i, path: path.mkdir(parents=True), execute, stage=stage, remote_cache=files)
+        (p.PROVISION / "a.json").write_text(json.dumps(c, indent=2) + "\n")
+        return c, seen
+
+    def test_cache_files_are_installed_on_the_new_disk_with_the_runner_modes(self):
+        for write_key in (True, False):
+            with self.subTest(write_key=write_key):
+                self.tearDown()
+                self.setUp()
+                c, seen = self.provision_with_cache(write_key)
+                self.assertEqual((seen["state"], seen["main"], seen["cache-provisioning"]), (0o755, 0o700, 0o700))
+                self.assertEqual(seen["config.json"][0], 0o444)
+                self.assertEqual(seen["read-key"][0], 0o400)
+                self.assertIn(b"READ-SECRET", seen["read-key"][1])
+                if write_key:
+                    self.assertEqual(seen["write-key"][0], 0o400)
+                else:
+                    self.assertNotIn("write-key", seen)
+                self.assertIn(" --remote-cache true ", seen["runner-args"])
+                self.assertEqual(seen["runner-args"], p.runner_args(c))
+                # The host keeps names and modes only, and the helper registry
+                # never sees the provisioning-only switch.
+                manifest = (self.root / "tenants/a" / p.REMOTE_CACHE_MANIFEST).read_text()
+                self.assertNotIn("SECRET", manifest)
+                expected = {"config.json": "0444", "read-key": "0400"}
+                if write_key:
+                    expected["write-key"] = "0400"
+                self.assertEqual(json.loads(manifest), expected)
+                self.assertNotIn("remote_cache", json.loads((p.REGISTRY / "a.json").read_text()))
+
+    def test_cache_record_and_files_must_come_together_before_any_mutation(self):
+        files = p.read_remote_cache(self.cache_dir(), SUB)
+        for c, remote_cache in ((p.checked({**config(), "remote_cache": True}), None), (config(), files)):
+            before = self.snapshot_tree()
+            with self.assertRaisesRegex(ValueError, "--remote-cache-dir"):
+                p.provision(c, mock.Mock(), mock.Mock(), remote_cache=remote_cache)
+            self.assertEqual(self.snapshot_tree(), before)
+        with self.assertRaisesRegex(ValueError, "remote_cache must be boolean"):
+            p.checked({**config(), "remote_cache": "true"})
+
+    def test_runner_args_turn_the_cache_on_only_for_a_cache_record(self):
+        plain = p.runner_args(config())
+        self.assertNotIn("--remote-cache", plain)
+        self.assertEqual(p.runner_args(p.checked({**config(), "remote_cache": False})), plain)
+        cached = p.runner_args(p.checked({**config(), "remote_cache": True}))
+        self.assertEqual(cached.replace("--remote-cache true ", ""), plain)
+
+    def test_cache_input_errors_name_the_file_but_never_a_secret(self):
+        def damaged(change):
+            shutil.rmtree(self.root / "cache-input", ignore_errors=True)
+            directory = self.cache_dir()
+            change(directory)
+            return directory
+        def rewrite(name, **fields):
+            def change(directory):
+                path = directory / name
+                path.chmod(0o600)
+                path.write_text(json.dumps({**json.loads(path.read_text()), **fields}))
+                path.chmod(0o444 if name == "config.json" else 0o400)
+            return change
+        def raw(name, text):
+            def change(directory):
+                path = directory / name
+                path.chmod(0o600)
+                path.write_text(text)
+                path.chmod(0o400)
+            return change
+        cases = [
+            (lambda d: (d / "read-key").unlink(), "lacks read-key"),
+            (lambda d: (d / "extra").write_text("x"), "unexpected file"),
+            (rewrite("write-key", generation="g2"), "different generations"),
+            (rewrite("config.json", prefix="tenant/" + SUB + "/"), "prefix"),
+            (rewrite("config.json", tenant="acct:01ARZ3NDEKTSV4RRFFQ69G5FAW"), "tenant must be"),
+            (lambda d: (d / "write-key").chmod(0o440), "owner alone"),
+            (raw("write-key", '{"secret_access_key": "WRITE-SECRET" broken'), "not valid JSON"),
+            (raw("write-key", '{"secret_access_key": "WRITE-SECRET"}'), "exactly the keys"),
+        ]
+        for change, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaises(ValueError) as caught:
+                    p.read_remote_cache(damaged(change), SUB)
+                self.assertIn(message, str(caught.exception))
+                self.assertNotIn("SECRET", str(caught.exception))
+        # Without a write key the set is complete for reads.
+        shutil.rmtree(self.root / "cache-input")
+        self.assertEqual(set(p.read_remote_cache(self.cache_dir(write_key=False), SUB)), {"config.json", "read-key"})
+
+    def test_switch_image_keeps_the_cache_files_and_the_cache_switch(self):
+        c, _seen = self.provision_with_cache()
+        disk = self.root / "tenants/a/disk.img"
+        disk.write_bytes(b"tenant disk holding state/main/cache-provisioning")
+        manifest = self.root / "tenants/a" / p.REMOTE_CACHE_MANIFEST
+        kept = (disk.read_bytes(), manifest.read_bytes())
+        for version in ("v2",):
+            image = self.root / "tenant-images" / version
+            image.mkdir(parents=True)
+            (image / "vmlinux").write_bytes(b"kernel-v2")
+            (image / "rootfs").write_bytes(b"root-v2")
+            (image / "manifest.json").write_text(json.dumps(dict(
+                version=version, kernel_sha256=hashlib.sha256(b"kernel-v2").hexdigest(),
+                rootfs_sha256=hashlib.sha256(b"root-v2").hexdigest())))
+        p.switch_image("a", "v2", make_base=self.fake_base, check_service=lambda _unit: "inactive",
+                       validate_image=mock.Mock(), output=lambda _line: None)
+        # switch-image never opens the tenant disk, so the files on it stay.
+        self.assertEqual((disk.read_bytes(), manifest.read_bytes()), kept)
+        record = p.checked(json.loads((p.PROVISION / "a.json").read_text()))
+        self.assertEqual(record["image_version"], "v2")
+        self.assertIn(" --remote-cache true ", p.runner_args(record))
+        self.assertEqual(hosted.remote_cache_report(record, p).split(";")[0],
+                         "remote cache: config.json 0444, read-key 0400, write-key 0400, "
+                         "so the tenant fills its own cache")
+
+    def test_check_installed_reports_cache_presence_without_contents(self):
+        self.assertEqual(hosted.remote_cache_report(config(), p), "remote cache: off")
+        c = p.checked({**config(), "remote_cache": True})
+        with self.assertRaisesRegex(ValueError, "cannot be read"):
+            hosted.remote_cache_report(c, p)
+        c, _seen = self.provision_with_cache(write_key=False)
+        report = hosted.remote_cache_report(c, p)
+        self.assertIn("no write-key, so the tenant reads the cache and never fills it", report)
+        self.assertNotIn("SECRET", report)
+        manifest = self.root / "tenants/a" / p.REMOTE_CACHE_MANIFEST
+        manifest.write_text(json.dumps({"config.json": "0444", "read-key": "0644"}))
+        with self.assertRaisesRegex(ValueError, "runner's modes"):
+            hosted.remote_cache_report(c, p)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -95,6 +95,8 @@ pub struct Harness {
     pub iats: Arc<Mutex<Vec<u64>>>,
     pub runs: Arc<AtomicUsize>,
     pub frames: Arc<Mutex<Vec<Frame>>>,
+    /// Each Hello the client sent the host, in order.
+    pub client_hellos: Arc<Mutex<Vec<Frame>>>,
     pub finished: Arc<std::sync::atomic::AtomicBool>,
     pub drop_lease: Arc<std::sync::atomic::AtomicBool>,
     pub release_admitted: Arc<std::sync::atomic::AtomicBool>,
@@ -188,6 +190,7 @@ impl Harness {
         let iats = Arc::new(Mutex::new(Vec::new()));
         let runs = Arc::new(AtomicUsize::new(0));
         let frames = Arc::new(Mutex::new(Vec::new()));
+        let client_hellos = Arc::new(Mutex::new(Vec::new()));
         let host_refusals = Arc::new(Mutex::new(VecDeque::<&'static str>::new()));
         let capacity = Arc::new(Mutex::new(None::<TenantCapacity>));
         let run_gate = Arc::new(tokio::sync::watch::Sender::new(true));
@@ -200,6 +203,7 @@ impl Harness {
             let iats = iats.clone();
             let runs = runs.clone();
             let frames = frames.clone();
+            let client_hellos = client_hellos.clone();
             async move {
                 while let Ok((socket, _)) = host.accept().await {
                     let acceptor = acceptor.clone();
@@ -208,6 +212,7 @@ impl Harness {
                     let iats = iats.clone();
                     let runs = runs.clone();
                     let frames = frames.clone();
+                    let client_hellos = client_hellos.clone();
                     let host_refusals = host_refusals.clone();
                     let capacity = capacity.clone();
                     let run_gate = run_gate.clone();
@@ -312,11 +317,12 @@ impl Harness {
                         super::super::tls::write(&mut tls, &Prelude::LeaseOk {})
                             .await
                             .unwrap();
-                        let Ok(Some(Frame::Hello { .. })) =
+                        let Ok(Some(hello @ Frame::Hello { .. })) =
                             motor_protocol::read_frame_async(&mut tls).await
                         else {
                             return;
                         };
+                        client_hellos.lock().unwrap().push(hello);
                         if let Behavior::RefuseHello(reason) = behavior {
                             super::super::tls::write(
                                 &mut tls,
@@ -669,6 +675,7 @@ impl Harness {
             iats,
             runs,
             frames,
+            client_hellos,
             finished,
             drop_lease,
             release_admitted,

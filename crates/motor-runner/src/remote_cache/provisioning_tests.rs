@@ -215,6 +215,56 @@ fn boat_and_tenant_vm_need_only_the_read_key() {
     }
 }
 
+/// A tenant VM's write key is optional: with it the generation carries it for
+/// the tenant's own fills, without it the read key alone is a complete set.
+/// A write key that is present must agree like any other key file, so a
+/// half-written rotation keeps the previous generation.
+#[test]
+fn tenant_vm_write_key_is_optional_but_must_agree_when_present() {
+    let host = Host::new(HostRole::TenantVm);
+    host.provision(1);
+    host.key(KeyRole::Write, 1);
+    let mut provisioning = host.provisioning();
+    assert_eq!(provisioning.reread().status, Status::Available);
+    let active = provisioning.admit().unwrap();
+    assert_eq!(
+        active.write_key.as_ref().unwrap().access_key_id,
+        "write-key-id-1"
+    );
+    let debug = format!("{active:?} {provisioning:?}");
+    assert!(!debug.contains("secret-1"), "{debug}");
+
+    // A rotation that has written its read key and config but not yet its
+    // write key is incomplete, and generation 1 stays active.
+    host.provision(2);
+    let reread = provisioning.reread();
+    assert!(!reread.activated);
+    assert_eq!(provisioning.admit().unwrap().generation, numbered(1));
+    host.key(KeyRole::Write, 2);
+    assert!(provisioning.reread().activated);
+    assert_eq!(read_id(&provisioning.admit().unwrap()), "read-key-id-2");
+
+    // A write key readable by other accounts is refused, not skipped.
+    let fresh = Host::new(HostRole::TenantVm);
+    fresh.provision(1);
+    fresh.write_raw(
+        KeyRole::Write.file_name(),
+        0o444,
+        key_json(KeyRole::Write, 1, 1).to_string().as_bytes(),
+    );
+    let status = fresh.provisioning().reread().status;
+    let Unavailable::NoCompleteGeneration { detail } = unavailable(&status) else {
+        panic!("{status:?}");
+    };
+    assert!(detail.contains("write-key: mode 0444"), "{detail}");
+
+    // Removing the key is a new generation without it.
+    fs::remove_file(host.layout.key_path(KeyRole::Write)).unwrap();
+    host.provision(3);
+    assert!(provisioning.reread().activated);
+    assert!(provisioning.admit().unwrap().write_key.is_none());
+}
+
 #[test]
 fn build_server_without_its_write_key_has_no_complete_generation() {
     let host = Host::new(HostRole::BuildServer);

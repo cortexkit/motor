@@ -274,12 +274,14 @@ def component(value):
 def checked(config):
     allowed = {"tenant", "sub", "vm", "image_version", "vcpu_ceiling", "guest_ram_mib", "disk_quota_bytes", "cpuset", "tap_index",
                "idle_suspend_s", "host_floor_bytes", "memory_headroom_mib", "snapshot_memory_high_mib", "io_weight", "resolvers",
-               "capture_console", "max_weight"}
+               "capture_console", "max_weight", "remote_cache"}
     if set(config) - allowed:
         raise ValueError("unknown provisioning key")
     c = dict(config)
     if "capture_console" in c and type(c["capture_console"]) is not bool:
         raise ValueError("capture_console must be boolean")
+    if "remote_cache" in c and type(c["remote_cache"]) is not bool:
+        raise ValueError("remote_cache must be boolean")
     for name in ("tenant", "vm", "image_version"):
         component(c[name])
     if not re.fullmatch(r"(?:acct|org):[0-9A-HJKMNP-TV-Z]{26}", c["sub"]):
@@ -331,12 +333,113 @@ def runner_args(c):
     # ceiling otherwise, so a record without the key produces the same bytes
     # it always did. The guest requires the two values to be equal.
     weight = c.get("max_weight", c["vcpu_ceiling"])
+    # A tenant provisioned with remote compile cache files turns the runner's
+    # cache switch on. A record without the key renders the same bytes it
+    # always did, so resize keeps rendering what install wrote.
+    cache = "--remote-cache true " if c.get("remote_cache") else ""
     return (f"--backend host --tenant-vm --job-network veth --state-root /tenant/state "
             f"--max-weight {weight} --rustc-slots {weight} "
             f"--sccache-size-gib {min(200, c['disk_quota_bytes'] // (4 * 1024**3))} "
             f"--free-space-floor-bytes {c['disk_quota_bytes'] // 10} "
+            f"{cache}"
             "--workspace-root /Users --owned-workspace-root /Users "
             "--workspace-root /home --owned-workspace-root /home\n")
+
+
+# The tenant runner's remote compile cache provisioning: the files motor-runner
+# reads from <state root>/<instance>/cache-provisioning
+# (crates/motor-runner/src/remote_cache/provisioning.rs), with the modes it
+# requires. The guest runs the runner as root, so root-owned files written here
+# are owned by the runner's account. A write key is optional: without it the
+# tenant's jobs read the cache and the tenant never fills it.
+REMOTE_CACHE_FILES = {"config.json": 0o444, "read-key": 0o400, "write-key": 0o400}
+REMOTE_CACHE_REQUIRED = {"config.json", "read-key"}
+REMOTE_CACHE_CONFIG_KEYS = {"generation", "tenant", "endpoint", "region", "bucket", "prefix", "storage_class", "enabled"}
+REMOTE_CACHE_KEY_KEYS = {"generation", "access_key_id", "secret_access_key"}
+# The directory under the tenant disk's root (the guest's /tenant): the
+# runner's state root, its `main` instance, then the provisioning directory.
+# The modes are the ones the guest agent and the runner create them with.
+REMOTE_CACHE_DIRECTORIES = (("state", 0o755), ("main", 0o700), ("cache-provisioning", 0o700))
+# A record of which cache files install wrote and their modes, never their
+# contents, so check-installed can report it without mounting the tenant disk.
+REMOTE_CACHE_MANIFEST = "remote-cache.json"
+REMOTE_CACHE_MAX_FILE = 64 * 1024
+
+
+def read_remote_cache(directory, sub):
+    """Read the operator's cache provisioning directory for tenant subject
+    `sub` and return each file's bytes by name.
+
+    The checks catch operator mistakes before the disk is written; the runner
+    checks the files again when it reads them. Errors name a file and the
+    problem, never a file's contents: the key files hold secrets."""
+    names = {entry.name for entry in directory.iterdir()}
+    unknown = names - set(REMOTE_CACHE_FILES)
+    if unknown:
+        raise ValueError(f"unexpected file in {directory}: {sorted(unknown)[0]}")
+    missing = REMOTE_CACHE_REQUIRED - names
+    if missing:
+        raise ValueError(f"{directory} lacks {', '.join(sorted(missing))}")
+    files, parsed = {}, {}
+    for name in sorted(names):
+        path = directory / name
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"{name} is not a regular file")
+        if info.st_size > REMOTE_CACHE_MAX_FILE:
+            raise ValueError(f"{name} is larger than {REMOTE_CACHE_MAX_FILE} bytes")
+        if name != "config.json" and info.st_mode & 0o077:
+            raise ValueError(f"{name} must be readable by its owner alone")
+        data = path.read_bytes()
+        try:
+            value = json.loads(data)
+        except ValueError:
+            # The parser's message can quote the text it choked on.
+            raise ValueError(f"{name} is not valid JSON") from None
+        expected = REMOTE_CACHE_CONFIG_KEYS if name == "config.json" else REMOTE_CACHE_KEY_KEYS
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ValueError(f"{name} must be a JSON object with exactly the keys {', '.join(sorted(expected))}")
+        if not isinstance(value["generation"], str) or not value["generation"]:
+            raise ValueError(f"{name}: generation must be a non-empty string")
+        files[name], parsed[name] = data, value
+    config = parsed["config.json"]
+    if config["tenant"] != sub:
+        raise ValueError("config.json: tenant must be the tenant's subject")
+    # The store policy confines the tenant's keys to this prefix; the runner
+    # refuses any other.
+    if config["prefix"] != f"tenant/{sub.replace(':', '-')}/":
+        raise ValueError("config.json: prefix must be tenant/<subject with each ':' replaced by '-'>/")
+    if any(value["generation"] != config["generation"] for value in parsed.values()):
+        raise ValueError("the cache provisioning files carry different generations")
+    return files
+
+
+def install_remote_cache(mount, files):
+    """Write the cache provisioning files into a freshly made tenant disk
+    mounted at `mount`, with the runner's exact modes."""
+    directory = mount
+    for name, mode in REMOTE_CACHE_DIRECTORIES:
+        directory = directory / name
+        directory.mkdir(mode=mode, exist_ok=True)
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError(f"not a directory on the new tenant disk: {directory}")
+        os.chmod(directory, mode)
+    for name, data in files.items():
+        fd = os.open(directory / name, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as out:
+            os.fchmod(out.fileno(), REMOTE_CACHE_FILES[name])
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+    while directory != mount:
+        sync_dir(directory)
+        directory = directory.parent
+    sync_dir(mount)
+
+
+def remote_cache_manifest(files):
+    """The manifest text for the installed files: names and modes only."""
+    return json.dumps({name: f"{REMOTE_CACHE_FILES[name]:04o}" for name in sorted(files)}, indent=2) + "\n"
 
 
 def base_path(c, image):
@@ -575,8 +678,10 @@ def unclean_stop_evidence(tenant):
 # Registry fields provision() derives from the tenant's home directory rather
 # than copying from the provisioning record.
 REGISTRY_PATHS = {"disk": "disk.img", "generation": "generation", "suspend": "suspend"}
-# Provisioning fields provision() leaves out of the helper registry.
-PROVISION_ONLY = {"tenant", "sub", "vm", "resolvers"}
+# Provisioning fields provision() leaves out of the helper registry. The helper
+# and motor-host refuse unknown registry fields, and remote_cache matters only
+# to the runner arguments, which are rendered from the provisioning record.
+PROVISION_ONLY = {"tenant", "sub", "vm", "resolvers", "remote_cache"}
 
 
 def repair_from_registry(tenant, validate_image=None, check_trusted=None, output=print):
@@ -1201,7 +1306,18 @@ def build_base(c, image, base, console=None, diagnostics=None):
     sync_dir(base.parent)
 
 
-def provision(c, make_base=build_base, execute=run, stage=None, runners=None):
+def provision(c, make_base=build_base, execute=run, stage=None, runners=None, remote_cache=None):
+    """Create a tenant. `remote_cache` is the cache provisioning files from
+    read_remote_cache, required exactly when the record sets remote_cache.
+
+    The files reach the guest only here, through the one host mount of a new
+    tenant disk, and stay on that persistent disk across switch-image and
+    resize. Replacing them (a key rotation, or adding or withdrawing a write
+    key) needs a reinstall of the tenant until a delivery channel exists that
+    passes them through motor-vm-helper and the guest agent at a cold start,
+    the way a resize's staged runner arguments travel."""
+    if bool(c.get("remote_cache")) != (remote_cache is not None):
+        raise ValueError("remote_cache in the record and --remote-cache-dir must be given together")
     capacity = read_capacity()
     # An unfinished resize holds host sizing fixed until it is resumed or aborted.
     refuse_resize_journal()
@@ -1273,14 +1389,18 @@ def provision(c, make_base=build_base, execute=run, stage=None, runners=None):
         execute("mount", "-o", "loop", disk, mount)
         try:
             atomic(Path(mount) / "runner-args", runner_args(c))
+            if remote_cache is not None:
+                install_remote_cache(Path(mount), remote_cache)
             if stage is not None:
                 stage(Path(mount))
         finally:
             execute("umount", mount)
     with disk.open("rb") as file:
         os.fsync(file.fileno())
+    if remote_cache is not None:
+        atomic(home / REMOTE_CACHE_MANIFEST, remote_cache_manifest(remote_cache))
     atomic(home / "generation", "0\n")
-    record = {k: v for k, v in c.items() if k not in {"tenant", "sub", "vm", "resolvers"}}
+    record = {k: v for k, v in c.items() if k not in PROVISION_ONLY}
     record.update(disk=str(disk), generation=str(home / "generation"), suspend=str(home / "suspend"))
     atomic(registry, json.dumps(record, indent=2) + "\n")
     registry.chmod(0o644)
@@ -1790,6 +1910,10 @@ def resize_abort(tenant, check_service=None, hook=None, output=print):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--remote-cache-dir", type=Path,
+                        help="when provisioning a new tenant whose record sets remote_cache: a root-only directory "
+                        "holding the runner's remote compile cache config.json and read-key, and optionally the "
+                        "tenant's write-key; they are installed on the new tenant disk only")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("apply-jobs-slice", help="validate capacity and apply the direct jobs slice limits")
     switch = commands.add_parser("switch-image", help="change an existing tenant's immutable image; "
@@ -1819,6 +1943,8 @@ def main():
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("provisioning requires root on the dedicated VM host")
+    if args.command is not None and args.remote_cache_dir is not None:
+        parser.error(f"{args.command} does not take --remote-cache-dir; cache files are installed only with a new tenant")
     if args.command == "apply-jobs-slice":
         if args.config is not None:
             parser.error("apply-jobs-slice does not take --config")
@@ -1899,6 +2025,13 @@ def main():
         parser.error("--config is required when provisioning a new tenant")
     trusted(args.config.resolve())
     c = checked(json.loads(args.config.read_text()))
+    remote_cache = None
+    if args.remote_cache_dir is not None:
+        directory = args.remote_cache_dir.resolve()
+        trusted(directory)
+        for entry in directory.iterdir():
+            trusted(entry)
+        remote_cache = read_remote_cache(directory, c["sub"])
     capacity = read_capacity()
     memory_fit(capacity, replacement=c)
     verify_jobs_slice(capacity)
@@ -1920,7 +2053,7 @@ def main():
             raise ValueError("Firecracker and jailer must both be 1.17.0")
     with (ROOT / "provision.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        provision(c)
+        provision(c, remote_cache=remote_cache)
 
 
 if __name__ == "__main__":

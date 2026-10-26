@@ -421,16 +421,25 @@ impl Heartbeats {
             {
                 continue;
             }
-            let reading = self
+            let sample = self
                 .runtime
                 .control
-                .runner_memory(tenant)
+                .runner_sample(tenant)
                 .map_err(|error| format!("{error:#}"));
-            self.runtime
-                .host
-                .lock()
-                .expect("host lock")
-                .record_memory(tenant, now_ms, reading);
+            let mut host = self.runtime.host.lock().expect("host lock");
+            host.record_memory(
+                tenant,
+                now_ms,
+                sample
+                    .as_ref()
+                    .map(|s| s.mem_available_bytes)
+                    .map_err(Clone::clone),
+            );
+            // A failed probe leaves the previous fill sample to go stale, so
+            // it stops counting rather than lingering.
+            if let Ok(sample) = sample {
+                host.record_fill(tenant, now_ms, sample.fill_permits)?;
+            }
         }
         Ok(())
     }

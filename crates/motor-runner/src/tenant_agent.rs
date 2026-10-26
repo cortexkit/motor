@@ -331,6 +331,10 @@ impl RunnerArgs {
                 "--workspace-root" => roots.push(PathBuf::from(value)),
                 "--owned-workspace-root" => owned.push(PathBuf::from(value)),
                 "--state-root" if value == "/tenant/state" => {}
+                // Provisioning turns the runner's remote cache switch on for a
+                // tenant installed with cache provisioning files; it never
+                // writes `false`, so only `true` is accepted.
+                "--remote-cache" if value == "true" => {}
                 _ => return Err(io::Error::other("unsupported runner-args option")),
             }
         }
@@ -830,6 +834,26 @@ mod tests {
         assert!(words
             .windows(3)
             .any(|words| words == ["serve", "--state-root", "/tenant/state"]));
+    }
+
+    /// A tenant installed with remote cache files runs its runner with the
+    /// cache switch on, passed through unchanged; any other value is refused.
+    #[test]
+    fn remote_cache_switch_is_passed_to_the_runner_only_when_true() {
+        let with_cache = format!("{TEST_ARGS} --remote-cache true");
+        let args = RunnerArgs::parse(&with_cache).unwrap();
+        let command = runner_command(&args, Path::new("/usr/local/bin/motor-runner"), &[]);
+        let words: Vec<_> = command
+            .get_args()
+            .map(|word| word.to_str().unwrap())
+            .collect();
+        assert!(words
+            .windows(2)
+            .any(|words| words == ["--remote-cache", "true"]));
+        for value in ["false", "1", ""] {
+            let invalid = format!("{TEST_ARGS} --remote-cache {value}");
+            assert!(RunnerArgs::parse(&invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]

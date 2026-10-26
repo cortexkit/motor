@@ -63,6 +63,9 @@ fn validate_runner_args(text: &str) -> Result<()> {
             "--workspace-root" => roots.push(std::path::PathBuf::from(value)),
             "--owned-workspace-root" => owned.push(std::path::PathBuf::from(value)),
             "--state-root" if value == "/tenant/state" => {}
+            // A tenant installed with remote cache files runs with the
+            // runner's cache switch on; provisioning never writes `false`.
+            "--remote-cache" if value == "true" => {}
             _ => return Err(Error("unsupported runner-args option".into())),
         }
     }

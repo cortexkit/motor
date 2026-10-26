@@ -40,6 +40,13 @@ fn staged_vector_and_guest_argument_grammar_are_strict_and_bounded() {
         activation.runner_args
     ))
     .unwrap();
+    // A tenant installed with remote cache files runs with the switch on;
+    // nothing else follows the option.
+    validate_runner_args(&format!("{} --remote-cache true", activation.runner_args)).unwrap();
+    for value in ["false", "yes", ""] {
+        let args = format!("{} --remote-cache {value}", activation.runner_args);
+        assert!(validate_runner_args(&args).is_err(), "{args}");
+    }
     let exact = format!(
         "{:<width$}",
         activation.runner_args,

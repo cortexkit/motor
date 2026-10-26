@@ -1064,13 +1064,17 @@ pub(crate) fn fixture_repo(scratch: &Path) -> PathBuf {
     repo
 }
 
-#[tokio::test]
-async fn direct_hosted_submission_omits_a_resolved_fill_tip() {
-    let boat = crate::hosted::boat_tests::Boat::new(0, false).await;
+/// Submits one direct hosted run, through `config`'s broker, of a repository
+/// whose default branch resolved, and returns that tip and the one Run frame
+/// the hosted runner recorded in `frames`.
+async fn direct_hosted_run_with_a_resolved_tip(
+    config: Config,
+    frames: &std::sync::Mutex<Vec<Frame>>,
+) -> (String, motor_protocol::Run) {
     let scratch = ScratchDir::new("hosted-fill-tip");
     let repo = fixture_repo(scratch.path());
     let motor = Motor::with_connector(
-        boat.config.clone(),
+        config,
         &scratch.join("state"),
         Arc::new(SpillPeer {
             withdrawn: Arc::new(AtomicBool::new(false)),
@@ -1100,9 +1104,9 @@ async fn direct_hosted_submission_omits_a_resolved_fill_tip() {
         &motor.storage,
     )
     .unwrap();
-    // Model a resolved default branch independently of the route: the wire
-    // submission must suppress even a nonempty, valid fill tip.
+    // Model a resolved default branch independently of the route.
     snapshots.main.tip = Some(snapshots.main.head.clone());
+    let tip = snapshots.main.head.clone();
     let (tx, mut rx) = mpsc::channel(32);
     let (_wake, wake) = watch::channel(false);
     let task = tokio::spawn(async move {
@@ -1130,16 +1134,46 @@ async fn direct_hosted_submission_omits_a_resolved_fill_tip() {
     .unwrap();
     task.await.unwrap().unwrap();
     assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
-    let frames = boat.frames.lock().unwrap();
+    let frames = frames.lock().unwrap();
     let runs: Vec<_> = frames
         .iter()
         .filter_map(|frame| match frame {
-            Frame::Run(request) => Some(request),
+            Frame::Run(request) => Some(request.clone()),
             _ => None,
         })
         .collect();
     assert_eq!(runs.len(), 1);
-    assert!(runs[0].integration_tip.is_empty());
+    (tip, runs.into_iter().next().unwrap())
+}
+
+/// Boat only reads the cache, so a Boat submission suppresses even a
+/// nonempty, valid fill tip.
+#[tokio::test]
+async fn direct_boat_submission_omits_a_resolved_fill_tip() {
+    let boat = crate::hosted::boat_tests::Boat::new(0, false).await;
+    let (tip, run) = direct_hosted_run_with_a_resolved_tip(boat.config.clone(), &boat.frames).await;
+    assert!(!tip.is_empty());
+    assert!(run.integration_tip.is_empty());
+}
+
+/// A registered host's tenant runner fills its own cache, so a submission
+/// placed there carries the resolved tip, after a Hello that offered tips.
+#[tokio::test]
+async fn direct_first_party_submission_sends_the_resolved_fill_tip() {
+    use crate::hosted::tests::harness::{Behavior, Harness};
+    let host = Harness::new(Behavior::CompleteRun).await;
+    let (tip, run) = direct_hosted_run_with_a_resolved_tip(host.config(), &host.frames).await;
+    assert!(!tip.is_empty());
+    assert_eq!(run.integration_tip, tip);
+    let hellos = host.client_hellos.lock().unwrap();
+    assert!(!hellos.is_empty());
+    assert!(hellos.iter().all(|hello| matches!(
+        hello,
+        Frame::Hello {
+            default_branch_tip: true,
+            ..
+        }
+    )));
 }
 
 /// Runs a spill-eligible job with the given queue-wait limit in seconds and

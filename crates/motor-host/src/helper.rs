@@ -33,13 +33,30 @@ pub trait Control: Send + Sync {
     fn capacity(&self) -> Result<crate::capacity::Capacity> {
         anyhow::bail!("host capacity file unavailable")
     }
-    /// The running guest's `mem_available_bytes` from the tenant runner's
-    /// health, or `None` when the runner's health reply does not carry it.
-    fn runner_memory(&self, tenant: &str) -> Result<Option<u64>> {
+    /// The running guest's `mem_available_bytes` and the permits its cache
+    /// fill holds, both from the tenant runner's `status` health. A runner
+    /// whose health lacks `mem_available_bytes` gives `None` there; one
+    /// without `fill_permits` (an older runner, or one not filling) gives 0.
+    fn runner_sample(&self, tenant: &str) -> Result<RunnerSample> {
         let reply = self.admin(tenant, &json!({"op":"status"}))?;
         ensure!(reply["ok"] == true, "tenant runner status refused");
-        Ok(reply["health"]["mem_available_bytes"].as_u64())
+        let health = &reply["health"];
+        Ok(RunnerSample {
+            mem_available_bytes: health["mem_available_bytes"].as_u64(),
+            fill_permits: health["fill_permits"]
+                .as_u64()
+                .map_or(0, |permits| u32::try_from(permits).unwrap_or(u32::MAX)),
+        })
     }
+}
+
+/// One probe of a running tenant's runner.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunnerSample {
+    pub mem_available_bytes: Option<u64>,
+    /// Permits held by the tenant's own cache fill; such a fill is never a
+    /// placed job and is never billed.
+    pub fill_permits: u32,
 }
 
 /// The helper refused to start a tenant VM for a host policy reason, such as
