@@ -278,7 +278,11 @@ async fn fleet_burst_over_one_heartbeat_waits_through_host_full_and_no_capacity(
         assert_eq!(state.hosted_code, None);
     }
     assert_eq!(h.runs.load(Ordering::SeqCst), 8);
-    assert!(lease_settlement_requests(&h).is_empty());
+    let settlement_requests = lease_settlement_requests(&h);
+    assert!(
+        settlement_requests.is_empty(),
+        "unexpected broker requests: {settlement_requests:?}"
+    );
     assert_eq!(
         motor.hosted_health().unwrap()["last_lease_error"],
         serde_json::Value::Null
