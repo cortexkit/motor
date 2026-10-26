@@ -9,10 +9,12 @@ guide, [windows-image.md](windows-image.md).
 
 The scripts under `script/runner/` encode one host layout: shared state under
 `/srv/build`, a single operator account that owns the runner's systemd user
-units, and caller paths under `/Users`, where macOS clients keep their
-checkouts. Read each script's first lines before running it; paths such as the
-operator's home and the network interface name are fixed in the scripts and the
-unit files, and must match your host.
+units, and caller paths under `/Users` (where macOS clients keep their
+checkouts) or under `/home`, served by caller-root mapping
+([section 9](#9-optional-caller-roots-for-home-checkouts)). Read each script's
+first lines before running it; paths such as the operator's home and the network
+interface name are fixed in the scripts and the unit files, and must match your
+host.
 
 ## Host requirements
 
@@ -21,8 +23,11 @@ unit files, and must match your host.
 - An XFS filesystem with reflink support mounted at `/srv/build`. The runner
   clones workspaces and targets with reflinks, which work only within one
   filesystem, so caller paths must live on the same filesystem. `setup.sh`
-  prepares only `/Users`, the macOS client location: it bind-mounts
+  prepares the macOS client location, `/Users`: it bind-mounts
   `/srv/build/Users` at `/Users` and probes a reflink copy across them.
+  Linux callers' `/home` checkouts are not prepared this way; they are stored
+  under per-instance caller roots on the same filesystem instead
+  ([section 9](#9-optional-caller-roots-for-home-checkouts)).
 - systemd with `PrivatePIDs=` support (systemd 257 or newer; the runner does
   not check the version). The CPU
   accounting parser is tested against output captured from systemd 259. Also
@@ -131,6 +136,9 @@ script/runner/setup.sh
 - creates `/srv/build/{src,target,cargo-home,tools-target,mirrors,bundles}`;
 - bind-mounts `/srv/build/Users` at `/Users` through `/etc/fstab` and proves a
   reflink copy between them; it refuses if `/Users` already holds data;
+- runs `script/runner/setup-caller-roots.sh`, which creates the per-instance
+  caller-root directories beside that data unless they already hold something
+  (see [section 9](#9-optional-caller-roots-for-home-checkouts));
 - sets a firewall that denies inbound traffic except SSH, and an SSH policy of
   keys only, no root login, no agent or TCP forwarding; it fails if any other
   inbound allow exists or any other service listens on a non-loopback address
@@ -208,7 +216,13 @@ bash script/runner/install-units.sh
 
 `install-units.sh` copies `script/runner/units/` into `~/.config/systemd/user/`, showing a diff
 and asking before replacing a file that differs, keeps a timestamped backup,
-and reloads systemd. It never restarts a runner. The units are:
+and reloads systemd. It never restarts a runner, and it is the only script that
+installs units. Before installing a runner unit file it runs, for each instance
+whose effective `ExecStart` that file sets, that instance's binary with
+`check-options` and the instance's serve arguments (section 9.2). A unit whose
+arguments carry `--caller-root` is skipped, with the refusal named, when the
+binary is absent, lacks `check-options`, or refuses them; the other files still
+install. The units are:
 
 | Unit | Runs |
 | --- | --- |
@@ -241,6 +255,7 @@ stay up (`loginctl enable-linger <operator>`).
 | `--free-space-eviction-bytes N` | twice the floor | Optional soft reclaim goal, strictly above the hard floor. Does not change admission while the hard reserve is available. |
 | `--workspace-root PATH` | `/Users` | Adds a root under which idle workspaces may be evicted. |
 | `--owned-workspace-root PATH` | `/Users` | Adds a root under which caller workspaces may be created. |
+| `--caller-root PREFIX=HOST` | absent | Maps caller paths beneath `PREFIX` onto `HOST`, a directory the runner owns, and presents them to the job at `PREFIX`. Repeatable. Needs isolated Linux host jobs; refused for Windows-VM and macOS-VM backends and for a tenant runner without `--boat-profile`. See [section 9](#9-optional-caller-roots-for-home-checkouts). |
 | `--backend host\|windows-vm` | `host` | Job backend. A third value, `vm`, is parsed but refused at startup in this build. |
 | `--vm-config FILE` | absent | Windows instance configuration. |
 | `--windows-cpus LIST` | absent | Linux placement avoidance: Windows VM host CPUs in CPU-list syntax; their online SMT siblings are included. Requires `--windows-slot-lock`. |
@@ -252,7 +267,11 @@ stay up (`loginctl enable-linger <operator>`).
 
 `motor-runner --version` prints the version. Other subcommands are `connect`
 (the SSH bridge `ck-motor` runs), `drain` and `resume`
-([drain-and-rollback.md](drain-and-rollback.md)).
+([drain-and-rollback.md](drain-and-rollback.md)), and two that open no state:
+`check-options <serve options>`, which runs the option parsing and the checks
+that need no state directory and prints the first refusal, and
+`forget-caller-root --prefix PREFIX <serve options>`
+([section 9.4](#94-forget-caller-root)).
 
 The main runner unit configures Windows CPU avoidance. Each new placement,
 including background cache fills, stats the slot-lock file and reads `/proc/locks`
@@ -419,6 +438,142 @@ as a reserved module, enroll its signing key in the vault, add the public key
 to the operator account's `authorized_keys`, and define the `alfonso-runner`
 SSH alias.
 
+## 9. Optional: caller roots for `/home` checkouts
+
+Linux callers keep their checkouts under `/home/<user>/...`. The runner never
+stores one there: the build server's own `/home` holds the operator account,
+its toolchains and the runner binary, and Boat's provider owns `/home` inside
+its sandboxes. Instead each instance maps the `/home` prefix onto a directory it
+owns, stores the checkout under that directory, and binds it back at the
+caller's `/home` path, so compiler errors, stack traces and test output show the
+caller's own paths. The job-side contract is in
+[job-isolation.md](job-isolation.md#38-caller-root-mapping).
+
+This section describes the rollout for a production host: it
+changes what the build server runs, so it is done by the operator, not by a
+script run from a pull request.
+
+### 9.1 The two steps
+
+Caller roots ship in two steps and never in one:
+
+1. **Dormant binary.** Deploy a runner that understands `--caller-root` while no
+   unit or Boat image configures one. Behaviour is then byte-identical to the
+   previous release, so the step changes nothing a caller can observe.
+2. **Flagged units.** Once the dormant release has run in production, the
+   units gain `--caller-root`. From then on every rollback target is a binary
+   that understands the flag.
+
+The edits that add the flag to `script/runner/units/motor-runner.service`,
+`script/runner/units/motor-runner@e2e.service.d/binary.conf` and
+`script/boat-image/motor-boat.service` are one separate change. It merges only
+at step two, after its own security audit and after `setup-caller-roots.sh` has
+run on the build server. Until then the repository units stay unflagged, so a
+routine `install-units.sh` run installs nothing flagged, and tests that need
+flagged arguments use fixture copies of the units.
+
+A downgrade to a binary that predates mapping, once caller roots were enabled on
+an instance, is not supported. Two gates enforce that: `deploy.sh` before any
+swap (9.3) and `install-units.sh` before installing a unit (5).
+
+### 9.2 Preparation
+
+On the build server, as the operator:
+
+```sh
+bash script/runner/setup-caller-roots.sh
+```
+
+It creates `/srv/build/callers/main/home` and `/srv/build/callers/e2e/home` with
+the owner, mode and device of `/srv/build/Users`, proves a reflink copy with an
+unnamed temporary file, and leaves both empty. It refuses a symlinked component,
+a non-directory, a non-empty directory, and a directory on another device. It
+does nothing else (no packages, no toolchain step), and the host's real `/home`
+is not touched. `setup.sh` calls it, so a freshly provisioned host already has
+the directories.
+
+The serve arguments of a unit are its effective `ExecStart`, meaning the last
+non-empty `ExecStart=` line with `%i` replaced by the instance, minus every word
+up to and including the first `serve`. For the repository units the command is
+```sh
+python3 script/runner/deploy_canary.py --repository-unit-command script/runner/units <instance>
+```
+which prints them from `script/runner/units/` for the instance (`main`, `e2e`,
+`windows`); `deploy.sh` and `install-units.sh` use the same extraction on the
+installed unit.
+
+### 9.3 Enablement
+
+1. Run `setup-caller-roots.sh` (9.2).
+2. Install the flagged units with `install-units.sh`. Each flagged unit is
+   checked first with its instance's binary and serve arguments (5), and a
+   refusal leaves that unit uninstalled.
+3. Per instance, run `deploy.sh` with a copy of the installed binary as the
+   candidate:
+
+   ```sh
+   script/runner/deploy.sh /path/to/installed/motor-runner main
+   ```
+
+   `deploy.sh` refuses before draining when the candidate's `check-options`
+   refuses the installed unit's arguments, and when the candidate lacks
+   `check-options` while the arguments carry `--caller-root` or the instance's
+   `<state-dir>/caller-roots-ever-enabled` exists. Otherwise it drains, swaps,
+   restarts with the flag and runs both canaries. The first start with the flag
+   writes `caller-roots-ever-enabled`; nothing removes it, `forget-caller-root`
+   included.
+
+Executable rollback does not undo enablement: it restarts the same flagged unit
+with the previous binary, which now starts with the flag. When the installed
+arguments carry `--caller-root`, a failed deploy therefore names the flag-off
+rollback (9.5) in its message.
+
+### 9.4 `forget-caller-root`
+
+`forget-caller-root` is the only way to retire a mapping. It requires the
+instance to be stopped and refuses, changing nothing, while a live job unit
+that belongs to one of that instance's jobs exists:
+
+```sh
+motor-runner forget-caller-root --prefix /home --instance main \
+  --state-root <state-root> --caller-root /home=/srv/build/callers/main/home
+```
+
+Pass the instance's full serve argument list, exactly as the unit has it (the
+list may still carry `--caller-root`; a different host directory than the
+recorded one refuses and names both values). It renames every child of the
+caller root's host directory into its trash, deletes the trees only its
+`caller-catalog.json` entries own, purges the trash and removes those entries
+and the mapped job records. A rerun converges after a kill at any point, and the
+following start without the flag succeeds. The mechanism and its tests are in
+[job-isolation.md](job-isolation.md#38-caller-root-mapping).
+
+### 9.5 Flag-off rollback
+
+1. Stop the instance.
+2. Run `forget-caller-root` with the instance's extracted serve arguments, which
+   still carry the flag.
+3. Install the unflagged unit with `install-units.sh`.
+4. Start it with `systemctl --user start <unit>`.
+5. Run `deploy.sh` with a copy of the installed binary to drain and run the
+   canary.
+
+Restoring the unflagged unit alone is not enough: once any mapped record exists
+(the canary's, for instance), a runner started without the flag refuses to start
+until `forget-caller-root` has removed it. `deploy.sh` cannot start a stopped
+instance, because its drain connects to the runner socket, which is why step 4
+starts it directly.
+
+### 9.6 Boat
+
+Boat's runner maps `/home` to `/var/lib/motor-boat/state/callers/home` on the
+state disk, outside the state directory and outside `state/workspaces`. Every
+Boat image after the first flagged image carries the same mapping: an image
+never drops it, and image verification resumes a state written by the previous
+flagged image and runs a `/home` job against it. Downgrading a Boat image to one
+without the mapping, once it was enabled, is the same unsupported downgrade as
+on the build server.
+
 ## Verify
 
 ```sh
@@ -439,5 +594,6 @@ checkout on the server.
 3. Remove the binaries from `~/.cargo/bin/` and the state root.
 4. Remove optional components as described in their sections.
 
-`setup.sh`'s host changes (packages, firewall, SSH policy, `/Users` bind mount)
-are not reversed by any script.
+`setup.sh`'s host changes (packages, firewall, SSH policy, `/Users` bind mount,
+caller-root directories) are not reversed by any script. Retiring a mapping is a
+separate, explicit step ([section 9.4](#94-forget-caller-root)).

@@ -30,7 +30,8 @@ workspace nested inside a known one, is refused before setup. Tests:
 (`crates/motor-runner/src/tests/nested_workspaces.rs`).
 
 1.3. Isolated Linux runners advertising `hello.sibling_paths` accept siblings
-in any of their allowed workspace roots, not only beside the repository root.
+in any of their allowed workspace roots, including a caller-root path, not only
+beside the repository root.
 Existing path components are resolved before authorization and overlap checks;
 a symlink cannot escape an allowed root or hide nesting. A disallowed path's
 refusal names `allowed_roots`. Siblings, their worktree aliases and workspaces
@@ -196,11 +197,26 @@ says that comparison is unavailable. Details retain the usual redaction and
 6.1. On Linux the runner checks the snapshot out at the same absolute path as
 the caller's checkout, so absolute paths in build output, error messages and
 `cwd` match the caller's. The destination must lie under an owned workspace
-root (default `/Users`; add more with `serve --owned-workspace-root`). Paths
-outside, including through a symlink, are refused before anything is written.
-Tests: `destination_roots_refuse_run_prepare_and_drop_before_mutation`,
+root (default `/Users`; add more with `serve --owned-workspace-root`) or under a
+path a caller root maps. Paths outside, including through a symlink, are refused
+before anything is written. Tests:
+`destination_roots_refuse_run_prepare_and_drop_before_mutation`,
 `destination_roots_check_future_paths_symlink_cwd_and_heads`
 (`crates/motor-runner/src/tests/workspace_lifetime.rs`).
+
+6.1.1. A caller path under a configured caller prefix is stored at the host
+directory the runner owns and bound into the job at the caller's path. The
+caller's spelling is what the runner records, reports and mounts; no host path
+appears in a record, a refusal or a returned-file manifest. A `/home` checkout
+therefore behaves like a `/Users` one, at its own absolute path. Mapped paths
+must be in canonical spelling: absolute, with no `.` or `..` component, repeated
+separator or trailing slash. Tests:
+`mapped_run_executes_in_the_host_checkout_and_returns_files_at_caller_paths`,
+`mapped_prepare_materializes_and_records_the_host_checkout`,
+`mapped_writer_and_catalog_checks_accept_only_authorized_host_paths`
+(`crates/motor-runner/src/tests/caller_authorization.rs`); the wire carries the
+same fields for both, as the `/home` vectors in
+[the protocol corpus](../test-vectors/exec-remote-v1/README.md) show.
 
 6.2. On Windows the same path is mapped under `C:\m`; see
 [windows-jobs.md](windows-jobs.md#4-paths).

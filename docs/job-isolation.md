@@ -113,7 +113,6 @@ Tests: `isolated_job_uses_022_umask_and_creates_755_directories_under_loose_pare
 3.4. A job may change or delete its own workspace files, including in ways that
 make its own cleanup fail. It cannot gain mounts or privileges. Changes are not
 copied back to the caller. Not covered by a test beyond 2.4 and 3.1.
-
 3.4.1. The workspace's `.git` is read-only because its objects are shared with
 the runner's mirror of the repository. Git commands that only read work; any
 command that writes the index, refs or objects fails, including `git add`,
@@ -141,6 +140,170 @@ sources. Tests: `isolated_nested_javascript_jobs_resolve_offline_and_reuse_trust
 (`crates/motor-runner/tests/it/javascript.rs`), and the tests in
 `crates/motor-runner/src/isolation/javascript_tests.rs`.
 
+3.7. A caller root never changes what a job sees at `/Users`. Caller paths under
+a configured prefix keep their own spelling, and paths outside it are served
+exactly as before; see 3.8.
+
+## 3.8 Caller-root mapping
+
+A Linux caller keeps its checkout under `/home/<user>/...`, but no runner may
+store it there: the build server's own `/home` holds the operator account, its
+toolchains and the runner binary, and Boat's provider owns `/home` inside the
+sandbox. A *caller root* therefore pairs one caller prefix with a host
+directory the runner owns, `PREFIX=HOST` for short, for example
+`--caller-root /home=/srv/build/callers/main/home`. The runner stores the
+checkout under the host directory and binds it, read-write, at the caller's
+`/home` path. Every path in the job, its output, `pwd`, `$PWD`, git's
+`safe.directory` entries, `WorkingDirectory` and its compiler diagnostics reads
+`/home/...`; nothing names the host directory.
+
+This section states the contract a caller root hands the job. The operator side
+(directories, unit flags, rollout and rollback) is in
+[runner-install.md](runner-install.md#9-optional-caller-roots-for-home-checkouts).
+Source: `crates/motor-runner/src/caller_path.rs` and
+`crates/motor-runner/src/caller_path/` (`startup.rs`, `owner.rs`, `trash.rs`,
+`forget.rs`).
+
+3.8.1. **One host directory per instance.** Main uses
+`/srv/build/callers/main/home` and the `e2e` instance
+`/srv/build/callers/e2e/home`; Boat uses
+`/var/lib/motor-boat/state/callers/home`. No two instances share one, so the
+instance's own `daemon.lock` fences every mutation under it. The directory is
+never the caller's real `/home`, never inside the state directory, and never
+inside an owned workspace root. Test:
+`caller_root_spelling_and_option_refusals_name_both_paths`
+(`crates/motor-runner/src/caller_path/startup_tests.rs`).
+
+3.8.2. **Owner marker.** Every start, and every `forget-caller-root`, reads
+`HOST/.motor-owner` by a no-follow walk from `/`; a symlinked component or
+marker refuses before anything outside the directory is opened. The marker names
+the instance and the state directory that own the tree. A start refuses, naming
+the path and both values, when the marker names another instance or state
+directory, is unreadable or malformed, or is absent while the directory holds
+entries. An empty directory is claimed by writing the full marker to an unnamed
+file and publishing it with `linkat`, so exactly one of two concurrent first
+starts wins and a crash before the link leaves the directory empty. The first
+start with any caller root also writes `<state-dir>/caller-roots-ever-enabled`;
+nothing removes it. Tests: `marker_claim_is_durable_and_names_instance_and_state`,
+`absent_nonempty_malformed_and_nonregular_markers_refuse_without_state`,
+`symlink_marker_and_ancestor_never_open_outside_fifo`,
+`concurrent_first_claims_have_exactly_one_winner`,
+`marker_crashes_before_link_leave_no_entry_and_after_link_can_resume`
+(`crates/motor-runner/src/caller_path/owner.rs`).
+
+3.8.3. **Mappings are fixed once enabled.** At start the runner reads every
+mapping named by the catalog files and by every job record. A prefix missing
+from the current `--caller-root` set, or configured with a different host
+directory, refuses the start, naming the prefix and both remedies: restore the
+flag, or run `forget-caller-root`. Nothing is reclassified, parked or deleted
+automatically, and a refused start changes no catalog file, record or tree. A
+restart with the same mapping, including a Boat stop and resume, replays against
+the recorded host directory. Tests:
+`sole_dual_key_pin_refuses_before_cleanup_in_both_move_directions`,
+`same_mapping_restart_preserves_catalog_and_retained_job_pins`
+(`crates/motor-runner/src/tests/caller_persistence.rs`).
+
+3.8.4. **Spelling and reserved names.** A mapped path must be spelled
+canonically: absolute, no `.` or `..` component, no repeated separator and no
+trailing slash, so each stored tree has exactly one accepted spelling. A caller
+path equal to the prefix (`/home` itself) is refused for every field, as is any
+path with a component directly beneath the prefix whose name begins with
+`.motor-`: the host directory's trash (`HOST/.motor-trash-<instance>`) and its
+owner marker.
+
+3.8.5. **Nested workspaces are refused under `/home` exactly as under
+`/Users`.** A workspace, repository or sibling that lies inside, or contains, a
+catalogued workspace, a sibling, a live job, a running admission or a running
+prepare is refused with the same `workspace_setup_failed` detail, in both
+orders, whether a job or a setup holds the first one. Mapped trees have one
+addition: a derived cache-fill checkout (the `.motor-base-<instance>-<name>`
+checkout a warm build uses) also counts as a known workspace, so a fill never
+nests a workspace and a workspace never nests a fill. The detail names both
+caller paths and the refusal happens before anything is created. `/home/u/proj2`
+is accepted beside `/home/u/proj`. Tests:
+`mapped_nested_workspaces_fence_catalog_running_starting_admission_and_prepare_in_both_orders`,
+`mapped_fill_checkouts_join_the_nested_known_set`,
+`queue_base_skips_a_mapped_fill_that_nests_a_workspace_and_retries`
+(`crates/motor-runner/src/tests/caller_authorization.rs`); the `/Users`
+equivalents are `nested_workspace_is_refused_before_any_workspace_is_created`
+(`crates/motor-runner/src/tests/nested_workspaces.rs`).
+
+3.8.6. **Trash.** Each host directory keeps one runner-private trash,
+`HOST/.motor-trash-<instance>`, created `0700` and checked runner-private. Every
+deletion of a mapped tree (drop, expiry, pressure eviction, retirement,
+`forget-caller-root`) renames into that trash first and removes the record
+second; a renamed tree is purged at once, and leftovers are purged at the next
+start. Nothing lands in the state directory's `trash`. Tests:
+`mapped_drop_renames_into_h_trash_even_on_states_mount_then_purges`,
+`mapped_expiry_and_pressure_use_host_paths_and_private_trash`,
+`only_caller_root_flag_warms_drops_expires_and_pressure_evicts`,
+`mapped_trash_requires_runner_private_mode_and_never_falls_back`
+(`crates/motor-runner/src/tests/caller_trash.rs`).
+
+3.8.7. **Returned files.** Returned files are read from the stored checkout and
+reported, like every other caller-visible path, in caller spelling: a refusal
+detail, a `workspace_changes` entry and a return manifest path name
+`/home/...`, never the host directory. A link into the workspace is followed; a
+link whose target leaves the caller workspace, including any target spelled with
+the host directory, is `escape`. Tests:
+`mapped_run_executes_in_the_host_checkout_and_returns_files_at_caller_paths`,
+`mapped_chunked_returns_refuse_outside_and_host_form_links`,
+`mapped_return_reads_use_host_files_and_refuse_escapes`,
+`mapped_writer_refusal_details_name_the_caller_not_host_storage`
+(`crates/motor-runner/src/tests/caller_authorization.rs`).
+
+3.8.8. **`forget-caller-root`** is the only way to retire a mapping. It takes
+the instance's full serve argument list and the prefix:
+
+```sh
+motor-runner forget-caller-root --prefix /home --instance main --state-root <state-root> \
+  --caller-root /home=/srv/build/callers/main/home # ... the instance's other serve options
+```
+
+The list is parsed exactly as `serve` and `check-options` parse it, so the
+instance, state root, Boat profile and owned roots match the serving process,
+and an instance's configuration is copied from its unit rather than retyped. A
+`--caller-root` entry for the forgotten prefix must name the recorded host
+directory: with a different one, forget refuses and names both values. Entries
+for other prefixes are parsed and ignored.
+
+- **Locks.** It takes `<state-dir>/daemon.lock` without waiting, so it requires a
+  stopped runner and fails while the lock is held. It reads the owner markers of
+  the forgotten host directory and of every other host directory a pinning
+  record names, by the same no-follow read.
+- **Live-unit fence.** It refuses before any mutation while a live
+  `motor-job-*` unit belongs to this instance's jobs: the unit each job record
+  names, plus the unit named by every job ID under `<state-dir>/jobs`. Linux job
+  unit names carry no instance, so units of other instances share the same
+  `systemctl` listing but never block this instance's forget; the operator still
+  drains another instance before forgetting its prefix. Test:
+  `forget_refuses_while_a_live_job_unit_exists_with_the_same_list_units_query`,
+  `forget_proceeds_with_only_unrelated_live_units`,
+  `forget_fence_with_a_live_unit_changes_neither_tree_nor_record`
+  (`crates/motor-runner/src/tests/caller_forget.rs`).
+- **Steps.** Each tolerates work already done, so a kill at any point leaves a
+  runner that still refuses to start and a rerun that converges: every child of
+  the host directory except its trash and marker is renamed into the trash; every
+  tree outside it owned by a pinning `caller-catalog.json` entry alone (a
+  workspace, a warm-build fill checkout, a legacy checkout) goes through the
+  normal deletion path into the trash of the host directory that holds it; the
+  trashes are purged synchronously; and only then are the pinning
+  `caller-catalog.json` entries and job records removed, after clearing
+  `sibling_freshness` on the `catalog.json` record of a key found in both files.
+  No `catalog.json` record is removed. The host directory, its empty trash and
+  its marker remain, and the next start without the flag succeeds. Tests:
+  `forget_sweeps_home_keeps_dual_keys_and_leaves_data_byte_identical`,
+  `forget_with_flagged_serve_args_reaches_the_same_end_state`,
+  `forget_with_mismatched_flagged_host_refuses_naming_both_and_changes_nothing`,
+  `forget_rerun_converges_after_kills_in_steps_one_to_three`,
+  `forget_rerun_converges_after_freshness_write_with_pins_remaining`,
+  `forget_refuses_a_swapped_trash_and_leaves_the_sentinel`.
+
+3.8.9. **Rollout.** Caller roots arrive in two steps: first a runner binary that
+understands `--caller-root` but serves no caller root, then the units that carry
+the flag. No binary that predates mapping may run against mapped state. The
+operator procedure is in
+[runner-install.md](runner-install.md#9-optional-caller-roots-for-home-checkouts).
 ## 4. Processes
 
 4.1. A job has a private PID namespace and cannot see or signal processes
