@@ -707,6 +707,7 @@ class OfflineImageTests(unittest.TestCase):
         self.failure = None
         self.data_roles = ["Data"]
         self.commands = []
+        self.guest_data = None
         native = patch.object(image.subprocess, "run", side_effect=self.command)
         native.start()
         self.addCleanup(native.stop)
@@ -721,7 +722,8 @@ class OfflineImageTests(unittest.TestCase):
         output = b""
         if step == "attach":
             self.assertIn("-nomount", args)
-            self.assertEqual(args[-1], str(self.disk))
+            self.active_disk = Path(args[-1])
+            self.assertEqual(self.active_disk.name, "disk.img")
             output = plistlib.dumps({"system-entities": [{"dev-entry": "/dev/disk42"}, {"dev-entry": "/dev/disk42s2"}]})
         elif step == "diskutil":
             self.assertEqual(args[1:], ["apfs", "list", "-plist"])
@@ -734,24 +736,30 @@ class OfflineImageTests(unittest.TestCase):
         elif step == "mount_apfs":
             self.assertEqual(args[-2], "/dev/disk43s5")
             self.mount = Path(args[-1])
-            agent = self.mount / "opt/motor/bin/motor-macagent"
-            agent.parent.mkdir(parents=True)
-            agent.write_bytes(b"installed agent, not build output")
-            database = self.mount / "Library/Application Support/com.apple.TCC/TCC.db"
-            database.parent.mkdir(parents=True)
-            database.write_bytes(b"system TCC database")
+            if self.guest_data is not None:
+                shutil.copytree(self.guest_data, self.mount, dirs_exist_ok=True)
+            else:
+                agent = self.mount / "opt/motor/bin/motor-macagent"
+                agent.parent.mkdir(parents=True)
+                agent.write_bytes(b"installed agent, not build output")
+                database = self.mount / "Library/Application Support/com.apple.TCC/TCC.db"
+                database.parent.mkdir(parents=True)
+                database.write_bytes(b"system TCC database")
         elif step == "codesign":
             self.assertEqual(args, ["/usr/bin/codesign", "-d", "-r-", str(self.mount / "opt/motor/bin/motor-macagent")])
             self.assertEqual(kwargs["stderr"], subprocess.STDOUT)
             output = "Executable=installed agent\n# designated => " + self.requirement + "\n"
+            if self.guest_data is not None and Path(args[-1]).read_bytes() == b"replacement signed agent":
+                output = "designated => " + self.swap_requirement + "\n"
         elif step == "csreq":
             self.assertEqual(args[1::2], ["-r", "-b"])
-            self.assertEqual(Path(args[2]).read_text(), self.requirement + "\n")
+            expected = self.swap_requirement if self.guest_data is not None else self.requirement
+            self.assertEqual(Path(args[2]).read_text(), expected + "\n")
             Path(args[4]).write_bytes(bytes.fromhex("fade0c000102"))
         elif step == "sqlite3":
             self.assertEqual(args[1], "-bail")
             self.assertEqual(Path(args[2]), self.mount / "Library/Application Support/com.apple.TCC/TCC.db")
-            self.disk.write_bytes(b"granted disk")
+            self.active_disk.write_bytes(b"granted disk")
         elif step == "detach":
             self.assertEqual(args, ["/usr/bin/hdiutil", "detach", "/dev/disk42"])
             if hasattr(self, "mount") and self.mount.exists():
@@ -759,8 +767,14 @@ class OfflineImageTests(unittest.TestCase):
                 self.mount.mkdir()
         elif step == "umount":
             self.assertEqual(args, ["/sbin/umount", str(self.mount)])
+            if self.guest_data is not None:
+                shutil.rmtree(self.guest_data)
+                shutil.copytree(self.mount, self.guest_data)
             shutil.rmtree(self.mount)
             self.mount.mkdir()
+        elif step == "cp":
+            self.assertEqual(args[:2], ["/bin/cp", "-c"])
+            shutil.copyfile(args[-2], args[-1])
         elif step == "lsof":
             return subprocess.CompletedProcess(args, 1, b"", b"")
         elif step != "sync":
@@ -862,6 +876,209 @@ class OfflineImageTests(unittest.TestCase):
         self.assertEqual((self.mount / "opt/motor/bin/motor-macagent").read_bytes(), b"installed agent, not build output")
         shutil.rmtree(self.mount)
 
+    def swap_inputs(self):
+        old = ready()
+        old["agent"]["sha256"] = hashlib.sha256(b"installed agent, not build output").hexdigest()
+        original = json.dumps(old, indent=2) + "\n"
+        manifest_sha = hashlib.sha256(original.encode()).hexdigest()
+        image.write_seal(self.bundle, manifest_sha, old["ipsw"], old["agent"],
+                         {"services": list(image.TCC_SERVICES), "requirement": self.requirement})
+        self.guest_data = self.root / "guest-data"
+        prefix = self.guest_data / "opt/motor"
+        (prefix / "bin").mkdir(parents=True)
+        (prefix / "bin/motor-macagent").write_bytes(b"installed agent, not build output")
+        (prefix / "toolchain.json").write_text(original)
+        (prefix / "agent.sha256").write_text(old["agent"]["sha256"] + "\n")
+        (prefix / "sealed.json").write_text(json.dumps({"manifest_sha256": manifest_sha,
+                                                        "agent_sha256": old["agent"]["sha256"], "remote_login": "Off"}))
+        database = self.guest_data / "Library/Application Support/com.apple.TCC/TCC.db"
+        database.parent.mkdir(parents=True)
+        database.write_bytes(b"system TCC database")
+        manifest = copy.deepcopy(old)
+        manifest["agent"] = {"commit": "b" * 40, "sha256": hashlib.sha256(b"replacement signed agent").hexdigest()}
+        path = self.root / "replacement-toolchain.json"
+        path.write_text(json.dumps(manifest, indent=2) + "\n")
+        binary = self.root / "new-agent"
+        binary.write_bytes(b"replacement signed agent")
+        self.swap_requirement = 'cdhash H"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"'
+        self.swap_args = SimpleNamespace(source=self.bundle, destination=self.root / "swapped", agent=binary, manifest=path)
+        return manifest
+
+    def swap(self, manifest):
+        with patch.object(image, "require_committed"), patch.object(image.os, "chown") as chown, patch("sys.stdout", io.StringIO()):
+            image.agent_swap(self.swap_args, manifest)
+        return chown
+
+    def test_agent_swap_clones_replaces_atomically_and_reseals_without_touching_source(self):
+        manifest = self.swap_inputs()
+        before = {path.name: (path.read_bytes(), path.stat().st_mode) for path in self.bundle.iterdir()}
+        destination = self.swap_args.destination
+        real_replace = os.replace
+
+        def replace(staged, installed):
+            self.assertFalse(destination.exists())
+            self.assertEqual(staged.parent, installed.parent)
+            self.assertEqual(installed.read_bytes(), b"installed agent, not build output")
+            self.assertEqual(staged.read_bytes(), b"replacement signed agent")
+            self.assertEqual(staged.stat().st_mode & 0o777, 0o555)
+            real_replace(staged, installed)
+
+        with patch.object(image.os, "replace", side_effect=replace) as atomic:
+            chown = self.swap(manifest)
+        atomic.assert_called_once()
+        chown.assert_called_once_with(atomic.call_args.args[0], 0, 0)
+        self.assertEqual(before, {path.name: (path.read_bytes(), path.stat().st_mode) for path in self.bundle.iterdir()})
+        copies = [args for args in self.commands if args[0] == "/bin/cp"]
+        self.assertEqual([Path(args[-2]).name for args in copies], list(image.IMAGE_FILES))
+        self.assertTrue(all(args[1] == "-c" for args in copies))
+        pin = json.loads((destination / "image.json").read_text())
+        self.assertEqual(pin["agent"], manifest["agent"])
+        self.assertEqual(pin["ipsw"], manifest["ipsw"])
+        self.assertEqual(pin["manifest_sha256"], parity.digest(self.swap_args.manifest))
+        self.assertEqual(pin["tcc"], {"services": list(image.TCC_SERVICES), "requirement": self.swap_requirement})
+        self.assertEqual((destination / "agent.sha256").read_text(), manifest["agent"]["sha256"] + "\n")
+        for name, sha in pin["files"].items():
+            self.assertEqual(sha, hashlib.sha256((destination / name).read_bytes()).hexdigest())
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o555)
+        self.assertTrue(all(path.stat().st_mode & 0o777 == 0o444 for path in destination.iterdir()))
+        assert self.guest_data is not None
+        self.assertEqual((self.guest_data / "opt/motor/toolchain.json").read_bytes(), self.swap_args.manifest.read_bytes())
+        self.assertEqual((self.guest_data / "opt/motor/agent.sha256").read_text(), manifest["agent"]["sha256"] + "\n")
+        receipt = json.loads((self.guest_data / "opt/motor/sealed.json").read_text())
+        self.assertEqual(receipt, {"manifest_sha256": pin["manifest_sha256"], "agent_sha256": manifest["agent"]["sha256"], "remote_login": "Off"})
+        self.assertEqual([args[2] for args in self.commands if args[:2] == ["/usr/bin/hdiutil", "attach"]], ["-nomount", "-nomount"])
+        self.assertFalse(self.mount.exists())
+
+    def test_agent_swap_rejects_bad_binary_and_unsealed_or_corrupt_source_before_attach(self):
+        manifest = self.swap_inputs()
+        self.swap_args.agent.write_bytes(b"not the reviewed binary")
+        with self.assertRaisesRegex(ValueError, "agent SHA-256"):
+            self.swap(manifest)
+        self.swap_args.agent.write_bytes(b"replacement signed agent")
+        self.bundle.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, "read-only sealed"):
+            self.swap(manifest)
+        self.bundle.chmod(0o555)
+        self.disk.chmod(0o644)
+        self.disk.write_bytes(b"tampered disk")
+        self.disk.chmod(0o444)
+        with self.assertRaisesRegex(ValueError, "digest differs: disk.img"):
+            self.swap(manifest)
+        self.assertFalse(any(args[0] in ("/bin/cp", "/usr/bin/hdiutil") for args in self.commands))
+        self.assertFalse(self.swap_args.destination.exists())
+
+    def test_agent_swap_refuses_non_agent_manifest_changes_and_cleans_staging(self):
+        manifest = self.swap_inputs()
+        manifest["ipsw"]["build"] = "other build"
+        self.swap_args.manifest.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "only agent changes"):
+            self.swap(manifest)
+        self.assertFalse(self.swap_args.destination.exists())
+        self.assertEqual(list(self.root.glob(".swapped-*")), [])
+        self.assertFalse(self.mount.exists())
+
+    def test_agent_swap_failures_never_publish_and_always_detach_after_attach(self):
+        for failure in ("cp", "attach", "diskutil", "mount_apfs", "codesign", "csreq", "sqlite3", "sync", "umount", "detach"):
+            with self.subTest(step=failure), tempfile.TemporaryDirectory() as directory:
+                original_root = self.root
+                self.root = Path(directory)
+                self.bundle = self.root / "image"
+                self.bundle.mkdir()
+                for name in image.IMAGE_FILES:
+                    (self.bundle / name).write_bytes(b"ungranted disk")
+                manifest = self.swap_inputs()
+                self.commands.clear()
+                self.failure = failure
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.swap(manifest)
+                self.assertFalse(self.swap_args.destination.exists())
+                self.assertEqual(list(self.root.glob(".swapped-*")), [])
+                if failure not in ("cp", "attach"):
+                    self.assertEqual(self.commands[-1], ["/usr/bin/hdiutil", "detach", "/dev/disk42"])
+                self.root = original_root
+
+    def build_account(self, **changes):
+        assert self.guest_data is not None
+        user = {"name": ["motorbuild"], "shell": ["/usr/bin/false"], "passwd": ["*"],
+                "home": ["/Users/motorbuild"], "generateduid": ["BUILD-UUID"]}
+        user.update(changes)
+        node = self.guest_data / "private/var/db/dslocal/nodes/Default"
+        (node / "users").mkdir(parents=True, exist_ok=True)
+        (node / "users/motorbuild.plist").write_bytes(plistlib.dumps(user))
+        (node / "groups").mkdir(exist_ok=True)
+        (node / "groups/admin.plist").write_bytes(plistlib.dumps({"users": [], "groupmembers": ["BUILD-UUID"]}))
+        return node / "users/motorbuild.plist"
+
+    def test_agent_swap_preserves_provably_locked_build_account_and_reports_admin_membership(self):
+        manifest = self.swap_inputs()
+        account = self.build_account(authentication_authority=[";DisabledUser;;ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2>"],
+                                     ShadowHashData=[b"disabled password material"])
+        before = account.read_bytes()
+        with patch("sys.stdout", io.StringIO()) as output:
+            image.require_locked_build_account(self.guest_data)
+        self.assertIn("direct admin membership: present", output.getvalue())
+        self.assertIn("account: locked", output.getvalue())
+        self.swap(manifest)
+        self.assertEqual(account.read_bytes(), before)
+        self.assertTrue(self.swap_args.destination.exists())
+
+    def test_agent_swap_refuses_enabled_shadowhash_even_with_password_marker(self):
+        manifest = self.swap_inputs()
+        self.build_account(authentication_authority=[";ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2>"],
+                           ShadowHashData=[b"usable password material"])
+        with self.assertRaisesRegex(ValueError, "authentication_authority contains an enabled"):
+            self.swap(manifest)
+        self.assertFalse(self.swap_args.destination.exists())
+        self.assertEqual(list(self.root.glob(".swapped-*")), [])
+        self.assertFalse(any(args[0] == "/usr/bin/sqlite3" for args in self.commands))
+        self.assertEqual(self.commands[-1], ["/usr/bin/hdiutil", "detach", "/dev/disk42"])
+
+    def test_build_account_lock_checks_reject_ambiguous_credentials_and_any_ssh_files(self):
+        self.swap_inputs()
+        assert self.guest_data is not None
+        for changes, reason in (({"shell": ["/bin/zsh"]}, "name/shell"),
+                                ({"passwd": ["********"]}, "passwd"),
+                                ({"ShadowHashData": [b"hash"]}, "ShadowHashData remains"),
+                                ({"authentication_authority": [";DisabledUser;", ";Kerberosv5;method"]}, "enabled or unknown"),
+                                ({"authentication_authority": ";DisabledUser;"}, "malformed"),
+                                ({"home": ["/Users/elsewhere"]}, "home must be")):
+            with self.subTest(changes=changes):
+                self.build_account(**changes)
+                with self.assertRaisesRegex(ValueError, reason):
+                    image.require_locked_build_account(self.guest_data)
+        account = self.build_account()
+        image.require_locked_build_account(self.guest_data)
+        ssh = self.guest_data / "Users/motorbuild/.ssh"
+        ssh.mkdir(parents=True)
+        for key in ("authorized_keys", "authorized_keys2", "id_ed25519", "config"):
+            with self.subTest(key=key):
+                (ssh / key).write_text("unreviewed SSH material")
+                with self.assertRaisesRegex(ValueError, "SSH configuration"):
+                    image.require_locked_build_account(self.guest_data)
+                (ssh / key).unlink()
+        ssh.rmdir()
+        ssh.symlink_to(account)
+        with self.assertRaisesRegex(ValueError, "symlinks"):
+            image.require_locked_build_account(self.guest_data)
+
+    def test_agent_swap_refuses_existing_destination_without_modifying_it(self):
+        manifest = self.swap_inputs()
+        self.swap_args.destination.mkdir()
+        sentinel = self.swap_args.destination / "keep"
+        sentinel.write_bytes(b"existing destination")
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            self.swap(manifest)
+        self.assertEqual(sentinel.read_bytes(), b"existing destination")
+        self.assertFalse(any(args[0] == "/bin/cp" for args in self.commands))
+
+    def test_agent_swap_never_stages_inside_the_source_even_when_running_as_root(self):
+        manifest = self.swap_inputs()
+        self.swap_args.destination = self.bundle / "nested"
+        before = sorted(path.name for path in self.bundle.iterdir())
+        with self.assertRaisesRegex(ValueError, "outside the sealed source"):
+            self.swap(manifest)
+        self.assertEqual(sorted(path.name for path in self.bundle.iterdir()), before)
+
 
 class ImageTests(unittest.TestCase):
     def test_sealing_disables_remote_login_and_deletes_build_access(self):
@@ -871,12 +1088,20 @@ class ImageTests(unittest.TestCase):
             (home / ".ssh/authorized_keys").write_text("build-only public key")
             sudoers = home / "sudoers"
             sudoers.write_text("temporary bootstrap permission")
-            with patch.object(guest, "run") as run, patch.object(guest.subprocess, "check_output", return_value="Remote Login: Off"):
+            with patch.object(guest, "run") as run, patch.object(guest.subprocess, "check_output", side_effect=["Remote Login: Off", "root\nmotorjob\n"]):
                 guest.drop_build_access("motorbuild", home, sudoers)
             self.assertFalse((home / ".ssh").exists())
             self.assertFalse(sudoers.exists())
             run.assert_any_call("/usr/sbin/systemsetup", "-f", "-setremotelogin", "off")
             run.assert_any_call("/usr/bin/dscl", ".", "-create", "/Users/motorbuild", "UserShell", "/usr/bin/false")
+            run.assert_any_call("/usr/sbin/dseditgroup", "-o", "edit", "-d", "motorbuild", "-t", "user", "admin")
+            run.assert_any_call("/usr/bin/dscl", ".", "-delete", "/Users/motorbuild")
+
+    def test_sealing_refuses_if_build_account_survives_deletion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(guest, "run"), patch.object(guest.subprocess, "check_output", side_effect=["Remote Login: Off", "root\nmotorbuild\n"]):
+                with self.assertRaisesRegex(ValueError, "still exists after deletion"):
+                    guest.drop_build_access("motorbuild", Path(directory), Path(directory) / "sudoers")
 
     def test_sealing_refuses_if_remote_login_stays_on(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -965,7 +1190,7 @@ class ImageTests(unittest.TestCase):
 
     def test_all_image_seal_entrypoints_reject_pending_lock(self):
         manifest = pending()
-        for operation in (image.seal, image.finalize):
+        for operation in (image.seal, image.finalize, image.agent_swap):
             with self.subTest(operation=operation.__name__), self.assertRaisesRegex(ValueError, "not reviewed"):
                 operation(None, manifest)
         with self.assertRaisesRegex(ValueError, "not reviewed"):
