@@ -939,23 +939,25 @@ struct Inner {
 
 fn nested_workspace_detail(
     inner: &Inner,
-    workspace: &str,
-    repository: &str,
+    plan: paths::RequestPlan<'_>,
     siblings: &[SiblingSnapshot],
 ) -> Option<String> {
+    let workspace = plan.caller_workspace_key.text().as_str();
+    let repository = plan.caller_repository_root.text().as_str();
     if inner.sibling_fences == crate::sibling_snapshots::SiblingFences::Legacy {
         // Snapshot mounts must not hide a subtree of another checkout, even
         // when an existing symlink gives the two paths different spellings.
-        let candidates = std::iter::once(workspace)
-            .chain(std::iter::once(repository))
-            .chain(siblings.iter().map(|s| s.canonical_path.as_str()));
-        let mut known: Vec<&str> = inner
-            .catalog
-            .workspaces
-            .iter()
+        let candidates = std::iter::once(plan.workspace_path())
+            .chain(std::iter::once(plan.repository_path()))
+            .chain(siblings.iter().map(paths::sibling));
+        let mut known: Vec<_> = paths::entries(&inner.catalog.workspaces)
             .flat_map(|(key, record)| {
-                std::iter::once(key.as_str())
-                    .chain(record.siblings.iter().map(|s| s.canonical_path.as_str()))
+                std::iter::once(key).chain(
+                    paths::workspace_record(record)
+                        .caller_siblings
+                        .iter()
+                        .map(paths::sibling),
+                )
             })
             .collect();
         for request in inner
@@ -972,34 +974,36 @@ fn nested_workspace_detail(
             .filter_map(|j| j.request.as_ref())
             .chain(inner.admitting.values())
         {
-            known.push(&request.workspace_key);
-            known.extend(request.siblings.iter().map(|s| s.canonical_path.as_str()));
+            known.push(paths::request(request).workspace_path());
+            known.extend(request.siblings.iter().map(paths::sibling));
         }
         for request in inner.preparing.values() {
-            known.push(&request.workspace_key);
-            known.extend(request.siblings.iter().map(|s| s.canonical_path.as_str()));
+            known.push(paths::request(request).workspace_path());
+            known.extend(request.siblings.iter().map(paths::sibling));
         }
         for candidate in candidates {
-            let path = match workspace::destination(Path::new(candidate)) {
+            let path = match workspace::destination(candidate.host.as_path()) {
                 Ok(path) => path,
                 Err(error) => {
                     return Some(format!(
-                        "cannot resolve workspace or sibling {candidate}: {error}"
+                        "cannot resolve workspace or sibling {}: {error}",
+                        candidate.caller.text()
                     ))
                 }
             };
             for known in &known {
-                let other = match workspace::destination(Path::new(known)) {
+                let other = match workspace::destination(known.host.as_path()) {
                     Ok(path) => path,
                     Err(error) => {
                         return Some(format!(
-                            "cannot resolve known workspace or sibling {known}: {error}"
+                            "cannot resolve known workspace or sibling {}: {error}",
+                            known.caller.text()
                         ))
                     }
                 };
                 if path != other && (path.starts_with(&other) || other.starts_with(&path)) {
                     return Some(format!(
-                        "path {candidate} overlaps runner workspace or sibling {known}; nested workspaces aren't supported"
+                        "path {} overlaps runner workspace or sibling {}; nested workspaces aren't supported", candidate.caller.text(), known.caller.text()
                     ));
                 }
             }
@@ -1011,12 +1015,12 @@ fn nested_workspace_detail(
         .chain(
             siblings
                 .iter()
-                .map(|sibling| ("sibling", sibling.canonical_path.as_str())),
+                .map(|sibling| ("sibling", paths::sibling(sibling).caller.text().as_str())),
         )
         .chain(std::iter::once(("repository", repository)));
     candidates.find_map(|(kind, candidate)| {
         let candidate_path = Path::new(candidate);
-        inner.catalog.workspaces.keys().find_map(|known| {
+        crate::caller_path::keys(&inner.catalog.workspaces).map(|path| path.caller.text()).find_map(|known| {
             let known_path = Path::new(known);
             (candidate_path != known_path && candidate_path.starts_with(known_path)).then(|| {
                 format!(
@@ -1683,10 +1687,8 @@ impl Runner {
             }
             let desired: Vec<_> = if changed.refill {
                 inner.refreshed_ms = None;
-                inner
-                    .catalog
-                    .repositories
-                    .iter()
+                crate::caller_path::entries(&inner.catalog.repositories)
+                    .map(|(path, record)| (path.caller.text(), record))
                     .filter_map(|(root, record)| {
                         record
                             .desired
@@ -2164,13 +2166,18 @@ impl Runner {
             let Some(request) = job.request else { continue };
             let repository = catalog
                 .repositories
-                .entry(request.repository_root.clone())
+                .entry(
+                    paths::request(&request)
+                        .caller_repository_root
+                        .text()
+                        .clone(),
+                )
                 .or_default();
             if repository.requested_descriptor.is_none() {
                 repository.requested_descriptor = job.writer_descriptor;
                 repository.desired = Some(BaseRequest {
+                    workspace: paths::run(&request).caller_cwd.text().clone(),
                     tip: request.snapshot_commit,
-                    workspace: request.cwd,
                     siblings: vec![],
                     git_dependencies: vec![],
                     command: Some(request.command),
@@ -2232,9 +2239,10 @@ impl Runner {
             .values()
             .filter(|job| !job.base && job.started_ms.is_some())
         {
-            if let (Some(finished_ms), Some(workspace)) =
-                (job.finished_ms, catalog.workspaces.get_mut(job.key()))
-            {
+            if let (Some(finished_ms), Some(workspace)) = (
+                job.finished_ms,
+                catalog.workspaces.get_mut(crate::caller_path::job_key(job)),
+            ) {
                 workspace.used_ms = workspace.used_ms.max(finished_ms);
             }
         }
@@ -2992,7 +3000,7 @@ impl Runner {
             if let Some(hook) = &hook {
                 hook("remove");
             }
-            let _access = crate::tree_access::lock(&path);
+            let _access = crate::tree_access::lock(paths::host(&path));
             #[cfg(target_os = "linux")]
             if restore_access {
                 if let Err(error) = crate::isolation::reclaim_runtime(&path) {
@@ -3054,7 +3062,7 @@ impl Runner {
                     .any(|r| Self::workspace_uses_sibling(key, &r.siblings)))
             || Self::scheduler_jobs(inner).any(|j| {
                 j.state == JobState::Running
-                    && (j.key() == key
+                    && (crate::caller_path::job_key(j) == key
                         || ((in_place || Self::legacy_sibling_user(inner, j))
                             && j.request
                                 .as_ref()
@@ -3078,8 +3086,8 @@ impl Runner {
     // Treat that shared path as owned in either role, including during setup.
     fn workspace_uses_sibling(key: &str, siblings: &[SiblingSnapshot]) -> bool {
         siblings.iter().any(|s| {
-            Path::new(key).starts_with(&s.canonical_path)
-                || Path::new(&s.canonical_path).starts_with(key)
+            Path::new(key).starts_with(paths::sibling(s).caller.text())
+                || Path::new(paths::sibling(s).caller.text()).starts_with(key)
         })
     }
     /// Record a workspace a setup created, so drop and retention can delete
@@ -3238,9 +3246,10 @@ impl Runner {
         // counted in `admission_saves`, so a concurrent admission cannot take
         // the same queue slot and a workspace drop or expiry still sees it.
         if refusal.is_none() {
-            inner
-                .admission_saves
-                .insert(job.id, request.workspace_key.clone());
+            inner.admission_saves.insert(
+                job.id,
+                paths::request(&request).caller_workspace_key.text().clone(),
+            );
         }
         drop(inner);
         let id = job.id;
@@ -3264,7 +3273,7 @@ impl Runner {
                 .lock()
                 .unwrap()
                 .record(self.now(), |c| c.accepted += 1);
-            tracing::info!(job_id = %job.id, workspace = %request.workspace_key, queue_position = depth, bundle_bytes = request.bundles.iter().map(|b| b.length).sum::<u64>(), "job accepted");
+            tracing::info!(job_id = %job.id, workspace = %paths::request(&request).caller_workspace_key.text(), queue_position = depth, bundle_bytes = request.bundles.iter().map(|b| b.length).sum::<u64>(), "job accepted");
         }
         inner.jobs.insert(job.id, job);
         if let Some(full) = disk_full.filter(|_| disk_refused) {
@@ -3401,7 +3410,7 @@ impl Runner {
             if request.weight_hint.is_some_and(|hint| hint > 4) {
                 return Some((RefusalReason::RequestRejected, "macos_vcpu_limit".into()));
             }
-            if !request.return_paths.is_empty() {
+            if !paths::run(request).caller_return_paths.is_empty() {
                 return Some((
                     RefusalReason::RequestRejected,
                     "return_paths_unsupported".into(),
@@ -3421,14 +3430,14 @@ impl Runner {
             }
         }
         if let Err(code) = validate_return_request(
-            &request.workspace_key,
-            &request.return_paths,
+            paths::request(request).caller_workspace_key.text(),
+            paths::run(request).caller_return_paths,
             request.return_max_bytes,
             request.return_chunked,
         ) {
             return Some((RefusalReason::RequestRejected, code.into()));
         }
-        if self.core.config.vm_instance() && !request.return_paths.is_empty() {
+        if self.core.config.vm_instance() && !paths::run(request).caller_return_paths.is_empty() {
             return Some((
                 RefusalReason::RequestRejected,
                 "return_paths_unsupported".into(),
@@ -3470,17 +3479,22 @@ impl Runner {
         } else if inner.drain_deadline.is_some() {
             Some((RefusalReason::RunnerDraining, "runner is draining".into()))
         } else if (!self.core.config.windows_instance()
-            && Self::deleting(inner, &request.workspace_key, &request.siblings))
+            && Self::deleting(
+                inner,
+                paths::request(request).host_workspace,
+                &request.siblings,
+            ))
             || self.dependencies_evicting(inner, &request.git_dependencies)
             || self.core.config.windows.as_ref().is_some_and(|vm| {
-                inner
-                    .evicting_caches
-                    .contains(&vm.caches().disk(&request.workspace_key))
+                inner.evicting_caches.contains(
+                    &vm.caches()
+                        .disk(paths::request(request).caller_workspace_key.text()),
+                )
             })
         {
             Some((RefusalReason::WorkspaceSetupFailed, format!(
                 "workspace or sibling overlaps deletion in progress: workspace={} dropping={:?} dependency_evictions={:?}",
-                request.workspace_key, inner.dropping, inner.evicting_dependencies
+                paths::request(request).caller_workspace_key.text(), inner.dropping, inner.evicting_dependencies
             )))
         } else if Self::pending_count(inner) >= self.core.config.max_queue_depth {
             Some((
@@ -3490,34 +3504,33 @@ impl Runner {
                     self.core.config.max_queue_depth
                 ),
             ))
-        } else if let Err(error) = workspace::validate(
-            &request.workspace_key,
-            &request.repository_root,
+        } else if let Err(error) = workspace::validate_request(
+            paths::request(request),
             &request.siblings,
             self.core.config.sibling_snapshot_mode(),
         ) {
             Some((RefusalReason::WorkspaceKeyRejected, error.to_string()))
-        } else if !workspace::absolute(&request.cwd)
-            || !Path::new(&request.cwd).starts_with(&request.workspace_key)
+        } else if !workspace::absolute(paths::run(request).caller_cwd.text())
+            || !paths::run(request)
+                .host_cwd
+                .as_path()
+                .starts_with(paths::request(request).caller_workspace_key.text())
         {
             Some((
                 RefusalReason::WorkspaceKeyRejected,
                 format!(
                     "cwd is not an absolute path within the workspace: {}",
-                    request.cwd
+                    paths::run(request).caller_cwd.text()
                 ),
             ))
-        } else if let Some(detail) = nested_workspace_detail(
-            inner,
-            &request.workspace_key,
-            &request.repository_root,
-            &request.siblings,
-        ) {
+        } else if let Some(detail) =
+            nested_workspace_detail(inner, paths::request(request), &request.siblings)
+        {
             Some((RefusalReason::WorkspaceSetupFailed, detail))
         } else if let Err(error) = self.validate_writer_paths_with_catalog(
             inner,
-            &request.workspace_key,
-            Some(&request.cwd),
+            paths::request(request).host_workspace,
+            Some(paths::run(request).host_cwd),
             &request.siblings,
         ) {
             Some((RefusalReason::WorkspaceKeyRejected, access.describe(&error)))
@@ -3530,8 +3543,8 @@ impl Runner {
 
     fn validate_writer_paths(
         &self,
-        workspace: &str,
-        cwd: Option<&str>,
+        workspace: paths::HostPath<'_>,
+        cwd: Option<paths::HostPath<'_>>,
         siblings: &[SiblingSnapshot],
     ) -> io::Result<()> {
         // The state lock is taken for each attempt and released before a
@@ -3559,19 +3572,21 @@ impl Runner {
     /// storage, not checkouts a job owned.
     fn reclaim_workspace_access(&self, request: &Run) -> crate::workspace_access::Repairs {
         let mut repairs = crate::workspace_access::Repairs::default();
-        if self.core.config.vm_instance() || !workspace::absolute(&request.workspace_key) {
+        if self.core.config.vm_instance()
+            || !workspace::absolute(paths::request(request).caller_workspace_key.text())
+        {
             return repairs;
         }
         let _ = crate::workspace_access::validate_with_repairs(
             &self.core.config,
-            &request.workspace_key,
+            paths::request(request).host_workspace,
             &request.siblings,
             &mut repairs,
             || {
                 crate::writer::validate_paths(
                     &self.core.config,
-                    &request.workspace_key,
-                    Some(&request.cwd),
+                    paths::request(request).host_workspace,
+                    Some(paths::run(request).host_cwd),
                     &request.siblings,
                     &[],
                 )
@@ -3582,8 +3597,8 @@ impl Runner {
 
     fn validate_destinations(
         &self,
-        key: &str,
-        cwd: Option<&str>,
+        key: paths::HostPath<'_>,
+        cwd: Option<paths::HostPath<'_>>,
         siblings: &[SiblingSnapshot],
     ) -> io::Result<()> {
         if self.core.config.vm_instance() {
@@ -3606,17 +3621,17 @@ impl Runner {
     fn validate_writer_paths_with_catalog(
         &self,
         inner: &Inner,
-        workspace: &str,
-        cwd: Option<&str>,
+        workspace: paths::HostPath<'_>,
+        cwd: Option<paths::HostPath<'_>>,
         siblings: &[SiblingSnapshot],
     ) -> io::Result<()> {
         if self.core.config.vm_instance() {
             return Ok(());
         }
         let mut known = Vec::new();
-        let mut derive = |workspace: &str, repository: &str| {
-            if workspace::absolute(workspace) {
-                if let Some(parent) = Path::new(workspace).parent() {
+        let mut derive = |workspace: paths::HostPath<'_>, repository: &str| {
+            if workspace::absolute(&workspace.as_path().to_string_lossy()) {
+                if let Some(parent) = workspace.as_path().parent() {
                     known.push(parent.join(format!(
                         ".motor-base-{}-{}",
                         self.core.config.instance,
@@ -3625,13 +3640,16 @@ impl Runner {
                 }
             }
         };
-        for (workspace, record) in &inner.catalog.workspaces {
-            derive(workspace, &record.repository);
+        for (workspace, record) in paths::entries(&inner.catalog.workspaces) {
+            derive(
+                workspace.host,
+                paths::workspace_record(record).repository.caller.text(),
+            );
         }
-        for (repository, record) in &inner.catalog.repositories {
-            derive(repository, repository);
+        for (repository, record) in paths::entries(&inner.catalog.repositories) {
+            derive(repository.host, repository.caller.text());
             if let Some(desired) = &record.desired {
-                derive(&desired.workspace, repository);
+                derive(paths::base(desired).host, repository.caller.text());
             }
         }
         for request in inner
@@ -3643,11 +3661,11 @@ impl Runner {
                         || job
                             .request
                             .as_ref()
-                            .is_some_and(|r| Path::new(&r.cwd).exists()))
+                            .is_some_and(|r| paths::run(r).host_cwd.as_path().exists()))
             })
             .filter_map(|job| job.request.as_ref())
         {
-            known.push(PathBuf::from(&request.cwd));
+            known.push(paths::run(request).host_cwd.as_path().to_path_buf());
         }
         crate::writer::validate_paths(&self.core.config, workspace, cwd, siblings, &known)?;
         if self.core.config.sibling_snapshot_mode() {
@@ -3660,7 +3678,7 @@ impl Runner {
         self.validate_destinations(workspace, cwd, siblings)
     }
 
-    fn deleting(inner: &Inner, key: &str, siblings: &[SiblingSnapshot]) -> bool {
+    fn deleting(inner: &Inner, key: paths::HostPath<'_>, siblings: &[SiblingSnapshot]) -> bool {
         // Without any drop in progress nothing overlaps; return before the
         // canonicalization below, which touches the filesystem with the state
         // lock held, for every queue head on every dispatch pass.
@@ -3675,15 +3693,19 @@ impl Runner {
         } else {
             &[]
         };
-        let paths: Vec<_> = std::iter::once(PathBuf::from(key))
-            .chain(siblings.iter().map(|s| PathBuf::from(&s.canonical_path)))
+        let paths: Vec<_> = std::iter::once(key.as_path().to_path_buf())
+            .chain(
+                siblings
+                    .iter()
+                    .map(|s| paths::sibling(s).host.as_path().to_path_buf()),
+            )
             .flat_map(|p| {
                 let canonical = p.canonicalize().ok();
                 std::iter::once(p).chain(canonical)
             })
             .collect();
         inner.dropping.iter().any(|dropping| {
-            let path = PathBuf::from(dropping);
+            let path = paths::identity(dropping).host.as_path().to_path_buf();
             std::iter::once(path.clone())
                 .chain(path.canonicalize().ok())
                 .any(|d| paths.iter().any(|p| p.starts_with(&d) || d.starts_with(p)))
@@ -3757,8 +3779,8 @@ impl Runner {
         let trees = &self.core.trees;
         let fetched = self
             .validate_writer_paths(
-                &request.workspace_key,
-                Some(&request.cwd),
+                paths::request(request).host_workspace,
+                Some(paths::run(request).host_cwd),
                 &request.siblings,
             )
             .and_then(|()| trees.validate_dependency_bundles(directory, &request.git_dependencies))
@@ -3766,7 +3788,7 @@ impl Runner {
                 trees.fetch(
                     directory,
                     &request.bundles,
-                    &request.repository_root,
+                    paths::request(request).caller_repository_root.text(),
                     &request.snapshot_commit,
                     &request.integration_tip,
                     &request.siblings,
@@ -3780,11 +3802,17 @@ impl Runner {
         let plan = (default_branch_tip
             && fetched.is_ok()
             && self.warm_builds_enabled(&request.integration_tip))
-        .then(|| self.base_plan(&request.repository_root, &request.integration_tip, false));
+        .then(|| {
+            self.base_plan(
+                paths::request(request).caller_repository_root.text(),
+                &request.integration_tip,
+                false,
+            )
+        });
         let _refs = self.core.ref_mutation.lock().unwrap();
         let fetched = fetched.and_then(|()| {
             trees.pin(
-                &request.repository_root,
+                paths::request(request).caller_repository_root.text(),
                 &request.snapshot_commit,
                 &request.integration_tip,
                 &request.siblings,
@@ -3862,8 +3890,8 @@ impl Runner {
         };
         let catalog = if self.queue_base_planned(
             &mut inner,
-            &request.repository_root,
-            &request.workspace_key,
+            paths::request(request).caller_repository_root.text(),
+            paths::request(request).caller_workspace_key.text(),
             plan,
         )? {
             Some(self.catalog_snapshot(&inner)?)
@@ -3876,14 +3904,18 @@ impl Runner {
     }
     pub(crate) fn fetch_prepare(&self, request: &Prepare, directory: &Path) -> io::Result<()> {
         self.allow_prepare()?;
-        self.validate_writer_paths(&request.workspace_key, None, &request.siblings)?;
+        self.validate_writer_paths(
+            paths::request(request).host_workspace,
+            None,
+            &request.siblings,
+        )?;
         self.core
             .trees
             .validate_dependency_bundles(directory, &request.git_dependencies)?;
         if let Err(error) = self.core.trees.fetch(
             directory,
             &request.bundles,
-            &request.repository_root,
+            paths::request(request).caller_repository_root.text(),
             &request.base_commit,
             &request.integration_tip,
             &request.siblings,
@@ -3898,7 +3930,7 @@ impl Runner {
         let _refs = self.core.ref_mutation.lock().unwrap();
         self.long_work("pin_refs_git");
         self.core.trees.pin(
-            &request.repository_root,
+            paths::request(request).caller_repository_root.text(),
             &request.base_commit,
             &request.integration_tip,
             &request.siblings,
@@ -3907,7 +3939,10 @@ impl Runner {
         inner.catalog.transferred.insert(
             request.transfer_id,
             RetainedTransfer {
-                repository: request.repository_root.clone(),
+                repository: paths::request(request)
+                    .caller_repository_root
+                    .text()
+                    .clone(),
                 snapshot: request.base_commit.clone(),
                 tip: request.integration_tip.clone(),
                 siblings: request.siblings.clone(),
@@ -3927,10 +3962,10 @@ impl Runner {
             .filter(|j| j.state == JobState::Running)
             .any(|j| {
                 let Some(r) = j.request.as_ref() else { return false; };
-                Self::workspace_uses_sibling(if j.base { &r.cwd } else { &r.workspace_key }, siblings)
+                Self::workspace_uses_sibling(if j.base { paths::run(r).caller_cwd.text() } else { paths::request(r).caller_workspace_key.text() }, siblings)
                 || r.siblings.iter().any(|active| {
                     siblings.iter().any(|s| {
-                        s.canonical_path == active.canonical_path && s.commit != active.commit
+                        paths::sibling(s).caller.text() == paths::sibling(active).caller.text() && s.commit != active.commit
                     })
                 })
             })
@@ -3941,9 +3976,9 @@ impl Runner {
                 Self::workspace_uses_sibling(key, siblings)
                 || r.siblings.iter().any(|active| {
                     siblings.iter().any(|s| {
-                        s.canonical_path == active.canonical_path
+                        paths::sibling(s).caller.text() == paths::sibling(active).caller.text()
                             && (s.commit != active.commit
-                                || inner.catalog.sibling_commits.get(&s.canonical_path)
+                                || inner.catalog.sibling_commits.get(paths::sibling(s).caller.text())
                                     != Some(&s.commit))
                     })
                 })
@@ -3954,27 +3989,26 @@ impl Runner {
     /// of prepares cannot hold up transfers and job starts.
     pub(crate) fn prepare(&self, r: &Prepare, default_branch_tip: bool) -> io::Result<()> {
         self.allow_prepare()?;
-        workspace::validate(
-            &r.workspace_key,
-            &r.repository_root,
+        workspace::validate_request(
+            paths::request(r),
             &r.siblings,
             self.core.config.sibling_snapshot_mode(),
         )?;
-        self.validate_writer_paths(&r.workspace_key, None, &r.siblings)?;
+        self.validate_writer_paths(paths::request(r).host_workspace, None, &r.siblings)?;
         let snapshot_mode = self.core.config.sibling_snapshot_mode();
         let (recorded, prior) = {
             let _restore = self.reserve_restore_barrier();
             let mut inner = self.core.inner.lock().unwrap();
-            if Self::deleting(&inner, &r.workspace_key, &r.siblings)
-                || Self::occupied(&inner, &r.workspace_key)
+            if Self::deleting(&inner, paths::request(r).host_workspace, &r.siblings)
+                || Self::occupied(&inner, paths::request(r).caller_workspace_key.text())
                 || Self::siblings_blocked(&inner, &r.siblings)
             {
                 return Err(io::Error::new(io::ErrorKind::WouldBlock, "workspace busy"));
             }
             inner.reserved.insert(
-                r.workspace_key.clone(),
+                paths::request(r).caller_workspace_key.text().clone(),
                 Reservation {
-                    repository: r.repository_root.clone(),
+                    repository: paths::request(r).caller_repository_root.text().clone(),
                     commit: r.base_commit.clone(),
                     siblings: r.siblings.clone(),
                     since_ms: self.now(),
@@ -3983,7 +4017,10 @@ impl Runner {
             (
                 inner.catalog.sibling_commits.clone(),
                 snapshot_mode.then(|| {
-                    crate::sibling_snapshots::freshness::Prior::of(&inner.catalog, &r.workspace_key)
+                    crate::sibling_snapshots::freshness::Prior::of(
+                        &inner.catalog,
+                        paths::request(r).caller_workspace_key.text(),
+                    )
                 }),
             )
         };
@@ -3992,17 +4029,17 @@ impl Runner {
         let started_at = std::time::SystemTime::now();
         // Released on every exit, including the early errors below.
         let reservation = Marker::new(self, {
-            let key = r.workspace_key.clone();
+            let key = paths::request(r).caller_workspace_key.text().clone();
             move |inner: &mut Inner| {
                 inner.reserved.remove(&key);
             }
         });
         let started = std::time::Instant::now();
         self.long_work("materialize");
-        self.validate_destinations(&r.workspace_key, None, &r.siblings)?;
+        self.validate_destinations(paths::request(r).host_workspace, None, &r.siblings)?;
         #[cfg(target_os = "linux")]
         if self.core.config.isolate_jobs {
-            let workspace_path = Path::new(&r.workspace_key);
+            let workspace_path = paths::request(r).host_workspace.as_path();
             if workspace_path.exists() {
                 setup_step(
                     "restore runner access before workspace prepare",
@@ -4017,7 +4054,10 @@ impl Runner {
             }
         }
         let tree_hash = workspace::git(
-            &self.core.trees.mirror(&r.repository_root),
+            &self
+                .core
+                .trees
+                .mirror(paths::request(r).caller_repository_root.text()),
             &["rev-parse", &format!("{}^{{tree}}", r.base_commit)],
         )?;
         let populated = match &prior {
@@ -4029,8 +4069,8 @@ impl Runner {
                 self.core
                     .trees
                     .populate_main(
-                        &r.workspace_key,
-                        &r.repository_root,
+                        paths::request(r).host_workspace,
+                        paths::request(r).caller_repository_root.text(),
                         &r.base_commit,
                         &tree_hash,
                         &r.base_commit,
@@ -4054,8 +4094,8 @@ impl Runner {
                 self.core
                     .trees
                     .populate(
-                        &r.workspace_key,
-                        &r.repository_root,
+                        paths::request(r).host_workspace,
+                        paths::request(r).caller_repository_root.text(),
                         &r.base_commit,
                         &r.siblings,
                         &recorded,
@@ -4072,12 +4112,14 @@ impl Runner {
                     "prepare workspace target",
                     crate::isolation::prepare_job_writable_target(
                         &self.core.trees.state,
-                        &Path::new(&r.workspace_key).join("target"),
+                        &paths::request(r).host_workspace.as_path().join("target"),
                     ),
                 )?;
                 setup_step(
                     "prepare workspace checkout root",
-                    crate::isolation::prepare_job_checkout_root(Path::new(&r.workspace_key)),
+                    crate::isolation::prepare_job_checkout_root(
+                        paths::request(r).host_workspace.as_path(),
+                    ),
                 )?;
                 Ok(freshness)
             })
@@ -4094,12 +4136,18 @@ impl Runner {
         let plan = (default_branch_tip
             && populated.is_ok()
             && self.warm_builds_enabled(&r.integration_tip))
-        .then(|| self.base_plan(&r.repository_root, &r.integration_tip, false));
+        .then(|| {
+            self.base_plan(
+                paths::request(r).caller_repository_root.text(),
+                &r.integration_tip,
+                false,
+            )
+        });
         let mut inner = self.core.inner.lock().unwrap();
         self.note_workspace(
             &mut inner,
-            &r.workspace_key,
-            &r.repository_root,
+            paths::request(r).caller_workspace_key.text(),
+            paths::request(r).caller_repository_root.text(),
             &r.base_commit,
             &r.siblings,
             populated.is_ok(),
@@ -4112,8 +4160,8 @@ impl Runner {
         // fails: the touch it describes has already happened.
         let populated = populated.map(|freshness| {
             for pending in freshness {
-                if !pending.apply(&mut inner.catalog, &r.workspace_key) {
-                    tracing::warn!(workspace = %r.workspace_key, "prepared workspace has no catalog entry for its sibling freshness record");
+                if !pending.apply(&mut inner.catalog, paths::request(r).caller_workspace_key.text()) {
+                    tracing::warn!(workspace = %paths::request(r).caller_workspace_key.text(), "prepared workspace has no catalog entry for its sibling freshness record");
                 }
             }
         });
@@ -4127,14 +4175,19 @@ impl Runner {
         reservation.clear(&mut inner);
         written?;
         if let Err(error) = populated {
-            tracing::warn!(workspace = %r.workspace_key, %error, "prepare failed");
+            tracing::warn!(workspace = %paths::request(r).caller_workspace_key.text(), %error, "prepare failed");
             return Err(error);
         }
-        tracing::info!(workspace = %r.workspace_key, elapsed_ms = started.elapsed().as_millis() as u64, "workspace prepared");
+        tracing::info!(workspace = %paths::request(r).caller_workspace_key.text(), elapsed_ms = started.elapsed().as_millis() as u64, "workspace prepared");
         let Some(plan) = plan else {
             return Ok(());
         };
-        if !self.queue_base_planned(&mut inner, &r.repository_root, &r.workspace_key, plan)? {
+        if !self.queue_base_planned(
+            &mut inner,
+            paths::request(r).caller_repository_root.text(),
+            paths::request(r).caller_workspace_key.text(),
+            plan,
+        )? {
             return Ok(());
         }
         let catalog = self.catalog_snapshot(&inner)?;
@@ -4447,7 +4500,7 @@ impl Runner {
                 && j.terminal.is_none()
                 && j.request
                     .as_ref()
-                    .is_some_and(|r| r.repository_root == root)
+                    .is_some_and(|r| paths::request(r).caller_repository_root.text() == root)
         }) {
             return Ok(true);
         }
@@ -4774,7 +4827,7 @@ impl Runner {
                 .jobs
                 .values()
                 .filter(|j| j.state == JobState::Running)
-                .map(|j| RunningJob::new(j.id, j.key(), j.weight))
+                .map(|j| RunningJob::new(j.id, crate::caller_path::job_key(j), j.weight))
                 .collect(),
         )
     }
@@ -4788,10 +4841,8 @@ impl Runner {
             queue_depth,
             running,
             !self.core.config.backend_degraded(),
-            inner
-                .catalog
-                .repositories
-                .iter()
+            crate::caller_path::entries(&inner.catalog.repositories)
+                .map(|(path, record)| (path.caller.text(), record))
                 .map(|(root, g)| {
                     let mut status = RepositoryStatus::new(root.clone());
                     if let Some(finished_ms) = g.finished_ms {
@@ -5285,31 +5336,31 @@ impl Runner {
         if inner.starting.contains(&id) || self.core.config.cleanup_pending(id) {
             return Some("workspace setup");
         }
-        Some(if inner.dropping.contains(job.key()) {
-            "workspace drop"
-        } else if index.workspaces.contains(job.key()) {
-            "workspace owner"
-        } else if index.occupied(job.key()) {
-            SIBLING_USER_WAIT
-        } else if job
-            .request
-            .as_ref()
-            .is_some_and(|r| index.siblings_blocked(&r.siblings, &inner.catalog.sibling_commits))
-        {
-            "sibling checkout owner"
-        } else if index.held_by_queued_workspace(inner, job, self.core.config.max_weight) {
-            "queued workspace job"
-        } else if job.weight > self.core.config.max_weight {
-            "demand exceeds capacity"
-        } else if index.weight.saturating_add(job.weight) > self.core.config.max_weight
-            || Self::start_deferred(inner, id, self.now())
-        {
-            // A job waiting out its start retry delay keeps its claim on
-            // capacity, as if it were waiting for permits.
-            "permits"
-        } else {
-            "queue order"
-        })
+        Some(
+            if inner.dropping.contains(crate::caller_path::job_key(job)) {
+                "workspace drop"
+            } else if index.workspaces.contains(crate::caller_path::job_key(job)) {
+                "workspace owner"
+            } else if index.occupied(crate::caller_path::job_key(job)) {
+                SIBLING_USER_WAIT
+            } else if job.request.as_ref().is_some_and(|r| {
+                index.siblings_blocked(&r.siblings, &inner.catalog.sibling_commits)
+            }) {
+                "sibling checkout owner"
+            } else if index.held_by_queued_workspace(inner, job, self.core.config.max_weight) {
+                "queued workspace job"
+            } else if job.weight > self.core.config.max_weight {
+                "demand exceeds capacity"
+            } else if index.weight.saturating_add(job.weight) > self.core.config.max_weight
+                || Self::start_deferred(inner, id, self.now())
+            {
+                // A job waiting out its start retry delay keeps its claim on
+                // capacity, as if it were waiting for permits.
+                "permits"
+            } else {
+                "queue order"
+            },
+        )
     }
 
     fn update_queue_wait_clocks(&self, inner: &Inner, now: u64, index: &DispatchIndex) {
@@ -5334,15 +5385,23 @@ impl Runner {
             .collect();
         for id in queued {
             let job = &inner.jobs[&id];
-            let is_workspace_head =
-                index.queued.get(job.key()).and_then(|queue| queue.first()) == Some(&id);
+            let is_workspace_head = index
+                .queued
+                .get(crate::caller_path::job_key(job))
+                .and_then(|queue| queue.first())
+                == Some(&id);
             // The running or setup jobs that hold this job's checkout: the
             // owner of the same workspace, and jobs that check out an
             // overlapping path as a sibling (the same host directory).
             let mut holders = BTreeMap::new();
             if is_workspace_head {
-                holders.extend(index.workspace_owners.get(job.key()).copied());
-                holders.extend(index.checkout_sibling_users(job.key()));
+                holders.extend(
+                    index
+                        .workspace_owners
+                        .get(crate::caller_path::job_key(job))
+                        .copied(),
+                );
+                holders.extend(index.checkout_sibling_users(crate::caller_path::job_key(job)));
                 holders.remove(&id);
             }
             // A job held back only so that an earlier queued workspace job can
@@ -5353,7 +5412,7 @@ impl Runner {
             // to be freed when checking that this job would otherwise fit.
             let held = holders.is_empty()
                 && is_workspace_head
-                && !index.occupied(job.key())
+                && !index.occupied(crate::caller_path::job_key(job))
                 && index.held_by_queued_workspace(inner, job, self.core.config.max_weight);
             let pause = job.queued_ms.is_some()
                 && (!holders.is_empty() || held)
@@ -5363,7 +5422,7 @@ impl Runner {
                         .fold(0u32, |sum, weight| sum.saturating_add(*weight));
                     let blocked_by_head = blockers.get(&id).is_some_and(Option::is_some);
                     !blocked_by_head
-                        && !Self::deleting(inner, job.key(), &request.siblings)
+                        && !Self::deleting(inner, paths::host_str(crate::caller_path::job_key(job)), &request.siblings)
                         && job.weight <= self.core.config.max_weight
                         && index
                             .weight
@@ -5430,7 +5489,7 @@ impl Runner {
                 format!(
                     "job={} workspace={} permits={} phase={} since_ms={}",
                     j.id,
-                    j.key(),
+                    paths::job_key(j),
                     j.weight,
                     if inner.starting.contains(&j.id) {
                         "setup"
@@ -5438,7 +5497,7 @@ impl Runner {
                         "running"
                     },
                     j.started_ms
-                        .or_else(|| inner.reserved.get(j.key()).map(|r| r.since_ms))
+                        .or_else(|| inner.reserved.get(paths::job_key(j)).map(|r| r.since_ms))
                         .unwrap_or(j.accepted_ms)
                 )
             })
@@ -5473,12 +5532,15 @@ impl Runner {
         // so name them: the holders list alone does not say which one it is.
         let sibling_users = if phase == SIBLING_USER_WAIT {
             let users: Vec<_> = index
-                .checkout_sibling_users(job.key())
+                .checkout_sibling_users(crate::caller_path::job_key(job))
                 .into_iter()
                 .map(|(user, weight)| {
                     format!(
                         "job={user} workspace={} permits={weight}",
-                        inner.jobs.get(&user).map_or("unknown", |j| j.key())
+                        inner
+                            .jobs
+                            .get(&user)
+                            .map_or("unknown", |j| paths::job_key(j))
                     )
                 })
                 .collect();
@@ -5496,7 +5558,7 @@ impl Runner {
     /// worker parked on the lock stops the runner answering other connections.
     pub async fn drop_workspace(&self, key: &str) -> io::Result<DropReply> {
         self.ensure_reconciled()?;
-        self.validate_destinations(key, None, &[])?;
+        self.validate_destinations(crate::caller_path::host_str(key), None, &[])?;
         let key = key.to_string();
         let (guard, mut ids, admitting) = self
             .off_runtime({
@@ -5514,7 +5576,7 @@ impl Runner {
                     let ids: Vec<_> = inner
                         .jobs
                         .values()
-                        .filter(|j| j.key() == key && j.terminal.is_none())
+                        .filter(|j| crate::caller_path::job_key(j) == key && j.terminal.is_none())
                         .map(|j| j.id)
                         .collect();
                     let admitting: Vec<_> = inner
@@ -5572,7 +5634,7 @@ impl Runner {
             // disconnects. Only this operation may remove its marker.
             let _guard = guard;
             let _pressure = runner.core.disk.lock().unwrap();
-            runner.validate_destinations(&key, None, &[])?;
+            runner.validate_destinations(crate::caller_path::host_str(&key), None, &[])?;
             let mut inner = runner.core.inner.lock().unwrap();
             let dropped = inner.catalog.workspaces.contains_key(&key);
             let catalog = if dropped {
@@ -5800,19 +5862,18 @@ impl Runner {
         if !self.core.quarantined.is_empty() {
             return Ok(false);
         }
-        let idle: Vec<_> = inner
-            .catalog
-            .workspaces
-            .iter()
+        let idle: Vec<_> = crate::caller_path::entries(&inner.catalog.workspaces)
+            .map(|(path, record)| (path.caller.text(), record))
             .filter(|(key, w)| {
                 w.kind != WorkspaceKind::Head
                     && self.now().saturating_sub(w.used_ms) >= RETENTION_MS
                     && !inner.reserved.contains_key(*key)
                     && !inner.preparing.values().any(|p| {
-                        Path::new(&p.workspace_key).starts_with(key)
-                            || Path::new(key).starts_with(&p.workspace_key)
+                        paths::request(p).host_workspace.as_path().starts_with(key)
+                            || Path::new(key)
+                                .starts_with(paths::request(p).caller_workspace_key.text())
                     })
-                    && !Self::deleting(&inner, key, &[])
+                    && !Self::deleting(&inner, paths::host_str(key), &[])
                     && !inner
                         .admission_saves
                         .values()
@@ -5820,12 +5881,14 @@ impl Runner {
                     && !inner
                         .jobs
                         .values()
-                        .any(|j| j.key() == *key && j.terminal.is_none())
+                        .any(|j| crate::caller_path::job_key(j) == *key && j.terminal.is_none())
             })
             .map(|(k, _)| k.clone())
             .collect();
         for key in idle {
-            if let Err(error) = self.validate_destinations(&key, None, &[]) {
+            if let Err(error) =
+                self.validate_destinations(crate::caller_path::host_str(&key), None, &[])
+            {
                 tracing::warn!(workspace = %key, %error, "workspace expiry refused outside owned roots");
                 continue;
             }
@@ -5843,20 +5906,24 @@ impl Runner {
         // and their failed-fill records stop a failing fill from rerunning.
         let nested_in_workspace = |repository: &str| {
             let path = Path::new(repository);
-            inner.catalog.workspaces.keys().any(|workspace| {
-                let workspace = Path::new(workspace);
-                path != workspace && path.starts_with(workspace)
-            })
+            crate::caller_path::keys(&inner.catalog.workspaces)
+                .map(|path| path.caller.text())
+                .any(|workspace| {
+                    let workspace = Path::new(workspace);
+                    path != workspace && path.starts_with(workspace)
+                })
         };
-        let stale_repositories: Vec<_> = inner
-            .catalog
-            .repositories
-            .iter()
+        let stale_repositories: Vec<_> = crate::caller_path::entries(&inner.catalog.repositories)
+            .map(|(path, record)| (path.caller.text(), record))
             .filter_map(|(repository, record)| {
                 let has_unfinished_job = inner.jobs.values().any(|job| {
                     job.terminal.is_none()
                         && job.request.as_ref().is_some_and(|request| {
-                            request.repository_root.as_str() == repository.as_str()
+                            paths::request(request)
+                                .caller_repository_root
+                                .text()
+                                .as_str()
+                                == repository.as_str()
                         })
                 });
                 let fill_in_progress = record.result.as_ref() == Some(&RebuildResult::Building);
@@ -6009,8 +6076,8 @@ impl Runner {
                 .or_default()
                 .insert(format!("refs/snapshots/{commit}"));
             for s in siblings {
-                known.insert(s.canonical_path.clone());
-                held.entry(s.canonical_path.clone())
+                known.insert(paths::sibling(s).caller.text().clone());
+                held.entry(paths::sibling(s).caller.text().clone())
                     .or_default()
                     .insert(format!("refs/snapshots/{}", s.commit));
             }
@@ -6019,26 +6086,26 @@ impl Runner {
             snapshot(
                 &mut known,
                 &mut held,
-                &w.repository,
+                paths::workspace_record(w).repository.caller.text(),
                 &w.snapshot,
-                &w.siblings,
+                paths::workspace_record(w).caller_siblings,
             );
         }
         for job in inner.jobs.values() {
             if let Some(r) = &job.request {
-                known.insert(r.repository_root.clone());
+                known.insert(paths::request(r).caller_repository_root.text().clone());
                 for s in &r.siblings {
-                    known.insert(s.canonical_path.clone());
+                    known.insert(paths::sibling(s).caller.text().clone());
                 }
                 if !job.base {
                     snapshot(
                         &mut known,
                         &mut held,
-                        &r.repository_root,
+                        paths::request(r).caller_repository_root.text(),
                         &r.snapshot_commit,
                         &r.siblings,
                     );
-                    held.entry(r.repository_root.clone())
+                    held.entry(paths::request(r).caller_repository_root.text().clone())
                         .or_default()
                         .insert(format!("refs/tips/{}", r.integration_tip));
                 }
@@ -6048,11 +6115,11 @@ impl Runner {
             snapshot(
                 &mut known,
                 &mut held,
-                &t.repository,
+                paths::retained_transfer(t).repository.caller.text(),
                 &t.snapshot,
-                &t.siblings,
+                paths::retained_transfer(t).caller_siblings,
             );
-            held.entry(t.repository.clone())
+            held.entry(paths::retained_transfer(t).repository.caller.text().clone())
                 .or_default()
                 .insert(format!("refs/tips/{}", t.tip));
         }
@@ -6060,18 +6127,20 @@ impl Runner {
             snapshot(
                 &mut known,
                 &mut held,
-                &p.repository_root,
+                paths::request(p).caller_repository_root.text(),
                 &p.base_commit,
                 &p.siblings,
             );
-            held.entry(p.repository_root.clone())
+            held.entry(paths::request(p).caller_repository_root.text().clone())
                 .or_default()
                 .insert(format!("refs/tips/{}", p.integration_tip));
         }
         for r in inner.reserved.values() {
             snapshot(&mut known, &mut held, &r.repository, &r.commit, &r.siblings);
         }
-        for (root, g) in &inner.catalog.repositories {
+        for (root, g) in crate::caller_path::entries(&inner.catalog.repositories)
+            .map(|(path, record)| (path.caller.text(), record))
+        {
             known.insert(root.clone());
             if let Some(commit) = &g.commit {
                 held.entry(root.clone())
@@ -6080,9 +6149,9 @@ impl Runner {
             }
         }
         for checkout in inner.catalog.legacy_checkouts.values() {
-            known.insert(checkout.repository.clone());
+            known.insert(paths::legacy_checkout(checkout).caller.text().clone());
             if let Some(tip) = &checkout.tip {
-                held.entry(checkout.repository.clone())
+                held.entry(paths::legacy_checkout(checkout).caller.text().clone())
                     .or_default()
                     .insert(format!("refs/tips/{tip}"));
             }
@@ -6093,11 +6162,11 @@ impl Runner {
             .filter(|j| j.base && j.terminal.is_none())
         {
             let r = job.request.as_ref().unwrap();
-            held.entry(r.repository_root.clone())
+            held.entry(paths::request(r).caller_repository_root.text().clone())
                 .or_default()
                 .insert(format!("refs/tips/{}", r.integration_tip));
             for s in &r.siblings {
-                held.entry(s.canonical_path.clone())
+                held.entry(paths::sibling(s).caller.text().clone())
                     .or_default()
                     .insert(format!("refs/snapshots/{}", s.commit));
             }
@@ -6441,18 +6510,16 @@ impl Runner {
         policy: &publication::PublishPolicy,
         now: u64,
     ) -> Vec<(String, BaseRequest)> {
-        inner
-            .catalog
-            .repositories
-            .iter()
+        crate::caller_path::entries(&inner.catalog.repositories)
+            .map(|(path, record)| (path.caller.text(), record))
             .filter(|(root, repository)| {
                 !Self::base_settlement_pending(inner, root)
                     && !inner.jobs.values().any(|j| {
                         j.base
                             && j.terminal.is_none()
-                            && j.request
-                                .as_ref()
-                                .is_some_and(|r| r.repository_root == **root)
+                            && j.request.as_ref().is_some_and(|r| {
+                                paths::request(r).caller_repository_root.text() == root.as_str()
+                            })
                     })
                     && repository
                         .filled_descriptor
@@ -6473,10 +6540,8 @@ impl Runner {
     /// Repositories whose desired warm build is not filled, has not failed
     /// and has no fill job yet, with that build.
     fn desired_bases(inner: &Inner) -> Vec<(String, BaseRequest)> {
-        inner
-            .catalog
-            .repositories
-            .iter()
+        crate::caller_path::entries(&inner.catalog.repositories)
+            .map(|(path, record)| (path.caller.text(), record))
             .filter_map(|(root, g)| {
                 let desired = g.desired.as_ref()?;
                 (g.requested_descriptor != g.filled_descriptor
@@ -6486,9 +6551,9 @@ impl Runner {
                     && !inner.jobs.values().any(|j| {
                         j.base
                             && j.terminal.is_none()
-                            && j.request
-                                .as_ref()
-                                .is_some_and(|r| r.repository_root == *root)
+                            && j.request.as_ref().is_some_and(|r| {
+                                paths::request(r).caller_repository_root.text() == root.as_str()
+                            })
                     }))
                 .then(|| (root.clone(), desired.clone()))
             })
@@ -6496,10 +6561,12 @@ impl Runner {
     }
 
     fn base_settlement_pending(inner: &Inner, root: &str) -> bool {
-        inner
-            .base_finishes
-            .values()
-            .any(|pending| pending.request.repository_root == root)
+        inner.base_finishes.values().any(|pending| {
+            paths::request(&pending.request)
+                .caller_repository_root
+                .text()
+                == root
+        })
     }
 
     fn dispatch(&self, inner: &mut Inner, now: u64) -> io::Result<()> {
@@ -6545,8 +6612,12 @@ impl Runner {
                     continue;
                 }
                 if (!self.core.config.windows_instance()
-                    && Self::deleting(inner, job.key(), &request.siblings))
-                    || index.occupied(job.key())
+                    && Self::deleting(
+                        inner,
+                        paths::host_str(crate::caller_path::job_key(job)),
+                        &request.siblings,
+                    ))
+                    || index.occupied(crate::caller_path::job_key(job))
                     || index.siblings_blocked(&request.siblings, &inner.catalog.sibling_commits)
                     || index.held_by_queued_workspace(inner, job, self.core.config.max_weight)
                 {
@@ -6560,7 +6631,11 @@ impl Runner {
                 // else: it can last until the VM is confirmed stopped.
                 #[cfg(unix)]
                 if self.core.config.macos_instance()
-                    && self.core.config.macos_runtime.workspace_busy(job.key(), id)
+                    && self
+                        .core
+                        .config
+                        .macos_runtime
+                        .workspace_busy(crate::caller_path::job_key(job), id)
                 {
                     continue;
                 }
@@ -6687,18 +6762,19 @@ impl Runner {
         inner.jobs.insert(id, queued_job);
         inner.starting.insert(id);
         inner.reserved.insert(
-            r.workspace_key.clone(),
+            paths::request(&r).caller_workspace_key.text().clone(),
             Reservation {
-                repository: r.repository_root.clone(),
+                repository: paths::request(&r).caller_repository_root.text().clone(),
                 commit: r.snapshot_commit.clone(),
                 siblings: r.siblings.clone(),
                 since_ms: self.now(),
             },
         );
         inner.dispatch += 1;
-        let rotation = inner
-            .rotation
-            .insert(r.workspace_key.clone(), inner.dispatch);
+        let rotation = inner.rotation.insert(
+            paths::request(&r).caller_workspace_key.text().clone(),
+            inner.dispatch,
+        );
         // In snapshot mode no sibling is checked out in place, so the
         // in-place sibling commits are not needed; the freshness record and
         // the start time the switch touch needs are taken here instead,
@@ -6714,7 +6790,10 @@ impl Runner {
                 inner.catalog.sibling_commits.clone()
             },
             snapshots: (snapshot_mode && !job.base).then(|| {
-                crate::sibling_snapshots::JobSiblings::reserve(&inner.catalog, &r.workspace_key)
+                crate::sibling_snapshots::JobSiblings::reserve(
+                    &inner.catalog,
+                    paths::request(&r).caller_workspace_key.text(),
+                )
             }),
             request: r,
         };
@@ -6724,7 +6803,10 @@ impl Runner {
         // a `PendingStart` dropped here would take that lock again: it is a
         // plain, non-reentrant mutex, so the scheduler would hang holding it.
         // The copy kept here undoes the dispatch under the lock already held.
-        let workspace = setup.request.workspace_key.clone();
+        let workspace = paths::request(&setup.request)
+            .caller_workspace_key
+            .text()
+            .clone();
         let base = job.base;
         let undo = (job, rotation);
         let kept = undo.clone();
@@ -6797,7 +6879,9 @@ impl Runner {
                     // is already saved.
                     pending.settled();
                     inner.starting.remove(&s.id);
-                    inner.reserved.remove(&s.request.workspace_key);
+                    inner
+                        .reserved
+                        .remove(paths::request(&s.request).caller_workspace_key.text());
                     if s.base {
                         if let Err(error) = self.finish_base(&mut inner, &s.request, false, None) {
                             tracing::error!(job_id = %s.id, %error, "warm build bookkeeping failed");
@@ -6841,8 +6925,8 @@ impl Runner {
                 // Validated before a sibling's mirror is read for it.
                 workspace::validate_destinations(
                     &self.core.config.owned_workspace_roots,
-                    &r.workspace_key,
-                    Some(&r.cwd),
+                    paths::request(r).host_workspace,
+                    Some(paths::run(r).host_cwd),
                     &r.siblings,
                 )?;
                 let resolved = setup_step(
@@ -6867,7 +6951,7 @@ impl Runner {
                     Ok(prepared) => return Ok(prepared),
                     Err(error) if crate::boat_quota::cold_cache(&error).is_some() => {
                         let request = crate::boat_quota::cold_cache(&error).unwrap();
-                        tracing::info!(job_id = %s.id, workspace = %s.request.workspace_key, initial_bytes = ?request.initial_bytes, cap_bytes = request.cap_bytes, minimum_growth_bytes = request.minimum_growth, "evicting Boat cache before one cold materialization retry");
+                        tracing::info!(job_id = %s.id, workspace = %paths::request(&s.request).caller_workspace_key.text(), initial_bytes = ?request.initial_bytes, cap_bytes = request.cap_bytes, minimum_growth_bytes = request.minimum_growth, "evicting Boat cache before one cold materialization retry");
                         self.evict_boat_setup_workspace(s)?;
                         let mut cold = self.core.config.clone();
                         cold.boat_cold_materialization = true;
@@ -6911,7 +6995,10 @@ impl Runner {
         let mut pending = PendingStart {
             runner: self.clone(),
             id: s.id,
-            workspace: s.request.workspace_key.clone(),
+            workspace: paths::request(&s.request)
+                .caller_workspace_key
+                .text()
+                .clone(),
             base: s.base,
             undo: None,
         };
@@ -6961,8 +7048,8 @@ impl Runner {
         } else {
             self.note_workspace(
                 &mut inner,
-                &r.workspace_key,
-                &r.repository_root,
+                paths::request(&r).caller_workspace_key.text(),
+                paths::request(&r).caller_repository_root.text(),
                 &r.snapshot_commit,
                 &r.siblings,
                 prepared.is_ok(),
@@ -6972,7 +7059,10 @@ impl Runner {
             // Only a setup that completed, and so completed its switch
             // touch, updates the workspace's sibling freshness record.
             if let Some(snapshots) = snapshots.filter(|_| prepared.is_ok()) {
-                snapshots.apply(&mut inner.catalog, &r.workspace_key);
+                snapshots.apply(
+                    &mut inner.catalog,
+                    paths::request(&r).caller_workspace_key.text(),
+                );
             }
         }
         let live = inner
@@ -7020,7 +7110,9 @@ impl Runner {
                 Err(error) => Err(error),
             };
             inner.starting.remove(&id);
-            inner.reserved.remove(&r.workspace_key);
+            inner
+                .reserved
+                .remove(paths::request(&r).caller_workspace_key.text());
             let finished = match prepared {
                 Err(error) if live => {
                     let (reason, detail) = if error.to_string() == "tree_hash_mismatch"
@@ -7085,7 +7177,9 @@ impl Runner {
                 let mut inner = self.core.inner.lock().unwrap();
                 inner.launching.remove(&id);
                 inner.starting.remove(&id);
-                inner.reserved.remove(&r.workspace_key);
+                inner
+                    .reserved
+                    .remove(paths::request(&r).caller_workspace_key.text());
                 return refuse(
                     &mut inner,
                     RefusalReason::WorkspaceSetupFailed,
@@ -7148,7 +7242,9 @@ impl Runner {
         // The start is settled either way: the job is published Running, or
         // `failed_launch` stops its process and refuses it.
         pending.settled();
-        inner.reserved.remove(&r.workspace_key);
+        inner
+            .reserved
+            .remove(paths::request(&r).caller_workspace_key.text());
         inner.launching.remove(&id);
         if let Err(error) = saved {
             // The job stays in `starting`, now with its launched process
@@ -7193,7 +7289,7 @@ impl Runner {
             drop(inner);
             return self.failed_launch(id, execution, error, false, "release_failed");
         }
-        tracing::info!(job_id = %id, workspace = %r.workspace_key, base = s.base, permits = weight, since_ms = started_ms, "job started");
+        tracing::info!(job_id = %id, workspace = %paths::request(&r).caller_workspace_key.text(), base = s.base, permits = weight, since_ms = started_ms, "job started");
         drop(inner);
         if launch.durable_output {
             if let Some(output) = output {
@@ -8083,7 +8179,7 @@ impl Runner {
         // reclaims the rest of the tree. A failure here only loses the scan.
         #[cfg(target_os = "linux")]
         if self.core.config.isolate_jobs && !job.base && !self.core.config.vm_instance() {
-            let root = Path::new(job.key());
+            let root = paths::job_workspace(&job).as_path();
             if fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_dir()) {
                 if let Err(error) = crate::isolation::restore_runner_root_access(root) {
                     tracing::warn!(job_id = %id, workspace = %root.display(), %error, "cannot restore runner access to the workspace root after the job");
@@ -8114,15 +8210,21 @@ impl Runner {
             (|| -> io::Result<()> {
                 #[cfg(target_os = "linux")]
                 if self.core.config.isolate_jobs {
-                    crate::isolation::restore_runner_access(Path::new(&r.cwd))?;
+                    crate::isolation::restore_runner_access(paths::run(r).host_cwd.as_path())?;
                 }
                 for (path, bytes) in crate::writer::fill::lockfiles(
-                    &self.core.trees.mirror(&r.repository_root),
+                    &self
+                        .core
+                        .trees
+                        .mirror(paths::request(r).caller_repository_root.text()),
                     &r.snapshot_commit,
-                    Path::new(&r.cwd),
+                    paths::run(r).host_cwd.as_path(),
                 )? {
                     let original = workspace::blob(
-                        &self.core.trees.mirror(&r.repository_root),
+                        &self
+                            .core
+                            .trees
+                            .mirror(paths::request(r).caller_repository_root.text()),
                         &format!("{}:{path}", r.snapshot_commit),
                     )?;
                     if bytes != original {
@@ -8184,7 +8286,10 @@ impl Runner {
         let reader_descriptor =
             if !job.base && crate::writer::fill::reader_missed(&self.core.trees.state, id) {
                 let r = job.request.as_ref().unwrap();
-                let mirror = self.core.trees.mirror(&r.repository_root);
+                let mirror = self
+                    .core
+                    .trees
+                    .mirror(paths::request(r).caller_repository_root.text());
                 let (steps, declared) = if self.core.config.base_commands.is_empty() {
                     workspace::warm_steps(&mirror, &r.snapshot_commit)
                 } else {
@@ -8217,7 +8322,7 @@ impl Runner {
         let return_result = job
             .request
             .as_ref()
-            .filter(|r| !r.return_paths.is_empty() && !r.return_chunked)
+            .filter(|r| !paths::run(r).caller_return_paths.is_empty() && !r.return_chunked)
             .map(|request| {
                 let seq = self.core.inner.lock().unwrap().jobs[&id].next_seq;
                 crate::return_paths::collect(request, seq)
@@ -8226,7 +8331,7 @@ impl Runner {
         let returned = job
             .request
             .as_ref()
-            .filter(|r| !r.return_paths.is_empty() && r.return_chunked)
+            .filter(|r| !paths::run(r).caller_return_paths.is_empty() && r.return_chunked)
             .map(|request| crate::return_paths::collect_chunked(request, &job_directory));
         self.finish_step(id, &job.kill, "returned files collected", finish_started);
         let log = self.job_log(id);
@@ -8480,17 +8585,21 @@ impl Runner {
                 cleanup,
             )?;
             let catalog = self.catalog_snapshot(&inner)?;
-            let next = inner.catalog.repositories[&request.repository_root]
-                .desired
-                .clone()
-                .filter(|desired| {
-                    self.warm_builds_enabled(&desired.tip) && inner.drain_deadline.is_none()
-                });
+            let next = inner.catalog.repositories
+                [paths::request(&request).caller_repository_root.text()]
+            .desired
+            .clone()
+            .filter(|desired| {
+                self.warm_builds_enabled(&desired.tip) && inner.drain_deadline.is_none()
+            });
             drop(inner);
             self.finish_step(id, &kill, "state lock released", finish_started);
             self.write_catalog(catalog)?;
             if let Some(desired) = next {
-                self.queue_next_base(&request.repository_root, &desired)?;
+                self.queue_next_base(
+                    paths::request(&request).caller_repository_root.text(),
+                    &desired,
+                )?;
             }
         } else {
             drop(inner);
@@ -8511,12 +8620,20 @@ impl Runner {
         request: &Run,
         reader_descriptor: Option<&String>,
     ) {
-        let Some(w) = inner.catalog.workspaces.get_mut(&request.workspace_key) else {
+        let Some(w) = inner
+            .catalog
+            .workspaces
+            .get_mut(paths::request(request).caller_workspace_key.text())
+        else {
             return;
         };
         w.used_ms = self.now();
         if let Some(descriptor) = reader_descriptor {
-            if let Some(g) = inner.catalog.repositories.get_mut(&request.repository_root) {
+            if let Some(g) = inner
+                .catalog
+                .repositories
+                .get_mut(paths::request(request).caller_repository_root.text())
+            {
                 // Aggregate misses cannot identify individual units. Restrict
                 // refills to matching graphs and one attempt per approved tip
                 // so a feature/profile the warm command omits cannot loop.
@@ -8700,12 +8817,15 @@ impl Runner {
             let mut inner = self.core.inner.lock().unwrap();
             inner.base_finishes.remove(&id);
             marker.clear(&mut inner);
-            inner.catalog.repositories[&request.repository_root]
+            inner.catalog.repositories[paths::request(&request).caller_repository_root.text()]
                 .desired
                 .clone()
         };
         if let Some(next) = next {
-            self.queue_next_base(&request.repository_root, &next)?;
+            self.queue_next_base(
+                paths::request(&request).caller_repository_root.text(),
+                &next,
+            )?;
         }
         Ok(())
     }
@@ -8792,7 +8912,7 @@ impl Runner {
         let g = inner
             .catalog
             .repositories
-            .get_mut(&r.repository_root)
+            .get_mut(paths::request(r).caller_repository_root.text())
             .unwrap();
         if success {
             g.failure_detail = None;
@@ -8823,7 +8943,7 @@ impl Runner {
                 })
                 .or_else(|| inner.jobs[&r.job_id].monitoring_error.clone())
                 .unwrap_or_else(|| "command/setup did not complete successfully".into());
-            tracing::warn!(job_id = %r.job_id, repository = %r.repository_root, reason = %detail, "dependency writer fill failed");
+            tracing::warn!(job_id = %r.job_id, repository = %paths::request(r).caller_repository_root.text(), reason = %detail, "dependency writer fill failed");
             #[cfg(unix)]
             {
                 fill_failure_detail = Some(detail.clone());
@@ -8856,7 +8976,7 @@ impl Runner {
                 let g = inner
                     .catalog
                     .repositories
-                    .get_mut(&r.repository_root)
+                    .get_mut(paths::request(r).caller_repository_root.text())
                     .unwrap();
                 publication::record(
                     g,
@@ -8869,14 +8989,14 @@ impl Runner {
                 match &outcome {
                     publication::Outcome::Published { keys } => tracing::info!(
                         job_id = %r.job_id,
-                        repository = %r.repository_root,
+                        repository = %paths::request(r).caller_repository_root.text(),
                         %descriptor,
                         keys = keys.len(),
                         "remote cache fill published"
                     ),
                     publication::Outcome::Failed { reason } => tracing::warn!(
                         job_id = %r.job_id,
-                        repository = %r.repository_root,
+                        repository = %paths::request(r).caller_repository_root.text(),
                         %descriptor,
                         reason = %reason,
                         "remote cache fill did not publish"
@@ -9073,15 +9193,16 @@ impl DispatchIndex {
         for job in Runner::scheduler_jobs(inner) {
             if excluded.contains(&job.id) {
                 if inner.starting.contains(&job.id) {
-                    excluded_reservations.insert(job.key().to_owned());
+                    excluded_reservations.insert(crate::caller_path::job_key(job).to_owned());
                 }
                 continue;
             }
             if job.state == JobState::Running || inner.starting.contains(&job.id) {
                 index.weight = index.weight.saturating_add(job.weight);
-                index
-                    .workspace_owners
-                    .insert(job.key().to_owned(), (job.id, job.weight));
+                index.workspace_owners.insert(
+                    crate::caller_path::job_key(job).to_owned(),
+                    (job.id, job.weight),
+                );
                 if index.in_place || Runner::legacy_sibling_user(inner, job) {
                     index.add_sibling_user(job);
                 }
@@ -9095,26 +9216,30 @@ impl DispatchIndex {
             if job.state == JobState::Queued && !inner.starting.contains(&job.id) {
                 index
                     .queued
-                    .entry(job.key().to_owned())
+                    .entry(crate::caller_path::job_key(job).to_owned())
                     .or_default()
                     .push(job.id);
             }
             if job.state == JobState::Running {
-                index.workspaces.insert(job.key().to_owned());
+                index
+                    .workspaces
+                    .insert(crate::caller_path::job_key(job).to_owned());
                 if let Some(request) = &job.request {
                     index.running_paths.insert(if job.base {
-                        request.cwd.clone()
+                        paths::run(request).caller_cwd.text().clone()
                     } else {
-                        request.workspace_key.clone()
+                        paths::request(request).caller_workspace_key.text().clone()
                     });
                     for sibling in &request.siblings {
                         if index.in_place || Runner::legacy_sibling_user(inner, job) {
-                            index.sibling_paths.insert(sibling.canonical_path.clone());
+                            index
+                                .sibling_paths
+                                .insert(paths::sibling(sibling).caller.text().clone());
                         }
                         if index.in_place {
                             index
                                 .running_siblings
-                                .entry(sibling.canonical_path.clone())
+                                .entry(paths::sibling(sibling).caller.text().clone())
                                 .or_default()
                                 .insert(sibling.commit.clone());
                         }
@@ -9131,7 +9256,12 @@ impl DispatchIndex {
             if let Some(request) = &job.request {
                 let newest = index
                     .newest_arrivals
-                    .entry(request.repository_root.clone())
+                    .entry(
+                        paths::request(request)
+                            .caller_repository_root
+                            .text()
+                            .clone(),
+                    )
                     .or_default();
                 *newest = (*newest).max(job.order);
             }
@@ -9152,9 +9282,10 @@ impl DispatchIndex {
             return;
         }
         for sibling in siblings {
-            self.sibling_paths.insert(sibling.canonical_path.clone());
+            self.sibling_paths
+                .insert(paths::sibling(sibling).caller.text().clone());
             self.reserved_siblings
-                .entry(sibling.canonical_path.clone())
+                .entry(paths::sibling(sibling).caller.text().clone())
                 .or_default()
                 .insert(sibling.commit.clone());
         }
@@ -9162,7 +9293,7 @@ impl DispatchIndex {
     fn add_sibling_user(&mut self, job: &Job) {
         for sibling in job.request.iter().flat_map(|request| &request.siblings) {
             self.sibling_users
-                .entry(sibling.canonical_path.clone())
+                .entry(paths::sibling(sibling).caller.text().clone())
                 .or_default()
                 .insert(job.id, job.weight);
         }
@@ -9197,18 +9328,19 @@ impl DispatchIndex {
                 self.running_paths
                     .iter()
                     .chain(&self.reserved_paths)
-                    .any(|path| Self::overlap(path, &sibling.canonical_path))
+                    .any(|path| Self::overlap(path, paths::sibling(sibling).caller.text()))
                     || self
                         .running_siblings
-                        .get(&sibling.canonical_path)
+                        .get(paths::sibling(sibling).caller.text())
                         .is_some_and(|commits| {
                             commits.iter().any(|commit| commit != &sibling.commit)
                         })
                     || self
                         .reserved_siblings
-                        .get(&sibling.canonical_path)
+                        .get(paths::sibling(sibling).caller.text())
                         .is_some_and(|commits| {
-                            catalog.get(&sibling.canonical_path) != Some(&sibling.commit)
+                            catalog.get(paths::sibling(sibling).caller.text())
+                                != Some(&sibling.commit)
                                 || commits.iter().any(|commit| commit != &sibling.commit)
                         })
             })
@@ -9247,7 +9379,7 @@ impl DispatchIndex {
                 && request
                     .siblings
                     .iter()
-                    .any(|sibling| Self::overlap(key, &sibling.canonical_path))
+                    .any(|sibling| Self::overlap(key, paths::sibling(sibling).caller.text()))
         })
     }
     /// The head of each workspace queue, in the order dispatch tries them:
@@ -9268,7 +9400,10 @@ impl DispatchIndex {
                     let newest = job
                         .request
                         .as_ref()
-                        .and_then(|request| self.newest_arrivals.get(&request.repository_root))
+                        .and_then(|request| {
+                            self.newest_arrivals
+                                .get(paths::request(request).caller_repository_root.text())
+                        })
                         .copied()
                         .unwrap_or(0);
                     (1, u64::MAX - newest, job.order, *id)
@@ -9279,7 +9414,11 @@ impl DispatchIndex {
                 } else {
                     (
                         3,
-                        inner.rotation.get(job.key()).copied().unwrap_or(0),
+                        inner
+                            .rotation
+                            .get(crate::caller_path::job_key(job))
+                            .copied()
+                            .unwrap_or(0),
                         job.order,
                         *id,
                     )
@@ -9291,7 +9430,7 @@ impl DispatchIndex {
     }
     fn started(&mut self, inner: &Inner, id: Uuid) {
         let job = &inner.jobs[&id];
-        let key = job.key();
+        let key = crate::caller_path::job_key(job);
         let queue = self.queued.get_mut(key).unwrap();
         queue.retain(|queued| *queued != id);
         if queue.is_empty() {

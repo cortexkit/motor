@@ -87,7 +87,9 @@ pub(super) fn snapshot(config: &Config, catalog: &Catalog, now: u64) -> RemoteCa
     }
     // Bound the wire block independently of repository history and URLs.
     // Operators can read the full publication records from catalog.json.
-    for (root, record) in &catalog.repositories {
+    for (root, record) in crate::caller_path::entries(&catalog.repositories)
+        .map(|(path, record)| (path.caller.text(), record))
+    {
         if record.filled_descriptor.is_none() && record.failed_descriptor.is_none() {
             continue;
         }
