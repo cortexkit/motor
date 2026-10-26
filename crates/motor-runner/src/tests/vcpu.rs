@@ -707,6 +707,8 @@ async fn isolated_oom_group_kill_preserves_signal_and_memory_detail() {
     config.isolate_jobs = true;
     config.cpu_topology = None;
     config.memory_floor_gib = Some(1);
+    // The gate hook must arm this job's cgroup, not an unrelated cache fill.
+    config.disable_warm_builds = true;
     let record = config
         .state_dir()
         .join("jobs")
