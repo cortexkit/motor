@@ -43,11 +43,14 @@ pub(crate) struct Unreadable {
 }
 
 impl Unreadable {
-    /// Record which caller path and which step hit a permission failure.
-    /// Any other error is returned unchanged.
+    /// Give every failed read a path and step, keeping permission failures
+    /// identifiable so validation can repair access before retrying.
     pub(crate) fn wrap(path: &Path, step: &'static str, error: io::Error) -> io::Error {
-        if error.kind() != io::ErrorKind::PermissionDenied {
+        if Self::of(&error).is_some() {
             return error;
+        }
+        if error.kind() != io::ErrorKind::PermissionDenied {
+            return io::Error::new(error.kind(), format!("{step} {}: {error}", path.display()));
         }
         io::Error::new(
             io::ErrorKind::PermissionDenied,

@@ -19,6 +19,11 @@ pub use cache::CacheFill;
 /// checkout to exist. A dangling symlink or a permission failure is not a safe
 /// missing ancestor and is refused rather than treated as a lexical path.
 pub(crate) fn canonical_future(path: &Path) -> io::Result<PathBuf> {
+    resolve_canonical_future(path)
+        .map_err(|error| Unreadable::wrap(path, "resolve writer path", error))
+}
+
+fn resolve_canonical_future(path: &Path) -> io::Result<PathBuf> {
     if !workspace::absolute(&path.to_string_lossy()) {
         return Err(io::Error::other(
             "writer path exclusion requires an absolute, clean path",
@@ -67,11 +72,17 @@ fn has_base_component(path: &Path, prefix: &str) -> bool {
         .any(|component| component.as_os_str().to_string_lossy().starts_with(prefix))
 }
 
-fn contains_base_checkout(path: &Path, prefix: &str) -> io::Result<bool> {
+fn contains_base_checkout(_config: &Config, path: &Path, prefix: &str) -> io::Result<bool> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
+        Err(error) => {
+            return Err(Unreadable::wrap(
+                path,
+                "inspect directory for runner base checkouts",
+                error,
+            ));
+        }
     };
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Ok(false);
@@ -81,10 +92,35 @@ fn contains_base_checkout(path: &Path, prefix: &str) -> io::Result<bool> {
     // checkouts. Never walk a workspace's retained target/ build directory: its
     // private job-owned directories may be unreadable to the runner, and build
     // trees can be enormous.
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
+    #[cfg(test)]
+    if let Some(hook) = &_config.long_work {
+        hook("writer_base_checkout_metadata");
+    }
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        // Snapshot-mode siblings can be retired after the metadata read. A
+        // missing directory cannot contain a writer checkout to hand to a job.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(Unreadable::wrap(
+                path,
+                "listing the directory for runner base checkouts",
+                error,
+            ));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            Unreadable::wrap(
+                path,
+                "read directory entry for runner base checkouts",
+                error,
+            )
+        })?;
         if entry.file_name().to_string_lossy().starts_with(prefix) {
-            let kind = entry.file_type()?;
+            let kind = entry.file_type().map_err(|error| {
+                Unreadable::wrap(&entry.path(), "inspect runner base checkout entry", error)
+            })?;
             if kind.is_dir() || kind.is_symlink() {
                 return Ok(true);
             }
@@ -107,9 +143,7 @@ pub(crate) fn validate_paths(
             .chain(cwd)
             .chain(siblings.iter().map(|s| crate::caller_path::sibling(s).host))
             .map(|path| {
-                let canonical = canonical_future(path.as_path()).map_err(|error| {
-                    Unreadable::wrap(path.as_path(), "resolving symlinks in the path", error)
-                })?;
+                let canonical = canonical_future(path.as_path())?;
                 Ok((path.as_path().to_path_buf(), canonical))
             }),
     )
@@ -150,13 +184,7 @@ fn validate_resolved_paths(
         if protected.iter().any(|owned| overlaps(&canonical, owned))
             || has_base_component(&supplied, &prefix)
             || has_base_component(&canonical, &prefix)
-            || contains_base_checkout(&canonical, &prefix).map_err(|error| {
-                Unreadable::wrap(
-                    &supplied,
-                    "listing the directory for runner base checkouts",
-                    error,
-                )
-            })?
+            || contains_base_checkout(config, &canonical, &prefix)?
         {
             return Err(io::Error::other(format!(
                 "caller path overlaps writer-owned storage: {}",
@@ -171,7 +199,10 @@ fn canonical_runner_path(path: &Path) -> io::Result<PathBuf> {
     if path.is_absolute() {
         canonical_future(path)
     } else {
-        canonical_future(&std::env::current_dir()?.join(path))
+        let cwd = std::env::current_dir().map_err(|error| {
+            Unreadable::wrap(path, "resolve runner storage relative path", error)
+        })?;
+        canonical_future(&cwd.join(path))
     }
 }
 
