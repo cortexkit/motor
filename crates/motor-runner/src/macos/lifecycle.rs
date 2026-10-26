@@ -506,34 +506,49 @@ impl Runtime {
                 .transpose()
                 .map(|alive| alive.unwrap_or(false))
         };
-        while helper_alive()? && started.elapsed() < self.grace {
+        // Each step names itself in its error, so a stop that cannot be proven
+        // says which check failed instead of a bare OS error.
+        let step = |name: &'static str| {
+            move |e: io::Error| io::Error::new(e.kind(), format!("{name}: {e}"))
+        };
+        while helper_alive().map_err(step("helper liveness"))? && started.elapsed() < self.grace {
             std::thread::park_timeout(Duration::from_millis(5));
         }
-        if helper_alive()? {
+        if helper_alive().map_err(step("helper liveness"))? {
             let mut owned = entry.owned.lock().unwrap();
             if let Some(helper) = owned.helper.as_mut() {
-                helper.child.kill()?;
+                helper.child.kill().map_err(step("helper kill"))?;
             } else if let Some(process) = record.helper {
-                self.host.kill(process)?;
+                self.host
+                    .kill(process)
+                    .map_err(step("recorded helper kill"))?;
             }
         }
         if let Some(service) = record.service {
-            self.host.kill(service)?;
+            self.host.kill(service).map_err(step("service kill"))?;
         }
         loop {
-            if !helper_alive()? {
+            if !helper_alive().map_err(step("helper liveness"))? {
                 if record.gate_open {
-                    self.host.stop_unrecorded(&record)?;
+                    self.host
+                        .stop_unrecorded(&record)
+                        .map_err(step("unrecorded service stop"))?;
                 }
                 let mut service_alive = false;
                 if let Some(service) = record.service {
-                    service_alive = self.host.alive(service)?;
+                    service_alive = self.host.alive(service).map_err(step("service liveness"))?;
                 }
                 // The scan is mandatory even when no service identity was ever
                 // reported. A process with another name can still hold the disks.
-                let released = self.host.release_proven(&record)?;
-                let unrecorded =
-                    record.gate_open && record.service.is_none() && self.unrecorded_owned()?;
+                let released = self
+                    .host
+                    .release_proven(&record)
+                    .map_err(step("disk release scan"))?;
+                let unrecorded = record.gate_open
+                    && record.service.is_none()
+                    && self
+                        .unrecorded_owned()
+                        .map_err(step("unrecorded service scan"))?;
                 if !service_alive && released && !unrecorded {
                     break;
                 }
