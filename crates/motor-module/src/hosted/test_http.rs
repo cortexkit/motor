@@ -28,6 +28,17 @@ impl Http {
     pub async fn with_reply_bytes(
         reply: impl Fn(&str, &Value) -> (u16, Vec<u8>) + Send + Sync + 'static,
     ) -> Self {
+        Self::with_async_reply(move |path, body| {
+            let response = reply(&path, &body);
+            std::future::ready(response)
+        })
+        .await
+    }
+    pub async fn with_async_reply<F, R>(reply: F) -> Self
+    where
+        F: Fn(String, Value) -> R + Send + Sync + 'static,
+        R: std::future::Future<Output = (u16, Vec<u8>)> + Send,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Requests::default();
@@ -69,7 +80,7 @@ impl Http {
                     .lock()
                     .unwrap()
                     .push((path.to_owned(), body.clone()));
-                let (status, body) = reply(path, &body);
+                let (status, body) = reply(path.to_owned(), body).await;
                 let head = format!("HTTP/1.1 {status} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
                 let _ = socket.write_all(head.as_bytes()).await;
                 let _ = socket.write_all(&body).await;

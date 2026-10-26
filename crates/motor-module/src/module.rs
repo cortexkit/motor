@@ -407,6 +407,7 @@ impl Handler {
         }
         if let Ok(motor) = self.initialized() {
             motor.shutdown_shadows().await;
+            motor.shutdown_hosted().await;
             let motor = motor.clone();
             match tokio::task::spawn_blocking(move || motor.shutdown_storage()).await {
                 Ok(Ok(())) => {}

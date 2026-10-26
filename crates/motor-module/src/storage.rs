@@ -309,10 +309,9 @@ impl State {
         self.jobs.retain(|id, job| {
             self.active_jobs.contains_key(id)
                 || job.pending_cancel
-                || job
-                    .hosted
-                    .as_ref()
-                    .is_some_and(|s| s.pending_finish.is_some())
+                || job.hosted.as_ref().is_some_and(|s| {
+                    s.pending_finish.is_some() || s.cleanup_pending && !s.finish_done
+                })
                 || (!job.legacy_expired(*id, now)
                     && (job.terminal_observed_at_ms.is_none()
                         || job.terminal_delivered_at_ms.is_none()
@@ -349,6 +348,7 @@ pub(crate) struct Storage {
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     tip_checks: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
     failed_tips: Mutex<BTreeMap<VerificationKey, Instant>>,
+    finish_locks: Mutex<BTreeMap<Uuid, Weak<tokio::sync::Mutex<()>>>>,
     // Fields drop after `Drop for Storage` returns, so the lease is released
     // only once the compactor is joined and the final checkpoint is written.
     _lease: StoreLease,
@@ -398,6 +398,32 @@ impl Drop for JobLease {
 }
 
 impl Storage {
+    pub(crate) async fn lock_finish(&self, id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.finish_locks.lock().unwrap();
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            let lock = locks.get(&id).and_then(Weak::upgrade).unwrap_or_default();
+            locks.insert(id, Arc::downgrade(&lock));
+            lock
+        };
+        lock.lock_owned().await
+    }
+
+    pub(crate) fn unsettled_hosted(&self) -> Vec<Uuid> {
+        self.state
+            .lock()
+            .unwrap()
+            .jobs
+            .iter()
+            .filter_map(|(id, job)| {
+                job.hosted
+                    .as_ref()
+                    .filter(|s| s.lease_attempted && !s.finish_done)
+                    .map(|_| *id)
+            })
+            .collect()
+    }
+
     pub(crate) fn shutdown(&self) -> io::Result<()> {
         // Freeze mutation before exporting; the lease outlives both the worker
         // and the final checkpoint, including when shutdown is called twice.
@@ -432,7 +458,8 @@ impl Storage {
             .filter_map(|(id, job)| {
                 let state = job.hosted.as_ref()?;
                 if state.finish_done
-                    || (state.pending_finish.is_none()
+                    || (!state.cleanup_pending
+                        && state.pending_finish.is_none()
                         && (state.terminal.is_none()
                             || state
                                 .placement
@@ -645,6 +672,7 @@ impl Storage {
             worker: Mutex::new(Some(worker)),
             tip_checks: Mutex::new(BTreeMap::new()),
             failed_tips: Mutex::new(BTreeMap::new()),
+            finish_locks: Mutex::new(BTreeMap::new()),
             _lease: lease,
             #[cfg(test)]
             write_count: std::sync::atomic::AtomicUsize::new(0),
@@ -864,6 +892,11 @@ impl Storage {
             let job = s.jobs.entry(id).or_default();
             job.pending_cancel = pending;
             if pending {
+                if job.build_server_job_id.is_none() {
+                    if let Some(hosted) = job.hosted.as_mut() {
+                        hosted.cleanup_pending = true;
+                    }
+                }
                 job.retain_until_ms = Some(
                     job.retain_until_ms
                         .unwrap_or_default()
