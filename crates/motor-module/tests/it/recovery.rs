@@ -1130,7 +1130,7 @@ async fn zero_queue_wait_withdraws_and_cancel_is_idempotent() {
 #[tokio::test]
 async fn draining_retry_hint_is_decoded_and_logged_by_ck_motor() {
     let f = Fixture::new(Cut::None, 28).await;
-    f.runner.begin_drain(Duration::from_secs(60), false);
+    f.runner.begin_drain(Duration::from_secs(2), false);
     let captured = crate::logging::Captured::default();
     let _logging = crate::logging::scoped(captured.clone());
     let motor = f.motor();
@@ -1152,7 +1152,7 @@ async fn draining_retry_hint_is_decoded_and_logged_by_ck_motor() {
         .unwrap()
         .parse()
         .unwrap();
-    assert!(hint > 0 && hint <= 60_000);
+    assert_eq!(hint, 5_000);
     assert_eq!(terminal.retry_after_ms(), Some(hint));
     assert_eq!(terminal.refusal_detail(), Some("runner_draining"));
     assert_eq!(terminal.ran, Some(Ran::None));
@@ -1174,9 +1174,48 @@ async fn draining_retry_hint_is_decoded_and_logged_by_ck_motor() {
         }
     );
     assert_eq!(reply.refusal_detail(), Some("runner_draining"));
-    assert!(reply
-        .retry_after_ms()
-        .is_some_and(|ms| ms > 0 && ms <= 60_000));
+    assert_eq!(reply.retry_after_ms(), Some(5_000));
+}
+
+#[tokio::test]
+async fn queued_drain_retry_hint_reaches_ck_motor_callers() {
+    let f = Fixture::new(Cut::None, 1).await;
+    let motor = f.motor();
+    let mut request = f.request("echo forbidden >> marker");
+    // A valid claim above the permit budget keeps the job queued until drain.
+    request.weight_hint = Some(2);
+    let mut stream = motor.run(request).unwrap();
+    let id = stream.job_id;
+    assert!(matches!(
+        stream.records.recv().await.unwrap().unwrap(),
+        StreamRecord::Accepted(_)
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !f
+            .jobs()
+            .iter()
+            .any(|j| j["id"] == id.to_string() && j["state"] == "Queued")
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.runner.begin_drain(Duration::from_secs(2), false);
+    let records = tokio::time::timeout(Duration::from_secs(5), collect(stream))
+        .await
+        .expect("drain must promptly refuse the queued job");
+    let terminal = terminal(&records);
+    assert_eq!(terminal.job_id, id);
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RunnerDraining
+        }
+    );
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(terminal.retry_after_ms(), Some(5_000));
+    assert!(!f.remote_key.join("marker").exists());
 }
 
 #[tokio::test]

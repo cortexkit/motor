@@ -617,9 +617,10 @@ async fn session(
                             Frame::Refusal(Refusal {
                                 job_id: Some(request.job_id),
                                 transfer_id: None,
+                                retry_after_ms: (reason == RefusalReason::RunnerDraining)
+                                    .then(|| runner.drain_retry_after_ms()),
                                 reason,
                                 disk_full: None,
-                                retry_after_ms: runner.drain_retry_after_ms(),
                                 detail,
                             }),
                         )

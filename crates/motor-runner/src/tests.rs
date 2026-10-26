@@ -970,9 +970,11 @@ async fn drain_refuses_new_and_queued_jobs_without_starting_queued_commands() {
     );
     let refused = terminal(&runner, new.job_id).await;
     assert_eq!(refused.ran, Some(Ran::None));
+    assert!(refused.retry_after_ms().is_some_and(|ms| ms >= 5_000));
     assert_eq!(runner.drain_result(), None);
     let refused = terminal(&runner, second.job_id).await;
     assert_eq!(refused.ran, Some(Ran::None));
+    assert!(refused.retry_after_ms().is_some_and(|ms| ms >= 5_000));
     assert_eq!(
         refused.outcome,
         Outcome::RefusedBeforeStart {
@@ -1190,7 +1192,7 @@ async fn concurrent_drains_answer_at_the_earliest_requested_deadline() {
     let (socket, server) = listener(&f, &runner);
     let started = std::time::Instant::now();
     let mut first = open_drain(&socket, 1200, false).await;
-    wait_for(|| runner.drain_retry_after_ms().is_some()).await;
+    wait_for(|| runner.is_draining()).await;
     let mut second = open_drain(&socket, 2, true).await;
 
     let replies = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1228,7 +1230,7 @@ async fn shorter_first_drain_still_answers_later_longer_request() {
     start_long_running_job(&f, &runner).await;
     let (socket, server) = listener(&f, &runner);
     let mut first = open_drain(&socket, 2, true).await;
-    wait_for(|| runner.drain_retry_after_ms().is_some()).await;
+    wait_for(|| runner.is_draining()).await;
     let mut second = open_drain(&socket, 1200, false).await;
 
     let replies = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1262,18 +1264,13 @@ async fn resume_answers_a_pending_drain_request() {
     start_long_running_job(&f, &runner).await;
     let (socket, server) = listener(&f, &runner);
     let mut drain = open_drain(&socket, 1200, false).await;
-    wait_for(|| runner.drain_retry_after_ms().is_some()).await;
+    wait_for(|| runner.is_draining()).await;
     // The second request asks for a shorter deadline, which the runner adopts
     // only once it has registered that request. Waiting for it keeps Resume
     // from arriving first, which would leave the second request to start a
     // fresh drain that nothing ever answers.
     let mut second_drain = open_drain(&socket, 600, true).await;
-    wait_for(|| {
-        runner
-            .drain_retry_after_ms()
-            .is_some_and(|ms| ms <= 600_000)
-    })
-    .await;
+    wait_for(|| runner.drain_retry_after_ms() <= 600_000).await;
 
     let mut resume = connect(&socket).await;
     write_frame_async(&mut resume, &Frame::Resume)
@@ -5051,13 +5048,12 @@ async fn withdraw_racing_dispatch_never_refuses_a_started_job() {
 }
 
 #[tokio::test]
-async fn drain_retry_hint_is_bounded_by_the_deadline_on_the_private_frame() {
+async fn drain_admission_retry_hint_carries_the_floor_on_the_private_frame() {
     let f = Fixture::new();
     let runner = Runner::open(f.config()).unwrap();
-    runner.begin_drain(Duration::from_secs(60), false);
+    runner.begin_drain(Duration::from_secs(2), false);
     let (request, _) = f.run("true");
-    let hint = runner.drain_retry_after_ms().unwrap();
-    assert!(hint <= 60_000 && hint > 0);
+    assert_eq!(runner.drain_retry_after_ms(), 5_000);
     let (socket, server) = listener(&f, &runner);
     let mut channel = connect(&socket).await;
     write_frame_async(&mut channel, &Frame::Run(request.clone()))
@@ -5066,14 +5062,62 @@ async fn drain_retry_hint_is_bounded_by_the_deadline_on_the_private_frame() {
     let Frame::Refusal(refusal) = read_next(&mut channel).await else {
         panic!("expected refusal")
     };
-    assert!(refusal.retry_after_ms.unwrap() <= hint);
+    assert_eq!(refusal.reason, RefusalReason::RunnerDraining);
+    assert_eq!(refusal.retry_after_ms, Some(5_000));
     let terminal = runner.job_status(request.job_id).unwrap().terminal.unwrap();
     assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(terminal.retry_after_ms(), Some(5_000));
     assert!(matches!(
         terminal.outcome,
         Outcome::RefusedBeforeStart { .. }
     ));
     server.abort();
+}
+
+#[test]
+fn drain_retry_hint_uses_the_floor_without_a_remaining_deadline() {
+    let f = Fixture::new();
+    let runner = manual_tick_runner(&f, 4);
+    assert_eq!(runner.drain_retry_after_ms(), 5_000);
+    runner.begin_drain(Duration::ZERO, false);
+    assert_eq!(runner.drain_retry_after_ms(), 5_000);
+}
+
+#[test]
+fn drain_retry_hint_tracks_a_long_deadline_without_truncating() {
+    let f = Fixture::new();
+    let runner = manual_tick_runner(&f, 4);
+    runner.begin_drain(Duration::from_secs(600), false);
+    assert!((599_000..=600_000).contains(&runner.drain_retry_after_ms()));
+}
+
+#[test]
+fn drain_retry_hint_saturates_at_the_wire_integer_limit() {
+    let f = Fixture::new();
+    let runner = manual_tick_runner(&f, 4);
+    runner.begin_drain(Duration::from_secs(u64::MAX / 1_000 + 60), false);
+    assert_eq!(runner.drain_retry_after_ms(), u64::MAX);
+}
+
+#[test]
+fn drain_tick_refusal_carries_the_retry_floor() {
+    let f = Fixture::new();
+    let runner = manual_tick_runner(&f, 4);
+    let (request, bytes) = f.run("true");
+    f.submit(&runner, &request, &bytes);
+    runner.begin_drain(Duration::from_secs(2), false);
+    runner.tick().unwrap();
+    let terminal = runner.job_status(request.job_id).unwrap().terminal.unwrap();
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RunnerDraining
+        }
+    );
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(terminal.retry_after_ms(), Some(5_000));
+    let persisted: Job = read_json(&runner.record_path(request.job_id)).unwrap();
+    assert_eq!(persisted.terminal, Some(terminal));
 }
 
 #[test]

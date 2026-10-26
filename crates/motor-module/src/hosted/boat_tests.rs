@@ -35,6 +35,7 @@ pub(crate) struct Boat {
 pub(crate) struct RunRefusal {
     pub reason: RefusalReason,
     pub detail: String,
+    pub retry_after_ms: Option<u64>,
     pub after_accept: bool,
 }
 impl Drop for Boat {
@@ -164,25 +165,25 @@ impl Boat {
                                         )
                                         .await
                                         .unwrap();
-                                        Frame::Terminal(
-                                            TerminalRecord::new(
-                                                id,
-                                                Outcome::RefusedBeforeStart {
-                                                    reason: refused.reason,
-                                                },
-                                                0,
-                                                0,
-                                                0,
-                                            )
-                                            .with_refusal_detail(refused.detail),
+                                        let mut terminal = TerminalRecord::new(
+                                            id,
+                                            Outcome::RefusedBeforeStart {
+                                                reason: refused.reason,
+                                            },
+                                            0,
+                                            0,
+                                            0,
                                         )
+                                        .with_refusal_detail(refused.detail);
+                                        terminal.retry_after_ms = refused.retry_after_ms;
+                                        Frame::Terminal(terminal)
                                     } else {
                                         let refusal = Refusal {
                                             job_id: Some(id),
                                             transfer_id: None,
                                             reason: refused.reason,
                                             disk_full: None,
-                                            retry_after_ms: None,
+                                            retry_after_ms: refused.retry_after_ms,
                                             detail: Some(refused.detail),
                                         };
                                         Frame::Refusal(refusal)
@@ -1167,6 +1168,44 @@ async fn direct_hosted_job_runs_on_a_lease_avoiding_no_host_with_hosted_routing_
     let state = motor.hosted_state(id).unwrap();
     assert!(state.hosted_test);
     assert_eq!(state.lease_request.unwrap().avoid_host, None);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires checkout under /Users or /home"]
+async fn hosted_drain_admission_retry_hint_reaches_the_caller() {
+    let boat = Boat::new(0, false).await;
+    *boat.run_refusal.lock().unwrap() = Some(RunRefusal {
+        reason: RefusalReason::RunnerDraining,
+        detail: "runner_draining".into(),
+        retry_after_ms: Some(5_000),
+        after_accept: false,
+    });
+    let (scratch, repo) = committed_repo();
+    let ssh = Arc::new(tests::harness::NoSsh(AtomicUsize::new(0)));
+    let motor =
+        crate::Motor::with_connector(boat.config.clone(), &scratch.0.join("state"), ssh.clone())
+            .unwrap();
+    let path = repo.to_str().unwrap();
+    let (_, terminal) = records(
+        motor
+            .run_direct_hosted(
+                RunRequest::new(path, path, path, "true").with_timeout(30),
+                None,
+                crate::ReturnOptions::default(),
+            )
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RunnerDraining
+        }
+    );
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(terminal.retry_after_ms(), Some(5_000));
+    assert_eq!(boat.runs.load(Ordering::SeqCst), 1);
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
 }
 

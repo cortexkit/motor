@@ -1467,12 +1467,16 @@ impl Motor {
                     return Ok(true);
                 }
                 if hosted {
+                    let retry_after_ms = refusal
+                        .retry_after_ms
+                        .filter(|_| reason == RefusalReason::RunnerDraining);
                     return self
-                        .refused(
+                        .refused_with_retry(
                             id,
                             reason,
                             Some(snapshots.main.tree_hash.clone()),
                             Some(format!("lease_mismatch: {}", detail.unwrap_or_default())),
+                            retry_after_ms,
                             tx,
                         )
                         .await
