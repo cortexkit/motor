@@ -2080,16 +2080,31 @@ async fn windows_backend_rejects_unsupported_manifests_but_accepts_cargo_config(
     // A password-bearing URL is refused before the job starts, and the
     // credential never appears in the refusal detail.
     {
-        let f = Fixture::new(); source(&f);
-        fs::write(f.main.join("Cargo.toml"),"[dependencies]\nsecret={git='https://user:secret@unroutable.invalid/private.git'}\n").unwrap();
-        git(&f.main,&["add","."]); git(&f.main,&["commit","-m","refusal"]);
-        let (c,a) = configure(&f,Fault::None,0); let runner = Runner::open_with_backend(c,Box::new(FakeHost)).unwrap();
-        let (r,bytes) = request(&f); f.submit(&runner,&r,&bytes); let t = terminal(&runner,r.job_id).await;
-        assert!(matches!(t.outcome,Outcome::RefusedBeforeStart { .. }));
+        let f = Fixture::new();
+        source(&f);
+        fs::write(
+            f.main.join("Cargo.toml"),
+            "[dependencies]\nsecret={git='https://user:secret@unroutable.invalid/private.git'}\n",
+        )
+        .unwrap();
+        git(&f.main, &["add", "."]);
+        git(&f.main, &["commit", "-m", "refusal"]);
+        let (c, a) = configure(&f, Fault::None, 0);
+        let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+        let (r, bytes) = request(&f);
+        f.submit(&runner, &r, &bytes);
+        let t = terminal(&runner, r.job_id).await;
+        assert!(matches!(t.outcome, Outcome::RefusedBeforeStart { .. }));
         let detail = t.refusal_detail.unwrap();
         assert!(!detail.contains("secret"), "credential leaked: {detail}");
-        assert!(detail.contains("undeclared") || detail.contains("unsupported") || detail.contains("redacted"), "{detail}");
-        assert_eq!(a.starts.load(Ordering::SeqCst),0); assert!(a.units.lock().unwrap().is_empty());
+        assert!(
+            detail.contains("undeclared")
+                || detail.contains("unsupported")
+                || detail.contains("redacted"),
+            "{detail}"
+        );
+        assert_eq!(a.starts.load(Ordering::SeqCst), 0);
+        assert!(a.units.lock().unwrap().is_empty());
     }
 
     let f = Fixture::new();
