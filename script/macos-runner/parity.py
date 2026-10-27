@@ -56,6 +56,24 @@ def tree_digest(directory):
     return result.hexdigest()
 
 
+# Build-server components the current macOS image does not carry yet. Each one
+# reaches macOS with the next macOS image build, and is removed from this set
+# then. llvm-tools was added to the build server on 27 Oct 2026 for iOS cross
+# builds, which macOS VMs build with Xcode's own tools instead.
+PENDING_MACOS_COMPONENTS = {"llvm-tools"}
+
+
+def macos_components(server_components):
+    """The macOS image's components for one build-server toolchain: the host's
+    own rust-std but no cross-target ones, and no pending components."""
+    return sorted(component.replace("x86_64-unknown-linux-gnu", HOST)
+                  for component in server_components
+                  if (not component.startswith("rust-std-")
+                      or component == "rust-std-x86_64-unknown-linux-gnu")
+                  and component.removesuffix("-x86_64-unknown-linux-gnu")
+                  not in PENDING_MACOS_COMPONENTS)
+
+
 def validate(manifest, server):
     if manifest.get("schema") != 1 or manifest.get("platform") != "macos":
         raise ValueError("invalid macOS parity schema")
@@ -68,10 +86,7 @@ def validate(manifest, server):
     expected = {}
     for name, spec in server["rust_toolchains"].items():
         version = name.removesuffix("-x86_64-unknown-linux-gnu")
-        components = sorted(component.replace("x86_64-unknown-linux-gnu", HOST)
-                            for component in spec["components"]
-                            if not component.startswith("rust-std-")
-                            or component == "rust-std-x86_64-unknown-linux-gnu")
+        components = macos_components(spec["components"])
         expected[version + "-" + HOST] = {
             "rustc": spec["rustc"], "targets": [HOST], "components": components}
     chains = manifest.get("rust_toolchains", {})

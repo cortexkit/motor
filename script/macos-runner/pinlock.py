@@ -20,10 +20,7 @@ def seed(server):
         chains[name] = {
             "rustc": spec["rustc"],
             "targets": [parity.HOST],
-            "components": sorted(component.replace("x86_64-unknown-linux-gnu", parity.HOST)
-                                 for component in spec["components"]
-                                 if not component.startswith("rust-std-")
-                                 or component == "rust-std-x86_64-unknown-linux-gnu"),
+            "components": parity.macos_components(spec["components"]),
             "rustc_verbose": PENDING, "sha256": PENDING,
         }
     bins = {name: copy.deepcopy(spec) for name, spec in server["cargo_binaries"].items()

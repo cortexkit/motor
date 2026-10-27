@@ -100,6 +100,15 @@ class ParityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "differ from build-server"):
             parity.validate(self.manifest, server)
 
+    def test_pending_component_is_skipped_but_any_other_new_component_is_not(self):
+        server = copy.deepcopy(SERVER)
+        components = server["rust_toolchains"]["1.99.0-x86_64-unknown-linux-gnu"]["components"]
+        components.append("llvm-tools-x86_64-unknown-linux-gnu")
+        parity.validate(self.manifest, server)
+        components.append("rust-src")
+        with self.assertRaisesRegex(ValueError, "differ from build-server"):
+            parity.validate(self.manifest, server)
+
     def test_macos_pin_drift_compares_with_sealed_manifest(self):
         self.manifest["sources"]["bash"]["sha256"] = "b" * 64
         errors = parity.differences(self.manifest, self.actual, job=True)
