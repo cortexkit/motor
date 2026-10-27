@@ -102,7 +102,7 @@
       "libxkbcommon-x11-dev"
     ]
   },
-  "capture_sha256": "ccee06b54c9e75f1462c00a546c929a798e14293fc60b177263e8d17b72b50b3",
+  "capture_sha256": "b903c7b1d7bd0155f46ed4a67c228e0464c44ce5f405c4cf346e2ca039eee3a2",
   "cargo_binaries": {
     "cargo": {
       "proxy": true
@@ -549,6 +549,9 @@
       "components": [
         "cargo-x86_64-unknown-linux-gnu",
         "clippy-x86_64-unknown-linux-gnu",
+        "llvm-tools-x86_64-unknown-linux-gnu",
+        "rust-std-aarch64-apple-ios",
+        "rust-std-aarch64-apple-ios-sim",
         "rust-std-aarch64-pc-windows-msvc",
         "rust-std-wasm32-unknown-unknown",
         "rust-std-wasm32-wasip1",
@@ -561,6 +564,8 @@
       ],
       "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
       "targets": [
+        "aarch64-apple-ios",
+        "aarch64-apple-ios-sim",
         "aarch64-pc-windows-msvc",
         "wasm32-unknown-unknown",
         "wasm32-wasip1",
@@ -573,6 +578,9 @@
     "stable-x86_64-unknown-linux-gnu": {
       "components": [
         "cargo-x86_64-unknown-linux-gnu",
+        "llvm-tools-x86_64-unknown-linux-gnu",
+        "rust-std-aarch64-apple-ios",
+        "rust-std-aarch64-apple-ios-sim",
         "rust-std-aarch64-pc-windows-msvc",
         "rust-std-wasm32-unknown-unknown",
         "rust-std-wasm32-wasip1",
@@ -584,6 +592,8 @@
       ],
       "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
       "targets": [
+        "aarch64-apple-ios",
+        "aarch64-apple-ios-sim",
         "aarch64-pc-windows-msvc",
         "wasm32-unknown-unknown",
         "wasm32-wasip1",

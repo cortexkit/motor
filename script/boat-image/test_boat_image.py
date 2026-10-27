@@ -136,13 +136,15 @@ class RecipeTests(unittest.TestCase):
         names = ('1.99.0-x86_64-unknown-linux-gnu', 'stable-x86_64-unknown-linux-gnu')
         actual = {call.args[3]: call.args for call in run.call_args_list
                   if call.args[:3] == ('rustup', 'toolchain', 'install') and call.args[3] in names}
-        targets = ('--target', 'aarch64-pc-windows-msvc', '--target', 'wasm32-unknown-unknown',
+        targets = ('--target', 'aarch64-apple-ios', '--target', 'aarch64-apple-ios-sim',
+                   '--target', 'aarch64-pc-windows-msvc', '--target', 'wasm32-unknown-unknown',
                    '--target', 'wasm32-wasip1', '--target', 'x86_64-pc-windows-gnu',
                    '--target', 'x86_64-pc-windows-msvc', '--target', 'x86_64-unknown-linux-gnu',
                    '--target', 'x86_64-unknown-linux-musl')
         self.assertEqual(actual, {
             names[0]: ('rustup', 'toolchain', 'install', names[0], '--profile', 'minimal',
-                       '--component', 'clippy', '--component', 'rustfmt', *targets),
+                       '--component', 'clippy', '--component', 'llvm-tools',
+                       '--component', 'rustfmt', *targets),
         })
         root = manifest['rustup_home'] + '/toolchains/'
         run.assert_any_call('cp', '-a', '--reflink=auto', root + names[0] + '/.', root + names[1])
