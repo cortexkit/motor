@@ -9219,6 +9219,7 @@ impl Runner {
                 probes = stats.probes,
                 errors = stats.errors,
                 read_refusals = stats.read_refusals,
+                write_refusals = stats.write_refusals,
                 breaker_open = stats.breaker_open,
                 "remote cache totals at job end"
             );
