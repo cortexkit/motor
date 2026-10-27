@@ -257,9 +257,9 @@ After authentication and schema validation, checks proceed in this order:
    that tenant's deleted period is refused 404 `job_unknown`, so a deleted job id is never accepted
    again. The D1 claim from step 1 remains, as for any refusal.
 3. Ask for placement. Binding explicit-only hints follow the rule above, without fallback.
-   Otherwise, if no active host has the requested platform, return 400
-   `platform_unsupported`. If active hosts have it but none is selectable, return 503
-   `no_capacity`, unless no candidate host could ever fit the lease (below), which is 422
+   Otherwise, if no registered host, in any status, has the requested platform, return 400
+   `platform_unsupported`. If hosts are registered for it but none is active and selectable
+   (including when every one is retired), return 503 `no_capacity`, unless no candidate host could ever fit the lease (below), which is 422
    `no_host_fits`. Before returning a refusal, repeat the existing-job check so a concurrent
    successful lease wins over that refusal. When `allow_spill` is `true`, Boat spill is
    enabled, the platform equals `BOAT_PLATFORM` and `timeout_s` is at most `BOAT_MAX_TIMEOUT_S`,
