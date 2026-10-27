@@ -236,13 +236,22 @@ pub struct Prepared {
     pub cargo_home: PathBuf,
 }
 impl Staging {
-    pub fn new(state: PathBuf, mirrors: PathBuf, tools: Tools) -> io::Result<Self> {
+    /// `state` holds staging's own prep folders. `tree_state` must be the
+    /// engine's state directory: the engine imports uploaded Git dependency
+    /// bundles into its `git-deps` mirrors and tells clients which commits it
+    /// holds, so staging has to read the same mirrors.
+    pub fn new(
+        state: PathBuf,
+        tree_state: PathBuf,
+        mirrors: PathBuf,
+        tools: Tools,
+    ) -> io::Result<Self> {
         Dir::open(&state, true)?;
         Dir::open(&mirrors, false)?;
         Ok(Self {
             trees: Trees {
                 mirrors,
-                state: state.clone(),
+                state: tree_state,
                 compacting: Arc::new(Mutex::new(BTreeSet::new())),
                 mirror_locks: Mutex::new(BTreeMap::new()),
             },

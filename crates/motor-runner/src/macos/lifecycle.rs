@@ -845,6 +845,8 @@ pub(super) fn remove(path: &Path) -> io::Result<()> {
 pub(super) fn staging(config: &Config, mirrors: PathBuf) -> io::Result<Staging> {
     Staging::new(
         config.state_root.clone(),
+        // The engine's state directory, where it keeps Git dependency mirrors.
+        config.state_dir(),
         mirrors,
         config
             .macos

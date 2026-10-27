@@ -65,8 +65,11 @@ impl Fixture {
         let bun = tool(tools.join("bun"), "#!/bin/sh\nexit 0\n");
         let mirrors = scratch.join("mirrors");
         host::create_dir_all(&mirrors).unwrap();
+        // Production keeps staging's prep folders at the state root and the
+        // engine's dependency mirrors one level down, in the instance folder.
         let staging = Staging::new(
             scratch.join("state"),
+            scratch.join("state/macos"),
             mirrors,
             Tools {
                 cargo,
@@ -952,6 +955,34 @@ fn binary_bun_lock_refusal_is_actionable_before_fetch() {
         .join(request.job_id.to_string());
     assert!(!job.join("cargo-home").exists());
     assert!(!job.join("Users/motor/project/node_modules").exists());
+}
+
+/// Job prep must read the same Git dependency mirrors the engine imports
+/// bundles into and reports to clients; otherwise a client skips uploading a
+/// commit the engine holds and prep then refuses it as missing.
+#[test]
+fn staging_reads_the_engines_git_dependency_mirrors() {
+    let f = Fixture::new();
+    let mut config = crate::engine::Config::new(f.scratch.join("root"), "macos");
+    config.macos = Some(Arc::new(VmConfig {
+        image: "/image".into(),
+        helper: "/helper".into(),
+        tools: f.staging.tools.clone(),
+        toolchain_version: "sealed".into(),
+    }));
+    host::create_dir_all(config.state_dir().join("mirrors")).unwrap();
+    let engine_trees = crate::workspace::Trees {
+        mirrors: config.state_dir().join("mirrors"),
+        state: config.state_dir(),
+        compacting: Arc::default(),
+        mirror_locks: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+    };
+    let staging = lifecycle::staging(&config, engine_trees.mirrors.clone()).unwrap();
+    let url = "ssh://git@github.com/cortexkit/avatar.git";
+    assert_eq!(
+        staging.trees.dependency_mirror(url),
+        engine_trees.dependency_mirror(url)
+    );
 }
 
 #[test]
