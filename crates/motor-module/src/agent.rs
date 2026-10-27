@@ -155,7 +155,14 @@ impl SignState {
 struct RuntimeDir(PathBuf);
 impl Drop for RuntimeDir {
     fn drop(&mut self) {
-        for name in ["s", "m", "identity.pub"] {
+        // "m" and the macOS master's socket are left behind if their master
+        // was killed rather than exiting cleanly.
+        for name in [
+            "s",
+            "m",
+            crate::transport::MACOS_CONTROL_NAME,
+            "identity.pub",
+        ] {
             let _ = fs::remove_file(self.0.join(name));
         }
         let _ = fs::remove_dir(&self.0);
