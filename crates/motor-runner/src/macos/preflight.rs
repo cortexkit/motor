@@ -146,7 +146,12 @@ fn npm(source: &str, base: &Path, roots: &[PathBuf]) -> io::Result<()> {
         local(relative, base, roots)?;
         return Ok(());
     }
-    if let Ok(url) = url::Url::parse(source) {
+    // An npm alias (`npm:<name>@<range>`) also parses as a URL with an `npm`
+    // scheme, so it is checked as a registry range below, not as a URL.
+    if let Some(url) = (!source.starts_with("npm:"))
+        .then(|| url::Url::parse(source).ok())
+        .flatten()
+    {
         if url.scheme() == "https"
             && url.username().is_empty()
             && url.password().is_none()
@@ -619,5 +624,31 @@ mod audit_tests {
         cargo(&value, &root, std::slice::from_ref(&root)).unwrap();
         let metadata:toml::Value=toml::from_str("[package]\nname='test'\n[package.metadata]\nworkspace='/not-a-cargo-workspace-pointer'\n").unwrap();
         cargo(&metadata, &root, std::slice::from_ref(&root)).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod npm_source_tests {
+    use super::npm;
+    use std::path::Path;
+
+    #[test]
+    fn npm_aliases_are_registry_ranges_and_other_schemes_are_refused() {
+        let base = Path::new("/Users/motor/main");
+        for accepted in [
+            "npm:string-width@^4.2.0",
+            "npm:@scope/name@1.2.3",
+            "^4.2.0",
+            "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz",
+        ] {
+            npm(accepted, base, &[]).unwrap_or_else(|e| panic!("{accepted}: {e}"));
+        }
+        for refused in [
+            "npm:../outside",
+            "ssh://host/repo.git",
+            "http://registry.npmjs.org/x.tgz",
+        ] {
+            assert!(npm(refused, base, &[]).is_err(), "{refused} accepted");
+        }
     }
 }
