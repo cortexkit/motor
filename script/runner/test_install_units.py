@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the interactive unit installer without writing host system units."""
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -9,6 +10,21 @@ import unittest
 
 
 HERE = Path(__file__).resolve().parent
+
+
+def strip_caller_roots(units):
+    """Remove every --caller-root option from the unit files under units.
+
+    The repository's main and e2e units carry their instance's caller root.
+    Tests of the unflagged install path, and tests that add their own flag,
+    start from those units with the repository's flag removed.
+    """
+    for path in units.rglob('*'):
+        if path.is_file():
+            text = path.read_text()
+            stripped = re.sub(r' --caller-root[ =]\S+', '', text)
+            if stripped != text:
+                path.write_text(stripped)
 
 
 class InstallUnitsTests(unittest.TestCase):
@@ -26,6 +42,13 @@ class InstallUnitsTests(unittest.TestCase):
                 command.chmod(0o755)
             env = dict(os.environ, HOME=str(home), PATH=str(tools) + ':' + os.environ['PATH'],
                        UNIT_TEST_LOG=str(log))
+            # The repository units carry --caller-root, so the installer checks
+            # them with each instance's binary; plant binaries that accept them.
+            for name in ('main', 'e2e', 'windows'):
+                binary = root / ('binary-' + name)
+                binary.write_text('#!/bin/sh\nexit 0\n')
+                binary.chmod(0o755)
+                env['RUNNER_BINARY_' + name] = str(binary)
             result = subprocess.run(['bash', str(HERE / 'install-units.sh')],
                                     input='y\n' * 20, text=True, capture_output=True, env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -54,6 +77,7 @@ class InstallUnitsTests(unittest.TestCase):
                         root = Path(directory)
                         source = root / 'runner'
                         shutil.copytree(HERE / 'units', source / 'units')
+                        strip_caller_roots(source / 'units')
                         for name in ('install-units.sh', 'deploy_canary.py'):
                             shutil.copyfile(HERE / name, source / name)
                         relative = {'main': 'motor-runner.service',
@@ -111,6 +135,7 @@ class InstallUnitsTests(unittest.TestCase):
                     root = Path(directory)
                     source = root / 'runner'
                     shutil.copytree(HERE / 'units', source / 'units')
+                    strip_caller_roots(source / 'units')
                     for name in ('install-units.sh', 'deploy_canary.py'):
                         shutil.copyfile(HERE / name, source / name)
                     relative = ('motor-runner.service' if instance == 'main' else

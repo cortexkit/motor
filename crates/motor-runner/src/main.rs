@@ -674,40 +674,75 @@ mod tests {
     #[tokio::test]
     async fn check_options_accepts_installed_units_with_and_without_caller_roots_without_state() {
         let scratch = cortexkit_test_support::ScratchDir::new("motor-check-options");
+        // Each repository unit carries its instance's caller root. The unflagged
+        // form is the same unit with that flag removed, which is what the
+        // instance ran before caller roots were enabled.
         let units = [
-            include_str!("../../../script/runner/units/motor-runner.service"),
-            include_str!("../../../script/runner/units/motor-runner@e2e.service.d/binary.conf"),
-            include_str!("../../../script/boat-image/motor-boat.service"),
+            (
+                include_str!("../../../script/runner/units/motor-runner.service"),
+                "/home=/srv/build/callers/main/home",
+            ),
+            (
+                include_str!("../../../script/runner/units/motor-runner@e2e.service.d/binary.conf"),
+                "/home=/srv/build/callers/e2e/home",
+            ),
+            (
+                include_str!("../../../script/boat-image/motor-boat.service"),
+                "/home=/var/lib/motor-boat/state/callers/home",
+            ),
         ];
-        for unit in units {
+        let mut flagged_main = None;
+        for (unit, caller_root) in units {
             let exec = unit
                 .lines()
                 .filter_map(|line| line.strip_prefix("ExecStart="))
                 .rfind(|line| !line.is_empty())
                 .unwrap();
-            let options: Vec<String> = exec
+            let flagged: Vec<String> = exec
                 .split_whitespace()
                 .skip_while(|word| *word != "serve")
                 .skip(1)
                 .map(|word| word.replace("%i", "e2e"))
                 .collect();
-            for flagged in [false, true] {
+            let flags: Vec<usize> = flagged
+                .iter()
+                .enumerate()
+                .filter(|(_, word)| word.starts_with("--caller-root"))
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(flags.len(), 1, "{exec}");
+            assert_eq!(flagged[flags[0]], "--caller-root", "{exec}");
+            assert_eq!(flagged[flags[0] + 1], caller_root, "{exec}");
+            let mut unflagged = flagged.clone();
+            unflagged.drain(flags[0]..flags[0] + 2);
+            flagged_main.get_or_insert_with(|| flagged.clone());
+            for options in [unflagged, flagged] {
                 let mut args = vec!["check-options".to_string()];
-                args.extend(options.clone());
+                args.extend(options);
                 args.extend([
                     "--state-root".into(),
                     scratch.join("absent-state").to_str().unwrap().into(),
                 ]);
-                if flagged {
-                    args.extend([
-                        "--caller-root".into(),
-                        "/home=/var/lib/motor-boat/state/callers/home".into(),
-                    ]);
-                }
                 super::run(args).await.unwrap();
                 assert!(!scratch.join("absent-state").exists());
             }
         }
+        // A second root for a prefix the unit already maps is refused by name
+        // rather than silently overriding the installed mapping.
+        let mut args = vec!["check-options".to_string()];
+        args.extend(flagged_main.unwrap());
+        args.extend([
+            "--state-root".into(),
+            scratch.join("absent-state").to_str().unwrap().into(),
+            "--caller-root".into(),
+            "/home=/srv/build/callers/other/home".into(),
+        ]);
+        let error = super::run(args).await.unwrap_err().to_string();
+        assert!(
+            error.contains("caller root /home conflicts with /home"),
+            "{error}"
+        );
+        assert!(!scratch.join("absent-state").exists());
         let args = [
             "check-options",
             "--state-root",
