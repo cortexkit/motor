@@ -2065,13 +2065,30 @@ async fn windows_backend_every_invalid_path_refuses_before_start_and_a_symlink_n
 
 #[tokio::test]
 async fn windows_backend_rejects_unsupported_manifests_but_accepts_cargo_config() {
-    for (file,body,offender) in [("Cargo.toml","[dependencies]\noutside={path='../../../../outside'}\n","outside"),("Cargo.toml","[dependencies]\nremote={git='ssh://private/repo'}\n","ssh://private/repo"),("Cargo.lock","version=3\n[[package]]\nname='bad'\nversion='0.1.0'\nsource='registry+https://other.example/index'\n","https://other.example/index")] {
+    // An undeclared Git source is refused even when its scheme is allowed;
+    // only a declared Git source backed by an uploaded Git bundle is accepted.
+    // A password-bearing URL is refused before the job starts.
+    for (file,body,offender) in [("Cargo.toml","[dependencies]\noutside={path='../../../../outside'}\n","outside"),("Cargo.toml","[dependencies]\nundeclared={git='https://unroutable.invalid/undeclared.git'}\n","undeclared"),("Cargo.lock","version=3\n[[package]]\nname='bad'\nversion='0.1.0'\nsource='registry+https://other.example/index'\n","https://other.example/index")] {
         let f = Fixture::new(); source(&f);
         fs::write(f.main.join(file),body).unwrap();
         git(&f.main,&["add","."]); git(&f.main,&["commit","-m","refusal"]);
         let (c,a) = configure(&f,Fault::None,0); let runner = Runner::open_with_backend(c,Box::new(FakeHost)).unwrap();
         let (r,bytes) = request(&f); f.submit(&runner,&r,&bytes); let t = terminal(&runner,r.job_id).await;
         assert!(matches!(t.outcome,Outcome::RefusedBeforeStart { .. })); assert!(t.refusal_detail.unwrap().contains(offender));
+        assert_eq!(a.starts.load(Ordering::SeqCst),0); assert!(a.units.lock().unwrap().is_empty());
+    }
+    // A password-bearing URL is refused before the job starts, and the
+    // credential never appears in the refusal detail.
+    {
+        let f = Fixture::new(); source(&f);
+        fs::write(f.main.join("Cargo.toml"),"[dependencies]\nsecret={git='https://user:secret@unroutable.invalid/private.git'}\n").unwrap();
+        git(&f.main,&["add","."]); git(&f.main,&["commit","-m","refusal"]);
+        let (c,a) = configure(&f,Fault::None,0); let runner = Runner::open_with_backend(c,Box::new(FakeHost)).unwrap();
+        let (r,bytes) = request(&f); f.submit(&runner,&r,&bytes); let t = terminal(&runner,r.job_id).await;
+        assert!(matches!(t.outcome,Outcome::RefusedBeforeStart { .. }));
+        let detail = t.refusal_detail.unwrap();
+        assert!(!detail.contains("secret"), "credential leaked: {detail}");
+        assert!(detail.contains("undeclared") || detail.contains("unsupported") || detail.contains("redacted"), "{detail}");
         assert_eq!(a.starts.load(Ordering::SeqCst),0); assert!(a.units.lock().unwrap().is_empty());
     }
 
@@ -2331,18 +2348,25 @@ async fn windows_backend_failed_refusal_persistence_retries_at_maintenance_witho
 
 #[tokio::test]
 async fn windows_backend_private_git_routes_verified_mirror_with_or_without_bundle() {
-    private_git_routes(false).await;
+    private_git_routes(false, "https://unroutable.invalid/private.git").await;
 }
 
 #[tokio::test]
 async fn windows_backend_reuses_git_dependency_shared_by_root_and_nested_lockfiles() {
-    private_git_routes(true).await;
+    private_git_routes(true, "https://unroutable.invalid/private.git").await;
 }
 
-async fn private_git_routes(nested: bool) {
+#[tokio::test]
+async fn windows_backend_bundled_ssh_git_source_is_accepted() {
+    // A private repo over ssh, identified by an ssh URL with a username, is
+    // fetched from its uploaded bundle through the local mirror.
+    private_git_routes(false, "ssh://git@unroutable.invalid/private.git").await;
+}
+
+async fn private_git_routes(nested: bool, url: &str) {
+    let url = url.to_owned();
     let f = Fixture::new();
     source(&f);
-    let url = "https://unroutable.invalid/private.git";
     let commit = git(&f.sibling, &["rev-parse", "HEAD"]);
     let reference = format!("refs/ck-motor/dep/{commit}");
     git(&f.sibling, &["update-ref", &reference, &commit]);
@@ -2365,6 +2389,7 @@ async fn private_git_routes(nested: bool) {
     let fetches = Arc::new(AtomicU64::new(0));
     let captured = fetches.clone();
     let original = c.windows_command.take().unwrap();
+    let asserted_url = url.clone();
     c.windows_command = Some(Arc::new(move |program, args| {
         if args.iter().any(|a| a == "windows-prepare") {
             prep::execute_with_fetch(Path::new(args.last().unwrap()), |cmd| {
@@ -2383,7 +2408,7 @@ async fn private_git_routes(nested: bool) {
                 assert_eq!(env["GIT_CONFIG_COUNT"], "2");
                 assert!(env["GIT_CONFIG_KEY_0"].starts_with("url.file://"));
                 assert!(env["GIT_CONFIG_KEY_0"].ends_with(".insteadOf"));
-                assert_eq!(env["GIT_CONFIG_VALUE_0"], url);
+                assert_eq!(env["GIT_CONFIG_VALUE_0"], asserted_url);
                 assert_eq!(env["GIT_CONFIG_KEY_1"], "safe.directory");
                 assert!(env["GIT_CONFIG_VALUE_1"].contains("/git-deps/"));
                 fs::create_dir_all(Path::new(&env["CARGO_HOME"]).join("git/checkouts/private"))?;
@@ -2401,18 +2426,18 @@ async fn private_git_routes(nested: bool) {
     for with_bundle in [true, false] {
         let (mut r, bytes) = request(&f);
         r.git_dependencies = vec![GitDependency {
-            url: url.into(),
+            url: url.clone(),
             commits: vec![commit.clone()],
             bundle: with_bundle.then(|| BundleManifest {
                 index: 2,
-                repository: url.into(),
+                repository: url.clone(),
                 length: dependency_bytes.len() as u64,
                 sha256: format!("{:x}", Sha256::digest(&dependency_bytes)),
             }),
         }];
         if nested {
             r.git_dependencies.push(GitDependency {
-                url: url.into(),
+                url: url.clone(),
                 commits: vec![commit.clone()],
                 bundle: None,
             });

@@ -748,6 +748,33 @@ fn local_git_file_url(path: &std::path::Path) -> io::Result<String> {
     Ok(format!("file://{encoded}"))
 }
 
+/// The job rewrites each declared Git source to a local file mirror, so the
+/// original URL is only an identifier that is never contacted. Accept the
+/// same schemes as the runner (https, http, ssh, git), including an ssh
+/// username such as `git@`, and refuse any password or control characters.
+#[cfg(any(windows, test))]
+fn job_git_rewrite_url_allowed(url: &str) -> bool {
+    if url.chars().any(char::is_control) {
+        return false;
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme, "https" | "http" | "ssh" | "git") {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return false;
+    }
+    if let Some((userinfo, host)) = authority.rsplit_once('@') {
+        if userinfo.is_empty() || host.is_empty() || userinfo.contains(':') {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(any(windows, test))]
 fn git_rewrite_environment(cargo_home: &std::path::Path) -> io::Result<BTreeMap<String, String>> {
     safe_directory(cargo_home)?;
@@ -797,10 +824,7 @@ fn git_rewrite_environment(cargo_home: &std::path::Path) -> io::Result<BTreeMap<
         ),
     ]);
     for (index, route) in manifest.routes.into_iter().enumerate() {
-        if !(route.url.starts_with("https://") || route.url.starts_with("http://"))
-            || route.url.contains('@')
-            || route.url.chars().any(char::is_control)
-        {
+        if !job_git_rewrite_url_allowed(&route.url) {
             return Err(invalid(
                 "job Git rewrite URL is not an allowed credential-free URL",
             ));
@@ -2186,6 +2210,37 @@ mod tests {
         );
         assert!(cargo_home.join("git/db").is_dir());
         assert!(cargo_home.join("git/checkouts").is_dir());
+    }
+
+    #[test]
+    fn job_git_rewrite_urls_accept_runner_schemes_and_refuse_passwords() {
+        // The guest rewrite is only an identifier: accept the same schemes as
+        // the runner, including an ssh username such as `git@`.
+        for url in [
+            "https://example.invalid/dependency.git",
+            "http://example.invalid/dependency.git",
+            "ssh://git@example.invalid/dependency.git",
+            "ssh://example.invalid/dependency.git",
+            "git://example.invalid/dependency.git",
+            "https://user@example.invalid/dependency.git",
+        ] {
+            assert!(
+                job_git_rewrite_url_allowed(url),
+                "job rewrite refused bundled source: {url}"
+            );
+        }
+        for url in [
+            "file:///tmp/dependency.git",
+            "git@example.invalid:dependency.git",
+            "https://user:secret@example.invalid/dependency.git",
+            "ssh://user:secret@example.invalid/dependency.git",
+            "https://example.invalid/dependency\u{7}.git",
+        ] {
+            assert!(
+                !job_git_rewrite_url_allowed(url),
+                "job rewrite accepted forbidden source: {url:?}"
+            );
+        }
     }
 
     #[test]

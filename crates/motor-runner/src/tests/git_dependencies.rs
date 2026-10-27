@@ -73,6 +73,8 @@ fn dependency_bad_commit_and_local_urls_are_refused() {
         "git@host:repo",
         "https://host/repo\n",
         "ext::command",
+        "https://user:secret@host/repo",
+        "ssh://user:secret@host/repo",
     ] {
         assert!(workspace::validate_dependencies(&[declaration(url, &[&"a".repeat(40)])]).is_err());
     }

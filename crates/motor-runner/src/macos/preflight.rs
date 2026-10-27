@@ -7,13 +7,11 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-fn https_git(source: &str) -> bool {
-    url::Url::parse(source).is_ok_and(|u| {
-        u.scheme() == "https"
-            && u.host_str().is_some()
-            && u.username().is_empty()
-            && u.password().is_none()
-    })
+// A Git source is only an identifier that Cargo rewrites to a local mirror.
+// Accept the same schemes as the Linux runner, including an ssh username
+// such as `git@`; a password must never reach the job.
+fn git_source(source: &str) -> bool {
+    crate::workspace::dependencies::valid_url(source)
 }
 fn local(source: &str, base: &Path, roots: &[PathBuf]) -> io::Result<PathBuf> {
     if Path::new(source).is_absolute() || source.contains(['\\', '\0']) {
@@ -81,7 +79,7 @@ fn cargo_values(value: &toml::Value, base: &Path, roots: &[PathBuf]) -> io::Resu
             }
         }
         if let Some(source) = table.get("git").and_then(toml::Value::as_str) {
-            if !https_git(source) {
+            if !git_source(source) {
                 return Err(invalid(format!("unsupported dependency source: {source}")));
             }
         }
@@ -116,7 +114,7 @@ fn lock(text: &str) -> io::Result<()> {
             ) {
                 continue;
             }
-            if source.strip_prefix("git+").is_some_and(https_git) {
+            if source.strip_prefix("git+").is_some_and(git_source) {
                 continue;
             }
             return Err(invalid(format!(

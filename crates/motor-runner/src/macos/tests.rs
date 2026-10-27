@@ -730,6 +730,83 @@ fn bundled_private_commit_with_unreachable_url_preps_offline_and_missing_commit_
 }
 
 #[test]
+fn ssh_git_source_with_bundled_commit_passes_preflight_and_password_is_refused() {
+    // An ssh source with a username is only an identifier that Cargo rewrites
+    // to the uploaded bundle's local mirror; a password must never reach the job.
+    let mut f = Fixture::new();
+    f.staging.tools.cargo = real_tool("cargo");
+    f.staging.tools.rustc = real_tool("rustc");
+    let private = f.scratch.join("private-ssh");
+    host::create_dir_all(&private).unwrap();
+    git(&private, &["init"]);
+    write(
+        &private.join("Cargo.toml"),
+        "[package]\nname='private-pkg'\nversion='0.1.0'\nedition='2021'\n",
+    );
+    write(&private.join("src/lib.rs"), "pub fn dependency() {}\n");
+    let (oid, _) = commit(&private);
+    let url = "ssh://git@127.0.0.1:1/never-contact/private";
+    write(&f.source.join("Cargo.toml"), &format!("[package]\nname='consumer'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nprivate-pkg={{git='{url}',rev='{oid}'}}\n"));
+    write(
+        &f.source.join("src/lib.rs"),
+        "pub fn consumer() { private_pkg::dependency(); }\n",
+    );
+    write(&f.source.join("Cargo.lock"), &format!("version=4\n[[package]]\nname='consumer'\nversion='0.1.0'\ndependencies=['private-pkg']\n[[package]]\nname='private-pkg'\nversion='0.1.0'\nsource='git+{url}?rev={oid}#{oid}'\n"));
+    let mut r = f.request();
+    r.git_dependencies.push(motor_protocol::GitDependency {
+        url: url.into(),
+        commits: vec![oid.clone()],
+        bundle: None,
+    });
+    let reference = format!("refs/ck-motor/dep/{oid}");
+    git(&private, &["update-ref", &reference, &oid]);
+    let upload = f.scratch.join("upload-ssh");
+    host::create_dir_all(&upload).unwrap();
+    let bundle = upload.join("0");
+    git(
+        &private,
+        &["bundle", "create", bundle.to_str().unwrap(), &reference],
+    );
+    let bytes = host::read(&bundle).unwrap();
+    r.git_dependencies[0].bundle = Some(motor_protocol::BundleManifest {
+        index: 0,
+        repository: url.into(),
+        length: bytes.len() as u64,
+        sha256: format!("{:x}", Sha256::digest(&bytes)),
+    });
+    f.staging
+        .trees
+        .validate_dependency_bundles(&upload, &r.git_dependencies)
+        .unwrap();
+    f.staging
+        .trees
+        .import_dependencies(&upload, &r.git_dependencies)
+        .unwrap();
+    r.job_id = uuid::Uuid::now_v7();
+    let prepared = f.staging.prepare(&r, Cancellation::default()).unwrap();
+    assert!(prepared.cargo_home.join("git/checkouts").is_dir());
+    for password_url in [
+        "ssh://user:secret@127.0.0.1:1/never-contact/private",
+        "https://user:secret@127.0.0.1:1/never-contact/private",
+    ] {
+        let g = Fixture::new();
+        write(&g.source.join("Cargo.toml"), &format!("[package]\nname='consumer'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nprivate-pkg={{git='{password_url}',rev='{oid}'}}\n"));
+        write(&g.source.join("Cargo.lock"), &format!("version=4\n[[package]]\nname='consumer'\nversion='0.1.0'\ndependencies=['private-pkg']\n[[package]]\nname='private-pkg'\nversion='0.1.0'\nsource='git+{password_url}?rev={oid}#{oid}'\n"));
+        let r = g.request();
+        let error = g
+            .staging
+            .prepare(&r, Cancellation::default())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("unsupported"),
+            "password URL was not refused: {error}"
+        );
+    }
+}
+
+#[test]
 fn relative_install_links_and_symlinked_package_ancestors_stay_inside_job_tree() {
     let f = Fixture::new();
     let root = f.scratch.join("mirrored/Users/motor/main");

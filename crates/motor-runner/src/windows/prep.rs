@@ -360,12 +360,10 @@ fn run_preparation(config: &Config, id: Uuid, args: &[String]) -> io::Result<Out
 }
 
 pub(super) fn validate_git_source_url(url: &str) -> io::Result<()> {
-    let parsed = url::Url::parse(url)
-        .map_err(|_| invalid(format!("unsupported Git bundle source URL: {url}")))?;
-    if !matches!(parsed.scheme(), "https" | "http")
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-    {
+    // The Git source URL is only an identifier that Cargo rewrites to a local
+    // mirror, so accept the same schemes as the Linux runner, including an
+    // ssh username such as `git@`, and reject any password.
+    if !crate::workspace::dependencies::valid_url(url) {
         return Err(invalid(format!("unsupported Git bundle source URL: {url}")));
     }
     Ok(())
@@ -1298,18 +1296,31 @@ mod git_source_validation_tests {
     }
 
     #[test]
-    fn valid_http_git_bundle_source_is_accepted() {
-        let url = "https://example.invalid/fixture.git";
-        let routes = BTreeMap::from([(url.to_owned(), PathBuf::from("git-mirrors/fixture"))]);
-        assert!(validate_lock(&lock_with_source(url), &routes).is_ok());
+    fn bundled_ssh_and_git_sources_are_accepted() {
+        for url in [
+            "https://example.invalid/fixture.git",
+            "http://example.invalid/fixture.git",
+            "ssh://git@example.invalid/fixture.git",
+            "ssh://example.invalid/fixture.git",
+            "git://example.invalid/fixture.git",
+            "https://user@example.invalid/fixture.git",
+        ] {
+            let routes = BTreeMap::from([(url.to_owned(), PathBuf::from("git-mirrors/fixture"))]);
+            assert!(
+                validate_lock(&lock_with_source(url), &routes).is_ok(),
+                "bundled Git source was refused: {url}"
+            );
+        }
     }
 
     #[test]
     fn unsupported_git_schemes_and_credentials_fail_before_fetch() {
         for url in [
-            "ssh://example.invalid/fixture.git",
             "file:///tmp/fixture.git",
+            "git@github.com:cortexkit/avatar.git",
             "https://user:secret@example.invalid/fixture.git",
+            "ssh://user:secret@example.invalid/fixture.git",
+            "https://example.invalid/fi\u{7}xture.git",
         ] {
             let routes = BTreeMap::from([(url.to_owned(), PathBuf::from("git-mirrors/fixture"))]);
             let error = validate_lock(&lock_with_source(url), &routes)

@@ -7,11 +7,16 @@ fn valid_commit(commit: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn valid_url(url: &str) -> bool {
+/// Shared Git source identifier check for Linux, Windows and macOS prep.
+/// The original URL is only an identifier that Cargo rewrites to a local
+/// mirror, so it must name a supported scheme with a host. A username such
+/// as `git@` is allowed, but a password must never reach the job.
+pub(crate) fn valid_url(url: &str) -> bool {
     !url.chars().any(char::is_control)
         && url::Url::parse(url).is_ok_and(|u| {
             matches!(u.scheme(), "https" | "http" | "ssh" | "git")
                 && u.host_str().is_some_and(|h| !h.is_empty())
+                && u.password().is_none()
         })
 }
 
