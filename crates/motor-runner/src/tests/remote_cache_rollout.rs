@@ -795,3 +795,158 @@ fn boat_manifest_switch_turns_the_cache_on_without_a_runtime() {
     config.isolate_jobs = false;
     assert!(config.remote_cache_available(false).is_none());
 }
+
+#[derive(Clone, Default)]
+struct LogBytes(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn captured_logs(f: impl FnOnce()) -> String {
+    let bytes = LogBytes::default();
+    tracing::subscriber::with_default(
+        motor_protocol::logging::LineSubscriber::new("[runner]", bytes.clone()),
+        f,
+    );
+    let captured = bytes.0.lock().unwrap().clone();
+    String::from_utf8(captured).unwrap()
+}
+
+/// A finished non-base job logs the gateway's cumulative per-tool totals, and
+/// a runner with the cache disabled logs nothing.
+#[test]
+fn remote_cache_totals_are_logged_at_job_end() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let f = Fixture::new();
+    let layout = Layout::new(f.scratch.join("provisioning"), HostRole::BuildServer);
+    layout.prepare().unwrap();
+    provision(&layout, true);
+    let gateway_runtime = runtime(&layout);
+    gateway_runtime.watch.reread();
+
+    let transport = gateway_runtime
+        .transport(TENANT, &[Tool::Sccache, Tool::Ccache])
+        .unwrap();
+    let writer = transport
+        .open(&f.scratch.join("writer"), Role::Fill)
+        .unwrap();
+    let reader = transport
+        .open(&f.scratch.join("reader"), Role::Job("job-1"))
+        .unwrap();
+    assert_eq!(request(&writer, Tool::Sccache, "PUT", "entry"), 200);
+    assert_eq!(request(&reader, Tool::Sccache, "GET", "entry"), 200);
+    assert_eq!(request(&reader, Tool::Sccache, "GET", "missing"), 404);
+    assert_eq!(
+        request(&reader, Tool::Sccache, "GET", ".sccache_check"),
+        404
+    );
+    assert_eq!(request(&reader, Tool::Sccache, "PUT", "forbidden"), 403);
+    let stats = gateway_runtime.gateway.stats(Tool::Sccache);
+    assert_eq!(
+        (
+            stats.hits,
+            stats.misses,
+            stats.probes,
+            stats.errors,
+            stats.read_refusals,
+            stats.breaker_open
+        ),
+        (1, 1, 1, 0, 1, 0)
+    );
+    assert_eq!(
+        gateway_runtime.gateway.stats(Tool::Ccache),
+        crate::remote_cache::gateway::ToolStats::default()
+    );
+
+    // Open without isolation so the portable fixture needs no host manager,
+    // then attach the gateway: the totals only need the switch and a running
+    // gateway, like health does.
+    let mut config = f.config();
+    config.manual_tick = true;
+    config.disable_warm_builds = true;
+    config.remote_cache = true;
+    let runner = Runner::open(config).unwrap();
+    let mut core = Arc::try_unwrap(runner.core).ok().unwrap();
+    core.config.remote_cache_runtime = Some(gateway_runtime.clone());
+    let runner = Runner {
+        core: Arc::new(core),
+    };
+    register_runner(&runner);
+
+    let (request, _) = f.run("true");
+    let id = request.job_id;
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        inner
+            .catalog
+            .workspaces
+            .insert(request.workspace_key.clone(), Workspace::default());
+        let mut job = Job::new(id, Some(request), runner.now(), 1, 2);
+        job.state = JobState::Running;
+        job.started_ms = Some(runner.now());
+        inner.jobs.insert(id, job);
+    }
+    let log = captured_logs(|| {
+        runner
+            .finish(id, Ok(std::process::ExitStatus::from_raw(0)))
+            .unwrap()
+    });
+    assert!(runner.core.inner.lock().unwrap().jobs[&id]
+        .terminal
+        .is_some());
+    let line = log
+        .lines()
+        .find(|line| line.contains("remote cache totals at job end"))
+        .unwrap_or_else(|| panic!("totals line missing: {log}"));
+    assert!(line.contains(&format!("job_id={id}")), "{line}");
+    assert!(line.contains("tool=sccache"), "{line}");
+    assert!(line.contains("hits=1"), "{line}");
+    assert!(line.contains("misses=1"), "{line}");
+    assert!(line.contains("probes=1"), "{line}");
+    assert!(line.contains("errors=0"), "{line}");
+    assert!(line.contains("read_refusals=1"), "{line}");
+    assert!(line.contains("breaker_open=0"), "{line}");
+    assert!(!log.contains("tool=ccache"), "{log}");
+    assert!(!log.contains(BUCKET), "{log}");
+    assert!(!log.contains("store.test"), "{log}");
+
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.manual_tick = true;
+    config.disable_warm_builds = true;
+    let runner = Runner::open(config).unwrap();
+    assert!(runner.config().remote_cache_runtime.is_none());
+    let (request, _) = f.run("true");
+    let id = request.job_id;
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        inner
+            .catalog
+            .workspaces
+            .insert(request.workspace_key.clone(), Workspace::default());
+        let mut job = Job::new(id, Some(request), runner.now(), 1, 2);
+        job.state = JobState::Running;
+        job.started_ms = Some(runner.now());
+        inner.jobs.insert(id, job);
+    }
+    let log = captured_logs(|| {
+        runner
+            .finish(id, Ok(std::process::ExitStatus::from_raw(0)))
+            .unwrap()
+    });
+    assert!(runner.core.inner.lock().unwrap().jobs[&id]
+        .terminal
+        .is_some());
+    assert!(
+        !log.contains("remote cache totals at job end"),
+        "disabled cache must stay silent: {log}"
+    );
+}

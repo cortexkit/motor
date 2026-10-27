@@ -9132,6 +9132,10 @@ impl Runner {
             // Replay waits for the state lock, so the terminal reaches clients
             // only after this point.
             self.finish_step(id, &kill, "state lock released", finish_started);
+            // Runner-wide cumulative totals, not per-job: jobs overlap, so the
+            // gateway cannot attribute counts to this job. No state change and
+            // no lock held while reading the counters.
+            self.log_remote_cache_totals(id);
         }
         self.prune_refs()?;
         Ok(())
@@ -9174,6 +9178,55 @@ impl Runner {
                 }
             }
         }
+    }
+
+    /// Log the gateway's cumulative per-tool totals at job end, one line per
+    /// tool with any traffic. The counts are runner-wide cumulative totals,
+    /// not per-job attribution: jobs overlap on the build server, so one
+    /// job's traffic cannot be isolated. Reads the gateway counters without
+    /// the engine state lock, like health does; the caller must not hold it.
+    #[cfg(unix)]
+    fn log_remote_cache_totals(&self, id: Uuid) {
+        if !self.core.config.remote_cache {
+            return;
+        }
+        let Some(runtime) = self.core.config.remote_cache_runtime.as_ref() else {
+            return;
+        };
+        let gateway = runtime.gateway.clone();
+        for tool in [
+            crate::remote_cache::gateway::Tool::Sccache,
+            crate::remote_cache::gateway::Tool::Ccache,
+        ] {
+            let stats = gateway.stats(tool);
+            if stats.hits == 0
+                && stats.misses == 0
+                && stats.probes == 0
+                && stats.errors == 0
+                && stats.read_refusals == 0
+                && stats.write_refusals == 0
+                && stats.breaker_open == 0
+                && stats.oversize == 0
+                && stats.tenant_mismatch == 0
+            {
+                continue;
+            }
+            tracing::info!(
+                job_id = %id,
+                tool = tool.id(),
+                hits = stats.hits,
+                misses = stats.misses,
+                probes = stats.probes,
+                errors = stats.errors,
+                read_refusals = stats.read_refusals,
+                breaker_open = stats.breaker_open,
+                "remote cache totals at job end"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    fn log_remote_cache_totals(&self, id: Uuid) {
+        let _ = id;
     }
 
     /// Log one step of finishing a job, with the time since finishing began.
