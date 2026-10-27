@@ -312,7 +312,8 @@ class Probe:
         if type(process) is not int or process < 1:
             raise ProbeError("missing numeric processId for detached command")
         # Boat does not time-limit detached commands; deletion bounds abandoned work.
-        until = min(self.deadline, time.monotonic() + poll_seconds + 20)
+        own_limit = time.monotonic() + poll_seconds + 20
+        until = min(self.deadline, own_limit)
         while time.monotonic() < until:
             status = self.command_status(sid, process)
             if status.get("status") == "exited":
@@ -320,6 +321,9 @@ class Probe:
             if status.get("status") == "lost":
                 raise ProbeError("Boat lost detached command after agent restart")
             time.sleep(2)
+        if self.deadline < own_limit:
+            # The whole run's --max-minutes budget ran out, not this command's own wait.
+            raise ProbeError("run deadline (--max-minutes) reached while polling command " + str(process))
         raise ProbeError("timed out polling command " + str(process))
 
     def command_status(self, sid, process):

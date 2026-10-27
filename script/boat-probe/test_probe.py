@@ -106,6 +106,16 @@ class ParsingTests(unittest.TestCase):
                              {"ready": True})
         self.assertIn("--port 9444", runner.execute.call_args.args[1])
 
+    def test_command_wait_names_the_run_deadline_when_that_ended_it(self):
+        client = FakeClient({("POST", "/sandboxes/bx_23456789/commands"): {"processId": 3},
+                             ("GET", "/sandboxes/bx_23456789/commands/3?tailBytes=8388608"): {"status": "running"}})
+        runner = probe.Probe(client, evidence(), lambda: None)
+        # The command starts and polls once before the run's deadline, which then
+        # passes during the wait between polls.
+        runner.deadline = probe.time.monotonic() + 1
+        with self.assertRaisesRegex(probe.ProbeError, r"run deadline \(--max-minutes\) reached while polling command 3"):
+            runner.execute("bx_23456789", "true")
+
     def test_lost_command_is_not_success(self):
         client = FakeClient({("POST", "/sandboxes/bx_23456789/commands"): {"processId": 2},
                              ("GET", "/sandboxes/bx_23456789/commands/2?tailBytes=8388608"): {"status": "lost"}})
