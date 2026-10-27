@@ -1500,13 +1500,31 @@ impl Trees {
         ))
     }
 
-    pub fn changes(&self, path: &Path) -> Vec<String> {
-        let Ok(status) = git(
+    /// Paths the job changed in its workspace: modified, deleted, staged and
+    /// new untracked files. Writes under ignored paths such as target/ are not
+    /// listed. A failed scan is an error, never an empty list, because callers
+    /// read an empty list as "no changes".
+    pub fn changes(&self, path: &Path) -> io::Result<Vec<String>> {
+        // After an isolated job the workspace root belongs to the job account,
+        // so Git refuses the runner's scan as "dubious ownership" unless this
+        // one tree is trusted. Trusting it is safe: the workspace's .git, and
+        // so all Git configuration and hooks, stays runner-owned and read-only
+        // to jobs, and status only reads the job's files as data. fsmonitor
+        // is off so no configured helper process runs.
+        let safe = format!("safe.directory={}", path.display());
+        let status = git(
             path,
-            &["status", "--porcelain", "-z", "--untracked-files=all"],
-        ) else {
-            return vec![];
-        };
+            &[
+                "-c",
+                &safe,
+                "-c",
+                "core.fsmonitor=false",
+                "status",
+                "--porcelain",
+                "-z",
+                "--untracked-files=all",
+            ],
+        )?;
         let mut records = status.split('\0');
         let mut changes = Vec::new();
         while let Some(record) = records.next() {
@@ -1524,6 +1542,6 @@ impl Trees {
                 records.next();
             }
         }
-        changes
+        Ok(changes)
     }
 }

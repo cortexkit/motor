@@ -1190,7 +1190,10 @@ impl Backend for HostBackend {
         trees: &Trees,
         job: &Job,
     ) -> io::Result<Option<Vec<String>>> {
-        Ok((!job.base).then(|| trees.changes(&paths::job_workspace(config, job))))
+        if job.base {
+            return Ok(None);
+        }
+        trees.changes(&paths::job_workspace(config, job)).map(Some)
     }
 
     fn reconcile(&self, config: &Config, interrupted: &[Job]) -> io::Result<Vec<Uuid>> {
