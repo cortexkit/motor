@@ -490,7 +490,7 @@ impl SnapshotStore {
             let mismatch = Trees::tree_hash_mismatch(temporary, tree_hash, &computed);
             return Err(invalid(format!("sibling {}: {mismatch}", key.repository)));
         }
-        dissociate(temporary)?;
+        dissociate(temporary, tree_hash)?;
         install_javascript(config, key, tree_hash, temporary)?;
         remove_group_and_other_write(temporary)?;
         restrict_job_access(config, temporary)?;
@@ -868,20 +868,61 @@ pub(crate) fn remove_group_and_other_write(_root: &Path) -> io::Result<()> {
     ))
 }
 
+/// The ref that keeps a snapshot's verified tree reachable while `dissociate`
+/// repacks. It exists only during the repack.
+const DISSOCIATE_PIN_REF: &str = "refs/motor/snapshot-tree";
+
 /// Copies every object the snapshot's Git directory borrows from the mirror
 /// into its own pack and drops the link to the mirror. Jobs cannot read the
 /// mirror, so Git inside a job needs the snapshot to stand alone. Both a
 /// fresh clone (`clone --shared`) and a copied predecessor (re-linked by the
 /// sync) borrow from the mirror at this point.
-pub(crate) fn dissociate(temporary: &Path) -> io::Result<()> {
+///
+/// `tree_hash`, the tree the snapshot was verified to hold, is copied too.
+/// `repack -a` copies only objects reachable from the snapshot's refs,
+/// reflogs and index. For a sibling with uncommitted changes, HEAD and the
+/// index name the caller commit, and the snapshot commit that holds
+/// `tree_hash` is named by nothing in a snapshot copied from a predecessor
+/// (a fresh clone still names it in HEAD's reflog). Without the temporary
+/// ref, that tree and its changed blobs stayed in the mirror only, and every
+/// later read of the tree in the snapshot, such as the JavaScript install's
+/// `git ls-tree`, failed with Git's bare "not a tree object".
+pub(crate) fn dissociate(temporary: &Path, tree_hash: &str) -> io::Result<()> {
     let alternates = temporary.join(".git/objects/info/alternates");
     if !alternates.is_file() {
         return Ok(());
     }
     crate::setup_log::phase("dissociate sibling snapshot", || {
-        crate::workspace::git(temporary, &["repack", "-a", "-d", "-q"])
-    })?;
-    fs::remove_file(alternates)
+        let git = |args: &[&str]| {
+            crate::workspace::git(temporary, args).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "dissociate snapshot: `git {}`: {}",
+                        args.join(" "),
+                        error.to_string().trim_end()
+                    ),
+                )
+            })
+        };
+        git(&["update-ref", DISSOCIATE_PIN_REF, tree_hash])?;
+        let packed = git(&["repack", "-a", "-d", "-q"]);
+        let unpinned = git(&["update-ref", "-d", DISSOCIATE_PIN_REF]);
+        packed?;
+        unpinned?;
+        fs::remove_file(&alternates)?;
+        // Refuse here, naming the tree, rather than leave a snapshot that
+        // cannot read its own tree to fail in a later step.
+        let present = format!("{tree_hash}^{{tree}}");
+        match crate::workspace::git(temporary, &["cat-file", "-e", &present]) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(invalid(format!(
+                "dissociate snapshot: tree {tree_hash} is missing after `git repack -a -d -q` \
+                 (`git cat-file -e {present}` failed: {})",
+                error.to_string().trim_end()
+            ))),
+        }
+    })
 }
 
 /// Installs the snapshot's JavaScript dependencies from its lockfiles, once,
@@ -905,7 +946,13 @@ fn install_javascript(
             )
         })
         .map_err(|error| {
-            io::Error::new(error.kind(), format!("sibling {}: {error}", key.repository))
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "sibling {}: prepare sibling snapshot javascript dependencies: {error}",
+                    key.repository
+                ),
+            )
         })
     }
     #[cfg(not(target_os = "linux"))]

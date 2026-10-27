@@ -495,6 +495,59 @@ fn snapshot_of_a_dirty_commit_shows_its_caller_commit_as_head() {
 }
 
 #[test]
+fn dirty_snapshot_copied_from_a_predecessor_holds_its_own_tree() {
+    // The snapshot commit of a sibling with uncommitted changes sits on top
+    // of the caller commit, and only the mirror names it (under a ref that
+    // `clone --shared` does not copy). A snapshot copied from an earlier
+    // snapshot of the caller commit never checks the snapshot commit out, so
+    // dissociating must still copy the verified tree into the snapshot.
+    let f = Fixture::new("motor-snapshot-store-dirty-predecessor");
+    let (base, base_tree) = f.commit(&[("kept", "same\n"), ("source", "one\n")]);
+    let (dirty, dirty_tree) = f.commit(&[("source", "two\n"), ("added", "new\n")]);
+    let (store, calls) = copying_store();
+    let predecessor = f.resolve(&store, &f.key(&base, &base), &base_tree).unwrap();
+    let directory = f
+        .resolve(&store, &f.key(&dirty, &base), &dirty_tree)
+        .unwrap();
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(source, _)| source.clone())
+            .collect::<Vec<_>>(),
+        [predecessor],
+        "the dirty snapshot was built from the clean one"
+    );
+    assert!(!directory.join(".git/objects/info/alternates").exists());
+    assert_eq!(git(&directory, &["rev-parse", "HEAD"]), base);
+    git(
+        &directory,
+        &["cat-file", "-e", &format!("{dirty_tree}^{{tree}}")],
+    );
+    let listed = git(&directory, &["ls-tree", "-r", "--name-only", &dirty_tree]);
+    assert_eq!(
+        listed.lines().collect::<Vec<_>>(),
+        ["added", "kept", "source"]
+    );
+    assert_eq!(
+        git(
+            &directory,
+            &["cat-file", "-p", &format!("{dirty_tree}:source")]
+        ),
+        "two"
+    );
+    assert_eq!(
+        git(
+            &directory,
+            &["for-each-ref", "--format=%(refname)", "refs/motor"]
+        ),
+        "",
+        "the ref that kept the tree during the repack is gone"
+    );
+}
+
+#[test]
 fn tree_mismatch_at_creation_refuses_and_publishes_nothing() {
     let f = Fixture::new("motor-snapshot-store-mismatch");
     let (first, _) = f.commit(&[("source", "one\n")]);

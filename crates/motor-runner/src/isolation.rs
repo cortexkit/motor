@@ -478,7 +478,18 @@ fn javascript_tracked_tree(workspace: &Path, tree: &str) -> io::Result<Javascrip
             "-z".as_ref(),
             tree.as_ref(),
         ],
-    )?;
+    )
+    .map_err(|error| {
+        // Git's "not a tree object" names no object, so say which tree and
+        // which command; the checkout's host path stays out of the message.
+        io::Error::new(
+            error.kind(),
+            format!(
+                "list the tracked files of tree {tree}: `git ls-tree -r -t -z {tree}`: {}",
+                error.to_string().trim_end()
+            ),
+        )
+    })?;
     let mut objects = BTreeMap::new();
     // ls-tree lists children, not the root whose verified ID the caller supplied.
     objects.insert(

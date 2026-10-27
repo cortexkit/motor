@@ -3006,7 +3006,8 @@ fn job_git_reads_a_sibling_owned_by_another_account_at_its_path_and_alias() {
         ],
     );
     assert!(snapshot.join(".git/objects/info/alternates").is_file());
-    crate::sibling_snapshots::store::dissociate(&snapshot).unwrap();
+    let head_tree = workspace::git(&source, &["rev-parse", "HEAD^{tree}"]).unwrap();
+    crate::sibling_snapshots::store::dissociate(&snapshot, &head_tree).unwrap();
     fs::remove_dir_all(&source).unwrap();
 
     let workspace = root.join("w/worktrees/a");
