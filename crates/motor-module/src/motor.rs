@@ -974,23 +974,28 @@ impl Motor {
                         // must still stay final rather than bypass the refusal.
                         // A lease body the broker could not parse (or that
                         // ck-motor would not send) booked nothing, so it is
-                        // not among them: a spilled job goes back.
-                        if !matches!(
+                        // not among them: a spilled job goes back. So does a
+                        // spilled job the broker has no platform for: the
+                        // build server already queued it, so its platform runs
+                        // there, and the broker may say platform_unsupported
+                        // only because every overflow backend is offline.
+                        let final_refusal = matches!(
                             error,
-                            crate::hosted::Error::AccountClosed
-                                | crate::hosted::Error::Rejected
-                                | crate::hosted::Error::Platform
-                        ) && self
-                            .return_spill(
-                                id,
-                                error.code(),
-                                spill_started,
-                                request
-                                    .queue_wait_limit_s
-                                    .is_none()
-                                    .then(|| (30 * 60).min(request.timeout.unwrap_or(30 * 60))),
-                            )
-                            .await?
+                            crate::hosted::Error::AccountClosed | crate::hosted::Error::Rejected
+                        ) || (!spilled
+                            && matches!(error, crate::hosted::Error::Platform));
+                        if !final_refusal
+                            && self
+                                .return_spill(
+                                    id,
+                                    error.code(),
+                                    spill_started,
+                                    request
+                                        .queue_wait_limit_s
+                                        .is_none()
+                                        .then(|| (30 * 60).min(request.timeout.unwrap_or(30 * 60))),
+                                )
+                                .await?
                         {
                             return Ok(true);
                         }

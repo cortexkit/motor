@@ -1644,6 +1644,45 @@ async fn spilled_provisioning_budget_resubmits_to_build_server() {
     assert!(text.contains("broker_code=hosted_provisioning"), "{text}");
 }
 
+/// The broker answers platform_unsupported for linux-x64 while every overflow
+/// backend is offline. The build server already queued the job, so it goes back.
+#[tokio::test]
+async fn spilled_platform_unsupported_returns_to_the_build_server() {
+    for status in [400, 422] {
+        let broker = crate::hosted::test_http::Http::new(move |path, _| {
+            if path == "/v1/leases" {
+                (status, serde_json::json!({"error": "platform_unsupported"}))
+            } else {
+                (404, serde_json::json!({"error": "job_unknown"}))
+            }
+        })
+        .await;
+        let scratch = ScratchDir::new("motor-spill-platform-unsupported");
+        let repo = fixture_repo(&scratch);
+        let peer = ResubmitPeer::new();
+        let log = peer.log.clone();
+        let motor = Motor::with_connector(
+            spill_config(&broker.url),
+            &scratch.join("state"),
+            Arc::new(peer),
+        )
+        .unwrap();
+        let id = Uuid::now_v7();
+        let captured = crate::logging::Captured::default();
+        let _log = crate::logging::scoped(captured.clone());
+        let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(30)).await;
+        assert_one_build_server_job(id, &records);
+        assert_resubmitted_once(id, &log.lock().unwrap(), 30);
+        assert_eq!(lease_requests(&broker.requests), 1, "{status}");
+        let text = captured.text();
+        assert_eq!(
+            text.matches("outcome=returned_to_build_server").count(),
+            1,
+            "{status}: {text}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn spilled_deliberate_refusals_stay_final() {
     for (status, code, reason, detail) in [
@@ -1658,12 +1697,6 @@ async fn spilled_deliberate_refusals_stay_final() {
             "job_conflict",
             RefusalReason::RequestRejected,
             "lease_mismatch",
-        ),
-        (
-            422,
-            "platform_unsupported",
-            RefusalReason::PlatformUnsupported,
-            "hosted_platform_unsupported",
         ),
     ] {
         let broker = crate::hosted::test_http::Http::new(move |path, _| {
