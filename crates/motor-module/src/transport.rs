@@ -3,6 +3,7 @@ use crate::{agent::VaultAgent, Config};
 use cortexkit_claustrum_client::{CredentialErrorClass, CredentialResolver};
 use motor_protocol::*;
 use std::{
+    ffi::OsStr,
     future::Future,
     io,
     path::{Path, PathBuf},
@@ -114,8 +115,15 @@ pub struct SshConnector {
     config: Config,
     // The foreground master is killed on drop, before the agent is retired.
     master: Mutex<Option<Child>>,
+    // The macOS endpoint's own master, separate from the build-server one so
+    // it keeps the endpoint's pinned host key and settings. Also killed before
+    // the agent is retired.
+    macos_master: Mutex<Option<EndpointMaster>>,
     credentials: Arc<CredentialState>,
     retry: Option<JoinHandle<()>>,
+    // The ssh program for explicit endpoints. Always "ssh" in production;
+    // tests point it at a fake to make ssh fail in a chosen way.
+    ssh: std::ffi::OsString,
 }
 struct Credentials {
     agent: Option<Arc<VaultAgent>>,
@@ -225,6 +233,7 @@ impl SshConnector {
         Self {
             config,
             master: Mutex::new(None),
+            macos_master: Mutex::new(None),
             credentials: Arc::new(CredentialState {
                 current: StdMutex::new(Credentials {
                     agent: None,
@@ -236,6 +245,7 @@ impl SshConnector {
                 stopped: AtomicBool::new(false),
             }),
             retry: None,
+            ssh: "ssh".into(),
         }
     }
     pub(crate) async fn initialize(
@@ -290,6 +300,11 @@ impl SshConnector {
         if let Some(mut master) = self.master.lock().await.take() {
             let _ = master.kill().await;
             let _ = master.wait().await;
+        }
+        if let Some(mut master) = self.macos_master.lock().await.take() {
+            let _ = master.child.kill().await;
+            let _ = master.child.wait().await;
+            let _ = std::fs::remove_file(&master.endpoint.control);
         }
         let agent = self.credentials.current.lock().unwrap().agent.clone();
         if let Some(agent) = agent {
@@ -433,6 +448,103 @@ impl SshConnector {
         *owned = Some(master);
         Ok(())
     }
+    /// Returns the control socket of a live SSH master to the macOS endpoint,
+    /// starting one if there is none, so each job opens a session on an
+    /// existing connection instead of paying a new TCP and SSH handshake. On a
+    /// shared, saturated uplink that handshake can outlast ssh's
+    /// ConnectTimeout, while a session on an open connection does not.
+    async fn ensure_macos_master(
+        &self,
+        runner: &crate::MacosRunner,
+        agent: &VaultAgent,
+    ) -> io::Result<PathBuf> {
+        let endpoint = MasterEndpoint {
+            // Beside the agent socket in ck-motor's private 0700 runtime
+            // directory. A one-letter name makes this path exactly as long as
+            // the build-server master's, so it fits the macOS 104-byte Unix
+            // socket limit, with OpenSSH's temporary suffix, wherever that
+            // master's does.
+            control: agent.control_path.with_file_name(MACOS_CONTROL_NAME),
+            host: runner.host.clone(),
+            port: runner.port,
+            user: runner.user.clone(),
+            host_key: runner.host_key.clone(),
+        };
+        // Serialize creation so concurrent jobs share one connection and one
+        // vault signature.
+        let mut owned = self.macos_master.lock().await;
+        if let Some(reason) = self.macos_refusal() {
+            return Err(io::Error::other(reason));
+        }
+        if let Some(master) = owned.as_mut() {
+            let alive = master.child.try_wait()?.is_none();
+            if alive && master.endpoint == endpoint && endpoint.control.exists() {
+                return Ok(endpoint.control);
+            }
+            // Dead, configured for another endpoint, or lost its socket: never
+            // reuse it. A killed master leaves its socket behind, and a stale
+            // socket would look ready to the check below.
+            let mut stale = owned.take().unwrap();
+            let _ = stale.child.kill().await;
+            let _ = stale.child.wait().await;
+            let _ = std::fs::remove_file(&stale.endpoint.control);
+            if !alive {
+                let cause = stale.stderr.last_line(Duration::from_secs(1)).await;
+                tracing::warn!(
+                    ssh_error = cause.as_deref().unwrap_or("none"),
+                    "macOS SSH master exited; starting a new one"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&endpoint.control);
+        let pin = EndpointPin::for_endpoint("motor-macos", &runner.host_key)?;
+        let mut command = macos_master_command(
+            &self.ssh,
+            runner,
+            &agent.socket,
+            &agent.identity,
+            &pin.0,
+            &endpoint.control,
+        );
+        let mut child = command.spawn()?;
+        let stderr = SshStderr::collect(child.stderr.take().unwrap());
+        let ready = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    return Err(None);
+                }
+                if endpoint.control.exists() {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or(Err(Some("ssh master did not start within 15s")));
+        if let Err(timeout) = ready {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = std::fs::remove_file(&endpoint.control);
+            if let Some(reason) = self.macos_refusal() {
+                return Err(io::Error::other(reason));
+            }
+            return Err(io::Error::other(
+                match (stderr.last_line(Duration::from_secs(1)).await, timeout) {
+                    (Some(line), _) => format!("ssh master exited: {line}"),
+                    (None, Some(timeout)) => timeout.to_owned(),
+                    (None, None) => "ssh master exited without an error message".to_owned(),
+                },
+            ));
+        }
+        let control = endpoint.control.clone();
+        *owned = Some(EndpointMaster {
+            endpoint,
+            child,
+            stderr,
+            _pin: pin,
+        });
+        Ok(control)
+    }
     /// The code health reports. Unlike `refusal`, which lets a job try again
     /// once a sign failure's backoff has passed, this keeps showing the sign
     /// failure until a sign succeeds.
@@ -466,11 +578,114 @@ impl Drop for SshConnector {
     }
 }
 
+/// The file name of the macOS master's control socket in the agent's runtime
+/// directory, which removes it with the directory.
+pub(crate) const MACOS_CONTROL_NAME: &str = "d";
+/// How much of an ssh child's stderr is kept for a failure message.
+const STDERR_TAIL_BYTES: usize = 2048;
+/// How long a failed connection waits for ssh to finish writing its error.
+const STDERR_WAIT: Duration = Duration::from_secs(1);
+
+/// The last bytes an ssh child wrote to stderr, published when ssh closes it.
+/// Explicit endpoints use it so a refusal names ssh's own error, telling a
+/// network timeout from an authentication or host-key failure.
+#[derive(Clone)]
+struct SshStderr(watch::Receiver<Option<Vec<u8>>>);
+impl SshStderr {
+    /// Drains `stderr` for the child's whole life, so a chatty remote command
+    /// never blocks on a full pipe, keeping only the last bytes.
+    fn collect(stderr: tokio::process::ChildStderr) -> Self {
+        let (done, tail) = watch::channel(None);
+        tokio::spawn(async move {
+            let mut stderr = stderr;
+            let mut kept = Vec::new();
+            let mut chunk = [0; 1024];
+            while let Ok(read @ 1..) = stderr.read(&mut chunk).await {
+                kept.extend_from_slice(&chunk[..read]);
+                if kept.len() > STDERR_TAIL_BYTES {
+                    kept.drain(..kept.len() - STDERR_TAIL_BYTES);
+                }
+            }
+            let _ = done.send(Some(kept));
+        });
+        Self(tail)
+    }
+    /// ssh's last meaningful stderr line, once ssh has closed stderr. `None` if
+    /// it wrote nothing useful or is still running after `wait`.
+    async fn last_line(mut self, wait: Duration) -> Option<String> {
+        let tail = tokio::time::timeout(wait, self.0.wait_for(Option::is_some))
+            .await
+            .ok()?
+            .ok()?;
+        last_meaningful_line(tail.as_deref()?)
+    }
+}
+
+/// The last nonblank line, cleaned for a single-line log field. ssh prints no
+/// key material at its default log level. If the kept bytes contain any part
+/// of a PEM block anyway, nothing is returned, since a base64 body line alone
+/// would not look like key material.
+fn last_meaningful_line(tail: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(tail);
+    if text.contains("-----BEGIN") || text.contains("-----END") || text.contains("PRIVATE KEY") {
+        return None;
+    }
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| {
+            line.chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .take(200)
+                .collect()
+        })
+}
+
+type ExitCause = Pin<Box<dyn Future<Output = Option<String>> + Send>>;
+
 struct SshPipe {
     read: tokio::process::ChildStdout,
     write: tokio::process::ChildStdin,
     _child: Child,
     _pin: Option<EndpointPin>,
+    /// stderr of an explicit-endpoint ssh; the build-server route discards it.
+    stderr: Option<SshStderr>,
+    /// The runner has sent at least one byte. Until then an EOF or a broken
+    /// pipe is a failure before the runner answered, and the error carries
+    /// ssh's last stderr line when there is one.
+    answered: bool,
+    // Reads and writes run in different tasks, so each waits on its own future
+    // and keeps its own waker.
+    read_exit: Option<ExitCause>,
+    write_exit: Option<(ExitCause, io::Error)>,
+}
+impl SshPipe {
+    fn new(mut child: Child, pin: Option<EndpointPin>, stderr: Option<SshStderr>) -> Self {
+        Self {
+            read: child.stdout.take().unwrap(),
+            write: child.stdin.take().unwrap(),
+            _child: child,
+            _pin: pin,
+            stderr,
+            answered: false,
+            read_exit: None,
+            write_exit: None,
+        }
+    }
+    /// For an explicit endpoint, spawns `command` with its stderr collected.
+    fn spawn_endpoint(mut command: Command, pin: EndpointPin) -> io::Result<Self> {
+        let mut child = command.stderr(Stdio::piped()).spawn()?;
+        let stderr = SshStderr::collect(child.stderr.take().unwrap());
+        Ok(Self::new(child, Some(pin), Some(stderr)))
+    }
+    fn exit_cause(&self) -> Option<ExitCause> {
+        if self.answered {
+            return None;
+        }
+        let stderr = self.stderr.clone()?;
+        Some(Box::pin(stderr.last_line(STDERR_WAIT)))
+    }
 }
 impl AsyncRead for SshPipe {
     fn poll_read(
@@ -478,7 +693,29 @@ impl AsyncRead for SshPipe {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        Pin::new(&mut self.read).poll_read(cx, buf)
+        let this = &mut *self;
+        if this.read_exit.is_none() {
+            let before = buf.filled().len();
+            let wanted = buf.remaining() > 0;
+            let result = std::task::ready!(Pin::new(&mut this.read).poll_read(cx, buf));
+            let eof = result.is_ok() && wanted && buf.filled().len() == before;
+            if buf.filled().len() > before {
+                this.answered = true;
+            }
+            match eof.then(|| this.exit_cause()).flatten() {
+                Some(cause) => this.read_exit = Some(cause),
+                None => return std::task::Poll::Ready(result),
+            }
+        }
+        let cause = std::task::ready!(this.read_exit.as_mut().unwrap().as_mut().poll(cx));
+        this.read_exit = None;
+        std::task::Poll::Ready(match cause {
+            Some(cause) => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("ssh exited: {cause}"),
+            )),
+            None => Ok(()),
+        })
     }
 }
 impl AsyncWrite for SshPipe {
@@ -487,7 +724,27 @@ impl AsyncWrite for SshPipe {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
-        Pin::new(&mut self.write).poll_write(cx, buf)
+        let this = &mut *self;
+        if this.write_exit.is_none() {
+            match std::task::ready!(Pin::new(&mut this.write).poll_write(cx, buf)) {
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                    match this.exit_cause() {
+                        Some(cause) => this.write_exit = Some((cause, error)),
+                        None => return std::task::Poll::Ready(Err(error)),
+                    }
+                }
+                result => return std::task::Poll::Ready(result),
+            }
+        }
+        let (cause, _) = this.write_exit.as_mut().unwrap();
+        let cause = std::task::ready!(cause.as_mut().poll(cx));
+        let (_, error) = this.write_exit.take().unwrap();
+        std::task::Poll::Ready(Err(match cause {
+            Some(cause) => {
+                io::Error::new(io::ErrorKind::BrokenPipe, format!("ssh exited: {cause}"))
+            }
+            None => error,
+        }))
     }
     fn poll_flush(
         mut self: Pin<&mut Self>,
@@ -501,6 +758,23 @@ impl AsyncWrite for SshPipe {
     ) -> std::task::Poll<io::Result<()>> {
         Pin::new(&mut self.write).poll_shutdown(cx)
     }
+}
+
+/// The identity of a macOS master's connection: a master opened for other
+/// settings, or under another agent, is replaced rather than reused.
+#[derive(PartialEq)]
+struct MasterEndpoint {
+    control: PathBuf,
+    host: String,
+    port: u16,
+    user: String,
+    host_key: String,
+}
+struct EndpointMaster {
+    endpoint: MasterEndpoint,
+    child: Child,
+    stderr: SshStderr,
+    _pin: EndpointPin,
 }
 impl Connector for SshConnector {
     fn macos_refusal(&self) -> Option<&'static str> {
@@ -551,13 +825,8 @@ impl Connector for SshConnector {
             if let Some(reason) = self.refusal() {
                 return Err(io::Error::other(reason));
             }
-            let mut child = self.command_for(id, instance, state_root).spawn()?;
-            Ok(Box::new(SshPipe {
-                read: child.stdout.take().unwrap(),
-                write: child.stdin.take().unwrap(),
-                _child: child,
-                _pin: None,
-            }) as Box<dyn Duplex>)
+            let child = self.command_for(id, instance, state_root).spawn()?;
+            Ok(Box::new(SshPipe::new(child, None, None)) as Box<dyn Duplex>)
         })
     }
     fn connect_windows<'a>(
@@ -580,15 +849,18 @@ impl Connector for SshConnector {
                 .agent
                 .clone()
                 .ok_or_else(|| io::Error::other("runner_credential_unavailable"))?;
+            // Windows keeps one connection per job: its LAN endpoint does not
+            // share the macOS endpoint's uplink, and its sshd differs.
             let pin = WindowsPin::new(runner)?;
-            let mut command = windows_command(id, runner, &agent.socket, &agent.identity, &pin.0);
-            let mut child = command.spawn()?;
-            Ok(Box::new(SshPipe {
-                read: child.stdout.take().unwrap(),
-                write: child.stdin.take().unwrap(),
-                _child: child,
-                _pin: Some(pin),
-            }) as Box<dyn Duplex>)
+            let command = windows_command(
+                &self.ssh,
+                id,
+                runner,
+                &agent.socket,
+                &agent.identity,
+                &pin.0,
+            );
+            Ok(Box::new(SshPipe::spawn_endpoint(command, pin)?) as Box<dyn Duplex>)
         })
     }
     fn connect_macos<'a>(&'a self, id: Uuid, runner: &'a crate::MacosRunner) -> ConnectFuture<'a> {
@@ -607,15 +879,23 @@ impl Connector for SshConnector {
                 .agent
                 .clone()
                 .ok_or_else(|| io::Error::other("runner_credential_unavailable"))?;
+            let control = self.ensure_macos_master(runner, &agent).await?;
+            if let Some(reason) = self.macos_refusal() {
+                return Err(io::Error::other(reason));
+            }
+            // The job's own pin still matters: if the master dies between the
+            // check above and this session, ssh connects directly instead.
             let pin = EndpointPin::for_endpoint("motor-macos", &runner.host_key)?;
-            let mut child =
-                macos_command(id, runner, &agent.socket, &agent.identity, &pin.0).spawn()?;
-            Ok(Box::new(SshPipe {
-                read: child.stdout.take().unwrap(),
-                write: child.stdin.take().unwrap(),
-                _child: child,
-                _pin: Some(pin),
-            }) as Box<dyn Duplex>)
+            let command = macos_command(
+                &self.ssh,
+                id,
+                runner,
+                &agent.socket,
+                &agent.identity,
+                &pin.0,
+                &control,
+            );
+            Ok(Box::new(SshPipe::spawn_endpoint(command, pin)?) as Box<dyn Duplex>)
         })
     }
 }
@@ -647,13 +927,14 @@ impl Drop for EndpointPin {
 }
 
 fn windows_command(
+    ssh: &OsStr,
     id: Uuid,
     runner: &crate::WindowsRunner,
     socket: &Path,
     identity: &Path,
     known_hosts: &Path,
 ) -> Command {
-    let mut command = windows_ssh_command(runner, socket, identity, known_hosts);
+    let mut command = windows_ssh_command(ssh, runner, socket, identity, known_hosts);
     command.arg(format!(
         "~/.cargo/bin/motor-runner connect --instance {} --state-root {} --job {id}",
         runner.instance, runner.state_root
@@ -662,6 +943,7 @@ fn windows_command(
 }
 
 fn windows_ssh_command(
+    ssh: &OsStr,
     runner: &crate::WindowsRunner,
     socket: &Path,
     identity: &Path,
@@ -669,11 +951,13 @@ fn windows_ssh_command(
 ) -> Command {
     endpoint_ssh_command(
         ExplicitEndpoint {
+            ssh,
             host: &runner.host,
             port: runner.port,
             user: &runner.user,
             alias: "motor-windows",
             timeout: 3,
+            mux: Mux::None,
         },
         socket,
         identity,
@@ -681,24 +965,23 @@ fn windows_ssh_command(
     )
 }
 
+/// A job's session on the macOS endpoint, carried by the master at `control`.
 fn macos_command(
+    ssh: &OsStr,
     id: Uuid,
     runner: &crate::MacosRunner,
     socket: &Path,
     identity: &Path,
     known_hosts: &Path,
+    control: &Path,
 ) -> Command {
-    let mut command = endpoint_ssh_command(
-        ExplicitEndpoint {
-            host: &runner.host,
-            port: runner.port,
-            user: &runner.user,
-            alias: "motor-macos",
-            timeout: 10,
-        },
+    let mut command = macos_ssh_command(
+        ssh,
+        runner,
         socket,
         identity,
         known_hosts,
+        Mux::Client(control),
     );
     command.arg(format!(
         "~/.cargo/bin/motor-runner connect --instance {} --state-root {} --job {id}",
@@ -707,12 +990,71 @@ fn macos_command(
     command
 }
 
+/// The macOS endpoint's master: authenticates once, runs no command, and
+/// serves job sessions on its control socket until it is killed.
+fn macos_master_command(
+    ssh: &OsStr,
+    runner: &crate::MacosRunner,
+    socket: &Path,
+    identity: &Path,
+    known_hosts: &Path,
+    control: &Path,
+) -> Command {
+    let mut command = macos_ssh_command(
+        ssh,
+        runner,
+        socket,
+        identity,
+        known_hosts,
+        Mux::Master(control),
+    );
+    command.stdin(Stdio::null()).stdout(Stdio::null());
+    command
+}
+
+fn macos_ssh_command(
+    ssh: &OsStr,
+    runner: &crate::MacosRunner,
+    socket: &Path,
+    identity: &Path,
+    known_hosts: &Path,
+    mux: Mux<'_>,
+) -> Command {
+    endpoint_ssh_command(
+        ExplicitEndpoint {
+            ssh,
+            host: &runner.host,
+            port: runner.port,
+            user: &runner.user,
+            alias: "motor-macos",
+            timeout: 10,
+            mux,
+        },
+        socket,
+        identity,
+        known_hosts,
+    )
+}
+
+/// How an explicit endpoint's ssh shares its connection.
+enum Mux<'a> {
+    /// One connection per job.
+    None,
+    /// A session on the master listening at this control socket. If the socket
+    /// is gone, ssh falls back to its own connection with the same settings.
+    Client(&'a Path),
+    /// The foreground master that creates this control socket.
+    Master(&'a Path),
+}
+
 struct ExplicitEndpoint<'a> {
+    ssh: &'a OsStr,
     host: &'a str,
     port: u16,
     user: &'a str,
     alias: &'a str,
     timeout: u64,
+    mux: Mux<'a>,
 }
 
 fn endpoint_ssh_command(
@@ -721,32 +1063,58 @@ fn endpoint_ssh_command(
     identity: &Path,
     known_hosts: &Path,
 ) -> Command {
-    let mut command = Command::new("ssh");
-    // Each explicit endpoint has its own pin and no shared master. In particular,
-    // the legacy build-server master must never carry an explicit endpoint's connection.
+    let mut command = Command::new(endpoint.ssh);
+    // Each explicit endpoint has its own pin, and any master it uses is its
+    // own. In particular, the legacy build-server master must never carry an
+    // explicit endpoint's connection.
+    command.args([
+        "-F",
+        "/dev/null",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "GlobalKnownHostsFile=/dev/null",
+        "-o",
+        "PasswordAuthentication=no",
+        "-o",
+        "KbdInteractiveAuthentication=no",
+    ]);
+    match endpoint.mux {
+        Mux::None => {
+            command.args(["-o", "ControlMaster=no", "-o", "ControlPath=none"]);
+        }
+        Mux::Client(control) => {
+            command
+                .args(["-o", "ControlMaster=no", "-o"])
+                .arg(format!("ControlPath={}", control.display()));
+        }
+        Mux::Master(control) => {
+            // Keepalives make a master whose connection silently died exit,
+            // so the next job replaces it instead of hanging on it. They are
+            // sent only after 15s without any data from the server.
+            command
+                .args([
+                    "-N",
+                    "-o",
+                    "ControlMaster=yes",
+                    "-o",
+                    "ControlPersist=no",
+                    "-o",
+                    "ServerAliveInterval=15",
+                    "-o",
+                    "ServerAliveCountMax=4",
+                    "-o",
+                ])
+                .arg(format!("ControlPath={}", control.display()));
+        }
+    }
     command
-        .args([
-            "-F",
-            "/dev/null",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ForwardAgent=no",
-            "-o",
-            "IdentitiesOnly=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            "-o",
-            "GlobalKnownHostsFile=/dev/null",
-            "-o",
-            "ControlMaster=no",
-            "-o",
-            "ControlPath=none",
-            "-o",
-            "PasswordAuthentication=no",
-            "-o",
-            "KbdInteractiveAuthentication=no",
-        ])
         .arg("-o")
         .arg(format!("HostKeyAlias={}", endpoint.alias))
         .arg("-o")
@@ -767,7 +1135,9 @@ fn endpoint_ssh_command(
         .env_remove("SUBC_LAUNCH_NONCE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // ssh's own error is what tells a network timeout from an
+        // authentication or host-key failure; see `SshStderr`.
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     command
 }
@@ -792,6 +1162,7 @@ mod windows_command_tests {
             ..Default::default()
         };
         let command = windows_command(
+            OsStr::new("ssh"),
             Uuid::nil(),
             &runner,
             Path::new("/vault/s"),
@@ -862,11 +1233,13 @@ mod macos_command_tests {
         );
         let path = pin.0.clone();
         let command = macos_command(
+            OsStr::new("ssh"),
             Uuid::nil(),
             &runner,
             Path::new("/vault/s"),
             Path::new("/vault/identity.pub"),
             &pin.0,
+            Path::new("/runtime/d"),
         );
         let args: Vec<_> = command
             .as_std()
@@ -881,7 +1254,7 @@ mod macos_command_tests {
             "GlobalKnownHostsFile=/dev/null",
             "HostKeyAlias=motor-macos",
             "ControlMaster=no",
-            "ControlPath=none",
+            "ControlPath=/runtime/d",
             "ConnectTimeout=10",
             "PasswordAuthentication=no",
             "KbdInteractiveAuthentication=no",
@@ -908,6 +1281,39 @@ mod macos_command_tests {
                 .get_envs()
                 .any(|(n, v)| n == name && v.is_none()));
         }
+        // The master carries the same pin, identity and timeout, owns the
+        // job sessions' control socket, and runs no remote command.
+        let master = macos_master_command(
+            OsStr::new("ssh"),
+            &runner,
+            Path::new("/vault/s"),
+            Path::new("/vault/identity.pub"),
+            &pin.0,
+            Path::new("/runtime/d"),
+        );
+        let master_args: Vec<_> = master
+            .as_std()
+            .get_args()
+            .map(|a| a.to_str().unwrap())
+            .collect();
+        for required in [
+            "-N",
+            "ControlMaster=yes",
+            "ControlPersist=no",
+            "ControlPath=/runtime/d",
+            "HostKeyAlias=motor-macos",
+            "ConnectTimeout=10",
+            "IdentityAgent=/vault/s",
+            "StrictHostKeyChecking=yes",
+        ] {
+            assert!(
+                master_args.contains(&required),
+                "missing {required}: {master_args:?}"
+            );
+        }
+        assert!(master_args.contains(&format!("UserKnownHostsFile={}", path.display()).as_str()));
+        assert!(!master_args.contains(&"ControlMaster=no"));
+        assert_eq!(master_args.last(), Some(&"macos.example.invalid"));
         drop(pin);
         assert!(!path.exists());
     }
