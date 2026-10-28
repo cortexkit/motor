@@ -125,6 +125,33 @@ impl Spool {
         fs::create_dir_all(&path)?;
         Ok(Self(path))
     }
+
+    fn clear_bundles(&self) -> io::Result<()> {
+        for entry in fs::read_dir(&self.0)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let bundle = name
+                .strip_prefix("bundle-")
+                .map(|suffix| suffix.strip_suffix(".lock").unwrap_or(suffix));
+            let dependency = name
+                .strip_prefix("dependency-")
+                .and_then(|suffix| suffix.strip_suffix(".git"));
+            if !bundle.or(dependency).is_some_and(|index| {
+                !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+            }) {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                fs::remove_dir_all(entry.path())?;
+            } else {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
+    }
 }
 impl Drop for Spool {
     fn drop(&mut self) {
@@ -1102,6 +1129,9 @@ impl Snapshots {
         held: &[RepositoryCandidates],
         dependency_capability: Option<&[GitDependencyCandidates]>,
     ) -> io::Result<(Vec<BundleManifest>, Vec<GitDependency>, Vec<BundleManifest>)> {
+        // Retries reuse the job's spool, but each runner can need different bundles.
+        // Discard earlier bundles, dependency repositories and abandoned Git locks.
+        self.spool.clear_bundles()?;
         let workspace = self.bundle(id, held)?;
         let mut upload = workspace.clone();
         let dependencies = dependency_bundles(
@@ -1740,6 +1770,97 @@ mod tests {
             commits: vec![feature],
         }];
         assert_eq!(snapshots.bundle(Uuid::now_v7(), &held).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn transfer_bundles_twice_with_git_dependency() {
+        const CHILD: &str = "MOTOR_TEST_TRANSFER_BUNDLES_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate Cargo's cache without changing the parent test process's environment.
+            let home = ScratchDir::new("motor-transfer-cargo-home");
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "snapshot::tests::transfer_bundles_twice_with_git_dependency",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("CARGO_HOME", home.as_ref())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated transfer test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let (_dependency_scratch, dependency, _, commit) = repository();
+        let cache = cargo_home()
+            .unwrap()
+            .join("git/db/transfer-dependency-test");
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        git(
+            &dependency,
+            &["clone", "--bare", ".", text(&cache).unwrap()],
+        )
+        .unwrap();
+        let (scratch, checkout, spool, _) = repository();
+        let url = "https://example.invalid/transfer-dependency.git";
+        fs::write(
+            checkout.join("Cargo.lock"),
+            format!(
+                "version = 3\n[[package]]\nname = \"dependency\"\nversion = \"0.1.0\"\nsource = \"git+{url}#{commit}\"\n"
+            ),
+        )
+        .unwrap();
+        let snapshots = build_snapshots(&checkout, &checkout, &spool);
+        let id = Uuid::now_v7();
+        let (workspace, dependencies, upload) =
+            snapshots.transfer_bundles(id, &[], Some(&[])).unwrap();
+        assert_eq!(workspace.len(), 1);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(upload.len(), 2);
+
+        let spool = &snapshots.spool.0;
+        fs::write(spool.join("dependency-1.git/stale"), "old repository").unwrap();
+        fs::write(spool.join("bundle-1.lock"), "abandoned lock").unwrap();
+        fs::write(spool.join("bundle-99"), "old bundle").unwrap();
+        fs::create_dir(spool.join("dependency-99.git")).unwrap();
+        fs::write(spool.join("unrelated"), "keep").unwrap();
+        let outside = scratch.join("outside-spool");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), "keep").unwrap();
+        std::os::unix::fs::symlink(&outside, spool.join("dependency-98.git")).unwrap();
+
+        let (workspace, dependencies, upload) = snapshots
+            .transfer_bundles(id, &[], Some(&[]))
+            .expect("a second transfer must regenerate the job's bundles");
+        assert_eq!(workspace.len(), 1);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(upload.len(), 2);
+        assert_eq!(workspace[0], upload[0]);
+        assert_eq!(dependencies[0].url, url);
+        assert_eq!(dependencies[0].commits, vec![commit]);
+        assert_eq!(dependencies[0].bundle.as_ref(), Some(&upload[1]));
+        for manifest in &upload {
+            let bytes = fs::read(spool.join(format!("bundle-{}", manifest.index))).unwrap();
+            assert_eq!(manifest.length, bytes.len() as u64);
+            assert_eq!(manifest.sha256, format!("{:x}", Sha256::digest(&bytes)));
+        }
+        for stale in [
+            "dependency-1.git/stale",
+            "bundle-1.lock",
+            "bundle-99",
+            "dependency-99.git",
+            "dependency-98.git",
+        ] {
+            assert!(!spool.join(stale).exists(), "stale artifact: {stale}");
+        }
+        assert_eq!(fs::read_to_string(spool.join("unrelated")).unwrap(), "keep");
+        assert_eq!(fs::read_to_string(outside.join("keep")).unwrap(), "keep");
     }
 
     #[test]
