@@ -481,9 +481,6 @@ fn configure_options(
             "--free-space-eviction-bytes" => {
                 config.free_space_eviction_bytes = Some(value.parse().map_err(io::Error::other)?)
             }
-            "--build-folder-cap-bytes" => {
-                config.build_folder_cap_bytes = value.parse().map_err(io::Error::other)?
-            }
             "--workspace-root" => config.workspace_roots.push(value.into()),
             "--snapshot-prefetch-timeout-s" => {
                 config.snapshot_prefetch_timeout =
@@ -901,27 +898,6 @@ fn job_network_flag_accepts_only_veth() {
     assert!(configure_options(
         &mut config,
         ["--job-network".into(), "pasta".into()].into_iter()
-    )
-    .is_err());
-}
-
-#[test]
-fn build_folder_cap_option_defaults_and_parses_bytes() {
-    let mut config = Config::new("unused", "test");
-    assert_eq!(config.build_folder_cap_bytes, 64 << 30);
-    configure_options(
-        &mut config,
-        ["--build-folder-cap-bytes", "12345"]
-            .map(String::from)
-            .into_iter(),
-    )
-    .unwrap();
-    assert_eq!(config.build_folder_cap_bytes, 12345);
-    assert!(configure_options(
-        &mut config,
-        ["--build-folder-cap-bytes", "invalid"]
-            .map(String::from)
-            .into_iter()
     )
     .is_err());
 }

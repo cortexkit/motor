@@ -118,328 +118,6 @@ fn allocated_bytes(path: &Path, device: u64) -> io::Result<u64> {
 }
 
 impl Runner {
-    /// Partial reclamation uses the same admission fence and overlapping-tree
-    /// exclusion as whole-workspace eviction. Queued jobs count as users too.
-    fn claim_build_folder(&self, key: &str) -> io::Result<Option<(Candidate, WorkspaceDrop)>> {
-        if !self.quarantine_cleanup_blockers().is_empty() {
-            return Ok(None);
-        }
-        let mut inner = self.core.inner.lock().unwrap();
-        let candidate = self.disk_candidates(&inner)?.into_iter().find(|candidate| {
-            candidate.workspace.as_deref() == Some(key)
-                && inner
-                    .eviction_retry_after
-                    .get(&candidate.path)
-                    .is_none_or(|retry| *retry <= self.now())
-        });
-        Ok(candidate.map(|candidate| {
-            inner.dropping.insert(key.to_owned());
-            (
-                candidate,
-                WorkspaceDrop {
-                    runner: self.clone(),
-                    key: key.to_owned(),
-                },
-            )
-        }))
-    }
-
-    fn build_folder_access(&self, candidate: &Candidate) -> io::Result<()> {
-        self.validate_destinations(crate::caller_path::host(&candidate.path), None, &[])?;
-        #[cfg(target_os = "linux")]
-        if self.core.config.isolate_jobs && !self.core.config.boat_profile {
-            crate::isolation::restore_runner_root_access(&candidate.path)?;
-            let target = candidate.path.join("target");
-            if fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.is_dir()) {
-                crate::isolation::reclaim_runtime(&target)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// All ordinary reclaimed paths, including selected Cargo outputs, end in
-    /// this physical removal. Mapped roots and Boat use their retirement paths.
-    fn remove_reclaimed_path(path: &Path) -> io::Result<()> {
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() {
-            return Err(invalid("cannot reclaim a symlink root"));
-        }
-        if metadata.is_dir() {
-            fs::remove_dir_all(path)
-        } else if metadata.is_file() {
-            fs::remove_file(path)
-        } else {
-            Err(invalid("cannot reclaim a special inode"))
-        }
-    }
-
-    fn remove_build_paths(
-        &self,
-        candidate: &Candidate,
-        paths: &[PathBuf],
-        device: u64,
-    ) -> io::Result<()> {
-        for path in paths {
-            // Selection only returns physical descendants of this target. Keep
-            // authorization tied to the workspace, never to an inferred owner.
-            let selected = Candidate {
-                path: path.clone(),
-                workspace: candidate.workspace.clone(),
-                last_used_ms: candidate.last_used_ms,
-                cache_disk: false,
-                snapshot: false,
-            };
-            allocated_bytes(path, device)?;
-            if let Some(root) = crate::caller_path::trash::mapped_root(
-                &self.core.config,
-                crate::caller_path::host(path),
-            ) {
-                #[cfg(target_os = "linux")]
-                if let Some(retired) = crate::caller_path::trash::detach(
-                    &self.core.config,
-                    root,
-                    crate::caller_path::host(path),
-                )? {
-                    retired.remove(self.core.config.isolate_jobs, self.core.config.boat_profile)?;
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    let _ = root;
-                    return Err(invalid("caller roots require Linux"));
-                }
-            } else {
-                #[cfg(target_os = "linux")]
-                if self.boat_private_candidate(&selected) {
-                    self.remove_boat_candidate(&selected)?;
-                    continue;
-                }
-                let _ = selected;
-                Self::remove_reclaimed_path(path)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn trim_build_folder(&self, candidate: &Candidate, pass: u8) -> io::Result<()> {
-        let Some(_tree) = crate::tree_access::try_lock(crate::caller_path::host(&candidate.path))
-        else {
-            return Ok(());
-        };
-        self.build_folder_access(candidate)?;
-        let target = candidate.path.join("target");
-        let metadata = match fs::symlink_metadata(&target) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            result => result?,
-        };
-        if !metadata.is_dir() {
-            return Ok(());
-        }
-        let device = crate::filesystem::device(&candidate.path)?;
-        let before = allocated_bytes(&target, device)?;
-        let paths = if pass == 1 {
-            if self.core.config.boat_profile {
-                return Ok(());
-            }
-            crate::cargo_gc::stale_units(
-                &target,
-                UNIX_EPOCH + Duration::from_millis(self.now()),
-                device,
-            )?
-        } else {
-            if pass == 0 && before <= self.core.config.build_folder_cap_bytes {
-                return Ok(());
-            }
-            crate::cargo_gc::incremental(&target)?
-                .into_iter()
-                .map(|path| vec![path])
-                .collect()
-        };
-        for unit in paths {
-            self.remove_build_paths(candidate, &unit, device)?;
-        }
-        let after = allocated_bytes(&target, device)?;
-        tracing::info!(path = %target.display(), bytes_before = before, bytes_after = after,
-            bytes_freed = before.saturating_sub(after), pass, "runner build folder reclaim");
-        Ok(())
-    }
-
-    pub(super) fn guard_build_folder(&self, key: &str) {
-        if self.core.config.vm_instance() {
-            return;
-        }
-        let result = (|| -> io::Result<()> {
-            let Some((candidate, _claim)) = self.claim_build_folder(key)? else {
-                return Ok(());
-            };
-            // A busy walker can defer the guard until periodic maintenance.
-            let Some(_tree) =
-                crate::tree_access::try_lock(crate::caller_path::host(&candidate.path))
-            else {
-                return Ok(());
-            };
-            self.trim_build_folder(&candidate, 0)?;
-            self.core
-                .inner
-                .lock()
-                .unwrap()
-                .build_guard_pending
-                .remove(key);
-            Ok(())
-        })();
-        if let Err(error) = result {
-            tracing::warn!(path = key, %error, "runner build folder size guard failed");
-        }
-    }
-
-    pub(super) fn maintain_build_folders(&self) {
-        if self.core.config.vm_instance() {
-            return;
-        }
-        let pending: Vec<_> = self
-            .core
-            .inner
-            .lock()
-            .unwrap()
-            .build_guard_pending
-            .iter()
-            .cloned()
-            .collect();
-        for key in pending {
-            self.guard_build_folder(&key);
-        }
-        let keys = {
-            let mut inner = self.core.inner.lock().unwrap();
-            let now = self.now();
-            let live: BTreeSet<_> = inner.catalog.workspaces.keys().cloned().collect();
-            inner.build_swept_ms.retain(|key, _| live.contains(key));
-            inner.build_guard_pending.retain(|key| live.contains(key));
-            self.disk_candidates(&inner)
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|candidate| candidate.workspace)
-                .filter(|key| {
-                    inner
-                        .build_swept_ms
-                        .get(key)
-                        .is_none_or(|last| now.saturating_sub(*last) >= 24 * 60 * 60 * 1000)
-                })
-                .collect::<Vec<_>>()
-        };
-        for key in keys {
-            let result = (|| -> io::Result<()> {
-                let Some((candidate, _claim)) = self.claim_build_folder(&key)? else {
-                    return Ok(());
-                };
-                let Some(_tree) =
-                    crate::tree_access::try_lock(crate::caller_path::host(&candidate.path))
-                else {
-                    return Ok(());
-                };
-                let mut inner = self.core.inner.lock().unwrap();
-                if inner
-                    .build_swept_ms
-                    .get(&key)
-                    .is_some_and(|last| self.now().saturating_sub(*last) < 24 * 60 * 60 * 1000)
-                {
-                    return Ok(());
-                }
-                inner.build_swept_ms.insert(key.clone(), self.now());
-                drop(inner);
-                self.trim_build_folder(&candidate, 1)
-            })();
-            if let Err(error) = result {
-                tracing::warn!(path = key, %error, "runner stale build unit sweep failed");
-            }
-        }
-    }
-
-    fn build_candidate_bytes(
-        &self,
-        candidate: &Candidate,
-        incremental_only: bool,
-    ) -> io::Result<u64> {
-        let Some(key) = &candidate.workspace else {
-            return allocated_bytes(
-                &candidate.path,
-                crate::filesystem::device(&self.core.trees.state)?,
-            );
-        };
-        let Some((candidate, _claim)) = self.claim_build_folder(key)? else {
-            return Ok(0);
-        };
-        let Some(_tree) = crate::tree_access::try_lock(crate::caller_path::host(&candidate.path))
-        else {
-            return Ok(0);
-        };
-        self.build_folder_access(&candidate)?;
-        let device = crate::filesystem::device(&candidate.path)?;
-        if incremental_only {
-            crate::cargo_gc::incremental(&candidate.path.join("target"))?
-                .iter()
-                .try_fold(0u64, |total, path| {
-                    Ok(total.saturating_add(allocated_bytes(path, device)?))
-                })
-        } else {
-            allocated_bytes(&candidate.path, device)
-        }
-    }
-
-    fn reclaim_build_pass(
-        &self,
-        pass: u8,
-        soft: u64,
-        floor: u64,
-        free: &mut u64,
-    ) -> io::Result<()> {
-        let candidates = self.disk_candidates(&self.core.inner.lock().unwrap())?;
-        let mut candidates: Vec<_> = candidates
-            .into_iter()
-            .filter(|candidate| candidate.workspace.is_some())
-            .filter(|candidate| {
-                *free < floor
-                    || self.now().saturating_sub(candidate.last_used_ms) >= SOFT_PRESSURE_MIN_AGE_MS
-            })
-            .map(|candidate| {
-                let bytes = if pass == 2 {
-                    self.build_candidate_bytes(&candidate, true).unwrap_or(0)
-                } else {
-                    0
-                };
-                (candidate, bytes)
-            })
-            .collect();
-        if pass == 2 {
-            candidates.sort_by(|(a, a_bytes), (b, b_bytes)| {
-                b_bytes.cmp(a_bytes).then_with(|| a.path.cmp(&b.path))
-            });
-        }
-        for (candidate, _) in candidates {
-            if *free >= soft {
-                break;
-            }
-            if *free >= floor
-                && self.now().saturating_sub(candidate.last_used_ms) < SOFT_PRESSURE_MIN_AGE_MS
-            {
-                continue;
-            }
-            let key = candidate.workspace.as_ref().unwrap();
-            let Some((candidate, _claim)) = self.claim_build_folder(key)? else {
-                continue;
-            };
-            // Last use may have advanced since the off-lock size ranking.
-            if *free >= floor
-                && self.now().saturating_sub(candidate.last_used_ms) < SOFT_PRESSURE_MIN_AGE_MS
-            {
-                continue;
-            }
-            if let Err(error) = self.trim_build_folder(&candidate, pass) {
-                tracing::warn!(path = %candidate.path.display(), pass, %error, "runner build folder reclaim failed");
-            }
-            *free = (self.core.config.free_space_probe)(&self.core.trees.state)?;
-        }
-        Ok(())
-    }
-
     // Only profiles with a disk reserve need this barrier. It is taken before
     // inner so waiting for allocation never prevents status or cancel reads.
     pub(super) fn reserve_restore_barrier(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
@@ -1119,8 +797,7 @@ impl Runner {
                     last_used_ms: candidate.last_used_ms,
                     evicted_ms: self.now(),
                 };
-                tracing::info!(path = %eviction.path, bytes, bytes_freed = bytes, pass = 3,
-                    last_used_ms = eviction.last_used_ms, evicted_ms = eviction.evicted_ms, "runner disk eviction");
+                tracing::info!(path = %eviction.path, bytes, last_used_ms = eviction.last_used_ms, evicted_ms = eviction.evicted_ms, "runner disk eviction");
                 self.core
                     .health
                     .lock()
@@ -1521,24 +1198,6 @@ impl Runner {
             tracing::warn!(quarantined_id = %id, "disk cleanup proceeding past ownerless quarantine; duplicate fence retained");
         }
         let device = crate::filesystem::device(&self.core.trees.state)?;
-        if !sweep_idle_workspaces && !self.core.config.vm_instance() {
-            for pass in [1, 2] {
-                self.reclaim_build_pass(pass, soft, floor, &mut free)?;
-                if free >= soft {
-                    return Ok(None);
-                }
-            }
-        }
-        // Size walks run with the state lock released. Re-enumeration below
-        // still applies every live-path and age protection before deletion.
-        let candidates = self.disk_candidates(&self.core.inner.lock().unwrap())?;
-        let sizes: BTreeMap<_, _> = candidates
-            .into_iter()
-            .map(|candidate| {
-                let bytes = self.build_candidate_bytes(&candidate, false).unwrap_or(0);
-                (candidate.path, bytes)
-            })
-            .collect();
         let mut attempted = BTreeSet::new();
         let mut skipped_recent = BTreeSet::new();
         loop {
@@ -1546,31 +1205,13 @@ impl Runner {
                 let mut inner = self.core.inner.lock().unwrap();
                 let now = self.now();
                 inner.eviction_retry_after.retain(|_, retry| *retry > now);
-                let mut candidates = match self.disk_candidates(&inner) {
+                let candidates = match self.disk_candidates(&inner) {
                     Ok(candidates) => candidates,
                     Err(error) => {
                         tracing::warn!(%error, "cannot enumerate runner disk eviction candidates");
                         Vec::new()
                     }
                 };
-                candidates.sort_by(|a, b| {
-                    // Unreferenced snapshots retain priority over rebuildable
-                    // workspaces; within each tier prefer bytes times idle age.
-                    b.snapshot
-                        .cmp(&a.snapshot)
-                        .then_with(|| {
-                            if a.snapshot && b.snapshot {
-                                a.last_used_ms.cmp(&b.last_used_ms)
-                            } else {
-                                let score = |candidate: &Candidate| {
-                                    u128::from(sizes.get(&candidate.path).copied().unwrap_or(0))
-                                        * u128::from(now.saturating_sub(candidate.last_used_ms))
-                                };
-                                score(b).cmp(&score(a))
-                            }
-                        })
-                        .then_with(|| a.path.cmp(&b.path))
-                });
                 let sandboxes = self.core.trees.state.join("sandboxes");
                 let trash = self.core.trees.state.join("trash");
                 let staging = self
@@ -1797,7 +1438,7 @@ impl Runner {
                     fs::create_dir_all(&candidate.path)?;
                     fs::remove_dir_all(trash)?;
                 } else {
-                    Self::remove_reclaimed_path(&candidate.path)?;
+                    fs::remove_dir_all(&candidate.path)?;
                 }
                 Ok(bytes)
             });
