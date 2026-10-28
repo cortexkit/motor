@@ -104,6 +104,64 @@ fn disk_eviction_skips_reserved_and_running_workspaces() {
 }
 
 #[test]
+fn tenant_status_reports_current_workspaces_and_drops_evicted_entries() {
+    let f = Fixture::new();
+    let oldest = f.scratch.join("remote/worktrees/old-warm");
+    let newest = f.scratch.join("remote/worktrees/new-warm");
+    let pressure = Arc::new(AtomicBool::new(false));
+    let active = pressure.clone();
+    let reclaim = oldest.clone();
+    let mut c = config(&f, move |_| {
+        Ok(if active.load(Ordering::SeqCst) && reclaim.exists() {
+            10
+        } else {
+            200
+        })
+    });
+    c.tenant_vm = true;
+    let runner = Runner::open(c).unwrap();
+    let now = runner.now();
+    let old_job = Uuid::now_v7();
+    let new_job = Uuid::now_v7();
+    workspace(&runner, &f.scratch.join("remote/worktrees/legacy"), now);
+    for (path, job_id, used_ms) in [(&oldest, old_job, now - 20), (&newest, new_job, now - 10)] {
+        workspace(&runner, path, used_ms);
+        runner
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .catalog
+            .workspaces
+            .get_mut(text(path))
+            .unwrap()
+            .last_job_id = Some(job_id);
+    }
+    let held = runner.runner_status().health.unwrap().held_workspaces;
+    assert_eq!(
+        held.iter().map(|row| row.job_id).collect::<Vec<_>>(),
+        vec![new_job, old_job]
+    );
+    assert_eq!(held[0].used_ms, now - 10);
+    pressure.store(true, Ordering::SeqCst);
+    assert!(runner.ensure_disk_space().unwrap().is_none());
+    assert!(!oldest.exists());
+    let held = runner.runner_status().health.unwrap().held_workspaces;
+    assert_eq!(
+        held,
+        vec![HeldWorkspace {
+            job_id: new_job,
+            used_ms: now - 10
+        }]
+    );
+    let wire = serde_json::to_string(&held).unwrap();
+    assert!(
+        !wire.contains(text(&newest)),
+        "host cache telemetry must not disclose workspace paths"
+    );
+}
+
+#[test]
 fn disk_admission_preserves_incoming_sibling_head() {
     let f = Fixture::new();
     let (request, _) = f.run("true");

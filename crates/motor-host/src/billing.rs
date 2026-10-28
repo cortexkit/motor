@@ -371,13 +371,7 @@ impl Host {
                 .values()
                 .filter(|l| l.state == LeaseState::Reserved && !l.delivered)
                 .count() as u64,
-            // The broker prefers a warm VM only when an entry's tenant (the
-            // lease subject, acct:<ULID>) and workspace_key_hash byte-match
-            // the lease, and it refuses any other shape with 400. Job tokens
-            // carry no workspace hash, so this host never learns one for the
-            // VMs it warms, and an empty list is always valid. Cold placement
-            // binds to the subject's tenant VM, so nothing depends on warm.
-            warm: Vec::new(),
+            warm: self.warm_workspaces(now_ms),
             running: self
                 .snapshot
                 .leases

@@ -262,7 +262,7 @@ impl Boat {
             sshd.authorize_public(&jwk,port);
             let request=job.lock().unwrap().clone().unwrap(); let now=now_s();
             let mem_mib = match token_mem.load(Ordering::SeqCst) { 0 => motor_lease::memory_max_mib(request.vcpus), mib => mib };
-            let claims=Claims {iss:motor_lease::ISSUER.into(),aud:"boat:test".into(),sub:"acct:test".into(),jti:id.clone(),iat:now,exp:now+120,vcpus:request.vcpus,mem_mib,platform:request.platform,net:request.net,placement:motor_lease::Placement {host:"boat:test".into(),vm:Some("test".into())},max_s:request.timeout_s,purpose,cnf:Confirmation{jkt:jwk.thumbprint().unwrap()}};
+            let claims=Claims {workspace_key_hash:None,iss:motor_lease::ISSUER.into(),aud:"boat:test".into(),sub:"acct:test".into(),jti:id.clone(),iat:now,exp:now+120,vcpus:request.vcpus,mem_mib,platform:request.platform,net:request.net,placement:motor_lease::Placement {host:"boat:test".into(),vm:Some("test".into())},max_s:request.timeout_s,purpose,cnf:Confirmation{jkt:jwk.thumbprint().unwrap()}};
             let lease=serde_json::json!({"provider":"boat","ssh":{"endpoint":sshd.endpoint,"host_key":sshd.host_key,"user":sshd.user},"runner_port":port,"lease_id":id,"job_id":id,"placement":claims.placement,"job_token":motor_lease::sign_token(&claims,"test",&SigningKey::from_bytes(&[7;32])).unwrap(),"token_expires_at_ms":claims.exp*1000,"max_s":claims.max_s,"reserved_vcpu_ms":60000});
             (201,lease)
         }).await;

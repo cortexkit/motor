@@ -209,6 +209,7 @@ async fn a_slow_hosted_client_receives_every_frame_after_the_tenant_runner_close
         "linux-x64"
     };
     let claims = Claims {
+        workspace_key_hash: None,
         iss: motor_lease::ISSUER.into(),
         aud: "host".into(),
         jti: id.to_string(),

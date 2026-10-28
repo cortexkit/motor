@@ -54,6 +54,12 @@ pub(crate) struct TenantAdvert {
     wake_pending: bool,
     /// The permits the tenant runner's own cache fill held at the last probe.
     fill: Option<FillSample>,
+    warm: Option<WarmSample>,
+}
+
+struct WarmSample {
+    at_ms: u64,
+    held: Vec<motor_protocol::HeldWorkspace>,
 }
 
 struct FillSample {
@@ -227,15 +233,24 @@ impl Host {
         });
     }
     /// Whether a running tenant needs a new memory sample.
-    pub(crate) fn memory_probe_due(&self, tenant: &str, now_ms: u64) -> bool {
+    pub(crate) fn memory_probe_due(&self, tenant: &str, now_ms: u64, force: bool) -> bool {
+        // Only a VM with known hashes needs an extra membership probe before
+        // a lifecycle heartbeat. Other VMs retain the memory renewal cadence.
+        let force = force
+            && self.snapshot.leases.values().any(|lease| {
+                lease.tenant == tenant
+                    && lease.delivered
+                    && lease.claims.workspace_key_hash.is_some()
+            });
         self.is_ready(tenant)
             && !self.is_suspending(tenant)
             && self.start_refusal(tenant).is_none()
-            && self
-                .advert
-                .get(tenant)
-                .and_then(|a| a.memory.as_ref())
-                .is_none_or(|s| now_ms.saturating_sub(s.at_ms) >= MEMORY_PROBE_MS)
+            && (force
+                || self
+                    .advert
+                    .get(tenant)
+                    .and_then(|a| a.memory.as_ref())
+                    .is_none_or(|s| now_ms.saturating_sub(s.at_ms) >= MEMORY_PROBE_MS))
     }
     /// A sample describes one run of the guest: a wake or stop discards it.
     pub(super) fn reset_memory(&mut self, tenant: &str) {
@@ -245,6 +260,7 @@ impl Host {
             // A fill dies with the guest run it belonged to; a restarted
             // guest reports its own fill, if any, at its first probe.
             advert.fill = None;
+            advert.warm = None;
         }
     }
     /// Records the permits a running tenant's own cache fill holds, from the
@@ -270,6 +286,97 @@ impl Host {
             .and_then(|advert| advert.fill.as_ref())
             .filter(|fill| now_ms.saturating_sub(fill.at_ms) <= MEMORY_FRESH_MS)
             .map_or(0, |fill| fill.permits)
+    }
+
+    /// Each heartbeat starts with no cache claim. A skipped or failed probe
+    /// must not preserve a workspace the guest may have evicted meanwhile.
+    pub(crate) fn clear_warm(&mut self) {
+        for advert in self.advert.values_mut() {
+            advert.warm = None;
+        }
+    }
+
+    pub fn record_warm(
+        &mut self,
+        tenant: &str,
+        now_ms: u64,
+        held: Vec<motor_protocol::HeldWorkspace>,
+    ) {
+        self.advert.entry(tenant.to_owned()).or_default().warm = Some(WarmSample {
+            at_ms: now_ms,
+            held,
+        });
+    }
+
+    pub(crate) fn warm_workspaces(&self, now_ms: u64) -> Vec<motor_lease::WarmVm> {
+        let mut entries = Vec::new();
+        for (tenant, advert) in &self.advert {
+            if !self.is_ready(tenant) || self.is_suspending(tenant) {
+                continue;
+            }
+            let Some(sample) = advert
+                .warm
+                .as_ref()
+                .filter(|s| now_ms.saturating_sub(s.at_ms) < MEMORY_PROBE_MS)
+            else {
+                continue;
+            };
+            for held in &sample.held {
+                if held.used_ms == 0 || held.used_ms > sample.at_ms {
+                    continue;
+                }
+                let Some(lease) = self.snapshot.leases.get(&held.job_id.to_string()) else {
+                    continue;
+                };
+                // Guest reports are tenant input: only this VM's delivered,
+                // authenticated jobs can identify one of its workspaces.
+                if lease.tenant != *tenant || !lease.delivered {
+                    continue;
+                }
+                let Some(hash) = lease.claims.workspace_key_hash.as_ref() else {
+                    continue;
+                };
+                let Some(vm) = lease.claims.placement.vm.as_ref() else {
+                    continue;
+                };
+                if !self
+                    .binding(&lease.claims)
+                    .is_ok_and(|t| t.tenant == *tenant)
+                {
+                    continue;
+                }
+                entries.push((
+                    held.used_ms,
+                    motor_lease::WarmVm {
+                        tenant: lease.claims.sub.clone(),
+                        workspace_key_hash: hash.clone(),
+                        vm: vm.clone(),
+                    },
+                ));
+            }
+        }
+        entries.sort_by(|a, b| {
+            b.0.cmp(&a.0).then_with(|| {
+                (&a.1.tenant, &a.1.workspace_key_hash, &a.1.vm).cmp(&(
+                    &b.1.tenant,
+                    &b.1.workspace_key_hash,
+                    &b.1.vm,
+                ))
+            })
+        });
+        let mut seen = std::collections::BTreeSet::new();
+        entries
+            .into_iter()
+            .filter_map(|(_, warm)| {
+                seen.insert((
+                    warm.tenant.clone(),
+                    warm.workspace_key_hash.clone(),
+                    warm.vm.clone(),
+                ))
+                .then_some(warm)
+            })
+            .take(64)
+            .collect()
     }
     pub(super) fn start_succeeded(&mut self, tenant: &str) {
         if let Some(advert) = self.advert.get_mut(tenant) {

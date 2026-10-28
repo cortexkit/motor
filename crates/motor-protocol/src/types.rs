@@ -181,7 +181,9 @@ pub struct RunnerStatusReply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk: Option<RunnerDiskStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub health: Option<RunnerHealth>,
+    // Telemetry grows independently of the other frames; keep it off the
+    // inline Frame layout without changing its JSON representation.
+    pub health: Option<Box<RunnerHealth>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -237,6 +239,10 @@ pub struct RunnerHealth {
     /// the VM's CPU quota or change usage and billing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill_permits: Option<u32>,
+    /// Current cached workspaces, identified by their latest job rather than
+    /// paths. The host joins these IDs to the workspace hashes it admitted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_workspaces: Vec<HeldWorkspace>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_wait_1h: Option<HealthQueueWait>,
     /// Reports the sealed image's guest-agent hash and whether it matches the release.
@@ -244,6 +250,14 @@ pub struct RunnerHealth {
     pub windows_guest_agent: Option<WindowsGuestAgentReadiness>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_cache: Option<RemoteCacheHealth>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HeldWorkspace {
+    #[serde(default, skip_serializing_if = "Uuid::is_nil")]
+    pub job_id: Uuid,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub used_ms: u64,
 }
 
 /// Credential-free gateway telemetry, not compiler-cache reuse statistics.

@@ -279,7 +279,7 @@ impl Runner {
     pub fn runner_status(&self) -> RunnerStatusReply {
         let now = self.now();
         // Keep retained job history out of the state-lock path of each probe.
-        let (status, permits_held, fill_permits) = {
+        let (status, permits_held, fill_permits, held_workspaces) = {
             let inner = self.core.inner.lock().unwrap();
             let usage = self.core.repository_usage.lock().unwrap();
             let active = &usage.active;
@@ -304,10 +304,30 @@ impl Runner {
                     .filter(|job| job.terminal.is_none())
                     .map_or(0, |job| job.weight)
             });
+            // Catalog removal is shared by pressure eviction and idle expiry;
+            // retained job history alone cannot establish cache membership.
+            let mut held_workspaces: Vec<_> = if self.core.config.tenant_vm {
+                inner
+                    .catalog
+                    .workspaces
+                    .values()
+                    .filter_map(|workspace| {
+                        workspace.last_job_id.map(|job_id| HeldWorkspace {
+                            job_id,
+                            used_ms: workspace.used_ms,
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            held_workspaces
+                .sort_by_key(|workspace| (std::cmp::Reverse(workspace.used_ms), workspace.job_id));
             (
                 self.status_with_jobs(&inner, queue_depth, running),
                 permits,
                 fill_permits,
+                held_workspaces,
             )
         };
         let (repository_usage, underused_reservations) = {
@@ -380,6 +400,7 @@ impl Runner {
                 permits_held: Some(permits_held),
                 permits_cap: Some(self.core.config.max_weight),
                 fill_permits,
+                held_workspaces,
                 queue_wait_1h: Some(counters.queue_wait(now)),
                 windows_guest_agent: self.core.config.windows_runtime.guest_agent_readiness(),
                 remote_cache,
@@ -392,7 +413,7 @@ impl Runner {
                 floor_bytes: self.core.config.free_space_floor_bytes,
                 last_eviction: self.core.inner.lock().unwrap().last_eviction.clone(),
             }),
-            health: Some(health),
+            health: Some(Box::new(health)),
         }
     }
 

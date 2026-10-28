@@ -93,6 +93,15 @@ pub(super) fn claims(
                 || lease.token_expires_at_ms <= now.saturating_mul(1000),
         ),
         ("cnf", motor_lease::bind_requester(&claims, &jwk).is_err()),
+        (
+            "workspace_key_hash",
+            claims.workspace_key_hash.as_deref().is_some_and(|hash| {
+                hash.len() != 43
+                    || !hash
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            }),
+        ),
     ]
     .into_iter()
     .find_map(|(field, failed)| failed.then_some(field));
@@ -101,6 +110,47 @@ pub(super) fn claims(
         return Err(Error::Auth);
     }
     Ok(claims)
+}
+
+#[cfg(test)]
+mod workspace_claim_tests {
+    use super::*;
+
+    #[test]
+    fn hosted_claims_accept_optional_workspace_hash_and_refuse_malformed_hash() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../motor-lease/contracts/cloud/job-tokens-workspace.json"
+        ))
+        .unwrap();
+        let requester = SigningKey::from_bytes(&std::array::from_fn(|i| 32 + i as u8));
+        for (name, purpose) in [("run", Purpose::Run), ("attach", Purpose::Attach)] {
+            let mut c: Claims =
+                serde_json::from_str(fixture["tokens"][name]["claims"].as_str().unwrap()).unwrap();
+            c.iat = now_s();
+            c.exp = c.iat + 300;
+            let id = Uuid::parse_str(&c.jti).unwrap();
+            for (hash, accepted) in [
+                (c.workspace_key_hash.clone(), true),
+                (None, true),
+                (Some("A".repeat(42)), false),
+                (Some(format!("{}=", "A".repeat(42))), false),
+            ] {
+                c.workspace_key_hash = hash;
+                let lease = LeaseResponse {
+                    lease_id: id.to_string(),
+                    job_id: id.to_string(),
+                    placement: c.placement.clone(),
+                    endpoint: "unused".into(),
+                    endpoint_spki_sha256: String::new(),
+                    job_token: motor_lease::sign_token(&c, "test", &requester).unwrap(),
+                    token_expires_at_ms: c.exp * 1000,
+                    max_s: c.max_s,
+                    reserved_vcpu_ms: 0,
+                };
+                assert_eq!(claims(id, &lease, &requester, purpose).is_ok(), accepted);
+            }
+        }
+    }
 }
 
 /// A failed connection to a hosted runner: the error ck-motor reports, the step

@@ -2454,7 +2454,10 @@ impl Runner {
                 job.finished_ms,
                 catalog.workspaces.get_mut(crate::caller_path::job_key(job)),
             ) {
-                workspace.used_ms = workspace.used_ms.max(finished_ms);
+                if finished_ms >= workspace.used_ms {
+                    workspace.used_ms = finished_ms;
+                    workspace.last_job_id = Some(job.id);
+                }
             }
         }
         paths::catalog::Split::new(&catalog, &config.caller_roots).save(
@@ -7569,6 +7572,15 @@ impl Runner {
                 snapshots.is_none(),
                 r.workspace_kind,
             );
+            if prepared.is_ok() {
+                if let Some(workspace) = inner
+                    .catalog
+                    .workspaces
+                    .get_mut(paths::request(&r).caller_workspace_key.text())
+                {
+                    workspace.last_job_id = Some(id);
+                }
+            }
             // Only a setup that completed, and so completed its switch
             // touch, updates the workspace's sibling freshness record.
             if let Some(snapshots) = snapshots.filter(|_| prepared.is_ok()) {
@@ -9163,6 +9175,7 @@ impl Runner {
             return;
         };
         w.used_ms = self.now();
+        w.last_job_id = Some(request.job_id);
         if let Some(descriptor) = reader_descriptor {
             if let Some(g) = inner
                 .catalog
