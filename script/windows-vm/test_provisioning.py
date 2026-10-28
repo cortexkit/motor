@@ -272,6 +272,35 @@ class BaselineInputsTests(unittest.TestCase):
                          'if ($targets -notcontains $target) { throw'):
             self.assertIn(expected, source)
 
+    def test_baseline_installs_checksum_pinned_nextest_beside_cargo_for_all_images(self):
+        source = (HERE / "setup-job-baseline.ps1").read_text()
+        catalogue = json.loads((HERE.parent / "runner/toolchain.json").read_text())
+        version = next(tool["version"] for tool in catalogue["cargo_installs"] if tool["crate"] == "cargo-nextest")
+        self.assertEqual(version, "0.9.138")
+        for expected in (f"$nextestVersion = '{version}'",
+                         "$nextestSha256 = 'e4606198dd067299f16863dcf5b9be007b9cae041e468c417884fc224760c0f4'",
+                         f"Invoke-WebRequest 'https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-{version}/cargo-nextest-{version}-x86_64-pc-windows-msvc.tar.gz' -OutFile $nextestArchive",
+                         "if ((Get-FileHash -LiteralPath $nextestArchive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $nextestSha256) {\n        throw 'cargo-nextest archive SHA-256 mismatch'\n    }",
+                         r"""& "$env:SystemRoot\System32\tar.exe" -xzf $nextestArchive -C 'C:\rust\cargo\bin' cargo-nextest.exe""",
+                         "if ($LASTEXITCODE -ne 0) { throw 'cargo-nextest extraction failed' }",
+                         "Remove-Item -LiteralPath $nextestArchive -Force -ErrorAction SilentlyContinue",
+                         r"& 'C:\rust\cargo\bin\cargo.exe' nextest --version",
+                         "if ($LASTEXITCODE -ne 0 -or $installedNextestVersion -notmatch ('^cargo-nextest ' + [regex]::Escape($nextestVersion) + '(?:\\s|$)')) {",
+                         "throw 'Machine-wide cargo-nextest version verification failed'"):
+            self.assertIn(expected, source)
+        self.assertLess(source.index("-OutFile $nextestArchive"), source.index("Get-FileHash -LiteralPath $nextestArchive"))
+        self.assertLess(source.index("throw 'cargo-nextest archive SHA-256 mismatch'"), source.index("-xzf $nextestArchive"))
+        self.assertLess(source.index("-xzf $nextestArchive"), source.index("nextest --version"))
+        self.assertLess(source.index("nextest --version"), source.index("# Freeze toolchain files"))
+        nextest_setup = source.split("$nextestVersion = ", 1)[1].split("$vswhere = ", 1)[0]
+        self.assertNotIn("$HyperVSpike", nextest_setup)
+        self.assertNotIn("hyperv-runner", nextest_setup)
+
+    def test_windows_image_qualification_requires_nextest_version(self):
+        operator = (HERE.parent.parent / "crates/motor-runner/src/tests/windows_operator.rs").read_text()
+        self.assertIn("cargo --version; cargo nextest --version; git --version", operator)
+        self.assertIn('line.starts_with("cargo-nextest 0.9.138 ")', operator)
+
     def test_guest_requests_arm64_msvc_on_every_install_path(self):
         source = (HERE / "setup-guest.ps1").read_text()
         winget = source.split("$vsArgs = @(", 1)[1].split(") -join", 1)[0]

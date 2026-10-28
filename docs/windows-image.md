@@ -109,12 +109,21 @@ administrator, randomizes local passwords and runs, in order:
    and on machine `PATH` for offline Git Bash jobs; the standard
    `motor-job` user and its batch-logon
    right and `SeCreateSymbolicLinkPrivilege`, a machine-wide Rust toolchain for `x86_64-pc-windows-msvc` under
-   `C:\rust` (read-only to the job user), the virtio-serial driver, and the
+   `C:\rust` (read-only to the job user, including clippy, rustfmt and
+   cargo-nextest 0.9.138), the virtio-serial driver, and the
    guest agent built from the seed's source with
    `cargo build --release --locked --target x86_64-pc-windows-msvc` and
    installed as an automatic LocalSystem service at
    `C:\ProgramData\Motor\motor-winagent.exe`. The agent's SHA-256 is written to
    `C:\build\provision\winagent.sha256`.
+
+The baseline downloads the official x86_64 Windows cargo-nextest 0.9.138
+`tar.gz` release while the image has network access, verifies its pinned SHA-256
+before extraction, and installs `cargo-nextest.exe` beside Cargo at
+`C:\rust\cargo\bin` on machine `PATH`. The URL and checksum are pinned in
+`setup-job-baseline.ps1`; a mismatch fails provisioning. Both QEMU and Hyper-V
+job images use this installer, so offline jobs can run `cargo nextest` without
+downloading tools.
 
 The local security policy is exported and configured with `secedit`. Only the
 `motor-job` SID is added to the existing account-right assignments; no Users or
@@ -217,7 +226,7 @@ binary must come from the same commit. The lane runs, from
 
 | Test | Checks |
 | --- | --- |
-| `windows_qualification_baseline_machine_wide_toolchain_and_msvc_build` | Standard-user PowerShell 7.6.7 execution and recursive write denial; a long-checkout MSVC build uses `C:\t` and is readable through checkout `target/`. |
+| `windows_qualification_baseline_machine_wide_toolchain_and_msvc_build` | Standard-user PowerShell 7.6.7 and cargo-nextest 0.9.138 execution and recursive write denial for PowerShell and Bun; a long-checkout MSVC build uses `C:\t` and is readable through checkout `target/`. |
 | `windows_qualification_standard_user_environment` | Windows' full machine `PATHEXT`, PowerShell on machine `PATH`, native command lookup from Git Bash and PowerShell, writable user application-data folders, and accepted request overrides. |
 | `windows_qualification_symlinks_do_not_escape_collection_or_cache` | Standard-user file/directory symlinks to absolute system/agent and UNC targets, inside and outside the workspace; link-only collection, no Linux link creation, and an explained cache inventory on the next job. |
 | `windows_qualification_no_network_but_loopback_works` | No network beyond loopback. |

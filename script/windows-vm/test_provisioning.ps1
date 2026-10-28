@@ -31,6 +31,65 @@ foreach ($commandText in @('& $rustup component add clippy rustfmt --toolchain $
 $checks++
 Write-Host 'PASS rust_components_and_arm64_target_unconditional'
 
+$nextestInstall = @($ast.EndBlock.Statements | Where-Object {
+    $_ -is [Management.Automation.Language.TryStatementAst] -and $_.Extent.Text.Contains('-OutFile $nextestArchive')
+})
+Assert ($nextestInstall.Count -eq 1) 'nextest must install unconditionally for QEMU and Hyper-V images'
+$nextestSetup = $nextestInstall[0].Extent.Text
+Assert ($nextestSetup.IndexOf('-OutFile $nextestArchive') -lt $nextestSetup.IndexOf('Get-FileHash -LiteralPath $nextestArchive')) 'nextest hash must follow download'
+Assert ($nextestSetup.IndexOf("throw 'cargo-nextest archive SHA-256 mismatch'") -lt $nextestSetup.IndexOf('-xzf $nextestArchive')) 'nextest hash must be verified before extraction'
+Assert ($nextestInstall[0].Extent.EndOffset -lt $baseline.IndexOf("# Freeze toolchain files")) 'nextest must install before the toolchain is made read-only'
+$checks++
+Write-Host 'PASS nextest_unconditional_download_verify_extract_before_freeze'
+
+# Execute the installer's guards without downloading or running Windows tools.
+$nextestHashGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text.Contains('Get-FileHash -LiteralPath $nextestArchive')}, $true)
+Assert ($null -ne $nextestHashGuard) 'missing nextest archive hash guard'
+$nextestArchive = 'nextest-fixture.tar.gz'
+$nextestSha256 = 'e4606198dd067299f16863dcf5b9be007b9cae041e468c417884fc224760c0f4'
+function Get-FileHash {
+    param($LiteralPath, $Algorithm)
+    Assert ($LiteralPath -eq $nextestArchive -and $Algorithm -eq 'SHA256') 'nextest hashed the wrong archive or algorithm'
+    [pscustomobject]@{ Hash = $fixtureHash }
+}
+try {
+    foreach ($fixtureHash in @($nextestSha256.ToUpperInvariant(), ('0' * 64))) {
+        $threw = $false
+        try { Invoke-Expression $nextestHashGuard.Extent.Text } catch {
+            Assert ($_.ToString().Contains('cargo-nextest archive SHA-256 mismatch')) "unexpected nextest hash error: $_"
+            $threw = $true
+        }
+        Assert ($threw -eq ($fixtureHash -eq ('0' * 64))) 'nextest accepted a wrong hash or rejected the pinned hash'
+    }
+} finally {
+    Remove-Item Function:\Get-FileHash
+}
+$checks++
+Write-Host 'PASS nextest_hash_guard_rejects_mismatch'
+
+$nextestVersionGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text.Contains('$installedNextestVersion -notmatch')}, $true)
+Assert ($null -ne $nextestVersionGuard) 'missing nextest version guard'
+$nextestVersion = '0.9.138'
+foreach ($case in @(
+    @{Version='cargo-nextest 0.9.138 (fc97e97bb 2026-06-21)'; Code=0; Reject=$false},
+    @{Version="cargo-nextest 0.9.138 (fc97e97bb 2026-06-21)`r"; Code=0; Reject=$false},
+    @{Version='cargo-nextest 0.9.137 (old)'; Code=0; Reject=$true},
+    @{Version='cargo-nextest 0.9.1380 (wrong)'; Code=0; Reject=$true},
+    @{Version=''; Code=127; Reject=$true},
+    @{Version='cargo-nextest 0.9.138 (fc97e97bb 2026-06-21)'; Code=1; Reject=$true}
+)) {
+    $installedNextestVersion = $case.Version
+    $LASTEXITCODE = $case.Code
+    $threw = $false
+    try { Invoke-Expression $nextestVersionGuard.Extent.Text } catch {
+        Assert ($_.ToString().Contains('Machine-wide cargo-nextest version verification failed')) "unexpected nextest version error: $_"
+        $threw = $true
+    }
+    Assert ($threw -eq $case.Reject) "wrong nextest version guard result: $($case.Version), exit $($case.Code)"
+}
+$checks++
+Write-Host 'PASS nextest_version_guard_rejects_wrong_missing_and_failed_tools'
+
 # Execute the real inventory guards with complete and incomplete rustup output.
 $hostTriple = 'x86_64-pc-windows-msvc'
 foreach ($inventory in @('components', 'targets')) {
@@ -86,6 +145,7 @@ Write-Host 'PASS developer_mode_absent_key_absent_value_zero_and_one'
 $items = [ordered]@{
     machine_toolchain = @("`$toolchain = '1.99.0'", "`$hostTriple = 'x86_64-pc-windows-msvc'", "`$env:RUSTUP_HOME = 'C:\rust\rustup'", "`$env:CARGO_HOME = 'C:\rust\cargo'", '--default-toolchain $toolchain --default-host $hostTriple --no-modify-path', "SetEnvironmentVariable('RUSTUP_HOME'", "SetEnvironmentVariable('Path'", "'C:\rust' /inheritance:r", ':(OI)(CI)RX')
     machine_bun = @("`$bunVersion = '1.4.2'", 'bun-v1.4.2/bun-windows-x64.zip', 'bun-v1.4.2/SHASUMS256.txt', 'ce4c17497b2f29712a99d3d53f028de28cd42e3bacb8589599e7f000e49b6405', 'Get-FileHash -LiteralPath $bunArchive -Algorithm SHA256', 'throw ''Bun archive SHA-256 mismatch''', "`$bunInstall = 'C:\Program Files\Bun'", '& icacls $bunInstall /inheritance:r', '*S-1-5-32-545:(OI)(CI)RX', '& icacls $bunInstall /setowner', 'SetEnvironmentVariable(''Path'', "$bunInstall;$machinePath", ''Machine'')', '& "$bunInstall\bun.exe" --version', '$installedBunVersion -cne $bunVersion')
+    machine_nextest = @("`$nextestVersion = '0.9.138'", 'cargo-nextest-0.9.138/cargo-nextest-0.9.138-x86_64-pc-windows-msvc.tar.gz', 'e4606198dd067299f16863dcf5b9be007b9cae041e468c417884fc224760c0f4', '-xzf $nextestArchive -C ''C:\rust\cargo\bin'' cargo-nextest.exe', "if (`$LASTEXITCODE -ne 0) { throw 'cargo-nextest extraction failed' }", 'Remove-Item -LiteralPath $nextestArchive -Force', '& ''C:\rust\cargo\bin\cargo.exe'' nextest --version')
     virtio_serial = @('vioserial\2k22\amd64\vioser.inf', '& pnputil /add-driver', '/install')
     standard_job_user = @("`$jobUser = 'motor-job'", 'New-LocalUser $jobUser', 'Remove-LocalGroupMember $admins', 'SeBatchLogonRight', 'SeCreateSymbolicLinkPrivilege', 'Job SID missing from $right', 'Job baseline must not enable Developer Mode', 'CreateProfile($jobSid', 'job-password.txt', '$credential /inheritance:r')
     service = @('build --release --locked', 'New-Service -Name motor-winagent', '-StartupType Automatic', "StartName -ne 'LocalSystem'", 'Get-FileHash', 'SHA256')

@@ -190,8 +190,10 @@ Git Bash may prepend its own normal shell directories. A caller cannot replace
 `managed_paths_win_and_windows_machine_then_user_paths_survive`.
 
 3.5. The toolchain is the baseline's machine-wide Rust for
-`x86_64-pc-windows-msvc`, with MSVC Build Tools, Git, Bun and PowerShell
-7.6.7 at `C:\Program Files\PowerShell\7`. The job can read and execute the
+`x86_64-pc-windows-msvc`, with clippy, rustfmt, cargo-nextest 0.9.138, MSVC Build
+Tools, Git, Bun and PowerShell 7.6.7 at `C:\Program Files\PowerShell\7`.
+`cargo-nextest.exe` is installed beside Cargo at `C:\rust\cargo\bin` so
+`cargo nextest` works offline. The job can read and execute the
 PowerShell installation but cannot write files or create entries anywhere in it.
 Its directory is provisioned on machine `PATH` and precedes Windows PowerShell
 5.1 in the job `PATH`; 5.1 remains available. Native children receive Windows

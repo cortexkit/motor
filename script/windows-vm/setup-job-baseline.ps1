@@ -229,6 +229,28 @@ foreach ($target in @($hostTriple, 'aarch64-pc-windows-msvc')) {
 $components | Write-Host
 $targets | Write-Host
 
+# Jobs are offline; install the verified Windows release beside Cargo before
+# the toolchain tree is made read-only for the job user.
+# SHA-256 source: https://github.com/cortexkit/aft/blob/main/.github/actions/setup-nextest/action.yml
+$nextestVersion = '0.9.138'
+$nextestSha256 = 'e4606198dd067299f16863dcf5b9be007b9cae041e468c417884fc224760c0f4'
+$nextestArchive = Join-Path $motor 'cargo-nextest-x86_64-pc-windows-msvc.tar.gz'
+try {
+    Invoke-WebRequest 'https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.138/cargo-nextest-0.9.138-x86_64-pc-windows-msvc.tar.gz' -OutFile $nextestArchive -UseBasicParsing
+    if ((Get-FileHash -LiteralPath $nextestArchive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $nextestSha256) {
+        throw 'cargo-nextest archive SHA-256 mismatch'
+    }
+    & "$env:SystemRoot\System32\tar.exe" -xzf $nextestArchive -C 'C:\rust\cargo\bin' cargo-nextest.exe
+    if ($LASTEXITCODE -ne 0) { throw 'cargo-nextest extraction failed' }
+} finally {
+    Remove-Item -LiteralPath $nextestArchive -Force -ErrorAction SilentlyContinue
+}
+$installedNextestVersion = & 'C:\rust\cargo\bin\cargo.exe' nextest --version
+if ($LASTEXITCODE -ne 0 -or $installedNextestVersion -notmatch ('^cargo-nextest ' + [regex]::Escape($nextestVersion) + '(?:\s|$)')) {
+    throw 'Machine-wide cargo-nextest version verification failed'
+}
+Write-Host "Verified machine-wide $installedNextestVersion"
+
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path $vswhere)) { throw 'Visual Studio locator is missing' }
 $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Workload.VCTools Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath

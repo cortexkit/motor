@@ -221,7 +221,13 @@ fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
     let output = run(
         &runner,
         &f,
-        &format!("set -e; rustc -vV; cargo --version; git --version; bun --version; pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; {probe}; cargo run --offline; test -f target/debug/motor-qualification.exe"),
+        &format!("set -e; rustc -vV; cargo --version; cargo nextest --version; git --version; bun --version; pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; {probe}; cargo run --offline; test -f target/debug/motor-qualification.exe"),
+    );
+    assert!(
+        output
+            .lines()
+            .any(|line| line.starts_with("cargo-nextest 0.9.138 ")),
+        "{output}"
     );
     assert!(
         output.lines().any(|line| line.trim() == "7.6.7"),

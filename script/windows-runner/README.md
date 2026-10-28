@@ -301,6 +301,13 @@ Get-Content "$provision\sealed.json"
 Get-FileHash "$provision\parent.vhdx" -Algorithm SHA256
 ```
 
+The Hyper-V guest uses `script/windows-vm/setup-job-baseline.ps1`, the same
+machine-wide toolchain installer as the QEMU job image. It includes clippy,
+rustfmt and cargo-nextest 0.9.138. Nextest's official x86_64 Windows archive is
+downloaded and SHA-256-verified during image provisioning, then installed beside
+Cargo at `C:\rust\cargo\bin` for offline jobs. Updating these tools requires a
+fresh parent image, not a host-side Cargo installation.
+
 Supply the exact public key line from the vault in a file; never transfer the
 private key. A registration with `MotorOwner=motor-hyperv-spike` can be
 explicitly adopted with `-AdoptSpikeRegistration`:
@@ -335,7 +342,8 @@ repository containing only `run.sh` with no Cargo manifest or lockfile;
 cold then warm registry/cache paths, large stdout and source-output collection,
 the non-admin `motor-job` guest account, and that host cache bytes do not leak into
 the guest's unrelated paths. Every real job first requires `bun --version` to
-return exactly `1.4.2`, including jobs using a custom gate command. The configured default commands are `cargo test
+return exactly `1.4.2` and prints `cargo nextest --version`, requiring
+`cargo-nextest 0.9.138`, including jobs using a custom gate command. The configured default commands are `cargo test
 --locked --offline -- --nocapture` and `cargo clippy --all-targets --locked --offline --
 -D warnings`. It retains host VM-lifecycle samples, startup hash timing, and guest
 logs. Any failure stops the service and does not count as a skip. Return the complete

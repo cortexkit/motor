@@ -88,6 +88,24 @@ class QualificationReadinessTests(unittest.TestCase):
                 result = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
                 self.assertEqual(result.returncode == 0, version.rstrip("\r") == "1.4.2" and code == 0, result.stderr)
 
+    def test_real_jobs_check_nextest_even_with_a_custom_gate(self):
+        source = (HERE / "qualify-jobs.py").read_text()
+        self.assertIn('+ NEXTEST_VERSION_CHECK + " || exit $?; " + ', source)
+
+    @unittest.skipUnless(shutil.which("bash"), "requires Bash for the Git Bash version guard")
+    def test_nextest_version_check_rejects_wrong_missing_and_failed_nextest(self):
+        expected = "cargo-nextest 0.9.138 (fc97e97bb 2026-06-21)"
+        for version, code, passes in ((expected, 0, True), (expected + "\r", 0, True),
+                                      (expected.replace("0.9.138", "0.9.137"), 0, False),
+                                      (expected.replace("0.9.138", "0.9.1380"), 0, False),
+                                      ("", 127, False), (expected, 1, False)):
+            with self.subTest(version=version, code=code):
+                command = f"cargo() {{ test \"$*\" = 'nextest --version' || return 1; printf '%s\\n' '{version}'; return {code}; }}; " + JOBS.NEXTEST_VERSION_CHECK
+                result = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, passes, result.stderr)
+                if passes:
+                    self.assertIn(expected, result.stdout)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
