@@ -9,7 +9,7 @@ Environment=HOME=/home/ubuntu
 Environment=CARGO_HOME=/srv/build/cargo-home
 Environment=RUSTUP_HOME=/home/ubuntu/.rustup
 Environment=PATH=/srv/build/cargo-home/bin:/home/ubuntu/.bun/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/home/ubuntu/.cargo/bin/motor-runner serve --instance %i
+ExecStart=/home/ubuntu/.cargo/bin/motor-runner serve --instance %i --build-folder-cap-bytes 68719476736
 Restart=on-failure
 RestartSec=2
 KillMode=mixed

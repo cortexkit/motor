@@ -167,6 +167,8 @@ pub struct Config {
     pub free_space_floor_bytes: u64,
     /// Optional soft reclaim goal; absent preserves twice the admission floor.
     pub free_space_eviction_bytes: Option<u64>,
+    /// Drop incremental state after an idle job leaves target above this size.
+    pub build_folder_cap_bytes: u64,
     /// Size of the preallocated file the runner keeps in its state directory
     /// so that a job which fills the disk on its own can still have its
     /// terminal record written (see `disk.rs`). Zero keeps no reserve; the
@@ -485,6 +487,7 @@ impl Config {
             windows_prep_executable: None,
             free_space_floor_bytes: DEFAULT_FREE_SPACE_FLOOR_BYTES,
             free_space_eviction_bytes: None,
+            build_folder_cap_bytes: 64 << 30,
             disk_reserve_bytes: 0,
             workspace_roots: vec![PathBuf::from("/Users")],
             owned_workspace_roots: vec![PathBuf::from("/Users")],
@@ -980,6 +983,8 @@ struct Inner {
     start_retries: BTreeMap<Uuid, StartRetry>,
     last_eviction: Option<DiskEviction>,
     eviction_retry_after: BTreeMap<PathBuf, u64>,
+    build_swept_ms: BTreeMap<String, u64>,
+    build_guard_pending: BTreeSet<String>,
     kill_retries: BTreeMap<Uuid, (u32, std::time::Instant)>,
     finalizing: BTreeSet<Uuid>,
     /// A real exit status delivered while the finalization owner is collecting
@@ -2581,6 +2586,8 @@ impl Runner {
                     evicting_caches: BTreeSet::new(),
                     last_eviction: None,
                     eviction_retry_after: BTreeMap::new(),
+                    build_swept_ms: BTreeMap::new(),
+                    build_guard_pending: BTreeSet::new(),
                     kill_retries: BTreeMap::new(),
                     finalizing: BTreeSet::new(),
                     exit_statuses: BTreeMap::new(),
@@ -6280,6 +6287,7 @@ impl Runner {
             }
         }
         self.expire_returned_files();
+        self.maintain_build_folders();
         if !maintained? {
             return Ok(());
         }
@@ -9153,6 +9161,7 @@ impl Runner {
             // gateway cannot attribute counts to this job. No state change and
             // no lock held while reading the counters.
             self.log_remote_cache_totals(id);
+            self.guard_build_folder(paths::request(&request).caller_workspace_key.text());
         }
         self.prune_refs()?;
         Ok(())
@@ -9176,6 +9185,9 @@ impl Runner {
         };
         w.used_ms = self.now();
         w.last_job_id = Some(request.job_id);
+        inner
+            .build_guard_pending
+            .insert(paths::request(request).caller_workspace_key.text().clone());
         if let Some(descriptor) = reader_descriptor {
             if let Some(g) = inner
                 .catalog

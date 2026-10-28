@@ -6,6 +6,7 @@ mod boat_quota;
 #[cfg(target_os = "linux")]
 mod boat_quota_events;
 mod caller_path;
+mod cargo_gc;
 mod cleanup;
 #[cfg(all(test, unix))]
 mod compatibility_config;

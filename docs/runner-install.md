@@ -253,6 +253,7 @@ stay up (`loginctl enable-linger <operator>`).
 | `--sccache-size-gib N` | 200 | Compile cache cap. |
 | `--free-space-floor-bytes N` | 137438953472 (128 GiB) | Disk admission floor; 0 disables. |
 | `--free-space-eviction-bytes N` | twice the floor | Optional soft reclaim goal, strictly above the hard floor. Does not change admission while the hard reserve is available. |
+| `--build-folder-cap-bytes N` | 68719476736 (64 GiB) | After a job, drop only `target/<profile>/incremental` if the idle workspace's allocated target bytes exceed this cap. Not a hard quota; other outputs remain. |
 | `--workspace-root PATH` | `/Users` | Adds a root under which idle workspaces may be evicted. |
 | `--owned-workspace-root PATH` | `/Users` | Adds a root under which caller workspaces may be created. |
 | `--caller-root PREFIX=HOST` | absent | Maps caller paths beneath `PREFIX` onto `HOST`, a directory the runner owns, and presents them to the job at `PREFIX`. Repeatable. Needs isolated Linux host jobs; refused for Windows-VM and macOS-VM backends and for a tenant runner without `--boat-profile`. See [section 9](#9-optional-caller-roots-for-home-checkouts). |
