@@ -3,7 +3,6 @@
 pub(crate) mod account;
 pub(crate) mod check;
 mod finish;
-pub(crate) use finish::SHADOW_CLEANUP_BOUND;
 pub(crate) mod placement;
 mod ssh;
 #[cfg(test)]
@@ -280,11 +279,6 @@ impl RequestField {
         std::str::from_utf8(&self.bytes[..usize::from(self.len)]).expect("validated ASCII field")
     }
 }
-/// How long a shadow waits for the broker to provision its sandbox. Resuming a
-/// stopped Boat sandbox takes about 100 s and a cold start from the prepared
-/// image up to about 3 minutes, so a shorter wait abandons most shadows that
-/// don't land on a warm sandbox.
-pub(crate) const SHADOW_PROVISIONING_BUDGET: Duration = Duration::from_secs(300);
 /// A spill has already surrendered its build-server queue slot. Healthy Boat
 /// starts take about 110 seconds; allow some headroom, but return a stuck start
 /// to the build server instead of spending the entire remaining queue budget.
@@ -445,7 +439,7 @@ pub(crate) fn validate(request: &RunRequest) -> Result<(), Error> {
         return Err(Error::NoTimeout);
     }
     // Fields of the lease body that come straight from the request. A job
-    // whose lease the broker would refuse never spills or shadows, and a job
+    // whose lease the broker would refuse never spills, and a job
     // routed to hosted is refused naming the field instead of sending it.
     if !request
         .timeout
@@ -563,10 +557,9 @@ pub(crate) fn valid_hint(placement: &Placement) -> bool {
 /// The first member of a lease body that CLOUD's lease parser refuses with
 /// 400 `bad_request`, or `None` when it accepts the body. It mirrors the
 /// rules of the pinned runners contract (POST /v1/leases and the common wire
-/// grammar). `shadow` says the body is sent with `"shadow": true`. Every
-/// lease request (spill, shadow, repository-routed and direct hosted) is
-/// checked here before it is sent.
-pub(crate) fn invalid_lease_field(body: &LeaseRequest, shadow: bool) -> Option<&'static str> {
+/// grammar). Every lease request (spill, repository-routed and direct hosted)
+/// is checked here before it is sent.
+pub(crate) fn invalid_lease_field(body: &LeaseRequest) -> Option<&'static str> {
     let base64url_43 = |value: &str| {
         value.len() == 43
             && value
@@ -601,8 +594,6 @@ pub(crate) fn invalid_lease_field(body: &LeaseRequest, shadow: bool) -> Option<&
         Some("requester_jwk")
     } else if body.allow_spill.is_none() {
         Some("allow_spill")
-    } else if shadow && body.allow_spill == Some(false) {
-        Some("shadow")
     } else {
         None
     }
@@ -612,7 +603,7 @@ pub(crate) fn invalid_lease_field(body: &LeaseRequest, shadow: bool) -> Option<&
 /// `field` names the member), or the broker refused it with a 4xx status.
 /// The requester key and the keyed path hashes are never logged. `route`
 /// says why the job wanted a hosted lease (spill, repository_routed,
-/// hosted_test, hosted or shadow).
+/// hosted_test or hosted).
 fn warn_lease_body(
     id: Uuid,
     body: &LeaseRequest,
@@ -671,14 +662,6 @@ fn reattach_body(key: &SigningKey) -> ReattachRequest {
     ReattachRequest {
         requester_jwk: RequesterJwk::from_key(&key.verifying_key()),
     }
-}
-
-#[derive(Serialize)]
-struct ShadowLeaseRequest<'a> {
-    #[serde(flatten)]
-    request: &'a LeaseRequest,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    shadow: bool,
 }
 
 pub(crate) struct Client {
@@ -1030,7 +1013,7 @@ impl Client {
         };
         // Never send a body the broker would refuse. The requester key that
         // each attempt below puts in is freshly generated and always valid.
-        if let Some(field) = invalid_lease_field(&body, false) {
+        if let Some(field) = invalid_lease_field(&body) {
             warn_lease_body(id, &body, route, None, None, Some(field));
             return Err(Error::RequestInvalid(RequestField::new(field)));
         }
@@ -1259,77 +1242,6 @@ impl Client {
             }
         }
     }
-    /// Shadows share lease validation and the pinned transport with spill, but
-    /// have no durable job or attach credentials in the motor store.
-    pub(crate) async fn shadow_run(
-        &self,
-        id: Uuid,
-        request: &RunRequest,
-        salt: &[u8; 32],
-        booked: &mut Option<Lease>,
-    ) -> Result<Channel, Error> {
-        let key = requester()?;
-        let body = lease_body(
-            id,
-            request,
-            (
-                keyed_hash(salt, "ck-ws-v1", &request.workspace_key).map_err(|_| Error::Path)?,
-                keyed_hash(salt, "ck-repo-v1", &request.repository_root)
-                    .map_err(|_| Error::Path)?,
-            ),
-            None,
-            self.route.avoid_host.clone(),
-            RequesterJwk::from_key(&key.verifying_key()),
-            Some(true),
-        )?;
-        // Extend only this request: older brokers may reject shadows, but normal
-        // leases must retain their closed wire schema.
-        let wire = ShadowLeaseRequest {
-            request: &body,
-            shadow: true,
-        };
-        if let Some(field) = invalid_lease_field(&body, true) {
-            warn_lease_body(id, &body, "shadow", None, None, Some(field));
-            return Err(Error::RequestInvalid(RequestField::new(field)));
-        }
-        let deadline = tokio::time::Instant::now() + SHADOW_PROVISIONING_BUDGET;
-        let lease: Lease = self
-            .post_ready_authorized(
-                "/v1/leases",
-                &wire,
-                self.bearer().await?,
-                deadline,
-                Error::Provisioning(MIN_PROVISIONING_RETRY_MS),
-            )
-            .await
-            .inspect_err(|error| {
-                if let Some(status) = self.broker_client_error() {
-                    warn_lease_body(
-                        id,
-                        &body,
-                        "shadow",
-                        Some(status),
-                        self.broker_code().as_deref(),
-                        error.request_field(),
-                    );
-                }
-            })?;
-        *booked = Some(lease.clone());
-        let claims = tls::claims(id, &lease, &key, motor_lease::Purpose::Run)?;
-        if lease.ssh.is_none()
-            || self.route.avoid_host.as_ref() == Some(&lease.placement.host)
-            || resource_mismatch(&claims, &body, true).is_some()
-            || lease.max_s < body.timeout_s
-        {
-            return Err(Error::Auth);
-        }
-        self.connect(id, &lease, &key, motor_lease::Purpose::Run)
-            .await
-            .map_err(|failure| {
-                tracing::warn!(job_id = %id, step = failure.step, code = failure.error.code(), "shadow connection failed");
-                failure.error
-            })
-    }
     async fn post_ready<T: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         path: &str,
@@ -1441,200 +1353,3 @@ mod sandbox_tests;
 mod tenant_heartbeat_tests;
 #[cfg(test)]
 pub(crate) mod tests;
-
-#[cfg(test)]
-mod shadow_wire_tests {
-    use super::*;
-    #[tokio::test]
-    async fn shadow_lease_explicitly_allows_spill() {
-        let http = test_http::Http::new(|path, body| {
-            if path == "/v1/leases" {
-                assert_eq!(body["allow_spill"], true);
-                assert_eq!(body["shadow"], true);
-                (402, serde_json::json!({"error":"budget_exhausted"}))
-            } else {
-                panic!("unexpected path: {path}")
-            }
-        })
-        .await;
-        std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
-        let client = Client::new(HostedJobState {
-            broker_url: http.url.clone(),
-            token_source: BrokerTokenSource::Fake,
-            ..HostedJobState::default()
-        });
-        let (_scratch, repo) = boat_tests::committed_repo();
-        let path = repo.to_str().unwrap();
-        let request = RunRequest::new(path, path, path, "true").with_timeout(30);
-        let mut booked = None;
-        assert_eq!(
-            client
-                .shadow_run(Uuid::now_v7(), &request, &[1; 32], &mut booked)
-                .await
-                .err(),
-            Some(Error::Budget)
-        );
-        assert!(booked.is_none());
-        assert_eq!(http.requests.lock().unwrap().len(), 1);
-    }
-    /// A shadow lease answered `no_host_fits` is skipped after one request:
-    /// nothing is booked and the broker is not asked again. The broker's
-    /// `max_vcpus` is kept when it is a number and read as unknown otherwise.
-    #[tokio::test]
-    async fn shadow_no_host_fits_is_one_request_with_or_without_max_vcpus() {
-        for (reply, expected) in [
-            (
-                serde_json::json!({"error":"no_host_fits","max_vcpus":8}),
-                Some(8),
-            ),
-            (serde_json::json!({"error":"no_host_fits"}), None),
-            (
-                serde_json::json!({"error":"no_host_fits","max_vcpus":"eight"}),
-                None,
-            ),
-            (
-                serde_json::json!({"error":"no_host_fits","max_vcpus":-1}),
-                None,
-            ),
-        ] {
-            let http = test_http::Http::new(move |path, _| {
-                assert_eq!(path, "/v1/leases");
-                (422, reply.clone())
-            })
-            .await;
-            std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
-            let client = Client::new(HostedJobState {
-                broker_url: http.url.clone(),
-                token_source: BrokerTokenSource::Fake,
-                ..HostedJobState::default()
-            });
-            let (_scratch, repo) = boat_tests::committed_repo();
-            let path = repo.to_str().unwrap();
-            let request = RunRequest::new(path, path, path, "true")
-                .with_timeout(30)
-                .with_weight_hint(16);
-            let mut booked = None;
-            assert_eq!(
-                client
-                    .shadow_run(Uuid::now_v7(), &request, &[1; 32], &mut booked)
-                    .await
-                    .err(),
-                Some(Error::NoHostFits(expected))
-            );
-            assert!(booked.is_none());
-            assert_eq!(http.requests.lock().unwrap().len(), 1);
-            assert_eq!(client.broker_code().as_deref(), Some("no_host_fits"));
-        }
-    }
-    #[test]
-    fn shadow_wire_omits_false_appends_true_and_preserves_ordinary_fields() {
-        let request =
-            RunRequest::new("/tmp/repo", "/tmp/repo", "/tmp/repo", "true").with_timeout(30);
-        let ordinary = lease_body(
-            Uuid::nil(),
-            &request,
-            ("a".repeat(64), "b".repeat(64)),
-            None,
-            Some("build-server".into()),
-            RequesterJwk::from_key(&SigningKey::from_bytes(&[1; 32]).verifying_key()),
-            Some(true),
-        )
-        .unwrap();
-        let absent = serde_json::to_string(&ordinary).unwrap();
-        let false_body = serde_json::to_string(&ShadowLeaseRequest {
-            request: &ordinary,
-            shadow: false,
-        })
-        .unwrap();
-        assert_eq!(absent, false_body);
-        let true_body = serde_json::to_string(&ShadowLeaseRequest {
-            request: &ordinary,
-            shadow: true,
-        })
-        .unwrap();
-        assert_eq!(
-            true_body,
-            format!("{},\"shadow\":true}}", &absent[..absent.len() - 1])
-        );
-        let mut value: serde_json::Value = serde_json::from_str(&true_body).unwrap();
-        assert_eq!(
-            value.as_object_mut().unwrap().remove("shadow"),
-            Some(serde_json::json!(true))
-        );
-        assert_eq!(value, serde_json::to_value(&ordinary).unwrap());
-    }
-    /// CLOUD's `shadow-lease.json` records a shadow lease's request body and
-    /// lease hash. ck-motor builds the shadow body the way `shadow_run` does
-    /// (no placement hint, spill allowed, then `shadow: true`); its members
-    /// match the recorded body, and its wire bytes without `requester_jwk`
-    /// are the hashed projection: the ordinary projection with
-    /// `"shadow":true` appended after `allow_spill`.
-    #[test]
-    fn cloud_shadow_lease_body_and_hash_match_the_shadow_vector() {
-        let vector: serde_json::Value = serde_json::from_str(include_str!(
-            "../../motor-lease/contracts/cloud/shadow-lease.json"
-        ))
-        .unwrap();
-        let expected = &vector["booked"]["request"]["body"];
-        assert_eq!(expected, &vector["provisioning"]["request"]["body"]);
-        let seed: [u8; 32] = vector["requester"]["test_only_seed_hex"]
-            .as_str()
-            .unwrap()
-            .as_bytes()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
-        let key = SigningKey::from_bytes(&seed);
-        let mut request = RunRequest::new(
-            "/home/test/repo",
-            "/home/test/repo",
-            "/home/test/repo",
-            "true",
-        )
-        .with_platform(motor_protocol::Platform::Linux)
-        .with_weight_hint(expected["vcpus"].as_u64().unwrap() as u32)
-        .with_timeout(expected["timeout_s"].as_u64().unwrap());
-        if expected["net"] == true {
-            request.network = Some(motor_protocol::Network::Outbound);
-        }
-        let body = lease_body(
-            Uuid::parse_str(expected["job_id"].as_str().unwrap()).unwrap(),
-            &request,
-            (
-                expected["workspace_key_hash"].as_str().unwrap().into(),
-                expected["repo_hash"].as_str().unwrap().into(),
-            ),
-            None,
-            serde_json::from_value(expected["avoid_host"].clone()).unwrap(),
-            RequesterJwk::from_key(&key.verifying_key()),
-            Some(true),
-        )
-        .unwrap();
-        let wire = ShadowLeaseRequest {
-            request: &body,
-            shadow: true,
-        };
-        assert_eq!(&serde_json::to_value(&wire).unwrap(), expected);
-        let text = serde_json::to_string(&wire).unwrap();
-        let requester = format!(
-            ",\"requester_jwk\":{}",
-            serde_json::to_string(&body.requester_jwk).unwrap()
-        );
-        assert_eq!(text.matches(&requester).count(), 1, "{text}");
-        let canonical = text.replacen(&requester, "", 1);
-        let ordinary = super::tests::canonical_lease_bytes(&body);
-        assert_eq!(
-            canonical,
-            format!("{},\"shadow\":true}}", &ordinary[..ordinary.len() - 1])
-        );
-        assert!(canonical.ends_with(",\"timeout_s\":100,\"allow_spill\":true,\"shadow\":true}"));
-        assert_eq!(
-            motor_lease::sha256_hex(canonical.as_bytes()),
-            vector["lease_hash"]
-        );
-    }
-}

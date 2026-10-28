@@ -59,15 +59,10 @@ fn wsl_checks_both_alias_directions_but_reports_supplied_spelling() {
 }
 
 #[test]
-fn home_jobs_are_eligible_for_spill_and_shadow_like_users_jobs() {
+fn home_jobs_are_eligible_for_spill_like_users_jobs() {
     let config = crate::Config {
         spill_to_hosted: true,
         spill_avoid_host: Some("build-server".into()),
-        shadow_to_hosted: crate::ShadowConfig {
-            enabled: true,
-            sample_rate: 1.0,
-            max_concurrent: 1,
-        },
         ..Default::default()
     };
     for prefix in ["/Users", "/home"] {
@@ -84,11 +79,6 @@ fn home_jobs_are_eligible_for_spill_and_shadow_like_users_jobs() {
             crate::spill::eligible(&config, &request, false, false),
             "{prefix}"
         );
-        assert!(
-            crate::shadow::eligible(&config, &request, false, false),
-            "{prefix}"
-        );
         assert!(!crate::spill::eligible(&config, &request, true, false));
-        assert!(!crate::shadow::eligible(&config, &request, true, false));
     }
 }

@@ -59,9 +59,6 @@ pub struct Motor {
     connector: Arc<dyn Connector>,
     spool_root: PathBuf,
     account_tokens: Option<Arc<crate::AccountTokens>>,
-    shadows: Arc<crate::shadow::Manager>,
-    #[cfg(test)]
-    shadow_deadline: Option<Duration>,
     windows_slots: Arc<Vec<Arc<tokio::sync::Semaphore>>>,
     /// Build-server jobs whose cancel `cancel` is delivering on its own
     /// connection right now. The job's stream leaves that delivery alone and
@@ -111,7 +108,6 @@ impl Drop for CancelInFlight {
 #[path = "hosted/account/boundary_tests.rs"]
 mod hosted_account_tests;
 mod hosted_cleanup;
-mod shadow_run;
 impl Motor {
     pub(crate) fn set_connector(&mut self, connector: Arc<dyn Connector>) {
         self.connector = connector;
@@ -139,9 +135,6 @@ impl Motor {
             connector,
             spool_root: storage_root.join("spools"),
             account_tokens: None,
-            shadows: Arc::new(crate::shadow::Manager::new(storage_root)),
-            #[cfg(test)]
-            shadow_deadline: None,
             windows_slots,
             cancels_in_flight: Arc::default(),
             submissions: Arc::default(),
@@ -864,18 +857,6 @@ impl Motor {
             }
             _ => wait,
         };
-        let shadow_request = (self.hosted_state(id).is_none()
-            && self
-                .storage
-                .job(id)
-                .is_some_and(|job| !job.gate_job && job.direct_secret_hash.is_none())
-            && crate::shadow::eligible(
-                &self.config,
-                &request,
-                false,
-                !returns.return_paths.is_empty(),
-            ))
-        .then(|| request.clone());
         let hosted = self.hosted_state(id).is_some();
         let windows = request.platform == Some(Platform::Windows);
         let macos = request.platform == Some(Platform::Macos);
@@ -1374,7 +1355,6 @@ impl Motor {
             .run_sent(id, hosted)
             .inspect_err(|error| self.log_hosted_failure(id, "persist_run", error))?;
         drop(_booking_open);
-        let shadow_run = shadow_request.map(|request| (request, run.clone()));
         if let Err(error) = channel.send(Frame::Run(run)).await {
             self.log_hosted_failure(id, "run_send", &error);
             drop(channel);
@@ -1426,11 +1406,6 @@ impl Motor {
                         .map(|_| false);
                 }
                 let wrong_platform = (windows || macos) && accepted.platform != request.platform;
-                if !wrong_platform && !resubmitted {
-                    if let Some((request, run)) = shadow_run {
-                        self.start_shadow(id, request, run, snapshots.clone());
-                    }
-                }
                 self.storage
                     .accepted(request.workspace_key, snapshots.commits())?;
                 // A runner cannot grant network access the caller did not request.
@@ -2212,9 +2187,6 @@ impl Motor {
                     // Unknown streams still advance the replay cursor; they are
                     // not terminal and cannot authorize a local fallback.
                     if matches!(output.stream, OutputStream::Stdout | OutputStream::Stderr) {
-                        if !hosted {
-                            self.shadows.output(id, &output);
-                        }
                         emit(tx, StreamRecord::Output(output)).await?;
                     }
                     backoff = 1;
@@ -2273,9 +2245,6 @@ impl Motor {
                     // A retry is safe only when the runner proves the command never started.
                     if !matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }) {
                         terminal.retry_after_ms = None;
-                    }
-                    if !hosted {
-                        self.shadows.terminal(id, &terminal);
                     }
                     terminal.refusal_detail = terminal.refusal_detail.map(bounded_detail);
                     if !hosted && matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }) {
@@ -3042,7 +3011,10 @@ fn incoming_cause(incoming: &io::Result<Incoming>) -> String {
 }
 
 fn log_refusal(id: Uuid, refusal: &Refusal) {
-    let detail = refusal.detail.as_deref().map(crate::shadow::detail_tail);
+    let detail = refusal
+        .detail
+        .as_deref()
+        .map(crate::diagnostics::detail_tail);
     tracing::warn!(job_id = %id, reason = ?refusal.reason, refusal_detail = ?detail,
         retry_after_ms = refusal.retry_after_ms, "runner admission refused");
 }

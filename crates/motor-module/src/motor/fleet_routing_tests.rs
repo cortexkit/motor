@@ -41,7 +41,6 @@ fn fleet_config_defaults_off_and_roundtrips() {
     let old_route: crate::HostedJobState = serde_json::from_value(old_wire).unwrap();
     assert!(!old_route.fleet_routed);
     assert!(!old_route.fleet_no_spill);
-    assert!(serde_json::from_str::<Config>(r#"{"shadow_to_hosted":true}"#).is_err());
 }
 
 #[tokio::test]
@@ -463,7 +462,6 @@ async fn rollback_fragment_routes_bounded_and_unbounded_jobs_direct_without_leas
         "hosted_runners": false,
         "hosted_repositories": [],
         "spill_to_hosted": false,
-        "shadow_to_hosted": false,
         "hosted_fleet_routing": false
     }"#,
     )

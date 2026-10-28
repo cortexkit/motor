@@ -38,11 +38,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("cancel") => {
             std::process::exit(motor_module::cli::cancel_main(&args[1..]).await.into())
         }
-        Some("shadow-report") => std::process::exit(
-            motor_module::cli::shadow_report_main(&args[1..])
-                .await
-                .into(),
-        ),
         // `ck motor`, `ck motor --help` and `ck motor help` all land here; the
         // daemon always passes --subc, so none of these can be a module start.
         None | Some("--help" | "-h" | "help") if args.len() <= 1 => {

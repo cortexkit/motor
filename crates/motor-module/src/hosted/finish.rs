@@ -12,16 +12,6 @@ enum Reply {
     Lost,
 }
 
-pub(crate) const SHADOW_CLEANUP_BOUND: Duration = Duration::from_secs(120);
-const SHADOW_RETRY_DELAYS: [Duration; 6] = [
-    Duration::ZERO,
-    Duration::from_secs(2),
-    Duration::from_secs(4),
-    Duration::from_secs(8),
-    Duration::from_secs(16),
-    Duration::from_secs(30),
-];
-
 impl Client {
     pub(crate) async fn release_stored(&self, id: Uuid, storage: &Storage) -> Result<(), Error> {
         let _finish = storage.lock_finish(id).await;
@@ -43,90 +33,6 @@ impl Client {
         result
     }
 
-    /// Retry settlement within a fixed budget without persisting shadow state.
-    /// A lost lease response can hide a booked sandbox. Probe release by job ID
-    /// even without a response, and finish if the broker says it was admitted.
-    pub(crate) async fn cleanup_shadow(
-        &self,
-        id: Uuid,
-        terminal: Option<&TerminalRecord>,
-        max_s: u64,
-        booked: bool,
-    ) {
-        if tokio::time::timeout(
-            SHADOW_CLEANUP_BOUND,
-            self.cleanup_shadow_with_delays(id, terminal, max_s, booked, &SHADOW_RETRY_DELAYS),
-        )
-        .await
-        .is_err()
-        {
-            tracing::warn!(job_id = %id, cause = "120-second cleanup deadline exceeded", "shadow lease cleanup exhausted budget; broker backstop must reclaim it");
-        }
-    }
-
-    async fn cleanup_shadow_with_delays(
-        &self,
-        id: Uuid,
-        terminal: Option<&TerminalRecord>,
-        max_s: u64,
-        booked: bool,
-        delays: &[Duration],
-    ) {
-        let body = terminal
-            .map(|t| Finish::from_terminal(t, max_s))
-            .unwrap_or(Finish {
-                outcome: "lost".into(),
-                run_ms: 0,
-            });
-        let mut finish = booked;
-        for (attempt, delay) in delays.iter().enumerate() {
-            tokio::time::sleep(*delay).await;
-            tracing::info!(job_id = %id, attempt = attempt + 1, finish, outcome = %body.outcome,
-                run_ms = body.run_ms, max_s, observed_run_ms = terminal.map(|t| t.wall_ms), "shadow lease cleanup attempt");
-            let result = tokio::time::timeout(Duration::from_secs(10), async {
-                if finish {
-                    match self.finish_once(id, &body).await? {
-                        Reply::Settled(_) | Reply::Lost => return Ok(()),
-                        Reply::Refused => {}
-                    }
-                }
-                match self.release(id).await {
-                    Ok(()) | Err(Error::NotGranted | Error::Released | Error::Finished) => Ok(()),
-                    Err(Error::Admitted) => {
-                        finish = true;
-                        match self.finish_once(id, &body).await? {
-                            Reply::Settled(_) | Reply::Lost => Ok(()),
-                            Reply::Refused => Err(Error::Rejected),
-                        }
-                    }
-                    Err(error) => Err(error),
-                }
-            })
-            .await;
-            let cause = match result {
-                Ok(Ok(())) => return,
-                Ok(Err(error)) => format!(
-                    "{}: {}",
-                    error.code(),
-                    self.broker_failure
-                        .lock()
-                        .unwrap()
-                        .as_deref()
-                        .unwrap_or("no broker response")
-                ),
-                Err(_) => format!(
-                    "cleanup attempt timed out after 10 seconds: {}",
-                    self.broker_failure
-                        .lock()
-                        .unwrap()
-                        .as_deref()
-                        .unwrap_or("no broker response")
-                ),
-            };
-            tracing::warn!(job_id = %id, attempt = attempt + 1, %cause, "shadow lease cleanup failed; retrying within cleanup budget");
-        }
-        tracing::warn!(job_id = %id, attempts = delays.len(), "shadow lease cleanup exhausted retries; broker backstop must reclaim it");
-    }
     pub(crate) async fn finish(
         &self,
         id: Uuid,
@@ -259,7 +165,7 @@ impl Client {
                     value
                         .get("error")
                         .and_then(|code| code.as_str())
-                        .map(crate::shadow::detail_tail)
+                        .map(crate::diagnostics::detail_tail)
                 });
             *self.broker_failure.lock().unwrap() =
                 Some(format!("HTTP {status}, broker_code={code:?}"));

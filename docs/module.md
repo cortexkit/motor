@@ -813,13 +813,12 @@ direct runner after a hosted failure; an unhinted `no_host_fits` answer, describ
 is a routing correction, not a failure. Windows stays on its direct runner. Outbound-network jobs can use
 hosted leases: the request's `net` flag must match the signed lease claim, and
 `network_routing` must still be enabled. Unlisted jobs retain their existing
-direct and spill behavior; spilled leases and shadow leases send `allow_spill:
-true`.
+direct and spill behavior; spilled leases send `allow_spill: true`.
 
 Set `hosted_repositories_placement_hint` to send exactly that `{host, vm}` hint
 on repository-routed leases, overriding any cached warm placement. The setting
 is omitted from serialized Config when unset, so older clients with closed
-schemas can still read the default config. Spill, shadow and fleet-routing leases
+schemas can still read the default config. Spill and fleet-routing leases
 never inherit the setting, and placements from hinted jobs are not cached as warm
 hints for other jobs. The hint is saved with the job's route before leasing, so
 retries and restarts retain it even if the config changes. With a broker host
@@ -864,9 +863,9 @@ stored decision survives restart, so a later attach reads the job from the build
 server. Time already spent waiting on the broker is taken off the job's
 queue-wait limit once, in whole seconds, and the reduced limit is both what the
 Run frame carries and what ck-motor enforces; a positive limit never drops below
-one second. The job does not spill. For spilled and shadow leases
-`no_host_fits` is an ordinary refusal: a spill goes back to the build server
-and a shadow is skipped, each after one lease request. The error code decides;
+one second. The job does not spill. For spilled leases `no_host_fits` is an
+ordinary refusal: a spill goes back to the build server after one lease request.
+The error code decides;
 a missing or non-numeric `max_vcpus` is read as unknown. Each selected job logs one INFO event, `routed to hosted
 (hosted_repositories)`, with `job_id` and `repo` fields. Hosted health metrics
 include `hosted_routed_jobs_1h`, counting repository-selected jobs (including
@@ -877,7 +876,7 @@ survive restart.
 
 A lease refused with HTTP 403 `{"error":"account_closed"}` means the hosted
 account was closed for good: none of its jobs may run anywhere. On every route
-(configured, repository-routed, spilled, shadow or a direct hosted test) the
+(configured, repository-routed, spilled or a direct hosted test) the
 lease is not retried and the job is refused before start with
 `RequestRejected` and detail `hosted_account_closed: hosted account closed`,
 with no retry delay and no local or direct fallback. A spilled job is not sent
@@ -901,10 +900,8 @@ Tests: `listed_main_and_linked_agent_and_direct_jobs_use_hosted_without_avoiding
 `stage1_no_host_fits_decision_survives_restart_and_attaches_to_the_build_server`,
 `stage1_no_host_fits_after_a_capacity_wait_sends_the_remaining_queue_wait`,
 `spill_no_host_fits_resubmits_to_the_build_server_without_retrying`,
-`shadow_no_host_fits_is_one_request_with_or_without_max_vcpus`,
 `no_host_fits_decision_trims_queue_wait_once_and_is_counted_for_an_hour`,
-`unlisted_spill_eligible_job_still_withdraws_and_sends_allow_spill_true`,
-`shadow_lease_explicitly_allows_spill`, and
+`unlisted_spill_eligible_job_still_withdraws_and_sends_allow_spill_true`, and
 `hosted_routed_counter_only_counts_repository_routes_in_the_last_hour`.
 Placement-hint coverage:
 `repository_placement_hint_config_roundtrips_absent_null_and_present`,
@@ -913,8 +910,7 @@ Placement-hint coverage:
 `hinted_no_capacity_retries_the_identical_body_then_runs_without_fallback`,
 `hinted_no_capacity_exhausts_the_queue_budget_without_fallback`,
 `hinted_no_host_fits_refuses_without_build_server_correction`,
-`unlisted_spill_eligible_job_still_withdraws_and_sends_allow_spill_true`,
-`shadow_hanging_or_refused_never_changes_callers_stream_or_exit`, and
+`unlisted_spill_eligible_job_still_withdraws_and_sends_allow_spill_true`, and
 `fleet_linux_default_platform_jobs_allow_hosted_spill_but_gates_stay_direct`.
 The canonical `no-spill-lease.json` fixture from `cortexkit-cloud` is pinned under
 `crates/motor-lease/contracts/cloud/`. Tests
@@ -942,43 +938,3 @@ sends its exact 422 reply bytes through ck-motor's broker client, and
 same answer.
 `python3 scripts/mixed-version.py` checks the default Config against the pinned
 older client.
-
-## Hosted shadow comparisons
-
-`shadow_to_hosted` is independent of `spill_to_hosted` and defaults to
-`{"enabled":false,"sample_rate":0.1,"max_concurrent":2}`. The entire default
-object is omitted when serializing configuration, so older clients still load
-it. Set `spill_avoid_host` to the build server's broker host ID before enabling
-shadowing; without it, selection fails closed.
-
-After build-server acceptance, sampled offline Linux jobs of at most 8 vCPUs
-can run a second copy on Boat. Direct-caller jobs (which have reattach secrets),
-return-path requests, Windows jobs and network requests are excluded. The
-broker must grant the account shadow permission and enable its shadow pool;
-`shadow_not_allowed` and `no_capacity` skip the shadow, never reroute the caller.
-Shadows use the captured snapshot and filtered environment, never attach, and
-never wait on the caller's delivery path. The concurrency bound covers a shadow
-and its pending comparison, so a slow primary cannot create unbounded captures.
-
-Completed comparisons append to `shadow.jsonl` in the module's store directory,
-rotated at 4 MiB with one previous file. No shadow job is persisted in
-`state.json`. Each side records outcome, exit code, wall time and raw-byte
-stdout/stderr SHA-256 and byte counts. Only mismatches retain the last 16 KiB of
-each stream, displayed as lossy UTF-8; files are created private (0600).
-Mismatch classes distinguish refusal before start, outcome kind, exit code and
-output differences. Output can legitimately differ because of timestamps and
-runner paths, so a mismatch is a triage signal, not a caller failure.
-
-`ck health ck-motor --verbose` includes `shadow` counts for retained comparisons
-from the last hour. `ck motor shadow-report [--since UNIX_SECONDS|Nh|Nm|Ns]`
-prints retained mismatches with both sides' stdout/stderr tails; like the other
-local motor commands, it needs `admit_direct_exec`. Shutdown cancels in-flight
-shadows and attempts broker release/finish within a bounded deadline. An abrupt
-process kill cannot perform cleanup; the broker's timeout remains the backstop.
-No shadow is replayed after restart.
-
-The shadow contracts are exercised by `shadow_hanging_or_refused_never_changes_callers_stream_or_exit`,
-`shadow_eligibility_excludes_net_windows_oversize_secrets_returns_and_unknown_host`,
-`shadow_concurrency_cap_and_zero_sampling_are_nonblocking`,
-`shadow_reuses_pinned_boat_path_and_records_both_tails`, and
-`restart_cancels_running_shadow_finishes_lease_and_never_resumes_it`.

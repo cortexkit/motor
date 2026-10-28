@@ -21,7 +21,6 @@ pub(crate) struct Boat {
     /// Like a real runner, refuse to serve an attach for a job that never
     /// received a Run frame (the connection drops).
     pub strict_attach: Arc<AtomicBool>,
-    pub hang_run: Arc<AtomicBool>,
     /// While the broker holds a lease as provisioning, the runner keeps a Run
     /// it receives without answering it: the booking is unplaced until the
     /// broker grants it, and the job stays pending until the grant.
@@ -57,8 +56,6 @@ impl Boat {
         let frames = Arc::new(Mutex::new(Vec::new()));
         let captured = frames.clone();
         let strict_attach = Arc::new(AtomicBool::new(false));
-        let hang_run = Arc::new(AtomicBool::new(false));
-        let hang = hang_run.clone();
         let run_refusal = Arc::new(Mutex::new(None::<RunRefusal>));
         let refusal = run_refusal.clone();
         let ran = Arc::new(Mutex::new(std::collections::HashSet::<Uuid>::new()));
@@ -71,7 +68,6 @@ impl Boat {
                 let hold_run = hold_connections.clone();
                 let attaches = attach_count.clone();
                 let strict = strict.clone();
-                let hang = hang.clone();
                 let refusal = refusal.clone();
                 let ran = ran.clone();
                 let frames = captured.clone();
@@ -197,9 +193,6 @@ impl Boat {
                                 )
                                 .await
                                 .unwrap();
-                                if hang.load(Ordering::SeqCst) {
-                                    continue;
-                                }
                                 send_result(&mut socket, id, 0).await;
                                 return;
                             }
@@ -257,9 +250,7 @@ impl Boat {
                 return (202, serde_json::json!({"status":"provisioning","retry_after_ms":10}));
             }
             let (id,jwk,purpose,sshd)=if path=="/v1/leases" {
-                let mut ordinary = body.clone();
-                if let Some(shadow) = ordinary.as_object_mut().unwrap().remove("shadow") { assert_eq!(shadow, true); }
-                let request: motor_lease::LeaseRequest=serde_json::from_value(ordinary).unwrap();
+                let request: motor_lease::LeaseRequest=serde_json::from_value(body.clone()).unwrap();
                 let mut saved=job.lock().unwrap();
                 if let Some(saved)=saved.as_ref() {assert_eq!(saved.job_id,request.job_id);}
                 *saved=Some(request.clone());
@@ -292,7 +283,6 @@ impl Boat {
             lost,
             mem_mib,
             strict_attach,
-            hang_run,
             hold_provisioning,
             reattach_unavailable,
             run_refusal,
@@ -466,8 +456,7 @@ async fn cloud_boat_vectors_match_client_request_lease_and_finish_types() {
         serde_json::from_value(booked_request["placement_hint"].clone()).unwrap(),
         serde_json::from_value(booked_request["avoid_host"].clone()).unwrap(),
         RequesterJwk::from_key(&key.verifying_key()),
-        // Every lease ck-motor sends that can reach Boat (spill and shadow)
-        // allows spilling.
+        // Every lease ck-motor sends that can reach Boat allows spilling.
         Some(true),
     )
     .unwrap();

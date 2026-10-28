@@ -238,11 +238,6 @@ async fn macos_routes_directly_despite_all_hosted_settings_and_does_not_reserve_
             },
             spill_to_hosted: true,
             spill_after_s: 0,
-            shadow_to_hosted: crate::ShadowConfig {
-                enabled: true,
-                sample_rate: 1.0,
-                max_concurrent: 2,
-            },
             ..h.config()
         };
         assert!(!crate::spill::eligible(
@@ -250,12 +245,6 @@ async fn macos_routes_directly_despite_all_hosted_settings_and_does_not_reserve_
             &request(&repo),
             false,
             true
-        ));
-        assert!(!crate::shadow::eligible(
-            &config,
-            &request(&repo),
-            false,
-            false
         ));
         let endpoint = config.macos_runner.clone().unwrap();
         let motor = Motor::with_connector(

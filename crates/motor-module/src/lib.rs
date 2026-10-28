@@ -15,7 +15,6 @@ pub mod logging;
 pub mod module;
 mod motor;
 mod return_paths;
-mod shadow;
 mod snapshot;
 mod spill;
 mod storage;
@@ -23,7 +22,7 @@ pub use return_paths::ReturnOptions;
 mod transport;
 mod wsl;
 
-pub use config::{BrokerTokenSource, Config, MacosRunner, ShadowConfig, WindowsRunner};
+pub use config::{BrokerTokenSource, Config, MacosRunner, WindowsRunner};
 pub use hosted::account::AccountTokens;
 pub use hosted::{BillingStatus, HostedJobState};
 pub use motor::{JobStream, Motor};

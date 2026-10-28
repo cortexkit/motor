@@ -130,7 +130,6 @@ pub const OPERATIONS: &[&str] = &[
     "exec.cancel",
     "exec.status",
     "runner.health",
-    "shadow.report",
     "workspace.prepare",
     "workspace.drop",
 ];
@@ -219,7 +218,7 @@ pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest 
                 .iter()
                 .map(|name| ManagementOperation {
                     name: (*name).into(),
-                    kind: if matches!(*name, "exec.status" | "runner.health" | "shadow.report") {
+                    kind: if matches!(*name, "exec.status" | "runner.health") {
                         ManagementOperationKind::Query
                     } else {
                         ManagementOperationKind::Mutate
@@ -498,7 +497,6 @@ impl Handler {
             let _ = sampler.await;
         }
         if let Ok(motor) = self.initialized() {
-            motor.shutdown_shadows().await;
             motor.shutdown_hosted().await;
             let motor = motor.clone();
             match tokio::task::spawn_blocking(move || motor.shutdown_storage()).await {
@@ -717,12 +715,7 @@ impl Handler {
         let op = envelope.op.as_str();
         if !matches!(
             op,
-            "exec.run"
-                | "exec.attach"
-                | "exec.cancel"
-                | "exec.status"
-                | "hosted.check"
-                | "shadow.report"
+            "exec.run" | "exec.attach" | "exec.cancel" | "exec.status" | "hosted.check"
         ) {
             return Ok(HandlerOutcome::Error {
                 code: "motor_op_not_permitted_for_principal".into(),
@@ -739,14 +732,6 @@ impl Handler {
             serde_json::from_value(params).map_err(io::Error::other)
         }
         match op {
-            "shadow.report" => {
-                let since = envelope
-                    .params
-                    .get("since")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                response(self.initialized()?.shadow_report(since)?)
-            }
             "hosted.check" => response(
                 crate::hosted::check::check(self.account_tokens.as_ref(), &self.config).await,
             ),
@@ -1074,9 +1059,6 @@ impl ModuleHandler for Handler {
                 "unreachable_refusals_since_boot".into(),
                 crate::diagnostics::health_metrics(),
             );
-            if let Some(motor) = self.motor.get() {
-                metrics.insert("shadow".into(), motor.shadow_health());
-            }
         }
         if let Some(reason) = reason {
             report.status = HealthStatus::Failing;

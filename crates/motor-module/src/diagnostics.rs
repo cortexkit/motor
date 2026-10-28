@@ -100,3 +100,30 @@ pub(crate) fn health_metrics() -> serde_json::Value {
         .collect::<serde_json::Map<_, _>>()
         .into()
 }
+
+/// Keep the end of a refusal for logging without splitting UTF-8 characters.
+pub(crate) fn detail_tail(detail: &str) -> String {
+    let mut start = detail.len().saturating_sub(16 * 1024);
+    while !detail.is_char_boundary(start) {
+        start += 1;
+    }
+    detail[start..].to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refusal_log_tail_is_bounded_and_preserves_utf8_and_the_end() {
+        for detail in ["", "short refusal", &"a".repeat(16 * 1024)] {
+            assert_eq!(detail_tail(detail), detail);
+        }
+        assert_eq!(
+            detail_tail(&format!("x{}", "a".repeat(16 * 1024))),
+            "a".repeat(16 * 1024)
+        );
+        let detail = format!("{}!", "é".repeat(16 * 1024));
+        assert_eq!(detail_tail(&detail), format!("{}!", "é".repeat(8191)));
+    }
+}

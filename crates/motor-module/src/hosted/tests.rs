@@ -1441,8 +1441,7 @@ fn invalid_lease_field_names_each_member_the_broker_refuses() {
         Some(true),
     )
     .unwrap();
-    assert_eq!(invalid_lease_field(&valid, false), None);
-    assert_eq!(invalid_lease_field(&valid, true), None);
+    assert_eq!(invalid_lease_field(&valid), None);
     type Mutation = fn(&mut LeaseRequest);
     let accepted: [(&str, Mutation); 8] = [
         ("timeout_s 10", |b| b.timeout_s = 10),
@@ -1462,7 +1461,7 @@ fn invalid_lease_field_names_each_member_the_broker_refuses() {
     for (name, mutate) in accepted {
         let mut body = valid.clone();
         mutate(&mut body);
-        assert_eq!(invalid_lease_field(&body, false), None, "{name}");
+        assert_eq!(invalid_lease_field(&body), None, "{name}");
     }
     let refused: [(&str, Mutation); 16] = [
         ("job_id", |b| b.job_id.replace_range(14..15, "4")),
@@ -1501,12 +1500,11 @@ fn invalid_lease_field_names_each_member_the_broker_refuses() {
     for (field, mutate) in refused {
         let mut body = valid.clone();
         mutate(&mut body);
-        assert_eq!(invalid_lease_field(&body, false), Some(field), "{body:?}");
+        assert_eq!(invalid_lease_field(&body), Some(field), "{body:?}");
     }
     let mut no_spill = valid.clone();
     no_spill.allow_spill = Some(false);
-    assert_eq!(invalid_lease_field(&no_spill, false), None);
-    assert_eq!(invalid_lease_field(&no_spill, true), Some("shadow"));
+    assert_eq!(invalid_lease_field(&no_spill), None);
 }
 
 /// A run request whose timeout or vCPU count no lease body can carry is

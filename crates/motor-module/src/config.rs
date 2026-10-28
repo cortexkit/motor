@@ -20,21 +20,17 @@ pub struct Config {
     /// resolved repository_root of their main checkout. Windows and macOS stay direct.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosted_repositories: Vec<String>,
-    /// Pin repository-routed leases to this broker placement hint. Spill, shadow
-    /// and fleet routes ignore it; hinted jobs never correct to the direct runner.
+    /// Pin repository-routed leases to this broker placement hint. Spill and
+    /// fleet routes ignore it; hinted jobs never correct to the direct runner.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hosted_repositories_placement_hint: Option<motor_lease::Placement>,
     /// Move only proven capacity-permit waits to hosted runners. Defaults are
     /// omitted so older clients with a closed Config schema can still load it.
     #[serde(skip_serializing_if = "is_false")]
     pub spill_to_hosted: bool,
-    /// Compare sampled build-server jobs against hosted runners without routing
-    /// caller traffic there. Omit defaults for older closed config schemas.
-    #[serde(
-        skip_serializing_if = "ShadowConfig::is_default",
-        deserialize_with = "disabled_or_shadow_config"
-    )]
-    pub shadow_to_hosted: ShadowConfig,
+    /// Ignored; kept so existing configs still parse.
+    #[serde(skip_serializing)]
+    pub shadow_to_hosted: serde::de::IgnoredAny,
     /// Capacity-permit wait before attempting spill, in seconds (default 45).
     #[serde(skip_serializing_if = "is_default_spill_after")]
     pub spill_after_s: u64,
@@ -96,46 +92,6 @@ pub enum BrokerTokenSource {
     Fake,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ShadowConfig {
-    pub enabled: bool,
-    pub sample_rate: f64,
-    pub max_concurrent: usize,
-}
-impl Default for ShadowConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            sample_rate: 0.1,
-            max_concurrent: 2,
-        }
-    }
-}
-impl ShadowConfig {
-    fn is_default(&self) -> bool {
-        self == &Self::default()
-    }
-}
-// A direct-only rollback can switch shadowing off with the same false literal
-// as the routing flags. Enabling shadowing still requires its explicit config.
-fn disabled_or_shadow_config<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<ShadowConfig, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Value {
-        Config(ShadowConfig),
-        Disabled(bool),
-    }
-    match Value::deserialize(deserializer)? {
-        Value::Config(config) => Ok(config),
-        Value::Disabled(false) => Ok(ShadowConfig::default()),
-        Value::Disabled(true) => Err(serde::de::Error::custom(
-            "enabling shadow_to_hosted requires an object with enabled: true",
-        )),
-    }
-}
 impl BrokerTokenSource {
     fn is_default(&self) -> bool {
         *self == Self::CkAccount
@@ -347,7 +303,7 @@ impl Default for Config {
             hosted_repositories: Vec::new(),
             hosted_repositories_placement_hint: None,
             spill_to_hosted: false,
-            shadow_to_hosted: ShadowConfig::default(),
+            shadow_to_hosted: serde::de::IgnoredAny,
             spill_after_s: 45,
             spill_max_vcpus: 8,
             spill_avoid_host: None,
@@ -426,14 +382,6 @@ impl Config {
             if !names.insert(&runner.name) {
                 return Err(error("name must be unique".into()));
             }
-        }
-        if !self.shadow_to_hosted.sample_rate.is_finite()
-            || !(0.0..=1.0).contains(&self.shadow_to_hosted.sample_rate)
-            || self.shadow_to_hosted.max_concurrent == 0
-        {
-            return Err(io::Error::other(
-                "shadow sample_rate must be 0..1 and max_concurrent must be positive",
-            ));
         }
         if self.runner_instance == "main" && self.broker_token_source == BrokerTokenSource::Fake {
             return Err(io::Error::other(
@@ -614,4 +562,30 @@ pub(crate) struct RunnerTarget {
     pub state_root: Option<String>,
     pub windows: Option<WindowsRunner>,
     pub macos: Option<MacosRunner>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_shadow_config_loads_but_is_ignored_and_not_serialized() {
+        let scratch = cortexkit_test_support::ScratchDir::new("ignored-config");
+        let path = scratch.join("config.jsonc");
+        for value in [
+            serde_json::json!({"enabled": true, "sample_rate": 1.0, "max_concurrent": 2}),
+            serde_json::json!({"enabled": false, "sample_rate": -1.0, "max_concurrent": 0}),
+            serde_json::json!(false),
+            serde_json::json!(true),
+        ] {
+            let legacy = serde_json::json!({"shadow_to_hosted": value});
+            std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+            let config = Config::load(&path).unwrap();
+            assert_eq!(
+                serde_json::to_value(config).unwrap(),
+                serde_json::to_value(Config::default()).unwrap(),
+            );
+        }
+        assert!(serde_json::from_str::<Config>(r#"{"unknown_config_key":true}"#).is_err());
+    }
 }
