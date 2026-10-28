@@ -58,7 +58,27 @@ if ($record.PSObject.Properties['provision_root']) {
 }
 # Clearing readonly applies only inside the owned root, never to another parent.
 $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\icacls.exe" -ArgumentList @("$Root\baselines\ally-hvsock.vhdx", '/grant:r', '*S-1-5-18:F', '*S-1-5-32-544:F', '/Q') -Operation 'restore owned parent ACL before removal' -LogPath $nativeLogPath
-Get-ChildItem -LiteralPath $Root -File -Recurse -Force | ForEach-Object { $_.IsReadOnly = $false }
-Remove-Item -LiteralPath $Root -Recurse -Force
+# Job checkouts in staging can hold paths longer than 260 characters, which
+# Windows PowerShell 5.1 cmdlets cannot reach. .NET's extended-length form
+# (\\?\) can, so both the readonly clear and the removal go through it.
+# The walk never enters a reparse point, so a link inside the root can't lead
+# the readonly clear outside it; Directory.Delete removes such links without
+# following them.
+$longRoot = '\\?\' + $Root
+$pending = [Collections.Generic.Stack[string]]::new()
+$pending.Push($longRoot)
+while ($pending.Count) {
+    $directory = $pending.Pop()
+    foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($directory)) {
+        $attributes = [IO.File]::GetAttributes($entry)
+        if ($attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+        if ($attributes -band [IO.FileAttributes]::Directory) {
+            $pending.Push($entry)
+        } elseif ($attributes -band [IO.FileAttributes]::ReadOnly) {
+            [IO.File]::SetAttributes($entry, $attributes -bxor [IO.FileAttributes]::ReadOnly)
+        }
+    }
+}
+[IO.Directory]::Delete($longRoot, $true)
 if ((Test-Path $Root) -or (Test-Path $key) -or (Get-LocalUser motor-prep -ErrorAction SilentlyContinue) -or (Get-LocalUser motor-ssh -ErrorAction SilentlyContinue)) { throw 'Uninstall left owned state' }
 Write-Host 'PASS uninstalled: service, accounts/key, job VMs/disks, hvsock registration, sealed parent and root removed; Hyper-V remains installed'

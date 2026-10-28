@@ -277,6 +277,19 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("partial-install-ssh-account-and-block-cleanup-without-ssh-block-record", fixture)
         self.assertIn("native-command-exit-code-ignores-stderr-and-logs-it", fixture)
 
+    def test_uninstaller_removes_the_root_through_extended_length_paths(self):
+        # Job checkouts under staging can exceed 260 characters, which Windows
+        # PowerShell 5.1's Get-ChildItem and Remove-Item cannot reach; on
+        # 2026-10-28 that stopped the Ally's uninstall halfway.
+        uninstall = (HERE / "uninstall.ps1").read_text()
+        removal = uninstall.split("restore owned parent ACL before removal", 1)[1].split("'Uninstall left owned state'", 1)[0]
+        self.assertIn("$longRoot = '\\\\?\\' + $Root", removal)
+        self.assertIn("[IO.Directory]::Delete($longRoot, $true)", removal)
+        self.assertNotIn("Get-ChildItem -LiteralPath $Root", removal)
+        self.assertNotIn("Remove-Item -LiteralPath $Root", removal)
+        # The readonly clear never follows a link out of the root.
+        self.assertLess(removal.index("ReparsePoint) { continue }"), removal.index("$pending.Push($entry)"))
+
     def test_cmd_never_echoes_a_variable_straight_into_a_redirect(self):
         # In cmd, `echo %errorlevel%>file` with a one-digit value reads as a
         # handle redirect (`0>`), so the file gets "ECHO is off." instead of
