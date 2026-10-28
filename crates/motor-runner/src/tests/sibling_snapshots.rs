@@ -122,6 +122,90 @@ fn snapshot_worktree_with_a_dangling_legacy_sibling_alias_is_admitted() {
 
 #[cfg(unix)]
 #[test]
+fn snapshot_sibling_alias_naming_its_own_checkout_is_admitted() {
+    for real_directory in [false, true] {
+        let mut f = Fixture::new();
+        fs::create_dir_all(&f.key).unwrap();
+        let alias = Path::new(&f.key).parent().unwrap().join("commons");
+        if real_directory {
+            f.canonical = text(&alias).into();
+        }
+        fs::create_dir_all(&f.canonical).unwrap();
+        if !real_directory {
+            std::os::unix::fs::symlink("../source/commons", &alias).unwrap();
+            assert_eq!(
+                fs::canonicalize(&alias).unwrap(),
+                fs::canonicalize(&f.canonical).unwrap()
+            );
+        }
+        let (config, _) = snapshot_config(&f);
+        let runner = manual_runner(config);
+        let (reader, _) = f.run("true");
+        assert_run_accepted(&runner, &reader);
+        runner
+            .admit_prepare(&prepare_for(&reader))
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn snapshot_sibling_alias_to_another_workspace_is_refused_with_its_target() {
+    for real_directory in [false, true] {
+        let f = Fixture::new();
+        let (config, _) = snapshot_config(&f);
+        let runner = manual_runner(config);
+        fs::create_dir_all(&f.key).unwrap();
+        let alias = Path::new(&f.key).parent().unwrap().join("commons");
+        let other = f.scratch.join("remote/other-workspace");
+        fs::create_dir_all(&other).unwrap();
+        let target = if real_directory {
+            fs::create_dir(&alias).unwrap();
+            "a real directory".into()
+        } else {
+            std::os::unix::fs::symlink(&other, &alias).unwrap();
+            format!("symlink {}", other.display())
+        };
+        let (reader, _) = f.run("true");
+        assert_alias_conflict_detail(&runner, reader, &alias, &target, &f.canonical);
+    }
+}
+
+#[cfg(unix)]
+fn assert_alias_conflict_detail(
+    runner: &Runner,
+    reader: Run,
+    alias: &Path,
+    target: &str,
+    sibling: &str,
+) {
+    let id = reader.job_id;
+    assert!(matches!(
+        runner.accept(reader).unwrap(),
+        Admission::Refused(RefusalReason::WorkspaceKeyRejected)
+    ));
+    let detail = runner.core.inner.lock().unwrap().jobs[&id]
+        .terminal
+        .as_ref()
+        .unwrap()
+        .refusal_detail
+        .clone()
+        .unwrap();
+    let expected = runner.safe_refusal_detail(
+        format!(
+            "validate sibling alias {}: points to {target}; requested sibling={sibling}; \
+             the alias must name the requested sibling",
+            alias.display(),
+        ),
+        std::iter::empty(),
+    );
+    assert!(detail.contains(&expected), "{detail}");
+    assert!(!detail.contains("os error 2"), "{detail}");
+}
+
+#[cfg(unix)]
+#[test]
 fn snapshot_worktree_rejects_unrelated_dangling_aliases_and_alias_root_escapes() {
     use std::os::unix::fs::symlink;
     let f = Fixture::new();
@@ -134,12 +218,16 @@ fn snapshot_worktree_rejects_unrelated_dangling_aliases_and_alias_root_escapes()
     assert!(roots.starts_with("allowed_roots=[") && roots.ends_with(']'));
     fs::create_dir_all(&f.key).unwrap();
     let alias = Path::new(&f.key).parent().unwrap().join("commons");
-    symlink(f.scratch.join("outside/commons"), &alias).unwrap();
+    let unrelated = f.scratch.join("outside/commons");
+    symlink(&unrelated, &alias).unwrap();
     let (reader, _) = f.run("true");
-    assert!(matches!(
-        runner.accept(reader).unwrap(),
-        Admission::Refused(RefusalReason::WorkspaceKeyRejected)
-    ));
+    assert_alias_conflict_detail(
+        &runner,
+        reader,
+        &alias,
+        &format!("symlink {}", unrelated.display()),
+        &f.canonical,
+    );
 
     let real_workspace = f.scratch.join("remote/real-reader");
     fs::create_dir_all(&real_workspace).unwrap();
