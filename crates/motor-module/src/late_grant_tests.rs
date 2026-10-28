@@ -222,6 +222,7 @@ impl Harness {
                     };
                     let now = crate::hosted::now_s();
                     let claims = Claims {
+                        workspace_key_hash: None,
                         iss: motor_lease::ISSUER.into(), aud: "boat:test".into(), sub: "acct:test".into(),
                         jti: request.job_id.clone(), iat: now, exp: now + 120,
                         vcpus: request.vcpus, mem_mib: motor_lease::memory_max_mib(request.vcpus),

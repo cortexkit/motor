@@ -113,8 +113,14 @@ fn cloud_long_lease_token_accepts_six_hours_but_boat_keeps_two() {
 
 #[test]
 fn cloud_job_tokens_and_requester_thumbprint_match_code_for_both_purposes() {
+    for name in ["job-tokens.json", "job-tokens-workspace.json"] {
+        check_cloud_job_tokens(name);
+    }
+}
+
+fn check_cloud_job_tokens(name: &str) {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    let v = vector("job-tokens.json");
+    let v = vector(name);
     let mut keys = KeySet::default();
     keys.refresh(Ok(serde_json::from_value(v["jwks"].clone()).unwrap()))
         .unwrap();
@@ -174,6 +180,48 @@ fn cloud_job_tokens_and_requester_thumbprint_match_code_for_both_purposes() {
             entry["claims"].as_str().unwrap().as_bytes()
         );
     }
+}
+
+#[test]
+fn cloud_job_tokens_refuse_malformed_workspace_hash() {
+    let v = vector("job-tokens-workspace.json");
+    let mut keys = KeySet::default();
+    keys.refresh(Ok(serde_json::from_value(v["jwks"].clone()).unwrap()))
+        .unwrap();
+    let mut claims: Claims =
+        serde_json::from_str(v["tokens"]["run"]["claims"].as_str().unwrap()).unwrap();
+    for hash in [
+        "".into(),
+        "A".repeat(42),
+        "A".repeat(44),
+        format!("{}=", "A".repeat(42)),
+        "é".repeat(43),
+    ] {
+        claims.workspace_key_hash = Some(hash);
+        let token = sign_token(
+            &claims,
+            v["key_id"].as_str().unwrap(),
+            &seed(v["seed_hex"].as_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            check_token(
+                &token,
+                &keys,
+                "host-a",
+                None,
+                Purpose::Run,
+                v["clock_ms"].as_u64().unwrap() / 1000
+            )
+            .unwrap_err()
+            .check,
+            "workspace_key_hash"
+        );
+    }
+    let mut raw: Value =
+        serde_json::from_str(v["tokens"]["run"]["claims"].as_str().unwrap()).unwrap();
+    raw["workspace_key_hash"] = Value::Null;
+    assert!(serde_json::from_value::<Claims>(raw).is_err());
 }
 
 /// The in-sandbox endpoint must accept CLOUD's recorded Boat token exactly as

@@ -19,8 +19,9 @@ host can also call `Nonces::prune` explicitly.
 ## Contract fixtures
 
 The broker repository, `cortexkit-cloud`, owns `docs/runners-contract.md` and
-`test-vectors/runners/`. `contracts/cloud/` mirrors fourteen canonical files
-verbatim at commit `813c8083`, including the six-hour `long-lease.json` and
+`test-vectors/runners/`. `contracts/cloud/` mirrors fifteen canonical files
+verbatim at commit `989f4e4f`, including optional workspace-hash job tokens,
+the six-hour `long-lease.json` and
 same-reservation `replace-lease.json` exchanges. `bad-request.json` now refuses
 `timeout_s: 21601`; registered hosts accept up to 21600, while Boat keeps 7200.
 `contracts/digest-manifest.json` records source paths,

@@ -37,14 +37,27 @@ Payload keys occur in this order, without whitespace:
 | `max_s` | Run limit enforced by the host from job start, not token issue |
 | `cnf` | `{"jkt":"<thumbprint>"}` |
 | `purpose` | `"run"` from lease; `"attach"` from reattach |
+| `workspace_key_hash` | When enabled by the broker, the lease request's `workspace_key_hash` verbatim (`^[A-Za-z0-9_-]{43}$`); always the last payload key, after `purpose` |
+
+The temporary broker rollout switch `JOB_TOKEN_WORKSPACE_HASH` emits `workspace_key_hash` only
+when its value is exactly the string `"true"`. Otherwise the payload and signed token bytes are
+unchanged. When enabled, every run and attach token for a newly recorded job includes the job's
+stored hash, on registered hosts and Boat alike, including re-request, re-sign, move, replace and
+reattach. While the claim is optional, a token for a job recorded before the broker stored its
+hash may omit it, even with the switch on. The broker stores a hash for every newly recorded job.
 
 `cnf.jkt` is the unpadded base64url SHA-256 RFC 7638 thumbprint of the UTF-8 JSON
 `{"crv":"Ed25519","kty":"OKP","x":"<requester x>"}`. The token is bound to the requester key.
 
 Hosts check expiration at connect only. They reject any other `alg` or `typ`, unknown `kid`, any
 `crit` header, wrong `iss` or `aud`, any purpose other than `run` or `attach`, and extra or missing
-claims. Host executions are keyed by `jti`: a `run` token starts an execution only if none exists
-for that job; later tokens reconnect without starting another execution or restarting `max_s`.
+claims, except that hosts must accept `workspace_key_hash` as optional during rollout and validate
+it against `^[A-Za-z0-9_-]{43}$` when present. Hosts may require it only after the operator announces
+the switch is on everywhere and confirms no hashless legacy job is still unsettled or inside its
+reattach window. Such jobs cannot be created anymore and age out within the 6-hour run limit plus
+the 24-hour settled-reattach window. Host executions are keyed by `jti`: a `run` token starts an
+execution only if none exists for that job; later tokens reconnect without starting another
+execution or restarting `max_s`.
 An `attach` token never starts an execution. A `run` token for an ended execution is refused. An
 `attach` token for an ended execution is accepted while the host retains the job's terminal
 record: the host replays the retained output and terminal records and reports no further usage.
@@ -558,6 +571,9 @@ most 64 entries. `state` is exactly `reserved`, `admitted` or `started`. The hea
 the host capacity snapshot, timestamped at broker receive time. `queued` is stored but does not
 affect placement.
 
+`warm` lists the tenant workspaces the host holds **now**, after eviction, most-recent first. A
+host holding more than 64 reports only the 64 most recent workspaces.
+
 `free_vcpus` and `free_mem_mib` answer one question for placement: can this host take one more job
 of a given size now? The broker places a lease on a host only if `free_vcpus ≥ vcpus` and
 `free_mem_mib ≥ max(16384, 3584 × vcpus)`. It reads them for nothing else: billing, `no_host_fits`
@@ -960,8 +976,11 @@ When a customer leaves, an operator closes the account (`close-account`, see
 ## Pinned conformance evidence
 
 `test-vectors/runners/job-tokens.json` pins both token purposes and their header/claim bytes,
-the fixed signing seed and its derived public key. `test-vectors/runners/lease.json` pins the
-lease request and exact reply, including the lease id and SPKI hash.
+the fixed signing seed and its derived public key. `test-vectors/runners/job-tokens-workspace.json`
+pins both purposes with `JOB_TOKEN_WORKSPACE_HASH="true"`, using the same deterministic signer
+inputs and appending the lease's workspace hash after `purpose`. The existing vectors keep the
+switch off. `test-vectors/runners/lease.json` pins the lease request and exact reply, including
+the lease id and SPKI hash.
 `test-vectors/runners/host-signature.json` pins the exact host signature input and signature.
 `test-vectors/runners/usage-settlement.json` pins the report and settlement reply.
 `test-vectors/runners/settled-reattach.json` pins a reattach for a job its host already settled by

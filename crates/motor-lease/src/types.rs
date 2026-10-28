@@ -92,6 +92,19 @@ pub struct Claims {
     pub max_s: u64,
     pub cnf: Confirmation,
     pub purpose: Purpose,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_workspace_hash"
+    )]
+    pub workspace_key_hash: Option<String>,
+}
+
+// Missing claims support older brokers; an explicit null is not a hash.
+fn present_workspace_hash<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

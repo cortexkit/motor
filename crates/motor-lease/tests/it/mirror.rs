@@ -69,6 +69,7 @@ fn cloud_final_files_match_their_manifest_digests() {
         "cloud/explicit-only-leases.json",
         "cloud/boat-lease.json",
         "cloud/job-tokens.json",
+        "cloud/job-tokens-workspace.json",
         "cloud/host-signature.json",
         "cloud/lease.json",
         "cloud/usage-settlement.json",
@@ -98,7 +99,7 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "b4ddcfd936d96f794e8553c8f12cebdd9197de106659a59a520f24d4c8850ae8",
+            "f0f36f84f51be4e5659cad89f67f12c3a4a454250e8ed8e983cc271a415689cd",
         ),
         (
             "bad-request.json",
@@ -127,6 +128,10 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         (
             "job-tokens.json",
             "541eccc153088ef5be8755bdda9d633bed44237544acae6e365be4124eecc8bb",
+        ),
+        (
+            "job-tokens-workspace.json",
+            "67b86a1bb25eeb6b62454a0aeb30ce1388da0b2474954ce589c84165d8ba8857",
         ),
         (
             "lease.json",

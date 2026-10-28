@@ -1,0 +1,73 @@
+{
+  "key_id": "runner_2026_10",
+  "seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+  "clock_ms": 1792195200123,
+  "jwks": {
+    "keys": [
+      {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+        "kid": "runner_2026_10",
+        "alg": "EdDSA",
+        "use": "sig"
+      }
+    ]
+  },
+  "test_only_requester_seed_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "requester_jkt": "AkXIZFzonb59ZmGwyKgi3H3BwMi6amevqdKQiLZhdtc",
+  "tokens": {
+    "run": {
+      "input": {
+        "tenant_id": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+        "vcpus": 2,
+        "mem_mib": 16384,
+        "platform": "linux-x64",
+        "net": true,
+        "placement": {
+          "host": "host-a",
+          "vm": "warm-vm-1"
+        },
+        "max_s": 12,
+        "requester_jwk": {
+          "kty": "OKP",
+          "crv": "Ed25519",
+          "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+        },
+        "purpose": "run",
+        "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4"
+      },
+      "header": "{\"alg\":\"EdDSA\",\"kid\":\"runner_2026_10\",\"typ\":\"ck-job+jwt\"}",
+      "claims": "{\"iss\":\"https://runners.cortexkit.io\",\"aud\":\"host-a\",\"sub\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"jti\":\"019e4567-89ab-7cde-8012-3456789abcde\",\"iat\":1792195200,\"exp\":1792195500,\"vcpus\":2,\"mem_mib\":16384,\"platform\":\"linux-x64\",\"net\":true,\"placement\":{\"host\":\"host-a\",\"vm\":\"warm-vm-1\"},\"max_s\":12,\"cnf\":{\"jkt\":\"AkXIZFzonb59ZmGwyKgi3H3BwMi6amevqdKQiLZhdtc\"},\"purpose\":\"run\",\"workspace_key_hash\":\"Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4\"}",
+      "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6MiwibWVtX21pYiI6MTYzODQsInBsYXRmb3JtIjoibGludXgteDY0IiwibmV0Ijp0cnVlLCJwbGFjZW1lbnQiOnsiaG9zdCI6Imhvc3QtYSIsInZtIjoid2FybS12bS0xIn0sIm1heF9zIjoxMiwiY25mIjp7ImprdCI6IkFrWElaRnpvbmI1OVptR3d5S2dpM0gzQndNaTZhbWV2cWRLUWlMWmhkdGMifSwicHVycG9zZSI6InJ1biIsIndvcmtzcGFjZV9rZXlfaGFzaCI6IkltaThJSUdxQ2lzMm1wOHh5cXpzZEtVTXNMRGI2M25EY1JfM0ZjMjZxUTQifQ.nvEzO9InAvmZ96DTU6Fh9sAjQZAkOOL-DOB_YWL7xfuH1xXZOU_PXnED0CmWNuYS9imxil448qPsNL7p38AfBg",
+      "token_expires_at_ms": 1792195500000
+    },
+    "attach": {
+      "input": {
+        "tenant_id": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+        "vcpus": 2,
+        "mem_mib": 16384,
+        "platform": "linux-x64",
+        "net": true,
+        "placement": {
+          "host": "host-a",
+          "vm": "warm-vm-1"
+        },
+        "max_s": 12,
+        "requester_jwk": {
+          "kty": "OKP",
+          "crv": "Ed25519",
+          "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+        },
+        "purpose": "attach",
+        "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4"
+      },
+      "header": "{\"alg\":\"EdDSA\",\"kid\":\"runner_2026_10\",\"typ\":\"ck-job+jwt\"}",
+      "claims": "{\"iss\":\"https://runners.cortexkit.io\",\"aud\":\"host-a\",\"sub\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"jti\":\"019e4567-89ab-7cde-8012-3456789abcde\",\"iat\":1792195200,\"exp\":1792195500,\"vcpus\":2,\"mem_mib\":16384,\"platform\":\"linux-x64\",\"net\":true,\"placement\":{\"host\":\"host-a\",\"vm\":\"warm-vm-1\"},\"max_s\":12,\"cnf\":{\"jkt\":\"AkXIZFzonb59ZmGwyKgi3H3BwMi6amevqdKQiLZhdtc\"},\"purpose\":\"attach\",\"workspace_key_hash\":\"Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4\"}",
+      "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6MiwibWVtX21pYiI6MTYzODQsInBsYXRmb3JtIjoibGludXgteDY0IiwibmV0Ijp0cnVlLCJwbGFjZW1lbnQiOnsiaG9zdCI6Imhvc3QtYSIsInZtIjoid2FybS12bS0xIn0sIm1heF9zIjoxMiwiY25mIjp7ImprdCI6IkFrWElaRnpvbmI1OVptR3d5S2dpM0gzQndNaTZhbWV2cWRLUWlMWmhkdGMifSwicHVycG9zZSI6ImF0dGFjaCIsIndvcmtzcGFjZV9rZXlfaGFzaCI6IkltaThJSUdxQ2lzMm1wOHh5cXpzZEtVTXNMRGI2M25EY1JfM0ZjMjZxUTQifQ.lt1OULBo2RZdDwHIojIYJh1mXmqsSVKYdxm8imP6ecN1ZvGUQDyrKfsYk2iSAS5TV1Sk2K4Qvedg-9jrW7K6CA",
+      "token_expires_at_ms": 1792195500000
+    }
+  }
+}

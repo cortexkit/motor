@@ -27,6 +27,7 @@ const JOB3: &str = "00000000-0000-7000-8000-000000000003";
 
 fn claims(job: &str) -> Claims {
     Claims {
+        workspace_key_hash: None,
         iss: motor_lease::ISSUER.into(),
         aud: "host".into(),
         jti: job.into(),

@@ -330,6 +330,15 @@ pub fn check_token(
         ),
         ("platform", !valid_name(&claims.platform)),
         ("cnf", decode::<32>(&claims.cnf.jkt).is_err()),
+        (
+            "workspace_key_hash",
+            claims.workspace_key_hash.as_deref().is_some_and(|hash| {
+                hash.len() != 43
+                    || !hash
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            }),
+        ),
     ]
     .into_iter()
     .find_map(|(check, failed)| failed.then_some(check));
