@@ -37,13 +37,15 @@ Payload keys occur in this order, without whitespace:
 | `max_s` | Run limit enforced by the host from job start, not token issue |
 | `cnf` | `{"jkt":"<thumbprint>"}` |
 | `purpose` | `"run"` from lease; `"attach"` from reattach |
-| `workspace_key_hash` | When enabled by the broker, the lease request's `workspace_key_hash` verbatim (`^[A-Za-z0-9_-]{43}$`); always the last payload key, after `purpose` |
+| `workspace_key_hash` | When enabled by the broker, on registered-host placements only: the lease request's `workspace_key_hash` verbatim (`^[A-Za-z0-9_-]{43}$`); always the last payload key, after `purpose` |
 
 The temporary broker rollout switch `JOB_TOKEN_WORKSPACE_HASH` emits `workspace_key_hash` only
 when its value is exactly the string `"true"`. Otherwise the payload and signed token bytes are
-unchanged. When enabled, every run and attach token for a newly recorded job includes the job's
-stored hash, on registered hosts and Boat alike, including re-request, re-sign, move, replace and
-reattach. While the claim is optional, a token for a job recorded before the broker stored its
+unchanged. When enabled, every run and attach token for a newly recorded job placed on a
+registered host includes the job's stored hash, including re-request, re-sign, move, replace and
+reattach. Tokens for Boat placements (`placement.host` of the form `boat:<sandbox id>`) never carry
+it: the broker chooses Boat sandboxes by workspace itself, so the sandbox has no use for the claim,
+and Boat token readers keep rejecting it as an unknown claim. While the claim is optional, a token for a job recorded before the broker stored its
 hash may omit it, even with the switch on. The broker stores a hash for every newly recorded job.
 
 `cnf.jkt` is the unpadded base64url SHA-256 RFC 7638 thumbprint of the UTF-8 JSON
