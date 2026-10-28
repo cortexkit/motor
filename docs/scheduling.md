@@ -221,13 +221,54 @@ runner never writes. Admission and eviction decisions are otherwise identical,
 and the catalog keeps the caller's `/home` path. See
 [job-isolation.md](job-isolation.md#38-caller-root-mapping).
 
+Linux host workspaces also retain their checkouts while trimming Cargo outputs:
+after a job becomes idle, `--build-folder-cap-bytes` (default 64 GiB) drops only
+incremental directories when allocated `target/` bytes exceed the cap. Periodic
+maintenance sweeps each idle workspace at most once per day per runner lifetime.
+It removes whole name/hash units only when every known output's atime is older
+than 48 hours, keeping a full extra day beyond relatime's update interval.
+Unknown files and symlinks are left alone; incremental crate directories are
+aged independently. Boat skips atime sweeping because its disk uses noatime,
+and retains its admission-time whole-workspace sweep. VM-backed jobs keep their
+backend-specific disk policies.
+
+The runner caches allocated workspace, target and incremental sizes in memory,
+with a measurement time and completeness flag. Read-only walks refresh them
+when a workspace becomes idle and populate missing entries lazily for ranking;
+a restart starts with an
+empty cache. Unreadable subtrees mark the estimate incomplete and log one
+warning per walk. Read-only measurement never claims a workspace or changes
+permissions.
+Build-folder cleanup scans before claiming and repairs ownership only when it
+has selected outputs to delete: repair transfers the target to the runner, so
+the next job must repair it back to the job account. An incomplete estimate is
+the exception: the guard, daily sweep and incremental pressure pass claim and
+repair that workspace, then measure again before deciding what to remove. This
+keeps jobs that narrow their target's permissions from hiding their disk usage.
+The whole-workspace pass tries eligible complete estimates first, then repairs
+unreadable workspaces one at a time, oldest first, and reranks their complete
+sizes. It stops before repairing another workspace if the free-space goal is met.
+Tests:
+`disk_size_guard_drops_only_incremental_and_defers_queued_workspace`,
+`disk_stale_unit_maintenance_deletes_whole_units_and_runs_once_daily`,
+`cargo_units_group_hashes_outputs_and_scripts_without_following_symlinks`.
+
 - The hard floor is `serve --free-space-floor-bytes N`, default 128 GiB
   (137438953472 bytes); 0 disables the check. The soft goal defaults to twice the
   floor; `--free-space-eviction-bytes N` explicitly sets a reclaim goal above it.
-- Below the soft goal, the runner first cleans up: it evicts workspaces not
-  used for 30 minutes, least recently used first, and stale staging. Under the
-  hard floor it also evicts recently used workspaces until it reaches the soft
-  goal. Tests: `disk_soft_cleanup_evicts_lru_before_the_hard_floor`,
+- Below the soft goal, cleanup has three passes: stale Cargo units, incremental
+  state (largest cached incremental size first), then whole workspaces and staging
+  ordered by allocated bytes times idle milliseconds, descending. Workspace sizes
+  come from the in-memory cache; staging sizes are measured on each pass.
+  Unreferenced sibling snapshots retain priority in the whole-tree pass.
+  Each pass stops once the free-space
+  probe reaches the soft goal; allocated bytes can double-count reflink extents.
+  Workspaces used in the last 30 minutes remain protected above the hard floor;
+  below it recent idle workspaces are eligible too. Tests:
+  `disk_pressure_stale_pass_reaches_goal_without_dropping_incremental`,
+  `disk_pressure_incremental_pass_prefers_largest_and_retains_workspaces`,
+  `disk_eviction_bytes_times_idle_prefers_huge_workspace_over_older_small_ones`,
+  `disk_soft_cleanup_evicts_lru_before_the_hard_floor`,
   `disk_soft_pressure_evicts_only_candidates_used_over_30_minutes_ago`,
   `disk_hard_pressure_evicts_recent_candidates_in_lru_order_until_soft_goal`,
   `disk_soft_cleanup_does_nothing_at_twice_the_floor`.
@@ -246,7 +287,7 @@ and the catalog keeps the caller's `/home` path. See
   `disk_admission_preserves_incoming_ordinary_workspace_and_sibling`,
   `disk_admission_protects_canonical_alias_through_job_insertion`.
 - A workspace served through a caller root counts like any other. Disk
-  accounting, the free-space floor and the LRU order all use the host directory
+  accounting, the free-space floor and the size/idle order all use the host directory
   that actually holds the trees, while the catalog keeps the caller's `/home`
   path. Eviction renames such a tree into the host directory's own trash, never
   the state directory's. Tests:
