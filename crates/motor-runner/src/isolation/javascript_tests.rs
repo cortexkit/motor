@@ -859,7 +859,10 @@ fn javascript_workspace_changes_exclude_prepared_node_modules_but_keep_edits() {
         prepared_workspace_changes_fixture(&["", "test-fixtures/javascript/npm [fixture]"]);
     fs::write(f.workspace.join("source"), "edited by the job").unwrap();
 
-    assert_eq!(trees.changes(&f.workspace, &prepared).unwrap(), ["source"]);
+    assert_eq!(
+        trees.changes(&f.workspace, &prepared, None).unwrap(),
+        ["source"]
+    );
 }
 
 #[test]
@@ -878,7 +881,7 @@ fn javascript_workspace_changes_keep_node_modules_in_unprepared_directories() {
         fs::write(path, "written by the job").unwrap();
     }
 
-    let mut changes = trees.changes(&f.workspace, &prepared).unwrap();
+    let mut changes = trees.changes(&f.workspace, &prepared, None).unwrap();
     changes.sort();
     assert_eq!(changes, created);
 }

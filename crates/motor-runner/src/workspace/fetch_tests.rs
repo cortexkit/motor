@@ -17,18 +17,21 @@ fn workspace_changes_list_edits_and_report_a_failed_scan_as_an_error() {
     let scratch = ScratchDir::new("motor-workspace-changes");
     let trees = trees(&scratch);
     let repo = committed_repo(&scratch, "changes");
-    assert_eq!(trees.changes(&repo, &[]).unwrap(), Vec::<String>::new());
+    assert_eq!(
+        trees.changes(&repo, &[], None).unwrap(),
+        Vec::<String>::new()
+    );
     fs::write(repo.join("source"), "edited").unwrap();
     fs::write(repo.join("new"), "untracked").unwrap();
     fs::write(repo.join(".gitignore"), "ignored/\n").unwrap();
     fs::create_dir_all(repo.join("ignored")).unwrap();
     fs::write(repo.join("ignored/out"), "build output").unwrap();
-    let mut changes = trees.changes(&repo, &[]).unwrap();
+    let mut changes = trees.changes(&repo, &[], None).unwrap();
     changes.sort();
     // Writes under ignored paths are not listed.
     assert_eq!(changes, [".gitignore", "new", "source"]);
     // A path git cannot scan is a failed scan, not "no changes".
-    assert!(trees.changes(&scratch.join("missing"), &[]).is_err());
+    assert!(trees.changes(&scratch.join("missing"), &[], None).is_err());
 }
 
 /// After an isolated job the workspace belongs to the job account. Git's own
@@ -38,11 +41,135 @@ fn workspace_changes_scan_a_tree_owned_by_another_account() {
     let scratch = ScratchDir::new("motor-workspace-changes-owner");
     let trees = trees(&scratch);
     let repo = committed_repo(&scratch, "owned");
+    fs::create_dir_all(&trees.state).unwrap();
+    fs::write(repo.join("source"), "caller edit").unwrap();
+    let commit = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+    let tree = trees.tree_hash(&repo).unwrap();
     fs::write(repo.join("source"), "edited by the job").unwrap();
     std::env::set_var("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1");
-    let changes = trees.changes(&repo, &[]);
+    let changes = trees.changes(&repo, &[], Some((&commit, &tree)));
     std::env::remove_var("GIT_TEST_ASSUME_DIFFERENT_OWNER");
     assert_eq!(changes.unwrap(), ["source"]);
+}
+
+fn dirty_snapshot(root: &Path) -> (Trees, PathBuf, String, String) {
+    let trees = trees(root);
+    fs::create_dir_all(&trees.state).unwrap();
+    let repo = committed_repo(root, "dirty-snapshot");
+    fs::write(repo.join("deleted"), "caller will delete this").unwrap();
+    fs::write(repo.join("clean"), "unchanged by caller").unwrap();
+    fs::write(repo.join(".gitignore"), "ignored/\n").unwrap();
+    git(&repo, &["add", "."]).unwrap();
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "baseline",
+        ],
+    )
+    .unwrap();
+    let commit = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+    fs::write(repo.join("source"), "caller edit").unwrap();
+    fs::write(repo.join("untracked"), "caller new file").unwrap();
+    fs::remove_file(repo.join("deleted")).unwrap();
+    fs::create_dir_all(repo.join("ignored")).unwrap();
+    fs::write(repo.join("ignored/input"), "force-added caller input").unwrap();
+    git(&repo, &["add", "-f", "ignored/input"]).unwrap();
+    let tree = trees.tree_hash(&repo).unwrap();
+    git(&repo, &["read-tree", "HEAD"]).unwrap();
+    stage_snapshot_ignored(&repo, &tree).unwrap();
+    (trees, repo, commit, tree)
+}
+
+#[test]
+fn workspace_changes_noop_dirty_snapshot_reports_nothing() {
+    let scratch = ScratchDir::new("motor-workspace-changes-noop");
+    let (trees, repo, commit, tree) = dirty_snapshot(&scratch);
+    assert!(!git(&repo, &["status", "--porcelain"]).unwrap().is_empty());
+    assert_eq!(
+        trees.changes(&repo, &[], Some((&commit, &tree))).unwrap(),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn workspace_changes_dirty_snapshot_reports_only_job_edits() {
+    let scratch = ScratchDir::new("motor-workspace-changes-dirty");
+    let (trees, repo, commit, tree) = dirty_snapshot(&scratch);
+    fs::write(repo.join("source"), "job edit after caller edit").unwrap();
+    fs::remove_file(repo.join("untracked")).unwrap();
+    fs::write(repo.join("clean"), "job edit to a clean file").unwrap();
+    fs::write(repo.join("new"), "job new file").unwrap();
+    let mut changes = trees.changes(&repo, &[], Some((&commit, &tree))).unwrap();
+    changes.sort();
+    assert_eq!(changes, ["clean", "new", "source", "untracked"]);
+}
+
+#[test]
+fn workspace_changes_clean_snapshot_keeps_status_behavior() {
+    let scratch = ScratchDir::new("motor-workspace-changes-clean");
+    let trees = trees(&scratch);
+    let repo = committed_repo(&scratch, "clean");
+    let commit = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+    let tree = git(&repo, &["rev-parse", "HEAD^{tree}"]).unwrap();
+    fs::write(repo.join("source"), "job edit").unwrap();
+    fs::write(repo.join("staged"), "job staged file").unwrap();
+    git(&repo, &["add", "staged"]).unwrap();
+    fs::write(repo.join("new"), "job new file").unwrap();
+    fs::write(repo.join(".gitignore"), "ignored/\n").unwrap();
+    fs::create_dir_all(repo.join("ignored")).unwrap();
+    fs::write(repo.join("ignored/output"), "job ignored output").unwrap();
+    let mut changes = trees.changes(&repo, &[], Some((&commit, &tree))).unwrap();
+    changes.sort();
+    assert_eq!(changes, [".gitignore", "new", "source", "staged"]);
+    assert_eq!(
+        trees.changes(&repo, &[], Some((&commit, &tree))).unwrap(),
+        trees.changes(&repo, &[], None).unwrap()
+    );
+}
+
+#[test]
+fn workspace_changes_detect_reverts_and_force_added_ignored_edits() {
+    let scratch = ScratchDir::new("motor-workspace-changes-reverted");
+    let (trees, repo, commit, tree) = dirty_snapshot(&scratch);
+    git(&repo, &["checkout", "HEAD", "--", "source", "deleted"]).unwrap();
+    fs::write(repo.join("ignored/input"), "job changed staged input").unwrap();
+    let mut changes = trees.changes(&repo, &[], Some((&commit, &tree))).unwrap();
+    changes.sort();
+    assert_eq!(changes, ["deleted", "ignored/input", "source"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_changes_compare_snapshot_modes_symlinks_and_clean_filters() {
+    use std::os::unix::{fs::symlink, fs::PermissionsExt};
+
+    let scratch = ScratchDir::new("motor-workspace-changes-modes");
+    let trees = trees(&scratch);
+    fs::create_dir_all(&trees.state).unwrap();
+    let repo = committed_repo(&scratch, "modes");
+    let commit = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+    fs::write(repo.join(".gitattributes"), "filtered text eol=crlf\n").unwrap();
+    fs::write(repo.join("filtered"), "caller text\r\n").unwrap();
+    fs::write(repo.join("executable"), "caller executable").unwrap();
+    fs::set_permissions(repo.join("executable"), fs::Permissions::from_mode(0o755)).unwrap();
+    symlink("missing-target", repo.join("link")).unwrap();
+    let tree = trees.tree_hash(&repo).unwrap();
+    assert!(trees
+        .changes(&repo, &[], Some((&commit, &tree)))
+        .unwrap()
+        .is_empty());
+    fs::set_permissions(repo.join("executable"), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::remove_file(repo.join("link")).unwrap();
+    fs::write(repo.join("link"), "missing-target").unwrap();
+    let mut changes = trees.changes(&repo, &[], Some((&commit, &tree))).unwrap();
+    changes.sort();
+    assert_eq!(changes, ["executable", "link"]);
 }
 
 /// A repository with one committed file, `source`.

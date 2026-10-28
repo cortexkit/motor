@@ -1599,6 +1599,41 @@ async fn inline_run_preserves_paths_targets_siblings_env_and_changes() {
 }
 
 #[tokio::test]
+async fn inline_workspace_changes_use_the_persisted_dirty_snapshot() {
+    let f = Fixture::new();
+    let runner = Runner::open(f.config()).unwrap();
+    fs::write(f.main.join("source"), "caller edit\n").unwrap();
+    fs::write(f.main.join("untracked"), "caller new file\n").unwrap();
+    let (request, bytes) = f.run_worktree("echo noop");
+    f.submit(&runner, &request, &bytes);
+    let result = terminal(&runner, request.job_id).await;
+    assert_eq!(result.outcome, Outcome::Exit { code: 0 });
+    assert_eq!(result.workspace_changes, Some(Vec::new()));
+
+    let job = runner.core.inner.lock().unwrap().jobs[&request.job_id].clone();
+    let restored: Job = serde_json::from_slice(&serde_json::to_vec(&job).unwrap()).unwrap();
+    assert_eq!(
+        runner
+            .core
+            .backend
+            .collect_changes(&runner.core.config, &runner.core.trees, &restored)
+            .unwrap(),
+        Some(Vec::new())
+    );
+
+    let (mut request, bytes) = f.run_worktree("echo job > source; rm untracked; echo new > extra");
+    // Older requests omit base_commit; setup and collection must resolve the
+    // same caller commit from the snapshot's parent.
+    request.base_commit = None;
+    f.submit(&runner, &request, &bytes);
+    let result = terminal(&runner, request.job_id).await;
+    assert_eq!(result.outcome, Outcome::Exit { code: 0 });
+    let mut changes = result.workspace_changes.unwrap();
+    changes.sort();
+    assert_eq!(changes, ["extra", "source", "untracked"]);
+}
+
+#[tokio::test]
 async fn remote_jobs_preserve_explicit_test_caps() {
     let f = Fixture::new();
     let runner = Runner::open(f.config()).unwrap();

@@ -167,6 +167,148 @@ fn stage_snapshot_ignored(path: &Path, tree_hash: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn change_scan_command(path: &Path) -> Command {
+    // Isolated workspaces belong to the job account, but their Git metadata
+    // remains runner-owned and read-only to jobs. Trust only this checkout,
+    // and never run a configured filesystem monitor while scanning it.
+    let mut command = git_command(path);
+    command.args([
+        "-c",
+        &format!("safe.directory={}", path.display()),
+        "-c",
+        "core.fsmonitor=false",
+    ]);
+    command
+}
+
+fn change_scan_git(path: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
+    let output = change_scan_command(path).args(args).output()?;
+    if !output.status.success() {
+        return Err(invalid(String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(output.stdout)
+}
+
+struct SnapshotEntry {
+    mode: String,
+    blob: String,
+}
+
+/// Only paths changed by the caller need a content comparison at job end.
+fn snapshot_entries(
+    path: &Path,
+    caller_commit: &str,
+    tree_hash: &str,
+) -> io::Result<BTreeMap<Vec<u8>, SnapshotEntry>> {
+    let diff = change_scan_git(
+        path,
+        &[
+            "diff",
+            "--raw",
+            "--no-abbrev",
+            "--no-renames",
+            "-z",
+            caller_commit,
+            tree_hash,
+            "--",
+        ],
+    )?;
+    let mut records = diff.split(|b| *b == 0).filter(|s| !s.is_empty());
+    let mut entries = BTreeMap::new();
+    while let Some(header) = records.next() {
+        let header = String::from_utf8_lossy(header);
+        let fields: Vec<_> = header.split_whitespace().collect();
+        let name = records
+            .next()
+            .ok_or_else(|| invalid("missing snapshot diff path"))?;
+        if fields.len() != 5 || !fields[0].starts_with(':') {
+            return Err(invalid("invalid snapshot diff entry"));
+        }
+        entries.insert(
+            name.to_vec(),
+            SnapshotEntry {
+                mode: fields[1].to_string(),
+                blob: fields[3].to_string(),
+            },
+        );
+    }
+    Ok(entries)
+}
+
+fn change_path(name: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(name))
+    }
+    #[cfg(not(unix))]
+    PathBuf::from(String::from_utf8_lossy(name).into_owned())
+}
+
+fn matches_snapshot(path: &Path, name: &Path, entry: &SnapshotEntry) -> io::Result<bool> {
+    let full = path.join(name);
+    let metadata = match fs::symlink_metadata(&full) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(entry.mode == "000000");
+        }
+        Err(error) => return Err(error),
+    };
+    let blob = match entry.mode.as_str() {
+        "120000" if metadata.is_symlink() => {
+            let target = fs::read_link(&full)?;
+            let mut command = change_scan_command(path);
+            command.args(["hash-object", "--stdin"]);
+            let output = git_input(command, target.as_os_str().as_encoded_bytes())?;
+            if !output.status.success() {
+                return Err(invalid(String::from_utf8_lossy(&output.stderr)));
+            }
+            output.stdout
+        }
+        "100644" | "100755" if metadata.is_file() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let executable = metadata.permissions().mode() & 0o100 != 0;
+                if executable != (entry.mode == "100755") {
+                    return Ok(false);
+                }
+            }
+            // --path selects the same clean filters and attributes as Git status.
+            let output = change_scan_command(path)
+                .args(["hash-object", "--path"])
+                .arg(name)
+                .arg("--")
+                .arg(name)
+                .output()?;
+            if !output.status.success() {
+                return Err(invalid(String::from_utf8_lossy(&output.stderr)));
+            }
+            output.stdout
+        }
+        "160000" if metadata.is_dir() => {
+            // Snapshots carry gitlinks, not submodule contents. An unpopulated
+            // submodule has no checkout to compare; populated ones must be clean.
+            if !full.join(".git").exists() {
+                return Ok(true);
+            }
+            if !change_scan_git(&full, &["status", "--porcelain", "--untracked-files=all"])?
+                .is_empty()
+            {
+                return Ok(false);
+            }
+            change_scan_git(&full, &["rev-parse", "HEAD"])?
+        }
+        _ => return Ok(false),
+    };
+    Ok(String::from_utf8_lossy(&blob).trim_end() == entry.blob)
+}
+
 pub(crate) fn absolute(path: &str) -> bool {
     #[cfg(windows)]
     {
@@ -1501,7 +1643,8 @@ impl Trees {
     }
 
     /// Paths the job changed in its workspace: modified, deleted, staged and
-    /// new untracked files. Writes under ignored paths such as target/ are not
+    /// new untracked files, relative to the supplied snapshot when available.
+    /// Writes under ignored paths such as target/ are not
     /// listed, nor are node_modules trees the runner prepared in the supplied
     /// workspace-relative package directories. A failed scan is an error, never
     /// an empty list, because callers read an empty list as "no changes".
@@ -1509,51 +1652,51 @@ impl Trees {
         &self,
         path: &Path,
         prepared_javascript_directories: &[PathBuf],
+        baseline: Option<(&str, &str)>,
     ) -> io::Result<Vec<String>> {
-        // After an isolated job the workspace root belongs to the job account,
-        // so Git refuses the runner's scan as "dubious ownership" unless this
-        // one tree is trusted. Trusting it is safe: the workspace's .git, and
-        // so all Git configuration and hooks, stays runner-owned and read-only
-        // to jobs, and status only reads the job's files as data. fsmonitor
-        // is off so no configured helper process runs.
-        let safe = format!("safe.directory={}", path.display());
-        let status = git(
+        let status = change_scan_git(
             path,
-            &[
-                "-c",
-                &safe,
-                "-c",
-                "core.fsmonitor=false",
-                "status",
-                "--porcelain",
-                "-z",
-                "--untracked-files=all",
-            ],
+            &["status", "--porcelain", "-z", "--untracked-files=all"],
         )?;
-        let mut records = status.split('\0');
+        let mut records = status.split(|b| *b == 0);
         let prepared_modules: Vec<_> = prepared_javascript_directories
             .iter()
             .map(|directory| directory.join("node_modules"))
             .collect();
+        let snapshot = match baseline {
+            Some((caller_commit, tree_hash)) => snapshot_entries(path, caller_commit, tree_hash)?,
+            None => BTreeMap::new(),
+        };
+        let excluded = |name: &Path| {
+            prepared_modules
+                .iter()
+                .any(|modules| name.starts_with(modules))
+        };
         let mut changes = Vec::new();
         while let Some(record) = records.next() {
             let Some(path) = record.get(3..) else {
                 continue;
             };
-            let prefix = &record.as_bytes()[..3];
+            let prefix = &record[..3];
             if prefix[2] != b' ' {
                 continue;
             }
-            if !prepared_modules
-                .iter()
-                .any(|modules| Path::new(path).starts_with(modules))
-            {
-                changes.push(path.to_string());
+            if !excluded(&change_path(path)) && !snapshot.contains_key(path) {
+                changes.push(String::from_utf8_lossy(path).into_owned());
             }
             // Porcelain -z emits the destination first, then an unprefixed
             // source path for renames and copies. The source is not a status.
             if prefix[..2].iter().any(|b| matches!(b, b'R' | b'C')) {
                 records.next();
+            }
+        }
+        // A deleted snapshot-only file, or a caller edit reverted to HEAD, has
+        // no status record. Compare every caller-dirty path, not just the ones
+        // still returned by status, without hashing the rest of the workspace.
+        for (name, entry) in snapshot {
+            let relative = change_path(&name);
+            if !excluded(&relative) && !matches_snapshot(path, &relative, &entry)? {
+                changes.push(String::from_utf8_lossy(&name).into_owned());
             }
         }
         Ok(changes)
