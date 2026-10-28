@@ -1202,14 +1202,15 @@ impl Backend for HostBackend {
         // The original request is durable, so recovered jobs use the same
         // submitted tree and caller commit as freshly completed jobs.
         let baseline = job.request.as_ref().map(|request| {
+            let mirror = trees.mirror(paths::request(request).caller_repository_root.text());
             let caller_commit = request.base_commit.clone().unwrap_or_else(|| {
                 workspace::resolve_caller_commit(
-                    &trees.mirror(paths::request(request).caller_repository_root.text()),
+                    &mirror,
                     &request.snapshot_commit,
                     &request.tree_hash,
                 )
             });
-            (caller_commit, request.tree_hash.as_str())
+            (mirror, caller_commit, request.tree_hash.as_str())
         });
         trees
             .changes(
@@ -1217,7 +1218,11 @@ impl Backend for HostBackend {
                 &job.prepared_javascript_directories,
                 baseline
                     .as_ref()
-                    .map(|(commit, tree)| (commit.as_str(), *tree)),
+                    .map(|(mirror, commit, tree)| workspace::ChangeBaseline {
+                        objects: mirror,
+                        caller_commit: commit,
+                        tree_hash: tree,
+                    }),
             )
             .map(Some)
     }

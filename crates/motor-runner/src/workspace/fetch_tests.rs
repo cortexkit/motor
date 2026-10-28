@@ -47,9 +47,54 @@ fn workspace_changes_scan_a_tree_owned_by_another_account() {
     let tree = trees.tree_hash(&repo).unwrap();
     fs::write(repo.join("source"), "edited by the job").unwrap();
     std::env::set_var("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1");
-    let changes = trees.changes(&repo, &[], Some((&commit, &tree)));
+    let changes = trees.changes(&repo, &[], Some(baseline(&repo, &commit, &tree)));
     std::env::remove_var("GIT_TEST_ASSUME_DIFFERENT_OWNER");
     assert_eq!(changes.unwrap(), ["source"]);
+}
+
+fn baseline<'a>(objects: &'a Path, commit: &'a str, tree: &'a str) -> ChangeBaseline<'a> {
+    ChangeBaseline {
+        objects,
+        caller_commit: commit,
+        tree_hash: tree,
+    }
+}
+
+/// An isolated job's workspace is dissociated from the repository mirror and
+/// may not hold the snapshot tree. The scan must read the snapshot from the
+/// mirror, so a no-op job on a dirty snapshot still reports nothing.
+#[test]
+fn workspace_changes_read_the_snapshot_from_the_mirror_when_the_workspace_lacks_it() {
+    let scratch = ScratchDir::new("motor-workspace-changes-mirror");
+    let (trees, mirror, commit, tree) = dirty_snapshot(&scratch);
+    let workspace = scratch.join("workspace");
+    git(
+        &scratch,
+        &[
+            "clone",
+            "-q",
+            "--no-local",
+            mirror.to_str().unwrap(),
+            workspace.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    fs::create_dir_all(workspace.join("ignored")).unwrap();
+    for name in ["source", "untracked", "ignored/input"] {
+        fs::copy(mirror.join(name), workspace.join(name)).unwrap();
+    }
+    fs::remove_file(workspace.join("deleted")).unwrap();
+    assert!(git(&workspace, &["cat-file", "-e", &tree]).is_err());
+
+    assert!(trees
+        .changes(&workspace, &[], Some(baseline(&workspace, &commit, &tree)))
+        .is_err());
+    assert_eq!(
+        trees
+            .changes(&workspace, &[], Some(baseline(&mirror, &commit, &tree)))
+            .unwrap(),
+        Vec::<String>::new()
+    );
 }
 
 fn dirty_snapshot(root: &Path) -> (Trees, PathBuf, String, String) {
@@ -92,7 +137,9 @@ fn workspace_changes_noop_dirty_snapshot_reports_nothing() {
     let (trees, repo, commit, tree) = dirty_snapshot(&scratch);
     assert!(!git(&repo, &["status", "--porcelain"]).unwrap().is_empty());
     assert_eq!(
-        trees.changes(&repo, &[], Some((&commit, &tree))).unwrap(),
+        trees
+            .changes(&repo, &[], Some(baseline(&repo, &commit, &tree)))
+            .unwrap(),
         Vec::<String>::new()
     );
 }
@@ -105,7 +152,9 @@ fn workspace_changes_dirty_snapshot_reports_only_job_edits() {
     fs::remove_file(repo.join("untracked")).unwrap();
     fs::write(repo.join("clean"), "job edit to a clean file").unwrap();
     fs::write(repo.join("new"), "job new file").unwrap();
-    let mut changes = trees.changes(&repo, &[], Some((&commit, &tree))).unwrap();
+    let mut changes = trees
+        .changes(&repo, &[], Some(baseline(&repo, &commit, &tree)))
+        .unwrap();
     changes.sort();
     assert_eq!(changes, ["clean", "new", "source", "untracked"]);
 }
@@ -124,11 +173,15 @@ fn workspace_changes_clean_snapshot_keeps_status_behavior() {
     fs::write(repo.join(".gitignore"), "ignored/\n").unwrap();
     fs::create_dir_all(repo.join("ignored")).unwrap();
     fs::write(repo.join("ignored/output"), "job ignored output").unwrap();
-    let mut changes = trees.changes(&repo, &[], Some((&commit, &tree))).unwrap();
+    let mut changes = trees
+        .changes(&repo, &[], Some(baseline(&repo, &commit, &tree)))
+        .unwrap();
     changes.sort();
     assert_eq!(changes, [".gitignore", "new", "source", "staged"]);
     assert_eq!(
-        trees.changes(&repo, &[], Some((&commit, &tree))).unwrap(),
+        trees
+            .changes(&repo, &[], Some(baseline(&repo, &commit, &tree)))
+            .unwrap(),
         trees.changes(&repo, &[], None).unwrap()
     );
 }
@@ -139,7 +192,9 @@ fn workspace_changes_detect_reverts_and_force_added_ignored_edits() {
     let (trees, repo, commit, tree) = dirty_snapshot(&scratch);
     git(&repo, &["checkout", "HEAD", "--", "source", "deleted"]).unwrap();
     fs::write(repo.join("ignored/input"), "job changed staged input").unwrap();
-    let mut changes = trees.changes(&repo, &[], Some((&commit, &tree))).unwrap();
+    let mut changes = trees
+        .changes(&repo, &[], Some(baseline(&repo, &commit, &tree)))
+        .unwrap();
     changes.sort();
     assert_eq!(changes, ["deleted", "ignored/input", "source"]);
 }
@@ -161,13 +216,15 @@ fn workspace_changes_compare_snapshot_modes_symlinks_and_clean_filters() {
     symlink("missing-target", repo.join("link")).unwrap();
     let tree = trees.tree_hash(&repo).unwrap();
     assert!(trees
-        .changes(&repo, &[], Some((&commit, &tree)))
+        .changes(&repo, &[], Some(baseline(&repo, &commit, &tree)))
         .unwrap()
         .is_empty());
     fs::set_permissions(repo.join("executable"), fs::Permissions::from_mode(0o644)).unwrap();
     fs::remove_file(repo.join("link")).unwrap();
     fs::write(repo.join("link"), "missing-target").unwrap();
-    let mut changes = trees.changes(&repo, &[], Some((&commit, &tree))).unwrap();
+    let mut changes = trees
+        .changes(&repo, &[], Some(baseline(&repo, &commit, &tree)))
+        .unwrap();
     changes.sort();
     assert_eq!(changes, ["executable", "link"]);
 }

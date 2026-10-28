@@ -195,6 +195,18 @@ struct SnapshotEntry {
 }
 
 /// Only paths changed by the caller need a content comparison at job end.
+/// The snapshot a job was given, for telling the job's own edits apart from
+/// the caller's uncommitted ones in [`Trees::changes`].
+#[derive(Clone, Copy)]
+pub struct ChangeBaseline<'a> {
+    /// A repository holding both objects. Isolated workspaces are dissociated
+    /// from the repository mirror before the job and may lack the snapshot
+    /// tree, so production passes the mirror here.
+    pub objects: &'a Path,
+    pub caller_commit: &'a str,
+    pub tree_hash: &'a str,
+}
+
 fn snapshot_entries(
     path: &Path,
     caller_commit: &str,
@@ -1652,7 +1664,7 @@ impl Trees {
         &self,
         path: &Path,
         prepared_javascript_directories: &[PathBuf],
-        baseline: Option<(&str, &str)>,
+        baseline: Option<ChangeBaseline<'_>>,
     ) -> io::Result<Vec<String>> {
         let status = change_scan_git(
             path,
@@ -1664,7 +1676,9 @@ impl Trees {
             .map(|directory| directory.join("node_modules"))
             .collect();
         let snapshot = match baseline {
-            Some((caller_commit, tree_hash)) => snapshot_entries(path, caller_commit, tree_hash)?,
+            Some(baseline) => {
+                snapshot_entries(baseline.objects, baseline.caller_commit, baseline.tree_hash)?
+            }
             None => BTreeMap::new(),
         };
         let excluded = |name: &Path| {
