@@ -87,7 +87,9 @@ async fn post_connect_refusals_and_admission_failure_log_the_cause() {
         assert!(log.contains("hosted connect succeeded"), "{fault}: {log}");
         let (step, cause) = match fault {
             "capabilities" => ("refused_before_start", "return_paths_unsupported"),
-            "bundles" => ("transfer_bundles", "fatal:"),
+            // The missing spool is found when the transfer clears its earlier
+            // bundles, before git runs.
+            "bundles" => ("transfer_bundles", "No such file or directory"),
             "have" => (
                 "have_exchange",
                 "peer closed connection without sending TLS close_notify",
