@@ -625,8 +625,7 @@ fn valid_keyed_hash(value: &str) -> bool {
 /// The ordinary lease-hash projection: requester keys can rotate on a re-request,
 /// but placement and resource choices (including the allow_spill value) cannot.
 /// `lease` refuses a body without allow_spill before this is used, so the member
-/// is always present here. The fake serves registered hosts only and does not
-/// accept shadow leases.
+/// is always present here.
 fn lease_identity(request: &LeaseRequest) -> Value {
     let mut identity = json!({
         "job_id": request.job_id,
