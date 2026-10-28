@@ -1089,6 +1089,10 @@ fn finish_writes_the_catalog_before_the_terminal_record() {
         saved.workspaces[&request.workspace_key].used_ms, finished_ms,
         "the terminal record is being saved before the catalog records the finish"
     );
+    assert_eq!(
+        saved.workspaces[&request.workspace_key].last_job_id,
+        Some(id)
+    );
     assert!(f.terminal(id).is_none());
     drop(held);
     assert!(poll(Duration::from_secs(30), || f.terminal(id).is_some()));
@@ -1173,6 +1177,10 @@ fn restart_counts_a_finished_job_as_its_workspace_last_use() {
         .get(&request.workspace_key)
         .map(|workspace| workspace.used_ms);
     assert_eq!(used_ms, Some(now - 1000), "startup expired the workspace");
+    assert_eq!(
+        runner.core.inner.lock().unwrap().catalog.workspaces[&request.workspace_key].last_job_id,
+        Some(id)
+    );
     assert!(Path::new(&request.workspace_key).exists());
 }
 

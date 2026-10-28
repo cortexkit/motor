@@ -79,7 +79,7 @@ async fn runner_health_op_returns_live_runner_values() {
     expected.load_1m = report.load_1m.clone();
     expected.threads = report.threads;
     expected.mem_available_bytes = report.mem_available_bytes;
-    assert_eq!(report, expected);
+    assert_eq!(report, *expected);
     motor
         .cancel(CancelRequest::new(stream.job_id))
         .await

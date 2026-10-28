@@ -458,14 +458,84 @@ fn heartbeat_uses_pinned_interim_values_and_released_is_reserved() {
     h.guest_ready("tenant", 1).unwrap();
     let hb = h.heartbeat(MS, 123, true);
     assert_eq!((hb.free_vcpus, hb.free_mem_mib, hb.queued), (1, 123, 1));
-    // A warm VM is never advertised: no token carries the workspace hash a
-    // contract warm entry needs, and an entry without one is a 400.
+    // Admission alone does not establish that the guest holds a workspace.
     assert!(hb.warm.is_empty());
     h.close(id).unwrap();
     let hb = h.heartbeat(MS, 123, true);
     assert_eq!(
         (hb.running[0].state, hb.free_vcpus),
         (JobState::Reserved, 2)
+    );
+}
+
+#[test]
+fn warm_workspaces_join_admitted_hashes_order_cap_and_forget_evictions() {
+    use motor_protocol::HeldWorkspace;
+    let mut h = host();
+    h.guest_ready("tenant", 1).unwrap();
+    let mut held = Vec::new();
+    for i in 0..71_u64 {
+        let job = format!("00000000-0000-7000-8000-{:012x}", i + 100);
+        let mut c = claims(&job);
+        c.workspace_key_hash = (i < 70).then(|| motor_lease::base64url(&[i as u8; 32]));
+        let (connection, _) = h.claim(c, MS).unwrap();
+        h.delivered(connection).unwrap();
+        h.event(
+            "tenant",
+            &event(i * 2 + 1, TenantEventKind::Admitted, Some(&job), None),
+            MS,
+        )
+        .unwrap();
+        h.event(
+            "tenant",
+            &event(i * 2 + 2, TenantEventKind::Terminal, Some(&job), None),
+            MS,
+        )
+        .unwrap();
+        held.push(HeldWorkspace {
+            job_id: job.parse().unwrap(),
+            used_ms: MS - 100 + i,
+        });
+    }
+    // Unknown jobs, including another VM's claims, cannot lend this VM a hash.
+    held.push(HeldWorkspace {
+        job_id: JOB.parse().unwrap(),
+        used_ms: MS,
+    });
+    let mut other = h.tenants["vm"].clone();
+    other.tenant = "other".into();
+    other.sub = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAW".into();
+    h.tenants.insert("other-vm".into(), other);
+    h.guest_ready("other", 1).unwrap();
+    h.record_warm("other", MS, held.clone());
+    assert!(h.heartbeat(MS, 0, true).warm.is_empty());
+    h.record_warm("tenant", MS, held.clone());
+    let warm = h.heartbeat(MS, 0, true).warm;
+    assert_eq!(warm.len(), 64);
+    assert_eq!(
+        warm[0].workspace_key_hash,
+        motor_lease::base64url(&[69; 32])
+    );
+    assert_eq!(
+        warm[63].workspace_key_hash,
+        motor_lease::base64url(&[6; 32])
+    );
+    assert_eq!(warm[0].tenant, claims(JOB).sub);
+    assert_eq!(warm[0].vm, "vm");
+    // The next probe is the entire current set, not additions to an old set.
+    h.record_warm("tenant", MS + 1, vec![held[0].clone()]);
+    let warm = h.heartbeat(MS + 1, 0, true).warm;
+    assert_eq!(warm.len(), 1);
+    assert_eq!(warm[0].workspace_key_hash, motor_lease::base64url(&[0; 32]));
+    h.record_warm("tenant", MS + 2, vec![held[70].clone()]);
+    assert!(
+        h.heartbeat(MS + 2, 0, true).warm.is_empty(),
+        "a legacy hashless job contributes nothing"
+    );
+    h.record_warm("tenant", MS + 3, vec![held[0].clone()]);
+    assert!(
+        h.heartbeat(MS + 15_003, 0, true).warm.is_empty(),
+        "old status reports cannot preserve stale affinity"
     );
 }
 

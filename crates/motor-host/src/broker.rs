@@ -369,7 +369,10 @@ impl Heartbeats {
                 }
             }
         }
-        self.probe_memory(&tenants, now_ms)?;
+        if due || changed {
+            self.runtime.host.lock().expect("host lock").clear_warm();
+        }
+        self.probe_memory(&tenants, now_ms, due || changed)?;
         let mut host = self.runtime.host.lock().expect("host lock");
         let memory = host.free_mem_mib(now_ms);
         let heartbeat = host.heartbeat(now_ms, memory, healthy);
@@ -393,14 +396,14 @@ impl Heartbeats {
     /// when its last sample is due for renewal. A tenant busy with a wake,
     /// suspend or other operation is skipped; its sample ages, and a sample
     /// older than the freshness bound advertises no free memory.
-    fn probe_memory(&self, tenants: &[String], now_ms: u64) -> Result<()> {
+    fn probe_memory(&self, tenants: &[String], now_ms: u64, heartbeat: bool) -> Result<()> {
         for tenant in tenants {
             if !self
                 .runtime
                 .host
                 .lock()
                 .expect("host lock")
-                .memory_probe_due(tenant, now_ms)
+                .memory_probe_due(tenant, now_ms, heartbeat)
             {
                 continue;
             }
@@ -417,7 +420,7 @@ impl Heartbeats {
                 .host
                 .lock()
                 .expect("host lock")
-                .memory_probe_due(tenant, now_ms)
+                .memory_probe_due(tenant, now_ms, heartbeat)
             {
                 continue;
             }
@@ -439,6 +442,9 @@ impl Heartbeats {
             // it stops counting rather than lingering.
             if let Ok(sample) = sample {
                 host.record_fill(tenant, now_ms, sample.fill_permits);
+                if heartbeat {
+                    host.record_warm(tenant, now_ms, sample.held_workspaces);
+                }
             }
         }
         Ok(())

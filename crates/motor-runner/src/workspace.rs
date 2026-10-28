@@ -840,6 +840,7 @@ pub(crate) fn record_workspace_entry(
             snapshot: commit.to_string(),
             siblings: siblings.to_vec(),
             used_ms: now,
+            last_job_id: None,
             sibling_freshness,
         },
     );

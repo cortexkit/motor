@@ -110,12 +110,15 @@ def check_health_compatibility():
             "errors": 0, "refusals": {"read": 0, "write": 0}}
     for present in (False, True):
         if present:
+            fixture["health"]["held_workspaces"] = [{
+                "job_id": "00000000-0000-7000-8000-000000000001", "used_ms": 42,
+            }]
             fixture["health"]["remote_cache"] = {
                 "state": "available", "sccache": tool, "ccache": tool,
             }
         subprocess.run([str(ROOT / "target/compat-client/oldest-health")],
                        input=json.dumps(fixture), text=True, check=True, env=CARGO_ENV)
-        print(f"Oldest production client {REVISION}: remote_cache {'present' if present else 'absent'} decoded", flush=True)
+        print(f"Oldest production client {REVISION}: remote_cache and held_workspaces {'present' if present else 'absent'} decoded", flush=True)
 
 
 def main():

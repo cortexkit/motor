@@ -14,6 +14,76 @@ use std::os::unix::fs::PermissionsExt;
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 
+#[test]
+fn guest_workspace_eviction_and_old_status_reach_the_next_heartbeat() {
+    let probe = Arc::new(Probe::default());
+    let t0 = NOW * 1000;
+    let mut h = host_with(vec![("vm", tenant_one())]);
+    h.guest_ready("tenant", 1).unwrap();
+    for (i, job) in [JOB, JOB2].into_iter().enumerate() {
+        let mut c = claims(job);
+        c.workspace_key_hash = Some(motor_lease::base64url(&[(i + 1) as u8; 32]));
+        let (connection, _) = h.claim(c, t0).unwrap();
+        h.delivered(connection).unwrap();
+        h.event(
+            "tenant",
+            &event(
+                (i * 2 + 1) as u64,
+                TenantEventKind::Admitted,
+                Some(job),
+                None,
+            ),
+            t0,
+        )
+        .unwrap();
+        h.event(
+            "tenant",
+            &event(
+                (i * 2 + 2) as u64,
+                TenantEventKind::Terminal,
+                Some(job),
+                None,
+            ),
+            t0,
+        )
+        .unwrap();
+    }
+    let runtime = Runtime::new("host".into(), h, probe.clone());
+    let mut publisher = Heartbeats::new(runtime.clone());
+    *probe.capacity.lock().unwrap() = Some(capacity_values());
+    *probe.free.lock().unwrap() = Some(144 * GIB);
+    let status = |held| {
+        Some(json!({"ok":true, "health":{"mem_available_bytes":70 * GIB, "held_workspaces":held}}))
+    };
+    *probe.status.lock().unwrap() = status(json!([
+        {"job_id":JOB, "used_ms":t0 - 1},
+        {"job_id":JOB2, "used_ms":t0 - 2}
+    ]));
+    publisher.step(t0).unwrap();
+    assert_eq!(last_heartbeat(&runtime).warm.len(), 2);
+    *probe.status.lock().unwrap() = status(json!([{"job_id":JOB2, "used_ms":t0 - 2}]));
+    publisher.step(t0 + 15_000).unwrap();
+    let warm = last_heartbeat(&runtime).warm;
+    assert_eq!(warm.len(), 1);
+    assert_eq!(warm[0].workspace_key_hash, motor_lease::base64url(&[2; 32]));
+    *probe.status.lock().unwrap() = None;
+    publisher.step(t0 + 30_000).unwrap();
+    assert!(
+        last_heartbeat(&runtime).warm.is_empty(),
+        "a failed status probe cannot preserve a stale workspace"
+    );
+    *probe.status.lock().unwrap() = status(json!([{"job_id":JOB2, "used_ms":t0 - 2}]));
+    publisher.step(t0 + 45_000).unwrap();
+    assert_eq!(last_heartbeat(&runtime).warm.len(), 1);
+    *probe.status.lock().unwrap() =
+        Some(json!({"ok":true, "health":{"mem_available_bytes":70 * GIB}}));
+    publisher.step(t0 + 60_000).unwrap();
+    assert!(
+        last_heartbeat(&runtime).warm.is_empty(),
+        "an older guest's status has no workspace membership"
+    );
+}
+
 /// The production capacity values for the first hosted tenant host.
 fn capacity_values() -> Capacity {
     Capacity {

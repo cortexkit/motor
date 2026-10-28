@@ -40,23 +40,33 @@ pub trait Control: Send + Sync {
     fn runner_sample(&self, tenant: &str) -> Result<RunnerSample> {
         let reply = self.admin(tenant, &json!({"op":"status"}))?;
         ensure!(reply["ok"] == true, "tenant runner status refused");
-        let health = &reply["health"];
-        Ok(RunnerSample {
+        Ok(RunnerSample::from_health(&reply["health"]))
+    }
+}
+
+impl RunnerSample {
+    fn from_health(health: &Value) -> Self {
+        Self {
             mem_available_bytes: health["mem_available_bytes"].as_u64(),
             fill_permits: health["fill_permits"]
                 .as_u64()
                 .map_or(0, |permits| u32::try_from(permits).unwrap_or(u32::MAX)),
-        })
+            held_workspaces: health
+                .get("held_workspaces")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or_default(),
+        }
     }
 }
 
 /// One probe of a running tenant's runner.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RunnerSample {
     pub mem_available_bytes: Option<u64>,
     /// Permits held by the tenant's own cache fill. Guest-reported, so they
     /// only lower that tenant's advertised capacity.
     pub fill_permits: u32,
+    pub held_workspaces: Vec<motor_protocol::HeldWorkspace>,
 }
 
 /// The helper refused to start a tenant VM for a host policy reason, such as
@@ -552,6 +562,25 @@ mod helper_deadline_tests {
 
     const REPLY: &[u8] =
         b"{\"result\":\"tenant\",\"running\":false,\"restored\":false,\"generation\":7}\n";
+
+    #[test]
+    fn runner_samples_from_old_guests_have_no_warm_workspaces() {
+        for health in [
+            Value::Null,
+            json!({}),
+            json!({"fill_permits": 2}),
+            json!({"held_workspaces": "invalid"}),
+        ] {
+            assert!(RunnerSample::from_health(&health)
+                .held_workspaces
+                .is_empty());
+        }
+        let sample = RunnerSample::from_health(
+            &json!({"held_workspaces": [{"job_id": "00000000-0000-7000-8000-000000000001", "used_ms": 42}]}),
+        );
+        assert_eq!(sample.held_workspaces.len(), 1);
+        assert_eq!(sample.held_workspaces[0].used_ms, 42);
+    }
 
     #[test]
     fn suspend_reply_budget_is_applied_to_the_actual_helper_socket_only() {

@@ -2533,6 +2533,7 @@ impl Motor {
         self.runner_status_for(platform)
             .await?
             .health
+            .map(|health| *health)
             .ok_or_else(|| io::Error::other("runner does not report health (upgrade required)"))
     }
     pub async fn job_status(&self, id: Uuid) -> io::Result<JobStatusReply> {

@@ -467,6 +467,9 @@ pub(crate) struct Workspace {
     pub snapshot: String,
     pub siblings: Vec<SiblingSnapshot>,
     pub used_ms: u64,
+    /// The host knows this job's signed workspace hash, but not its path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_job_id: Option<Uuid>,
     /// Per sibling path, the trees whose artifacts may still be in this
     /// workspace's `target/`, used to keep Cargo from reusing them after a
     /// switch to another sibling snapshot; see `sibling_snapshots::freshness`.
