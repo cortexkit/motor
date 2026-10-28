@@ -1474,6 +1474,171 @@ fn disk_eviction_bytes_times_idle_prefers_huge_workspace_over_older_small_ones()
     assert!(small.iter().all(|path| path.exists()));
 }
 
+#[test]
+fn disk_build_folder_measurement_and_ranking_never_claim_or_repair() {
+    let f = Fixture::new();
+    let pressure = Arc::new(AtomicBool::new(false));
+    let active = pressure.clone();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let observed = calls.clone();
+    let core = Arc::new(Mutex::new(std::sync::Weak::<Core>::new()));
+    let measuring = core.clone();
+    let mut c = config(&f, move |_| {
+        Ok(if active.load(Ordering::SeqCst) {
+            150
+        } else {
+            200
+        })
+    });
+    c.long_work = Some(Arc::new(move |label| {
+        if label == "build_folder_measure" {
+            let core = measuring.lock().unwrap().upgrade().unwrap();
+            let inner = core.inner.try_lock().expect("measurement held state lock");
+            assert!(inner.dropping.is_empty());
+        }
+        if label.starts_with("build_folder_") {
+            observed.lock().unwrap().push(label);
+        }
+    }));
+    let runner = Runner::open(c).unwrap();
+    *core.lock().unwrap() = Arc::downgrade(&runner.core);
+    let idle = f.scratch.join("remote/worktrees/measured");
+    workspace(&runner, &idle, runner.now());
+    let incremental = cargo_output(&idle, "debug/incremental/foo/state.bin", runner.now());
+    runner.guard_build_folder(text(&idle));
+    assert!(runner.core.inner.lock().unwrap().dropping.is_empty());
+    assert_eq!(*calls.lock().unwrap(), ["build_folder_measure"]);
+
+    let lazy = f.scratch.join("remote/worktrees/lazy-measurement");
+    workspace(&runner, &lazy, runner.now());
+    pressure.store(true, Ordering::SeqCst);
+    assert!(runner.ensure_disk_space().unwrap().is_none());
+    assert!(runner.core.inner.lock().unwrap().dropping.is_empty());
+    assert_eq!(
+        *calls.lock().unwrap(),
+        ["build_folder_measure", "build_folder_measure"]
+    );
+    assert!(incremental.exists() && lazy.exists());
+}
+
+#[test]
+fn disk_eviction_ranks_cached_workspace_sizes_without_another_walk() {
+    let f = Fixture::new();
+    let large = f.scratch.join("remote/worktrees/cached-large");
+    let small = f.scratch.join("remote/worktrees/cached-small");
+    let probe = large.clone();
+    let pressure = Arc::new(AtomicBool::new(false));
+    let active = pressure.clone();
+    let measurements = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = measurements.clone();
+    let mut c = config(&f, move |_| {
+        Ok(if active.load(Ordering::SeqCst) && probe.exists() {
+            150
+        } else {
+            200
+        })
+    });
+    c.long_work = Some(Arc::new(move |label| {
+        if label == "build_folder_measure" {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+    let runner = Runner::open(c).unwrap();
+    for path in [&large, &small] {
+        workspace(&runner, path, runner.now() - 60 * 60 * 1000);
+    }
+    fs::write(large.join("target/large.bin"), vec![8; 2 * 1024 * 1024]).unwrap();
+    runner.guard_build_folder(text(&large));
+    runner.guard_build_folder(text(&small));
+    assert_eq!(measurements.load(Ordering::SeqCst), 2);
+    // Reverse the physical sizes after measuring. Ranking must use the cached
+    // estimates rather than walking the trees again under disk pressure.
+    fs::write(large.join("target/large.bin"), []).unwrap();
+    fs::write(small.join("target/larger.bin"), vec![9; 4 * 1024 * 1024]).unwrap();
+    pressure.store(true, Ordering::SeqCst);
+    assert!(runner.ensure_disk_space().unwrap().is_none());
+    assert!(!large.exists() && small.exists());
+    assert_eq!(measurements.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn disk_build_folder_incremental_ranking_uses_cached_sizes() {
+    let f = Fixture::new();
+    let large = f.scratch.join("remote/worktrees/cached-large-incremental");
+    let small = f.scratch.join("remote/worktrees/cached-small-incremental");
+    let probe = large.join("target/debug/incremental");
+    let pressure = Arc::new(AtomicBool::new(false));
+    let active = pressure.clone();
+    let measurements = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = measurements.clone();
+    let mut c = config(&f, move |_| {
+        Ok(if active.load(Ordering::SeqCst) && probe.exists() {
+            150
+        } else {
+            200
+        })
+    });
+    c.long_work = Some(Arc::new(move |label| {
+        if label == "build_folder_measure" {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+    let runner = Runner::open(c).unwrap();
+    for path in [&large, &small] {
+        workspace(&runner, path, runner.now() - 60 * 60 * 1000);
+        cargo_output(path, "debug/incremental/foo/state.bin", runner.now());
+    }
+    let large_state = large.join("target/debug/incremental/foo/state.bin");
+    let small_state = small.join("target/debug/incremental/foo/state.bin");
+    fs::write(&large_state, vec![8; 2 * 1024 * 1024]).unwrap();
+    runner.guard_build_folder(text(&large));
+    runner.guard_build_folder(text(&small));
+    assert_eq!(measurements.load(Ordering::SeqCst), 2);
+    fs::write(&large_state, []).unwrap();
+    fs::write(&small_state, vec![9; 4 * 1024 * 1024]).unwrap();
+    pressure.store(true, Ordering::SeqCst);
+    assert!(runner.ensure_disk_space().unwrap().is_none());
+    assert!(!large_state.exists() && small_state.exists());
+    assert!(large.exists() && small.exists());
+    assert_eq!(measurements.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn disk_build_folder_sweep_with_nothing_stale_never_claims_or_repairs() {
+    let f = Fixture::new();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let observed = calls.clone();
+    let mut c = f.config();
+    c.long_work = Some(Arc::new(move |label| {
+        if matches!(label, "build_folder_claim" | "build_folder_repair") {
+            observed.lock().unwrap().push(label);
+        }
+    }));
+    let runner = Runner::open(c).unwrap();
+    let idle = f.scratch.join("remote/worktrees/fresh-units");
+    workspace(&runner, &idle, runner.now());
+    let dep = cargo_output(
+        &idle,
+        "debug/deps/libfoo-0123456789abcdef.rlib",
+        runner.now(),
+    );
+    let no_target = f.scratch.join("remote/worktrees/no-target");
+    workspace(&runner, &no_target, runner.now());
+    fs::remove_dir_all(no_target.join("target")).unwrap();
+    runner.guard_build_folder(text(&no_target));
+    runner.maintain_build_folders();
+    assert!(calls.lock().unwrap().is_empty());
+    assert!(runner.core.inner.lock().unwrap().dropping.is_empty());
+    assert!(dep.exists() && no_target.exists());
+    assert!(runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .build_swept_ms
+        .contains_key(text(&idle)));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires trusted host sudo and motor-job account; see motor-runner README"]

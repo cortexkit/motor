@@ -230,7 +230,17 @@ than 48 hours, keeping a full extra day beyond relatime's update interval.
 Unknown files and symlinks are left alone; incremental crate directories are
 aged independently. Boat skips atime sweeping because its disk uses noatime,
 and retains its admission-time whole-workspace sweep. VM-backed jobs keep their
-backend-specific disk policies. Tests:
+backend-specific disk policies.
+
+The runner caches allocated workspace, target and incremental sizes in memory,
+with a measurement time. Read-only walks refresh them when a workspace becomes
+idle and populate missing entries lazily for ranking; a restart starts with an
+empty cache. Unreadable subtrees contribute zero to the estimate and log one
+warning per walk. Measurement never claims a workspace or changes permissions.
+Build-folder cleanup scans before claiming and repairs ownership only when it
+has selected outputs to delete: repair transfers the target to the runner, so
+the next job must repair it back to the job account.
+Tests:
 `disk_size_guard_drops_only_incremental_and_defers_queued_workspace`,
 `disk_stale_unit_maintenance_deletes_whole_units_and_runs_once_daily`,
 `cargo_units_group_hashes_outputs_and_scripts_without_following_symlinks`.
@@ -239,9 +249,11 @@ backend-specific disk policies. Tests:
   (137438953472 bytes); 0 disables the check. The soft goal defaults to twice the
   floor; `--free-space-eviction-bytes N` explicitly sets a reclaim goal above it.
 - Below the soft goal, cleanup has three passes: stale Cargo units, incremental
-  state (largest first), then whole workspaces and staging ordered by allocated
-  bytes times idle milliseconds, descending. Unreferenced sibling snapshots
-  retain priority in the whole-tree pass. Each pass stops once the free-space
+  state (largest cached incremental size first), then whole workspaces and staging
+  ordered by allocated bytes times idle milliseconds, descending. Workspace sizes
+  come from the in-memory cache; staging sizes are measured on each pass.
+  Unreferenced sibling snapshots retain priority in the whole-tree pass.
+  Each pass stops once the free-space
   probe reaches the soft goal; allocated bytes can double-count reflink extents.
   Workspaces used in the last 30 minutes remain protected above the hard floor;
   below it recent idle workspaces are eligible too. Tests:

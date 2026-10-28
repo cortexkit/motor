@@ -27,6 +27,16 @@ struct Candidate {
     snapshot: bool,
 }
 
+/// Approximate allocated sizes for ranking, refreshed when a workspace becomes
+/// idle. They are not evidence of how many bytes a deletion will actually free.
+#[derive(Clone, Copy, Default)]
+pub(super) struct BuildFolderSize {
+    workspace_bytes: u64,
+    target_bytes: u64,
+    incremental_bytes: u64,
+    measured_ms: u64,
+}
+
 // Caches used in the last half hour are likely to be reused; deleting them costs a cold rebuild.
 const SOFT_PRESSURE_MIN_AGE_MS: u64 = 30 * 60 * 1000;
 
@@ -117,6 +127,68 @@ fn allocated_bytes(path: &Path, device: u64) -> io::Result<u64> {
     Ok(bytes)
 }
 
+fn measure_build_folder(path: &Path, measured_ms: u64) -> BuildFolderSize {
+    let mut size = BuildFolderSize {
+        measured_ms,
+        ..BuildFolderSize::default()
+    };
+    let mut warned = false;
+    let mut warn = |path: &Path, error: io::Error| {
+        if !warned {
+            tracing::warn!(path = %path.display(), %error,
+                "runner size estimate skips unreadable subtrees; logging first error only");
+            warned = true;
+        }
+    };
+    let device = match crate::filesystem::device(path) {
+        Ok(device) => device,
+        Err(error) => {
+            warn(path, error);
+            return size;
+        }
+    };
+    let target = path.join("target");
+    let incremental = crate::cargo_gc::incremental(&target).unwrap_or_else(|error| {
+        warn(&target, error);
+        Vec::new()
+    });
+    let mut pending = vec![path.to_path_buf()];
+    let mut inodes = BTreeSet::new();
+    while let Some(path) = pending.pop() {
+        let result = (|| -> io::Result<()> {
+            let metadata = fs::symlink_metadata(&path)?;
+            let (dev, ino, bytes) = crate::filesystem::identity(&path)?;
+            if dev != device {
+                return Err(invalid("size estimate cannot cross a mount"));
+            }
+            let entries = metadata.is_dir().then(|| fs::read_dir(&path)).transpose()?;
+            if inodes.insert((dev, ino, 0)) {
+                size.workspace_bytes = size.workspace_bytes.saturating_add(bytes);
+            }
+            if path.starts_with(&target) && inodes.insert((dev, ino, 1)) {
+                size.target_bytes = size.target_bytes.saturating_add(bytes);
+            }
+            if incremental.iter().any(|root| path.starts_with(root)) && inodes.insert((dev, ino, 2))
+            {
+                size.incremental_bytes = size.incremental_bytes.saturating_add(bytes);
+            }
+            if let Some(entries) = entries {
+                for entry in entries {
+                    match entry {
+                        Ok(entry) => pending.push(entry.path()),
+                        Err(error) => warn(&path, error),
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            warn(&path, error);
+        }
+    }
+    size
+}
+
 impl Runner {
     /// Partial reclamation uses the same admission fence and overlapping-tree
     /// exclusion as whole-workspace eviction. Queued jobs count as users too.
@@ -127,12 +199,13 @@ impl Runner {
         let mut inner = self.core.inner.lock().unwrap();
         let candidate = self.disk_candidates(&inner)?.into_iter().find(|candidate| {
             candidate.workspace.as_deref() == Some(key)
+                && Self::has_build_folder(candidate)
                 && inner
                     .eviction_retry_after
                     .get(&candidate.path)
                     .is_none_or(|retry| *retry <= self.now())
         });
-        Ok(candidate.map(|candidate| {
+        let claimed = candidate.map(|candidate| {
             inner.dropping.insert(key.to_owned());
             (
                 candidate,
@@ -141,11 +214,17 @@ impl Runner {
                     key: key.to_owned(),
                 },
             )
-        }))
+        });
+        drop(inner);
+        if claimed.is_some() {
+            self.long_work("build_folder_claim");
+        }
+        Ok(claimed)
     }
 
     fn build_folder_access(&self, candidate: &Candidate) -> io::Result<()> {
         self.validate_destinations(crate::caller_path::host(&candidate.path), None, &[])?;
+        self.long_work("build_folder_repair");
         #[cfg(target_os = "linux")]
         if self.core.config.isolate_jobs && !self.core.config.boat_profile {
             crate::isolation::restore_runner_root_access(&candidate.path)?;
@@ -155,6 +234,17 @@ impl Runner {
             }
         }
         Ok(())
+    }
+
+    fn has_build_folder(candidate: &Candidate) -> bool {
+        fs::symlink_metadata(candidate.path.join("target")).is_ok_and(|metadata| metadata.is_dir())
+    }
+
+    fn build_candidate(&self, key: &str) -> io::Result<Option<Candidate>> {
+        Ok(self
+            .disk_candidates(&self.core.inner.lock().unwrap())?
+            .into_iter()
+            .find(|candidate| candidate.workspace.as_deref() == Some(key)))
     }
 
     /// All ordinary reclaimed paths, including selected Cargo outputs, end in
@@ -220,25 +310,19 @@ impl Runner {
         Ok(())
     }
 
-    fn trim_build_folder(&self, candidate: &Candidate, pass: u8) -> io::Result<()> {
+    fn trim_build_folder(&self, candidate: &Candidate, pass: u8) -> io::Result<bool> {
         let Some(_tree) = crate::tree_access::try_lock(crate::caller_path::host(&candidate.path))
         else {
-            return Ok(());
+            return Ok(false);
         };
-        self.build_folder_access(candidate)?;
         let target = candidate.path.join("target");
-        let metadata = match fs::symlink_metadata(&target) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            result => result?,
-        };
-        if !metadata.is_dir() {
-            return Ok(());
+        if !Self::has_build_folder(candidate) {
+            return Ok(true);
         }
         let device = crate::filesystem::device(&candidate.path)?;
-        let before = allocated_bytes(&target, device)?;
         let paths = if pass == 1 {
             if self.core.config.boat_profile {
-                return Ok(());
+                return Ok(true);
             }
             crate::cargo_gc::stale_units(
                 &target,
@@ -246,21 +330,41 @@ impl Runner {
                 device,
             )?
         } else {
-            if pass == 0 && before <= self.core.config.build_folder_cap_bytes {
-                return Ok(());
+            if pass == 0
+                && self.build_candidate_size(candidate).target_bytes
+                    <= self.core.config.build_folder_cap_bytes
+            {
+                return Ok(true);
             }
             crate::cargo_gc::incremental(&target)?
                 .into_iter()
                 .map(|path| vec![path])
                 .collect()
         };
+        if paths.is_empty() {
+            return Ok(true);
+        }
+        let key = candidate.workspace.as_ref().unwrap();
+        let Some((claimed, _claim)) = self.claim_build_folder(key)? else {
+            return Ok(false);
+        };
+        // A job may have used the folder while the read-only scan was running.
+        // Its new outputs must not be deleted using the earlier selection.
+        if claimed.last_used_ms != candidate.last_used_ms {
+            return Ok(false);
+        }
+        // Repair flips target ownership to the runner; the next job must repair
+        // it back. Only pay for those walks when there is something to delete.
+        self.build_folder_access(&claimed)?;
+        let before = allocated_bytes(&target, device)?;
         for unit in paths {
-            self.remove_build_paths(candidate, &unit, device)?;
+            self.remove_build_paths(&claimed, &unit, device)?;
         }
         let after = allocated_bytes(&target, device)?;
+        self.measure_build_candidate(&claimed);
         tracing::info!(path = %target.display(), bytes_before = before, bytes_after = after,
             bytes_freed = before.saturating_sub(after), pass, "runner build folder reclaim");
-        Ok(())
+        Ok(true)
     }
 
     pub(super) fn guard_build_folder(&self, key: &str) {
@@ -268,7 +372,7 @@ impl Runner {
             return;
         }
         let result = (|| -> io::Result<()> {
-            let Some((candidate, _claim)) = self.claim_build_folder(key)? else {
+            let Some(candidate) = self.build_candidate(key)? else {
                 return Ok(());
             };
             // A busy walker can defer the guard until periodic maintenance.
@@ -277,7 +381,10 @@ impl Runner {
             else {
                 return Ok(());
             };
-            self.trim_build_folder(&candidate, 0)?;
+            self.measure_build_candidate(&candidate);
+            if !self.trim_build_folder(&candidate, 0)? {
+                return Ok(());
+            }
             self.core
                 .inner
                 .lock()
@@ -310,9 +417,16 @@ impl Runner {
         let keys = {
             let mut inner = self.core.inner.lock().unwrap();
             let now = self.now();
-            let live: BTreeSet<_> = inner.catalog.workspaces.keys().cloned().collect();
-            inner.build_swept_ms.retain(|key, _| live.contains(key));
-            inner.build_guard_pending.retain(|key| live.contains(key));
+            let Inner {
+                catalog,
+                build_swept_ms,
+                build_guard_pending,
+                build_folder_sizes,
+                ..
+            } = &mut *inner;
+            build_swept_ms.retain(|key, _| catalog.workspaces.contains_key(key));
+            build_guard_pending.retain(|key| catalog.workspaces.contains_key(key));
+            build_folder_sizes.retain(|key, _| catalog.workspaces.contains_key(key));
             self.disk_candidates(&inner)
                 .unwrap_or_default()
                 .into_iter()
@@ -327,7 +441,7 @@ impl Runner {
         };
         for key in keys {
             let result = (|| -> io::Result<()> {
-                let Some((candidate, _claim)) = self.claim_build_folder(&key)? else {
+                let Some(candidate) = self.build_candidate(&key)? else {
                     return Ok(());
                 };
                 let Some(_tree) =
@@ -335,7 +449,7 @@ impl Runner {
                 else {
                     return Ok(());
                 };
-                let mut inner = self.core.inner.lock().unwrap();
+                let inner = self.core.inner.lock().unwrap();
                 if inner
                     .build_swept_ms
                     .get(&key)
@@ -343,9 +457,16 @@ impl Runner {
                 {
                     return Ok(());
                 }
-                inner.build_swept_ms.insert(key.clone(), self.now());
                 drop(inner);
-                self.trim_build_folder(&candidate, 1)
+                if self.trim_build_folder(&candidate, 1)? {
+                    self.core
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .build_swept_ms
+                        .insert(key.clone(), self.now());
+                }
+                Ok(())
             })();
             if let Err(error) = result {
                 tracing::warn!(path = key, %error, "runner stale build unit sweep failed");
@@ -353,35 +474,38 @@ impl Runner {
         }
     }
 
-    fn build_candidate_bytes(
-        &self,
-        candidate: &Candidate,
-        incremental_only: bool,
-    ) -> io::Result<u64> {
-        let Some(key) = &candidate.workspace else {
-            return allocated_bytes(
-                &candidate.path,
-                crate::filesystem::device(&self.core.trees.state)?,
-            );
-        };
-        let Some((candidate, _claim)) = self.claim_build_folder(key)? else {
-            return Ok(0);
-        };
-        let Some(_tree) = crate::tree_access::try_lock(crate::caller_path::host(&candidate.path))
-        else {
-            return Ok(0);
-        };
-        self.build_folder_access(&candidate)?;
-        let device = crate::filesystem::device(&candidate.path)?;
-        if incremental_only {
-            crate::cargo_gc::incremental(&candidate.path.join("target"))?
-                .iter()
-                .try_fold(0u64, |total, path| {
-                    Ok(total.saturating_add(allocated_bytes(path, device)?))
-                })
-        } else {
-            allocated_bytes(&candidate.path, device)
+    fn measure_build_candidate(&self, candidate: &Candidate) -> BuildFolderSize {
+        self.long_work("build_folder_measure");
+        let size = measure_build_folder(&candidate.path, self.now());
+        if let Some(key) = &candidate.workspace {
+            let mut inner = self.core.inner.lock().unwrap();
+            if inner
+                .catalog
+                .workspaces
+                .get(key)
+                .is_some_and(|workspace| workspace.used_ms == candidate.last_used_ms)
+                && inner
+                    .build_folder_sizes
+                    .get(key)
+                    .is_none_or(|cached| cached.measured_ms <= size.measured_ms)
+            {
+                inner.build_folder_sizes.insert(key.clone(), size);
+            }
         }
+        size
+    }
+
+    fn build_candidate_size(&self, candidate: &Candidate) -> BuildFolderSize {
+        let cached = candidate.workspace.as_ref().and_then(|key| {
+            self.core
+                .inner
+                .lock()
+                .unwrap()
+                .build_folder_sizes
+                .get(key)
+                .copied()
+        });
+        cached.unwrap_or_else(|| self.measure_build_candidate(candidate))
     }
 
     fn reclaim_build_pass(
@@ -395,13 +519,14 @@ impl Runner {
         let mut candidates: Vec<_> = candidates
             .into_iter()
             .filter(|candidate| candidate.workspace.is_some())
+            .filter(Self::has_build_folder)
             .filter(|candidate| {
                 *free < floor
                     || self.now().saturating_sub(candidate.last_used_ms) >= SOFT_PRESSURE_MIN_AGE_MS
             })
             .map(|candidate| {
                 let bytes = if pass == 2 {
-                    self.build_candidate_bytes(&candidate, true).unwrap_or(0)
+                    self.build_candidate_size(&candidate).incremental_bytes
                 } else {
                     0
                 };
@@ -417,16 +542,6 @@ impl Runner {
             if *free >= soft {
                 break;
             }
-            if *free >= floor
-                && self.now().saturating_sub(candidate.last_used_ms) < SOFT_PRESSURE_MIN_AGE_MS
-            {
-                continue;
-            }
-            let key = candidate.workspace.as_ref().unwrap();
-            let Some((candidate, _claim)) = self.claim_build_folder(key)? else {
-                continue;
-            };
-            // Last use may have advanced since the off-lock size ranking.
             if *free >= floor
                 && self.now().saturating_sub(candidate.last_used_ms) < SOFT_PRESSURE_MIN_AGE_MS
             {
@@ -1120,6 +1235,9 @@ impl Runner {
         inner.evicting_caches.remove(&candidate.path);
         if let Some(key) = &candidate.workspace {
             inner.dropping.remove(key);
+            if deleted.is_ok() || disappeared {
+                inner.build_folder_sizes.remove(key);
+            }
         }
         // The fill records describe the cache's contents, so they go with
         // them, also when the deletion failed after the cache had left.
@@ -1550,13 +1668,13 @@ impl Runner {
                 }
             }
         }
-        // Size walks run with the state lock released. Re-enumeration below
-        // still applies every live-path and age protection before deletion.
+        // Cache misses use read-only walks with the state lock released.
+        // Re-enumeration still applies live-path and age protections before deletion.
         let candidates = self.disk_candidates(&self.core.inner.lock().unwrap())?;
         let sizes: BTreeMap<_, _> = candidates
             .into_iter()
             .map(|candidate| {
-                let bytes = self.build_candidate_bytes(&candidate, false).unwrap_or(0);
+                let bytes = self.build_candidate_size(&candidate).workspace_bytes;
                 (candidate.path, bytes)
             })
             .collect();

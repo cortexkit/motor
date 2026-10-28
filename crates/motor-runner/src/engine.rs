@@ -985,6 +985,7 @@ struct Inner {
     eviction_retry_after: BTreeMap<PathBuf, u64>,
     build_swept_ms: BTreeMap<String, u64>,
     build_guard_pending: BTreeSet<String>,
+    build_folder_sizes: BTreeMap<String, disk::BuildFolderSize>,
     kill_retries: BTreeMap<Uuid, (u32, std::time::Instant)>,
     finalizing: BTreeSet<Uuid>,
     /// A real exit status delivered while the finalization owner is collecting
@@ -2588,6 +2589,7 @@ impl Runner {
                     eviction_retry_after: BTreeMap::new(),
                     build_swept_ms: BTreeMap::new(),
                     build_guard_pending: BTreeSet::new(),
+                    build_folder_sizes: BTreeMap::new(),
                     kill_retries: BTreeMap::new(),
                     finalizing: BTreeSet::new(),
                     exit_statuses: BTreeMap::new(),
@@ -9185,6 +9187,9 @@ impl Runner {
         };
         w.used_ms = self.now();
         w.last_job_id = Some(request.job_id);
+        inner
+            .build_folder_sizes
+            .remove(paths::request(request).caller_workspace_key.text());
         inner
             .build_guard_pending
             .insert(paths::request(request).caller_workspace_key.text().clone());
