@@ -1502,9 +1502,14 @@ impl Trees {
 
     /// Paths the job changed in its workspace: modified, deleted, staged and
     /// new untracked files. Writes under ignored paths such as target/ are not
-    /// listed. A failed scan is an error, never an empty list, because callers
-    /// read an empty list as "no changes".
-    pub fn changes(&self, path: &Path) -> io::Result<Vec<String>> {
+    /// listed, nor are node_modules trees the runner prepared in the supplied
+    /// workspace-relative package directories. A failed scan is an error, never
+    /// an empty list, because callers read an empty list as "no changes".
+    pub fn changes(
+        &self,
+        path: &Path,
+        prepared_javascript_directories: &[PathBuf],
+    ) -> io::Result<Vec<String>> {
         // After an isolated job the workspace root belongs to the job account,
         // so Git refuses the runner's scan as "dubious ownership" unless this
         // one tree is trusted. Trusting it is safe: the workspace's .git, and
@@ -1526,6 +1531,10 @@ impl Trees {
             ],
         )?;
         let mut records = status.split('\0');
+        let prepared_modules: Vec<_> = prepared_javascript_directories
+            .iter()
+            .map(|directory| directory.join("node_modules"))
+            .collect();
         let mut changes = Vec::new();
         while let Some(record) = records.next() {
             let Some(path) = record.get(3..) else {
@@ -1535,7 +1544,12 @@ impl Trees {
             if prefix[2] != b' ' {
                 continue;
             }
-            changes.push(path.to_string());
+            if !prepared_modules
+                .iter()
+                .any(|modules| Path::new(path).starts_with(modules))
+            {
+                changes.push(path.to_string());
+            }
             // Porcelain -z emits the destination first, then an unprefixed
             // source path for renames and copies. The source is not a status.
             if prefix[..2].iter().any(|b| matches!(b, b'R' | b'C')) {

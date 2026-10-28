@@ -790,6 +790,7 @@ impl Fixture {
             read_only: Vec::new(),
             read_write: Vec::new(),
             wrapper: None,
+            prepared_javascript_directories: Vec::new(),
             runtime: std::sync::Arc::new(RuntimeDir(
                 self.scratch.join("unprepared"),
                 std::sync::OnceLock::new(),
@@ -970,6 +971,7 @@ fn systemd_job_command_preserves_shell_source_and_forces_private_tmp() {
         read_only: Vec::new(),
         read_write: Vec::new(),
         wrapper: None,
+        prepared_javascript_directories: Vec::new(),
         runtime: std::sync::Arc::new(RuntimeDir(
             f.scratch.join("unprepared"),
             std::sync::OnceLock::new(),
@@ -1468,6 +1470,7 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 read_only: sandbox.read_only.clone(),
                 read_write: sandbox.read_write.clone(),
                 wrapper: None,
+                prepared_javascript_directories: sandbox.prepared_javascript_directories.clone(),
                 runtime: sandbox.runtime.clone(),
                 retain_failed: false,
                 network: false,
@@ -1524,6 +1527,7 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 read_only: sandbox.read_only.clone(),
                 read_write: sandbox.read_write.clone(),
                 wrapper: None,
+                prepared_javascript_directories: sandbox.prepared_javascript_directories.clone(),
                 runtime: sandbox.runtime.clone(),
                 retain_failed: false,
                 network: false,
@@ -1972,6 +1976,7 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
         read_only: vec![],
         read_write: vec![],
         wrapper: None,
+        prepared_javascript_directories: Vec::new(),
         runtime: std::sync::Arc::new(RuntimeDir(
             f.scratch.join("unprepared"),
             std::sync::OnceLock::new(),

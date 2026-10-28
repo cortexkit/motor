@@ -604,7 +604,7 @@ fn prepare_javascript_dependencies(
     workspace: &Path,
     tree: &str,
     tools: &JavascriptTools,
-) -> io::Result<()> {
+) -> io::Result<Vec<PathBuf>> {
     let tracked = javascript_tracked_tree(workspace, tree)?;
     prepare_javascript_with(workspace, &tracked.paths, tools, |install, command| {
         cache_javascript_install(
@@ -777,6 +777,7 @@ pub(crate) fn prepare_snapshot_javascript(
             },
         )
     })
+    .map(|_| ())
 }
 
 fn prepare_javascript_checkouts(
@@ -784,9 +785,9 @@ fn prepare_javascript_checkouts(
     repository: &str,
     tree: &str,
     siblings: &[SiblingSnapshot],
-    mut prepare: impl FnMut(&Path, &str, &str) -> io::Result<()>,
-) -> io::Result<()> {
-    prepare(workspace, repository, tree)?;
+    mut prepare: impl FnMut(&Path, &str, &str) -> io::Result<Vec<PathBuf>>,
+) -> io::Result<Vec<PathBuf>> {
+    let workspace_prepared = prepare(workspace, repository, tree)?;
     for sibling in siblings {
         prepare(
             crate::caller_path::sibling(sibling).host.as_path(),
@@ -794,7 +795,8 @@ fn prepare_javascript_checkouts(
             &sibling.tree_hash,
         )?;
     }
-    Ok(())
+    // Sibling installs are outside the workspace's change scan.
+    Ok(workspace_prepared)
 }
 
 fn prepare_javascript_with(
@@ -802,10 +804,11 @@ fn prepare_javascript_with(
     paths: &[PathBuf],
     tools: &JavascriptTools,
     mut install: impl FnMut(&JavascriptInstall, &mut Command) -> io::Result<()>,
-) -> io::Result<()> {
-    for entry in discover_javascript_installs(paths)? {
-        let result = javascript_install_command(workspace, &entry, tools)
-            .and_then(|mut command| install(&entry, &mut command));
+) -> io::Result<Vec<PathBuf>> {
+    let installs = discover_javascript_installs(paths)?;
+    for entry in &installs {
+        let result = javascript_install_command(workspace, entry, tools)
+            .and_then(|mut command| install(entry, &mut command));
         result.map_err(|error| {
             io::Error::other(format!(
                 "JavaScript setup in directory {} using {}: {error}",
@@ -819,7 +822,7 @@ fn prepare_javascript_with(
             ))
         })?;
     }
-    Ok(())
+    Ok(installs.into_iter().map(|entry| entry.directory).collect())
 }
 
 fn javascript_manager(lockfile: &str) -> &'static str {
@@ -2070,6 +2073,7 @@ pub(crate) struct Sandbox {
     read_only: Vec<String>,
     read_write: Vec<String>,
     pub(crate) wrapper: Option<PathBuf>,
+    pub(crate) prepared_javascript_directories: Vec<PathBuf>,
     runtime: std::sync::Arc<RuntimeDir>,
     /// Keep a failed unit loaded after it exits, so the engine can read its
     /// Result (for example oom-kill) before resetting it. Only the engine sets
@@ -2802,7 +2806,7 @@ impl Sandbox {
         // Offline jobs have no route to package registries. Resolve only from
         // a checked-in lockfile while still trusted, and never run package
         // lifecycle scripts as the daemon.
-        if !writer {
+        let prepared_javascript_directories = if !writer {
             crate::setup_log::phase("prepare javascript dependencies", || {
                 prepare_javascript_checkouts(
                     workspace,
@@ -2819,8 +2823,10 @@ impl Sandbox {
                         )
                     },
                 )
-            })?;
-        }
+            })?
+        } else {
+            Vec::new()
+        };
         // Each checkout's Git metadata is read-only inside the job. Dissociate
         // it first so Git needs neither a mirror mount nor the daemon's home.
         for path in std::iter::once(workspace.to_path_buf()).chain(
@@ -3152,6 +3158,7 @@ impl Sandbox {
             read_only,
             read_write,
             wrapper,
+            prepared_javascript_directories,
             runtime,
             retain_failed: false,
             #[cfg(test)]

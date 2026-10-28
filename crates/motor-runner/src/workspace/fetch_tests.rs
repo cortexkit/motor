@@ -17,18 +17,18 @@ fn workspace_changes_list_edits_and_report_a_failed_scan_as_an_error() {
     let scratch = ScratchDir::new("motor-workspace-changes");
     let trees = trees(&scratch);
     let repo = committed_repo(&scratch, "changes");
-    assert_eq!(trees.changes(&repo).unwrap(), Vec::<String>::new());
+    assert_eq!(trees.changes(&repo, &[]).unwrap(), Vec::<String>::new());
     fs::write(repo.join("source"), "edited").unwrap();
     fs::write(repo.join("new"), "untracked").unwrap();
     fs::write(repo.join(".gitignore"), "ignored/\n").unwrap();
     fs::create_dir_all(repo.join("ignored")).unwrap();
     fs::write(repo.join("ignored/out"), "build output").unwrap();
-    let mut changes = trees.changes(&repo).unwrap();
+    let mut changes = trees.changes(&repo, &[]).unwrap();
     changes.sort();
     // Writes under ignored paths are not listed.
     assert_eq!(changes, [".gitignore", "new", "source"]);
     // A path git cannot scan is a failed scan, not "no changes".
-    assert!(trees.changes(&scratch.join("missing")).is_err());
+    assert!(trees.changes(&scratch.join("missing"), &[]).is_err());
 }
 
 /// After an isolated job the workspace belongs to the job account. Git's own
@@ -40,7 +40,7 @@ fn workspace_changes_scan_a_tree_owned_by_another_account() {
     let repo = committed_repo(&scratch, "owned");
     fs::write(repo.join("source"), "edited by the job").unwrap();
     std::env::set_var("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1");
-    let changes = trees.changes(&repo);
+    let changes = trees.changes(&repo, &[]);
     std::env::remove_var("GIT_TEST_ASSUME_DIFFERENT_OWNER");
     assert_eq!(changes.unwrap(), ["source"]);
 }

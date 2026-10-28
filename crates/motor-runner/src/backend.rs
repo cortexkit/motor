@@ -123,6 +123,9 @@ pub(crate) struct Prepared {
 /// Owns the prepared service and mount configuration. Tests can substitute a
 /// launcher to observe dispatch without requiring systemd or a job account.
 pub(crate) trait IsolationLauncher: Send + Sync {
+    fn prepared_javascript_directories(&self) -> &[PathBuf] {
+        &[]
+    }
     #[cfg(unix)]
     fn cache_generation(
         &self,
@@ -144,6 +147,9 @@ pub(crate) trait IsolationLauncher: Send + Sync {
 
 #[cfg(target_os = "linux")]
 impl IsolationLauncher for crate::isolation::Sandbox {
+    fn prepared_javascript_directories(&self) -> &[PathBuf] {
+        &self.prepared_javascript_directories
+    }
     fn cache_generation(
         &self,
     ) -> Option<(
@@ -1193,7 +1199,12 @@ impl Backend for HostBackend {
         if job.base {
             return Ok(None);
         }
-        trees.changes(&paths::job_workspace(config, job)).map(Some)
+        trees
+            .changes(
+                &paths::job_workspace(config, job),
+                &job.prepared_javascript_directories,
+            )
+            .map(Some)
     }
 
     fn reconcile(&self, config: &Config, interrupted: &[Job]) -> io::Result<Vec<Uuid>> {

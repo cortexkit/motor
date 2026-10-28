@@ -9,6 +9,9 @@
 # Rust build output
 /target/
 
+# JavaScript dependencies
+node_modules/
+
 # Editors and OS
 .idea/
 .vscode/

@@ -561,6 +561,7 @@ fn writer_fixture_command_uses_sandbox_identity_and_mounts() {
             "/writer-cache:/motor-cache".into(),
         ],
         wrapper: None,
+        prepared_javascript_directories: Vec::new(),
         runtime: std::sync::Arc::new(RuntimeDir(
             f.scratch.join("unprepared"),
             std::sync::OnceLock::new(),

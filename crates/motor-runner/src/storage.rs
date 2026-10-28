@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File},
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -236,6 +236,10 @@ pub(crate) struct Job {
     /// the field, and a record they rewrite loses it, which only fences more.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sibling_sources: Option<Vec<String>>,
+    /// Workspace-relative package directories whose node_modules were prepared
+    /// by the runner, not the job. Persisted so recovered jobs exclude them too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepared_javascript_directories: Vec<PathBuf>,
 }
 
 /// A sidecar preserves damaged records and any independently readable ownership.
@@ -334,6 +338,7 @@ impl Job {
             reservation_use: None,
             execution_ended_ms: None,
             sibling_sources: None,
+            prepared_javascript_directories: Vec::new(),
         }
     }
     pub fn pending(&self) -> bool {
@@ -833,6 +838,30 @@ pub(crate) fn mint_ms(id: Uuid) -> u64 {
 mod tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
+
+    #[test]
+    fn prepared_javascript_directories_survive_job_record_roundtrip() {
+        let mut job = Job::new(Uuid::now_v7(), None, 123, 1, 2);
+        let directories = vec![
+            PathBuf::new(),
+            PathBuf::from("test-fixtures/javascript/npm"),
+        ];
+        job.prepared_javascript_directories = directories.clone();
+        let mut record = serde_json::to_value(&job).unwrap();
+        let restored: Job = serde_json::from_value(record.clone()).unwrap();
+        assert_eq!(restored.prepared_javascript_directories, directories);
+
+        record
+            .as_object_mut()
+            .unwrap()
+            .remove("prepared_javascript_directories");
+        let legacy: Job = serde_json::from_value(record).unwrap();
+        assert!(legacy.prepared_javascript_directories.is_empty());
+        assert!(serde_json::to_value(&legacy)
+            .unwrap()
+            .get("prepared_javascript_directories")
+            .is_none());
+    }
 
     #[test]
     fn first_job_record_is_complete_before_uuid_directory_is_published() {

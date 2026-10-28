@@ -726,21 +726,27 @@ if [ -f "$JS_MEMBERS" ]; then for m in $(/bin/cat "$JS_MEMBERS"); do /bin/mkdir 
         JavascriptTools::at(ToolchainRole::BuildServer, &self.bin, &self.bin)
     }
     fn prepare(&self, f: &Fixture, tree: &str) -> io::Result<()> {
-        self.prepare_checkout(f, &f.workspace, tree)
+        self.prepare_checkout(f, &f.workspace, tree).map(|_| ())
     }
-    fn prepare_checkout(&self, f: &Fixture, checkout: &Path, tree: &str) -> io::Result<()> {
+    fn prepare_checkout(
+        &self,
+        f: &Fixture,
+        checkout: &Path,
+        tree: &str,
+    ) -> io::Result<Vec<PathBuf>> {
         let tracked = javascript_tracked_tree(checkout, tree)?;
         self.prepare_tracked_checkout(f, checkout, &tracked)
     }
     fn prepare_tracked(&self, f: &Fixture, tracked: &JavascriptTree) -> io::Result<()> {
         self.prepare_tracked_checkout(f, &f.workspace, tracked)
+            .map(|_| ())
     }
     fn prepare_tracked_checkout(
         &self,
         f: &Fixture,
         checkout: &Path,
         tracked: &JavascriptTree,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<PathBuf>> {
         let tools = self.tools();
         prepare_javascript_with(checkout, &tracked.paths, &tools, |install, command| {
             let mut fake = Command::new(&self.executable);
@@ -775,7 +781,7 @@ fn prepare_checkouts_with_fake_manager(
     manager: &FakeJavascriptManager,
     workspace_tree: &str,
     siblings: &[SiblingSnapshot],
-) -> io::Result<()> {
+) -> io::Result<Vec<PathBuf>> {
     prepare_javascript_checkouts(
         &f.workspace,
         &f.workspace.to_string_lossy(),
@@ -796,11 +802,85 @@ fn javascript_sibling_with_lockfile_gets_node_modules() {
     let siblings = [sibling_snapshot(&sibling, &sibling_tree)];
     let manager = FakeJavascriptManager::new(&f);
 
-    prepare_checkouts_with_fake_manager(&f, &manager, &workspace_tree, &siblings).unwrap();
+    let prepared =
+        prepare_checkouts_with_fake_manager(&f, &manager, &workspace_tree, &siblings).unwrap();
 
+    assert!(prepared.is_empty());
     assert!(sibling.join("node_modules/.bin/fixture-tool").is_file());
     assert!(!f.workspace.join("node_modules").exists());
     assert_eq!(manager.count(), 1);
+}
+
+fn prepared_workspace_changes_fixture(
+    directories: &[&str],
+) -> (Fixture, workspace::Trees, Vec<PathBuf>) {
+    let f = Fixture::new();
+    for directory in directories {
+        write_js_pair(&f.workspace, directory, "package-lock.json");
+    }
+    fs::write(f.workspace.join("source"), "original").unwrap();
+    let tree = tracked_tree(&f.workspace);
+    workspace::git(
+        &f.workspace,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    )
+    .unwrap();
+    let manager = FakeJavascriptManager::new(&f);
+    let prepared = prepare_checkouts_with_fake_manager(&f, &manager, &tree, &[]).unwrap();
+    assert_eq!(prepared.len(), directories.len());
+    for directory in directories {
+        assert!(prepared.contains(&PathBuf::from(directory)));
+        assert!(f
+            .workspace
+            .join(directory)
+            .join("node_modules/.bin/fixture-tool")
+            .is_file());
+    }
+    let trees = workspace::Trees {
+        mirrors: f.state.join("mirrors"),
+        state: f.state.clone(),
+        compacting: Default::default(),
+        mirror_locks: Default::default(),
+    };
+    (f, trees, prepared)
+}
+
+#[test]
+fn javascript_workspace_changes_exclude_prepared_node_modules_but_keep_edits() {
+    let (f, trees, prepared) =
+        prepared_workspace_changes_fixture(&["", "test-fixtures/javascript/npm [fixture]"]);
+    fs::write(f.workspace.join("source"), "edited by the job").unwrap();
+
+    assert_eq!(trees.changes(&f.workspace, &prepared).unwrap(), ["source"]);
+}
+
+#[test]
+fn javascript_workspace_changes_keep_node_modules_in_unprepared_directories() {
+    let (f, trees, prepared) =
+        prepared_workspace_changes_fixture(&["test-fixtures/javascript/npm"]);
+    let created = [
+        "node_modules/job-created/index.js",
+        "test-fixtures/javascript/npm-copy/node_modules/job-created/index.js",
+        "test-fixtures/javascript/npm/node_modules-extra/index.js",
+        "unprepared/node_modules/job-created/index.js",
+    ];
+    for path in created {
+        let path = f.workspace.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "written by the job").unwrap();
+    }
+
+    let mut changes = trees.changes(&f.workspace, &prepared).unwrap();
+    changes.sort();
+    assert_eq!(changes, created);
 }
 
 #[test]

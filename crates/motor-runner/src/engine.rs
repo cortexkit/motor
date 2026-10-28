@@ -7712,6 +7712,11 @@ impl Runner {
         job.state = JobState::Running;
         job.process = launch.process;
         job.durable_output = launch.durable_output;
+        job.prepared_javascript_directories = prepared
+            .sandbox
+            .as_ref()
+            .map(|sandbox| sandbox.prepared_javascript_directories().to_vec())
+            .unwrap_or_default();
         // A fill's write sockets record what its PUTs did, so its publication
         // is decided from them once no PUT is in flight any more.
         #[cfg(unix)]
