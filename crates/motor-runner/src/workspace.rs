@@ -598,25 +598,60 @@ pub(crate) fn sibling_aliases(
                         .file_name()
                         .ok_or_else(|| invalid("sibling path has no name"))?,
                 );
-            let canonical = match destination(&path) {
-                Ok(canonical) => canonical,
-                Err(error)
-                    if error.kind() == io::ErrorKind::NotFound
-                        && fs::symlink_metadata(&path).is_ok_and(|m| m.is_symlink()) =>
-                {
-                    let parent = path
-                        .parent()
-                        .ok_or_else(|| invalid("alias has no parent"))?;
-                    let target = parent.join(fs::read_link(&path).map_err(|error| {
+            let sibling_path = paths::sibling(sibling).host.as_path();
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => Some(metadata),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(crate::workspace_access::Unreadable::wrap(
+                        &path,
+                        "inspect sibling alias",
+                        error,
+                    ));
+                }
+            };
+            let link = metadata
+                .as_ref()
+                .filter(|metadata| metadata.is_symlink())
+                .map(|_| {
+                    fs::read_link(&path).map_err(|error| {
                         crate::workspace_access::Unreadable::wrap(
                             &path,
                             "read sibling alias",
                             error,
                         )
-                    })?);
-                    if destination(&target)? != destination(paths::sibling(sibling).host.as_path())?
-                    {
-                        return Err(error);
+                    })
+                })
+                .transpose()?;
+            let conflict = || {
+                let target = match &link {
+                    Some(target) => format!("symlink {}", target.display()),
+                    None if metadata.as_ref().is_some_and(|metadata| metadata.is_dir()) => {
+                        "a real directory".into()
+                    }
+                    None => "a real non-directory node".into(),
+                };
+                invalid(format!(
+                    "validate sibling alias {}: points to {target}; requested sibling={}; \
+                     the alias must name the requested sibling",
+                    path.display(),
+                    sibling_path.display(),
+                ))
+            };
+            let canonical = match destination(&path) {
+                Ok(canonical) => {
+                    if metadata.is_some() && canonical != destination(sibling_path)? {
+                        return Err(conflict());
+                    }
+                    canonical
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound && link.is_some() => {
+                    let parent = path
+                        .parent()
+                        .ok_or_else(|| invalid("alias has no parent"))?;
+                    let target = parent.join(link.as_ref().unwrap());
+                    if destination(&target)? != destination(sibling_path)? {
+                        return Err(conflict());
                     }
                     // Retiring an in-place sibling leaves its worktree alias dangling.
                     // Snapshot mounts hide that host link: validate the virtual mount

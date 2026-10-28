@@ -294,7 +294,7 @@ fn snapshot_prefetch_helper_binds_snapshots_at_sibling_paths_and_hides_neighbour
 fn mapped_prefetch_helper_binds_the_host_checkout_at_the_caller_path() {
     let scratch = ScratchDir::new("mapped-prefetch-helper");
     let launched: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
-    let config = fake(
+    let mut config = fake(
         &scratch,
         Arc::default(),
         SUCCEEDED,
@@ -303,13 +303,21 @@ fn mapped_prefetch_helper_binds_the_host_checkout_at_the_caller_path() {
     );
     let host_root = scratch.join("callers/home");
     let host = host_root.join("u/proj");
-    let caller = Path::new("/home/u/proj");
-    let sibling = PathBuf::from("/home/v/library");
+    let caller_root = scratch.join("caller/home");
+    let caller = caller_root.join("u/proj");
+    let sibling = caller_root.join("v/library");
     let snapshot = config.sibling_snapshots_dir().join("library/1234");
     for path in [&host, &snapshot] {
         fs::create_dir_all(path).unwrap();
     }
-    let view = View::prefetch_tree(&host, caller, &[(snapshot.clone(), sibling.clone())]).unwrap();
+    for parent in [caller.parent().unwrap(), sibling.parent().unwrap()] {
+        fs::create_dir_all(parent).unwrap();
+    }
+    config.caller_roots.push(crate::caller_path::CallerRoot {
+        caller_prefix: caller_root.to_string_lossy().into_owned(),
+        host_root: host_root.clone(),
+    });
+    let view = View::prefetch_tree(&host, &caller, &[(snapshot.clone(), sibling.clone())]).unwrap();
     let mut command = shell(&config.state_dir());
     // The prefetch names the manifest by the path the helper sees.
     command.arg(caller.join("Cargo.toml"));
@@ -327,17 +335,17 @@ fn mapped_prefetch_helper_binds_the_host_checkout_at_the_caller_path() {
     for expected in [
         format!(
             "--property=TemporaryFileSystem={}:ro",
-            w(Path::new("/home/u"))
+            w(&caller_root.join("u"))
         ),
         format!(
             "--property=TemporaryFileSystem={}:ro",
-            w(Path::new("/home/v"))
+            w(&caller_root.join("v"))
         ),
         format!(
             "--property=BindReadOnlyPaths={} {} {}",
-            bind(&host, caller).unwrap(),
+            bind(&host, &caller).unwrap(),
             bind(&snapshot, &sibling).unwrap(),
-            bind(&snapshot, Path::new("/home/u/library")).unwrap(),
+            bind(&snapshot, &caller_root.join("u/library")).unwrap(),
         ),
     ] {
         assert!(
@@ -365,6 +373,106 @@ fn mapped_prefetch_helper_binds_the_host_checkout_at_the_caller_path() {
             ),
         }
     }
+}
+
+#[test]
+fn snapshot_helper_creates_missing_mount_parents_before_launch() {
+    let scratch = ScratchDir::new("snapshot-helper-mount-parents");
+    let config = fake(
+        &scratch,
+        Arc::default(),
+        SUCCEEDED,
+        UNLOADED,
+        Arc::default(),
+    );
+    let host = scratch.join("host/workspace");
+    let workspace = scratch.join("caller/worktrees/a");
+    let sibling = scratch.join("caller/e2e-siblings/b");
+    let snapshot = config.sibling_snapshots_dir().join("b/1");
+    for path in [&host, &snapshot] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let view = View::prefetch_tree(&host, &workspace, &[(snapshot, sibling.clone())]).unwrap();
+    assert!(!workspace.parent().unwrap().exists());
+    assert!(!sibling.parent().unwrap().exists());
+    let mut config = config;
+    let parents = [workspace.parent().unwrap(), sibling.parent().unwrap()].map(Path::to_path_buf);
+    config.snapshot_helper_launcher = Some(Arc::new(move |_| {
+        for parent in &parents {
+            assert!(
+                parent.is_dir(),
+                "{} missing before launch",
+                parent.display()
+            );
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(parent).unwrap().uid(), unsafe {
+                libc::geteuid()
+            });
+        }
+        Ok(output(0, ""))
+    }));
+    run(
+        &config,
+        Helper::CargoPrefetch,
+        Duration::from_secs(60),
+        &shell(&config.state_dir()),
+        &view,
+    )
+    .unwrap();
+    assert!(!workspace.exists());
+    assert!(!sibling.exists());
+    assert!(!workspace.parent().unwrap().join("b").exists());
+}
+
+#[test]
+fn snapshot_helper_mount_parent_failure_names_the_step_and_path() {
+    let scratch = ScratchDir::new("snapshot-helper-mount-parent-error");
+    let launched = Arc::default();
+    let config = fake(
+        &scratch,
+        Arc::default(),
+        SUCCEEDED,
+        UNLOADED,
+        Arc::clone(&launched),
+    );
+    let blocker = scratch.join("caller");
+    fs::write(&blocker, "not a directory").unwrap();
+    let parent = blocker.join("e2e-siblings");
+    let view = View::javascript(&config.state_dir(), &parent.join("b"));
+    let error = run(
+        &config,
+        Helper::JavascriptInstall,
+        Duration::from_secs(60),
+        &shell(&config.state_dir()),
+        &view,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains(&format!(
+            "prepare snapshot helper mount parent {}:",
+            parent.display()
+        )),
+        "{error}"
+    );
+    assert!(launched.lock().unwrap().is_empty());
+}
+
+#[test]
+fn mapped_snapshot_helper_never_creates_missing_caller_parents() {
+    let scratch = ScratchDir::new("mapped-helper-missing-parent");
+    let mut config = Config::new(scratch.join("runner"), "main");
+    let caller = scratch.join("caller");
+    config.caller_roots.push(crate::caller_path::CallerRoot {
+        caller_prefix: caller.to_string_lossy().into_owned(),
+        host_root: scratch.join("host"),
+    });
+    let view = View::javascript(&config.state_dir(), &caller.join("siblings/b"));
+    let error = view.prepare_mount_points(&config).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert!(error
+        .to_string()
+        .contains("prepare snapshot helper mount parent"));
+    assert!(!caller.exists());
 }
 
 #[test]
@@ -984,4 +1092,76 @@ fn isolated_snapshot_helper_sees_the_snapshot_at_the_sibling_path() {
     assert_eq!(read("w"), "workspace");
     assert_eq!(read("parent").trim(), "b");
     assert_eq!(fs::read_to_string(sibling.join("marker")).unwrap(), "host");
+}
+
+/// Mount setup must not leave root-owned parents in a caller tree that did
+/// not exist before the helper. The runner must still be able to write there.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
+fn isolated_snapshot_helper_missing_caller_parents_stay_runner_owned() {
+    use std::os::unix::fs::MetadataExt;
+    let uid = unsafe { libc::geteuid() };
+    assert_ne!(
+        uid, 0,
+        "run as the runner account with sudo access to systemd"
+    );
+    let scratch = ScratchDir::new("snapshot-helper-caller-ownership");
+    let config = isolated_config(&scratch, &unique_instance());
+    let host = scratch.join("host/workspace");
+    let workspace = scratch.join("caller/worktrees/a");
+    let sibling = scratch.join("caller/e2e-siblings/b");
+    let snapshot = config.sibling_snapshots_dir().join("b/1");
+    for (path, marker) in [(&host, "workspace"), (&snapshot, "snapshot")] {
+        fs::create_dir_all(path).unwrap();
+        fs::write(path.join("marker"), marker).unwrap();
+    }
+    assert!(!scratch.join("caller").exists());
+    let out = config.state_dir().join("out");
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-ec",
+            &format!(
+                "cat {}/marker > {}.workspace; cat {}/marker > {}.sibling; \
+                 cat {}/b/marker > {}.alias",
+                workspace.display(),
+                out.display(),
+                sibling.display(),
+                out.display(),
+                workspace.parent().unwrap().display(),
+                out.display(),
+            ),
+        ])
+        .current_dir(config.state_dir());
+    let view = View::prefetch_tree(&host, &workspace, &[(snapshot, sibling.clone())]).unwrap();
+    run(
+        &config,
+        Helper::CargoPrefetch,
+        Duration::from_secs(60),
+        &command,
+        &view,
+    )
+    .unwrap();
+    for (suffix, marker) in [
+        ("workspace", "workspace"),
+        ("sibling", "snapshot"),
+        ("alias", "snapshot"),
+    ] {
+        assert_eq!(
+            fs::read_to_string(out.with_extension(suffix)).unwrap(),
+            marker
+        );
+    }
+    for parent in [
+        scratch.join("caller"),
+        workspace.parent().unwrap().to_path_buf(),
+        sibling.parent().unwrap().to_path_buf(),
+    ] {
+        assert_eq!(fs::metadata(&parent).unwrap().uid(), uid);
+        fs::write(parent.join("runner-can-write"), "owned by runner").unwrap();
+    }
+    assert!(!workspace.exists());
+    assert!(!sibling.exists());
+    assert!(!workspace.parent().unwrap().join("b").exists());
 }

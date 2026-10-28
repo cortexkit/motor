@@ -207,6 +207,40 @@ impl View {
             .collect()
     }
 
+    fn prepare_mount_points(&self, config: &Config) -> io::Result<()> {
+        for directory in self.hidden() {
+            // systemd sets up mounts as root, before switching to the helper's
+            // user. Create the tmpfs parents as the runner so systemd cannot
+            // leave root-owned directories in the caller tree. Bind destinations
+            // beneath these parents are created inside the private tmpfs only.
+            let mapped = config.caller_roots.iter().any(|root| {
+                let caller = Path::new(&root.caller_prefix);
+                directory.starts_with(caller) || caller.starts_with(&directory)
+            });
+            let prepared = if mapped {
+                // A mapped caller spelling is not its host storage path. Never
+                // create directories there; only mount over an existing parent.
+                fs::metadata(&directory).and_then(|metadata| {
+                    if metadata.is_dir() {
+                        Ok(())
+                    } else {
+                        Err(io::Error::other("mount parent is not a directory"))
+                    }
+                })
+            } else {
+                fs::create_dir_all(&directory)
+            };
+            prepared.map_err(|error| {
+                crate::workspace_access::Unreadable::wrap(
+                    &directory,
+                    "prepare snapshot helper mount parent",
+                    error,
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     fn bound(&self, path: &Path) -> bool {
         self.read_only
             .iter()
@@ -439,6 +473,7 @@ pub(crate) fn run(
             )
         })
         .and_then(|arguments| {
+            view.prepare_mount_points(config)?;
             crate::setup_log::phase(helper.label(), || {
                 start(config, &arguments)?;
                 observe(config, &unit, limit + END_GRACE)
