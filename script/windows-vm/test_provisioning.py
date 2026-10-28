@@ -284,9 +284,9 @@ class BaselineInputsTests(unittest.TestCase):
                          r"""& "$env:SystemRoot\System32\tar.exe" -xzf $nextestArchive -C 'C:\rust\cargo\bin' cargo-nextest.exe""",
                          "if ($LASTEXITCODE -ne 0) { throw 'cargo-nextest extraction failed' }",
                          "Remove-Item -LiteralPath $nextestArchive -Force -ErrorAction SilentlyContinue",
-                         r"& 'C:\rust\cargo\bin\cargo.exe' nextest --version",
-                         "if ($LASTEXITCODE -ne 0 -or $installedNextestVersion -notmatch ('^cargo-nextest ' + [regex]::Escape($nextestVersion) + '(?:\\s|$)')) {",
-                         "throw 'Machine-wide cargo-nextest version verification failed'"):
+                         r"$nextestOutput = @(& 'C:\rust\cargo\bin\cargo.exe' nextest --version)",
+                         "if ($LASTEXITCODE -ne 0 -or [string]($nextestOutput | Select-Object -First 1) -notmatch ('^cargo-nextest ' + [regex]::Escape($nextestVersion) + '(?:\\s|$)')) {",
+                         'throw "Machine-wide cargo-nextest version verification failed: '):
             self.assertIn(expected, source)
         self.assertLess(source.index("-OutFile $nextestArchive"), source.index("Get-FileHash -LiteralPath $nextestArchive"))
         self.assertLess(source.index("throw 'cargo-nextest archive SHA-256 mismatch'"), source.index("-xzf $nextestArchive"))

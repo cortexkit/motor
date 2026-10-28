@@ -67,25 +67,29 @@ try {
 $checks++
 Write-Host 'PASS nextest_hash_guard_rejects_mismatch'
 
-$nextestVersionGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text.Contains('$installedNextestVersion -notmatch')}, $true)
+$nextestVersionGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text.Contains('$nextestOutput | Select-Object -First 1) -notmatch')}, $true)
 Assert ($null -ne $nextestVersionGuard) 'missing nextest version guard'
 $nextestVersion = '0.9.138'
+# The first case is nextest 0.9.138's real `--version` output: five lines.
+$realOutput = @('cargo-nextest 0.9.138 (fc97e97bb 2026-06-21)', 'release: 0.9.138', 'commit-hash: fc97e97bbe0a3927482a694247da00c099f4269e', 'commit-date: 2026-06-21', 'host: x86_64-pc-windows-msvc')
 foreach ($case in @(
-    @{Version='cargo-nextest 0.9.138 (fc97e97bb 2026-06-21)'; Code=0; Reject=$false},
-    @{Version="cargo-nextest 0.9.138 (fc97e97bb 2026-06-21)`r"; Code=0; Reject=$false},
-    @{Version='cargo-nextest 0.9.137 (old)'; Code=0; Reject=$true},
-    @{Version='cargo-nextest 0.9.1380 (wrong)'; Code=0; Reject=$true},
-    @{Version=''; Code=127; Reject=$true},
-    @{Version='cargo-nextest 0.9.138 (fc97e97bb 2026-06-21)'; Code=1; Reject=$true}
+    @{Version=$realOutput; Code=0; Reject=$false},
+    @{Version=@('cargo-nextest 0.9.138 (fc97e97bb 2026-06-21)'); Code=0; Reject=$false},
+    @{Version=@("cargo-nextest 0.9.138 (fc97e97bb 2026-06-21)`r"); Code=0; Reject=$false},
+    @{Version=@('cargo-nextest 0.9.137 (old)', 'release: 0.9.137'); Code=0; Reject=$true},
+    @{Version=@('release: 0.9.138', 'cargo-nextest 0.9.138 (fc97e97bb 2026-06-21)'); Code=0; Reject=$true},
+    @{Version=@('cargo-nextest 0.9.1380 (wrong)'); Code=0; Reject=$true},
+    @{Version=@(); Code=127; Reject=$true},
+    @{Version=$realOutput; Code=1; Reject=$true}
 )) {
-    $installedNextestVersion = $case.Version
+    $nextestOutput = $case.Version
     $LASTEXITCODE = $case.Code
     $threw = $false
     try { Invoke-Expression $nextestVersionGuard.Extent.Text } catch {
         Assert ($_.ToString().Contains('Machine-wide cargo-nextest version verification failed')) "unexpected nextest version error: $_"
         $threw = $true
     }
-    Assert ($threw -eq $case.Reject) "wrong nextest version guard result: $($case.Version), exit $($case.Code)"
+    Assert ($threw -eq $case.Reject) "wrong nextest version guard result: $($case.Version -join ' | '), exit $($case.Code)"
 }
 $checks++
 Write-Host 'PASS nextest_version_guard_rejects_wrong_missing_and_failed_tools'

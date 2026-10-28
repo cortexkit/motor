@@ -245,11 +245,14 @@ try {
 } finally {
     Remove-Item -LiteralPath $nextestArchive -Force -ErrorAction SilentlyContinue
 }
-$installedNextestVersion = & 'C:\rust\cargo\bin\cargo.exe' nextest --version
-if ($LASTEXITCODE -ne 0 -or $installedNextestVersion -notmatch ('^cargo-nextest ' + [regex]::Escape($nextestVersion) + '(?:\s|$)')) {
-    throw 'Machine-wide cargo-nextest version verification failed'
+# `cargo nextest --version` prints five lines (version, release, commit hash,
+# commit date, host). PowerShell's -notmatch on that array returns the four
+# non-matching lines, which is truthy, so only the first line is checked.
+$nextestOutput = @(& 'C:\rust\cargo\bin\cargo.exe' nextest --version)
+if ($LASTEXITCODE -ne 0 -or [string]($nextestOutput | Select-Object -First 1) -notmatch ('^cargo-nextest ' + [regex]::Escape($nextestVersion) + '(?:\s|$)')) {
+    throw "Machine-wide cargo-nextest version verification failed: $($nextestOutput -join ' | ')"
 }
-Write-Host "Verified machine-wide $installedNextestVersion"
+Write-Host "Verified machine-wide $($nextestOutput | Select-Object -First 1)"
 
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path $vswhere)) { throw 'Visual Studio locator is missing' }
