@@ -336,15 +336,24 @@ impl Host {
                 let Some(hash) = lease.claims.workspace_key_hash.as_ref() else {
                     continue;
                 };
-                let Some(vm) = lease.claims.placement.vm.as_ref() else {
-                    continue;
-                };
                 if !self
                     .binding(&lease.claims)
                     .is_ok_and(|t| t.tenant == *tenant)
                 {
                     continue;
                 }
+                // A cold placement's token names no VM, so the VM id comes from
+                // this host's own binding for the tenant. That is the id the
+                // broker echoes back in a warm placement and that admission looks
+                // the token's placement.vm up by.
+                let Some(vm) = self
+                    .tenants
+                    .iter()
+                    .find(|(_, t)| t.tenant == *tenant && t.sub == lease.claims.sub)
+                    .map(|(id, _)| id)
+                else {
+                    continue;
+                };
                 entries.push((
                     held.used_ms,
                     motor_lease::WarmVm {

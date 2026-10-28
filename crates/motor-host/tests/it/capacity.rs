@@ -23,6 +23,12 @@ fn guest_workspace_eviction_and_old_status_reach_the_next_heartbeat() {
     for (i, job) in [JOB, JOB2].into_iter().enumerate() {
         let mut c = claims(job);
         c.workspace_key_hash = Some(motor_lease::base64url(&[(i + 1) as u8; 32]));
+        // The broker's first placement of a workspace is cold and names no VM.
+        // Its warm entry must still name this host's VM, or no later placement
+        // could ever be warm.
+        if i == 0 {
+            c.placement.vm = None;
+        }
         let (connection, _) = h.claim(c, t0).unwrap();
         h.delivered(connection).unwrap();
         h.event(
@@ -60,7 +66,12 @@ fn guest_workspace_eviction_and_old_status_reach_the_next_heartbeat() {
         {"job_id":JOB2, "used_ms":t0 - 2}
     ]));
     publisher.step(t0).unwrap();
-    assert_eq!(last_heartbeat(&runtime).warm.len(), 2);
+    let warm = last_heartbeat(&runtime).warm;
+    assert_eq!(warm.len(), 2);
+    assert!(
+        warm.iter().all(|w| w.vm == "vm"),
+        "warm entries name the host's VM binding even for cold placements: {warm:?}"
+    );
     *probe.status.lock().unwrap() = status(json!([{"job_id":JOB2, "used_ms":t0 - 2}]));
     publisher.step(t0 + 15_000).unwrap();
     let warm = last_heartbeat(&runtime).warm;
