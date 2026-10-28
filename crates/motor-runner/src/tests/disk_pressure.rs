@@ -1339,7 +1339,10 @@ fn disk_size_guard_preserves_incremental_below_cap() {
 fn disk_stale_unit_maintenance_deletes_whole_units_and_runs_once_daily() {
     let f = Fixture::new();
     let idle = f.scratch.join("remote/worktrees/stale-units");
-    let runner = Runner::open(f.config()).unwrap();
+    let mut c = f.config();
+    // Only the explicit sweep may observe the day-long clock jump.
+    c.manual_tick = true;
+    let runner = Runner::open(c).unwrap();
     workspace(&runner, &idle, runner.now());
     let old = runner.now() - 49 * 60 * 60 * 1000;
     let dep = cargo_output(&idle, "debug/deps/libfoo-0123456789abcdef.rlib", old);
@@ -1490,6 +1493,8 @@ fn disk_build_folder_measurement_and_ranking_never_claim_or_repair() {
             200
         })
     });
+    // A background tick must not hold the state lock during the measurement probe.
+    c.manual_tick = true;
     c.long_work = Some(Arc::new(move |label| {
         if label == "build_folder_measure" {
             let core = measuring.lock().unwrap().upgrade().unwrap();
@@ -1538,6 +1543,8 @@ fn disk_eviction_ranks_cached_workspace_sizes_without_another_walk() {
             200
         })
     });
+    // Only explicit guard and pressure calls may contribute measurement counts.
+    c.manual_tick = true;
     c.long_work = Some(Arc::new(move |label| {
         if label == "build_folder_measure" {
             observed.fetch_add(1, Ordering::SeqCst);
@@ -1578,6 +1585,8 @@ fn disk_build_folder_incremental_ranking_uses_cached_sizes() {
             200
         })
     });
+    // Only explicit guard and pressure calls may contribute measurement counts.
+    c.manual_tick = true;
     c.long_work = Some(Arc::new(move |label| {
         if label == "build_folder_measure" {
             observed.fetch_add(1, Ordering::SeqCst);
@@ -1639,6 +1648,64 @@ fn disk_build_folder_sweep_with_nothing_stale_never_claims_or_repairs() {
         .contains_key(text(&idle)));
 }
 
+#[test]
+fn disk_build_folder_incomplete_measurement_falls_back_to_repair() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("requires an unprivileged user so mode 000 denies directory reads");
+        return;
+    }
+    let f = Fixture::new();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let observed = calls.clone();
+    let mut c = f.config();
+    // Only the explicit guard may attempt repair of the unreadable fixture.
+    c.manual_tick = true;
+    c.build_folder_cap_bytes = 1;
+    c.long_work = Some(Arc::new(move |label| {
+        if label.starts_with("build_folder_") {
+            observed.lock().unwrap().push(label);
+        }
+    }));
+    let runner = Runner::open(c).unwrap();
+    let idle = f.scratch.join("remote/worktrees/unreadable-target");
+    workspace(&runner, &idle, runner.now());
+    let incremental = cargo_output(&idle, "debug/incremental/foo/state.bin", runner.now());
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .build_guard_pending
+        .insert(text(&idle).into());
+    let target = idle.join("target");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(
+        fs::read_dir(&target).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    runner.guard_build_folder(text(&idle));
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+
+    // A non-isolated runner has no privileged repair. It must try the fallback
+    // and retain the pending guard, not accept the partial size as under cap.
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [
+            "build_folder_measure",
+            "build_folder_claim",
+            "build_folder_repair",
+            "build_folder_measure"
+        ]
+    );
+    let inner = runner.core.inner.lock().unwrap();
+    assert!(!inner.build_folder_sizes.get(text(&idle)).unwrap().complete);
+    assert!(inner.build_guard_pending.contains(text(&idle)));
+    assert!(inner.dropping.is_empty());
+    assert!(fs::symlink_metadata(incremental).unwrap().is_file());
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires trusted host sudo and motor-job account; see motor-runner README"]
@@ -1646,6 +1713,8 @@ fn isolated_build_folder_reclaims_job_owned_units() {
     let f = Fixture::new();
     let idle = f.scratch.join("remote/worktrees/job-owned-build");
     let mut c = f.config();
+    // Keep background sweeps out of the fixture's ownership and ACL changes.
+    c.manual_tick = true;
     c.isolate_jobs = true;
     c.build_folder_cap_bytes = 1;
     let runner = Runner::open(c).unwrap();
@@ -1682,10 +1751,16 @@ fn isolated_build_folder_reclaims_job_owned_units() {
         .unwrap()
         .success());
     runner.guard_build_folder(text(&idle));
-    assert!(!incremental.exists());
-    assert!(dep.exists());
+    assert_eq!(
+        fs::symlink_metadata(&incremental).unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(fs::symlink_metadata(&dep).unwrap().is_file());
     runner.maintain_build_folders();
-    assert!(!dep.exists());
+    assert_eq!(
+        fs::symlink_metadata(&dep).unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
     assert!(outside.exists() && fs::symlink_metadata(link).unwrap().file_type().is_symlink());
     assert!(idle.join("target/artifact").exists());
 }

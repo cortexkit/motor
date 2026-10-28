@@ -783,3 +783,91 @@ fn mapped_trash_repair_refuses_changed_physical_trash_before_privileged_commands
         fs::rename(held, trash(&config)).unwrap();
     }
 }
+
+struct HeldBuildWorker<T> {
+    release: Option<Release>,
+    join: Option<std::thread::JoinHandle<T>>,
+}
+
+impl<T: Send + 'static> HeldBuildWorker<T> {
+    fn spawn(hold: Arc<Hold>, work: impl FnOnce() -> T + Send + 'static) -> Self {
+        Self {
+            release: Some(Release(hold)),
+            join: Some(std::thread::spawn(work)),
+        }
+    }
+
+    fn join(mut self) -> std::thread::Result<T> {
+        drop(self.release.take());
+        self.join.take().unwrap().join()
+    }
+}
+
+impl<T> Drop for HeldBuildWorker<T> {
+    fn drop(&mut self) {
+        // Release and join even when an assertion fails, so fixture cleanup
+        // cannot race a worker still using the mapped workspace.
+        drop(self.release.take());
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+#[test]
+fn mapped_pressure_detaches_while_build_folder_measurement_is_paused() {
+    let f = Fixture::new();
+    let mut config = configured(&f);
+    let key = "/home/motor-trash-fixture/measuring-pressure";
+    let observed = paths::host_path(&config, key);
+    let free = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let probe = free.clone();
+    config.free_space_floor_bytes = 1;
+    config.free_space_eviction_bytes = Some(2);
+    config.free_space_probe = Arc::new(move |_| {
+        Ok(if observed.exists() {
+            probe.load(Ordering::SeqCst)
+        } else {
+            u64::MAX
+        })
+    });
+    let measuring = Hold::new("build_folder_measure");
+    let removing = Hold::new("remove");
+    let measure_hook = measuring.hook();
+    let remove_hook = removing.hook();
+    config.long_work = Some(Arc::new(move |label| {
+        measure_hook(label);
+        remove_hook(label);
+    }));
+    let runner = Runner::open(config.clone()).unwrap();
+    let host = plant(&runner, key);
+    fs::create_dir_all(host.join("target")).unwrap();
+    fs::write(host.join("target/artifact"), [8; 8192]).unwrap();
+
+    measuring.arm();
+    let guarding = runner.clone();
+    let guard_worker = HeldBuildWorker::spawn(measuring.clone(), move || {
+        guarding.guard_build_folder(key);
+    });
+    assert!(poll(Duration::from_secs(10), || measuring.held()));
+    removing.arm();
+    free.store(0, Ordering::SeqCst);
+    let reclaiming = runner.clone();
+    let pressure_worker =
+        HeldBuildWorker::spawn(removing.clone(), move || reclaiming.ensure_disk_space());
+    assert!(
+        poll(Duration::from_secs(10), || removing.held()),
+        "read-only build-folder measurement blocked mapped workspace detach"
+    );
+    assert_eq!(
+        fs::symlink_metadata(&host).unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(fs::read_dir(trash(&config))
+        .unwrap()
+        .any(|entry| { entry.unwrap().path().join("secret").exists() }));
+    assert!(pressure_worker.join().unwrap().unwrap().is_none());
+    guard_worker.join().unwrap();
+    runner.wait_for_background_deletes(Duration::from_secs(10));
+    assert!(fs::read_dir(trash(&config)).unwrap().next().is_none());
+}

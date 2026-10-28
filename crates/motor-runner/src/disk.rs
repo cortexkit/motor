@@ -35,6 +35,13 @@ pub(super) struct BuildFolderSize {
     target_bytes: u64,
     incremental_bytes: u64,
     measured_ms: u64,
+    pub(super) complete: bool,
+}
+
+impl Candidate {
+    fn needs_size_repair(&self, sizes: &BTreeMap<PathBuf, BuildFolderSize>) -> bool {
+        self.workspace.is_some() && sizes.get(&self.path).is_none_or(|size| !size.complete)
+    }
 }
 
 // Caches used in the last half hour are likely to be reused; deleting them costs a cold rebuild.
@@ -133,7 +140,9 @@ fn measure_build_folder(path: &Path, measured_ms: u64) -> BuildFolderSize {
         ..BuildFolderSize::default()
     };
     let mut warned = false;
+    let mut complete = true;
     let mut warn = |path: &Path, error: io::Error| {
+        complete = false;
         if !warned {
             tracing::warn!(path = %path.display(), %error,
                 "runner size estimate skips unreadable subtrees; logging first error only");
@@ -186,6 +195,7 @@ fn measure_build_folder(path: &Path, measured_ms: u64) -> BuildFolderSize {
             warn(&path, error);
         }
     }
+    size.complete = complete;
     size
 }
 
@@ -245,6 +255,33 @@ impl Runner {
             .disk_candidates(&self.core.inner.lock().unwrap())?
             .into_iter()
             .find(|candidate| candidate.workspace.as_deref() == Some(key)))
+    }
+
+    fn repair_build_folder(
+        &self,
+        candidate: &Candidate,
+    ) -> io::Result<Option<(Candidate, WorkspaceDrop, BuildFolderSize)>> {
+        let Some((claimed, claim)) =
+            self.claim_build_folder(candidate.workspace.as_ref().unwrap())?
+        else {
+            return Ok(None);
+        };
+        if claimed.last_used_ms != candidate.last_used_ms {
+            return Ok(None);
+        }
+        let Some(_tree) = crate::tree_access::try_lock(crate::caller_path::host(&claimed.path))
+        else {
+            return Ok(None);
+        };
+        // A job can narrow its target's mode or ACL mask and hide its outputs.
+        // Only those unreadable workspaces pay for ownership repair before we
+        // know what can be removed; readable targets keep the cheap scan path.
+        self.build_folder_access(&claimed)?;
+        let size = self.measure_build_candidate(&claimed);
+        if !size.complete {
+            return Err(invalid("build folder size remains incomplete after repair"));
+        }
+        Ok(Some((claimed, claim, size)))
     }
 
     /// All ordinary reclaimed paths, including selected Cargo outputs, end in
@@ -310,52 +347,87 @@ impl Runner {
         Ok(())
     }
 
-    fn trim_build_folder(&self, candidate: &Candidate, pass: u8) -> io::Result<bool> {
-        let Some(_tree) = crate::tree_access::try_lock(crate::caller_path::host(&candidate.path))
-        else {
-            return Ok(false);
-        };
+    fn trim_build_folder(
+        &self,
+        candidate: &Candidate,
+        pass: u8,
+        repair_incomplete: bool,
+    ) -> io::Result<bool> {
         let target = candidate.path.join("target");
         if !Self::has_build_folder(candidate) {
             return Ok(true);
         }
-        let device = crate::filesystem::device(&candidate.path)?;
-        let paths = if pass == 1 {
-            if self.core.config.boat_profile {
-                return Ok(true);
-            }
-            crate::cargo_gc::stale_units(
-                &target,
-                UNIX_EPOCH + Duration::from_millis(self.now()),
-                device,
-            )?
-        } else {
-            if pass == 0
-                && self.build_candidate_size(candidate).target_bytes
-                    <= self.core.config.build_folder_cap_bytes
-            {
-                return Ok(true);
-            }
-            crate::cargo_gc::incremental(&target)?
-                .into_iter()
-                .map(|path| vec![path])
-                .collect()
-        };
-        if paths.is_empty() {
+        if pass == 1 && self.core.config.boat_profile {
             return Ok(true);
         }
+        let mut size = self.build_candidate_size(candidate);
+        let repaired = if !size.complete {
+            if !repair_incomplete {
+                return Ok(false);
+            }
+            let Some(repaired) = self.repair_build_folder(candidate)? else {
+                return Ok(false);
+            };
+            size = repaired.2;
+            Some(repaired)
+        } else {
+            None
+        };
+        let device = crate::filesystem::device(&candidate.path)?;
+        let scan = || -> io::Result<Vec<Vec<PathBuf>>> {
+            if pass == 1 {
+                crate::cargo_gc::stale_units(
+                    &target,
+                    UNIX_EPOCH + Duration::from_millis(self.now()),
+                    device,
+                )
+            } else {
+                if pass == 0 && size.target_bytes <= self.core.config.build_folder_cap_bytes {
+                    return Ok(Vec::new());
+                }
+                Ok(crate::cargo_gc::incremental(&target)?
+                    .into_iter()
+                    .map(|path| vec![path])
+                    .collect())
+            }
+        };
+        if scan()?.is_empty() {
+            return Ok(true);
+        }
+        let already_repaired = repaired.is_some();
         let key = candidate.workspace.as_ref().unwrap();
-        let Some((claimed, _claim)) = self.claim_build_folder(key)? else {
-            return Ok(false);
+        let (claimed, _claim) = if let Some((claimed, claim, _)) = repaired {
+            (claimed, claim)
+        } else {
+            let Some((claimed, claim)) = self.claim_build_folder(key)? else {
+                return Ok(false);
+            };
+            if claimed.last_used_ms != candidate.last_used_ms {
+                return Ok(false);
+            }
+            (claimed, claim)
         };
         // A job may have used the folder while the read-only scan was running.
         // Its new outputs must not be deleted using the earlier selection.
         if claimed.last_used_ms != candidate.last_used_ms {
             return Ok(false);
         }
-        // Repair flips target ownership to the runner; the next job must repair
-        // it back. Only pay for those walks when there is something to delete.
-        self.build_folder_access(&claimed)?;
+        let Some(_tree) = crate::tree_access::try_lock(crate::caller_path::host(&claimed.path))
+        else {
+            return Ok(false);
+        };
+        // Read-only scans must not hold up whole-workspace eviction. Take the
+        // tree lock only after claiming deletion, and rescan under the fence in
+        // case another cleanup changed the outputs since the first scan.
+        let paths = scan()?;
+        if paths.is_empty() {
+            return Ok(true);
+        }
+        if !already_repaired {
+            // Repair flips target ownership to the runner; the next job must
+            // repair it back. Readable folders pay only when deleting outputs.
+            self.build_folder_access(&claimed)?;
+        }
         let before = allocated_bytes(&target, device)?;
         for unit in paths {
             self.remove_build_paths(&claimed, &unit, device)?;
@@ -375,14 +447,8 @@ impl Runner {
             let Some(candidate) = self.build_candidate(key)? else {
                 return Ok(());
             };
-            // A busy walker can defer the guard until periodic maintenance.
-            let Some(_tree) =
-                crate::tree_access::try_lock(crate::caller_path::host(&candidate.path))
-            else {
-                return Ok(());
-            };
             self.measure_build_candidate(&candidate);
-            if !self.trim_build_folder(&candidate, 0)? {
+            if !self.trim_build_folder(&candidate, 0, true)? {
                 return Ok(());
             }
             self.core
@@ -444,11 +510,6 @@ impl Runner {
                 let Some(candidate) = self.build_candidate(&key)? else {
                     return Ok(());
                 };
-                let Some(_tree) =
-                    crate::tree_access::try_lock(crate::caller_path::host(&candidate.path))
-                else {
-                    return Ok(());
-                };
                 let inner = self.core.inner.lock().unwrap();
                 if inner
                     .build_swept_ms
@@ -458,7 +519,7 @@ impl Runner {
                     return Ok(());
                 }
                 drop(inner);
-                if self.trim_build_folder(&candidate, 1)? {
+                if self.trim_build_folder(&candidate, 1, true)? {
                     self.core
                         .inner
                         .lock()
@@ -525,17 +586,27 @@ impl Runner {
                     || self.now().saturating_sub(candidate.last_used_ms) >= SOFT_PRESSURE_MIN_AGE_MS
             })
             .map(|candidate| {
-                let bytes = if pass == 2 {
-                    self.build_candidate_size(&candidate).incremental_bytes
+                let size = if pass == 2 {
+                    self.build_candidate_size(&candidate)
                 } else {
-                    0
+                    BuildFolderSize::default()
                 };
-                (candidate, bytes)
+                (candidate, size)
             })
             .collect();
         if pass == 2 {
-            candidates.sort_by(|(a, a_bytes), (b, b_bytes)| {
-                b_bytes.cmp(a_bytes).then_with(|| a.path.cmp(&b.path))
+            candidates.sort_by(|(a, a_size), (b, b_size)| {
+                b_size
+                    .complete
+                    .cmp(&a_size.complete)
+                    .then_with(|| {
+                        if a_size.complete && b_size.complete {
+                            b_size.incremental_bytes.cmp(&a_size.incremental_bytes)
+                        } else {
+                            a.last_used_ms.cmp(&b.last_used_ms)
+                        }
+                    })
+                    .then_with(|| a.path.cmp(&b.path))
             });
         }
         for (candidate, _) in candidates {
@@ -547,7 +618,7 @@ impl Runner {
             {
                 continue;
             }
-            if let Err(error) = self.trim_build_folder(&candidate, pass) {
+            if let Err(error) = self.trim_build_folder(&candidate, pass, pass == 2) {
                 tracing::warn!(path = %candidate.path.display(), pass, %error, "runner build folder reclaim failed");
             }
             *free = (self.core.config.free_space_probe)(&self.core.trees.state)?;
@@ -1671,11 +1742,11 @@ impl Runner {
         // Cache misses use read-only walks with the state lock released.
         // Re-enumeration still applies live-path and age protections before deletion.
         let candidates = self.disk_candidates(&self.core.inner.lock().unwrap())?;
-        let sizes: BTreeMap<_, _> = candidates
+        let mut sizes: BTreeMap<_, _> = candidates
             .into_iter()
             .map(|candidate| {
-                let bytes = self.build_candidate_size(&candidate).workspace_bytes;
-                (candidate.path, bytes)
+                let size = self.build_candidate_size(&candidate);
+                (candidate.path, size)
             })
             .collect();
         let mut attempted = BTreeSet::new();
@@ -1693,17 +1764,27 @@ impl Runner {
                     }
                 };
                 candidates.sort_by(|a, b| {
-                    // Unreferenced snapshots retain priority over rebuildable
-                    // workspaces; within each tier prefer bytes times idle age.
+                    // Keep snapshot priority, then try complete size estimates
+                    // before workspaces needing repair. Known sizes retain the
+                    // bytes-times-idle policy; unknown sizes use oldest first.
                     b.snapshot
                         .cmp(&a.snapshot)
                         .then_with(|| {
-                            if a.snapshot && b.snapshot {
+                            a.needs_size_repair(&sizes)
+                                .cmp(&b.needs_size_repair(&sizes))
+                        })
+                        .then_with(|| {
+                            if (a.snapshot && b.snapshot)
+                                || (a.needs_size_repair(&sizes) && b.needs_size_repair(&sizes))
+                            {
                                 a.last_used_ms.cmp(&b.last_used_ms)
                             } else {
                                 let score = |candidate: &Candidate| {
-                                    u128::from(sizes.get(&candidate.path).copied().unwrap_or(0))
-                                        * u128::from(now.saturating_sub(candidate.last_used_ms))
+                                    u128::from(
+                                        sizes
+                                            .get(&candidate.path)
+                                            .map_or(0, |size| size.workspace_bytes),
+                                    ) * u128::from(now.saturating_sub(candidate.last_used_ms))
                                 };
                                 score(b).cmp(&score(a))
                             }
@@ -1764,7 +1845,9 @@ impl Runner {
                         inner.evicting_caches.insert(candidate.path.clone());
                     }
                     if let Some(key) = &candidate.workspace {
-                        inner.dropping.insert(key.clone());
+                        if sweep_idle_workspaces || !candidate.needs_size_repair(&sizes) {
+                            inner.dropping.insert(key.clone());
+                        }
                     }
                     if candidate.path.parent()
                         == Some(self.core.trees.state.join("git-deps").as_path())
@@ -1775,6 +1858,34 @@ impl Runner {
                 next
             };
             let Some(candidate) = candidate else { break };
+            if !sweep_idle_workspaces && candidate.needs_size_repair(&sizes) {
+                // Try every eligible complete estimate before paying to repair
+                // an unreadable workspace. Repair one at a time, then rerank
+                // with its complete size; an unknown size is never a tiny one.
+                let result = (|| -> io::Result<Option<BuildFolderSize>> {
+                    let size = self.build_candidate_size(&candidate);
+                    if size.complete {
+                        return Ok(Some(size));
+                    }
+                    Ok(self
+                        .repair_build_folder(&candidate)?
+                        .map(|(_, _claim, size)| size))
+                })();
+                match result {
+                    Ok(Some(size)) => {
+                        sizes.insert(candidate.path.clone(), size);
+                    }
+                    result => {
+                        attempted.insert(candidate.path.clone());
+                        if let Err(error) = result {
+                            tracing::warn!(path = %candidate.path.display(), %error,
+                                "runner workspace size repair failed");
+                        }
+                    }
+                }
+                free = probe()?;
+                continue;
+            }
             if candidate.snapshot {
                 attempted.insert(candidate.path.clone());
                 let deleted = match self.evict_sibling_snapshot(&candidate.path, device) {

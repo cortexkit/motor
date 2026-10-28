@@ -233,13 +233,21 @@ and retains its admission-time whole-workspace sweep. VM-backed jobs keep their
 backend-specific disk policies.
 
 The runner caches allocated workspace, target and incremental sizes in memory,
-with a measurement time. Read-only walks refresh them when a workspace becomes
-idle and populate missing entries lazily for ranking; a restart starts with an
-empty cache. Unreadable subtrees contribute zero to the estimate and log one
-warning per walk. Measurement never claims a workspace or changes permissions.
+with a measurement time and completeness flag. Read-only walks refresh them
+when a workspace becomes idle and populate missing entries lazily for ranking;
+a restart starts with an
+empty cache. Unreadable subtrees mark the estimate incomplete and log one
+warning per walk. Read-only measurement never claims a workspace or changes
+permissions.
 Build-folder cleanup scans before claiming and repairs ownership only when it
 has selected outputs to delete: repair transfers the target to the runner, so
-the next job must repair it back to the job account.
+the next job must repair it back to the job account. An incomplete estimate is
+the exception: the guard, daily sweep and incremental pressure pass claim and
+repair that workspace, then measure again before deciding what to remove. This
+keeps jobs that narrow their target's permissions from hiding their disk usage.
+The whole-workspace pass tries eligible complete estimates first, then repairs
+unreadable workspaces one at a time, oldest first, and reranks their complete
+sizes. It stops before repairing another workspace if the free-space goal is met.
 Tests:
 `disk_size_guard_drops_only_incremental_and_defers_queued_workspace`,
 `disk_stale_unit_maintenance_deletes_whole_units_and_runs_once_daily`,
