@@ -19,8 +19,8 @@ host can also call `Nonces::prune` explicitly.
 ## Contract fixtures
 
 The broker repository, `cortexkit-cloud`, owns `docs/runners-contract.md` and
-`test-vectors/runners/`. `contracts/cloud/` mirrors fifteen canonical files
-verbatim at commit `5d25d34`, including the six-hour `long-lease.json` and
+`test-vectors/runners/`. `contracts/cloud/` mirrors fourteen canonical files
+verbatim at commit `813c8083`, including the six-hour `long-lease.json` and
 same-reservation `replace-lease.json` exchanges. `bad-request.json` now refuses
 `timeout_s: 21601`; registered hosts accept up to 21600, while Boat keeps 7200.
 `contracts/digest-manifest.json` records source paths,
@@ -43,10 +43,7 @@ is derived, not a route-generated vector.
 Since `e483f20` the broker requires `allow_spill` on every lease body and
 answers a body without it 400 `bad_request` before claiming the job; the fake
 broker does the same. `lease.json`, `boat-lease.json` and
-`settled-reattach.json` now send `"allow_spill": true`. `shadow-lease.json`
-records a Boat shadow lease (`allow_spill: true`, then `shadow: true`) and its
-`lease_hash`: the ordinary projection without `requester_jwk`, with
-`"shadow":true` as the last member after `allow_spill`. A re-request must
+`settled-reattach.json` send `"allow_spill": true`. A re-request must
 repeat the same `allow_spill` value.
 
 `no-host-fits-lease.json` records the broker's final refusal for a no-spill

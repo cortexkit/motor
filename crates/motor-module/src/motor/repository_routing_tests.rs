@@ -508,7 +508,7 @@ async fn assert_stage1_bad_request(status: u16, body: String, expected_field: Op
 #[tokio::test]
 async fn stage1_cloud_bad_request_fields_reach_warning_and_refusal() {
     let replies = crate::hosted::tests::cloud_bad_request_replies();
-    assert_eq!(replies.len(), 10);
+    assert_eq!(replies.len(), 9);
     for (status, body) in replies {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_stage1_bad_request(status, body, parsed["field"].as_str()).await;

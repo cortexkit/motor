@@ -73,7 +73,6 @@ fn cloud_final_files_match_their_manifest_digests() {
         "cloud/lease.json",
         "cloud/usage-settlement.json",
         "cloud/settled-reattach.json",
-        "cloud/shadow-lease.json",
         "cloud/account-closure.json",
         "cloud/long-lease.json",
         "cloud/replace-lease.json",
@@ -99,11 +98,11 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "520a1817354d156850de324367470e90042170c238ced37318662970d5a3aead",
+            "b4ddcfd936d96f794e8553c8f12cebdd9197de106659a59a520f24d4c8850ae8",
         ),
         (
             "bad-request.json",
-            "4f2d775a85a89d7024fd65186162b53bed696ccf0ad02ce839efc5949ffd1fbc",
+            "262f34f1523384bafc9f4b725ddbff9053273ed93dce2f2825bee2fb4a146e39",
         ),
         (
             "no-host-fits-lease.json",
@@ -140,10 +139,6 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         (
             "settled-reattach.json",
             "59308e456afcde26a9fa9973bd9b243a67f8f8cb3886dc8f20c344c597176b16",
-        ),
-        (
-            "shadow-lease.json",
-            "cf0f4481a403e2ab3ab2e7cf65a3375bf70131e4e2e8ad1786e6541c9cf33574",
         ),
         (
             "account-closure.json",

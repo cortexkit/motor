@@ -127,8 +127,7 @@ schema or the fixed value `body`, and never echoes client-supplied names. It is 
 - A body that isn't JSON or isn't an object is `body`. So is a body the strict JSON rules above
   refuse before any member is identified: invalid UTF-8, a duplicate key, a number with a fraction
   or exponent or outside the safe-integer range, or more than 65536 bytes.
-- A rule between members names the member that makes the body invalid: `shadow: true` with
-  `allow_spill: false` names `shadow` (`allow_spill: false` is valid on its own), and a usage
+- A rule between members names the member that makes the body invalid: a usage
   `ended_at_ms` before its `started_at_ms` names `ended_at_ms`. A checked value that doesn't match
   the job names that value's member: a finish `run_ms` above `max_s × 1000` names `run_ms`, and a
   usage `vcpus` that differs from the lease names `vcpus`.
@@ -145,7 +144,7 @@ request and reply bytes.
 | 400 | `bad_request`, `platform_unsupported` |
 | 401 | `unauthorized` (client routes), `host_auth_failed` (host routes) |
 | 402 | `budget_exhausted` |
-| 403 | `shadow_not_allowed`, `account_closed` (lease only; never carries `Retry-After`) |
+| 403 | `account_closed` (lease only; never carries `Retry-After`) |
 | 404 | `not_found`, `job_unknown` |
 | 409 | `job_conflict`, `job_admitted`, `job_released`, `job_finished`, `job_settled`, `usage_conflict`, `sandbox_lost` |
 | 422 | `no_host_fits` (lease only; never carries `Retry-After`) |
@@ -177,18 +176,17 @@ The exact body fields, in canonical order, are:
  placement_hint, avoid_host, timeout_s, requester_jwk, allow_spill}
 ```
 
-plus the optional boolean member `shadow`. `allow_spill` is a required boolean, described under
-"Per-lease spill policy" below; `shadow` is described under "Shadow leases". No other members
-are accepted.
+`allow_spill` is a required boolean, described under "Per-lease spill policy" below. No other
+members are accepted.
 
 The canonical lease hash uses this exact member order:
 
 ```text
-{ job_id, vcpus, platform, net, workspace_key_hash, repo_hash, placement_hint, avoid_host, timeout_s, allow_spill, shadow? }
+{ job_id, vcpus, platform, net, workspace_key_hash, repo_hash, placement_hint, avoid_host, timeout_s, allow_spill }
 ```
 
 It omits `requester_jwk`. `allow_spill` goes immediately after `timeout_s` with its exact boolean
-value (`true` and `false` hash differently). `shadow` stays last and is included only when true.
+value (`true` and `false` hash differently).
 `test-vectors/runners/no-spill-lease.json` records `canonical_lease_bytes`, the exact canonical
 JSON string hashed, for clients to byte-compare. A re-request must repeat the same `allow_spill`
 value or receive 409 `job_conflict` wherever a differing lease hash conflicts.
@@ -213,8 +211,7 @@ No other host or Boat is allowed, even with `allow_spill: true`.
 
 Binding refusals apply in this order:
 
-1. A binding host on the wrong platform, or a shadow lease naming an explicit-only host (shadows
-   can run only on Boat), is **422** `{"error":"no_host_fits","max_vcpus":0}`.
+1. A binding host on the wrong platform is **422** `{"error":"no_host_fits","max_vcpus":0}`.
 2. A retired or avoided binding host gives the existing retryable **503**
    `{"error":"no_capacity"}` with `Retry-After: 5`.
 3. For any other active binding host whose recorded ceilings cannot ever fit the lease, the reply
@@ -665,8 +662,7 @@ filling one, the placement object keeps a ledger: when it answers a placement a 
 (a new lease, or a replace) with host H, it records `{job_id, host: H, vcpus, mem_mib}` in the
 same storage transaction as the decision. A host's effective free vCPUs and memory are its last
 heartbeat's `free_vcpus` and `free_mem_mib` minus the `vcpus` and `mem_mib` of its live entries;
-the fit check and the ordering both use them. A shadow lease, which never uses a host, records
-nothing. An entry is removed on any of these events (the 1024-entry cap below can also evict one):
+the fit check and the ordering both use them. An entry is removed on any of these events (the 1024-entry cap below can also evict one):
 
 - on the first heartbeat from H whose `running` list shows the job `admitted` or `started`, the
   point from which the host's own `free_vcpus` counts it. A heartbeat that shows the job
@@ -736,9 +732,7 @@ larger than every registered host's per-job ceiling returns 422 `no_host_fits` w
 `max_vcpus` counts registered hosts only.
 `true` allows ordinary spill behavior. This is per lease, not per tenant, so
 callers sharing a fleet account can choose independently.
-It does not override the Boat enablement, platform, size or budget gates. `shadow: true` with
-`allow_spill: false` is contradictory and returns 400 `bad_request` during schema validation,
-before shadow permission or any job claim is checked.
+It does not override the Boat enablement, platform, size or budget gates.
 
 **Eligibility.** The lease's platform equals `BOAT_PLATFORM` (`linux-x64`), its `timeout_s` is at
 most `BOAT_MAX_TIMEOUT_S` (default 7200; the deploy preflight requires 10 to 7200, because Boat's
@@ -748,9 +742,9 @@ own auto-stop is capped at three hours and must outlast the run and its deadline
 `vcpus ≥ job.vcpus`; the smallest such size is used. Memory does not decide eligibility. No
 fitting size is 503 `no_capacity`, or 422 `no_host_fits` when no registered host could ever fit
 the lease either (see step 3 of the lease order). A lease above `BOAT_MAX_TIMEOUT_S` never goes to
-Boat, real or shadow: it gets the registered-host answer unchanged, 503 `no_capacity` when no host
+Boat: it gets the registered-host answer unchanged, 503 `no_capacity` when no host
 has room now, or 422 `no_host_fits` with `max_vcpus` counting registered hosts only when no host's
-ceiling could ever fit it. A shadow above it is 503 `no_capacity`.
+ceiling could ever fit it.
 
 **Order.** The budget candidate is computed first, exactly as for hosts; below 10 seconds the
 lease is 402 `budget_exhausted` and no Boat call is made. While the shared Boat breaker is open
@@ -850,28 +844,6 @@ file cannot be written, the job settles with reason `lost`, and lease re-request
 finish answer 409 `sandbox_lost`. Boat settlements update the tenant's budget totals but are
 **never counted** in the `runners` / `vcpu_ms` usage aggregate; their facts (and Boat's own
 machine-time meter per run window) are recorded in D1 only, until a billing rule exists.
-
-**Shadow leases.** A shadow lease runs a copy of a job on Boat purely to compare its result with
-the same job on the build server; its caller is served elsewhere. The lease body may carry
-`shadow: true`. Absent and `false` mean an ordinary lease and canonicalize identically: the
-canonical lease hash omits the member then, so ordinary leases hash exactly as before, and appends
-`"shadow":true` as the last member, after `allow_spill`, when it is true.
-A re-request must repeat it. Any other value is 400 `bad_request`.
-
-- Only accounts with the operator-set shadow permission in D1 `allowances` may send it; any other
-  account gets 403 `shadow_not_allowed`, checked right after schema validation.
-- A shadow is placed on Boat only, never on a registered host, and only while `BOAT_SHADOW_ENABLED`
-  is `"true"`, independently of `BOAT_ENABLED` (which governs ordinary spill). With shadows off,
-  Boat unavailable, or the tenant at `BOAT_MAX_SHADOWS` concurrent shadows (default 2), the answer
-  is 503 `no_capacity`; the client skips that shadow and never falls back. A fresh shadow with a
-  binding explicit-only hint instead gets 422 `no_host_fits` with `max_vcpus: 0`, as described above.
-- A shadow counts toward the pool's sandbox cap, the hourly and daily Boat start limits and the
-  daily start count, like any Boat lease.
-- A shadow is never charged to the tenant's allowance and never counted in the account usage
-  ledger. Its job is still recorded in D1 `provider_jobs` with a shadow flag and Boat's own
-  machine-time meter, so the cost of shadow-running stays visible.
-- Re-request, reattach, release, finish and settlement otherwise behave exactly as for an ordinary
-  Boat lease.
 
 **Image obligations** (the tenant sandbox image):
 
