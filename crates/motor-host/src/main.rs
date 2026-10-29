@@ -124,6 +124,11 @@ async fn main() -> Result<()> {
     // Starts latched: no lease is admitted until a probe finds the capacity
     // file valid and enough host storage free.
     host.enforce_storage();
+    let vcpu_ceiling = host
+        .tenants
+        .values()
+        .map(|t| (t.tenant.clone(), t.vcpu_ceiling))
+        .collect();
     let runtime = Runtime::with_broker(
         config.host_id,
         host,
@@ -131,6 +136,7 @@ async fn main() -> Result<()> {
             socket: config.helper_socket,
             storage: config.storage,
             capacity: motor_host::capacity::CONFIG.into(),
+            vcpu_ceiling,
             guest_init,
         }),
         broker_endpoint,

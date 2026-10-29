@@ -87,12 +87,30 @@ impl std::fmt::Display for StartRefused {
 }
 impl std::error::Error for StartRefused {}
 
+/// A recovery exhausted its shared disk-check budget before the guest was ready.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct RecoveryTimeout {
+    pub step: String,
+    pub elapsed_ms: u64,
+}
+impl std::fmt::Display for RecoveryTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tenant recovery timed out step={} elapsed_ms={}",
+            self.step, self.elapsed_ms
+        )
+    }
+}
+impl std::error::Error for RecoveryTimeout {}
+
 pub struct Helper {
     pub socket: PathBuf,
     pub storage: PathBuf,
     /// The capacity file; production uses [`crate::capacity::CONFIG`].
     pub capacity: PathBuf,
     pub guest_init: BTreeMap<String, Value>,
+    pub vcpu_ceiling: BTreeMap<String, u32>,
 }
 impl Helper {
     fn request(&self, request: Value) -> Result<(Value, Vec<OwnedFd>)> {
@@ -260,7 +278,17 @@ impl Control for Helper {
             })?;
         let recovery = reply["recovery_required"] == true;
         if recovery || !running || initialized_generation != Some(generation) {
-            self.quota(tenant, 1).map_err(|error| {
+            // Recovery checks run before any lease can start. Large disks need
+            // the configured VM capacity rather than the idle one-vCPU quota.
+            let vcpus = if recovery {
+                *self
+                    .vcpu_ceiling
+                    .get(tenant)
+                    .context("tenant vCPU ceiling")?
+            } else {
+                1
+            };
+            self.quota(tenant, vcpus).map_err(|error| {
                 if activation_pending {
                     self.activation_refused(tenant, error)
                 } else {
@@ -286,12 +314,44 @@ impl Control for Helper {
                 request["generation"] = json!(generation);
                 if recovery {
                     request["recovery_required"] = json!(true);
+                    request["recovery_budget_ms"] = json!((control_read_deadline(&request)
+                        - motor_protocol::TENANT_ATTACH_READ_DEADLINE
+                        - motor_protocol::TENANT_RECOVERY_REPLY_MARGIN)
+                        .as_millis()
+                        as u64);
                 }
                 request
             };
             request["unix_ms"] = json!(crate::server::unix_ms());
             request["seed"] = json!(motor_lease::base64url(&rand::random::<[u8; 32]>()));
+            let started = Instant::now();
             let initialized = self.admin(tenant, &request);
+            if recovery {
+                if let Ok(reply) = &initialized {
+                    if reply["ok"] != true && reply["timed_out"] == true {
+                        return Err(RecoveryTimeout {
+                            step: reply["step"].as_str().unwrap_or("unknown").into(),
+                            elapsed_ms: reply["elapsed_ms"]
+                                .as_u64()
+                                .unwrap_or(started.elapsed().as_millis() as u64),
+                        }
+                        .into());
+                    }
+                } else if initialized.as_ref().unwrap_err().chain().any(|cause| {
+                    cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                        matches!(
+                            e.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        )
+                    })
+                }) {
+                    return Err(RecoveryTimeout {
+                        step: "attach_reply".into(),
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    }
+                    .into());
+                }
+            }
             match initialized {
                 Ok(reply) if reply["ok"] == true => {}
                 result => {
@@ -402,7 +462,7 @@ fn check_start_reply(reply: &Value) -> Result<()> {
 /// guest's runner-readiness wait; recovery also checks the tenant disk.
 pub fn control_read_deadline(request: &Value) -> Duration {
     if request["recovery_required"] == true {
-        motor_protocol::TENANT_ATTACH_READ_DEADLINE + Duration::from_secs(600)
+        motor_protocol::TENANT_ATTACH_READ_DEADLINE + motor_protocol::TENANT_RECOVERY_ALLOWANCE
     } else if request["op"] == "attach_tenant" {
         motor_protocol::TENANT_ATTACH_READ_DEADLINE
     } else {

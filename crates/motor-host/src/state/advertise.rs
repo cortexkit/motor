@@ -51,6 +51,7 @@ pub(crate) struct TenantAdvert {
     /// logged once when it starts.
     memory_case: Option<MemoryCase>,
     start_refused: Option<StartRefusal>,
+    recovery_failure: Option<RecoveryFailure>,
     wake_pending: bool,
     /// The permits the tenant runner's own cache fill held at the last probe.
     fill: Option<FillSample>,
@@ -96,7 +97,43 @@ struct StartRefusal {
     retry_at_ms: u64,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RecoveryFailure {
+    #[serde(flatten)]
+    pub timeout: crate::helper::RecoveryTimeout,
+    pub attempts: u32,
+    pub stuck: bool,
+}
+
 impl Host {
+    pub fn recovery_failure(&self, tenant: &str) -> Option<&RecoveryFailure> {
+        self.advert.get(tenant)?.recovery_failure.as_ref()
+    }
+    pub fn recovery_stuck(&self, tenant: &str) -> bool {
+        self.recovery_failure(tenant)
+            .is_some_and(|failure| failure.stuck)
+    }
+    pub(crate) fn recovery_timed_out(
+        &mut self,
+        tenant: &str,
+        timeout: crate::helper::RecoveryTimeout,
+    ) {
+        let advert = self.advert.entry(tenant.to_owned()).or_default();
+        let attempts = advert
+            .recovery_failure
+            .as_ref()
+            .map_or(1, |f| f.attempts.saturating_add(1));
+        advert.recovery_failure = Some(RecoveryFailure {
+            timeout,
+            attempts,
+            stuck: attempts >= 2,
+        });
+    }
+    pub(crate) fn clear_recovery_timeouts(&mut self, tenant: &str) {
+        if let Some(advert) = self.advert.get_mut(tenant) {
+            advert.recovery_failure = None;
+        }
+    }
     /// Turns on the storage refusal for a registered host. The latch is
     /// already set, so nothing is admitted until a probe clears it.
     pub fn enforce_storage(&mut self) {
@@ -209,6 +246,7 @@ impl Host {
             .iter()
             .filter(|(tenant, advert)| {
                 !self.is_removed(tenant)
+                    && !self.recovery_stuck(tenant)
                     && advert
                         .start_refused
                         .as_ref()
