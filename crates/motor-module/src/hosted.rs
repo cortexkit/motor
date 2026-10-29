@@ -649,9 +649,9 @@ fn lease_body(
         net: request.network.is_some(),
         workspace_key_hash: hashes.0,
         repo_hash: hashes.1,
-        // The hint is optional: one the broker would refuse is left out
-        // rather than costing the job its lease.
-        placement_hint: hint.filter(valid_hint),
+        // Configured hints can be binding. Refuse an invalid pin during
+        // validation rather than silently placing the job somewhere else.
+        placement_hint: hint,
         avoid_host,
         timeout_s: request.timeout.ok_or(Error::NoTimeout)?,
         requester_jwk,
@@ -987,9 +987,15 @@ impl Client {
             .as_ref()
             .and_then(|state| state.repository_placement_hint.clone());
         let mut body = match job.hosted.and_then(|state| state.lease_request) {
+            // The broker hashes placement_hint. Replay legacy requests unchanged
+            // (apart from requester_jwk below), even if they contain a cached hint:
+            // clearing it could turn an in-flight lease into job_conflict.
             Some(request) => request,
             None => {
-                let mut body = lease_body(
+                // Only configured hints may opt into an explicit-only host.
+                // Workspace affinity belongs to the broker's current warm inventory,
+                // matched by workspace_key_hash, not a previous job's placement.
+                lease_body(
                     id,
                     request,
                     (
@@ -998,17 +1004,11 @@ impl Client {
                         keyed_hash(&salt, "ck-repo-v1", &request.repository_root)
                             .map_err(|_| Error::Path)?,
                     ),
-                    storage.hosted_placement(&request.workspace_key),
+                    repository_hint,
                     avoid_host,
                     RequesterJwk::from_key(&requester()?.verifying_key()),
                     Some(allow_spill),
-                )?;
-                // Unlike a cached warm placement, a configured hint is binding.
-                // Never discard it, even if invalid: refuse rather than unpin.
-                if let Some(hint) = repository_hint {
-                    body.placement_hint = Some(hint);
-                }
-                body
+                )?
             }
         };
         // Never send a body the broker would refuse. The requester key that
