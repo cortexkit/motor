@@ -2105,6 +2105,7 @@ pub(crate) struct Sandbox {
     cache_forwarders: Vec<crate::remote_cache::transport::Forwarder>,
     cache_generation: Option<std::sync::Arc<crate::remote_cache::provisioning::ActiveGeneration>>,
     cargo_overlays: Option<cargo_overlay::Plan>,
+    locked_git_commits: Vec<String>,
 }
 
 pub(crate) struct RuntimeDir(
@@ -2170,6 +2171,35 @@ impl Drop for RuntimeDir {
 }
 
 const MAX_CARGO_LOCKFILES: usize = 128;
+
+fn known_git_commits(workspace: &Path, tree: &str) -> io::Result<Vec<String>> {
+    let mut locks = vec![PathBuf::from("Cargo.lock")];
+    locks.extend(cargo_lockfiles(
+        workspace,
+        tree,
+        &mut crate::setup_log::cargo_skip,
+    )?);
+    let mut commits = std::collections::BTreeSet::new();
+    for lock in locks {
+        let mut object = std::ffi::OsString::from(tree);
+        object.push(":");
+        object.push(&lock);
+        let Ok(bytes) = javascript_git(workspace, &["show".as_ref(), &object]) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        match workspace::dependencies::locked_dependencies(&text) {
+            Ok(dependencies) => commits.extend(
+                dependencies
+                    .into_iter()
+                    .flat_map(|dependency| dependency.commits)
+                    .map(|commit| commit.to_ascii_lowercase()),
+            ),
+            Err(error) => crate::setup_log::cargo_skip(&lock, &error.to_string()),
+        }
+    }
+    Ok(commits.into_iter().collect())
+}
 const NESTED_CARGO_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Optional fetches use only immutable snapshot entries, never warm untracked files.
@@ -2889,6 +2919,11 @@ impl Sandbox {
         // Each job gets a private root tree so its visible mount ancestors can
         // stay root-owned even when the host checkout lives under an operator's
         // writable home directory.
+        let locked_git_commits = if tenant_vm {
+            known_git_commits(workspace, tree)?
+        } else {
+            Vec::new()
+        };
         let runtime = std::sync::Arc::new(RuntimeDir(
             state.join("sandboxes").join(id.to_string()),
             std::sync::OnceLock::new(),
@@ -3223,6 +3258,7 @@ impl Sandbox {
             cache_forwarders,
             cache_generation: None,
             cargo_overlays: None,
+            locked_git_commits,
         })
     }
 
@@ -3328,6 +3364,7 @@ impl Sandbox {
                 &self.cargo,
                 &mut self.read_only,
                 &mut self.read_write,
+                &self.locked_git_commits,
             )?);
         }
         let resolver = self.runtime.0.join("resolv.conf");

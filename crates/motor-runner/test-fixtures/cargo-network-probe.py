@@ -55,7 +55,7 @@ status = Path("/proc/self/status").read_text().splitlines()
 for field in ["CapEff", "CapPrm", "CapBnd"]:
     assert int(next(line.split()[1] for line in status if line.startswith(field + ":")), 16) == 0
 assert not list(home.glob(f"registry/cache/*/{name}-{version}.crate"))
-for path in ["registry/index/seed", "registry/cache/seed", "git/db/seed"]:
+for path in ["registry/index/seed", "registry/cache/seed"]:
     canary = home / path / "canary"
     assert canary.read_text() == "shared\n"
 
@@ -89,13 +89,16 @@ try:
     else:
         raise AssertionError("job can reach raw overlay lower/upper/work directories")
     mounts = Path("/proc/self/mountinfo").read_text().splitlines()
-    for cache in ["registry", "git"]:
-        assert any(line.split()[4] == str(home / cache) and " - overlay " in line for line in mounts)
-    for path in ["registry/index/seed", "registry/cache/seed", "git/db/seed"]:
+    assert any(line.split()[4] == str(home / "registry/cache") and " - overlay " in line for line in mounts)
+    for path in ["registry/index/seed", "registry/cache/seed"]:
         (home / path).chmod(0o700)
         (home / path / "canary").chmod(0o600)
         (home / path / "canary").write_text("private\n")
         (home / path / "new-private-file").write_text("private\n")
+    private_git = home / "git/db/private-job"
+    private_git.mkdir(parents=True)
+    (private_git / "canary").write_text("private\n")
+    assert not (home / "git/db/seed/canary").exists()
     print("downloaded private crate")
 finally:
     server.shutdown()

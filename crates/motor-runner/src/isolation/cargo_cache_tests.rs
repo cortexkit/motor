@@ -64,28 +64,32 @@ fn print_kernel() {
 fn no_seeded_files(sandbox: &Sandbox) {
     // The operator inspects only private, otherwise job-owned directories before
     // job execution. Revoke this delegated access before the job command starts.
-    let home = sandbox.runtime.0.join("home");
-    restore_runner_access(&home).unwrap();
-    let mut inspected = Vec::new();
-    for name in ["registry", "git"] {
-        for path in [
-            sandbox.runtime.0.join("home/cargo").join(name),
-            sandbox
-                .runtime
-                .0
-                .join("cargo-overlay")
-                .join(name)
-                .join("upper"),
-        ] {
-            let empty = match fs::read_dir(&path) {
-                Ok(mut entries) => Ok(entries.next().is_none()),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
-                Err(error) => Err(error),
-            };
-            inspected.push((path, empty));
-        }
+    let private = sandbox.runtime.0.join("cargo-overlay/private");
+    if !private.exists() {
+        return;
     }
-    prepare_job_home(&home).unwrap();
+    restore_runner_access(&private).unwrap();
+    let upper = sandbox.runtime.0.join("cargo-overlay/archives/upper");
+    if upper.exists() {
+        restore_runner_access(&upper).unwrap();
+    }
+    let mut inspected = Vec::new();
+    let mut paths = vec![private.join("src"), private.join("cache"), upper.clone()];
+    if sandbox.locked_git_commits.is_empty() {
+        paths.extend([private.join("git/db"), private.join("git/checkouts")]);
+    }
+    for path in paths {
+        let empty = match fs::read_dir(&path) {
+            Ok(mut entries) => Ok(entries.next().is_none()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error),
+        };
+        inspected.push((path, empty));
+    }
+    prepare_job_home(&private).unwrap();
+    if upper.exists() {
+        prepare_job_home(&upper).unwrap();
+    }
     for (path, empty) in inspected {
         assert!(
             empty.unwrap(),
@@ -136,10 +140,8 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
     )
     .unwrap();
     let before = fingerprint(&shared);
-    for name in ["registry", "git"] {
-        cargo_overlay::ownership::validate(&shared.join(name));
-        cargo_overlay::ownership::validated_owner(&shared.join(name)).unwrap();
-    }
+    cargo_overlay::ownership::validate(&shared.join("registry/cache"));
+    cargo_overlay::ownership::validated_owner(&shared.join("registry/cache")).unwrap();
 
     // An offline job still reads the shared trees and cannot write to them.
     let mut offline = f.sandbox().in_tenant_vm(true);
@@ -155,7 +157,7 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
 
     let mut sandbox = f.sandbox().in_tenant_vm(true);
     shared_cache(&mut sandbox, &shared);
-    let sandbox = host_inputs::fixture::with(
+    let mut sandbox = host_inputs::fixture::with(
         host_inputs::fixture::Inputs {
             environment: BTreeMap::from([("CARGO_HOME", shared.clone().into_os_string())]),
             existing: BTreeMap::new(),
@@ -165,9 +167,35 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
     );
     let runtime = sandbox.runtime.0.clone();
     no_seeded_files(&sandbox);
+    let overlays = sandbox.cargo_overlays.take();
     let mut launch = sandbox
         .launch("python3 cargo-network-probe.py", &f.workspace, &[])
         .unwrap();
+    if let Some(overlays) = overlays {
+        let decoy_fixture = Fixture::new();
+        let decoy = decoy_fixture.sandbox().in_tenant_vm(true);
+        let mut decoy_launch = decoy.launch("true", &decoy_fixture.workspace, &[]).unwrap();
+        let decoy_pid =
+            systemctl(&["show", "--property=MainPID", "--value", &unit(decoy.id)]).unwrap();
+        let decoy_pid = String::from_utf8_lossy(&decoy_pid.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        let refused = overlays
+            .setup_with_pid_for_test(sandbox.id, decoy_pid)
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("cargo_overlay_target_refused"),
+            "{refused}"
+        );
+        assert!(refused.to_string().contains("cgroup"), "{refused}");
+        decoy_launch.release().unwrap();
+        assert!(decoy_launch.wait().unwrap().success());
+        decoy_launch.reap();
+        drop(decoy_launch);
+        drop(decoy);
+        overlays.setup(sandbox.id).unwrap();
+    }
     // Namespace setup has finished, but the start gate still prevents Cargo
     // from running. Even a populated lower must leave both uppers empty.
     no_seeded_files(&sandbox);
@@ -290,32 +318,77 @@ fn isolated_tenant_net_overlay_setup_on_large_cache() {
         cargo_overlay::ownership::validated_owner(&path).unwrap();
     }
     println!(
-        "CARGO_OVERLAY_STARTUP entries={entries} elapsed_ms={}",
+        "CARGO_CACHE_INVENTORY entries={entries} elapsed_ms={}",
         started.elapsed().as_millis()
+    );
+    let archive_started = Instant::now();
+    let (archive_entries, _) = cargo_overlay::ownership::validate(&home.join("registry/cache"));
+    cargo_overlay::ownership::validated_owner(&home.join("registry/cache")).unwrap();
+    println!(
+        "CARGO_ARCHIVE_OWNERSHIP_STARTUP entries={archive_entries} elapsed_ms={}",
+        archive_started.elapsed().as_millis()
     );
     assert!(
         entries >= 200_000,
         "use a production-sized shared cache, found {entries} entries"
     );
     let f = Fixture::new();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let archive = javascript_git(repository, &["archive".as_ref(), "HEAD".as_ref()]).unwrap();
+    tar::Archive::new(std::io::Cursor::new(archive))
+        .unpack(&f.workspace)
+        .unwrap();
+    fs::write(
+        f.workspace.join("cargo-source-bench.py"),
+        include_str!("../../test-fixtures/cargo-source-bench.py"),
+    )
+    .unwrap();
+    let head = javascript_git(repository, &["rev-parse".as_ref(), "HEAD".as_ref()]).unwrap();
+    let commits = known_git_commits(repository, String::from_utf8_lossy(&head).trim()).unwrap();
     let started = Instant::now();
-    let sandbox = f.sandbox().in_tenant_vm(true);
+    let mut sandbox = f.sandbox().in_tenant_vm(true);
+    sandbox.locked_git_commits = commits;
     println!(
         "CARGO_SANDBOX_BASE_PREPARE_MS={}",
         started.elapsed().as_millis()
     );
     let network_started = Instant::now();
-    let sandbox = sandbox.with_network().unwrap();
+    let mut sandbox = sandbox.with_network().unwrap();
     println!(
         "CARGO_NETWORK_PREPARE_MS={}",
         network_started.elapsed().as_millis()
     );
     println!("CARGO_OVERLAY_PREPARE_MS={}", started.elapsed().as_millis());
+    let host_home = sandbox.runtime.0.join("home");
+    restore_runner_access(&host_home).unwrap();
+    for name in ["registry", "git"] {
+        fs::create_dir_all(host_home.join("reference-cargo").join(name)).unwrap();
+        sandbox.read_only.push(
+            bind(
+                &home.join(name),
+                &sandbox.home.join("reference-cargo").join(name),
+            )
+            .unwrap(),
+        );
+    }
+    prepare_job_home(&host_home).unwrap();
     no_seeded_files(&sandbox);
-    let mut launch = sandbox.launch("true", &f.workspace, &[]).unwrap();
+    let mut launch = sandbox
+        .launch("python3 cargo-source-bench.py", &f.workspace, &[])
+        .unwrap();
     no_seeded_files(&sandbox);
     launch.release().unwrap();
-    assert!(launch.wait().unwrap().success());
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    launch.stdout.read_to_string(&mut stdout).unwrap();
+    launch.stderr.read_to_string(&mut stderr).unwrap();
+    let status = launch.wait().unwrap();
+    assert!(status.success(), "{stdout}\n{stderr}");
+    println!("{stdout}");
     launch.reap();
     drop(launch);
     let started = Instant::now();

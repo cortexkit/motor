@@ -3,19 +3,32 @@ use std::os::unix::fs::PermissionsExt;
 
 #[path = "cargo_overlay_ownership.rs"]
 pub(super) mod ownership;
+#[path = "cargo_overlay_seed.rs"]
+mod seed;
+#[path = "cargo_overlay_fs.rs"]
+mod tree_fs;
 
 pub(super) const LAYERS: &str = "/motor-cargo-overlay";
+const SETUP: &str = include_str!("cargo-overlay-setup.py");
+struct Target {
+    pid: u32,
+    cgroup: String,
+    unit: String,
+}
 
 struct Cache {
     name: &'static str,
     source: PathBuf,
     owner: ownership::Owner,
+    validation_root: PathBuf,
+    target: PathBuf,
 }
 
 pub(super) struct Plan {
     caches: Vec<Cache>,
     job_uid: u32,
     job_gid: u32,
+    guard: (u64, u64, u32),
 }
 
 impl Plan {
@@ -25,17 +38,21 @@ impl Plan {
         cargo: &Path,
         read_only: &mut Vec<String>,
         read_write: &mut Vec<String>,
+        commits: &[String],
     ) -> io::Result<Self> {
         let mut caches = Vec::new();
-        for name in ["registry", "git"] {
-            let source = shared.join(name);
-            if read_only.contains(&bind(&source, &cargo.join(name))?) {
-                caches.push(Cache {
-                    name,
-                    owner: ownership::validated_owner(&source)?,
-                    source,
-                });
-            }
+        let registry = shared.join("registry");
+        let source = registry.join("cache");
+        match ownership::validated_owner(&source) {
+            Ok(owner) => caches.push(Cache {
+                name: "archives",
+                owner,
+                validation_root: source.clone(),
+                source,
+                target: cargo.join("registry/cache"),
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         let job_uid = account_uid(USER)?
             .ok_or_else(|| io::Error::other("cargo_overlay_account_missing: motor-job"))?;
@@ -47,6 +64,25 @@ impl Plan {
         let layers = runtime.join("cargo-overlay");
         fs::create_dir(&layers)?;
         fs::set_permissions(&layers, fs::Permissions::from_mode(0o700))?;
+        let guard = tree_fs::Directory::open(&layers)?.stat()?;
+        let private = layers.join("private");
+        seed::prepare(shared, &private, commits)?;
+        prepare_job_home(&private)?;
+        // Cargo rewrites indexes, repairs source trees and mutates Git metadata.
+        // None may be a live lower. Only archive bytes are append-only: trusted
+        // fetch never rewrites a nonempty .crate, and automatic GC is disabled.
+        for name in ["registry", "git"] {
+            let old = bind(&shared.join(name), &cargo.join(name))?;
+            read_only.retain(|entry| entry != &old);
+        }
+        for (name, target) in [
+            ("index", "registry/index"),
+            ("src", "registry/src"),
+            ("git", "git"),
+        ] {
+            read_write.push(bind(&private.join(name), &cargo.join(target))?);
+        }
+        read_write.push(bind(&private.join("cache"), &cargo.join("registry/cache"))?);
         for cache in &caches {
             for name in ["lower", "mapped-lower", "upper", "work"] {
                 fs::create_dir_all(layers.join(cache.name).join(name))?;
@@ -62,7 +98,7 @@ impl Plan {
                     ]),
             )?;
             read_only.push(bind(
-                &shared.join(cache.name),
+                &cache.source,
                 &Path::new(LAYERS).join(cache.name).join("lower"),
             )?);
         }
@@ -73,81 +109,100 @@ impl Plan {
             caches,
             job_uid,
             job_gid,
+            guard: (guard.st_dev, guard.st_ino, guard.st_uid),
         })
     }
 
     pub(super) fn setup(&self, id: Uuid) -> io::Result<Duration> {
-        let started = Instant::now();
-        for cache in &self.caches {
-            if ownership::validated_owner(&cache.source)? != cache.owner {
-                return Err(io::Error::other(
-                    "cargo_overlay_lower_changed: owner changed before mount",
-                ));
-            }
-        }
-        let output = systemctl(&["show", "--property=MainPID", "--value", &unit(id)])?;
-        let pid = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<u32>()
-            .ok()
-            .filter(|pid| *pid != 0)
-            .ok_or_else(|| {
-                io::Error::other("cargo_overlay_mount_refused: job has no main process")
-            })?;
-        self.mount(pid, &["--make-rprivate".into(), "/".into()])?;
-        for cache in &self.caches {
-            let base = format!("{LAYERS}/{}", cache.name);
-            let mapping =
-                lower_mapping(cache.owner.uid, cache.owner.gid, self.job_uid, self.job_gid);
-            self.mount(
-                pid,
-                &[
-                    "--internal-only".into(),
-                    "--no-mtab".into(),
-                    "--bind".into(),
-                    "--read-only".into(),
-                    "-o".into(),
-                    mapping,
-                    format!("{base}/lower"),
-                    format!("{base}/mapped-lower"),
-                ],
-            )?;
-            let options = format!(
-                "lowerdir={base}/mapped-lower,upperdir={base}/upper,workdir={base}/work,index=off,nosuid,nodev",
-            );
-            self.mount(
-                pid,
-                &[
-                    "--internal-only".into(),
-                    "--no-mtab".into(),
-                    "-t".into(),
-                    "overlay".into(),
-                    "-o".into(),
-                    options,
-                    "overlay".into(),
-                    format!("/motor-home/cargo/{}", cache.name),
-                ],
-            )?;
-        }
-        Ok(started.elapsed())
+        self.setup_target(Self::target(id)?)
     }
 
-    fn mount(&self, pid: u32, arguments: &[String]) -> io::Result<()> {
-        // Enter PID as well as mount/root so mount(8)'s /proc/self operations
-        // resolve in the job's private procfs. Only the external helper runs
-        // the mount arguments; the waiting job process remains unprivileged.
+    fn target(id: Uuid) -> io::Result<Target> {
+        let output = systemctl(&[
+            "show",
+            "--property=MainPID",
+            "--property=ControlGroup",
+            &unit(id),
+        ])?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        let value = |key: &str| text.lines().find_map(|line| line.strip_prefix(key));
+        let pid = value("MainPID=")
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|pid| *pid != 0)
+            .ok_or_else(|| {
+                io::Error::other("cargo_overlay_target_refused: unit has no main task")
+            })?;
+        let cgroup = value("ControlGroup=")
+            .filter(|group| group.starts_with('/') && *group != "/")
+            .ok_or_else(|| {
+                io::Error::other("cargo_overlay_target_refused: unit has no control group")
+            })?
+            .to_owned();
+        if !output.status.success() {
+            return Err(io::Error::other(
+                "cargo_overlay_target_refused: cannot inspect unit",
+            ));
+        }
+        Ok(Target {
+            pid,
+            cgroup,
+            unit: unit(id),
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::isolation) fn setup_with_pid_for_test(
+        &self,
+        id: Uuid,
+        pid: u32,
+    ) -> io::Result<Duration> {
+        let mut target = Self::target(id)?;
+        target.pid = pid;
+        self.setup_target(target)
+    }
+
+    fn setup_target(&self, target: Target) -> io::Result<Duration> {
+        let started = Instant::now();
+        let mut mounts = vec![vec!["--make-rprivate".to_owned(), "/".to_owned()]];
+        for cache in &self.caches {
+            ownership::validated_owner(&cache.validation_root)?;
+            if ownership::Owner::observed(&cache.source)? != cache.owner {
+                return Err(io::Error::other(
+                    "cargo_overlay_lower_changed: archive root changed before mount",
+                ));
+            }
+            let base = format!("{LAYERS}/{}", cache.name);
+            mounts.push(vec![
+                "--internal-only".into(),
+                "--no-mtab".into(),
+                "--bind".into(),
+                "--read-only".into(),
+                "-o".into(),
+                lower_mapping(cache.owner.uid, cache.owner.gid, self.job_uid, self.job_gid),
+                format!("{base}/lower"),
+                format!("{base}/mapped-lower"),
+            ]);
+            mounts.push(vec![
+                "--internal-only".into(), "--no-mtab".into(), "-t".into(), "overlay".into(), "-o".into(),
+                format!("lowerdir={base}/mapped-lower,upperdir={base}/upper,workdir={base}/work,index=off,nosuid,nodev,metacopy=off,redirect_dir=nofollow"),
+                "overlay".into(), cache.target.to_string_lossy().into_owned(),
+            ]);
+        }
+        let plan = serde_json::json!({ "pid": target.pid, "unit": target.unit, "cgroup": target.cgroup, "guard": self.guard, "mounts": mounts });
+        // Bootstrap in the trusted daemon namespace. The helper opens pidfd,
+        // proc and namespace handles before entering the verified unit, then
+        // uses only those pinned handles for the entire mount sequence.
         let output = crate::systemd::output(
             crate::privilege::command("/usr/bin/nsenter")
                 .args([
-                    "--target",
-                    &pid.to_string(),
-                    "--mount",
-                    "--pid",
-                    "--root",
-                    "--wd=/",
-                    "/usr/bin/mount",
+                    "--mount=/proc/self/ns/mnt",
+                    "--",
+                    "/usr/bin/python3",
+                    "-I",
+                    "-c",
+                    SETUP,
                 ])
-                .args(arguments),
+                .arg(plan.to_string()),
         )?;
         if !output.status.success() {
             return Err(io::Error::other(format!(
@@ -159,7 +214,7 @@ impl Plan {
                 String::from_utf8_lossy(&output.stderr).trim(),
             )));
         }
-        Ok(())
+        Ok(started.elapsed())
     }
 }
 
@@ -196,6 +251,12 @@ fn id_swap(kind: char, source: u32, job: u32) -> Vec<String> {
 
 pub(crate) fn start_validation() {
     if let Some(home) = host_inputs::environment("CARGO_HOME") {
+        let created = tree_fs::Directory::open(Path::new(&home))
+            .and_then(|home| home.ensure_child(std::ffi::OsStr::new("registry")))
+            .and_then(|registry| registry.ensure_child(std::ffi::OsStr::new("cache")));
+        if let Err(error) = created {
+            tracing::warn!(%error, "cannot initialize archive lower root");
+        }
         ownership::start(Path::new(&home));
     }
 }
@@ -220,5 +281,15 @@ mod tests {
                 "u:1001:1001:4294966294",
             ]
         );
+    }
+
+    #[test]
+    fn wrong_unit_cgroup_is_refused_before_any_mount() {
+        let output = Command::new("/usr/bin/python3").args(["-I", "-c", SETUP])
+            .arg(serde_json::json!({"pid": std::process::id(), "unit": "not-the-gated-unit.service", "cgroup": "/not-the-gated-unit", "guard": [0,0,0], "mounts": []}).to_string())
+            .output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("cgroup does not match the gated unit"));
     }
 }
