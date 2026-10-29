@@ -102,6 +102,41 @@ Write-Host "Verified machine-wide Python $pythonVersion with protected user read
 if ($LASTEXITCODE -ne 0) { throw 'Machine-wide Python stdlib verification failed' }
 Write-Host 'Verified machine-wide Python stdlib imports: json, hashlib, subprocess, tomllib'
 
+# Offline tests start a real NATS server, so put the verified release on the
+# machine PATH rather than relying on a job to download its own executable.
+# SHA-256 source: https://github.com/nats-io/nats-server/releases/download/v2.15.0/SHA256SUMS
+$natsVersion = '2.15.0'
+$natsSha256 = '2d0861dc2ca3567d17f7d19611d7b346cc2ccbd7086a0a77cc957a2c71663200'
+$natsArchive = Join-Path $motor 'nats-server-v2.15.0-windows-amd64.zip'
+$natsInstall = 'C:\Program Files\NATS'
+try {
+    Invoke-WebRequest 'https://github.com/nats-io/nats-server/releases/download/v2.15.0/nats-server-v2.15.0-windows-amd64.zip' -OutFile $natsArchive -UseBasicParsing
+    if ((Get-FileHash -LiteralPath $natsArchive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $natsSha256) {
+        throw 'nats-server archive SHA-256 mismatch'
+    }
+    if (Test-Path -LiteralPath $natsInstall) { throw 'NATS destination already exists; use a fresh provisioning image' }
+    New-Item $natsInstall -ItemType Directory | Out-Null
+    & icacls $natsInstall /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'
+    if ($LASTEXITCODE -ne 0) { throw 'NATS root ACL setup failed' }
+    Expand-Archive -LiteralPath $natsArchive -DestinationPath $natsInstall
+    Move-Item -LiteralPath "$natsInstall\nats-server-v$natsVersion-windows-amd64\nats-server.exe" -Destination "$natsInstall\nats-server.exe"
+    Remove-Item -LiteralPath "$natsInstall\nats-server-v$natsVersion-windows-amd64" -Recurse -Force
+    & icacls "$natsInstall\*" /reset /T /C /L /Q
+    if ($LASTEXITCODE -ne 0) { throw 'NATS ACL inheritance reset failed' }
+    & icacls $natsInstall /setowner '*S-1-5-32-544' /T /C /L /Q
+    if ($LASTEXITCODE -ne 0) { throw 'NATS ownership setup failed' }
+} finally {
+    Remove-Item -LiteralPath $natsArchive -Force -ErrorAction SilentlyContinue
+}
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+if (($machinePath -split ';' | ForEach-Object { $_.TrimEnd('\') }) -notcontains $natsInstall) {
+    [Environment]::SetEnvironmentVariable('Path', "$natsInstall;$machinePath", 'Machine')
+}
+$env:Path = "$natsInstall;" + $env:Path
+$installedNatsVersion = & "$natsInstall\nats-server.exe" --version
+if ($LASTEXITCODE -ne 0 -or $installedNatsVersion -cne "nats-server: v$natsVersion") { throw 'Machine-wide nats-server version verification failed' }
+Write-Host "Verified machine-wide nats-server v$natsVersion with protected user read/execute access"
+
 $bytes = New-Object byte[] 48
 $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
 $rng.GetBytes($bytes)
@@ -271,6 +306,22 @@ foreach ($target in @($hostTriple, 'aarch64-pc-windows-msvc')) {
 }
 $components | Write-Host
 $targets | Write-Host
+
+# rustup reserves the stable name for official toolchains, so a custom link
+# cannot provide it. Copy the complete pinned toolchain, including its component
+# metadata and ARM64 target, so stable selection needs no channel download.
+$stableInstall = Join-Path $env:RUSTUP_HOME "toolchains\stable-$hostTriple"
+if (Test-Path -LiteralPath $stableInstall) { throw 'Rust stable destination already exists; use a fresh provisioning image' }
+Copy-Item -LiteralPath "$env:RUSTUP_HOME\toolchains\$toolchain-$hostTriple" -Destination $stableInstall -Recurse
+$stableRustc = & 'C:\rust\cargo\bin\rustc.exe' +stable -vV
+if ($LASTEXITCODE -ne 0 -or $stableRustc -notcontains "release: $toolchain" -or $stableRustc -notcontains "host: $hostTriple") {
+    throw 'Machine-wide Rust stable version/host verification failed'
+}
+$stableComponents = & $rustup component list --installed --toolchain stable
+if ($LASTEXITCODE -ne 0 -or (Compare-Object $components $stableComponents)) { throw 'Rust stable components differ from pinned toolchain' }
+$stableTargets = & $rustup target list --installed --toolchain stable
+if ($LASTEXITCODE -ne 0 -or (Compare-Object $targets $stableTargets)) { throw 'Rust stable targets differ from pinned toolchain' }
+Write-Host "Verified machine-wide Rust stable $toolchain with matching components and targets"
 
 # Jobs are offline; install the verified Windows release beside Cargo before
 # the toolchain tree is made read-only for the job user.

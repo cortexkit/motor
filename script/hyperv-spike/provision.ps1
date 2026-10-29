@@ -133,6 +133,8 @@ try {
         Assert-Spike ($bootstrap -match 'Verified machine-wide Bun 1\.4\.2 with protected user read/execute access') 'verified-machine-bun-version' '1.4.2'
         Assert-Spike ($bootstrap -match 'Verified machine-wide Python 3\.13\.17 with protected user read/execute access') 'verified-machine-python-version' '3.13.17'
         Assert-Spike ($bootstrap -match 'Verified machine-wide Python stdlib imports: json, hashlib, subprocess, tomllib') 'verified-machine-python-stdlib' 'json, hashlib, subprocess, tomllib'
+        Assert-Spike ($bootstrap -match 'Verified machine-wide nats-server v2\.15\.0 with protected user read/execute access') 'verified-machine-nats-version' '2.15.0'
+        Assert-Spike ($bootstrap -match 'Verified machine-wide Rust stable 1\.99\.0 with matching components and targets') 'verified-machine-rust-stable' '1.99.0'
         $agent = [IO.Path]::Combine($volume, 'ProgramData\Motor\motor-winagent.exe')
         $expected = (([IO.File]::ReadAllText([IO.Path]::Combine($provision, 'winagent.sha256'))) -split '\s+')[0]
         Assert-Spike ((Get-SpikeFileSha256 $agent) -eq $expected) 'installed-agent-hash' $expected
