@@ -113,29 +113,31 @@ class QualificationReadinessTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("bash"), "requires Bash for the Git Bash Python check")
     def test_python_check_rejects_wrong_missing_failed_and_incomplete_stdlib(self):
         for version3, version, code, smoke, passes in (
-            ("Python 3.13.17", "Python 3.13.17", 0, 0, True),
-            ("Python 3.13.17\r", "Python 3.13.17\r", 0, 0, True),
-            ("Python 3.13.12", "Python 3.13.17", 0, 0, False),
-            ("Python 3.13.170", "Python 3.13.17", 0, 0, False),
-            ("Python 3.13.17", "Python 3.13.12", 0, 0, False),
-            ("Python 3.13.17", "", 0, 0, False),
-            ("", "Python 3.13.17", 127, 0, False),
-            ("Python 3.13.17", "Python 3.13.17", 1, 0, False),
-            ("Python 3.13.17", "Python 3.13.17", 0, 1, False),
+            ("Python 3.14.8", "Python 3.14.8", 0, 0, True),
+            ("Python 3.14.8\r", "Python 3.14.8\r", 0, 0, True),
+            ("Python 3.13.17", "Python 3.14.8", 0, 0, False),
+            ("Python 3.14.7", "Python 3.14.8", 0, 0, False),
+            ("Python 3.14.80", "Python 3.14.8", 0, 0, False),
+            ("Python 3.14.8", "Python 3.13.17", 0, 0, False),
+            ("Python 3.14.8", "Python 3.14.7", 0, 0, False),
+            ("Python 3.14.8", "", 0, 0, False),
+            ("", "Python 3.14.8", 127, 0, False),
+            ("Python 3.14.8", "Python 3.14.8", 1, 0, False),
+            ("Python 3.14.8", "Python 3.14.8", 0, 1, False),
         ):
             with self.subTest(version3=version3, version=version, code=code, smoke=smoke):
                 command = (
                     "python3() { if test \"$*\" = --version; then "
                     f"printf '%s\\n' '{version3}'; return {code}; fi; "
                     "test \"$#\" -eq 2 && test \"$1\" = -c && "
-                    "test \"$2\" = 'import json, hashlib, subprocess, tomllib' || return 99; "
+                    "test \"$2\" = 'import json, hashlib, subprocess, tomllib, compression.zstd' || return 99; "
                     f"return {smoke}; }}; "
                     f"python() {{ test \"$*\" = --version || return 99; printf '%s\\n' '{version}'; }}; "
                 ) + JOBS.PYTHON_CHECK
                 result = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
                 self.assertEqual(result.returncode == 0, passes, result.stderr)
                 if passes:
-                    self.assertIn("Python 3.13.17", result.stdout)
+                    self.assertIn("Python 3.14.8", result.stdout)
 
     def test_real_jobs_check_nats_and_stable_even_with_a_custom_gate(self):
         source = (HERE / "qualify-jobs.py").read_text()

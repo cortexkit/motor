@@ -131,8 +131,8 @@ try {
             Assert-Spike ($bootstrap -match "Verified $right for motor-job SID S-1-") 'verified-effective-job-right' $right
         }
         Assert-Spike ($bootstrap -match 'Verified machine-wide Bun 1\.4\.2 with protected user read/execute access') 'verified-machine-bun-version' '1.4.2'
-        Assert-Spike ($bootstrap -match 'Verified machine-wide Python 3\.13\.17 with protected user read/execute access') 'verified-machine-python-version' '3.13.17'
-        Assert-Spike ($bootstrap -match 'Verified machine-wide Python stdlib imports: json, hashlib, subprocess, tomllib') 'verified-machine-python-stdlib' 'json, hashlib, subprocess, tomllib'
+        Assert-Spike ($bootstrap -match 'Verified machine-wide Python 3\.14\.8 with protected user read/execute access') 'verified-machine-python-version' '3.14.8'
+        Assert-Spike ($bootstrap -match 'Verified machine-wide Python stdlib imports: json, hashlib, subprocess, tomllib, compression.zstd') 'verified-machine-python-stdlib' 'json, hashlib, subprocess, tomllib, compression.zstd'
         Assert-Spike ($bootstrap -match 'Verified machine-wide nats-server v2\.15\.0 with protected user read/execute access') 'verified-machine-nats-version' '2.15.0'
         Assert-Spike ($bootstrap -match 'Verified machine-wide Rust stable 1\.99\.0 with matching components and targets') 'verified-machine-rust-stable' '1.99.0'
         $agent = [IO.Path]::Combine($volume, 'ProgramData\Motor\motor-winagent.exe')

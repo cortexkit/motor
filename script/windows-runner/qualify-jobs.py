@@ -277,9 +277,9 @@ def require_gate_success(terminal):
 BUN_VERSION_CHECK = "bun_version=$(bun --version) && test \"${bun_version%$'\\r'}\" = \"1.4.2\""
 NEXTEST_VERSION_CHECK = "nextest_version=$(cargo nextest --version) && printf '%s\\n' \"$nextest_version\" && [[ \"$nextest_version\" == 'cargo-nextest 0.9.138 '* ]]"
 PYTHON_CHECK = (
-    "python_version=$(python3 --version) && printf '%s\\n' \"$python_version\" && test \"${python_version%$'\\r'}\" = 'Python 3.13.17' && "
-    "python_version=$(python --version) && test \"${python_version%$'\\r'}\" = 'Python 3.13.17' && "
-    'python3 -c "import json, hashlib, subprocess, tomllib"'
+    "python_version=$(python3 --version) && printf '%s\\n' \"$python_version\" && test \"${python_version%$'\\r'}\" = 'Python 3.14.8' && "
+    "python_version=$(python --version) && test \"${python_version%$'\\r'}\" = 'Python 3.14.8' && "
+    'python3 -c "import json, hashlib, subprocess, tomllib, compression.zstd"'
 )
 NATS_VERSION_CHECK = "nats_version=$(nats-server --version) && printf '%s\\n' \"$nats_version\" && test \"${nats_version%$'\\r'}\" = 'nats-server: v2.15.0'"
 STABLE_VERSION_CHECK = "stable_version=$(rustc +stable --version) && printf '%s\\n' \"$stable_version\" && [[ \"$stable_version\" == 'rustc 1.99.0 '* ]]"

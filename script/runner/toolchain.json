@@ -56,6 +56,7 @@
       "pkg-config": "2.5.1-4",
       "procps": "2:4.0.4-9ubuntu1",
       "python3": "3.14.3-0ubuntu2",
+      "ripgrep": "15.1.0-1ubuntu1",
       "rsync": "3.4.1+ds1-7ubuntu0.3",
       "sqlite3": "3.46.1-9ubuntu0.3",
       "sudo": "1.9.17p2-1ubuntu3.2",
@@ -65,7 +66,8 @@
       "x11-apps": "7.7+11build4",
       "xfsprogs": "6.18.0-3",
       "xvfb": "2:21.1.22-1ubuntu1.3",
-      "xz-utils": "5.8.3-1ubuntu0.1"
+      "xz-utils": "5.8.3-1ubuntu0.1",
+      "zstd": "1.5.7+dfsg-3"
     },
     "required": [
       "python3",
@@ -84,11 +86,13 @@
       "pkg-config",
       "libssl-dev",
       "git",
+      "ripgrep",
       "rsync",
       "curl",
       "ca-certificates",
       "unzip",
       "xz-utils",
+      "zstd",
       "file",
       "lsof",
       "patch",

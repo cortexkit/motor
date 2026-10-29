@@ -221,7 +221,7 @@ fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
     let output = run(
         &runner,
         &f,
-        &format!("set -e; rustc -vV; cargo --version; cargo nextest --version; git --version; bun --version; pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; python3 --version; python --version; python3 -c \"import json, hashlib, subprocess, tomllib\"; nats-server --version; rustc +stable --version; {probe}; cargo +stable run --offline; test -f target/debug/motor-qualification.exe"),
+        &format!("set -e; rustc -vV; cargo --version; cargo nextest --version; git --version; bun --version; pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; python3 --version; python --version; python3 -c \"import json, hashlib, subprocess, tomllib, compression.zstd\"; nats-server --version; rustc +stable --version; {probe}; cargo +stable run --offline; test -f target/debug/motor-qualification.exe"),
     );
     assert!(
         output
@@ -245,7 +245,7 @@ fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
     assert_eq!(
         output
             .lines()
-            .filter(|line| line.trim() == "Python 3.13.17")
+            .filter(|line| line.trim() == "Python 3.14.8")
             .count(),
         2,
         "{output}"
@@ -284,7 +284,7 @@ $ErrorActionPreference='Stop'
 $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
 if($identity.Name.Split('\')[-1] -cne 'motor-job'){throw "unexpected job user: $($identity.Name)"}
 if(([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'job user is an administrator'}
-foreach($tool in @(@{name='PowerShell';command='pwsh.exe';path='C:\Program Files\PowerShell\7'},@{name='Bun';command='bun.exe';path='C:\Program Files\Bun'},@{name='Python';command='python3.exe';path='C:\Python313'},@{name='NATS';command='nats-server.exe';path='C:\Program Files\NATS'})) {
+foreach($tool in @(@{name='PowerShell';command='pwsh.exe';path='C:\Program Files\PowerShell\7'},@{name='Bun';command='bun.exe';path='C:\Program Files\Bun'},@{name='Python';command='python3.exe';path='C:\Python314'},@{name='NATS';command='nats-server.exe';path='C:\Program Files\NATS'})) {
 $install=$tool.path
 if((Get-Command $tool.command -ErrorAction Stop).Source -cne (Join-Path $install $tool.command)){throw "$($tool.name) resolves outside the protected installation"}
 $directories=@((Get-Item -LiteralPath $install)) + @(Get-ChildItem -LiteralPath $install -Directory -Recurse -Force -ErrorAction Stop)

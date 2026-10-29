@@ -61,13 +61,14 @@ Write-Host "Verified machine-wide Bun $installedBunVersion with protected user r
 
 # Offline jobs need the full standard library, so use the official all-users
 # installer rather than the embeddable distribution with its restricted site path.
-# SHA-256 source: https://www.python.org/ftp/python/3.13.17/python-3.13.17-amd64.exe.spdx.json
-$pythonVersion = '3.13.17'
-$pythonSha256 = '5da012101ba2e17113a9a1cd901e9ce1441086f2b7ecb5de06ec94163899a190'
-$pythonInstaller = Join-Path $motor 'python-3.13.17-amd64.exe'
-$pythonInstall = 'C:\Python313'
+# Archive probes need Python 3.14's compression.zstd module.
+# SHA-256 source: https://www.python.org/ftp/python/3.14.8/python-3.14.8-amd64.exe.spdx.json
+$pythonVersion = '3.14.8'
+$pythonSha256 = '759be887b96e736a3ca886daf8d575f18fcae1a09efab6902f42d59e8999f8ef'
+$pythonInstaller = Join-Path $motor 'python-3.14.8-amd64.exe'
+$pythonInstall = 'C:\Python314'
 try {
-    Invoke-WebRequest 'https://www.python.org/ftp/python/3.13.17/python-3.13.17-amd64.exe' -OutFile $pythonInstaller -UseBasicParsing
+    Invoke-WebRequest 'https://www.python.org/ftp/python/3.14.8/python-3.14.8-amd64.exe' -OutFile $pythonInstaller -UseBasicParsing
     if ((Get-FileHash -LiteralPath $pythonInstaller -Algorithm SHA256).Hash.ToLowerInvariant() -cne $pythonSha256) {
         throw 'Python installer SHA-256 mismatch'
     }
@@ -98,9 +99,9 @@ foreach ($command in @('python3.exe', 'python.exe')) {
     if ($LASTEXITCODE -ne 0 -or $installedPythonVersion -cne "Python $pythonVersion") { throw "Machine-wide Python version verification failed for ${command}: $installedPythonVersion" }
 }
 Write-Host "Verified machine-wide Python $pythonVersion with protected user read/execute access"
-& "$pythonInstall\python3.exe" -c "import json, hashlib, subprocess, tomllib"
+& "$pythonInstall\python3.exe" -c "import json, hashlib, subprocess, tomllib, compression.zstd"
 if ($LASTEXITCODE -ne 0) { throw 'Machine-wide Python stdlib verification failed' }
-Write-Host 'Verified machine-wide Python stdlib imports: json, hashlib, subprocess, tomllib'
+Write-Host 'Verified machine-wide Python stdlib imports: json, hashlib, subprocess, tomllib, compression.zstd'
 
 # Offline tests start a real NATS server, so put the verified release on the
 # machine PATH rather than relying on a job to download its own executable.

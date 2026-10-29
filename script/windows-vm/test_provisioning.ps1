@@ -145,14 +145,14 @@ Write-Host 'PASS python_installer_exit_guard_rejects_failure'
 
 $pythonVersionGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text.Contains('$installedPythonVersion -cne')}, $true)
 Assert ($null -ne $pythonVersionGuard) 'missing Python version guard'
-$pythonVersion = '3.13.17'
+$pythonVersion = '3.14.8'
 $command = 'python3.exe'
 foreach ($case in @(
-    @{Version='Python 3.13.17'; Code=0; Reject=$false},
-    @{Version='Python 3.13.16'; Code=0; Reject=$true},
-    @{Version='Python 3.13.170'; Code=0; Reject=$true},
+    @{Version='Python 3.14.8'; Code=0; Reject=$false},
+    @{Version='Python 3.14.7'; Code=0; Reject=$true},
+    @{Version='Python 3.14.80'; Code=0; Reject=$true},
     @{Version=''; Code=127; Reject=$true},
-    @{Version='Python 3.13.17'; Code=1; Reject=$true}
+    @{Version='Python 3.14.8'; Code=1; Reject=$true}
 )) {
     $installedPythonVersion = $case.Version
     $LASTEXITCODE = $case.Code

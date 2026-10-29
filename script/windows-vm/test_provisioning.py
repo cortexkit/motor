@@ -304,13 +304,14 @@ class BaselineInputsTests(unittest.TestCase):
     def test_baseline_installs_checksum_pinned_machine_wide_python_on_path(self):
         source = (HERE / "setup-job-baseline.ps1").read_text()
         for expected in (
-            "$pythonVersion = '3.13.17'",
-            "https://www.python.org/ftp/python/3.13.17/python-3.13.17-amd64.exe.spdx.json",
-            "$pythonSha256 = '5da012101ba2e17113a9a1cd901e9ce1441086f2b7ecb5de06ec94163899a190'",
-            "Invoke-WebRequest 'https://www.python.org/ftp/python/3.13.17/python-3.13.17-amd64.exe' -OutFile $pythonInstaller",
+            "$pythonVersion = '3.14.8'",
+            "https://www.python.org/ftp/python/3.14.8/python-3.14.8-amd64.exe.spdx.json",
+            "$pythonSha256 = '759be887b96e736a3ca886daf8d575f18fcae1a09efab6902f42d59e8999f8ef'",
+            "$pythonInstaller = Join-Path $motor 'python-3.14.8-amd64.exe'",
+            "Invoke-WebRequest 'https://www.python.org/ftp/python/3.14.8/python-3.14.8-amd64.exe' -OutFile $pythonInstaller",
             "Get-FileHash -LiteralPath $pythonInstaller -Algorithm SHA256",
             "throw 'Python installer SHA-256 mismatch'",
-            "$pythonInstall = 'C:\\Python313'",
+            "$pythonInstall = 'C:\\Python314'",
             "'/quiet', 'InstallAllUsers=1', 'PrependPath=0', 'Include_launcher=0', 'Include_test=0'",
             '"TargetDir=$pythonInstall"',
             "Start-Process -FilePath $pythonInstaller -ArgumentList $pythonArguments -Wait -PassThru",
@@ -322,7 +323,7 @@ class BaselineInputsTests(unittest.TestCase):
             "[Environment]::SetEnvironmentVariable('Path', \"$pythonInstall;$machinePath\", 'Machine')",
             '$env:Path = "$pythonInstall;" + $env:Path',
             r'& "$pythonInstall\$command" --version',
-            r'& "$pythonInstall\python3.exe" -c "import json, hashlib, subprocess, tomllib"',
+            r'& "$pythonInstall\python3.exe" -c "import json, hashlib, subprocess, tomllib, compression.zstd"',
             "throw 'Machine-wide Python stdlib verification failed'",
         ):
             self.assertIn(expected, source)
@@ -336,13 +337,13 @@ class BaselineInputsTests(unittest.TestCase):
 
     def test_windows_image_qualification_requires_python_version_and_stdlib(self):
         operator = (HERE.parent.parent / "crates/motor-runner/src/tests/windows_operator.rs").read_text()
-        self.assertIn('python3 --version; python --version; python3 -c \\"import json, hashlib, subprocess, tomllib\\"', operator)
-        self.assertIn('line.trim() == "Python 3.13.17"', operator)
-        self.assertIn("@{name='Python';command='python3.exe';path='C:\\Python313'}", operator)
+        self.assertIn('python3 --version; python --version; python3 -c \\"import json, hashlib, subprocess, tomllib, compression.zstd\\"', operator)
+        self.assertIn('line.trim() == "Python 3.14.8"', operator)
+        self.assertIn("@{name='Python';command='python3.exe';path='C:\\Python314'}", operator)
         self.assertIn('output.contains("Python installation is read-only")', operator)
         provision = (HERE.parent / "hyperv-spike/provision.ps1").read_text()
-        self.assertIn("Assert-Spike ($bootstrap -match 'Verified machine-wide Python 3\\.13\\.17 with protected user read/execute access')", provision)
-        self.assertIn("Assert-Spike ($bootstrap -match 'Verified machine-wide Python stdlib imports: json, hashlib, subprocess, tomllib')", provision)
+        self.assertIn("Assert-Spike ($bootstrap -match 'Verified machine-wide Python 3\\.14\\.8 with protected user read/execute access')", provision)
+        self.assertIn("Assert-Spike ($bootstrap -match 'Verified machine-wide Python stdlib imports: json, hashlib, subprocess, tomllib, compression.zstd')", provision)
 
     def test_baseline_installs_checksum_pinned_machine_wide_nats_on_path(self):
         source = (HERE / "setup-job-baseline.ps1").read_text()
