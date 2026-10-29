@@ -218,7 +218,25 @@ fn isolated_tenant_prefetch_writes_as_validated_cache_owner() {
     print_kernel();
     let f = Fixture::new();
     let scratch = f.scratch.join("prefetch");
-    check_tenant_cargo_fetch(&scratch).unwrap();
+    assert!(crate::privilege::uses_sudo());
+    let rustup = PathBuf::from(std::env::var_os("RUSTUP_HOME").unwrap());
+    let mut config = crate::Config::new(&scratch, "state");
+    config.tenant_vm = true;
+    let snapshots = SnapshotSiblings {
+        config: &config,
+        siblings: Vec::new(),
+    };
+    // check-tenant-cargo-fetch is a root-only CLI. Use its cold fetch and
+    // snapshot helpers without changing the operator's delegated sudo mode.
+    cargo_fetch::check_online_via(&scratch, &rustup, |command, limit| {
+        let view =
+            crate::sibling_snapshots::helper::View::prefetch(&scratch.join("workspace"), &[])?
+                .keep(&scratch.join("cargo-home"), true)
+                .keep(&rustup, false);
+        snapshots.run(&view, command, CargoFetch::TenantAttempt(limit))
+    })
+    .unwrap();
+    assert!(crate::privilege::uses_sudo());
     let registry = scratch.join("cargo-home/registry");
     let (entries, _) = cargo_overlay::ownership::validate(&registry);
     assert!(entries > 0, "the cold prefetch must create cache files");
@@ -249,7 +267,17 @@ fn isolated_tenant_net_overlay_setup_on_large_cache() {
     );
     let f = Fixture::new();
     let started = Instant::now();
-    let sandbox = f.sandbox().in_tenant_vm(true).with_network().unwrap();
+    let sandbox = f.sandbox().in_tenant_vm(true);
+    println!(
+        "CARGO_SANDBOX_BASE_PREPARE_MS={}",
+        started.elapsed().as_millis()
+    );
+    let network_started = Instant::now();
+    let sandbox = sandbox.with_network().unwrap();
+    println!(
+        "CARGO_NETWORK_PREPARE_MS={}",
+        network_started.elapsed().as_millis()
+    );
     println!("CARGO_OVERLAY_PREPARE_MS={}", started.elapsed().as_millis());
     no_seeded_files(&sandbox);
     let mut launch = sandbox.launch("true", &f.workspace, &[]).unwrap();
