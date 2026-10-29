@@ -50,6 +50,10 @@ class Registry(http.server.BaseHTTPRequestHandler):
 home = Path(os.environ["CARGO_HOME"])
 assert str(home) == "/motor-home/cargo"
 assert os.environ["CARGO_NET_OFFLINE"] == "true"
+assert os.geteuid() != 0
+status = Path("/proc/self/status").read_text().splitlines()
+for field in ["CapEff", "CapPrm", "CapBnd"]:
+    assert int(next(line.split()[1] for line in status if line.startswith(field + ":")), 16) == 0
 assert not list(home.glob(f"registry/cache/*/{name}-{version}.crate"))
 for path in ["registry/index/seed", "registry/cache/seed", "git/db/seed"]:
     canary = home / path / "canary"
@@ -78,7 +82,18 @@ try:
     downloaded = list(home.glob(f"registry/cache/*/{name}-{version}.crate"))
     assert len(downloaded) == 1
     assert downloaded[0].read_bytes() == crate
+    try:
+        os.listdir("/motor-cargo-overlay")
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("job can reach raw overlay lower/upper/work directories")
+    mounts = Path("/proc/self/mountinfo").read_text().splitlines()
+    for cache in ["registry", "git"]:
+        assert any(line.split()[4] == str(home / cache) and " - overlay " in line for line in mounts)
     for path in ["registry/index/seed", "registry/cache/seed", "git/db/seed"]:
+        (home / path).chmod(0o700)
+        (home / path / "canary").chmod(0o600)
         (home / path / "canary").write_text("private\n")
         (home / path / "new-private-file").write_text("private\n")
     print("downloaded private crate")

@@ -328,6 +328,13 @@ pub(crate) fn fetch_command(
     let empty_home = state.join("fetch-home");
     fs::create_dir_all(&empty_home)?;
     let mut cmd = Command::new("cargo");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // New cache entries must have the same owner as startup-validated
+        // entries, including when this command runs outside a snapshot helper.
+        cmd.uid(unsafe { libc::geteuid() });
+    }
     cmd.args(["fetch", "--locked", "--manifest-path"])
         .arg(workspace.join("Cargo.toml"))
         .current_dir(state);

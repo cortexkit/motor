@@ -20,6 +20,7 @@ use std::{
 use uuid::Uuid;
 
 mod cargo_fetch;
+pub(crate) mod cargo_overlay;
 mod host_inputs;
 mod hosts;
 mod javascript_tools;
@@ -2103,6 +2104,7 @@ pub(crate) struct Sandbox {
     /// command, one per active tool; empty when the unit has no remote cache.
     cache_forwarders: Vec<crate::remote_cache::transport::Forwarder>,
     cache_generation: Option<std::sync::Arc<crate::remote_cache::provisioning::ActiveGeneration>>,
+    cargo_overlays: Option<cargo_overlay::Plan>,
 }
 
 pub(crate) struct RuntimeDir(
@@ -3220,6 +3222,7 @@ impl Sandbox {
             provider_unset_env: Vec::new(),
             cache_forwarders,
             cache_generation: None,
+            cargo_overlays: None,
         })
     }
 
@@ -3319,23 +3322,13 @@ impl Sandbox {
                 host_inputs::environment("CARGO_HOME")
                     .ok_or_else(|| io::Error::other("CARGO_HOME unset"))?,
             );
-            let private = self.runtime.0.join("home/cargo");
-            // Online Cargo may need sources beyond the trusted lockfile fetch.
-            // Reflinks seed independent, writable inodes without copying cached
-            // file data or giving the job a write path into the shared cache.
-            for name in ["registry", "git"] {
-                let source = shared.join(name);
-                let binding = bind(&source, &self.cargo.join(name))?;
-                if self.read_only.contains(&binding) {
-                    let destination = private.join(name);
-                    fs::remove_dir(&destination)?;
-                    platform::clone_target(&source, &destination)?;
-                    self.read_only.retain(|entry| entry != &binding);
-                }
-            }
-            // Shared-cache ownership and inherited read-only ACLs must not
-            // prevent Cargo from updating the job's independent copies.
-            prepare_job_home(&private)?;
+            self.cargo_overlays = Some(cargo_overlay::Plan::prepare(
+                &self.runtime.0,
+                &shared,
+                &self.cargo,
+                &mut self.read_only,
+                &mut self.read_write,
+            )?);
         }
         let resolver = self.runtime.0.join("resolv.conf");
         fs::write(&resolver, "nameserver 1.1.1.1\nnameserver 9.9.9.9\n")?;
@@ -3710,6 +3703,21 @@ impl Sandbox {
             )));
         }
         let active_at = Instant::now();
+        if let Some(overlays) = &self.cargo_overlays {
+            match overlays.setup(self.id) {
+                Ok(elapsed) => {
+                    tracing::info!(job_id = %self.id, elapsed_ms = elapsed.as_millis(), "Cargo overlay namespace setup finished");
+                    #[cfg(test)]
+                    println!("CARGO_OVERLAY_MOUNT_MS={}", elapsed.as_millis());
+                }
+                Err(error) => {
+                    discard_unstarted(self.id);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            }
+        }
         if let Err(error) = allow_low_ports(self.id) {
             discard_unstarted(self.id);
             let _ = child.kill();
@@ -3914,7 +3922,11 @@ thread_local! {
 }
 
 pub(crate) fn reserved_destinations(config: &crate::Config) -> Vec<PathBuf> {
-    RunnerBindPlan::new(&JavascriptTools::for_config(config)).destinations()
+    let mut destinations = RunnerBindPlan::new(&JavascriptTools::for_config(config)).destinations();
+    if config.tenant_vm && !config.boat_profile && config.job_network.is_some() {
+        destinations.push(cargo_overlay::LAYERS.into());
+    }
+    destinations
 }
 
 /// Host sources shared by job, writer and snapshot-helper sandboxes.

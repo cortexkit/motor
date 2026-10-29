@@ -45,6 +45,55 @@ fn shared_cache(sandbox: &mut Sandbox, shared: &Path) {
     }
 }
 
+fn no_seeded_files(sandbox: &Sandbox) {
+    // The operator inspects only private, otherwise job-owned directories before
+    // job execution. Revoke this delegated access before the job command starts.
+    let home = sandbox.runtime.0.join("home");
+    restore_runner_access(&home).unwrap();
+    let mut inspected = Vec::new();
+    for name in ["registry", "git"] {
+        for path in [
+            sandbox.runtime.0.join("home/cargo").join(name),
+            sandbox
+                .runtime
+                .0
+                .join("cargo-overlay")
+                .join(name)
+                .join("upper"),
+        ] {
+            let empty = match fs::read_dir(&path) {
+                Ok(mut entries) => Ok(entries.next().is_none()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+                Err(error) => Err(error),
+            };
+            inspected.push((path, empty));
+        }
+    }
+    prepare_job_home(&home).unwrap();
+    for (path, empty) in inspected {
+        assert!(
+            empty.unwrap(),
+            "cache files copied into {} before Cargo ran",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn overlay_backing_path_is_reserved_for_tenant_network_jobs() {
+    let f = Fixture::new();
+    let mut config = crate::Config::new(&f.state, "reserved-overlay");
+    let reserved = |config: &crate::Config| {
+        reserved_destinations(config).contains(&PathBuf::from(cargo_overlay::LAYERS))
+    };
+    assert!(!reserved(&config));
+    config.tenant_vm = true;
+    config.job_network = Some(crate::network::JobNetwork::Veth);
+    assert!(reserved(&config));
+    config.boat_profile = true;
+    assert!(!reserved(&config));
+}
+
 #[test]
 #[ignore = "operator only: non-root account with sudo -n, provisioned motor_net and trusted host isolation"]
 fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
@@ -64,6 +113,10 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
     )
     .unwrap();
     let before = fingerprint(&shared);
+    for name in ["registry", "git"] {
+        cargo_overlay::ownership::validate(&shared.join(name));
+        cargo_overlay::ownership::validated_owner(&shared.join(name)).unwrap();
+    }
 
     // An offline job still reads the shared trees and cannot write to them.
     let mut offline = f.sandbox().in_tenant_vm(true);
@@ -79,11 +132,6 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
 
     let mut sandbox = f.sandbox().in_tenant_vm(true);
     shared_cache(&mut sandbox, &shared);
-    // The tenant daemon is root, but operator fixtures delegate only individual
-    // privileged operations. Grant the trusted preparer access for the reflink
-    // copy, then revoke that access before launching any job code.
-    let home = sandbox.runtime.0.join("home");
-    restore_runner_access(&home).unwrap();
     let sandbox = host_inputs::fixture::with(
         host_inputs::fixture::Inputs {
             environment: BTreeMap::from([("CARGO_HOME", shared.clone().into_os_string())]),
@@ -92,9 +140,22 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
         },
         || sandbox.with_network().unwrap(),
     );
-    prepare_job_home(&home).unwrap();
     let runtime = sandbox.runtime.0.clone();
-    let (status, stdout, stderr) = output(&sandbox, "python3 cargo-network-probe.py", &f.workspace);
+    no_seeded_files(&sandbox);
+    let mut launch = sandbox
+        .launch("python3 cargo-network-probe.py", &f.workspace, &[])
+        .unwrap();
+    // Namespace setup has finished, but the start gate still prevents Cargo
+    // from running. Even a populated lower must leave both uppers empty.
+    no_seeded_files(&sandbox);
+    launch.release().unwrap();
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    launch.stdout.read_to_string(&mut stdout).unwrap();
+    launch.stderr.read_to_string(&mut stderr).unwrap();
+    let status = launch.wait().unwrap();
+    launch.reap();
+    drop(launch);
     assert!(status.success(), "{stdout}\n{stderr}");
     assert!(stdout.contains("downloaded private crate"), "{stdout}");
     assert_eq!(fingerprint(&shared), before);
@@ -104,4 +165,74 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
         "private Cargo cache survived job cleanup"
     );
     assert_eq!(fingerprint(&shared), before);
+}
+
+#[test]
+#[ignore = "operator only: non-root account with sudo -n and trusted host isolation"]
+fn isolated_tenant_overlay_refuses_mixed_cache_owners() {
+    let f = Fixture::new();
+    let lower = f.scratch.join("lower");
+    fs::create_dir(&lower).unwrap();
+    fs::write(lower.join("foreign-owner"), "cache entry").unwrap();
+    checked(
+        crate::privilege::command("/usr/bin/chown")
+            .args(["--", "motor-job:motor-job"])
+            .arg(lower.join("foreign-owner")),
+    )
+    .unwrap();
+    cargo_overlay::ownership::validate(&lower);
+    let error = cargo_overlay::ownership::validated_owner(&lower).unwrap_err();
+    assert!(
+        error.to_string().contains("cargo_overlay_mixed_ownership"),
+        "{error}"
+    );
+}
+
+#[test]
+#[ignore = "operator only: non-root account with sudo -n and online trusted snapshot helpers"]
+fn isolated_tenant_prefetch_writes_as_validated_cache_owner() {
+    let f = Fixture::new();
+    let scratch = f.scratch.join("prefetch");
+    check_tenant_cargo_fetch(&scratch).unwrap();
+    let registry = scratch.join("cargo-home/registry");
+    let (entries, _) = cargo_overlay::ownership::validate(&registry);
+    assert!(entries > 0, "the cold prefetch must create cache files");
+    let owner = cargo_overlay::ownership::validated_owner(&registry).unwrap();
+    assert_eq!(owner.uid, unsafe { libc::geteuid() });
+}
+
+#[test]
+#[ignore = "operator only: non-root account with sudo -n, a large shared Cargo cache and provisioned motor_net"]
+fn isolated_tenant_net_overlay_setup_on_large_cache() {
+    let _guard = net_operator_lock();
+    let home = PathBuf::from(std::env::var_os("CARGO_HOME").unwrap());
+    let mut entries = 0;
+    let started = Instant::now();
+    for name in ["registry", "git"] {
+        let path = home.join(name);
+        entries += cargo_overlay::ownership::validate(&path).0;
+        cargo_overlay::ownership::validated_owner(&path).unwrap();
+    }
+    println!(
+        "CARGO_OVERLAY_STARTUP entries={entries} elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+    assert!(
+        entries >= 200_000,
+        "use a production-sized shared cache, found {entries} entries"
+    );
+    let f = Fixture::new();
+    let started = Instant::now();
+    let sandbox = f.sandbox().in_tenant_vm(true).with_network().unwrap();
+    println!("CARGO_OVERLAY_PREPARE_MS={}", started.elapsed().as_millis());
+    no_seeded_files(&sandbox);
+    let mut launch = sandbox.launch("true", &f.workspace, &[]).unwrap();
+    no_seeded_files(&sandbox);
+    launch.release().unwrap();
+    assert!(launch.wait().unwrap().success());
+    launch.reap();
+    drop(launch);
+    let started = Instant::now();
+    drop(sandbox);
+    println!("CARGO_OVERLAY_CLEANUP_MS={}", started.elapsed().as_millis());
 }
