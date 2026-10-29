@@ -41,6 +41,182 @@ fn fingerprint(root: &Path) -> String {
     format!("{:x}", hash.finalize())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct InventoryEntry {
+    kind: &'static str,
+    size: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    mtime: (i64, i64),
+    content: Option<String>,
+    acl: String,
+}
+
+type Inventory = BTreeMap<PathBuf, InventoryEntry>;
+
+fn inventory(root: &Path) -> Inventory {
+    fn visit(root: &Path, path: &Path, entries: &mut Inventory) {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            Err(error) => panic!("inventory {path:?}: {error}"),
+        };
+        let kind = if metadata.is_dir() {
+            "directory"
+        } else if metadata.is_file() {
+            "file"
+        } else if metadata.file_type().is_symlink() {
+            "symlink"
+        } else {
+            "special"
+        };
+        let content = if metadata.is_file() {
+            Some(format!("{:x}", Sha256::digest(fs::read(path).unwrap())))
+        } else {
+            None
+        };
+        let acl = Command::new("/usr/bin/getfacl")
+            .args(["-c", "-n", "-p", "-P", "--"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(acl.status.success());
+        entries.insert(
+            path.strip_prefix(root).unwrap().to_path_buf(),
+            InventoryEntry {
+                kind,
+                size: metadata.len(),
+                mode: metadata.mode(),
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                mtime: (metadata.mtime(), metadata.mtime_nsec()),
+                content,
+                acl: format!("{:x}", Sha256::digest(acl.stdout)),
+            },
+        );
+        if metadata.is_dir() {
+            let mut children: Vec<_> = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            children.sort();
+            for child in children {
+                visit(root, &child, entries);
+            }
+        }
+    }
+    let mut entries = BTreeMap::new();
+    visit(root, root, &mut entries);
+    entries
+}
+
+fn inventory_diff(before: &Inventory, after: &Inventory) -> String {
+    fn describe(entry: Option<&InventoryEntry>) -> String {
+        match entry {
+            None => "<absent>".into(),
+            Some(entry) => format!(
+                "kind={} size={} mode={:06o} owner={}:{} mtime={}.{:09} content={} acl={}",
+                entry.kind,
+                entry.size,
+                entry.mode,
+                entry.uid,
+                entry.gid,
+                entry.mtime.0,
+                entry.mtime.1,
+                entry.content.as_deref().unwrap_or("-"),
+                entry.acl,
+            ),
+        }
+    }
+    let paths: std::collections::BTreeSet<_> = before.keys().chain(after.keys()).collect();
+    let changed: Vec<_> = paths
+        .into_iter()
+        .filter(|path| before.get(*path) != after.get(*path))
+        .collect();
+    if changed.is_empty() {
+        return String::new();
+    }
+    // One header, at most 48 path records, and one truncation line stay within
+    // 50 lines. Debug paths escape newlines in unexpected cache filenames.
+    let mut lines = vec![format!(
+        "shared-cache inventory differences: {} changed paths",
+        changed.len()
+    )];
+    for path in changed.iter().take(48) {
+        lines.push(format!(
+            "{path:?}: before [{}] -> after [{}]",
+            describe(before.get(*path)),
+            describe(after.get(*path))
+        ));
+    }
+    if changed.len() > 48 {
+        lines.push(format!(
+            "... {} more changed paths omitted",
+            changed.len() - 48
+        ));
+    }
+    lines.join("\n")
+}
+
+struct CacheSnapshot {
+    fingerprint: String,
+    inventory: Inventory,
+}
+
+impl CacheSnapshot {
+    fn capture(root: &Path) -> Self {
+        Self {
+            fingerprint: fingerprint(root),
+            inventory: inventory(root),
+        }
+    }
+
+    fn assert_unchanged(&self, root: &Path) {
+        let after = inventory(root);
+        let differences = inventory_diff(&self.inventory, &after);
+        if !differences.is_empty() {
+            eprintln!("{differences}");
+        }
+        // Retain the original byte/ACL/metadata fingerprint and exact equality;
+        // the inventory is diagnostic only and excludes nothing from the check.
+        let actual = fingerprint(root);
+        if actual != self.fingerprint && differences.is_empty() {
+            eprintln!("shared-cache digest changed without a recorded per-path difference; cache changed during inventory capture");
+        }
+        assert_eq!(actual, self.fingerprint);
+    }
+}
+
+#[test]
+fn shared_cache_inventory_diff_reports_fields_and_is_bounded() {
+    let scratch = cortexkit_test_support::ScratchDir::new("shared-cache-diff");
+    let before = inventory(scratch.path());
+    for number in 0..60 {
+        fs::write(scratch.path().join(format!("file-{number:02}")), "changed").unwrap();
+    }
+    let after = inventory(scratch.path());
+    let differences = inventory_diff(&before, &after);
+    assert!(differences.lines().count() <= 50);
+    for field in [
+        "file-00",
+        "kind=file",
+        "size=7",
+        "mode=",
+        "owner=",
+        "mtime=",
+        "content=",
+        "acl=",
+        "omitted",
+    ] {
+        assert!(
+            differences.contains(field),
+            "missing {field}: {differences}"
+        );
+    }
+    assert!(!inventory_diff(&after, &after).contains("changed"));
+}
+
 fn shared_cache(sandbox: &mut Sandbox, shared: &Path) {
     for name in ["registry", "git"] {
         let destination = sandbox.cargo.join(name);
@@ -139,7 +315,7 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
         include_str!("../../test-fixtures/cargo-network-probe.py"),
     )
     .unwrap();
-    let before = fingerprint(&shared);
+    let offline_before = CacheSnapshot::capture(&shared);
     cargo_overlay::ownership::validate(&shared.join("registry/cache"));
     cargo_overlay::ownership::validated_owner(&shared.join("registry/cache")).unwrap();
 
@@ -153,7 +329,7 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
     );
     assert!(status.success(), "{stdout}\n{stderr}");
     drop(offline);
-    assert_eq!(fingerprint(&shared), before);
+    offline_before.assert_unchanged(&shared);
 
     let mut sandbox = f.sandbox().in_tenant_vm(true);
     shared_cache(&mut sandbox, &shared);
@@ -165,6 +341,10 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
         },
         || sandbox.with_network().unwrap(),
     );
+    // Trusted seed preparation creates Cargo's two package-cache lock files and
+    // changes their parent's size/mtime. Snapshot after that authorized setup,
+    // before namespace setup or job code, without excluding any cache path.
+    let before = CacheSnapshot::capture(&shared);
     let runtime = sandbox.runtime.0.clone();
     no_seeded_files(&sandbox);
     let overlays = sandbox.cargo_overlays.take();
@@ -209,13 +389,13 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
     drop(launch);
     assert!(status.success(), "{stdout}\n{stderr}");
     assert!(stdout.contains("downloaded private crate"), "{stdout}");
-    assert_eq!(fingerprint(&shared), before);
+    before.assert_unchanged(&shared);
     drop(sandbox);
     assert!(
         !runtime.exists(),
         "private Cargo cache survived job cleanup"
     );
-    assert_eq!(fingerprint(&shared), before);
+    before.assert_unchanged(&shared);
 }
 
 #[test]
