@@ -2052,6 +2052,200 @@ fn nested_lockfile_prefetch_populates_offline_sources() {
     cargo_prefetch_fixture(true);
 }
 
+fn cargo_sibling_fixture(path: &Path, tree: &str) -> SiblingSnapshot {
+    SiblingSnapshot {
+        canonical_path: path.to_string_lossy().into_owned(),
+        commit: String::new(),
+        tree_hash: tree.to_owned(),
+        base_commit: None,
+    }
+}
+
+#[test]
+fn sibling_lockfile_prefetch_populates_offline_registry_sources() {
+    use sha2::{Digest, Sha256};
+    let f = Fixture::new();
+    cargo_package_fixture(&f.workspace, "main-probe", false);
+    commit_cargo_fixture(&f.workspace);
+    let sibling = f.scratch.join("sibling");
+    cargo_package_fixture(&sibling, "sibling-probe", false);
+
+    // A local registry keeps the test independent of public registries and the host cache.
+    let registry = f.scratch.join("registry");
+    let package = registry.join("sibling-only-1.0.0");
+    fs::create_dir_all(package.join("src")).unwrap();
+    fs::write(package.join("src/lib.rs"), "pub fn sibling_only() {}\n").unwrap();
+    fs::write(
+        package.join("Cargo.toml"),
+        "[package]\nname='sibling-only'\nversion='1.0.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    let archive = registry.join("sibling-only-1.0.0.crate");
+    checked(
+        Command::new("tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&registry)
+            .arg("sibling-only-1.0.0"),
+    )
+    .unwrap();
+    let checksum = format!("{:x}", Sha256::digest(fs::read(&archive).unwrap()));
+    let index = registry.join("index");
+    fs::create_dir_all(index.join("si/bl")).unwrap();
+    fs::write(
+        index.join("config.json"),
+        serde_json::json!({"dl": format!("file://{}/{{crate}}-{{version}}.crate", registry.display())}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        index.join("si/bl/sibling-only"),
+        serde_json::json!({"name":"sibling-only", "vers":"1.0.0", "deps":[], "cksum":checksum, "features":{}, "yanked":false}).to_string(),
+    )
+    .unwrap();
+    commit_cargo_fixture(&index);
+    let registry_url = format!("file://{}", index.display());
+    fs::write(
+        sibling.join("Cargo.toml"),
+        "[package]\nname='sibling-probe'\nversion='0.2.0'\nedition='2021'\n[workspace]\n[dependencies]\nsibling-only={version='=1.0.0',registry='fixture'}\n",
+    )
+    .unwrap();
+    fs::write(
+        sibling.join("Cargo.lock"),
+        format!("version=4\n[[package]]\nname='sibling-probe'\nversion='0.2.0'\ndependencies=['sibling-only']\n[[package]]\nname='sibling-only'\nversion='1.0.0'\nsource='registry+{registry_url}'\nchecksum='{checksum}'\n"),
+    )
+    .unwrap();
+    commit_cargo_fixture(&sibling);
+    let sibling_tree = workspace::git(&sibling, &["rev-parse", "HEAD^{tree}"]).unwrap();
+    let siblings = [cargo_sibling_fixture(&sibling, &sibling_tree)];
+    for tenant_vm in [false, true] {
+        let cargo = f.scratch.join(format!("cold-cargo-{tenant_vm}"));
+        fs::create_dir_all(&cargo).unwrap();
+        fs::write(
+            cargo.join("config.toml"),
+            format!("[registries.fixture]\nindex='{registry_url}'\n"),
+        )
+        .unwrap();
+        let rustup = PathBuf::from(std::env::var_os("RUSTUP_HOME").unwrap());
+        let offline = || {
+            let mut command = workspace::dependencies::fetch_command(
+                &f.state,
+                &sibling,
+                &BTreeMap::new(),
+                &cargo,
+                &rustup,
+            )
+            .unwrap();
+            command.env("CARGO_NET_OFFLINE", "true");
+            command.output().unwrap()
+        };
+        assert!(
+            !offline().status.success(),
+            "sibling-only crate must start cold"
+        );
+        prefetch_cargo_dependencies(
+            false,
+            tenant_vm,
+            &f.state,
+            &f.workspace,
+            "HEAD",
+            &siblings,
+            &BTreeMap::new(),
+            &cargo,
+            &rustup,
+            None,
+        )
+        .unwrap();
+        let ready = offline();
+        assert!(
+            ready.status.success(),
+            "sibling registry sources not prefetched: {}",
+            String::from_utf8_lossy(&ready.stderr)
+        );
+        assert!(
+            !sibling.join("target").exists(),
+            "trusted prefetch must not compile"
+        );
+    }
+}
+
+#[test]
+fn sibling_cargo_prefetch_uses_resolved_snapshot_and_its_tree() {
+    let f = Fixture::new();
+    let caller = f.scratch.join("caller/sibling");
+    let snapshot = f.scratch.join("snapshots/sibling");
+    let siblings = [cargo_sibling_fixture(&caller, "sibling-tree")];
+    let config = crate::engine::Config::new(&f.scratch, "runner");
+    let snapshots = SnapshotSiblings {
+        config: &config,
+        siblings: vec![(snapshot.clone(), caller.clone())],
+    };
+    let mut prepared = Vec::new();
+    prepare_cargo_checkouts(
+        (&f.workspace).into(),
+        "main-tree",
+        &siblings,
+        Some(&snapshots),
+        |checkout, tree| {
+            prepared.push((
+                checkout.host.as_path().to_path_buf(),
+                checkout.caller.to_path_buf(),
+                tree.to_owned(),
+            ));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        prepared,
+        vec![
+            (f.workspace.clone(), f.workspace.clone(), "main-tree".into()),
+            (snapshot, caller, "sibling-tree".into()),
+        ]
+    );
+}
+
+#[test]
+fn sibling_root_cargo_fetch_failure_is_fatal_and_names_checkout() {
+    let f = Fixture::new();
+    fs::write(f.workspace.join("source"), "main checkout").unwrap();
+    commit_cargo_fixture(&f.workspace);
+    let sibling = f.scratch.join("sibling");
+    cargo_package_fixture(&sibling, "sibling-probe", false);
+    commit_cargo_fixture(&sibling);
+    let siblings = [cargo_sibling_fixture(&sibling, "HEAD")];
+    for tenant_vm in [false, true] {
+        let error = prepare_cargo_checkouts(
+            (&f.workspace).into(),
+            "HEAD",
+            &siblings,
+            None,
+            |checkout, tree| {
+                prefetch_cargo_with(
+                    checkout.host.as_path(),
+                    tree,
+                    tenant_vm,
+                    NESTED_CARGO_FETCH_TIMEOUT,
+                    |_| {
+                        let mut command = Command::new("sh");
+                        command
+                            .args(["-c", "echo 'sibling-only registry unavailable' >&2; exit 1"]);
+                        Ok(command)
+                    },
+                    |path, error| panic!("required sibling graph was skipped: {path:?}: {error}"),
+                )
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(sibling.to_str().unwrap()), "{error}");
+        assert!(
+            error.contains("sibling-only registry unavailable"),
+            "{error}"
+        );
+    }
+}
+
 #[test]
 fn cargo_prefetch_is_bounded_and_ignores_untracked_lockfiles() {
     let f = Fixture::new();
@@ -2405,6 +2599,7 @@ fn cargo_prefetch_fixture(nested: bool) {
         &f.state,
         &branch,
         "HEAD",
+        &[],
         &BTreeMap::new(),
         &cargo,
         &rustup,
@@ -2427,7 +2622,16 @@ fn cargo_prefetch_fixture(nested: bool) {
     );
     let routes = BTreeMap::from([(url, mirror)]);
     prefetch_cargo_dependencies(
-        true, false, &f.state, &tip, "HEAD", &routes, &cargo, &rustup, None,
+        true,
+        false,
+        &f.state,
+        &tip,
+        "HEAD",
+        &[],
+        &routes,
+        &cargo,
+        &rustup,
+        None,
     )
     .unwrap();
     let ready = metadata();
@@ -2729,6 +2933,64 @@ fn tenant_job_unit_does_not_inherit_daemon_dns_or_network_authority() {
     );
 }
 
+#[test]
+#[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
+fn isolated_sibling_lockfile_prefetch_uses_snapshot_registry_graph() {
+    let scratch = cortexkit_test_support::ScratchDir::new("sibling-registry-prefetch-view");
+    let mut config = crate::engine::Config::new(scratch.join("runner"), "sibling-prefetch");
+    config.isolate_jobs = true;
+    let state = config.state_dir();
+    fs::create_dir_all(&state).unwrap();
+    let workspace = scratch.join("source/main");
+    let host = scratch.join("source/sibling");
+    let snapshot = config.sibling_snapshots_dir().join("sibling/1");
+    cargo_package_fixture(&workspace, "main-probe", false);
+    cargo_package_fixture(&host, "unrelated-host-probe", true);
+    cargo_package_fixture(&snapshot, "sibling-probe", false);
+    fs::write(
+        snapshot.join("Cargo.toml"),
+        "[package]\nname='sibling-probe'\nversion='0.2.0'\nedition='2021'\n[workspace]\n[dependencies]\nitoa='=1.0.18'\n",
+    ).unwrap();
+    fs::write(
+        snapshot.join("Cargo.lock"),
+        "version=4\n[[package]]\nname='sibling-probe'\nversion='0.2.0'\ndependencies=['itoa']\n[[package]]\nname='itoa'\nversion='1.0.18'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682'\n",
+    ).unwrap();
+    for checkout in [&workspace, &snapshot] {
+        commit_cargo_fixture(checkout);
+    }
+    let tree = workspace::git(&snapshot, &["rev-parse", "HEAD^{tree}"]).unwrap();
+    let siblings = [cargo_sibling_fixture(&host, &tree)];
+    let cargo = scratch.join("cold-cargo-home");
+    fs::create_dir_all(&cargo).unwrap();
+    let rustup = PathBuf::from(std::env::var_os("RUSTUP_HOME").unwrap());
+    prefetch_cargo_dependencies(
+        false,
+        false,
+        &state,
+        &workspace,
+        "HEAD",
+        &siblings,
+        &BTreeMap::new(),
+        &cargo,
+        &rustup,
+        Some(&SnapshotSiblings {
+            config: &config,
+            siblings: vec![(snapshot.clone(), host)],
+        }),
+    )
+    .unwrap();
+    let mut offline = workspace::dependencies::fetch_command(
+        &state,
+        &snapshot,
+        &BTreeMap::new(),
+        &cargo,
+        &rustup,
+    )
+    .unwrap();
+    offline.env("CARGO_NET_OFFLINE", "true");
+    checked(&mut offline).expect("trusted helper must populate the sibling's own registry graph");
+}
+
 /// The trusted prefetch resolves a `../b/crate` path dependency from the
 /// sibling's snapshot, not from the host checkout at the sibling's path. The
 /// host checkout's crate declares a dependency that the workspace's
@@ -2786,6 +3048,7 @@ fn isolated_prefetch_resolves_sibling_path_dependency_from_snapshot() {
             &state,
             &workspace,
             "HEAD",
+            &[],
             &BTreeMap::new(),
             &cargo,
             &rustup,

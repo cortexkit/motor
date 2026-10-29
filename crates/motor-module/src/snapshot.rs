@@ -925,14 +925,24 @@ impl Snapshots {
                 })?,
             );
         }
-        let git_dependencies =
-            lockfile_sources(&main.path, &main.commit).map_err(|error| Failure {
-                tree_hash: hash,
-                check: format!(
-                    "cannot read git dependencies from Cargo.lock at {}: {error}",
-                    main.commit
-                ),
-            })?;
+        let mut git_dependencies: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for checkout in std::iter::once(&main).chain(&snapshots) {
+            let sources =
+                lockfile_sources(&checkout.path, &checkout.commit).map_err(|error| Failure {
+                    tree_hash: hash.clone(),
+                    check: format!(
+                        "cannot read git dependencies from Cargo.lock in {} at {}: {error}",
+                        checkout.repository, checkout.commit
+                    ),
+                })?;
+            for (url, commits) in sources {
+                git_dependencies.entry(url).or_default().extend(commits);
+            }
+        }
+        for commits in git_dependencies.values_mut() {
+            commits.sort();
+            commits.dedup();
+        }
         Ok(Self {
             main,
             siblings: snapshots,
@@ -1770,6 +1780,86 @@ mod tests {
             commits: vec![feature],
         }];
         assert_eq!(snapshots.bundle(Uuid::now_v7(), &held).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sibling_lockfile_git_dependency_arrives_as_bundle() {
+        const CHILD: &str = "MOTOR_TEST_SIBLING_DEPENDENCY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Give the transfer its own Cargo cache without changing other tests' environment.
+            let home = ScratchDir::new("motor-sibling-cargo-home");
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "snapshot::tests::sibling_lockfile_git_dependency_arrives_as_bundle",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("CARGO_HOME", home.as_ref())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "sibling transfer failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let (_dependency_scratch, dependency, _, commit) = repository();
+        let cache = cargo_home().unwrap().join("git/db/sibling-dependency-test");
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        git(
+            &dependency,
+            &["clone", "--bare", ".", text(&cache).unwrap()],
+        )
+        .unwrap();
+        let (_scratch, checkout, spool, _) = repository();
+        let (_sibling_scratch, sibling, _, _) = repository();
+        let url = "https://example.invalid/sibling-dependency.git";
+        fs::write(
+            sibling.join("Cargo.lock"),
+            format!("version=4\n[[package]]\nname='dependency'\nversion='0.1.0'\nsource='git+{url}#{commit}'\n"),
+        )
+        .unwrap();
+        assert!(!checkout.join("Cargo.lock").exists());
+        let storage = Storage::open(&spool.join("store")).unwrap();
+        let snapshots = Snapshots::build(
+            &Config::default(),
+            text(&checkout).unwrap(),
+            text(&checkout).unwrap(),
+            &[text(&sibling).unwrap().to_owned()],
+            &spool,
+            Uuid::now_v7(),
+            None,
+            &storage,
+        )
+        .unwrap_or_else(|failure| panic!("{}", failure.check));
+        // Only the captured lockfile may select dependencies, not later caller edits.
+        fs::write(sibling.join("Cargo.lock"), "invalid later lockfile").unwrap();
+        let (_, dependencies, upload) = snapshots
+            .transfer_bundles(Uuid::now_v7(), &[], Some(&[]))
+            .unwrap();
+        assert_eq!(dependencies.len(), 1, "sibling dependency was not declared");
+        assert_eq!(dependencies[0].url, url);
+        assert_eq!(dependencies[0].commits, vec![commit.clone()]);
+        let manifest = dependencies[0]
+            .bundle
+            .as_ref()
+            .expect("cold dependency bundle");
+        assert!(upload.contains(manifest));
+        let bundle = snapshots.spool.0.join(format!("bundle-{}", manifest.index));
+        let heads = git(&checkout, &["bundle", "list-heads", text(&bundle).unwrap()]).unwrap();
+        assert_eq!(heads, format!("{commit} refs/ck-motor/dep/{commit}"));
+        let held = [GitDependencyCandidates {
+            url: url.into(),
+            commits: vec![commit],
+        }];
+        let (_, dependencies, _) = snapshots
+            .transfer_bundles(Uuid::now_v7(), &[], Some(&held))
+            .unwrap();
+        assert!(dependencies[0].bundle.is_none());
     }
 
     #[test]

@@ -55,6 +55,51 @@ fn import(runner: &Runner, directory: &Path, deps: &[GitDependency]) {
         .import_dependencies(directory, deps)
         .unwrap();
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn sibling_git_lockfile_pins_routed_bundle_aliases() {
+    let f = Fixture::new();
+    let oid = git(&f.main, &["rev-parse", "HEAD"]);
+    fs::write(
+        f.sibling.join("Cargo.lock"),
+        format!("version=4\n[[package]]\nname='private'\nversion='0.1.0'\nsource='git+{URL}?branch=sibling#{oid}'\n"),
+    ).unwrap();
+    commit(&f.sibling, "sibling locked dependency");
+    let mut config = f.config();
+    config.manual_tick = true;
+    let runner = Runner::open(config).unwrap();
+    let (mut request, bytes) = f.run("true");
+    let (mut dependency, bundle) = dep_bundle(&f, &f.main, &oid, 2, &[]);
+    let directory = stage(&f, &dependency, &bundle);
+    import(&runner, &directory, std::slice::from_ref(&dependency));
+    dependency.bundle = None;
+    request.git_dependencies = vec![dependency];
+    upload_and_fetch(&runner, &request, &bytes);
+    let trees = &runner.core.trees;
+    let lockfiles = trees.checkout_dependency_lockfiles(
+        &request.repository_root,
+        &request.snapshot_commit,
+        &request.siblings,
+    );
+    assert!(lockfiles[0].is_empty(), "main has no git dependencies");
+    assert_eq!(lockfiles.len(), 2);
+    let (routes, missing) = trees
+        .dependency_fetch_routes_for_lockfiles(&request.git_dependencies, &lockfiles)
+        .unwrap();
+    assert!(missing.is_empty(), "{missing:?}");
+    trees
+        .refresh_dependency_aliases_for_lockfiles(&lockfiles, &routes)
+        .unwrap();
+    let mirror = &routes[URL];
+    assert_eq!(git(mirror, &["rev-parse", "refs/heads/sibling"]), oid);
+    assert_eq!(git(mirror, &["rev-parse", "HEAD"]), oid);
+    assert_eq!(
+        git(mirror, &["rev-parse", &format!("refs/ck-motor/dep/{oid}")]),
+        oid
+    );
+}
+
 #[test]
 fn dependency_bad_commit_and_local_urls_are_refused() {
     for oid in [
