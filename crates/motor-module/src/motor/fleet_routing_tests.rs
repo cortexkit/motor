@@ -100,6 +100,40 @@ async fn fleet_linux_default_platform_jobs_allow_hosted_spill() {
 }
 
 #[tokio::test]
+async fn fleet_workspace_with_a_recorded_placement_leaves_affinity_to_the_broker() {
+    let h = Harness::new(Behavior::CompleteRun).await;
+    let (scratch, repo) = committed_repo();
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let root = scratch.0.join("state");
+    let motor = Motor::with_connector(config(&h), &root, ssh.clone()).unwrap();
+    let stream = motor.run(request(&repo)).unwrap();
+    let first_id = stream.job_id;
+    let (_, terminal) = records(stream).await;
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+    let placement = motor.hosted_state(first_id).unwrap().placement.unwrap();
+    drop(motor);
+
+    let restored = Motor::with_connector(config(&h), &root, ssh.clone()).unwrap();
+    assert_eq!(
+        restored.hosted_state(first_id).unwrap().placement,
+        Some(placement)
+    );
+    let stream = restored.run(request(&repo)).unwrap();
+    let id = stream.job_id;
+    let (_, terminal) = records(stream).await;
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+    assert!(restored.hosted_state(id).unwrap().fleet_routed);
+    let bodies = lease_bodies(&h);
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(
+        bodies[0]["workspace_key_hash"],
+        bodies[1]["workspace_key_hash"]
+    );
+    assert_eq!(bodies[1]["placement_hint"], serde_json::Value::Null);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn fleet_gate_takes_a_host_only_lease_and_sends_the_gate_mark() {
     let h = Harness::new(Behavior::CompleteRun).await;
     let (scratch, repo) = committed_repo();

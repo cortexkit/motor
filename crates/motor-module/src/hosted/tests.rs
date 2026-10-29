@@ -1183,6 +1183,75 @@ fn cloud_no_host_fits_request_matches_the_vector_body_and_hash() {
 }
 
 #[tokio::test]
+async fn stored_legacy_cached_hint_is_replayed_without_changing_the_lease_hash() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    let request = Harness::request(&scratch.0);
+    let hint = Placement {
+        host: "draining-host".into(),
+        vm: Some("old-vm".into()),
+    };
+    let body = lease_body(
+        id,
+        &request,
+        (
+            motor_lease::base64url(&[1; 32]),
+            motor_lease::base64url(&[2; 32]),
+        ),
+        Some(hint.clone()),
+        None,
+        RequesterJwk::from_key(&SigningKey::from_bytes(&[3; 32]).verifying_key()),
+        Some(true),
+    )
+    .unwrap();
+    let expected = canonical_lease_bytes(&body);
+    let mut route = h.route.clone();
+    route.fleet_routed = true;
+    route.lease_request = Some(body);
+    let storage = stored(&scratch, id, route.clone());
+    drop(storage);
+
+    let storage = Arc::new(Storage::open(&scratch.0.join("state")).unwrap());
+    assert!(storage
+        .job(id)
+        .unwrap()
+        .hosted
+        .unwrap()
+        .repository_placement_hint
+        .is_none());
+    for _ in 0..2 {
+        drop(
+            Client::new(route.clone())
+                .run(id, &request, &storage)
+                .await
+                .unwrap()
+                .0,
+        );
+    }
+    let bodies = h.lease_bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    for bytes in bodies.iter() {
+        let sent: LeaseRequest = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(sent.placement_hint, Some(hint.clone()));
+        assert_eq!(canonical_lease_bytes(&sent), expected);
+    }
+    assert_eq!(
+        canonical_lease_bytes(
+            &storage
+                .job(id)
+                .unwrap()
+                .hosted
+                .unwrap()
+                .lease_request
+                .unwrap()
+        ),
+        expected
+    );
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn stored_allow_spill_presence_and_value_survive_lease_re_requests() {
     for allow_spill in [None, Some(false), Some(true)] {
         let h = Harness::new(Behavior::Normal).await;

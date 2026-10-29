@@ -125,9 +125,7 @@ async fn repository_routed_lease_carries_the_configured_hint_without_caching_it_
     config.hosted_repositories_placement_hint = Some(control_placement());
     let root = scratch.0.join("state");
     let motor = Motor::with_connector(config, &root, ssh.clone()).unwrap();
-    let request = request(&repo);
-    let workspace_key = request.workspace_key.clone();
-    let stream = motor.run(request).unwrap();
+    let stream = motor.run(request(&repo)).unwrap();
     let id = stream.job_id;
     let (_, terminal) = records(stream).await;
     assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
@@ -140,17 +138,32 @@ async fn repository_routed_lease_carries_the_configured_hint_without_caching_it_
     assert_eq!(bodies[0]["allow_spill"], false);
     assert_eq!(bodies[0]["avoid_host"], serde_json::Value::Null);
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
-    assert!(motor.storage.hosted_placement(&workspace_key).is_none());
     drop(motor);
 
-    let restored = Motor::with_connector(h.config(), &root, ssh).unwrap();
+    let restored = Motor::with_connector(
+        Config {
+            hosted_fleet_routing: true,
+            ..h.config()
+        },
+        &root,
+        ssh.clone(),
+    )
+    .unwrap();
     let state = restored.hosted_state(id).unwrap();
     assert_eq!(state.repository_placement_hint, Some(control_placement()));
     assert_eq!(
         state.lease_request.unwrap().placement_hint,
         Some(control_placement())
     );
-    assert!(restored.storage.hosted_placement(&workspace_key).is_none());
+    let stream = restored.run(request(&repo)).unwrap();
+    let fleet_id = stream.job_id;
+    let (_, terminal) = records(stream).await;
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+    assert!(restored.hosted_state(fleet_id).unwrap().fleet_routed);
+    let bodies = lease_bodies(&h);
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[1]["placement_hint"], serde_json::Value::Null);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

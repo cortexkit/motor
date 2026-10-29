@@ -592,23 +592,6 @@ impl Storage {
             s.jobs.entry(id).or_default().hosted = Some(route);
         })
     }
-    pub(crate) fn hosted_placement(&self, key: &str) -> Option<motor_lease::Placement> {
-        self.state
-            .lock()
-            .unwrap()
-            .jobs
-            .values()
-            .rev()
-            .find(|j| {
-                j.workspace_key.as_deref() == Some(key)
-                    && j.hosted.as_ref().is_some_and(|h| {
-                        // A host selected by a repository placement hint must
-                        // not become a warm hint for jobs that did not select it.
-                        h.placement.is_some() && h.repository_placement_hint.is_none()
-                    })
-            })
-            .and_then(|j| j.hosted.as_ref()?.placement.clone())
-    }
     pub(crate) fn hosted_salt(&self) -> io::Result<[u8; 32]> {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let _guard = self.state.lock().unwrap();
