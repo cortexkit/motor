@@ -771,6 +771,10 @@ impl Storage {
     pub fn job(&self, id: Uuid) -> Option<Job> {
         self.state.lock().unwrap().jobs.get(&id).cloned()
     }
+    #[cfg(test)]
+    pub(crate) fn job_count(&self) -> usize {
+        self.state.lock().unwrap().jobs.len()
+    }
     pub(crate) fn keyed_job(&self, principal: &str, key: &str) -> io::Result<Option<(Uuid, Job)>> {
         self.update(|_| {})?;
         Ok(self
