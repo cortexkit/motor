@@ -176,6 +176,7 @@ fn health_reports_reserved_permits_pending_jobs_and_optional_wire_fields() {
         "permits_held",
         "permits_cap",
         "queue_wait_1h",
+        "oldest_wait_s",
         "remote_cache",
     ] {
         legacy.as_object_mut().unwrap().remove(key);
@@ -183,8 +184,64 @@ fn health_reports_reserved_permits_pending_jobs_and_optional_wire_fields() {
     let decoded: RunnerHealth = serde_json::from_value(legacy.clone()).unwrap();
     assert!(decoded.load_1m.is_none());
     assert!(decoded.queue_wait_1h.is_none());
+    assert!(decoded.oldest_wait_s.is_none());
     assert!(decoded.remote_cache.is_none());
     assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+}
+
+#[test]
+fn health_oldest_wait_tracks_pending_jobs_and_ignores_running_jobs() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.manual_tick = true;
+    let runner = Runner::open(config).unwrap();
+    assert_eq!(
+        runner.runner_status().health.unwrap().oldest_wait_s,
+        Some(0)
+    );
+    let (request, _) = f.run("true");
+    let mut queued = request.clone();
+    queued.job_id = Uuid::now_v7();
+    let mut running = request.clone();
+    running.job_id = Uuid::now_v7();
+    for request in [&request, &queued, &running] {
+        runner.accept(request.clone()).unwrap();
+    }
+    let now = f.clock.load(Ordering::SeqCst);
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let upload = inner.jobs.get_mut(&request.job_id).unwrap();
+        upload.accepted_ms = now - 15_999;
+        runner.save(upload).unwrap();
+        let queued = inner.jobs.get_mut(&queued.job_id).unwrap();
+        queued.state = JobState::Queued;
+        queued.accepted_ms = now - 60_000;
+        queued.queued_ms = Some(now - 5_000);
+        runner.save(queued).unwrap();
+        let running = inner.jobs.get_mut(&running.job_id).unwrap();
+        running.state = JobState::Running;
+        running.accepted_ms = now - 120_000;
+        runner.save(running).unwrap();
+    }
+    assert_eq!(
+        runner.runner_status().health.unwrap().oldest_wait_s,
+        Some(15)
+    );
+    f.clock.fetch_add(2_000, Ordering::SeqCst);
+    assert_eq!(
+        runner.runner_status().health.unwrap().oldest_wait_s,
+        Some(17)
+    );
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let upload = inner.jobs.get_mut(&request.job_id).unwrap();
+        upload.state = JobState::Running;
+        runner.save(upload).unwrap();
+    }
+    assert_eq!(
+        runner.runner_status().health.unwrap().oldest_wait_s,
+        Some(7)
+    );
 }
 
 fn recorded_job(

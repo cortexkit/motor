@@ -147,7 +147,7 @@ struct FinishedJob {
 #[derive(Default)]
 pub(super) struct RepositoryUsage {
     jobs: BTreeMap<Uuid, FinishedJob>,
-    pub active: BTreeMap<Uuid, (RunningJob, bool)>,
+    pub active: BTreeMap<Uuid, (RunningJob, bool, u64)>,
     pub underused: BTreeMap<Uuid, HealthUnderusedReservation>,
 }
 
@@ -170,6 +170,7 @@ impl RepositoryUsage {
                 (
                     RunningJob::new(job.id, crate::caller_path::job_key(job), job.weight),
                     job.pending(),
+                    job.queued_ms.unwrap_or(job.accepted_ms),
                 ),
             );
         }

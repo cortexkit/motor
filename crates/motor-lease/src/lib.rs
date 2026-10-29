@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod fake;
+pub mod metrics;
 pub mod types;
 
 pub use auth::*;

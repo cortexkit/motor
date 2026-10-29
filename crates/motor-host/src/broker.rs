@@ -1,4 +1,4 @@
-//! One sender orders heartbeats and usage requests under one durable counter.
+//! One sender orders all signed host requests under one durable counter.
 use crate::{
     billing::{sign_request, Request},
     server::{unix_ms, Runtime},
@@ -56,6 +56,7 @@ pub struct Sender {
     failures: u32,
     /// No request is sent before this time after a failure.
     retry_at_ms: u64,
+    metrics: Option<std::sync::mpsc::Receiver<Request>>,
     #[cfg(test)]
     heartbeats: Heartbeats,
 }
@@ -84,6 +85,12 @@ fn kind(request: &Request) -> &'static str {
 }
 impl Sender {
     #[cfg(test)]
+    pub fn test_metrics(&mut self) -> std::sync::mpsc::SyncSender<Request> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.metrics = Some(rx);
+        tx
+    }
+    #[cfg(test)]
     pub fn test_endpoint(&mut self, endpoint: String) {
         self.endpoint = endpoint;
     }
@@ -101,6 +108,7 @@ impl Sender {
             in_flight: None,
             failures: 0,
             retry_at_ms: 0,
+            metrics: None,
         })
     }
     #[cfg(test)]
@@ -109,6 +117,9 @@ impl Sender {
         self.send_next(now_ms)
     }
     pub fn send_next(&mut self, now_ms: u64) -> Result<()> {
+        // Drain even during backoff: diagnostics must never build an outbox
+        // behind the heartbeat and settlement traffic needed for placement.
+        let metrics = self.metrics.as_ref().and_then(|r| r.try_recv().ok());
         if now_ms < self.retry_at_ms {
             return Ok(());
         }
@@ -151,6 +162,9 @@ impl Sender {
             }
         }
         let Some(request) = self.in_flight.clone() else {
+            if let Some(metrics) = metrics {
+                self.send_metrics(metrics, now_ms)?;
+            }
             return Ok(());
         };
         let headers = {
@@ -233,6 +247,61 @@ impl Sender {
         }
         Ok(())
     }
+    fn send_metrics(&self, request: Request, now_ms: u64) -> Result<()> {
+        if now_ms.saturating_sub(request.created_ms) >= 60_000 {
+            return Ok(());
+        }
+        let headers = {
+            let mut host = self.runtime.host.lock().expect("host lock");
+            // Recheck after collection: an admission can publish a heartbeat
+            // while the sampler is running. Only idle transport sends metrics.
+            if !host.snapshot.outbox.is_empty() {
+                return Ok(());
+            }
+            sign_request(
+                &mut host,
+                &self.runtime.host_id,
+                &request,
+                now_ms,
+                &self.key,
+            )?
+        };
+        let response = self
+            .client
+            .post(format!("{}{}", self.endpoint, request.path))
+            .timeout(METRICS_TIMEOUT)
+            .header("CK-Host", headers.host)
+            .header("CK-Timestamp", headers.timestamp.to_string())
+            .header("CK-Counter", headers.counter.to_string())
+            .header("CK-Signature", headers.signature)
+            .header("Content-Type", "application/json")
+            .body(request.body)
+            .send();
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let mut body = Vec::new();
+                use std::io::Read;
+                let _ = response.take(512).read_to_end(&mut body);
+                let reply = motor_lease::metrics::parse_reply(status, &body);
+                // A timed-out metrics request can arrive after a heartbeat
+                // used a higher counter. The broker rejects only the old
+                // sample; the heartbeat and its host state remain valid.
+                match reply {
+                    motor_lease::metrics::MetricsReply::Accepted => {}
+                    motor_lease::metrics::MetricsReply::AuthFailed => {
+                        tracing::debug!(status, "host_metrics_dropped")
+                    }
+                    motor_lease::metrics::MetricsReply::BadRequest { field } => {
+                        tracing::warn!(status, field, "host_metrics_dropped")
+                    }
+                    _ => tracing::warn!(status, "host_metrics_dropped"),
+                }
+            }
+            Err(_) => tracing::warn!("host_metrics_push_failed"),
+        }
+        Ok(())
+    }
     /// Records the closed accounts a heartbeat reply lists. The heartbeat
     /// already succeeded: a journal failure here is logged, and the broker
     /// lists the same subjects again in its next reply.
@@ -266,7 +335,9 @@ fn lifecycle_state(mut heartbeat: Heartbeat) -> Heartbeat {
     heartbeat
 }
 
-pub fn run(runtime: Arc<Runtime>, key: SigningKey) -> Result<()> {
+const METRICS_TIMEOUT: Duration = Duration::from_secs(3);
+
+pub fn run(runtime: Arc<Runtime>, key: SigningKey, storage: std::path::PathBuf) -> Result<()> {
     let mut heartbeats = Heartbeats::new(runtime.clone());
     // Publishing cannot wait for an in-flight broker response: admission changes
     // and observation timestamps must reach the durable queue during an outage.
@@ -276,7 +347,39 @@ pub fn run(runtime: Arc<Runtime>, key: SigningKey) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(250));
     });
+    let (metrics_tx, metrics_rx) = std::sync::mpsc::sync_channel(1);
+    let sampler_runtime = runtime.clone();
+    std::thread::spawn(move || {
+        let mut sampler = crate::metrics::Sampler::default();
+        // Prime CPU counters so busy_pct describes an interval, not uptime.
+        let _ = sampler.sample(&sampler_runtime, &storage, unix_ms());
+        // Offset the minute timer from heartbeat boundaries: otherwise an idle
+        // host could drop every sample behind the heartbeat due at that instant.
+        let mut next = std::time::Instant::now() + Duration::from_millis(RETRY_MS / 2);
+        loop {
+            std::thread::sleep(next.saturating_duration_since(std::time::Instant::now()));
+            next = std::time::Instant::now() + Duration::from_secs(60);
+            let result = sampler
+                .sample(&sampler_runtime, &storage, unix_ms())
+                .and_then(|sample| {
+                    let body = sample.encode(unix_ms()).map_err(anyhow::Error::msg)?;
+                    Ok(Request {
+                        path: format!("/v1/hosts/{}/metrics", sampler_runtime.host_id),
+                        body,
+                        job: None,
+                        created_ms: sample.at_ms,
+                    })
+                });
+            match result {
+                Ok(request) => {
+                    let _ = metrics_tx.try_send(request);
+                }
+                Err(_) => tracing::warn!("host_metrics_sample_failed"),
+            }
+        }
+    });
     let mut sender = Sender::new(runtime, key)?;
+    sender.metrics = Some(metrics_rx);
     loop {
         if sender.send_next(unix_ms()).is_err() {
             tracing::warn!("host_request_retry");

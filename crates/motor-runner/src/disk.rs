@@ -841,20 +841,26 @@ impl Runner {
     pub fn runner_status(&self) -> RunnerStatusReply {
         let now = self.now();
         // Keep retained job history out of the state-lock path of each probe.
-        let (status, permits_held, fill_permits, held_workspaces) = {
+        let (status, permits_held, fill_permits, held_workspaces, oldest_wait_s) = {
             let inner = self.core.inner.lock().unwrap();
             let usage = self.core.repository_usage.lock().unwrap();
             let active = &usage.active;
-            let queue_depth = active.values().filter(|(_, pending)| *pending).count() as u32;
+            let queue_depth = active.values().filter(|(_, pending, _)| *pending).count() as u32;
+            let oldest_wait_s = active
+                .values()
+                .filter(|(_, pending, _)| *pending)
+                .map(|(_, _, since)| now.saturating_sub(*since) / 1000)
+                .max()
+                .unwrap_or(0);
             let running = active
                 .values()
-                .filter(|(_, pending)| !pending)
-                .map(|(job, _)| job.clone())
+                .filter(|(_, pending, _)| !pending)
+                .map(|(job, _, _)| job.clone())
                 .collect();
             let permits = active
                 .iter()
-                .filter(|(id, (_, pending))| !pending || inner.starting.contains(id))
-                .map(|(_, (job, _))| job.weight)
+                .filter(|(id, (_, pending, _))| !pending || inner.starting.contains(id))
+                .map(|(_, (job, _, _))| job.weight)
                 .sum();
             // Only a tenant VM reports its fill: its host subtracts these
             // permits from the capacity it advertises, so the broker places
@@ -890,6 +896,7 @@ impl Runner {
                 permits,
                 fill_permits,
                 held_workspaces,
+                oldest_wait_s,
             )
         };
         let (repository_usage, underused_reservations) = {
@@ -945,6 +952,7 @@ impl Runner {
                 free_bytes,
                 queue_depth,
                 running,
+                oldest_wait_s: Some(oldest_wait_s),
                 failed_job_units,
                 cleanup_blocked_by_quarantine: self
                     .core

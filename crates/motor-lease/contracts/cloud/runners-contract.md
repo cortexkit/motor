@@ -86,7 +86,8 @@ authentication or body check, with no writes. Unexpected failures return 500
 
 Bodies are UTF-8 JSON. A POST requires media type `application/json`; parameters such as
 `charset=utf-8` are accepted. Missing or different Content-Type, or more than 65536 raw body
-bytes, is 400 `bad_request` at the route's specified check position. GET routes have no body and
+bytes, is 400 `bad_request` at the route's specified check position. Metrics instead has a 16384-byte
+limit and returns 413 above it. GET routes have no body and
 no Content-Type check. Objects at every nesting level have exactly the documented keys: unknown,
 missing or duplicate keys are invalid. Integers are safe JSON numbers without fraction or
 exponent. Body field order need not match the canonical order.
@@ -511,6 +512,14 @@ Hosts are operator-enrolled with a raw 32-byte Ed25519 public key encoded as 64 
 characters. Retired hosts still authenticate and settle existing jobs; they are excluded only
 from new placement.
 
+The registry's `role` is `placement` by default or `monitor`. A monitor has its own signing key
+and may call only the metrics route. Heartbeat and usage return 401 `host_auth_failed` before
+consuming a counter. Placement excludes monitors even if an older heartbeat remains stored.
+An explicit-only hint naming a monitor refuses with 503 `no_capacity` rather than falling back.
+A role is fixed when a host is registered: retire a placement host and let its jobs finish before
+re-registering it as a monitor, because the lease path does not re-read the role when it signs a
+replay or reattach token for a job already on that host.
+
 HTTP header names are case-insensitive. Values are exact:
 
 | Header | Value |
@@ -541,7 +550,8 @@ values. Signature verification precedes JSON parsing.
 After routing, checks run in this order:
 
 1. Invalid path-host grammar, any query string, missing/wrong Content-Type or an oversized body:
-   400 `bad_request`, with no `HostDO` storage or counter write.
+   400 `bad_request`, with no `HostDO` storage or counter write. For metrics only, an oversized
+   body returns 413 with an empty body instead.
 2. Malformed headers, a `CK-Host` mismatch, an unregistered host or a bad signature against its
    registered key: 401 `host_auth_failed`, with no counter write. Signing a request for host B
    with host A's key changes nothing on B. Retirement is not an authentication failure.
@@ -558,6 +568,55 @@ After routing, checks run in this order:
 
 All authentication failures are exactly `{"error":"host_auth_failed"}`. Post-counter 4xx
 outcomes never roll the counter back.
+
+### POST /v1/hosts/{host_id}/metrics
+
+Hosts, including monitor-only machines, push every 60 seconds using the same signature and
+per-host counter as heartbeat and usage. The limit is 16 KiB of raw UTF-8 body bytes. Success is
+204 with no body. Malformed JSON or schema returns 400 `bad_request` with `field`; authentication
+failures are 401 `host_auth_failed`. Size is checked before authentication, schema after it.
+The route never updates heartbeat, placement capacity, availability or admission state. Missing
+metrics never prevents a placement host from receiving jobs.
+
+The strict body has exactly these members (nested objects are strict too):
+
+```json
+{
+  "at_ms": 1800000000000,
+  "cpu": { "threads": 32, "busy_pct": 41, "load1": 12.4 },
+  "mem": { "total_mib": 128000, "avail_mib": 22000 },
+  "disks": [{ "mount": "/", "total_gib": 900, "free_gib": 310 }],
+  "tenants": [{ "vm": "vm-1", "state": "ready", "vcpus": 30, "mem_mib": 106496,
+    "slots_total": 90, "slots_used": 41, "jobs_running": 12, "recovery": null, "detail": null }],
+  "runners": [{ "name": "direct", "state": "ready", "slots_total": 16, "slots_used": 3,
+    "queued": 0, "oldest_wait_s": 0, "detail": null }]
+}
+```
+
+- `at_ms` is within 300000 ms of broker receive time, inclusive in both directions.
+- `cpu.busy_pct` is an integer 0..100; `cpu.load1` is non-negative with at most two decimal
+  places (decimal notation is allowed here, unlike other routes). All other numeric fields are
+  non-negative safe integers. Exponent notation is not accepted.
+- Each array has at most eight entries and may be empty. `mount` is 1..128 UTF-8 bytes with no
+  Unicode control characters. `vm` matches `^[A-Za-z0-9._-]{1,64}$`.
+- Tenant `state` is `ready`, `starting`, `recovering` or `stopped`. `recovery` must be null except
+  for `recovering`, when it is `{ "step": string (1..64 characters), "since_ms": int, "attempts": int }`.
+- Runner `name` matches `^[a-z0-9-]{1,32}$`; its `state` is `ready`, `draining`, `stopped` or `error`.
+- Every `detail` is null or 1..200 UTF-8 bytes without Unicode control characters. It contains
+  only host-generated errors or step names, never job or guest output. Do not include account,
+  workspace, job or path data anywhere in metrics (the disk mount identifies a monitored filesystem).
+
+HostDO holds the latest canonical body with broker `received_at_ms`. D1 `host_metrics_5m` uses
+`floor(received_at_ms / 300000) * 300000` buckets and is pruned after 14 days by the bounded Cron
+retention pass. It increments `samples`, retains maximum busy percentage and load, last busy
+percentage and total memory, minimum available memory and disk free space, last total tenant
+slots, and maximum summed tenant slots used and jobs running. Disk free space is the minimum
+across the body's disks, or NULL with no disks; a bucket retains the minimum non-null sample.
+`last_body` is the last accepted body serialized in the schema's key order without whitespace.
+States and per-disk details are available in that body, not separate rollup columns.
+
+`test-vectors/runners/host-metrics.json` pins an accepted signed push, the 413 boundary, and
+bad-enum, overlong-detail and stale-clock refusals, produced by the real signer and parser.
 
 ### POST /v1/hosts/{host_id}/heartbeat
 
@@ -663,7 +722,7 @@ identical: authentication consumes the counter before settlement idempotency is 
 
 ## Placement, deadlines and metering
 
-Selectable hosts are active, platform-matching, healthy, no more than 60000 ms since heartbeat,
+Selectable hosts have role `placement`, are active, platform-matching, healthy, no more than 60000 ms since heartbeat,
 have a snapshot for their current registry generation, and have sufficient **effective** free
 vCPUs and memory (below). Explicit-only hosts are excluded unless named by the binding hint
 described under [POST /v1/leases](#post-v1leases); a binding hint restricts every selection step
@@ -723,22 +782,33 @@ When no registered host fits a lease, the broker can spill it to a Boat (boat.de
 drives through Boat's API. Spill is off unless `BOAT_ENABLED` is `"true"` and every Boat setting
 is configured; with it off no lease spills, while sandboxes that already exist are still stopped
 and cleaned up. Each tenant may have at most `BOAT_MAX_SANDBOXES` sandboxes whose machines may be running
-(stopped sandboxes kept for reuse do not count), and **a sandbox serves at most one live lease**. Placement hints never select a sandbox.
+(confirmed stopped sandboxes do not count), and **a sandbox serves at most one live lease**. Placement hints never select a sandbox.
 
-**Stuck stops.** An idle sandbox is normally archived for reuse; a retired or unhealthy sandbox
-is stopped for deletion. If either stop is still unconfirmed after 10 minutes, the broker reads
-Boat's state again. With neither a provisioning claim nor a live lease, a delete-bound stop goes
-directly to deletion if the fresh state is anything other than `running` or `starting`, without
-waiting for stop or snapshot completion. An archive-bound stop uses the same fallback to abandon
-reuse, except that ended states (`archived`, `error` or `cancelled`) keep their normal handling.
-A fresh `running` or `starting` read may reflect a lost resume: on either path the stop is resent,
-never bypassed for deletion. A claim or live lease appearing during the fresh read blocks the fallback.
-The switch logs
-`boat_stop_stuck_deleted` with only the tenant slot and sandbox id, alongside `boat_stop_stuck`.
-Deletion uses the ordinary cleanup path: the request is recorded before sending, and 404 means
-deleted. A sandbox in `deleting` no longer counts toward the cap. The separate cap exemption for
-a stopping sandbox is unchanged: it needs a stuck report and a post-deadline Boat read whose
-latest state is `archiving` or an ended state.
+**Cleanup and provider debugging.** Idle ready sandboxes with no claim or live lease are
+**deleted directly** after `BOAT_IDLE_MS`, without stopping or taking a stop snapshot. The broker
+never resumes, restarts or recovers a stopped sandbox; stopped entries left by an older broker
+are deleted by cleanup or reconciliation. Delete intents are persisted in D1 before Boat DELETE.
+A direct deletion of a running sandbox holds capacity until deletion completes.
+A `lost` finish retires the sandbox: the client cannot prove its job stopped, so the sandbox is
+deleted rather than booked again. Other finish outcomes retain ordinary ready reuse.
+
+A start still unready after `START_TIMEOUT_MS` (5 minutes) gets the bounded timeout diagnostic,
+then is stopped and marked `kept_for_provider` when fewer than two boxes are already kept across
+all tenants. Otherwise it is stopped and deleted normally. D1 `provider_sandboxes.kept_at_ms`
+persists the reservation. A kept sandbox never takes a job and frees running capacity only once
+its stop is confirmed. The broker logs `boat_sandbox_kept` with `{sandbox_id, incarnation,
+started_at_ms, timed_out_at_ms}` and no tenant or workspace. Cron deletes it 24 hours after it
+was kept, or earlier after `node scripts/operators.mjs release-kept-sandbox <sandbox_id> --execute`
+queues a deletion request. The public alert `boat_sandbox_kept` remains active until deletion
+completes, so the operator can send its id to Boat before its logs are deleted.
+
+**Stuck stops.** A delete-bound stop still unconfirmed after 15 minutes is checked against Boat
+again. With neither a claim nor a live lease, any fresh state other than `running` or `starting`
+allows direct deletion; running or starting resends the stop. A claim or lease appearing during
+the read blocks deletion. The switch logs `boat_stop_stuck_deleted` alongside `boat_stop_stuck`.
+A kept box never uses this deletion fallback. A stopping delete-bound sandbox only frees its cap
+slot after a stuck report and a post-deadline read of `archiving` or an ended state. A kept box
+requires stop confirmation. Ordinary confirmed-stopped deletions do not count toward the cap.
 
 **Per-lease spill policy.** The required `allow_spill` member is strictly a JSON boolean; a body
 without it, or with any other value, is 400 `bad_request` before any job claim or Boat call.
@@ -770,38 +840,28 @@ lease is 402 `budget_exhausted` and no Boat call is made. While the shared Boat 
 Then, in one transaction that computes the budget candidate again (402 `budget_exhausted` below
 10 seconds), a provisioning record keyed by `job_id` claims a pool slot. A sandbox records the
 `workspace_key_hash` of the lease last booked on it; an entry with no recorded workspace matches
-nothing, and the hash is compared for equality only. The claim prefers a match: the oldest free
-ready sandbox, else the oldest archived one to resume, else one being stopped (waited for, then
-resumed). Otherwise the order is unchanged: a free ready sandbox, else an archived one to resume,
-else one being stopped (waited for, then resumed), else a new sandbox under the cap, oldest first
-within each state. A matching archived or stopping sandbox needs a start. If that start is not
-allowed right now (the hourly limit is already reached, or the cap leaves no room), the match is
-not waited for and a free ready sandbox is claimed at once, so a resume is never preferred over
-a lease that can run immediately. At claim time the limit's wait, or the cap's refusal, applies
-only when no ready sandbox exists. A claimed ready sandbox whose Boat auto-stop would come before
-the lease's deadline is still stopped and resumed with a new lifetime before booking, and that
-resume is a start like any other. A placement hint still does not select a sandbox. Every slot but a free
-ready one needs a start (a create or a resume), and a tenant gets at most its hourly start limit
-in any hour, resumes included: the account's own limit when the operator set one (1 to 1000),
-else `BOAT_MAX_STARTS_PER_HOUR` (6). Past that the lease is 503 `no_capacity` with Retry-After the
-wait until a start leaves the hour. No slot is 503 `no_capacity`.
+nothing, and the hash is compared for equality only. Placement takes (a) a running, ready,
+free sandbox that last served the same workspace, oldest first; (b) any running, ready, free
+sandbox of the right size, oldest first; or (c) a fresh sandbox under the cap. A lease never waits
+on a resume. A ready sandbox whose remaining Boat TTL is insufficient is retired and the lease
+is placed afresh; it is never stopped and restarted. Placement hints never select a sandbox.
 
-Only starts sent to Boat count toward the hourly limit and daily start counter. A claim needing
-a start holds a persisted reservation, as do TTL-cycle and recover steps; the hourly admission
-limit includes reservations plus sent starts in the last hour. The send fence converts the
-reservation into a counted start. A claim ending unsent (including expiry, refusal, release or
-booking a sandbox that became ready) releases its reservation. A sent start is never refunded
-on failure or a lost reply. Replays of a create's persisted idempotency key count once; each
-resume or recover POST sent counts, including a retry after a lost reply.
+Creates count against the tenant's hourly start limit: its operator-set account limit (1 to 1000),
+otherwise `BOAT_MAX_STARTS_PER_HOUR` (6). A fresh claim holds a persisted start reservation;
+admission includes reservations plus sent starts in the last hour. The send fence counts the
+start and releases its reservation. Unsent claims ending release their reservation. A sent create
+is never refunded on failure or a lost reply, but exact-key replays count only once. Daily D1
+start reporting counts sent creates as well. A ready sandbox may be reused at either limit.
+Past the hourly limit, with no ready sandbox, the lease gets 503 `no_capacity` with Retry-After
+until a start leaves the hour; lack of a cap slot is also 503 `no_capacity`.
 
 **Provisioning hold.** The claiming transaction reserves a provisioning hold of
 `min(vcpus × 60000, vcpus × max_s × 1000)` vCPU-ms, the minimum a booked Boat job is charged; it
 appears in the tenant's `reserved_vcpu_ms`. Booking turns the hold into the job's reservation. A
 record that ends without a booking (it expired, Boat refused the start, or the budget was gone)
-**charges the hold** if a Boat create or resume was sent for it: it moves to `settled_vcpu_ms`,
+**charges the hold** if a Boat create was sent for it: it moves to `settled_vcpu_ms`,
 reason `lost`, on the broker clock, and like every Boat settlement is never counted in the usage
-aggregate. This includes a resume whose reply was lost and whose retry Boat then refused: the first
-attempt may have started the machine. A record that started nothing releases its hold.
+aggregate. This includes a create whose reply was lost: Boat may have started the machine. A record that started nothing releases its hold.
 
 **Provisioning reply.** While the claimed sandbox starts (until Boat reports it `ready` and
 `hydrated`, then through setup), the answer is **202** with exactly
@@ -840,7 +900,7 @@ sandbox's whole usable memory, not the fleet formula. `runner_port` is 9443.
 host) as `ssh.user`, pins `ssh.host_key` (exactly `ssh-ed25519 <base64>`, no options or comment),
 and opens one local forward to `127.0.0.1:<runner_port>` with `-N`, then runs the normal token and
 admission challenge over it. The endpoint and host key come from Boat's `POST /sshkey` reply,
-fetched once per sandbox incarnation (they change on every resume), and every re-request and
+fetched once per created sandbox incarnation, and every re-request and
 reattach returns the sandbox's current pair. The sandbox's `~/.ssh/authorized_keys` holds exactly
 one line, for the lease's requester Ed25519 key (the one `cnf.jkt` names):
 
@@ -867,21 +927,22 @@ machine-time meter per run window) are recorded in D1 only, until a billing rule
 
 - Tenant sandboxes are created confined (`noEnv`), so the snapshot must not depend on any account
   secret, and is built from a `noEnv` sandbox through the clean image pipeline.
-- The broker writes `/etc/motor/tenant/id` after every create or resume, once Boat reports the
+- The broker writes `/etc/motor/tenant/id` after every create, once Boat reports the
   sandbox hydrated, root-owned `0444`, holding the sandbox id as ASCII with no newline: it stages
   the id with Boat's file API at `/tmp/ck-motor-tenant-id`, then runs `sudo install -D -m 0444 -o
   root -g root /tmp/ck-motor-tenant-id /etc/motor/tenant/id && rm -f /tmp/ck-motor-tenant-id &&
   cat /etc/motor/tenant/id` and requires the printed id back. The runner reads it, refuses all
   connections while it is missing, and checks the token's `aud` equals `boat:<id>`.
 - **Compile-cache provisioning.** The broker installs the sandbox's compile-cache provisioning
-  after every create or resume, once Boat reports the sandbox hydrated. Running ready sandboxes,
+  after every create, once Boat reports the sandbox hydrated. Running ready sandboxes,
   including those serving a job, are brought up to the tenant's current key version without a
   restart: the alarm schedules a best-effort check every 60 seconds, and convergence may take
   longer, subject to the attempts below. For already-running sandboxes this refresh does not hold
-  up booking, reserve a start, or count against an hourly or daily start limit. The runner re-checks the files on every admission. A stop, retire,
-  cycle or recovery supersedes an in-flight install; its completion cannot revive the sandbox.
+  up booking, reserve a start, or count against an hourly or daily start limit. The runner re-checks
+  the files on every admission. A stop, retirement or deletion supersedes an in-flight install;
+  its completion cannot revive the sandbox.
   A guest reboot the broker does not see clears `/run`; an unchanged recorded version cannot
-  detect that loss, so the cache is then unavailable until the next create or resume.
+  detect that loss, so the cache is then unavailable until the next create.
   - **Paths and modes.** `/run/motor/cache/` is a root-owned (`root:root`) `0700` directory on
     tmpfs. It holds two root-owned files: `/run/motor/cache/read-key`, mode `0400`, and
     `/run/motor/cache/config.json`, mode `0444` (plus, only during a write, its temporary file).
@@ -941,7 +1002,7 @@ machine-time meter per run window) are recorded in D1 only, until a billing rule
 - Once the runner listens with its signing keys loaded, the image writes `/run/motor/endpoint-ready`
   holding the sandbox id (the content of `/etc/motor/tenant/id`, a trailing newline allowed). The
   broker reads it with the fixed command `cat /run/motor/endpoint-ready` through Boat's exec API
-  after every start, create or resume, and books no lease onto the sandbox until it names this
+  after every create, and books no lease onto the sandbox until it names this
   sandbox. `/run` is cleared at boot, so the marker always belongs to the current start. The
   endpoint removes the marker whenever it cannot admit jobs (its runner disk full, say) and writes
   it again once it can: before booking a sandbox that is already running from an earlier lease,
@@ -949,7 +1010,7 @@ machine-time meter per run window) are recorded in D1 only, until a billing rule
   sandbox is stopped and deleted.
 - sshd sets `AllowTcpForwarding local`, `PermitTTY no`, `AllowAgentForwarding no`,
   `X11Forwarding no` and `PermitTunnel no`, and the boot unit empties `authorized_keys` on every
-  resume.
+  boot.
 - Nothing in the sandbox signs to the broker: no report key, heartbeat or usage report.
 
 ## Account closure
@@ -976,6 +1037,12 @@ When a customer leaves, an operator closes the account (`close-account`, see
   disks after that tenant's last lease on the host ends.
 
 ## Pinned conformance evidence
+
+Registered-host placements also increment the per-host D1 counter `host_grants_daily`
+(`day` as UTC `YYYY-MM-DD`, `host_id`, `grants`) when TenantDO confirms the winning assignment,
+at the same point as `host_placement_daily`. Selection alone, refused placement, dropped losers,
+keep retries, lease replay and token re-signing do not increment it. Boat is not a registered host
+and does not contribute. The counter contains no tenant, workspace or job data.
 
 `test-vectors/runners/job-tokens.json` pins both token purposes and their header/claim bytes,
 the fixed signing seed and its derived public key. `test-vectors/runners/job-tokens-workspace.json`
