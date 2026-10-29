@@ -453,21 +453,6 @@ impl Storage {
             })
             .collect()
     }
-    pub(crate) fn pending_finishes(&self) -> Vec<(Uuid, crate::HostedJobState)> {
-        self.state
-            .lock()
-            .unwrap()
-            .jobs
-            .iter()
-            .filter_map(|(id, job)| {
-                let state = job.hosted.as_ref()?;
-                if state.finish_done || !state.needs_cleanup() {
-                    return None;
-                }
-                Some((*id, state.clone()))
-            })
-            .collect()
-    }
     pub fn return_result(&self, result: ReturnResult) -> io::Result<()> {
         let id = result.job_id;
         self.update(|state| {

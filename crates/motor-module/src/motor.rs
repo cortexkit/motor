@@ -161,7 +161,10 @@ impl Motor {
         for id in self.storage.pending_hosted_cancels() {
             self.recover_hosted(id);
         }
-        for (id, _) in self.storage.pending_finishes() {
+        // Detached Boat jobs still own their bookings. Recover the full
+        // inventory so their host deadlines are watched even if nobody attaches
+        // after a restart; cleanup leaves live jobs alone until then.
+        for id in self.storage.unsettled_hosted() {
             self.recover_hosted(id);
         }
     }
