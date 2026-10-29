@@ -17,10 +17,37 @@ pub(crate) fn registry(name: &str) -> Registry {
         tap_index: 1,
         idle_suspend_s: 60,
         host_floor_bytes: 2147483648,
-        memory_headroom_mib: 512,
+        memory_headroom_mib: 2048,
         snapshot_memory_high_mib: 16384,
         io_weight: 100,
     }
+}
+
+#[test]
+fn memory_headroom_scales_with_ram_and_refuses_undersized_records() {
+    let mut r = registry("a");
+    for (ram, headroom, bytes) in [
+        (1, 2048, 2148532224),
+        (78 * 1024, 2397, 86265298944),
+        (104 * 1024, 3195, 115019350016),
+    ] {
+        assert_eq!(minimum_memory_headroom_mib(ram), headroom);
+        r.guest_ram_mib = ram;
+        r.memory_headroom_mib = headroom;
+        r.validate("a").unwrap();
+        assert_eq!(r.memory_max().unwrap(), bytes);
+        r.memory_headroom_mib -= 1;
+        assert!(r.validate("a").is_err());
+        r.memory_headroom_mib = 512;
+        let error = r.memory_max().unwrap_err().0;
+        assert!(error.contains(&format!("below minimum {headroom} MiB")));
+        assert!(error.contains("run provision.py switch-image or resize"));
+    }
+    r.memory_headroom_mib = 4096;
+    assert_eq!(r.memory_max().unwrap(), 108 * 1024 * 1048576);
+    r.guest_ram_mib = u64::MAX;
+    r.memory_headroom_mib = u64::MAX;
+    assert!(r.memory_max().is_err());
 }
 
 #[test]
@@ -1197,7 +1224,7 @@ fn hosted_tenant_wire_rejects_extra_arguments_without_changing_job_ops() {
 #[test]
 fn hosted_caps_and_bases_are_per_guest_size() {
     let r = registry("a");
-    assert_eq!(r.memory_max().unwrap(), 19864223744);
+    assert_eq!(r.memory_max().unwrap(), 21474836480);
     assert_eq!(r.vcpu_ceiling + 64, 66);
     assert_eq!(r.base(), PathBuf::from(IMAGES).join("v1/base/2-18432"));
     let mut small = registry("b");

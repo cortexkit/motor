@@ -54,6 +54,18 @@ def config():
 
 
 class ProvisionTests(unittest.TestCase):
+    def test_headroom_default_minimum_and_larger_override(self):
+        for ram, minimum in ((1, 2048), (78 * 1024, 2397), (104 * 1024, 3195)):
+            with self.subTest(ram=ram):
+                c = dict(config(), guest_ram_mib=ram)
+                del c["memory_headroom_mib"]
+                self.assertEqual(p.checked(c)["memory_headroom_mib"], minimum)
+                for below in (512, minimum - 1):
+                    with self.assertRaisesRegex(ValueError, f"{below} MiB is below minimum {minimum} MiB"):
+                        p.checked(dict(c, memory_headroom_mib=below))
+                self.assertEqual(p.checked(dict(c, memory_headroom_mib=minimum))["memory_headroom_mib"], minimum)
+                self.assertEqual(p.checked(dict(c, memory_headroom_mib=4096))["memory_headroom_mib"], 4096)
+
     @staticmethod
     def owned_tap(tap):
         return {'ifname': tap, 'linkinfo': {'info_kind': 'tun', 'info_data': {
@@ -105,6 +117,46 @@ class ProvisionTests(unittest.TestCase):
                         rootfs_sha256=hashlib.sha256(b"root-v2").hexdigest())
         (self.root / "tenant-images/v2/manifest.json").write_text(json.dumps(manifest))
         return c, provision_path, registry_path, suspend, manifest
+
+    def test_switch_image_rewrites_old_headroom_in_both_records_even_for_same_image(self):
+        c, provision_path, registry_path, _suspend, _manifest = self.switch_records()
+        for path in (provision_path, registry_path):
+            record = json.loads(path.read_text())
+            record.update(guest_ram_mib=79872, memory_headroom_mib=512)
+            path.write_text(json.dumps(record, indent=2) + "\n")
+        p.switch_image("a", "v1", make_base=self.fake_base, check_service=lambda _unit: "inactive",
+                       validate_image=lambda _image: None, output=lambda _line: None)
+        for path in (provision_path, registry_path):
+            record = json.loads(path.read_text())
+            self.assertEqual(record["guest_ram_mib"], 79872)
+            self.assertEqual(record["memory_headroom_mib"], 2397)
+            self.assertEqual(record["image_version"], c["image_version"])
+
+    def test_switch_image_refuses_upgraded_headroom_that_no_longer_fits_without_writes(self):
+        _c, provision_path, registry_path, _suspend, _manifest = self.switch_records()
+        for path in (provision_path, registry_path):
+            record = json.loads(path.read_text())
+            record.update(guest_ram_mib=79872, memory_headroom_mib=512)
+            path.write_text(json.dumps(record, indent=2) + "\n")
+        before = self.snapshot_tree()
+        base = mock.Mock()
+        with mock.patch.object(p, "memtotal_bytes", return_value=134647791616), \
+                self.assertRaisesRegex(ValueError, "memory fit requires 135657422848 bytes, MemTotal is 134647791616 bytes"):
+            p.switch_image("a", "v2", make_base=base, check_service=lambda _unit: "inactive",
+                           validate_image=lambda _image: None)
+        base.assert_not_called()
+        self.assertEqual(self.snapshot_tree(), before)
+
+    def test_switch_image_keeps_larger_explicit_headroom(self):
+        _c, provision_path, registry_path, _suspend, _manifest = self.switch_records()
+        for path in (provision_path, registry_path):
+            record = json.loads(path.read_text())
+            record["memory_headroom_mib"] = 4096
+            path.write_text(json.dumps(record, indent=2) + "\n")
+        p.switch_image("a", "v2", make_base=self.fake_base, check_service=lambda _unit: "inactive",
+                       validate_image=lambda _image: None, output=lambda _line: None)
+        for path in (provision_path, registry_path):
+            self.assertEqual(json.loads(path.read_text())["memory_headroom_mib"], 4096)
 
     @staticmethod
     def fake_base(_config, _image, base):

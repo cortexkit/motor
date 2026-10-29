@@ -107,8 +107,9 @@ class ResizeTests(unittest.TestCase):
 
     def tenant(self, name="a", tap=1, cpuset="0-1", **extra):
         config = dict(tenant=name, sub=SUB, vm=f"vm-{name}", image_version="v1", vcpu_ceiling=2,
-                      guest_ram_mib=4096, disk_quota_bytes=20 * GIB, cpuset=cpuset, tap_index=tap,
-                      idle_suspend_s=600, host_floor_bytes=p.RUNNER_DEFAULT_FLOOR, resolvers=["1.1.1.1"])
+                       guest_ram_mib=4096, disk_quota_bytes=20 * GIB, cpuset=cpuset, tap_index=tap,
+                       idle_suspend_s=600, host_floor_bytes=p.RUNNER_DEFAULT_FLOOR, memory_headroom_mib=2048,
+                       resolvers=["1.1.1.1"])
         config.update(extra)
         (p.PROVISION / f"{name}.json").write_text(json.dumps(config, indent=2) + "\n")
         home = self.root / "tenants" / name
@@ -199,6 +200,39 @@ class ResizeTests(unittest.TestCase):
         self.assertEqual({leaf: (set_aside[0] / leaf).read_bytes() for leaf in SNAPSHOT}, SNAPSHOT)
         self.assertTrue(p.base_present(p.checked(new_config), self.image))
         self.assertEqual(self.commands, [])
+
+    def test_resize_upgrades_old_headroom_and_resumes_its_record_publication(self):
+        for path in (p.PROVISION / "a.json", p.REGISTRY / "a.json"):
+            record = json.loads(path.read_text())
+            record["memory_headroom_mib"] = 512
+            path.write_text(json.dumps(record, indent=2) + "\n")
+        arguments = dict(guest_ram_mib=79872)
+        with self.assertRaises(Crash):
+            self.resize(arguments, hook=self.crash_at("step:publish:provision"))
+        self.resize(arguments)
+        for path in (p.PROVISION / "a.json", p.REGISTRY / "a.json"):
+            record = json.loads(path.read_text())
+            self.assertEqual(record["memory_headroom_mib"], 2397)
+            self.assertEqual(record["guest_ram_mib"], 79872)
+
+    def test_resize_raises_automatic_headroom_for_ram_growth_and_keeps_larger_overrides(self):
+        for headroom, expected in ((2048, 2397), (4096, 4096)):
+            with self.subTest(headroom=headroom):
+                self.reset()
+                for path in (p.PROVISION / "a.json", p.REGISTRY / "a.json"):
+                    record = json.loads(path.read_text())
+                    record["memory_headroom_mib"] = headroom
+                    path.write_text(json.dumps(record, indent=2) + "\n")
+                self.resize(dict(guest_ram_mib=79872))
+                for path in (p.PROVISION / "a.json", p.REGISTRY / "a.json"):
+                    self.assertEqual(json.loads(path.read_text())["memory_headroom_mib"], expected)
+
+    def test_resize_refuses_new_headroom_that_no_longer_fits_without_writes(self):
+        before = self.tree()
+        with mock.patch.object(p, "memtotal_bytes", return_value=134647791616), \
+                self.assertRaisesRegex(ValueError, "memory fit requires 135657422848 bytes, MemTotal is 134647791616 bytes"):
+            self.resize(dict(guest_ram_mib=79872))
+        self.assertEqual(self.tree(), before)
 
     def test_full_resize_publishes_the_new_state_through_every_step(self):
         seen = []

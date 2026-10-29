@@ -30,7 +30,7 @@ SCHEMA = _schema_module.SCHEMA
 
 GIB = 1024**3
 RAM_MIB = 18432
-HEADROOM_MIB = 512
+HEADROOM_MIB = max(2048, (RAM_MIB * 3 + 99) // 100)
 # Live scratch: 45 GiB disks + 36 GiB memory snapshots + 8 GiB rootfs copies + 7 GiB margin.
 MEASUREMENT_BUDGET_GIB = 96
 PROBE_WORKSPACE = "/Users/spike/probe"
@@ -662,7 +662,7 @@ def summarize(samples, error=None):
     if samples.get("suspend_restore") and statistics.median(samples["suspend_restore"]) > 5000:
         reasons.append("suspend restore p50 exceeds 5 seconds")
     if samples.get("restore_memory_peak_bytes") and max(samples["restore_memory_peak_bytes"]) > (RAM_MIB + HEADROOM_MIB) * 1024**2:
-        reasons.append("restore needs more than 512 MiB of memory headroom")
+        reasons.append(f"restore needs more than {HEADROOM_MIB} MiB of memory headroom")
     return {"metrics": metrics, "verdict": "replan" if reasons else "go", "reasons": reasons}
 
 

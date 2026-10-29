@@ -374,7 +374,7 @@ fn hosted_jail_caps_use_ceiling_tasks_and_memory_headroom_not_job_memory() {
             ("cpuset.cpus", "0-1".into()),
             ("cpuset.mems", "0".into()),
             ("cpu.max", "100000 100000".into()),
-            ("memory.max", "19864223744".into()),
+            ("memory.max", "21474836480".into()),
             ("pids.max", "66".into()),
             ("io.weight", "default 100".into())
         ]

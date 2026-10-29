@@ -68,7 +68,9 @@ class CapacityTests(unittest.TestCase):
                   "ActiveState": self.active_state, "ControlGroup": self.control_group}
         return SimpleNamespace(stdout="".join(f"{name}={values[name]}\n" for name in args[3].split(",")))
 
-    def tenant(self, name="a", ram_mib=79872, headroom_mib=512):
+    def tenant(self, name="a", ram_mib=77824, headroom_mib=None):
+        if headroom_mib is None:
+            headroom_mib = p.minimum_memory_headroom_mib(ram_mib)
         record = dict(guest_ram_mib=ram_mib, memory_headroom_mib=headroom_mib)
         (p.REGISTRY / f"{name}.json").write_text(json.dumps(record))
         return dict(record, tenant=name)
@@ -152,12 +154,12 @@ class CapacityTests(unittest.TestCase):
 
     def test_provision_fit_and_dropin_preflights_write_nothing(self):
         proposed = dict(tenant="new", vm="new", image_version="v1", tap_index=1, vcpu_ceiling=2,
-                        guest_ram_mib=81920, memory_headroom_mib=512)
+                        guest_ram_mib=81920, memory_headroom_mib=2458)
         before = self.tree()
         with self.assertRaisesRegex(ValueError, "memory fit requires"):
             p.provision(proposed)
         self.assertEqual(self.tree(), before)
-        proposed["guest_ram_mib"] = 79872
+        proposed["guest_ram_mib"] = 77824
         with self.assertRaisesRegex(ValueError, "missing or unreadable jobs-slice drop-in"):
             p.provision(proposed)
         self.assertEqual(self.tree(), before)
@@ -171,9 +173,9 @@ class CapacityTests(unittest.TestCase):
 
     def test_memory_fit_exact_limit_includes_headroom(self):
         p.MEMINFO.write_text(f"MemTotal: {128 * GIB // 1024} kB\n")
-        tenant = self.tenant(ram_mib=83456)
+        tenant = self.tenant(ram_mib=81522)
         p.memory_fit(CAPACITY)
-        tenant["guest_ram_mib"] = 83457
+        tenant["guest_ram_mib"] = 81523
         before = self.tree()
         with self.assertRaisesRegex(ValueError, "memory fit requires 137440002048 bytes"):
             p.memory_fit(CAPACITY, replacement=tenant)
@@ -183,11 +185,25 @@ class CapacityTests(unittest.TestCase):
         self.tenant()
         p.memory_fit(CAPACITY)
         self.tenant(name="b", ram_mib=1024)
-        with self.assertRaisesRegex(ValueError, "memory fit requires 135291469824 bytes"):
+        with self.assertRaisesRegex(ValueError, "memory fit requires 136666152960 bytes"):
             p.memory_fit(CAPACITY)
 
+    def test_default_headroom_refuses_78_gib_on_measured_host(self):
+        tenant = p.checked(dict(tenant="a", vm="vm-a", sub="acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                                image_version="v1", vcpu_ceiling=2, cpuset="0-1", tap_index=1,
+                                guest_ram_mib=79872, disk_quota_bytes=20 * GIB, resolvers=["1.1.1.1"]))
+        with self.assertRaisesRegex(ValueError, "memory fit requires 135657422848 bytes, MemTotal is 134647791616 bytes"):
+            p.memory_fit(CAPACITY, replacement=tenant)
+
+    def test_memory_fit_refuses_below_formula_record(self):
+        self.tenant(ram_mib=79872, headroom_mib=512)
+        before = self.tree()
+        with self.assertRaisesRegex(ValueError, "512 MiB is below minimum 2397 MiB.*switch-image or resize"):
+            p.memory_fit(CAPACITY)
+        self.assertEqual(self.tree(), before)
+
     def test_memory_fit_checked_arithmetic_and_memtotal(self):
-        self.tenant(ram_mib=2**64 - 1)
+        self.tenant(ram_mib=2**64 - 1, headroom_mib=2**64 - 1)
         with self.assertRaisesRegex(ValueError, "memory fit sum"):
             p.memory_fit(CAPACITY)
         self.tenant()
@@ -198,7 +214,7 @@ class CapacityTests(unittest.TestCase):
                     p.memory_fit(CAPACITY)
         with mock.patch.object(Path, "read_text", side_effect=PermissionError("unreadable MemTotal")):
             with self.assertRaisesRegex(ValueError, "MemTotal"):
-                p.memory_fit(CAPACITY, replacement=dict(tenant="a", guest_ram_mib=79872, memory_headroom_mib=512))
+                p.memory_fit(CAPACITY, replacement=dict(tenant="a", guest_ram_mib=77824, memory_headroom_mib=2335))
 
     def test_jobs_slice_render_adds_windows_to_direct_jobs_budget(self):
         self.assertEqual(p.jobs_slice_render(CAPACITY), RENDERED)

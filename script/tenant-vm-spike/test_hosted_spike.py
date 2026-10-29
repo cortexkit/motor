@@ -417,7 +417,7 @@ class HostedSpikeTests(unittest.TestCase):
 
     def test_restore_headroom_breach_replans(self):
         samples = complete_samples()
-        samples["restore_memory_peak_bytes"][-1] = 19 * spike.GIB
+        samples["restore_memory_peak_bytes"][-1] = 21 * spike.GIB
         self.assertEqual(spike.summarize(samples)["verdict"], "replan")
 
     def test_an_error_cannot_produce_go(self):
