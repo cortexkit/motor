@@ -94,9 +94,14 @@ def check_kernel(path):
             errors.append(f"CONFIG_{name} must be built in")
         if value == "n" and any(f"CONFIG_{name}={v}" in resolved for v in ("y", "m")):
             errors.append(f"CONFIG_{name} must be disabled")
+    # Built-in Linux Security Modules must also be in the default boot-time list.
+    lsms = next((line.split("=", 1)[1].strip('"').split(",")
+                 for line in resolved if line.startswith("CONFIG_LSM=")), [])
+    if "landlock" not in lsms:
+        errors.append("CONFIG_LSM must include landlock")
     if errors:
         raise ValueError("; ".join(errors))
-    print(f"kernel config: {sum('=' in line for line in options)} checks passed")
+    print(f"kernel config: {sum('=' in line for line in options) + 1} checks passed")
 
 
 def checked_copy(source, target, expected):

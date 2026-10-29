@@ -33,7 +33,7 @@ guest = module("install_guest", HERE / "install-guest.py")
 
 def resolved_config():
     return "\n".join(f"CONFIG_{line}" for line in (HERE / "kernel-options.txt").read_text().splitlines()
-                     if line.endswith("=y")) + "\n"
+                     if line.endswith("=y")) + '\nCONFIG_LSM="landlock,lockdown,yama,integrity,apparmor"\n'
 
 
 class ImageTests(unittest.TestCase):
@@ -366,6 +366,7 @@ class ImageTests(unittest.TestCase):
                      "VIRTIO_VSOCKETS_COMMON", "VIRTIO", "VIRTIO_MMIO", "VIRTIO_MMIO_CMDLINE_DEVICES",
                      "VIRTIO_NET", "VIRTIO_CONSOLE", "SERIAL_8250", "SERIAL_8250_CONSOLE", "PRINTK",
                      "HW_RANDOM", "HW_RANDOM_VIRTIO",
+                     "SYSFS", "MULTIUSER", "SECURITY", "SECURITY_PATH", "SECURITY_NETWORK", "SECURITY_LANDLOCK",
                      "EXT4_FS", "TMPFS", "MEMCG", "CGROUP_PIDS", "BPF_SYSCALL", "CGROUP_BPF",
                      "SECCOMP_FILTER", "NET_NS", "NF_TABLES", "VETH"):
             self.assertIn(f"CONFIG_{name}=y", config)
@@ -393,6 +394,37 @@ class ImageTests(unittest.TestCase):
                     path.write_text(resolved_config().replace(f"CONFIG_{name}=y", f"CONFIG_{name}={value}"))
                     with self.assertRaisesRegex(ValueError, f"CONFIG_{name} must be built in"):
                         image.check_kernel(path)
+
+    def test_resolved_kernel_rejects_disabled_or_modular_landlock_dependencies(self):
+        path = self.root / "kernel.config"
+        for name in ("SYSFS", "MULTIUSER", "SECURITY", "SECURITY_PATH", "SECURITY_NETWORK", "SECURITY_LANDLOCK"):
+            for replacement in (f"# CONFIG_{name} is not set", f"CONFIG_{name}=m", ""):
+                with self.subTest(name=name, replacement=replacement):
+                    path.write_text(resolved_config().replace(f"CONFIG_{name}=y", replacement))
+                    with self.assertRaisesRegex(ValueError, f"CONFIG_{name} must be built in"):
+                        image.check_kernel(path)
+
+    def test_resolved_kernel_rejects_disabled_landlock(self):
+        path = self.root / "kernel.config"
+        config = resolved_config().replace("CONFIG_SECURITY_LANDLOCK=y\n", "")
+        path.write_text(config + "# CONFIG_SECURITY_LANDLOCK is not set\n")
+        with self.assertRaisesRegex(ValueError, "CONFIG_SECURITY_LANDLOCK must be built in"):
+            image.check_kernel(path)
+
+    def test_resolved_kernel_requires_landlock_in_lsm_list_without_replacing_other_lsms(self):
+        path = self.root / "kernel.config"
+        original = 'CONFIG_LSM="landlock,lockdown,yama,integrity,apparmor"'
+        for value in ('"landlock,lockdown,yama,integrity,apparmor"',
+                      '"lockdown,yama,landlock,integrity,apparmor"'):
+            with self.subTest(value=value):
+                path.write_text(resolved_config().replace(original, f"CONFIG_LSM={value}"))
+                image.check_kernel(path)
+        for replacement in ('CONFIG_LSM="lockdown,yama,integrity,apparmor"',
+                            'CONFIG_LSM="notlandlock"', ""):
+            with self.subTest(replacement=replacement):
+                path.write_text(resolved_config().replace(original, replacement))
+                with self.assertRaisesRegex(ValueError, "CONFIG_LSM must include landlock"):
+                    image.check_kernel(path)
 
     def test_module_load_requests_are_removed_without_masking_the_loader(self):
         directories = ("etc/modules-load.d", "run/modules-load.d", "usr/local/lib/modules-load.d",

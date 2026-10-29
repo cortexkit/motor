@@ -40,6 +40,13 @@ PID_NS=y
 NET_NS=y
 SECCOMP=y
 SECCOMP_FILTER=y
+# Job shell sandboxes need Landlock and its security framework dependencies.
+SYSFS=y
+MULTIUSER=y
+SECURITY=y
+SECURITY_PATH=y
+SECURITY_NETWORK=y
+SECURITY_LANDLOCK=y
 UNIX=y
 INET=y
 # Inet nftables needs IPv6 code even when guest IPv6 networking is disabled.

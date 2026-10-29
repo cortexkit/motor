@@ -118,7 +118,7 @@ class RunnerHostTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 exec(source, {})
             self.assertTrue(json.loads(output.getvalue())['passed'])
-            self.assertEqual(30, json.loads(output.getvalue())['syscalls'])
+            self.assertEqual(31, json.loads(output.getvalue())['syscalls'])
             target.rmdir()
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 exec(source, {})

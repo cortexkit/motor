@@ -45,6 +45,12 @@ def capture():
         results[name] = {'errno': error, 'result': errno.errorcode.get(error, 'OK')}
         return result
 
+    # Querying the ABI changes no sandbox state and detects both missing and
+    # boot-disabled Landlock, which job shell sandboxes require.
+    abi = call('landlock_create_ruleset.VERSION', 444, ctypes.c_void_p(),
+               ctypes.c_size_t(0), ctypes.c_uint(1))
+    results['landlock_create_ruleset.VERSION']['abi'] = abi
+
     with tempfile.TemporaryDirectory(prefix='motor-syscalls-') as tmp:
         root = Path(tmp)
         (root / 'source').write_bytes(b'motor syscall probe\n')
@@ -120,7 +126,7 @@ SUCCESS = (
     'fcntl.SETLK', 'fcntl.UNLCK', 'fcntl.OFD_SETLK', 'fcntl.OFD_UNLCK',
     'close_range', 'pidfd_open', 'faccessat2.EACCESS', 'ioctl.FS_IOC_GETFLAGS',
     'ioctl.FICLONE', 'copy_file_range', 'fallocate.PUNCH_HOLE_KEEP_SIZE',
-    'fsync', 'syncfs', 'getrandom', 'memfd_create',
+    'fsync', 'syncfs', 'getrandom', 'memfd_create', 'landlock_create_ruleset.VERSION',
 )
 
 
@@ -154,6 +160,11 @@ def differences(actual, job=False):
         if observed not in allowed:
             labels = [errno.errorcode.get(value, 'OK') for value in sorted(allowed)]
             errors.append(f'syscall {name}: expected {labels}, observed errno {observed!r}')
+    landlock = actual.get('landlock_create_ruleset.VERSION', {})
+    if landlock.get('errno') == 0:
+        abi = landlock.get('abi')
+        if type(abi) is not int or abi < 1:
+            errors.append(f'syscall landlock_create_ruleset.VERSION: expected ABI >= 1, observed ABI {abi!r}')
     return errors
 
 

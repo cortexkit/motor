@@ -90,8 +90,36 @@ class SyscallSurfaceTests(unittest.TestCase):
             actual = parity.syscall_surface.capture()
         self.assertEqual(1, len(chmod_calls))
         self.assertEqual({'errno': errno.ENOSYS, 'result': 'ENOSYS'}, actual['fchmodat2.EMPTY_PATH'])
-        self.assertEqual(30, len(actual))
+        self.assertEqual(31, len(actual))
         self.assertEqual(set(parity.syscall_surface.expectations(True)), set(actual))
+
+    def test_landlock_probe_reports_abi_and_syscall_errors(self):
+        for result, error, passes in ((1, 0, True), (8, 0, True), (0, 0, False),
+                                      (-1, errno.ENOSYS, False), (-1, errno.EOPNOTSUPP, False)):
+            with self.subTest(result=result, error=error):
+                calls = []
+
+                def syscall(number, *args):
+                    if number.value == 444:
+                        calls.append(args)
+                        ctypes.set_errno(error)
+                        return result
+                    ctypes.set_errno(errno.ENOSYS)
+                    return -1
+
+                with patch.object(parity.syscall_surface.ctypes, 'CDLL') as library:
+                    library.return_value.syscall.side_effect = syscall
+                    actual = parity.syscall_surface.capture()
+                self.assertEqual(1, len(calls))
+                attributes, size, flags = calls[0]
+                self.assertIsNone(attributes.value)
+                self.assertEqual((0, 1), (size.value, flags.value))
+                self.assertEqual({'abi': result, 'errno': error,
+                                  'result': errno.errorcode.get(error, 'OK')},
+                                 actual['landlock_create_ruleset.VERSION'])
+                errors = parity.syscall_surface.differences(actual)
+                landlock_errors = [message for message in errors if 'landlock_create_ruleset.VERSION' in message]
+                self.assertEqual(passes, not landlock_errors, errors)
 
     def test_job_clone3_denial_is_required_but_not_expected_on_the_host(self):
         self.assertEqual({errno.ENOSYS}, parity.syscall_surface.expectations(True)['clone3.invalid'])
@@ -100,7 +128,7 @@ class SyscallSurfaceTests(unittest.TestCase):
     def test_missing_probe_results_fail_closed(self):
         errors = parity.syscall_surface.differences({})
         self.assertIn('syscall fchmodat2.EMPTY_PATH', '\n'.join(errors))
-        self.assertEqual(31, len(errors))
+        self.assertEqual(32, len(errors))
 
 
 class JobAccountTests(unittest.TestCase):
@@ -450,6 +478,7 @@ class ParityTests(unittest.TestCase):
                                   'primary_group': 'motor-job', 'shell': '/usr/sbin/nologin'}
                                  if role == 'boat' else dict(manifest['job_identity_by_role'][role])),
                 'syscalls': {**{name: {'errno': 0} for name in parity.syscall_surface.SUCCESS},
+                             'landlock_create_ruleset.VERSION': {'errno': 0, 'abi': 1},
                              'openat2.reject_symlink': {'errno': errno.ELOOP},
                              'mount_setattr.invalid': {'errno': errno.EINVAL},
                              'open_tree.invalid': {'errno': errno.EBADF},
@@ -478,6 +507,30 @@ class ParityTests(unittest.TestCase):
                     errors = parity.differences(self.manifest, actual, role, job)
                     self.assertEqual(["syscall fchmodat2.EMPTY_PATH: expected ['OK'], observed errno 38"],
                                      [error for error in errors if error.startswith('syscall ')])
+
+    def test_landlock_requires_abi_one_on_every_linux_role_and_mode(self):
+        for role in ('build-server', 'boat', 'tenant'):
+            for job in (False, True):
+                for abi, passes in ((1, True), (8, True), (0, False), (None, False), (-1, False), (True, False)):
+                    with self.subTest(role=role, job=job, abi=abi):
+                        actual = self.observed(role)
+                        actual['syscalls']['clone3.invalid']['errno'] = errno.ENOSYS if job else errno.EINVAL
+                        actual['syscalls']['landlock_create_ruleset.VERSION']['abi'] = abi
+                        errors = parity.differences(self.manifest, actual, role, job)
+                        self.assertEqual(passes,
+                                         not any('landlock_create_ruleset.VERSION' in error for error in errors), errors)
+                for error in (errno.ENOSYS, errno.EOPNOTSUPP, errno.EPERM):
+                    with self.subTest(role=role, job=job, error=error):
+                        actual = self.observed(role)
+                        actual['syscalls']['clone3.invalid']['errno'] = errno.ENOSYS if job else errno.EINVAL
+                        actual['syscalls']['landlock_create_ruleset.VERSION'] = {'errno': error, 'abi': -1}
+                        errors = parity.differences(self.manifest, actual, role, job)
+                        self.assertTrue(any('syscall landlock_create_ruleset.VERSION' in error for error in errors), errors)
+                with self.subTest(role=role, job=job, missing=True):
+                    actual = self.observed(role)
+                    del actual['syscalls']['landlock_create_ruleset.VERSION']
+                    errors = parity.differences(self.manifest, actual, role, job)
+                    self.assertTrue(any('landlock_create_ruleset.VERSION' in error for error in errors), errors)
 
     def report(self, actual, job=False, role='build-server', remote_cache_on=False):
         captured = copy.deepcopy(actual)
