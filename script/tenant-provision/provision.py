@@ -1392,6 +1392,7 @@ def provision(c, make_base=build_base, execute=run, stage=None, runners=None, re
             raise ValueError("tap index already assigned")
     memory_fit(capacity, replacement=c)
     verify_jobs_slice(capacity)
+    check_windows_cpus(c["cpuset"], capacity)
     manifest = json.loads((image / "manifest.json").read_text())
     if manifest["version"] != c["image_version"]:
         raise ValueError("image version mismatch")
@@ -1514,6 +1515,12 @@ def cpu_numbers(cpuset):
         bounds = [int(n) for n in part.split("-")]
         numbers.update(range(bounds[0], bounds[-1] + 1))
     return numbers
+
+
+def check_windows_cpus(cpuset, capacity):
+    # Only hosts budgeting memory for a Windows VM must keep its threads free.
+    if capacity["windows_vm_bytes"] > 0 and cpu_numbers(cpuset) & cpu_numbers(WINDOWS_CPUS):
+        raise ValueError(f"cpuset {cpuset} overlaps the Windows VM's CPUs {WINDOWS_CPUS}")
 
 
 def registered_tenants():
@@ -1721,8 +1728,7 @@ def plan_resize(tenant, arguments):
     if new["vcpu_ceiling"] > 32 or (new["vcpu_ceiling"] != 1 and new["vcpu_ceiling"] % 2):
         raise ValueError(f"vcpu_ceiling {new['vcpu_ceiling']} must be 1 or an even number of at most 32")
     cpus = cpu_numbers(new["cpuset"])
-    if cpus & cpu_numbers(WINDOWS_CPUS):
-        raise ValueError(f"cpuset {new['cpuset']} overlaps the Windows VM's CPUs {WINDOWS_CPUS}")
+    check_windows_cpus(new["cpuset"], capacity)
     for name, other in registered_tenants():
         if name != tenant and cpus & cpu_numbers(other["cpuset"]):
             raise ValueError(f"cpuset {new['cpuset']} overlaps tenant {name}'s cpuset {other['cpuset']}")
@@ -2093,6 +2099,7 @@ def main():
     capacity = read_capacity()
     memory_fit(capacity, replacement=c)
     verify_jobs_slice(capacity)
+    check_windows_cpus(c["cpuset"], capacity)
     for directory in (ROOT, REGISTRY, BINDINGS.parent, ROOT / "jail", ROOT / "tenants"):
         directory.mkdir(parents=True, exist_ok=True)
         trusted(directory)

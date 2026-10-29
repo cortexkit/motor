@@ -207,6 +207,29 @@ class ResizeTests(unittest.TestCase):
         self.assert_new_state()
         self.assertEqual(self.bases, [self.image / "base/4-8192"])
 
+    def test_resize_accepts_windows_threads_without_a_windows_vm(self):
+        capacity = dict(CAPACITY, windows_vm_bytes=0)
+        for cpuset, vcpus in (("12-15", 4), ("28-31", 4), ("0-14,16-30", 30)):
+            with self.subTest(cpuset=cpuset):
+                self.reset()
+                p.JOBS_DROP_IN.write_text(p.jobs_slice_render(capacity))
+                with mock.patch.object(p, "read_capacity", return_value=capacity) as read, \
+                        mock.patch.object(p, "slice_properties", return_value={"LoadState": "loaded", "MemoryMax": str(24 * GIB)}):
+                    self.resize(dict(cpuset=cpuset, vcpu_ceiling=vcpus))
+                    read.assert_called_once_with()
+                self.assertEqual(json.loads((p.REGISTRY / "a.json").read_text())["cpuset"], cpuset)
+                self.assertEqual(json.loads(p.HELPER_CONFIG.read_text())["slots"][0]["cpus"], cpuset)
+                self.assertEqual(self.commands, [])
+
+    def test_resize_reserves_threads_for_any_positive_windows_budget(self):
+        for cpuset in ("12-15", "28-31"):
+            with self.subTest(cpuset=cpuset), mock.patch.object(p, "read_capacity", return_value=dict(CAPACITY, windows_vm_bytes=1)):
+                before = self.tree()
+                with self.assertRaisesRegex(ValueError, "overlaps the Windows VM's CPUs"):
+                    self.resize(dict(cpuset=cpuset))
+                self.assertEqual(self.tree(), before)
+                self.assertEqual(self.commands, [])
+
     def test_every_precondition_refuses_before_any_mutation_with_its_own_message(self):
         home = self.root / "tenants/a"
 

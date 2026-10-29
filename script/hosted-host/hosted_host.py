@@ -77,8 +77,8 @@ TENANT_RECORD = Path("/etc/motor-host/provision/tenant-1.json")
 HELPER_CONFIG = Path("/etc/motor-vm-helper.json")
 
 # The build server has 16 cores / 32 threads; thread n and n+16 share a core.
-# The Windows build VM owns cores 12-15 (threads 12-15 and 28-31). Nothing of
-# the hosted host may run there.
+# When capacity.json budgets memory for a Windows VM, it owns cores 12-15
+# (threads 12-15 and 28-31), which must stay clear of hosted work.
 THREADS = 32
 WINDOWS_CPUS = "12-15,28-31"
 
@@ -141,7 +141,8 @@ def read_record(path: Path) -> dict:
     return record
 
 
-def helper_config(uid: int, gid: int, uplink: str, public_ipv4: str, tenant: dict | None = None) -> dict:
+def helper_config(uid: int, gid: int, uplink: str, public_ipv4: str, tenant: dict | None = None,
+                  *, capacity: dict | None = None) -> dict:
     """/etc/motor-vm-helper.json admitting only the motor-host account.
 
     Its slot CPUs are the tenant's cpuset: the installed record's when one is
@@ -154,7 +155,10 @@ def helper_config(uid: int, gid: int, uplink: str, public_ipv4: str, tenant: dic
         raise ValueError("the host agent account must not be root")
     if not isinstance(tenant.get("cpuset"), str):
         raise ValueError("the tenant record has no cpuset")
-    if cpus(tenant["cpuset"]) & cpus(WINDOWS_CPUS):
+    tenant_cpus = cpus(tenant["cpuset"])
+    host_capacity: dict = load_provision().read_capacity() if capacity is None else capacity
+    # Reserve Windows threads only on hosts that budget memory for that VM.
+    if host_capacity["windows_vm_bytes"] > 0 and tenant_cpus & cpus(WINDOWS_CPUS):
         raise ValueError(f"tenant cpuset {tenant['cpuset']} overlaps the Windows VM's CPUs {WINDOWS_CPUS}")
     images = STORAGE / "images"
     # Absent files the helper never opens: they are read only when a job slot
@@ -180,17 +184,18 @@ def helper_config(uid: int, gid: int, uplink: str, public_ipv4: str, tenant: dic
     }
 
 
-def validate_tenant(config: dict, provision=None) -> None:
+def validate_tenant(config: dict, provision=None, *, capacity: dict | None = None) -> None:
     """provision.py's own checks, plus this machine's: the cpuset avoids the
-    Windows VM's CPUs and exists on this host, and the resolvers are the host
-    agent's."""
+    Windows VM's CPUs when present and exists on this host, and the resolvers
+    are the host agent's."""
     provision = load_provision() if provision is None else provision
     try:
         provision.checked(config)
     except (KeyError, TypeError) as error:
         raise ValueError(f"invalid tenant record: {error!r}") from error
+    host_capacity: dict = provision.read_capacity() if capacity is None else capacity
     cpuset = cpus(config["cpuset"])
-    if cpuset & cpus(WINDOWS_CPUS):
+    if host_capacity["windows_vm_bytes"] > 0 and cpuset & cpus(WINDOWS_CPUS):
         raise ValueError(f"tenant cpuset {config['cpuset']} overlaps the Windows VM's CPUs {WINDOWS_CPUS}")
     if max(cpuset) >= THREADS:
         raise ValueError(f"tenant cpuset {config['cpuset']} names a CPU beyond this host's {THREADS} threads")
@@ -284,6 +289,13 @@ def check_installed(uid: int, gid: int, record_path: Path = TENANT_RECORD, helpe
             return False
         return True
 
+    capacity = None
+
+    def read_capacity():
+        nonlocal capacity
+        capacity = provision.read_capacity()
+
+    capacity_ok = check("capacity.json", read_capacity)
     record = None
 
     def load():
@@ -291,7 +303,8 @@ def check_installed(uid: int, gid: int, record_path: Path = TENANT_RECORD, helpe
         record = read_record(record_path)
 
     if check(str(record_path), load):
-        check(str(record_path), lambda: validate_tenant(record, provision))
+        if capacity_ok:
+            check(str(record_path), lambda: validate_tenant(record, provision, capacity=capacity))
 
         def registry():
             path = provision.REGISTRY / f"{provision.component(record['tenant'])}.json"
@@ -310,19 +323,15 @@ def check_installed(uid: int, gid: int, record_path: Path = TENANT_RECORD, helpe
 
         def helper():
             installed = json.loads(helper_path.read_text())
-            expected = render_json(helper_config(uid, gid, installed['uplink'], installed['public_ipv4'], record))
+            expected = render_json(helper_config(uid, gid, installed['uplink'], installed['public_ipv4'], record,
+                                                 capacity=capacity))
             if helper_path.read_text() != expected:
                 raise ValueError("differs from the render of the installed tenant record")
 
-        check(str(helper_path), helper)
+        if capacity_ok:
+            check(str(helper_path), helper)
 
-    capacity = None
-
-    def read_capacity():
-        nonlocal capacity
-        capacity = provision.read_capacity()
-
-    if check("capacity.json", read_capacity):
+    if capacity_ok:
         check("memory fit", lambda: provision.memory_fit(capacity))
         check("jobs slice", lambda: provision.verify_jobs_slice(capacity))
     check("resize", provision.refuse_resize_journal)
