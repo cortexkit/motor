@@ -866,7 +866,10 @@ impl Motor {
         let macos = request.platform == Some(Platform::Macos);
         let build_server_id = self.build_server_id(id);
         // A resubmitted spill gets one spill attempt only.
-        let resubmitted = build_server_id != id;
+        let resubmitted = self
+            .storage
+            .job(id)
+            .is_some_and(|j| j.build_server_job_id.is_some());
         let spilled = self
             .hosted_state(id)
             .is_some_and(|route| route.spill_wait_ms.is_some());
@@ -966,7 +969,9 @@ impl Motor {
                         // only because every overflow backend is offline.
                         let final_refusal = matches!(
                             error,
-                            crate::hosted::Error::AccountClosed | crate::hosted::Error::Rejected
+                            crate::hosted::Error::AccountClosed
+                                | crate::hosted::Error::Rejected
+                                | crate::hosted::Error::BoatHostFull
                         ) || (!spilled
                             && matches!(error, crate::hosted::Error::Platform));
                         if !final_refusal
@@ -1290,7 +1295,7 @@ impl Motor {
             } else {
                 None
             },
-            job_id: build_server_id,
+            job_id: self.build_server_id(id),
             workspace_key: request.workspace_key.clone(),
             workspace_kind: Some(workspace_kind),
             repository_root: request.repository_root,
@@ -1417,6 +1422,8 @@ impl Motor {
                     accepted.network = None;
                 }
                 let accepted = accepted.with_env_not_forwarded(env_not_forwarded);
+                let mut accepted = accepted;
+                accepted.job_id = id;
                 if wrong_platform {
                     self.log_hosted_failure(id, "admission", "accepted platform mismatch");
                     self.cancel(CancelRequest::new(id)).await?;
@@ -1711,14 +1718,10 @@ impl Motor {
         detail.truncate(end);
         Some(bounded_detail(detail + separator + &note))
     }
-    /// The ID the build server knows this job by. It differs from the caller's
-    /// job ID only after a spilled job whose hosted route failed before any Run
-    /// frame reached a hosted runner was resubmitted to the build server.
+    /// Resolve the runner ID for the common frame/record translation used by
+    /// bounced spills and fresh hosted bookings alike.
     fn build_server_id(&self, id: Uuid) -> Uuid {
-        self.storage
-            .job(id)
-            .and_then(|j| j.build_server_job_id)
-            .unwrap_or(id)
+        self.storage.runner_id(id)
     }
     /// Whether a spilled job whose hosted route failed may go back to the build
     /// server. A hosted runner, Boat or first-party, runs a command only from
@@ -2040,7 +2043,7 @@ impl Motor {
                     if channel
                         .as_ref()
                         .unwrap()
-                        .send(Frame::Cancel(CancelRequest::new(id)))
+                        .send(Frame::Cancel(CancelRequest::new(build_server_id)))
                         .await
                         .inspect_err(|error| self.log_hosted_failure(id, "cancel", error))
                         .is_err()
@@ -2348,7 +2351,7 @@ impl Motor {
                         .map(|_| false);
                 }
                 Ok(Incoming::Frame(Frame::HostedTerminal(terminal)))
-                    if hosted && terminal.job_id == id =>
+                    if hosted && terminal.job_id == build_server_id =>
                 {
                     let state = self.hosted_state(id).unwrap();
                     if state.terminal.is_none()
@@ -2371,7 +2374,9 @@ impl Motor {
                     return self.finish_hosted(id, false, tx).await.map(|_| false);
                 }
                 Ok(Incoming::Frame(Frame::WithdrawReply { .. })) => {}
-                Ok(Incoming::Frame(Frame::CancelReply(reply))) if hosted && reply.job_id == id => {
+                Ok(Incoming::Frame(Frame::CancelReply(reply)))
+                    if hosted && reply.job_id == build_server_id =>
+                {
                     tracing::info!(job_id = %id, step = "cancel", cause = "runner acknowledged cancellation", "hosted cancellation acknowledged");
                     self.storage.cancel_acknowledged(id)?;
                 }
@@ -2997,6 +3002,8 @@ async fn emit(tx: &mpsc::Sender<io::Result<StreamRecord>>, record: StreamRecord)
 #[path = "queue_tests.rs"]
 mod queue_tests;
 
+#[cfg(test)]
+mod boat_capacity_tests;
 #[cfg(test)]
 mod fleet_capacity_tests;
 #[cfg(test)]

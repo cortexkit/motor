@@ -27,6 +27,8 @@ pub(crate) struct Boat {
     pub hold_provisioning: Arc<AtomicBool>,
     pub reattach_unavailable: Arc<AtomicBool>,
     pub run_refusal: Arc<Mutex<Option<RunRefusal>>>,
+    pub connect_host_full: Arc<AtomicUsize>,
+    pub fresh_no_capacity: Arc<AtomicUsize>,
     _http: Http,
     _host: JoinHandle<()>,
 }
@@ -58,6 +60,8 @@ impl Boat {
         let strict_attach = Arc::new(AtomicBool::new(false));
         let run_refusal = Arc::new(Mutex::new(None::<RunRefusal>));
         let refusal = run_refusal.clone();
+        let connect_host_full = Arc::new(AtomicUsize::new(0));
+        let host_full = connect_host_full.clone();
         let ran = Arc::new(Mutex::new(std::collections::HashSet::<Uuid>::new()));
         let run_count = runs.clone();
         let attach_count = attaches.clone();
@@ -69,6 +73,7 @@ impl Boat {
                 let attaches = attach_count.clone();
                 let strict = strict.clone();
                 let refusal = refusal.clone();
+                let host_full = host_full.clone();
                 let ran = ran.clone();
                 let frames = captured.clone();
                 tokio::spawn(async move {
@@ -105,6 +110,20 @@ impl Boat {
                     motor_lease::Nonces::default()
                         .verify(&challenge, &claims, &requester_jwk, &sig, now_s())
                         .unwrap();
+                    if host_full
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok()
+                    {
+                        tls::write(
+                            &mut socket,
+                            &motor_lease::Prelude::LeaseRefused {
+                                reason: "host_full".into(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        return;
+                    }
                     tls::write(&mut socket, &motor_lease::Prelude::LeaseOk {})
                         .await
                         .unwrap();
@@ -218,6 +237,24 @@ impl Boat {
                                 .unwrap();
                                 return;
                             }
+                            Frame::JobStatus { job_id } => {
+                                assert_eq!(job_id, id);
+                                write_frame_async(
+                                    &mut socket,
+                                    &Frame::JobStatusReply(JobStatusReply {
+                                        job_id: id,
+                                        state: "running".into(),
+                                        waiting_on: None,
+                                        terminal: None,
+                                        unit: None,
+                                        unit_alive: None,
+                                        queue_wait_ms: None,
+                                    }),
+                                )
+                                .await
+                                .unwrap();
+                                return;
+                            }
                             _ => panic!("unexpected Boat frame"),
                         }
                     }
@@ -226,6 +263,9 @@ impl Boat {
         });
         let requests_seen = Arc::new(AtomicUsize::new(0));
         let job = Arc::new(Mutex::new(None::<motor_lease::LeaseRequest>));
+        let finished = Arc::new(Mutex::new(std::collections::HashSet::<String>::new()));
+        let fresh_no_capacity = Arc::new(AtomicUsize::new(0));
+        let capacity = fresh_no_capacity.clone();
         let lost = Arc::new(AtomicUsize::new(0));
         let lost_reply = lost.clone();
         let mem_mib = Arc::new(AtomicU64::new(0));
@@ -237,7 +277,11 @@ impl Boat {
         let http=Http::new(move |path,body| {
             if path.ends_with("/reattach") && unavailable.load(Ordering::SeqCst) { return (503, serde_json::json!({"error":"temporarily_unavailable"})); }
             if path.ends_with("/reattach") && lost_reply.load(Ordering::SeqCst) != 0 { return (409, serde_json::json!({"error":"sandbox_lost"})); }
-            if path.ends_with("/finish") {return (200,serde_json::json!({"job_id":path.split('/').nth(3).unwrap(),"settled_vcpu_ms":250,"released_vcpu_ms":59750}));}
+            if path.ends_with("/finish") {
+                let id = path.split('/').nth(3).unwrap();
+                finished.lock().unwrap().insert(id.to_owned());
+                return (200,serde_json::json!({"job_id":id,"settled_vcpu_ms":250,"released_vcpu_ms":59750}));
+            }
             // CLOUD admits a Boat job at booking, so release can never end it.
             if path.ends_with("/release") { return (409, serde_json::json!({"error":"job_admitted"})); }
             if path.ends_with("/reattach") && job.lock().unwrap().is_none() {
@@ -246,13 +290,22 @@ impl Boat {
             if path == "/v1/leases" && hold.load(Ordering::SeqCst) {
                 return (202, serde_json::json!({"status":"provisioning","retry_after_ms":5000}));
             }
+            if path == "/v1/leases" && !finished.lock().unwrap().is_empty()
+                && capacity.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok()
+            {
+                return (503, serde_json::json!({"error":"no_capacity"}));
+            }
             if requests_seen.fetch_add(1, Ordering::SeqCst) < provisioning {
                 return (202, serde_json::json!({"status":"provisioning","retry_after_ms":10}));
             }
             let (id,jwk,purpose,sshd)=if path=="/v1/leases" {
                 let request: motor_lease::LeaseRequest=serde_json::from_value(body.clone()).unwrap();
                 let mut saved=job.lock().unwrap();
-                if let Some(saved)=saved.as_ref() {assert_eq!(saved.job_id,request.job_id);}
+                let finished = finished.lock().unwrap();
+                assert!(!finished.contains(&request.job_id), "finished bookings cannot be leased again");
+                if let Some(saved)=saved.as_ref() {
+                    assert!(saved.job_id == request.job_id || finished.contains(&saved.job_id));
+                }
                 *saved=Some(request.clone());
                 (request.job_id,request.requester_jwk,Purpose::Run,&initial)
             } else {
@@ -286,6 +339,8 @@ impl Boat {
             hold_provisioning,
             reattach_unavailable,
             run_refusal,
+            connect_host_full,
+            fresh_no_capacity,
             _http: http,
             _host: task,
         }

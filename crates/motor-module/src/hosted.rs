@@ -117,6 +117,14 @@ fn stored_lease_request<'de, D: serde::Deserializer<'de>>(
         .map_err(serde::de::Error::custom)
 }
 impl HostedJobState {
+    /// The runner and broker use the current booking's ID. The caller keeps
+    /// its original ID even when a refused Boat booking needed a fresh lease.
+    pub(crate) fn runner_id(&self, caller: Uuid) -> Uuid {
+        self.lease_request
+            .as_ref()
+            .and_then(|request| Uuid::parse_str(&request.job_id).ok())
+            .unwrap_or(caller)
+    }
     pub(crate) fn awaiting_cancel_terminal(&self) -> bool {
         self.terminal.as_ref().is_some_and(|t| {
             matches!(t.outcome, motor_protocol::Outcome::OutcomeUnknown)
@@ -216,6 +224,7 @@ pub(crate) enum Error {
     SandboxLost,
     BrokerRefused,
     HostFull,
+    BoatHostFull,
     Capacity,
     NoCapacity(u64),
     /// The broker answered a lease request with `no_host_fits`: no host it
@@ -312,7 +321,7 @@ impl Error {
             Self::Provisioning(_) => "hosted_provisioning",
             Self::SandboxLost => "hosted_sandbox_lost",
             Self::BrokerRefused => "hosted_broker_refused",
-            Self::HostFull => "hosted_host_full",
+            Self::HostFull | Self::BoatHostFull => "hosted_host_full",
             Self::Capacity | Self::NoCapacity(_) => "hosted_capacity",
             Self::NoHostFits(_) => "hosted_no_host_fits",
             Self::AccountClosed => "hosted_account_closed",
@@ -348,9 +357,11 @@ impl Error {
             | Self::AccountAuthRequired
             | Self::AccountPermanent
             | Self::AccountInvalid => RefusalReason::RunnerAuthenticationFailed,
-            Self::HostFull | Self::Capacity | Self::NoCapacity(_) | Self::StorageFull => {
-                RefusalReason::RunnerFull
-            }
+            Self::HostFull
+            | Self::BoatHostFull
+            | Self::Capacity
+            | Self::NoCapacity(_)
+            | Self::StorageFull => RefusalReason::RunnerFull,
             Self::Connect | Self::Broker | Self::AccountTransient(_) | Self::Provisioning(_) => {
                 RefusalReason::Unreachable
             }
@@ -366,6 +377,8 @@ impl Error {
             format!("{}: a person must run `ck account login`", self.code())
         } else if self == Self::AccountClosed {
             format!("{}: hosted account closed", self.code())
+        } else if self == Self::BoatHostFull {
+            format!("{}; spill_attempted={}", self.code(), self.code())
         } else if let Some(field) = self.request_field() {
             format!("{}: {field}", self.code())
         } else {
@@ -907,6 +920,7 @@ impl Client {
         {
             return Err(Error::Admitted);
         }
+        let id = self.route.runner_id(id);
         self.post::<_, motor_lease::ReleaseReply>(
             &format!("/v1/leases/{id}/release"),
             &ReleaseRequest::default(),
@@ -916,8 +930,12 @@ impl Client {
     }
     pub(crate) async fn attach(&self, id: Uuid, storage: &Storage) -> Result<Channel, Error> {
         let key = requester()?;
+        let runner_id = self.route.runner_id(id);
         let lease: Lease = self
-            .post_ready(&format!("/v1/leases/{id}/reattach"), &reattach_body(&key))
+            .post_ready(
+                &format!("/v1/leases/{runner_id}/reattach"),
+                &reattach_body(&key),
+            )
             .await?;
         if self
             .route
@@ -941,7 +959,7 @@ impl Client {
         storage
             .hosted_update(id, |state| state.lease(&lease))
             .map_err(|_| Error::Broker)?;
-        self.connect(id, &lease, &key, motor_lease::Purpose::Attach)
+        self.connect(runner_id, &lease, &key, motor_lease::Purpose::Attach)
             .await
             .map_err(|failure| {
                 tracing::info!(job_id = %id, code = failure.error.code(), step = failure.step,
@@ -1028,6 +1046,7 @@ impl Client {
         // returns the host-full refusal (runner full) rather than the
         // transport failure the cut-off causes.
         let mut cut_off = Error::Provisioning(MIN_PROVISIONING_RETRY_MS);
+        let mut boat_host_full = false;
         'lease_requests: loop {
             let state = storage
                 .job(id)
@@ -1048,6 +1067,7 @@ impl Client {
             let spilled = state.spill_wait_ms.is_some();
             let hosted_test = state.hosted_test;
             let capacity_routed = state.capacity_routed();
+            let runner_id = state.runner_id(id);
             let key = requester()?;
             body.requester_jwk = RequesterJwk::from_key(&key.verifying_key());
             // Acquire credentials before recording this attempt: a vault refusal
@@ -1100,6 +1120,9 @@ impl Client {
                         );
                     }
                     match error {
+                        Error::NoCapacity(_) | Error::Provisioning(_) if boat_host_full => {
+                            return Err(Error::BoatHostFull);
+                        }
                         // No host can ever hold this many vCPUs, so the same
                         // request would be refused again. The caller decides
                         // where the job goes instead.
@@ -1131,7 +1154,7 @@ impl Client {
                 tracing::info!(job_id = %id, attempt, provider = if boat { "boat" } else { "first_party" },
                 host = %lease.placement.host, vm = lease.placement.vm.as_deref().unwrap_or(""),
                 max_s = lease.max_s, "hosted lease granted");
-                let claims = tls::claims(id, &lease, &key, motor_lease::Purpose::Run)?;
+                let claims = tls::claims(runner_id, &lease, &key, motor_lease::Purpose::Run)?;
                 if let Some((field, expected, actual)) = resource_mismatch(&claims, &body, boat) {
                     tracing::info!(job_id = %id, field, expected = %expected, actual = %actual,
                     "hosted lease claims mismatch");
@@ -1146,7 +1169,7 @@ impl Client {
                 tracing::info!(job_id = %id, attempt, transport = if lease.ssh.is_some() { "ssh" } else { "tls" },
                 "hosted connect started");
                 let connected = self
-                    .connect(id, &lease, &key, motor_lease::Purpose::Run)
+                    .connect(runner_id, &lease, &key, motor_lease::Purpose::Run)
                     .await;
                 match &connected {
                     Ok(_) => tracing::info!(job_id = %id, attempt, "hosted connect succeeded"),
@@ -1155,6 +1178,56 @@ impl Client {
                         cause = failure.host_reason.as_deref().unwrap_or(failure.error.code()),
                         host_reason = failure.host_reason.as_deref().unwrap_or(""), "hosted connect failed")
                     }
+                }
+                if boat
+                    && matches!(&connected, Err(failure) if failure.error == Error::HostFull)
+                    && !state.run_sent
+                {
+                    // Boat admits at booking, so release cannot free this grant.
+                    // A lost finish retires the busy sandbox; only after settlement
+                    // may a fresh booking use another internal ID. Keep the caller's
+                    // submission and snapshot, and charge every grant to the same
+                    // placement limit and queue deadline.
+                    let settled = tokio::time::timeout_at(
+                        provisioning_deadline,
+                        self.finish_never_ran(id, storage),
+                    )
+                    .await;
+                    if !matches!(settled, Ok(Ok(())))
+                        || !storage
+                            .job(id)
+                            .and_then(|j| j.hosted)
+                            .is_some_and(|s| s.finish_done)
+                        || attempt >= 2
+                    {
+                        return Err(Error::BoatHostFull);
+                    }
+                    let retry_at =
+                        tokio::time::Instant::now() + Duration::from_millis(HOST_FULL_RETRY_MS);
+                    if retry_at >= provisioning_deadline {
+                        tokio::time::sleep_until(provisioning_deadline).await;
+                        return Err(Error::BoatHostFull);
+                    }
+                    tracing::info!(job_id = %id, attempt, retry_after_ms = HOST_FULL_RETRY_MS,
+                        "Boat host full; waiting for a fresh booking");
+                    tokio::time::sleep_until(retry_at).await;
+                    body.job_id = Uuid::now_v7().to_string();
+                    storage
+                        .hosted_update(id, |s| {
+                            s.lease_request = Some(body.clone());
+                            s.placement = None;
+                            s.endpoint = None;
+                            s.endpoint_spki_sha256 = None;
+                            s.max_runtime_s = None;
+                            s.billed_vcpu_ms = None;
+                            s.billing = BillingStatus::Pending;
+                            s.finish_done = false;
+                            s.lease_attempted = false;
+                        })
+                        .map_err(|_| Error::Broker)?;
+                    boat_host_full = true;
+                    cut_off = Error::BoatHostFull;
+                    continue 'lease_requests;
                 }
                 if matches!(&connected, Err(failure) if failure.error == Error::HostFull) && !boat {
                     let state = storage
@@ -1176,7 +1249,7 @@ impl Client {
                         let replacement = tokio::time::timeout_at(
                             provisioning_deadline,
                             self.post::<_, Lease>(
-                                &format!("/v1/leases/{id}/replace"),
+                                &format!("/v1/leases/{runner_id}/replace"),
                                 &serde_json::json!({}),
                             ),
                         )
@@ -1265,8 +1338,15 @@ impl Client {
     ) -> Result<R, Error> {
         let mut pending = cut_off;
         loop {
-            match tokio::time::timeout_at(deadline, self.post_authorized(path, body, bearer)).await
-            {
+            let reply =
+                tokio::time::timeout_at(deadline, self.post_authorized(path, body, bearer)).await;
+            let reply = match reply {
+                Ok(Err(Error::HostFull | Error::Capacity)) if cut_off == Error::BoatHostFull => {
+                    Ok(Err(Error::NoCapacity(HOST_FULL_RETRY_MS)))
+                }
+                reply => reply,
+            };
+            match reply {
                 Err(_) => return Err(pending),
                 Ok(Err(error @ (Error::Provisioning(_) | Error::NoCapacity(_)))) => {
                     let retry_after_ms =
