@@ -1256,7 +1256,8 @@ fn manifest_advertises_exact_capability_and_all_operations() {
             "flow-scopes/v1",
             "exec-remote-return/v1",
             "exec-remote-return/v2",
-            "exec-remote-submission-key/v1"
+            "exec-remote-submission-key/v1",
+            "exec-remote-progress/v1"
         ])
     );
     let bytes = serde_json::to_string(&value).unwrap();

@@ -178,6 +178,7 @@ pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest 
         RETURN_CAPABILITY.into(),
         RETURN_CHUNKED_CAPABILITY.into(),
         motor_protocol::SUBMISSION_KEY_CAPABILITY.into(),
+        motor_protocol::PROGRESS_CAPABILITY.into(),
     ];
     if !config.windows_runners.is_empty()
         || (config.windows_runner_instance.is_some() && config.windows_runner_state_root.is_some())

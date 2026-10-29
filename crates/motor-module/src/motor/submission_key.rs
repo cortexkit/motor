@@ -26,6 +26,7 @@ pub(crate) struct KeyRecord {
 fn digest(request: &RunRequest) -> io::Result<String> {
     let mut caller = request.clone();
     caller.resume_from_seq = None;
+    caller = caller.with_progress(false);
     caller.submission_key = None;
     caller.env.retain(|name, _| allowed_env(name));
     let canonical = serde_json_canonicalizer::to_vec(&caller).map_err(io::Error::other)?;

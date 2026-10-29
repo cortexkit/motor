@@ -117,12 +117,15 @@ async fn known_key_replays_exclusively_and_does_not_recapture_checkout() {
     std::fs::write(repo.join("changed-after-submit"), "different snapshot").unwrap();
     let replay = records(
         motor
-            .submit_agent(request.clone(), None, PRINCIPAL)
+            .submit_agent(request.clone().with_progress(true), None, PRINCIPAL)
             .await
             .unwrap(),
     )
     .await;
     attached(&replay, id);
+    assert!(!replay
+        .iter()
+        .any(|record| matches!(record, StreamRecord::Progress(_))));
     assert!(replay
         .iter()
         .any(|r| matches!(r, StreamRecord::Started(s) if s.seq == 0)));
@@ -196,6 +199,10 @@ fn digest_is_canonical_and_covers_all_caller_execution_fields() {
     let original: RunRequest = serde_json::from_str(r#"{"workspace_key":"/repo","repository_root":"/repo","cwd":"/repo","command":"echo hello","env":{"CI":"1","PATH":"ignored"},"siblings":[],"submission_key":"caller:submission-0001"}"#).unwrap();
     let reordered: RunRequest = serde_json::from_str(r#"{"resume_from_seq":7,"submission_key":"caller:submission-0001","siblings":[],"env":{"PATH":"also ignored","CI":"1"},"command":"echo hello","cwd":"/repo","repository_root":"/repo","workspace_key":"/repo"}"#).unwrap();
     assert_eq!(digest(&original).unwrap(), digest(&reordered).unwrap());
+    assert_eq!(
+        digest(&original).unwrap(),
+        digest(&original.clone().with_progress(true)).unwrap()
+    );
     for (field, replacement) in [
         ("command", serde_json::json!("echo changed")),
         ("cwd", serde_json::json!("/repo/sub")),

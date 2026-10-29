@@ -689,6 +689,7 @@ pub(crate) struct Client {
     broker_status: std::sync::Mutex<Option<u16>>,
     broker_failure: std::sync::Mutex<Option<String>>,
     booking_open: Option<Arc<std::sync::Mutex<bool>>>,
+    progress: crate::motor::progress::Reporter,
     #[cfg(test)]
     connector: Option<Arc<dyn crate::transport::Connector>>,
 }
@@ -706,6 +707,7 @@ impl Client {
             broker_status: std::sync::Mutex::new(None),
             broker_failure: std::sync::Mutex::new(None),
             booking_open: None,
+            progress: crate::motor::progress::Reporter::new(false, 2),
             #[cfg(test)]
             connector: None,
         }
@@ -730,6 +732,10 @@ impl Client {
     }
     pub(crate) fn with_booking_gate(mut self, gate: Arc<std::sync::Mutex<bool>>) -> Self {
         self.booking_open = Some(gate);
+        self
+    }
+    pub(crate) fn with_progress(mut self, progress: crate::motor::progress::Reporter) -> Self {
+        self.progress = progress;
         self
     }
     #[cfg(test)]
@@ -984,6 +990,8 @@ impl Client {
         storage: &Arc<Storage>,
         caller: &str,
     ) -> Result<(Channel, Lease), Error> {
+        self.progress
+            .phase(motor_protocol::ProgressPhase::PlacementWait);
         let job = storage.job(id).ok_or(Error::Broker)?;
         let provisioning_deadline =
             tokio::time::Instant::now() + Duration::from_millis(spill_wait_budget_ms(&job));
@@ -1058,6 +1066,8 @@ impl Client {
         let mut cut_off = Error::Provisioning(MIN_PROVISIONING_RETRY_MS);
         let mut boat_host_full = false;
         'lease_requests: loop {
+            self.progress
+                .phase(motor_protocol::ProgressPhase::PlacementWait);
             let state = storage
                 .job(id)
                 .and_then(|j| j.hosted)
@@ -1179,6 +1189,7 @@ impl Client {
                 }
                 tracing::info!(job_id = %id, attempt, transport = if lease.ssh.is_some() { "ssh" } else { "tls" },
                 "hosted connect started");
+                self.progress.phase(motor_protocol::ProgressPhase::Connect);
                 let connected = self
                     .connect(runner_id, &lease, &key, motor_lease::Purpose::Run)
                     .await;
@@ -1189,6 +1200,11 @@ impl Client {
                         cause = failure.host_reason.as_deref().unwrap_or(failure.error.code()),
                         host_reason = failure.host_reason.as_deref().unwrap_or(""), "hosted connect failed")
                     }
+                }
+                if matches!(&connected, Err(failure) if matches!(failure.error, Error::HostFull | Error::Capacity))
+                {
+                    self.progress
+                        .phase(motor_protocol::ProgressPhase::PlacementWait);
                 }
                 if boat
                     && matches!(&connected, Err(failure) if failure.error == Error::HostFull)

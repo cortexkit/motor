@@ -75,6 +75,9 @@ pub struct Motor {
     wsl: crate::wsl::Checks,
 }
 mod agent_run;
+pub(crate) mod progress;
+#[cfg(test)]
+mod progress_tests;
 pub(crate) mod submission_key;
 
 struct Submission {
@@ -722,6 +725,52 @@ impl Motor {
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
         wake: watch::Receiver<bool>,
     ) -> io::Result<()> {
+        let progress = progress::Reporter::new(
+            submission.0.progress(),
+            submission.0.weight_hint.unwrap_or(2),
+        );
+        // Legacy streams keep their original delivery path and never see progress.
+        if !progress.enabled() {
+            return self
+                .run_job_with_progress(
+                    id,
+                    submission,
+                    env_not_forwarded,
+                    (wait, spill),
+                    tx,
+                    wake,
+                    &progress,
+                )
+                .await;
+        }
+        let (records, receive) = mpsc::channel(32);
+        progress
+            .forward(
+                self.run_job_with_progress(
+                    id,
+                    submission,
+                    env_not_forwarded,
+                    (wait, spill),
+                    &records,
+                    wake,
+                    &progress,
+                ),
+                receive,
+                tx,
+            )
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn run_job_with_progress(
+        &self,
+        id: Uuid,
+        submission: (RunRequest, crate::ReturnOptions, String),
+        env_not_forwarded: Vec<String>,
+        (wait, spill): (u64, bool),
+        tx: &mpsc::Sender<io::Result<StreamRecord>>,
+        wake: watch::Receiver<bool>,
+        progress: &progress::Reporter,
+    ) -> io::Result<()> {
         let (request, returns, caller) = submission;
         let hosted = self.hosted_state(id).is_some();
         if let Err(code) = validate_return_request(
@@ -891,6 +940,7 @@ impl Motor {
                     wake.clone(),
                     &caller,
                     &mut windows_queue,
+                    progress,
                 )
                 .await
                 .inspect_err(|error| self.log_hosted_failure(id, "run_snapshot", error))?
@@ -932,6 +982,7 @@ impl Motor {
                     // All configured Windows runners share one queue-wait
                     // budget. After trying the last runner, revisit earlier
                     // busy runners instead of failing while capacity can free up.
+                    progress.phase(ProgressPhase::PlacementWait);
                     tokio::select! {
                         _ = tokio::time::sleep_until(queue.deadline.min(tokio::time::Instant::now() + queue.retry_delay)) => {},
                         _ = tx.closed() => return Err(io::Error::other("caller detached")),
@@ -965,6 +1016,7 @@ impl Motor {
             wake,
             "direct",
             &mut None,
+            &progress::Reporter::new(false, 2),
         )
         .await
     }
@@ -981,6 +1033,7 @@ impl Motor {
         wake: watch::Receiver<bool>,
         caller: &str,
         windows_queue: &mut Option<WindowsQueue>,
+        progress: &progress::Reporter,
     ) -> io::Result<bool> {
         let (mut request, mut returns) = submission;
         // Routing back to the build server can change the stored queue budget.
@@ -1061,7 +1114,7 @@ impl Motor {
         let spill_started = tokio::time::Instant::now();
         let (mut channel, held) = loop {
             let opened = if let Some(state) = self.hosted_state(id) {
-                let client = self.hosted_client(state);
+                let client = self.hosted_client(state).with_progress(progress.clone());
                 match client
                     .run_for_caller(id, &request, &self.storage, caller)
                     .await
@@ -1175,6 +1228,7 @@ impl Motor {
                     }
                 }
             } else {
+                progress.phase(ProgressPhase::Connect);
                 let opened = async {
                     let mut channel =
                         open_for_request(connector.as_ref().unwrap().as_ref(), build_server_id)
@@ -1250,6 +1304,9 @@ impl Motor {
                         .map(|_| false);
                 }
             };
+            // Bundle bytes move only after Accepted. Preparing local manifests
+            // is not an upload phase and must not extend the connect phase.
+            progress.clear();
             if let Err(error) = snapshots.validate_sibling_paths(channel.sibling_paths) {
                 return self
                     .refused(
