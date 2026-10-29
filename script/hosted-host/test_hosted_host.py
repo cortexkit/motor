@@ -1,5 +1,7 @@
 """Run with python3 -m unittest -v script/hosted-host/test_hosted_host.py."""
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import re
@@ -66,7 +68,29 @@ def cutover_rule(guest_ram_mib, placeable, reserve_mib=TENANT_MEMORY_RESERVE_MIB
     return advertised_mib(guest_ram_mib, reserve_mib) >= memory_max_mib(placeable)
 
 
-class HostedHostConfigTests(unittest.TestCase):
+def renderer_cli(*args):
+    """Run the renderer's parser with the test host's capacity loader."""
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with mock.patch.object(hosted.sys, "argv", ["hosted_host.py", *map(str, args)]), \
+            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        try:
+            code = hosted.main()
+        except SystemExit as error:
+            assert isinstance(error.code, int)
+            code = error.code
+    return subprocess.CompletedProcess(args, code, stdout.getvalue(), stderr.getvalue())
+
+
+class CapacityConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.capacity = dict(CAPACITY)
+        for patch in (mock.patch.object(hosted, "load_provision", return_value=provision),
+                      mock.patch.object(provision, "read_capacity", side_effect=lambda: dict(self.capacity))):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+
+class HostedHostConfigTests(CapacityConfigTests):
     def test_helper_uplink_is_explicit_and_rendered_for_a_different_host(self):
         config = hosted.helper_config(998, 998, 'eno1', '8.8.8.8')
         self.assertEqual((config['uplink'], config['public_ipv4']), ('eno1', '8.8.8.8'))
@@ -105,6 +129,48 @@ class HostedHostConfigTests(unittest.TestCase):
             self.assertFalse(hosted.cpus(slot["cpus"]) & hosted.cpus(hosted.WINDOWS_CPUS))
         with self.assertRaises(ValueError):
             hosted.helper_config(0, 0, "enp6s0", "8.8.8.8")
+
+    def test_helper_accepts_windows_threads_without_a_windows_vm(self):
+        self.capacity["windows_vm_bytes"] = 0
+        for cpuset in ("12-15", "28-31"):
+            with self.subTest(cpuset=cpuset):
+                helper = hosted.helper_config(998, 998, "enp6s0", "8.8.8.8", {"cpuset": cpuset})
+                self.assertEqual(helper["slots"][0]["cpus"], cpuset)
+
+    def test_validate_tenant_accepts_windows_threads_without_a_windows_vm(self):
+        self.capacity["windows_vm_bytes"] = 0
+        template = dict(json.loads(hosted.TENANT_FILE.read_text()), sub=SUB, vcpu_ceiling=4)
+        for cpuset in ("12-15", "28-31"):
+            with self.subTest(cpuset=cpuset):
+                self.assertIsNone(hosted.validate_tenant(dict(template, cpuset=cpuset)))
+
+    def test_helper_still_parses_the_cpuset_without_a_windows_vm(self):
+        self.capacity["windows_vm_bytes"] = 0
+        with self.assertRaises(ValueError):
+            hosted.helper_config(998, 998, "enp6s0", "8.8.8.8", {"cpuset": "not-a-cpuset"})
+
+    def test_helpers_and_tenants_reserve_threads_for_any_positive_windows_budget(self):
+        self.capacity["windows_vm_bytes"] = 1
+        template = dict(json.loads(hosted.TENANT_FILE.read_text()), sub=SUB, vcpu_ceiling=4)
+        for cpuset in ("12-15", "28-31"):
+            with self.subTest(cpuset=cpuset):
+                record = dict(template, cpuset=cpuset)
+                with self.assertRaisesRegex(ValueError, "overlaps the Windows VM's CPUs"):
+                    hosted.helper_config(998, 998, "enp6s0", "8.8.8.8", record)
+                with self.assertRaisesRegex(ValueError, "overlaps the Windows VM's CPUs"):
+                    hosted.validate_tenant(record)
+
+    def test_capacity_load_failures_refuse_helpers_and_tenants(self):
+        record = dict(json.loads(hosted.TENANT_FILE.read_text()), sub=SUB)
+        for error in ("invalid capacity.json: missing", "capacity.json windows_vm_bytes must be a u64"):
+            with self.subTest(error=error), mock.patch.object(provision, "read_capacity", side_effect=ValueError(error)) as read:
+                with self.assertRaisesRegex(ValueError, "capacity.json"):
+                    hosted.helper_config(998, 998, "enp6s0", "8.8.8.8", record)
+                read.assert_called_once_with()
+                read.reset_mock()
+                with self.assertRaisesRegex(ValueError, "capacity.json"):
+                    hosted.validate_tenant(record)
+                read.assert_called_once_with()
 
     def test_tenant_one_fits_beside_the_runner_and_passes_provisioning_checks(self):
         tenant = hosted.tenant_config(SUB)
@@ -186,12 +252,12 @@ class HostedHostConfigTests(unittest.TestCase):
         output = subprocess.run(["python3", str(HERE / "hosted_host.py"), "host", "--host-id", HOST_ID, "--port", "9443"],
                                 check=True, capture_output=True, text=True).stdout
         self.assertEqual(json.loads(output), hosted.host_config(HOST_ID, port=9443))
-        tenant_output = subprocess.run(["python3", str(HERE / "hosted_host.py"), "tenant", "--sub", SUB,
-                                        "--image-version", "next-image"], check=True, capture_output=True, text=True).stdout
-        self.assertEqual(json.loads(tenant_output)["image_version"], "next-image")
+        tenant_output = renderer_cli("tenant", "--sub", SUB, "--image-version", "next-image")
+        self.assertEqual(tenant_output.returncode, 0, tenant_output.stderr)
+        self.assertEqual(json.loads(tenant_output.stdout)["image_version"], "next-image")
         for args in (["tenant", "--sub", "nope"], ["tenant"], ["host"]):
             with self.subTest(args=args):
-                refused = subprocess.run(["python3", str(HERE / "hosted_host.py"), *args], capture_output=True, text=True)
+                refused = renderer_cli(*args)
                 self.assertEqual(refused.returncode, 2)
 
 
@@ -232,12 +298,13 @@ class Crash(BaseException):
     """Stops a resize at a hook point the way a killed process would."""
 
 
-class InstalledStateTests(unittest.TestCase):
+class InstalledStateTests(CapacityConfigTests):
     """install.sh --check (and --start) through check_installed, against a
     scratch host whose provision.py paths, capacity inputs and systemctl
     reads are doubles."""
 
     def setUp(self):
+        super().setUp()
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
@@ -271,7 +338,7 @@ class InstalledStateTests(unittest.TestCase):
     def read_capacity(self):
         if self.capacity_error is not None:
             raise ValueError(self.capacity_error)
-        return dict(CAPACITY)
+        return dict(self.capacity)
 
     def registry_entry(self, record):
         """The helper registry entry provision() writes for a record."""
@@ -302,6 +369,15 @@ class InstalledStateTests(unittest.TestCase):
     def test_a_first_install_passes(self):
         self.assertEqual(self.problems(), [])
         self.assertEqual(json.loads(self.record_path.read_text()), {**json.loads(hosted.TENANT_FILE.read_text()), "sub": SUB})
+
+    def test_no_windows_installed_state_reuses_one_capacity_read(self):
+        self.capacity["windows_vm_bytes"] = 0
+        self.slice["MemoryMax"] = str(provision.jobs_slice_limits(self.capacity)[0])
+        provision.JOBS_DROP_IN.write_text(provision.jobs_slice_render(self.capacity))
+        self.install(dict(self.resized(), cpuset="0-14,16-30", vcpu_ceiling=30))
+        with mock.patch.object(provision, "read_capacity", wraps=self.read_capacity) as read:
+            self.assertEqual(self.problems(), [])
+            read.assert_called_once_with()
 
     def test_a_resized_record_passes_and_neither_check_nor_a_render_resets_it(self):
         record = self.resized()
@@ -460,10 +536,11 @@ class InstalledStateTests(unittest.TestCase):
         self.assertEqual(self.problems(), [])
 
 
-class InstalledRenderTests(unittest.TestCase):
+class InstalledRenderTests(CapacityConfigTests):
     """The renders install.sh installs, with and without an installed record."""
 
     def setUp(self):
+        super().setUp()
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.path = Path(tmp.name) / "tenant-1.json"
@@ -473,7 +550,7 @@ class InstalledRenderTests(unittest.TestCase):
     def cli(self, *args):
         if args[0] == 'helper':
             args = (*args, '--uplink', 'enp6s0', '--public-ip', '8.8.8.8')
-        return subprocess.run(["python3", str(HERE / "hosted_host.py"), *map(str, args)], capture_output=True, text=True)
+        return renderer_cli(*args)
 
     def test_an_installed_record_keeps_its_sizing(self):
         self.assertEqual(hosted.tenant_config(SUB, installed=self.path), self.record)
@@ -505,6 +582,19 @@ class InstalledRenderTests(unittest.TestCase):
         helper = self.cli("helper", "--uid", UID, "--gid", UID, "--installed", self.path)
         self.assertEqual(helper.returncode, 0, helper.stderr)
         self.assertEqual({slot["cpus"] for slot in json.loads(helper.stdout)["slots"]}, {"0-11,16-27"})
+
+    def test_first_install_template_uses_windows_threads_without_a_windows_vm(self):
+        self.capacity["windows_vm_bytes"] = 0
+        template = dict(self.record, cpuset="0-14,16-30", vcpu_ceiling=30)
+        del template["sub"]
+        self.path.write_text(hosted.render_json(template))
+        rendered = self.cli("tenant", "--sub", SUB, "--template", self.path)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertEqual(json.loads(rendered.stdout), dict(template, sub=SUB))
+        self.path.write_text(rendered.stdout)
+        helper = self.cli("helper", "--uid", UID, "--gid", UID, "--installed", self.path)
+        self.assertEqual(helper.returncode, 0, helper.stderr)
+        self.assertEqual({slot["cpus"] for slot in json.loads(helper.stdout)["slots"]}, {"0-14,16-30"})
 
     def test_a_template_override_cannot_replace_an_installed_record(self):
         refused = self.cli("tenant", "--sub", SUB, "--installed", self.path, "--template", self.path)
@@ -589,8 +679,9 @@ class RunnerLogTests(unittest.TestCase):
         self.assertEqual(reply, {"ok": True, "journal": {"entries": []}})
 
 
-class InstallScriptTests(unittest.TestCase):
+class InstallScriptTests(CapacityConfigTests):
     def setUp(self):
+        super().setUp()
         self.script = (HERE / "install.sh").read_text()
 
     def test_install_script_parses(self):

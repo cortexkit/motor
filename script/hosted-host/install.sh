@@ -24,10 +24,10 @@
 # provision.py resize and switch-image change, and the helper config takes its
 # slot CPUs from that record (--tenant-disk-quota-gib is then refused).
 # --check verifies every file and unit this script installs and changes
-# nothing. It also checks the installed tenant record itself (provision.py's
-# checks, a cpuset clear of the Windows CPUs), that the helper registry entry
-# agrees with it, that the helper config is its render, capacity.json, the
-# memory fit and the jobs slice cap, and that no resize.json is pending.
+# nothing. It also checks the installed tenant record (provision.py's checks,
+# excluding Windows CPUs only when capacity.json budgets a Windows VM), that
+# the helper registry entry agrees with it, that the helper config is its render,
+# capacity.json, the memory fit and jobs slice cap, and no pending resize.json.
 # --start runs the same checks,
 # then opens the agent's firewall port and enables and starts both units: the
 # broker places work on this host from its first signed heartbeat, so this is

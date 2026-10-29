@@ -380,7 +380,8 @@ class ProvisionTests(unittest.TestCase):
 
     def installer_render(self, image_version):
         """The bytes install.sh installs, and compares, for tenant-1's record."""
-        return json.dumps(hosted.tenant_config(SUB, 100, image_version), indent=2) + "\n"
+        with mock.patch.object(hosted, "load_provision", return_value=p):
+            return json.dumps(hosted.tenant_config(SUB, 100, image_version), indent=2) + "\n"
 
     def add_image(self, version):
         image = self.root / "tenant-images" / version
@@ -519,6 +520,33 @@ class ProvisionTests(unittest.TestCase):
         make_base.assert_not_called()
         execute.assert_not_called()
         self.assertEqual(before, sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*")))
+
+    def test_new_tenant_reserves_windows_threads_only_with_a_windows_vm(self):
+        c = dict(config(), cpuset="12-15,28-31", vcpu_ceiling=8)
+        capacity = dict(p.read_capacity(), windows_vm_bytes=1)
+
+        def execute(*args):
+            if args[0] == "fallocate":
+                args[-1].write_bytes(b"allocated")
+
+        def base(_c, _image, path):
+            path.mkdir(parents=True)
+
+        for windows in (1, 0):
+            capacity["windows_vm_bytes"] = windows
+            p.JOBS_DROP_IN.write_text(p.jobs_slice_render(capacity))
+            before = sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*"))
+            with self.subTest(windows_vm_bytes=windows), mock.patch.object(p, "read_capacity", return_value=capacity) as read, \
+                    mock.patch.object(p, "slice_properties", return_value={"LoadState": "loaded", "MemoryMax": str(24 * 1024**3 + windows)}), \
+                    mock.patch.object(p.shutil, "disk_usage", return_value=type("Usage", (), {"free": 2**63})):
+                if windows:
+                    with self.assertRaisesRegex(ValueError, "overlaps the Windows VM's CPUs"):
+                        p.provision(c, base, execute)
+                    self.assertEqual(before, sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*")))
+                else:
+                    p.provision(c, base, execute)
+                    self.assertEqual(json.loads((p.REGISTRY / "a.json").read_text())["cpuset"], c["cpuset"])
+                read.assert_called_once_with()
 
     def test_existing_base_space_still_reserves_suspend_room(self):
         c = config()
