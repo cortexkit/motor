@@ -281,6 +281,8 @@ PYTHON_CHECK = (
     "python_version=$(python --version) && test \"${python_version%$'\\r'}\" = 'Python 3.13.17' && "
     'python3 -c "import json, hashlib, subprocess, tomllib"'
 )
+NATS_VERSION_CHECK = "nats_version=$(nats-server --version) && printf '%s\\n' \"$nats_version\" && test \"${nats_version%$'\\r'}\" = 'nats-server: v2.15.0'"
+STABLE_VERSION_CHECK = "stable_version=$(rustc +stable --version) && printf '%s\\n' \"$stable_version\" && [[ \"$stable_version\" == 'rustc 1.99.0 '* ]]"
 
 
 GIT_DEP_URL = "https://dep.invalid/itoa-fixture"
@@ -386,7 +388,7 @@ def run(root, runner, evidence, gate):
         job = str(uuid.uuid4())
         channel = Channel(runner, root, evidence / f"bridge-{iteration}.log")
         try:
-            command = BUN_VERSION_CHECK + " || exit $?; " + NEXTEST_VERSION_CHECK + " || exit $?; " + PYTHON_CHECK + " || exit $?; " + ("test -f /c/t/qualification-cache-marker && " if iteration else "") + gate + " && printf cached > /c/t/qualification-cache-marker"
+            command = BUN_VERSION_CHECK + " || exit $?; " + NEXTEST_VERSION_CHECK + " || exit $?; " + PYTHON_CHECK + " || exit $?; " + NATS_VERSION_CHECK + " || exit $?; " + STABLE_VERSION_CHECK + " || exit $?; " + ("test -f /c/t/qualification-cache-marker && " if iteration else "") + gate + " && printf cached > /c/t/qualification-cache-marker"
             request = dict(type="run", job_id=job, gate_job=True, platform="windows", workspace_key="/qualification/workspace", repository_root="/qualification/workspace", cwd="/qualification/workspace", command=command, env={}, weight_hint=4, timeout=600, queue_wait_limit_s=60, snapshot_commit=commit, tree_hash=tree, integration_tip=commit, siblings=[], git_dependencies=[], bundles=[dict(index=0, repository="/qualification/workspace", length=len(data), sha256=hashlib.sha256(data).hexdigest())])
             channel.send(request)
             channel.until("accepted")

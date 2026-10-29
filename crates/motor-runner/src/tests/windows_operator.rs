@@ -205,7 +205,7 @@ fn no_units(runner: &Runner) {
 }
 
 /// The standard job user must execute the machine-wide tools but cannot modify
-/// PowerShell, Bun or Python. A checkout path exceeding 260 characters must build
+/// PowerShell, Bun, Python or NATS. A checkout path exceeding 260 characters must build
 /// through the target cache mounted at C:\t instead of writing long output paths.
 #[test]
 #[ignore = "trusted operator: sealed Windows baseline, dedicated accounts, KVM and systemd required"]
@@ -221,7 +221,7 @@ fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
     let output = run(
         &runner,
         &f,
-        &format!("set -e; rustc -vV; cargo --version; cargo nextest --version; git --version; bun --version; pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; python3 --version; python --version; python3 -c \"import json, hashlib, subprocess, tomllib\"; {probe}; cargo run --offline; test -f target/debug/motor-qualification.exe"),
+        &format!("set -e; rustc -vV; cargo --version; cargo nextest --version; git --version; bun --version; pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; python3 --version; python --version; python3 -c \"import json, hashlib, subprocess, tomllib\"; nats-server --version; rustc +stable --version; {probe}; cargo +stable run --offline; test -f target/debug/motor-qualification.exe"),
     );
     assert!(
         output
@@ -255,6 +255,20 @@ fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
         "{output}"
     );
     assert!(
+        output
+            .lines()
+            .any(|line| line.trim() == "nats-server: v2.15.0"),
+        "{output}"
+    );
+    assert!(
+        output.contains("NATS installation is read-only"),
+        "{output}"
+    );
+    assert!(
+        output.lines().any(|line| line.starts_with("rustc 1.99.0 ")),
+        "{output}"
+    );
+    assert!(
         output.contains("short target cache is writable"),
         "{output}"
     );
@@ -270,7 +284,7 @@ $ErrorActionPreference='Stop'
 $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
 if($identity.Name.Split('\')[-1] -cne 'motor-job'){throw "unexpected job user: $($identity.Name)"}
 if(([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'job user is an administrator'}
-foreach($tool in @(@{name='PowerShell';command='pwsh.exe';path='C:\Program Files\PowerShell\7'},@{name='Bun';command='bun.exe';path='C:\Program Files\Bun'},@{name='Python';command='python3.exe';path='C:\Python313'})) {
+foreach($tool in @(@{name='PowerShell';command='pwsh.exe';path='C:\Program Files\PowerShell\7'},@{name='Bun';command='bun.exe';path='C:\Program Files\Bun'},@{name='Python';command='python3.exe';path='C:\Python313'},@{name='NATS';command='nats-server.exe';path='C:\Program Files\NATS'})) {
 $install=$tool.path
 if((Get-Command $tool.command -ErrorAction Stop).Source -cne (Join-Path $install $tool.command)){throw "$($tool.name) resolves outside the protected installation"}
 $directories=@((Get-Item -LiteralPath $install)) + @(Get-ChildItem -LiteralPath $install -Directory -Recurse -Force -ErrorAction Stop)

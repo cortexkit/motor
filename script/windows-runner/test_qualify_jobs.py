@@ -137,6 +137,52 @@ class QualificationReadinessTests(unittest.TestCase):
                 if passes:
                     self.assertIn("Python 3.13.17", result.stdout)
 
+    def test_real_jobs_check_nats_and_stable_even_with_a_custom_gate(self):
+        source = (HERE / "qualify-jobs.py").read_text()
+        self.assertIn('+ NATS_VERSION_CHECK + " || exit $?; " + ', source)
+        self.assertIn('+ STABLE_VERSION_CHECK + " || exit $?; " + ', source)
+
+    @unittest.skipUnless(shutil.which("bash"), "requires Bash for the Git Bash NATS check")
+    def test_nats_version_check_rejects_wrong_missing_and_failed_tools(self):
+        for version, code, passes in (
+            ("nats-server: v2.15.0", 0, True),
+            ("nats-server: v2.15.0\r", 0, True),
+            ("nats-server: v2.14.0", 0, False),
+            ("nats-server: v2.15.00", 0, False),
+            ("", 127, False),
+            ("nats-server: v2.15.0", 1, False),
+        ):
+            with self.subTest(version=version, code=code):
+                command = (
+                    "nats-server() { test \"$*\" = --version || return 99; "
+                    f"printf '%s\\n' '{version}'; return {code}; }}; "
+                ) + JOBS.NATS_VERSION_CHECK
+                result = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, passes, result.stderr)
+                if passes:
+                    self.assertIn("nats-server: v2.15.0", result.stdout)
+
+    @unittest.skipUnless(shutil.which("bash"), "requires Bash for the Git Bash stable check")
+    def test_stable_version_check_rejects_wrong_missing_and_failed_tools(self):
+        for version, code, passes in (
+            ("rustc 1.99.0 (abc123 2026-09-01)", 0, True),
+            ("rustc 1.99.0 (abc123 2026-09-01)\r", 0, True),
+            ("rustc 1.98.0 (old)", 0, False),
+            ("rustc 1.99.00 (wrong)", 0, False),
+            ("rustc 1.99.0-nightly (wrong)", 0, False),
+            ("", 127, False),
+            ("rustc 1.99.0 (abc123 2026-09-01)", 1, False),
+        ):
+            with self.subTest(version=version, code=code):
+                command = (
+                    "rustc() { test \"$*\" = '+stable --version' || return 99; "
+                    f"printf '%s\\n' '{version}'; return {code}; }}; "
+                ) + JOBS.STABLE_VERSION_CHECK
+                result = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, passes, result.stderr)
+                if passes:
+                    self.assertIn("rustc 1.99.0 ", result.stdout)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

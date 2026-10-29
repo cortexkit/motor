@@ -344,6 +344,72 @@ class BaselineInputsTests(unittest.TestCase):
         self.assertIn("Assert-Spike ($bootstrap -match 'Verified machine-wide Python 3\\.13\\.17 with protected user read/execute access')", provision)
         self.assertIn("Assert-Spike ($bootstrap -match 'Verified machine-wide Python stdlib imports: json, hashlib, subprocess, tomllib')", provision)
 
+    def test_baseline_installs_checksum_pinned_machine_wide_nats_on_path(self):
+        source = (HERE / "setup-job-baseline.ps1").read_text()
+        version = json.loads((HERE.parent / "runner/toolchain.json").read_text())["tools"]["nats-server"]["version"].removeprefix("nats-server: v")
+        self.assertEqual(version, "2.15.0")
+        for expected in (
+            f"$natsVersion = '{version}'",
+            "https://github.com/nats-io/nats-server/releases/download/v2.15.0/SHA256SUMS",
+            "$natsSha256 = '2d0861dc2ca3567d17f7d19611d7b346cc2ccbd7086a0a77cc957a2c71663200'",
+            "Invoke-WebRequest 'https://github.com/nats-io/nats-server/releases/download/v2.15.0/nats-server-v2.15.0-windows-amd64.zip' -OutFile $natsArchive",
+            "Get-FileHash -LiteralPath $natsArchive -Algorithm SHA256",
+            "throw 'nats-server archive SHA-256 mismatch'",
+            "$natsInstall = 'C:\\Program Files\\NATS'",
+            "& icacls $natsInstall /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'",
+            'Expand-Archive -LiteralPath $natsArchive -DestinationPath $natsInstall',
+            r'Move-Item -LiteralPath "$natsInstall\nats-server-v$natsVersion-windows-amd64\nats-server.exe" -Destination "$natsInstall\nats-server.exe"',
+            r'& icacls "$natsInstall\*" /reset /T /C /L /Q',
+            "& icacls $natsInstall /setowner '*S-1-5-32-544' /T /C /L /Q",
+            "Remove-Item -LiteralPath $natsArchive -Force -ErrorAction SilentlyContinue",
+            "[Environment]::SetEnvironmentVariable('Path', \"$natsInstall;$machinePath\", 'Machine')",
+            '$env:Path = "$natsInstall;" + $env:Path',
+            r'& "$natsInstall\nats-server.exe" --version',
+            '$installedNatsVersion -cne "nats-server: v$natsVersion"',
+        ):
+            self.assertIn(expected, source)
+        self.assertLess(source.index('-OutFile $natsArchive'), source.index('Get-FileHash -LiteralPath $natsArchive'))
+        self.assertLess(source.index("throw 'nats-server archive SHA-256 mismatch'"), source.index('Expand-Archive -LiteralPath $natsArchive'))
+        self.assertLess(source.index('& icacls $natsInstall /inheritance:r'), source.index('Expand-Archive -LiteralPath $natsArchive'))
+        self.assertLess(source.index('& icacls $natsInstall /setowner'), source.index(r'& "$natsInstall\nats-server.exe" --version'))
+        setup = source.split("$natsVersion = ", 1)[1].split("$bytes = ", 1)[0]
+        self.assertNotIn('$HyperVSpike', setup)
+        self.assertNotIn('$HasWinget', setup)
+
+    def test_baseline_copies_complete_pinned_rust_to_stable_before_freeze(self):
+        source = (HERE / "setup-job-baseline.ps1").read_text()
+        copy = r'Copy-Item -LiteralPath "$env:RUSTUP_HOME\toolchains\$toolchain-$hostTriple" -Destination $stableInstall -Recurse'
+        for expected in (
+            r'$stableInstall = Join-Path $env:RUSTUP_HOME "toolchains\stable-$hostTriple"',
+            copy,
+            r"& 'C:\rust\cargo\bin\rustc.exe' +stable -vV",
+            '$stableRustc -notcontains "release: $toolchain"',
+            '$stableRustc -notcontains "host: $hostTriple"',
+            '& $rustup component list --installed --toolchain stable',
+            'Compare-Object $components $stableComponents',
+            '& $rustup target list --installed --toolchain stable',
+            'Compare-Object $targets $stableTargets',
+        ):
+            self.assertIn(expected, source)
+        self.assertLess(source.index('component add clippy rustfmt'), source.index(copy))
+        self.assertLess(source.index('target add aarch64-pc-windows-msvc'), source.index(copy))
+        self.assertLess(source.index(copy), source.index("& 'C:\\rust\\cargo\\bin\\rustc.exe' +stable -vV"))
+        self.assertLess(source.index('Compare-Object $targets $stableTargets'), source.index('# Freeze toolchain files'))
+        setup = source.split('$stableInstall = ', 1)[1].split('$nextestVersion = ', 1)[0]
+        self.assertNotIn('$HyperVSpike', setup)
+
+    def test_windows_image_qualification_requires_nats_and_stable(self):
+        operator = (HERE.parent.parent / "crates/motor-runner/src/tests/windows_operator.rs").read_text()
+        self.assertIn('nats-server --version; rustc +stable --version', operator)
+        self.assertIn('line.trim() == "nats-server: v2.15.0"', operator)
+        self.assertIn('line.starts_with("rustc 1.99.0 ")', operator)
+        self.assertIn('cargo +stable run --offline', operator)
+        self.assertIn("@{name='NATS';command='nats-server.exe';path='C:\\Program Files\\NATS'}", operator)
+        self.assertIn('output.contains("NATS installation is read-only")', operator)
+        provision = (HERE.parent / "hyperv-spike/provision.ps1").read_text()
+        self.assertIn("Assert-Spike ($bootstrap -match 'Verified machine-wide nats-server v2\\.15\\.0 with protected user read/execute access')", provision)
+        self.assertIn("Assert-Spike ($bootstrap -match 'Verified machine-wide Rust stable 1\\.99\\.0 with matching components and targets')", provision)
+
     def test_guest_requests_arm64_msvc_on_every_install_path(self):
         source = (HERE / "setup-guest.ps1").read_text()
         winget = source.split("$vsArgs = @(", 1)[1].split(") -join", 1)[0]

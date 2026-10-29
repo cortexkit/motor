@@ -180,6 +180,121 @@ foreach ($code in @(0, 1)) {
 $checks++
 Write-Host 'PASS python_stdlib_guard_rejects_failure'
 
+$natsInstall = @($ast.EndBlock.Statements | Where-Object {
+    $_ -is [Management.Automation.Language.TryStatementAst] -and $_.Extent.Text.Contains('-OutFile $natsArchive')
+})
+Assert ($natsInstall.Count -eq 1) 'NATS must install unconditionally for QEMU and Hyper-V images'
+$natsSetup = $natsInstall[0].Extent.Text
+Assert ($natsSetup.IndexOf('-OutFile $natsArchive') -lt $natsSetup.IndexOf('Get-FileHash -LiteralPath $natsArchive')) 'NATS hash must follow download'
+Assert ($natsSetup.IndexOf("throw 'nats-server archive SHA-256 mismatch'") -lt $natsSetup.IndexOf('Expand-Archive -LiteralPath $natsArchive')) 'NATS hash must be verified before extraction'
+Assert ($natsSetup.IndexOf('& icacls $natsInstall /inheritance:r') -lt $natsSetup.IndexOf('Expand-Archive -LiteralPath $natsArchive')) 'NATS root must be protected before extraction'
+$checks++
+Write-Host 'PASS nats_unconditional_download_verify_extract'
+
+$natsHashGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text.Contains('Get-FileHash -LiteralPath $natsArchive')}, $true)
+Assert ($null -ne $natsHashGuard) 'missing NATS archive hash guard'
+$natsArchive = 'nats-fixture.zip'
+$natsSha256 = '2d0861dc2ca3567d17f7d19611d7b346cc2ccbd7086a0a77cc957a2c71663200'
+function Get-FileHash {
+    param($LiteralPath, $Algorithm)
+    Assert ($LiteralPath -eq $natsArchive -and $Algorithm -eq 'SHA256') 'NATS hashed the wrong archive or algorithm'
+    [pscustomobject]@{ Hash = $fixtureHash }
+}
+try {
+    foreach ($fixtureHash in @($natsSha256.ToUpperInvariant(), ('0' * 64))) {
+        $threw = $false
+        try { Invoke-Expression $natsHashGuard.Extent.Text } catch {
+            Assert ($_.ToString().Contains('nats-server archive SHA-256 mismatch')) "unexpected NATS hash error: $_"
+            $threw = $true
+        }
+        Assert ($threw -eq ($fixtureHash -eq ('0' * 64))) 'NATS accepted a wrong hash or rejected the pinned hash'
+    }
+} finally {
+    Remove-Item Function:\Get-FileHash
+}
+$checks++
+Write-Host 'PASS nats_hash_guard_rejects_mismatch'
+
+$natsVersionGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text.Contains('$installedNatsVersion -cne')}, $true)
+Assert ($null -ne $natsVersionGuard) 'missing NATS version guard'
+$natsVersion = '2.15.0'
+foreach ($case in @(
+    @{Version='nats-server: v2.15.0'; Code=0; Reject=$false},
+    @{Version='nats-server: v2.14.0'; Code=0; Reject=$true},
+    @{Version='nats-server: v2.15.00'; Code=0; Reject=$true},
+    @{Version=''; Code=127; Reject=$true},
+    @{Version='nats-server: v2.15.0'; Code=1; Reject=$true}
+)) {
+    $installedNatsVersion = $case.Version
+    $LASTEXITCODE = $case.Code
+    $threw = $false
+    try { Invoke-Expression $natsVersionGuard.Extent.Text } catch {
+        Assert ($_.ToString().Contains('Machine-wide nats-server version verification failed')) "unexpected NATS version error: $_"
+        $threw = $true
+    }
+    Assert ($threw -eq $case.Reject) "wrong NATS version guard result: $($case.Version), exit $($case.Code)"
+}
+$checks++
+Write-Host 'PASS nats_version_guard_rejects_wrong_missing_and_failed_tools'
+
+$stableCopyText = 'Copy-Item -LiteralPath "$env:RUSTUP_HOME\toolchains\$toolchain-$hostTriple" -Destination $stableInstall -Recurse'
+$stableCopy = @($ast.EndBlock.Statements | Where-Object { $_.Extent.Text -eq $stableCopyText })
+Assert ($stableCopy.Count -eq 1) 'stable must be a complete unconditional copy of the numbered Rust toolchain'
+Assert ($baseline.IndexOf('target add aarch64-pc-windows-msvc') -lt $stableCopy[0].Extent.StartOffset) 'stable must include the installed ARM64 target'
+Assert ($baseline.IndexOf('component add clippy rustfmt') -lt $stableCopy[0].Extent.StartOffset) 'stable must include the installed Rust components'
+Assert ($stableCopy[0].Extent.EndOffset -lt $baseline.IndexOf('# Freeze toolchain files')) 'stable must inherit the read-only toolchain ACL'
+$checks++
+Write-Host 'PASS rust_stable_complete_copy_before_freeze'
+
+$stableVersionGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text.Contains('$stableRustc -notcontains')}, $true)
+Assert ($null -ne $stableVersionGuard) 'missing stable version guard'
+$toolchain = '1.99.0'
+$hostTriple = 'x86_64-pc-windows-msvc'
+foreach ($case in @(
+    @{Version=@('release: 1.99.0', "host: $hostTriple"); Code=0; Reject=$false},
+    @{Version=@('release: 1.98.0', "host: $hostTriple"); Code=0; Reject=$true},
+    @{Version=@('release: 1.99.00', "host: $hostTriple"); Code=0; Reject=$true},
+    @{Version=@('release: 1.99.0', 'host: aarch64-pc-windows-msvc'); Code=0; Reject=$true},
+    @{Version=@(); Code=127; Reject=$true},
+    @{Version=@('release: 1.99.0', "host: $hostTriple"); Code=1; Reject=$true}
+)) {
+    $stableRustc = $case.Version
+    $LASTEXITCODE = $case.Code
+    $threw = $false
+    try { Invoke-Expression $stableVersionGuard.Extent.Text } catch {
+        Assert ($_.ToString().Contains('Machine-wide Rust stable version/host verification failed')) "unexpected stable version error: $_"
+        $threw = $true
+    }
+    Assert ($threw -eq $case.Reject) "wrong stable version guard result: $($case.Version -join ' | '), exit $($case.Code)"
+}
+$checks++
+Write-Host 'PASS rust_stable_version_guard_rejects_wrong_missing_and_failed_tools'
+
+foreach ($inventory in @('components', 'targets')) {
+    $guard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Extent.Text.Contains("throw 'Rust stable $inventory differ from pinned toolchain'")}, $true)
+    Assert ($null -ne $guard) "missing stable $inventory guard"
+    $complete = if ($inventory -eq 'components') { @("clippy-$hostTriple", "rustfmt-$hostTriple") } else { @($hostTriple, 'aarch64-pc-windows-msvc') }
+    Set-Variable -Name $inventory -Value $complete
+    foreach ($case in @(
+        @{Entries=$complete; Code=0; Reject=$false},
+        @{Entries=@($complete[0]); Code=0; Reject=$true},
+        @{Entries=@($complete[1]); Code=0; Reject=$true},
+        @{Entries=@($complete + 'unexpected'); Code=0; Reject=$true},
+        @{Entries=$complete; Code=1; Reject=$true}
+    )) {
+        Set-Variable -Name "stable$inventory" -Value $case.Entries
+        $LASTEXITCODE = $case.Code
+        $threw = $false
+        try { Invoke-Expression $guard.Extent.Text } catch {
+            Assert ($_.ToString().Contains("Rust stable $inventory differ from pinned toolchain")) "unexpected stable inventory error: $_"
+            $threw = $true
+        }
+        Assert ($threw -eq $case.Reject) "stable $inventory guard accepted mismatched output or rejected matching output"
+    }
+    $checks++
+    Write-Host "PASS rust_stable_${inventory}_guard_rejects_mismatch_and_failure"
+}
+
 # Execute the real inventory guards with complete and incomplete rustup output.
 $hostTriple = 'x86_64-pc-windows-msvc'
 foreach ($inventory in @('components', 'targets')) {
