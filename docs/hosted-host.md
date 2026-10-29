@@ -486,6 +486,26 @@ part of a rollback.
 
 To return to service, run `--check`, then `--start`.
 
+### Recovery timeouts
+
+After an unclean stop, disk recovery uses the VM's full configured CPU quota
+before any job can start. The checks share a recovery budget within the host's
+attach deadline; guest logs record each step's duration, including Git checks.
+Recovery CPU is not charged to tenant jobs.
+
+Two consecutive recovery timeouts latch `tenant_recovery_stuck` in motor-host.
+The host log includes the step, elapsed milliseconds and attempt count. The
+tenant's admin `status` reply reports `error: "tenant_recovery_stuck"` and
+`health.tenant_recovery_stuck` with `step`, `elapsed_ms`, `attempts` and `stuck`.
+The tenant advertises zero capacity and further wakes are refused as
+`host_full`; automatic retries stop. Other tenants are not affected.
+
+Inspect the guest recovery journal and host storage and CPU configuration,
+then fix the cause before explicitly restarting `motor-host.service` to clear
+the in-memory latch and allow another recovery attempt. A host restart resets
+the timeout count; it does not mark the disk recovered. Keep the tenant disk
+and journal. Never wipe the disk to clear a recovery timeout.
+
 ## Read the tenant runner's log
 
 The tenant runner logs inside the VM, where there is no SSH or exec. The

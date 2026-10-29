@@ -132,6 +132,7 @@ fn isolated_staged_resize_cold_start() {
         socket: config["helper_socket"].as_str().unwrap().into(),
         storage: storage.into(),
         capacity: "/etc/motor-host/capacity.json".into(),
+        vcpu_ceiling: BTreeMap::from([(tenant.clone(), r.vcpu_ceiling)]),
         guest_init: BTreeMap::from([(
             tenant.clone(),
             json!({

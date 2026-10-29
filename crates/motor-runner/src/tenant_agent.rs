@@ -9,6 +9,7 @@ use std::{
     os::fd::AsRawFd,
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -89,6 +90,20 @@ async fn agent_session<S: AsyncRead + AsyncWrite + Unpin>(
 fn agent_result(result: io::Result<Value>) -> Value {
     match result {
         Ok(value) => value,
+        Err(error)
+            if error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<RecoveryFailure>())
+                .is_some() =>
+        {
+            let failure = error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<RecoveryFailure>()
+                .unwrap();
+            json!({"ok":false,"error":"tenant_recovery_failed","detail":error.to_string(),
+                "timed_out":failure.timed_out,"step":failure.step,"elapsed_ms":failure.elapsed_ms})
+        }
         Err(error) if error.to_string().starts_with("tenant_recovery_failed") => {
             json!({"ok":false,"error":"tenant_recovery_failed","detail":error.to_string()})
         }
@@ -484,6 +499,7 @@ fn root_name_service_files(hostname: &str) -> [(&'static str, String); 2] {
 }
 
 fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
+    let started = Instant::now();
     let TenantAgentRequest::AttachTenant {
         generation,
         recovery_required,
@@ -526,7 +542,7 @@ fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
             )
         },
         runner_socket::control,
-        || initialize_tenant(request),
+        || initialize_tenant(request, started),
     )?;
     fs::write(marker, generation.to_string())?;
     if recovery_required {
@@ -535,10 +551,11 @@ fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
     Ok(())
 }
 
-fn initialize_tenant(request: TenantAgentRequest) -> io::Result<()> {
+fn initialize_tenant(request: TenantAgentRequest, started: Instant) -> io::Result<()> {
     let TenantAgentRequest::AttachTenant {
         generation,
         recovery_required,
+        recovery_budget_ms,
         unix_ms,
         seed,
         address,
@@ -575,10 +592,13 @@ fn initialize_tenant(request: TenantAgentRequest) -> io::Result<()> {
     }
     let _mountpoint = paths::Directory::absolute(Path::new("/tenant"), 0)?;
     if recovery_required {
+        let deadline = recovery_deadline(started, recovery_budget_ms);
         if snapshot::mounted("/tenant")? {
-            command("umount", &["/tenant"])?;
+            recovery_step("initial_unmount", || {
+                recovery_command(deadline, "initial_unmount", "umount", &["/tenant"])
+            })?;
         }
-        recover_tenant_disk()?;
+        recover_tenant_disk(deadline)?;
     } else if !snapshot::mounted("/tenant")? {
         command("mount", &["-t", "xfs", "/dev/vdb", "/tenant"])?;
     }
@@ -618,13 +638,25 @@ fn initialize_tenant(request: TenantAgentRequest) -> io::Result<()> {
     Ok(())
 }
 
-fn recover_tenant_disk() -> io::Result<()> {
+fn recovery_deadline(started: Instant, budget_ms: Option<u64>) -> Instant {
+    let maximum = TENANT_RECOVERY_ALLOWANCE - TENANT_RECOVERY_REPLY_MARGIN;
+    started
+        + budget_ms
+            .map(Duration::from_millis)
+            .unwrap_or(maximum)
+            .min(maximum)
+}
+
+fn recover_tenant_disk(deadline: Instant) -> io::Result<()> {
     recovery_steps(|step| match step {
-        "replay" | "remount" => {
-            recovery_command(step, "mount", &["-t", "xfs", "/dev/vdb", "/tenant"])
-        }
-        "unmount" => recovery_command(step, "umount", &["/tenant"]),
-        "xfs_check" => recovery_command(step, "xfs_repair", &["-n", "/dev/vdb"]),
+        "replay" | "remount" => recovery_command(
+            deadline,
+            step,
+            "mount",
+            &["-t", "xfs", "/dev/vdb", "/tenant"],
+        ),
+        "unmount" => recovery_command(deadline, step, "umount", &["/tenant"]),
+        "xfs_check" => recovery_command(deadline, step, "xfs_repair", &["-n", "/dev/vdb"]),
         "stores" => {
             let mirrors = Path::new("/tenant/state/main/mirrors");
             let entries = match fs::read_dir(mirrors) {
@@ -638,21 +670,24 @@ fn recover_tenant_disk() -> io::Result<()> {
                     return Err(io::Error::other("bare store is not a directory"));
                 }
                 let path = entry.path();
-                recovery_command(
-                    "git_fsck",
-                    "git",
-                    &[
-                        "--no-optional-locks",
-                        "-c",
-                        "safe.directory=*",
-                        "-C",
-                        path.to_str()
-                            .ok_or_else(|| io::Error::other("non-UTF8 bare store"))?,
-                        "fsck",
-                        "--full",
-                        "--no-dangling",
-                    ],
-                )?;
+                recovery_step("git_fsck", || {
+                    recovery_command(
+                        deadline,
+                        "git_fsck",
+                        "git",
+                        &[
+                            "--no-optional-locks",
+                            "-c",
+                            "safe.directory=*",
+                            "-C",
+                            path.to_str()
+                                .ok_or_else(|| io::Error::other("non-UTF8 bare store"))?,
+                            "fsck",
+                            "--full",
+                            "--no-dangling",
+                        ],
+                    )
+                })?;
             }
             Ok(())
         }
@@ -664,25 +699,92 @@ fn recovery_steps(mut run: impl FnMut(&str) -> io::Result<()>) -> io::Result<()>
     // Only the guest kernel mounts tenant-controlled XFS. Check without repairs,
     // then verify retained Git objects before any runner can accept work.
     for step in ["replay", "unmount", "xfs_check", "remount", "stores"] {
-        run(step).map_err(|error| {
-            io::Error::other(format!("tenant_recovery_failed step={step}: {error}"))
-        })?;
+        recovery_step(step, || run(step))?;
     }
     Ok(())
 }
 
-fn recovery_command(step: &str, program: &str, args: &[&str]) -> io::Result<()> {
-    use std::{
-        io::Read,
-        process::Stdio,
-        time::{Duration, Instant},
-    };
+#[derive(Debug)]
+struct RecoveryFailure {
+    step: String,
+    elapsed_ms: u64,
+    timed_out: bool,
+    detail: String,
+}
+
+impl std::fmt::Display for RecoveryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tenant_recovery_failed step={} elapsed_ms={} timed_out={}: {}",
+            self.step, self.elapsed_ms, self.timed_out, self.detail
+        )
+    }
+}
+impl std::error::Error for RecoveryFailure {}
+
+fn recovery_step(step: &str, run: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+    let started = Instant::now();
+    tracing::info!(step, "tenant_recovery_step_started");
+    let result = run();
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    tracing::info!(
+        step,
+        elapsed_ms,
+        ok = result.is_ok(),
+        "tenant_recovery_step_finished"
+    );
+    result.map_err(|error| {
+        if error.get_ref().is_some_and(|e| e.is::<RecoveryFailure>()) {
+            return error;
+        }
+        io::Error::new(
+            error.kind(),
+            RecoveryFailure {
+                step: step.into(),
+                elapsed_ms,
+                timed_out: error.kind() == io::ErrorKind::TimedOut,
+                detail: error.to_string(),
+            },
+        )
+    })
+}
+
+fn wait_recovery_command<T>(
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+    mut poll: impl FnMut() -> io::Result<Option<T>>,
+    mut sleep: impl FnMut(Duration),
+) -> io::Result<T> {
+    loop {
+        if let Some(status) = poll()? {
+            return Ok(status);
+        }
+        if now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "recovery budget exhausted",
+            ));
+        }
+        sleep(Duration::from_millis(20));
+    }
+}
+
+fn recovery_command(deadline: Instant, step: &str, program: &str, args: &[&str]) -> io::Result<()> {
+    use std::{io::Read, os::unix::process::CommandExt, process::Stdio};
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "recovery budget exhausted",
+        ));
+    }
     let mut child = Command::new(program)
         .args(args)
         .env("GIT_NO_LAZY_FETCH", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()?;
     fn bounded(
         mut reader: impl Read + Send + 'static,
@@ -703,25 +805,29 @@ fn recovery_command(step: &str, program: &str, args: &[&str]) -> io::Result<()> 
     }
     let stdout = bounded(child.stdout.take().unwrap());
     let stderr = bounded(child.stderr.take().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break Some(status);
+    let status = wait_recovery_command(
+        deadline,
+        Instant::now,
+        || child.try_wait(),
+        std::thread::sleep,
+    );
+    if status.is_err() {
+        // Git may have children holding the output pipes. Stop the entire check
+        // before joining readers, so a timeout can actually reach the host.
+        // SAFETY: the child was spawned in its own process group above.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
         }
-        if Instant::now() >= deadline {
-            child.kill()?;
-            child.wait()?;
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+        child.wait()?;
+    }
     let out = stdout
         .join()
         .map_err(|_| io::Error::other("recovery output reader"))??;
     let err = stderr
         .join()
         .map_err(|_| io::Error::other("recovery error reader"))??;
-    if !status.is_some_and(|s| s.success()) {
+    let status = status?;
+    if !status.success() {
         return Err(io::Error::other(format!(
             "{step}: status={status:?} stdout={} stderr={}",
             String::from_utf8_lossy(&out),
@@ -827,6 +933,103 @@ fn runner_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_step_longer_than_120_seconds_fits_shared_attach_budget() {
+        let started = Instant::now();
+        let now = std::cell::Cell::new(started);
+        let deadline = recovery_deadline(started, None);
+        recovery_step("xfs_check", || {
+            wait_recovery_command(
+                deadline,
+                || now.get(),
+                || Ok((now.get().duration_since(started).as_secs() >= 150).then_some(())),
+                |_| now.set(now.get() + Duration::from_secs(30)),
+            )
+        })
+        .unwrap();
+        assert_eq!(now.get().duration_since(started), Duration::from_secs(150));
+        assert!(now.get() < deadline);
+    }
+
+    #[test]
+    fn recovery_mirrors_share_one_deadline_and_timeout_reply_names_git_fsck() {
+        let started = Instant::now();
+        let now = std::cell::Cell::new(started);
+        let deadline = recovery_deadline(started, Some(500));
+        let check = |duration| {
+            let check_started = now.get();
+            recovery_step("git_fsck", || {
+                wait_recovery_command(
+                    deadline,
+                    || now.get(),
+                    || Ok((now.get().duration_since(check_started) >= duration).then_some(())),
+                    |delay| now.set(now.get() + delay),
+                )
+            })
+        };
+        check(Duration::from_millis(300)).unwrap();
+        let error = recovery_steps(|step| {
+            if step == "stores" {
+                check(Duration::from_millis(300))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        let reply = agent_result(Err(error));
+        assert_eq!(reply["error"], "tenant_recovery_failed");
+        assert_eq!(reply["timed_out"], true);
+        assert_eq!(reply["step"], "git_fsck");
+        assert!(reply["elapsed_ms"].is_u64());
+        assert_eq!(
+            now.get().duration_since(started),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn recovery_budget_is_additive_and_reserves_runner_startup_and_reply_time() {
+        let request = json!({"op":"attach_tenant","generation":1,"recovery_required":true,
+            "unix_ms":1,"seed":"","address":"","gateway":"","resolvers":[],"hostname":"","machine_id":""});
+        assert!(matches!(
+            serde_json::from_value::<TenantAgentRequest>(request).unwrap(),
+            TenantAgentRequest::AttachTenant {
+                recovery_budget_ms: None,
+                ..
+            }
+        ));
+        let started = Instant::now();
+        assert_eq!(
+            recovery_deadline(started, None).duration_since(started),
+            Duration::from_secs(590)
+        );
+        assert_eq!(
+            recovery_deadline(started, Some(u64::MAX)),
+            recovery_deadline(started, None)
+        );
+        assert_eq!(
+            recovery_deadline(started, Some(10)).duration_since(started),
+            Duration::from_millis(10)
+        );
+    }
+
+    #[test]
+    fn recovery_command_timeout_terminates_children_and_returns_typed_failure() {
+        let error = recovery_step("xfs_check", || {
+            recovery_command(
+                Instant::now() + Duration::from_millis(40),
+                "xfs_check",
+                "sh",
+                &["-c", "sleep 30 & wait"],
+            )
+        })
+        .unwrap_err();
+        let reply = agent_result(Err(error));
+        assert_eq!(reply["timed_out"], true);
+        assert_eq!(reply["step"], "xfs_check");
+        assert!(reply["elapsed_ms"].as_u64().unwrap() < 30_000);
+    }
 
     #[test]
     fn recovery_replays_checks_read_only_then_remounts_and_verifies_stores_before_start() {

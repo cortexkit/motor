@@ -478,6 +478,12 @@ impl Runtime {
                 !host.is_suspending(tenant),
                 Error::Refused(Refusal::Capacity)
             );
+            // Two exhausted recovery budgets need operator attention, not
+            // another identical check on every automatic wake.
+            ensure!(
+                !host.recovery_stuck(tenant),
+                Error::Refused(Refusal::HostFull)
+            );
             // A start the helper refused is not asked for again before its
             // retry time, whoever asks: at most one start attempt a minute.
             if host
@@ -498,6 +504,43 @@ impl Runtime {
             self.host.lock().expect("host lock").start_pending(tenant);
             tracing::info!(tenant, initialized_generation = ?generation, "tenant_wake_started");
             let generation = self.control.wake(tenant, generation).map_err(|error| {
+                {
+                    let mut host = self.host.lock().expect("host lock");
+                    if let Some(timeout) = error.downcast_ref::<crate::helper::RecoveryTimeout>() {
+                        host.recovery_timed_out(tenant, timeout.clone());
+                        let failure = host.recovery_failure(tenant).expect("recorded timeout");
+                        let stuck = failure.stuck;
+                        tracing::error!(
+                            tenant,
+                            step = timeout.step,
+                            elapsed_ms = timeout.elapsed_ms,
+                            attempts = failure.attempts,
+                            stuck,
+                            "tenant_recovery_timeout"
+                        );
+                        if stuck {
+                            tracing::error!(
+                                tenant,
+                                step = timeout.step,
+                                elapsed_ms = timeout.elapsed_ms,
+                                attempts = failure.attempts,
+                                "tenant_recovery_stuck"
+                            );
+                        }
+                        host.start_refused(
+                            tenant,
+                            if stuck {
+                                "tenant_recovery_stuck"
+                            } else {
+                                "tenant_recovery_timeout"
+                            },
+                            now_ms,
+                        );
+                        host.start_attempt_failed(tenant);
+                        return Error::Refused(Refusal::HostFull);
+                    }
+                    host.clear_recovery_timeouts(tenant);
+                }
                 if let Some(refused) = error.downcast_ref::<crate::helper::StartRefused>() {
                     // A policy refusal is host capacity, not a fault: the
                     // lease ends before Run as retryable host_full, and the
@@ -533,6 +576,7 @@ impl Runtime {
             })?;
             tracing::info!(tenant, generation, "tenant_wake_ready");
             let mut host = self.host.lock().expect("host lock");
+            host.clear_recovery_timeouts(tenant);
             host.guest_ready(tenant, generation)?;
         }
         let update = self
@@ -973,6 +1017,16 @@ impl Runtime {
         // Decode the closed guest schema so the local socket cannot become an
         // alternate route to disk attachment or clock/identity mutation.
         let request: motor_protocol::TenantAgentRequest = serde_json::from_value(request.clone())?;
+        if matches!(request, motor_protocol::TenantAgentRequest::Status) {
+            let host = self.host.lock().expect("host lock");
+            if let Some(failure) = host
+                .recovery_failure(tenant)
+                .filter(|failure| failure.stuck)
+            {
+                return Ok(json!({"ok":false,"error":"tenant_recovery_stuck",
+                    "health":{"tenant_recovery_stuck":failure}}));
+            }
+        }
         let operations = self.tenant_operations(tenant)?;
         let _operation = operations.lock().expect("tenant operations lock");
         self.control.admin(tenant, &serde_json::to_value(request)?)

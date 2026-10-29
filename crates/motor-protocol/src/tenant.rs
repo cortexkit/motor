@@ -20,6 +20,11 @@ pub const TENANT_ATTACH_READ_DEADLINE: Duration = Duration::from_secs(
     TENANT_RUNNER_READINESS_WAIT.as_secs() + TENANT_ATTACH_SETUP_MARGIN.as_secs(),
 );
 
+/// Extra attach time for disk recovery, separate from runner startup.
+pub const TENANT_RECOVERY_ALLOWANCE: Duration = Duration::from_secs(600);
+/// Leave time to terminate a timed-out check and return its failure to the host.
+pub const TENANT_RECOVERY_REPLY_MARGIN: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LeasePurpose {
@@ -94,6 +99,10 @@ pub enum TenantAgentRequest {
         generation: u64,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         recovery_required: bool,
+        /// Shared disk-check budget, excluding runner startup and reply time.
+        /// Older hosts omit it and use the standard recovery allowance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery_budget_ms: Option<u64>,
         unix_ms: u64,
         seed: String,
         address: String,

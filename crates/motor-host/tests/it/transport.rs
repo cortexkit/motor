@@ -16,6 +16,7 @@ struct Fake {
     peers: Mutex<Vec<UnixStream>>,
     /// The helper refuses every start with this case.
     refuse_start: Mutex<Option<&'static str>>,
+    recovery_timeout: Mutex<bool>,
     wake_gate: Mutex<Option<WakeGate>>,
 }
 struct WakeGate {
@@ -28,6 +29,13 @@ impl Control for Fake {
     }
     fn wake(&self, _: &str, _: Option<u64>) -> Result<u64> {
         self.calls.lock().unwrap().push("wake".into());
+        if *self.recovery_timeout.lock().unwrap() {
+            return Err(motor_host::helper::RecoveryTimeout {
+                step: "xfs_check".into(),
+                elapsed_ms: 590_000,
+            }
+            .into());
+        }
         if let Some(gate) = self.wake_gate.lock().unwrap().take() {
             let _ = gate.entered.send(());
             let _ = gate.release.recv();
@@ -88,6 +96,96 @@ impl Control for Fake {
 #[tokio::test]
 async fn pending_runner_readiness_keeps_capacity_withdrawn_and_new_leases_retryable() {
     pending_readiness_refuses_lease(false).await;
+}
+
+#[tokio::test]
+async fn repeated_recovery_timeouts_latch_stuck_in_health_and_stop_automatic_wakes() {
+    let (runtime, fake, broker, requester, claims) = fixture();
+    *fake.recovery_timeout.lock().unwrap() = true;
+    let now = unix_ms();
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .start_refused("tenant", "initialization", now);
+    for attempt in 1..=2 {
+        let due = runtime
+            .host
+            .lock()
+            .unwrap()
+            .start_retry_at("tenant")
+            .unwrap();
+        assert!(runtime.retry_refused_starts(due).is_err());
+        let host = runtime.host.lock().unwrap();
+        assert_eq!(host.recovery_failure("tenant").unwrap().attempts, attempt);
+        assert_eq!(host.recovery_stuck("tenant"), attempt == 2);
+    }
+    runtime
+        .retry_refused_starts(now + 10 * motor_host::state::START_RETRY_MS)
+        .unwrap();
+    assert_eq!(*fake.calls.lock().unwrap(), ["wake", "wake"]);
+    let status = runtime.admin("tenant", &json!({"op":"status"})).unwrap();
+    assert_eq!(
+        status,
+        json!({"ok":false,"error":"tenant_recovery_stuck",
+        "health":{"tenant_recovery_stuck":{"step":"xfs_check","elapsed_ms":590_000,"attempts":2,"stuck":true}}})
+    );
+    {
+        let host = runtime.host.lock().unwrap();
+        assert_eq!(
+            host.start_refusal_case("tenant"),
+            Some("tenant_recovery_stuck")
+        );
+        let heartbeat = host.heartbeat(now, 0, true);
+        assert_eq!((heartbeat.free_vcpus, heartbeat.free_mem_mib), (0, 0));
+    }
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime, server));
+    let challenge = hello(&mut client, &broker, &requester, &claims).await;
+    assert_eq!(
+        respond(&mut client, &requester, &claims, challenge).await,
+        json!({"type":"lease_refused","reason":"host_full"})
+    );
+    task.await.unwrap().unwrap();
+    assert_eq!(*fake.calls.lock().unwrap(), ["wake", "wake"]);
+}
+
+#[test]
+fn recovery_timeout_streak_resets_after_other_failure_or_success() {
+    let (runtime, fake, _, _, _) = fixture();
+    let now = unix_ms();
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .start_refused("tenant", "initialization", now);
+    for failure in ["timeout", "wake", "timeout", "success"] {
+        *fake.recovery_timeout.lock().unwrap() = failure == "timeout";
+        *fake.fail.lock().unwrap() = (failure == "wake").then_some("wake");
+        let due = runtime
+            .host
+            .lock()
+            .unwrap()
+            .start_retry_at("tenant")
+            .unwrap();
+        assert_eq!(
+            runtime.retry_refused_starts(due).is_ok(),
+            failure == "success"
+        );
+        let host = runtime.host.lock().unwrap();
+        assert!(!host.recovery_stuck("tenant"));
+        assert_eq!(
+            host.recovery_failure("tenant").map(|f| f.attempts),
+            (failure == "timeout").then_some(1)
+        );
+    }
+    assert!(runtime.host.lock().unwrap().is_ready("tenant"));
+    assert!(fake
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call == "quota:1"));
 }
 
 #[tokio::test]

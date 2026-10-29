@@ -182,6 +182,7 @@ fn helper_initialization_holds_one_vcpu_until_attach_or_post_restore_reply() {
             socket: path,
             storage: directory.path().to_path_buf(),
             capacity: directory.path().join("capacity.json"),
+            vcpu_ceiling: BTreeMap::from([("tenant".into(), 24)]),
             guest_init: BTreeMap::from([(
                 "tenant".into(),
                 json!({"address":"10.200.1.2/30","gateway":"10.200.1.1","resolvers":["1.1.1.1"],"hostname":"motor-1","machine_id":"12345678901234567890123456789012"}),
@@ -194,7 +195,7 @@ fn helper_initialization_holds_one_vcpu_until_attach_or_post_restore_reply() {
 
 #[test]
 fn recovery_guest_pass_clears_flag_but_failure_or_unreachable_guest_keeps_tenant_fenced() {
-    for result in ["pass", "fail", "unreachable"] {
+    for result in ["pass", "fail", "timeout", "unreachable"] {
         let directory = scratch();
         let socket = directory.path().join("helper.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -208,17 +209,32 @@ fn recovery_guest_pass_clears_flag_but_failure_or_unreachable_guest_keeps_tenant
                 let request: Value = serde_json::from_str(&line).unwrap();
                 assert_eq!(request["op"], op);
                 assert_eq!(request["tenant"], "tenant");
+                if op == "set_cpu_max" {
+                    assert_eq!(
+                        request["vcpus"], 24,
+                        "recovery needs the full configured quota"
+                    );
+                }
                 if op == "open_relay" {
                     let (fd, mut guest) = UnixStream::pair().unwrap();
                     descriptor_reply(&stream, &fd);
                     let init = read_json(&mut guest).unwrap();
                     assert_eq!(init["recovery_required"], true);
                     assert_eq!(init["op"], "attach_tenant");
+                    assert_eq!(init["recovery_budget_ms"], 590_000);
                     if result == "pass" {
                         write_json(&mut guest, &json!({"ok":true})).unwrap();
                     }
                     if result == "fail" {
                         write_json(&mut guest,&json!({"ok":false,"error":"tenant_recovery_failed","detail":"xfs_check failed"})).unwrap();
+                    }
+                    if result == "timeout" {
+                        write_json(
+                            &mut guest,
+                            &json!({"ok":false,"error":"tenant_recovery_failed",
+                            "timed_out":true,"step":"xfs_check","elapsed_ms":590_000}),
+                        )
+                        .unwrap();
                     }
                 } else {
                     writeln!(stream,"{}",json!({"result":"tenant","running":op!="adopt","generation":2,"recovery_required":true})).unwrap();
@@ -256,11 +272,22 @@ fn recovery_guest_pass_clears_flag_but_failure_or_unreachable_guest_keeps_tenant
             socket,
             storage: directory.path().into(),
             capacity: directory.path().join("capacity.json"),
+            vcpu_ceiling: BTreeMap::from([("tenant".into(), 24)]),
             guest_init: BTreeMap::from([("tenant".into(), json!({}))]),
         };
         let response = helper.wake("tenant", None);
         assert_eq!(response.is_ok(), result == "pass", "{result}: {response:?}");
-        if result != "pass" {
+        if result == "timeout" {
+            assert_eq!(
+                response
+                    .unwrap_err()
+                    .downcast_ref::<motor_host::helper::RecoveryTimeout>(),
+                Some(&motor_host::helper::RecoveryTimeout {
+                    step: "xfs_check".into(),
+                    elapsed_ms: 590_000
+                })
+            );
+        } else if result != "pass" {
             assert!(matches!(
                 response
                     .unwrap_err()
@@ -307,6 +334,7 @@ fn helper_start_refused_reply_is_a_typed_start_refusal_and_stops_the_wake() {
         socket,
         storage: directory.path().into(),
         capacity: directory.path().join("capacity.json"),
+        vcpu_ceiling: BTreeMap::from([("tenant".into(), 24)]),
         guest_init: BTreeMap::from([("tenant".into(), json!({}))]),
     };
     let error = helper.wake("tenant", None).unwrap_err();
@@ -348,6 +376,7 @@ fn adopted_vm_must_still_be_running_after_idempotent_activation() {
         socket,
         storage: directory.path().into(),
         capacity: directory.path().join("capacity.json"),
+        vcpu_ceiling: BTreeMap::from([("tenant".into(), 24)]),
         guest_init: BTreeMap::new(),
     };
     let error = helper.wake("tenant", Some(2)).unwrap_err();
