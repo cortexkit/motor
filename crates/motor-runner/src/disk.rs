@@ -35,14 +35,19 @@ pub(super) struct BuildFolderSize {
     target_bytes: u64,
     incremental_bytes: u64,
     measured_ms: u64,
+    // Workspace estimates can be partial even when target-only cleanup is safe.
     pub(super) complete: bool,
+    target_complete: bool,
 }
 
 impl Candidate {
-    fn needs_size_repair(&self, sizes: &BTreeMap<PathBuf, BuildFolderSize>) -> bool {
+    fn incomplete_workspace_size(&self, sizes: &BTreeMap<PathBuf, BuildFolderSize>) -> bool {
         self.workspace.is_some() && sizes.get(&self.path).is_none_or(|size| !size.complete)
     }
 }
+
+const BUILD_FOLDER_RETRY_MS: u64 = 5 * 60 * 1000;
+const BUILD_FOLDER_SWEEP_MS: u64 = 24 * 60 * 60 * 1000;
 
 // Caches used in the last half hour are likely to be reused; deleting them costs a cold rebuild.
 const SOFT_PRESSURE_MIN_AGE_MS: u64 = 30 * 60 * 1000;
@@ -139,12 +144,17 @@ fn measure_build_folder(path: &Path, measured_ms: u64) -> BuildFolderSize {
         measured_ms,
         ..BuildFolderSize::default()
     };
+    let target = path.join("target");
     let mut warned = false;
     let mut complete = true;
+    let mut target_complete = true;
     let mut warn = |path: &Path, error: io::Error| {
         complete = false;
+        if path.starts_with(&target) || target.starts_with(path) {
+            target_complete = false;
+        }
         if !warned {
-            tracing::warn!(path = %path.display(), %error,
+            tracing::debug!(path = %path.display(), %error,
                 "runner size estimate skips unreadable subtrees; logging first error only");
             warned = true;
         }
@@ -156,7 +166,6 @@ fn measure_build_folder(path: &Path, measured_ms: u64) -> BuildFolderSize {
             return size;
         }
     };
-    let target = path.join("target");
     let incremental = crate::cargo_gc::incremental(&target).unwrap_or_else(|error| {
         warn(&target, error);
         Vec::new()
@@ -196,6 +205,7 @@ fn measure_build_folder(path: &Path, measured_ms: u64) -> BuildFolderSize {
         }
     }
     size.complete = complete;
+    size.target_complete = target_complete;
     size
 }
 
@@ -278,7 +288,7 @@ impl Runner {
         // know what can be removed; readable targets keep the cheap scan path.
         self.build_folder_access(&claimed)?;
         let size = self.measure_build_candidate(&claimed);
-        if !size.complete {
+        if !size.target_complete {
             return Err(invalid("build folder size remains incomplete after repair"));
         }
         Ok(Some((claimed, claim, size)))
@@ -353,6 +363,9 @@ impl Runner {
         pass: u8,
         repair_incomplete: bool,
     ) -> io::Result<bool> {
+        if !self.build_folder_retry_ready(candidate.workspace.as_ref().unwrap(), pass) {
+            return Ok(false);
+        }
         let target = candidate.path.join("target");
         if !Self::has_build_folder(candidate) {
             return Ok(true);
@@ -361,7 +374,7 @@ impl Runner {
             return Ok(true);
         }
         let mut size = self.build_candidate_size(candidate);
-        let repaired = if !size.complete {
+        let repaired = if !size.target_complete {
             if !repair_incomplete {
                 return Ok(false);
             }
@@ -440,7 +453,7 @@ impl Runner {
     }
 
     pub(super) fn guard_build_folder(&self, key: &str) {
-        if self.core.config.vm_instance() {
+        if self.core.config.vm_instance() || !self.build_folder_retry_ready(key, 0) {
             return;
         }
         let result = (|| -> io::Result<()> {
@@ -460,7 +473,33 @@ impl Runner {
             Ok(())
         })();
         if let Err(error) = result {
+            self.back_off_build_folder(key, 0);
             tracing::warn!(path = key, %error, "runner build folder size guard failed");
+        }
+    }
+
+    fn build_folder_retry_ready(&self, key: &str, pass: u8) -> bool {
+        self.core
+            .inner
+            .lock()
+            .unwrap()
+            .build_retry_after
+            .get(key)
+            .is_none_or(|retry| retry[usize::from(pass)] <= self.now())
+    }
+
+    fn back_off_build_folder(&self, key: &str, pass: u8) {
+        let mut inner = self.core.inner.lock().unwrap();
+        let retry = inner.build_retry_after.entry(key.to_owned()).or_default();
+        // All passes touch the same target. A failed repair must also pause the
+        // other passes, rather than letting them repeat it in the same upkeep.
+        for (index, after) in retry.iter_mut().enumerate() {
+            let delay = if pass == 1 && index == 1 {
+                BUILD_FOLDER_SWEEP_MS
+            } else {
+                BUILD_FOLDER_RETRY_MS
+            };
+            *after = (*after).max(self.now().saturating_add(delay));
         }
     }
 
@@ -488,11 +527,15 @@ impl Runner {
                 build_swept_ms,
                 build_guard_pending,
                 build_folder_sizes,
+                build_retry_after,
                 ..
             } = &mut *inner;
             build_swept_ms.retain(|key, _| catalog.workspaces.contains_key(key));
             build_guard_pending.retain(|key| catalog.workspaces.contains_key(key));
             build_folder_sizes.retain(|key, _| catalog.workspaces.contains_key(key));
+            build_retry_after.retain(|key, retry| {
+                catalog.workspaces.contains_key(key) && retry.iter().any(|after| *after > now)
+            });
             self.disk_candidates(&inner)
                 .unwrap_or_default()
                 .into_iter()
@@ -501,35 +544,42 @@ impl Runner {
                     inner
                         .build_swept_ms
                         .get(key)
-                        .is_none_or(|last| now.saturating_sub(*last) >= 24 * 60 * 60 * 1000)
+                        .is_none_or(|last| now.saturating_sub(*last) >= BUILD_FOLDER_SWEEP_MS)
+                        && inner
+                            .build_retry_after
+                            .get(key)
+                            .is_none_or(|retry| retry[1] <= now)
                 })
                 .collect::<Vec<_>>()
         };
         for key in keys {
-            let result = (|| -> io::Result<()> {
-                let Some(candidate) = self.build_candidate(&key)? else {
-                    return Ok(());
-                };
-                let inner = self.core.inner.lock().unwrap();
-                if inner
-                    .build_swept_ms
-                    .get(&key)
-                    .is_some_and(|last| self.now().saturating_sub(*last) < 24 * 60 * 60 * 1000)
-                {
-                    return Ok(());
-                }
-                drop(inner);
-                if self.trim_build_folder(&candidate, 1, true)? {
-                    self.core
-                        .inner
-                        .lock()
-                        .unwrap()
-                        .build_swept_ms
-                        .insert(key.clone(), self.now());
-                }
-                Ok(())
-            })();
+            let result =
+                (|| -> io::Result<()> {
+                    if !self.build_folder_retry_ready(&key, 1) {
+                        return Ok(());
+                    }
+                    let Some(candidate) = self.build_candidate(&key)? else {
+                        return Ok(());
+                    };
+                    let inner = self.core.inner.lock().unwrap();
+                    if inner.build_swept_ms.get(&key).is_some_and(|last| {
+                        self.now().saturating_sub(*last) < BUILD_FOLDER_SWEEP_MS
+                    }) {
+                        return Ok(());
+                    }
+                    drop(inner);
+                    if self.trim_build_folder(&candidate, 1, true)? {
+                        self.core
+                            .inner
+                            .lock()
+                            .unwrap()
+                            .build_swept_ms
+                            .insert(key.clone(), self.now());
+                    }
+                    Ok(())
+                })();
             if let Err(error) = result {
+                self.back_off_build_folder(&key, 1);
                 tracing::warn!(path = key, %error, "runner stale build unit sweep failed");
             }
         }
@@ -582,6 +632,9 @@ impl Runner {
             .filter(|candidate| candidate.workspace.is_some())
             .filter(Self::has_build_folder)
             .filter(|candidate| {
+                self.build_folder_retry_ready(candidate.workspace.as_ref().unwrap(), pass)
+            })
+            .filter(|candidate| {
                 *free < floor
                     || self.now().saturating_sub(candidate.last_used_ms) >= SOFT_PRESSURE_MIN_AGE_MS
             })
@@ -597,10 +650,10 @@ impl Runner {
         if pass == 2 {
             candidates.sort_by(|(a, a_size), (b, b_size)| {
                 b_size
-                    .complete
-                    .cmp(&a_size.complete)
+                    .target_complete
+                    .cmp(&a_size.target_complete)
                     .then_with(|| {
-                        if a_size.complete && b_size.complete {
+                        if a_size.target_complete && b_size.target_complete {
                             b_size.incremental_bytes.cmp(&a_size.incremental_bytes)
                         } else {
                             a.last_used_ms.cmp(&b.last_used_ms)
@@ -619,6 +672,7 @@ impl Runner {
                 continue;
             }
             if let Err(error) = self.trim_build_folder(&candidate, pass, pass == 2) {
+                self.back_off_build_folder(candidate.workspace.as_ref().unwrap(), pass);
                 tracing::warn!(path = %candidate.path.display(), pass, %error, "runner build folder reclaim failed");
             }
             *free = (self.core.config.free_space_probe)(&self.core.trees.state)?;
@@ -1742,7 +1796,7 @@ impl Runner {
         // Cache misses use read-only walks with the state lock released.
         // Re-enumeration still applies live-path and age protections before deletion.
         let candidates = self.disk_candidates(&self.core.inner.lock().unwrap())?;
-        let mut sizes: BTreeMap<_, _> = candidates
+        let sizes: BTreeMap<_, _> = candidates
             .into_iter()
             .map(|candidate| {
                 let size = self.build_candidate_size(&candidate);
@@ -1764,18 +1818,19 @@ impl Runner {
                     }
                 };
                 candidates.sort_by(|a, b| {
-                    // Keep snapshot priority, then try complete size estimates
-                    // before workspaces needing repair. Known sizes retain the
-                    // bytes-times-idle policy; unknown sizes use oldest first.
+                    // Keep snapshot priority, then complete workspace estimates.
+                    // Partial estimates use oldest first: unreadable bytes are
+                    // unknown, not small, and target repair cannot reveal them.
                     b.snapshot
                         .cmp(&a.snapshot)
                         .then_with(|| {
-                            a.needs_size_repair(&sizes)
-                                .cmp(&b.needs_size_repair(&sizes))
+                            a.incomplete_workspace_size(&sizes)
+                                .cmp(&b.incomplete_workspace_size(&sizes))
                         })
                         .then_with(|| {
                             if (a.snapshot && b.snapshot)
-                                || (a.needs_size_repair(&sizes) && b.needs_size_repair(&sizes))
+                                || (a.incomplete_workspace_size(&sizes)
+                                    && b.incomplete_workspace_size(&sizes))
                             {
                                 a.last_used_ms.cmp(&b.last_used_ms)
                             } else {
@@ -1845,9 +1900,7 @@ impl Runner {
                         inner.evicting_caches.insert(candidate.path.clone());
                     }
                     if let Some(key) = &candidate.workspace {
-                        if sweep_idle_workspaces || !candidate.needs_size_repair(&sizes) {
-                            inner.dropping.insert(key.clone());
-                        }
+                        inner.dropping.insert(key.clone());
                     }
                     if candidate.path.parent()
                         == Some(self.core.trees.state.join("git-deps").as_path())
@@ -1858,34 +1911,6 @@ impl Runner {
                 next
             };
             let Some(candidate) = candidate else { break };
-            if !sweep_idle_workspaces && candidate.needs_size_repair(&sizes) {
-                // Try every eligible complete estimate before paying to repair
-                // an unreadable workspace. Repair one at a time, then rerank
-                // with its complete size; an unknown size is never a tiny one.
-                let result = (|| -> io::Result<Option<BuildFolderSize>> {
-                    let size = self.build_candidate_size(&candidate);
-                    if size.complete {
-                        return Ok(Some(size));
-                    }
-                    Ok(self
-                        .repair_build_folder(&candidate)?
-                        .map(|(_, _claim, size)| size))
-                })();
-                match result {
-                    Ok(Some(size)) => {
-                        sizes.insert(candidate.path.clone(), size);
-                    }
-                    result => {
-                        attempted.insert(candidate.path.clone());
-                        if let Err(error) = result {
-                            tracing::warn!(path = %candidate.path.display(), %error,
-                                "runner workspace size repair failed");
-                        }
-                    }
-                }
-                free = probe()?;
-                continue;
-            }
             if candidate.snapshot {
                 attempted.insert(candidate.path.clone());
                 let deleted = match self.evict_sibling_snapshot(&candidate.path, device) {
