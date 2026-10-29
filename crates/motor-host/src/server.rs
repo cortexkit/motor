@@ -991,7 +991,20 @@ impl Runtime {
             .tenant
             .clone();
         let operations = self.tenant_operations(&tenant)?;
-        let _operation = operations.lock().expect("tenant operations lock");
+        let _operation = match operations.try_lock() {
+            Ok(operation) => operation,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // A lease may have been admitted just before another lease
+                // began waking the tenant. Refuse rather than queue it behind
+                // a potentially minutes-long readiness wait.
+                ensure!(
+                    !self.host.lock().expect("host lock").is_waking(&tenant),
+                    Error::Refused(Refusal::HostFull)
+                );
+                operations.lock().expect("tenant operations lock")
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("tenant operations lock poisoned"),
+        };
         self.ensure_locked(&tenant, unix_ms())?;
         self.start_events(tenant.clone());
         let mut stream = self.control.relay(&tenant, 52).map_err(|error| {

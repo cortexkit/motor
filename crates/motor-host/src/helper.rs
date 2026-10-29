@@ -402,7 +402,7 @@ fn check_start_reply(reply: &Value) -> Result<()> {
 /// guest's runner-readiness wait; recovery also checks the tenant disk.
 pub fn control_read_deadline(request: &Value) -> Duration {
     if request["recovery_required"] == true {
-        Duration::from_secs(600)
+        motor_protocol::TENANT_ATTACH_READ_DEADLINE + Duration::from_secs(600)
     } else if request["op"] == "attach_tenant" {
         motor_protocol::TENANT_ATTACH_READ_DEADLINE
     } else {

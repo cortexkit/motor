@@ -82,14 +82,14 @@ pub(super) fn bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-struct Process {
+pub(super) struct Process {
     pid: u32,
     ppid: u32,
-    state: String,
+    pub(super) state: String,
     start_ticks: u64,
 }
 
-fn process(pid: u32, text: &str) -> Option<Process> {
+pub(super) fn process(pid: u32, text: &str) -> Option<Process> {
     // comm may contain spaces and parentheses; fields after its final ')' have
     // fixed positions in proc_pid_stat, including starttime at field 22.
     let fields: Vec<_> = text.rsplit_once(')')?.1.split_whitespace().collect();

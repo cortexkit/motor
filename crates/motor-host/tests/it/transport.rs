@@ -16,6 +16,11 @@ struct Fake {
     peers: Mutex<Vec<UnixStream>>,
     /// The helper refuses every start with this case.
     refuse_start: Mutex<Option<&'static str>>,
+    wake_gate: Mutex<Option<WakeGate>>,
+}
+struct WakeGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 impl Control for Fake {
     fn adopt(&self, _: &str) -> Result<bool> {
@@ -23,6 +28,10 @@ impl Control for Fake {
     }
     fn wake(&self, _: &str, _: Option<u64>) -> Result<u64> {
         self.calls.lock().unwrap().push("wake".into());
+        if let Some(gate) = self.wake_gate.lock().unwrap().take() {
+            let _ = gate.entered.send(());
+            let _ = gate.release.recv();
+        }
         if *self.fail.lock().unwrap() == Some("wake") {
             bail!("unsafe guest /usr/local/lib");
         }
@@ -74,6 +83,76 @@ impl Control for Fake {
     fn available_bytes(&self) -> Result<u64> {
         Ok(u64::MAX)
     }
+}
+
+#[tokio::test]
+async fn pending_runner_readiness_keeps_capacity_withdrawn_and_new_leases_retryable() {
+    pending_readiness_refuses_lease(false).await;
+}
+
+#[tokio::test]
+async fn lease_admitted_before_wake_is_refused_without_waiting_for_readiness() {
+    pending_readiness_refuses_lease(true).await;
+}
+
+async fn pending_readiness_refuses_lease(admitted_before_wake: bool) {
+    let (runtime, fake, broker, requester, claims) = fixture();
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    *fake.wake_gate.lock().unwrap() = Some(WakeGate {
+        entered,
+        release: gate,
+    });
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut client, &broker, &requester, &claims).await;
+    assert_eq!(
+        respond(&mut client, &requester, &claims, challenge).await,
+        json!({"type":"lease_ok"})
+    );
+    let mut second = claims.clone();
+    second.jti = JOB2.into();
+    let (mut other, server) = tokio::io::duplex(8192);
+    let other_task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut other, &broker, &requester, &second).await;
+    if admitted_before_wake {
+        assert_eq!(
+            respond(&mut other, &requester, &second, challenge.clone()).await,
+            json!({"type":"lease_ok"})
+        );
+    }
+    write_frame(&mut client, &json!({"type":"hello","protocol_version":1}))
+        .await
+        .unwrap();
+    waiting.await.unwrap();
+    {
+        let host = runtime.host.lock().unwrap();
+        assert!(!host.is_ready("tenant"));
+        assert_eq!(host.start_refusal_case("tenant"), None);
+        let heartbeat = host.heartbeat(unix_ms(), 0, true);
+        assert_eq!((heartbeat.free_vcpus, heartbeat.free_mem_mib), (0, 0));
+    }
+    let refused = if admitted_before_wake {
+        write_frame(&mut other, &json!({"type":"hello","protocol_version":1}))
+            .await
+            .unwrap();
+        read_frame(&mut other).await.unwrap()
+    } else {
+        respond(&mut other, &requester, &second, challenge).await
+    };
+    assert_eq!(
+        refused,
+        json!({"type":"lease_refused","reason":"host_full"})
+    );
+    assert_eq!(other_task.await.unwrap().is_err(), admitted_before_wake);
+    assert_eq!(*fake.calls.lock().unwrap(), ["wake"]);
+    release.send(()).unwrap();
+    let guest = peer(&fake).await;
+    assert!(runtime.host.lock().unwrap().is_ready("tenant"));
+    drop(guest);
+    drop(client);
+    let _ = task.await.unwrap();
+    runtime.host.lock().unwrap().guest_unready("tenant");
 }
 fn fixture() -> (Arc<Runtime>, Arc<Fake>, SigningKey, SigningKey, Claims) {
     let fake = Arc::new(Fake::default());

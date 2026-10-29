@@ -487,6 +487,58 @@ fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
     let TenantAgentRequest::AttachTenant {
         generation,
         recovery_required,
+        seed,
+        address,
+        gateway,
+        resolvers,
+        hostname,
+        machine_id,
+        ..
+    } = &request
+    else {
+        unreachable!()
+    };
+    validate_identity(address, gateway, resolvers, hostname, machine_id)?;
+    seed_bytes(seed)?;
+    let generation = *generation;
+    let recovery_required = *recovery_required;
+    let marker = Path::new("/run/motor-tenant-generation");
+    match fs::read_to_string(marker) {
+        Ok(previous) if previous.trim() != generation.to_string() => {
+            return Err(io::Error::other(
+                "tenant is already attached to another generation",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    runner_socket::attach_or_start(
+        runner_socket::unit()?,
+        |pid| {
+            // A prior attach may have lost its reply while the runner was
+            // cleaning old state. Do not remount, rebind, or unlink its socket.
+            let directory = paths::Directory::absolute(Path::new("/tenant/state/main"), 0)?;
+            runner_socket::wait(
+                &directory.fd_path().join("runner.sock"),
+                pid,
+                runner_socket::main_pid,
+            )
+        },
+        runner_socket::control,
+        || initialize_tenant(request),
+    )?;
+    fs::write(marker, generation.to_string())?;
+    if recovery_required {
+        fs::write("/run/motor-tenant-recovered", generation.to_string())?;
+    }
+    Ok(())
+}
+
+fn initialize_tenant(request: TenantAgentRequest) -> io::Result<()> {
+    let TenantAgentRequest::AttachTenant {
+        generation,
+        recovery_required,
         unix_ms,
         seed,
         address,
@@ -498,12 +550,6 @@ fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
     else {
         unreachable!()
     };
-    validate_identity(&address, &gateway, &resolvers, &hostname, &machine_id)?;
-    seed_bytes(&seed)?;
-    // A duplicate fresh-start request must not mount over a running tenant.
-    if Path::new("/run/motor-tenant-generation").exists() {
-        return Err(io::Error::other("tenant is already attached"));
-    }
     clock_and_rng(unix_ms, &seed)?;
     command("ip", &["link", "set", "eth0", "up"])?;
     command("ip", &["address", "flush", "dev", "eth0"])?;
@@ -529,8 +575,11 @@ fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
     }
     let _mountpoint = paths::Directory::absolute(Path::new("/tenant"), 0)?;
     if recovery_required {
+        if snapshot::mounted("/tenant")? {
+            command("umount", &["/tenant"])?;
+        }
         recover_tenant_disk()?;
-    } else {
+    } else if !snapshot::mounted("/tenant")? {
         command("mount", &["-t", "xfs", "/dev/vdb", "/tenant"])?;
     }
     let layout = paths::prepare_disk_layout(Path::new("/tenant"), 0)?;
@@ -566,10 +615,6 @@ fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
         },
         || start_runner(&args, &layout.runner.fd_path().join("runner.sock")),
     )?;
-    fs::write("/run/motor-tenant-generation", generation.to_string())?;
-    if recovery_required {
-        fs::write("/run/motor-tenant-recovered", generation.to_string())?;
-    }
     Ok(())
 }
 
@@ -748,7 +793,8 @@ fn start_runner(args: &RunnerArgs, socket: &Path) -> io::Result<()> {
     }
     runner_socket::wait(
         socket,
-        motor_protocol::TENANT_RUNNER_READINESS_WAIT,
+        runner_socket::main_pid()?
+            .ok_or_else(|| io::Error::other("tenant_runner_exited: no MainPID after start"))?,
         runner_socket::main_pid,
     )
 }

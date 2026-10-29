@@ -466,6 +466,11 @@ impl Host {
             // retain a typed retryable refusal instead of a silent client timeout.
             return refuse(Refusal::Capacity);
         }
+        // A runner cleaning old state can take minutes to listen. Do not
+        // admit another lease that would wait behind that startup handshake.
+        if self.is_waking(&tenant.tenant) {
+            return refuse(Refusal::HostFull);
+        }
         let old = self.snapshot.leases.get(&claims.jti).cloned();
         // A heartbeat can revoke this host's placement while the old run token
         // is still valid. Its signature no longer authorizes admission here.
