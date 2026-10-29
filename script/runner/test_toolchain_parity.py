@@ -820,6 +820,16 @@ class ParityTests(unittest.TestCase):
                 self.assertIn('missing apt package: file',
                               parity.differences(self.manifest, actual, role=role))
 
+    def test_lsof_package_is_required_on_every_linux_role(self):
+        for role in ('build-server', 'tenant', 'boat'):
+            with self.subTest(role=role):
+                packages = self.manifest['apt_packages']
+                self.assertIn('lsof', packages['required'] + packages['by_role'][role])
+                actual = self.observed(role)
+                actual['apt_packages'].pop('lsof')
+                self.assertIn('missing apt package: lsof',
+                              parity.differences(self.manifest, actual, role=role))
+
     def test_musl_tools_is_required_only_on_the_build_server(self):
         manifest = self.manifest
         self.assertIn('musl-tools', manifest['apt_packages']['by_role']['build-server'])
