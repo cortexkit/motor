@@ -276,6 +276,11 @@ def require_gate_success(terminal):
 
 BUN_VERSION_CHECK = "bun_version=$(bun --version) && test \"${bun_version%$'\\r'}\" = \"1.4.2\""
 NEXTEST_VERSION_CHECK = "nextest_version=$(cargo nextest --version) && printf '%s\\n' \"$nextest_version\" && [[ \"$nextest_version\" == 'cargo-nextest 0.9.138 '* ]]"
+PYTHON_CHECK = (
+    "python_version=$(python3 --version) && printf '%s\\n' \"$python_version\" && test \"${python_version%$'\\r'}\" = 'Python 3.13.17' && "
+    "python_version=$(python --version) && test \"${python_version%$'\\r'}\" = 'Python 3.13.17' && "
+    'python3 -c "import json, hashlib, subprocess, tomllib"'
+)
 
 
 GIT_DEP_URL = "https://dep.invalid/itoa-fixture"
@@ -381,7 +386,7 @@ def run(root, runner, evidence, gate):
         job = str(uuid.uuid4())
         channel = Channel(runner, root, evidence / f"bridge-{iteration}.log")
         try:
-            command = BUN_VERSION_CHECK + " || exit $?; " + NEXTEST_VERSION_CHECK + " || exit $?; " + ("test -f /c/t/qualification-cache-marker && " if iteration else "") + gate + " && printf cached > /c/t/qualification-cache-marker"
+            command = BUN_VERSION_CHECK + " || exit $?; " + NEXTEST_VERSION_CHECK + " || exit $?; " + PYTHON_CHECK + " || exit $?; " + ("test -f /c/t/qualification-cache-marker && " if iteration else "") + gate + " && printf cached > /c/t/qualification-cache-marker"
             request = dict(type="run", job_id=job, gate_job=True, platform="windows", workspace_key="/qualification/workspace", repository_root="/qualification/workspace", cwd="/qualification/workspace", command=command, env={}, weight_hint=4, timeout=600, queue_wait_limit_s=60, snapshot_commit=commit, tree_hash=tree, integration_tip=commit, siblings=[], git_dependencies=[], bundles=[dict(index=0, repository="/qualification/workspace", length=len(data), sha256=hashlib.sha256(data).hexdigest())])
             channel.send(request)
             channel.until("accepted")
