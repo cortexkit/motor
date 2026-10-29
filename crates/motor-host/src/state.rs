@@ -839,7 +839,20 @@ impl Host {
                 continue;
             }
             let exp_ms = lease.claims.exp.saturating_mul(1000);
-            let admission_deadline = lease.claims.iat.saturating_add(360).saturating_mul(1000);
+            // Accepted jobs can queue behind other work in the guest. Keep them
+            // until the reservation's overall deadline, not the delivery deadline.
+            // The broker uses the original issue time; a pre-admission replacement
+            // updates these claims, so this safety backstop can run slightly later.
+            let unstarted_deadline = if lease.state == LeaseState::Admitted {
+                lease
+                    .claims
+                    .iat
+                    .saturating_add(lease.claims.max_s)
+                    .saturating_add(600)
+                    .saturating_mul(1000)
+            } else {
+                lease.claims.iat.saturating_add(360).saturating_mul(1000)
+            };
             let continuous = self
                 .live
                 .get(&lease.tenant)
@@ -847,10 +860,10 @@ impl Host {
                 .is_some_and(|since| since <= exp_ms);
             let expired = matches!(lease.state, LeaseState::Reserved | LeaseState::Released)
                 && now_ms >= exp_ms;
-            if expired || now_ms >= admission_deadline {
+            if expired || now_ms >= unstarted_deadline {
                 close_jobs.insert(job.clone());
             }
-            if now_ms >= admission_deadline {
+            if now_ms >= unstarted_deadline {
                 cancel.push((lease.tenant.clone(), job.clone()));
                 next.pending_cancels
                     .insert(job.clone(), lease.tenant.clone());
