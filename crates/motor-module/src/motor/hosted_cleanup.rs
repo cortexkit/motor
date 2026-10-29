@@ -43,15 +43,6 @@ impl Motor {
         let Some(state) = job.hosted else {
             return;
         };
-        // A detached caller has not cancelled its command. Leave an ordinary
-        // running job attachable; only cancellation or settlement owns cleanup.
-        if state.run_sent
-            && !job.pending_cancel
-            && !state.needs_cleanup()
-            && !*self.hosted_cleanup.shutdown.borrow()
-        {
-            return;
-        }
         if state.finish_done
             || (!state.booked_or_attempted()
                 && state.pending_finish.is_none()
@@ -135,7 +126,8 @@ impl Motor {
                 Err(error) => self.log_hosted_failure(id, "settlement_recovery", error),
             }
             if stopping {
-                // The pending body is durable before HTTP; startup retries it.
+                // Any pending finish body is durable before HTTP; startup
+                // retries it and resumes deadline watches for live jobs.
                 return;
             }
             tokio::select! {
@@ -158,7 +150,10 @@ impl Motor {
         stopping: bool,
         legacy_deadline: Option<u64>,
     ) -> io::Result<bool> {
-        let Some(state) = self.storage.job(id).and_then(|job| job.hosted) else {
+        let Some(job) = self.storage.job(id) else {
+            return Ok(true);
+        };
+        let Some(state) = job.hosted else {
             return Ok(true);
         };
         if state.finish_done {
@@ -210,14 +205,20 @@ impl Motor {
                             .saturating_add(crate::hosted::HOST_LOST_GRACE_S)
                     });
                 let expired = crate::hosted::now_s() >= deadline;
-                if !stopping && !expired {
+                // A restart is not evidence that the runner stopped. Keep the
+                // booking attachable until its host deadline, even when a
+                // cancellation could not be delivered before shutdown.
+                if !expired && state.terminal.is_none() && (stopping || !job.pending_cancel) {
+                    return Ok(stopping);
+                }
+                if !stopping && !expired && !state.awaiting_cancel_terminal() {
                     self.storage.cancel(id, true)?;
                     if let Err(error) = self.send_cancel(id).await {
                         self.log_hosted_failure(id, "settlement_cancel", error);
                         return Ok(false);
                     }
                 }
-                tracing::info!(job_id = %id, step = "settlement_recovery", cause = if stopping { "shutdown" } else if expired { "host deadline passed" } else { "cancellation acknowledged" }, "settling unknown hosted outcome");
+                tracing::info!(job_id = %id, step = "settlement_recovery", cause = if expired { "host deadline passed" } else { "cancellation acknowledged" }, "settling unknown hosted outcome");
             }
             client.finish(id, Some(&terminal), &self.storage).await?;
         }
