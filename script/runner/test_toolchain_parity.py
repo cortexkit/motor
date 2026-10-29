@@ -912,6 +912,28 @@ class ParityTests(unittest.TestCase):
                     self.assertIn(f'missing apt package: {package}',
                                   parity.differences(self.manifest, actual, role=role))
 
+    def test_portable_build_and_test_packages_are_required_on_every_linux_role(self):
+        # Host-global utilities and native headers do not follow a workspace's
+        # lockfile install; job images must supply these dependencies themselves.
+        required = (
+            '7zip', 'bc', 'bind9-dnsutils', 'bubblewrap', 'cpio', 'ed', 'fakeroot',
+            'fontconfig', 'gawk', 'less', 'netcat-openbsd', 'psmisc', 'strace',
+            'time', 'wabt', 'wget', 'x11-utils', 'x11-xserver-utils', 'xauth',
+            'xdg-utils', 'xxd', 'libarchive13t64', 'libfl-dev', 'libjemalloc2',
+            'liblzma-dev', 'libncurses-dev', 'libsodium23', 'libuv1-dev',
+            'libxml2-dev', 'python3-gdbm', 'python3-packaging',
+            'python3-setuptools', 'python3-yaml',
+        )
+        for role in ('build-server', 'tenant', 'boat'):
+            for name in required:
+                with self.subTest(role=role, package=name):
+                    packages = self.manifest['apt_packages']
+                    self.assertIn(name, packages['required'] + packages['by_role'][role])
+                    actual = self.observed(role)
+                    actual['apt_packages'].pop(name)
+                    self.assertIn('missing apt package: ' + name,
+                                  parity.differences(self.manifest, actual, role=role))
+
     def test_musl_tools_is_required_only_on_the_build_server(self):
         manifest = self.manifest
         self.assertIn('musl-tools', manifest['apt_packages']['by_role']['build-server'])
