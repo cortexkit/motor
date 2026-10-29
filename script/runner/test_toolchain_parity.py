@@ -810,6 +810,16 @@ class ParityTests(unittest.TestCase):
         boat_errors = parity.differences(manifest, self.observed('boat'), role='boat')
         self.assertNotIn('missing apt package: binaryen', boat_errors)
 
+    def test_file_package_is_required_on_every_linux_role(self):
+        for role in ('build-server', 'tenant', 'boat'):
+            with self.subTest(role=role):
+                packages = self.manifest['apt_packages']
+                self.assertIn('file', packages['required'] + packages['by_role'][role])
+                actual = self.observed(role)
+                actual['apt_packages'].pop('file')
+                self.assertIn('missing apt package: file',
+                              parity.differences(self.manifest, actual, role=role))
+
     def test_musl_tools_is_required_only_on_the_build_server(self):
         manifest = self.manifest
         self.assertIn('musl-tools', manifest['apt_packages']['by_role']['build-server'])
