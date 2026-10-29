@@ -53,6 +53,47 @@ pub(crate) fn dependency_commits(
 }
 
 impl Trees {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn checkout_dependency_lockfiles(
+        &self,
+        repository: &str,
+        commit: &str,
+        siblings: &[SiblingSnapshot],
+    ) -> Vec<String> {
+        std::iter::once((repository, commit))
+            .chain(siblings.iter().map(|s| {
+                (
+                    crate::caller_path::sibling(s).caller.text().as_str(),
+                    s.commit.as_str(),
+                )
+            }))
+            .map(|(repository, commit)| {
+                git(
+                    &self.mirror(repository),
+                    &["show", &format!("{commit}:Cargo.lock")],
+                )
+                .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn dependency_fetch_routes_for_lockfiles(
+        &self,
+        dependencies: &[GitDependency],
+        lockfiles: &[String],
+    ) -> io::Result<(BTreeMap<String, PathBuf>, Vec<String>)> {
+        let mut declarations = dependencies.to_vec();
+        for lockfile in lockfiles {
+            for dependency in locked_dependencies(lockfile)? {
+                if dependencies.iter().any(|d| d.url == dependency.url) {
+                    declarations.push(dependency);
+                }
+            }
+        }
+        self.dependency_routes(&declarations)
+    }
+
     pub fn dependency_mirror(&self, url: &str) -> PathBuf {
         self.state
             .join("git-deps")
@@ -421,15 +462,27 @@ impl Trees {
     }
 
     /// The caller holds each mapped mirror's lock until Cargo fetch finishes.
-    /// Aliases are derived only from the workspace's committed lockfile.
+    /// Aliases are derived only from committed lockfiles.
     pub fn refresh_dependency_aliases(
         &self,
         lockfile: &str,
         routes: &BTreeMap<String, PathBuf>,
     ) -> io::Result<()> {
+        self.refresh_dependency_aliases_for_lockfiles(&[lockfile], routes)
+    }
+
+    pub(crate) fn refresh_dependency_aliases_for_lockfiles(
+        &self,
+        lockfiles: &[impl AsRef<str>],
+        routes: &BTreeMap<String, PathBuf>,
+    ) -> io::Result<()> {
         let mut aliases: BTreeMap<(String, String), String> = BTreeMap::new();
         let mut heads: BTreeMap<String, String> = BTreeMap::new();
-        for (url, commit, alias) in locked_sources(lockfile)? {
+        let sources = lockfiles
+            .iter()
+            .map(|lockfile| locked_sources(lockfile.as_ref()))
+            .collect::<io::Result<Vec<_>>>()?;
+        for (url, commit, alias) in sources.into_iter().flatten() {
             let Some(mirror) = routes.get(&url) else {
                 continue;
             };

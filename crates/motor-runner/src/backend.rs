@@ -803,13 +803,13 @@ impl Backend for HostBackend {
         };
         #[cfg(target_os = "linux")]
         let sandbox = if config.isolate_jobs {
-            let lockfile = workspace::git(
-                &trees.mirror(paths::request(r).caller_repository_root.text()),
-                &["show", &format!("{}:Cargo.lock", r.snapshot_commit)],
-            )
-            .unwrap_or_default();
+            let lockfiles = trees.checkout_dependency_lockfiles(
+                paths::request(r).caller_repository_root.text(),
+                &r.snapshot_commit,
+                &r.siblings,
+            );
             let (routes, missing) =
-                trees.dependency_fetch_routes(&r.git_dependencies, &lockfile)?;
+                trees.dependency_fetch_routes_for_lockfiles(&r.git_dependencies, &lockfiles)?;
             if s.base && !missing.is_empty() {
                 return Err(invalid(missing.join("; ")));
             }
@@ -823,7 +823,7 @@ impl Backend for HostBackend {
                     crate::setup_log::lock_wait("dependency_mirror", || lock.lock().unwrap())
                 })
                 .collect();
-            trees.refresh_dependency_aliases(&lockfile, &routes)?;
+            trees.refresh_dependency_aliases_for_lockfiles(&lockfiles, &routes)?;
             // In snapshot mode the sandbox mounts each sibling's snapshot at
             // the sibling's path, and the Cargo prefetch sees the same view.
             let snapshots =

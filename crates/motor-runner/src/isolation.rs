@@ -2366,9 +2366,9 @@ fn prefetch_cargo_in(
     mut skip: impl FnMut(&Path, &str),
     mut run: impl FnMut(&mut Command, CargoFetch) -> io::Result<()>,
 ) -> io::Result<()> {
-    // Only the root graph is an admission requirement. Experimental nested
-    // crates may have stale locks or unavailable dependencies without breaking
-    // unrelated jobs in the same repository.
+    // Each explicitly requested checkout's root graph is an admission requirement.
+    // Experimental nested crates may have stale locks or unavailable dependencies
+    // without breaking unrelated jobs in the same repository.
     if workspace.join("Cargo.toml").is_file() {
         if tenant_vm {
             // The daemon alone resolves and downloads sources into persistent
@@ -2402,6 +2402,45 @@ fn prefetch_cargo_in(
     Ok(())
 }
 
+fn prepare_cargo_checkouts(
+    workspace: crate::caller_path::JobTree<'_>,
+    tree: &str,
+    siblings: &[SiblingSnapshot],
+    snapshots: Option<&SnapshotSiblings<'_>>,
+    mut prepare: impl FnMut(crate::caller_path::JobTree<'_>, &str) -> io::Result<()>,
+) -> io::Result<()> {
+    prepare(workspace, tree)?;
+    for sibling in siblings {
+        let plan = crate::caller_path::sibling(sibling);
+        let caller = Path::new(plan.caller.text());
+        let host = match snapshots {
+            Some(snapshots) => snapshots
+                .siblings
+                .iter()
+                .find(|(_, canonical)| canonical == caller)
+                .map(|(snapshot, _)| snapshot.as_path())
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "sibling {} has no resolved snapshot",
+                        caller.display()
+                    ))
+                })?,
+            None if workspace.host.as_path() == workspace.caller => plan.host.as_path(),
+            None => {
+                return Err(io::Error::other(
+                    "mapped siblings require resolved snapshots",
+                ))
+            }
+        };
+        prepare(
+            crate::caller_path::JobTree::new(host, caller),
+            &sibling.tree_hash,
+        )
+        .map_err(|error| io::Error::other(format!("sibling {}: {error}", caller.display())))?;
+    }
+    Ok(())
+}
+
 /// Populate sources as the trusted daemon, never as the cache-writing account.
 /// Writer inputs are its mirror-materialized tip, not the requesting branch.
 /// With `snapshots`, every fetch runs in a helper unit that shows the job's
@@ -2413,6 +2452,7 @@ fn prefetch_cargo_dependencies<'a>(
     state: &Path,
     job_tree: impl Into<crate::caller_path::JobTree<'a>>,
     tree: &str,
+    siblings: &[SiblingSnapshot],
     dependency_routes: &BTreeMap<String, PathBuf>,
     cargo: &Path,
     rustup: &Path,
@@ -2442,40 +2482,42 @@ fn prefetch_cargo_dependencies<'a>(
         })
         .transpose()?;
     crate::setup_log::phase("fetch cargo dependencies", || {
-        prefetch_cargo_in(
-            workspace,
-            tree,
-            tenant_vm,
-            NESTED_CARGO_FETCH_TIMEOUT,
-            |directory| {
-                // A helper unit sees the workspace only at its caller path, so
-                // its manifest argument names that path; a fetch run directly
-                // on the host reads the host checkout.
-                let directory = if view.is_some() {
-                    job_tree.caller_form(directory)
-                } else {
-                    directory.to_path_buf()
-                };
-                let mut command = workspace::dependencies::fetch_command(
-                    state,
-                    &directory,
-                    dependency_routes,
-                    cargo,
-                    rustup,
-                )?;
-                // The tenant fallback re-runs this builder in offline mode, so
-                // only the build server forces network on here.
-                if !tenant_vm {
-                    command.env("CARGO_NET_OFFLINE", "false");
-                }
-                Ok(command)
-            },
-            crate::setup_log::cargo_skip,
-            |command, fetch| match (snapshots, &view) {
-                (Some(snapshots), Some(view)) => snapshots.run(view, command, fetch),
-                _ => run_cargo_fetch_on_host(command, fetch),
-            },
-        )
+        prepare_cargo_checkouts(job_tree, tree, siblings, snapshots, |job_tree, tree| {
+            prefetch_cargo_in(
+                job_tree.host.as_path(),
+                tree,
+                tenant_vm,
+                NESTED_CARGO_FETCH_TIMEOUT,
+                |directory| {
+                    // A helper unit sees the workspace only at its caller path, so
+                    // its manifest argument names that path; a fetch run directly
+                    // on the host reads the host checkout.
+                    let directory = if view.is_some() {
+                        job_tree.caller_form(directory)
+                    } else {
+                        directory.to_path_buf()
+                    };
+                    let mut command = workspace::dependencies::fetch_command(
+                        state,
+                        &directory,
+                        dependency_routes,
+                        cargo,
+                        rustup,
+                    )?;
+                    // The tenant fallback re-runs this builder in offline mode, so
+                    // only the build server forces network on here.
+                    if !tenant_vm {
+                        command.env("CARGO_NET_OFFLINE", "false");
+                    }
+                    Ok(command)
+                },
+                crate::setup_log::cargo_skip,
+                |command, fetch| match (snapshots, &view) {
+                    (Some(snapshots), Some(view)) => snapshots.run(view, command, fetch),
+                    _ => run_cargo_fetch_on_host(command, fetch),
+                },
+            )
+        })
     })
     .map_err(|error| io::Error::other(fetch_failure(stage, &error.to_string())))
 }
@@ -2792,6 +2834,7 @@ impl Sandbox {
                 state,
                 job_tree,
                 tree,
+                siblings,
                 dependency_routes,
                 &cargo,
                 &rustup,
