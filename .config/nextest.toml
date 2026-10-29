@@ -11,7 +11,7 @@ slow-timeout = { period = "120s", terminate-after = 2, grace-period = "60s" }
 filter = 'package(=motor-module) and binary(=motor_e2e)'
 slow-timeout = { period = "3600s", terminate-after = 6, grace-period = "60s" }
 
-# The operator cache benchmark compares two cold Rust builds after mount setup.
+# The shared Cargo crate-cache benchmark compares two cold builds after mount setup.
 [[profile.default.overrides]]
 filter = 'test(=isolation::tests::cargo_cache::isolated_tenant_net_overlay_setup_on_large_cache)'
 slow-timeout = { period = "600s", terminate-after = 2, grace-period = "60s" }

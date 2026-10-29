@@ -68,7 +68,8 @@ def setup(plan):
         descriptors.append(namespaces)
         handles = {}
         for name, kind in (("mnt", 0x20000), ("pid", 0x20000000), ("user", 0x10000000)):
-            # Final procfs namespace entries are intentional kernel magic links.
+            # Earlier proc directory components were opened no-follow. Follow
+            # only these final namespace links to obtain the handles setns needs.
             fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC, dir_fd=namespaces)
             descriptors.append(fd)
             if fcntl.ioctl(fd, 0xB703) != kind:
