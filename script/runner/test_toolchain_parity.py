@@ -883,6 +883,24 @@ class ParityTests(unittest.TestCase):
                 self.assertIn('missing apt package: lsof',
                               parity.differences(self.manifest, actual, role=role))
 
+    def test_chromium_runtime_packages_are_required_on_every_linux_role(self):
+        # Repository-downloaded browsers need the same runtime libraries in jobs
+        # as on the build host; installing a browser on the host is not enough.
+        required = (
+            'libnspr4', 'libnss3', 'libatk1.0-0t64', 'libatk-bridge2.0-0t64',
+            'libcups2t64', 'libasound2t64', 'libcairo2', 'libpango-1.0-0',
+            'libxcomposite1', 'libxdamage1', 'libatspi2.0-0t64',
+        )
+        for role in ('build-server', 'tenant', 'boat'):
+            for name in required:
+                with self.subTest(role=role, package=name):
+                    packages = self.manifest['apt_packages']
+                    self.assertIn(name, packages['required'] + packages['by_role'][role])
+                    actual = self.observed(role)
+                    actual['apt_packages'].pop(name)
+                    self.assertIn('missing apt package: ' + name,
+                                  parity.differences(self.manifest, actual, role=role))
+
     def test_zstd_and_ripgrep_packages_are_required_on_every_linux_role(self):
         for package in ('zstd', 'ripgrep'):
             for role in ('build-server', 'tenant', 'boat'):
@@ -892,6 +910,28 @@ class ParityTests(unittest.TestCase):
                     actual = self.observed(role)
                     actual['apt_packages'].pop(package)
                     self.assertIn(f'missing apt package: {package}',
+                                  parity.differences(self.manifest, actual, role=role))
+
+    def test_portable_build_and_test_packages_are_required_on_every_linux_role(self):
+        # Host-global utilities and native headers do not follow a workspace's
+        # lockfile install; job images must supply these dependencies themselves.
+        required = (
+            '7zip', 'bc', 'bind9-dnsutils', 'bubblewrap', 'cpio', 'ed', 'fakeroot',
+            'fontconfig', 'gawk', 'less', 'netcat-openbsd', 'psmisc', 'strace',
+            'time', 'wabt', 'wget', 'x11-utils', 'x11-xserver-utils', 'xauth',
+            'xdg-utils', 'xxd', 'libarchive13t64', 'libfl-dev', 'libjemalloc2',
+            'liblzma-dev', 'libncurses-dev', 'libsodium23', 'libuv1-dev',
+            'libxml2-dev', 'python3-gdbm', 'python3-packaging',
+            'python3-setuptools', 'python3-yaml',
+        )
+        for role in ('build-server', 'tenant', 'boat'):
+            for name in required:
+                with self.subTest(role=role, package=name):
+                    packages = self.manifest['apt_packages']
+                    self.assertIn(name, packages['required'] + packages['by_role'][role])
+                    actual = self.observed(role)
+                    actual['apt_packages'].pop(name)
+                    self.assertIn('missing apt package: ' + name,
                                   parity.differences(self.manifest, actual, role=role))
 
     def test_musl_tools_is_required_only_on_the_build_server(self):
