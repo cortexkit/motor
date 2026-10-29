@@ -1,4 +1,5 @@
 # Windows PowerShell parser, policy, and temporary-VHD fixtures. Never boots a VM.
+param([switch]$UpdateOnly, [string]$UpdateCase = '', [string]$ScratchRoot = $env:TMPDIR)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 # Any failure that escapes a check reports its script line and stack, so even
@@ -23,6 +24,151 @@ foreach ($file in $files) {
     $count++
 }
 . "$PSScriptRoot\accounts.ps1"
+if ($UpdateOnly -and $UpdateCase -eq 'vm-present') {
+    & {
+        . "$PSScriptRoot\update-functions.ps1"
+        function Get-VM { return [pscustomobject]@{Name='motor-ally-blocking-job'} }
+        function Get-Service { return [pscustomobject]@{Status='Running'} }
+        function Get-RunnerUpdateStatus { return [pscustomobject]@{running_jobs=@();queue_depth=0} }
+        $failure = $null
+        try { Assert-RunnerUpdateIdle 'unused-before-vm-refusal' } catch { $failure = [string]$_ }
+        if ($failure -notmatch 'blocked by job VM\(s\): motor-ally-blocking-job') { throw "FAIL update-vm-present-refuses-before-writes: $failure" }
+        Write-Host 'PASS update-vm-present-refuses-before-writes'
+    }
+    Write-Host "PASS $($count + 1) PowerShell parser/update fixture checks"
+    return
+}
+if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    $fixtureIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    if (-not ([Security.Principal.WindowsPrincipal]$fixtureIdentity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run the Windows update/ACL fixtures in an elevated administrator shell; -UpdateOnly -UpdateCase vm-present needs no elevation' }
+    $count += & {
+        . "$PSScriptRoot\parent-identity.ps1"
+        . "$PSScriptRoot\update-functions.ps1"
+        if (-not $ScratchRoot) { $ScratchRoot = Join-Path (Get-Location).Path 'target\scratch' }
+        $fixture = Join-Path $ScratchRoot ('motor-update-' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $fixture -Force | Out-Null
+        $script:updateServiceState = 'Running'
+        $script:updateStops = 0
+        $script:updateStarts = 0
+        $script:updateSets = 0
+        $script:updateVms = @()
+        $script:updateJobs = @()
+        $script:updateQueue = 0
+        $script:updateFailNew = $false
+        $script:updateReady = $true
+        $script:updateRoot = ''
+        $script:updateDefinition = $null
+        function Import-Module([string]$Name) { if ($Name -cne 'Hyper-V') { throw "Unexpected fixture module $Name" } }
+        function Get-VM { return $script:updateVms }
+        function Get-Service { param([string]$Name) if ($Name -cne 'MotorRunner') { throw 'Unexpected fixture service' }; return [pscustomobject]@{Status=$script:updateServiceState} }
+        function Stop-RunnerUpdateService { $script:updateStops++; $script:updateServiceState = 'Stopped' }
+        function Start-Service {
+            param([string]$Name)
+            $script:updateStarts++
+            if ($script:updateFailNew -and [IO.File]::ReadAllText("$script:updateRoot\bin\motor-runner.exe") -ceq 'new-runner') { throw 'fixture new service failed to start' }
+            $script:updateServiceState = 'Running'
+        }
+        function Get-RunnerUpdateStatus {
+            return [pscustomobject]@{running_jobs=$script:updateJobs; queue_depth=$script:updateQueue; health=[pscustomobject]@{windows_guest_agent=[pscustomobject]@{ready=$script:updateReady}}}
+        }
+        function Get-RunnerUpdateServiceDefinition { return $script:updateDefinition }
+        function Set-RunnerUpdateServiceDefinition($Definition, [string]$LogPath) { $script:updateSets++; $script:updateDefinition = $Definition }
+        $checks = 0
+        try {
+            foreach ($case in @('vm-present','job-present','queue-present','agent-mismatch','checksum-mismatch','swap','start-failure','readiness-failure','manual-rollback')) {
+                if ($UpdateCase -and $case -cne $UpdateCase) { continue }
+                $caseRoot = Join-Path $fixture $case
+                $installed = Join-Path $caseRoot 'installed'
+                $bundle = Join-Path $caseRoot 'bundle'
+                New-Item -ItemType Directory -Path "$installed\bin","$installed\state\ally\local-registry-cache","$installed\state\ally\mirrors","$installed\baselines","$installed\ssh","$installed\prep-toolchain\bin","$bundle\bin","$bundle\script\windows-runner","$bundle\script\hyperv-spike" -Force | Out-Null
+                $nativeLog = Join-Path $caseRoot 'fixture-native.jsonl'
+                Protect-RunnerPath $installed $nativeLog
+                Protect-RunnerPath "$installed\bin" $nativeLog
+                $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\icacls.exe" -ArgumentList @("$installed\bin", '/grant:r', '*S-1-5-21-111-222-333-1001:(OI)(CI)RX', '/Q') -Operation 'fixture bridge read access' -LogPath $nativeLog
+                [IO.File]::WriteAllText("$installed\bin\motor-runner.exe", 'old-runner')
+                [IO.File]::WriteAllText("$installed\bin\hyperv.ps1", 'old-script')
+                [IO.File]::WriteAllText("$installed\.motor-runner-root", 'motor-runner-hyperv-v1')
+                [IO.File]::WriteAllText("$bundle\bin\motor-runner.exe", 'new-runner')
+                [IO.File]::WriteAllText("$bundle\bin\motor-winagent.exe", 'sealed-agent')
+                Copy-Item -LiteralPath "$bundle\bin\motor-winagent.exe" -Destination "$installed\bin\motor-winagent.exe"
+                $hash = (Get-FileHash -LiteralPath "$bundle\bin\motor-winagent.exe" -Algorithm SHA256).Hash
+                if ($case -eq 'agent-mismatch') { $hash = 'B' * 64 }
+                [IO.File]::WriteAllText("$installed\vm.toml", "guest_agent_sha256 = '$hash'`r`n")
+                foreach ($name in @('hyperv.ps1','parent-identity.ps1','guest-agent-identity.ps1','guest-evidence.ps1','accounts.ps1','qualify.ps1','qualify-peer.ps1','uninstall.ps1','run-system.ps1','verify-sshd-system.ps1','qualify-jobs.py','update.ps1','update-functions.ps1','service-definition.ps1')) {
+                    [IO.File]::WriteAllText("$bundle\script\windows-runner\$name", 'new-script')
+                }
+                Copy-Item -LiteralPath "$PSScriptRoot\service-definition.ps1" -Destination "$bundle\script\windows-runner\service-definition.ps1" -Force
+                foreach ($name in @('common.ps1','process.ps1')) { [IO.File]::WriteAllText("$bundle\script\hyperv-spike\$name", 'new-common-script') }
+                Write-RunnerUpdateManifest $bundle
+                if ($case -eq 'checksum-mismatch') { [IO.File]::WriteAllText("$bundle\bin\motor-runner.exe", 'corrupt-runner') }
+                $preserved = @('state\ally\local-registry-cache\cache.bin','state\ally\mirrors\mirror.bin','state\parent-verified.json','baselines\ally-hvsock.vhdx','installation.json','ssh\authorized_keys','prep-toolchain\bin\cargo.exe')
+                foreach ($path in $preserved) { [IO.File]::WriteAllText((Join-Path $installed $path), "keep-$path") }
+                $preserved += 'vm.toml'
+                $before = @{}
+                foreach ($path in $preserved) {
+                    $full = Join-Path $installed $path
+                    $before[$path] = @([IO.File]::ReadAllText($full), (Get-Acl -LiteralPath $full).Sddl)
+                }
+                $binAcl = (Get-Acl -LiteralPath "$installed\bin").Sddl
+                $script:updateRoot = $installed
+                $script:updateServiceState = 'Running'
+                $script:updateStops = 0; $script:updateStarts = 0; $script:updateSets = 0
+                $script:updateVms = @(); $script:updateJobs = @(); $script:updateQueue = 0
+                $script:updateFailNew = $case -eq 'start-failure'
+                $script:updateReady = $true
+                $script:updateDefinition = [pscustomobject]@{binary='old-service-command';display_name='old-service';start='auto';dependencies=@('vmms');environment=@('HOME=old-home')}
+                function Get-RunnerUpdateStatus {
+                    return [pscustomobject]@{running_jobs=$script:updateJobs; queue_depth=$script:updateQueue; health=[pscustomobject]@{windows_guest_agent=[pscustomobject]@{ready=$script:updateReady}}}
+                }
+                if ($case -eq 'vm-present') { $script:updateVms = @([pscustomobject]@{Name='motor-ally-blocking-job'}) }
+                if ($case -eq 'job-present') { $script:updateJobs = @([pscustomobject]@{job_id='blocking-job-id'}) }
+                if ($case -eq 'queue-present') { $script:updateQueue = 1 }
+                if ($case -eq 'readiness-failure') {
+                    function Get-RunnerUpdateStatus {
+                        $isOld = [IO.File]::ReadAllText("$script:updateRoot\bin\motor-runner.exe") -ceq 'old-runner'
+                        return [pscustomobject]@{running_jobs=@();queue_depth=0;health=[pscustomobject]@{windows_guest_agent=[pscustomobject]@{ready=$isOld}}}
+                    }
+                }
+                $failure = $null
+                try { Invoke-RunnerHostUpdate -Root $installed -Bundle $bundle -ReadyTimeoutSeconds 1 } catch { $failure = [string]$_ }
+                if ($case -in @('vm-present','job-present','queue-present','agent-mismatch','checksum-mismatch')) {
+                    $expected = switch ($case) {
+                        'vm-present' { 'blocked by job VM\(s\): motor-ally-blocking-job' }
+                        'job-present' { 'blocked by MotorRunner job\(s\): blocking-job-id' }
+                        'queue-present' { 'queued=1' }
+                        'agent-mismatch' { 'a parent rebuild is required.*full uninstall/reinstall' }
+                        'checksum-mismatch' { 'Release hash mismatch: bin/motor-runner.exe' }
+                    }
+                    if ($failure -notmatch $expected -or $script:updateStops -or $script:updateStarts -or $script:updateSets -or (Test-Path -LiteralPath "$installed\payload-next") -or (Test-Path -LiteralPath "$installed\payload-backup") -or [IO.File]::ReadAllText("$installed\bin\motor-runner.exe") -cne 'old-runner') { throw "FAIL update-$case-refuses-before-writes: $failure" }
+                } elseif ($case -in @('start-failure','readiness-failure')) {
+                    $expected = if ($case -eq 'start-failure') { 'fixture new service failed to start' } else { 'did not report ready' }
+                    if ($failure -notmatch $expected -or $failure -notmatch 'previous payload restored' -or $script:updateStarts -ne 2 -or $script:updateServiceState -cne 'Running' -or $script:updateDefinition.binary -cne 'old-service-command' -or [IO.File]::ReadAllText("$installed\bin\motor-runner.exe") -cne 'old-runner' -or [IO.File]::ReadAllText("$installed\bin\hyperv.ps1") -cne 'old-script') { throw "FAIL update-$case-rolls-back: $failure" }
+                } else {
+                    if ($failure -or [IO.File]::ReadAllText("$installed\bin\motor-runner.exe") -cne 'new-runner' -or [IO.File]::ReadAllText("$installed\bin\hyperv.ps1") -cne 'new-script' -or [IO.File]::ReadAllText("$installed\payload-previous\bin\motor-runner.exe") -cne 'old-runner' -or $script:updateServiceState -cne 'Running' -or $script:updateDefinition.binary -notlike '*motor-runner.exe* service *') { throw "FAIL update-$case-swap: $failure" }
+                    if ((Get-Acl -LiteralPath "$installed\bin").Sddl -cne $binAcl) { throw "FAIL update-$case-preserves-bridge-acl" }
+                    foreach ($item in @(Get-Item -LiteralPath "$installed\bin") + @(Get-ChildItem -LiteralPath "$installed\bin" -Recurse)) {
+                        if ((Get-Acl -LiteralPath $item.FullName).GetOwner([Security.Principal.SecurityIdentifier]).Value -cne 'S-1-5-32-544') { throw "FAIL update-$case-administrators-owner: $($item.FullName)" }
+                    }
+                    if ($case -eq 'manual-rollback') {
+                        Invoke-RunnerHostUpdate -Root $installed -Rollback -ReadyTimeoutSeconds 1
+                        if ([IO.File]::ReadAllText("$installed\bin\motor-runner.exe") -cne 'old-runner' -or [IO.File]::ReadAllText("$installed\payload-previous\bin\motor-runner.exe") -cne 'new-runner' -or $script:updateDefinition.binary -cne 'old-service-command') { throw 'FAIL update-manual-rollback-restores-previous-payload-and-service' }
+                    }
+                }
+                foreach ($path in $preserved) {
+                    $full = Join-Path $installed $path
+                    if ([IO.File]::ReadAllText($full) -cne $before[$path][0] -or (Get-Acl -LiteralPath $full).Sddl -cne $before[$path][1]) { throw "FAIL update-$case-preserves-$path" }
+                }
+                Write-Host "PASS update-$case"
+                $checks++
+            }
+        } finally {
+            try { Remove-Item -LiteralPath $fixture -Recurse -Force } catch { Write-Warning "Fixture cleanup failed at ${fixture}: $_" -WarningAction Continue }
+        }
+        if ($UpdateCase -and -not $checks) { throw "Unknown update fixture case: $UpdateCase" }
+        return $checks
+    }
+}
+if ($UpdateOnly) { Write-Host "PASS $count PowerShell parser/update fixture checks"; return }
 . "$PSScriptRoot\qualify-peer.ps1"
 $root = Join-Path ([IO.Path]::GetTempPath()) ('motor-runner-script-tests-' + [Guid]::NewGuid())
 New-Item $root -ItemType Directory | Out-Null

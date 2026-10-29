@@ -12,6 +12,7 @@ Set-StrictMode -Version Latest
 . "$PSScriptRoot\accounts.ps1"
 . "$PSScriptRoot\guest-evidence.ps1"
 . "$PSScriptRoot\guest-agent-identity.ps1"
+. "$PSScriptRoot\service-definition.ps1"
 $Root = 'C:\ProgramData\MotorRunner'
 $nativeLogPath = Join-Path $Root 'installation-native.jsonl'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -52,7 +53,7 @@ Protect-RunnerPath "$Root\state\ally\local-registry-cache" $nativeLogPath
 Protect-RunnerPath "$Root\staging" $nativeLogPath
 Copy-Item "$Bundle\bin\*" "$Root\bin" -Recurse
 Copy-Item "$Bundle\prep-toolchain" $Root -Recurse
-foreach ($name in @('hyperv.ps1','parent-identity.ps1','guest-evidence.ps1','accounts.ps1','qualify.ps1','qualify-peer.ps1','uninstall.ps1','run-system.ps1','verify-sshd-system.ps1','qualify-jobs.py')) { Copy-Item "$PSScriptRoot\$name" "$Root\bin" }
+foreach ($name in @('hyperv.ps1','parent-identity.ps1','guest-agent-identity.ps1','guest-evidence.ps1','accounts.ps1','qualify.ps1','qualify-peer.ps1','uninstall.ps1','run-system.ps1','verify-sshd-system.ps1','qualify-jobs.py','update.ps1','update-functions.ps1','service-definition.ps1')) { Copy-Item "$PSScriptRoot\$name" "$Root\bin" }
 foreach ($name in @('common.ps1','process.ps1')) { Copy-Item "$PSScriptRoot\..\hyperv-spike\$name" "$Root\bin" }
 $parent = "$Root\baselines\ally-hvsock.vhdx"
 Copy-Item -LiteralPath $ParentPath -Destination $parent
@@ -213,8 +214,8 @@ cpu_set = [0, 1, 2, 3]
 concurrent_jobs = 1
 toolchain_version = 'rustc 1.99.0 (Windows MSVC)'
 "@ | Set-Content "$Root\vm.toml" -Encoding ascii
-$binary = '"C:\ProgramData\MotorRunner\bin\motor-runner.exe" service --instance ally --state-root C:\ProgramData\MotorRunner\state --backend windows-vm --vm-config C:\ProgramData\MotorRunner\vm.toml'
-New-Service -Name MotorRunner -BinaryPathName $binary -DisplayName 'Motor offline Hyper-V runner' -StartupType Automatic -DependsOn vmms | Out-Null
+$serviceDefinition = Get-RunnerServiceDefinition $Root
+New-Service -Name MotorRunner -BinaryPathName $serviceDefinition.binary -DisplayName $serviceDefinition.display_name -StartupType Automatic -DependsOn $serviceDefinition.dependencies | Out-Null
 # The bridge authenticates the pipe against SCM's registered process ID. Grant
 # only SERVICE_QUERY_STATUS to its SID, never service control/configuration.
 $sddlResult = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('sdshow', 'MotorRunner') -Operation 'read runner service security descriptor' -LogPath $nativeLogPath
@@ -226,7 +227,7 @@ $ace = [Security.AccessControl.CommonAce]::new([Security.AccessControl.AceFlags]
 $descriptor.DiscretionaryAcl.InsertAce($descriptor.DiscretionaryAcl.Count, $ace)
 $updatedSddl = $descriptor.GetSddlForm([Security.AccessControl.AccessControlSections]::All)
 $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('sdset', 'MotorRunner', $updatedSddl) -Operation 'set runner service security descriptor' -LogPath $nativeLogPath
-New-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\MotorRunner' -Name Environment -PropertyType MultiString -Value @('HOME=C:\ProgramData\MotorRunner\service-home','PATH=C:\Windows\System32;C:\Windows;C:\Program Files\Git\cmd;C:\Program Files\Git\bin') -Force | Out-Null
+New-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\MotorRunner' -Name Environment -PropertyType MultiString -Value $serviceDefinition.environment -Force | Out-Null
 $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('failure', 'MotorRunner', 'reset=', '86400', 'actions=', 'restart/5000/restart/15000/restart/60000') -Operation 'configure runner service recovery' -LogPath $nativeLogPath
 $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('failureflag', 'MotorRunner', '1') -Operation 'enable runner recovery on service failure' -LogPath $nativeLogPath
 Start-Service MotorRunner

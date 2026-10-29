@@ -389,10 +389,36 @@ errors are recorded rather than silently omitted. A socket connection alone is
 not protocol qualification; closing the passive probe can produce an expected
 guest EOF. No guest passwords, DPAPI files, registry hives or disk images are copied.
 
+## Upgrade
+
+For host-only runner or script changes, pause incoming fleet work, wait for jobs
+to finish, then run `update.ps1` from the verified, freshly extracted release in
+an elevated administrator PowerShell shell (not SYSTEM). It refuses existing job
+VMs, active/queued service jobs, invalid release checksums, or a guest-agent hash
+different from the installed parent's pin. It swaps only `bin` and the service
+definition; state, registry cache, mirrors, sealed parent, accounts, SSH setup and
+their access control lists stay in place. A failed start/readiness check restores
+the old payload and exits nonzero. Restore the protected previous payload with
+`update.ps1 -Rollback`. A guest-agent change requires the full uninstall,
+fresh-parent provisioning and reinstall path below, not a host-only update.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$src\script\windows-runner\update.ps1" -Bundle $src
+if ($LASTEXITCODE -ne 0) { throw 'Host update failed; inspect the reported blocker or rollback error before resuming work' }
+# To restore the previous host payload instead:
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$src\script\windows-runner\update.ps1" -Rollback
+```
+
+Keep incoming fleet work paused until the command reports ready. Readiness uses
+the authenticated service bridge and Windows agent status, not just the Windows
+Service Control Manager's Running state; service startup still verifies the
+existing parent. No new parent is built.
+The previous payload survives one successful swap; a later update replaces it.
+
 ## One removal
 
 Before uninstalling, copy any evidence you need to retain from the runner root to a location
-outside it. Upgrades use this uninstall/reinstall path; install.ps1 refuses an existing
+outside it. Guest-agent upgrades use this uninstall/reinstall path; install.ps1 refuses an existing
 root, so a fresh sealed parent must be provisioned before reinstalling. The uninstaller
 removes the marked SSH block even if an earlier install stopped before recording
 `ssh_block`. Copy removal scripts outside the root because the root, sealed parent,
