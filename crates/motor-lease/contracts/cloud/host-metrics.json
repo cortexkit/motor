@@ -98,6 +98,25 @@
         "status": 400,
         "body": "{\"error\":\"bad_request\",\"field\":\"at_ms\"}"
       }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/hosts/metrics-vector/metrics",
+        "body": "{\"at_ms\":1800000000000,\"cpu\":{\"threads\":32,\"busy_pct\":41,\"load1\":null},\"mem\":{\"total_mib\":128000,\"avail_mib\":22000},\"disks\":[{\"mount\":\"/\",\"total_gib\":900,\"free_gib\":310}],\"tenants\":[{\"vm\":\"vm-1\",\"state\":\"ready\",\"vcpus\":30,\"mem_mib\":106496,\"slots_total\":90,\"slots_used\":41,\"jobs_running\":12,\"recovery\":null,\"detail\":null}],\"runners\":[{\"name\":\"direct\",\"state\":\"ready\",\"slots_total\":16,\"slots_used\":3,\"queued\":0,\"oldest_wait_s\":0,\"detail\":null}]}",
+        "headers": {
+          "Content-Type": "application/json",
+          "CK-Host": "metrics-vector",
+          "CK-Timestamp": "1800000000000",
+          "CK-Counter": "6",
+          "CK-Signature": "f3595fbe6f38d7ac34ac910ac863e9380287d75c9ab5ca975e77d100bdbd627c1ffa276b65b2e515c8989d7e94805ffa116aa4bd0577c2c2ceceac078f72700e"
+        }
+      },
+      "signed_string": "ck-host-v1\nPOST\n/v1/hosts/metrics-vector/metrics\nf5d9d6f0e934f54888b63b353eb91bff8a459b2e3f8c16f7ee3c1e84f29402fc\n1800000000000\n6",
+      "reply": {
+        "status": 204,
+        "body": ""
+      }
     }
   ]
 }

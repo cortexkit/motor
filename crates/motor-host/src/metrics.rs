@@ -49,7 +49,7 @@ impl Sampler {
                     .checked_div(elapsed)
                     .unwrap_or(0)
                     .min(100),
-                load1: (load * 100.0).round() / 100.0,
+                load1: Some((load * 100.0).round() / 100.0),
             },
             mem: memory(&std::fs::read_to_string("/proc/meminfo")?)?,
             disks: vec![disk(Path::new("/"))?],

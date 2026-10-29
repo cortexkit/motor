@@ -30,12 +30,12 @@ fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
     let v = vector("host-metrics.json");
     let key = seed(v["seed_hex"].as_str().unwrap());
     let now = v["clock_ms"].as_u64().unwrap();
-    let metrics = HostMetrics {
+    let mut metrics = HostMetrics {
         at_ms: now,
         cpu: Cpu {
             threads: 32,
             busy_pct: 41,
-            load1: 12.4,
+            load1: Some(12.4),
         },
         mem: Memory {
             total_mib: 128000,
@@ -74,6 +74,14 @@ fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
             .unwrap()
             .as_bytes()
     );
+    metrics.cpu.load1 = None;
+    assert_eq!(
+        metrics.encode(now).unwrap(),
+        v["cases"][5]["request"]["body"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+    );
     let expected = [
         MetricsReply::Accepted,
         MetricsReply::TooLarge,
@@ -86,6 +94,7 @@ fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
         MetricsReply::BadRequest {
             field: Some("at_ms".into()),
         },
+        MetricsReply::Accepted,
     ];
     for (case, reply) in v["cases"].as_array().unwrap().iter().zip(expected) {
         let request = &case["request"];

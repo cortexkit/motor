@@ -100,11 +100,11 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "eca2e1d517623c6be6c71108509edb819d7ca09cce7dc5a0854b76c269a70df7",
+            "c7ddab3386b42b7d3988a3e52dfb036842fe2fa627cef2899e356c8616b2e34b",
         ),
         (
             "host-metrics.json",
-            "f11de13dc95c0584e761b94b09c90e346902cfefaa65cea31600f3749a38d7ed",
+            "c1a3daf40d39f5c96ee98ad5766f18cb9af336b488b2a34d431e50405d8acf9a",
         ),
         (
             "bad-request.json",
