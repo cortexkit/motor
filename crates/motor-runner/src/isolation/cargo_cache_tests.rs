@@ -15,6 +15,13 @@ fn fingerprint(root: &Path) -> String {
             metadata.mtime(),
             metadata.mtime_nsec(),
         ));
+        let acl = Command::new("/usr/bin/getfacl")
+            .args(["-c", "-n", "-p", "--"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(acl.status.success());
+        hash.update(acl.stdout);
         if metadata.is_dir() {
             let mut children: Vec<_> = fs::read_dir(path)
                 .unwrap()
@@ -43,6 +50,15 @@ fn shared_cache(sandbox: &mut Sandbox, shared: &Path) {
             .read_only
             .push(bind(&shared.join(name), &destination).unwrap());
     }
+}
+
+fn print_kernel() {
+    let output = Command::new("/usr/bin/uname").arg("-r").output().unwrap();
+    assert!(output.status.success());
+    println!(
+        "CARGO_OVERLAY_KERNEL={}",
+        String::from_utf8_lossy(&output.stdout).trim()
+    );
 }
 
 fn no_seeded_files(sandbox: &Sandbox) {
@@ -97,6 +113,7 @@ fn overlay_backing_path_is_reserved_for_tenant_network_jobs() {
 #[test]
 #[ignore = "operator only: non-root account with sudo -n, provisioned motor_net and trusted host isolation"]
 fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
+    print_kernel();
     let _guard = net_operator_lock();
     let f = Fixture::new();
     let shared = f.scratch.join("shared-cargo");
@@ -106,6 +123,12 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
         fs::write(directory.join("canary"), "shared\n").unwrap();
         fs::set_permissions(directory.join("canary"), fs::Permissions::from_mode(0o444)).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o555)).unwrap();
+    }
+    for name in ["registry", "git"] {
+        // Production defaults name both reader accounts. Exercise ACL copy-up
+        // as well as file data, and leave the shared ACLs untouched.
+        grant_read_only_tree_as(&shared.join(name), true, USER).unwrap();
+        grant_read_only_tree_as(&shared.join(name), true, WRITER_USER).unwrap();
     }
     fs::write(
         f.workspace.join("cargo-network-probe.py"),
@@ -170,6 +193,7 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
 #[test]
 #[ignore = "operator only: non-root account with sudo -n and trusted host isolation"]
 fn isolated_tenant_overlay_refuses_mixed_cache_owners() {
+    print_kernel();
     let f = Fixture::new();
     let lower = f.scratch.join("lower");
     fs::create_dir(&lower).unwrap();
@@ -191,6 +215,7 @@ fn isolated_tenant_overlay_refuses_mixed_cache_owners() {
 #[test]
 #[ignore = "operator only: non-root account with sudo -n and online trusted snapshot helpers"]
 fn isolated_tenant_prefetch_writes_as_validated_cache_owner() {
+    print_kernel();
     let f = Fixture::new();
     let scratch = f.scratch.join("prefetch");
     check_tenant_cargo_fetch(&scratch).unwrap();
@@ -204,6 +229,7 @@ fn isolated_tenant_prefetch_writes_as_validated_cache_owner() {
 #[test]
 #[ignore = "operator only: non-root account with sudo -n, a large shared Cargo cache and provisioned motor_net"]
 fn isolated_tenant_net_overlay_setup_on_large_cache() {
+    print_kernel();
     let _guard = net_operator_lock();
     let home = PathBuf::from(std::env::var_os("CARGO_HOME").unwrap());
     let mut entries = 0;

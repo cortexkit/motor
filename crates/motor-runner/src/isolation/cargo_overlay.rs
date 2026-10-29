@@ -1,5 +1,5 @@
 use super::*;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 
 #[path = "cargo_overlay_ownership.rs"]
 pub(super) mod ownership;
@@ -48,20 +48,19 @@ impl Plan {
         fs::create_dir(&layers)?;
         fs::set_permissions(&layers, fs::Permissions::from_mode(0o700))?;
         for cache in &caches {
-            for name in ["lower", "upper", "work"] {
+            for name in ["lower", "mapped-lower", "upper", "work"] {
                 fs::create_dir_all(layers.join(cache.name).join(name))?;
             }
-            // The upper's root supplies the merged root's ownership. All other
-            // entries retain their validated lower ownership until copy-up.
-            let upper = layers.join(cache.name).join("upper");
-            let metadata = fs::metadata(&upper)?;
-            if metadata.uid() != cache.owner.uid || metadata.gid() != cache.owner.gid {
-                checked(
-                    crate::privilege::command("/usr/bin/chown")
-                        .args(["--", &format!("{}:{}", cache.owner.uid, cache.owner.gid)])
-                        .arg(&upper),
-                )?;
-            }
+            // Only the lower bind is idmapped. The plain upper/work directories
+            // use the job's real IDs, including metadata copied up by overlayfs.
+            checked(
+                crate::privilege::command("/usr/bin/chown")
+                    .args(["--", &format!("{job_uid}:{job_gid}")])
+                    .args([
+                        layers.join(cache.name).join("upper"),
+                        layers.join(cache.name).join("work"),
+                    ]),
+            )?;
             read_only.push(bind(
                 &shared.join(cache.name),
                 &Path::new(LAYERS).join(cache.name).join("lower"),
@@ -98,9 +97,23 @@ impl Plan {
         self.mount(pid, &["--make-rprivate".into(), "/".into()])?;
         for cache in &self.caches {
             let base = format!("{LAYERS}/{}", cache.name);
+            let mapping =
+                lower_mapping(cache.owner.uid, cache.owner.gid, self.job_uid, self.job_gid);
+            self.mount(
+                pid,
+                &[
+                    "--internal-only".into(),
+                    "--no-mtab".into(),
+                    "--bind".into(),
+                    "--read-only".into(),
+                    "-o".into(),
+                    mapping,
+                    format!("{base}/lower"),
+                    format!("{base}/mapped-lower"),
+                ],
+            )?;
             let options = format!(
-                "lowerdir={base}/lower,upperdir={base}/upper,workdir={base}/work,index=off,nosuid,nodev,X-mount.idmap=u:{}:{}:1 g:{}:{}:1",
-                cache.owner.uid, self.job_uid, cache.owner.gid, self.job_gid,
+                "lowerdir={base}/mapped-lower,upperdir={base}/upper,workdir={base}/work,index=off,nosuid,nodev",
             );
             self.mount(
                 pid,
@@ -138,7 +151,10 @@ impl Plan {
         )?;
         if !output.status.success() {
             return Err(io::Error::other(format!(
-                "cargo_overlay_mount_refused: {}: {}",
+                "cargo_overlay_mount_refused: kernel={}: {}: {}",
+                fs::read_to_string("/proc/sys/kernel/osrelease")
+                    .unwrap_or_else(|_| "unknown".into())
+                    .trim(),
                 output.status,
                 String::from_utf8_lossy(&output.stderr).trim(),
             )));
@@ -147,8 +163,62 @@ impl Plan {
     }
 }
 
+fn lower_mapping(source_uid: u32, source_gid: u32, job_uid: u32, job_gid: u32) -> String {
+    // Keep every other ID representable: shared default ACLs also name the job
+    // and writer accounts. An owner-only map can fail while copying those ACLs.
+    let mut mappings = id_swap('u', source_uid, job_uid);
+    mappings.extend(id_swap('g', source_gid, job_gid));
+    format!("X-mount.idmap={}", mappings.join(" "))
+}
+
+fn id_swap(kind: char, source: u32, job: u32) -> Vec<String> {
+    if source == job {
+        return vec![format!("{kind}:0:0:{}", u32::MAX)];
+    }
+    // mount(8) takes visible mount ID first, backing filesystem ID second.
+    let mut mappings = vec![
+        format!("{kind}:{job}:{source}:1"),
+        format!("{kind}:{source}:{job}:1"),
+    ];
+    let mut next = 0_u64;
+    for excluded in [
+        u64::from(source.min(job)),
+        u64::from(source.max(job)),
+        u64::from(u32::MAX),
+    ] {
+        if excluded > next {
+            mappings.push(format!("{kind}:{next}:{next}:{}", excluded - next));
+        }
+        next = excluded + 1;
+    }
+    mappings
+}
+
 pub(crate) fn start_validation() {
     if let Some(home) = host_inputs::environment("CARGO_HOME") {
         ownership::start(Path::new(&home));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lower_idmap_presents_backing_owner_as_job_identity() {
+        assert_eq!(
+            lower_mapping(0, 0, 999, 999),
+            "X-mount.idmap=u:999:0:1 u:0:999:1 u:1:1:998 u:1000:1000:4294966295 g:999:0:1 g:0:999:1 g:1:1:998 g:1000:1000:4294966295",
+        );
+        assert_eq!(id_swap('u', 44, 44), ["u:0:0:4294967295"]);
+        assert_eq!(
+            id_swap('u', 1000, 999),
+            [
+                "u:999:1000:1",
+                "u:1000:999:1",
+                "u:0:0:999",
+                "u:1001:1001:4294966294",
+            ]
+        );
     }
 }
