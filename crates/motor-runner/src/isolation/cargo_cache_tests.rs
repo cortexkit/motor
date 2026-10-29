@@ -46,13 +46,8 @@ fn shared_cache(sandbox: &mut Sandbox, shared: &Path) {
 }
 
 #[test]
-#[ignore = "requires root, reflink scratch, motor-job, systemd and provisioned motor_net"]
+#[ignore = "operator only: non-root account with sudo -n, provisioned motor_net and trusted host isolation"]
 fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
-    assert_eq!(
-        unsafe { libc::geteuid() },
-        0,
-        "run as root on the operator host"
-    );
     let _guard = net_operator_lock();
     let f = Fixture::new();
     let shared = f.scratch.join("shared-cargo");
@@ -84,6 +79,11 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
 
     let mut sandbox = f.sandbox().in_tenant_vm(true);
     shared_cache(&mut sandbox, &shared);
+    // The tenant daemon is root, but operator fixtures delegate only individual
+    // privileged operations. Grant the trusted preparer access for the reflink
+    // copy, then revoke that access before launching any job code.
+    let home = sandbox.runtime.0.join("home");
+    restore_runner_access(&home).unwrap();
     let sandbox = host_inputs::fixture::with(
         host_inputs::fixture::Inputs {
             environment: BTreeMap::from([("CARGO_HOME", shared.clone().into_os_string())]),
@@ -92,6 +92,7 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
         },
         || sandbox.with_network().unwrap(),
     );
+    prepare_job_home(&home).unwrap();
     let runtime = sandbox.runtime.0.clone();
     let (status, stdout, stderr) = output(&sandbox, "python3 cargo-network-probe.py", &f.workspace);
     assert!(status.success(), "{stdout}\n{stderr}");
