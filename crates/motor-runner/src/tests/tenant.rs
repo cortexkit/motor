@@ -28,6 +28,9 @@ fn lease(id: Uuid, purpose: LeasePurpose) -> VerifiedLease {
     }
 }
 fn hello() -> Frame {
+    hello_with_gate_jobs(false)
+}
+fn hello_with_gate_jobs(gate_jobs: bool) -> Frame {
     Frame::Hello {
         return_paths: false,
         return_chunked: false,
@@ -35,7 +38,7 @@ fn hello() -> Frame {
         protocol_version: motor_protocol::PROTOCOL_VERSION,
         started: true,
         default_branch_tip: false,
-        gate_jobs: false,
+        gate_jobs,
         platforms: vec![],
     }
 }
@@ -55,18 +58,25 @@ async fn connect(
     runner: &Runner,
     lease: VerifiedLease,
 ) -> (DuplexStream, tokio::task::JoinHandle<io::Result<()>>) {
+    connect_with_gate_jobs(runner, lease, false).await
+}
+async fn connect_with_gate_jobs(
+    runner: &Runner,
+    lease: VerifiedLease,
+    gate_jobs: bool,
+) -> (DuplexStream, tokio::task::JoinHandle<io::Result<()>>) {
     let (mut client, server) = tokio::io::duplex(2 * 1024 * 1024);
     let runner = runner.clone();
     let task = tokio::spawn(crate::server::tenant_channel(runner, server));
     motor_protocol::write_frame_async(&mut client, &Frame::VerifiedLease(lease))
         .await
         .unwrap();
-    motor_protocol::write_frame_async(&mut client, &hello())
+    motor_protocol::write_frame_async(&mut client, &hello_with_gate_jobs(gate_jobs))
         .await
         .unwrap();
     assert!(matches!(
         frame(&mut client).await,
-        Some(Frame::Hello { .. })
+        Some(Frame::Hello { gate_jobs: supported, .. }) if supported == gate_jobs
     ));
     (client, task)
 }
@@ -454,6 +464,69 @@ async fn tenant_accepted_is_admitted_and_withdraw_is_terminal() {
         [TenantEventKind::Terminal]
     );
     task.await.unwrap().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tenant_gated_run_gets_permits_before_an_older_queued_worker() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.manual_tick = true;
+    config.tenant_vm = true;
+    config.max_weight = 2;
+    config.cpu_topology = Some(CpuTopology::new((0..2).map(|cpu| vec![cpu]).collect()).unwrap());
+    let runner = Runner::open(config).unwrap();
+    let mut clients = Vec::new();
+    let mut ids = Vec::new();
+    for gate in [false, true] {
+        let (mut run, bundles) = f.run("true");
+        run.weight_hint = Some(2);
+        run.timeout = Some(30);
+        run.network = None;
+        run.platform = None;
+        run.gate_job = gate;
+        let id = run.job_id;
+        let (mut client, task) =
+            connect_with_gate_jobs(&runner, lease(id, LeasePurpose::Run), gate).await;
+        motor_protocol::write_frame_async(&mut client, &Frame::Run(run))
+            .await
+            .unwrap();
+        assert!(matches!(frame(&mut client).await, Some(Frame::Accepted(_))));
+        for (index, bytes) in bundles.into_iter().enumerate() {
+            motor_protocol::write_frame_async(
+                &mut client,
+                &Frame::BundleChunk {
+                    index: index as u32,
+                    offset: 0,
+                    data: BytePayload(bytes),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while runner.job_status(id).unwrap().state != "queued" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        ids.push(id);
+        clients.push((client, task));
+    }
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        assert!(!inner.jobs[&ids[0]].gate_job());
+        assert!(inner.jobs[&ids[1]].gate_job());
+        assert!(inner.jobs[&ids[0]].order < inner.jobs[&ids[1]].order);
+        runner.dispatch(&mut inner, runner.now()).unwrap();
+        assert_eq!(inner.starting, BTreeSet::from([ids[1]]));
+        assert!(inner.jobs[&ids[0]].setup_ms.is_none());
+    }
+    for (_, task) in clients {
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 #[tokio::test]

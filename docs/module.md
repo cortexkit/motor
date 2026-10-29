@@ -90,6 +90,29 @@ snapshots, not runner probes or per-request lists; they add only a few hundred
 bytes to the module's bounded health cache (16 KiB maximum). The SDK separately
 degrades health when a full pool has waited more than two seconds.
 
+Health also names first-party hosted hosts seen in retained leases, with the
+newest job's lease outcome for each host. `ck health motor` includes them in its
+detail and `metrics.hosted.hosted_hosts`; the hosted `runner.health` response
+includes `hosted_hosts` directly. Boat placements are excluded. These are
+lease observations, not live capacity samples: `capacity` is null, and
+`hosted_hosts_source` and `hosted_hosts_missing` disclose that the broker's
+registered-host inventory and heartbeat capacity are not exposed to ck-motor.
+A host never leased by this client cannot be discovered here, and an observed
+host can disappear when its jobs leave retention. No runner or broker probe is
+made by the health check. Test:
+`health_lists_retained_host_leases_without_inventing_capacity`.
+
+The background sampler still probes the configured direct Linux runner when
+`hosted_runners` is enabled. Its sample is labeled as the direct gate lane, or
+the `no_host_fits` fallback lane with fleet routing enabled. Windows runners
+remain separately named and sampled beside it and the hosted hosts. The Linux
+`exec.status` aggregate retains its hosted placeholder for compatibility; that
+placeholder is not a component-health probe and is never fed to the health
+sampler as an unreachable runner. Linux has a configured direct target even
+when its settings are omitted (the default instance is selected); optional
+Windows targets that are not configured are omitted, not reported unreachable.
+Test: `hosted_runner_health_and_sampler_use_direct_linux_runner`.
+
 If an authorized run or attach handler sees a long-held operation that the
 prefix classifier put in the default pool, it increments
 `request_pools.long_held_fallbacks_total` (since module start). This catches

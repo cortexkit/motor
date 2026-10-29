@@ -1667,6 +1667,45 @@ async fn started_relay(
     guest
 }
 
+#[tokio::test]
+async fn relay_preserves_gate_capability_and_run_mark_for_the_tenant() {
+    let (runtime, fake, broker, requester, c) = fixture();
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime, server));
+    let challenge = hello(&mut client, &broker, &requester, &c).await;
+    assert_eq!(
+        respond(&mut client, &requester, &c, challenge).await["type"],
+        "lease_ok"
+    );
+    let handshake = json!({"type":"hello", "protocol_version":1, "gate_jobs":true});
+    write_frame(&mut client, &handshake).await.unwrap();
+    let guest = peer(&fake).await;
+    guest.set_nonblocking(true).unwrap();
+    let mut guest = tokio::net::UnixStream::from_std(guest).unwrap();
+    assert_eq!(
+        read_frame(&mut guest).await.unwrap()["type"],
+        "verified_lease"
+    );
+    assert_eq!(read_frame(&mut guest).await.unwrap(), handshake);
+    write_frame(&mut guest, &handshake).await.unwrap();
+    assert_eq!(read_frame(&mut client).await.unwrap(), handshake);
+    let run = json!({
+        "type":"run", "job_id":JOB, "gate_job":true,
+        "workspace_key":"/repo", "repository_root":"/repo", "cwd":"/repo",
+        "command":"true", "env":{}, "queue_wait_limit_s":1800,
+        "snapshot_commit":"", "tree_hash":"", "integration_tip":"",
+        "siblings":[], "bundles":[]
+    });
+    assert!(
+        matches!(serde_json::from_value::<motor_protocol::Frame>(run.clone()).unwrap(),
+        motor_protocol::Frame::Run(run) if run.gate_job)
+    );
+    write_frame(&mut client, &run).await.unwrap();
+    assert_eq!(read_frame(&mut guest).await.unwrap(), run);
+    drop(client);
+    task.await.unwrap().unwrap();
+}
+
 #[derive(Default)]
 struct WatermarkGate {
     released: Mutex<bool>,

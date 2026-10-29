@@ -607,6 +607,10 @@ impl Handler {
             backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
         }
     }
+    #[cfg(test)]
+    pub(crate) fn start_health_sampler_for_test(&self) {
+        self.start_health_sampler();
+    }
     fn start_health_sampler(&self) {
         let mut sampler = self.health_sampler.lock().unwrap();
         if sampler.0.is_some() {
@@ -1051,6 +1055,30 @@ impl ModuleHandler for Handler {
             .lock()
             .unwrap()
             .report(std::time::Instant::now());
+        if let Some(role) = self.motor.get().and_then(Motor::direct_linux_health_role) {
+            if let Some(detail) = report.detail.as_mut() {
+                if let Some(rest) = detail.strip_prefix("build server") {
+                    *detail = format!("build server (direct Linux: {role}){rest}");
+                }
+            }
+            if let Some(metrics) = report.metrics.as_mut().and_then(Value::as_object_mut) {
+                metrics.insert("direct_linux_workload".into(), json!(role));
+            }
+        }
+        if let Some(hosted) = self.motor.get().and_then(|motor| motor.hosted_health()) {
+            if let Some(hosts) = hosted["hosted_hosts"].as_array() {
+                for host in hosts {
+                    let name = host["host"].as_str().unwrap_or("unknown");
+                    let outcome = host["last_lease_outcome"].as_str().unwrap_or("unknown");
+                    report.detail.get_or_insert_default().push_str(&format!(
+                        "; hosted {name}: last lease {outcome}, capacity unavailable"
+                    ));
+                }
+            }
+            if let Some(metrics) = report.metrics.as_mut().and_then(Value::as_object_mut) {
+                metrics.insert("hosted".into(), hosted);
+            }
+        }
         // The detail line stays one sentence; the refusal counters are
         // diagnostics, shown with `ck health ck-motor --verbose`.
         if let Some(serde_json::Value::Object(metrics)) = report.metrics.as_mut() {
@@ -1433,6 +1461,69 @@ mod health_tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Err(io::Error::other("offline")) })
         }
+    }
+
+    #[tokio::test]
+    async fn health_lists_retained_host_leases_without_inventing_capacity() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-hosted-health");
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let storage = crate::storage::Storage::open(&scratch).unwrap();
+            for (host, code) in [
+                ("ovh-2", None),
+                ("other-host", None),
+                ("ovh-2", Some("host_full")),
+                ("boat:test", None),
+            ] {
+                storage
+                    .hosted_route(
+                        Uuid::now_v7(),
+                        crate::HostedJobState {
+                            placement: Some(motor_lease::Placement {
+                                host: host.into(),
+                                vm: Some("tenant".into()),
+                            }),
+                            lease_attempted: true,
+                            hosted_code: code.map(str::to_owned),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        let motor = Motor::with_connector(
+            Config::default(),
+            &scratch,
+            Arc::new(CountingConnector(calls.clone())),
+        )
+        .unwrap();
+        let runner_health = motor.hosted_health().unwrap();
+        let handler = Handler::new(Config::default()).with_motor(motor);
+        let report = handler.health().await;
+        let detail = report.detail.unwrap();
+        assert!(
+            detail.contains("hosted ovh-2: last lease host_full, capacity unavailable"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("hosted other-host: last lease leased"),
+            "{detail}"
+        );
+        let hosted = &report.metrics.unwrap()["hosted"];
+        assert_eq!(hosted, &runner_health);
+        assert_eq!(hosted["hosted_hosts"].as_array().unwrap().len(), 2);
+        assert_eq!(hosted["hosted_hosts"][1]["host"], "ovh-2");
+        assert_eq!(hosted["hosted_hosts"][1]["last_lease_outcome"], "host_full");
+        assert_eq!(
+            hosted["hosted_hosts"][1].get("capacity"),
+            Some(&Value::Null)
+        );
+        assert_eq!(hosted["hosted_hosts_source"], "retained_leases");
+        assert!(hosted["hosted_hosts_missing"]
+            .as_str()
+            .unwrap()
+            .contains("live capacity"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -10,8 +10,10 @@ pub struct Config {
     #[serde(skip_serializing_if = "is_false")]
     pub hosted_runners: bool,
     /// Give the global hosted route capacity waits and pre-Run direct correction.
-    /// Gate jobs keep the direct priority lane. Other jobs need a 10..=21600 s
-    /// timeout, 1..=64 vCPUs, and paths accepted by hosted::validate, or stay direct.
+    /// Gates use host-only leases and the tenant runner's priority lane. Jobs need
+    /// a 10..=21600 s timeout, 1..=64 vCPUs, and paths accepted by hosted::validate,
+    /// or stay direct. Without fleet routing, gates stay direct unless an
+    /// explicit repository route selects hosted routing.
     /// hosted_runners still controls whether the global hosted route is enabled.
     #[serde(skip_serializing_if = "is_false")]
     pub hosted_fleet_routing: bool,
