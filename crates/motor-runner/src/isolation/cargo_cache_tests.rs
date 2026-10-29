@@ -222,10 +222,32 @@ fn isolated_tenant_prefetch_writes_as_validated_cache_owner() {
     let rustup = PathBuf::from(std::env::var_os("RUSTUP_HOME").unwrap());
     let mut config = crate::Config::new(&scratch, "state");
     config.tenant_vm = true;
-    let snapshots = SnapshotSiblings {
-        config: &config,
-        siblings: Vec::new(),
-    };
+    // The operator host is not an attached tenant. Give the helper a private
+    // copy of its usable DNS addresses without writing the fixed /run paths.
+    let directory = f.scratch.join("tenant-resolver");
+    let resolvers: Vec<String> = fs::read_to_string("/etc/resolv.conf")
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            if fields.next()? != "nameserver" {
+                return None;
+            }
+            fields.next()?.parse::<std::net::Ipv4Addr>().ok()
+        })
+        .take(3)
+        .map(|address| address.to_string())
+        .collect();
+    assert!(
+        !resolvers.is_empty(),
+        "operator host needs an IPv4 DNS resolver"
+    );
+    crate::tenant_agent::dns::install(&directory, &resolvers, unsafe { libc::geteuid() }).unwrap();
+    let marker = f.scratch.join("tenant-resolver-marker");
+    fs::write(&marker, Uuid::now_v7().to_string()).unwrap();
+    use crate::sibling_snapshots::helper::{self, Helper, TenantResolver};
+    let resolver = TenantResolver::from_test_attachment(&config, &marker, &directory);
+    assert!(matches!(&resolver, TenantResolver::Attached { .. }));
     // check-tenant-cargo-fetch is a root-only CLI. Use its cold fetch and
     // snapshot helpers without changing the operator's delegated sudo mode.
     cargo_fetch::check_online_via(&scratch, &rustup, |command, limit| {
@@ -233,7 +255,14 @@ fn isolated_tenant_prefetch_writes_as_validated_cache_owner() {
             crate::sibling_snapshots::helper::View::prefetch(&scratch.join("workspace"), &[])?
                 .keep(&scratch.join("cargo-home"), true)
                 .keep(&rustup, false);
-        snapshots.run(&view, command, CargoFetch::TenantAttempt(limit))
+        helper::run_with_test_resolver(
+            &config,
+            Helper::CargoPrefetch,
+            limit.min(Helper::CargoPrefetch.limit(&config)),
+            command,
+            &view,
+            resolver.clone(),
+        )
     })
     .unwrap();
     assert!(crate::privilege::uses_sudo());
