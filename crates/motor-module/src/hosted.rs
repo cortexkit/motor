@@ -82,7 +82,7 @@ pub struct HostedJobState {
     /// so capacity waits and pre-Run correction survive configuration changes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) fleet_routed: bool,
-    /// Outbound-network fleet jobs cannot run on Boat. Store the restriction
+    /// Gate and outbound-network fleet jobs cannot run on Boat. Store the restriction
     /// before requesting a lease so retries and restarts keep the same policy.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) fleet_no_spill: bool,

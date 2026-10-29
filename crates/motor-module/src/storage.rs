@@ -508,6 +508,24 @@ impl Storage {
             .filter_map(|j| j.hosted.clone())
             .find(|h| h.booked_or_attempted())
     }
+    /// Retained leases are the client's only host inventory; they are not live
+    /// capacity samples. Keep the newest job per first-party host for health.
+    pub(crate) fn last_hosted_per_host(&self) -> BTreeMap<String, (Uuid, crate::HostedJobState)> {
+        let state = self.state.lock().unwrap();
+        let mut hosts = BTreeMap::new();
+        for (id, job) in state.jobs.iter().rev() {
+            let Some(route) = &job.hosted else { continue };
+            let Some(placement) = &route.placement else {
+                continue;
+            };
+            if !placement.host.starts_with("boat:") {
+                hosts
+                    .entry(placement.host.clone())
+                    .or_insert_with(|| (*id, route.clone()));
+            }
+        }
+        hosts
+    }
     pub(crate) fn hosted_routed_jobs_1h(&self) -> usize {
         self.hosted_routed_jobs_1h_at(now_ms())
     }

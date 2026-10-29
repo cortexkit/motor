@@ -352,7 +352,7 @@ impl Harness {
                                 },
                                 started: true,
                                 default_branch_tip: true,
-                                gate_jobs: false,
+                                gate_jobs: true,
                                 platforms: vec!["linux".into()],
                             },
                         )

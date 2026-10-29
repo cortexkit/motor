@@ -380,12 +380,13 @@ impl Motor {
         } else if wsl_refusal.is_none()
             && self.config.hosted_runners
             && matches!(request.platform, None | Some(Platform::Linux))
-            && (!self.config.hosted_fleet_routing
-                || (!gate_job && crate::hosted::validate(&request).is_ok()))
+            && (!gate_job || self.config.hosted_fleet_routing)
+            && (!self.config.hosted_fleet_routing || crate::hosted::validate(&request).is_ok())
         {
             let mut route = crate::HostedJobState::new(&self.config);
             route.fleet_routed = self.config.hosted_fleet_routing;
-            route.fleet_no_spill = route.fleet_routed && request.network.is_some();
+            // Gate priority belongs to the tenant's queue, not to shared Boat capacity.
+            route.fleet_no_spill = route.fleet_routed && (gate_job || request.network.is_some());
             route.hosted_no_fallback = route.fleet_routed;
             self.storage.hosted_route(id, route)?;
         }
@@ -1797,15 +1798,38 @@ impl Motor {
     pub(crate) fn hosted_health(&self) -> Option<serde_json::Value> {
         let routed = self.storage.hosted_routed_jobs_1h();
         let no_host_fits = self.storage.hosted_no_host_fits_1h();
+        let host_leases = self.storage.last_hosted_per_host();
         if !self.config.hosted_runners
             && self.config.hosted_repositories.is_empty()
             && routed == 0
             && no_host_fits == 0
+            && host_leases.is_empty()
         {
             return None;
         }
         let last = self.storage.last_hosted();
         let error = last.as_ref().and_then(|s| s.hosted_code.as_deref());
+        let hosts: Vec<_> = host_leases
+            .into_iter()
+            .map(|(host, (id, state))| {
+                let outcome = state
+                    .hosted_code
+                    .as_deref()
+                    .unwrap_or(if state.finish_done {
+                        "finished"
+                    } else if state.run_sent {
+                        "run_sent"
+                    } else {
+                        "leased"
+                    });
+                serde_json::json!({
+                    "host": host,
+                    "last_lease_job_id": id,
+                    "last_lease_outcome": outcome,
+                    "capacity": null,
+                })
+            })
+            .collect();
         Some(serde_json::json!({
             "hosted": self.config.hosted_runners,
             "hosted_routed_jobs_1h": routed,
@@ -1813,6 +1837,9 @@ impl Motor {
             "token_source": self.config.broker_token_source,
             "broker_reachable": last.as_ref().and_then(|s| if s.hosted_code.as_deref() == Some("hosted_broker_unreachable") { Some(false) } else if s.placement.is_some() { Some(true) } else { None }),
             "last_lease_error": error,
+            "hosted_hosts": hosts,
+            "hosted_hosts_source": "retained_leases",
+            "hosted_hosts_missing": "broker host inventory and live capacity are not exposed to ck-motor",
         }))
     }
     async fn open_job_channel(&self, id: Uuid) -> Result<Channel, crate::hosted::Error> {
@@ -2463,12 +2490,21 @@ impl Motor {
         platform: Option<&Platform>,
     ) -> io::Result<RunnerStatusReply> {
         if self.config.hosted_runners && matches!(platform, None | Some(Platform::Linux)) {
+            // This is the aggregate exec.status view, not a direct-runner probe.
+            // Component health uses its own status request so an intentionally
+            // skipped aggregate probe is never counted as a connection failure.
             return Ok(RunnerStatusReply {
                 status: StatusReply::new(0, Vec::new(), false, Vec::new(), "hosted"),
                 disk: None,
                 health: None,
             });
         }
+        self.direct_runner_status_for(platform).await
+    }
+    async fn direct_runner_status_for(
+        &self,
+        platform: Option<&Platform>,
+    ) -> io::Result<RunnerStatusReply> {
         let connector = self.connector_for_target(self.config.target(platform)?);
         Self::status_from_connector(connector.as_ref()).await
     }
@@ -2526,11 +2562,20 @@ impl Motor {
     pub async fn runner_health(&self) -> io::Result<RunnerHealth> {
         self.runner_health_for(None).await
     }
+    pub(crate) fn direct_linux_health_role(&self) -> Option<&'static str> {
+        self.config
+            .hosted_runners
+            .then_some(if self.config.hosted_fleet_routing {
+                "no_host_fits fallback"
+            } else {
+                "gate jobs"
+            })
+    }
     pub(crate) async fn runner_health_for(
         &self,
         platform: Option<&Platform>,
     ) -> io::Result<RunnerHealth> {
-        self.runner_status_for(platform)
+        self.direct_runner_status_for(platform)
             .await?
             .health
             .map(|health| *health)

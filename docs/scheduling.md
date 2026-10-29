@@ -142,6 +142,19 @@ dispatcher chooses among heads:
 3. Newer heads, rotating between workspaces by least recent dispatch.
 4. Background warm builds and cache fills, last.
 
+With global fleet routing enabled, gates take host-only leases with
+`allow_spill: false` and carry the same `run.gate_job` mark through motor-host. The mark
+does not affect broker placement. Each tenant VM has its own runner and queue,
+so priority can reorder only that tenant's jobs, never another tenant's jobs.
+Without fleet routing, global gate submissions keep using the direct runner;
+explicit repository routes still take precedence. Gates retain their 30-minute
+queue budget and can correct to the direct runner on a pre-Run `no_host_fits`.
+Tests: `fleet_gate_takes_a_host_only_lease_and_sends_the_gate_mark`,
+`fleet_off_gate_uses_the_direct_runner_without_a_lease`,
+`fleet_gate_no_host_fits_corrects_to_the_direct_priority_lane`,
+`relay_preserves_gate_capability_and_run_mark_for_the_tenant`,
+`tenant_gated_run_gets_permits_before_an_older_queued_worker`.
+
 When a head does not fit the free capacity, smaller heads behind it may run in
 its place (backfill) for its first 60 seconds. After that, or when the blocked
 head is a gate job, backfill stops until it fits. A head blocked by its own

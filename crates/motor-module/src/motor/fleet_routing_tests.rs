@@ -44,7 +44,7 @@ fn fleet_config_defaults_off_and_roundtrips() {
 }
 
 #[tokio::test]
-async fn fleet_linux_default_platform_jobs_allow_hosted_spill_but_gates_stay_direct() {
+async fn fleet_linux_default_platform_jobs_allow_hosted_spill() {
     let h = Harness::new(Behavior::CompleteRun).await;
     let (scratch, repo) = committed_repo();
     let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
@@ -53,11 +53,7 @@ async fn fleet_linux_default_platform_jobs_allow_hosted_spill_but_gates_stay_dir
     config.spill_after_s = 0;
     config.hosted_repositories_placement_hint = Some(control_placement());
     let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
-    for (platform, timeout, gate) in [
-        (None, 10, false),
-        (Some(Platform::Linux), 7200, false),
-        (Some(Platform::Linux), 600, true),
-    ] {
+    for (platform, timeout) in [(None, 10), (Some(Platform::Linux), 7200)] {
         let mut request = request(&repo);
         request.platform = platform;
         request.timeout = Some(timeout);
@@ -65,7 +61,7 @@ async fn fleet_linux_default_platform_jobs_allow_hosted_spill_but_gates_stay_dir
             .run_classified(
                 request,
                 (None, None),
-                gate,
+                false,
                 false,
                 false,
                 Default::default(),
@@ -73,22 +69,13 @@ async fn fleet_linux_default_platform_jobs_allow_hosted_spill_but_gates_stay_dir
             .unwrap();
         let id = stream.job_id;
         let (_, terminal) = records(stream).await;
-        if gate {
-            assert_eq!(terminal.outcome, Outcome::Exit { code: 17 });
-            assert!(motor.hosted_state(id).is_none());
-            assert!(motor.storage.job(id).unwrap().gate_job);
-            assert!(!lease_bodies(&h)
-                .iter()
-                .any(|body| body["job_id"] == id.to_string()));
-        } else {
-            assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
-            let state = motor.hosted_state(id).unwrap();
-            assert!(state.fleet_routed && state.run_sent && state.hosted_no_fallback);
-            assert!(!state.repository_routed && !state.fleet_no_spill);
-            let restored: crate::HostedJobState =
-                serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
-            assert!(restored.fleet_routed && restored.capacity_routed());
-        }
+        assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+        let state = motor.hosted_state(id).unwrap();
+        assert!(state.fleet_routed && state.run_sent && state.hosted_no_fallback);
+        assert!(!state.repository_routed && !state.fleet_no_spill);
+        let restored: crate::HostedJobState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert!(restored.fleet_routed && restored.capacity_routed());
     }
     let bodies = lease_bodies(&h);
     assert_eq!(bodies.len(), 2);
@@ -109,7 +96,101 @@ async fn fleet_linux_default_platform_jobs_allow_hosted_spill_but_gates_stay_dir
         );
     }
     assert_eq!(h.runs.load(Ordering::SeqCst), 2);
+    assert_eq!(peer.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn fleet_gate_takes_a_host_only_lease_and_sends_the_gate_mark() {
+    let h = Harness::new(Behavior::CompleteRun).await;
+    let (scratch, repo) = committed_repo();
+    let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
+    let motor = Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
+    let mut request = request(&repo);
+    request.queue_wait_limit_s = Some(1);
+    let stream = motor
+        .run_direct_authorized(request, None, Default::default(), true, false, [7; 32])
+        .unwrap();
+    let id = stream.job_id;
+    let (_, terminal) = records(stream).await;
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+    let route = motor.hosted_state(id).unwrap();
+    assert!(route.fleet_routed && route.fleet_no_spill && route.run_sent);
+    let job = motor.storage.job(id).unwrap();
+    assert!(job.gate_job);
+    assert_eq!(job.queue_wait_limit_s, 30 * 60);
+    let leases = lease_bodies(&h);
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0]["allow_spill"], false);
+    assert!(leases[0].get("gate_job").is_none());
+    assert!(h
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| { matches!(frame, Frame::Run(run) if run.job_id == id && run.gate_job && run.queue_wait_limit_s == 1800) }));
+    assert_eq!(peer.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn fleet_off_gate_uses_the_direct_runner_without_a_lease() {
+    for hosted_runners in [false, true] {
+        let h = Harness::new(Behavior::CompleteRun).await;
+        let (scratch, repo) = committed_repo();
+        let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
+        let config = Config {
+            hosted_runners,
+            hosted_fleet_routing: false,
+            ..config(&h)
+        };
+        let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
+        let stream = motor
+            .run_direct_authorized(
+                request(&repo),
+                None,
+                Default::default(),
+                false,
+                false,
+                [7; 32],
+            )
+            .unwrap();
+        let id = stream.job_id;
+        let (_, terminal) = records(stream).await;
+        assert_eq!(terminal.outcome, Outcome::Exit { code: 17 });
+        assert!(motor.hosted_state(id).is_none());
+        assert_eq!(motor.storage.job(id).unwrap().queue_wait_limit_s, 30 * 60);
+        assert!(lease_bodies(&h).is_empty());
+        assert_eq!(peer.0.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn fleet_gate_no_host_fits_corrects_to_the_direct_priority_lane() {
+    let h = Harness::new(Behavior::CompleteRun).await;
+    h.broker.lock().unwrap().knobs.refusal = Some((422, "no_host_fits".into()));
+    let (scratch, repo) = committed_repo();
+    let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
+    let motor = Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
+    let stream = motor
+        .run_direct_authorized(
+            request(&repo),
+            None,
+            Default::default(),
+            false,
+            false,
+            [7; 32],
+        )
+        .unwrap();
+    let id = stream.job_id;
+    let (_, terminal) = records(stream).await;
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 17 });
+    assert!(motor.hosted_state(id).is_none());
+    let job = motor.storage.job(id).unwrap();
+    assert!(job.gate_job);
+    assert_eq!(job.routed_direct_reason.as_deref(), Some("no_host_fits"));
+    assert_eq!(job.queue_wait_limit_s, 30 * 60);
+    assert_eq!(lease_bodies(&h)[0]["allow_spill"], false);
     assert_eq!(peer.0.load(Ordering::SeqCst), 1);
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

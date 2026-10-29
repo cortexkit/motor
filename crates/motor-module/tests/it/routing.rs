@@ -1212,6 +1212,107 @@ async fn platform_reports_select_windows_and_default_linux_reply_bytes_are_uncha
         .any(|v| v.instance == "windows" && v.root.as_deref() == Some(WINDOWS_ROOT)));
 }
 
+#[tokio::test]
+async fn hosted_runner_health_and_sampler_use_direct_linux_runner() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    let mut config = configured(f.config.clone());
+    config.hosted_runners = true;
+    config.hosted_fleet_routing = false;
+    config.broker_url = Some("https://unused.invalid".into());
+    {
+        let storage = crate::storage::Storage::open(&peer.module_state).unwrap();
+        storage
+            .hosted_route(
+                Uuid::now_v7(),
+                crate::HostedJobState {
+                    placement: Some(motor_lease::Placement {
+                        host: "fixture-host".into(),
+                        vm: Some("tenant".into()),
+                    }),
+                    lease_attempted: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let motor = peer.motor(config.clone());
+    let placeholder = motor.runner_status_for(None).await.unwrap();
+    assert_eq!(placeholder.status.rustc_version, "hosted");
+    assert!(placeholder.health.is_none());
+    assert!(peer.visits.lock().unwrap().is_empty());
+    let expected = peer.linux_status.health.as_deref().unwrap().clone();
+    assert_eq!(motor.runner_health().await.unwrap(), expected);
+    assert!(peer
+        .visits
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|visit| { visit.instance == config.runner_instance && visit.root.is_none() }));
+    peer.visits.lock().unwrap().clear();
+    peer.frames.lock().unwrap().clear();
+    let handler = crate::module::Handler::new(config.clone()).with_motor(motor);
+    handler.start_health_sampler_for_test();
+    let report = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let report =
+                <crate::module::Handler as subc_client_rs::ModuleHandler>::health(&handler).await;
+            if report
+                .metrics
+                .as_ref()
+                .is_some_and(|metrics| metrics["build_server"].is_object())
+            {
+                break report;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    handler.shutdown().await;
+    assert_eq!(report.status, subc_client_rs::HealthStatus::Ok);
+    let detail = report.detail.unwrap();
+    assert!(
+        detail.contains("build server (direct Linux: gate jobs)"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("Windows build-server: available"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("hosted fixture-host: last lease leased"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains("unreachable") && !detail.contains("stale"),
+        "{detail}"
+    );
+    let metrics = report.metrics.unwrap();
+    assert_eq!(metrics["build_server"]["queue_depth"], expected.queue_depth);
+    assert_eq!(metrics["direct_linux_workload"], "gate jobs");
+    assert_eq!(metrics["hosted"]["hosted_hosts"][0]["host"], "fixture-host");
+    assert_eq!(metrics["windows_runners"][0]["reachable"], true);
+    assert!(peer
+        .visits
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|visit| { visit.instance == config.runner_instance && visit.root.is_none() }));
+    assert!(peer
+        .visits
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|visit| visit.instance == "windows"));
+    assert!(peer
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame, Frame::Status)));
+}
+
 #[tokio::test(start_paused = true)]
 async fn windows_reports_error_when_unconfigured_or_unreachable_without_linux_fallback() {
     let f = Fixture::new(Cut::None, 28).await;
