@@ -1706,6 +1706,192 @@ fn disk_build_folder_incomplete_measurement_falls_back_to_repair() {
     assert!(fs::symlink_metadata(incremental).unwrap().is_file());
 }
 
+#[test]
+fn disk_build_folder_unreadable_outside_target_does_not_trigger_repair() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("requires an unprivileged user so mode 000 denies directory reads");
+        return;
+    }
+    let f = Fixture::new();
+    let repairs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = repairs.clone();
+    let mut c = f.config();
+    c.manual_tick = true;
+    c.long_work = Some(Arc::new(move |label| {
+        if label == "build_folder_repair" {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+    let runner = Runner::open(c).unwrap();
+    let idle = f.scratch.join("remote/worktrees/unreadable-outside-target");
+    workspace(&runner, &idle, runner.now());
+    let unreadable = idle.join("scripts/__pycache__");
+    fs::create_dir_all(&unreadable).unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(
+        fs::read_dir(&unreadable).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .build_guard_pending
+        .insert(text(&idle).into());
+    runner.guard_build_folder(text(&idle));
+    runner.maintain_build_folders();
+    let no_op_repairs = repairs.load(Ordering::SeqCst);
+    let (guard_done, swept) = {
+        let inner = runner.core.inner.lock().unwrap();
+        (
+            !inner.build_guard_pending.contains(text(&idle)),
+            inner.build_swept_ms.contains_key(text(&idle)),
+        )
+    };
+
+    let old = runner.now() - 49 * 60 * 60 * 1000;
+    let dep = cargo_output(&idle, "debug/deps/libfoo-0123456789abcdef.rlib", old);
+    let incremental = cargo_output(&idle, "debug/incremental/foo/state.bin", old);
+    f.clock.fetch_add(24 * 60 * 60 * 1000, Ordering::SeqCst);
+    runner.maintain_build_folders();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(no_op_repairs, 0);
+    assert!(
+        guard_done && swept,
+        "outside permissions blocked target maintenance"
+    );
+    // Actual deletion still repairs ownership; only measurement-driven repair
+    // is unnecessary when the unreadable directory is outside target.
+    assert_eq!(repairs.load(Ordering::SeqCst), 1);
+    assert!(!dep.exists() && !incremental.exists());
+    assert!(idle.join("target/artifact").exists());
+    assert!(unreadable.exists());
+    assert!(!runner.core.inner.lock().unwrap().build_folder_sizes[text(&idle)].complete);
+}
+
+#[test]
+fn disk_eviction_uses_partial_workspace_estimate_without_target_repair() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("requires an unprivileged user so mode 000 denies directory reads");
+        return;
+    }
+    let f = Fixture::new();
+    let idle = f
+        .scratch
+        .join("remote/worktrees/partial-workspace-estimate");
+    let probe = idle.clone();
+    let pressure = Arc::new(AtomicBool::new(false));
+    let active = pressure.clone();
+    let repairs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = repairs.clone();
+    let mut c = config(&f, move |_| {
+        Ok(if active.load(Ordering::SeqCst) && probe.exists() {
+            150
+        } else {
+            200
+        })
+    });
+    c.manual_tick = true;
+    c.long_work = Some(Arc::new(move |label| {
+        if label == "build_folder_repair" {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+    let runner = Runner::open(c).unwrap();
+    workspace(&runner, &idle, runner.now() - 60 * 60 * 1000);
+    let unreadable = idle.join("scripts/__pycache__");
+    fs::create_dir_all(&unreadable).unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    runner.guard_build_folder(text(&idle));
+    // The portable fixture cannot perform privileged whole-tree deletion.
+    // Restore access after caching a partial estimate, before pressure eviction.
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!runner.core.inner.lock().unwrap().build_folder_sizes[text(&idle)].complete);
+    pressure.store(true, Ordering::SeqCst);
+    assert!(runner.ensure_disk_space().unwrap().is_none());
+    assert_eq!(repairs.load(Ordering::SeqCst), 0);
+    assert!(
+        !idle.exists(),
+        "partial ranking estimate blocked whole-workspace eviction"
+    );
+}
+
+#[test]
+fn disk_build_folder_failed_repair_backs_off_guard_and_sweep() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("requires an unprivileged user so mode 000 denies directory reads");
+        return;
+    }
+    for (guard, delay_ms) in [(true, 5 * 60 * 1000), (false, 24 * 60 * 60 * 1000)] {
+        let f = Fixture::new();
+        let repairs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = repairs.clone();
+        let mut c = f.config();
+        c.manual_tick = true;
+        c.build_folder_cap_bytes = 1;
+        c.long_work = Some(Arc::new(move |label| {
+            if label == "build_folder_repair" {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        let runner = Runner::open(c).unwrap();
+        let idle = f.scratch.join("remote/worktrees/failed-target-repair");
+        workspace(&runner, &idle, runner.now());
+        let incremental = cargo_output(&idle, "debug/incremental/foo/state.bin", runner.now());
+        if guard {
+            runner
+                .core
+                .inner
+                .lock()
+                .unwrap()
+                .build_guard_pending
+                .insert(text(&idle).into());
+        }
+        let target = idle.join("target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+        runner.maintain_build_folders();
+        let first = repairs.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            runner.maintain_build_folders();
+        }
+        f.clock.fetch_add(delay_ms - 1, Ordering::SeqCst);
+        runner.maintain_build_folders();
+        let before_retry = repairs.load(Ordering::SeqCst);
+        f.clock.fetch_add(1, Ordering::SeqCst);
+        runner.maintain_build_folders();
+        let after_retry = repairs.load(Ordering::SeqCst);
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(first, 1, "guard={guard}: passes repeated the failed repair");
+        assert_eq!(
+            before_retry, 1,
+            "guard={guard}: retried before the deadline"
+        );
+        assert_eq!(
+            after_retry, 2,
+            "guard={guard}: did not retry at the deadline"
+        );
+        assert!(incremental.exists(), "failed repair deleted hidden outputs");
+
+        // Once access returns, the next due attempt must make progress rather
+        // than treating the cached incomplete estimate as a permanent failure.
+        f.clock.fetch_add(delay_ms, Ordering::SeqCst);
+        runner.maintain_build_folders();
+        let inner = runner.core.inner.lock().unwrap();
+        assert!(!inner.build_guard_pending.contains(text(&idle)));
+        assert!(inner.build_swept_ms.contains_key(text(&idle)));
+        assert!(inner.dropping.is_empty());
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires trusted host sudo and motor-job account; see motor-runner README"]

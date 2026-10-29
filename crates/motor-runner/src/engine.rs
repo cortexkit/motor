@@ -986,6 +986,7 @@ struct Inner {
     build_swept_ms: BTreeMap<String, u64>,
     build_guard_pending: BTreeSet<String>,
     build_folder_sizes: BTreeMap<String, disk::BuildFolderSize>,
+    build_retry_after: BTreeMap<String, [u64; 3]>,
     kill_retries: BTreeMap<Uuid, (u32, std::time::Instant)>,
     finalizing: BTreeSet<Uuid>,
     /// A real exit status delivered while the finalization owner is collecting
@@ -2590,6 +2591,7 @@ impl Runner {
                     build_swept_ms: BTreeMap::new(),
                     build_guard_pending: BTreeSet::new(),
                     build_folder_sizes: BTreeMap::new(),
+                    build_retry_after: BTreeMap::new(),
                     kill_retries: BTreeMap::new(),
                     finalizing: BTreeSet::new(),
                     exit_statuses: BTreeMap::new(),
