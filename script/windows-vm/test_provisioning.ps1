@@ -94,6 +94,92 @@ foreach ($case in @(
 $checks++
 Write-Host 'PASS nextest_version_guard_rejects_wrong_missing_and_failed_tools'
 
+$pythonInstall = @($ast.EndBlock.Statements | Where-Object {
+    $_ -is [Management.Automation.Language.TryStatementAst] -and $_.Extent.Text.Contains('-OutFile $pythonInstaller')
+})
+Assert ($pythonInstall.Count -eq 1) 'Python must install unconditionally for QEMU and Hyper-V images'
+$pythonSetup = $pythonInstall[0].Extent.Text
+Assert ($pythonSetup.IndexOf('-OutFile $pythonInstaller') -lt $pythonSetup.IndexOf('Get-FileHash -LiteralPath $pythonInstaller')) 'Python hash must follow download'
+Assert ($pythonSetup.IndexOf("throw 'Python installer SHA-256 mismatch'") -lt $pythonSetup.IndexOf('Start-Process -FilePath $pythonInstaller')) 'Python hash must be verified before execution'
+Assert ($pythonSetup.IndexOf('Start-Process -FilePath $pythonInstaller') -lt $pythonSetup.IndexOf('Copy-Item -LiteralPath "$pythonInstall\python.exe"')) 'python3 must come from the installed interpreter'
+$checks++
+Write-Host 'PASS python_unconditional_download_verify_install_and_alias'
+
+$pythonHashGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text.Contains('Get-FileHash -LiteralPath $pythonInstaller')}, $true)
+Assert ($null -ne $pythonHashGuard) 'missing Python installer hash guard'
+$pythonInstaller = 'python-fixture.exe'
+$pythonSha256 = '5da012101ba2e17113a9a1cd901e9ce1441086f2b7ecb5de06ec94163899a190'
+function Get-FileHash {
+    param($LiteralPath, $Algorithm)
+    Assert ($LiteralPath -eq $pythonInstaller -and $Algorithm -eq 'SHA256') 'Python hashed the wrong installer or algorithm'
+    [pscustomobject]@{ Hash = $fixtureHash }
+}
+try {
+    foreach ($fixtureHash in @($pythonSha256.ToUpperInvariant(), ('0' * 64))) {
+        $threw = $false
+        try { Invoke-Expression $pythonHashGuard.Extent.Text } catch {
+            Assert ($_.ToString().Contains('Python installer SHA-256 mismatch')) "unexpected Python hash error: $_"
+            $threw = $true
+        }
+        Assert ($threw -eq ($fixtureHash -eq ('0' * 64))) 'Python accepted a wrong hash or rejected the pinned hash'
+    }
+} finally {
+    Remove-Item Function:\Get-FileHash
+}
+$checks++
+Write-Host 'PASS python_hash_guard_rejects_mismatch'
+
+$pythonExitGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text.Contains('$pythonProcess.ExitCode')}, $true)
+Assert ($null -ne $pythonExitGuard) 'missing Python installer exit code guard'
+foreach ($code in @(0, 3010, 1, 1603)) {
+    $pythonProcess = [pscustomobject]@{ExitCode = $code}
+    $threw = $false
+    try { Invoke-Expression $pythonExitGuard.Extent.Text } catch {
+        Assert ($_.ToString().Contains('Machine-wide Python installation failed')) "unexpected Python installer error: $_"
+        $threw = $true
+    }
+    Assert ($threw -eq ($code -notin @(0,3010))) "wrong Python installer exit code result: $code"
+}
+$checks++
+Write-Host 'PASS python_installer_exit_guard_rejects_failure'
+
+$pythonVersionGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text.Contains('$installedPythonVersion -cne')}, $true)
+Assert ($null -ne $pythonVersionGuard) 'missing Python version guard'
+$pythonVersion = '3.13.17'
+$command = 'python3.exe'
+foreach ($case in @(
+    @{Version='Python 3.13.17'; Code=0; Reject=$false},
+    @{Version='Python 3.13.16'; Code=0; Reject=$true},
+    @{Version='Python 3.13.170'; Code=0; Reject=$true},
+    @{Version=''; Code=127; Reject=$true},
+    @{Version='Python 3.13.17'; Code=1; Reject=$true}
+)) {
+    $installedPythonVersion = $case.Version
+    $LASTEXITCODE = $case.Code
+    $threw = $false
+    try { Invoke-Expression $pythonVersionGuard.Extent.Text } catch {
+        Assert ($_.ToString().Contains('Machine-wide Python version verification failed')) "unexpected Python version error: $_"
+        $threw = $true
+    }
+    Assert ($threw -eq $case.Reject) "wrong Python version guard result: $($case.Version), exit $($case.Code)"
+}
+$checks++
+Write-Host 'PASS python_version_guard_rejects_wrong_missing_and_failed_tools'
+
+$pythonStdlibGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Extent.Text.Contains("throw 'Machine-wide Python stdlib verification failed'")}, $true)
+Assert ($null -ne $pythonStdlibGuard) 'missing Python stdlib guard'
+foreach ($code in @(0, 1)) {
+    $LASTEXITCODE = $code
+    $threw = $false
+    try { Invoke-Expression $pythonStdlibGuard.Extent.Text } catch {
+        Assert ($_.ToString().Contains('Machine-wide Python stdlib verification failed')) "unexpected Python stdlib error: $_"
+        $threw = $true
+    }
+    Assert ($threw -eq ($code -ne 0)) "wrong Python stdlib guard result: $code"
+}
+$checks++
+Write-Host 'PASS python_stdlib_guard_rejects_failure'
+
 # Execute the real inventory guards with complete and incomplete rustup output.
 $hostTriple = 'x86_64-pc-windows-msvc'
 foreach ($inventory in @('components', 'targets')) {

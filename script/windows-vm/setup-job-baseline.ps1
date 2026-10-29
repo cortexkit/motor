@@ -59,6 +59,49 @@ $installedBunVersion = & "$bunInstall\bun.exe" --version
 if ($LASTEXITCODE -ne 0 -or $installedBunVersion -cne $bunVersion) { throw 'Machine-wide Bun version verification failed' }
 Write-Host "Verified machine-wide Bun $installedBunVersion with protected user read/execute access"
 
+# Offline jobs need the full standard library, so use the official all-users
+# installer rather than the embeddable distribution with its restricted site path.
+# SHA-256 source: https://www.python.org/ftp/python/3.13.17/python-3.13.17-amd64.exe.spdx.json
+$pythonVersion = '3.13.17'
+$pythonSha256 = '5da012101ba2e17113a9a1cd901e9ce1441086f2b7ecb5de06ec94163899a190'
+$pythonInstaller = Join-Path $motor 'python-3.13.17-amd64.exe'
+$pythonInstall = 'C:\Python313'
+try {
+    Invoke-WebRequest 'https://www.python.org/ftp/python/3.13.17/python-3.13.17-amd64.exe' -OutFile $pythonInstaller -UseBasicParsing
+    if ((Get-FileHash -LiteralPath $pythonInstaller -Algorithm SHA256).Hash.ToLowerInvariant() -cne $pythonSha256) {
+        throw 'Python installer SHA-256 mismatch'
+    }
+    if (Test-Path -LiteralPath $pythonInstall) { throw 'Python destination already exists; use a fresh provisioning image' }
+    New-Item $pythonInstall -ItemType Directory | Out-Null
+    & icacls $pythonInstall /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'
+    if ($LASTEXITCODE -ne 0) { throw 'Python root ACL setup failed' }
+    $pythonArguments = @('/quiet', 'InstallAllUsers=1', 'PrependPath=0', 'Include_launcher=0', 'Include_test=0', "TargetDir=$pythonInstall")
+    $pythonProcess = Start-Process -FilePath $pythonInstaller -ArgumentList $pythonArguments -Wait -PassThru
+    if ($pythonProcess.ExitCode -notin @(0,3010)) { throw "Machine-wide Python installation failed: $($pythonProcess.ExitCode)" }
+    # The installer provides python.exe only. An adjacent copy gives Git Bash
+    # python3 without a user alias, launcher or Windows Store execution stub.
+    Copy-Item -LiteralPath "$pythonInstall\python.exe" -Destination "$pythonInstall\python3.exe"
+    & icacls "$pythonInstall\*" /reset /T /C /L /Q
+    if ($LASTEXITCODE -ne 0) { throw 'Python ACL inheritance reset failed' }
+    & icacls $pythonInstall /setowner '*S-1-5-32-544' /T /C /L /Q
+    if ($LASTEXITCODE -ne 0) { throw 'Python ownership setup failed' }
+} finally {
+    Remove-Item -LiteralPath $pythonInstaller -Force -ErrorAction SilentlyContinue
+}
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+if (($machinePath -split ';' | ForEach-Object { $_.TrimEnd('\') }) -notcontains $pythonInstall) {
+    [Environment]::SetEnvironmentVariable('Path', "$pythonInstall;$machinePath", 'Machine')
+}
+$env:Path = "$pythonInstall;" + $env:Path
+foreach ($command in @('python3.exe', 'python.exe')) {
+    $installedPythonVersion = & "$pythonInstall\$command" --version
+    if ($LASTEXITCODE -ne 0 -or $installedPythonVersion -cne "Python $pythonVersion") { throw "Machine-wide Python version verification failed for ${command}: $installedPythonVersion" }
+}
+Write-Host "Verified machine-wide Python $pythonVersion with protected user read/execute access"
+& "$pythonInstall\python3.exe" -c "import json, hashlib, subprocess, tomllib"
+if ($LASTEXITCODE -ne 0) { throw 'Machine-wide Python stdlib verification failed' }
+Write-Host 'Verified machine-wide Python stdlib imports: json, hashlib, subprocess, tomllib'
+
 $bytes = New-Object byte[] 48
 $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
 $rng.GetBytes($bytes)
