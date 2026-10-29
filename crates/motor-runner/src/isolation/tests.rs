@@ -17,6 +17,9 @@ mod mapped;
 #[path = "remote_cache_tests.rs"]
 mod remote_cache;
 
+#[path = "cargo_cache_tests.rs"]
+mod cargo_cache;
+
 #[test]
 fn stale_lockfile_refusal_says_to_update_it_locally() {
     // Both wordings Cargo has used for a manifest edited past its lockfile.

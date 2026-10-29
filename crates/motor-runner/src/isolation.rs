@@ -3314,6 +3314,29 @@ impl Sandbox {
 
     pub(crate) fn with_network(mut self) -> io::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
+        if self.tenant_vm && !self.boat_profile {
+            let shared = PathBuf::from(
+                host_inputs::environment("CARGO_HOME")
+                    .ok_or_else(|| io::Error::other("CARGO_HOME unset"))?,
+            );
+            let private = self.runtime.0.join("home/cargo");
+            // Online Cargo may need sources beyond the trusted lockfile fetch.
+            // Reflinks seed independent, writable inodes without copying cached
+            // file data or giving the job a write path into the shared cache.
+            for name in ["registry", "git"] {
+                let source = shared.join(name);
+                let binding = bind(&source, &self.cargo.join(name))?;
+                if self.read_only.contains(&binding) {
+                    let destination = private.join(name);
+                    fs::remove_dir(&destination)?;
+                    platform::clone_target(&source, &destination)?;
+                    self.read_only.retain(|entry| entry != &binding);
+                }
+            }
+            // Shared-cache ownership and inherited read-only ACLs must not
+            // prevent Cargo from updating the job's independent copies.
+            prepare_job_home(&private)?;
+        }
         let resolver = self.runtime.0.join("resolv.conf");
         fs::write(&resolver, "nameserver 1.1.1.1\nnameserver 9.9.9.9\n")?;
         fs::set_permissions(&resolver, fs::Permissions::from_mode(0o444))?;
