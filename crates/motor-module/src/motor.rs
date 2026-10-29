@@ -2654,18 +2654,9 @@ impl Motor {
         }
     }
     pub async fn drop_workspace(&self, request: DropRequest) -> io::Result<DropReply> {
-        if self.config.hosted_runners {
-            let id = Uuid::now_v7();
-            self.storage
-                .hosted_route(id, crate::HostedJobState::new(&self.config))?;
-            self.storage.hosted_update(id, |s| {
-                s.hosted_no_fallback = true;
-                s.hosted_code = Some("hosted_prepare_unsupported".into());
-            })?;
-            return Err(io::Error::other(
-                "hosted_prepare_unsupported: hosted_no_fallback",
-            ));
-        }
+        // Hosted hosts have no workspace-drop operation; their tenants evict idle
+        // workspaces. The direct runner may still hold gate or fallback workspaces,
+        // so always forward its drop and preserve its reply or connection error.
         let mut channel = Channel::open(self.connector.as_ref(), Uuid::now_v7())
             .await
             .map_err(|r| io::Error::other(format!("{r:?}")))?;
@@ -2687,12 +2678,8 @@ impl Motor {
                 .with_refusal_detail(message));
         }
         if self.config.hosted_runners {
-            self.storage
-                .hosted_route(id, crate::HostedJobState::new(&self.config))?;
-            self.storage.hosted_update(id, |s| {
-                s.hosted_no_fallback = true;
-                s.hosted_code = Some("hosted_prepare_unsupported".into());
-            })?;
+            // Prepare targets a single runner, but hosted jobs are placed at run time.
+            // A refused transfer is not a job and must not enter job storage.
             return Ok(prepare_refused(id, RefusalReason::RequestRejected)
                 .with_refusal_detail("hosted_prepare_unsupported: hosted_no_fallback"));
         }
@@ -3013,6 +3000,8 @@ mod fleet_capacity_tests;
 mod fleet_routing_tests;
 #[cfg(test)]
 mod repository_routing_tests;
+#[cfg(test)]
+mod workspace_tests;
 #[cfg(test)]
 mod wsl_tests;
 

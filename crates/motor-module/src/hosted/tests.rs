@@ -619,12 +619,7 @@ async fn hosted_invalid_requests_refuse_before_snapshot_lease_or_ssh() {
         .await
         .unwrap();
     assert!(reply.refusal_detail.unwrap().contains("hosted_no_fallback"));
-    assert!(motor
-        .drop_workspace(DropRequest::new("/tmp/missing"))
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("hosted_no_fallback"));
+    assert!(motor.hosted_state(reply.transfer_id).is_none());
     motor.status().await;
     assert_eq!(h.requests.lock().unwrap().len(), 0);
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);

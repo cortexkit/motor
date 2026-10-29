@@ -196,10 +196,7 @@ async fn wsl_non_drive_and_non_wsl_requests_keep_normal_validation_and_routing()
                 .await
                 .unwrap();
             assert!(!reply.refusal_detail().unwrap().contains("Under WSL"));
-            assert_eq!(
-                motor.hosted_state(reply.transfer_id).is_some(),
-                matches!(route, "hosted" | "fleet")
-            );
+            assert!(motor.hosted_state(reply.transfer_id).is_none());
             if matches!(route, "hosted" | "fleet") {
                 assert_eq!(
                     reply.refusal_detail(),
