@@ -13,6 +13,66 @@ LOCAL_USER_DESCRIPTION_MAX = 48
 
 
 class InstallScriptTests(unittest.TestCase):
+    def test_update_vm_present_refuses_before_writes(self):
+        update = (HERE / 'update-functions.ps1').read_text()
+        guard = update.split('function Assert-RunnerUpdateIdle', 1)[1].split('function Wait-RunnerUpdateReady', 1)[0]
+        self.assertIn("Get-VM | Where-Object { $_.Name -like 'motor-ally-*' }", guard)
+        self.assertIn('if ($vms.Count) { throw "Host update blocked by job VM(s):', guard)
+        self.assertIn('$status.running_jobs', guard)
+        self.assertIn('$status.queue_depth -ne 0', guard)
+        transaction = update.split('function Invoke-RunnerHostUpdate', 1)[1]
+        self.assertLess(transaction.index('Assert-RunnerUpdateIdle $Root'), transaction.index('New-Item -ItemType Directory -Path $next'))
+        fixture = (HERE / 'test_scripts.ps1').read_text()
+        self.assertIn('FAIL update-$case-refuses-before-writes:', fixture)
+        self.assertIn("Name='motor-ally-blocking-job'", fixture)
+
+    def test_update_agent_identity_and_checksums_precede_staging(self):
+        update = (HERE / 'update-functions.ps1').read_text()
+        transaction = update.split('function Invoke-RunnerHostUpdate', 1)[1]
+        stage = transaction.index('New-Item -ItemType Directory -Path $next')
+        for check in ('Test-RunnerUpdateManifest $source', '$candidateAgent -ine $agent[0].Groups[1].Value', 'Get-RunnerUpdateServiceDefinition'):
+            self.assertLess(transaction.index(check), stage)
+        self.assertIn('guest_agent_sha256', transaction)
+        self.assertIn("$files[$payload['bin/motor-winagent.exe']]", transaction)
+        self.assertIn('a parent rebuild is required; use the README full uninstall/reinstall path', transaction)
+        self.assertIn('Release hash mismatch:', update)
+        self.assertIn('Staged release hash mismatch:', update)
+        self.assertIn('Unsafe or duplicate release manifest path:', update)
+        self.assertIn('[IO.FileAttributes]::ReparsePoint', update)
+
+    def test_update_swaps_and_rolls_back_without_reinstalling_state(self):
+        update = (HERE / 'update-functions.ps1').read_text()
+        self.assertIn('Move-Item -LiteralPath "$Root\\bin" -Destination "$backup\\bin"', update)
+        self.assertIn('Move-Item -LiteralPath "$next\\bin" -Destination "$Root\\bin"', update)
+        self.assertIn('Move-Item -LiteralPath "$oldContainer\\bin" -Destination "$Root\\bin"', update)
+        self.assertIn('Set-RunnerUpdateServiceDefinition $oldDefinition $log', update)
+        self.assertIn('Wait-RunnerUpdateReady $Root $ReadyTimeoutSeconds', update)
+        self.assertIn('$status.health.windows_guest_agent.ready -eq $true', update)
+        self.assertIn("Send-UpdateFrame @{type='status'}", update)
+        self.assertIn('automatic rollback also failed:', update)
+        self.assertIn('Set-Acl -LiteralPath "$next\\bin" -AclObject $binAcl', update)
+        self.assertIn("'/setowner', '*S-1-5-32-544', '/T'", update)
+        self.assertIn('Protect-RunnerPath $backup $log', update)
+        for destructive in ('Remove-LocalUser', 'New-LocalUser', 'New-Service', 'Remove-Service', 'Mount-VHD', 'Set-RunnerSshConfigBlock'):
+            self.assertNotIn(destructive, update)
+        fixture = (HERE / 'test_scripts.ps1').read_text()
+        for case in ('vm-present', 'agent-mismatch', 'swap', 'start-failure', 'manual-rollback'):
+            self.assertIn(f"'{case}'", fixture)
+        self.assertIn('state\\parent-verified.json', fixture)
+        self.assertIn('preserves-bridge-acl', fixture)
+
+    def test_update_requires_elevated_administrator_and_shared_service_definition(self):
+        entry = (HERE / 'update.ps1').read_text()
+        self.assertLess(entry.index("$identity.User.Value -eq 'S-1-5-18'"), entry.index('Invoke-RunnerHostUpdate'))
+        self.assertIn('-not $admin', entry)
+        install = (HERE / 'install.ps1').read_text()
+        update = (HERE / 'update-functions.ps1').read_text()
+        for text in (install, update):
+            self.assertIn('service-definition.ps1', text)
+            self.assertIn('Get-RunnerServiceDefinition $Root', text)
+        self.assertIn('start=$start', update)
+        self.assertIn("'config','MotorRunner'", update)
+
     def test_ssh_key_is_profile_independent_and_validated_before_restart(self):
         install = (HERE / "install.ps1").read_text()
         accounts = (HERE / "accounts.ps1").read_text()
