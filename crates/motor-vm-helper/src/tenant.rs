@@ -65,7 +65,6 @@ pub struct Registry {
     pub tap_index: u8,
     pub idle_suspend_s: u64,
     pub host_floor_bytes: u64,
-    #[serde(default = "default_headroom")]
     pub memory_headroom_mib: u64,
     #[serde(default = "default_snapshot_high")]
     pub snapshot_memory_high_mib: u64,
@@ -79,8 +78,10 @@ fn optional_weight<'de, D: serde::Deserializer<'de>>(
 ) -> std::result::Result<Option<u32>, D::Error> {
     u32::deserialize(deserializer).map(Some)
 }
-fn default_headroom() -> u64 {
-    512
+pub fn minimum_memory_headroom_mib(guest_ram_mib: u64) -> u64 {
+    // RAM-dependent VMM bookkeeping and drive cache/writeback share the guest's
+    // cgroup. Keep a 2 GiB floor and round the 3% allowance up, without overflow.
+    2048.max(guest_ram_mib / 100 * 3 + (guest_ram_mib % 100 * 3).div_ceil(100))
 }
 fn default_snapshot_high() -> u64 {
     16384
@@ -107,7 +108,6 @@ impl Registry {
             || self.disk_quota_bytes == 0
             || !(1..=10000).contains(&self.io_weight)
             || !crate::config::cpu_list(&self.cpuset)
-            || self.memory_headroom_mib < 512
         {
             return Err(Error("invalid tenant registry".into()));
         }
@@ -129,6 +129,13 @@ impl Registry {
         format!("mtap{}", self.tap_index)
     }
     pub fn memory_max(&self) -> Result<u64> {
+        let minimum = minimum_memory_headroom_mib(self.guest_ram_mib);
+        if self.memory_headroom_mib < minimum {
+            return Err(Error(format!(
+                "memory_headroom_mib {} MiB is below minimum {minimum} MiB for guest_ram_mib {} MiB; run provision.py switch-image or resize to rewrite memory_headroom_mib",
+                self.memory_headroom_mib, self.guest_ram_mib
+            )));
+        }
         self.guest_ram_mib
             .checked_add(self.memory_headroom_mib)
             .and_then(|v| v.checked_mul(1048576))

@@ -9,7 +9,7 @@
   "tap_index": 1,
   "idle_suspend_s": 600,
   "host_floor_bytes": 137438953472,
-  "memory_headroom_mib": 512,
+  "memory_headroom_mib": 2048,
   "snapshot_memory_high_mib": 16384,
   "io_weight": 100,
   "resolvers": ["1.1.1.1", "9.9.9.9"]

@@ -111,8 +111,8 @@ jobs get their tools and isolation from the tenant image instead.
 6. Write capacity.json and apply the jobs slice as described below. With no
    Windows VM, set `windows_vm_bytes` to 0. `jobs_min_bytes` must be positive
    even without a Linux runner; 1 GiB gives the unused jobs slice a small cap.
-   With `host_reserve_bytes` 6 GiB and a 79,872 MiB guest plus 512 MiB headroom,
-   the fit is 78.5 + 0 + 6 + 1 = 85.5 GiB, checked against actual `MemTotal`,
+   With `host_reserve_bytes` 6 GiB and a 79,872 MiB guest plus 2,397 MiB headroom,
+   the fit is about 80.341 + 0 + 6 + 1 = 87.341 GiB, checked against actual `MemTotal`,
    not the rental's advertised memory. Keep the storage margins and tenant
    memory reserve unless there is a separate reviewed capacity change.
 
@@ -241,9 +241,12 @@ MiB), a 600 GiB sparse disk, a permit budget (`max_weight`) of 64 and
 cpuset, shared with the Windows VM
 ([scheduling.md](scheduling.md#confining-linux-jobs-to-a-cpu-list)). The
 tenant then advertises at most 77,824 MiB, so the broker's ceilings for the
-host are `max_job_vcpus` 21 and `max_job_mem_mib` 75,264. The memory fit is
-(79,872 + 512) MiB + 16 + 6 + 24 GiB = 124.5 GiB, within this server's
-125.4 GiB `MemTotal`. At idle 0 the storage threshold is 136 GiB, the release
+host are `max_job_vcpus` 21 and `max_job_mem_mib` 75,264. Headroom defaults to
+and must be at least `max(2048, ceil(guest_ram_mib * 3 / 100))` MiB. The memory fit is
+(79,872 + 2,397) MiB + 16 + 6 + 24 GiB = 126.341 GiB, or 135,657,422,848 bytes.
+This exceeds the measured 134,647,791,616-byte `MemTotal` by 1,009,631,232 bytes:
+the example is refused unless the guest or another memory reservation is smaller.
+At idle 0 the storage threshold is 136 GiB, the release
 point 144 GiB and the operating requirement 208 GiB; the resize itself needs
 288.5 GiB (309,774,516,224 bytes) free while its new size base is absent.
 
@@ -384,13 +387,32 @@ extra rule.
    It verifies the image with the hosted
    image inventory command, builds the tenant's size-specific base if needed,
    and updates the helper registry and `/etc/motor-host/provision/tenant-1.json`
-   together. An image-mismatched suspend snapshot is moved to a timestamped
+   together. It also raises `memory_headroom_mib` in both records to the minimum
+   `max(2048, ceil(guest_ram_mib * 3 / 100))` MiB, preserving any larger value,
+   and checks whole-host fit before building a base or publishing either record.
+   This is the only sizing field `switch-image` may rewrite, including on a
+   repeated switch to the same image. Old 512-MiB records must pass through this
+   offline update (or `resize`) before starting the new helper: starts and
+   `install.sh --check` refuse below-minimum values and name the remedy. The
+   records remain the source of truth; no extra allowance is hidden at start.
+   See the [headroom rationale](../script/tenant-provision/README.md) for the
+   observed cgroup exhaustion and the limits of Firecracker's VMM-overhead figure.
+   An image-mismatched suspend snapshot is moved to a timestamped
    sibling directory rather than deleted, and its new path is printed. The
    command prints the old and new image versions and an exact rollback command.
    A repeated switch to the same image is safe. `install.sh --check` checks the
    installed record as it is, image included (see step 6). The
    command never starts the host; run the existing `install.sh --start` only
    after `install.sh --check` and a review of its results.
+
+   For an upgrade from below-minimum headroom, use this order: stop both motor
+   services, run `switch-image` from the new checkout, run `install.sh --build`,
+   run `install.sh --check`, then run `install.sh --start`. Resolve any capacity
+   shortfall before the switch. `--build` installs files but does not start or
+   restart either motor service, and cannot be combined with `--start`. Running
+   it before the record update fails strict tenant validation after binaries
+   may already have been replaced; keeping the services stopped avoids starting
+   the new helper with the old limit.
 
    To change a tenant's size (vCPUs, cpuset, RAM, disk, `max_weight`,
    `idle_suspend_s`), use `provision.py resize` with both services stopped; it

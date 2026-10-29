@@ -20,15 +20,45 @@ The JSON configuration has these required fields:
 
 Optional fields are `idle_suspend_s` (600), `host_floor_bytes` (128 GiB,
 minimum: the direct runner's 128 GiB free-space floor),
-`memory_headroom_mib` (512, minimum 512), `snapshot_memory_high_mib` (16384,
+`memory_headroom_mib` (default and minimum: `max(2048, ceil(guest_ram_mib * 3 / 100))`), `snapshot_memory_high_mib` (16384,
 clamped to guest RAM), `io_weight` (100, range 1–10000), and `max_weight` (the
 permit budget, described below). `idle_suspend_s` 0 means the tenant never
 suspends. The default memory
-limit is `(guest_ram_mib + 512) * 1048576`, with `memory.high` applied **only**
+limit is `(guest_ram_mib + memory_headroom_mib) * 1048576`, with headroom rounded
+up to whole MiB and `memory.high` applied **only**
 while creating a snapshot. The fixed jail `pids.max` is `vcpu_ceiling + 64`.
 Snapshot creation has substantial writeback costs; tune the I/O weight and
 headroom on the target host before production use. Weight is proportional
 sharing, not an absolute bandwidth guarantee.
+
+The 2 GiB floor and 3% allowance cover more than the VMM's userspace threads:
+the cgroup also pays for page tables, drive page cache and writeback. A 78 GiB
+guest was killed at a guest-plus-512-MiB cgroup limit despite free host memory;
+a 104 GiB guest repeatedly hit the same margin. The new allowances are 2,397
+and 3,195 MiB respectively, leaving space for RAM-dependent bookkeeping and
+I/O bursts rather than relying on reclaim at the old cap. These are minimum
+budgets, not a bound on every workload's overhead; a larger explicit value is
+allowed and is counted in host capacity.
+
+Firecracker's [specification](https://github.com/firecracker-microvm/firecracker/blob/main/SPECIFICATION.md)
+documents at most 5 MiB of VMM-thread overhead for a one-vCPU, 128-MiB test VM,
+dependent on workload and configuration and excluding MMDS data. It does not
+give a fixed overhead per GiB of guest RAM or a total cgroup-memory guarantee.
+Its [hugepage documentation](https://github.com/firecracker-microvm/firecracker/blob/main/docs/hugepages.md)
+also explains how page size and dirty tracking affect page-table overhead.
+
+The helper registry always carries `memory_headroom_mib` explicitly. Below-minimum
+records, including old 512-MiB values, are refused by helper starts and
+`install.sh --check`, with the recorded value, required minimum, guest RAM and
+the remedy. With both services stopped, `switch-image` or `resize` raises this
+field to `max(recorded headroom, formula)` in both the provisioning record and
+helper registry, through its paired update or resize journal. `switch-image`
+may rewrite this one sizing field even when selecting the same image. Resize
+also raises it when RAM grows; larger explicit allowances are preserved. The
+whole-host memory fit is checked before either operation changes records or
+builds a base. If it no longer fits, reduce another reservation or choose a
+smaller target before retrying; the helper never silently uses a different
+limit from the record and never rewrites records on start.
 
 `max_weight` is the tenant's budget of concurrent job permits, counted as
 summed vCPU claims. It is optional: without it the budget is `vcpu_ceiling`,

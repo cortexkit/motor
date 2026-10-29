@@ -107,6 +107,20 @@ def memtotal_bytes():
     return u64(int(matches[0]) * 1024, "MemTotal conversion")
 
 
+def minimum_memory_headroom_mib(guest_ram_mib):
+    # VMM bookkeeping grows with RAM; synchronous drive I/O also charges cache
+    # and writeback to the VM's cgroup. A fixed 512 MiB exhausted large guests.
+    return max(2048, (guest_ram_mib * 3 + 99) // 100)
+
+
+def check_memory_headroom(guest_ram_mib, headroom_mib):
+    minimum = minimum_memory_headroom_mib(guest_ram_mib)
+    if headroom_mib < minimum:
+        raise ValueError(f"memory_headroom_mib {headroom_mib} MiB is below minimum {minimum} MiB "
+                         f"for guest_ram_mib {guest_ram_mib} MiB; run provision.py switch-image or resize "
+                         "to rewrite memory_headroom_mib")
+
+
 def memory_fit(capacity, replacement=None):
     total = sum(capacity[key] for key in ("windows_vm_bytes", "host_reserve_bytes", "jobs_min_bytes"))
     tenants = []
@@ -118,6 +132,7 @@ def memory_fit(capacity, replacement=None):
     for tenant in tenants:
         ram = u64(tenant["guest_ram_mib"], "guest_ram_mib")
         headroom = u64(tenant["memory_headroom_mib"], "memory_headroom_mib")
+        check_memory_headroom(ram, headroom)
         total = u64(total + (ram + headroom) * 1048576, "memory fit sum")
     u64(total, "memory fit sum")
     available = memtotal_bytes()
@@ -286,7 +301,7 @@ def component(value):
     return value
 
 
-def checked(config):
+def checked(config, *, allow_old_headroom=False):
     allowed = {"tenant", "sub", "vm", "image_version", "vcpu_ceiling", "guest_ram_mib", "disk_quota_bytes", "cpuset", "tap_index",
                "idle_suspend_s", "host_floor_bytes", "memory_headroom_mib", "snapshot_memory_high_mib", "io_weight", "resolvers",
                "capture_console", "max_weight", "remote_cache"}
@@ -302,8 +317,11 @@ def checked(config):
     if not re.fullmatch(r"(?:acct|org):[0-9A-HJKMNP-TV-Z]{26}", c["sub"]):
         raise ValueError("invalid tenant subject")
     for name, default in (("idle_suspend_s", 600), ("host_floor_bytes", 128 * 1024**3),
-                          ("memory_headroom_mib", 512), ("snapshot_memory_high_mib", 16384), ("io_weight", 100)):
+                          ("snapshot_memory_high_mib", 16384), ("io_weight", 100)):
         c.setdefault(name, default)
+    if type(c["guest_ram_mib"]) is not int or c["guest_ram_mib"] <= 0:
+        raise ValueError("guest_ram_mib must be a positive integer")
+    c.setdefault("memory_headroom_mib", minimum_memory_headroom_mib(c["guest_ram_mib"]))
     for name in ("vcpu_ceiling", "guest_ram_mib", "disk_quota_bytes", "tap_index", "memory_headroom_mib", "snapshot_memory_high_mib", "io_weight"):
         if type(c[name]) is not int or c[name] <= 0:
             raise ValueError(f"{name} must be a positive integer")
@@ -317,8 +335,13 @@ def checked(config):
         # floor under that lets the threshold sit below the point where the
         # runner already stopped admitting.
         raise ValueError(f"host_floor_bytes must be at least the direct runner floor {RUNNER_DEFAULT_FLOOR}")
-    if c["vcpu_ceiling"] > 256 or c["tap_index"] > 254 or c["io_weight"] > 10000 or c["memory_headroom_mib"] < 512:
+    if c["vcpu_ceiling"] > 256 or c["tap_index"] > 254 or c["io_weight"] > 10000:
         raise ValueError("invalid tenant limits")
+    # Offline updates and aborts must validate saved records with old limits.
+    # Successful updates raise both records; an abort leaves the old records
+    # in place, and normal helper starts still reject their undersized limits.
+    if not allow_old_headroom:
+        check_memory_headroom(c["guest_ram_mib"], c["memory_headroom_mib"])
     if not re.fullmatch(r"[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*", c["cpuset"]):
         raise ValueError("invalid cpuset")
     for part in c["cpuset"].split(","):
@@ -618,7 +641,7 @@ def switch_image(tenant, image_version, make_base=None, check_service=None, vali
         provision_path = PROVISION / f"{tenant}.json"
         registry_path = REGISTRY / f"{tenant}.json"
         original_config = json.loads(provision_path.read_text())
-        current = checked(original_config)
+        current = checked(original_config, allow_old_headroom=True)
         if current["tenant"] != tenant:
             raise ValueError(f"provisioning record tenant does not match {tenant}")
         record = json.loads(registry_path.read_text())
@@ -636,7 +659,11 @@ def switch_image(tenant, image_version, make_base=None, check_service=None, vali
         if manifest.get("version") != image_version:
             raise ValueError("image manifest version mismatch")
 
-        updated = checked({**original_config, "image_version": image_version})
+        updated_config = dict(original_config, image_version=image_version,
+                              memory_headroom_mib=max(current["memory_headroom_mib"],
+                                                      minimum_memory_headroom_mib(current["guest_ram_mib"])))
+        updated = checked(updated_config)
+        memory_fit(read_capacity(), replacement=updated)
         base = base_path(updated, image)
         if base.exists() or base.is_symlink():
             if base.is_symlink() or not base.is_dir():
@@ -653,9 +680,8 @@ def switch_image(tenant, image_version, make_base=None, check_service=None, vali
         old_version = current["image_version"]
         moved = move_stale_suspend(stale, old_version) if stale is not None else None
         record["image_version"] = image_version
-        updated_config = dict(original_config)
-        updated_config["image_version"] = image_version
-        if old_version != image_version:
+        record["memory_headroom_mib"] = updated["memory_headroom_mib"]
+        if original_config != updated_config:
             try:
                 atomic_pair([
                     (registry_path, json.dumps(record, indent=2) + "\n"),
@@ -1582,7 +1608,7 @@ def read_resize_journal(tenant):
         for name in ("quota_grew", "base_existed"):
             if type(journal[name]) is not bool:
                 raise ValueError(f"{name} is not a boolean")
-        old, new = checked(journal["old"]), checked(journal["new"])
+        old, new = checked(journal["old"], allow_old_headroom=True), checked(journal["new"])
         if json.loads(journal["provision_old"]) != journal["old"] or json.loads(journal["provision_new"]) != journal["new"]:
             raise ValueError("recorded provisioning bytes differ from the recorded records")
         # Abort deletes the base and the staged files and renames the set-aside
@@ -1657,7 +1683,12 @@ def resize_target(old_config, arguments):
     """The provisioning record a resize with these arguments publishes."""
     if set(arguments) - set(RESIZE_FIELDS):
         raise ValueError(f"a resize changes only {', '.join(RESIZE_FIELDS)}")
-    return {**old_config, **arguments}
+    target = {**old_config, **arguments}
+    ram = target["guest_ram_mib"]
+    if type(ram) is not int or ram <= 0:
+        raise ValueError("guest_ram_mib must be a positive integer")
+    target["memory_headroom_mib"] = max(old_config.get("memory_headroom_mib", 0), minimum_memory_headroom_mib(ram))
+    return target
 
 
 def render_helper_config(text, old_cpuset, new_cpuset):
@@ -1692,7 +1723,7 @@ def plan_resize(tenant, arguments):
     registry_path = REGISTRY / f"{tenant}.json"
     provision_old = provision_path.read_text()
     old_config = json.loads(provision_old)
-    old = checked(old_config)
+    old = checked(old_config, allow_old_headroom=True)
     if old["tenant"] != tenant:
         raise ValueError(f"provisioning record tenant does not match {tenant}")
     registry_old = registry_path.read_text()
@@ -1756,6 +1787,7 @@ def plan_resize(tenant, arguments):
 
     registry_new = dict(record)
     registry_new.update({name: new_config[name] for name in arguments})
+    registry_new["memory_headroom_mib"] = new["memory_headroom_mib"]
     return {
         "schema": RESIZE_SCHEMA, "tenant": tenant, "phase": RESIZE_PHASES[0],
         "old": old_config, "new": new_config,
@@ -1782,7 +1814,7 @@ def resize_forward(journal, make_base, hook, output):
     re-run after a crash anywhere in a step repeats it safely."""
     tenant = journal["tenant"]
     home = ROOT / "tenants" / tenant
-    old, new = checked(journal["old"]), checked(journal["new"])
+    old, new = checked(journal["old"], allow_old_headroom=True), checked(journal["new"])
     image = ROOT / "tenant-images" / new["image_version"]
     disk = home / "disk.img"
     suspend = home / "suspend"
@@ -1962,7 +1994,7 @@ def resize_abort(tenant, check_service=None, hook=None, output=print):
             if published.read_text() != journal[key]:
                 raise ValueError(f"{published} differs from its state before the resize; inspect it before "
                                  f"removing {path}")
-        quota = checked(journal["old"])["disk_quota_bytes"]
+        quota = checked(journal["old"], allow_old_headroom=True)["disk_quota_bytes"]
         length = (home / "disk.img").stat().st_size
         if length != quota:
             raise ValueError(f"disk length {length} differs from the old quota {quota}; inspect it before removing {path}")
@@ -2055,7 +2087,8 @@ def main():
         if args.abort:
             resize_abort(tenant)
             return
-        image = ROOT / "tenant-images" / checked(json.loads((PROVISION / f"{tenant}.json").read_text()))["image_version"]
+        image = ROOT / "tenant-images" / checked(json.loads((PROVISION / f"{tenant}.json").read_text()),
+                                                allow_old_headroom=True)["image_version"]
         for name in ("manifest.json", "vmlinux", "rootfs"):
             trusted(image / name)
         for binary in (BIN / "firecracker", BIN / "jailer"):

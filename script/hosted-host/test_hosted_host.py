@@ -287,7 +287,7 @@ CAPACITY = dict(windows_vm_bytes=16 * GIB, host_reserve_bytes=6 * GIB, jobs_min_
 MEMTOTAL = 131491984 * 1024
 # Tenant 1 after the cutover resize.
 RESIZED = dict(vcpu_ceiling=24, cpuset="0-11,16-27", guest_ram_mib=79872, disk_quota_bytes=600 * GIB,
-               max_weight=64, idle_suspend_s=0)
+               max_weight=64, idle_suspend_s=0, memory_headroom_mib=2397)
 UID = 998
 # A provision.py module of its own, so the tests can point its paths and probes
 # at a scratch tree.
@@ -309,7 +309,9 @@ class InstalledStateTests(CapacityConfigTests):
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
         self.capacity_error = None
-        self.memtotal = MEMTOTAL
+        # Leave room for the resized fixture; the measured host is tested
+        # separately because 78 GiB no longer fits its Windows/jobs budgets.
+        self.memtotal = 128 * GIB
         self.limit = provision.jobs_slice_limits(CAPACITY)[0]
         self.slice = {"LoadState": "loaded", "MemoryMax": str(self.limit)}
         patch = mock.patch.multiple(
@@ -452,19 +454,29 @@ class InstalledStateTests(CapacityConfigTests):
         self.record_path.write_text("{")
         self.assertFails("cannot read the installed tenant record")
 
+    def test_below_formula_headroom_reports_the_rewrite_remedy(self):
+        self.record_path.write_text(hosted.render_json(dict(self.resized(), memory_headroom_mib=512)))
+        self.assertFails("512 MiB is below minimum 2397 MiB for guest_ram_mib 79872 MiB")
+        self.assertFails("run provision.py switch-image or resize to rewrite memory_headroom_mib")
+
+    def test_measured_host_refuses_resized_tenant_with_new_headroom(self):
+        self.install(self.resized())
+        self.memtotal = MEMTOTAL
+        self.assertFails("memory fit requires 135657422848 bytes, MemTotal is 134647791616 bytes")
+
     def test_capacity_fit_and_live_cap_are_checked(self):
         self.install(self.resized())
         self.assertEqual(self.problems(), [])
         self.capacity_error = "invalid capacity.json: not root-owned"
         self.assertFails("capacity.json: invalid capacity.json: not root-owned")
         self.capacity_error = None
-        # 78 GiB + 512 MiB headroom + 16 + 6 + 24 GiB fits exactly, not one byte less.
-        needed = (79872 + 512) * 1048576 + 46 * GIB
+        # 78 GiB + 2397 MiB headroom + 16 + 6 + 24 GiB fits exactly, not one byte less.
+        needed = (79872 + 2397) * 1048576 + 46 * GIB
         self.memtotal = needed
         self.assertEqual(self.problems(), [])
         self.memtotal = needed - 1
         self.assertFails(f"memory fit: memory fit requires {needed} bytes")
-        self.memtotal = MEMTOTAL
+        self.memtotal = 128 * GIB
         for value in (str(self.limit + 1), "infinity"):
             with self.subTest(MemoryMax=value):
                 self.slice = {"LoadState": "loaded", "MemoryMax": value}
@@ -506,7 +518,8 @@ class InstalledStateTests(CapacityConfigTests):
                 (base / name).write_bytes(b"base")
 
         with mock.patch.object(provision.shutil, "disk_usage", return_value=mock.Mock(free=1 << 50)):
-            provision.resize("tenant-1", dict(RESIZED), make_base=make_base, check_service=lambda _unit: "inactive",
+            arguments = {key: value for key, value in RESIZED.items() if key in provision.RESIZE_FIELDS}
+            provision.resize("tenant-1", arguments, make_base=make_base, check_service=lambda _unit: "inactive",
                              vmms=lambda: [], hook=hook, output=lambda *_args: None)
 
     def test_a_cpuset_changing_resize_passes_check_directly(self):

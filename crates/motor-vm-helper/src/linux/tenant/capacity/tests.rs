@@ -136,27 +136,33 @@ fn fit_counts_headroom_all_tenants_and_checked_memtotal() {
     let p = policy();
     let mut tenant = crate::tenant::tests::registry("a");
     tenant.guest_ram_mib = 78 * 1024;
-    // 78 GiB RAM + 512 MiB VMM + 16 GiB Windows + 6 GiB host + 24 GiB jobs.
+    tenant.memory_headroom_mib = 2397;
+    // 78 GiB RAM + 2397 MiB headroom + 16 GiB Windows + 6 GiB host + 24 GiB jobs.
     assert!(p
-        .check_fit(&[tenant.clone()], "MemTotal: 130547712 kB\n")
+        .check_fit(&[tenant.clone()], "MemTotal: 132477952 kB\n")
         .is_ok());
     assert_eq!(
-        p.check_fit(&[tenant.clone()], "MemTotal: 130547711 kB\n")
+        p.check_fit(&[tenant.clone()], "MemTotal: 132477951 kB\n")
             .unwrap_err()
             .case,
         Fit
     );
-    assert!(p
+    let refused = p
         .check_fit(&[tenant.clone()], "MemTotal: 131491984 kB\n")
-        .is_ok());
+        .unwrap_err();
+    assert_eq!(refused.case, Fit);
+    assert!(refused.message.contains("reserved_bytes=135657422848"));
+    assert!(refused.message.contains("MemTotal_bytes=134647791616"));
     tenant.guest_ram_mib += 1024;
+    tenant.memory_headroom_mib = 2427;
     assert_eq!(
         p.check_fit(&[tenant.clone()], "MemTotal: 131491984 kB\n")
             .unwrap_err()
             .case,
         Fit
     );
-    tenant.guest_ram_mib = 39 * 1024;
+    tenant.guest_ram_mib = 37 * 1024;
+    tenant.memory_headroom_mib = 2048;
     assert!(p
         .check_fit(
             &[tenant.clone(), tenant.clone()],
@@ -181,6 +187,24 @@ fn fit_counts_headroom_all_tenants_and_checked_memtotal() {
     ] {
         assert_eq!(p.check_fit(&[], bad).unwrap_err().case, Fit);
     }
+}
+
+#[test]
+fn fit_refuses_old_headroom_with_the_rewrite_remedy() {
+    let mut tenant = crate::tenant::tests::registry("a");
+    tenant.guest_ram_mib = 78 * 1024;
+    tenant.memory_headroom_mib = 512;
+    let refused = policy()
+        .check_fit(&[tenant], "MemTotal: 131491984 kB\n")
+        .unwrap_err();
+    assert_eq!(refused.case, Fit);
+    assert!(refused
+        .message
+        .contains("512 MiB is below minimum 2397 MiB"));
+    assert!(refused.message.contains("guest_ram_mib 79872 MiB"));
+    assert!(refused
+        .message
+        .contains("run provision.py switch-image or resize"));
 }
 
 #[test]

@@ -537,7 +537,7 @@ class Harness:
             tenant=self.name, vm=self.name, sub="acct:01ARZ3NDEKTSV4RRFFQ69G5FAV", image_version=self.name,
             vcpu_ceiling=2, guest_ram_mib=16384, disk_quota_bytes=20 * GIB, cpuset=self.args.cpuset,
             tap_index=self.args.tap_index, idle_suspend_s=3600, host_floor_bytes=FLOOR,
-            memory_headroom_mib=512, snapshot_memory_high_mib=14336, io_weight=10,
+            snapshot_memory_high_mib=14336, io_weight=10,
             resolvers=["1.1.1.1"], capture_console=True))
         self.json_file(self.results / "provision-config.json", self.config)
 
