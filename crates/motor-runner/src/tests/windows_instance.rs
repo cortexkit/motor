@@ -529,6 +529,8 @@ fn windows_health_and_status_use_the_instance_units_and_baseline_toolchain() {
         shape["queue_wait_1h"],
         serde_json::json!({"p50_ms": 0, "p90_ms": 0, "refusals": 0})
     );
+    // An empty queue reports its oldest wait as zero rather than omitting it.
+    assert_eq!(shape["oldest_wait_s"], 0);
     for key in [
         "load_1m",
         "threads",
@@ -536,6 +538,7 @@ fn windows_health_and_status_use_the_instance_units_and_baseline_toolchain() {
         "permits_held",
         "permits_cap",
         "queue_wait_1h",
+        "oldest_wait_s",
     ] {
         shape.as_object_mut().unwrap().remove(key);
     }
