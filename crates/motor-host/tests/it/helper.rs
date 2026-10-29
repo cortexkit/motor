@@ -11,6 +11,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 #[test]
 fn fresh_attach_read_deadline_outlasts_guest_runner_readiness_wait() {
     let attach = control_read_deadline(&json!({"op":"attach_tenant"}));
+    assert!(attach > std::time::Duration::from_secs(15 * 60));
     assert_eq!(attach, motor_protocol::TENANT_ATTACH_READ_DEADLINE);
     assert!(
         attach > motor_protocol::TENANT_RUNNER_READINESS_WAIT,
@@ -18,6 +19,10 @@ fn fresh_attach_read_deadline_outlasts_guest_runner_readiness_wait() {
     );
     assert!(
         control_read_deadline(&json!({"op":"attach_tenant","recovery_required":true})) > attach
+    );
+    assert!(
+        control_read_deadline(&json!({"op":"attach_tenant","recovery_required":true}))
+            >= std::time::Duration::from_secs(15 * 60 + 600)
     );
     assert_eq!(
         control_read_deadline(&json!({"op":"status"})),

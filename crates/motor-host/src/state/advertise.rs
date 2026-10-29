@@ -409,6 +409,10 @@ impl Host {
         }
     }
 
+    pub(crate) fn is_waking(&self, tenant: &str) -> bool {
+        self.advert.get(tenant).is_some_and(|a| a.wake_pending)
+    }
+
     fn start_fenced(&self, tenant: &str) -> bool {
         self.advert
             .get(tenant)

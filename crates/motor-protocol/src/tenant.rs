@@ -4,9 +4,9 @@ use crate::Uuid;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// How long the guest's tenant agent waits, after starting the tenant runner,
-/// for that runner to listen on its socket. Attach fails when this expires.
-pub const TENANT_RUNNER_READINESS_WAIT: Duration = Duration::from_secs(30);
+/// Upper bound on runner startup, including cleanup of old state on the disk.
+/// The agent checks process liveness throughout the wait and reports progress.
+pub const TENANT_RUNNER_READINESS_WAIT: Duration = Duration::from_secs(15 * 60);
 
 /// Room for the rest of a fresh attach around the readiness wait: setting the
 /// clock and network, mounting and laying out the tenant disk, binding tool
