@@ -291,7 +291,13 @@ fn hard_budget_rejects_effects_when_background_compaction_fails() {
     let storage = Storage::open(&root).unwrap();
     let retained = Uuid::now_v7();
     storage.create(retained, 60, None, None, false).unwrap();
-    storage.retain_job(retained, None).unwrap();
+    // Fix the first two access times so they round to the same saved deadline
+    // and the second needs no journal write. One millisecond past that bucket
+    // requires a new deadline, which the full journal must reject while
+    // checkpointing is blocked.
+    let start = now_ms().div_ceil(RETENTION_RENEWAL_MS) * RETENTION_RENEWAL_MS;
+    storage.retain_job_at(retained, None, start + 1).unwrap();
+    let until = storage.job(retained).unwrap().retain_until_ms;
     fs::create_dir(root.join("state.tmp")).unwrap();
     storage
         .accepted(
@@ -301,11 +307,19 @@ fn hard_budget_rejects_effects_when_background_compaction_fails() {
         .unwrap();
     assert!(storage.persistence.backend.lock().unwrap().bytes() >= journal::HARD_BYTES);
     assert!(storage.persistence.wait_for_compaction().is_err());
-    storage.retain_job(retained, None).unwrap();
+    let writes = storage.write_count.load(Ordering::SeqCst);
+    storage
+        .retain_job_at(retained, None, start + RETENTION_RENEWAL_MS)
+        .unwrap();
     storage.retain_job(Uuid::now_v7(), None).unwrap();
+    assert!(storage
+        .retain_job_at(retained, None, start + RETENTION_RENEWAL_MS + 1)
+        .is_err());
+    assert_eq!(storage.job(retained).unwrap().retain_until_ms, until);
     let id = Uuid::now_v7();
     assert!(storage.cancel(id, true).is_err());
     assert!(storage.job(id).is_none());
+    assert_eq!(storage.write_count.load(Ordering::SeqCst), writes);
     fs::remove_dir(root.join("state.tmp")).unwrap();
 }
 
