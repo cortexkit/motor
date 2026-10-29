@@ -17,6 +17,9 @@ mod mapped;
 #[path = "remote_cache_tests.rs"]
 mod remote_cache;
 
+#[path = "cargo_cache_tests.rs"]
+mod cargo_cache;
+
 #[test]
 fn stale_lockfile_refusal_says_to_update_it_locally() {
     // Both wordings Cargo has used for a manifest edited past its lockfile.
@@ -806,6 +809,8 @@ impl Fixture {
             provider_unset_env: Vec::new(),
             cache_forwarders: Vec::new(),
             cache_generation: None,
+            cargo_overlays: None,
+            locked_git_commits: Vec::new(),
             parent_umask: 0o022,
             memory_floor_gib: None,
             slice_budget: std::sync::Mutex::new(None),
@@ -987,6 +992,8 @@ fn systemd_job_command_preserves_shell_source_and_forces_private_tmp() {
         provider_unset_env: Vec::new(),
         cache_forwarders: Vec::new(),
         cache_generation: None,
+        cargo_overlays: None,
+        locked_git_commits: Vec::new(),
         parent_umask: 0o022,
         memory_floor_gib: None,
         slice_budget: std::sync::Mutex::new(None),
@@ -1482,6 +1489,8 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 provider_unset_env: Vec::new(),
                 cache_forwarders: Vec::new(),
                 cache_generation: None,
+                cargo_overlays: None,
+                locked_git_commits: Vec::new(),
                 parent_umask: 0o022,
                 memory_floor_gib: None,
                 slice_budget: std::sync::Mutex::new(None),
@@ -1539,6 +1548,8 @@ fn measure_isolated_launch_and_warm_cargo_check() {
                 provider_unset_env: Vec::new(),
                 cache_forwarders: Vec::new(),
                 cache_generation: None,
+                cargo_overlays: None,
+                locked_git_commits: Vec::new(),
                 parent_umask: 0o022,
                 memory_floor_gib: None,
                 slice_budget: std::sync::Mutex::new(None),
@@ -1992,6 +2003,8 @@ fn durable_cache_drivers_preserve_raw_shell_comments_heredocs_and_exit_codes() {
         provider_unset_env: Vec::new(),
         cache_forwarders: Vec::new(),
         cache_generation: None,
+        cargo_overlays: None,
+        locked_git_commits: Vec::new(),
         parent_umask: 0o022,
         memory_floor_gib: None,
         slice_budget: std::sync::Mutex::new(None),

@@ -357,6 +357,11 @@ impl TenantResolver {
         )
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn from_test_attachment(config: &Config, marker: &Path, directory: &Path) -> Self {
+        Self::under(config.tenant_vm, config.boat_profile, marker, directory)
+    }
+
     /// [`Self::new`], reading the attachment's marker from `marker` and the
     /// private resolver from `directory`, so tests need not touch `/run`.
     ///
@@ -455,23 +460,40 @@ pub(crate) fn run(
     command: &Command,
     view: &View,
 ) -> io::Result<()> {
+    run_via(config, helper, limit, command, view, || {
+        TenantResolver::new(config)
+    })
+}
+
+/// Supply a real scratch attachment while retaining normal unit, account and
+/// resolver-file checks. Only the attachment's discovery paths differ.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn run_with_test_resolver(
+    config: &Config,
+    helper: Helper,
+    limit: Duration,
+    command: &Command,
+    view: &View,
+    resolver: TenantResolver,
+) -> io::Result<()> {
+    run_via(config, helper, limit, command, view, move || resolver)
+}
+
+fn run_via(
+    config: &Config,
+    helper: Helper,
+    limit: Duration,
+    command: &Command,
+    view: &View,
+    resolver: impl FnOnce() -> TenantResolver,
+) -> io::Result<()> {
     let id = Uuid::now_v7();
     let unit = unit_name(&config.instance, id);
     let files = Files::new(config, id);
     let started = Instant::now();
     let observed = files
         .create(command)
-        .and_then(|()| {
-            arguments(
-                config,
-                &unit,
-                limit,
-                command,
-                view,
-                &files,
-                TenantResolver::new(config),
-            )
-        })
+        .and_then(|()| arguments(config, &unit, limit, command, view, &files, resolver()))
         .and_then(|arguments| {
             view.prepare_mount_points(config)?;
             crate::setup_log::phase(helper.label(), || {

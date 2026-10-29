@@ -328,6 +328,13 @@ pub(crate) fn fetch_command(
     let empty_home = state.join("fetch-home");
     fs::create_dir_all(&empty_home)?;
     let mut cmd = Command::new("cargo");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // New cache entries must have the same owner as startup-validated
+        // entries, including when this command runs outside a snapshot helper.
+        cmd.uid(unsafe { libc::geteuid() });
+    }
     cmd.args(["fetch", "--locked", "--manifest-path"])
         .arg(workspace.join("Cargo.toml"))
         .current_dir(state);
@@ -336,6 +343,11 @@ pub(crate) fn fetch_command(
     }
     cmd.env("CARGO_HOME", cargo)
         .env("RUSTUP_HOME", rustup)
+        // The archive lower is append-only for its lifetime: Cargo may fill a
+        // new/empty .crate, but must not age-delete a published archive. Index,
+        // source trees and Git are private job state, not live lowers. Manual
+        // archive repair/cleanup must drain and retire the lower first.
+        .env("CARGO_CACHE_AUTO_CLEAN_FREQUENCY", "never")
         // Empty overrides also disable wrappers configured in CARGO_HOME. Merely
         // unsetting these variables lets Cargo resurrect the shared sccache.
         .env("RUSTC_WRAPPER", "")
@@ -560,5 +572,27 @@ impl Trees {
             git(&routes[&url], &["symbolic-ref", "HEAD", &alias])?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cache_gc_tests {
+    use super::*;
+    #[test]
+    fn trusted_fetch_disables_automatic_shared_cache_cleanup() {
+        let scratch = cortexkit_test_support::ScratchDir::new("trusted-fetch-no-gc");
+        let command = fetch_command(
+            scratch.path(),
+            scratch.path(),
+            &BTreeMap::new(),
+            scratch.path(),
+            scratch.path(),
+        )
+        .unwrap();
+        let setting = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CARGO_CACHE_AUTO_CLEAN_FREQUENCY"))
+            .and_then(|(_, value)| value);
+        assert_eq!(setting, Some(std::ffi::OsStr::new("never")));
     }
 }

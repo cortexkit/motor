@@ -577,6 +577,8 @@ fn writer_fixture_command_uses_sandbox_identity_and_mounts() {
         provider_unset_env: Vec::new(),
         cache_forwarders: Vec::new(),
         cache_generation: None,
+        cargo_overlays: None,
+        locked_git_commits: Vec::new(),
         parent_umask: 0o022,
         memory_floor_gib: None,
         slice_budget: std::sync::Mutex::new(None),

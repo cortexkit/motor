@@ -20,6 +20,7 @@ use std::{
 use uuid::Uuid;
 
 mod cargo_fetch;
+pub(crate) mod cargo_overlay;
 mod host_inputs;
 mod hosts;
 mod javascript_tools;
@@ -2103,6 +2104,8 @@ pub(crate) struct Sandbox {
     /// command, one per active tool; empty when the unit has no remote cache.
     cache_forwarders: Vec<crate::remote_cache::transport::Forwarder>,
     cache_generation: Option<std::sync::Arc<crate::remote_cache::provisioning::ActiveGeneration>>,
+    cargo_overlays: Option<cargo_overlay::Plan>,
+    locked_git_commits: Vec<String>,
 }
 
 pub(crate) struct RuntimeDir(
@@ -2168,6 +2171,35 @@ impl Drop for RuntimeDir {
 }
 
 const MAX_CARGO_LOCKFILES: usize = 128;
+
+fn known_git_commits(workspace: &Path, tree: &str) -> io::Result<Vec<String>> {
+    let mut locks = vec![PathBuf::from("Cargo.lock")];
+    locks.extend(cargo_lockfiles(
+        workspace,
+        tree,
+        &mut crate::setup_log::cargo_skip,
+    )?);
+    let mut commits = std::collections::BTreeSet::new();
+    for lock in locks {
+        let mut object = std::ffi::OsString::from(tree);
+        object.push(":");
+        object.push(&lock);
+        let Ok(bytes) = javascript_git(workspace, &["show".as_ref(), &object]) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        match workspace::dependencies::locked_dependencies(&text) {
+            Ok(dependencies) => commits.extend(
+                dependencies
+                    .into_iter()
+                    .flat_map(|dependency| dependency.commits)
+                    .map(|commit| commit.to_ascii_lowercase()),
+            ),
+            Err(error) => crate::setup_log::cargo_skip(&lock, &error.to_string()),
+        }
+    }
+    Ok(commits.into_iter().collect())
+}
 const NESTED_CARGO_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Optional fetches use only immutable snapshot entries, never warm untracked files.
@@ -2887,6 +2919,11 @@ impl Sandbox {
         // Each job gets a private root tree so its visible mount ancestors can
         // stay root-owned even when the host checkout lives under an operator's
         // writable home directory.
+        let locked_git_commits = if tenant_vm {
+            known_git_commits(workspace, tree)?
+        } else {
+            Vec::new()
+        };
         let runtime = std::sync::Arc::new(RuntimeDir(
             state.join("sandboxes").join(id.to_string()),
             std::sync::OnceLock::new(),
@@ -3220,6 +3257,8 @@ impl Sandbox {
             provider_unset_env: Vec::new(),
             cache_forwarders,
             cache_generation: None,
+            cargo_overlays: None,
+            locked_git_commits,
         })
     }
 
@@ -3314,6 +3353,20 @@ impl Sandbox {
 
     pub(crate) fn with_network(mut self) -> io::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
+        if self.tenant_vm && !self.boat_profile {
+            let shared = PathBuf::from(
+                host_inputs::environment("CARGO_HOME")
+                    .ok_or_else(|| io::Error::other("CARGO_HOME unset"))?,
+            );
+            self.cargo_overlays = Some(cargo_overlay::Plan::prepare(
+                &self.runtime.0,
+                &shared,
+                &self.cargo,
+                &mut self.read_only,
+                &mut self.read_write,
+                &self.locked_git_commits,
+            )?);
+        }
         let resolver = self.runtime.0.join("resolv.conf");
         fs::write(&resolver, "nameserver 1.1.1.1\nnameserver 9.9.9.9\n")?;
         fs::set_permissions(&resolver, fs::Permissions::from_mode(0o444))?;
@@ -3687,6 +3740,21 @@ impl Sandbox {
             )));
         }
         let active_at = Instant::now();
+        if let Some(overlays) = &self.cargo_overlays {
+            match overlays.setup(self.id) {
+                Ok(elapsed) => {
+                    tracing::info!(job_id = %self.id, elapsed_ms = elapsed.as_millis(), "Cargo overlay namespace setup finished");
+                    #[cfg(test)]
+                    println!("CARGO_OVERLAY_MOUNT_MS={}", elapsed.as_millis());
+                }
+                Err(error) => {
+                    discard_unstarted(self.id);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            }
+        }
         if let Err(error) = allow_low_ports(self.id) {
             discard_unstarted(self.id);
             let _ = child.kill();
@@ -3891,7 +3959,11 @@ thread_local! {
 }
 
 pub(crate) fn reserved_destinations(config: &crate::Config) -> Vec<PathBuf> {
-    RunnerBindPlan::new(&JavascriptTools::for_config(config)).destinations()
+    let mut destinations = RunnerBindPlan::new(&JavascriptTools::for_config(config)).destinations();
+    if config.tenant_vm && !config.boat_profile && config.job_network.is_some() {
+        destinations.push(cargo_overlay::LAYERS.into());
+    }
+    destinations
 }
 
 /// Host sources shared by job, writer and snapshot-helper sandboxes.

@@ -1807,7 +1807,14 @@ fn prepare_job_shared_roots(config: &Config) -> io::Result<()> {
     }
     crate::isolation::prepare_shared_read_access(&crate::isolation::JavascriptTools::for_config(
         config,
-    ))
+    ))?;
+    if config.tenant_vm && !config.boat_profile && config.job_network.is_some() {
+        // The scan runs independently of readiness and never takes runner state.
+        // Offline jobs need no ownership invariant; pending or unsafe cache
+        // ownership refuses only jobs that request writable Cargo overlays.
+        crate::isolation::cargo_overlay::start_validation();
+    }
+    Ok(())
 }
 
 impl Runner {
