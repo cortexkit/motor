@@ -312,17 +312,12 @@ fn failed_journal_never_publishes_reservation_or_watermark() {
 }
 
 #[test]
-fn admitted_unstarted_deadline_persists_zero_and_cancel_until_acknowledged() {
+fn reserved_unstarted_deadline_persists_zero_and_cancel_until_acknowledged() {
     let directory = scratch();
     let mut h = disk_host(directory.path());
     let (id, _) = h.claim(claims(JOB), NOW * 1000).unwrap();
     h.delivered(id).unwrap();
-    h.event(
-        "tenant",
-        &event(1, TenantEventKind::Admitted, Some(JOB), None),
-        NOW * 1000,
-    )
-    .unwrap();
+    assert_eq!(h.snapshot.leases[JOB].state, LeaseState::Reserved);
     assert!(h.expire((NOW + 359) * 1000).unwrap().is_empty());
     assert_eq!(
         h.expire((NOW + 360) * 1000).unwrap(),
@@ -335,6 +330,58 @@ fn admitted_unstarted_deadline_persists_zero_and_cancel_until_acknowledged() {
     assert_eq!(report.started_at_ms, report.ended_at_ms);
     h.cancel_delivered(JOB).unwrap();
     assert!(h.expire((NOW + 362) * 1000).unwrap().is_empty());
+    assert_eq!(h.snapshot.zero_usage.len(), 1);
+}
+
+#[test]
+fn admitted_unstarted_lease_survives_admission_deadline() {
+    let mut h = host();
+    let (id, _) = h.claim(claims(JOB), NOW * 1000).unwrap();
+    h.delivered(id).unwrap();
+    h.event(
+        "tenant",
+        &event(1, TenantEventKind::Admitted, Some(JOB), None),
+        NOW * 1000,
+    )
+    .unwrap();
+    assert!(h.expire((NOW + 360) * 1000).unwrap().is_empty());
+    assert_eq!(h.snapshot.leases[JOB].state, LeaseState::Admitted);
+    assert!(h.snapshot.zero_usage.is_empty());
+    assert_eq!(h.share("tenant", (NOW + 360) * 1000), 1);
+    assert!(h.connection_live(id));
+}
+
+#[test]
+fn admitted_unstarted_overall_deadline_persists_zero_and_cancel_until_acknowledged() {
+    let directory = scratch();
+    let mut h = disk_host(directory.path());
+    let (id, _) = h.claim(claims(JOB), NOW * 1000).unwrap();
+    h.delivered(id).unwrap();
+    h.event(
+        "tenant",
+        &event(1, TenantEventKind::Admitted, Some(JOB), None),
+        NOW * 1000,
+    )
+    .unwrap();
+    // A 30-second runtime cap holds the reservation until 630 seconds after issue.
+    assert!(h.expire((NOW + 630) * 1000 - 1).unwrap().is_empty());
+    assert_eq!(h.snapshot.leases[JOB].state, LeaseState::Admitted);
+    assert!(h.snapshot.zero_usage.is_empty());
+    assert_eq!(
+        h.expire((NOW + 630) * 1000).unwrap(),
+        vec![("tenant".into(), JOB.into())]
+    );
+    assert_eq!(h.snapshot.leases[JOB].state, LeaseState::Ended);
+    assert_eq!(h.share("tenant", (NOW + 630) * 1000), 0);
+    assert!(!h.connection_live(id));
+    drop(h);
+    let mut h = disk_host(directory.path());
+    assert_eq!(h.expire((NOW + 631) * 1000).unwrap().len(), 1);
+    let report = &h.snapshot.zero_usage[JOB];
+    assert_eq!(report.started_at_ms, (NOW + 630) * 1000);
+    assert_eq!(report.ended_at_ms, (NOW + 630) * 1000);
+    h.cancel_delivered(JOB).unwrap();
+    assert!(h.expire((NOW + 632) * 1000).unwrap().is_empty());
     assert_eq!(h.snapshot.zero_usage.len(), 1);
 }
 

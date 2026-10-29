@@ -104,8 +104,11 @@ After another 60 seconds without a runner result on the job relay (port 52) or
 a terminal lifecycle event on the event stream (port 53), the watchdog records
 the job as lost. Receiving the job-relay result prevents that lost outcome. If
 its lifecycle event is missing for 30 seconds, the host instead uses the receipt
-time of the job-relay result as the end. An unstarted lease is cancelled at token
-issue time plus six minutes.
+time of the job-relay result as the end. A lease not yet accepted by the guest
+runner is cancelled at token issue time plus six minutes. Once accepted, a job
+may queue under the runner's `queue_wait_limit_s`; an accepted but unstarted
+lease is cancelled only at the overall backstop, `iat + max_s + 600` seconds,
+using its stored run-token claims.
 Lost jobs have a stored empty output truncation marker and unsequenced
 `outcome_unknown` terminal, followed by the immutable `hosted_terminal` billing
 record. The synthesized empty output uses exec-remote/v1's `bytes` field. Reattaches replay

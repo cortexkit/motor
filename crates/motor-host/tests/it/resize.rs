@@ -73,7 +73,7 @@ impl Backend for Machine {
             "suspend":"/var/lib/motor-vm/tenants/tenant/suspend",
             "image_version":"v1", "vcpu_ceiling":2,"guest_ram_mib":18432,
             "disk_quota_bytes":21474836480u64,"cpuset":"0-1","tap_index":1,
-            "idle_suspend_s":60,"host_floor_bytes":2147483648u64
+            "idle_suspend_s":60,"host_floor_bytes":2147483648u64,"memory_headroom_mib":2048
         }))
         .unwrap())
     }
