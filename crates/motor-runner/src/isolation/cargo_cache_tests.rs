@@ -222,6 +222,9 @@ fn isolated_tenant_prefetch_writes_as_validated_cache_owner() {
     let rustup = PathBuf::from(std::env::var_os("RUSTUP_HOME").unwrap());
     let mut config = crate::Config::new(&scratch, "state");
     config.tenant_vm = true;
+    // Launch already uses sudo; isolated mode also delegates stop/kill/reset
+    // so cleanup can stop the system-managed helper after recording its exit.
+    config.isolate_jobs = true;
     // The operator host is not an attached tenant. Give the helper a private
     // copy of its usable DNS addresses without writing the fixed /run paths.
     let directory = f.scratch.join("tenant-resolver");
