@@ -480,6 +480,15 @@ impl Storage {
             }
         })
     }
+    /// Resolve the destination ID without changing the caller's stored job.
+    /// A bounced spill uses its build-server mapping; a hosted retry uses the
+    /// current lease body. Both share the same stream and record translation.
+    pub(crate) fn runner_id(&self, id: Uuid) -> Uuid {
+        self.job(id).map_or(id, |job| {
+            job.build_server_job_id
+                .unwrap_or_else(|| job.hosted.as_ref().map_or(id, |route| route.runner_id(id)))
+        })
+    }
     pub(crate) fn has_live_stream(&self, id: Uuid) -> bool {
         self.state.lock().unwrap().active_jobs.contains_key(&id)
     }

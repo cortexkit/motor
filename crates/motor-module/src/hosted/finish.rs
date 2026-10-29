@@ -78,7 +78,7 @@ impl Client {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_secs(attempt)).await;
             }
-            match self.finish_once(id, &body).await {
+            match self.finish_once(state.runner_id(id), &body).await {
                 Ok(Reply::Settled(settled)) => {
                     storage.hosted_update(id, |s| {
                         s.pending_finish = None;
