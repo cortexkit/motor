@@ -106,11 +106,11 @@ impl Backend for MacosBackend {
     }
     fn collect_changes(
         &self,
-        _config: &Config,
+        config: &Config,
         _trees: &Trees,
-        _job: &Job,
+        job: &Job,
     ) -> io::Result<Option<Vec<String>>> {
-        Ok(None)
+        Ok(config.macos_runtime.take_changes(job.id))
     }
     fn reconcile(&self, config: &Config, _interrupted: &[Job]) -> io::Result<Vec<Uuid>> {
         config.macos_runtime.recover(&config.state_root)?;
@@ -200,7 +200,29 @@ fn prepare(
         }
     }
     #[allow(unreachable_code)]
-    start_io(config, setup, entry, nonce, staged)
+    start_io(config, setup, entry, nonce, staged, staging)
+}
+
+pub(super) fn capture_changes(
+    runtime: &Runtime,
+    trees: &Trees,
+    entry: &Entry,
+    request: &motor_protocol::Run,
+    staged: &Staged,
+) {
+    // A guest's Exit frame does not detach virtiofs. Only the stop proof makes
+    // the host tree safe to scan; failed stops leave changes unavailable.
+    if !entry.owned.lock().unwrap().record.stop_proven {
+        return;
+    }
+    match trees.changes_for_request(
+        &staged.workspace,
+        &staged.prepared_javascript_directories,
+        Some(request),
+    ) {
+        Ok(changes) => runtime.record_changes(request.job_id, changes),
+        Err(error) => tracing::warn!(job_id = %request.job_id, %error, "scan_failed"),
+    }
 }
 
 pub(super) fn target_in(config: &Config, entry: &Entry, staged: &Staged) -> io::Result<()> {
@@ -333,9 +355,11 @@ fn start_io(
     entry: Arc<Entry>,
     nonce: String,
     staged: Staged,
+    staging: super::Staging,
 ) -> io::Result<Prepared> {
     let config = config.clone();
     let request = setup.request.clone();
+    let scan_request = request.clone();
     let (stdout_tx, stdout_rx) = mpsc::sync_channel(4);
     let (stderr_tx, stderr_rx) = mpsc::sync_channel(4);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -422,6 +446,9 @@ fn start_io(
                 thread_entry.failed.store(true, Ordering::Release);
                 tracing::warn!(%error, "macOS VM stop failed; retaining command outcome and resource ownership");
             }
+            // Keep the entry active until the scan finishes, so maintenance
+            // cannot delete the tree while Git is reading it.
+            capture_changes(&config.macos_runtime, &staging.trees, &thread_entry, &scan_request, &staged);
             if !thread_entry.cancel.0.load(Ordering::Acquire)
                 && thread_entry.owned.lock().unwrap().record.stop_proven
             {

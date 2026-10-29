@@ -129,6 +129,35 @@ impl Fixture {
     }
 }
 
+pub(crate) fn capture_finished_workspace(
+    config: &crate::engine::Config,
+    trees: &Trees,
+    request: &Run,
+    workspace: PathBuf,
+) {
+    let runtime = &config.macos_runtime;
+    let entry = runtime
+        .begin(&config.state_root, request.job_id, &request.workspace_key)
+        .unwrap();
+    // No VM is started by these tests; model the stop proof produced by the
+    // execution worker before it scans and releases the staged tree.
+    entry.owned.lock().unwrap().record.stop_proven = true;
+    let tree = config
+        .state_root
+        .join("jobs")
+        .join(request.job_id.to_string());
+    let staged = Prepared {
+        cargo_home: tree.join("cargo-home"),
+        tree,
+        workspace,
+        siblings: vec![],
+        prepared_javascript_directories: vec![],
+    };
+    execution::capture_changes(runtime, trees, &entry, request, &staged);
+    runtime.finish(&config.state_root, &entry);
+    assert!(!staged.tree.exists());
+}
+
 #[test]
 fn caller_paths_are_strict_and_never_touched() {
     let f = Fixture::new();
@@ -157,6 +186,136 @@ fn caller_paths_are_strict_and_never_touched() {
     assert!(f.staging.prepare(&r, Cancellation::default()).is_err());
     assert!(!caller.exists());
     assert!(!f.staging.state.join("jobs").exists());
+}
+
+#[test]
+fn workspace_changes_compare_macos_staging_with_the_callers_snapshot() {
+    let f = Fixture::new();
+    write(&f.source.join("source"), "committed\n");
+    write(&f.source.join(".gitignore"), "target/\n");
+    let mut request = f.request();
+    write(&f.source.join("source"), "caller edit\n");
+    write(&f.source.join("caller-new"), "caller addition\n");
+    git(&f.source, &["add", "."]);
+    git(
+        &f.source,
+        &[
+            "-c",
+            "user.name=ck-motor",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "ck-motor snapshot",
+        ],
+    );
+    request.snapshot_commit = git(&f.source, &["rev-parse", "HEAD"]);
+    request.tree_hash = git(&f.source, &["rev-parse", "HEAD^{tree}"]);
+    let mirror = f.staging.trees.mirror(&request.repository_root);
+    git(
+        &mirror,
+        &[
+            "fetch",
+            f.source.to_str().unwrap(),
+            "HEAD:refs/snapshots/test",
+        ],
+    );
+    let staged = f
+        .staging
+        .prepare(&request, Cancellation::default())
+        .unwrap();
+    assert_eq!(
+        staged.workspace,
+        f.staging
+            .state
+            .join("jobs")
+            .join(request.job_id.to_string())
+            .join("Users/motor/project")
+    );
+    let changes = || {
+        f.staging.trees.changes_for_request(
+            &staged.workspace,
+            &staged.prepared_javascript_directories,
+            Some(&request),
+        )
+    };
+    assert_eq!(changes().unwrap(), Vec::<String>::new());
+    write(&staged.workspace.join("source"), "job edit\n");
+    write(&staged.workspace.join("job-new"), "job addition\n");
+    write(&staged.workspace.join("target/output"), "ignored\n");
+    let mut edited = changes().unwrap();
+    edited.sort();
+    assert_eq!(edited, ["job-new", "source"]);
+
+    request.base_commit = None;
+    let mut legacy = f
+        .staging
+        .trees
+        .changes_for_request(&staged.workspace, &[], Some(&request))
+        .unwrap();
+    legacy.sort();
+    assert_eq!(legacy, edited);
+}
+
+#[test]
+fn workspace_changes_require_a_stopped_vm_and_survive_tree_cleanup() {
+    let f = Fixture::new();
+    write(&f.source.join("source"), "committed\n");
+    let request = f.request();
+    let config = crate::engine::Config::new(&f.staging.state, "macos");
+    let runtime = &config.macos_runtime;
+    let entry = runtime
+        .begin(&config.state_root, request.job_id, &request.workspace_key)
+        .unwrap();
+    let staged = f
+        .staging
+        .prepare(&request, Cancellation::default())
+        .unwrap();
+    write(&staged.workspace.join("source"), "job edit\n");
+    write(&staged.workspace.join("new"), "job addition\n");
+    execution::capture_changes(runtime, &f.staging.trees, &entry, &request, &staged);
+    assert!(runtime.take_changes(request.job_id).is_none());
+
+    entry.owned.lock().unwrap().record.stop_proven = true;
+    execution::capture_changes(runtime, &f.staging.trees, &entry, &request, &staged);
+    runtime.finish(&config.state_root, &entry);
+    assert!(!staged.tree.exists());
+    assert!(runtime.entry(request.job_id).is_none());
+    let mut changes = runtime.take_changes(request.job_id).unwrap();
+    changes.sort();
+    assert_eq!(changes, ["new", "source"]);
+    assert!(runtime.take_changes(request.job_id).is_none());
+}
+
+#[test]
+fn workspace_changes_failed_macos_scan_is_unavailable_not_empty() {
+    let f = Fixture::new();
+    let request = f.request();
+    let config = crate::engine::Config::new(&f.staging.state, "macos");
+    let runtime = &config.macos_runtime;
+    let entry = runtime
+        .begin(&config.state_root, request.job_id, &request.workspace_key)
+        .unwrap();
+    let staged = f
+        .staging
+        .prepare(&request, Cancellation::default())
+        .unwrap();
+    entry.owned.lock().unwrap().record.stop_proven = true;
+    host::remove_dir_all(&staged.workspace).unwrap();
+    execution::capture_changes(runtime, &f.staging.trees, &entry, &request, &staged);
+    assert!(runtime.take_changes(request.job_id).is_none());
+}
+
+#[test]
+fn workspace_changes_prune_only_results_without_a_live_job() {
+    let runtime = lifecycle::Runtime::default();
+    let live = uuid::Uuid::now_v7();
+    let abandoned = uuid::Uuid::now_v7();
+    runtime.record_changes(live, vec!["source".into()]);
+    runtime.record_changes(abandoned, vec![]);
+    runtime.prune_finished(&BTreeSet::from([live]));
+    assert_eq!(runtime.take_changes(live), Some(vec!["source".into()]));
+    assert!(runtime.take_changes(abandoned).is_none());
 }
 
 #[test]
@@ -287,6 +446,20 @@ printf fetched > "$CARGO_HOME/registry/cache/demo"
     assert_eq!(
         host::read_to_string(prepared.workspace.join("packages/a/node_modules/demo")).unwrap(),
         "nested"
+    );
+    let mut directories = prepared.prepared_javascript_directories.clone();
+    directories.sort();
+    assert_eq!(directories, [PathBuf::new(), PathBuf::from("packages/a")]);
+    assert_eq!(
+        f.staging
+            .trees
+            .changes_for_request(
+                &prepared.workspace,
+                &prepared.prepared_javascript_directories,
+                Some(&r),
+            )
+            .unwrap(),
+        Vec::<String>::new()
     );
     assert!(!f
         .staging

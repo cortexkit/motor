@@ -305,6 +305,9 @@ pub(crate) struct Runtime {
     pub(super) jobs: Mutex<BTreeMap<Uuid, Arc<Entry>>>,
     pub(super) host: Arc<dyn Host>,
     cancelled: Mutex<std::collections::BTreeSet<Uuid>>,
+    // Cleanup can remove the tree and its entry before terminal publication.
+    // Keep completed scans separately until the engine consumes them.
+    changes: Mutex<BTreeMap<Uuid, Vec<String>>>,
     runner_lock: Mutex<Option<ScopedLock>>,
     grace: Duration,
     stop_timeout: Duration,
@@ -315,6 +318,7 @@ impl Default for Runtime {
             jobs: Mutex::new(BTreeMap::new()),
             host: Arc::new(Native),
             cancelled: Mutex::default(),
+            changes: Mutex::default(),
             runner_lock: Mutex::default(),
             grace: Duration::from_millis(600),
             stop_timeout: Duration::from_millis(1400),
@@ -397,11 +401,21 @@ impl Runtime {
     pub fn cancelled(&self, id: Uuid) -> bool {
         self.cancelled.lock().unwrap().contains(&id)
     }
-    pub fn prune_cancelled(&self, live: &std::collections::BTreeSet<Uuid>) {
+    pub(super) fn record_changes(&self, id: Uuid, changes: Vec<String>) {
+        self.changes.lock().unwrap().insert(id, changes);
+    }
+    pub(super) fn take_changes(&self, id: Uuid) -> Option<Vec<String>> {
+        self.changes.lock().unwrap().remove(&id)
+    }
+    pub fn prune_finished(&self, live: &std::collections::BTreeSet<Uuid>) {
         self.cancelled
             .lock()
             .unwrap()
             .retain(|id| live.contains(id));
+        self.changes
+            .lock()
+            .unwrap()
+            .retain(|id, _| live.contains(id));
     }
     pub fn cleanup_pending(&self, id: Uuid) -> bool {
         self.entry(id).is_some_and(|e| {

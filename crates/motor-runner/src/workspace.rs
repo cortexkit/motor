@@ -1690,6 +1690,34 @@ impl Trees {
         ))
     }
 
+    /// Use the durable request's snapshot even when the job checkout no longer
+    /// contains its objects. Both host and VM checkouts read them from the mirror.
+    pub(crate) fn changes_for_request(
+        &self,
+        path: &Path,
+        prepared_javascript_directories: &[PathBuf],
+        request: Option<&Run>,
+    ) -> io::Result<Vec<String>> {
+        let baseline = request.map(|request| {
+            let mirror = self.mirror(paths::request(request).caller_repository_root.text());
+            let caller_commit = request.base_commit.clone().unwrap_or_else(|| {
+                resolve_caller_commit(&mirror, &request.snapshot_commit, &request.tree_hash)
+            });
+            (mirror, caller_commit, request.tree_hash.as_str())
+        });
+        self.changes(
+            path,
+            prepared_javascript_directories,
+            baseline
+                .as_ref()
+                .map(|(mirror, commit, tree)| ChangeBaseline {
+                    objects: mirror,
+                    caller_commit: commit,
+                    tree_hash: tree,
+                }),
+        )
+    }
+
     /// Paths the job changed in its workspace: modified, deleted, staged and
     /// new untracked files, relative to the supplied snapshot when available.
     /// Writes under ignored paths such as target/ are not

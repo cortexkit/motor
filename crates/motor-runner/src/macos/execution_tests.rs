@@ -165,6 +165,7 @@ fn staged(root: &Path, id: Uuid) -> Staged {
         workspace,
         cargo_home: tree.join("cargo-home"),
         siblings: vec![],
+        prepared_javascript_directories: vec![],
     }
 }
 #[test]

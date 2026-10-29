@@ -1,6 +1,13 @@
 use super::*;
 
 fn platform_runner(f: &Fixture, kind: BackendKind) -> Runner {
+    let config = platform_config(f, kind);
+    // Inject only the portable backend: these tests stop at admission, before
+    // any Windows command could be handed to the host executor.
+    Runner::open_with_backend(config, Box::new(backend::HostBackend)).unwrap()
+}
+
+fn platform_config(f: &Fixture, kind: BackendKind) -> Config {
     let mut config = f.config();
     if kind == BackendKind::WindowsVm {
         config = windows_instance::config(f);
@@ -22,9 +29,7 @@ fn platform_runner(f: &Fixture, kind: BackendKind) -> Runner {
         config.free_space_probe = Arc::new(|_| Ok(100 << 30));
     }
     config.backend = kind;
-    // Inject only the portable backend: these tests stop at admission, before
-    // any Windows command could be handed to the host executor.
-    Runner::open_with_backend(config, Box::new(backend::HostBackend)).unwrap()
+    config
 }
 
 fn assert_platform_terminal(runner: &Runner, id: Uuid, requested: &str, served: &str) {
@@ -484,7 +489,7 @@ fn macos_backend_guard_requires_explicit_development_override() {
 
 #[cfg(unix)]
 #[test]
-fn macos_terminal_never_claims_workspace_changes_and_queued_cancel_is_prompt() {
+fn macos_terminal_without_a_scan_is_unknown_and_queued_cancel_is_prompt() {
     let f = Fixture::new();
     let runner = platform_runner(&f, BackendKind::MacosVm);
     let request = macos_request(&f);
@@ -506,4 +511,122 @@ fn macos_terminal_never_claims_workspace_changes_and_queued_cancel_is_prompt() {
     let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
     assert_eq!(job.terminal.unwrap().outcome, Outcome::Cancelled);
     assert!(job.started_ms.is_none());
+}
+
+#[cfg(unix)]
+struct MacosTerminalBackend;
+
+#[cfg(unix)]
+impl Backend for MacosTerminalBackend {
+    fn materialize(&self, _: &Config, _: &Trees, _: &Setup) -> io::Result<Prepared> {
+        unreachable!("terminal tests do not launch a VM")
+    }
+    fn launch(
+        &self,
+        _: &Config,
+        _: &Trees,
+        _: &Setup,
+        _: &Prepared,
+        _: u32,
+    ) -> io::Result<backend::Launch> {
+        unreachable!("terminal tests do not launch a VM")
+    }
+    fn cancel(&self, _: &Config, _: &Job, _: bool) -> io::Result<()> {
+        Ok(())
+    }
+    fn unit_alive(
+        &self,
+        _: &Config,
+        _: Option<platform::ProcessIdentity>,
+    ) -> io::Result<Option<bool>> {
+        Ok(None)
+    }
+    fn collect_changes(
+        &self,
+        config: &Config,
+        trees: &Trees,
+        job: &Job,
+    ) -> io::Result<Option<Vec<String>>> {
+        crate::macos::MacosBackend.collect_changes(config, trees, job)
+    }
+    fn reconcile(&self, _: &Config, _: &[Job]) -> io::Result<Vec<Uuid>> {
+        Ok(vec![])
+    }
+}
+
+#[cfg(unix)]
+fn macos_terminal_after_workspace_scan(failed_scan: bool) -> TerminalRecord {
+    use std::os::unix::process::ExitStatusExt;
+    let f = Fixture::new();
+    let mut config = platform_config(&f, BackendKind::MacosVm);
+    config.manual_tick = true;
+    let runner = Runner::open_with_backend(config, Box::new(MacosTerminalBackend)).unwrap();
+    let request = macos_request(&f);
+    runner.accept(request.clone()).unwrap();
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let job = inner.jobs.get_mut(&request.job_id).unwrap();
+        job.state = JobState::Running;
+        job.started_ms = Some(runner.now());
+        job.durable_output = true;
+        runner.save(job).unwrap();
+    }
+    let mirror = runner
+        .core
+        .trees
+        .ensure_mirror(&request.repository_root)
+        .unwrap();
+    git(&mirror, &["fetch", text(&f.main), "HEAD:refs/heads/main"]);
+    let workspace = runner
+        .config()
+        .state_root
+        .join("jobs")
+        .join(request.job_id.to_string())
+        .join("Users/motor/project");
+    fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+    git(
+        &f.main,
+        &["clone", "--no-local", text(&f.main), text(&workspace)],
+    );
+    fs::write(workspace.join("source"), "job edit\n").unwrap();
+    fs::write(workspace.join("new"), "job addition\n").unwrap();
+    if failed_scan {
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+    crate::macos::capture_finished_workspace(
+        runner.config(),
+        &runner.core.trees,
+        &request,
+        workspace,
+    );
+    runner
+        .finish_execution(
+            request.job_id,
+            Ok(backend::ExecutionOutcome::Unix(
+                std::process::ExitStatus::from_raw(0),
+            )),
+            false,
+        )
+        .unwrap();
+    let disk: Job = read_json(&runner.record_path(request.job_id)).unwrap();
+    let terminal = disk.terminal.unwrap();
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 0 });
+    assert_eq!(terminal.ran, Some(Ran::Remote));
+    terminal
+}
+
+#[cfg(unix)]
+#[test]
+fn macos_terminal_reports_workspace_changes_after_tree_cleanup() {
+    let terminal = macos_terminal_after_workspace_scan(false);
+    let mut changes = terminal.workspace_changes.unwrap();
+    changes.sort();
+    assert_eq!(changes, ["new", "source"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn macos_terminal_omits_workspace_changes_when_scan_fails() {
+    let terminal = macos_terminal_after_workspace_scan(true);
+    assert!(terminal.workspace_changes.is_none());
 }

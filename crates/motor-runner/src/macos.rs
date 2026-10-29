@@ -29,6 +29,8 @@ pub(crate) use lifecycle::{Runtime, VmConfig};
 #[cfg(test)]
 mod tests;
 use fs::Dir;
+#[cfg(test)]
+pub(crate) use tests::capture_finished_workspace;
 
 /// Maximum preparation runtime: ten minutes, including time spent waiting for locks.
 pub const PREP_TIMEOUT: Duration = Duration::from_secs(600);
@@ -234,6 +236,7 @@ pub struct Prepared {
     pub workspace: PathBuf,
     pub siblings: Vec<(String, PathBuf)>,
     pub cargo_home: PathBuf,
+    pub prepared_javascript_directories: Vec<PathBuf>,
 }
 impl Staging {
     /// `state` holds staging's own prep folders. `tree_state` must be the
@@ -438,8 +441,19 @@ impl Staging {
         for root in &prep_roots {
             preflight::validate_links(root, &prep_roots, &control)?;
         }
+        let mut prepared_javascript_directories = Vec::new();
         for ((logical, ..), root) in roots.iter().zip(&prep_roots) {
             for installation in preflight::installations(root, &control)? {
+                if logical == &request.workspace_key {
+                    prepared_javascript_directories.push(
+                        installation
+                            .parent()
+                            .unwrap()
+                            .strip_prefix(root)
+                            .map_err(invalid)?
+                            .to_path_buf(),
+                    );
+                }
                 Dir::open(&installation, false)?.clone_into(
                     &Dir::open(
                         &job.join(mapped(logical)?)
@@ -481,6 +495,7 @@ impl Staging {
                 })
                 .collect::<io::Result<_>>()?,
             cargo_home: job_cargo,
+            prepared_javascript_directories,
             tree: job,
         })
     }

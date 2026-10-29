@@ -6271,7 +6271,7 @@ impl Runner {
                     .map(|job| job.id)
                     .collect()
             };
-            self.core.config.macos_runtime.prune_cancelled(&live);
+            self.core.config.macos_runtime.prune_finished(&live);
         }
         if self.core.config.windows_instance() {
             self.core.config.windows_runtime.retry_cleanups();
