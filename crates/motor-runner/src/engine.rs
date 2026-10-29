@@ -161,6 +161,8 @@ pub struct Config {
     #[cfg(test)]
     pub(crate) windows_socket_pair: bool,
     #[cfg(test)]
+    pub(crate) windows_native_slot: bool,
+    #[cfg(test)]
     pub(crate) windows_clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     #[cfg(test)]
     pub(crate) windows_phase: Option<Arc<dyn Fn(motor_winagent::Phase) + Send + Sync>>,
@@ -477,6 +479,8 @@ impl Config {
             windows_vm: None,
             #[cfg(test)]
             windows_socket_pair: false,
+            #[cfg(test)]
+            windows_native_slot: false,
             #[cfg(test)]
             windows_clock: None,
             #[cfg(test)]
@@ -6277,6 +6281,20 @@ impl Runner {
         }
         if self.core.config.windows_instance() {
             self.core.config.windows_runtime.retry_cleanups();
+            let terminal = self
+                .core
+                .inner
+                .lock()
+                .unwrap()
+                .jobs
+                .values()
+                .filter(|job| job.terminal.is_some() || job.state == JobState::Tombstone)
+                .map(|job| job.id)
+                .collect();
+            self.core
+                .config
+                .windows_runtime
+                .reconcile_terminal(&terminal);
         }
         let mut set_aside = Vec::new();
         let maintained = self.maintain_state(&mut set_aside);
@@ -7658,7 +7676,10 @@ impl Runner {
                         (RefusalReason::TreeHashMismatch, None)
                     } else if error.to_string().starts_with("runner_disk_full:") {
                         (RefusalReason::RunnerDiskFull, Some(error.to_string()))
-                    } else if error.to_string() == "windows_slot_busy" {
+                    } else if error.to_string() == "windows_slot_busy"
+                        || error.to_string().starts_with("windows_slot_busy:")
+                        || error.to_string().contains(": windows_slot_busy:")
+                    {
                         (RefusalReason::RunnerFull, None)
                     } else {
                         (

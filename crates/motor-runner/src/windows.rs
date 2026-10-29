@@ -31,6 +31,8 @@ mod hvsock;
 pub(crate) mod prep;
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) mod prep_error;
+#[cfg(any(windows, test))]
+mod slot;
 #[cfg(test)]
 mod staging;
 #[cfg(windows)]
@@ -41,6 +43,10 @@ pub(crate) mod vm;
 #[path = "windows/hyperv.rs"]
 pub(crate) mod vm;
 pub(crate) use agent::Runtime;
+#[cfg(test)]
+pub(crate) fn probe_slot(config: &Config) -> io::Result<()> {
+    slot::Slot::acquire(config, Uuid::now_v7()).map(drop)
+}
 pub(crate) use caches::CacheDisks;
 #[cfg(test)]
 pub(crate) use vm::VmHook;

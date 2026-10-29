@@ -27,11 +27,25 @@ pub(crate) struct Runtime {
     jobs: Mutex<std::collections::BTreeMap<Uuid, Arc<Control>>>,
     cleanups: Mutex<VecDeque<super::vm::Resources>>,
     cleanup_ids: Mutex<std::collections::BTreeSet<Uuid>>,
+    #[cfg(any(windows, test))]
+    pub(super) slot_owners: super::slot::Owners,
     guest_agent_readiness: Mutex<Option<WindowsGuestAgentReadiness>>,
     #[cfg(test)]
     pub(crate) cache_timings: Mutex<std::collections::BTreeMap<Uuid, motor_winagent::CacheTimings>>,
 }
 impl Runtime {
+    #[cfg(any(windows, test))]
+    pub(super) fn finish_prepare<T>(
+        &self,
+        id: Uuid,
+        prepare: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        let prepared = prepare()?;
+        if self.setup_aborted(id) {
+            return Err(invalid("Windows setup cancelled after Hyper-V Prepare"));
+        }
+        Ok(prepared)
+    }
     // Only the Hyper-V host path sets readiness, and it is Windows-only.
     #[cfg(windows)]
     pub(crate) fn set_guest_agent_readiness(&self, readiness: WindowsGuestAgentReadiness) {
@@ -56,6 +70,31 @@ impl Runtime {
             .unwrap()
             .get(&id)
             .is_some_and(|control| control.output_blocked.load(Ordering::Acquire))
+    }
+    pub(super) fn cleanup_failed(&self, id: Uuid, error: &io::Error) {
+        self.cleanup_ids.lock().unwrap().insert(id);
+        #[cfg(any(windows, test))]
+        if let Some(reason) = self.slot_owners.lock().unwrap().get_mut(&id) {
+            *reason = format!("cleanup pending: {error}");
+        }
+        let _ = error;
+    }
+    #[cfg(any(windows, test))]
+    pub(super) fn slot_busy(&self) -> io::Error {
+        let owners = self.slot_owners.lock().unwrap();
+        let detail = owners
+            .iter()
+            .map(|(id, reason)| format!("held by {id} ({reason})"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        invalid(format!(
+            "windows_slot_busy: {}",
+            if detail.is_empty() {
+                "held by another runner (host slot lock)"
+            } else {
+                &detail
+            }
+        ))
     }
     pub(super) fn defer_cleanup(&self, resources: super::vm::Resources) {
         self.cleanup_ids.lock().unwrap().insert(resources.id);
@@ -85,11 +124,28 @@ impl Runtime {
             match resources.finalize() {
                 Ok(()) => {
                     self.cleanup_ids.lock().unwrap().remove(&resources.id);
+                    tracing::info!(job_id = %resources.id, "Windows VM cleanup completed; slot released");
                 }
                 Err(error) => {
+                    self.cleanup_failed(resources.id, &error);
                     tracing::warn!(job_id = %resources.id, %error, "Windows VM cleanup retry failed");
                     self.cleanups.lock().unwrap().push_back(resources);
                 }
+            }
+        }
+    }
+    pub(crate) fn reconcile_terminal(&self, terminal: &std::collections::BTreeSet<Uuid>) {
+        // A terminal record need not have a process identity: setup can still
+        // own a VM while waiting for the guest or for the execution gate.
+        for (id, control) in self.jobs.lock().unwrap().iter() {
+            if terminal.contains(id) && !control.done.load(Ordering::Acquire) {
+                tracing::warn!(job_id = %id, "reconciling Windows VM owned by terminal job");
+                #[cfg(any(windows, test))]
+                if let Some(reason) = self.slot_owners.lock().unwrap().get_mut(id) {
+                    *reason = "cleanup pending: terminal job owner stopping".into();
+                }
+                control.cancel.store(2, Ordering::Release);
+                control.abandon();
             }
         }
     }
@@ -115,15 +171,12 @@ impl Runtime {
             .map(|c| !c.done.load(Ordering::Acquire))
     }
     pub(super) fn abort_setup(&self, id: Uuid) {
-        self.jobs
-            .lock()
-            .unwrap()
-            .entry(id)
-            .or_default()
-            .cancel
-            .store(2, Ordering::Release);
+        let mut jobs = self.jobs.lock().unwrap();
+        let control = jobs.entry(id).or_default();
+        control.cancel.store(2, Ordering::Release);
+        control.wake();
     }
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", windows, test))]
     pub(super) fn setup_aborted(&self, id: Uuid) -> bool {
         self.jobs
             .lock()
@@ -827,7 +880,9 @@ fn materialize_attempt(
                 .map_err(|_| invalid("Windows setup owner disappeared"))?;
             // No transport activity is permitted to open the execution gate.
             while !thread_control.release.load(Ordering::Acquire) {
-                if thread_control.abandoned.load(Ordering::Acquire) {
+                if thread_control.abandoned.load(Ordering::Acquire)
+                    || thread_control.cancel.load(Ordering::Acquire) > 0
+                {
                     return Err(invalid("Windows execution not released"));
                 }
                 std::thread::park_timeout(Duration::from_millis(5));
@@ -967,6 +1022,25 @@ mod tests {
         assert!(!qualification_io_is_quiet(15_000, 4_999, true));
         assert!(!qualification_io_is_quiet(60_000, 60_000, false));
         assert!(qualification_io_is_quiet(15_000, 5_000, true));
+    }
+
+    #[test]
+    fn windows_backend_cancel_during_prepare_waits_for_completion_then_aborts() {
+        let runtime = Runtime::default();
+        let id = Uuid::now_v7();
+        let mut completed = false;
+        let result = runtime.finish_prepare(id, || {
+            runtime.abort_setup(id);
+            // Model the remaining disk attachment and writing the VM's Notes
+            // ownership label, which cleanup uses to identify an incomplete VM.
+            completed = true;
+            Ok(())
+        });
+        assert!(completed);
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Windows setup cancelled after Hyper-V Prepare"
+        );
     }
 
     #[test]

@@ -1,10 +1,7 @@
 //! Native Hyper-V VM ownership. Framing, cancellation and collection live in agent.rs.
 use super::*;
 use crate::native_process::Child;
-use std::{
-    fs::File,
-    process::{ExitStatus, Stdio},
-};
+use std::process::{ExitStatus, Stdio};
 
 pub(crate) fn path_error(operation: &str, path: &Path, error: io::Error) -> io::Error {
     io::Error::new(
@@ -56,7 +53,12 @@ pub(super) fn checked_validation(command: Command) -> io::Result<std::process::O
     Ok(output)
 }
 fn checked_setup(config: &Config, command: Command, id: Uuid) -> io::Result<std::process::Output> {
-    checked_control(command, None, || config.windows_runtime.setup_aborted(id))
+    // Killing Prepare between New-VM and disk attachment leaves an incomplete
+    // VM. Let Prepare finish within its 120-second timeout, then honor cancel
+    // before starting the VM.
+    config
+        .windows_runtime
+        .finish_prepare(id, || checked_control(command, None, || false))
 }
 fn checked_control(
     mut command: Command,
@@ -283,8 +285,9 @@ pub(crate) struct Resources {
     vm_id: Option<Uuid>,
     attached: bool,
     cleaned: bool,
+    cleanup_attempted: bool,
     cleanup_on_drop: bool,
-    _slot: Option<File>,
+    _slot: Option<super::slot::Slot>,
 }
 pub(super) struct Monitor(Option<Child>);
 impl Monitor {
@@ -302,22 +305,7 @@ impl Resources {
         id: Uuid,
         workspace: &str,
     ) -> io::Result<Self> {
-        use fs2::FileExt;
-        let vm = config.windows.as_ref().unwrap();
-        let mut slot = None;
-        for index in 0..vm.concurrent_jobs {
-            let file = fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(vm.layout_root.join(format!("slot-{index}.lock")))?;
-            if file.try_lock_exclusive().is_ok() {
-                slot = Some(file);
-                break;
-            }
-        }
-        let slot = slot.ok_or_else(|| invalid("windows_slot_busy"))?;
+        let slot = super::slot::Slot::acquire(config, id)?;
         fs::create_dir(&staging)?;
         let resources = Self {
             config: config.clone(),
@@ -328,6 +316,7 @@ impl Resources {
             vm_id: None,
             attached: false,
             cleaned: false,
+            cleanup_attempted: false,
             cleanup_on_drop: true,
             _slot: Some(slot),
         };
@@ -388,6 +377,7 @@ impl Resources {
         if self.cleaned {
             return Ok(());
         }
+        self.cleanup_attempted = true;
         // Remove collects logs from the stopped guest before deleting its disk.
         // Finish or terminate the monitor first so a late Start-VM cannot race
         // that offline disk inspection.
@@ -418,17 +408,33 @@ impl Resources {
         Ok(())
     }
     pub(super) fn finalize(&mut self) -> io::Result<()> {
-        self.cleanup(false)
+        let result = self.cleanup(false);
+        if let Err(error) = &result {
+            self.config.windows_runtime.cleanup_failed(self.id, error);
+        }
+        result
     }
     pub(super) fn finalize_known(&mut self) -> io::Result<()> {
-        self.cleanup(true)
+        let result = self.cleanup(true);
+        if let Err(error) = &result {
+            self.config.windows_runtime.cleanup_failed(self.id, error);
+        }
+        result
     }
 }
 impl Drop for Resources {
     fn drop(&mut self) {
         if self.cleanup_on_drop && !self.cleaned {
-            if let Err(error) = self.cleanup(false) {
+            let failed = if self.cleanup_attempted {
+                true
+            } else if let Err(error) = self.cleanup(false) {
+                self.config.windows_runtime.cleanup_failed(self.id, &error);
                 tracing::error!(job_id = %self.id, %error, "Hyper-V resources and slot retained until cleanup retry succeeds");
+                true
+            } else {
+                false
+            };
+            if failed {
                 let runtime = self.config.windows_runtime.clone();
                 let mut config = self.config.clone();
                 config.windows_runtime = Default::default();
@@ -441,6 +447,7 @@ impl Drop for Resources {
                     vm_id: self.vm_id,
                     attached: self.attached,
                     cleaned: false,
+                    cleanup_attempted: true,
                     cleanup_on_drop: false,
                     _slot: self._slot.take(),
                 });

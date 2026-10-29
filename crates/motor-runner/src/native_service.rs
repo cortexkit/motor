@@ -25,6 +25,13 @@ static STOP: AtomicBool = AtomicBool::new(false);
 const NAME: &str = "MotorRunner";
 define_windows_service!(service_entry, service_main);
 pub(super) fn dispatch() -> io::Result<()> {
+    let mut config = super::default_config()?;
+    super::configure_options(&mut config, std::env::args().skip(2))?;
+    // Install before the Service Control Manager callback can emit events. Ordinary
+    // serve uses the same bounded logs/runner.log sink under the instance state
+    // directory. No command output is copied into the host service log.
+    super::service_logging::init(&config.state_root.join(&config.instance))?;
+    tracing::info!("native runner service starting");
     service_dispatcher::start(NAME, service_entry).map_err(io::Error::other)
 }
 fn service_status(state: ServiceState, code: u32) -> ServiceStatus {
@@ -109,18 +116,11 @@ fn service_main(_: Vec<OsString>) {
     let stopping = STOP.load(Ordering::Acquire);
     if let Err(error) = &result {
         if !stopping {
-            eprintln!("native runner service failed: {error}");
-            use std::io::Write;
-            if let Ok(mut log) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(r"C:\ProgramData\MotorRunner\evidence\service-errors.log")
-            {
-                let _ = writeln!(log, "native runner service failed: {error}");
-            }
+            tracing::error!(%error, "native runner service failed");
         }
     }
     let code = if result.is_ok() || stopping { 0 } else { 1 };
+    tracing::info!(code, "native runner service stopped");
     if let Ok(slot) = status_slot.lock() {
         if let Some(handle) = slot.as_ref() {
             let _ = handle.set_service_status(service_status(ServiceState::Stopped, code));

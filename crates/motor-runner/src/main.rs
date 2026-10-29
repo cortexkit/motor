@@ -11,6 +11,8 @@ const MAX_DRAIN_TIMEOUT_S: u64 = 86_400;
 
 #[cfg(windows)]
 mod native_service;
+#[cfg(any(windows, test))]
+mod service_logging;
 
 fn main() -> io::Result<()> {
     // A Boat job unit execs the runner as its PID namespace init. Dispatch it
@@ -100,18 +102,7 @@ async fn run(args: Vec<String>) -> io::Result<()> {
     }
     let mut args = args.into_iter();
     let operation = args.next().unwrap_or_else(|| "serve".into());
-    let home = PathBuf::from(
-        std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .ok_or_else(|| io::Error::other("HOME/USERPROFILE is unset"))?,
-    );
-    let data = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/share"));
-    let mut config = Config::new(data.join("cortexkit/motor-runner"), "main");
-    // Never silently fall back to the runner's administrative account on Linux.
-    config.isolate_jobs = cfg!(target_os = "linux");
-    config.build_slot_root = data.join("cortexkit/motor-build-slots");
+    let mut config = default_config()?;
     if operation == "forget-caller-root" {
         return forget_caller_root_args(args.collect());
     }
@@ -261,9 +252,7 @@ async fn run(args: Vec<String>) -> io::Result<()> {
             }
             #[cfg(windows)]
             {
-                let path = config.state_root.parent().ok_or_else(|| io::Error::other("native state root has no parent"))?.join("evidence/runner.log");
-                let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-                motor_protocol::logging::init_with_writer(LOG_PREFIX, file).map_err(io::Error::other)?;
+                service_logging::init(&config.state_root.join(&config.instance))?;
             }
             // A tenant runner is root inside its own VM; its privileged helpers
             // run directly, starting with the ones Runner::open itself needs.
@@ -415,6 +404,22 @@ fn check_javascript_setup(args: &[String]) -> io::Result<()> {
         "PASS runner JavaScript setup: bun.lock, package-lock.json and pnpm-lock.yaml installs"
     );
     Ok(())
+}
+
+fn default_config() -> io::Result<Config> {
+    let home = PathBuf::from(
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .ok_or_else(|| io::Error::other("HOME/USERPROFILE is unset"))?,
+    );
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"));
+    let mut config = Config::new(data.join("cortexkit/motor-runner"), "main");
+    // Never silently fall back to the runner's administrative account on Linux.
+    config.isolate_jobs = cfg!(target_os = "linux");
+    config.build_slot_root = data.join("cortexkit/motor-build-slots");
+    Ok(config)
 }
 
 fn configure_options(

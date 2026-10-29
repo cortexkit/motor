@@ -7,6 +7,19 @@ HERE = Path(__file__).resolve().parent
 
 
 class ParentVerificationTests(unittest.TestCase):
+    def test_prepare_finishes_before_observing_cancel_and_service_logs_are_bounded(self):
+        native = HERE.parents[1] / 'crates/motor-runner/src'
+        control = (native / 'windows/hyperv.rs').read_text().split('fn checked_setup(', 1)[1].split('fn checked_control(', 1)[0]
+        self.assertIn('.finish_prepare(id, ||', control)
+        self.assertIn('checked_control(command, None, || false)', control)
+        service = (native / 'native_service.rs').read_text()
+        self.assertLess(service.index('service_logging::init('), service.index('service_dispatcher::start('))
+        self.assertNotIn('service-errors.log', service)
+        log = (native / 'service_logging.rs').read_text()
+        self.assertIn('10 * 1024 * 1024', log)
+        self.assertIn('file.sync_data()', log)
+        self.assertIn('self.file.take()', log)
+
     def test_changetime_fixture_uses_unique_file_and_bounded_metadata_flips(self):
         fixture = (HERE / "test_scripts.ps1").read_text()
         self.assertIn("'motor-parent-tests-' + [Guid]::NewGuid()", fixture)

@@ -1546,6 +1546,188 @@ async fn windows_backend_cancel_during_boot_never_releases_command() {
     assert_eq!(a.starts.load(Ordering::SeqCst), 0);
 }
 
+fn detached_setup(runner: &Runner, f: &Fixture, r: Run) -> Setup {
+    for (repo, local) in [
+        (&r.repository_root, &f.main),
+        (&r.siblings[0].canonical_path, &f.sibling),
+    ] {
+        let mirror = runner.core.trees.ensure_mirror(repo).unwrap();
+        git(&mirror, &["fetch", text(local), "HEAD"]);
+    }
+    let mut job = Job::new(r.job_id, Some(r.clone()), 0, 0, 4);
+    job.state = JobState::Queued;
+    fs::create_dir_all(runner.record_path(r.job_id).parent().unwrap()).unwrap();
+    runner.save(&job).unwrap();
+    runner.core.inner.lock().unwrap().jobs.insert(r.job_id, job);
+    Setup {
+        id: r.job_id,
+        cpus: vec![12, 13, 14, 15],
+        request: r,
+        base: false,
+        recorded: BTreeMap::new(),
+        snapshots: None,
+    }
+}
+
+#[tokio::test]
+async fn windows_backend_cancel_during_staging_reconciles_terminal_owner() {
+    let f = Fixture::new();
+    source(&f);
+    let (mut config, agent) = configure(&f, Fault::Transfer, 0);
+    config.manual_tick = true;
+    config.windows_native_slot = true;
+    let runner = Runner::open_with_backend(config, Box::new(FakeHost)).unwrap();
+    let (r, _) = request(&f);
+    let setup = detached_setup(&runner, &f, r.clone());
+    // Keep setup in flight with a created VM but no engine process identity.
+    // A terminal record must suffice to find this owner even if dispatch no
+    // longer lists it in `starting`.
+    let worker_runner = runner.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result =
+            WindowsBackend.materialize(worker_runner.config(), &worker_runner.core.trees, &setup);
+        tx.send(result.is_err()).unwrap();
+    });
+    phase(&agent, 2).await;
+    runner.cancel(r.job_id).unwrap();
+    assert_eq!(
+        runner.core.inner.lock().unwrap().jobs[&r.job_id].state,
+        JobState::Tombstone
+    );
+    let busy = crate::windows::probe_slot(runner.config())
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(busy.contains(&format!("held by {}", r.job_id)), "{busy}");
+    runner.maintenance().unwrap();
+    let ended = rx.recv_timeout(Duration::from_secs(5));
+    // Always reap the fixture worker, including when the regression is red.
+    if ended.is_err() {
+        WindowsBackend
+            .cancel(
+                runner.config(),
+                &runner.core.inner.lock().unwrap().jobs[&r.job_id],
+                true,
+            )
+            .unwrap();
+    }
+    worker.join().unwrap();
+    assert!(ended.expect("terminal setup owner was not reclaimed by maintenance"));
+    cleaned(runner.config(), r.job_id, &agent);
+    crate::windows::probe_slot(runner.config()).unwrap();
+    assert_eq!(agent.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn windows_backend_tombstone_at_execution_gate_is_reconciled() {
+    let f = Fixture::new();
+    source(&f);
+    let (mut config, agent) = configure(&f, Fault::None, 0);
+    config.manual_tick = true;
+    config.windows_native_slot = true;
+    let runner = Runner::open_with_backend(config, Box::new(FakeHost)).unwrap();
+    let (r, _) = request(&f);
+    let setup = detached_setup(&runner, &f, r.clone());
+    let prepared = WindowsBackend
+        .materialize(runner.config(), &runner.core.trees, &setup)
+        .unwrap();
+    runner
+        .core
+        .inner
+        .lock()
+        .unwrap()
+        .jobs
+        .get_mut(&r.job_id)
+        .unwrap()
+        .state = JobState::Tombstone;
+    runner.maintenance().unwrap();
+    let reclaimed = tokio::time::timeout(Duration::from_secs(5), async {
+        while crate::windows::probe_slot(runner.config()).is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let vm = prepared
+        .vm
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap();
+    vm.reap();
+    assert!(
+        reclaimed.is_ok(),
+        "maintenance did not reclaim the tombstone's slot"
+    );
+    cleaned(runner.config(), r.job_id, &agent);
+    crate::windows::probe_slot(runner.config()).unwrap();
+    assert_eq!(agent.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn windows_backend_failed_vm_teardown_keeps_named_slot_until_maintenance() {
+    let f = Fixture::new();
+    source(&f);
+    let (mut config, agent) = configure(&f, Fault::Transfer, 0);
+    config.manual_tick = true;
+    config.windows_native_slot = true;
+    let failures = fail_stops(&mut config, 1);
+    let runner = Runner::open_with_backend(config, Box::new(FakeHost)).unwrap();
+    let (r, _) = request(&f);
+    let setup = detached_setup(&runner, &f, r.clone());
+    let worker_runner = runner.clone();
+    let worker = std::thread::spawn(move || {
+        WindowsBackend
+            .materialize(worker_runner.config(), &worker_runner.core.trees, &setup)
+            .is_err()
+    });
+    phase(&agent, 2).await;
+    runner.cancel(r.job_id).unwrap();
+    runner.maintenance().unwrap();
+    assert!(worker.join().unwrap());
+    assert!(runner.config().windows_runtime.cleanup_pending(r.job_id));
+    assert_eq!(failures.attempts.load(Ordering::SeqCst), 1);
+    let busy = crate::windows::probe_slot(runner.config())
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        busy.contains(&format!("held by {} (cleanup pending:", r.job_id)),
+        "{busy}"
+    );
+    assert!(busy.contains("injected live unit stop failure"), "{busy}");
+    let (next, _) = request(&f);
+    let next_setup = detached_setup(&runner, &f, next.clone());
+    let prepared = WindowsBackend.materialize(runner.config(), &runner.core.trees, &next_setup);
+    assert!(prepared.is_err());
+    runner
+        .launch_without_dispatch(next_setup, prepared)
+        .unwrap();
+    let refused = terminal(&runner, next.job_id).await;
+    assert_eq!(
+        refused.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RunnerFull
+        }
+    );
+    let detail = refused.refusal_detail().unwrap();
+    assert!(
+        detail.contains(&format!("held by {} (cleanup pending:", r.job_id)),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("injected live unit stop failure"),
+        "{detail}"
+    );
+    runner.maintenance().unwrap();
+    assert_eq!(failures.attempts.load(Ordering::SeqCst), 2);
+    assert!(!runner.config().windows_runtime.cleanup_pending(r.job_id));
+    cleaned(runner.config(), r.job_id, &agent);
+    crate::windows::probe_slot(runner.config()).unwrap();
+}
+
 struct ExitedChild(i32);
 impl UnitChild for ExitedChild {
     fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {

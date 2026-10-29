@@ -54,6 +54,10 @@ pub(super) struct Resources {
     cleanup_attempted: bool,
     cleanup_on_drop: bool,
     pub child: Box<dyn UnitChild>,
+    // Selected tests use Hyper-V's slot lease with the fake UnitChild and
+    // socket-connected guest. Other tests retain QEMU's child-owned flock.
+    #[cfg(test)]
+    _slot: Option<super::slot::Slot>,
 }
 #[derive(Debug)]
 struct PathIoError {
@@ -174,6 +178,11 @@ impl Resources {
             // not be deleted by this one's failure.
             cleanup_on_drop: false,
             child: Box::new(NotBooted),
+            #[cfg(test)]
+            _slot: config
+                .windows_native_slot
+                .then(|| super::slot::Slot::acquire(config, id))
+                .transpose()?,
         };
         fs::create_dir(&resources.staging)
             .map_err(|error| path_error("create staging directory", &resources.staging, error))?;
@@ -378,7 +387,11 @@ impl Resources {
         Ok(())
     }
     pub(super) fn finalize(&mut self) -> io::Result<()> {
-        self.cleanup()
+        let result = self.cleanup();
+        if let Err(error) = &result {
+            self.config.windows_runtime.cleanup_failed(self.id, error);
+        }
+        result
     }
     pub(super) fn finalize_known(&mut self) -> io::Result<()> {
         // Keep the on-disk attachment marker until all cleanup succeeds. A
@@ -386,7 +399,8 @@ impl Resources {
         // is known. Do not expose a reusable disk before finalization can fail.
         self.attached = false;
         let result = self.cleanup().and_then(|()| self.complete(true));
-        if result.is_err() {
+        if let Err(error) = &result {
+            self.config.windows_runtime.cleanup_failed(self.id, error);
             self.cleaned = false;
             // A failed stop can leave QEMU using the cache. Retain the attachment
             // so cleanup retries discard it only after the unit is gone.
@@ -407,6 +421,7 @@ impl Drop for Resources {
             match self.cleanup() {
                 Ok(()) => return,
                 Err(error) => {
+                    self.config.windows_runtime.cleanup_failed(self.id, &error);
                     tracing::warn!(job_id = %self.id, %error, "Windows VM cleanup deferred to maintenance");
                 }
             }
@@ -430,6 +445,8 @@ impl Drop for Resources {
             cleanup_attempted: true,
             cleanup_on_drop: false,
             child: std::mem::replace(&mut self.child, Box::new(NotBooted)),
+            #[cfg(test)]
+            _slot: self._slot.take(),
         };
         runtime.defer_cleanup(pending);
     }

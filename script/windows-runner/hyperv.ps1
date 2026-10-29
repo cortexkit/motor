@@ -123,15 +123,46 @@ function Harvest-Job([string]$Id, [switch]$Lightweight) {
         throw
     }
 }
+function Test-IncompleteJob([string]$Id) {
+    $vm = Get-VM -Name "$prefix$Id" -ErrorAction SilentlyContinue
+    if (-not $vm -or @(Get-VMHardDiskDrive -VM $vm).Count -ne 0) { return $false }
+    # New-VM can survive a terminated Prepare without attaching its OS disk.
+    # Never mount a disk for this case; require independent ownership evidence
+    # before deleting the incomplete VM and its private files.
+    if ($vm.State -ne 'Off') { throw 'Incomplete job VM is not Off; preserving resources' }
+    if ($vm.Notes -cne "$owner`:$Id") { throw 'Incomplete job VM owner Notes mismatch or missing; preserving resources' }
+    $directory = Job-Path $Id
+    foreach ($path in @("$Root\vm", "$Root\vm\jobs", $directory, "$directory\job.json", "$directory\os.vhdx")) {
+        if (-not (Test-Path -LiteralPath $path)) { throw "Incomplete job owned path missing: $path" }
+        if ((Get-Item -LiteralPath $path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Incomplete job reparse path refused: $path" }
+    }
+    $journal = Get-Content -LiteralPath "$directory\job.json" -Raw | ConvertFrom-Json
+    if ([IO.Path]::GetDirectoryName($journal.parent) -cne "$Root\baselines" -or $journal.sha256 -notmatch '^[0-9a-f]{64}$' -or [UInt64]$journal.quota -eq 0) { throw 'Incomplete job journal mismatch; preserving resources' }
+    $expected = [IO.Path]::GetFullPath("$directory\os.vhdx")
+    $vhd = Get-VHD -Path $expected
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($expected, [IO.Path]::GetFullPath($vhd.Path)) -or [string]$vhd.VhdType -ne 'Differencing' -or -not [StringComparer]::OrdinalIgnoreCase.Equals($journal.parent, $vhd.ParentPath)) { throw 'Incomplete job child disk or journal parent mismatch; preserving resources' }
+    $dvds = @(Get-VMDvdDrive -VM $vm)
+    if ($dvds.Count -gt 1) { throw 'Incomplete job has unexpected DVD paths; preserving resources' }
+    foreach ($dvd in $dvds) {
+        if ($dvd.Path -and -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($dvd.Path), "$directory\nonce.iso")) { throw 'Incomplete job has unexpected DVD path; preserving resources' }
+    }
+    return $true
+}
 function Remove-Job([string]$Id, [switch]$LightweightHarvest) {
     # A binding mismatch is not an ordinary collection failure: never delete a
     # different attached disk after silently inspecting the expected path.
-    Assert-JobDiskBinding $Id
+    $incomplete = Test-IncompleteJob $Id
+    if (-not $incomplete) { Assert-JobDiskBinding $Id }
     $vm = Owned-VM $Id
     if ($vm -and $vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force }
-    # Every path collects logs before destruction. Only protocol-complete jobs
-    # use the lightweight log copy; failures and recovery include full diagnostics.
-    try { Harvest-Job $Id -Lightweight:$LightweightHarvest } catch { Write-Warning "Guest harvest failed before removal; inspect $Root\evidence\$Id-guest: $_" }
+    # Attached guests are harvested before destruction. Incomplete creation is
+    # never mounted; only protocol-complete jobs use the lightweight log copy.
+    if ($incomplete) {
+        Evidence $Id 'incomplete-creation-cleanup' @{disk_mounted=$false; vm_off=$true; no_attached_disks=$true}
+        if (-not (Test-IncompleteJob $Id)) { throw 'Incomplete job changed before removal; preserving resources' }
+    } else {
+        try { Harvest-Job $Id -Lightweight:$LightweightHarvest } catch { Write-Warning "Guest harvest failed before removal; inspect $Root\evidence\$Id-guest: $_" }
+    }
     $vm = Owned-VM $Id
     if ($vm) { Remove-VM -VM $vm -Force }
     $directory = Job-Path $Id
