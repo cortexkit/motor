@@ -1,6 +1,33 @@
 use std::io;
 use std::path::Path;
 
+pub(super) fn collect_file_keys<K: PartialEq>(
+    owned_process: bool,
+    owned_disks: &[K],
+    descriptors: impl IntoIterator<Item = io::Result<Option<K>>>,
+) -> io::Result<Vec<K>> {
+    let mut keys = Vec::new();
+    let mut vanished = None;
+    for descriptor in descriptors {
+        match descriptor {
+            Ok(Some(key)) => keys.push(key),
+            Ok(None) => {}
+            // libproc's descriptor list is a snapshot. Another process can
+            // close a listed file descriptor before proc_pidfdinfo inspects
+            // it. Keep scanning: another descriptor may prove that
+            // this is an owner of our disks, which must still fail closed.
+            Err(e) if e.raw_os_error() == Some(libc::EBADF) => vanished = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    if (owned_process || keys.iter().any(|key| owned_disks.contains(key)))
+        && let Some(e) = vanished
+    {
+        return Err(e);
+    }
+    Ok(keys)
+}
+
 pub(super) fn skip_denied_descriptor(executable: &Path, error: &io::Error) -> bool {
     // Apple system processes in GUI sessions can deny inspection of their open
     // file descriptors, even to the same user. Guest jobs never run host code;
@@ -21,6 +48,58 @@ pub(super) fn skip_denied_descriptor(executable: &Path, error: &io::Error) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_churn_in_unrelated_process_does_not_abort_scan() {
+        let disk = 42;
+        let mut holders = Vec::new();
+        for (pid, descriptors) in [
+            (
+                100,
+                vec![
+                    Ok(Some(1)),
+                    Err(io::Error::from_raw_os_error(libc::EBADF)),
+                    Ok(Some(2)),
+                ],
+            ),
+            (200, vec![Ok(Some(disk))]),
+        ] {
+            let keys = collect_file_keys(false, &[disk], descriptors).unwrap();
+            if pid == 100 {
+                assert_eq!(keys, [1, 2]);
+            }
+            if keys.contains(&disk) {
+                holders.push(pid);
+            }
+        }
+        assert_eq!(holders, [200]);
+    }
+
+    #[test]
+    fn descriptor_churn_in_owned_process_still_fails() {
+        let disk = 42;
+        for (known_owner, keys) in [(true, vec![1]), (false, vec![disk])] {
+            // Put the vanished descriptor first so a later disk match cannot
+            // be hidden by an early return from the scan.
+            let descriptors = std::iter::once(Err(io::Error::from_raw_os_error(libc::EBADF)))
+                .chain(keys.into_iter().map(|key| Ok(Some(key))));
+            let error = collect_file_keys(known_owner, &[disk], descriptors).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        }
+    }
+
+    #[test]
+    fn unrelated_process_inspection_keeps_other_errors_fatal() {
+        for errno in [libc::EPERM, libc::EACCES, libc::EIO, libc::ESRCH] {
+            let error = collect_file_keys(
+                false,
+                &[42],
+                [Ok(Some(1)), Err(io::Error::from_raw_os_error(errno))],
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(errno));
+        }
+    }
 
     #[test]
     fn denied_descriptor_policy_is_limited_to_sealed_non_vm_executables() {

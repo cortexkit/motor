@@ -1023,7 +1023,11 @@ pub mod process {
             Err(e) => Err(e),
         }
     }
-    fn open_files(pid: i32) -> io::Result<Vec<Vnode>> {
+    fn open_files(
+        pid: i32,
+        owned_process: Option<ProcessIdentity>,
+        owned_disks: &[Vnode],
+    ) -> io::Result<Vec<Vnode>> {
         let identity = process_identity(pid)?;
         let fds: Vec<libc::proc_fdinfo> = list(|buffer, size| unsafe {
             libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, buffer, size)
@@ -1031,21 +1035,21 @@ pub mod process {
         let ports: Vec<FilePort> = list(|buffer, size| unsafe {
             libc::proc_pidinfo(pid, PROC_PIDLISTFILEPORTS, 0, buffer, size)
         })?;
-        let mut keys = Vec::new();
-        for fd in fds {
-            if fd.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32
-                && let Some(key) = inspect_descriptor(pid, fd.proc_fd, false)?
-            {
-                keys.push(key);
-            }
-        }
-        for port in ports {
-            if port.kind == libc::PROX_FDTYPE_VNODE as u32
-                && let Some(key) = inspect_descriptor(pid, port.port as i32, true)?
-            {
-                keys.push(key);
-            }
-        }
+        let descriptors = fds
+            .into_iter()
+            .filter(|fd| fd.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32)
+            .map(|fd| inspect_descriptor(pid, fd.proc_fd, false))
+            .chain(
+                ports
+                    .into_iter()
+                    .filter(|port| port.kind == libc::PROX_FDTYPE_VNODE as u32)
+                    .map(|port| inspect_descriptor(pid, port.port as i32, true)),
+            );
+        let keys = disk_release::collect_file_keys(
+            owned_process == Some(identity),
+            owned_disks,
+            descriptors,
+        )?;
         if process_identity(pid)? != identity {
             return Err(io::Error::other("process changed during file inspection"));
         }
@@ -1087,7 +1091,7 @@ pub mod process {
                 continue;
             }
             let identity = process_identity(pid)?;
-            let holds_boot_disk = open_files(pid)?.contains(&boot);
+            let holds_boot_disk = open_files(pid, Some(helper), &[boot])?.contains(&boot);
             let responsible_pid = if holds_boot_disk {
                 responsible_pid(pid)?
             } else {
@@ -1123,7 +1127,7 @@ pub mod process {
             file_key(nonce_disk)?,
         ];
         for pid in same_uid_pids()? {
-            match open_files(pid) {
+            match open_files(pid, service, &keys) {
                 Ok(open) if open.iter().any(|key| keys.contains(key)) => return Ok(false),
                 Ok(_) => {}
                 Err(e) if e.raw_os_error() == Some(libc::ESRCH) => continue,
@@ -1151,7 +1155,7 @@ pub mod process {
                 continue;
             }
             let identity = process_identity(pid)?;
-            if open_files(pid)?.contains(&boot) {
+            if open_files(pid, None, &[boot])?.contains(&boot) {
                 if process_identity(pid)? != identity {
                     return Err(io::Error::other("VM service identity changed"));
                 }
@@ -1164,6 +1168,11 @@ pub mod process {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn vanished_descriptor_query_reports_ebadf() {
+            let error = fd_key(std::process::id() as i32, -1, false).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        }
         #[test]
         fn descriptor_query_matches_actual_open_file_vnode() {
             use std::os::fd::AsRawFd;
