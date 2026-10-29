@@ -31,6 +31,227 @@ impl Control for NoVm {
     }
 }
 
+fn metrics_request(ms: u64) -> motor_host::billing::Request {
+    let vector: Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/host-metrics.json"
+    ))
+    .unwrap();
+    motor_host::billing::Request {
+        path: "/v1/hosts/host/metrics".into(),
+        body: vector["cases"][0]["request"]["body"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .to_vec(),
+        job: None,
+        created_ms: ms,
+    }
+}
+
+fn queue_heartbeat(runtime: &Runtime, ms: u64) {
+    let mut host = runtime.host.lock().unwrap();
+    let heartbeat = host.heartbeat(ms, 0, true);
+    host.queue_heartbeat("host", &heartbeat, ms).unwrap();
+}
+
+fn signed_request(stream: &std::net::TcpStream) -> (String, Vec<u8>, HostHeaders) {
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let path = line.split_whitespace().nth(1).unwrap().to_owned();
+    let mut headers = BTreeMap::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        if line == "\r\n" {
+            break;
+        }
+        let (key, value) = line.trim().split_once(':').unwrap();
+        headers.insert(key.to_ascii_lowercase(), value.trim().to_owned());
+    }
+    let mut body = vec![0; headers["content-length"].parse::<usize>().unwrap()];
+    reader.read_exact(&mut body).unwrap();
+    (
+        path,
+        body,
+        HostHeaders {
+            host: headers["ck-host"].clone(),
+            timestamp: headers["ck-timestamp"].parse().unwrap(),
+            counter: headers["ck-counter"].parse().unwrap(),
+            signature: headers["ck-signature"].clone(),
+        },
+    )
+}
+
+#[test]
+fn metrics_yield_to_heartbeat_and_usage_and_share_counters_in_send_order() {
+    let ms = NOW * 1000;
+    let runtime = Runtime::new("host".into(), host(), Arc::new(NoVm));
+    runtime.host.lock().unwrap().start_billing(ms).unwrap();
+    let initial = runtime.host.lock().unwrap().snapshot.counter;
+    let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+    let public = key.verifying_key();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut sender = Sender::new(runtime.clone(), key).unwrap();
+    sender.test_endpoint(format!("http://{}", listener.local_addr().unwrap()));
+    let tx = sender.test_metrics();
+    let broker = std::thread::spawn(move || {
+        let mut auth = HostAuthenticator::default();
+        auth.register("host".into(), public);
+        for (index, route) in ["heartbeat", "metrics", "usage", "heartbeat"]
+            .iter()
+            .enumerate()
+        {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (path, body, headers) = signed_request(&stream);
+            assert!(path.ends_with(route), "{path}");
+            assert_eq!(headers.counter, initial + index as u64 + 1);
+            auth.verify("POST", &path, &body, &headers, ms).unwrap();
+            let (status, reply) = match *route {
+                "metrics" => (204, String::new()),
+                "usage" => (
+                    200,
+                    json!({"job_id":JOB,"settled_vcpu_ms":18000,"released_vcpu_ms":12000})
+                        .to_string(),
+                ),
+                _ => (200, json!({"ignored":[],"closed_subjects":[]}).to_string()),
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            )
+            .unwrap();
+        }
+    });
+    tx.send(metrics_request(ms)).unwrap();
+    queue_heartbeat(&runtime, ms);
+    sender.send_next(ms).unwrap();
+    assert!(sender.send_next(ms).is_ok());
+    assert_eq!(runtime.host.lock().unwrap().snapshot.counter, initial + 1);
+    tx.send(metrics_request(ms)).unwrap();
+    sender.send_next(ms).unwrap();
+    {
+        let mut host = runtime.host.lock().unwrap();
+        started(&mut host, JOB, 1);
+        end(&mut host, JOB, 3, ms + 18_000, terminal(JOB, "exit"));
+        host.terminal_delivered(JOB, ms + 18_000).unwrap();
+    }
+    tx.send(metrics_request(ms)).unwrap();
+    queue_heartbeat(&runtime, ms + 18_000);
+    sender.send_next(ms + 18_000).unwrap();
+    sender.send_next(ms + 18_000).unwrap();
+    broker.join().unwrap();
+    assert_eq!(runtime.host.lock().unwrap().snapshot.counter, initial + 4);
+    assert!(runtime.host.lock().unwrap().snapshot.outbox.is_empty());
+}
+
+#[test]
+fn metrics_timeout_is_dropped_and_heartbeat_publication_does_not_wait() {
+    use std::time::{Duration, Instant};
+    let ms = NOW * 1000;
+    let runtime = Runtime::new("host".into(), host(), Arc::new(NoVm));
+    runtime.host.lock().unwrap().start_billing(ms).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut sender = Sender::new(
+        runtime.clone(),
+        ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    sender.test_endpoint(format!("http://{}", listener.local_addr().unwrap()));
+    let tx = sender.test_metrics();
+    tx.send(metrics_request(ms)).unwrap();
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+    let broker = std::thread::spawn(move || {
+        let (stalled, _) = listener.accept().unwrap();
+        let (path, _, metrics) = signed_request(&stalled);
+        assert!(path.ends_with("/metrics"));
+        seen_tx.send(()).unwrap();
+        let (mut heartbeat, _) = listener.accept().unwrap();
+        let (path, _, headers) = signed_request(&heartbeat);
+        assert!(path.ends_with("/heartbeat"));
+        assert!(headers.counter > metrics.counter);
+        write!(
+            heartbeat,
+            "HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{{\"ignored\":[]}}"
+        )
+        .unwrap();
+        drop(stalled);
+    });
+    let worker = std::thread::spawn(move || {
+        let start = Instant::now();
+        sender.send_next(ms).unwrap();
+        assert!(start.elapsed() >= Duration::from_secs(2));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        sender.send_next(ms + 1).unwrap();
+    });
+    seen_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    // Publishing takes only the host-state lock, not the blocked HTTP transport.
+    queue_heartbeat(&runtime, ms + 1);
+    assert_eq!(runtime.host.lock().unwrap().snapshot.last_alive, ms + 1);
+    worker.join().unwrap();
+    broker.join().unwrap();
+    let host = runtime.host.lock().unwrap();
+    assert!(host.snapshot.outbox.is_empty());
+    assert!(host.snapshot.expired_outbox.is_empty());
+    assert!(host.snapshot.rejected_outbox.is_empty());
+}
+
+#[test]
+fn metrics_sample_reports_real_host_counters_and_safe_recovery_latch() {
+    use motor_lease::metrics::TenantState;
+    let ms = NOW * 1000;
+    let runtime = Runtime::new("host".into(), host(), Arc::new(NoVm));
+    let mut sampler = motor_host::metrics::Sampler::default();
+    let first = sampler
+        .sample(&runtime, std::path::Path::new("/"), ms)
+        .unwrap();
+    assert!(first.cpu.threads > 0);
+    assert!(first.mem.total_mib > 0);
+    assert!(first.mem.avail_mib <= first.mem.total_mib);
+    assert_eq!(first.disks[0].mount, "/");
+    assert!(first.disks[0].total_gib > 0);
+    assert_eq!(first.tenants[0].state, TenantState::Stopped);
+    assert_eq!(first.tenants[0].slots_total, 2);
+    for (at, step) in [(ms, "xfs_check"), (ms + 1000, "secret /tenant/job-output")] {
+        runtime.host.lock().unwrap().recovery_timed_out(
+            "tenant",
+            motor_host::helper::RecoveryTimeout {
+                step: step.into(),
+                elapsed_ms: 500,
+            },
+            at,
+        );
+    }
+    let sample = sampler
+        .sample(&runtime, std::path::Path::new("/"), ms + 1000)
+        .unwrap();
+    let tenant = &sample.tenants[0];
+    assert_eq!(tenant.state, TenantState::Recovering);
+    assert_eq!(tenant.recovery.as_ref().unwrap().since_ms, ms - 500);
+    assert_eq!(tenant.recovery.as_ref().unwrap().attempts, 2);
+    assert_eq!(tenant.recovery.as_ref().unwrap().step, "unknown");
+    assert_eq!(tenant.detail.as_deref(), Some("tenant_recovery_stuck"));
+    let bytes = sample.encode(ms + 1000).unwrap();
+    assert!(!String::from_utf8(bytes).unwrap().contains("secret"));
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .clear_recovery_timeouts("tenant");
+    let sample = sampler
+        .sample(&runtime, std::path::Path::new("/"), ms + 1001)
+        .unwrap();
+    assert!(sample.tenants[0].recovery.is_none());
+    assert_eq!(
+        sample.tenants[0].detail.as_deref(),
+        Some("tenant_recovery_stuck")
+    );
+}
+
 #[test]
 fn signed_sender_heartbeats_at_fifteen_seconds_and_on_change_and_resigns_unchanged_usage_after_lost_reply(
 ) {

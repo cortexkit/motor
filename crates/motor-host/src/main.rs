@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
         host,
         Arc::new(Helper {
             socket: config.helper_socket,
-            storage: config.storage,
+            storage: config.storage.clone(),
             capacity: motor_host::capacity::CONFIG.into(),
             vcpu_ceiling,
             guest_init,
@@ -154,7 +154,13 @@ async fn main() -> Result<()> {
     let seed = enroll::read_signing_seed(&config.host_signing_key)?;
     let sender = runtime.clone();
     std::thread::spawn(move || {
-        if motor_host::broker::run(sender, ed25519_dalek::SigningKey::from_bytes(&seed)).is_err() {
+        if motor_host::broker::run(
+            sender,
+            ed25519_dalek::SigningKey::from_bytes(&seed),
+            config.storage,
+        )
+        .is_err()
+        {
             tracing::error!("host_sender_failed");
         }
     });

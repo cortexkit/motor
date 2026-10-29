@@ -507,7 +507,7 @@ impl Runtime {
                 {
                     let mut host = self.host.lock().expect("host lock");
                     if let Some(timeout) = error.downcast_ref::<crate::helper::RecoveryTimeout>() {
-                        host.recovery_timed_out(tenant, timeout.clone());
+                        host.recovery_timed_out(tenant, timeout.clone(), unix_ms());
                         let failure = host.recovery_failure(tenant).expect("recorded timeout");
                         let stuck = failure.stuck;
                         tracing::error!(

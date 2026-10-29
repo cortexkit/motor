@@ -52,6 +52,8 @@ pub(crate) struct TenantAdvert {
     memory_case: Option<MemoryCase>,
     start_refused: Option<StartRefusal>,
     recovery_failure: Option<RecoveryFailure>,
+    /// Fixed host-owned code only, retained after recovery for diagnostics.
+    last_metrics_error: Option<&'static str>,
     wake_pending: bool,
     /// The permits the tenant runner's own cache fill held at the last probe.
     fill: Option<FillSample>,
@@ -103,9 +105,16 @@ pub struct RecoveryFailure {
     pub timeout: crate::helper::RecoveryTimeout,
     pub attempts: u32,
     pub stuck: bool,
+    /// First observed timeout's start, retained across retries in this process.
+    #[serde(skip)]
+    pub since_ms: u64,
 }
 
 impl Host {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn last_metrics_error(&self, tenant: &str) -> Option<&'static str> {
+        self.advert.get(tenant)?.last_metrics_error
+    }
     pub fn recovery_failure(&self, tenant: &str) -> Option<&RecoveryFailure> {
         self.advert.get(tenant)?.recovery_failure.as_ref()
     }
@@ -117,16 +126,27 @@ impl Host {
         &mut self,
         tenant: &str,
         timeout: crate::helper::RecoveryTimeout,
+        now_ms: u64,
     ) {
         let advert = self.advert.entry(tenant.to_owned()).or_default();
         let attempts = advert
             .recovery_failure
             .as_ref()
             .map_or(1, |f| f.attempts.saturating_add(1));
+        let since_ms = advert
+            .recovery_failure
+            .as_ref()
+            .map_or_else(|| now_ms.saturating_sub(timeout.elapsed_ms), |f| f.since_ms);
         advert.recovery_failure = Some(RecoveryFailure {
             timeout,
             attempts,
             stuck: attempts >= 2,
+            since_ms,
+        });
+        advert.last_metrics_error = Some(if attempts >= 2 {
+            "tenant_recovery_stuck"
+        } else {
+            "tenant_recovery_timeout"
         });
     }
     pub(crate) fn clear_recovery_timeouts(&mut self, tenant: &str) {
@@ -221,10 +241,13 @@ impl Host {
     /// advertisement is zero and its leases are refused without calling the
     /// helper; the next start attempt waits [`START_RETRY_MS`].
     pub fn start_refused(&mut self, tenant: &str, case: &str, now_ms: u64) {
-        self.advert
-            .entry(tenant.to_owned())
-            .or_default()
-            .start_refused = Some(StartRefusal {
+        let advert = self.advert.entry(tenant.to_owned()).or_default();
+        advert.last_metrics_error = Some(match case {
+            "tenant_recovery_stuck" => "tenant_recovery_stuck",
+            "tenant_recovery_timeout" => "tenant_recovery_timeout",
+            _ => "tenant_start_refused",
+        });
+        advert.start_refused = Some(StartRefusal {
             case: case.to_owned(),
             retry_at_ms: now_ms.saturating_add(START_RETRY_MS),
         });

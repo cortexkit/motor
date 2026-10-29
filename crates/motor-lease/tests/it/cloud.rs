@@ -24,6 +24,136 @@ fn seed(text: &str) -> SigningKey {
     SigningKey::from_bytes(&bytes.try_into().unwrap())
 }
 
+#[test]
+fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
+    use metrics::*;
+    let v = vector("host-metrics.json");
+    let key = seed(v["seed_hex"].as_str().unwrap());
+    let now = v["clock_ms"].as_u64().unwrap();
+    let metrics = HostMetrics {
+        at_ms: now,
+        cpu: Cpu {
+            threads: 32,
+            busy_pct: 41,
+            load1: 12.4,
+        },
+        mem: Memory {
+            total_mib: 128000,
+            avail_mib: 22000,
+        },
+        disks: vec![Disk {
+            mount: "/".into(),
+            total_gib: 900,
+            free_gib: 310,
+        }],
+        tenants: vec![Tenant {
+            vm: "vm-1".into(),
+            state: TenantState::Ready,
+            vcpus: 30,
+            mem_mib: 106496,
+            slots_total: 90,
+            slots_used: 41,
+            jobs_running: 12,
+            recovery: None,
+            detail: None,
+        }],
+        runners: vec![Runner {
+            name: "direct".into(),
+            state: RunnerState::Ready,
+            slots_total: 16,
+            slots_used: 3,
+            queued: 0,
+            oldest_wait_s: 0,
+            detail: None,
+        }],
+    };
+    assert_eq!(
+        metrics.encode(now).unwrap(),
+        v["cases"][0]["request"]["body"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+    );
+    let expected = [
+        MetricsReply::Accepted,
+        MetricsReply::TooLarge,
+        MetricsReply::BadRequest {
+            field: Some("runners[0].state".into()),
+        },
+        MetricsReply::BadRequest {
+            field: Some("tenants[0].detail".into()),
+        },
+        MetricsReply::BadRequest {
+            field: Some("at_ms".into()),
+        },
+    ];
+    for (case, reply) in v["cases"].as_array().unwrap().iter().zip(expected) {
+        let request = &case["request"];
+        let headers = &request["headers"];
+        let body = request["body"].as_str().unwrap();
+        let timestamp = headers["CK-Timestamp"].as_str().unwrap().parse().unwrap();
+        let counter = headers["CK-Counter"].as_str().unwrap().parse().unwrap();
+        let path = request["pathname"].as_str().unwrap();
+        let signed = host_message_bytes("POST", path, body.as_bytes(), timestamp, counter);
+        assert_eq!(signed, case["signed_string"].as_str().unwrap().as_bytes());
+        let signed = HostHeaders::sign(
+            "metrics-vector",
+            "POST",
+            path,
+            body.as_bytes(),
+            timestamp,
+            counter,
+            &key,
+        )
+        .unwrap();
+        assert_eq!(signed.signature, headers["CK-Signature"]);
+        assert_eq!(
+            parse_reply(
+                case["reply"]["status"].as_u64().unwrap() as u16,
+                case["reply"]["body"].as_str().unwrap().as_bytes()
+            ),
+            reply
+        );
+    }
+    assert_eq!(
+        parse_reply(400, br#"{"error":"bad_request"}"#),
+        MetricsReply::BadRequest { field: None }
+    );
+    assert_eq!(
+        parse_reply(401, br#"{"error":"host_auth_failed"}"#),
+        MetricsReply::AuthFailed
+    );
+}
+
+#[test]
+fn cloud_host_metrics_invalid_samples_are_not_signed() {
+    let v = vector("host-metrics.json");
+    let now = v["clock_ms"].as_u64().unwrap();
+    for index in [0, 3, 4] {
+        let sample: metrics::HostMetrics =
+            serde_json::from_str(v["cases"][index]["request"]["body"].as_str().unwrap()).unwrap();
+        assert_eq!(sample.encode(now).is_ok(), index == 0);
+    }
+    assert!(serde_json::from_str::<metrics::HostMetrics>(
+        v["cases"][2]["request"]["body"].as_str().unwrap()
+    )
+    .is_err());
+    assert_eq!(
+        v["cases"][1]["request"]["body"].as_str().unwrap().len(),
+        metrics::MAX_BODY_BYTES + 1
+    );
+    let mut sample: metrics::HostMetrics =
+        serde_json::from_str(v["cases"][0]["request"]["body"].as_str().unwrap()).unwrap();
+    sample.cpu.busy_pct = 101;
+    assert!(sample.encode(now).is_err());
+    sample.cpu.busy_pct = 100;
+    sample.tenants[0].state = metrics::TenantState::Recovering;
+    assert!(sample.encode(now).is_err());
+    sample.tenants[0].state = metrics::TenantState::Ready;
+    sample.tenants[0].detail = Some("job output\nwith control".into());
+    assert!(sample.encode(now).is_err());
+}
+
 fn canonical_lease_hash(body_bytes: &str) -> String {
     let body: LeaseRequest = serde_json::from_str(body_bytes).unwrap();
     let wire = serde_json::to_string(&body).unwrap();

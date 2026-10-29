@@ -71,6 +71,7 @@ fn cloud_final_files_match_their_manifest_digests() {
         "cloud/job-tokens.json",
         "cloud/job-tokens-workspace.json",
         "cloud/host-signature.json",
+        "cloud/host-metrics.json",
         "cloud/lease.json",
         "cloud/usage-settlement.json",
         "cloud/settled-reattach.json",
@@ -99,7 +100,11 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "ffefbd47faf21690c37d14585b81708212b04bec68a0bddd55ba109da3281040",
+            "eca2e1d517623c6be6c71108509edb819d7ca09cce7dc5a0854b76c269a70df7",
+        ),
+        (
+            "host-metrics.json",
+            "f11de13dc95c0584e761b94b09c90e346902cfefaa65cea31600f3749a38d7ed",
         ),
         (
             "bad-request.json",

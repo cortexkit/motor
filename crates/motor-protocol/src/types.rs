@@ -207,6 +207,9 @@ pub struct RunnerHealth {
     pub free_bytes: Option<u64>,
     pub queue_depth: u32,
     pub running: Vec<HealthRunningJob>,
+    /// Age of the oldest pending job, including uploads; zero for an empty queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_wait_s: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_job_units: Option<u64>,
     /// IDs blocking disk cleanup at its latest evaluation, initially all
