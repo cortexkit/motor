@@ -1193,10 +1193,12 @@ impl ModuleHandler for Handler {
                     };
                     pump(
                         &ctx,
-                        motor.run_agent(
+                        motor.run_agent_recorded(
                             request,
                             self.attribution(ctx.route_handle(), envelope.preset),
                             returns,
+                            None,
+                            &principal,
                         )?,
                         0,
                     )

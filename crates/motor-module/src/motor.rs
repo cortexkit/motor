@@ -93,6 +93,13 @@ struct CancelInFlight {
     cancels: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, usize>>>,
     id: Uuid,
 }
+
+struct WindowsQueue {
+    deadline: tokio::time::Instant,
+    run_sent: bool,
+    accepted: bool,
+    retry_delay: Duration,
+}
 impl Drop for CancelInFlight {
     fn drop(&mut self) {
         let mut cancels = self.cancels.lock().unwrap();
@@ -287,7 +294,7 @@ impl Motor {
             allow_gate_spill,
             hosted_test,
             returns,
-            None,
+            (None, "direct".into()),
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -299,7 +306,7 @@ impl Motor {
         allow_gate_spill: bool,
         hosted_test: bool,
         returns: crate::ReturnOptions,
-        key: Option<submission_key::KeyRecord>,
+        (key, caller): (Option<submission_key::KeyRecord>, String),
     ) -> io::Result<JobStream> {
         let (attribution, secret_hash) = identity;
         let wsl_refusal = self.wsl.refusal(
@@ -435,9 +442,9 @@ impl Motor {
                 return;
             }
             if let Err(e) = motor
-                .run_job(
+                .run_job_for_caller(
                     id,
-                    (request, returns),
+                    (request, returns, caller),
                     env_not_forwarded,
                     (wait, spill),
                     &tx,
@@ -686,16 +693,36 @@ impl Motor {
         self.storage.local_terminal(terminal.clone())?;
         emit(tx, StreamRecord::Terminal(terminal)).await
     }
+    #[cfg(test)]
     async fn run_job(
         &self,
         id: Uuid,
-        submission: (RunRequest, crate::ReturnOptions),
+        (request, returns): (RunRequest, crate::ReturnOptions),
+        env_not_forwarded: Vec<String>,
+        budget: (u64, bool),
+        tx: &mpsc::Sender<io::Result<StreamRecord>>,
+        wake: watch::Receiver<bool>,
+    ) -> io::Result<()> {
+        self.run_job_for_caller(
+            id,
+            (request, returns, "direct".into()),
+            env_not_forwarded,
+            budget,
+            tx,
+            wake,
+        )
+        .await
+    }
+    async fn run_job_for_caller(
+        &self,
+        id: Uuid,
+        submission: (RunRequest, crate::ReturnOptions, String),
         env_not_forwarded: Vec<String>,
         (wait, spill): (u64, bool),
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
         wake: watch::Receiver<bool>,
     ) -> io::Result<()> {
-        let (request, returns) = submission;
+        let (request, returns, caller) = submission;
         let hosted = self.hosted_state(id).is_some();
         if let Err(code) = validate_return_request(
             &request.workspace_key,
@@ -819,9 +846,41 @@ impl Motor {
             }
         };
         let snapshots = Arc::new(snapshots);
+        let mut windows_queue = (request.platform == Some(Platform::Windows)
+            && !self.config.windows_runners.is_empty())
+        .then(|| WindowsQueue {
+            deadline: tokio::time::Instant::now() + Duration::from_secs(wait),
+            run_sent: false,
+            accepted: false,
+            retry_delay: Duration::from_secs(5),
+        });
+        // A zero queue budget still permits one immediate admission attempt.
+        let mut first_attempt = true;
         loop {
+            let windows_last = windows_queue.is_some()
+                && self
+                    .storage
+                    .job(id)
+                    .and_then(|job| job.windows_runner)
+                    .is_some_and(|runner| {
+                        runner.name == self.config.windows_runners.last().unwrap().name
+                    });
+            if let Some(queue) = &windows_queue {
+                if self.pending(id) {
+                    let terminal =
+                        TerminalRecord::new(id, Outcome::Cancelled, 0, 0, 0).with_ran(Ran::None);
+                    self.storage.local_terminal(terminal.clone())?;
+                    return emit(tx, StreamRecord::Terminal(terminal)).await;
+                }
+                if !first_attempt && tokio::time::Instant::now() >= queue.deadline {
+                    return self
+                        .refused(id, RefusalReason::QueueWaitExceeded, None, None, tx)
+                        .await;
+                }
+            }
+            first_attempt = false;
             if !self
-                .run_snapshot(
+                .run_snapshot_for_caller(
                     id,
                     (request.clone(), returns.clone()),
                     env_not_forwarded.clone(),
@@ -830,15 +889,60 @@ impl Motor {
                     snapshots.clone(),
                     tx,
                     wake.clone(),
+                    &caller,
+                    &mut windows_queue,
                 )
                 .await
                 .inspect_err(|error| self.log_hosted_failure(id, "run_snapshot", error))?
             {
                 return Ok(());
             }
+            if let Some(queue) = &mut windows_queue {
+                let current = self
+                    .storage
+                    .job(id)
+                    .and_then(|job| job.windows_runner)
+                    .unwrap();
+                let index = self
+                    .config
+                    .windows_runners
+                    .iter()
+                    .position(|runner| runner.name == current.name)
+                    .unwrap();
+                let next =
+                    &self.config.windows_runners[(index + 1) % self.config.windows_runners.len()];
+                // Runners retain refusals by destination ID. A proven
+                // before-start retry needs a new ID, durably mapped with its
+                // endpoint before another Run can be sent.
+                self.storage.bind_windows_retry(
+                    id,
+                    next.clone(),
+                    queue.run_sent.then(Uuid::now_v7),
+                    u64::try_from(
+                        queue
+                            .deadline
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .as_millis()
+                            .div_ceil(1000),
+                    )
+                    .unwrap_or(u64::MAX),
+                )?;
+                queue.run_sent = false;
+                if windows_last {
+                    // All configured Windows runners share one queue-wait
+                    // budget. After trying the last runner, revisit earlier
+                    // busy runners instead of failing while capacity can free up.
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(queue.deadline.min(tokio::time::Instant::now() + queue.retry_delay)) => {},
+                        _ = tx.closed() => return Err(io::Error::other("caller detached")),
+                    }
+                    queue.retry_delay = Duration::from_secs(5);
+                }
+            }
         }
     }
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     async fn run_snapshot(
         &self,
         id: Uuid,
@@ -849,6 +953,34 @@ impl Motor {
         snapshots: Arc<Snapshots>,
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
         wake: watch::Receiver<bool>,
+    ) -> io::Result<bool> {
+        self.run_snapshot_for_caller(
+            id,
+            submission,
+            env_not_forwarded,
+            wait,
+            spill,
+            snapshots,
+            tx,
+            wake,
+            "direct",
+            &mut None,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn run_snapshot_for_caller(
+        &self,
+        id: Uuid,
+        submission: (RunRequest, crate::ReturnOptions),
+        env_not_forwarded: Vec<String>,
+        wait: u64,
+        spill: bool,
+        snapshots: Arc<Snapshots>,
+        tx: &mpsc::Sender<io::Result<StreamRecord>>,
+        wake: watch::Receiver<bool>,
+        caller: &str,
+        windows_queue: &mut Option<WindowsQueue>,
     ) -> io::Result<bool> {
         let (mut request, mut returns) = submission;
         // Routing back to the build server can change the stored queue budget.
@@ -866,14 +998,26 @@ impl Motor {
         let macos = request.platform == Some(Platform::Macos);
         let build_server_id = self.build_server_id(id);
         // A resubmitted spill gets one spill attempt only.
-        let resubmitted = self
-            .storage
-            .job(id)
-            .is_some_and(|j| j.build_server_job_id.is_some());
+        let resubmitted = !windows
+            && self
+                .storage
+                .job(id)
+                .is_some_and(|j| j.build_server_job_id.is_some());
         let spilled = self
             .hosted_state(id)
             .is_some_and(|route| route.spill_wait_ms.is_some());
         let spill_after = (spill && !hosted && !resubmitted).then_some(self.config.spill_after_s);
+        let wait = windows_queue.as_ref().map_or(wait, |queue| {
+            u64::try_from(
+                queue
+                    .deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_millis()
+                    .div_ceil(1000),
+            )
+            .unwrap_or(u64::MAX)
+            .min(wait)
+        });
         let wire_wait = spill_after.map_or(wait, |after| wait.min(after));
         let connector = if hosted {
             None
@@ -907,7 +1051,6 @@ impl Motor {
                 match self.windows_slots[index].clone().try_acquire_owned() {
                     Ok(permit) => Some(permit),
                     Err(_) => {
-                        self.next_windows_runner(id)?;
                         return Ok(true);
                     }
                 }
@@ -919,7 +1062,10 @@ impl Motor {
         let (mut channel, held) = loop {
             let opened = if let Some(state) = self.hosted_state(id) {
                 let client = self.hosted_client(state);
-                match client.run(id, &request, &self.storage).await {
+                match client
+                    .run_for_caller(id, &request, &self.storage, caller)
+                    .await
+                {
                     Err(crate::hosted::Error::Shutdown) => {
                         return Err(io::Error::other("hosted booking stopped during shutdown"));
                     }
@@ -995,7 +1141,17 @@ impl Motor {
                                     .hosted_state(id)
                                     .is_some_and(|s| s.capacity_routed() && !s.run_sent) =>
                             {
-                                return self.follow_inner(id, 0, None, tx, wake, spill_after).await
+                                return self
+                                    .follow_attempt(
+                                        id,
+                                        0,
+                                        None,
+                                        tx,
+                                        wake,
+                                        spill_after,
+                                        windows_queue.as_mut(),
+                                    )
+                                    .await
                             }
                             crate::hosted::Error::SandboxLost
                                 if !self
@@ -1072,7 +1228,13 @@ impl Motor {
             let mut channel = match opened {
                 Ok(c) => c,
                 Err((reason, detail, retry_after_ms)) => {
-                    if explicit_windows && self.next_windows_runner(id)? {
+                    if explicit_windows
+                        && (self.has_next_windows_runner(id)
+                            || matches!(
+                                reason,
+                                RefusalReason::Unreachable | RefusalReason::RunnerFull
+                            ))
+                    {
                         return Ok(true);
                     }
                     return self
@@ -1161,7 +1323,7 @@ impl Motor {
                     .iter()
                     .any(|platform| platform == required_platform)
             {
-                if explicit_windows && self.next_windows_runner(id)? {
+                if explicit_windows && self.has_next_windows_runner(id) {
                     return Ok(true);
                 }
                 if self
@@ -1224,7 +1386,7 @@ impl Motor {
                     continue;
                 }
                 Err(_) => {
-                    if explicit_windows && self.next_windows_runner(id)? {
+                    if explicit_windows {
                         return Ok(true);
                     }
                     return self
@@ -1346,7 +1508,8 @@ impl Motor {
             return Err(io::Error::other("job already terminal before Run"));
         }
         // From this point on even a failed write might have reached the runner.
-        // Never resubmit or invent a before-start outcome after attempting run.
+        // Resubmission now requires a definitive before-start refusal; a lost
+        // connection cannot prove that the command never ran.
         // The hosted route records that durably first: it is what stops a
         // spilled job from returning to the build server once it may have run.
         // A hosted Run is also fenced against shutdown, so the shutdown
@@ -1364,6 +1527,9 @@ impl Motor {
             .run_sent(id, hosted)
             .inspect_err(|error| self.log_hosted_failure(id, "persist_run", error))?;
         drop(_booking_open);
+        if let Some(queue) = windows_queue {
+            queue.run_sent = true;
+        }
         if let Err(error) = channel.send(Frame::Run(run)).await {
             self.log_hosted_failure(id, "run_send", &error);
             drop(channel);
@@ -1374,7 +1540,9 @@ impl Motor {
             {
                 return Ok(true);
             }
-            return self.follow_inner(id, 0, None, tx, wake, spill_after).await;
+            return self
+                .follow_attempt(id, 0, None, tx, wake, spill_after, windows_queue.as_mut())
+                .await;
         }
         if hosted {
             tracing::info!(job_id = %id, step = "run_send", cause = "Run frame written; awaiting admission", "hosted Run sent");
@@ -1431,28 +1599,45 @@ impl Motor {
                 // The caller already holds this job's acceptance from its first
                 // build-server submission. Neither a spill to a hosted runner
                 // nor a resubmission is a second job.
-                if !resubmitted && !spilled {
+                if !resubmitted
+                    && !spilled
+                    && !windows_queue.as_ref().is_some_and(|queue| queue.accepted)
+                {
                     emit(tx, StreamRecord::Accepted(accepted))
                         .await
                         .inspect_err(|error| {
                             self.log_hosted_failure(id, "accepted_delivery", error)
                         })?;
+                    if let Some(queue) = windows_queue.as_mut() {
+                        queue.accepted = true;
+                    }
                 }
                 if wrong_platform {
                     drop(channel);
                     drop(snapshots);
-                    return self.follow_inner(id, 0, None, tx, wake, spill_after).await;
+                    return self
+                        .follow_attempt(id, 0, None, tx, wake, spill_after, windows_queue.as_mut())
+                        .await;
                 }
             }
             Ok(Incoming::Frame(Frame::Refusal(refusal))) => {
                 log_refusal(id, &refusal);
                 let (reason, detail) = runner_refusal_fields(&refusal);
                 // A positive refusal proves this Run did not start. A lost
-                // acknowledgement or any Accepted response never permits a move.
+                // acknowledgement or an Accepted response alone cannot permit a move.
                 if explicit_windows
-                    && reason == RefusalReason::RunnerFull
-                    && self.next_windows_runner(id)?
+                    && !self.pending(id)
+                    && ((reason == RefusalReason::RunnerFull && self.has_next_windows_runner(id))
+                        || (matches!(
+                            reason,
+                            RefusalReason::RunnerFull | RefusalReason::WorkspaceSetupFailed
+                        ) && windows_slot_busy(detail.as_deref())))
                 {
+                    if let Some(queue) = windows_queue.as_mut() {
+                        queue.retry_delay = queue
+                            .retry_delay
+                            .max(Duration::from_millis(refusal.retry_after_ms.unwrap_or(0)));
+                    }
                     return Ok(true);
                 }
                 if hosted {
@@ -1500,7 +1685,9 @@ impl Motor {
                 {
                     return Ok(true);
                 }
-                return self.follow_inner(id, 0, None, tx, wake, spill_after).await;
+                return self
+                    .follow_attempt(id, 0, None, tx, wake, spill_after, windows_queue.as_mut())
+                    .await;
             }
         };
         let uploaded = self.upload(&channel, &snapshots, &upload, Some(id)).await;
@@ -1512,15 +1699,25 @@ impl Motor {
         }
         if uploaded.is_err() {
             drop(channel);
-            return self.follow_inner(id, 0, None, tx, wake, spill_after).await;
+            return self
+                .follow_attempt(id, 0, None, tx, wake, spill_after, windows_queue.as_mut())
+                .await;
         }
         // The first build-server submission can still spill while queued. A
         // hosted or resubmitted Run cannot move again once its upload completes.
         if hosted || resubmitted {
             self.submission_ready(id);
         }
-        self.follow_inner(id, 0, Some(channel), tx, wake, spill_after)
-            .await
+        self.follow_attempt(
+            id,
+            0,
+            Some(channel),
+            tx,
+            wake,
+            spill_after,
+            windows_queue.as_mut(),
+        )
+        .await
     }
     async fn have(
         &self,
@@ -1719,7 +1916,7 @@ impl Motor {
         Some(bounded_detail(detail + separator + &note))
     }
     /// Resolve the runner ID for the common frame/record translation used by
-    /// bounced spills and fresh hosted bookings alike.
+    /// bounced spills, Windows retries and fresh hosted bookings alike.
     fn build_server_id(&self, id: Uuid) -> Uuid {
         self.storage.runner_id(id)
     }
@@ -1994,11 +2191,25 @@ impl Motor {
     async fn follow_inner(
         &self,
         id: Uuid,
+        cursor: u64,
+        channel: Option<Channel>,
+        tx: &mpsc::Sender<io::Result<StreamRecord>>,
+        wake: watch::Receiver<bool>,
+        spill_after: Option<u64>,
+    ) -> io::Result<bool> {
+        self.follow_attempt(id, cursor, channel, tx, wake, spill_after, None)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn follow_attempt(
+        &self,
+        id: Uuid,
         mut cursor: u64,
         mut channel: Option<Channel>,
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
         mut wake: watch::Receiver<bool>,
         spill_after: Option<u64>,
+        mut windows_queue: Option<&mut WindowsQueue>,
     ) -> io::Result<bool> {
         let hosted = self.hosted_state(id).is_some();
         // Frames to and from the build server carry its ID for the job; records
@@ -2194,6 +2405,7 @@ impl Motor {
                     started_at_ms,
                     path_mapping,
                 })) if job_id == build_server_id => {
+                    windows_queue = None;
                     self.submission_ready(id);
                     if let Some(watch) = spill_watch.as_mut() {
                         watch.started();
@@ -2209,6 +2421,7 @@ impl Motor {
                     backoff = 1;
                 }
                 Ok(Incoming::Frame(Frame::Output(output))) => {
+                    windows_queue = None;
                     self.submission_ready(id);
                     if let Some(watch) = spill_watch.as_mut() {
                         watch.started();
@@ -2275,6 +2488,20 @@ impl Motor {
                         ));
                     }
                     terminal.job_id = id;
+                    if terminal.ran == Some(Ran::None)
+                        && matches!(&terminal.outcome, Outcome::RefusedBeforeStart { reason }
+                            if *reason == RefusalReason::Unreachable
+                                || (matches!(reason, RefusalReason::RunnerFull | RefusalReason::WorkspaceSetupFailed)
+                                    && windows_slot_busy(terminal.refusal_detail.as_deref())))
+                        && !self.pending(id)
+                    {
+                        if let Some(queue) = windows_queue.as_mut() {
+                            queue.retry_delay = queue
+                                .retry_delay
+                                .max(Duration::from_millis(terminal.retry_after_ms.unwrap_or(0)));
+                            return Ok(true);
+                        }
+                    }
                     // A retry is safe only when the runner proves the command never started.
                     if !matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }) {
                         terminal.retry_after_ms = None;
@@ -2830,9 +3057,9 @@ impl Motor {
             .stored_target(job.as_ref().and_then(|j| j.runner_instance.as_deref()))?;
         Ok(self.connector_for_target(target))
     }
-    fn next_windows_runner(&self, id: Uuid) -> io::Result<bool> {
+    fn has_next_windows_runner(&self, id: Uuid) -> bool {
         let Some(current) = self.storage.job(id).and_then(|j| j.windows_runner) else {
-            return Ok(false);
+            return false;
         };
         let next = self
             .config
@@ -2840,16 +3067,20 @@ impl Motor {
             .iter()
             .position(|r| r.name == current.name)
             .and_then(|index| self.config.windows_runners.get(index + 1));
-        if let Some(next) = next {
-            self.storage.bind_windows(id, next.clone())?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        next.is_some()
     }
 }
 
 pub(crate) const WINDOWS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn windows_slot_busy(detail: Option<&str>) -> bool {
+    detail.is_some_and(|detail| {
+        detail == "windows_slot_busy"
+            || detail.starts_with("windows_slot_busy:")
+            || detail.ends_with(": windows_slot_busy")
+            || detail.contains(": windows_slot_busy:")
+    })
+}
 
 fn windows_busy(status: &RunnerStatusReply, max_concurrent: usize) -> bool {
     status

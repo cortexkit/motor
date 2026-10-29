@@ -9,20 +9,22 @@ impl Motor {
     /// returns, `cwd` is the request's working directory: it is stored with
     /// the job so the agent route can forward the runner's return result with
     /// cwd-relative paths, including after a restart or a reattach.
+    #[cfg(test)]
     pub(crate) fn run_agent(
         &self,
         request: RunRequest,
         attribution: Option<JobAttribution>,
         returns: Option<crate::agent_route::ReturnRequest>,
     ) -> io::Result<JobStream> {
-        self.run_agent_recorded(request, attribution, returns, None)
+        self.run_agent_recorded(request, attribution, returns, None, "reserved:aft")
     }
-    pub(super) fn run_agent_recorded(
+    pub(crate) fn run_agent_recorded(
         &self,
         request: RunRequest,
         attribution: Option<JobAttribution>,
         returns: Option<crate::agent_route::ReturnRequest>,
         key: Option<super::submission_key::KeyRecord>,
+        caller: &str,
     ) -> io::Result<JobStream> {
         let Some(crate::agent_route::ReturnRequest {
             options,
@@ -37,7 +39,7 @@ impl Motor {
                 false,
                 false,
                 crate::ReturnOptions::default(),
-                key,
+                (key, caller.into()),
             );
         };
         let stream = self.run_classified_keyed(
@@ -47,7 +49,7 @@ impl Motor {
             false,
             false,
             options,
-            key,
+            (key, caller.into()),
         )?;
         if let Some(requested) = requested {
             self.storage.return_requested(stream.job_id, requested)?;

@@ -968,11 +968,21 @@ impl Client {
                 failure.error
             })
     }
+    #[cfg(test)]
     pub(crate) async fn run(
         &self,
         id: Uuid,
         request: &RunRequest,
         storage: &Arc<Storage>,
+    ) -> Result<(Channel, Lease), Error> {
+        self.run_for_caller(id, request, storage, "direct").await
+    }
+    pub(crate) async fn run_for_caller(
+        &self,
+        id: Uuid,
+        request: &RunRequest,
+        storage: &Arc<Storage>,
+        caller: &str,
     ) -> Result<(Channel, Lease), Error> {
         let job = storage.job(id).ok_or(Error::Broker)?;
         let provisioning_deadline =
@@ -1093,6 +1103,7 @@ impl Client {
                     .map_err(|_| Error::Broker)?;
             }
             tracing::info!(job_id = %id, attempt, vcpus = body.vcpus, platform = %body.platform,
+                caller, repo = %Path::new(&request.repository_root).file_name().unwrap_or_default().to_string_lossy(),
                 spilled, "hosted lease requested");
             let mut lease: Lease = match self
                 .post_ready_authorized(

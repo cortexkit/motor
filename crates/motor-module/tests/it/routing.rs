@@ -48,6 +48,7 @@ struct RoutingPeer {
     queued: Arc<tokio::sync::Notify>,
     queue_release: Arc<tokio::sync::Semaphore>,
     endpoints: Mutex<Vec<crate::WindowsRunner>>,
+    refused: Arc<Mutex<std::collections::HashMap<Uuid, TerminalRecord>>>,
 }
 
 impl RoutingPeer {
@@ -73,6 +74,7 @@ impl RoutingPeer {
             queued: Arc::new(tokio::sync::Notify::new()),
             queue_release: Arc::new(tokio::sync::Semaphore::new(0)),
             endpoints: Mutex::new(Vec::new()),
+            refused: Arc::default(),
         })
     }
     fn motor(self: &Arc<Self>, config: Config) -> Motor {
@@ -161,11 +163,12 @@ impl Connector for RoutingPeer {
         let fail_cancel = self.fail_cancel_once.clone();
         let queued = self.queued.clone();
         let queue_release = self.queue_release.clone();
+        let refused = self.refused.clone();
         Box::pin(async move {
             if behavior == 1 {
                 return std::future::pending().await;
             }
-            if offline {
+            if offline || behavior == 12 {
                 return Err(io::Error::other("windows peer offline"));
             }
             let (client, mut peer) = tokio::io::duplex(65536);
@@ -208,13 +211,22 @@ impl Connector for RoutingPeer {
                         }
                         Frame::Run(run) => {
                             let stored = crate::storage::durable_value(&module_state).unwrap();
+                            let binding = stored["jobs"]
+                                .as_object()
+                                .unwrap()
+                                .iter()
+                                .find(|(caller, job)| {
+                                    *caller == &id.to_string()
+                                        || job["build_server_job_id"] == id.to_string()
+                                })
+                                .unwrap()
+                                .1;
                             assert_eq!(
-                                stored["jobs"][id.to_string()]["runner_instance"],
-                                instance,
+                                binding["runner_instance"], instance,
                                 "binding must be durable before Run"
                             );
                             assert_eq!(run.platform, windows.then_some(Platform::Windows));
-                            if behavior == 2 {
+                            if matches!(behavior, 2 | 13) {
                                 let _ = write_frame_async(
                                     &mut peer,
                                     &Frame::Refusal(Refusal {
@@ -223,7 +235,14 @@ impl Connector for RoutingPeer {
                                         reason: RefusalReason::RunnerFull,
                                         disk_full: None,
                                         retry_after_ms: None,
-                                        detail: Some("windows_slot_busy".into()),
+                                        detail: Some(
+                                            if behavior == 2 {
+                                                "windows_slot_busy"
+                                            } else {
+                                                "job exceeds runner capacity"
+                                            }
+                                            .into(),
+                                        ),
                                     }),
                                 )
                                 .await;
@@ -251,6 +270,46 @@ impl Connector for RoutingPeer {
                             return;
                         }
                         Frame::Attach(request) => {
+                            let retained = refused.lock().unwrap().get(&id).cloned();
+                            if let Some(terminal) = retained {
+                                let _ =
+                                    write_frame_async(&mut peer, &Frame::Terminal(terminal)).await;
+                                return;
+                            }
+                            if matches!(behavior, 8..=11 | 14..=16) {
+                                let mut terminal = TerminalRecord::new(id, Outcome::RefusedBeforeStart {
+                                    reason: if behavior == 8 { RefusalReason::WorkspaceSetupFailed }
+                                        else if behavior == 14 { RefusalReason::Unreachable }
+                                        else { RefusalReason::RunnerFull },
+                                }, 0, 0, 0).with_ran(match behavior {
+                                    10 => Ran::Unknown("maybe".into()),
+                                    11 => Ran::Remote,
+                                    _ => Ran::None,
+                                }).with_refusal_detail(if behavior == 8 {
+                                    format!(r"prepare job staging C:\ProgramData\MotorRunner\staging\{id}: windows_slot_busy")
+                                } else { format!("windows_slot_busy: held by {id} since earlier") });
+                                terminal.retry_after_ms = Some(6_000);
+                                if behavior == 15 {
+                                    terminal.ran = None;
+                                }
+                                if behavior == 16 {
+                                    let _ = write_frame_async(
+                                        &mut peer,
+                                        &Frame::Started {
+                                            job_id: id,
+                                            seq: 0,
+                                            queue_wait_ms: 0,
+                                            started_at_ms: 1,
+                                            path_mapping: None,
+                                        },
+                                    )
+                                    .await;
+                                }
+                                refused.lock().unwrap().insert(id, terminal.clone());
+                                let _ =
+                                    write_frame_async(&mut peer, &Frame::Terminal(terminal)).await;
+                                return;
+                            }
                             if behavior == 7 {
                                 let _ = write_frame_async(
                                     &mut peer,
@@ -562,7 +621,7 @@ async fn ordered_windows_last_runner_admission_full_still_refuses() {
     let f = Fixture::new(Cut::None, 28).await;
     let peer = RoutingPeer::new(&f);
     peer.ally_behavior.store(5, Ordering::SeqCst);
-    peer.last_behavior.store(2, Ordering::SeqCst);
+    peer.last_behavior.store(13, Ordering::SeqCst);
     let motor = peer.motor(ordered(f.config.clone()));
     let records = collect(
         motor
@@ -615,6 +674,270 @@ async fn ordered_windows_busy_refusal_resubmits_but_lost_ack_and_started_never_m
             usize::from(behavior != 3)
         );
     }
+}
+
+#[tokio::test]
+async fn ordered_windows_busy_slot_terminal_falls_through_for_old_and_new_reasons() {
+    for behavior in [8, 9] {
+        let f = Fixture::new(Cut::None, 28).await;
+        let peer = RoutingPeer::new(&f);
+        peer.ally_behavior.store(behavior, Ordering::SeqCst);
+        let motor = peer.motor(ordered(f.config.clone()));
+        let stream = motor
+            .run(f.request("true").with_platform(Platform::Windows))
+            .unwrap();
+        let id = stream.job_id;
+        let records = collect(stream).await;
+        let visits = peer.visits.lock().unwrap();
+        assert!(
+            visits.iter().any(|v| v.instance == "windows"),
+            "busy-slot refusal must try the next runner: {visits:?}"
+        );
+        let mapped = crate::storage::durable_value(&peer.module_state).unwrap()["jobs"]
+            [id.to_string()]["build_server_job_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(mapped, id.to_string());
+        assert!(visits
+            .iter()
+            .filter(|v| v.instance == "windows")
+            .all(|v| v.id.to_string() == mapped));
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| matches!(r, StreamRecord::Accepted(_)))
+                .count(),
+            1
+        );
+        assert!(matches!(records.last(), Some(StreamRecord::Terminal(t)) if t.job_id == id));
+    }
+}
+
+#[tokio::test]
+async fn ordered_windows_zero_queue_budget_can_start_on_a_free_runner() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    let motor = peer.motor(ordered(f.config.clone()));
+    let mut request = f.request("true").with_platform(Platform::Windows);
+    request.queue_wait_limit_s = Some(0);
+    let records = collect(motor.run(request).unwrap()).await;
+    assert!(records
+        .iter()
+        .any(|record| matches!(record, StreamRecord::Accepted(_))));
+}
+
+#[tokio::test]
+async fn ordered_windows_busy_slot_without_proof_of_no_run_never_moves() {
+    for behavior in [10, 11, 15, 16] {
+        let f = Fixture::new(Cut::None, 28).await;
+        let peer = RoutingPeer::new(&f);
+        peer.ally_behavior.store(behavior, Ordering::SeqCst);
+        let motor = peer.motor(ordered(f.config.clone()));
+        let records = collect(
+            motor
+                .run(f.request("true").with_platform(Platform::Windows))
+                .unwrap(),
+        )
+        .await;
+        assert!(matches!(records.last(), Some(StreamRecord::Terminal(_))));
+        assert!(peer
+            .visits
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|v| v.instance == "ally-windows"));
+    }
+}
+
+#[tokio::test]
+async fn ordered_windows_last_busy_slot_refusal_queues_with_fresh_ids_and_remaining_budget() {
+    for behavior in [2, 8, 9, 14] {
+        let f = Fixture::new(Cut::None, 28).await;
+        let peer = RoutingPeer::new(&f);
+        peer.ally_behavior.store(5, Ordering::SeqCst);
+        peer.last_behavior.store(behavior, Ordering::SeqCst);
+        let motor = peer.motor(ordered(f.config.clone()));
+        let mut request = f.request("true").with_platform(Platform::Windows);
+        request.queue_wait_limit_s = Some(30);
+        let mut stream = motor.run(request).unwrap();
+        wait_for_windows_runs(&peer, 1).await;
+        if behavior != 2 {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while peer.refused.lock().unwrap().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        peer.last_behavior.store(7, Ordering::SeqCst);
+        wait_for_windows_runs(&peer, 2).await;
+        {
+            let frames = peer.frames.lock().unwrap();
+            let runs: Vec<_> = frames
+                .iter()
+                .filter_map(|frame| {
+                    if let Frame::Run(run) = frame {
+                        Some(run)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_ne!(
+                runs[0].job_id, runs[1].job_id,
+                "a retained refusal must never be replayed"
+            );
+            assert!(
+                runs[1].queue_wait_limit_s <= 25,
+                "the retry must spend the original budget"
+            );
+            assert!(runs[1].queue_wait_limit_s > 0);
+            let visits = peer.visits.lock().unwrap();
+            let first = visits
+                .iter()
+                .find(|visit| visit.id == runs[0].job_id && visit.instance == "windows")
+                .unwrap();
+            let retry = visits
+                .iter()
+                .find(|visit| visit.id == runs[1].job_id && visit.instance == "windows")
+                .unwrap();
+            let delay = if behavior == 2 { 5 } else { 6 };
+            assert!(retry.at.duration_since(first.at) >= Duration::from_secs(delay));
+        }
+        peer.queued.notified().await;
+        assert!(matches!(
+            stream.records.recv().await.unwrap().unwrap(),
+            StreamRecord::Accepted(_)
+        ));
+        peer.queue_release.add_permits(1);
+        assert_windows_queue_completes(stream).await;
+    }
+}
+
+async fn wait_for_windows_runs(peer: &RoutingPeer, count: usize) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if peer
+                .frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|frame| matches!(frame, Frame::Run(_)))
+                .count()
+                >= count
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Windows attempt should reach a runner within its retry budget");
+}
+
+#[tokio::test]
+async fn ordered_windows_last_unreachable_revisits_busy_earlier_runner() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    peer.ally_behavior.store(5, Ordering::SeqCst);
+    peer.last_behavior.store(12, Ordering::SeqCst);
+    let motor = peer.motor(ordered(f.config.clone()));
+    let stream = motor
+        .run(f.request("true").with_platform(Platform::Windows))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if peer
+                .visits
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|v| v.instance == "windows")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    peer.ally_behavior.store(0, Ordering::SeqCst);
+    let records = collect(stream).await;
+    assert!(matches!(records.last(), Some(StreamRecord::Terminal(_))));
+    let visits = peer.visits.lock().unwrap();
+    let offline = visits
+        .iter()
+        .rposition(|v| v.instance == "windows")
+        .unwrap();
+    assert!(visits[offline + 1..]
+        .iter()
+        .all(|v| v.instance == "ally-windows"));
+    assert!(visits[offline + 1].at.duration_since(visits[offline].at) >= Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn ordered_windows_retry_exhausts_budget_instead_of_refusing_unreachable() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    peer.ally_behavior.store(5, Ordering::SeqCst);
+    peer.last_behavior.store(12, Ordering::SeqCst);
+    let motor = peer.motor(ordered(f.config.clone()));
+    let mut request = f.request("true").with_platform(Platform::Windows);
+    request.queue_wait_limit_s = Some(1);
+    let records = collect(motor.run(request).unwrap()).await;
+    assert!(
+        matches!(records.last(), Some(StreamRecord::Terminal(t)) if t.outcome == Outcome::RefusedBeforeStart { reason: RefusalReason::QueueWaitExceeded } && t.ran == Some(Ran::None))
+    );
+}
+
+#[tokio::test]
+async fn ordered_windows_restart_attaches_to_latest_retry_destination() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    peer.ally_behavior.store(9, Ordering::SeqCst);
+    peer.last_behavior.store(7, Ordering::SeqCst);
+    let config = ordered(f.config.clone());
+    let motor = peer.motor(config.clone());
+    let mut stream = motor
+        .run(f.request("true").with_platform(Platform::Windows))
+        .unwrap();
+    assert_windows_queued(&peer, &mut stream).await;
+    let id = stream.job_id;
+    let stored = crate::storage::durable_value(&peer.module_state).unwrap();
+    let latest: Uuid = stored["jobs"][id.to_string()]["build_server_job_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_ne!(latest, id);
+    drop(stream);
+    peer.queue_release.add_permits(1);
+    motor.close().await;
+    peer.visits.lock().unwrap().clear();
+    let motor = peer.motor(config);
+    let stream = motor.attach(AttachRequest::new(id, 0)).unwrap();
+    peer.queued.notified().await;
+    motor.cancel(CancelRequest::new(id)).await.unwrap();
+    peer.queue_release.add_permits(1);
+    let records = collect(stream).await;
+    assert!(matches!(records.last(), Some(StreamRecord::Terminal(t)) if t.job_id == id));
+    assert!(peer
+        .visits
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|v| v.instance == "windows" && v.id == latest));
+    assert_eq!(
+        peer.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|frame| matches!(frame, Frame::Run(_)))
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]

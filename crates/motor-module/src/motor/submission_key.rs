@@ -54,7 +54,7 @@ impl Motor {
                         .refuse_before_start(RefusalReason::RequestRejected, Some(detail.into()))
                 }
             };
-            return self.run_agent(request, attribution, returns);
+            return self.run_agent_recorded(request, attribution, returns, None, principal);
         };
         let cursor = request.resume_from_seq;
         let digest = digest(&request)?;
@@ -92,7 +92,13 @@ impl Motor {
                 };
                 request.submission_key = None;
                 request.resume_from_seq = None;
-                return self.run_agent_recorded(request, attribution, returns, Some(record));
+                return self.run_agent_recorded(
+                    request,
+                    attribution,
+                    returns,
+                    Some(record),
+                    principal,
+                );
             }
         };
         let (id, job) = known.unwrap();

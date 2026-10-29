@@ -2017,6 +2017,71 @@ async fn spilled_success_logs_placed_once() {
     assert!(placed[0].contains(&format!("job_id={id}")), "{text}");
 }
 
+#[tokio::test]
+async fn hosted_lease_log_names_caller_and_only_repository_folder() {
+    use crate::hosted::tests::harness::{Behavior, Harness};
+    for caller in ["direct", "reserved:aft"] {
+        for keyed in [false, true] {
+            if caller == "direct" && keyed {
+                continue;
+            }
+            let hosted = Harness::new(Behavior::CompleteRun).await;
+            let (scratch, repo) = crate::hosted::boat_tests::committed_repo();
+            let motor = Motor::with_connector(
+                Config {
+                    hosted_runners: true,
+                    ..hosted.config()
+                },
+                &scratch.0.join("state"),
+                Arc::new(ResubmitPeer::new()),
+            )
+            .unwrap();
+            let captured = crate::logging::Captured::default();
+            let _log = crate::logging::scoped(captured.clone());
+            let root = repo.to_str().unwrap();
+            let mut request = RunRequest::new(root, root, root, "exit 23").with_timeout(30);
+            let stream = if caller == "direct" {
+                motor
+                    .run_direct_hosted(request, None, crate::ReturnOptions::default())
+                    .unwrap()
+            } else {
+                if keyed {
+                    request.submission_key = Some("source-log-key-0001".into());
+                }
+                motor.submit_agent(request, None, caller).await.unwrap()
+            };
+            let id = stream.job_id;
+            let mut records = stream.records;
+            while let Some(record) = records.recv().await {
+                if let StreamRecord::Terminal(terminal) = record.unwrap() {
+                    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+                    break;
+                }
+            }
+            let text = captured.text();
+            let requested: Vec<_> = text
+                .lines()
+                .filter(|line| line.contains("hosted lease requested"))
+                .collect();
+            assert_eq!(requested.len(), 1, "{text}");
+            let line = requested[0];
+            for field in [
+                format!("job_id={id}"),
+                format!("caller={caller}"),
+                "repo=repo".into(),
+                "vcpus=".into(),
+                "platform=".into(),
+            ] {
+                assert!(line.contains(&field), "missing {field}: {line}");
+            }
+            assert!(
+                !line.contains(root) && !line.contains("source-log-key") && !line.contains("eyJ"),
+                "{line}"
+            );
+        }
+    }
+}
+
 fn boat_paths(boat: &crate::hosted::boat_tests::Boat) -> Vec<String> {
     boat.requests
         .lock()

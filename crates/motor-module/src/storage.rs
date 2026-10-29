@@ -92,6 +92,8 @@ pub(crate) struct Job {
     /// keeps the withdrawn first submission as a tombstone under the caller's
     /// job ID and never admits that ID again, so the resubmission runs there
     /// under this ID. The caller keeps using its original job ID throughout.
+    /// Also names the destination of a Windows retry after a proven before-start
+    /// refusal: the refusing runner retains the old ID and would replay it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_server_job_id: Option<Uuid>,
     /// Why a job first routed to hosted runners by `hosted_repositories` was
@@ -482,7 +484,8 @@ impl Storage {
     }
     /// Resolve the destination ID without changing the caller's stored job.
     /// A bounced spill uses its build-server mapping; a hosted retry uses the
-    /// current lease body. Both share the same stream and record translation.
+    /// current lease body. Windows retries use the same mapping so status,
+    /// cancel and attach keep reaching the latest destination after a restart.
     pub(crate) fn runner_id(&self, id: Uuid) -> Uuid {
         self.job(id).map_or(id, |job| {
             job.build_server_job_id
@@ -757,6 +760,24 @@ impl Storage {
             let job = state.jobs.get_mut(&id).expect("job exists before binding");
             job.runner_instance = Some(runner.instance.clone());
             job.windows_runner = Some(runner);
+        })
+    }
+
+    pub(crate) fn bind_windows_retry(
+        &self,
+        id: Uuid,
+        runner: crate::WindowsRunner,
+        destination: Option<Uuid>,
+        remaining_s: u64,
+    ) -> io::Result<()> {
+        self.update(|state| {
+            let job = state.jobs.get_mut(&id).expect("job exists before retry");
+            job.runner_instance = Some(runner.instance.clone());
+            job.windows_runner = Some(runner);
+            if let Some(destination) = destination {
+                job.build_server_job_id = Some(destination);
+            }
+            job.queue_wait_limit_s = remaining_s;
         })
     }
 
