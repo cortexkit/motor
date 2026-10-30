@@ -916,7 +916,7 @@
     "crt": "14.44.17.14",
     "license_note": "xwin downloads Microsoft MSVC CRT and Windows SDK headers and libraries under the same Microsoft Build Tools/SDK terms accepted by the Windows job image's unattended installation. They are used privately to build our own software, never redistributed. Only our binaries ship; cargo-xwin's MIT licence does not relicense the Microsoft SDK. No latest-version fallback or host-global installation.",
     "manifest_note": "cargo-xwin 0.23.1 rejects minor 17.14 in --xwin-version despite its help text; component versions remain exact and the resolved manifest/cache content hashes are recorded.",
-    "package_manifest_sha256": "87791000b1d6357e174f039ce9c2f03d150d4e90b45e8e52468d797dac62022c",
+    "package_manifest_sha256": "963760b01f621ed4fa40d1cf97aeb042f7bc6e04e3176c13c38abb19d265f789",
     "prep_toolchain": {
       "cargo_exe_sha256": "c9b44417dc8228b81923a1068a3c09e32d2793f2cced2a816789cf433c1f0d46",
       "components": {
@@ -940,7 +940,7 @@
     "sdk_subdir": "xwin",
     "tools": "target/windows-cross/tools",
     "variant": "desktop",
-    "vs_channel_build": "17.14.37824.6",
+    "vs_channel_build": "17.14.37827.9",
     "vs_manifest": "17"
   }
 }
