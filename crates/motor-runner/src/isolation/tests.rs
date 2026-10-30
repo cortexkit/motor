@@ -2226,6 +2226,105 @@ fn sibling_lockfile_prefetch_populates_offline_registry_sources() {
 }
 
 #[test]
+fn sibling_git_dependency_survives_private_cargo_seed_offline() {
+    let f = Fixture::new();
+    cargo_package_fixture(&f.workspace, "main-probe", false);
+    commit_cargo_fixture(&f.workspace);
+    let dependency = f.scratch.join("git-dependency");
+    cargo_package_fixture(&dependency, "sibling-only", false);
+    commit_cargo_fixture(&dependency);
+    let oid = workspace::git(&dependency, &["rev-parse", "HEAD"]).unwrap();
+    let mirror = f.scratch.join("dependency.git");
+    workspace::git(
+        &dependency,
+        &[
+            "clone",
+            "--bare",
+            dependency.to_str().unwrap(),
+            mirror.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    let url = "https://github.com/cortexkit/commons";
+    let sibling = f.scratch.join("sibling");
+    cargo_package_fixture(&sibling, "sibling-probe", false);
+    fs::write(
+        sibling.join("Cargo.toml"),
+        format!("[package]\nname='sibling-probe'\nversion='0.2.0'\nedition='2021'\n[workspace]\n[dependencies]\nsibling-only={{git='{url}',rev='{oid}'}}\n"),
+    ).unwrap();
+    fs::write(
+        sibling.join("Cargo.lock"),
+        format!("version=4\n[[package]]\nname='sibling-probe'\nversion='0.2.0'\ndependencies=['sibling-only']\n[[package]]\nname='sibling-only'\nversion='0.2.0'\nsource='git+{url}?rev={oid}#{oid}'\n"),
+    ).unwrap();
+    commit_cargo_fixture(&sibling);
+    let siblings = [cargo_sibling_fixture(&sibling, "HEAD")];
+    let rustup = PathBuf::from(std::env::var_os("RUSTUP_HOME").unwrap());
+    let routes = BTreeMap::from([(url.to_owned(), mirror)]);
+    for tenant_vm in [false, true] {
+        let shared = f.scratch.join(format!("shared-cargo-{tenant_vm}"));
+        fs::create_dir(&shared).unwrap();
+        prefetch_cargo_dependencies(
+            false,
+            tenant_vm,
+            &f.state,
+            &f.workspace,
+            "HEAD",
+            &siblings,
+            &routes,
+            &shared,
+            &rustup,
+            None,
+        )
+        .unwrap();
+        let cargo = if tenant_vm {
+            let commits =
+                known_checkout_git_commits((&f.workspace).into(), "HEAD", &siblings, None).unwrap();
+            let private = f.scratch.join("private-cargo");
+            cargo_overlay::Plan::seed_for_test(&shared, &private, &commits).unwrap();
+            private
+        } else {
+            shared
+        };
+        // No rewrite is passed to the job: Cargo must find its own URL-derived
+        // database name and ready checkout in the cache made visible to it.
+        let result = Command::new("cargo")
+            .args(["metadata", "--locked", "--offline", "--format-version", "1"])
+            .current_dir(&sibling)
+            .env("CARGO_HOME", &cargo)
+            .env("RUSTUP_HOME", &rustup)
+            .env("CARGO_NET_OFFLINE", "true")
+            .env("GIT_CONFIG_COUNT", "0")
+            .env("RUSTC_WRAPPER", "")
+            .env("CARGO_BUILD_RUSTC_WRAPPER", "")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "sibling offline metadata (tenant_vm={tenant_vm}): {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let metadata: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert!(metadata["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|package| {
+                package["name"] == "sibling-only"
+                    && package["source"] == format!("git+{url}?rev={oid}#{oid}")
+            }));
+        let names: Vec<_> = fs::read_dir(cargo.join("git/db"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 1);
+        println!(
+            "tenant_vm={tenant_vm}: Cargo git database {}",
+            names[0].to_string_lossy()
+        );
+    }
+}
+
+#[test]
 fn sibling_cargo_prefetch_uses_resolved_snapshot_and_its_tree() {
     let f = Fixture::new();
     let caller = f.scratch.join("caller/sibling");

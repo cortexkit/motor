@@ -32,6 +32,16 @@ pub(super) struct Plan {
 }
 
 impl Plan {
+    // Exercise the private cache seed without mounting it or looking up the job account.
+    #[cfg(test)]
+    pub(in crate::isolation) fn seed_for_test(
+        shared: &Path,
+        private: &Path,
+        commits: &[String],
+    ) -> io::Result<()> {
+        seed::prepare(shared, private, commits)
+    }
+
     pub(super) fn prepare(
         runtime: &Path,
         shared: &Path,
