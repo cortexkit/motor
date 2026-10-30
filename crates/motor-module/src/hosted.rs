@@ -1114,6 +1114,9 @@ impl Client {
             }
             tracing::info!(job_id = %id, attempt, vcpus = body.vcpus, platform = %body.platform,
                 caller, repo = %Path::new(&request.repository_root).file_name().unwrap_or_default().to_string_lossy(),
+                // A prefix of the salted hash the broker already receives: enough to
+                // follow one workspace across hosts in the log, and reveals no path.
+                workspace = %body.workspace_key_hash.get(..8).unwrap_or_default(),
                 spilled, "hosted lease requested");
             let mut lease: Lease = match self
                 .post_ready_authorized(
