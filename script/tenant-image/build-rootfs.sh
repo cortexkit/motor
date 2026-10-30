@@ -11,11 +11,13 @@ done
 suite=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["debian_suite"])' "$out/versions.json")
 snapshot=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["debian_snapshot"])' "$out/versions.json")
 size=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rootfs_gib"])' "$out/versions.json")
+# debootstrap installs the base system only; install-guest.py installs the job
+# package contract (toolchain.json's apt_packages) with apt, which resolves the
+# virtual packages debootstrap can't.
 packages=$(python3 - "$out/versions.json" "$out/script/runner/toolchain.json" <<'PY'
 import json, sys
 base, manifest = (json.load(open(path)) for path in sys.argv[1:])
-print(",".join(sorted(set(base["packages"] + manifest["apt_packages"]["required"]
-                          + manifest["apt_packages"]["by_role"]["tenant"]
+print(",".join(sorted(set(base["packages"]
                           + manifest["tools"]["git"]["source"]["build_packages"]))))
 PY
 )

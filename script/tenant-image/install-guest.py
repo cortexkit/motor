@@ -85,6 +85,24 @@ def published_hash(url, filename):
     raise ValueError(f"no checksum for {filename} at {url}")
 
 
+def install_job_packages(pins, manifest):
+    """Installs the shared job package contract with apt inside the guest.
+
+    debootstrap installs only the base system: its resolver can't satisfy a
+    dependency that only a virtual package provides, and the GTK and WebKit
+    development packages jobs need depend on several. apt resolves those. Both
+    read the same pinned Debian snapshot, so a package gets the version
+    debootstrap would have picked; recommends stay out, as with debootstrap.
+    """
+    Path("/etc/apt/sources.list").write_text(
+        f"deb https://snapshot.debian.org/archive/debian/{pins['debian_snapshot']}/ {pins['debian_suite']} main\n")
+    Path("/etc/apt/apt.conf.d/99snapshot").write_text('Acquire::Check-Valid-Until "false";\n')
+    packages = sorted(set(manifest["apt_packages"]["required"] + manifest["apt_packages"]["by_role"]["tenant"]))
+    os.environ["DEBIAN_FRONTEND"] = "noninteractive"
+    run("apt-get", "update")
+    run("apt-get", "install", "-y", "--no-install-recommends", *packages)
+
+
 def install_tools(pins):
     # Use the same measured releases, target/component sets and installers as
     # Boat; tenant-only pins describe the OS and kernel, never a second toolchain.
@@ -405,6 +423,7 @@ def verify(pins):
 
 def main():
     pins = json.loads((BUILD / "versions.json").read_text())
+    install_job_packages(pins, json.loads((BUILD / "script/runner/toolchain.json").read_text()))
     install_tools(pins)
     configure(pins)
     verify(pins)

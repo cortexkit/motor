@@ -63,6 +63,21 @@ class ImageTests(unittest.TestCase):
                 guest.configure({})
         account.ensure.assert_called_once_with({'uid': 999, 'gid': 986}, guest.run)
 
+    def test_job_packages_are_installed_by_apt_from_the_pinned_snapshot(self):
+        manifest = json.loads((image.REPO / 'script/runner/toolchain.json').read_text())
+        pins = {'debian_snapshot': '20261016T000000Z', 'debian_suite': 'trixie'}
+        written = {}
+        with mock.patch.object(guest, 'run') as run, \
+                mock.patch.object(guest.Path, 'write_text', lambda path, text: written.__setitem__(str(path), text)), \
+                mock.patch.dict(guest.os.environ):
+            guest.install_job_packages(pins, manifest)
+        self.assertIn('snapshot.debian.org/archive/debian/20261016T000000Z/ trixie main', written['/etc/apt/sources.list'])
+        install = run.call_args_list[-1].args
+        self.assertEqual(install[:4], ('apt-get', 'install', '-y', '--no-install-recommends'))
+        expected = set(manifest['apt_packages']['required'] + manifest['apt_packages']['by_role']['tenant'])
+        self.assertEqual(set(install[4:]), expected)
+        self.assertIn('libwebkit2gtk-4.1-dev', install[4:])
+
     def test_default_build_output_uses_root_trusted_vm_bind_view(self):
         with mock.patch.object(sys, "argv", ["build.py", "build", "test-version", "--runner", "/runner", "--build-budget-gib", "1"]), mock.patch.object(image, "build") as build:
             image.main()
@@ -708,9 +723,12 @@ elif name in ("truncate", "mkfs.ext4"):
         debootstrap = next(call for call in calls if call[0] == 'debootstrap')
         included = next(arg.removeprefix('--include=') for arg in debootstrap if arg.startswith('--include=')).split(',')
         manifest = json.loads((image.REPO / 'script/runner/toolchain.json').read_text())
-        self.assertIn('openssh-server', included)
-        self.assertTrue(set(manifest['apt_packages']['required']).issubset(included))
-        self.assertTrue(set(manifest['apt_packages']['by_role']['tenant']).issubset(included))
+        pins = json.loads((HERE / 'versions.txt').read_text())
+        # debootstrap gets the base system only; the job packages go through
+        # apt in the guest (install_job_packages), which resolves virtual
+        # packages that debootstrap can't.
+        self.assertEqual(set(included), set(pins['packages'] + manifest['tools']['git']['source']['build_packages']))
+        self.assertNotIn('libwebkit2gtk-4.1-dev', included)
         chroot = next(call for call in calls if call[0] == "chroot")
         self.assertEqual(chroot[2:4], ["/usr/bin/env", "-i"])
         self.assertIn("RUSTC_WRAPPER=", chroot)
