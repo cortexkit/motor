@@ -54,23 +54,31 @@ pub(crate) fn identity(pid: i32) -> Option<ProcessIdentity> {
 /// Only signal a recorded process group if its leader still has the recorded
 /// kernel start time. A PID reused after a crash belongs to somebody else.
 #[cfg(target_os = "linux")]
-pub(crate) fn signal(process: ProcessIdentity, hard: bool) {
+pub(crate) fn signal(process: ProcessIdentity, hard: bool) -> io::Result<()> {
     if let Some(id) = process.unit {
-        crate::isolation::signal(id, hard);
-        return;
+        return crate::isolation::signal(id, hard);
     }
     if identity(process.pid).is_some_and(|p| p.start == process.start) {
         unsafe {
-            libc::kill(
+            if libc::kill(
                 -process.pid,
                 if hard { libc::SIGKILL } else { libc::SIGTERM },
-            );
+            ) != 0
+            {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+            }
         }
     }
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn signal(_process: ProcessIdentity, _hard: bool) {}
+pub(crate) fn signal(_process: ProcessIdentity, _hard: bool) -> io::Result<()> {
+    Ok(())
+}
 
 #[cfg(target_os = "linux")]
 pub(crate) fn launch(command: &str, cwd: &Path, env: &[(String, String)]) -> io::Result<Launch> {

@@ -1127,12 +1127,12 @@ impl Backend for HostBackend {
         if let Some(process) = job.process {
             #[cfg(test)]
             if let (Some(run), Some(unit)) = (&config.systemd_command, process.unit) {
-                let _ =
-                    crate::systemd::signal(&self.unit_name(config, unit), hard, |args| run(args));
-                return Ok(());
+                return crate::systemd::signal(&self.unit_name(config, unit), hard, |args| {
+                    run(args)
+                });
             }
             let _ = config;
-            platform::signal(process, hard);
+            platform::signal(process, hard)?;
         }
         Ok(())
     }

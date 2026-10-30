@@ -5489,40 +5489,40 @@ impl Runner {
                 drop(inner);
                 self.save(&updated)?;
                 tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel recorded");
-                let signalling = log.lock_signalling();
                 inner = self.core.inner.lock().unwrap();
                 inner.jobs.insert(id, updated);
-                if inner.finalizing.contains(&id) || inner.base_finishes.contains_key(&id) {
-                    tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel found job already finishing");
-                    return Ok(());
-                }
-                let job = inner.jobs[&id].clone();
-                // Query and stop the unit without the state lock: each is a
-                // systemctl process, slow on a loaded host, and every other
-                // job's admission and status reply waits for that lock.
-                // `signalling` keeps finalization from being claimed
-                // meanwhile, so an exited job being finalized is never
-                // signalled.
-                drop(inner);
-                let unit_exited =
-                    job.process.is_some() && self.unit_alive(job.process)? == Some(false);
-                if job.process.is_none() || unit_exited {
-                    tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel found unit already exited");
-                    drop(signalling);
-                    drop(write);
-                    return self.finish_unobserved_unit(
-                        id,
-                        "cancel recorded after unit exited",
-                        unit_exited,
-                    );
-                } else {
-                    tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel checked unit is alive");
-                    self.core.backend.cancel(&self.core.config, &job, false)?;
-                    tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel issued unit stop");
-                }
-            } else {
-                tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel already recorded; stop retries belong to the scheduler");
             }
+            // A previous stop may have failed even though its intent was saved.
+            // Every caller retry must reach the unit, not just acknowledge that
+            // intent again. Finalization still fences off further signalling.
+            drop(inner);
+            let signalling = log.lock_signalling();
+            inner = self.core.inner.lock().unwrap();
+            if inner.finalizing.contains(&id) || inner.base_finishes.contains_key(&id) {
+                tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel found job already finishing");
+                return Ok(());
+            }
+            let job = inner.jobs[&id].clone();
+            // systemctl can be slow; keep other jobs' admission and status
+            // independent of this query and stop.
+            drop(inner);
+            let unit_exited = job.process.is_some() && self.unit_alive(job.process)? == Some(false);
+            if job.process.is_none() || unit_exited {
+                tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel found unit already exited");
+                drop(signalling);
+                drop(write);
+                return self.finish_unobserved_unit(
+                    id,
+                    "cancel recorded after unit exited",
+                    unit_exited,
+                );
+            }
+            tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel checked unit is alive");
+            if let Err(error) = self.core.backend.cancel(&self.core.config, &job, false) {
+                tracing::warn!(job_id = %id, %error, "cancel stop failed; intent retained for scheduler retry");
+                return Err(error);
+            }
+            tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "cancel issued unit stop");
         } else {
             job.terminal_ended(Outcome::Cancelled, self.now());
             job.state = JobState::Tombstone;
@@ -6873,15 +6873,21 @@ impl Runner {
                 }
                 Ok(_) => {
                     let hard = now.saturating_sub(killed_at) >= 2000;
-                    if hard && attempts < 3 {
-                        self.core.backend.cancel(&self.core.config, &job, true)?;
-                        (
-                            attempts + 1,
-                            instant + Duration::from_millis(500 * (1 << (attempts + 1))),
-                        )
-                    } else if !hard && attempts == 0 {
-                        self.core.backend.cancel(&self.core.config, &job, false)?;
-                        (attempts, instant + Duration::from_secs(2))
+                    if (hard && attempts < 3) || (!hard && attempts == 0) {
+                        match self.core.backend.cancel(&self.core.config, &job, hard) {
+                            Ok(()) if hard => (
+                                attempts + 1,
+                                instant + Duration::from_millis(500 * (1 << (attempts + 1))),
+                            ),
+                            Ok(()) => (attempts, instant + Duration::from_secs(2)),
+                            Err(error) => {
+                                // A failed systemctl invocation did not stop
+                                // anything. Do not exhaust the bounded kill
+                                // budget on errors or stall other jobs' ticks.
+                                tracing::warn!(job_id = %id, %error, "cancel stop failed; retrying in two seconds");
+                                (attempts, instant + Duration::from_secs(2))
+                            }
+                        }
                     } else {
                         (attempts, instant + Duration::from_secs(5))
                     }

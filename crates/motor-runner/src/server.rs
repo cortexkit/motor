@@ -849,12 +849,7 @@ async fn session(
                 .await;
             }
             Frame::Cancel(request) => {
-                let id = request.job_id;
-                let received = std::time::Instant::now();
-                tracing::info!(job_id = %id, "runner cancel frame received");
-                locked(&runner, move |r| r.cancel(id)).await?;
-                tracing::info!(job_id = %id, elapsed_ms = received.elapsed().as_millis() as u64, "runner cancel handled");
-                send(tx, Frame::CancelReply(CancelReply::new(request.job_id))).await?;
+                cancel_job(&runner, request.job_id, tx, true).await?;
                 if tenant.is_some() {
                     continue;
                 }
@@ -1001,6 +996,45 @@ async fn upload(
     Ok(upload)
 }
 
+async fn cancel_job(
+    runner: &Runner,
+    id: Uuid,
+    tx: &mpsc::Sender<Frame>,
+    reply: bool,
+) -> io::Result<()> {
+    let received = std::time::Instant::now();
+    tracing::info!(job_id = %id, "runner cancel frame received");
+    match locked(runner, move |r| r.cancel(id)).await {
+        Ok(()) => {
+            tracing::info!(job_id = %id, elapsed_ms = received.elapsed().as_millis() as u64, "runner cancel handled");
+            if reply {
+                send(tx, Frame::CancelReply(CancelReply::new(id))).await?;
+            }
+        }
+        Err(error) => {
+            tracing::warn!(job_id = %id, %error, "runner cancel failed");
+            // Refusing the operation is not a job terminal. In particular a
+            // failed unit stop must leave an attached stream able to deliver
+            // the eventual terminal after the scheduler retries the stop.
+            let detail =
+                runner.safe_refusal_detail(format!("cancel failed: {error}"), std::iter::empty());
+            send(
+                tx,
+                Frame::Refusal(Refusal {
+                    job_id: Some(id),
+                    transfer_id: None,
+                    reason: RefusalReason::RequestRejected,
+                    disk_full: None,
+                    retry_after_ms: None,
+                    detail: Some(detail),
+                }),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn attach(
     runner: &Runner,
     id: Uuid,
@@ -1042,11 +1076,7 @@ async fn attach(
             frame = next(rx) => match frame {
                 None => return Ok(()),
                 Some(Frame::Cancel(_)) => {
-                    let received = std::time::Instant::now();
-                    tracing::info!(job_id = %id, "runner cancel frame received on job stream");
-                    locked(runner, move |r| r.cancel(id)).await?;
-                    tracing::info!(job_id = %id, elapsed_ms = received.elapsed().as_millis() as u64, "runner cancel handled");
-                    if tenant { send(tx, Frame::CancelReply(CancelReply::new(id))).await?; }
+                    cancel_job(runner, id, tx, tenant).await?;
                 },
                 Some(Frame::Attach(request)) if tenant => from = request.from_seq,
                 Some(Frame::JobStatus { .. }) if tenant => {

@@ -1539,12 +1539,10 @@ fn systemctl(args: &[&str]) -> io::Result<std::process::Output> {
     crate::systemd::systemctl(args, true)
 }
 
-pub(crate) fn signal(id: Uuid, hard: bool) {
+pub(crate) fn signal(id: Uuid, hard: bool) -> io::Result<()> {
     // Stop marks a unit as stopping as well as killing its entire cgroup. It
     // also cancels a pending start; unlike kill(pid), it crosses the UID boundary.
-    if let Err(error) = crate::systemd::signal(&unit(id), hard, systemctl) {
-        tracing::error!(%id, %error, "could not stop isolated job cgroup");
-    }
+    crate::systemd::signal(&unit(id), hard, systemctl)
 }
 
 /// Stop a sandbox that never started and unload its unit. Job units stay loaded
@@ -1552,7 +1550,9 @@ pub(crate) fn signal(id: Uuid, hard: bool) {
 /// finish path unloads them. A sandbox refused before start never reaches that
 /// path, so without this its failed unit would stay loaded indefinitely.
 fn discard_unstarted(id: Uuid) {
-    signal(id, true);
+    if let Err(error) = signal(id, true) {
+        tracing::error!(%id, %error, "could not stop isolated job cgroup");
+    }
     // The stop is asynchronous. Wait, bounded, for the unit to settle, so that
     // reset-failed acts on its final state rather than on a unit still stopping.
     let deadline = Instant::now() + Duration::from_secs(5);

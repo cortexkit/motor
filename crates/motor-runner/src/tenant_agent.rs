@@ -268,6 +268,13 @@ async fn forward_socket(
             Some(reply) => reply,
             None => return Err(io::Error::other("runner closed before agent reply")),
         };
+        if let (Frame::Cancel(request), Frame::Refusal(refusal)) = (&frame, &reply) {
+            if refusal.job_id == Some(request.job_id) {
+                return Err(io::Error::other(
+                    refusal.detail.as_deref().unwrap_or("runner refused cancel"),
+                ));
+            }
+        }
         let expected = matches!(
             (&frame, &reply),
             (Frame::Cancel(_), Frame::CancelReply(_))
@@ -1285,6 +1292,48 @@ mod tests {
             );
             assert_eq!(result.unwrap()["ok"], true);
         }
+    }
+
+    #[tokio::test]
+    async fn agent_reports_the_runner_cancel_stop_error() {
+        use cortexkit_test_support::ScratchDir;
+        let root = ScratchDir::new("motor-tenant-cancel-error");
+        let path = root.join("runner.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let id = Uuid::now_v7();
+        let task = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let hello = read_frame_async(&mut socket).await.unwrap().unwrap();
+            assert!(matches!(hello, Frame::Hello { .. }));
+            write_frame_async(&mut socket, &hello).await.unwrap();
+            assert_eq!(
+                read_frame_async(&mut socket).await.unwrap(),
+                Some(Frame::Cancel(CancelRequest::new(id)))
+            );
+            write_frame_async(
+                &mut socket,
+                &Frame::Refusal(motor_protocol::Refusal {
+                    job_id: Some(id),
+                    transfer_id: None,
+                    reason: motor_protocol::RefusalReason::RequestRejected,
+                    disk_full: None,
+                    retry_after_ms: None,
+                    detail: Some("cancel failed: control bus unavailable".into()),
+                }),
+            )
+            .await
+            .unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            forward_socket(&path, Frame::Cancel(CancelRequest::new(id)), || Ok(Some(
+                std::process::id()
+            ))),
+            task
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("control bus unavailable"));
     }
 
     #[tokio::test]

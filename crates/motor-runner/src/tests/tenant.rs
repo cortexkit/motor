@@ -4,6 +4,8 @@ use tokio::io::DuplexStream;
 
 #[path = "tenant_accounting.rs"]
 mod accounting;
+#[path = "tenant_cancellation.rs"]
+mod cancellation;
 
 fn open(f: &Fixture) -> Runner {
     let mut config = f.config();

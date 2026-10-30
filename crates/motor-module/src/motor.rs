@@ -1991,6 +1991,13 @@ impl Motor {
                 tracing::info!(job_id = %id, elapsed_ms = elapsed_ms(), "runner acknowledged cancel");
                 self.storage.cancel_acknowledged(id)
             }
+            Incoming::Frame(Frame::Refusal(refusal)) if refusal.job_id == Some(build_server_id) => {
+                Err(io::Error::other(
+                    refusal
+                        .detail
+                        .unwrap_or_else(|| "runner refused cancel".into()),
+                ))
+            }
             _ => Err(io::Error::other("expected cancel_reply")),
         }
     }
@@ -2425,6 +2432,7 @@ impl Motor {
             .hosted_state(id)
             .filter(|state| state.awaiting_cancel_terminal())
             .map(|_| tokio::time::Instant::now() + Duration::from_secs(30));
+        let mut cancel_retry_at = tokio::time::Instant::now();
         let host_deadline =
             self.hosted_state(id)
                 .and_then(|s| s.host_deadline_s())
@@ -2440,8 +2448,12 @@ impl Motor {
             // A cancel that `cancel` is still delivering on its own connection
             // needs nothing from this stream, which keeps reading so the
             // terminal arrives without a reconnect.
-            if self.pending(id) && (hosted || !self.cancel_in_flight(id)) {
+            if self.pending(id)
+                && (hosted || !self.cancel_in_flight(id))
+                && tokio::time::Instant::now() >= cancel_retry_at
+            {
                 if hosted && channel.is_some() {
+                    cancel_retry_at = tokio::time::Instant::now() + Duration::from_secs(2);
                     if channel
                         .as_ref()
                         .unwrap()
@@ -2524,7 +2536,10 @@ impl Motor {
                 if let Ok(c) = opened {
                     // A persisted cancellation may arrive while the connection
                     // opens. Send it first, unless `cancel` is delivering it.
-                    if self.pending(id) && (hosted || !self.cancel_in_flight(id)) {
+                    if self.pending(id)
+                        && (hosted || !self.cancel_in_flight(id))
+                        && tokio::time::Instant::now() >= cancel_retry_at
+                    {
                         drop(c);
                         continue;
                     }
@@ -2824,6 +2839,20 @@ impl Motor {
                         hosted_terminal_deadline =
                             Some(tokio::time::Instant::now() + Duration::from_secs(30));
                     }
+                }
+                Ok(Incoming::Frame(Frame::Refusal(refusal)))
+                    if refusal.job_id == Some(build_server_id)
+                        && refusal.reason == RefusalReason::RequestRejected
+                        && self.pending(id) =>
+                {
+                    // A refused stop is not a terminal. Keep reading this
+                    // connection while the runner retries its durable intent.
+                    self.log_hosted_failure(
+                        id,
+                        "cancel",
+                        refusal.detail.as_deref().unwrap_or("runner refused cancel"),
+                    );
+                    cancel_retry_at = tokio::time::Instant::now() + Duration::from_secs(2);
                 }
                 other => {
                     if hosted {
