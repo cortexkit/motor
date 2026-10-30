@@ -894,6 +894,19 @@ class ParityTests(unittest.TestCase):
                 self.assertIn('missing apt package: lsof',
                               parity.differences(self.manifest, actual, role=role))
 
+    def test_web_view_build_packages_are_required_on_every_linux_role(self):
+        # CKDESK embeds a web view through wry, whose Linux builds need WebKitGTK
+        # 4.1 and GTK 3 development files in every job image, not just on the host.
+        for role in ('build-server', 'tenant', 'boat'):
+            for name in ('libwebkit2gtk-4.1-dev', 'libgtk-3-dev'):
+                with self.subTest(role=role, package=name):
+                    packages = self.manifest['apt_packages']
+                    self.assertIn(name, packages['required'] + packages['by_role'][role])
+                    actual = self.observed(role)
+                    actual['apt_packages'].pop(name)
+                    self.assertIn('missing apt package: ' + name,
+                                  parity.differences(self.manifest, actual, role=role))
+
     def test_chromium_runtime_packages_are_required_on_every_linux_role(self):
         # Repository-downloaded browsers need the same runtime libraries in jobs
         # as on the build host; installing a browser on the host is not enough.
