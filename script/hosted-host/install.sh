@@ -331,6 +331,15 @@ configs() {
 }
 
 host_configs() {
+  if [ -d /etc/needrestart ]; then
+    directory /etc/needrestart/conf.d root:root 755
+    cat > "$scratch/needrestart.conf" <<'NEEDRESTART'
+# Never let package installs restart services on a hosted host: restarting
+# motor-vm-helper stops every tenant VM and ends all jobs on it. List only.
+$nrconf{restart} = "l";
+NEEDRESTART
+    place config "$scratch/needrestart.conf" /etc/needrestart/conf.d/90-motor-list-only.conf root:root 644
+  fi
   directory /etc/systemd/journald.conf.d root:root 755
   directory /etc/sysctl.d root:root 755
   place config "$checkout/script/runner/journald/60-motor-retention.conf" /etc/systemd/journald.conf.d/60-motor-retention.conf root:root 644
