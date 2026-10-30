@@ -21,7 +21,7 @@ pub const RETENTION_BATCH: usize = 256;
 /// How often the host tick runs a retention pass while nothing is left over.
 pub const RETENTION_INTERVAL_MS: u64 = 10 * 60 * 1000;
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct JobBilling {
     pub started_live: bool,
@@ -45,7 +45,7 @@ pub struct JobBilling {
     pub egress_end: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Request {
     pub path: String,
     pub body: Vec<u8>,

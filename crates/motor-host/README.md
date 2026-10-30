@@ -69,12 +69,24 @@ platform name, lowercase UUIDv7 job IDs and nullable placement VM field. A null
 or unknown VM has no provisioned tenant binding and is refused with `auth`;
 the host does not invent a placement for it.
 
-The journal is an atomically replaced, file-and-directory-fsynced snapshot. Its
-lease states, current token issue time, delivered flag, nonce replay set,
+The host's durable state lives in SQLite at `<journal_dir>/store.db`, opened
+through the fleet's `cortexkit-store` layer (single-writer lease, versioned
+migrations, removals journal). Each state change is one transaction holding
+only the entries that changed, committed durably before the host acts on it.
+Its lease states, current token issue time, delivered flag, nonce replay set,
 acknowledged lifecycle event numbers and highest client-output sequence numbers
-survive restart. A failed
-journal write authorizes neither relay delivery nor an acknowledgement. The host
-journals each higher output sequence before writing it to a client.
+survive restart. A failed write authorizes neither relay delivery nor an
+acknowledgement. The host records each higher output sequence before writing it
+to a client. A finished job's records leave through the removals journal
+(`<journal_dir>/removals/journal`), so an older copy of the database can't bring
+them back.
+
+The first start of this version imports the earlier whole-file
+`<journal_dir>/journal.json` and renames it to `journal.json.imported`. To go
+back to an older motor-host, stop motor-host, run
+`motor-host export-journal <journal_dir>`, which writes `journal.json` from the
+database, and start the older binary; the next start of this version imports
+that file again.
 
 Every run token checks the tenant ceiling, including while the VM is warm. RAM
 kill caps are not summed for admission. Strictly newer pre-admission tokens close

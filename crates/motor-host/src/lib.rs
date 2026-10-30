@@ -13,6 +13,7 @@ mod relay;
 pub mod sandbox;
 pub mod server;
 pub mod state;
+pub mod store;
 pub mod wire;
 
 #[cfg(test)]

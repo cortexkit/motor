@@ -10,6 +10,12 @@ pub trait Journal: Send {
 
 /// A rename publishes a complete snapshot; syncing the directory makes the
 /// rename durable as well as the contents. No credential or signature is stored.
+///
+/// Every save rewrites the whole state, so this suits only a small state that
+/// stays small: the in-sandbox endpoint, which serves one job. A registered
+/// host keeps its state in SQLite ([`crate::store::SqliteJournal`]) and uses
+/// this format only to import an older host's state and to export it for a
+/// rollback.
 pub struct FileJournal {
     path: PathBuf,
     /// Names in `outbox-expired`, once read; see `remove_unlisted_archives`.

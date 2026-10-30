@@ -1,9 +1,9 @@
 use anyhow::{bail, ensure, Context, Result};
 use motor_host::enroll;
 use motor_host::helper::Helper;
-use motor_host::journal::FileJournal;
 use motor_host::server::{admin_socket, serve_with_slot, unix_ms, Runtime};
 use motor_host::state::{Host, Tenant};
+use motor_host::store::SqliteJournal;
 use motor_vm_helper::tenant::{validate_name, Registry};
 use serde::Deserialize;
 use serde_json::json;
@@ -45,6 +45,14 @@ async fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("keygen") => return keygen(std::env::args().skip(2).collect()),
         Some("show-enrollment") => return show_enrollment(std::env::args().skip(2).collect()),
+        Some("export-journal") => {
+            let directory = std::env::args_os()
+                .nth(2)
+                .context("usage: motor-host export-journal <journal_dir>")?;
+            let written = SqliteJournal::export(std::path::Path::new(&directory))?;
+            println!("{}", written.display());
+            return Ok(());
+        }
         _ => {}
     }
     if std::env::args_os()
@@ -119,7 +127,7 @@ async fn main() -> Result<()> {
             },
         );
     }
-    let (journal, snapshot) = FileJournal::open(&config.journal_dir)?;
+    let (journal, snapshot) = SqliteJournal::open(&config.journal_dir)?;
     let mut host = Host::new(tenants, snapshot, Box::new(journal));
     // Starts latched: no lease is admitted until a probe finds the capacity
     // file valid and enough host storage free.

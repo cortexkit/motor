@@ -35,7 +35,7 @@ pub enum LeaseState {
     Ended,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Lease {
     pub claims: Claims,
     pub tenant: String,
@@ -49,14 +49,14 @@ pub struct Lease {
     pub refusal: Option<Refusal>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Vm {
     pub initialized_generation: Option<u64>,
     pub stop_pending: bool,
     pub event_seq: u64,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Snapshot {
     pub leases: BTreeMap<String, Lease>,
     pub nonces: BTreeMap<String, u64>,
