@@ -114,7 +114,7 @@ impl HealthCache {
             .target(Some(&motor_protocol::Platform::Windows))
             .is_err()
         {
-            availability("unavailable", Some("not configured on this machine"))
+            availability("unavailable", Some("not set up on this machine"))
         } else if !fresh {
             unavailable()
         } else if self
@@ -133,7 +133,7 @@ impl HealthCache {
             unavailable()
         };
         let macos = if self.config.macos_runner.is_none() {
-            availability("unavailable", Some("not configured on this machine"))
+            availability("unavailable", Some("not set up on this machine"))
         } else if fresh
             && self
                 .macos
@@ -209,28 +209,50 @@ impl HealthCache {
             }
         }
         let machine = machine_name();
-        let mut detail = format!(
-            "{machine}: daemon running; runner {}; broker {}; sign-in: {}",
-            connection["runner"].as_str().unwrap(),
+        let mut detail = format!("{machine}: daemon running");
+        if !hosted {
+            detail.push_str(&format!(
+                "; Linux runner {}",
+                connection["runner"].as_str().unwrap()
+            ));
+        }
+        detail.push_str(&format!(
+            "; broker {}; sign-in: {}",
             connection["broker"].as_str().unwrap(),
             connection["sign_in"].as_str().unwrap()
-        );
+        ));
         if let Some(reason) = refusal {
             detail.push_str(&format!("; module error: {reason}"));
         }
         for platform in ["linux", "windows", "macos"] {
-            detail.push_str(&format!(
-                "; {platform}: {}",
-                platforms[platform]["status"].as_str().unwrap()
-            ));
-            if let Some(reason) = platforms[platform]["reason"].as_str() {
+            let status = platforms[platform]["status"].as_str().unwrap();
+            let reason = platforms[platform]["reason"].as_str();
+            if status == "unavailable" && reason == Some("not set up on this machine") {
+                detail.push_str(&format!("; {platform}: not set up on this machine"));
+                continue;
+            }
+            let label = if status == "busy (queueing)" {
+                "busy"
+            } else {
+                status
+            };
+            detail.push_str(&format!("; {platform}: {label}"));
+            if let Some(reason) = reason {
                 detail.push_str(&format!(" ({reason})"));
             }
+            if status == "unavailable" {
+                continue;
+            }
             if let Some(jobs) = jobs {
-                detail.push_str(&format!(
-                    ", {} running, {} waiting for capacity on {machine}",
-                    jobs[platform]["running"], jobs[platform]["waiting_for_capacity"]
-                ));
+                for (key, label) in [
+                    ("running", "running"),
+                    ("waiting_for_capacity", "waiting for capacity"),
+                ] {
+                    let count = jobs[platform][key].as_u64().unwrap_or(0);
+                    if count > 0 {
+                        detail.push_str(&format!(", {count} {label}"));
+                    }
+                }
                 let unknown = jobs[platform]["unknown"].as_u64().unwrap_or(0);
                 if unknown > 0 {
                     detail.push_str(&format!(
@@ -240,7 +262,7 @@ impl HealthCache {
             }
         }
         if jobs.is_none() {
-            detail.push_str("; this machine's job state not confirmed yet");
+            detail.push_str("; job state not confirmed yet");
         }
         HealthReport {
             status: if refusal.is_some() {

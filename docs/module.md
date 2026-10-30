@@ -93,8 +93,11 @@ degrades health when a full pool has waited more than two seconds.
 `ck health motor` describes remote runs from the caller's machine, not the
 hosted infrastructure. Its detail and metrics name that machine, report daemon,
 connection and sign-in readiness, and summarize `linux`, `windows` and `macos`
-as `available`, `busy (queueing)` or `unavailable` with an actionable reason.
-An unconfigured platform is unavailable. For hosted Linux, **available
+in text as `available`, `busy` or `unavailable` with an actionable reason.
+Platforms that are not set up on the caller's machine say so without counts.
+The machine name appears once, and zero counts are left out. Machine-readable
+status retains `busy (queueing)` and the complete per-platform counts.
+For hosted Linux, **available
 (requests accepted)** means the authenticated broker answers this machine's
 requests, not that capacity is guaranteed: clients do not receive live fleet
 inventory. A current placement or capacity wait from this machine makes that
@@ -118,7 +121,9 @@ external rental-provider placements (the Boat route), with null `capacity` and
 explicit source/missing-data markers;
 these are not live capacity samples. The direct Linux sampler remains active
 with hosted routing enabled, so existing health-status degradation still detects
-loss of that connection. The Linux `exec.status` hosted placeholder is unchanged
+loss of that connection. The hosted-routing text leaves out the direct Linux
+runner's connection label rather than implying it checked a broker-selected
+runner. The Linux `exec.status` hosted placeholder is unchanged
 and is never used as a health sample. Test:
 `hosted_runner_health_and_sampler_use_direct_linux_runner`.
 

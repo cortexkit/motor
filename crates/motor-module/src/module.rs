@@ -1556,7 +1556,7 @@ mod health_tests {
             report.metrics.unwrap()["platforms"]["linux"]["status"],
             "busy (queueing)"
         );
-        assert!(report.detail.unwrap().contains("linux: busy (queueing)"));
+        assert!(report.detail.unwrap().contains("linux: busy"));
         handler.start_health_sampler();
         tokio::time::timeout(Duration::from_secs(1), async {
             while calls.load(Ordering::SeqCst) == 0 {

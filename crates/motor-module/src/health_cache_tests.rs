@@ -38,11 +38,7 @@ fn busy_platform_is_healthy_without_host_telemetry() {
     cache.update(Some(sample()), now);
     let report = cache.report(now);
     assert_eq!(report.status, HealthStatus::Ok);
-    assert!(report
-        .detail
-        .as_ref()
-        .unwrap()
-        .contains("linux: busy (queueing)"));
+    assert!(report.detail.as_ref().unwrap().contains("linux: busy"));
     let metrics = report.metrics.unwrap();
     assert_eq!(metrics["platforms"]["linux"]["status"], "busy (queueing)");
     for key in [
@@ -118,7 +114,7 @@ fn macos_availability_uses_its_own_sample_and_reports_missing_configuration() {
     cache.update(Some(sample()), now);
     assert_eq!(
         cache.report(now).metrics.unwrap()["platforms"]["macos"]["reason"],
-        "not configured on this machine"
+        "not set up on this machine"
     );
     cache.config.macos_runner = Some(crate::MacosRunner::default());
     for (sample, expected) in [
@@ -275,5 +271,104 @@ fn local_failure_preserves_failing_status_and_marks_platforms_unavailable() {
     assert_eq!(metrics["connection"]["error"], "storage_lease_busy");
     for platform in ["linux", "windows", "macos"] {
         assert_eq!(metrics["platforms"][platform]["status"], "unavailable");
+    }
+}
+
+fn hosted_text_cache(now: Instant) -> HealthCache {
+    let mut cache = HealthCache::default();
+    cache.config.hosted_runners = true;
+    cache.update(Some(sample()), now);
+    cache.account = Some(json!({"sign_in": "signed in", "broker": "ok"}));
+    cache.jobs = Some(json!({
+        "linux": {"running": 0, "waiting_for_capacity": 0, "unknown": 0},
+        "windows": {"running": 0, "waiting_for_capacity": 0, "unknown": 0},
+        "macos": {"running": 0, "waiting_for_capacity": 0, "unknown": 0},
+    }));
+    cache
+}
+
+#[test]
+fn hosted_text_names_machine_once_and_omits_zero_and_unavailable_counts() {
+    let now = Instant::now();
+    let mut cache = hosted_text_cache(now);
+    cache.jobs.as_mut().unwrap()["windows"] =
+        json!({"running": 4, "waiting_for_capacity": 5, "unknown": 6});
+    let report = cache.report(now);
+    assert_eq!(report.detail.unwrap(), format!(
+        "{}: daemon running; broker ok; sign-in: signed in; linux: available (requests accepted); windows: not set up on this machine; macos: not set up on this machine",
+        machine_name(),
+    ));
+    let metrics = report.metrics.unwrap();
+    assert_eq!(metrics["machine"]["jobs"]["linux"]["running"], 0);
+    assert_eq!(metrics["machine"]["jobs"]["windows"]["running"], 4);
+    assert_eq!(metrics["platforms"]["windows"]["status"], "unavailable");
+}
+
+#[test]
+fn hosted_busy_text_only_includes_nonzero_counts() {
+    let now = Instant::now();
+    let mut cache = hosted_text_cache(now);
+    for (running, waiting, expected) in [
+        (1, 2, "busy, 1 running, 2 waiting for capacity"),
+        (0, 2, "busy, 2 waiting for capacity"),
+        (1, 0, "available (requests accepted), 1 running"),
+    ] {
+        cache.jobs.as_mut().unwrap()["linux"] =
+            json!({"running": running, "waiting_for_capacity": waiting, "unknown": 0});
+        let report = cache.report(now);
+        assert_eq!(report.detail.unwrap(), format!(
+            "{}: daemon running; broker ok; sign-in: signed in; linux: {expected}; windows: not set up on this machine; macos: not set up on this machine",
+            machine_name(),
+        ));
+        assert_eq!(
+            report.metrics.unwrap()["platforms"]["linux"]["status"],
+            if waiting > 0 {
+                "busy (queueing)"
+            } else {
+                "available"
+            }
+        );
+    }
+}
+
+#[test]
+fn unavailable_connection_text_omits_job_counts_without_hiding_metrics() {
+    let now = Instant::now();
+    let mut cache = hosted_text_cache(now);
+    cache.jobs.as_mut().unwrap()["linux"] =
+        json!({"running": 7, "waiting_for_capacity": 8, "unknown": 9});
+    cache.account.as_mut().unwrap()["broker"] = json!("unavailable");
+    let report = cache.report(now);
+    assert_eq!(report.detail.unwrap(), format!(
+        "{}: daemon running; broker unavailable; sign-in: signed in; linux: unavailable (broker connection not confirmed; check network and retry); windows: not set up on this machine; macos: not set up on this machine",
+        machine_name(),
+    ));
+    assert_eq!(
+        report.metrics.unwrap()["machine"]["jobs"]["linux"],
+        json!({"running": 7, "waiting_for_capacity": 8, "unknown": 9})
+    );
+}
+
+#[test]
+fn linux_connection_label_is_explicit_and_only_shown_for_direct_routing() {
+    let now = Instant::now();
+    let mut cache = HealthCache::default();
+    cache.update(Some(sample()), now);
+    assert!(cache
+        .report(now)
+        .detail
+        .unwrap()
+        .contains("; Linux runner ok;"));
+    for route in ["global", "repository", "spill"] {
+        cache.config.hosted_runners = route == "global";
+        cache.config.hosted_repositories = if route == "repository" {
+            vec!["repository".into()]
+        } else {
+            Vec::new()
+        };
+        cache.config.spill_to_hosted = route == "spill";
+        let report = cache.report(now);
+        assert!(!report.detail.unwrap().contains("runner"));
+        assert_eq!(report.metrics.unwrap()["connection"]["runner"], "ok");
     }
 }
