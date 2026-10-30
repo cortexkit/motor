@@ -418,6 +418,7 @@ async fn restart_retries_unknown_hosted_cancel_before_boat_finish() {
     )
     .unwrap();
     assert!(motor.pending(id));
+    let (_stream, _tx, _wake) = motor.stream(id);
     motor.resume_finishes().await;
     assert!(motor.pending(id));
     assert!(!boat
@@ -435,6 +436,9 @@ async fn restart_retries_unknown_hosted_cancel_before_boat_finish() {
     .await
     .unwrap();
     assert_eq!(motor.hosted_state(id).unwrap().terminal, Some(terminal));
+    assert!(boat.requests.lock().unwrap().iter().any(|(path, body)| {
+        path == &format!("/v1/leases/{id}/finish") && body["outcome"] == "cancelled"
+    }));
     assert!(boat
         .frames
         .lock()

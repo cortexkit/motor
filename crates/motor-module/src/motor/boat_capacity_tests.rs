@@ -61,7 +61,7 @@ async fn stored_fresh_boat_booking_uses_lease_id_for_status_cancel_attach_and_fi
         .all(|(p, _)| p == &format!("/v1/leases/{booking}/reattach")));
     assert!(calls
         .iter()
-        .any(|(p, b)| p == &format!("/v1/leases/{booking}/finish") && b["outcome"] == "exit"));
+        .any(|(p, b)| p == &format!("/v1/leases/{booking}/finish") && b["outcome"] == "cancelled"));
     assert!(boat
         .frames
         .lock()
