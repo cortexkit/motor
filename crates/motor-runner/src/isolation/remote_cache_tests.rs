@@ -136,11 +136,11 @@ fn rendered_argv(
 
 /// SHA-256 of the rendered argv of every remote case below.
 ///
-/// Updated when the writer shell began asking an installed script whether the
-/// tree it is about to compile has a root `Cargo.toml`, so a declared fill
-/// without one is not skipped; only the `writer` cases changed.
+/// Updated when job and fill units began starting with a 65536 open-file soft
+/// limit: each of the 16 rendered cases gains one `LimitNOFILE=65536:524288`
+/// line and nothing else changes.
 const REMOTE_PINNED_SHA256: &str =
-    "c20b3f34052769f35470cd8a8fb6abf91ae9bfe48d65c2e8eebb8b17069f9991";
+    "62d7197c910aa05539242b063306d20148c9fd875359056b1a702fbe56a7b62c";
 
 /// Every unit kind, rendered with and without forwarders: only forwarder starts
 /// and active-tool statistics change. Forwarders start right after the gate; with no

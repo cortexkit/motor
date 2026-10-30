@@ -8,6 +8,7 @@
 --property=Slice=motor-jobs.slice
 --property=OOMScoreAdjust=900
 --property=OOMPolicy=kill
+--property=LimitNOFILE=65536:524288
 --property=PrivatePIDs=yes
 --property=StandardInput=file:<SCRATCH>/unprepared/gate
 --property=StandardOutput=append:<SCRATCH>/unprepared/output/stdout
