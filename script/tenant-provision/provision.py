@@ -30,6 +30,9 @@ CAPACITY = Path("/etc/motor-host/capacity.json")
 MEMINFO = Path("/proc/meminfo")
 JOBS_DROP_IN = Path("/etc/systemd/system/motor-jobs.slice.d/50-capacity.conf")
 U64_MAX = 2**64 - 1
+# Disk I/O uses host page cache charged to the VMM's cgroup. Keep this
+# reclaimable allowance separate from the VMM's OOM-safety headroom.
+DEFAULT_PAGE_CACHE_MIB = 8192
 CAPACITY_KEYS = {"windows_vm_bytes", "host_reserve_bytes", "jobs_min_bytes", "storage_margin_bytes",
                  "growth_allowance_bytes", "tenant_memory_reserve_bytes"}
 U32_MAX = 2**32 - 1
@@ -108,8 +111,8 @@ def memtotal_bytes():
 
 
 def minimum_memory_headroom_mib(guest_ram_mib):
-    # VMM bookkeeping grows with RAM; synchronous drive I/O also charges cache
-    # and writeback to the VM's cgroup. A fixed 512 MiB exhausted large guests.
+    # VMM bookkeeping grows with RAM. This OOM-safety allowance is separate
+    # from the reclaimable host page cache used for disk I/O.
     return max(2048, (guest_ram_mib * 3 + 99) // 100)
 
 
@@ -132,8 +135,9 @@ def memory_fit(capacity, replacement=None):
     for tenant in tenants:
         ram = u64(tenant["guest_ram_mib"], "guest_ram_mib")
         headroom = u64(tenant["memory_headroom_mib"], "memory_headroom_mib")
+        page_cache = u64(tenant.get("page_cache_mib", DEFAULT_PAGE_CACHE_MIB), "page_cache_mib")
         check_memory_headroom(ram, headroom)
-        total = u64(total + (ram + headroom) * 1048576, "memory fit sum")
+        total = u64(total + (ram + headroom + page_cache) * 1048576, "memory fit sum")
     u64(total, "memory fit sum")
     available = memtotal_bytes()
     if total > available:
@@ -303,7 +307,7 @@ def component(value):
 
 def checked(config, *, allow_old_headroom=False):
     allowed = {"tenant", "sub", "vm", "image_version", "vcpu_ceiling", "guest_ram_mib", "disk_quota_bytes", "cpuset", "tap_index",
-               "idle_suspend_s", "host_floor_bytes", "memory_headroom_mib", "snapshot_memory_high_mib", "io_weight", "resolvers",
+               "idle_suspend_s", "host_floor_bytes", "memory_headroom_mib", "page_cache_mib", "snapshot_memory_high_mib", "io_weight", "resolvers",
                "capture_console", "max_weight", "remote_cache"}
     if set(config) - allowed:
         raise ValueError("unknown provisioning key")
@@ -317,11 +321,14 @@ def checked(config, *, allow_old_headroom=False):
     if not re.fullmatch(r"(?:acct|org):[0-9A-HJKMNP-TV-Z]{26}", c["sub"]):
         raise ValueError("invalid tenant subject")
     for name, default in (("idle_suspend_s", 600), ("host_floor_bytes", 128 * 1024**3),
-                          ("snapshot_memory_high_mib", 16384), ("io_weight", 100)):
+                          ("snapshot_memory_high_mib", 16384), ("io_weight", 100), ("page_cache_mib", DEFAULT_PAGE_CACHE_MIB)):
         c.setdefault(name, default)
     if type(c["guest_ram_mib"]) is not int or c["guest_ram_mib"] <= 0:
         raise ValueError("guest_ram_mib must be a positive integer")
     c.setdefault("memory_headroom_mib", minimum_memory_headroom_mib(c["guest_ram_mib"]))
+    u64(c["page_cache_mib"], "page_cache_mib")
+    u64((c["guest_ram_mib"] + u64(c["memory_headroom_mib"], "memory_headroom_mib") + c["page_cache_mib"]) * 1048576,
+        "tenant memory limit")
     for name in ("vcpu_ceiling", "guest_ram_mib", "disk_quota_bytes", "tap_index", "memory_headroom_mib", "snapshot_memory_high_mib", "io_weight"):
         if type(c[name]) is not int or c[name] <= 0:
             raise ValueError(f"{name} must be a positive integer")
@@ -613,7 +620,7 @@ def move_stale_suspend(suspend, old_version):
     return moved
 
 
-def switch_image(tenant, image_version, make_base=None, check_service=None, validate_image=None, output=print):
+def switch_image(tenant, image_version, make_base=None, check_service=None, validate_image=None, output=print, *, page_cache_mib=None):
     """Point a stopped tenant at another image.
 
     The tenant's VM must not be running: it would keep the old image and be
@@ -660,8 +667,9 @@ def switch_image(tenant, image_version, make_base=None, check_service=None, vali
             raise ValueError("image manifest version mismatch")
 
         updated_config = dict(original_config, image_version=image_version,
-                              memory_headroom_mib=max(current["memory_headroom_mib"],
-                                                      minimum_memory_headroom_mib(current["guest_ram_mib"])))
+                               memory_headroom_mib=max(current["memory_headroom_mib"],
+                                                       minimum_memory_headroom_mib(current["guest_ram_mib"])),
+                              page_cache_mib=current["page_cache_mib"] if page_cache_mib is None else page_cache_mib)
         updated = checked(updated_config)
         memory_fit(read_capacity(), replacement=updated)
         base = base_path(updated, image)
@@ -679,9 +687,11 @@ def switch_image(tenant, image_version, make_base=None, check_service=None, vali
         stale = suspend_snapshot_to_move(suspend, manifest)
         old_version = current["image_version"]
         moved = move_stale_suspend(stale, old_version) if stale is not None else None
+        original_record = dict(record)
         record["image_version"] = image_version
         record["memory_headroom_mib"] = updated["memory_headroom_mib"]
-        if original_config != updated_config:
+        record["page_cache_mib"] = updated["page_cache_mib"]
+        if original_config != updated_config or record != original_record:
             try:
                 atomic_pair([
                     (registry_path, json.dumps(record, indent=2) + "\n"),
@@ -1308,7 +1318,7 @@ def build_base(c, image, base, console=None, diagnostics=None):
         args = [BIN / "jailer", "--id", identifier, "--exec-file", BIN / "firecracker", "--uid", uid, "--gid", uid,
                 "--chroot-base-dir", boundary, "--netns", f"/run/netns/{netns}", "--cgroup-version", "2", "--parent-cgroup", "motor-tenant-provision",
                 "--cgroup", "cpu.max=100000 100000", "--cgroup", f"cpuset.cpus={c['cpuset']}",
-                "--cgroup", f"memory.max={(c['guest_ram_mib'] + c['memory_headroom_mib']) * 1048576}",
+                "--cgroup", f"memory.max={(c['guest_ram_mib'] + c['memory_headroom_mib'] + c['page_cache_mib']) * 1048576}",
                 "--cgroup", f"pids.max={c['vcpu_ceiling'] + 64}", "--cgroup", f"io.weight=default {c['io_weight']}",
                 "--", "--api-sock", "/api.sock"]
         evidence.record("jailer_launch", argv=[str(a) for a in args])
@@ -1499,7 +1509,7 @@ def provision(c, make_base=build_base, execute=run, stage=None, runners=None, re
 # Offline resize
 #
 # provision.py resize <tenant> changes a stopped tenant's vCPU ceiling, guest
-# RAM, cpuset, permit budget, idle suspend and disk quota. RAM and disk only
+# RAM, cpuset, permit budget, idle suspend, page-cache allowance and disk quota. RAM and disk only
 # grow. Every step is recorded first in the tenant's resize.json journal, so a
 # crash at any point leaves either the old state (resize --abort restores it
 # exactly) or a committed state that a same-argument re-run finishes. The host
@@ -1519,7 +1529,7 @@ HELPER_CGROUPS = Path("/sys/fs/cgroup/system.slice/motor-vm-helper.service/tenan
 WINDOWS_CPUS = "12-15,28-31"
 RESIZE_SCHEMA = 1
 # The record fields a resize may change; every other field stays as provisioned.
-RESIZE_FIELDS = ("vcpu_ceiling", "guest_ram_mib", "cpuset", "max_weight", "idle_suspend_s", "disk_quota_bytes")
+RESIZE_FIELDS = ("vcpu_ceiling", "guest_ram_mib", "cpuset", "max_weight", "idle_suspend_s", "disk_quota_bytes", "page_cache_mib")
 # Forward phases, in order. Before "committed" the published records are the
 # old ones and resize --abort restores everything; from "committed" on the
 # resize only rolls forward.
@@ -1688,6 +1698,7 @@ def resize_target(old_config, arguments):
     if type(ram) is not int or ram <= 0:
         raise ValueError("guest_ram_mib must be a positive integer")
     target["memory_headroom_mib"] = max(old_config.get("memory_headroom_mib", 0), minimum_memory_headroom_mib(ram))
+    target.setdefault("page_cache_mib", DEFAULT_PAGE_CACHE_MIB)
     return target
 
 
@@ -1740,7 +1751,7 @@ def plan_resize(tenant, arguments):
 
     new_config = resize_target(old_config, arguments)
     new = checked(new_config)
-    if new == old:
+    if new == old and "page_cache_mib" in old_config and "page_cache_mib" in record:
         raise ValueError("the resize changes nothing")
     if new["disk_quota_bytes"] < old["disk_quota_bytes"]:
         raise ValueError(f"disk shrink from {old['disk_quota_bytes']} to {new['disk_quota_bytes']} bytes is refused; "
@@ -1788,6 +1799,7 @@ def plan_resize(tenant, arguments):
     registry_new = dict(record)
     registry_new.update({name: new_config[name] for name in arguments})
     registry_new["memory_headroom_mib"] = new["memory_headroom_mib"]
+    registry_new["page_cache_mib"] = new["page_cache_mib"]
     return {
         "schema": RESIZE_SCHEMA, "tenant": tenant, "phase": RESIZE_PHASES[0],
         "old": old_config, "new": new_config,
@@ -2016,6 +2028,7 @@ def main():
                                  f"stop both services first: {STOP_COMMAND}")
     switch.add_argument("tenant")
     switch.add_argument("image_version")
+    switch.add_argument("--page-cache-mib", type=int, help="host page-cache allowance in MiB; keep the existing value if omitted")
     repair = commands.add_parser(
         "repair-from-registry",
         help="set the provisioning record's image_version to the helper registry's, when nothing else differs")
@@ -2034,7 +2047,7 @@ def main():
     resize_command.add_argument("--abort", action="store_true",
                                 help="undo a resize that has not reached its commit point")
     for field, kind in (("vcpu_ceiling", int), ("guest_ram_mib", int), ("cpuset", str), ("max_weight", int),
-                        ("idle_suspend_s", int), ("disk_quota_bytes", int)):
+                        ("idle_suspend_s", int), ("disk_quota_bytes", int), ("page_cache_mib", int)):
         resize_command.add_argument("--" + field.replace("_", "-"), dest=field, type=kind)
     args = parser.parse_args()
     if os.geteuid() != 0:
@@ -2114,7 +2127,7 @@ def main():
             trusted(binary)
             if "1.17.0" not in run(binary, "--version").stdout:
                 raise ValueError("Firecracker and jailer must both be 1.17.0")
-        switch_image(tenant, image_version)
+        switch_image(tenant, image_version, page_cache_mib=args.page_cache_mib)
         return
     if args.command is not None:
         parser.error(f"unknown command: {args.command}")

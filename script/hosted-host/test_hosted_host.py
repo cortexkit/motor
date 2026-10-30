@@ -311,7 +311,7 @@ class InstalledStateTests(CapacityConfigTests):
         self.capacity_error = None
         # Leave room for the resized fixture; the measured host is tested
         # separately because 78 GiB no longer fits its Windows/jobs budgets.
-        self.memtotal = 128 * GIB
+        self.memtotal = 160 * GIB
         self.limit = provision.jobs_slice_limits(CAPACITY)[0]
         self.slice = {"LoadState": "loaded", "MemoryMax": str(self.limit)}
         patch = mock.patch.multiple(
@@ -462,7 +462,7 @@ class InstalledStateTests(CapacityConfigTests):
     def test_measured_host_refuses_resized_tenant_with_new_headroom(self):
         self.install(self.resized())
         self.memtotal = MEMTOTAL
-        self.assertFails("memory fit requires 135657422848 bytes, MemTotal is 134647791616 bytes")
+        self.assertFails("memory fit requires 144247357440 bytes, MemTotal is 134647791616 bytes")
 
     def test_capacity_fit_and_live_cap_are_checked(self):
         self.install(self.resized())
@@ -470,13 +470,14 @@ class InstalledStateTests(CapacityConfigTests):
         self.capacity_error = "invalid capacity.json: not root-owned"
         self.assertFails("capacity.json: invalid capacity.json: not root-owned")
         self.capacity_error = None
-        # 78 GiB + 2397 MiB headroom + 16 + 6 + 24 GiB fits exactly, not one byte less.
-        needed = (79872 + 2397) * 1048576 + 46 * GIB
+        # RAM, headroom and 8 GiB page cache plus host reservations fit exactly,
+        # but one byte less must refuse even though the page cache is reclaimable.
+        needed = (79872 + 2397 + 8192) * 1048576 + 46 * GIB
         self.memtotal = needed
         self.assertEqual(self.problems(), [])
         self.memtotal = needed - 1
         self.assertFails(f"memory fit: memory fit requires {needed} bytes")
-        self.memtotal = 128 * GIB
+        self.memtotal = 160 * GIB
         for value in (str(self.limit + 1), "infinity"):
             with self.subTest(MemoryMax=value):
                 self.slice = {"LoadState": "loaded", "MemoryMax": value}
@@ -526,7 +527,7 @@ class InstalledStateTests(CapacityConfigTests):
         self.provisioned_home()
         self.resize()
         self.assertEqual(self.problems(), [])
-        self.assertEqual(json.loads(self.record_path.read_text()), self.resized())
+        self.assertEqual(json.loads(self.record_path.read_text()), dict(self.resized(), page_cache_mib=8192))
         self.assertEqual(hosted.render_json(hosted.tenant_config(SUB, installed=self.record_path)),
                          self.record_path.read_text())
         self.assertEqual(self.commands, [])
@@ -542,7 +543,7 @@ class InstalledStateTests(CapacityConfigTests):
             self.resize(hook=crash)
         # The records are the new size and the helper config still the old: the
         # journal and the stale helper config both fail the check.
-        self.assertEqual(json.loads(self.record_path.read_text()), self.resized())
+        self.assertEqual(json.loads(self.record_path.read_text()), dict(self.resized(), page_cache_mib=8192))
         self.assertFails("resize: pending resize journal")
         self.assertFails("differs from the render of the installed tenant record")
         self.resize()

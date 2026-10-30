@@ -66,6 +66,10 @@ pub struct Registry {
     pub idle_suspend_s: u64,
     pub host_floor_bytes: u64,
     pub memory_headroom_mib: u64,
+    // Disk I/O uses reclaimable host page cache charged to the VMM's cgroup,
+    // separate from the VMM's OOM-safety headroom.
+    #[serde(default = "default_page_cache_mib")]
+    pub page_cache_mib: u64,
     #[serde(default = "default_snapshot_high")]
     pub snapshot_memory_high_mib: u64,
     #[serde(default = "default_io_weight")]
@@ -79,12 +83,15 @@ fn optional_weight<'de, D: serde::Deserializer<'de>>(
     u32::deserialize(deserializer).map(Some)
 }
 pub fn minimum_memory_headroom_mib(guest_ram_mib: u64) -> u64 {
-    // RAM-dependent VMM bookkeeping and drive cache/writeback share the guest's
-    // cgroup. Keep a 2 GiB floor and round the 3% allowance up, without overflow.
+    // RAM-dependent VMM bookkeeping needs OOM-safety headroom separate from
+    // reclaimable page cache. Round the 3% allowance up, without overflow.
     2048.max(guest_ram_mib / 100 * 3 + (guest_ram_mib % 100 * 3).div_ceil(100))
 }
 fn default_snapshot_high() -> u64 {
     16384
+}
+fn default_page_cache_mib() -> u64 {
+    8192
 }
 fn default_io_weight() -> u32 {
     100
@@ -138,6 +145,7 @@ impl Registry {
         }
         self.guest_ram_mib
             .checked_add(self.memory_headroom_mib)
+            .and_then(|v| v.checked_add(self.page_cache_mib))
             .and_then(|v| v.checked_mul(1048576))
             .ok_or_else(|| Error("tenant memory limit overflow".into()))
     }

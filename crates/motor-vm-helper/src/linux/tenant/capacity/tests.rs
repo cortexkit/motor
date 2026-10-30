@@ -137,12 +137,12 @@ fn fit_counts_headroom_all_tenants_and_checked_memtotal() {
     let mut tenant = crate::tenant::tests::registry("a");
     tenant.guest_ram_mib = 78 * 1024;
     tenant.memory_headroom_mib = 2397;
-    // 78 GiB RAM + 2397 MiB headroom + 16 GiB Windows + 6 GiB host + 24 GiB jobs.
+    // 78 GiB RAM + 2397 MiB headroom + 8 GiB page cache, plus host reservations.
     assert!(p
-        .check_fit(&[tenant.clone()], "MemTotal: 132477952 kB\n")
+        .check_fit(&[tenant.clone()], "MemTotal: 140866560 kB\n")
         .is_ok());
     assert_eq!(
-        p.check_fit(&[tenant.clone()], "MemTotal: 132477951 kB\n")
+        p.check_fit(&[tenant.clone()], "MemTotal: 140866559 kB\n")
             .unwrap_err()
             .case,
         Fit
@@ -151,7 +151,7 @@ fn fit_counts_headroom_all_tenants_and_checked_memtotal() {
         .check_fit(&[tenant.clone()], "MemTotal: 131491984 kB\n")
         .unwrap_err();
     assert_eq!(refused.case, Fit);
-    assert!(refused.message.contains("reserved_bytes=135657422848"));
+    assert!(refused.message.contains("reserved_bytes=144247357440"));
     assert!(refused.message.contains("MemTotal_bytes=134647791616"));
     tenant.guest_ram_mib += 1024;
     tenant.memory_headroom_mib = 2427;
@@ -161,7 +161,7 @@ fn fit_counts_headroom_all_tenants_and_checked_memtotal() {
             .case,
         Fit
     );
-    tenant.guest_ram_mib = 37 * 1024;
+    tenant.guest_ram_mib = 29 * 1024;
     tenant.memory_headroom_mib = 2048;
     assert!(p
         .check_fit(

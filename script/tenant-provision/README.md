@@ -20,25 +20,31 @@ The JSON configuration has these required fields:
 
 Optional fields are `idle_suspend_s` (600), `host_floor_bytes` (128 GiB,
 minimum: the direct runner's 128 GiB free-space floor),
-`memory_headroom_mib` (default and minimum: `max(2048, ceil(guest_ram_mib * 3 / 100))`), `snapshot_memory_high_mib` (16384,
+`memory_headroom_mib` (default and minimum: `max(2048, ceil(guest_ram_mib * 3 / 100))`),
+`page_cache_mib` (8192 MiB, a nonnegative integer), `snapshot_memory_high_mib` (16384,
 clamped to guest RAM), `io_weight` (100, range 1–10000), and `max_weight` (the
 permit budget, described below). `idle_suspend_s` 0 means the tenant never
 suspends. The default memory
-limit is `(guest_ram_mib + memory_headroom_mib) * 1048576`, with headroom rounded
+limit is `(guest_ram_mib + memory_headroom_mib + page_cache_mib) * 1048576`, with headroom rounded
 up to whole MiB and `memory.high` applied **only**
 while creating a snapshot. The fixed jail `pids.max` is `vcpu_ceiling + 64`.
 Snapshot creation has substantial writeback costs; tune the I/O weight and
-headroom on the target host before production use. Weight is proportional
+page-cache allowance on the target host before production use. Weight is proportional
 sharing, not an absolute bandwidth guarantee.
 
-The 2 GiB floor and 3% allowance cover more than the VMM's userspace threads:
-the cgroup also pays for page tables, drive page cache and writeback. A 78 GiB
+The 2 GiB floor and 3% headroom allowance provide OOM-safety room for the VMM's
+userspace threads and RAM-dependent bookkeeping, including page tables. A 78 GiB
 guest was killed at a guest-plus-512-MiB cgroup limit despite free host memory;
-a 104 GiB guest repeatedly hit the same margin. The new allowances are 2,397
-and 3,195 MiB respectively, leaving space for RAM-dependent bookkeeping and
-I/O bursts rather than relying on reclaim at the old cap. These are minimum
+a 104 GiB guest repeatedly hit the same margin. The headroom allowances are 2,397
+and 3,195 MiB respectively. These are minimum
 budgets, not a bound on every workload's overhead; a larger explicit value is
 allowed and is counted in host capacity.
+
+Disk I/O also charges host page cache and writeback to the VMM's cgroup.
+`page_cache_mib` provides a separate allowance so a guest using all its RAM
+does not force busy disk I/O to reclaim continually within the headroom margin.
+The page cache is reclaimable host memory, but the fit check counts the entire
+allowance so the host never overcommits.
 
 Firecracker's [specification](https://github.com/firecracker-microvm/firecracker/blob/main/SPECIFICATION.md)
 documents at most 5 MiB of VMM-thread overhead for a one-vCPU, 128-MiB test VM,
@@ -53,12 +59,20 @@ records, including old 512-MiB values, are refused by helper starts and
 the remedy. With both services stopped, `switch-image` or `resize` raises this
 field to `max(recorded headroom, formula)` in both the provisioning record and
 helper registry, through its paired update or resize journal. `switch-image`
-may rewrite this one sizing field even when selecting the same image. Resize
+may rewrite sizing fields even when selecting the same image. Resize
 also raises it when RAM grows; larger explicit allowances are preserved. The
 whole-host memory fit is checked before either operation changes records or
 builds a base. If it no longer fits, reduce another reservation or choose a
 smaller target before retrying; the helper never silently uses a different
 limit from the record and never rewrites records on start.
+
+An existing record without `page_cache_mib` uses the 8192-MiB default, including
+in the host fit check. With services stopped during a planned drain, run
+`resize TENANT --page-cache-mib 8192` to write the allowance explicitly into
+both the provisioning record and helper registry; the next VM start applies
+the cap. `switch-image` also writes the default into records missing the field.
+Both commands preserve an existing allowance when `--page-cache-mib` is omitted
+and accept an explicit value to override it.
 
 `max_weight` is the tenant's budget of concurrent job permits, counted as
 summed vCPU claims. It is optional: without it the budget is `vcpu_ceiling`,
@@ -136,7 +150,7 @@ installing host binaries that read them.
 Memory fit uses `/proc/meminfo`'s `MemTotal` in checked bytes, not `MemAvailable`:
 
 ```text
-sum((guest_ram_mib + memory_headroom_mib) * 1048576 for every tenant)
+sum((guest_ram_mib + memory_headroom_mib + page_cache_mib) * 1048576 for every tenant)
     + windows_vm_bytes + host_reserve_bytes + jobs_min_bytes <= MemTotal
 ```
 
@@ -279,7 +293,7 @@ automatic `remove_tenant`. The procedure and how to undo a removal are in
 sudo systemctl stop motor-host.service motor-vm-helper.service
 sudo python3 script/tenant-provision/provision.py resize <tenant> \
     [--vcpu-ceiling N] [--guest-ram-mib N] [--cpuset LIST] [--max-weight N] \
-    [--idle-suspend-s N] [--disk-quota-bytes N]
+    [--idle-suspend-s N] [--disk-quota-bytes N] [--page-cache-mib N]
 sudo python3 script/tenant-provision/provision.py resize --abort <tenant>
 ```
 

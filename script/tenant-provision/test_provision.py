@@ -124,8 +124,9 @@ class ProvisionTests(unittest.TestCase):
             record = json.loads(path.read_text())
             record.update(guest_ram_mib=79872, memory_headroom_mib=512)
             path.write_text(json.dumps(record, indent=2) + "\n")
-        p.switch_image("a", "v1", make_base=self.fake_base, check_service=lambda _unit: "inactive",
-                       validate_image=lambda _image: None, output=lambda _line: None)
+        with mock.patch.object(p, "memtotal_bytes", return_value=160 * 1024**3):
+            p.switch_image("a", "v1", make_base=self.fake_base, check_service=lambda _unit: "inactive",
+                           validate_image=lambda _image: None, output=lambda _line: None)
         for path in (provision_path, registry_path):
             record = json.loads(path.read_text())
             self.assertEqual(record["guest_ram_mib"], 79872)
@@ -141,7 +142,7 @@ class ProvisionTests(unittest.TestCase):
         before = self.snapshot_tree()
         base = mock.Mock()
         with mock.patch.object(p, "memtotal_bytes", return_value=134647791616), \
-                self.assertRaisesRegex(ValueError, "memory fit requires 135657422848 bytes, MemTotal is 134647791616 bytes"):
+                self.assertRaisesRegex(ValueError, "memory fit requires 144247357440 bytes, MemTotal is 134647791616 bytes"):
             p.switch_image("a", "v2", make_base=base, check_service=lambda _unit: "inactive",
                            validate_image=lambda _image: None)
         base.assert_not_called()
@@ -157,6 +158,39 @@ class ProvisionTests(unittest.TestCase):
                        validate_image=lambda _image: None, output=lambda _line: None)
         for path in (provision_path, registry_path):
             self.assertEqual(json.loads(path.read_text())["memory_headroom_mib"], 4096)
+
+    def test_page_cache_default_override_and_validation(self):
+        self.assertEqual(config()["page_cache_mib"], 8192)
+        for value in (0, 12288):
+            self.assertEqual(p.checked(dict(config(), page_cache_mib=value))["page_cache_mib"], value)
+        for value in (-1, True, "8192", None, 2**64):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "page_cache_mib"):
+                p.checked(dict(config(), page_cache_mib=value))
+        with self.assertRaisesRegex(ValueError, "tenant memory limit"):
+            p.checked(dict(config(), page_cache_mib=2**64 - 1))
+
+    def test_switch_image_preserves_page_cache_and_accepts_explicit_value(self):
+        _c, provision_path, registry_path, _suspend, _manifest = self.switch_records()
+        for path in (provision_path, registry_path):
+            record = json.loads(path.read_text())
+            record["page_cache_mib"] = 12288
+            path.write_text(json.dumps(record, indent=2) + "\n")
+        for override, expected in ((None, 12288), (16384, 16384)):
+            p.switch_image("a", "v2", make_base=self.fake_base, check_service=lambda _unit: "inactive",
+                           validate_image=lambda _image: None, output=lambda _line: None, page_cache_mib=override)
+            for path in (provision_path, registry_path):
+                self.assertEqual(json.loads(path.read_text())["page_cache_mib"], expected)
+
+    def test_switch_image_rewrites_missing_page_cache_for_same_image(self):
+        _c, provision_path, registry_path, _suspend, _manifest = self.switch_records()
+        for path in (provision_path, registry_path):
+            record = json.loads(path.read_text())
+            del record["page_cache_mib"]
+            path.write_text(json.dumps(record, indent=2) + "\n")
+        p.switch_image("a", "v1", make_base=self.fake_base, check_service=lambda _unit: "inactive",
+                       validate_image=lambda _image: None, output=lambda _line: None)
+        for path in (provision_path, registry_path):
+            self.assertEqual(json.loads(path.read_text())["page_cache_mib"], 8192)
 
     @staticmethod
     def fake_base(_config, _image, base):
@@ -710,7 +744,8 @@ class ProvisionTests(unittest.TestCase):
             p.provision(c2, execute=execute, runners=runner)
         execute.assert_called()
 
-    def test_pre_operation_requirement_passes_at_exact_and_refuses_one_byte_short(self):
+    @mock.patch.object(p, "memtotal_bytes", return_value=192 * 1024**3)
+    def test_pre_operation_requirement_passes_at_exact_and_refuses_one_byte_short(self, _memtotal):
         index = [0]
         for base, idle in ((False, 60), (True, 60), (False, 0), (True, 0)):
             with self.subTest(base=base, idle=idle):
@@ -768,7 +803,8 @@ class ProvisionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "idle_suspend_s"):
             p.checked({**config(), "idle_suspend_s": -1})
 
-    def test_a_sparse_v1_image_truncates_and_other_images_fallocate(self):
+    @mock.patch.object(p, "memtotal_bytes", return_value=192 * 1024**3)
+    def test_a_sparse_v1_image_truncates_and_other_images_fallocate(self, _memtotal):
         for index, (capabilities, allocated) in enumerate([(["sparse-v1"], False), ([], True), (None, True)]):
             with self.subTest(capabilities=capabilities):
                 manifest = dict(version="v1", kernel_sha256=hashlib.sha256(b"kernel").hexdigest(),
