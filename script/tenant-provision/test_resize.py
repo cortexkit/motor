@@ -108,7 +108,7 @@ class ResizeTests(unittest.TestCase):
     def tenant(self, name="a", tap=1, cpuset="0-1", **extra):
         config = dict(tenant=name, sub=SUB, vm=f"vm-{name}", image_version="v1", vcpu_ceiling=2,
                        guest_ram_mib=4096, disk_quota_bytes=20 * GIB, cpuset=cpuset, tap_index=tap,
-                       idle_suspend_s=600, host_floor_bytes=p.RUNNER_DEFAULT_FLOOR, memory_headroom_mib=2048,
+                       idle_suspend_s=600, host_floor_bytes=p.RUNNER_DEFAULT_FLOOR, memory_headroom_mib=2048, page_cache_mib=8192,
                        resolvers=["1.1.1.1"])
         config.update(extra)
         (p.PROVISION / f"{name}.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -207,9 +207,10 @@ class ResizeTests(unittest.TestCase):
             record["memory_headroom_mib"] = 512
             path.write_text(json.dumps(record, indent=2) + "\n")
         arguments = dict(guest_ram_mib=79872)
-        with self.assertRaises(Crash):
-            self.resize(arguments, hook=self.crash_at("step:publish:provision"))
-        self.resize(arguments)
+        with mock.patch.object(p, "memtotal_bytes", return_value=160 * GIB):
+            with self.assertRaises(Crash):
+                self.resize(arguments, hook=self.crash_at("step:publish:provision"))
+            self.resize(arguments)
         for path in (p.PROVISION / "a.json", p.REGISTRY / "a.json"):
             record = json.loads(path.read_text())
             self.assertEqual(record["memory_headroom_mib"], 2397)
@@ -223,16 +224,42 @@ class ResizeTests(unittest.TestCase):
                     record = json.loads(path.read_text())
                     record["memory_headroom_mib"] = headroom
                     path.write_text(json.dumps(record, indent=2) + "\n")
-                self.resize(dict(guest_ram_mib=79872))
+                with mock.patch.object(p, "memtotal_bytes", return_value=160 * GIB):
+                    self.resize(dict(guest_ram_mib=79872))
                 for path in (p.PROVISION / "a.json", p.REGISTRY / "a.json"):
                     self.assertEqual(json.loads(path.read_text())["memory_headroom_mib"], expected)
 
     def test_resize_refuses_new_headroom_that_no_longer_fits_without_writes(self):
         before = self.tree()
         with mock.patch.object(p, "memtotal_bytes", return_value=134647791616), \
-                self.assertRaisesRegex(ValueError, "memory fit requires 135657422848 bytes, MemTotal is 134647791616 bytes"):
+                self.assertRaisesRegex(ValueError, "memory fit requires 144247357440 bytes, MemTotal is 134647791616 bytes"):
             self.resize(dict(guest_ram_mib=79872))
         self.assertEqual(self.tree(), before)
+
+    def test_resize_preserves_page_cache_and_accepts_explicit_value(self):
+        for path in (p.PROVISION / "a.json", p.REGISTRY / "a.json"):
+            record = json.loads(path.read_text())
+            record["page_cache_mib"] = 12288
+            path.write_text(json.dumps(record, indent=2) + "\n")
+        self.resize(dict(max_weight=16))
+        for path in (p.PROVISION / "a.json", p.REGISTRY / "a.json"):
+            self.assertEqual(json.loads(path.read_text())["page_cache_mib"], 12288)
+        (self.root / "tenants/a/runner-args.staged").unlink()
+        self.resize(dict(page_cache_mib=16384))
+        for path in (p.PROVISION / "a.json", p.REGISTRY / "a.json"):
+            self.assertEqual(json.loads(path.read_text())["page_cache_mib"], 16384)
+
+    def test_resize_rewrites_missing_page_cache_even_when_effective_size_is_unchanged(self):
+        for path in (p.PROVISION / "a.json", p.REGISTRY / "a.json"):
+            record = json.loads(path.read_text())
+            del record["page_cache_mib"]
+            path.write_text(json.dumps(record, indent=2) + "\n")
+        arguments = dict(page_cache_mib=8192)
+        with self.assertRaises(Crash):
+            self.resize(arguments, hook=self.crash_at("step:publish:provision"))
+        self.resize(arguments)
+        for path in (p.PROVISION / "a.json", p.REGISTRY / "a.json"):
+            self.assertEqual(json.loads(path.read_text())["page_cache_mib"], 8192)
 
     def test_full_resize_publishes_the_new_state_through_every_step(self):
         seen = []
@@ -302,6 +329,9 @@ class ResizeTests(unittest.TestCase):
             ("drop-in differs", lambda: p.JOBS_DROP_IN.write_text(RENDERED + "\n"), {}, {}, "drop-in differs"),
             ("max_weight above u32", lambda: None, {}, dict(max_weight=2**32), "max_weight must be"),
             ("max_weight below ceiling", lambda: None, {}, dict(max_weight=2), "at least vcpu_ceiling"),
+            ("negative page cache", lambda: None, {}, dict(page_cache_mib=-1), "page_cache_mib"),
+            ("boolean page cache", lambda: None, {}, dict(page_cache_mib=True), "page_cache_mib"),
+            ("overflowing page cache", lambda: None, {}, dict(page_cache_mib=2**64 - 1), "tenant memory limit"),
         ]
         for label, prepare, kwargs, change, message in cases:
             with self.subTest(label):
