@@ -404,6 +404,20 @@ class ImageTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, f"CONFIG_{name} must be built in"):
                         image.check_kernel(path)
 
+    def test_resolved_kernel_requires_psi_enabled_at_boot(self):
+        # A job's cgroup memory.pressure file exists only with PSI on; the job
+        # isolation contract promises it to jobs.
+        path = self.root / "kernel.config"
+        for config in (resolved_config().replace("CONFIG_PSI=y\n", "# CONFIG_PSI is not set\n"),
+                       resolved_config().replace("CONFIG_PSI=y\n", "CONFIG_PSI=m\n")):
+            with self.subTest(config=config[-60:]):
+                path.write_text(config)
+                with self.assertRaisesRegex(ValueError, "CONFIG_PSI must be built in"):
+                    image.check_kernel(path)
+        path.write_text(resolved_config() + "CONFIG_PSI_DEFAULT_DISABLED=y\n")
+        with self.assertRaisesRegex(ValueError, "CONFIG_PSI_DEFAULT_DISABLED must be disabled"):
+            image.check_kernel(path)
+
     def test_resolved_kernel_rejects_disabled_landlock(self):
         path = self.root / "kernel.config"
         config = resolved_config().replace("CONFIG_SECURITY_LANDLOCK=y\n", "")

@@ -27,6 +27,10 @@ OVERLAY_FS=y
 POSIX_MQUEUE=y
 CGROUPS=y
 MEMCG=y
+# Jobs read their cgroup's memory.pressure (docs/job-isolation.md 4.4.2), which
+# needs pressure stall information compiled in and not disabled at boot.
+PSI=y
+PSI_DEFAULT_DISABLED=n
 CGROUP_PIDS=y
 CGROUP_SCHED=y
 CFS_BANDWIDTH=y
