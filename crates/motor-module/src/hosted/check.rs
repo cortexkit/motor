@@ -3,10 +3,13 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+/// The non-secret claims of the account service's worker token, as the runners
+/// contract defines them: the token names its account in `account` (there is
+/// no `sub`). `device` and `jti` are left out because nothing here needs them.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Claims {
     pub aud: String,
-    pub sub: String,
+    pub account: String,
     pub iat: u64,
     pub exp: u64,
 }
@@ -55,7 +58,10 @@ pub(crate) async fn check(tokens: Option<&Arc<AccountTokens>>, config: &crate::C
         .and_then(|payload| URL_SAFE_NO_PAD.decode(payload).ok())
         .and_then(|payload| serde_json::from_slice::<Claims>(&payload).ok());
     let Some(claims) = claims.filter(|c| {
-        c.aud == "cortexkit-runners" && !c.sub.is_empty() && c.iat < c.exp && c.exp > super::now_s()
+        c.aud == "cortexkit-runners"
+            && !c.account.is_empty()
+            && c.iat < c.exp
+            && c.exp > super::now_s()
     }) else {
         return Check::refusal(Error::AccountInvalid);
     };

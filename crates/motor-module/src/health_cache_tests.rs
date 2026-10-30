@@ -247,7 +247,7 @@ fn account_summary_excludes_claims_and_distinguishes_auth_from_connection() {
             broker_status,
             claims: Some(crate::hosted::check::Claims {
                 aud: "cortexkit-runners".into(),
-                sub: "private-account-id".into(),
+                account: "private-account-id".into(),
                 iat: 1,
                 exp: 2,
             }),

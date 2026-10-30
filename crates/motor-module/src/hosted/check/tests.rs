@@ -28,7 +28,9 @@ async fn hosted_check_returns_only_nonsecret_claims_with_switch_off() {
     let logs = crate::logging::Captured::default();
     let _guard = crate::logging::scoped(logs.clone());
     tracing::warn!("hosted check log capture active");
-    let payload = motor_lease::base64url(serde_json::to_vec(&serde_json::json!({"aud":"cortexkit-runners", "sub":"acct:test", "iat":1,"exp":u64::MAX,"secret":"not-for-output"})).unwrap().as_slice());
+    // The worker token's claim set from the runners contract: account, device,
+    // iat, exp, aud and jti.
+    let payload = motor_lease::base64url(serde_json::to_vec(&serde_json::json!({"aud":"cortexkit-runners", "account":"01KXJJHK4V6DB42W1YAN2XD9QN", "device":"not-for-output-device", "jti":"not-for-output-jti", "iat":1,"exp":u64::MAX,"secret":"not-for-output"})).unwrap().as_slice());
     let jwt = format!("secret-header.{payload}.secret-signature");
     let vault = FakeVault::new(vec![Ok(token(&jwt))]);
     let result = check(Some(&vault.client()), &crate::Config::default()).await;
@@ -39,12 +41,14 @@ async fn hosted_check_returns_only_nonsecret_claims_with_switch_off() {
         "secret-header",
         "secret-signature",
         "not-for-output",
+        "not-for-output-device",
+        "not-for-output-jti",
         &payload,
     ] {
         assert!(!output.contains(secret));
         assert!(!logs.text().contains(secret));
     }
-    assert!(output.contains("acct:test"));
+    assert!(output.contains("01KXJJHK4V6DB42W1YAN2XD9QN"));
     assert!(logs.text().contains("hosted check log capture active"));
 }
 
@@ -56,7 +60,7 @@ async fn hosted_check_probes_invalid_lease_body_and_returns_only_http_status() {
         (400, serde_json::json!({"error":"private-broker-text"}))
     })
     .await;
-    let payload=motor_lease::base64url(&serde_json::to_vec(&serde_json::json!({"aud":"cortexkit-runners","sub":"acct:test","iat":1,"exp":u64::MAX})).unwrap());
+    let payload=motor_lease::base64url(&serde_json::to_vec(&serde_json::json!({"aud":"cortexkit-runners","account":"01KXJJHK4V6DB42W1YAN2XD9QN","device":"d","jti":"j","iat":1,"exp":u64::MAX})).unwrap());
     let jwt = format!("secret-header.{payload}.secret-signature");
     let vault = FakeVault::new(vec![Ok(token(&jwt))]);
     let config = crate::Config {

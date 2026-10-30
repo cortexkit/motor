@@ -1303,7 +1303,7 @@ async fn hosted_check_is_direct_only_and_mints_through_real_module_with_hosted_o
     assert!(!config.hosted_runners);
     let payload = motor_lease::base64url(
         &serde_json::to_vec(
-            &json!({"aud":"cortexkit-runners", "sub":"acct:operator", "iat":1,"exp":u64::MAX}),
+            &json!({"aud":"cortexkit-runners", "account":"01KXOPERATOR", "device":"d", "jti":"j", "iat":1,"exp":u64::MAX}),
         )
         .unwrap(),
     );
@@ -1346,7 +1346,7 @@ async fn hosted_check_is_direct_only_and_mints_through_real_module_with_hosted_o
         let value: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(value["status"], status);
         if status == "ok" {
-            assert_eq!(value["claims"]["sub"], "acct:operator");
+            assert_eq!(value["claims"]["account"], "01KXOPERATOR");
         }
         if status == "transient" {
             assert_eq!(value["retry_after_ms"], 4321);
