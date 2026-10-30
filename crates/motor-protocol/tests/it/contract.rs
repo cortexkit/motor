@@ -899,6 +899,7 @@ fn request_environment_policy_allows_build_controls_but_not_paths_or_credentials
         "NO_COLOR",
         "CLICOLOR",
         "CLICOLOR_FORCE",
+        "MOTOR_RUNNER_INSTANCE",
     ] {
         assert!(allowed_env(name), "denied {name}");
     }

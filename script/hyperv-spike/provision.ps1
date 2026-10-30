@@ -134,6 +134,7 @@ try {
         Assert-Spike ($bootstrap -match 'Verified machine-wide Python 3\.14\.8 with protected user read/execute access') 'verified-machine-python-version' '3.14.8'
         Assert-Spike ($bootstrap -match 'Verified machine-wide Python stdlib imports: json, hashlib, subprocess, tomllib, compression.zstd') 'verified-machine-python-stdlib' 'json, hashlib, subprocess, tomllib, compression.zstd'
         Assert-Spike ($bootstrap -match 'Verified machine-wide nats-server v2\.15\.0 with protected user read/execute access') 'verified-machine-nats-version' '2.15.0'
+        Assert-Spike ($bootstrap -match 'Verified machine-wide LLVM 21\.1\.8 and libclang\.dll with protected user read/execute access') 'verified-machine-llvm-version' '21.1.8'
         Assert-Spike ($bootstrap -match 'Verified machine-wide Rust stable 1\.99\.0 with matching components and targets') 'verified-machine-rust-stable' '1.99.0'
         $agent = [IO.Path]::Combine($volume, 'ProgramData\Motor\motor-winagent.exe')
         $expected = (([IO.File]::ReadAllText([IO.Path]::Combine($provision, 'winagent.sha256'))) -split '\s+')[0]

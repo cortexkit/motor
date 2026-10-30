@@ -95,6 +95,7 @@ struct Agent {
     unit_exit_checked: AtomicBool,
     clock: AtomicU64,
     tree: Mutex<Vec<u8>>,
+    env: Mutex<BTreeMap<String, String>>,
     units: Mutex<Vec<Vec<String>>>,
     exit_reply: Mutex<Option<ExitReply>>,
 }
@@ -388,6 +389,7 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                         _ => unreachable!(),
                     }
                 };
+                *a.env.lock().unwrap() = command.env.clone();
                 if fault == Fault::Transfer {
                     stall(&a, &s, 2);
                     return Ok(());
@@ -747,6 +749,33 @@ async fn registry_job(has_lockfile: bool) {
         has_lockfile
     );
     cleaned(runner.config(), r.job_id, &a);
+}
+
+#[tokio::test]
+async fn windows_backend_sends_configured_runner_instance_in_job_environment() {
+    for instance in ["windows", "ally"] {
+        let f = Fixture::new();
+        source(&f);
+        let (mut c, a) = configure(&f, Fault::None, 0);
+        c.instance = instance.into();
+        let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+        let (mut r, bytes) = request(&f);
+        r.env
+            .insert("MOTOR_RUNNER_INSTANCE".into(), "spoofed".into());
+        r.env.insert("RUST_BACKTRACE".into(), "1".into());
+        f.submit(&runner, &r, &bytes);
+        assert_eq!(
+            terminal(&runner, r.job_id).await.outcome,
+            Outcome::WindowsExit { code: 0 }
+        );
+        let env = a.env.lock().unwrap().clone();
+        assert_eq!(
+            env.get("MOTOR_RUNNER_INSTANCE").map(String::as_str),
+            Some(instance)
+        );
+        assert_eq!(env.get("RUST_BACKTRACE").map(String::as_str), Some("1"));
+        cleaned(runner.config(), r.job_id, &a);
+    }
 }
 
 #[tokio::test]

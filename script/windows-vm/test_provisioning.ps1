@@ -237,6 +237,77 @@ foreach ($case in @(
 $checks++
 Write-Host 'PASS nats_version_guard_rejects_wrong_missing_and_failed_tools'
 
+$llvmInstall = @($ast.EndBlock.Statements | Where-Object {
+    $_ -is [Management.Automation.Language.TryStatementAst] -and $_.Extent.Text.Contains('-OutFile $llvmInstaller')
+})
+Assert ($llvmInstall.Count -eq 1) 'LLVM must install unconditionally for QEMU and Hyper-V images'
+$llvmSetup = $llvmInstall[0].Extent.Text
+Assert ($llvmSetup.IndexOf('-OutFile $llvmInstaller') -lt $llvmSetup.IndexOf('Get-FileHash -LiteralPath $llvmInstaller')) 'LLVM hash must follow download'
+Assert ($llvmSetup.IndexOf("throw 'LLVM installer SHA-256 mismatch'") -lt $llvmSetup.IndexOf('Start-Process -FilePath $llvmInstaller')) 'LLVM hash must be verified before execution'
+Assert ($llvmSetup.IndexOf('& icacls $llvmInstall /inheritance:r') -lt $llvmSetup.IndexOf('Start-Process -FilePath $llvmInstaller')) 'LLVM root must be protected before installation'
+$checks++
+Write-Host 'PASS llvm_unconditional_download_verify_install'
+
+$llvmHashGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text.Contains('Get-FileHash -LiteralPath $llvmInstaller')}, $true)
+Assert ($null -ne $llvmHashGuard) 'missing LLVM installer hash guard'
+$llvmInstaller = 'llvm-fixture.exe'
+$llvmSha256 = '7a5386c26497db1691f320121e5b113364dd0274b98e55f15f4dbc00c0450113'
+function Get-FileHash {
+    param($LiteralPath, $Algorithm)
+    Assert ($LiteralPath -eq $llvmInstaller -and $Algorithm -eq 'SHA256') 'LLVM hashed the wrong installer or algorithm'
+    [pscustomobject]@{ Hash = $fixtureHash }
+}
+try {
+    foreach ($fixtureHash in @($llvmSha256.ToUpperInvariant(), ('0' * 64))) {
+        $threw = $false
+        try { Invoke-Expression $llvmHashGuard.Extent.Text } catch {
+            Assert ($_.ToString().Contains('LLVM installer SHA-256 mismatch')) "unexpected LLVM hash error: $_"
+            $threw = $true
+        }
+        Assert ($threw -eq ($fixtureHash -eq ('0' * 64))) 'LLVM accepted a wrong hash or rejected the pinned hash'
+    }
+} finally {
+    Remove-Item Function:\Get-FileHash
+}
+$checks++
+Write-Host 'PASS llvm_hash_guard_rejects_mismatch'
+
+$llvmExitGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text.Contains('$llvmProcess.ExitCode')}, $true)
+Assert ($null -ne $llvmExitGuard) 'missing LLVM installer exit code guard'
+foreach ($code in @(0, 1, 1603)) {
+    $llvmProcess = [pscustomobject]@{ExitCode = $code}
+    $threw = $false
+    try { Invoke-Expression $llvmExitGuard.Extent.Text } catch {
+        Assert ($_.ToString().Contains('Machine-wide LLVM installation failed')) "unexpected LLVM installer error: $_"
+        $threw = $true
+    }
+    Assert ($threw -eq ($code -ne 0)) "wrong LLVM installer exit code result: $code"
+}
+$checks++
+Write-Host 'PASS llvm_installer_exit_guard_rejects_failure'
+
+$llvmVersionGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text.Contains('$installedClangVersion | Select-Object -First 1')}, $true)
+Assert ($null -ne $llvmVersionGuard) 'missing LLVM version guard'
+$llvmVersion = '21.1.8'
+foreach ($case in @(
+    @{Version=@('clang version 21.1.8', 'Target: x86_64-pc-windows-msvc'); Code=0; Reject=$false},
+    @{Version='clang version 21.1.7'; Code=0; Reject=$true},
+    @{Version='clang version 21.1.80'; Code=0; Reject=$true},
+    @{Version=''; Code=127; Reject=$true},
+    @{Version='clang version 21.1.8'; Code=1; Reject=$true}
+)) {
+    $installedClangVersion = $case.Version
+    $LASTEXITCODE = $case.Code
+    $threw = $false
+    try { Invoke-Expression $llvmVersionGuard.Extent.Text } catch {
+        Assert ($_.ToString().Contains('Machine-wide LLVM version verification failed')) "unexpected LLVM version error: $_"
+        $threw = $true
+    }
+    Assert ($threw -eq $case.Reject) "wrong LLVM version guard result: $($case.Version), exit $($case.Code)"
+}
+$checks++
+Write-Host 'PASS llvm_version_guard_rejects_wrong_missing_and_failed_tools'
+
 $stableCopyText = 'Copy-Item -LiteralPath "$env:RUSTUP_HOME\toolchains\$toolchain-$hostTriple" -Destination $stableInstall -Recurse'
 $stableCopy = @($ast.EndBlock.Statements | Where-Object { $_.Extent.Text -eq $stableCopyText })
 Assert ($stableCopy.Count -eq 1) 'stable must be a complete unconditional copy of the numbered Rust toolchain'
@@ -348,6 +419,7 @@ foreach ($state in @('key-absent','value-absent','zero','one')) {
 $checks++
 Write-Host 'PASS developer_mode_absent_key_absent_value_zero_and_one'
 $items = [ordered]@{
+    machine_llvm = @("`$llvmVersion = '21.1.8'", 'llvmorg-21.1.8/LLVM-21.1.8-win64.exe', 'https://api.github.com/repos/llvm/llvm-project/releases/assets/329799346', '7a5386c26497db1691f320121e5b113364dd0274b98e55f15f4dbc00c0450113', "`$llvmInstall = 'C:\Program Files\LLVM'", 'Start-Process -FilePath $llvmInstaller -ArgumentList "/S /D=$llvmInstall" -Wait -PassThru', '& icacls "$llvmInstall\*" /reset /T /C /L /Q', '& icacls $llvmInstall /setowner', 'SetEnvironmentVariable(''Path'', "$llvmBin;$machinePath", ''Machine'')', 'SetEnvironmentVariable(''LIBCLANG_PATH'', $llvmBin, ''Machine'')', 'Test-Path -LiteralPath "$llvmBin\libclang.dll" -PathType Leaf', '& "$llvmBin\clang.exe" --version')
     machine_toolchain = @("`$toolchain = '1.99.0'", "`$hostTriple = 'x86_64-pc-windows-msvc'", "`$env:RUSTUP_HOME = 'C:\rust\rustup'", "`$env:CARGO_HOME = 'C:\rust\cargo'", '--default-toolchain $toolchain --default-host $hostTriple --no-modify-path', "SetEnvironmentVariable('RUSTUP_HOME'", "SetEnvironmentVariable('Path'", "'C:\rust' /inheritance:r", ':(OI)(CI)RX')
     machine_bun = @("`$bunVersion = '1.4.2'", 'bun-v1.4.2/bun-windows-x64.zip', 'bun-v1.4.2/SHASUMS256.txt', 'ce4c17497b2f29712a99d3d53f028de28cd42e3bacb8589599e7f000e49b6405', 'Get-FileHash -LiteralPath $bunArchive -Algorithm SHA256', 'throw ''Bun archive SHA-256 mismatch''', "`$bunInstall = 'C:\Program Files\Bun'", '& icacls $bunInstall /inheritance:r', '*S-1-5-32-545:(OI)(CI)RX', '& icacls $bunInstall /setowner', 'SetEnvironmentVariable(''Path'', "$bunInstall;$machinePath", ''Machine'')', '& "$bunInstall\bun.exe" --version', '$installedBunVersion -cne $bunVersion')
     machine_nextest = @("`$nextestVersion = '0.9.138'", 'cargo-nextest-0.9.138/cargo-nextest-0.9.138-x86_64-pc-windows-msvc.tar.gz', 'e4606198dd067299f16863dcf5b9be007b9cae041e468c417884fc224760c0f4', '-xzf $nextestArchive -C ''C:\rust\cargo\bin'' cargo-nextest.exe', "if (`$LASTEXITCODE -ne 0) { throw 'cargo-nextest extraction failed' }", 'Remove-Item -LiteralPath $nextestArchive -Force', '& ''C:\rust\cargo\bin\cargo.exe'' nextest --version')

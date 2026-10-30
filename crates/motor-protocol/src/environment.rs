@@ -5,7 +5,10 @@ pub fn allowed_env(name: &str) -> bool {
         || matches!(name, "RUSTFLAGS" | "RUSTDOCFLAGS")
         || name.starts_with("CARGO_")
         || name.starts_with("NEXTEST_")
-        || matches!(name, "CI" | "NO_COLOR" | "CLICOLOR" | "CLICOLOR_FORCE"))
+        || matches!(
+            name,
+            "CI" | "NO_COLOR" | "CLICOLOR" | "CLICOLOR_FORCE" | "MOTOR_RUNNER_INSTANCE"
+        ))
         && !matches!(
             name,
             "CARGO_HOME" | "CARGO_INSTALL_ROOT" | "CARGO_TARGET_DIR"

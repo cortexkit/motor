@@ -889,6 +889,23 @@
       "version_pattern": "x86_64-w64-mingw32-gcc \\(GCC\\) [0-9.]+-win32"
     }
   },
+  "windows_tools": {
+    "llvm": {
+      "version": "21.1.8",
+      "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.8/LLVM-21.1.8-win64.exe",
+      "sha256": "7a5386c26497db1691f320121e5b113364dd0274b98e55f15f4dbc00c0450113",
+      "digest_source": "https://api.github.com/repos/llvm/llvm-project/releases/assets/329799346",
+      "install_dir": "C:\\Program Files\\LLVM"
+    },
+    "python": {
+      "version": "3.14.8",
+      "install_dir": "C:\\Python314"
+    },
+    "nats-server": {
+      "version": "2.15.0",
+      "install_dir": "C:\\Program Files\\NATS"
+    }
+  },
   "windows_cross": {
     "arch": "x86_64",
     "cache": "target/windows-cross/cache",

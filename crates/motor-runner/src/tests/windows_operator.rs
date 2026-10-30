@@ -221,7 +221,7 @@ fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
     let output = run(
         &runner,
         &f,
-        &format!("set -e; rustc -vV; cargo --version; cargo nextest --version; git --version; bun --version; pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; python3 --version; python --version; python3 -c \"import json, hashlib, subprocess, tomllib, compression.zstd\"; nats-server --version; rustc +stable --version; {probe}; cargo +stable run --offline; test -f target/debug/motor-qualification.exe"),
+        &format!("set -e; rustc -vV; cargo --version; cargo nextest --version; git --version; bun --version; pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; python3 --version; python --version; python3 -c \"import json, hashlib, subprocess, tomllib, compression.zstd\"; nats-server --version; rustc +stable --version; clang --version; {probe}; cargo +stable run --offline; test -f target/debug/motor-qualification.exe"),
     );
     assert!(
         output
@@ -275,6 +275,16 @@ fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
     assert!(output.contains("release: 1.99.0"));
     assert!(output.contains("host: x86_64-pc-windows-msvc"));
     assert!(output.contains("MSVC binary ran"));
+    assert!(
+        output
+            .lines()
+            .any(|line| line.trim() == "clang version 21.1.8"),
+        "{output}"
+    );
+    assert!(
+        output.contains("LLVM installation is read-only"),
+        "{output}"
+    );
     no_units(&runner);
 }
 
@@ -284,9 +294,12 @@ $ErrorActionPreference='Stop'
 $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
 if($identity.Name.Split('\')[-1] -cne 'motor-job'){throw "unexpected job user: $($identity.Name)"}
 if(([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'job user is an administrator'}
-foreach($tool in @(@{name='PowerShell';command='pwsh.exe';path='C:\Program Files\PowerShell\7'},@{name='Bun';command='bun.exe';path='C:\Program Files\Bun'},@{name='Python';command='python3.exe';path='C:\Python314'},@{name='NATS';command='nats-server.exe';path='C:\Program Files\NATS'})) {
+if($env:LIBCLANG_PATH -cne 'C:\Program Files\LLVM\bin'){throw 'LIBCLANG_PATH does not name the protected LLVM bin directory'}
+if(-not (Test-Path -LiteralPath "$env:LIBCLANG_PATH\libclang.dll" -PathType Leaf)){throw 'libclang.dll is missing'}
+foreach($tool in @(@{name='PowerShell';command='pwsh.exe';path='C:\Program Files\PowerShell\7'},@{name='Bun';command='bun.exe';path='C:\Program Files\Bun'},@{name='Python';command='python3.exe';path='C:\Python314'},@{name='NATS';command='nats-server.exe';path='C:\Program Files\NATS'},@{name='LLVM';command='clang.exe';path='C:\Program Files\LLVM\bin'})) {
 $install=$tool.path
 if((Get-Command $tool.command -ErrorAction Stop).Source -cne (Join-Path $install $tool.command)){throw "$($tool.name) resolves outside the protected installation"}
+if($tool.name -eq 'LLVM'){$install=Split-Path -Parent $install}
 $directories=@((Get-Item -LiteralPath $install)) + @(Get-ChildItem -LiteralPath $install -Directory -Recurse -Force -ErrorAction Stop)
 foreach($directory in $directories) {
  $probe=Join-Path $directory.FullName ('motor-write-probe-'+[Guid]::NewGuid().ToString())
