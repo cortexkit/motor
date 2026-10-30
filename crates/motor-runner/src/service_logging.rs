@@ -20,14 +20,20 @@ struct BoundedLog {
 impl BoundedLog {
     fn open(path: PathBuf, limit: u64) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let bytes = file.metadata()?.len().min(limit);
-        file.set_len(bytes)?;
-        Ok(Self {
+        let bytes = file.metadata()?.len();
+        let mut log = Self {
             path,
             file: Some(file),
             bytes,
             limit,
-        })
+        };
+        // A log already at its limit (left by a crash) is rotated, never cut with
+        // set_len: on Windows an append-only handle lacks write-data access, so
+        // set_len fails with Access is denied and the service never starts.
+        if log.bytes >= limit {
+            log.rotate()?;
+        }
+        Ok(log)
     }
 
     fn rotate(&mut self) -> io::Result<()> {
@@ -128,6 +134,26 @@ mod tests {
         log.write_all(b"restarted\n").unwrap();
         log.flush().unwrap();
         assert!(fs::read_to_string(path).unwrap().contains("restarted"));
+    }
+
+    /// Opening must not truncate: the Windows append-only handle cannot, which
+    /// made every service start fail before it reached the Service Control
+    /// Manager. A log at its limit moves whole to runner.log.1 instead.
+    #[test]
+    fn service_log_rotates_an_oversized_log_at_open_without_truncating_it() {
+        let scratch = cortexkit_test_support::ScratchDir::new("windows-service-log-reopen");
+        let path = scratch.path().join("runner.log");
+        let old = "y".repeat(200);
+        fs::write(&path, &old).unwrap();
+        let mut log = BoundedLog::open(path.clone(), 128).unwrap();
+        log.write_all(b"fresh\n").unwrap();
+        log.flush().unwrap();
+        assert_eq!(
+            fs::read_to_string(path.with_extension("log.1")).unwrap(),
+            old
+        );
+        let current = fs::read_to_string(&path).unwrap();
+        assert!(current.ends_with(" fresh\n") && !current.contains('y'));
     }
 
     #[test]
