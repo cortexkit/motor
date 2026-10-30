@@ -235,7 +235,9 @@ probes. The account probe uses the same non-booking credential check as
 `hosted.check`, without publishing token claims. Three consecutive direct Linux
 failures or two minutes without a successful direct Linux sample still degrade
 module health. Busy queues alone remain healthy, and startup and SSH credential
-failures still report failing health.
+failures still report failing health. Failing detail starts with the
+machine-readable reason followed by `; `, before the caller-machine summary,
+so the cause is visible first.
 
 Module metrics contain `daemon`, `connection`, `platforms`, `machine`, plus the
 existing local `request_pools` and `unreachable_refusals_since_boot` diagnostics.

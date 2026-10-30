@@ -372,3 +372,24 @@ fn linux_connection_label_is_explicit_and_only_shown_for_direct_routing() {
         assert_eq!(report.metrics.unwrap()["connection"]["runner"], "ok");
     }
 }
+
+#[test]
+fn failing_detail_leads_with_reason_before_caller_facing_summary() {
+    let now = Instant::now();
+    let cache = hosted_text_cache(now);
+    let report = cache.report_with_refusal(now, Some("runner_credential_grant_refused"));
+    assert_eq!(report.status, HealthStatus::Failing);
+    let detail = report.detail.unwrap();
+    assert!(
+        detail.starts_with(&format!(
+            "runner_credential_grant_refused; {}: daemon running;",
+            machine_name(),
+        )),
+        "{detail}"
+    );
+    assert_eq!(detail.matches("runner_credential_grant_refused").count(), 1);
+    assert_eq!(
+        report.metrics.unwrap()["connection"]["error"],
+        "runner_credential_grant_refused"
+    );
+}

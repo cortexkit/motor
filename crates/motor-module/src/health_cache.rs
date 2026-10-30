@@ -209,7 +209,11 @@ impl HealthCache {
             }
         }
         let machine = machine_name();
-        let mut detail = format!("{machine}: daemon running");
+        // Lead with the refusal so failing health summaries expose the cause before context.
+        let mut detail = match refusal {
+            Some(reason) => format!("{reason}; {machine}: daemon running"),
+            None => format!("{machine}: daemon running"),
+        };
         if !hosted {
             detail.push_str(&format!(
                 "; Linux runner {}",
@@ -221,9 +225,6 @@ impl HealthCache {
             connection["broker"].as_str().unwrap(),
             connection["sign_in"].as_str().unwrap()
         ));
-        if let Some(reason) = refusal {
-            detail.push_str(&format!("; module error: {reason}"));
-        }
         for platform in ["linux", "windows", "macos"] {
             let status = platforms[platform]["status"].as_str().unwrap();
             let reason = platforms[platform]["reason"].as_str();
