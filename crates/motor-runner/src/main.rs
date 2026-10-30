@@ -108,6 +108,15 @@ async fn run(args: Vec<String>) -> io::Result<()> {
     }
     let (job, drain_timeout_s, exit_after) = configure_options(&mut config, args)?;
     match operation.as_str() {
+        "metrics-key" => {
+            println!("{}", motor_runner::metrics::public_key(&config)?);
+            Ok(())
+        }
+        "metrics-push" => {
+            let _ = motor_protocol::logging::init(LOG_PREFIX);
+            tokio::task::spawn_blocking(move || motor_runner::metrics::run(&config))
+                .await.map_err(io::Error::other)?
+        }
         "check-options" => Ok(()),
         #[cfg(windows)]
         "qualify-prep" => motor_runner::hyperv_qualify_prep(config),
@@ -260,6 +269,7 @@ async fn run(args: Vec<String>) -> io::Result<()> {
             if config.tenant_vm {
                 motor_runner::run_helpers_directly_as_root()?;
             }
+            motor_runner::metrics::start(&config)?;
             let runner = Runner::open(config)?;
             #[cfg(windows)]
             native_service::watch_power_and_stop(runner.clone())?;
@@ -323,7 +333,7 @@ async fn run(args: Vec<String>) -> io::Result<()> {
             Ok(())
         }
         _ => Err(io::Error::other(
-              "usage: motor-runner serve|connect|drain|resume|tenant-agent|forget-caller-root --prefix PREFIX [--instance NAME] [--drain-timeout-s SECONDS] [--backend host|vm|windows-vm|macos-vm] [--tenant-vm] [--vm-config FILE] [--development-allow-host-backend] [--remote-cache true|false]",
+              "usage: motor-runner serve|connect|drain|resume|metrics-key|metrics-push|tenant-agent|forget-caller-root --prefix PREFIX [--instance NAME] [--drain-timeout-s SECONDS] [--backend host|vm|windows-vm|macos-vm] [--tenant-vm] [--vm-config FILE] [--development-allow-host-backend] [--remote-cache true|false] [--metrics-push --metrics-endpoint HTTPS_ORIGIN --metrics-host-id ID]",
         )),
     }
 }
@@ -430,6 +440,10 @@ fn configure_options(
     let mut drain_timeout_s = 1800;
     let mut exit_after = true;
     while let Some(arg) = args.next() {
+        if arg == "--metrics-push" {
+            config.metrics.enabled = true;
+            continue;
+        }
         if arg == "--tenant-vm" {
             config.tenant_vm = true;
             continue;
@@ -447,6 +461,10 @@ fn configure_options(
             .next()
             .ok_or_else(|| io::Error::other("missing option value"))?;
         match arg.as_str() {
+            "--metrics-endpoint" => config.metrics.endpoint = Some(value),
+            "--metrics-host-id" => config.metrics.host_id = Some(value),
+            "--metrics-key-file" => config.metrics.key_file = Some(value.into()),
+            "--metrics-counter-journal" => config.metrics.counter_journal = Some(value.into()),
             "--instance" => config.instance = value,
             "--remote-cache" => config.remote_cache = value.parse().map_err(io::Error::other)?,
             "--remote-cache-forwarder-port" => {
@@ -543,6 +561,7 @@ fn configure_options(
         ));
     }
     config.check_options()?;
+    config.metrics.check()?;
     Ok((job, drain_timeout_s, exit_after))
 }
 
@@ -674,6 +693,49 @@ fn version_requested(args: &[String]) -> bool {
 
 fn binary_version() -> &'static str {
     concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")")
+}
+
+#[cfg(test)]
+mod metrics_cli_tests {
+    use super::*;
+
+    #[test]
+    fn monitor_cli_is_explicit_and_keeps_option_values_separate() {
+        let mut config = Config::new("unused", "monitor");
+        configure_options(
+            &mut config,
+            [
+                "--metrics-host-id",
+                "monitor-1",
+                "--metrics-endpoint",
+                "https://runners.cortexkit.io",
+            ]
+            .map(str::to_owned)
+            .into_iter(),
+        )
+        .unwrap();
+        assert!(!config.metrics.enabled);
+        assert_eq!(config.metrics.host_id.as_deref(), Some("monitor-1"));
+        let result = configure_options(
+            &mut config,
+            [
+                "--metrics-push",
+                "--metrics-key-file",
+                "signing-key",
+                "--metrics-counter-journal",
+                "journal",
+            ]
+            .map(str::to_owned)
+            .into_iter(),
+        );
+        result.unwrap();
+        assert!(config.metrics.enabled);
+        assert_eq!(config.metrics.key_file, Some(PathBuf::from("signing-key")));
+        assert_eq!(
+            config.metrics.counter_journal,
+            Some(PathBuf::from("journal"))
+        );
+    }
 }
 
 #[cfg(test)]

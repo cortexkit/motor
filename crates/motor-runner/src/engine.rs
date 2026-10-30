@@ -84,6 +84,8 @@ pub type FreeSpaceProbe = Arc<dyn Fn(&Path) -> io::Result<u64> + Send + Sync>;
 /// Paths are instance-specific except build_slot_root, which is machine-wide.
 #[derive(Clone)]
 pub struct Config {
+    /// Diagnostic pushes are opt-in and use an identity separate from job state.
+    pub metrics: crate::metrics::Settings,
     /// Accept host-authenticated tenant connections over vsock and limit each
     /// job unit to 4096 tasks, with no permission to open AF_VSOCK sockets.
     pub tenant_vm: bool,
@@ -433,6 +435,7 @@ impl Config {
     pub fn new(state_root: impl Into<PathBuf>, instance: impl Into<String>) -> Self {
         let state_root = state_root.into();
         Self {
+            metrics: crate::metrics::Settings::default(),
             tenant_vm: false,
             boat_profile: false,
             boat_cold_materialization: false,

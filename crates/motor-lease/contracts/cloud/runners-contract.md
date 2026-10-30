@@ -516,9 +516,17 @@ The registry's `role` is `placement` by default or `monitor`. A monitor has its 
 and may call only the metrics route. Heartbeat and usage return 401 `host_auth_failed` before
 consuming a counter. Placement excludes monitors even if an older heartbeat remains stored.
 An explicit-only hint naming a monitor refuses with 503 `no_capacity` rather than falling back.
-A role is fixed when a host is registered: retire a placement host and let its jobs finish before
-re-registering it as a monitor, because the lease path does not re-read the role when it signs a
-replay or reattach token for a job already on that host.
+A role is fixed for a host ID, including after retirement and re-registration. The CLI refuses
+a role change before writing; use a new host ID instead. The lease path does not re-read the
+role when it signs a replay or reattach token for a job already on that host.
+
+Register monitors with `node workers/runners/scripts/operators.mjs register-host <host_id>
+<public_key_hex> <platform> --role monitor`, without endpoint or SPKI arguments. Monitors open
+no listener and are never dialled; `hosts.endpoint` and `hosts.endpoint_spki_sha256` are both
+NULL for monitors. Placement registration defaults to `--role placement` and keeps the five
+positional arguments `<host_id> <public_key_hex> <endpoint> <endpoint_spki_sha256> <platform>`;
+both endpoint columns must be non-null. A table CHECK enforces those role-specific shapes.
+Both forms print SQL by default and require `--execute` to write.
 
 HTTP header names are case-insensitive. Values are exact:
 
@@ -594,8 +602,10 @@ The strict body has exactly these members (nested objects are strict too):
 ```
 
 - `at_ms` is within 300000 ms of broker receive time, inclusive in both directions.
-- `cpu.busy_pct` is an integer 0..100; `cpu.load1` is non-negative with at most two decimal
-  places (decimal notation is allowed here, unlike other routes). All other numeric fields are
+- `cpu.busy_pct` is an integer 0..100; `cpu.load1` is a non-negative finite number with at most two
+  decimal places, or null when the platform has no load average (for example, Windows). The
+  `load1` key is always required; Linux and macOS send a number. Decimal notation is allowed
+  here, unlike other routes. All other numeric fields are
   non-negative safe integers. Exponent notation is not accepted.
 - Each array has at most eight entries and may be empty. `mount` is 1..128 UTF-8 bytes with no
   Unicode control characters. `vm` matches `^[A-Za-z0-9._-]{1,64}$`.
@@ -612,10 +622,11 @@ retention pass. It increments `samples`, retains maximum busy percentage and loa
 percentage and total memory, minimum available memory and disk free space, last total tenant
 slots, and maximum summed tenant slots used and jobs running. Disk free space is the minimum
 across the body's disks, or NULL with no disks; a bucket retains the minimum non-null sample.
+Load retains the maximum non-null sample, or NULL when every sample in the bucket has null load.
 `last_body` is the last accepted body serialized in the schema's key order without whitespace.
 States and per-disk details are available in that body, not separate rollup columns.
 
-`test-vectors/runners/host-metrics.json` pins an accepted signed push, the 413 boundary, and
+`test-vectors/runners/host-metrics.json` pins accepted signed pushes with numeric and null load, the 413 boundary, and
 bad-enum, overlong-detail and stale-clock refusals, produced by the real signer and parser.
 
 ### POST /v1/hosts/{host_id}/heartbeat

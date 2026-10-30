@@ -20,6 +20,7 @@ mod isolation;
 pub mod local_transport;
 #[cfg(unix)]
 pub mod macos;
+pub mod metrics;
 #[cfg(windows)]
 mod native_process;
 pub mod network;

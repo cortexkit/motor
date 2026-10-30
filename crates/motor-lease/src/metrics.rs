@@ -19,7 +19,8 @@ pub struct HostMetrics {
 pub struct Cpu {
     pub threads: u64,
     pub busy_pct: u64,
-    pub load1: f64,
+    #[serde(deserialize_with = "required_nullable")]
+    pub load1: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -110,9 +111,11 @@ impl HostMetrics {
             return Err("at_ms");
         }
         if self.cpu.busy_pct > 100
-            || !self.cpu.load1.is_finite()
-            || self.cpu.load1 < 0.0
-            || (self.cpu.load1 * 100.0 - (self.cpu.load1 * 100.0).round()).abs() > 0.000001
+            || self.cpu.load1.is_some_and(|load| {
+                !load.is_finite()
+                    || load < 0.0
+                    || (load * 100.0 - (load * 100.0).round()).abs() > 0.000001
+            })
         {
             return Err("cpu");
         }

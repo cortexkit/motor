@@ -2,12 +2,38 @@
 """Portable checks for Cargo diagnostics run as Windows SYSTEM and registry preparation."""
 from pathlib import Path
 import re
+import subprocess
 import unittest
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 SRC = ROOT / "crates/motor-runner/src"
 WINDOWS = SRC / "windows"
+
+
+class RunnerTlsDependencyTests(unittest.TestCase):
+    def cargo_tree(self, target, edges):
+        # The Python CI job starts without a Cargo registry cache; use Cargo's
+        # configured network policy rather than forcing offline resolution.
+        return subprocess.run(
+            ["cargo", "tree", "-p", "motor-runner", "--target", target,
+             "--edges", edges, "--prefix", "none", "--locked"],
+            cwd=ROOT, check=True, capture_output=True, text=True,
+        ).stdout
+
+    def test_windows_metrics_tls_uses_schannel_without_c_crypto_dependencies(self):
+        tree = self.cargo_tree("x86_64-pc-windows-msvc", "normal")
+        packages = {line.split()[0] for line in tree.splitlines() if line.strip()}
+        # Keep HTTPS and signing available without requiring a C compiler for
+        # the Linux-to-Windows clippy check.
+        self.assertNotIn("ring", packages)
+        self.assertNotIn("openssl-sys", packages)
+        self.assertIn("schannel", packages)
+        self.assertIn("ed25519-dalek", packages)
+
+    def test_linux_metrics_keeps_reqwest_rustls_tls(self):
+        tree = self.cargo_tree("x86_64-unknown-linux-gnu", "features")
+        self.assertIn('reqwest feature "rustls-tls"', tree)
 
 
 class TrustedPrepDiagnosticTests(unittest.TestCase):
