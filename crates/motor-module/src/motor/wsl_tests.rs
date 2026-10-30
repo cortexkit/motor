@@ -144,7 +144,7 @@ async fn wsl_prepare_refuses_every_field_before_hosted_route_and_snapshot() {
 }
 
 #[tokio::test]
-async fn wsl_non_drive_and_non_wsl_requests_keep_normal_validation_and_routing() {
+async fn wsl_non_drive_paths_use_normal_validation_including_fleet_path_refusals() {
     let h = Harness::new(Behavior::CompleteRun).await;
     let (scratch, repo) = committed_repo();
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
@@ -186,6 +186,18 @@ async fn wsl_non_drive_and_non_wsl_requests_keep_normal_validation_and_routing()
                 Outcome::RefusedBeforeStart { .. }
             ));
             assert!(!terminal.refusal_detail().unwrap().contains("Under WSL"));
+            if route == "fleet" {
+                assert_eq!(
+                    terminal.outcome,
+                    Outcome::RefusedBeforeStart {
+                        reason: RefusalReason::RequestRejected
+                    }
+                );
+                let detail = terminal.refusal_detail().unwrap();
+                assert!(detail.contains("workspace_key"), "{detail}");
+                assert!(detail.contains(path), "{detail}");
+                assert!(detail.contains("under /Users or /home"), "{detail}");
+            }
             assert_eq!(
                 motor.hosted_state(id).is_some(),
                 matches!(route, "hosted" | "repository" | "forced")

@@ -476,11 +476,11 @@ impl Connector for SixteenVcpuRunner {
 /// the build server before any Run, and is refused there before start with
 /// `runner_full`. The refusal names both limits: the build server's 16 and
 /// `hosted max_vcpus 21` from the broker's answer, or `unknown` when the
-/// answer named no number. A 17-vCPU job over the lease time limit goes
-/// direct without a lease request, so its refusal names only the build
-/// server's limit. None of them waits or is submitted twice.
+/// answer named no number. A job outside the lease time limit is rejected
+/// naming timeout_s, without contacting either runner. None of these jobs
+/// waits or is submitted twice.
 #[tokio::test]
-async fn oversized_fleet_jobs_are_refused_before_start_naming_both_routes_limits() {
+async fn invalid_fleet_timeouts_are_refused_while_valid_oversized_jobs_name_capacity_limits() {
     let detail_max = motor_protocol::REFUSAL_DETAIL_MAX_BYTES;
     let long = "é".repeat(detail_max);
     for (claim, timeout, stub_without_max, long_detail, leases, suffix) in [
@@ -514,7 +514,11 @@ async fn oversized_fleet_jobs_are_refused_before_start_naming_both_routes_limits
         assert_eq!(
             terminal.outcome,
             Outcome::RefusedBeforeStart {
-                reason: RefusalReason::RunnerFull
+                reason: if suffix.is_some() {
+                    RefusalReason::RunnerFull
+                } else {
+                    RefusalReason::RequestRejected
+                }
             }
         );
         assert_eq!(terminal.ran, Some(Ran::None));
@@ -532,10 +536,8 @@ async fn oversized_fleet_jobs_are_refused_before_start_naming_both_routes_limits
                 assert_eq!(job.routed_direct_reason.as_deref(), Some("no_host_fits"));
             }
             None => {
-                assert_eq!(
-                    detail,
-                    "vcpu request 17 is outside the supported range 1..=16 (Linux job claim limit)"
-                );
+                assert!(detail.contains("timeout_s"), "{detail}");
+                assert!(detail.contains("10..=21600"), "{detail}");
                 assert!(motor
                     .storage
                     .job(id)
@@ -545,7 +547,11 @@ async fn oversized_fleet_jobs_are_refused_before_start_naming_both_routes_limits
             }
         }
         assert!(motor.hosted_state(id).is_none());
-        assert_eq!(*peer.runs.lock().unwrap(), vec![(id, Some(claim))]);
+        if suffix.is_some() {
+            assert_eq!(*peer.runs.lock().unwrap(), vec![(id, Some(claim))]);
+        } else {
+            assert!(peer.runs.lock().unwrap().is_empty());
+        }
         let bodies = lease_bodies(&h);
         assert_eq!(bodies.len(), leases);
         if leases == 1 {

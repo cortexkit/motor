@@ -14,6 +14,8 @@ enum Branch {
     BeforeConnect,
     BeforeRun,
     Accepted,
+    Queued,
+    UploadCancelled,
     Refused,
     Lost,
     Running,
@@ -105,7 +107,11 @@ impl Connector for Runner {
                             write_frame_async(
                                 &mut server,
                                 &Frame::HaveReply {
-                                    repositories,
+                                    repositories: if branch == Branch::UploadCancelled {
+                                        Vec::new()
+                                    } else {
+                                        repositories
+                                    },
                                     git_dependencies: Some(Vec::new()),
                                 },
                             )
@@ -172,6 +178,28 @@ impl Connector for Runner {
                                 .unwrap();
                             }
                             gates.cancel_ready.notified().await;
+                            if branch == Branch::UploadCancelled {
+                                let terminal = tombstone
+                                    .lock()
+                                    .unwrap()
+                                    .clone()
+                                    .expect("cancelled upload tombstone");
+                                write_frame_async(&mut server, &Frame::Terminal(terminal))
+                                    .await
+                                    .unwrap();
+                                write_frame_async(
+                                    &mut server,
+                                    &Frame::HostedTerminal(motor_protocol::HostedTerminal {
+                                        job_id: id,
+                                        placement: "first_party/host:test".into(),
+                                        billed_vcpu_ms: 0,
+                                        max_runtime_s: 7200,
+                                    }),
+                                )
+                                .await
+                                .unwrap();
+                                return;
+                            }
                             write_frame_async(
                                 &mut server,
                                 &Frame::Heartbeat {
@@ -219,10 +247,23 @@ impl Connector for Runner {
                                     .await
                                     .unwrap();
                             }
+                            if branch == Branch::Queued {
+                                continue;
+                            }
+                            if branch == Branch::UploadCancelled {
+                                gates.cancel_ready.notify_one();
+                            }
                             return;
                         }
                         Frame::Attach(_) => {
                             attaches.fetch_add(1, Ordering::SeqCst);
+                            if branch == Branch::UploadCancelled {
+                                // Only the connection that sent Run has the final
+                                // records ready. A new Attach connection closes
+                                // before replay is available, so the first reader
+                                // must stay open to learn the cancellation outcome.
+                                return;
+                            }
                             let terminal = if branch == Branch::Running {
                                 assert_eq!(runs.load(Ordering::SeqCst), 1);
                                 let mut terminal =
@@ -868,6 +909,51 @@ async fn cancel_after_run_accepted_finishes_cancelled_once() {
     assert_eq!(terminal(job.stream).await.outcome, Outcome::Cancelled);
     job.motor.shutdown_hosted().await;
     assert_settled(&h, &job.motor, id, "cancelled", 7_000);
+}
+
+#[tokio::test]
+async fn first_party_cancel_after_admission_reads_queued_tombstone() {
+    let h = Harness::with_host(Branch::Queued, "host:test").await;
+    let job = Job::running(&h).await;
+    let id = job.stream.job_id;
+    job.motor.cancel(CancelRequest::new(id)).await.unwrap();
+    h.gates.cancel_ready.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), job.owner)
+        .await
+        .expect("cancel acknowledgment must trigger reading the queued terminal")
+        .unwrap()
+        .unwrap();
+    let terminal = terminal(job.stream).await;
+    assert_eq!(terminal.outcome, Outcome::Cancelled);
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(terminal.wall_ms, 0);
+    assert_eq!(h.runner.attaches.load(Ordering::SeqCst), 1);
+    assert_eq!(h.runner.runs.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        job.motor.hosted_state(id).unwrap().billing,
+        crate::BillingStatus::Available
+    );
+}
+
+#[tokio::test]
+async fn first_party_cancel_during_upload_drains_the_admission_terminal() {
+    let h = Harness::with_host(Branch::UploadCancelled, "host:test").await;
+    let job = Job::start(&h).await;
+    let id = job.stream.job_id;
+    h.gates.grant.notify_one();
+    h.gates.run.notified().await;
+    job.motor.cancel(CancelRequest::new(id)).await.unwrap();
+    h.gates.admission.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), job.owner)
+        .await
+        .expect("cancelled upload must drain its existing admission stream")
+        .unwrap()
+        .unwrap();
+    let terminal = terminal(job.stream).await;
+    assert_eq!(terminal.outcome, Outcome::Cancelled);
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert_eq!(h.runner.attaches.load(Ordering::SeqCst), 0);
+    assert_eq!(job.motor.hosted_state(id).unwrap().billed_vcpu_ms, Some(0));
 }
 
 #[tokio::test]

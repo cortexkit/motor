@@ -460,7 +460,7 @@ pub fn parse_attach_args(args: &[String]) -> Result<Option<AttachArgs>, String> 
 pub struct SecretFile {
     file: fs::File,
     path: PathBuf,
-    remove_on_terminal: bool,
+    is_default: bool,
 }
 
 impl SecretFile {
@@ -474,7 +474,7 @@ impl SecretFile {
         Ok(Self {
             file,
             path: path.into(),
-            remove_on_terminal: false,
+            is_default: false,
         })
     }
 
@@ -489,7 +489,7 @@ impl SecretFile {
         Some(Self {
             file,
             path,
-            remove_on_terminal: true,
+            is_default: true,
         })
     }
 
@@ -505,7 +505,7 @@ impl SecretFile {
         Ok(Self {
             file,
             path,
-            remove_on_terminal: true,
+            is_default: true,
         })
     }
 
@@ -517,10 +517,6 @@ impl SecretFile {
     /// Write `secret` and flush it to disk.
     pub fn write(&mut self, secret: &str) -> std::io::Result<()> {
         self.save(secret)
-    }
-
-    fn remove_after_terminal(&self) -> std::io::Result<()> {
-        fs::remove_file(&self.path)
     }
 }
 
@@ -835,6 +831,15 @@ pub trait ExecClient: Send + Sync {
         secret: &str,
     ) -> Result<Box<dyn RecordStream>, SubmitError>;
     async fn status(&self, job_id: Uuid, secret: &str) -> Result<JobStatusReply, SubmitError>;
+    /// Keep additive status members when displaying the module's JSON reply.
+    async fn status_json(
+        &self,
+        job_id: Uuid,
+        secret: &str,
+    ) -> Result<serde_json::Value, SubmitError> {
+        serde_json::to_value(self.status(job_id, secret).await?)
+            .map_err(|_| SubmitError::Unknown("unreadable job status".into()))
+    }
     /// Send `exec.cancel`. Its reply is only an acknowledgement; the job's
     /// terminal still arrives on its run stream.
     async fn cancel(&self, job_id: Uuid, secret: Option<&str>) -> Result<(), String>;
@@ -1015,7 +1020,7 @@ pub async fn drive_attach<C: ExecClient + ?Sized>(
 
 /// The lookup `ck motor attach` and `ck motor cancel` share: the file an
 /// attach finds for a job (the default one named by the job ID, or the explicit
-/// `--secret-file`), and the default file path that a terminal outcome removes.
+/// `--secret-file`), and the default file retained for later job inspection.
 #[derive(Debug)]
 pub struct ReattachSecret {
     pub secret: String,
@@ -1076,16 +1081,26 @@ async fn drive_attach_inner<C: ExecClient + ?Sized>(
     interrupts: &mut mpsc::Receiver<()>,
 ) -> u8 {
     if args.status {
-        return match wait_for_motor(|| client.status(args.job_id, &found.secret), err).await {
-            Ok(status) => {
+        return match wait_for_motor(|| client.status_json(args.job_id, &found.secret), err).await {
+            Ok(value) => {
+                let status: JobStatusReply = match serde_json::from_value(value.clone()) {
+                    Ok(status) => status,
+                    Err(_) => {
+                        return attach_failure(
+                            SubmitError::Unknown("unreadable job status".into()),
+                            "attach",
+                            err,
+                        )
+                    }
+                };
                 let _ = writeln!(
                     out,
                     "{}",
-                    serde_json::to_string(&status).expect("serializable status")
+                    serde_json::to_string(&value).expect("serializable status")
                 );
                 if status.terminal.is_some() {
                     if let Some(path) = &default_secret_file {
-                        let _ = fs::remove_file(path);
+                        let _ = retain_terminal_secret(path);
                     }
                 }
                 status.terminal.as_ref().map_or(0, exit_code)
@@ -1188,6 +1203,7 @@ async fn cancel_line<C: ExecClient + ?Sized>(
         Ok(status) => status.terminal,
         Err(_) => None,
     };
+    let already_finished = ended.is_some();
     if ended.is_none() {
         if let Err(error) = wait_for_motor(
             || async {
@@ -1215,17 +1231,12 @@ async fn cancel_line<C: ExecClient + ?Sized>(
         let _ = writeln!(out, "cancelled");
         return 0;
     };
-    // A cancel is acknowledged before the job's terminal, so a wait that began
-    // while the job was running returns without one. A saved secret file then
-    // settles it: `ck motor run` deletes the file once the running job ends,
-    // so a file still on disk means the job had not ended. A job that started
-    // or was refused before start kept its file, and a job whose terminal
-    // `run` already handled has none left.
-    let ended = match saved_file {
-        Some(saved_file) => saved_file.remove_after_terminal().is_err(),
-        None => true,
-    };
-    if ended {
+    // File existence no longer indicates whether the job ended: completed jobs
+    // retain their credential for inspection. Use the state read before cancel.
+    if let Some(file) = saved_file.filter(|file| file.is_default) {
+        let _ = retain_terminal_secret(&file.path);
+    }
+    if already_finished {
         let _ = writeln!(out, "already finished: {}", describe_outcome(&terminal));
     } else {
         let _ = writeln!(out, "cancelled");
@@ -1570,15 +1581,11 @@ async fn consume<C: ExecClient + ?Sized>(
                         state.billed_line()
                     );
                 }
-                if let Some(file) = session
-                    .secret_file
-                    .as_ref()
-                    .filter(|file| file.remove_on_terminal)
-                {
-                    let _ = file.remove_after_terminal();
+                if let Some(file) = session.secret_file.as_ref().filter(|file| file.is_default) {
+                    let _ = retain_terminal_secret(&file.path);
                 }
                 if let Some(path) = &session.default_secret_file {
-                    let _ = fs::remove_file(path);
+                    let _ = retain_terminal_secret(path);
                 }
                 return settle_named(&terminal, name, err);
             }
@@ -1595,10 +1602,16 @@ async fn consume<C: ExecClient + ?Sized>(
     }
 }
 
+fn retain_terminal_secret(path: &Path) -> std::io::Result<()> {
+    // Completed jobs remain inspectable with the same credential. Start the
+    // secret-file cleanup window at completion, not submission.
+    open_default_secret(path)?.set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
+}
+
 fn reattach_hint(job_id: Option<Uuid>, secret_file: Option<&SecretFile>, err: &mut dyn Write) {
     if let Some(id) = job_id {
         let file = secret_file
-            .filter(|file| !file.remove_on_terminal)
+            .filter(|file| !file.is_default)
             .map(|file| {
                 format!(
                     " {}",
@@ -1873,6 +1886,15 @@ impl ExecClient for SubcClient {
     }
 
     async fn status(&self, job_id: Uuid, secret: &str) -> Result<JobStatusReply, SubmitError> {
+        serde_json::from_value(self.status_json(job_id, secret).await?)
+            .map_err(|_| SubmitError::Unknown("unreadable job status".into()))
+    }
+
+    async fn status_json(
+        &self,
+        job_id: Uuid,
+        secret: &str,
+    ) -> Result<serde_json::Value, SubmitError> {
         self.refresh_route().await?;
         let route = self.route.lock().await;
         let route = route.as_ref().expect("route opened before status");
@@ -2858,8 +2880,31 @@ mod hosted_cli_tests {
             )
             .unwrap()]))))
         }
-        async fn status(&self, _: Uuid, _: &str) -> Result<JobStatusReply, SubmitError> {
-            unreachable!()
+        async fn status(&self, job_id: Uuid, secret: &str) -> Result<JobStatusReply, SubmitError> {
+            assert_eq!(secret, self.expected_secret);
+            let mut terminal = TerminalRecord::new(job_id, Outcome::Exit { code: 0 }, 0, 0, 0)
+                .with_ran(motor_protocol::Ran::Remote);
+            terminal.queue_wait_ms = 17;
+            Ok(JobStatusReply {
+                job_id,
+                state: "terminal".into(),
+                waiting_on: None,
+                terminal: Some(terminal),
+                unit: None,
+                unit_alive: None,
+                queue_wait_ms: Some(17),
+            })
+        }
+        async fn status_json(
+            &self,
+            job_id: Uuid,
+            secret: &str,
+        ) -> Result<serde_json::Value, SubmitError> {
+            let mut value = serde_json::to_value(self.status(job_id, secret).await?).unwrap();
+            value["placement"] = "first_party/test-host".into();
+            value["placement_wait_ms"] = 81.into();
+            value["runner_queue_wait_ms"] = 17.into();
+            Ok(value)
         }
         async fn cancel(&self, _: Uuid, _: Option<&str>) -> Result<(), String> {
             unreachable!()
@@ -3022,7 +3067,12 @@ mod hosted_cli_tests {
         assert!(String::from_utf8(err)
             .unwrap()
             .contains(&format!("job_id={job_id} secret-file=")));
-        assert!(!default_secret_path(&directory, job_id).exists());
+        assert_eq!(
+            fs::read_to_string(default_secret_path(&directory, job_id))
+                .unwrap()
+                .trim(),
+            secret
+        );
 
         let attach_id = Uuid::now_v7();
         let attach_secret = "e".repeat(64);
@@ -3059,7 +3109,102 @@ mod hosted_cli_tests {
         )
         .await;
         assert_eq!(code, 0);
-        assert!(!default_secret_path(&directory, attach_id).exists());
+        assert!(default_secret_path(&directory, attach_id).exists());
+    }
+
+    #[test]
+    fn terminal_secret_retention_starts_at_completion_and_is_swept_after_24_hours() {
+        let scratch = cortexkit_test_support::ScratchDir::new("terminal-secret-retention");
+        let directory = prepare_default_secret_directory_under(scratch.path()).unwrap();
+        let id = Uuid::now_v7();
+        let mut file = SecretFile::create_default(&directory, id).unwrap();
+        file.save(&"a".repeat(64)).unwrap();
+        let old = SystemTime::now() - JOB_SECRET_RETENTION - Duration::from_secs(60);
+        file.file
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        retain_terminal_secret(&file.path).unwrap();
+        sweep_default_secrets(&directory).unwrap();
+        assert!(SecretFile::open_default(&directory, id).is_some());
+        file.file
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        sweep_default_secrets(&directory).unwrap();
+        assert!(SecretFile::open_default(&directory, id).is_none());
+    }
+
+    #[tokio::test]
+    async fn finished_status_keeps_credentials_and_additive_placement_timing_fields() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-cli-finished-status");
+        let directory = prepare_default_secret_directory_under(scratch.path()).unwrap();
+        let id = Uuid::now_v7();
+        let secret = "a".repeat(64);
+        let mut file = SecretFile::create_default(&directory, id).unwrap();
+        file.save(&secret).unwrap();
+        let client = SecretCheckingClient {
+            expected_secret: secret.clone(),
+        };
+        for _ in 0..2 {
+            let found = reattach_secret(id, None, &b""[..], |id| {
+                SecretFile::open_default(&directory, id)
+            });
+            let default_file = found.default_file.clone();
+            let (_, mut interrupts) = mpsc::channel(1);
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            assert_eq!(
+                drive_attach_inner(
+                    &client,
+                    &AttachArgs {
+                        job_id: id,
+                        secret_file: None,
+                        status: true
+                    },
+                    found,
+                    default_file,
+                    &mut out,
+                    &mut err,
+                    &mut interrupts
+                )
+                .await,
+                0
+            );
+            let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(
+                value["terminal"]["outcome"],
+                json!({"type": "exit", "code": 0})
+            );
+            assert_eq!(value["terminal"]["ran"], "remote");
+            assert_eq!(value["placement"], "first_party/test-host");
+            assert_eq!(value["placement_wait_ms"], 81);
+            assert_eq!(value["runner_queue_wait_ms"], 17);
+            assert!(SecretFile::open_default(&directory, id).is_some());
+            assert!(!String::from_utf8(out).unwrap().contains(&secret));
+            assert!(!String::from_utf8(err).unwrap().contains(&secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_of_a_finished_job_keeps_its_default_secret() {
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-cli-cancel-finished");
+        let directory = prepare_default_secret_directory_under(scratch.path()).unwrap();
+        let id = Uuid::now_v7();
+        let secret = "b".repeat(64);
+        let mut file = SecretFile::create_default(&directory, id).unwrap();
+        file.save(&secret).unwrap();
+        let client = SecretCheckingClient {
+            expected_secret: secret.clone(),
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(
+            cancel_line(&client, id, &secret, Some(file), &mut out, &mut err).await,
+            0
+        );
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("already finished:"));
+        assert!(SecretFile::open_default(&directory, id).is_some());
     }
 
     #[tokio::test]

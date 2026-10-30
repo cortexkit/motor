@@ -77,6 +77,7 @@ pub struct Motor {
     keyed_admissions: Arc<std::sync::Mutex<()>>,
     health_progress:
         Arc<std::sync::Mutex<std::collections::HashMap<Uuid, (Platform, progress::Reporter)>>>,
+    health_probes: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, health::Probe>>>,
     wsl: crate::wsl::Checks,
 }
 mod agent_run;
@@ -161,6 +162,7 @@ impl Motor {
             #[cfg(test)]
             hosted_connector: None,
             keyed_admissions: Arc::default(),
+            health_probes: Arc::default(),
             health_progress: Arc::default(),
             wsl: crate::wsl::Checks::default(),
         })
@@ -333,6 +335,19 @@ impl Motor {
             .map(Path::new),
         );
         let macos_not_hosted = hosted_test && request.platform == Some(Platform::Macos);
+        let fleet_refusal = if self.config.hosted_runners
+            && self.config.hosted_fleet_routing
+            && matches!(request.platform, None | Some(Platform::Linux))
+        {
+            crate::hosted::validate(&request).err().map(|error| {
+                (
+                    error.reason(),
+                    crate::hosted::validation_detail(&request, error),
+                )
+            })
+        } else {
+            None
+        };
         let mut env_not_forwarded: Vec<_> = request
             .env
             .keys()
@@ -379,6 +394,7 @@ impl Motor {
             .map(|t| t.instance);
         self.storage
             .create_authorized(id, wait, attribution, instance, gate_job, secret_hash)?;
+        self.storage.health_deadline(id, request.timeout)?;
         if let Some(key) = key {
             self.storage.record_submission(id, key)?;
         }
@@ -401,10 +417,10 @@ impl Motor {
             tracing::info!(job_id = %id, repo = %request.repository_root,
                 "routed to hosted (hosted_repositories)");
         } else if wsl_refusal.is_none()
+            && fleet_refusal.is_none()
             && self.config.hosted_runners
             && matches!(request.platform, None | Some(Platform::Linux))
             && (!gate_job || self.config.hosted_fleet_routing)
-            && (!self.config.hosted_fleet_routing || crate::hosted::validate(&request).is_ok())
         {
             let mut route = crate::HostedJobState::new(&self.config);
             route.fleet_routed = self.config.hosted_fleet_routing;
@@ -450,6 +466,12 @@ impl Motor {
                     )
                     .await;
                 if let Err(error) = result {
+                    let _ = tx.send(Err(error)).await;
+                }
+                return;
+            }
+            if let Some((reason, detail)) = fleet_refusal {
+                if let Err(error) = motor.refused(id, reason, None, Some(detail), &tx).await {
                     let _ = tx.send(Err(error)).await;
                 }
                 return;
@@ -1770,6 +1792,26 @@ impl Motor {
             }
         }
         if uploaded.is_err() {
+            if hosted
+                && self
+                    .hosted_state(id)
+                    .is_some_and(|state| state.awaiting_cancel_terminal())
+            {
+                // The cancel connection only acknowledged intent. The admission
+                // stream may still carry the queued job's real terminal and host
+                // settlement; keep draining it before resorting to reattach.
+                return self
+                    .follow_attempt(
+                        id,
+                        0,
+                        Some(channel),
+                        tx,
+                        wake,
+                        spill_after,
+                        windows_queue.as_mut(),
+                    )
+                    .await;
+            }
             drop(channel);
             return self
                 .follow_attempt(id, 0, None, tx, wake, spill_after, windows_queue.as_mut())
@@ -2379,7 +2421,10 @@ impl Motor {
         let mut queue_deadline = None;
         let mut wake_open = true;
         let mut reattaches = 0;
-        let mut hosted_terminal_deadline = None;
+        let mut hosted_terminal_deadline = self
+            .hosted_state(id)
+            .filter(|state| state.awaiting_cancel_terminal())
+            .map(|_| tokio::time::Instant::now() + Duration::from_secs(30));
         let host_deadline =
             self.hosted_state(id)
                 .and_then(|s| s.host_deadline_s())
@@ -2726,6 +2771,10 @@ impl Motor {
                             Some(tokio::time::Instant::now() + Duration::from_secs(5));
                         continue;
                     }
+                    // Retain only the terminal summary, not the output stream, so
+                    // status no longer depends on runner retention.
+                    self.storage.remote_terminal(terminal.clone())?;
+                    self.storage.cancel(id, false)?;
                     return emit(tx, StreamRecord::Terminal(terminal))
                         .await
                         .map(|_| false);
@@ -2759,6 +2808,22 @@ impl Motor {
                 {
                     tracing::info!(job_id = %id, step = "cancel", cause = "runner acknowledged cancellation", "hosted cancellation acknowledged");
                     self.storage.cancel_acknowledged(id)?;
+                    if self
+                        .hosted_state(id)
+                        .is_some_and(|s| s.awaiting_cancel_terminal())
+                    {
+                        // A queued cancellation can create a tombstone without a
+                        // live job stream. Ask for its retained result on the same
+                        // connection instead of treating the acknowledgment as an
+                        // execution outcome or waiting only for billing.
+                        let _ = channel
+                            .as_ref()
+                            .unwrap()
+                            .send(Frame::Attach(AttachRequest::new(build_server_id, cursor)))
+                            .await;
+                        hosted_terminal_deadline =
+                            Some(tokio::time::Instant::now() + Duration::from_secs(30));
+                    }
                 }
                 other => {
                     if hosted {
@@ -2970,6 +3035,24 @@ impl Motor {
     }
     pub async fn job_status(&self, id: Uuid) -> io::Result<JobStatusReply> {
         self.storage.retain_job(id, None)?;
+        // Direct clients need a stable result after runner eviction. Ordinary
+        // callers still inspect the runner for current unit and route diagnostics.
+        if let Some(terminal) = self
+            .storage
+            .job(id)
+            .filter(|job| job.direct_secret_hash.is_some() || job.health_retired())
+            .and_then(|job| job.remote_terminal.or(job.local_terminal))
+        {
+            return Ok(JobStatusReply {
+                job_id: id,
+                state: "terminal".into(),
+                waiting_on: None,
+                queue_wait_ms: Some(terminal.queue_wait_ms),
+                terminal: Some(terminal),
+                unit: None,
+                unit_alive: None,
+            });
+        }
         if let Some(state) = self.hosted_state(id).filter(|s| s.terminal.is_some()) {
             if state.billing == crate::BillingStatus::Pending {
                 let (tx, mut rx) = mpsc::channel(32);
@@ -2984,7 +3067,9 @@ impl Motor {
                 terminal: self.hosted_state(id).and_then(|s| s.terminal),
                 unit: None,
                 unit_alive: None,
-                queue_wait_ms: None,
+                queue_wait_ms: self
+                    .hosted_state(id)
+                    .and_then(|s| s.terminal.map(|t| t.queue_wait_ms)),
             });
         }
         let mut channel = match self.open_job_channel(id).await {
@@ -3039,6 +3124,18 @@ impl Motor {
                 "job_id={id}: expected job_status_reply"
             ))),
         }
+    }
+    pub(crate) fn direct_placement(&self, id: Uuid) -> Option<String> {
+        let job = self.storage.job(id)?;
+        job.windows_runner
+            .map(|runner| {
+                if runner.name.is_empty() {
+                    runner.instance
+                } else {
+                    runner.name
+                }
+            })
+            .or(job.runner_instance)
     }
     pub async fn drop_workspace(&self, request: DropRequest) -> io::Result<DropReply> {
         // Hosted hosts have no workspace-drop operation; their tenants evict idle
@@ -3515,10 +3612,13 @@ mod delivery_tests {
                     }
                     write_frame_async(
                         &mut peer,
-                        &Frame::Terminal(
-                            TerminalRecord::new(id, Outcome::Exit { code: 0 }, 1, 0, 0)
-                                .with_ran(Ran::Remote),
-                        ),
+                        &Frame::Terminal({
+                            let mut terminal =
+                                TerminalRecord::new(id, Outcome::Exit { code: 0 }, 1, 0, 0)
+                                    .with_ran(Ran::Remote);
+                            terminal.queue_wait_ms = 27;
+                            terminal
+                        }),
                     )
                     .await
                     .unwrap();
@@ -3556,6 +3656,84 @@ mod delivery_tests {
             .unwrap()
             .terminal_delivered_at_ms
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn finished_direct_status_survives_restart_without_a_runner_connection() {
+        let scratch = ScratchDir::new("motor-finished-status");
+        let motor = Motor::with_connector(
+            Config {
+                runner_instance: "linux-runner".into(),
+                ..Config::default()
+            },
+            &scratch,
+            Arc::new(TerminalPeer),
+        )
+        .unwrap();
+        let id = Uuid::now_v7();
+        let secret = crate::direct_secret::DirectSecret::mint().unwrap();
+        motor
+            .storage
+            .create(id, 60, None, Some("linux-runner".into()), false)
+            .unwrap();
+        motor
+            .storage
+            .set_direct_secret_hash(id, secret.hash())
+            .unwrap();
+        let mut stream = motor.attach(AttachRequest::new(id, 0)).unwrap();
+        let record = stream.records.recv().await.unwrap().unwrap();
+        assert!(matches!(record, StreamRecord::Terminal(_)));
+        stream.acknowledge_terminal().unwrap();
+        drop(stream);
+        motor.close().await;
+        let peer = Arc::new(crate::hosted::tests::harness::NoSsh(
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let motor = Motor::with_connector(Config::default(), &scratch, peer.clone()).unwrap();
+        assert!(motor.direct_authorized(id, Some(secret.expose())));
+        let status = motor.job_status(id).await.unwrap();
+        assert_eq!(status.state, "terminal");
+        let terminal = status.terminal.unwrap();
+        assert_eq!(terminal.outcome, Outcome::Exit { code: 0 });
+        assert_eq!(terminal.ran, Some(Ran::Remote));
+        assert_eq!(status.queue_wait_ms, Some(27));
+        assert_eq!(motor.direct_placement(id).as_deref(), Some("linux-runner"));
+        let subc_client_rs::HandlerOutcome::Response(bytes) =
+            crate::module::status_reply(&motor, &serde_json::json!({"job_id": id}))
+                .await
+                .unwrap()
+        else {
+            panic!("expected status response");
+        };
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["placement"], "linux-runner");
+        assert_eq!(value["placement_wait_ms"], 0);
+        assert_eq!(value["runner_queue_wait_ms"], 27);
+        assert_eq!(peer.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn windows_status_placement_uses_the_configured_name() {
+        let scratch = ScratchDir::new("motor-windows-placement-name");
+        let motor = Motor::open(Config::default(), &scratch).unwrap();
+        let id = Uuid::now_v7();
+        motor.storage.create(id, 60, None, None, false).unwrap();
+        motor
+            .storage
+            .bind_windows(
+                id,
+                crate::WindowsRunner {
+                    name: "windows-builder".into(),
+                    instance: "private-service-instance".into(),
+                    host: "192.0.2.10".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            motor.direct_placement(id).as_deref(),
+            Some("windows-builder")
+        );
     }
 
     #[tokio::test]

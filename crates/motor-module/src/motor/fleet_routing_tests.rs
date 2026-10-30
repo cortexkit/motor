@@ -72,6 +72,18 @@ async fn fleet_linux_default_platform_jobs_allow_hosted_spill() {
         assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
         let state = motor.hosted_state(id).unwrap();
         assert!(state.fleet_routed && state.run_sent && state.hosted_no_fallback);
+        assert!(state.placement_wait_ms.is_some());
+        let subc_client_rs::HandlerOutcome::Response(bytes) =
+            crate::module::status_reply(&motor, &serde_json::json!({"job_id": id}))
+                .await
+                .unwrap()
+        else {
+            panic!("expected status response");
+        };
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["placement"], "first_party/test-host");
+        assert_eq!(value["placement_wait_ms"].as_u64(), state.placement_wait_ms);
+        assert_eq!(value["runner_queue_wait_ms"], terminal.queue_wait_ms);
         assert!(!state.repository_routed && !state.fleet_no_spill);
         let restored: crate::HostedJobState =
             serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
@@ -228,7 +240,7 @@ async fn fleet_gate_no_host_fits_corrects_to_the_direct_priority_lane() {
 }
 
 #[tokio::test]
-async fn fleet_platform_and_timeout_exclusions_never_request_a_lease() {
+async fn fleet_non_linux_platforms_never_request_a_lease() {
     let h = Harness::new(Behavior::CompleteRun).await;
     let (scratch, repo) = committed_repo();
     let mut config = config(&h);
@@ -251,9 +263,6 @@ async fn fleet_platform_and_timeout_exclusions_never_request_a_lease() {
     for (platform, timeout) in [
         (Some(Platform::Windows), Some(600)),
         (Some(Platform::Macos), Some(600)),
-        (None, None),
-        (None, Some(9)),
-        (None, Some(21601)),
     ] {
         let mut request = request(&repo);
         request.platform = platform;
@@ -264,7 +273,72 @@ async fn fleet_platform_and_timeout_exclusions_never_request_a_lease() {
         assert_eq!(terminal.outcome, Outcome::Exit { code: 17 });
         assert!(motor.hosted_state(id).is_none());
     }
-    assert_eq!(peer.0.load(Ordering::SeqCst), 5);
+    assert_eq!(peer.0.load(Ordering::SeqCst), 2);
+    assert!(lease_bodies(&h).is_empty());
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn fleet_invalid_linux_requests_are_refused_without_direct_fallback() {
+    let h = Harness::new(Behavior::CompleteRun).await;
+    let (scratch, repo) = committed_repo();
+    let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
+    let motor = Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
+    let mut cases = Vec::new();
+    for timeout in [None, Some(0), Some(9), Some(21601)] {
+        let mut request = request(&repo);
+        request.timeout = timeout;
+        cases.push((request, "timeout_s", "10..=21600"));
+    }
+    for vcpus in [0, 65] {
+        let mut request = request(&repo);
+        request.weight_hint = Some(vcpus);
+        cases.push((request, "vcpus", "1..=64"));
+    }
+    for field in ["workspace_key", "repository_root", "cwd", "sibling"] {
+        let mut request = request(&repo);
+        match field {
+            "workspace_key" => request.workspace_key = "/tmp/werni".into(),
+            "repository_root" => request.repository_root = "/tmp/werni".into(),
+            "cwd" => request.cwd = "/tmp/werni".into(),
+            _ => request.siblings.push("/tmp/werni".into()),
+        }
+        cases.push((request, field, "/tmp/werni"));
+    }
+    for (request, field, remedy) in cases {
+        for (platform, gate) in [(None, false), (Some(Platform::Linux), true)] {
+            let mut request = request.clone();
+            request.platform = platform;
+            let (_, terminal) = records(
+                motor
+                    .run_classified(
+                        request,
+                        (None, None),
+                        gate,
+                        false,
+                        false,
+                        Default::default(),
+                    )
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                terminal.outcome,
+                Outcome::RefusedBeforeStart {
+                    reason: RefusalReason::RequestRejected
+                },
+                "{field}"
+            );
+            assert_eq!(terminal.ran, Some(Ran::None));
+            let detail = terminal.refusal_detail.unwrap();
+            assert!(detail.contains(field), "{detail}");
+            assert!(detail.contains(remedy), "{detail}");
+            if remedy == "/tmp/werni" {
+                assert!(detail.contains("under /Users or /home"), "{detail}");
+            }
+        }
+    }
+    assert_eq!(peer.0.load(Ordering::SeqCst), 0);
     assert!(lease_bodies(&h).is_empty());
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
 }

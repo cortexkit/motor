@@ -35,6 +35,10 @@ pub enum BillingStatus {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedJobState {
+    /// Informational placement latency only. Recovery must not depend on it:
+    /// an older client can drop this field when rewriting the store on rollback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) placement_wait_ms: Option<u64>,
     pub hosted_no_fallback: bool,
     pub hosted_code: Option<String>,
     pub placement: Option<Placement>,
@@ -498,6 +502,43 @@ pub(crate) fn validate(request: &RunRequest) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+pub(crate) fn validation_detail(request: &RunRequest, error: Error) -> String {
+    let remedy = match error {
+        Error::NoTimeout => "timeout_s: set a timeout in 10..=21600 seconds".into(),
+        Error::RequestInvalid(Some(field)) if field.as_str() == "timeout_s" => {
+            "set timeout_s in 10..=21600 seconds".into()
+        }
+        Error::RequestInvalid(Some(field)) if field.as_str() == "vcpus" => {
+            format!(
+                "set vcpus in {}..={}",
+                LEASE_VCPUS.start(),
+                LEASE_VCPUS.end()
+            )
+        }
+        Error::Path => {
+            let invalid = [
+                ("workspace_key", &request.workspace_key),
+                ("repository_root", &request.repository_root),
+                ("cwd", &request.cwd),
+            ]
+            .into_iter()
+            .chain(request.siblings.iter().map(|path| ("sibling", path)))
+            .find(|(_, path)| {
+                let path = Path::new(path);
+                !allowed_path(path)
+                    || std::fs::canonicalize(path).is_ok_and(|path| !allowed_path(&path))
+            });
+            let remedy =
+                "use a path under /Users or /home, including its symlink target, without '..'";
+            match invalid {
+                Some((field, path)) => format!("{field}={path:?}: {remedy}"),
+                None => remedy.into(),
+            }
+        }
+        _ => return error.detail(),
+    };
+    format!("{}; {remedy}", error.detail())
 }
 fn allowed_path(path: &Path) -> bool {
     (path.starts_with("/Users") || path.starts_with("/home"))
@@ -1014,6 +1055,7 @@ impl Client {
         self.progress
             .phase(motor_protocol::ProgressPhase::PlacementWait);
         let job = storage.job(id).ok_or(Error::Broker)?;
+        let placement_started = tokio::time::Instant::now();
         let provisioning_deadline =
             tokio::time::Instant::now() + Duration::from_millis(spill_wait_budget_ms(&job));
         let salt = storage.hosted_salt().map_err(|_| Error::Auth)?;
@@ -1327,7 +1369,20 @@ impl Client {
                     }
                 }
                 match connected.map_err(|failure| failure.error) {
-                    Ok(channel) => return Ok((channel, lease)),
+                    Ok(channel) => {
+                        storage
+                            .hosted_update(id, |state| {
+                                state.placement_wait_ms = Some(
+                                    placement_started
+                                        .elapsed()
+                                        .as_millis()
+                                        .try_into()
+                                        .unwrap_or(u64::MAX),
+                                );
+                            })
+                            .map_err(|_| Error::Broker)?;
+                        return Ok((channel, lease));
+                    }
                     Err(e) if lease.ssh.is_some() => return Err(e),
                     Err(e @ (Error::HostFull | Error::Capacity)) if hosted_test => return Err(e),
                     // The broker's view of the host lags its heartbeats, so it can

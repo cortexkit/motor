@@ -895,7 +895,7 @@ impl Handler {
                 {
                     return Ok(direct_job_not_found(&self.module_id));
                 }
-                response(self.initialized()?.job_status(id).await?)
+                status_reply(self.initialized()?, &serde_json::json!({"job_id": id})).await
             }
         }
     }
@@ -1279,10 +1279,33 @@ pub(crate) async fn status_reply(
         let reply = motor.job_status(id).await?;
         // Billing may have settled after the job's terminal record was
         // streamed; the status reply carries the figure as it stands now.
-        response(crate::agent_route::status_with_hosted(
+        let queue_wait_ms = reply
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.queue_wait_ms);
+        let state = motor.hosted_state(id);
+        let mut value = serde_json::to_value(crate::agent_route::status_with_hosted(
             reply,
-            motor.hosted_state(id).as_ref(),
+            state.as_ref(),
         ))
+        .map_err(io::Error::other)?;
+        if let Some(state) = state {
+            if let Some(placement) = state.placement.as_ref() {
+                value["placement"] = crate::hosted::placement::terminal_placement(placement).into();
+            }
+            if let Some(wait) = state.placement_wait_ms {
+                value["placement_wait_ms"] = wait.into();
+            }
+        } else {
+            if let Some(instance) = motor.direct_placement(id) {
+                value["placement"] = instance.into();
+            }
+            value["placement_wait_ms"] = 0.into();
+        }
+        if let Some(wait) = queue_wait_ms {
+            value["runner_queue_wait_ms"] = wait.into();
+        }
+        response(value)
     } else if !matches!(platform, None | Some(motor_protocol::Platform::Linux)) {
         let reply = motor.runner_status_for(platform.as_ref()).await?;
         if params.get("disk").and_then(serde_json::Value::as_bool) == Some(true) {

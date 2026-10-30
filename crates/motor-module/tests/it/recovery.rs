@@ -1420,9 +1420,9 @@ async fn capped_unavailable_tips_do_not_resend_a_prepared_worktrees_history() {
 }
 
 #[tokio::test]
-async fn fleet_invalid_vcpus_keep_the_claim_and_are_refused_by_direct_admission_once() {
-    // Keep every non-vCPU input hosted-valid so the route exclusion proves the
-    // claim was invalid, rather than merely rejecting a test scratch path.
+async fn fleet_invalid_vcpus_are_refused_naming_the_field_without_direct_admission() {
+    // Keep every non-vCPU input hosted-valid so the refusal proves the CPU
+    // check runs before admission, rather than rejecting a test scratch path.
     let (hosted_scratch, _) = crate::hosted::boat_tests::committed_repo();
     let mut f = Fixture::with_local_root(
         Cut::None,
@@ -1455,10 +1455,13 @@ async fn fleet_invalid_vcpus_keep_the_claim_and_are_refused_by_direct_admission_
         assert_eq!(
             terminal.outcome,
             Outcome::RefusedBeforeStart {
-                reason: RefusalReason::RunnerFull
+                reason: RefusalReason::RequestRejected
             }
         );
         assert_eq!(terminal.ran, Some(Ran::None));
+        let detail = terminal.refusal_detail().unwrap();
+        assert!(detail.contains("vcpus"), "{detail}");
+        assert!(detail.contains("1..=64"), "{detail}");
         assert!(!marker.exists());
         let frames = f.proxy.frames.lock().unwrap();
         let runs: Vec<_> = frames
@@ -1468,8 +1471,7 @@ async fn fleet_invalid_vcpus_keep_the_claim_and_are_refused_by_direct_admission_
                 _ => None,
             })
             .collect();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].weight_hint, Some(claim));
+        assert!(runs.is_empty());
     }
     assert!(
         tokio::time::timeout(Duration::from_millis(10), broker.accept())

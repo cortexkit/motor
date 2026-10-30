@@ -4,6 +4,31 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use uuid::Uuid;
 
+// Legacy rows lack the requested timeout. Eight-hour jobs have run here;
+// 48 hours leaves ample headroom before treating an abandoned row as stale.
+const LEGACY_JOB_HORIZON_MS: u64 = 48 * 60 * 60 * 1000;
+const FAILURE_HORIZON_MS: u64 = 60 * 60 * 1000;
+const STALE_PROBE_INTERVAL_MS: u64 = 15 * 60 * 1000;
+
+#[derive(Default)]
+pub(super) struct Probe {
+    failures: u32,
+    first_failure_ms: u64,
+    next_probe_ms: u64,
+}
+
+fn deadline(id: Uuid, job: &crate::storage::Job) -> u64 {
+    job.health_deadline_ms.unwrap_or_else(|| {
+        id.get_timestamp().map_or(u64::MAX, |timestamp| {
+            let (seconds, nanos) = timestamp.to_unix();
+            seconds
+                .saturating_mul(1000)
+                .saturating_add(u64::from(nanos) / 1_000_000)
+                .saturating_add(LEGACY_JOB_HORIZON_MS)
+        })
+    })
+}
+
 pub(super) struct Submission {
     motor: Motor,
     id: Uuid,
@@ -82,6 +107,11 @@ impl Motor {
     }
 
     pub(crate) async fn machine_jobs_health(&self) -> Value {
+        self.machine_jobs_health_at(crate::hosted::now_s().saturating_mul(1000))
+            .await
+    }
+
+    async fn machine_jobs_health_at(&self, now: u64) -> Value {
         let mut jobs = json!({});
         for platform in ["linux", "windows", "macos"] {
             jobs[platform] = json!({"running": 0, "waiting_for_capacity": 0, "unknown": 0});
@@ -95,6 +125,10 @@ impl Motor {
             .collect();
         let mut probes = tokio::task::JoinSet::new();
         let candidates = self.storage.health_jobs();
+        self.health_probes
+            .lock()
+            .unwrap()
+            .retain(|id, _| candidates.iter().any(|(candidate, _)| candidate == id));
         for batch in candidates.chunks(16) {
             for (id, job) in batch {
                 let platform = active
@@ -125,6 +159,24 @@ impl Motor {
                     }
                     continue;
                 }
+                let deadline = deadline(*id, job);
+                let retirable = now >= deadline
+                    && !job.pending_cancel
+                    && job.hosted.is_none()
+                    && !self.storage.has_live_stream(*id)
+                    && !active.contains_key(id);
+                if retirable
+                    && self
+                        .health_probes
+                        .lock()
+                        .unwrap()
+                        .get(id)
+                        .is_some_and(|probe| now < probe.next_probe_ms)
+                {
+                    let count = jobs[platform]["unknown"].as_u64().unwrap();
+                    jobs[platform]["unknown"] = json!(count + 1);
+                    continue;
+                }
                 let motor = self.clone();
                 let id = *id;
                 probes.spawn(async move {
@@ -150,11 +202,50 @@ impl Motor {
                         .await
                         .ok()
                         .flatten();
-                    (platform, reply)
+                    (id, platform, reply, retirable, deadline)
                 });
             }
             while let Some(result) = probes.join_next().await {
-                if let Ok((platform, reply)) = result {
+                if let Ok((id, platform, reply, retirable, deadline)) = result {
+                    let mut retire_cause = None;
+                    if let Some(reply) = &reply {
+                        self.health_probes.lock().unwrap().remove(&id);
+                        if let Some(terminal) = &reply.terminal {
+                            if self.hosted_state(id).is_none() {
+                                let mut terminal = terminal.clone();
+                                terminal.job_id = id;
+                                let _ = self.storage.remote_terminal(terminal);
+                            }
+                        } else if retirable && reply.state == "not_found" {
+                            retire_cause = Some("runner no longer knows this job");
+                        }
+                    } else if retirable {
+                        let mut probes = self.health_probes.lock().unwrap();
+                        let probe = probes.entry(id).or_insert_with(|| Probe {
+                            first_failure_ms: now,
+                            ..Probe::default()
+                        });
+                        probe.failures = probe.failures.saturating_add(1);
+                        probe.next_probe_ms = now.saturating_add(STALE_PROBE_INTERVAL_MS);
+                        if probe.failures >= 3
+                            && now.saturating_sub(probe.first_failure_ms) >= FAILURE_HORIZON_MS
+                            && now.saturating_sub(deadline) >= FAILURE_HORIZON_MS
+                        {
+                            retire_cause = Some("runner unreachable past the job's deadline");
+                        }
+                    }
+                    if let Some(cause) = retire_cause {
+                        match self.storage.retire_health_job(id, cause, now) {
+                            Ok(true) => {
+                                self.health_probes.lock().unwrap().remove(&id);
+                                tracing::info!(job_id = %id, cause, "retired abandoned job from health polling");
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(job_id = %id, %error, "could not retain health retirement")
+                            }
+                        }
+                    }
                     let state = reply.as_ref().map_or(Some("unknown"), job_state);
                     if let Some(state) = state {
                         let count = jobs[platform][state].as_u64().unwrap();
@@ -182,6 +273,140 @@ mod tests {
     struct StatusPeer {
         replies: HashMap<Uuid, JobStatusReply>,
         visits: Arc<Mutex<Vec<Uuid>>>,
+    }
+
+    struct UnreachablePeer(Arc<std::sync::atomic::AtomicUsize>);
+    impl crate::Connector for UnreachablePeer {
+        fn connect(
+            &self,
+            _: Uuid,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = io::Result<Box<dyn crate::Duplex>>> + Send + '_>,
+        > {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Err(io::Error::other("runner unavailable")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_unknown_jobs_are_retired_once_and_terminal_probes_are_cached() {
+        let scratch = cortexkit_test_support::ScratchDir::new("health-retirement");
+        let missing = Uuid::now_v7();
+        let finished = Uuid::now_v7();
+        let unbounded = Uuid::now_v7();
+        let visits = Arc::new(Mutex::new(Vec::new()));
+        let mut ended = reply(finished, "terminal", None);
+        ended.terminal = Some(
+            TerminalRecord::new(finished, Outcome::Exit { code: 7 }, 13, 20, 0)
+                .with_ran(Ran::Remote),
+        );
+        let peer = Arc::new(StatusPeer {
+            replies: [
+                reply(missing, "not_found", None),
+                ended,
+                reply(unbounded, "not_found", None),
+            ]
+            .into_iter()
+            .map(|reply| (reply.job_id, reply))
+            .collect(),
+            visits: visits.clone(),
+        });
+        let motor =
+            Motor::with_connector(crate::Config::default(), &scratch, peer.clone()).unwrap();
+        for id in [missing, finished, unbounded] {
+            motor.storage.create(id, 60, None, None, false).unwrap();
+        }
+        motor.storage.health_deadline(unbounded, None).unwrap();
+        let now = crate::hosted::now_s() * 1000 + LEGACY_JOB_HORIZON_MS + 1000;
+        motor.machine_jobs_health_at(now).await;
+        let terminal = motor.storage.job(missing).unwrap().local_terminal.unwrap();
+        assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
+        assert!(terminal
+            .refusal_detail
+            .unwrap()
+            .contains("runner no longer knows this job"));
+        assert_eq!(
+            motor
+                .storage
+                .job(finished)
+                .unwrap()
+                .remote_terminal
+                .unwrap()
+                .outcome,
+            Outcome::Exit { code: 7 }
+        );
+        assert!(motor
+            .storage
+            .job(unbounded)
+            .unwrap()
+            .local_terminal
+            .is_none());
+        motor.machine_jobs_health_at(now + 15_000).await;
+        assert_eq!(
+            visits
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|id| **id == missing)
+                .count(),
+            1
+        );
+        assert_eq!(
+            visits
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|id| **id == finished)
+                .count(),
+            1
+        );
+        drop(motor);
+        let motor = Motor::with_connector(crate::Config::default(), &scratch, peer).unwrap();
+        motor.machine_jobs_health_at(now + 30_000).await;
+        assert_eq!(
+            visits
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|id| **id == missing)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_stale_probes_back_off_and_retire_only_after_an_hour() {
+        let scratch = cortexkit_test_support::ScratchDir::new("health-failure-bound");
+        let visits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let motor = Motor::with_connector(
+            crate::Config::default(),
+            &scratch,
+            Arc::new(UnreachablePeer(visits.clone())),
+        )
+        .unwrap();
+        let id = Uuid::now_v7();
+        motor.storage.create(id, 60, None, None, false).unwrap();
+        let now = crate::hosted::now_s() * 1000 + LEGACY_JOB_HORIZON_MS + 1000;
+        motor.machine_jobs_health_at(now).await;
+        let attempts = visits.load(std::sync::atomic::Ordering::SeqCst);
+        motor.machine_jobs_health_at(now + 15_000).await;
+        assert_eq!(visits.load(std::sync::atomic::Ordering::SeqCst), attempts);
+        for minutes in [15, 30, 45] {
+            motor.machine_jobs_health_at(now + minutes * 60_000).await;
+            assert!(motor.storage.job(id).unwrap().local_terminal.is_none());
+        }
+        motor.machine_jobs_health_at(now + FAILURE_HORIZON_MS).await;
+        let terminal = motor.storage.job(id).unwrap().local_terminal.unwrap();
+        assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
+        assert!(terminal
+            .refusal_detail
+            .unwrap()
+            .contains("runner unreachable past the job's deadline"));
+        let attempts = visits.load(std::sync::atomic::Ordering::SeqCst);
+        motor
+            .machine_jobs_health_at(now + FAILURE_HORIZON_MS + 15_000)
+            .await;
+        assert_eq!(visits.load(std::sync::atomic::Ordering::SeqCst), attempts);
     }
     impl crate::Connector for StatusPeer {
         fn connect(

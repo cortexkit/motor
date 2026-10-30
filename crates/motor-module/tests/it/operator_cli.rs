@@ -2263,13 +2263,11 @@ async fn cli_cancel_ends_a_running_job_with_killed_cancel() {
         "{terminal:?}"
     );
     assert_eq!(cli::exit_code(&terminal), cli::EXIT_CANCELLED);
-    // The saved file is what tells `ck motor cancel` the job was still
-    // running: it answers `cancelled` exactly when a saved file it read for
-    // the job is still on disk. The job's own stop racing the cancel does not
-    // change that.
+    // Keep the credential after cancellation so a later status or attach can
+    // inspect the terminal, even after the original route disconnects.
     assert!(
-        saved_path.is_some(),
-        "the cancel read the saved secret file"
+        saved_path.unwrap().exists(),
+        "cancel must retain the saved secret file"
     );
 }
 

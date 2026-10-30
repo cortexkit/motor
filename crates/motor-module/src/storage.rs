@@ -78,6 +78,13 @@ pub(crate) struct Job {
     pub queue_wait_limit_s: u64,
     pub pending_cancel: bool,
     pub local_terminal: Option<TerminalRecord>,
+    /// A status summary only; output replays still attach to the runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) remote_terminal: Option<TerminalRecord>,
+    /// Health-only retirement horizon. MAX means no timeout. Older clients can
+    /// drop it on rollback, so execution and recovery must not depend on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) health_deadline_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_observed_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -129,6 +136,8 @@ impl PartialEq for Job {
             queue_wait_limit_s,
             pending_cancel,
             local_terminal,
+            remote_terminal,
+            health_deadline_ms,
             terminal_observed_at_ms,
             terminal_delivered_at_ms,
             retain_until_ms,
@@ -150,6 +159,8 @@ impl PartialEq for Job {
             && queue_wait_limit_s == &other.queue_wait_limit_s
             && pending_cancel == &other.pending_cancel
             && local_terminal == &other.local_terminal
+            && remote_terminal == &other.remote_terminal
+            && health_deadline_ms == &other.health_deadline_ms
             && terminal_observed_at_ms == &other.terminal_observed_at_ms
             && terminal_delivered_at_ms == &other.terminal_delivered_at_ms
             && retain_until_ms == &other.retain_until_ms
@@ -160,6 +171,15 @@ impl PartialEq for Job {
     }
 }
 impl Job {
+    pub(crate) fn health_retired(&self) -> bool {
+        self.local_terminal.as_ref().is_some_and(|terminal| {
+            matches!(terminal.outcome, Outcome::OutcomeUnknown)
+                && terminal
+                    .refusal_detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.starts_with("health_retired: "))
+        })
+    }
     /// For a job sent to the build server because the broker answered
     /// `no_host_fits`, the `max_vcpus` that answer named (inner None when it
     /// named none). Outer None for every other job.
@@ -173,6 +193,8 @@ impl Job {
             && self.return_cwd.is_none()
             && self.return_requested.is_none()
             && self.direct_secret_hash.is_none()
+            && self.health_deadline_ms.is_none()
+            && self.remote_terminal.is_none()
             && !self.gate_job
             && self.runner_instance.is_none()
             && self.windows_runner.is_none()
@@ -320,7 +342,7 @@ impl State {
                 || job.hosted.as_ref().is_some_and(|s| s.needs_cleanup())
                 || (!job.legacy_expired(*id, now)
                     && (job.terminal_observed_at_ms.is_none()
-                        || job.terminal_delivered_at_ms.is_none()
+                        || (job.terminal_delivered_at_ms.is_none() && !job.health_retired())
                         || job.retain_until_ms.is_none_or(|until| until > now)))
         });
         // Legacy cache entries get a full horizon on first load. Snapshot entries
@@ -503,6 +525,7 @@ impl Storage {
             .iter()
             .filter(|(_, job)| {
                 job.local_terminal.is_none()
+                    && job.remote_terminal.is_none()
                     && job.terminal_observed_at_ms.is_none()
                     && job
                         .hosted
@@ -1074,6 +1097,53 @@ impl Storage {
             job.terminal_observed_at_ms.get_or_insert(now_ms());
         })
     }
+    pub(crate) fn remote_terminal(&self, terminal: TerminalRecord) -> io::Result<()> {
+        self.update(|s| {
+            let job = s.jobs.entry(terminal.job_id).or_default();
+            job.remote_terminal = Some(terminal);
+            job.terminal_observed_at_ms.get_or_insert(now_ms());
+        })
+    }
+    pub(crate) fn health_deadline(&self, id: Uuid, timeout: Option<u64>) -> io::Result<()> {
+        self.update(|s| {
+            let job = s.jobs.entry(id).or_default();
+            job.health_deadline_ms = Some(timeout.map_or(u64::MAX, |timeout| {
+                now_ms().saturating_add(
+                    job.queue_wait_limit_s
+                        .saturating_add(timeout)
+                        .saturating_add(600)
+                        .saturating_mul(1000),
+                )
+            }));
+        })
+    }
+    pub(crate) fn retire_health_job(&self, id: Uuid, cause: &str, now: u64) -> io::Result<bool> {
+        let mut retired = false;
+        self.update(|s| {
+            if s.active_jobs.contains_key(&id) {
+                return;
+            }
+            let Some(job) = s.jobs.get_mut(&id) else {
+                return;
+            };
+            if job.pending_cancel
+                || job.hosted.is_some()
+                || job.local_terminal.is_some()
+                || job.remote_terminal.is_some()
+            {
+                return;
+            }
+            job.local_terminal = Some(
+                TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
+                    .with_ran(Ran::Unknown("maybe".into()))
+                    .with_refusal_detail(format!("health_retired: {cause}")),
+            );
+            job.terminal_observed_at_ms = Some(now);
+            job.retain_until_ms = Some(now.saturating_add(RETENTION_MS));
+            retired = true;
+        })?;
+        Ok(retired)
+    }
     pub fn previous(&self, key: &str) -> BTreeMap<String, String> {
         self.state
             .lock()
@@ -1093,6 +1163,42 @@ impl Storage {
 
 #[cfg(test)]
 mod retention_tests {
+    #[test]
+    fn health_retirement_is_bounded_without_claiming_delivery_and_protects_live_jobs() {
+        use super::*;
+        let scratch = cortexkit_test_support::ScratchDir::new("health-summary-retention");
+        let storage = Arc::new(Storage::open(&scratch).unwrap());
+        let now = now_ms();
+        let id = Uuid::now_v7();
+        storage.create(id, 60, None, None, false).unwrap();
+        assert!(storage
+            .retire_health_job(id, "runner no longer knows this job", now)
+            .unwrap());
+        let job = storage.job(id).unwrap();
+        assert!(job.terminal_delivered_at_ms.is_none());
+        let mut state = storage.state.lock().unwrap();
+        state.prune(now + RETENTION_MS - 1);
+        assert!(state.jobs.contains_key(&id));
+        state.prune(now + RETENTION_MS);
+        assert!(!state.jobs.contains_key(&id));
+        drop(state);
+        for protection in ["active", "cancel", "hosted"] {
+            let id = Uuid::now_v7();
+            storage.create(id, 60, None, None, false).unwrap();
+            let lease = (protection == "active").then(|| storage.lease_job(id));
+            if protection == "cancel" {
+                storage.cancel(id, true).unwrap();
+            }
+            if protection == "hosted" {
+                storage.hosted_route(id, Default::default()).unwrap();
+            }
+            assert!(!storage
+                .retire_health_job(id, "runner no longer knows this job", now)
+                .unwrap());
+            drop(lease);
+        }
+    }
+
     #[test]
     fn direct_secret_hash_survives_reopen_and_expires_with_its_job() {
         use super::*;
