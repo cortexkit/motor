@@ -12,7 +12,7 @@
 //! reattach limit.
 
 use super::tls;
-use crate::transport::Incoming;
+use crate::transport::{Channel, Incoming};
 use ed25519_dalek::SigningKey;
 use motor_host::server::{serve, unix_ms, Runtime};
 use motor_host::state::{Host, Snapshot, Tenant};
@@ -153,9 +153,16 @@ fn lifecycle(seq: u64, event: TenantEventKind, job: Uuid) -> TenantEvent {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_slow_hosted_client_receives_every_frame_after_the_tenant_runner_closes_its_job_stream() {
-    let scratch = cortexkit_test_support::ScratchDir::new("hosted-relay-close");
+struct HostedRelay {
+    runner: motor_runner::Runner,
+    vm: Arc<TenantVm>,
+    runtime: Arc<Runtime>,
+    channel: Channel,
+    served: tokio::task::JoinHandle<anyhow::Result<()>>,
+    id: Uuid,
+}
+
+async fn hosted_relay(scratch: &Path) -> HostedRelay {
     let remote = scratch.join("remote");
     let mut config = motor_runner::Config::new(scratch.join("runner-state"), "e2e");
     config.tenant_vm = true;
@@ -246,9 +253,255 @@ async fn a_slow_hosted_client_receives_every_frame_after_the_tenant_runner_close
 
     let (pipe, server) = narrow_tcp_pair().await;
     let served = tokio::spawn(serve(runtime.clone(), server));
-    let mut channel = tls::authenticate(Box::new(pipe), &lease, &requester, &claims)
+    let channel = tls::authenticate(Box::new(pipe), &lease, &requester, &claims)
         .await
         .unwrap_or_else(|failure| panic!("hosted connect failed: {failure:?}"));
+    HostedRelay {
+        runner,
+        vm,
+        runtime,
+        channel,
+        served,
+        id,
+    }
+}
+
+struct ReleaseQueuedJob {
+    unlock: std::sync::mpsc::Sender<()>,
+    release_file: std::path::PathBuf,
+}
+impl Drop for ReleaseQueuedJob {
+    fn drop(&mut self) {
+        let _ = self.unlock.send(());
+        let _ = std::fs::write(&self.release_file, "release");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accepted_hosted_job_queued_past_read_inactivity_keeps_heartbeats_and_delivers_terminal() {
+    let scratch = cortexkit_test_support::ScratchDir::new("hosted-queued-heartbeat");
+    let HostedRelay {
+        runner,
+        runtime,
+        mut channel,
+        served,
+        id,
+        ..
+    } = hosted_relay(scratch.path()).await;
+    let (commit, tree, bundle) = repository(scratch.path());
+    let remote = scratch.join("remote");
+    let root = remote.join("source/main").to_string_lossy().into_owned();
+    let workspace = remote.join("worktrees/a").to_string_lossy().into_owned();
+    let run = |job_id: Uuid, command: String, timeout: u64| -> Run {
+        serde_json::from_value(serde_json::json!({
+            "job_id": job_id, "workspace_key": workspace, "repository_root": root,
+            "cwd": workspace, "command": command, "env": {},
+            "weight_hint": 1, "timeout": timeout, "queue_wait_limit_s": 300,
+            "snapshot_commit": commit, "tree_hash": tree, "integration_tip": commit,
+            "base_commit": commit, "siblings": [],
+            "bundles": [{"index": 0, "repository": root, "length": bundle.len(),
+                "sha256": format!("{:x}", sha2::Sha256::digest(&bundle))}],
+        }))
+        .unwrap()
+    };
+    let upload = Frame::BundleChunk {
+        index: 0,
+        offset: 0,
+        data: BytePayload(bundle.clone()),
+    };
+    let first_id = Uuid::now_v7();
+    let (mut first_pipe, first_guest) = tokio::io::duplex(1 << 20);
+    let first_served = tokio::spawn(motor_runner::serve_tenant_connection(
+        runner.clone(),
+        first_guest,
+    ));
+    write_frame_async(
+        &mut first_pipe,
+        &Frame::VerifiedLease(VerifiedLease {
+            jti: first_id,
+            purpose: LeasePurpose::Run,
+            sub: "acct:test".into(),
+            vcpus: 1,
+            mem_mib: 16384,
+            platform: if cfg!(target_arch = "aarch64") {
+                "linux-arm64"
+            } else {
+                "linux-x64"
+            }
+            .into(),
+            net: false,
+            max_s: 180,
+            exp: unix_ms() / 1000 + 300,
+        }),
+    )
+    .await
+    .unwrap();
+    let mut first = Channel::from_hosted(Box::new(first_pipe), false)
+        .await
+        .unwrap();
+    let (unlock, unlock_rx) = std::sync::mpsc::channel();
+    let release = ReleaseQueuedJob {
+        unlock,
+        release_file: scratch.join("release-first"),
+    };
+    // Occupying the same checkout keeps the second job genuinely queued,
+    // rather than simulating a silent runner or a slow upload.
+    let command = format!(
+        "printf ready; while [ ! -f '{}' ]; do sleep 0.05; done",
+        release.release_file.display()
+    );
+    first
+        .send(Frame::Run(run(first_id, command, 180)))
+        .await
+        .unwrap();
+    assert!(matches!(
+        first.next().await.unwrap(),
+        Incoming::Frame(Frame::Accepted(_))
+    ));
+    first.send(upload.clone()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if matches!(first.next().await.unwrap(), Incoming::Frame(Frame::Output(record)) if record.bytes.0 == b"ready") {
+                break;
+            }
+        }
+    }).await.expect("first job did not occupy the checkout");
+
+    channel
+        .send(Frame::Run(run(id, "printf queued; exit 7".into(), 30)))
+        .await
+        .unwrap();
+    assert!(matches!(
+        channel.next().await.unwrap(),
+        Incoming::Frame(Frame::Accepted(_))
+    ));
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .event(
+            "tenant",
+            &lifecycle(1, TenantEventKind::Admitted, id),
+            unix_ms(),
+        )
+        .unwrap();
+    channel.send(upload).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while runner.job_status(id).unwrap().state != "queued" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("accepted job never entered the tenant queue");
+
+    let locked_runtime = runtime.clone();
+    let (entered, locked) = tokio::sync::oneshot::channel();
+    let lock_holder = tokio::task::spawn_blocking(move || {
+        let _host = locked_runtime.host.lock().unwrap();
+        entered.send(()).unwrap();
+        unlock_rx
+            .recv_timeout(Duration::from_secs(90))
+            .expect("host lock was not released");
+    });
+    locked.await.unwrap();
+    // Channel's real read-inactivity timer is 60 seconds. Keep the Host lock
+    // held beyond it: only guest heartbeats may keep this connection alive.
+    let held_at = tokio::time::Instant::now();
+    let until = held_at + Duration::from_secs(65);
+    let mut last_heartbeat = None;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(until) => break,
+            incoming = channel.next_job() => match incoming.expect("queued hosted stream hit read inactivity while the lease was active") {
+                Incoming::Frame(Frame::Heartbeat { .. }) => last_heartbeat = Some(tokio::time::Instant::now()),
+                Incoming::Frame(Frame::Started { .. } | Frame::Terminal(_)) => panic!("job left its queue before the checkout was released"),
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        last_heartbeat.expect("no guest heartbeat reached the client")
+            >= held_at + Duration::from_secs(60)
+    );
+    assert_eq!(runner.job_status(id).unwrap().state, "queued");
+    drop(release);
+    lock_holder.await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while runner.job_status(id).unwrap().terminal.is_none() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("queued job did not finish after the checkout was released");
+    {
+        let mut host = runtime.host.lock().unwrap();
+        host.event(
+            "tenant",
+            &lifecycle(2, TenantEventKind::Started, id),
+            unix_ms(),
+        )
+        .unwrap();
+        host.sample(
+            "tenant",
+            motor_host::billing::Metrics {
+                memory_bytes: 1 << 20,
+                egress_bytes: 0,
+            },
+        )
+        .unwrap();
+        host.event(
+            "tenant",
+            &lifecycle(3, TenantEventKind::Terminal, id),
+            unix_ms(),
+        )
+        .unwrap();
+        host.billing_tick(unix_ms()).unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut terminal = false;
+        loop {
+            match channel.next().await.unwrap() {
+                Incoming::Frame(Frame::Terminal(record)) => {
+                    assert_eq!(record.outcome, Outcome::Exit { code: 7 });
+                    terminal = true;
+                }
+                Incoming::Frame(Frame::HostedTerminal(_)) => {
+                    assert!(terminal);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the attached stream did not deliver both terminal records");
+    drop(channel);
+    tokio::time::timeout(Duration::from_secs(30), served)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(first);
+    tokio::time::timeout(Duration::from_secs(30), first_served)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_hosted_client_receives_every_frame_after_the_tenant_runner_closes_its_job_stream() {
+    let scratch = cortexkit_test_support::ScratchDir::new("hosted-relay-close");
+    let HostedRelay {
+        runner,
+        vm,
+        runtime,
+        mut channel,
+        served,
+        id,
+    } = hosted_relay(scratch.path()).await;
+    let remote = scratch.join("remote");
 
     let (commit, tree, bundle) = repository(scratch.path());
     let root = remote.join("source/main").to_string_lossy().into_owned();

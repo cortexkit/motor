@@ -2012,6 +2012,77 @@ async fn client_heartbeats_reach_guest_while_watermark_store_is_blocked() {
     runtime.host.lock().unwrap().guest_unready("tenant");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn guest_heartbeats_reach_client_while_output_waits_for_its_durable_watermark() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let (runtime, fake, broker, requester, c) = fixture();
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let guest = started_relay(
+        &runtime,
+        &fake,
+        &broker,
+        &requester,
+        &c,
+        &mut client,
+        unix_ms(),
+    )
+    .await;
+    guest.set_nonblocking(true).unwrap();
+    let mut guest = tokio::net::UnixStream::from_std(guest).unwrap();
+    let gate = Arc::new(WatermarkGate::default());
+    let release = ReleaseWatermark(gate.clone());
+    let inner = MemoryJournal::default();
+    let stored = inner.0.clone();
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .replace_journal(Box::new(GatedWatermarkJournal {
+            inner,
+            gate: Some(gate.clone()),
+        }));
+    let output = json!({"type":"output","job_id":JOB,"seq":1,"data":"aGVsbG8="});
+    write_frame(&mut guest, &output).await.unwrap();
+    let entered = timeout(Duration::from_secs(1), gate.entered.notified()).await;
+    let heartbeat = json!({"type":"heartbeat","queue_wait_ms":1234});
+    write_frame(&mut guest, &heartbeat).await.unwrap();
+    let received = timeout(Duration::from_secs(1), read_frame(&mut client)).await;
+    let early_output = timeout(Duration::from_millis(50), read_frame(&mut client)).await;
+    let persisted_early = !stored.lock().unwrap().is_empty();
+    // Unblock the synchronous store even when a liveness assertion will fail.
+    drop(release);
+    let visible_output = timeout(Duration::from_secs(2), read_frame(&mut client)).await;
+    drop(client);
+    let cleanup = timeout(Duration::from_secs(2), task).await;
+    drop(guest);
+
+    assert!(entered.is_ok(), "watermark store was never entered");
+    assert_eq!(
+        received
+            .expect("guest heartbeat waited for the Host journal")
+            .unwrap(),
+        heartbeat
+    );
+    assert!(
+        early_output.is_err(),
+        "output became visible before persistence"
+    );
+    assert!(!persisted_early);
+    assert!(!gate
+        .failsafe_fired
+        .load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(visible_output.unwrap().unwrap(), output);
+    assert_eq!(
+        stored.lock().unwrap().last().unwrap().leases[JOB].highest_seq,
+        1
+    );
+    cleanup.unwrap().unwrap().unwrap();
+    runtime.host.lock().unwrap().guest_unready("tenant");
+}
+
 struct SlowWatermarkJournal {
     inner: MemoryJournal,
     start: Option<Arc<WatermarkGate>>,
