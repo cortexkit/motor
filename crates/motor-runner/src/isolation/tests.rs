@@ -1346,8 +1346,8 @@ fn isolated_cancel_kills_entire_cgroup_including_term_ignoring_child() {
         .lines()
         .map(|p| platform::identity(p.parse().unwrap()).unwrap())
         .collect();
-    platform::signal(launch.identity, false);
-    platform::signal(launch.identity, true);
+    let _ = platform::signal(launch.identity, false);
+    let _ = platform::signal(launch.identity, true);
     assert!(!launch.wait().unwrap().success());
     launch.reap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1451,7 +1451,7 @@ fn isolated_service_identity_does_not_alias_another_instances_job_id() {
     );
     let mut first_launch = first.launch("touch first", &a.workspace, &[]).unwrap();
     let mut second_launch = second.launch("touch second", &b.workspace, &[]).unwrap();
-    platform::signal(first_launch.identity, true);
+    let _ = platform::signal(first_launch.identity, true);
     assert!(!first_launch.wait().unwrap().success());
     first_launch.reap();
     // Killing the first account-boundary cgroup must not affect the second

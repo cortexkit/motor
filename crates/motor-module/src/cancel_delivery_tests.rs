@@ -4,7 +4,7 @@ use cortexkit_test_support::ScratchDir;
 use std::{
     future::Future,
     pin::Pin,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tokio::sync::Notify;
 
@@ -18,6 +18,8 @@ struct CancelPeer {
     cancel_release: Notify,
     next_output: Notify,
     terminal: Notify,
+    refuse_cancel: AtomicBool,
+    attach_refusal: AtomicBool,
 }
 
 struct Peer(Arc<CancelPeer>);
@@ -62,6 +64,11 @@ impl Connector for Peer {
                         for seq in 0..2 {
                             if seq > 0 {
                                 peer.next_output.notified().await;
+                                if peer.attach_refusal.load(Ordering::SeqCst) {
+                                    write_frame_async(&mut stream, &cancel_refusal(id))
+                                        .await
+                                        .unwrap();
+                                }
                             }
                             write_frame_async(
                                 &mut stream,
@@ -91,7 +98,11 @@ impl Connector for Peer {
                         peer.cancel_release.notified().await;
                         write_frame_async(
                             &mut stream,
-                            &Frame::CancelReply(CancelReply::new(request.job_id)),
+                            &if peer.refuse_cancel.load(Ordering::SeqCst) {
+                                cancel_refusal(request.job_id)
+                            } else {
+                                Frame::CancelReply(CancelReply::new(request.job_id))
+                            },
                         )
                         .await
                         .unwrap();
@@ -110,6 +121,65 @@ async fn next(stream: &mut JobStream) -> StreamRecord {
         .expect("the job stream stalled")
         .unwrap()
         .unwrap()
+}
+
+fn cancel_refusal(id: Uuid) -> Frame {
+    Frame::Refusal(Refusal {
+        job_id: Some(id),
+        transfer_id: None,
+        reason: RefusalReason::RequestRejected,
+        disk_full: None,
+        retry_after_ms: None,
+        detail: Some("cancel failed: control bus unavailable".into()),
+    })
+}
+
+#[tokio::test]
+async fn refused_cancel_preserves_the_stop_error_and_pending_intent() {
+    let scratch = ScratchDir::new("motor-cancel-refusal");
+    let peer = Arc::new(CancelPeer::default());
+    peer.refuse_cancel.store(true, Ordering::SeqCst);
+    peer.cancel_release.notify_one();
+    let motor = Motor::with_connector(Config::default(), &scratch, Arc::new(Peer(peer))).unwrap();
+    let id = Uuid::now_v7();
+    motor.storage.create(id, 60, None, None, false).unwrap();
+    motor.storage.cancel(id, true).unwrap();
+    let error = motor.send_cancel_once(id).await.unwrap_err();
+    assert!(
+        error.to_string().contains("control bus unavailable"),
+        "{error}"
+    );
+    assert!(
+        motor.pending(id),
+        "a refused cancel must not be recorded as acknowledged"
+    );
+}
+
+#[tokio::test]
+async fn refused_cancel_keeps_the_attached_connection_for_the_eventual_terminal() {
+    let scratch = ScratchDir::new("motor-cancel-attached-refusal");
+    let peer = Arc::new(CancelPeer::default());
+    peer.attach_refusal.store(true, Ordering::SeqCst);
+    let motor =
+        Motor::with_connector(Config::default(), &scratch, Arc::new(Peer(peer.clone()))).unwrap();
+    let id = Uuid::now_v7();
+    motor.storage.create(id, 60, None, None, false).unwrap();
+    let delivering = motor.deliver_cancel(id);
+    let mut stream = motor.attach(AttachRequest::new(id, 0)).unwrap();
+    assert!(matches!(next(&mut stream).await, StreamRecord::Output(_)));
+    motor.storage.cancel(id, true).unwrap();
+    peer.next_output.notify_one();
+    assert!(matches!(next(&mut stream).await, StreamRecord::Output(_)));
+    assert!(motor.pending(id));
+    peer.terminal.notify_one();
+    assert!(matches!(next(&mut stream).await, StreamRecord::Terminal(_)));
+    assert_eq!(
+        peer.attaches.load(Ordering::SeqCst),
+        1,
+        "no reattach after stop refusal"
+    );
+    assert_eq!(peer.cancels.load(Ordering::SeqCst), 0);
+    drop(delivering);
 }
 
 /// While `cancel` waits for the runner to acknowledge a cancel, the job's
