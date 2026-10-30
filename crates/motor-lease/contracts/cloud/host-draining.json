@@ -1,0 +1,143 @@
+{
+  "note": "TEST-ONLY signed heartbeat bytes produced by the broker: draining true echoes the stored drain, omission and false clear it; the seed reproduces the host key.",
+  "test_only_host_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "clock_ms": 1792195200123,
+  "host": {
+    "host_id": "host-a",
+    "public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+    "endpoint": "runner.example:7443",
+    "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "platform": "linux-x64"
+  },
+  "exchanges": [
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/hosts/host-a/heartbeat",
+        "body": {
+          "free_vcpus": 60,
+          "free_mem_mib": 245760,
+          "queued": 0,
+          "warm": [],
+          "running": [],
+          "healthy": true,
+          "draining": true
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "CK-Host": "host-a",
+          "CK-Timestamp": "1792195200123",
+          "CK-Counter": "2",
+          "CK-Signature": "cae81fa9cbe913f88432c54954a25f21a2538f3d46c65dd63eb52a2556c9acca3763002d13dfb103905c3067f086f941259787747a963fbd05944bde00b80802"
+        },
+        "body_bytes": "{\"free_vcpus\":60,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"draining\":true}"
+      },
+      "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-a/heartbeat\n5f252178819e2cdf4a74e01f20c3e385706b18aead799f400d1b37974c719ec8\n1792195200123\n2",
+      "reply": {
+        "status": 200,
+        "body": {
+          "ignored": [],
+          "closed_subjects": [],
+          "draining": true
+        },
+        "body_bytes": "{\"ignored\":[],\"closed_subjects\":[],\"draining\":true}"
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/hosts/host-a/heartbeat",
+        "body": {
+          "free_vcpus": 60,
+          "free_mem_mib": 245760,
+          "queued": 0,
+          "warm": [],
+          "running": [],
+          "healthy": true
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "CK-Host": "host-a",
+          "CK-Timestamp": "1792195200123",
+          "CK-Counter": "3",
+          "CK-Signature": "e5dd838b4abdc16199a5e86cb49a052933fb1f8d0df486c66a3adf5b1be7b371bb7243bfd096a7ee4755d1d8e18975436b8bf648706444c8970e09a4ab2efb00"
+        },
+        "body_bytes": "{\"free_vcpus\":60,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true}"
+      },
+      "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-a/heartbeat\n9876f2d9d27564db6a7a11e349ec3e0c0ae025b479c6bf1a42e94466b5029d7e\n1792195200123\n3",
+      "reply": {
+        "status": 200,
+        "body": {
+          "ignored": [],
+          "closed_subjects": []
+        },
+        "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/hosts/host-a/heartbeat",
+        "body": {
+          "free_vcpus": 60,
+          "free_mem_mib": 245760,
+          "queued": 0,
+          "warm": [],
+          "running": [],
+          "healthy": true,
+          "draining": true
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "CK-Host": "host-a",
+          "CK-Timestamp": "1792195200123",
+          "CK-Counter": "4",
+          "CK-Signature": "90e14929b010f902e73212b60c8e695303c589e98e606515a4e5d9bab9960a59e5c6594419b6ec4cc3c25e43b8cab170809dce4442c3f5e3651f7dcfcd337f04"
+        },
+        "body_bytes": "{\"free_vcpus\":60,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"draining\":true}"
+      },
+      "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-a/heartbeat\n5f252178819e2cdf4a74e01f20c3e385706b18aead799f400d1b37974c719ec8\n1792195200123\n4",
+      "reply": {
+        "status": 200,
+        "body": {
+          "ignored": [],
+          "closed_subjects": [],
+          "draining": true
+        },
+        "body_bytes": "{\"ignored\":[],\"closed_subjects\":[],\"draining\":true}"
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/hosts/host-a/heartbeat",
+        "body": {
+          "free_vcpus": 60,
+          "free_mem_mib": 245760,
+          "queued": 0,
+          "warm": [],
+          "running": [],
+          "healthy": true,
+          "draining": false
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "CK-Host": "host-a",
+          "CK-Timestamp": "1792195200123",
+          "CK-Counter": "5",
+          "CK-Signature": "24e25b893b6ebf749f1d87f41af25c5147b063353ade3281efe29686d96df85f83477f81960b9c0d410333f637f5bcb89b8dadfdf3813180c85126f27ad9e902"
+        },
+        "body_bytes": "{\"free_vcpus\":60,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"draining\":false}"
+      },
+      "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-a/heartbeat\nde3da6097eca6f8c3622163181b4b32c9a408678d0b5ea93a812b922011fd58e\n1792195200123\n5",
+      "reply": {
+        "status": 200,
+        "body": {
+          "ignored": [],
+          "closed_subjects": []
+        },
+        "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+      }
+    }
+  ]
+}

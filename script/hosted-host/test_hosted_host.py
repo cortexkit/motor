@@ -692,6 +692,61 @@ class RunnerLogTests(unittest.TestCase):
         self.assertEqual(reply, {"ok": True, "journal": {"entries": []}})
 
 
+class HostDrainTests(unittest.TestCase):
+    def test_waits_for_an_echo_strictly_after_the_set_not_a_stale_or_equal_time(self):
+        stale = {"ok": True, "draining": True, "broker_draining": True,
+                 "broker_heartbeat_at_ms": 99}
+        replies = [{"ok": True, "draining": True, "set_at_ms": 100}, stale,
+                   dict(stale, broker_heartbeat_at_ms=100),
+                   dict(stale, broker_draining=False, broker_heartbeat_at_ms=101),
+                   dict(stale, broker_heartbeat_at_ms=102)]
+        clock = [0.0]
+        with mock.patch.object(hosted, "admin_exchange", side_effect=replies) as exchange, \
+                mock.patch.object(hosted.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(hosted.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+            result = hosted.drain_host(10)
+        self.assertEqual(result["broker_heartbeat_at_ms"], 102)
+        self.assertEqual([call.args[0] for call in exchange.call_args_list],
+                         [{"op": "drain_host"}] + [{"op": "host_status"}] * 4)
+        self.assertEqual(clock[0], 3)
+
+    def test_timeout_without_a_new_echo_never_clears_the_drain(self):
+        clock = [0.0]
+        status = {"ok": True, "draining": True, "broker_draining": False,
+                  "broker_heartbeat_at_ms": None}
+        def answer(request, *args, **kwargs):
+            return {"ok": True, "draining": True, "set_at_ms": 100} if request["op"] == "drain_host" else status
+        with mock.patch.object(hosted, "admin_exchange", side_effect=answer) as exchange, \
+                mock.patch.object(hosted.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(hosted.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+            with self.assertRaisesRegex(ValueError, "timed out.*broker draining echo.*do not switch"):
+                hosted.drain_host(2)
+        self.assertEqual(clock[0], 2)
+        self.assertNotIn({"op": "undrain_host"}, [call.args[0] for call in exchange.call_args_list])
+
+    def test_clear_is_host_level_and_refusals_are_errors(self):
+        with mock.patch.object(hosted, "admin_exchange", return_value={"ok": True, "draining": False}) as exchange:
+            self.assertFalse(hosted.undrain_host()["draining"])
+        exchange.assert_called_once_with({"op": "undrain_host"}, hosted.ADMIN_SOCKET)
+        with mock.patch.object(hosted, "admin_exchange", return_value={"ok": False, "error": "admin_refused"}):
+            with self.assertRaisesRegex(ValueError, "refused drain_host"):
+                hosted.drain_host()
+            with self.assertRaisesRegex(ValueError, "refused undrain_host"):
+                hosted.undrain_host()
+
+    def test_cli_reports_timeout_and_clear(self):
+        with mock.patch.object(hosted.sys, "argv", ["hosted_host.py", "drain-host", "--timeout", "3"]), \
+                mock.patch.object(hosted, "drain_host", side_effect=ValueError("timed out waiting for broker draining echo")) as drain, \
+                mock.patch.object(hosted.sys, "stderr"):
+            self.assertEqual(hosted.main(), 2)
+        drain.assert_called_once_with(3)
+        with mock.patch.object(hosted.sys, "argv", ["hosted_host.py", "undrain-host"]), \
+                mock.patch.object(hosted, "undrain_host", return_value={"ok": True, "draining": False}) as clear, \
+                mock.patch.object(hosted.sys, "stdout"):
+            self.assertEqual(hosted.main(), 0)
+        clear.assert_called_once_with()
+
+
 class InstallScriptTests(CapacityConfigTests):
     def setUp(self):
         super().setUp()

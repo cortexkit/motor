@@ -82,6 +82,9 @@ pub struct Snapshot {
     /// Tenants whose accounts the broker reported closed, by tenant name.
     #[serde(default)]
     pub closed: BTreeMap<String, crate::closure::ClosedTenant>,
+    /// Keep fleet placement paused across host and helper restarts during an update.
+    #[serde(default)]
+    pub draining: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -207,6 +210,8 @@ pub struct Host {
     /// The capacity file as last read, `None` while it is missing or invalid.
     capacity: Option<crate::capacity::Capacity>,
     advert: BTreeMap<String, advertise::TenantAdvert>,
+    pub(crate) broker_draining: bool,
+    pub(crate) broker_heartbeat_at_ms: Option<u64>,
 }
 impl Host {
     pub fn new(
@@ -229,6 +234,8 @@ impl Host {
             storage: Default::default(),
             capacity: None,
             advert: BTreeMap::new(),
+            broker_draining: false,
+            broker_heartbeat_at_ms: None,
         }
     }
     /// Replaces the journal, so tests can make writes fail the way a full
@@ -265,6 +272,11 @@ impl Host {
         self.snapshot = next;
         self.publish_connections();
         Ok(())
+    }
+    pub fn set_draining(&mut self, draining: bool) -> Result<(), Error> {
+        let mut next = self.snapshot.clone();
+        next.draining = draining;
+        self.save(next)
     }
     fn publish_connections(&self) {
         for connection in &self.connections {

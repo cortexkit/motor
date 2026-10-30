@@ -269,6 +269,8 @@ pub struct Heartbeat {
     pub warm: Vec<WarmVm>,
     pub running: Vec<RunningJob>,
     pub healthy: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub draining: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

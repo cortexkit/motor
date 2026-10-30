@@ -635,13 +635,27 @@ The exact body is:
 
 ```text
 {free_vcpus, free_mem_mib, queued, warm:[{tenant, workspace_key_hash, vm}],
- running:[{job_id, state, elapsed_ms}], healthy}
+ running:[{job_id, state, elapsed_ms}], healthy, draining?}
 ```
 
 Integers are non-negative safe integers. `healthy` is boolean. `warm` and `running` each have at
 most 64 entries. `state` is exactly `reserved`, `admitted` or `started`. The heartbeat replaces
 the host capacity snapshot, timestamped at broker receive time. `queued` is stored but does not
 affect placement.
+
+The optional final member `draining` is boolean; absent and `false` mean the same. Every other
+unknown body member is still refused. Only the latest accepted snapshot stored by PlacementDO
+controls draining: a delayed older heartbeat cannot set or clear it. The next accepted heartbeat
+that omits `draining` or sends `false` clears the drain.
+
+While that snapshot has `draining: true`, fleet placement treats the host as absent, including
+warm affinity, and ordinary Boat spill proceeds normally. A lease whose `placement_hint.host`
+names the draining host is a canary: the hint is binding, exactly as for `explicit_only`. It can
+use that host, including a cold VM, but waits if the host is full or otherwise unavailable; it
+never falls back to another host or Boat. Draining hosts still count for the registry's
+`no_host_fits` / `max_vcpus` ceiling check because draining is temporary. A job only a draining
+host can fit receives retryable `no_capacity` with `Retry-After`, not `no_host_fits` (and may
+spill when allowed). The independent operator `explicit_only` override is unchanged.
 
 `warm` lists the tenant workspaces the host holds **now**, after eviction, most-recent first. A
 host holding more than 64 reports only the 64 most recent workspaces.
@@ -665,8 +679,9 @@ machine that runs its jobs:
   sample (older than 30,000 ms, or a failed probe) reports 0.
 - A host with several tenants reports, for each field independently, the maximum over its tenants.
 
-The broker subtracts every job it placed on a host, until the host's own figures count it, from
-that host's reported free capacity before comparing (see the in-flight ledger under
+The broker subtracts each placed job's vCPUs until the host's latest accepted snapshot lists it
+in `running` in any state (`reserved`, `admitted` or `started`), and its memory until `admitted`
+or `started`, from that host's reported free capacity before comparing (see the in-flight ledger under
 [Placement, deadlines and metering](#placement-deadlines-and-metering)), so several leases placed
 within one heartbeat interval don't all pass against the same values. The figures are still a
 snapshot, not a lock: the host's own admission is the real limit, and a lease it can't take is
@@ -681,8 +696,12 @@ host has no effect. A reserved job on this host updates
 `started` permanently mark it admitted; later `reserved` does not clear that flag. This prevents
 lease re-request and replace, but not reattach.
 
-Success is **200** with exactly `{"ignored":[<job_id>…],"closed_subjects":[<subject>…]}`, in that
-member order and with no other member. `ignored` lists strings in entry order.
+Success is **200**. When the host's stored latest snapshot after this heartbeat is draining, the
+reply is exactly `{"ignored":[<job_id>…],"closed_subjects":[<subject>…],"draining":true}`, in that
+member order. Otherwise it is exactly `{"ignored":[<job_id>…],"closed_subjects":[<subject>…]}`,
+unchanged for hosts that never send the field. The echo describes the stored snapshot even when
+this heartbeat finished after a newer one. A host waits for the `draining: true` echo before
+waiting for its existing leases to finish. `ignored` lists strings in entry order.
 
 `closed_subjects` lists the closed accounts (see [Account closure](#account-closure)) among the
 tenants this heartbeat's snapshot reports: each `warm` entry's `tenant`, and the owner of each
@@ -749,12 +768,16 @@ sample. So that a burst of placements inside one heartbeat interval spreads over
 filling one, the placement object keeps a ledger: when it answers a placement a lease will use
 (a new lease, or a replace) with host H, it records `{job_id, host: H, vcpus, mem_mib}` in the
 same storage transaction as the decision. A host's effective free vCPUs and memory are its last
-heartbeat's `free_vcpus` and `free_mem_mib` minus the `vcpus` and `mem_mib` of its live entries;
-the fit check and the ordering both use them. An entry is removed on any of these events (the 1024-entry cap below can also evict one):
+accepted heartbeat's `free_vcpus` and `free_mem_mib` minus the resources its live entries still
+hold. A job listed in that host's latest accepted `running` list in any state (`reserved`,
+`admitted` or `started`) no longer holds vCPUs: the host already counts its reservation.
+Memory stays held until `admitted` or `started`, because a queued job uses no guest memory yet.
+A job not reported by that host still holds both resources. The fit check and ordering both use
+these effective figures. An entry is removed on any of these events (the 1024-entry cap below can also evict one):
 
 - on the first heartbeat from H whose `running` list shows the job `admitted` or `started`, the
-  point from which the host's own `free_vcpus` counts it. A heartbeat that shows the job
-  `reserved`, or doesn't list it, keeps the entry;
+  point from which the host's own figures count both resources. A heartbeat that shows the job
+  `reserved`, or doesn't list it, keeps the entry for memory or both resources respectively;
 - when the job settles (usage report or alarm), is released, or is replaced away from H, and
   when the lease that asked for the placement doesn't commit it (the job already existed, or the
   budget ran out while the token was signed);
