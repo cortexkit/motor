@@ -222,12 +222,10 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                     .get_args()
                     .map(|s| s.to_str().unwrap())
                     .collect::<Vec<_>>();
-                for target in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
-                    assert!(
-                        args.windows(2).any(|a| a == ["--target", target]),
-                        "prep must fetch crates for {target}: {args:?}"
-                    );
-                }
+                assert!(
+                    !args.iter().any(|arg| arg.starts_with("--target")),
+                    "prep must fetch crates for every locked platform: {args:?}"
+                );
                 assert!(args.contains(&"--locked"));
                 let home = cmd
                     .get_envs()
@@ -1988,6 +1986,94 @@ async fn windows_backend_tar_contains_only_m_and_selected_cargo_home_members() {
     assert!(names
         .iter()
         .all(|name| !name.contains("/.git/") && !name.ends_with(".json")));
+}
+
+#[tokio::test]
+async fn windows_backend_fetches_all_locked_platforms_including_android_and_arm64_windows() {
+    let f = Fixture::new();
+    source(&f);
+    fs::write(
+        f.main.join("Cargo.toml"),
+        r#"[package]
+name = "test"
+version = "0.1.0"
+edition = "2021"
+[target.'cfg(target_os = "android")'.dependencies]
+android_system_properties = "=0.1.6"
+[target.aarch64-pc-windows-msvc.dependencies]
+windows_aarch64_msvc = "=0.52.6"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        f.main.join("Cargo.lock"),
+        format!(
+            r#"version = 3
+[[package]]
+name = "test"
+version = "0.1.0"
+dependencies = ["android_system_properties", "windows_aarch64_msvc"]
+[[package]]
+name = "android_system_properties"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "{}"
+[[package]]
+name = "windows_aarch64_msvc"
+version = "0.52.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "{}"
+"#,
+            "a".repeat(64),
+            "b".repeat(64)
+        ),
+    )
+    .unwrap();
+    git(&f.main, &["add", "Cargo.toml", "Cargo.lock"]);
+    git(
+        &f.main,
+        &["commit", "-m", "locked platform-specific dependencies"],
+    );
+    let (mut c, _) = configure(&f, Fault::None, 0);
+    let original = c.windows_command.take().unwrap();
+    let fetches = Arc::new(Mutex::new(Vec::new()));
+    let observed = fetches.clone();
+    c.windows_command = Some(Arc::new(move |program, args| {
+        if args.iter().any(|arg| arg == "windows-prepare") {
+            prep::execute_with_fetch(Path::new(args.last().unwrap()), |cmd| {
+                let args: Vec<_> = cmd
+                    .get_args()
+                    .map(|arg| arg.to_str().unwrap().to_owned())
+                    .collect();
+                let manifest_index = args
+                    .iter()
+                    .position(|arg| arg == "--manifest-path")
+                    .unwrap();
+                let manifest = Path::new(&args[manifest_index + 1]);
+                let lockfile = fs::read_to_string(manifest.with_file_name("Cargo.lock"))?;
+                for package in ["android_system_properties", "windows_aarch64_msvc"] {
+                    assert!(lockfile.contains(package), "missing locked {package}");
+                }
+                observed.lock().unwrap().push(args);
+                Ok(())
+            })?;
+            return Ok(output(0, Vec::new(), Vec::new()));
+        }
+        original(program, args)
+    }));
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let (r, bytes) = request(&f);
+    f.submit(&runner, &r, &bytes);
+    let t = terminal(&runner, r.job_id).await;
+    assert_eq!(t.outcome, Outcome::WindowsExit { code: 0 }, "{t:?}");
+    let fetches = fetches.lock().unwrap();
+    assert_eq!(fetches.len(), 1);
+    let args = &fetches[0];
+    assert!(
+        !args.iter().any(|arg| arg.starts_with("--target")),
+        "offline metadata needs all locked platforms, including Android and ARM64 Windows: {args:?}"
+    );
+    assert_eq!(&args[..3], ["fetch", "--locked", "--manifest-path"]);
 }
 
 #[tokio::test]
