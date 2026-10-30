@@ -184,6 +184,27 @@ fn tenant_snapshot_helpers_bind_daemon_dns_without_hiding_etc() {
 }
 
 #[test]
+fn snapshot_helper_units_do_not_set_the_job_nofile_limit() {
+    let scratch = ScratchDir::new("snapshot-helper-nofile");
+    let config = Config::new(&*scratch, "main");
+    fs::create_dir_all(config.state_dir()).unwrap();
+    let view = View::prefetch(&scratch.join("worktrees/a"), &[]).unwrap();
+    let args = arguments(
+        &config,
+        "motor-snaphelper-main-test.service",
+        Duration::from_secs(120),
+        &shell(&config.state_dir()),
+        &view,
+        &Files::new(&config, Uuid::now_v7()),
+        TenantResolver::new(&config),
+    )
+    .unwrap();
+    assert!(!args
+        .iter()
+        .any(|arg| arg.starts_with("--property=LimitNOFILE=")));
+}
+
+#[test]
 fn snapshot_helper_names_match_only_their_own_instance() {
     let id = Uuid::now_v7();
     assert!(belongs_to("main", &unit_name("main", id)));

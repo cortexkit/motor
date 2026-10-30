@@ -32,13 +32,10 @@ fn render(name: &str, sandbox: &Sandbox, f: &Fixture, durable: bool) -> String {
 }
 
 /// SHA-256 of the rendered argv of every case below.
-// Updated when the writer shell began asking an installed script whether the
-// tree it is about to compile has a root Cargo.toml, so a declared fill without
-// one is not skipped: the writer cases render
-// `/bin/bash /motor-tools/writer-cargo-check.sh` where they rendered
-// `python3 /motor-tools/writer-preflight.py`. Every other unit's argv, and the
-// job shells for units that are not writer fills, are unchanged.
-const PINNED_SHA256: &str = "e01aee6d4f0091cd6bd151583bd922add36dc20c7281daa85a167a64a0830c79";
+// Jobs and repository-building writer fills need a 65536 open-file soft limit.
+// Every case adds LimitNOFILE=65536:524288, preserving systemd's hard ceiling;
+// the remaining argv is unchanged.
+const PINNED_SHA256: &str = "419cbab8b13f1cb32378ff65947f208f0026909abb5474b80b505e0b77e5fc97";
 
 #[test]
 fn job_unit_commands_match_the_pinned_argv() {

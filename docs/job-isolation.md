@@ -557,6 +557,16 @@ A job can fill the disk while it runs. Not covered by a test.
 7.5. There is no per-job limit on the number of processes or threads beyond
 the memory cap and the host's own limits. Not covered by a test.
 
+7.6. Linux jobs and repository-building cache fills start with an open-file soft
+limit of 65536 and hard limit of 524288 (`LimitNOFILE=65536:524288`). macOS jobs
+start with a soft `RLIMIT_NOFILE` of `min(65536, hard)`, leaving the inherited
+hard limit unchanged. Windows jobs have no POSIX open-file limit. Tests:
+`job_and_fill_units_raise_nofile_soft_limit_and_keep_the_hard_limit`,
+`isolated_job_starts_with_65536_nofile_soft_limit_and_524288_hard_limit`
+(operator-only), and
+`execution::tests::job_nofile_soft_limit_is_capped_by_the_inherited_hard_limit`
+(`crates/motor-macagent/src/lib.rs`).
+
 ## 8. What isolation does not provide
 
 - It is a filesystem, credential and network boundary inside one shared Linux

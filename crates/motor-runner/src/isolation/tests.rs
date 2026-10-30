@@ -38,6 +38,39 @@ fn stale_lockfile_refusal_says_to_update_it_locally() {
 }
 
 #[test]
+fn job_and_fill_units_raise_nofile_soft_limit_and_keep_the_hard_limit() {
+    let f = Fixture::new();
+    for (tenant, boat, private_pids, writer) in [
+        (false, false, true, false),
+        (true, false, true, false),
+        (false, true, true, false),
+        (false, true, false, false),
+        (false, false, true, true),
+    ] {
+        for durable in [false, true] {
+            let mut sandbox = f
+                .command_sandbox()
+                .in_tenant_vm(tenant)
+                .with_boat_profile(boat, private_pids, Some(14 << 30))
+                .with_pid_init(Some(test_identity()));
+            sandbox.writer = writer;
+            if writer {
+                sandbox.user = WRITER_USER;
+            }
+            let command = sandbox
+                .command("ulimit -Sn", &f.workspace, &[], durable, &[0], 1)
+                .unwrap();
+            let limits: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .filter(|arg| arg.starts_with("--property=LimitNOFILE="))
+                .collect();
+            assert_eq!(limits, ["--property=LimitNOFILE=65536:524288"]);
+        }
+    }
+}
+
+#[test]
 fn memory_max_scales_per_vcpu_with_a_sixteen_gib_floor() {
     for vcpus in 1..=4 {
         assert_eq!(crate::backend::memory_max(vcpus, None), 17_179_869_184);
@@ -1605,6 +1638,16 @@ fn isolated_private_tmp_supports_build_filesystem_reflinks() {
         !runtime.exists(),
         "private scratch must be reclaimed after the job"
     );
+}
+
+#[test]
+#[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
+fn isolated_job_starts_with_65536_nofile_soft_limit_and_524288_hard_limit() {
+    let f = Fixture::new();
+    let sandbox = f.sandbox();
+    let (status, stdout, stderr) = output(&sandbox, "ulimit -Sn; ulimit -Hn", &f.workspace);
+    assert!(status.success(), "{stdout}\n{stderr}");
+    assert_eq!(stdout, "65536\n524288\n");
 }
 
 #[test]

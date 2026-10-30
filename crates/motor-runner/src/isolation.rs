@@ -3447,6 +3447,9 @@ impl Sandbox {
         ])
         .arg(format!("--unit={}", unit(self.id)));
         cmd.args(crate::systemd::JOB_MEMORY_PROPERTIES);
+        // Repository builds need more than systemd's 1024 soft default; keep
+        // its existing hard ceiling, including for cache fills that build code.
+        cmd.arg("--property=LimitNOFILE=65536:524288");
         if self.tenant_vm {
             cmd.args(tenant_unit_properties());
         }

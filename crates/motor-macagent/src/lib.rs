@@ -109,6 +109,25 @@ mod execution {
     const OUTPUT_CHUNK: usize = 16 * 1024;
     type SharedProtocol = Arc<Mutex<Protocol>>;
 
+    fn job_nofile_soft_limit(hard: libc::rlim_t) -> libc::rlim_t {
+        hard.min(65_536)
+    }
+
+    fn set_job_nofile_limit() -> io::Result<()> {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        limit.rlim_cur = job_nofile_soft_limit(limit.rlim_max);
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub fn job_environment(
         caller: &BTreeMap<String, String>,
         tmpdir: &Path,
@@ -576,6 +595,11 @@ mod execution {
                 process.as_std_mut().process_group(0);
             }
         }
+        // Raise only the child's soft limit so file-heavy builds do not inherit
+        // launchd's 256 default. pre_exec runs after std drops credentials;
+        // staying within the inherited hard limit needs no privilege.
+        // The hook calls only libc limit functions and constructs OS errors.
+        unsafe { process.pre_exec(set_job_nofile_limit) };
         let mut child = process.spawn()?;
         #[cfg(test)]
         if let KillScope::ProcessGroup { pid, .. } = &*settings.scope {
@@ -661,6 +685,45 @@ mod execution {
         use tokio::io::DuplexStream;
 
         const NONCE: &str = "0123456789abcdef0123456789abcdef";
+        #[test]
+        fn job_nofile_soft_limit_is_capped_by_the_inherited_hard_limit() {
+            for (hard, soft) in [
+                (0, 0),
+                (256, 256),
+                (65_535, 65_535),
+                (65_536, 65_536),
+                (65_537, 65_536),
+                (524_288, 65_536),
+                (libc::RLIM_INFINITY, 65_536),
+            ] {
+                assert_eq!(job_nofile_soft_limit(hard), soft);
+                assert!(job_nofile_soft_limit(hard) <= hard);
+            }
+        }
+
+        #[test]
+        fn job_nofile_limit_raises_only_the_child_soft_limit() {
+            let mut process = std::process::Command::new("/bin/bash");
+            process.args(["-c", "ulimit -Sn; ulimit -Hn"]);
+            // Restrict only the forked child, not the test runner or other tests.
+            unsafe {
+                process.pre_exec(|| {
+                    let limit = libc::rlimit {
+                        rlim_cur: 128,
+                        rlim_max: 256,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+                process.pre_exec(set_job_nofile_limit);
+            }
+            let output = process.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, b"256\n256\n");
+        }
+
         #[test]
         fn root_uid_or_primary_gid_is_rejected() {
             for user in [User { uid: 0, gid: 20 }, User { uid: 501, gid: 0 }] {
