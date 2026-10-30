@@ -53,7 +53,8 @@ class RecipeTests(unittest.TestCase):
         self.assertIn("libsqlite3-dev", manifest["apt_packages"]["required"])
         self.assertIn("python3", manifest["apt_packages"]["required"])
         self.assertEqual(set(manifest["rust_toolchains"]), {
-            name + "-x86_64-unknown-linux-gnu" for name in ("1.91.0", "1.96.0", "1.99.0", "stable")})
+            name + "-x86_64-unknown-linux-gnu"
+            for name in ("1.91.0", "1.92.0", "1.96.0", "1.99.0", "stable")})
 
     def test_accounts_use_boats_system_assigned_rule(self):
         with patch.object(install.job_account, 'ensure') as ensure, \
@@ -84,7 +85,15 @@ class RecipeTests(unittest.TestCase):
                 self.assertIn('wasm32-unknown-unknown', targets)
                 self.assertIn('x86_64-pc-windows-gnu', targets)
                 self.assertIn('x86_64-unknown-linux-musl', targets)
-            self.assertIn('clippy', components)
+            # Components follow the manifest, so a minimal MSRV toolchain such as
+            # 1.92.0 stays without clippy, exactly as on the build server.
+            host = command[3].split('-', 1)[1]
+            expected = {install.rustup_component_name(component, host)
+                        for component in manifest['rust_toolchains'][command[3]]['components']
+                        if not component.startswith('rust-std-')} - {'cargo', 'rustc'}
+            self.assertEqual(set(components), expected)
+        self.assertNotIn('clippy', [c for cmd in commands if cmd[3].startswith('1.92.0-')
+                                    for c in cmd])
 
     def test_recipe_disables_rustup_self_update_before_installing_toolchains(self):
         manifest = json.loads(install.PARITY_PATH.read_text())

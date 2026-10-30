@@ -628,6 +628,17 @@
         "x86_64-unknown-linux-gnu"
       ]
     },
+    "1.92.0-x86_64-unknown-linux-gnu": {
+      "components": [
+        "cargo-x86_64-unknown-linux-gnu",
+        "rust-std-x86_64-unknown-linux-gnu",
+        "rustc-x86_64-unknown-linux-gnu"
+      ],
+      "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+      "targets": [
+        "x86_64-unknown-linux-gnu"
+      ]
+    },
     "1.96.0-x86_64-unknown-linux-gnu": {
       "components": [
         "cargo-x86_64-unknown-linux-gnu",
