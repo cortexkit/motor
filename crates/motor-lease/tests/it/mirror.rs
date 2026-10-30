@@ -101,7 +101,7 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "8aac63ee83e31acc0b4a747002241bcbfded944035b56d64f8acf07148fe865c",
+            "4676345c5f0ba8576799847bd1efee289c784fc44b2e5295e1c1e2de20ab01aa",
         ),
         (
             "host-draining.json",
@@ -125,7 +125,7 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         ),
         (
             "explicit-only-leases.json",
-            "93136da9d2703acee05e80889ed18c1aaa1d0dd1623848548d08c29b5f673708",
+            "1d2c58991e29ff3b8c05da6a32afd22f3ab35903d15fab5ac27a6cb6006a4c61",
         ),
         (
             "boat-lease.json",
@@ -137,15 +137,15 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         ),
         (
             "job-tokens.json",
-            "541eccc153088ef5be8755bdda9d633bed44237544acae6e365be4124eecc8bb",
+            "ea25d7cf326b9a85ff21823441720ad94f1e844c82cb7f44f868a3bbd708e96f",
         ),
         (
             "job-tokens-workspace.json",
-            "67b86a1bb25eeb6b62454a0aeb30ce1388da0b2474954ce589c84165d8ba8857",
+            "2222c91ce5c80eec97c1a0c9ad9222c154d817c8ecc53801e70721020638b8be",
         ),
         (
             "lease.json",
-            "aa3996947d5da23807cd32813be57c673610c23ed704d92bf95b24db8ee14d81",
+            "baadae93c60f128cb0ec6b66f4bb9375d31de409f2961bf03170496ad45b29b2",
         ),
         (
             "usage-settlement.json",
@@ -153,7 +153,7 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         ),
         (
             "settled-reattach.json",
-            "59308e456afcde26a9fa9973bd9b243a67f8f8cb3886dc8f20c344c597176b16",
+            "8098795ac5c5377e34d93e32cc58808a54a8905f5eecb6618283aa2f0af103e7",
         ),
         (
             "account-closure.json",
@@ -161,11 +161,11 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         ),
         (
             "long-lease.json",
-            "a0fb260259ccf90b00ecf8d08af5b06aa649564ba0f898ebac8987c0eaab2b4c",
+            "8768f651736efacc59d532ae4ad76501a0d9b64b8d8eff880e2f32798af3487f",
         ),
         (
             "replace-lease.json",
-            "96c5abfae5898ac7756847152f6e7f9aca6791d94880b29b5758ff1d5ce077d6",
+            "98b06275ad2fc5025ce2818f429d5a922ca4fae81746dfdb3054c3141bb1fb48",
         ),
     ] {
         assert_eq!(

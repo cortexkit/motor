@@ -411,7 +411,7 @@ impl FakeBroker {
             iat,
             exp,
             vcpus: job.request.vcpus,
-            mem_mib: memory_max_mib(job.request.vcpus),
+            mem_mib: job_memory_mib(job.request.vcpus),
             platform: job.request.platform.clone(),
             net: job.request.net,
             placement: self.config.placement.clone(),

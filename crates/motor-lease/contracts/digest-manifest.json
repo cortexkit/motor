@@ -3,15 +3,15 @@
     "canonical_repository": "cortexkit-cloud",
     "canonical_contract": "docs/runners-contract.md",
     "canonical_vectors": "test-vectors/runners/",
-    "revision": "f19c6ab9",
+    "revision": "c65465cda5a0a79cd6411737d856827b11f9ede1",
     "kind": "canonical"
   },
   "files": [
     {
       "path": "cloud/runners-contract.md",
-      "sha256": "8aac63ee83e31acc0b4a747002241bcbfded944035b56d64f8acf07148fe865c",
+      "sha256": "4676345c5f0ba8576799847bd1efee289c784fc44b2e5295e1c1e2de20ab01aa",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "f19c6ab9",
+      "source_commit": "c65465cda5a0a79cd6411737d856827b11f9ede1",
       "source_path": "docs/runners-contract.md",
       "canonical": true
     },
@@ -41,9 +41,9 @@
     },
     {
       "path": "cloud/explicit-only-leases.json",
-      "sha256": "93136da9d2703acee05e80889ed18c1aaa1d0dd1623848548d08c29b5f673708",
+      "sha256": "1d2c58991e29ff3b8c05da6a32afd22f3ab35903d15fab5ac27a6cb6006a4c61",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "6268b3f7213dbb4cc9a63f09e781b0bd98de6fba",
+      "source_commit": "c65465cda5a0a79cd6411737d856827b11f9ede1",
       "source_path": "test-vectors/runners/explicit-only-leases.json",
       "canonical": true
     },
@@ -65,25 +65,25 @@
     },
     {
       "path": "cloud/job-tokens.json",
-      "sha256": "541eccc153088ef5be8755bdda9d633bed44237544acae6e365be4124eecc8bb",
+      "sha256": "ea25d7cf326b9a85ff21823441720ad94f1e844c82cb7f44f868a3bbd708e96f",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "6268b3f7213dbb4cc9a63f09e781b0bd98de6fba",
+      "source_commit": "c65465cda5a0a79cd6411737d856827b11f9ede1",
       "source_path": "test-vectors/runners/job-tokens.json",
       "canonical": true
     },
     {
       "path": "cloud/job-tokens-workspace.json",
-      "sha256": "67b86a1bb25eeb6b62454a0aeb30ce1388da0b2474954ce589c84165d8ba8857",
+      "sha256": "2222c91ce5c80eec97c1a0c9ad9222c154d817c8ecc53801e70721020638b8be",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "6268b3f7213dbb4cc9a63f09e781b0bd98de6fba",
+      "source_commit": "c65465cda5a0a79cd6411737d856827b11f9ede1",
       "source_path": "test-vectors/runners/job-tokens-workspace.json",
       "canonical": true
     },
     {
       "path": "cloud/lease.json",
-      "sha256": "aa3996947d5da23807cd32813be57c673610c23ed704d92bf95b24db8ee14d81",
+      "sha256": "baadae93c60f128cb0ec6b66f4bb9375d31de409f2961bf03170496ad45b29b2",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "6268b3f7213dbb4cc9a63f09e781b0bd98de6fba",
+      "source_commit": "c65465cda5a0a79cd6411737d856827b11f9ede1",
       "source_path": "test-vectors/runners/lease.json",
       "canonical": true
     },
@@ -97,9 +97,9 @@
     },
     {
       "path": "cloud/settled-reattach.json",
-      "sha256": "59308e456afcde26a9fa9973bd9b243a67f8f8cb3886dc8f20c344c597176b16",
+      "sha256": "8098795ac5c5377e34d93e32cc58808a54a8905f5eecb6618283aa2f0af103e7",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "6268b3f7213dbb4cc9a63f09e781b0bd98de6fba",
+      "source_commit": "c65465cda5a0a79cd6411737d856827b11f9ede1",
       "source_path": "test-vectors/runners/settled-reattach.json",
       "canonical": true
     },
@@ -113,17 +113,17 @@
     },
     {
       "path": "cloud/long-lease.json",
-      "sha256": "a0fb260259ccf90b00ecf8d08af5b06aa649564ba0f898ebac8987c0eaab2b4c",
+      "sha256": "8768f651736efacc59d532ae4ad76501a0d9b64b8d8eff880e2f32798af3487f",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "6268b3f7213dbb4cc9a63f09e781b0bd98de6fba",
+      "source_commit": "c65465cda5a0a79cd6411737d856827b11f9ede1",
       "source_path": "test-vectors/runners/long-lease.json",
       "canonical": true
     },
     {
       "path": "cloud/replace-lease.json",
-      "sha256": "96c5abfae5898ac7756847152f6e7f9aca6791d94880b29b5758ff1d5ce077d6",
+      "sha256": "98b06275ad2fc5025ce2818f429d5a922ca4fae81746dfdb3054c3141bb1fb48",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "6268b3f7213dbb4cc9a63f09e781b0bd98de6fba",
+      "source_commit": "c65465cda5a0a79cd6411737d856827b11f9ede1",
       "source_path": "test-vectors/runners/replace-lease.json",
       "canonical": true
     },

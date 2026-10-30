@@ -580,30 +580,35 @@ fn spill_wait_budget_ms(job: &crate::storage::Job) -> u64 {
 }
 /// The first leased resource whose token claim differs from what ck-motor
 /// requested, as (field, expected, actual). A first-party host's token states
-/// the runner's per-job memory cap exactly. A Boat token states the whole
-/// sandbox's usable memory, which may be below that cap; it must lie in
-/// [`motor_lease::boat_memory_range`], the range the in-sandbox endpoint
-/// also accepts.
+/// one of the broker's per-job figures, the ones
+/// [`motor_lease::first_party_mem_mib_accepted`] admits. A Boat token states
+/// the whole sandbox's usable memory, which must lie in
+/// [`motor_lease::boat_memory_range`]. Each check is the one the host or
+/// in-sandbox endpoint also applies.
 fn resource_mismatch(
     claims: &motor_lease::Claims,
     body: &LeaseRequest,
     boat: bool,
 ) -> Option<(&'static str, String, String)> {
-    let cap = motor_lease::memory_max_mib(body.vcpus);
-    let range = motor_lease::boat_memory_range(body.vcpus);
-    let memory_ok = if boat {
-        range.contains(&claims.mem_mib)
+    let (memory_ok, expected) = if boat {
+        let range = motor_lease::boat_memory_range(body.vcpus);
+        (
+            range.contains(&claims.mem_mib),
+            format!("{}..={}", range.start(), range.end()),
+        )
     } else {
-        claims.mem_mib == cap
+        (
+            motor_lease::first_party_mem_mib_accepted(body.vcpus, claims.mem_mib),
+            format!(
+                "{} or {}",
+                motor_lease::job_memory_mib(body.vcpus),
+                motor_lease::memory_max_mib(body.vcpus)
+            ),
+        )
     };
     if claims.vcpus != body.vcpus {
         Some(("vcpus", body.vcpus.to_string(), claims.vcpus.to_string()))
     } else if !memory_ok {
-        let expected = if boat {
-            format!("{}..={}", range.start(), range.end())
-        } else {
-            cap.to_string()
-        };
         Some(("mem_mib", expected, claims.mem_mib.to_string()))
     } else if claims.platform != body.platform {
         Some(("platform", body.platform.clone(), claims.platform.clone()))

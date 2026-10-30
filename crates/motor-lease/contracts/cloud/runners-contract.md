@@ -210,7 +210,10 @@ value or receive 409 `job_conflict` wherever a differing lease hash conflicts.
 `vcpus` is 1–64 and `timeout_s` 10–21600 (6 hours). A Boat sandbox takes only a lease whose
 `timeout_s` is at most `BOAT_MAX_TIMEOUT_S` (7200 unless the operator lowers it); a longer lease
 runs only on a registered host (see [Boat placements](#boat-placements)). `net` is boolean. There is no client `mem_mib` field:
-the broker derives memory as `max(16384, 3584 × vcpus)` MiB for placement and the token.
+the broker derives memory as `min(16384, max(4096, 3584 × vcpus))` MiB (3584 MiB per vCPU, at
+least 4 GiB and at most 16 GiB) for placement and the token's `mem_mib`, which is the host runner's
+per-job memory cap. Hosts must also accept the previous token figure, `max(16384, 3584 × vcpus)`,
+until the operator removes it.
 `placement_hint` is JSON `null` or exactly `{host, vm}`, both strings following the common name
 grammar, except that `host` may also carry the `boat:` prefix of a Boat placement, so a client can
 send back the placement it was last given. A matching selectable warm placement is preferred; an
@@ -285,7 +288,7 @@ After authentication and schema validation, checks proceed in this order:
    age, generation and free
    capacity are ignored: they are temporary, so a host that could fit when idle and healthy
    keeps the answer at `no_capacity`. A candidate can fit when its registry per-job ceilings are
-   both recorded and `max_job_vcpus ≥ vcpus` and `max_job_mem_mib ≥ max(16384, 3584 × vcpus)`.
+   both recorded and `max_job_vcpus ≥ vcpus` and `max_job_mem_mib ≥ min(16384, max(4096, 3584 × vcpus))`.
    If any candidate's ceiling is unrecorded (NULL), the broker never concludes "never fits" and
    answers exactly as without this rule. With at least one candidate, all ceilings recorded and
    none able to fit, the reply is **422** `{"error":"no_host_fits","max_vcpus":N}` with no
@@ -295,7 +298,7 @@ After authentication and schema validation, checks proceed in this order:
    platform (enabled, configured, with a current image, and `timeout_s` at most
    `BOAT_MAX_TIMEOUT_S`) and a Boat size fits, the lease spills
    instead. `N` is the largest vCPU count that could be placed: for each candidate, the largest
-   `v` whose `v` and `max(16384, 3584 × v)` both fit its ceilings (0 if none), maximized over
+   `v` whose `v` and `min(16384, max(4096, 3584 × v))` both fit its ceilings (0 if none), maximized over
    candidates; when the lease allows spill and Boat is available for its platform, also the
    largest Boat size's `vcpus`. A `no_host_fits` refusal makes no Boat call and leaves no
    `TenantDO` job row, reservation, provisioning hold, pool claim or spill record, so a
@@ -662,7 +665,7 @@ host holding more than 64 reports only the 64 most recent workspaces.
 
 `free_vcpus` and `free_mem_mib` answer one question for placement: can this host take one more job
 of a given size now? The broker places a lease on a host only if `free_vcpus ≥ vcpus` and
-`free_mem_mib ≥ max(16384, 3584 × vcpus)`. It reads them for nothing else: billing, `no_host_fits`
+`free_mem_mib ≥ min(16384, max(4096, 3584 × vcpus))`. It reads them for nothing else: billing, `no_host_fits`
 and pricing use the registry ceilings and the usage reports instead. A host reports them for the
 machine that runs its jobs:
 
@@ -749,6 +752,8 @@ Success is **200** with exactly:
 
 A repeated authenticated report needs a new `CK-Counter` even when its canonical body is
 identical: authentication consumes the counter before settlement idempotency is checked.
+
+Once the broker has acknowledged a usage report and the job's token has expired, hosts need not keep the job's records, because the broker holds the billing record.
 
 ## Placement, deadlines and metering
 

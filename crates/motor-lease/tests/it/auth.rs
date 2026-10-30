@@ -688,8 +688,46 @@ fn refused_tokens_name_their_first_failed_check() {
     );
 }
 
+/// A first-party host accepts exactly the broker's two per-job figures: the
+/// current one (3.5 GiB per vCPU, 4 GiB to 16 GiB) and the previous
+/// `max(16 GiB, 3.5 GiB per vCPU)`, which the runners contract keeps valid
+/// until the operator retires it. Anything else is refused as `mem_mib`.
+#[test]
+fn first_party_host_accepts_the_current_and_previous_memory_figures_only() {
+    let key = SigningKey::from_bytes(&[1; 32]);
+    let host = claims().aud;
+    for (vcpus, current) in [
+        (1, 4096),
+        (2, 7168),
+        (3, 10752),
+        (4, 14336),
+        (5, 16384),
+        (21, 16384),
+    ] {
+        assert_eq!(job_memory_mib(vcpus), current, "{vcpus} vCPUs");
+        let mut c = claims();
+        c.vcpus = vcpus;
+        for (mem_mib, accepted) in [
+            (current, true),
+            (memory_max_mib(vcpus), true),
+            (current - 1, false),
+            (current + 1, false),
+            (memory_max_mib(vcpus) + 1, false),
+        ] {
+            c.mem_mib = mem_mib;
+            let token = sign_token(&c, "current", &key).unwrap();
+            let result = check_token(&token, &keys(), &host, None, Purpose::Run, c.iat);
+            assert_eq!(
+                result.map(|_| ()).map_err(|refusal| refusal.check),
+                if accepted { Ok(()) } else { Err("mem_mib") },
+                "{vcpus} vCPUs, {mem_mib} MiB"
+            );
+        }
+    }
+}
+
 /// A Boat sandbox accepts its size's usable memory between 1 GiB per vCPU and
-/// the fleet formula; a first-party host still requires the formula exactly.
+/// the fleet formula.
 #[test]
 fn boat_audience_accepts_sandbox_memory_within_the_shared_range() {
     let key = SigningKey::from_bytes(&[1; 32]);

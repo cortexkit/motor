@@ -866,10 +866,20 @@ fn cloud_boat_vector_token_memory_is_accepted_for_boat_only() {
     assert_eq!(claims.mem_mib, vector["boat_sizes"][0]["mem_mib"]);
     assert_ne!(claims.mem_mib, motor_lease::memory_max_mib(body.vcpus));
     assert_eq!(resource_mismatch(&claims, &body, true), None);
+    // A first-party token must state one of the broker's per-job figures,
+    // which a Boat sandbox's usable memory is not.
     assert_eq!(
         resource_mismatch(&claims, &body, false).map(|(field, ..)| field),
         Some("mem_mib")
     );
+    for figure in [
+        motor_lease::job_memory_mib(body.vcpus),
+        motor_lease::memory_max_mib(body.vcpus),
+    ] {
+        let mut first_party = claims.clone();
+        first_party.mem_mib = figure;
+        assert_eq!(resource_mismatch(&first_party, &body, false), None);
+    }
     // Production's large size: 8 vCPUs with 13444 MiB usable.
     let mut large = claims.clone();
     let mut large_body = body.clone();

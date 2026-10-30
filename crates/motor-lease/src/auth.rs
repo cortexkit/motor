@@ -292,7 +292,7 @@ pub fn check_token(
     let memory_ok = if boat {
         crate::boat_memory_range(claims.vcpus).contains(&claims.mem_mib)
     } else {
-        claims.mem_mib == crate::memory_max_mib(claims.vcpus)
+        crate::first_party_mem_mib_accepted(claims.vcpus, claims.mem_mib)
     };
     // Checks run in this order, and the first failure is the one reported.
     let failed = [
