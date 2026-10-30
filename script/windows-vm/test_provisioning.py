@@ -399,6 +399,62 @@ class BaselineInputsTests(unittest.TestCase):
         setup = source.split('$stableInstall = ', 1)[1].split('$nextestVersion = ', 1)[0]
         self.assertNotIn('$HyperVSpike', setup)
 
+    def test_baseline_installs_checksum_pinned_machine_wide_llvm(self):
+        source = (HERE / "setup-job-baseline.ps1").read_text()
+        tools = json.loads((HERE.parent / "runner/toolchain.json").read_text())["windows_tools"]
+        llvm = tools["llvm"]
+        self.assertEqual(llvm["version"], "21.1.8")
+        self.assertIn(f"$llvmVersion = '{llvm['version']}'", source)
+        self.assertIn(f"$llvmSha256 = '{llvm['sha256']}'", source)
+        self.assertIn(llvm["url"], source)
+        self.assertIn(llvm["digest_source"], source)
+        self.assertIn(f"$llvmInstall = '{llvm['install_dir']}'", source)
+        self.assertIn(f"$pythonVersion = '{tools['python']['version']}'", source)
+        self.assertIn(f"$natsVersion = '{tools['nats-server']['version']}'", source)
+        for expected in (
+            "$llvmVersion = '21.1.8'",
+            "https://api.github.com/repos/llvm/llvm-project/releases/assets/329799346",
+            "$llvmSha256 = '7a5386c26497db1691f320121e5b113364dd0274b98e55f15f4dbc00c0450113'",
+            "$llvmInstaller = Join-Path $motor 'LLVM-21.1.8-win64.exe'",
+            "Invoke-WebRequest 'https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.8/LLVM-21.1.8-win64.exe' -OutFile $llvmInstaller",
+            "Get-FileHash -LiteralPath $llvmInstaller -Algorithm SHA256",
+            "throw 'LLVM installer SHA-256 mismatch'",
+            r"$llvmInstall = 'C:\Program Files\LLVM'",
+            "& icacls $llvmInstall /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'",
+            'Start-Process -FilePath $llvmInstaller -ArgumentList "/S /D=$llvmInstall" -Wait -PassThru',
+            r'& icacls "$llvmInstall\*" /reset /T /C /L /Q',
+            "& icacls $llvmInstall /setowner '*S-1-5-32-544' /T /C /L /Q",
+            "Remove-Item -LiteralPath $llvmInstaller -Force -ErrorAction SilentlyContinue",
+            r'$llvmBin = "$llvmInstall\bin"',
+            "[Environment]::SetEnvironmentVariable('Path', \"$llvmBin;$machinePath\", 'Machine')",
+            "[Environment]::SetEnvironmentVariable('LIBCLANG_PATH', $llvmBin, 'Machine')",
+            '$env:LIBCLANG_PATH = $llvmBin',
+            '$env:Path = "$llvmBin;" + $env:Path',
+            r'Test-Path -LiteralPath "$llvmBin\libclang.dll" -PathType Leaf',
+            r'& "$llvmBin\clang.exe" --version',
+            '($installedClangVersion | Select-Object -First 1) -cne "clang version $llvmVersion"',
+            "throw 'Machine-wide LLVM version verification failed'",
+        ):
+            self.assertIn(expected, source)
+        self.assertLess(source.index('-OutFile $llvmInstaller'), source.index('Get-FileHash -LiteralPath $llvmInstaller'))
+        self.assertLess(source.index("throw 'LLVM installer SHA-256 mismatch'"), source.index('Start-Process -FilePath $llvmInstaller'))
+        self.assertLess(source.index('& icacls $llvmInstall /inheritance:r'), source.index('Start-Process -FilePath $llvmInstaller'))
+        self.assertLess(source.index('& icacls $llvmInstall /setowner'), source.index(r'& "$llvmBin\clang.exe" --version'))
+        setup = source.split("$llvmVersion = ", 1)[1].split("$bytes = ", 1)[0]
+        self.assertNotIn('$HyperVSpike', setup)
+        self.assertNotIn('$HasWinget', setup)
+
+    def test_windows_image_qualification_requires_llvm(self):
+        operator = (HERE.parent.parent / "crates/motor-runner/src/tests/windows_operator.rs").read_text()
+        self.assertIn('clang --version', operator)
+        self.assertIn('line.trim() == "clang version 21.1.8"', operator)
+        self.assertIn("@{name='LLVM';command='clang.exe';path='C:\\Program Files\\LLVM\\bin'}", operator)
+        self.assertIn('output.contains("LLVM installation is read-only")', operator)
+        self.assertIn("$env:LIBCLANG_PATH -cne 'C:\\Program Files\\LLVM\\bin'", operator)
+        self.assertIn('libclang.dll', operator)
+        provision = (HERE.parent / "hyperv-spike/provision.ps1").read_text()
+        self.assertIn("Assert-Spike ($bootstrap -match 'Verified machine-wide LLVM 21\\.1\\.8 and libclang\\.dll with protected user read/execute access')", provision)
+
     def test_windows_image_qualification_requires_nats_and_stable(self):
         operator = (HERE.parent.parent / "crates/motor-runner/src/tests/windows_operator.rs").read_text()
         self.assertIn('nats-server --version; rustc +stable --version', operator)

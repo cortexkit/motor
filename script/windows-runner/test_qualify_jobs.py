@@ -139,6 +139,37 @@ class QualificationReadinessTests(unittest.TestCase):
                 if passes:
                     self.assertIn("Python 3.14.8", result.stdout)
 
+    def test_real_jobs_check_llvm_even_with_a_custom_gate(self):
+        source = (HERE / "qualify-jobs.py").read_text()
+        self.assertIn('+ LLVM_CHECK + " || exit $?; " + ', source)
+
+    @unittest.skipUnless(shutil.which("bash"), "requires Bash for the Git Bash LLVM check")
+    def test_llvm_check_rejects_wrong_missing_failed_and_incomplete_tools(self):
+        for version, code, path, dll, passes in (
+            ("clang version 21.1.8", 0, r"C:\Program Files\LLVM\bin", 0, True),
+            ("clang version 21.1.8\r\nTarget: x86_64-pc-windows-msvc\r", 0, r"C:\Program Files\LLVM\bin", 0, True),
+            ("clang version 21.1.7", 0, r"C:\Program Files\LLVM\bin", 0, False),
+            ("clang version 21.1.80", 0, r"C:\Program Files\LLVM\bin", 0, False),
+            ("", 127, r"C:\Program Files\LLVM\bin", 0, False),
+            ("clang version 21.1.8", 1, r"C:\Program Files\LLVM\bin", 0, False),
+            ("clang version 21.1.8", 0, "", 0, False),
+            ("clang version 21.1.8", 0, r"C:\other", 0, False),
+            ("clang version 21.1.8", 0, r"C:\Program Files\LLVM\bin", 1, False),
+        ):
+            with self.subTest(version=version, code=code, path=path, dll=dll):
+                command = (
+                    "clang() { test \"$*\" = --version || return 99; "
+                    f"printf '%s\\n' '{version}'; return {code}; }}; "
+                    "test() { if builtin test \"$1\" = -f; then "
+                    "builtin test \"$2\" = '/c/Program Files/LLVM/bin/libclang.dll' || return 99; "
+                    f"return {dll}; fi; builtin test \"$@\"; }}; "
+                    f"LIBCLANG_PATH='{path}'; "
+                ) + JOBS.LLVM_CHECK
+                result = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, passes, result.stderr)
+                if passes:
+                    self.assertIn("clang version 21.1.8", result.stdout)
+
     def test_real_jobs_check_nats_and_stable_even_with_a_custom_gate(self):
         source = (HERE / "qualify-jobs.py").read_text()
         self.assertIn('+ NATS_VERSION_CHECK + " || exit $?; " + ', source)

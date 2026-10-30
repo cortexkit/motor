@@ -138,6 +138,46 @@ $installedNatsVersion = & "$natsInstall\nats-server.exe" --version
 if ($LASTEXITCODE -ne 0 -or $installedNatsVersion -cne "nats-server: v$natsVersion") { throw 'Machine-wide nats-server version verification failed' }
 Write-Host "Verified machine-wide nats-server v$natsVersion with protected user read/execute access"
 
+# Bindgen needs the shared libclang library in the same machine-wide layout as
+# GitHub's Windows images; offline jobs cannot download LLVM themselves.
+# SHA-256 source: https://api.github.com/repos/llvm/llvm-project/releases/assets/329799346 (published digest for LLVM-21.1.8-win64.exe)
+# Installer signature: https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.8/LLVM-21.1.8-win64.exe.sig
+$llvmVersion = '21.1.8'
+$llvmSha256 = '7a5386c26497db1691f320121e5b113364dd0274b98e55f15f4dbc00c0450113'
+$llvmInstaller = Join-Path $motor 'LLVM-21.1.8-win64.exe'
+$llvmInstall = 'C:\Program Files\LLVM'
+try {
+    Invoke-WebRequest 'https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.8/LLVM-21.1.8-win64.exe' -OutFile $llvmInstaller -UseBasicParsing
+    if ((Get-FileHash -LiteralPath $llvmInstaller -Algorithm SHA256).Hash.ToLowerInvariant() -cne $llvmSha256) {
+        throw 'LLVM installer SHA-256 mismatch'
+    }
+    if (Test-Path -LiteralPath $llvmInstall) { throw 'LLVM destination already exists; use a fresh provisioning image' }
+    New-Item $llvmInstall -ItemType Directory | Out-Null
+    & icacls $llvmInstall /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'
+    if ($LASTEXITCODE -ne 0) { throw 'LLVM root ACL setup failed' }
+    # NSIS requires /D to be last and unquoted, even when the path has spaces.
+    $llvmProcess = Start-Process -FilePath $llvmInstaller -ArgumentList "/S /D=$llvmInstall" -Wait -PassThru
+    if ($llvmProcess.ExitCode -ne 0) { throw "Machine-wide LLVM installation failed: $($llvmProcess.ExitCode)" }
+    & icacls "$llvmInstall\*" /reset /T /C /L /Q
+    if ($LASTEXITCODE -ne 0) { throw 'LLVM ACL inheritance reset failed' }
+    & icacls $llvmInstall /setowner '*S-1-5-32-544' /T /C /L /Q
+    if ($LASTEXITCODE -ne 0) { throw 'LLVM ownership setup failed' }
+} finally {
+    Remove-Item -LiteralPath $llvmInstaller -Force -ErrorAction SilentlyContinue
+}
+$llvmBin = "$llvmInstall\bin"
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+if (($machinePath -split ';' | ForEach-Object { $_.TrimEnd('\') }) -notcontains $llvmBin) {
+    [Environment]::SetEnvironmentVariable('Path', "$llvmBin;$machinePath", 'Machine')
+}
+[Environment]::SetEnvironmentVariable('LIBCLANG_PATH', $llvmBin, 'Machine')
+$env:LIBCLANG_PATH = $llvmBin
+$env:Path = "$llvmBin;" + $env:Path
+if (-not (Test-Path -LiteralPath "$llvmBin\libclang.dll" -PathType Leaf)) { throw 'Machine-wide LLVM libclang.dll is missing' }
+$installedClangVersion = & "$llvmBin\clang.exe" --version
+if ($LASTEXITCODE -ne 0 -or ($installedClangVersion | Select-Object -First 1) -cne "clang version $llvmVersion") { throw 'Machine-wide LLVM version verification failed' }
+Write-Host "Verified machine-wide LLVM $llvmVersion and libclang.dll with protected user read/execute access"
+
 $bytes = New-Object byte[] 48
 $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
 $rng.GetBytes($bytes)

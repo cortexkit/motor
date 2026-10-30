@@ -772,6 +772,16 @@ fn materialize_attempt(
     let (result_tx, result_rx) = mpsc::sync_channel(1);
     let (stdout_tx, stdout_rx) = mpsc::sync_channel(32);
     let (stderr_tx, stderr_rx) = mpsc::sync_channel(32);
+    let mut env = setup
+        .request
+        .env
+        .iter()
+        .filter(|(k, _)| crate::allowed_env(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    // The instance identifies the host, not the identically named guest image.
+    // Set it after caller overrides so jobs cannot report a spoofed runner name.
+    env.insert("MOTOR_RUNNER_INSTANCE".into(), config.instance.clone());
     let command = motor_winagent::Command {
         command: setup.request.command.clone(),
         cwd: crate::caller_path::run(&setup.request)
@@ -783,13 +793,7 @@ fn materialize_attempt(
             .text()
             .clone(),
         source_commit: setup.request.snapshot_commit.clone(),
-        env: setup
-            .request
-            .env
-            .iter()
-            .filter(|(k, _)| crate::allowed_env(k))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+        env,
     };
     let thread_control = control.clone();
     let thread = std::thread::spawn(move || {
