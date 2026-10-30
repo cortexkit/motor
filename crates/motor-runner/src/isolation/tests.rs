@@ -2507,6 +2507,100 @@ fn commit_cargo_fixture(path: &Path) {
     .unwrap();
 }
 
+#[test]
+#[ignore = "requires the trusted build-server isolation gate; see motor-runner README"]
+fn isolated_tenant_prepare_reads_snapshot_lockfile_before_dissociating_checkout() {
+    const LOCKED_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    let f = Fixture::new();
+    let source = f.scratch.join("source");
+    let mirror = f.scratch.join("mirror.git");
+    fs::create_dir_all(&source).unwrap();
+    // A lockfile without a manifest exercises lockfile discovery without
+    // fetching a dependency or depending on a package registry.
+    fs::write(source.join("Cargo.lock"), "version = 4\n").unwrap();
+    commit_cargo_fixture(&source);
+    let head = workspace::git(&source, &["rev-parse", "HEAD"]).unwrap();
+    workspace::git(
+        &f.scratch,
+        &[
+            "clone",
+            "--mirror",
+            source.to_str().unwrap(),
+            mirror.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    workspace::git(
+        &f.scratch,
+        &[
+            "clone",
+            "--shared",
+            mirror.to_str().unwrap(),
+            f.workspace.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+
+    let lock = format!(
+        "version = 4\n\n[[package]]\nname = \"dependency\"\nversion = \"0.1.0\"\n\
+         source = \"git+https://example.invalid/dependency#{LOCKED_COMMIT}\"\n"
+    );
+    fs::write(source.join("Cargo.lock"), &lock).unwrap();
+    commit_cargo_fixture(&source);
+    let tree = workspace::git(&source, &["rev-parse", "HEAD"]).unwrap();
+    // The mirror retains the dirty snapshot, but the shared checkout's refs
+    // still reach only its parent. Repacking must not make later preparation
+    // depend on the snapshot remaining available through the alternates.
+    workspace::git(
+        &source,
+        &[
+            "push",
+            mirror.to_str().unwrap(),
+            "HEAD:refs/snapshots/dirty",
+        ],
+    )
+    .unwrap();
+    fs::write(f.workspace.join("Cargo.lock"), &lock).unwrap();
+    assert_eq!(
+        workspace::git(&f.workspace, &["rev-parse", "HEAD"]).unwrap(),
+        head
+    );
+    assert_eq!(
+        workspace::git(&f.workspace, &["rev-list", "--all"]).unwrap(),
+        head
+    );
+    assert_eq!(
+        workspace::git(&f.workspace, &["show", &format!("{tree}:Cargo.lock")]).unwrap(),
+        lock.trim()
+    );
+    let alternates = f.workspace.join(".git/objects/info/alternates");
+    assert!(alternates.is_file());
+
+    let target = f.workspace.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let sandbox = Sandbox::prepare_with_dependencies(
+        Uuid::now_v7(),
+        &f.state,
+        f.workspace.as_path(),
+        &target,
+        &[],
+        None,
+        &f.state.join("slots"),
+        1,
+        &BTreeMap::new(),
+        &tree,
+        "tenant-prepare-fixture",
+        true,
+        false,
+        None,
+        &JavascriptTools::for_role(ToolchainRole::BuildServer),
+        None,
+    )
+    .expect("tenant preparation must read the snapshot before removing mirror alternates");
+    assert!(!alternates.exists());
+    assert_eq!(sandbox.locked_git_commits, [LOCKED_COMMIT]);
+}
+
 fn cargo_prefetch_fixture(nested: bool) {
     let f = Fixture::new();
     let dependency = f.scratch.join("tip-only-dependency");
