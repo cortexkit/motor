@@ -8,12 +8,15 @@ pub const DELIVERY_GRACE_MS: u64 = 60_000;
 pub const OUTBOX_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// How many rejected requests the journal keeps for diagnosis; older ones are dropped.
 pub const REJECTED_OUTBOX_LIMIT: usize = 32;
-/// How long a finished job's billing and lease records are kept: 13 months,
-/// counted as 395 days (365 + 30). The public privacy page promises that host
-/// billing records are deleted 13 months after the job finished; a full year
-/// of history plus one month leaves the last billing period of that year time
-/// to close and be disputed before its evidence goes.
-pub const BILLING_RETENTION_MS: u64 = 395 * 24 * 60 * 60 * 1000;
+/// How long a finished job's records stay on the host once nothing else holds
+/// them: one hour. The broker keeps the billing record of every settled job
+/// (its size, placement, run interval and usage) for 13 months, so the host
+/// is not a second store of billing history; a server can disappear at any
+/// time. The host keeps a job only while it still needs it: its lease is open,
+/// its usage report is not yet acknowledged, or its token can still be
+/// replayed. The hour after that covers late reattaches and lets an operator
+/// look at a job that just ended.
+pub const RECORD_RETENTION_MS: u64 = 60 * 60 * 1000;
 /// At most this many jobs are deleted per retention pass, so one pass after a
 /// long outage never holds the host-state mutex (and with it admission) for a
 /// large rewrite. Later passes delete the rest.
@@ -531,7 +534,7 @@ impl Host {
         Ok(pruned)
     }
     /// Deletes the billing and lease records of up to `RETENTION_BATCH` jobs
-    /// that finished more than `BILLING_RETENTION_MS` ago, and returns how
+    /// that finished more than `RECORD_RETENTION_MS` ago, and returns how
     /// many jobs it deleted. A job's records are its lease (which carries the
     /// account identifier), billing state, no-start report, pending cancel,
     /// and every outbox, set-aside or rejected usage request naming it.
@@ -552,7 +555,7 @@ impl Host {
         // Finished strictly before this instant means more than the
         // retention period ago. Before the epoch plus one period nothing is
         // old enough, and the saturated zero matches no finish time.
-        let cutoff = now_ms.saturating_sub(BILLING_RETENTION_MS);
+        let cutoff = now_ms.saturating_sub(RECORD_RETENTION_MS);
         let snapshot = &self.snapshot;
         let retrying: std::collections::BTreeSet<&str> = snapshot
             .outbox

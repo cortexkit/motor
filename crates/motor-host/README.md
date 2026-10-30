@@ -147,8 +147,10 @@ Only one signed request is in flight. `usage_conflict`, `job_settled` and
 days an entry is archived under `journal_dir/outbox-expired` and the queue moves
 on. A 401 emits a key-retirement alert for an operator to check clock reversal.
 
-Billing and lease records are kept for 13 months (`BILLING_RETENTION_MS`, 395
-days) after the job finished, then deleted: the lease with its account
+A finished job's records are kept for one hour (`RECORD_RETENTION_MS`) after
+the job finished, then deleted; the broker keeps each settled job's billing
+record for 13 months, so the host holds no billing history. Deleted are the
+lease with its account
 identifier, billing state, no-start report, pending cancel, and every queued,
 set-aside (including its `outbox-expired` file) or rejected usage request for
 the job, plus expired replay nonces. A job is kept whatever its age while its

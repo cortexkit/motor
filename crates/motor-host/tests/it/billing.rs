@@ -791,8 +791,8 @@ fn watchdog_runtime_stops_the_only_lease_once_and_clears_durable_stop_pending() 
 }
 
 #[test]
-fn retention_deletes_records_just_past_thirteen_months_and_keeps_unsettled_reports() {
-    use motor_host::billing::{BILLING_RETENTION_MS, RETENTION_INTERVAL_MS};
+fn retention_deletes_records_just_past_the_retention_period_and_keeps_unsettled_reports() {
+    use motor_host::billing::{RECORD_RETENTION_MS, RETENTION_INTERVAL_MS};
     let dir = scratch();
     let mut h = disk_host(dir.path());
     h.consume_nonce("nonce".into(), NOW, NOW).unwrap();
@@ -821,10 +821,10 @@ fn retention_deletes_records_just_past_thirteen_months_and_keeps_unsettled_repor
     started(&mut h, JOB3, 7);
     end(&mut h, JOB3, 9, MS + 3000, terminal(JOB3, "exit"));
     h.terminal_delivered(JOB3, MS + 3000).unwrap();
-    let boundary = MS + 3001 + BILLING_RETENTION_MS;
+    let boundary = MS + 3001 + RECORD_RETENTION_MS;
     h.snapshot.outbox[0].created_ms = boundary - 86_400_000;
 
-    // JOB2 finished exactly thirteen months ago: not more than, so it stays.
+    // JOB2 finished exactly one retention period ago: not more, so it stays.
     assert_eq!(h.prune_retention(boundary - 1).unwrap(), 0);
     assert_eq!(h.retention_tick(boundary).unwrap(), 1);
     assert!(h.snapshot.nonces.is_empty());
@@ -840,7 +840,7 @@ fn retention_deletes_records_just_past_thirteen_months_and_keeps_unsettled_repor
     assert!(!h.snapshot.leases.contains_key(JOB));
     assert!(h.snapshot.leases.contains_key(JOB2));
     // A pass is not repeated before its interval: the tick one millisecond
-    // later skips JOB2 even though it is then past thirteen months.
+    // later skips JOB2 even though it is then past the retention period.
     assert_eq!(h.retention_tick(boundary).unwrap(), 0);
     assert_eq!(h.retention_tick(boundary + 1).unwrap(), 0);
     assert!(h.snapshot.leases.contains_key(JOB2));
@@ -868,7 +868,7 @@ fn retention_deletes_records_just_past_thirteen_months_and_keeps_unsettled_repor
 
 #[test]
 fn retention_never_deletes_a_running_lease_and_drains_a_backlog_in_bounded_passes() {
-    use motor_host::billing::{BILLING_RETENTION_MS, RETENTION_BATCH};
+    use motor_host::billing::{RECORD_RETENTION_MS, RETENTION_BATCH};
     let mut h = host();
     started(&mut h, JOB, 1);
     end(&mut h, JOB, 3, MS + 3000, terminal(JOB, "exit"));
@@ -888,7 +888,7 @@ fn retention_never_deletes_a_running_lease_and_drains_a_backlog_in_bounded_passe
             .insert(format!("old-{n:04}"), finished.clone());
     }
     started(&mut h, JOB2, 4);
-    let later = MS + 3000 + BILLING_RETENTION_MS + 1;
+    let later = MS + 3000 + RECORD_RETENTION_MS + 1;
     assert_eq!(h.retention_tick(later).unwrap(), RETENTION_BATCH);
     // A full batch leaves the next pass due at once, on the next tick.
     assert_eq!(
