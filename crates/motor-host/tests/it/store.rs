@@ -178,3 +178,47 @@ fn a_second_writer_is_refused_while_the_first_holds_the_store() {
     let (_journal, _) = SqliteJournal::open(dir.path()).unwrap();
     assert!(SqliteJournal::open(dir.path()).is_err());
 }
+
+/// Measures one output-sequence update against a copy of a live host's
+/// journal, through the whole-file journal and through SQLite. Run by hand:
+/// `MOTOR_HOST_STORE_BENCH=<dir holding journal.json> cargo test --release
+/// -p motor-host store_cost_on_a_live_journal -- --ignored --nocapture`.
+#[test]
+#[ignore = "needs a copy of a live journal"]
+fn store_cost_on_a_live_journal() {
+    let source = std::env::var("MOTOR_HOST_STORE_BENCH").expect("MOTOR_HOST_STORE_BENCH");
+    let bytes = std::fs::read(Path::new(&source).join("journal.json")).unwrap();
+    let live: Snapshot = serde_json::from_slice(&bytes).unwrap();
+    let job = live
+        .leases
+        .iter()
+        .find(|(_, l)| l.state == LeaseState::Started)
+        .or_else(|| live.leases.iter().next())
+        .map(|(job, _)| job.clone())
+        .unwrap();
+    const ROUNDS: u64 = 100;
+    let bump = |s: &mut Snapshot| s.leases.get_mut(&job).unwrap().highest_seq += 1;
+    for (name, mut journal) in [
+        (
+            "file",
+            Box::new(FileJournal::open(scratch().keep().as_path()).unwrap().0) as Box<dyn Journal>,
+        ),
+        (
+            "sqlite",
+            Box::new(SqliteJournal::open(scratch().keep().as_path()).unwrap().0),
+        ),
+    ] {
+        let mut s = live.clone();
+        journal.store(&s).unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            bump(&mut s);
+            journal.store(&s).unwrap();
+        }
+        println!(
+            "{name}: {} leases, {:?} per output-sequence update",
+            s.leases.len(),
+            started.elapsed() / ROUNDS as u32
+        );
+    }
+}
