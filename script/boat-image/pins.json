@@ -9,7 +9,7 @@
     "script/runner/units/system/motor-jobs.slice": "9ff0c0e449aa78f5b0c3ea6d1f0ea86e81983e2bf16569b6e52106777b1ade3d",
     "script/runner/tools.txt": "deeae6c16195cbdea75324bc293e48117944e09956eadaa8c4e456f3188d743d",
     "script/runner/install-tools.sh": "4323305915be8fd51690509ae111ddaed122ae96f66e3451e627fec45adefb50",
-    "script/runner/toolchain.json": "b6d54327386363ec755f1eebe8852e7223e5682bf56aa3f4651178a74cb90731",
+    "script/runner/toolchain.json": "cb0a5e468fdfdc5c32e9508f8d36b70c013b16ec0424a3df29fa9732beb3294d",
     "script/runner/toolchain-parity.py": "aafa20bf4a68cb0f98856dfe7682e304d4139aff2d866c175b7be689df8773d7",
     "script/runner/syscall-surface.py": "571656805760f208eb43c6718952bd68cc6e9e18c372e139ee4f843cac2d4074",
     "script/runner/cargo-seed.py": "6759e7b26778d7bb62a5c081bac8162e1ed1ee1b67eca28bec3927e9ee07f485",
