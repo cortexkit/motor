@@ -84,7 +84,10 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
                 $nativeLog = Join-Path $caseRoot 'fixture-native.jsonl'
                 Protect-RunnerPath $installed $nativeLog
                 Protect-RunnerPath "$installed\bin" $nativeLog
-                $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\icacls.exe" -ArgumentList @("$installed\bin", '/grant:r', '*S-1-5-21-111-222-333-1001:(OI)(CI)RX', '/Q') -Operation 'fixture bridge read access' -LogPath $nativeLog
+                # Stand-in for the SSH bridge account's read grant, which update must
+                # keep. Real icacls refuses a SID that no account maps to (exit 1332),
+                # so use the built-in Guests group: always present, otherwise absent here.
+                $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\icacls.exe" -ArgumentList @("$installed\bin", '/grant:r', '*S-1-5-32-546:(OI)(CI)RX', '/Q') -Operation 'fixture bridge read access' -LogPath $nativeLog
                 [IO.File]::WriteAllText("$installed\bin\motor-runner.exe", 'old-runner')
                 [IO.File]::WriteAllText("$installed\bin\hyperv.ps1", 'old-script')
                 [IO.File]::WriteAllText("$installed\.motor-runner-root", 'motor-runner-hyperv-v1')
