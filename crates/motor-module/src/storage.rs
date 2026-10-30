@@ -960,15 +960,20 @@ impl Storage {
             let job = s.jobs.entry(id).or_default();
             if job.build_server_job_id.is_none() {
                 if let Some(hosted) = job.hosted.as_mut() {
-                    if !hosted.finish_done && hosted.terminal.is_none() {
-                        // Acknowledgement proves delivery, not the final outcome.
-                        // Keep that uncertainty in a terminal the rollback client
-                        // already preserves, until the runner supplies its result.
-                        hosted.terminal = Some(
-                            TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
-                                .with_ran(Ran::Unknown("maybe".into()))
-                                .with_refusal_detail(crate::hosted::CANCEL_ACKNOWLEDGED),
-                        );
+                    if !hosted.finish_done
+                        && hosted
+                            .terminal
+                            .as_ref()
+                            .is_none_or(|t| matches!(t.outcome, Outcome::OutcomeUnknown))
+                    {
+                        // The runner acknowledged cancellation, even if its final
+                        // frame is unavailable. Keep execution evidence unknown;
+                        // the observed start timestamp supplies only elapsed time.
+                        let mut terminal = TerminalRecord::new(id, Outcome::Cancelled, 0, 0, 0)
+                            .with_ran(Ran::Unknown("maybe".into()))
+                            .with_refusal_detail(crate::hosted::CANCEL_ACKNOWLEDGED);
+                        terminal.wall_ms = hosted.elapsed_ms();
+                        hosted.terminal = Some(terminal);
                     }
                 }
             }

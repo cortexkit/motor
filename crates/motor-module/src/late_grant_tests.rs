@@ -6,7 +6,7 @@ use crate::hosted::test_http::Http;
 use cortexkit_test_support::ScratchDir;
 use motor_lease::{Claims, Confirmation, Purpose};
 use motor_protocol::{read_frame_async, write_frame_async, Accepted, CancelReply, Refusal};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -29,6 +29,8 @@ struct Gates {
     admission: Notify,
     accepted: Notify,
     cancel_ready: Notify,
+    cancel_received: Notify,
+    cancel_reply: Notify,
 }
 
 struct Runner {
@@ -40,6 +42,9 @@ struct Runner {
     attaches: Arc<AtomicUsize>,
     cancels: Arc<AtomicUsize>,
     tombstone: Arc<std::sync::Mutex<Option<TerminalRecord>>>,
+    started_at_ms: AtomicU64,
+    hold_cancel: Arc<AtomicBool>,
+    fail_cancel: AtomicBool,
 }
 
 impl Connector for Runner {
@@ -61,6 +66,9 @@ impl Connector for Runner {
         let attaches = self.attaches.clone();
         let cancels = self.cancels.clone();
         let tombstone = self.tombstone.clone();
+        let started_at_ms = self.started_at_ms.load(Ordering::SeqCst);
+        let hold_cancel = self.hold_cancel.clone();
+        let fail_cancel = self.fail_cancel.load(Ordering::SeqCst);
         Box::pin(async move {
             if attempt > 0 && matches!(branch, Branch::BeforeRun | Branch::Lost) {
                 return Err(io::Error::other("runner connection lost"));
@@ -137,6 +145,32 @@ impl Connector for Runner {
                                 .await
                                 .unwrap();
                             gates.accepted.notify_one();
+                            if started_at_ms != 0 {
+                                for timestamp in [started_at_ms, started_at_ms + 60_000] {
+                                    write_frame_async(
+                                        &mut server,
+                                        &Frame::Started {
+                                            job_id: id,
+                                            seq: 0,
+                                            queue_wait_ms: 0,
+                                            started_at_ms: timestamp,
+                                            path_mapping: None,
+                                        },
+                                    )
+                                    .await
+                                    .unwrap();
+                                }
+                                write_frame_async(
+                                    &mut server,
+                                    &Frame::Output(Output::new(
+                                        1,
+                                        OutputStream::Stdout,
+                                        BytePayload(b"running".to_vec()),
+                                    )),
+                                )
+                                .await
+                                .unwrap();
+                            }
                             gates.cancel_ready.notified().await;
                             write_frame_async(
                                 &mut server,
@@ -149,6 +183,17 @@ impl Connector for Runner {
                         }
                         Frame::Cancel(_) => {
                             cancels.fetch_add(1, Ordering::SeqCst);
+                            loop {
+                                let release = gates.cancel_reply.notified();
+                                if !hold_cancel.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                gates.cancel_received.notify_one();
+                                release.await;
+                            }
+                            if fail_cancel {
+                                return;
+                            }
                             let mut terminal = TerminalRecord::new(
                                 id,
                                 Outcome::Cancelled,
@@ -301,6 +346,9 @@ impl Harness {
             attaches: Arc::default(),
             cancels: Arc::default(),
             tombstone: Arc::default(),
+            started_at_ms: AtomicU64::new(0),
+            hold_cancel: Arc::default(),
+            fail_cancel: AtomicBool::new(false),
         });
         Self {
             broker,
@@ -588,9 +636,182 @@ async fn acknowledged_cancel_recovery_settles_before_host_deadline() {
     let motor = reopen(&h, motor, &scratch);
     motor.resume_finishes().await;
     motor.wait_hosted_cleanup(id).await;
-    assert_settled(&h, &motor, id, "lost", 0);
+    assert_settled(&h, &motor, id, "cancelled", 0);
     assert_eq!(h.runner.cancels.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        terminal(motor.attach(AttachRequest::new(id, 0)).unwrap())
+            .await
+            .outcome,
+        Outcome::Cancelled
+    );
     motor.shutdown_hosted().await;
+}
+
+#[tokio::test]
+async fn acknowledged_cancel_after_started_and_restart_retains_elapsed_time() {
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    let h = Harness::new(Branch::Running).await;
+    let started = now_ms() - 70 * 60 * 1000;
+    h.runner.started_at_ms.store(started, Ordering::SeqCst);
+    let mut job = Job::running(&h).await;
+    let mut starts = 0;
+    loop {
+        match job.stream.records.recv().await.unwrap().unwrap() {
+            StreamRecord::Started(record) => {
+                starts += 1;
+                assert_eq!(record.started_at_ms, started);
+                let stored =
+                    serde_json::to_value(job.motor.hosted_state(job.stream.job_id)).unwrap();
+                assert_eq!(
+                    stored["started_at_ms"], started,
+                    "persist before forwarding"
+                );
+            }
+            StreamRecord::Output(_) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(starts, 1, "duplicate Started frames are not forwarded");
+    let (motor, scratch, id) = detach_running(&h, job).await;
+    motor.shutdown_hosted().await;
+    let motor = reopen(&h, motor, &scratch);
+    let earliest = now_ms() - started;
+    motor.cancel(CancelRequest::new(id)).await.unwrap();
+    motor.wait_hosted_cleanup(id).await;
+    let latest = now_ms() - started;
+    let terminal = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
+    assert_eq!(terminal.outcome, Outcome::Cancelled);
+    assert_eq!(terminal.ran, Some(Ran::Unknown("maybe".into())));
+    assert!(
+        (earliest..=latest).contains(&terminal.wall_ms),
+        "elapsed time must use the first Started across restart: {terminal:?}"
+    );
+    assert_settled(&h, &motor, id, "cancelled", terminal.wall_ms);
+    assert_eq!(h.runner.runs.load(Ordering::SeqCst), 1);
+    assert_eq!(h.runner.cancels.load(Ordering::SeqCst), 1);
+    assert_eq!(motor.storage.job(id).unwrap().build_server_job_id, None);
+    motor.shutdown_hosted().await;
+}
+
+#[tokio::test]
+async fn concurrent_hosted_cancels_and_finish_share_acknowledged_result() {
+    use std::{future::Future, task::Poll};
+
+    let h = Harness::new(Branch::Running).await;
+    let job = Job::running(&h).await;
+    let (motor, scratch, id) = detach_running(&h, job).await;
+    motor.shutdown_hosted().await;
+    let motor = reopen(&h, motor, &scratch);
+    h.runner.hold_cancel.store(true, Ordering::SeqCst);
+    let (tx1, mut rx1) = mpsc::channel(4);
+    let (tx2, mut rx2) = mpsc::channel(4);
+    let mut cancel1 = Box::pin(motor.cancel(CancelRequest::new(id)));
+    let mut cancel2 = Box::pin(motor.cancel(CancelRequest::new(id)));
+    let mut finish1 = Box::pin(motor.finish_hosted(id, false, &tx1));
+    let mut finish2 = Box::pin(motor.finish_hosted(id, false, &tx2));
+    // Poll every owner before allowing an acknowledgment, so each has captured
+    // the pre-cancel state rather than merely reading an already-finished job.
+    std::future::poll_fn(|cx| {
+        assert!(cancel1.as_mut().poll(cx).is_pending());
+        assert!(cancel2.as_mut().poll(cx).is_pending());
+        assert!(finish1.as_mut().poll(cx).is_pending());
+        assert!(finish2.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let (c1, c2, f1, f2, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(cancel1, cancel2, finish1, finish2, async {
+            h.gates.cancel_received.notified().await;
+            h.runner.hold_cancel.store(false, Ordering::SeqCst);
+            h.gates.cancel_reply.notify_waiters();
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(c1.unwrap(), CancelReply::new(id));
+    assert_eq!(c2.unwrap(), CancelReply::new(id));
+    f1.unwrap();
+    f2.unwrap();
+    let Some(Ok(StreamRecord::Terminal(first))) = rx1.recv().await else {
+        panic!("first finish did not deliver a terminal")
+    };
+    let Some(Ok(StreamRecord::Terminal(second))) = rx2.recv().await else {
+        panic!("second finish did not deliver a terminal")
+    };
+    assert_eq!(first.outcome, Outcome::Cancelled);
+    assert_eq!(first, second);
+    motor.wait_hosted_cleanup(id).await;
+    assert_settled(&h, &motor, id, "cancelled", 0);
+    assert_eq!(h.runner.cancels.load(Ordering::SeqCst), 1);
+    assert_eq!(h.runner.runs.load(Ordering::SeqCst), 1);
+    assert_eq!(motor.storage.job(id).unwrap().build_server_job_id, None);
+    let before = h.broker.requests.lock().unwrap().len();
+    motor.cancel(CancelRequest::new(id)).await.unwrap();
+    assert_eq!(
+        terminal(motor.attach(AttachRequest::new(id, 0)).unwrap())
+            .await
+            .outcome,
+        Outcome::Cancelled
+    );
+    assert_eq!(h.broker.requests.lock().unwrap().len(), before);
+    motor.shutdown_hosted().await;
+}
+
+#[tokio::test]
+async fn concurrent_hosted_cancel_delivery_shares_failure() {
+    use std::{future::Future, task::Poll};
+
+    let h = Harness::new(Branch::Running).await;
+    let job = Job::running(&h).await;
+    let (motor, _scratch, id) = detach_running(&h, job).await;
+    motor.shutdown_hosted().await;
+    h.runner.hold_cancel.store(true, Ordering::SeqCst);
+    h.runner.fail_cancel.store(true, Ordering::SeqCst);
+    motor.storage.cancel(id, true).unwrap();
+    let mut first = Box::pin(motor.send_cancel(id));
+    let mut second = Box::pin(motor.send_cancel(id));
+    std::future::poll_fn(|cx| {
+        assert!(first.as_mut().poll(cx).is_pending());
+        assert!(second.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let (first, second, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(first, second, async {
+            h.gates.cancel_received.notified().await;
+            h.runner.hold_cancel.store(false, Ordering::SeqCst);
+            h.gates.cancel_reply.notify_waiters();
+        })
+    })
+    .await
+    .unwrap();
+    let first = first.unwrap_err();
+    let second = second.unwrap_err();
+    assert_eq!(first.kind(), second.kind());
+    assert_eq!(first.to_string(), second.to_string());
+    assert_eq!(h.runner.cancels.load(Ordering::SeqCst), 1);
+    assert!(motor.pending(id));
+    assert!(motor.hosted_state(id).unwrap().terminal.is_none());
+    assert!(!motor.hosted_state(id).unwrap().finish_done);
+    assert!(h
+        .broker
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(path, _)| !path.ends_with("/finish") && !path.ends_with("/release")));
+    motor
+        .storage
+        .hosted_update(id, |s| s.retry_iat = Some(0))
+        .unwrap();
+    motor.cleanup_hosted_once(id, false).await.unwrap();
+    assert_settled(&h, &motor, id, "lost", 0);
 }
 
 #[tokio::test]
@@ -707,6 +928,61 @@ async fn connection_lost_after_run_and_cancel_finishes_lost_at_host_deadline() {
 
 #[tokio::test]
 #[ignore = "run scripts/mixed-version.py with the real rollback client"]
+async fn rollback_oldest_client_reads_optional_started_timestamp() {
+    let helper = std::env::var_os("MOTOR_COMPAT_CLIENT")
+        .expect("run python3 scripts/mixed-version.py for the oldest pinned client");
+    for started in [None, Some(1_730_000_000_000_u64)] {
+        let scratch = ScratchDir::new("oldest-hosted-started");
+        let root = scratch.join("state");
+        let storage = Storage::open(&root).unwrap();
+        let id = Uuid::now_v7();
+        let config = Config {
+            runner_instance: "test".into(),
+            ..Config::default()
+        };
+        let mut value = serde_json::to_value(crate::HostedJobState::new(&config)).unwrap();
+        if let Some(timestamp) = started {
+            value["started_at_ms"] = serde_json::json!(timestamp);
+        }
+        storage
+            .hosted_route(id, serde_json::from_value(value).unwrap())
+            .unwrap();
+        storage.shutdown().unwrap();
+        drop(storage);
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("state.json")).unwrap()).unwrap();
+        assert_eq!(
+            stored["jobs"][id.to_string()]["hosted"]["started_at_ms"].as_u64(),
+            started
+        );
+        let config_path = scratch.join("config.json");
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let helper = helper.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(helper)
+                .args([
+                    "127.0.0.1:1",
+                    config_path.to_str().unwrap(),
+                    root.to_str().unwrap(),
+                    "store",
+                    &id.to_string(),
+                ])
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "run scripts/mixed-version.py with the real rollback client"]
 async fn rollback_222d833_preserves_recovery_and_uncancelled_detach() {
     let helper = std::env::var_os("MOTOR_ROLLBACK_CLIENT")
         .expect("run python3 scripts/mixed-version.py for the real 222d833 client");
@@ -715,6 +991,7 @@ async fn rollback_222d833_preserves_recovery_and_uncancelled_detach() {
         "cancel_pending",
         "cancel_acknowledged",
         "detached",
+        "started",
     ] {
         let h = Harness::new(Branch::Lost).await;
         let scratch = ScratchDir::new("rollback-boat-recovery");
@@ -740,6 +1017,11 @@ async fn rollback_222d833_preserves_recovery_and_uncancelled_detach() {
             0
         });
         route.run_sent = case != "never_run";
+        if case == "started" {
+            let mut value = serde_json::to_value(&route).unwrap();
+            value["started_at_ms"] = serde_json::json!(1_730_000_000_000_u64);
+            route = serde_json::from_value(value).unwrap();
+        }
         storage.hosted_route(id, route).unwrap();
         if case == "cancel_pending" || case == "cancel_acknowledged" {
             storage.cancel(id, true).unwrap();
@@ -782,6 +1064,19 @@ async fn rollback_222d833_preserves_recovery_and_uncancelled_detach() {
         );
         let mut actual_job = rewritten["jobs"][id.to_string()].clone();
         let mut expected_job = expected["jobs"][id.to_string()].clone();
+        if case == "started" {
+            assert_eq!(
+                expected_job["hosted"]["started_at_ms"],
+                1_730_000_000_000_u64
+            );
+            expected_job["hosted"]
+                .as_object_mut()
+                .unwrap()
+                .remove("started_at_ms");
+            assert!(actual_job["hosted"].get("started_at_ms").is_none());
+        } else {
+            assert!(expected_job["hosted"].get("started_at_ms").is_none());
+        }
         actual_job
             .as_object_mut()
             .unwrap()
@@ -811,7 +1106,12 @@ async fn rollback_222d833_preserves_recovery_and_uncancelled_detach() {
             assert!(!motor.hosted_state(id).unwrap().finish_done);
         } else {
             motor.wait_hosted_cleanup(id).await;
-            assert_settled(&h, &motor, id, "lost", 0);
+            let outcome = if case == "cancel_acknowledged" {
+                "cancelled"
+            } else {
+                "lost"
+            };
+            assert_settled(&h, &motor, id, outcome, 0);
             assert!(!motor.pending(id));
         }
         assert_eq!(h.runner.runs.load(Ordering::SeqCst), 0);

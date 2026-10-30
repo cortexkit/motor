@@ -55,10 +55,25 @@ impl Client {
         {
             return Ok(state.hosted_code.as_deref() == Some("hosted_sandbox_lost"));
         }
+        // Cancellation can be acknowledged while another flow holds an older
+        // unknown terminal. Prefer the durable known result under the finish lock.
+        let terminal = terminal
+            .filter(|t| !matches!(t.outcome, motor_protocol::Outcome::OutcomeUnknown))
+            .or(state
+                .terminal
+                .as_ref()
+                .filter(|t| !matches!(t.outcome, motor_protocol::Outcome::OutcomeUnknown)))
+            .or(terminal)
+            .or(state.terminal.as_ref());
         let mut body = None;
         storage.hosted_update(id, |state| {
             if !state.finish_done {
-                if state.terminal.is_none() {
+                if state
+                    .terminal
+                    .as_ref()
+                    .is_none_or(|t| matches!(t.outcome, motor_protocol::Outcome::OutcomeUnknown))
+                    || state.awaiting_cancel_terminal()
+                {
                     state.terminal = terminal.cloned();
                 }
                 if state.pending_finish.is_none() {

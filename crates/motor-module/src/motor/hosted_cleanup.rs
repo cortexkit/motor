@@ -190,9 +190,11 @@ impl Motor {
                 }
             }
         } else {
-            let terminal = state.terminal.clone().unwrap_or_else(|| {
-                TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
-                    .with_ran(Ran::Unknown("maybe".into()))
+            let mut terminal = state.terminal.clone().unwrap_or_else(|| {
+                let mut terminal = TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
+                    .with_ran(Ran::Unknown("maybe".into()));
+                terminal.wall_ms = state.elapsed_ms();
+                terminal
             });
             let unknown = matches!(terminal.outcome, Outcome::OutcomeUnknown);
             if unknown && state.pending_finish.is_none() {
@@ -218,7 +220,13 @@ impl Motor {
                         return Ok(false);
                     }
                 }
-                tracing::info!(job_id = %id, step = "settlement_recovery", cause = if expired { "host deadline passed" } else { "cancellation acknowledged" }, "settling unknown hosted outcome");
+                if state.awaiting_cancel_terminal() {
+                    self.storage.cancel_acknowledged(id)?;
+                }
+                if let Some(recorded) = self.storage.job(id).and_then(|j| j.hosted?.terminal) {
+                    terminal = recorded;
+                }
+                tracing::info!(job_id = %id, step = "settlement_recovery", cause = if expired { "host deadline passed" } else { "cancellation acknowledged" }, outcome = ?terminal.outcome, "settling hosted outcome");
             }
             client.finish(id, Some(&terminal), &self.storage).await?;
         }

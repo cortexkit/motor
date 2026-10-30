@@ -95,6 +95,10 @@ pub struct HostedJobState {
     /// the lease, the job provably never ran; afterwards it may have.
     #[serde(default)]
     pub(crate) run_sent: bool,
+    /// Preserve the first runner timestamp across detach and restart so a
+    /// synthesized terminal can report elapsed time without guessing from Run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) started_at_ms: Option<u64>,
     pub(crate) broker_url: String,
     pub(crate) token_source: BrokerTokenSource,
 }
@@ -117,6 +121,17 @@ fn stored_lease_request<'de, D: serde::Deserializer<'de>>(
         .map_err(serde::de::Error::custom)
 }
 impl HostedJobState {
+    pub(crate) fn elapsed_ms(&self) -> u64 {
+        self.started_at_ms.map_or(0, |started| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX);
+            now.saturating_sub(started)
+        })
+    }
     /// The runner and broker use the current booking's ID. The caller keeps
     /// its original ID even when a refused Boat booking needed a fresh lease.
     pub(crate) fn runner_id(&self, caller: Uuid) -> Uuid {
@@ -126,10 +141,9 @@ impl HostedJobState {
             .unwrap_or(caller)
     }
     pub(crate) fn awaiting_cancel_terminal(&self) -> bool {
-        self.terminal.as_ref().is_some_and(|t| {
-            matches!(t.outcome, motor_protocol::Outcome::OutcomeUnknown)
-                && t.refusal_detail.as_deref() == Some(CANCEL_ACKNOWLEDGED)
-        })
+        self.terminal
+            .as_ref()
+            .is_some_and(|t| t.refusal_detail.as_deref() == Some(CANCEL_ACKNOWLEDGED))
     }
     pub(crate) fn booked_or_attempted(&self) -> bool {
         self.lease_attempted

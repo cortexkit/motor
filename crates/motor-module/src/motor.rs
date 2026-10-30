@@ -65,6 +65,9 @@ pub struct Motor {
     /// keeps reading. If it sent a second cancel instead, it would wait for
     /// that reply and then reattach before it could read the terminal.
     cancels_in_flight: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, usize>>>,
+    /// Detached callers and settlement recovery share delivery of a hosted
+    /// cancellation, including its failure, instead of racing separate attaches.
+    hosted_cancels: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, CancelDelivery>>>,
     /// Attach must not follow a withdrawn runner while its submission owner can
     /// still move the command to another runner. Closing a watch opens the fence.
     submissions: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, watch::Sender<()>>>>,
@@ -96,6 +99,8 @@ struct CancelInFlight {
     cancels: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, usize>>>,
     id: Uuid,
 }
+
+type CancelDelivery = watch::Receiver<Option<Result<(), (io::ErrorKind, String)>>>;
 
 struct WindowsQueue {
     deadline: tokio::time::Instant,
@@ -147,6 +152,7 @@ impl Motor {
             account_tokens: None,
             windows_slots,
             cancels_in_flight: Arc::default(),
+            hosted_cancels: Arc::default(),
             submissions: Arc::default(),
             hosted_cleanup: Arc::default(),
             #[cfg(test)]
@@ -1866,6 +1872,58 @@ impl Motor {
         self.storage.job(id).is_some_and(|j| j.pending_cancel)
     }
     async fn send_cancel(&self, id: Uuid) -> io::Result<()> {
+        if self.hosted_state(id).is_none() {
+            return self.send_cancel_once(id).await;
+        }
+        let mut delivery = {
+            let mut deliveries = self.hosted_cancels.lock().unwrap();
+            if let Some(delivery) = deliveries.get(&id) {
+                delivery.clone()
+            } else {
+                // Recheck after joining the delivery gate: an earlier attempt
+                // may already have acknowledged cancellation and settled Boat.
+                if self.hosted_state(id).is_some_and(|s| {
+                    s.awaiting_cancel_terminal()
+                        || s.terminal
+                            .as_ref()
+                            .is_some_and(|t| !matches!(t.outcome, Outcome::OutcomeUnknown))
+                }) {
+                    self.storage.cancel_acknowledged(id)?;
+                    return Ok(());
+                }
+                let (tx, rx) = watch::channel(None);
+                deliveries.insert(id, rx.clone());
+                let motor = self.clone();
+                // Delivery outlives any one waiting caller, so detaching cannot
+                // strand another waiter or abandon a booked lease's cleanup.
+                tokio::spawn(async move {
+                    let result = motor
+                        .send_cancel_once(id)
+                        .await
+                        .map_err(|error| (error.kind(), error.to_string()));
+                    tx.send_replace(Some(result));
+                    motor.hosted_cancels.lock().unwrap().remove(&id);
+                    if motor
+                        .hosted_state(id)
+                        .is_some_and(|s| s.placement.is_some_and(|p| p.host.starts_with("boat:")))
+                    {
+                        motor.recover_hosted(id);
+                    }
+                });
+                rx
+            }
+        };
+        loop {
+            if let Some(result) = delivery.borrow().clone() {
+                return result.map_err(|(kind, message)| io::Error::new(kind, message));
+            }
+            delivery
+                .changed()
+                .await
+                .map_err(|_| io::Error::other("hosted cancellation delivery stopped"))?;
+        }
+    }
+    async fn send_cancel_once(&self, id: Uuid) -> io::Result<()> {
         let started = tokio::time::Instant::now();
         let elapsed_ms = || started.elapsed().as_millis() as u64;
         let build_server_id = self.build_server_id(id);
@@ -2124,8 +2182,10 @@ impl Motor {
             .hosted_state(id)
             .ok_or_else(|| io::Error::other("missing hosted route"))?;
         let mut terminal = state.terminal.clone().unwrap_or_else(|| {
-            TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
-                .with_ran(Ran::Unknown("maybe".into()))
+            let mut terminal = TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
+                .with_ran(Ran::Unknown("maybe".into()));
+            terminal.wall_ms = state.elapsed_ms();
+            terminal
         });
         // Exhausting reattach attempts is not evidence that the runner stopped.
         // Attempt cancellation first, but a network failure must not leave the
@@ -2156,6 +2216,14 @@ impl Motor {
                         Some(cause) => format!("{detail}; {cause}"),
                         None => detail.into(),
                     }));
+            }
+        }
+        // Another cancel caller or cleanup task may have recorded the result
+        // while this flow was attaching. Never settle or emit its stale unknown.
+        if let Some(recorded) = self.hosted_state(id).and_then(|s| s.terminal) {
+            if !matches!(recorded.outcome, Outcome::OutcomeUnknown) {
+                terminal = recorded;
+                cancel_unconfirmed = false;
             }
         }
         // Settling a Boat booking makes its runner impossible to reattach.
@@ -2225,9 +2293,11 @@ impl Motor {
             .as_ref()
             .and_then(|p| p.vm.as_deref())
             .unwrap_or("unknown");
-        TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
+        let mut terminal = TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
             .with_ran(Ran::Unknown("maybe".into()))
-            .with_refusal_detail(format!("hosted_sandbox_lost: {sandbox}"))
+            .with_refusal_detail(format!("hosted_sandbox_lost: {sandbox}"));
+        terminal.wall_ms = state.elapsed_ms();
+        terminal
     }
     async fn follow(
         &self,
@@ -2368,9 +2438,10 @@ impl Motor {
                     return self.lost_sandbox(id, tx).await.map(|_| false);
                 }
                 if let Err(error @ crate::hosted::Error::BrokerRefused) = opened.as_ref() {
-                    let terminal = TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
+                    let mut terminal = TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
                         .with_ran(Ran::Unknown("maybe".into()))
                         .with_refusal_detail(error.code());
+                    terminal.wall_ms = self.hosted_state(id).map_or(0, |s| s.elapsed_ms());
                     self.storage.hosted_update(id, |s| {
                         s.hosted_code = Some(error.code().into());
                         s.hosted_no_fallback = true;
@@ -2464,6 +2535,11 @@ impl Motor {
                 })) if job_id == build_server_id => {
                     windows_queue = None;
                     self.submission_ready(id);
+                    if hosted {
+                        self.storage.hosted_update(id, |state| {
+                            state.started_at_ms.get_or_insert(started_at_ms);
+                        })?;
+                    }
                     if let Some(watch) = spill_watch.as_mut() {
                         watch.started();
                     }
@@ -2615,6 +2691,7 @@ impl Motor {
                                 .terminal
                                 .as_ref()
                                 .is_none_or(|t| matches!(t.outcome, Outcome::OutcomeUnknown))
+                                || state.awaiting_cancel_terminal()
                             {
                                 state.terminal = Some(terminal.clone());
                             }
