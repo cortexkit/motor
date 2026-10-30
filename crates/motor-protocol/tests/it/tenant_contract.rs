@@ -2,6 +2,21 @@ use motor_protocol::*;
 use serde_json::json;
 
 #[test]
+fn terminal_job_peak_is_an_optional_addition_to_lifecycle_events() {
+    for peak in [None, Some(481)] {
+        let mut value = json!({"type":"event","event_seq":3,"event":"terminal","jti":"00000000-0000-4000-8000-000000000001"});
+        if let Some(peak) = peak {
+            value["mem_peak_mib"] = json!(peak);
+        }
+        let Frame::Event(event) = serde_json::from_value::<Frame>(value.clone()).unwrap() else {
+            panic!("expected event")
+        };
+        assert_eq!(event.mem_peak_mib, peak);
+        assert_eq!(serde_json::to_value(Frame::Event(event)).unwrap(), value);
+    }
+}
+
+#[test]
 fn pinned_tenant_frames_are_inline_and_integer_only() {
     let id = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
     let value = json!({"type":"verified_lease","jti":id,"purpose":"run","sub":"acct:test","vcpus":2,
@@ -18,6 +33,7 @@ fn pinned_tenant_frames_are_inline_and_integer_only() {
         jti: Some(id),
         cause: Some(RefusedCause::Mismatch),
         setup: None,
+        mem_peak_mib: None,
     });
     assert_eq!(
         serde_json::to_value(event).unwrap(),
@@ -29,6 +45,7 @@ fn pinned_tenant_frames_are_inline_and_integer_only() {
         jti: None,
         cause: None,
         setup: None,
+        mem_peak_mib: None,
     });
     assert_eq!(
         serde_json::to_value(idle).unwrap(),

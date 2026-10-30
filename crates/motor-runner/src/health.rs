@@ -130,6 +130,7 @@ impl Health {
             total.soft_goal_unmet_passes += counts.soft_goal_unmet_passes;
             total.skipped_recent += counts.skipped_recent;
             total.oom_stops += counts.oom_stops;
+            total.memory_peak_unavailable += counts.memory_peak_unavailable;
         }
         total
     }

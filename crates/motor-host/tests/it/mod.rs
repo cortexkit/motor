@@ -91,6 +91,7 @@ fn event(
         jti: job.map(|s| s.parse().unwrap()),
         cause,
         setup: None,
+        mem_peak_mib: None,
     }
 }
 fn disk_host(path: &std::path::Path) -> Host {

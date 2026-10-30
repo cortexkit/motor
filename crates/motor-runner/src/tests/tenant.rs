@@ -90,6 +90,66 @@ fn pending(runner: &Runner) -> Vec<motor_protocol::TenantEvent> {
     events
 }
 
+#[test]
+fn finished_successful_unit_keeps_final_summary_peak_in_durable_lifecycle() {
+    for (memory_line, expected) in [
+        ("Memory peak: 4.2M (swap: 0B)\n", Some(5)),
+        ("", None),
+        ("Memory peak: n/a\n", None),
+    ] {
+        let f = Fixture::new();
+        let runner = open(&f);
+        let id = Uuid::now_v7();
+        let now = runner.now();
+        let mut job = Job::new(id, None, now, 0, 1);
+        job.started_ms = Some(now);
+        job.process = Some(platform::ProcessIdentity {
+            pid: 0,
+            start: 0,
+            unit: Some(id),
+        });
+        job.memory_accounting_pending = true;
+        job.execution_ended_ms = Some(now + 100);
+        job.terminal_ended(Outcome::Exit { code: 0 }, now + 100);
+        runner.tenant_events().unwrap().admit(id).unwrap();
+        runner.save(&job).unwrap();
+        runner.core.inner.lock().unwrap().jobs.insert(id, job);
+        assert!(pending(&runner)
+            .iter()
+            .all(|e| e.event != TenantEventKind::Terminal));
+        // A finished unit can already be unloaded. Its separate launcher's
+        // final summary remains available without any post-exit systemctl query.
+        let unit = runner.core.backend.unit_name(runner.config(), id);
+        let report = format!("Running as unit: {unit}; invocation ID: a7ad6ff018994eb4b96f81c0ca2798c8\nFinished with result: success\nCPU time consumed: 95ms\n{memory_line}");
+        runner.collect_accounting(id, report.as_bytes());
+        let disk: Job = read_json(&runner.record_path(id)).unwrap();
+        assert_eq!(disk.mem_peak_mib, expected);
+        assert!(!disk.memory_accounting_pending);
+        assert_eq!(disk.terminal.unwrap().outcome, Outcome::Exit { code: 0 });
+        let events = pending(&runner);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, TenantEventKind::Terminal);
+        assert_eq!(events[0].mem_peak_mib, expected);
+        let counts = runner.core.health.lock().unwrap().counts(runner.now());
+        assert_eq!(
+            counts.memory_peak_unavailable,
+            u64::from(expected.is_none())
+        );
+        runner.collect_accounting(id, report.as_bytes());
+        assert!(pending(&runner).is_empty());
+        assert_eq!(
+            runner
+                .core
+                .health
+                .lock()
+                .unwrap()
+                .counts(runner.now())
+                .memory_peak_unavailable,
+            counts.memory_peak_unavailable
+        );
+    }
+}
+
 #[tokio::test]
 async fn tenant_first_frame_is_strict_and_local_ssh_still_uses_hello() {
     let f = Fixture::new();

@@ -37,7 +37,9 @@ pub struct JobBilling {
     pub enqueued: bool,
     pub delivered: bool,
     pub overlapping: bool,
+    /// Legacy VM samples retained for snapshot rollback, never job settlement.
     pub memory_peak_bytes: u64,
+    pub mem_peak_mib: Option<u64>,
     pub metrics_observed: bool,
     pub egress_start: Option<u64>,
     pub egress_end: u64,
@@ -116,7 +118,8 @@ pub(crate) fn finalize_ready(next: &mut Snapshot, now_ms: u64) {
             vcpus: lease.claims.vcpus,
             started_at_ms: start,
             ended_at_ms: end,
-            mem_peak_mib: (!b.overlapping).then_some(b.memory_peak_bytes.div_ceil(1_048_576)),
+            // VM samples include the runner and cache fills, not just this job.
+            mem_peak_mib: lease.started_at_ms.and(b.mem_peak_mib),
             egress_bytes: (!b.overlapping).then_some(
                 b.egress_end
                     .saturating_sub(b.egress_start.unwrap_or(b.egress_end)),
