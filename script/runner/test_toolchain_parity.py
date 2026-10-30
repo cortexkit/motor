@@ -822,6 +822,17 @@ class ParityTests(unittest.TestCase):
         actual['rust_toolchains']['stable-x86_64-unknown-linux-gnu']['components'].append('clippy-x86_64-unknown-linux-gnu')
         self.assertFalse(self.report(actual)['passed'])
 
+    def test_missing_rust_analyzer_component_fails_for_every_role(self):
+        toolchain = '1.99.0-x86_64-unknown-linux-gnu'
+        for role in ('build-server', 'boat', 'tenant'):
+            with self.subTest(role=role):
+                actual = self.observed(role=role, job=True)
+                actual['rust_toolchains'][toolchain]['components'].remove('rust-analyzer-x86_64-unknown-linux-gnu')
+                report = self.report(actual, role=role, job=True)
+                self.assertFalse(report['passed'])
+                self.assertEqual(len(report['errors']), 1)
+                self.assertIn(toolchain + ' components:', report['errors'][0])
+
     def test_missing_target_payload_fails_even_with_rustup_receipt(self):
         actual = self.observed()
         actual['rust_target_payloads']['1.99.0-x86_64-unknown-linux-gnu']['wasm32-unknown-unknown'] = False
@@ -1259,6 +1270,37 @@ class JournalRetentionHostFileTests(unittest.TestCase):
 
 
 class InstallerTests(unittest.TestCase):
+    def test_default_toolchain_lists_and_installs_rust_analyzer_for_all_roles(self):
+        manifest = json.loads(parity.MANIFEST.read_text())
+        toolchain = '1.99.0-x86_64-unknown-linux-gnu'
+        self.assertIn('rust-analyzer-x86_64-unknown-linux-gnu',
+                      manifest['rust_toolchains'][toolchain]['components'])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest['cargo_installs'] = []
+            manifest['tools'] = {}
+            (root / 'toolchain.json').write_text(json.dumps(manifest))
+            script = root / 'install-tools.sh'
+            script.write_text((parity.HERE / 'install-tools.sh').read_text().replace('/srv/build', str(root)))
+            bins = root / 'cargo-home/bin'
+            bins.mkdir(parents=True)
+            rustup = bins / 'rustup'
+            rustup.write_text('#!/usr/bin/env python3\nimport json, os, sys\n'
+                              'with open(os.environ["TEST_RUSTUP_LOG"], "a") as stream:\n'
+                              '    stream.write(json.dumps(sys.argv[1:]) + "\\n")\n')
+            rustup.chmod(0o755)
+            log = root / 'rustup.jsonl'
+            for role in ('build-server', 'boat', 'tenant'):
+                with self.subTest(role=role):
+                    log.write_text('')
+                    result = subprocess.run(['bash', str(script), role],
+                                            env=dict(os.environ, TEST_RUSTUP_LOG=str(log)),
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    commands = [json.loads(line) for line in log.read_text().splitlines()]
+                    for component in ('clippy', 'rustfmt', 'rust-analyzer'):
+                        self.assertIn(['component', 'add', '--toolchain', toolchain, component], commands)
+
     def test_cargo_installer_consumes_manifest_and_places_pinned_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1301,6 +1343,9 @@ class InstallerTests(unittest.TestCase):
                             'source = pathlib.Path(os.environ["TEST_ARCHIVE_DIR"]) / ("bun.zip" if "bun-linux-x64.zip" in url else "node.tar.xz")\n'
                             'shutil.copyfile(source, target)\n')
             curl.chmod(0o755)
+            rustup = fake_bin / 'rustup'
+            rustup.write_text('#!/bin/sh\nexit 0\n')
+            rustup.chmod(0o755)
             env = dict(os.environ, TEST_MANIFEST=str(root / 'toolchain.json'), TEST_ARCHIVE_DIR=str(archive_dir),
                        TEST_CARGO_LOG=str(root / 'cargo-installs.log'),
                        TOOLCHAIN_INSTALL_ROOT=str(root / 'sysroot'),
