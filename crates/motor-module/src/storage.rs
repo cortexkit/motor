@@ -495,6 +495,23 @@ impl Storage {
     pub(crate) fn has_live_stream(&self, id: Uuid) -> bool {
         self.state.lock().unwrap().active_jobs.contains_key(&id)
     }
+    pub(crate) fn health_jobs(&self) -> Vec<(Uuid, Job)> {
+        self.state
+            .lock()
+            .unwrap()
+            .jobs
+            .iter()
+            .filter(|(_, job)| {
+                job.local_terminal.is_none()
+                    && job.terminal_observed_at_ms.is_none()
+                    && job
+                        .hosted
+                        .as_ref()
+                        .is_none_or(|hosted| hosted.terminal.is_none() && !hosted.finish_done)
+            })
+            .map(|(id, job)| (*id, job.clone()))
+            .collect()
+    }
     pub(crate) fn last_hosted(&self) -> Option<crate::HostedJobState> {
         self.state
             .lock()

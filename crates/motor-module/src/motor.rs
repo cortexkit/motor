@@ -75,9 +75,12 @@ pub struct Motor {
     #[cfg(test)]
     hosted_connector: Option<Arc<dyn Connector>>,
     keyed_admissions: Arc<std::sync::Mutex<()>>,
+    health_progress:
+        Arc<std::sync::Mutex<std::collections::HashMap<Uuid, (Platform, progress::Reporter)>>>,
     wsl: crate::wsl::Checks,
 }
 mod agent_run;
+mod health;
 pub(crate) mod progress;
 #[cfg(test)]
 mod progress_tests;
@@ -158,6 +161,7 @@ impl Motor {
             #[cfg(test)]
             hosted_connector: None,
             keyed_admissions: Arc::default(),
+            health_progress: Arc::default(),
             wsl: crate::wsl::Checks::default(),
         })
     }
@@ -734,6 +738,11 @@ impl Motor {
         let progress = progress::Reporter::new(
             submission.0.progress(),
             submission.0.weight_hint.unwrap_or(2),
+        );
+        let _health = self.observe_health_submission(
+            id,
+            submission.0.platform.clone().unwrap_or(Platform::Linux),
+            progress.clone(),
         );
         // Legacy streams keep their original delivery path and never see progress.
         if !progress.enabled() {
@@ -2948,15 +2957,6 @@ impl Motor {
     }
     pub async fn runner_health(&self) -> io::Result<RunnerHealth> {
         self.runner_health_for(None).await
-    }
-    pub(crate) fn direct_linux_health_role(&self) -> Option<&'static str> {
-        self.config
-            .hosted_runners
-            .then_some(if self.config.hosted_fleet_routing {
-                "no_host_fits fallback"
-            } else {
-                "gate jobs"
-            })
     }
     pub(crate) async fn runner_health_for(
         &self,

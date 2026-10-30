@@ -1583,7 +1583,7 @@ async fn hosted_runner_health_and_sampler_use_direct_linux_runner() {
             if report
                 .metrics
                 .as_ref()
-                .is_some_and(|metrics| metrics["build_server"].is_object())
+                .is_some_and(|metrics| metrics["connection"]["runner"] == "ok")
             {
                 break report;
             }
@@ -1595,27 +1595,28 @@ async fn hosted_runner_health_and_sampler_use_direct_linux_runner() {
     handler.shutdown().await;
     assert_eq!(report.status, subc_client_rs::HealthStatus::Ok);
     let detail = report.detail.unwrap();
-    assert!(
-        detail.contains("build server (direct Linux: gate jobs)"),
-        "{detail}"
-    );
-    assert!(
-        detail.contains("Windows build-server: available"),
-        "{detail}"
-    );
-    assert!(
-        detail.contains("hosted fixture-host: last lease leased"),
-        "{detail}"
-    );
+    assert!(detail.contains("daemon running"), "{detail}");
+    assert!(detail.contains("windows: available"), "{detail}");
     assert!(
         !detail.contains("unreachable") && !detail.contains("stale"),
         "{detail}"
     );
     let metrics = report.metrics.unwrap();
-    assert_eq!(metrics["build_server"]["queue_depth"], expected.queue_depth);
-    assert_eq!(metrics["direct_linux_workload"], "gate jobs");
-    assert_eq!(metrics["hosted"]["hosted_hosts"][0]["host"], "fixture-host");
-    assert_eq!(metrics["windows_runners"][0]["reachable"], true);
+    assert_eq!(metrics["platforms"]["windows"]["status"], "available");
+    assert_eq!(metrics["machine"]["jobs"]["linux"]["running"], 0);
+    for private in [
+        "build server",
+        "build-server",
+        "fixture-host",
+        "slots",
+        "tenant",
+        "hosted_hosts",
+    ] {
+        assert!(
+            !format!("{detail} {metrics}").contains(private),
+            "{detail} {metrics}"
+        );
+    }
     assert!(peer
         .visits
         .lock()

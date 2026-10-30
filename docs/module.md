@@ -90,28 +90,42 @@ snapshots, not runner probes or per-request lists; they add only a few hundred
 bytes to the module's bounded health cache (16 KiB maximum). The SDK separately
 degrades health when a full pool has waited more than two seconds.
 
-Health also names first-party hosted hosts seen in retained leases, with the
-newest job's lease outcome for each host. `ck health motor` includes them in its
-detail and `metrics.hosted.hosted_hosts`; the hosted `runner.health` response
-includes `hosted_hosts` directly. Boat placements are excluded. These are
-lease observations, not live capacity samples: `capacity` is null, and
-`hosted_hosts_source` and `hosted_hosts_missing` disclose that the broker's
-registered-host inventory and heartbeat capacity are not exposed to ck-motor.
-A host never leased by this client cannot be discovered here, and an observed
-host can disappear when its jobs leave retention. No runner or broker probe is
-made by the health check. Test:
-`health_lists_retained_host_leases_without_inventing_capacity`.
+`ck health motor` describes remote runs from the caller's machine, not the
+hosted infrastructure. Its detail and metrics name that machine, report daemon,
+connection and sign-in readiness, and summarize `linux`, `windows` and `macos`
+in text as `available`, `busy` or `unavailable` with an actionable reason.
+Platforms that are not set up on the caller's machine say so without counts.
+The machine name appears once, and zero counts are left out. Machine-readable
+status retains `busy (queueing)` and the complete per-platform counts.
+For hosted Linux, **available
+(requests accepted)** means the authenticated broker answers this machine's
+requests, not that capacity is guaranteed: clients do not receive live fleet
+inventory. A current placement or capacity wait from this machine makes that
+platform busy. Direct platforms use cached runner reachability and capacity
+samples. Windows endpoints are aggregated, and macOS has its own probe.
 
-The background sampler still probes the configured direct Linux runner when
-`hosted_runners` is enabled. Its sample is labeled as the direct gate lane, or
-the `no_host_fits` fallback lane with fleet routing enabled. Windows runners
-remain separately named and sampled beside it and the hosted hosts. The Linux
-`exec.status` aggregate retains its hosted placeholder for compatibility; that
-placeholder is not a component-health probe and is never fed to the health
-sampler as an unreachable runner. Linux has a configured direct target even
-when its settings are omitted (the default instance is selected); optional
-Windows targets that are not configured are omitted, not reported unreachable.
-Test: `hosted_runner_health_and_sampler_use_direct_linux_runner`.
+The `machine.jobs` metric counts only jobs retained by this installation, per
+platform, as `running`, `waiting_for_capacity` or `unknown`. Workspace, upload
+and setup waits are not capacity waits. Unconfirmed job states are counted as
+unknown rather than silently reported as idle; an unsampled or expired job
+snapshot is null. No host names, slot counts, VM state, host memory, host disk,
+repository usage or historical queue percentiles enter module health, including
+its machine-readable metrics. Tests:
+`health_hides_retained_host_leases_from_text_and_metrics`,
+`machine_counts_only_its_jobs_per_platform_and_live_capacity_waits`,
+`windows_aggregates_all_endpoints_without_names_or_limits`.
+
+The separate `runner.health` operation is unchanged. Its hosted response still
+includes retained first-party lease observations in `hosted_hosts`, excluding
+external rental-provider placements (the Boat route), with null `capacity` and
+explicit source/missing-data markers;
+these are not live capacity samples. The direct Linux sampler remains active
+with hosted routing enabled, so existing health-status degradation still detects
+loss of that connection. The hosted-routing text leaves out the direct Linux
+runner's connection label rather than implying it checked a broker-selected
+runner. The Linux `exec.status` hosted placeholder is unchanged
+and is never used as a health sample. Test:
+`hosted_runner_health_and_sampler_use_direct_linux_runner`.
 
 If an authorized run or attach handler sees a long-held operation that the
 prefix classifier put in the default pool, it increments
@@ -214,24 +228,30 @@ Tests (`crates/motor-module/tests/it/placement.rs`): `aft_bind_is_admitted`,
 `health_flow_reaches_only_the_read_only_health_report`,
 `other_reserved_principals_are_refused_at_bind`.
 
-The daemon's `health.check` reads an in-memory build-server sample, refreshed in
-the background every 15 seconds with a ten-second timeout; it never connects to
-the runner itself. Metrics include host capacity, hourly queue wait, and the top
-five repositories by reserved vCPU-hours over 24 hours. A failed sample makes
-runner fields null; three consecutive failures or two minutes without a
-successful sample degrade module health. Busy queues alone remain healthy. The
-`history` metric contains at most 180 oldest-first minute points with the keys
-`minute_ms`, `permits_held`, `permits_cap`, `queue_depth`, and `queue_p90_ms`;
-only minutes with a successful sample appear. Startup and credential failures
-still report failing health, and the detail still includes diagnostics for an
-unreachable runner. Tests:
+The daemon's `health.check` reads an in-memory snapshot; it never connects to a
+runner or broker itself. The background sampler ticks every 15 seconds, with a
+ten-second direct Linux timeout and bounded platform, job-status and account
+probes. The account probe uses the same non-booking credential check as
+`hosted.check`, without publishing token claims. Three consecutive direct Linux
+failures or two minutes without a successful direct Linux sample still degrade
+module health. Busy queues alone remain healthy, and startup and SSH credential
+failures still report failing health. Failing detail starts with the
+machine-readable reason followed by `; `, before the caller-machine summary,
+so the cause is visible first.
+
+Module metrics contain `daemon`, `connection`, `platforms`, `machine`, plus the
+existing local `request_pools` and `unreachable_refusals_since_boot` diagnostics.
+The old `build_server`, `queue_wait_1h`, `top_repos`, `sample_age_ms`, `headline`,
+`history`, `windows_runners`, `direct_linux_workload` and `hosted` keys are removed;
+the daemon's `HealthReport` envelope (`status`, `detail`, `metrics`) is unchanged.
+Hourly queue percentiles describe waits of jobs that already started, so they
+cannot establish current queueing and are no longer presented as current wait
+estimates. Tests:
 `health_check_reads_only_cache_without_runner_calls`,
-`busy_server_is_healthy_and_metrics_have_cli_shape`,
+`busy_platform_is_healthy_without_host_telemetry`,
+`idle_runner_does_not_report_historical_queue_wait_as_current_capacity`,
 `idle_cache_stales_after_two_minutes_and_recovers`,
-`unreachable_samples_are_null_and_three_failures_degrade`,
-`history_keeps_the_last_sample_in_each_minute`,
-`history_is_bounded_to_180_points_and_evicts_the_oldest`,
-`history_leaves_a_gap_for_a_minute_without_a_successful_sample`.
+`unreachable_samples_and_three_failures_degrade`.
 
 For scoped `exec.run` requests, `ck-motor` stores the caller's session, scope
 reference and epoch, and the optional `preset` with the job, for attribution
