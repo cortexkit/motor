@@ -146,6 +146,7 @@ mod tests {
                 elapsed_ms: 0,
             }],
             healthy: true,
+            draining: false,
         }
     }
 

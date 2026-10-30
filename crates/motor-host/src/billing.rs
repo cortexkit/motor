@@ -392,6 +392,7 @@ impl Host {
                 })
                 .collect(),
             healthy,
+            draining: self.snapshot.draining,
         }
     }
     pub fn queue_heartbeat(
@@ -636,6 +637,7 @@ impl Host {
             counter: snapshot.counter,
             last_alive: snapshot.last_alive,
             closed: snapshot.closed.clone(),
+            draining: snapshot.draining,
         };
         next.nonces.retain(|_, until| *until >= now_s);
         // A removed tenant's closure record names its account; it goes on

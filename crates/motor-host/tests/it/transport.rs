@@ -703,6 +703,62 @@ fn admin_only_relays_four_closed_control_operations() {
     assert!(runtime.admin("unknown", &json!({"op":"status"})).is_err());
     assert_eq!(fake.calls.lock().unwrap().len(), 4);
 }
+
+#[tokio::test]
+async fn host_drain_admin_socket_ops_are_host_level_and_durable() {
+    let dir = scratch();
+    let fake = Arc::new(Fake::default());
+    let runtime = Runtime::new("host".into(), disk_host(dir.path()), fake.clone());
+    let socket = dir.path().join("admin.sock");
+    let server_runtime = runtime.clone();
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        motor_host::server::admin_socket(server_runtime, &server_socket).await
+    });
+    async fn exchange(path: &std::path::Path, request: Value) -> Value {
+        let mut stream = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match tokio::net::UnixStream::connect(path).await {
+                    Ok(stream) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("admin connect: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        write_frame(&mut stream, &request).await.unwrap();
+        read_frame(&mut stream).await.unwrap()
+    }
+    let initial = exchange(&socket, json!({"op":"host_status"})).await;
+    assert_eq!(initial["draining"], false);
+    assert_eq!(initial["broker_draining"], false);
+    assert_eq!(initial["broker_heartbeat_at_ms"], Value::Null);
+    let before = unix_ms();
+    let drain = exchange(&socket, json!({"op":"drain_host"})).await;
+    assert_eq!(drain["ok"], true);
+    assert_eq!(drain["draining"], true);
+    assert!(drain["set_at_ms"].as_u64().unwrap() >= before);
+    assert!(disk_host(dir.path()).snapshot.draining);
+    for invalid in [
+        json!({"op":"drain_host","tenant":"tenant"}),
+        json!({"op":"drain_host","extra":true}),
+        json!({"op":"resume"}),
+        json!({"op":"status"}),
+    ] {
+        assert_eq!(exchange(&socket, invalid).await["ok"], false);
+    }
+    assert!(runtime.host.lock().unwrap().snapshot.draining);
+    let cleared = exchange(&socket, json!({"op":"undrain_host"})).await;
+    assert_eq!(cleared["ok"], true);
+    assert_eq!(cleared["draining"], false);
+    assert!(!disk_host(dir.path()).snapshot.draining);
+    assert!(fake.calls.lock().unwrap().is_empty());
+    server.abort();
+}
+
 #[tokio::test]
 async fn tls_listener_runs_the_pinned_requester_bound_prelude() {
     let (runtime, fake, broker, requester, c) = fixture();

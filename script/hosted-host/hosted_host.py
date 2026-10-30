@@ -42,12 +42,14 @@ from datetime import datetime, timezone
 import importlib.util
 import ipaddress
 import json
+import math
 from pathlib import Path
 import re
 import socket
 import struct
 import subprocess
 import sys
+import time
 
 HERE = Path(__file__).resolve().parent
 TENANT_FILE = HERE / "tenant-1.json"
@@ -391,11 +393,11 @@ def runner_log_request(tenant: str, since: int, until: int | None, job: str | No
     return request
 
 
-def admin_exchange(request: dict, path: Path = ADMIN_SOCKET) -> dict:
+def admin_exchange(request: dict, path: Path = ADMIN_SOCKET, *, timeout: float = 60) -> dict:
     """One length-prefixed JSON request and reply on motor-host's admin socket."""
     body = json.dumps(request).encode()
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-        connection.settimeout(60)
+        connection.settimeout(timeout)
         connection.connect(str(path))
         connection.sendall(struct.pack(">I", len(body)) + body)
         header = connection.recv(4, socket.MSG_WAITALL)
@@ -409,6 +411,42 @@ def admin_exchange(request: dict, path: Path = ADMIN_SOCKET) -> dict:
                 raise ValueError("motor-host closed the admin socket mid-reply")
             reply += chunk
     return json.loads(reply)
+
+
+def drain_host(timeout_s: float = 120, path: Path = ADMIN_SOCKET) -> dict:
+    """Persist the drain and wait for a newer broker acknowledgement, not a stale echo."""
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError("drain timeout must be a positive finite number of seconds")
+    deadline = time.monotonic() + timeout_s
+    try:
+        reply = admin_exchange({"op": "drain_host"}, path, timeout=timeout_s)
+        if reply.get("ok") is not True or reply.get("draining") is not True:
+            raise ValueError(f"motor-host refused drain_host: {reply}")
+        set_at_ms = reply.get("set_at_ms")
+        if type(set_at_ms) is not int:
+            raise ValueError("drain_host reply has no set_at_ms")
+        while time.monotonic() < deadline:
+            status = admin_exchange({"op": "host_status"}, path,
+                                    timeout=max(0.001, deadline - time.monotonic()))
+            if status.get("ok") is not True:
+                raise ValueError(f"motor-host refused host_status: {status}")
+            echoed_at_ms = status.get("broker_heartbeat_at_ms")
+            if (status.get("draining") is True and status.get("broker_draining") is True
+                    and type(echoed_at_ms) is int and echoed_at_ms > set_at_ms):
+                return status
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
+    except TimeoutError:
+        pass
+    raise ValueError(f"timed out after {timeout_s:g}s waiting for a new broker draining echo; "
+                     "do not switch binaries; the host drain has not been cleared")
+
+
+def undrain_host(path: Path = ADMIN_SOCKET) -> dict:
+    """Resume fleet placement on the next accepted heartbeat."""
+    reply = admin_exchange({"op": "undrain_host"}, path)
+    if reply.get("ok") is not True or reply.get("draining") is not False:
+        raise ValueError(f"motor-host refused undrain_host: {reply}")
+    return reply
 
 
 def runner_log_lines(reply: dict) -> list[str]:
@@ -461,8 +499,23 @@ def main() -> int:
     runner_log.add_argument("--since", required=True, help="Unix seconds or ISO 8601 (UTC if no zone)")
     runner_log.add_argument("--until", help="Unix seconds or ISO 8601 (UTC if no zone)")
     runner_log.add_argument("--job", help="keep only entries naming this job id (jti)")
+    drain = commands.add_parser("drain-host", help="persist host drain and wait for the broker echo")
+    drain.add_argument("--timeout", type=float, default=120, help="seconds to wait (default: 120)")
+    commands.add_parser("undrain-host", help="clear the durable host drain")
+    commands.add_parser("host-status", help="show the local drain and latest broker echo")
     args = parser.parse_args()
     try:
+        if args.command in {"drain-host", "undrain-host", "host-status"}:
+            if args.command == "drain-host":
+                reply = drain_host(args.timeout)
+            elif args.command == "undrain-host":
+                reply = undrain_host()
+            else:
+                reply = admin_exchange({"op": "host_status"})
+                if reply.get("ok") is not True:
+                    raise ValueError(f"motor-host refused host_status: {reply}")
+            sys.stdout.write(render_json(reply))
+            return 0
         if args.command == 'install-network-settings':
             load_network_policy().install_settings(args.source)
             return 0
@@ -503,7 +556,7 @@ def main() -> int:
                                   None if args.installed is None else read_record(args.installed))
         else:
             value = tenant_config(args.sub, args.disk_quota_gib, args.image_version, args.installed, args.template)
-    except ValueError as error:
+    except (ValueError, OSError) as error:
         print(f"hosted-host: {error}", file=sys.stderr)
         return 2
     sys.stdout.write(render_json(value))

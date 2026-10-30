@@ -5,6 +5,7 @@ mod billing;
 mod broker;
 mod capacity;
 mod closure;
+mod drain;
 mod enroll;
 mod helper;
 mod replacement;

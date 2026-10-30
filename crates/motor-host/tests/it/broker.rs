@@ -54,6 +54,93 @@ fn queue_heartbeat(runtime: &Runtime, ms: u64) {
     host.queue_heartbeat("host", &heartbeat, ms).unwrap();
 }
 
+#[test]
+fn host_drain_changes_publish_without_waiting_for_the_heartbeat_interval() {
+    let runtime = Runtime::new("host".into(), host(), Arc::new(NoVm));
+    let mut publisher = motor_host::broker::Heartbeats::new(runtime.clone());
+    publisher.step(NOW * 1000).unwrap();
+    for (offset, op, expected) in [(1, "drain_host", true), (2, "undrain_host", false)] {
+        runtime.host_admin(&json!({"op":op})).unwrap();
+        publisher.step(NOW * 1000 + offset).unwrap();
+        let host = runtime.host.lock().unwrap();
+        let request = host.snapshot.outbox.last().unwrap();
+        assert_eq!(request.created_ms, NOW * 1000 + offset);
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["draining"].as_bool().unwrap_or(false), expected);
+        assert_eq!(body.get("draining").is_some(), expected);
+    }
+}
+
+#[test]
+fn host_drain_echo_parses_pinned_replies_and_records_receipt_time() {
+    let vector: Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/host-draining.json"
+    ))
+    .unwrap();
+    let replies: Vec<String> = vector["exchanges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|exchange| exchange["reply"]["body_bytes"].as_str().unwrap().to_owned())
+        .chain([
+            r#"{"ignored":[],"closed_subjects":[],"draining":false}"#.into(),
+            r#"{"ignored":[],"closed_subjects":[],"draining":"true"}"#.into(),
+            r#"{"error":"unavailable"}"#.into(),
+        ])
+        .collect();
+    let dir = scratch();
+    let runtime = Runtime::new("host".into(), disk_host(dir.path()), Arc::new(NoVm));
+    runtime.host_admin(&json!({"op":"drain_host"})).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut sender = Sender::new(
+        runtime.clone(),
+        ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    sender.test_endpoint(format!("http://{}", listener.local_addr().unwrap()));
+    let broker = std::thread::spawn(move || {
+        for (index, reply) in replies.into_iter().enumerate() {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (path, _, _) = signed_request(&stream);
+            assert!(path.ends_with("/heartbeat"));
+            let status = if index == 6 { 503 } else { 200 };
+            write!(
+                stream,
+                "HTTP/1.1 {status} Reply\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            )
+            .unwrap();
+        }
+    });
+    let mut last_reply = Value::Null;
+    for (index, expected) in [true, false, true, false, false, false, false]
+        .into_iter()
+        .enumerate()
+    {
+        let ms = NOW * 1000 + index as u64 * 10_000;
+        queue_heartbeat(&runtime, ms);
+        let before = motor_host::server::unix_ms();
+        sender.send_next(ms).unwrap();
+        let after = motor_host::server::unix_ms();
+        let status = runtime.host_admin(&json!({"op":"host_status"})).unwrap();
+        assert_eq!(status["draining"], true);
+        assert_eq!(status["broker_draining"], expected);
+        if index < 5 {
+            let received = status["broker_heartbeat_at_ms"].as_u64().unwrap();
+            assert!((before..=after).contains(&received));
+            last_reply = status["broker_heartbeat_at_ms"].clone();
+        } else {
+            assert_eq!(status["broker_heartbeat_at_ms"], last_reply);
+        }
+    }
+    broker.join().unwrap();
+    let restarted = Runtime::new("host".into(), disk_host(dir.path()), Arc::new(NoVm));
+    let status = restarted.host_admin(&json!({"op":"host_status"})).unwrap();
+    assert_eq!(status["draining"], true);
+    // A fresh process must obtain its own acknowledgement before switching.
+    assert_eq!(status["broker_heartbeat_at_ms"], Value::Null);
+}
+
 fn signed_request(stream: &std::net::TcpStream) -> (String, Vec<u8>, HostHeaders) {
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))

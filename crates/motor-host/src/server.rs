@@ -997,6 +997,25 @@ impl Runtime {
         }
         Ok(())
     }
+    pub fn host_admin(&self, request: &Value) -> Result<Value> {
+        let op = request["op"].as_str().context("admin operation")?;
+        ensure!(
+            matches!(op, "drain_host" | "undrain_host" | "host_status")
+                && request == &json!({"op": op}),
+            "invalid host admin operation"
+        );
+        let mut host = self.host.lock().expect("host lock");
+        let set_at_ms = match op {
+            "drain_host" | "undrain_host" => {
+                host.set_draining(op == "drain_host")?;
+                Some(unix_ms())
+            }
+            _ => None,
+        };
+        Ok(json!({"ok":true,"draining":host.snapshot.draining,
+            "broker_draining":host.broker_draining,
+            "broker_heartbeat_at_ms":host.broker_heartbeat_at_ms,"set_at_ms":set_at_ms}))
+    }
     pub fn admin(&self, tenant: &str, request: &Value) -> Result<Value> {
         ensure!(
             self.host
@@ -1854,13 +1873,16 @@ pub async fn admin_socket(runtime: Arc<Runtime>, path: &std::path::Path) -> Resu
         tokio::spawn(async move {
             let result = async {
                 let mut frame = read_frame(&mut stream).await?;
-                let tenant = frame["tenant"].as_str().context("tenant")?.to_owned();
-                frame
-                    .as_object_mut()
-                    .context("admin object")?
-                    .remove("tenant");
-                let result =
-                    tokio::task::spawn_blocking(move || runtime.admin(&tenant, &frame)).await??;
+                let result = if frame.get("tenant").is_some() {
+                    let tenant = frame["tenant"].as_str().context("tenant")?.to_owned();
+                    frame
+                        .as_object_mut()
+                        .context("admin object")?
+                        .remove("tenant");
+                    tokio::task::spawn_blocking(move || runtime.admin(&tenant, &frame)).await??
+                } else {
+                    tokio::task::spawn_blocking(move || runtime.host_admin(&frame)).await??
+                };
                 write_frame(&mut stream, &result).await
             }
             .await;

@@ -467,6 +467,46 @@ extra rule.
    enables the units, because an enabled unit would start on the next reboot
    and make the host placeable.
 
+## Drain the host for an update
+
+From the checkout on the host, pause fleet placement before stopping or switching
+any service:
+
+```sh
+sudo python3 script/hosted-host/hosted_host.py drain-host --timeout 120
+```
+
+The command sets the durable host drain, then waits until the broker echoes
+`draining: true` in a heartbeat reply received strictly after the set. A timeout
+exits nonzero, leaves the drain set, and stops the update: do not switch binaries
+without that acknowledgement. Inspect the local state and latest reply with:
+
+```sh
+sudo python3 script/hosted-host/hosted_host.py host-status
+```
+
+`draining` is what the host sends; `broker_draining` is the latest valid heartbeat
+reply's echo, and `broker_heartbeat_at_ms` is its receipt time in Unix milliseconds
+(null before a reply in the current host process). The drain survives motor-host
+and helper restarts. It does not cancel leases or refuse local admission.
+
+After the echo, wait for all existing leases to end, checking each tenant's normal
+admin `status` for queued and running jobs. Then stop the services, switch the
+binaries or tenant image, and run the existing `--check` and `--start` procedure
+above. Keep the host draining through the restart and run a canary lease with
+`placement_hint.host` set to the host's id. That explicit host hint remains binding
+while draining; ordinary fleet placement skips the host. Only after the canary
+succeeds, clear the drain:
+
+```sh
+sudo python3 script/hosted-host/hosted_host.py undrain-host
+```
+
+Clearing takes effect at the broker on the next accepted heartbeat. If the canary
+or update fails, leave the drain set while investigating or rolling back. A binary
+older than host self-drain ignores the journal field, so coordinate placement with
+the broker before rolling back to such a version.
+
 ## Roll back
 
 Ask the broker operator to stop placing on the host, then:

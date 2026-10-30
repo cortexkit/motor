@@ -229,6 +229,13 @@ impl Sender {
             .finish_request(&request, status, &body)?
         {
             if request.path.ends_with("/heartbeat") && (200..300).contains(&status) {
+                if let Some(draining) = heartbeat_draining(&body) {
+                    let mut host = self.runtime.host.lock().expect("host lock");
+                    host.broker_draining = draining;
+                    // Timestamp receipt, not send time: an update must wait for
+                    // the broker's acknowledgement after the drain was set.
+                    host.broker_heartbeat_at_ms = Some(crate::server::unix_ms());
+                }
                 self.closed_accounts(&body, now_ms);
             }
             self.in_flight = None;
@@ -323,6 +330,19 @@ impl Sender {
     fn failed(&mut self, now_ms: u64) {
         self.failures = self.failures.saturating_add(1);
         self.retry_at_ms = now_ms.saturating_add(retry_delay_ms(self.failures));
+    }
+}
+
+fn heartbeat_draining(reply: &Value) -> Option<bool> {
+    // A malformed success body is not evidence that placement has stopped.
+    for field in ["ignored", "closed_subjects"] {
+        if !reply[field].as_array()?.iter().all(Value::is_string) {
+            return None;
+        }
+    }
+    match reply.get("draining") {
+        Some(value) => value.as_bool(),
+        None => Some(false),
     }
 }
 
