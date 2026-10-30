@@ -91,6 +91,74 @@ pub(super) fn end(h: &mut Host, job: &str, seq: u64, at: u64, frame: Value) {
 }
 
 #[test]
+fn vm_memory_is_never_a_job_peak_when_the_runner_has_no_peak() {
+    let mut h = host();
+    started(&mut h, JOB, 1);
+    h.sample(
+        "tenant",
+        Metrics {
+            memory_bytes: 109_600 * 1_048_576,
+            egress_bytes: 100,
+        },
+    )
+    .unwrap();
+    end(&mut h, JOB, 3, MS + 3000, terminal(JOB, "exit"));
+    let usage = h.snapshot.billing[JOB].usage.as_ref().unwrap();
+    assert_eq!(usage.mem_peak_mib, None);
+    assert!(serde_json::to_value(usage).unwrap()["mem_peak_mib"].is_null());
+}
+
+#[test]
+fn terminal_lifecycle_settles_the_job_peak_even_with_another_job_in_the_vm() {
+    for overlapping in [false, true] {
+        let mut h = host();
+        started(&mut h, JOB, 1);
+        if overlapping {
+            admitted(&mut h, JOB2, 3);
+        }
+        let mut ended = event(4, TenantEventKind::Terminal, Some(JOB), None);
+        ended.mem_peak_mib = Some(481);
+        h.event("tenant", &ended, MS + 3000).unwrap();
+        h.sample(
+            "tenant",
+            Metrics {
+                memory_bytes: 109_600 * 1_048_576,
+                egress_bytes: 145,
+            },
+        )
+        .unwrap();
+        h.receive_terminal(JOB, terminal(JOB, "exit"), MS + 3000)
+            .unwrap();
+        h.terminal_delivered(JOB, MS + 3000).unwrap();
+        assert_eq!(
+            h.snapshot.billing[JOB].usage.as_ref().unwrap().mem_peak_mib,
+            Some(481)
+        );
+        let request = h
+            .snapshot
+            .outbox
+            .iter()
+            .find(|r| r.path.ends_with("/usage"))
+            .unwrap();
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["mem_peak_mib"], 481);
+    }
+}
+
+#[test]
+fn an_unstarted_job_cannot_report_a_memory_peak() {
+    let mut h = host();
+    admitted(&mut h, JOB, 1);
+    let mut ended = event(2, TenantEventKind::Terminal, Some(JOB), None);
+    ended.mem_peak_mib = Some(481);
+    h.event("tenant", &ended, MS + 3000).unwrap();
+    h.receive_terminal(JOB, terminal(JOB, "refused_before_start"), MS + 3000)
+        .unwrap();
+    let usage = h.snapshot.billing[JOB].usage.as_ref().unwrap();
+    assert_eq!(usage.mem_peak_mib, None);
+}
+
+#[test]
 fn observed_usage_ignores_guest_clocks_caps_and_maps_all_outcomes() {
     for (outcome, killed, expected) in [
         ("exit", None, UsageOutcome::Exit),
@@ -110,10 +178,7 @@ fn observed_usage_ignores_guest_clocks_caps_and_maps_all_outcomes() {
         let usage = b.usage.as_ref().unwrap();
         assert_eq!((usage.started_at_ms, usage.ended_at_ms), (MS, MS + 3000));
         assert_eq!(usage.outcome, expected);
-        assert_eq!(
-            (usage.mem_peak_mib, usage.egress_bytes),
-            (Some(13), Some(45))
-        );
+        assert_eq!((usage.mem_peak_mib, usage.egress_bytes), (None, Some(45)));
         assert_eq!(b.hosted_terminal.as_ref().unwrap()["billed_vcpu_ms"], 3000);
     }
     let mut h = host();
@@ -361,11 +426,10 @@ fn overlap_makes_both_metrics_null_and_missing_metrics_are_not_fabricated_zero()
 
 /// A tenant's own cache fill produces no usage record of its own. A job that
 /// runs beside its tenant's fill, whether the fill started before or after it,
-/// keeps its memory peak and egress in settlement: those VM-wide figures
-/// include the fill, which is that tenant's real usage on its own VM. Only a
-/// second job of the same tenant marks a job as overlapping.
+/// keeps its egress in settlement. Memory is unknown without a job-unit peak:
+/// the VM sample also includes the fill and cannot be attributed to the job.
 #[test]
-fn a_job_beside_its_tenants_fill_keeps_its_memory_and_egress() {
+fn a_job_beside_its_tenants_fill_keeps_egress_but_not_vm_memory() {
     let mut h = host();
     h.record_fill("tenant", MS, 4);
     h.billing_tick(MS + 120_000).unwrap();
@@ -388,7 +452,7 @@ fn a_job_beside_its_tenants_fill_keeps_its_memory_and_egress() {
         assert_eq!(usage.vcpus, claims(JOB).vcpus, "{fill_first}");
         assert_eq!(
             (usage.mem_peak_mib, usage.egress_bytes),
-            (Some(13), Some(45)),
+            (None, Some(45)),
             "{fill_first}"
         );
         assert_eq!(
@@ -427,10 +491,7 @@ fn a_forged_fill_report_grants_no_cpu_waives_no_usage_and_lowers_only_its_own_ca
     assert_eq!((honest_quota, honest_free), (1, 1));
     assert_eq!(quota, honest_quota);
     assert_eq!(usage, honest_usage);
-    assert_eq!(
-        (usage.mem_peak_mib, usage.egress_bytes),
-        (Some(13), Some(45))
-    );
+    assert_eq!((usage.mem_peak_mib, usage.egress_bytes), (None, Some(45)));
     assert_eq!(terminal, honest_terminal);
     assert_eq!(free, 0);
 

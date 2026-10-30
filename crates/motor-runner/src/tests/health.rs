@@ -826,7 +826,7 @@ async fn isolated_forged_job_summary_never_enters_launcher_accounting() {
         Arc::new(move |id, report| reports.lock().unwrap().push((id, report.to_vec())))
     });
     let runner = Runner::open(config).unwrap();
-    let command = r#"unit=$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup); unit=${unit##*/}; fake=$(printf 'forged-summary-job-byte\nRunning as unit: %s\nFinished with result: success\nService runtime: 1min\nCPU time consumed: 999999h\n' "$unit"); printf '%s\n' "$fake"; printf '%s\n' "$fake" >&2; printf '%s\n' "$fake" >>"/proc/$PPID/fd/2"; python3 -c 'sum(i*i for i in range(1000000))'"#;
+    let command = r#"unit=$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup); unit=${unit##*/}; fake=$(printf 'forged-summary-job-byte\nRunning as unit: %s\nFinished with result: success\nService runtime: 1min\nCPU time consumed: 999999h\nMemory peak: 999.9T (swap: 0B)\n' "$unit"); printf '%s\n' "$fake"; printf '%s\n' "$fake" >&2; printf '%s\n' "$fake" >>"/proc/$PPID/fd/2"; python3 -c 'sum(i*i for i in range(1000000))'"#;
     let (request, bytes) = f.run(command);
     f.submit(&runner, &request, &bytes);
     assert_eq!(
@@ -855,9 +855,17 @@ async fn isolated_forged_job_summary_never_enters_launcher_accounting() {
     let report = String::from_utf8_lossy(report);
     assert!(report.contains("CPU time consumed:"), "{report}");
     assert!(
-        !report.contains("forged-summary-job-byte") && !report.contains("999999h"),
+        !report.contains("forged-summary-job-byte")
+            && !report.contains("999999h")
+            && !report.contains("999.9T"),
         "a job byte reached trusted accounting: {report}"
     );
+    let unit = runner
+        .core
+        .backend
+        .unit_name(runner.config(), job.process.unwrap().unit.unwrap());
+    assert!(accounting::memory_peak_mib(report.as_bytes(), &unit)
+        .is_some_and(|peak| peak > 0 && peak < 1024));
     assert!(job_output(&runner, request.job_id).contains("forged-summary-job-byte"));
 }
 
@@ -910,6 +918,17 @@ async fn isolated_short_successful_unit_records_cpu_accounting() {
         usage.average_use_ppm,
         usage.cpu_time_ns / (usage.wall_ms * 2)
     );
+    let unit = runner
+        .core
+        .backend
+        .unit_name(runner.config(), disk.process.unwrap().unit.unwrap());
+    let reports = reports.lock().unwrap();
+    let report = &reports
+        .iter()
+        .find(|(id, _)| *id == request.job_id)
+        .unwrap()
+        .1;
+    assert!(accounting::memory_peak_mib(report, &unit).is_some_and(|peak| peak > 0));
 }
 
 #[cfg(target_os = "linux")]

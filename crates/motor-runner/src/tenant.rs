@@ -50,6 +50,7 @@ impl Events {
             jti,
             cause,
             setup: None,
+            mem_peak_mib: None,
         });
     }
 }
@@ -102,7 +103,8 @@ impl EventLog {
             return Ok(());
         };
         let started = job.started_ms.is_some() && !progress.started;
-        let terminal = job.terminal.is_some() && !progress.terminal;
+        let terminal =
+            job.terminal.is_some() && !job.memory_accounting_pending && !progress.terminal;
         if !started && !terminal {
             return Ok(());
         }
@@ -115,6 +117,7 @@ impl EventLog {
         }
         if terminal {
             state.push(TenantEventKind::Terminal, Some(job.id), None);
+            state.pending.back_mut().unwrap().mem_peak_mib = job.mem_peak_mib;
         }
         atomic_json_private(&self.path, &state)?;
         *guard = state;
@@ -319,6 +322,7 @@ mod tests {
                 jti: None,
                 cause: None,
                 setup: None,
+                mem_peak_mib: None,
             }
         );
     }

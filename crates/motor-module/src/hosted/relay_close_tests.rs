@@ -150,6 +150,7 @@ fn lifecycle(seq: u64, event: TenantEventKind, job: Uuid) -> TenantEvent {
         jti: Some(job),
         cause: None,
         setup: None,
+        mem_peak_mib: None,
     }
 }
 

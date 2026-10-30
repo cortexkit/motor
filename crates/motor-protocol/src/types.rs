@@ -376,6 +376,9 @@ pub struct HealthCounts {
     pub skipped_recent: u64,
     #[serde(default)]
     pub oom_stops: u64,
+    /// Hosted jobs whose final launcher summary had no usable memory peak.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub memory_peak_unavailable: u64,
 }
 
 impl std::ops::Deref for RunnerStatusReply {

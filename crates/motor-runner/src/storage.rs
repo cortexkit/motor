@@ -228,6 +228,13 @@ pub(crate) struct Job {
     /// Fixed execution end, independent of delayed launcher-accounting delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_ended_ms: Option<u64>,
+    /// The launcher's final displayed peak, conservatively rounded up to MiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_peak_mib: Option<u64>,
+    /// A live accounting reader will finish the terminal lifecycle event. A
+    /// restart loses that reader, so recovered records default to no pending read.
+    #[serde(skip)]
+    pub memory_accounting_pending: bool,
     /// The sibling snapshot directories this job's unit binds at its
     /// siblings' paths, set in the save that records its process and start.
     /// A running job without it was started with each sibling bound from its
@@ -337,6 +344,8 @@ impl Job {
             memory_limit_detail: None,
             reservation_use: None,
             execution_ended_ms: None,
+            mem_peak_mib: None,
+            memory_accounting_pending: false,
             sibling_sources: None,
             prepared_javascript_directories: Vec::new(),
         }

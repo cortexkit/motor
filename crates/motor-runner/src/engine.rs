@@ -7767,6 +7767,9 @@ impl Runner {
         job.state = JobState::Running;
         job.process = launch.process;
         job.durable_output = launch.durable_output;
+        job.memory_accounting_pending = self.core.tenant_events.is_some()
+            && launch.durable_output
+            && job.process.is_some_and(|p| p.unit.is_some());
         job.prepared_javascript_directories = prepared
             .sandbox
             .as_ref()
@@ -7843,6 +7846,15 @@ impl Runner {
             Ok(output) => Some(output),
             Err(error) if launch.durable_output => {
                 tracing::warn!(job_id = %id, %error, "job CPU accounting unavailable");
+                if std::mem::take(&mut inner.jobs.get_mut(&id).unwrap().memory_accounting_pending) {
+                    self.core
+                        .health
+                        .lock()
+                        .unwrap()
+                        .record(self.now(), |counts| {
+                            counts.memory_peak_unavailable += 1;
+                        });
+                }
                 None
             }
             Err(error) => {
@@ -7984,6 +7996,7 @@ impl Runner {
             inner.finalizing.insert(id);
             inner.jobs[&id].clone()
         };
+        finished.memory_accounting_pending = false;
         self.long_work("launch-cleanup");
         let mut delay = Duration::from_millis(50);
         loop {
@@ -8614,32 +8627,67 @@ impl Runner {
         )
     }
     fn collect_accounting(&self, id: Uuid, mut reader: impl Read) {
+        let unit = self
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .jobs
+            .get(&id)
+            .and_then(|job| job.process)
+            .and_then(|p| p.unit)
+            .map(|unit| self.core.backend.unit_name(&self.core.config, unit));
+        let mut report = Vec::new();
+        let read = reader.by_ref().take(65_537).read_to_end(&mut report);
+        let drained = io::copy(&mut reader, &mut io::sink());
+        #[cfg(test)]
+        if let Some(observe) = &self.core.config.accounting_report {
+            observe(id, &report);
+        }
+        let mut mem_peak_mib = None;
         let result = (|| -> io::Result<()> {
-            let unit = {
-                let inner = self.core.inner.lock().unwrap();
-                let process = inner.jobs[&id]
-                    .process
-                    .and_then(|process| process.unit)
-                    .ok_or_else(|| io::Error::other("job has no launch unit"))?;
-                self.core.backend.unit_name(&self.core.config, process)
-            };
-            #[cfg(test)]
-            let cpu_time_ns = if let Some(observe) = &self.core.config.accounting_report {
-                let mut report = Vec::new();
-                reader.by_ref().take(65_537).read_to_end(&mut report)?;
-                io::copy(&mut reader, &mut io::sink())?;
-                observe(id, &report);
-                accounting::read_cpu_time_ns(&report[..], &unit)?
-            } else {
-                accounting::read_cpu_time_ns(reader, &unit)?
-            };
-            #[cfg(not(test))]
-            let cpu_time_ns = accounting::read_cpu_time_ns(&mut reader, &unit)?;
-            self.record_cpu_time(id, cpu_time_ns)
+            read?;
+            drained?;
+            let unit = unit.ok_or_else(|| io::Error::other("job has no launch unit"))?;
+            mem_peak_mib = accounting::memory_peak_mib(&report, &unit);
+            self.record_cpu_time(id, accounting::read_cpu_time_ns(&report[..], &unit)?)
         })();
         if let Err(error) = result {
             tracing::warn!(job_id = %id, %error, "job CPU accounting unavailable");
         }
+        // The terminal and workspace can finish independently of launcher I/O.
+        // Only the hosted lifecycle event waits for the final memory summary.
+        while let Err(error) = self.record_memory_peak(id, mem_peak_mib) {
+            tracing::warn!(job_id = %id, %error, "job memory accounting persistence failed; retrying");
+            std::thread::park_timeout(Duration::from_secs(1));
+        }
+    }
+
+    fn record_memory_peak(&self, id: Uuid, mem_peak_mib: Option<u64>) -> io::Result<()> {
+        let log = self.job_log(id);
+        let _write = log.lock_write();
+        let mut inner = self.core.inner.lock().unwrap();
+        let Some(job) = inner.jobs.get(&id).filter(|j| j.memory_accounting_pending) else {
+            return Ok(());
+        };
+        let mut updated = job.clone();
+        updated.mem_peak_mib = mem_peak_mib;
+        updated.memory_accounting_pending = false;
+        drop(inner);
+        self.save(&updated)?;
+        inner = self.core.inner.lock().unwrap();
+        inner.jobs.insert(id, updated);
+        if mem_peak_mib.is_none() {
+            self.core
+                .health
+                .lock()
+                .unwrap()
+                .record(self.now(), |counts| {
+                    counts.memory_peak_unavailable += 1;
+                });
+            tracing::warn!(job_id = %id, "job memory peak unavailable in final launcher summary");
+        }
+        Ok(())
     }
 
     fn record_cpu_time(&self, id: Uuid, cpu_time_ns: u64) -> io::Result<()> {

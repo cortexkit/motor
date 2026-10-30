@@ -776,6 +776,7 @@ impl Host {
                             let billing = next.billing.entry(job.clone()).or_default();
                             billing.terminal_live = live_event;
                             billing.ended_observed_ms = Some(now_ms);
+                            billing.mem_peak_mib = event.mem_peak_mib.filter(|v| *v < (1 << 53));
                         }
                     }
                     TenantEventKind::Refused

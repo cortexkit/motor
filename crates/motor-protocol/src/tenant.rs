@@ -75,6 +75,9 @@ pub struct TenantEvent {
     pub cause: Option<RefusedCause>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<TenantSetupPhase>,
+    /// Final job-unit peak from the trusted launcher summary, rounded up to MiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_peak_mib: Option<u64>,
 }
 
 /// Trusted operation names only; never command arguments, paths or peer text.
