@@ -368,7 +368,13 @@ fn linux_connection_label_is_explicit_and_only_shown_for_direct_routing() {
         };
         cache.config.spill_to_hosted = route == "spill";
         let report = cache.report(now);
-        assert!(!report.detail.unwrap().contains("runner"));
+        // The detail opens with the caller's hostname, which can itself contain
+        // "runner" (CI hosts do), so check only the text after it.
+        let detail = report.detail.unwrap();
+        let summary = detail
+            .strip_prefix(&format!("{}: ", machine_name()))
+            .unwrap_or(&detail);
+        assert!(!summary.contains("runner"), "{detail}");
         assert_eq!(report.metrics.unwrap()["connection"]["runner"], "ok");
     }
 }
