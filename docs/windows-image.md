@@ -101,7 +101,9 @@ administrator, randomizes local passwords and runs, in order:
 2. `setup-job-baseline.ps1`: PowerShell 7.6.7 installed natively by the elevated
    `install-powershell.ps1` at `C:\Program Files\PowerShell\7`, protected with
    SYSTEM/Administrators full control and Users read/execute and added to machine
-   `PATH` so native tools rebuilding their environment also find it; Bun 1.4.2
+   `PATH` so native tools rebuilding their environment also find it; CMake 4.4.5,
+   Ninja 1.13.2 and Node 24 LTS with npm, each checksum-pinned and installed
+   under `C:\Program Files\` on machine `PATH`; Bun 1.4.4
    downloaded during provisioning from the official `bun-windows-x64.zip` release,
    verified against the SHA-256 from that release's `SHASUMS256.txt` (pins and
    source URL in `setup-job-baseline.ps1`), and installed at
