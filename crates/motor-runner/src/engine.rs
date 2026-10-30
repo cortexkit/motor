@@ -1004,6 +1004,9 @@ struct Inner {
     /// collecting changes or persisting the terminal for the same job.
     ended_executions: BTreeSet<Uuid>,
     cpu_times: BTreeMap<Uuid, u64>,
+    /// Null accounting has settled in memory, but its lifecycle event could not
+    /// yet be written. Retry event durability without retrying launcher I/O.
+    memory_event_retries: BTreeMap<Uuid, u64>,
     pending_start_refusals: BTreeSet<Uuid>,
     /// The sibling fences scheduling applies; fixed by the configuration.
     sibling_fences: crate::sibling_snapshots::SiblingFences,
@@ -2611,6 +2614,7 @@ impl Runner {
                     exit_statuses: BTreeMap::new(),
                     ended_executions: BTreeSet::new(),
                     cpu_times: BTreeMap::new(),
+                    memory_event_retries: BTreeMap::new(),
                     pending_start_refusals: BTreeSet::new(),
                     sibling_fences,
                 }),
@@ -6890,6 +6894,7 @@ impl Runner {
         Ok(())
     }
     fn tick(&self) -> io::Result<()> {
+        self.expire_memory_accounting();
         self.refresh_quarantine_admission(false);
         self.enforce_kills(std::time::Instant::now())?;
         let mut inner = self.core.inner.lock().unwrap();
@@ -7881,12 +7886,14 @@ impl Runner {
                 std::thread::spawn(move || {
                     let _ = io::copy(&mut { output.stdout }, &mut io::sink());
                 });
-                let runner = self.clone();
-                std::thread::spawn(move || runner.collect_accounting(id, output.stderr));
+                self.spawn_accounting_reader(id, output.stderr);
             }
             let runner = self.clone();
             std::thread::spawn(move || {
                 runner.monitor_unit(id);
+                // The launcher may still be stuck after the unit and job have
+                // finished. Its wait must not retain the runner instance lock.
+                drop(runner);
                 let _ = execution.wait();
                 execution.reap();
             });
@@ -8626,9 +8633,8 @@ impl Runner {
             execution_ended,
         )
     }
-    fn collect_accounting(&self, id: Uuid, mut reader: impl Read) {
-        let unit = self
-            .core
+    fn accounting_unit(&self, id: Uuid) -> Option<String> {
+        self.core
             .inner
             .lock()
             .unwrap()
@@ -8636,58 +8642,173 @@ impl Runner {
             .get(&id)
             .and_then(|job| job.process)
             .and_then(|p| p.unit)
-            .map(|unit| self.core.backend.unit_name(&self.core.config, unit));
-        let mut report = Vec::new();
-        let read = reader.by_ref().take(65_537).read_to_end(&mut report);
-        let drained = io::copy(&mut reader, &mut io::sink());
+            .map(|unit| self.core.backend.unit_name(&self.core.config, unit))
+    }
+
+    fn spawn_accounting_reader(
+        &self,
+        id: Uuid,
+        reader: Box<dyn Read + Send>,
+    ) -> std::thread::JoinHandle<()> {
+        let unit = self.accounting_unit(id);
+        let weak = Arc::downgrade(&self.core);
+        std::thread::spawn(move || {
+            // A launcher or inherited writer can keep this pipe open forever.
+            // Own no Core, workspace or instance lock until reading has ended.
+            let (report, read) = accounting::read_report(reader);
+            if let Some(core) = weak.upgrade() {
+                (Runner { core }).record_accounting(id, unit, &report, read);
+            }
+        })
+    }
+
+    #[cfg(test)]
+    fn collect_accounting(&self, id: Uuid, reader: impl Read) {
+        let unit = self.accounting_unit(id);
+        let (report, read) = accounting::read_report(reader);
+        self.record_accounting(id, unit, &report, read);
+    }
+
+    fn record_accounting(
+        &self,
+        id: Uuid,
+        unit: Option<String>,
+        report: &[u8],
+        read: io::Result<()>,
+    ) {
         #[cfg(test)]
         if let Some(observe) = &self.core.config.accounting_report {
-            observe(id, &report);
+            observe(id, report);
         }
         let mut mem_peak_mib = None;
         let result = (|| -> io::Result<()> {
             read?;
-            drained?;
             let unit = unit.ok_or_else(|| io::Error::other("job has no launch unit"))?;
-            mem_peak_mib = accounting::memory_peak_mib(&report, &unit);
-            self.record_cpu_time(id, accounting::read_cpu_time_ns(&report[..], &unit)?)
+            mem_peak_mib = accounting::memory_peak_mib(report, &unit);
+            self.record_cpu_time(id, accounting::read_cpu_time_ns(report, &unit)?)
         })();
         if let Err(error) = result {
             tracing::warn!(job_id = %id, %error, "job CPU accounting unavailable");
         }
-        // The terminal and workspace can finish independently of launcher I/O.
-        // Only the hosted lifecycle event waits for the final memory summary.
-        while let Err(error) = self.record_memory_peak(id, mem_peak_mib) {
-            tracing::warn!(job_id = %id, %error, "job memory accounting persistence failed; retrying");
-            std::thread::park_timeout(Duration::from_secs(1));
-        }
+        self.record_memory_peak(id, mem_peak_mib);
     }
 
-    fn record_memory_peak(&self, id: Uuid, mem_peak_mib: Option<u64>) -> io::Result<()> {
+    fn record_memory_peak(&self, id: Uuid, mem_peak_mib: Option<u64>) {
         let log = self.job_log(id);
         let _write = log.lock_write();
-        let mut inner = self.core.inner.lock().unwrap();
+        let inner = self.core.inner.lock().unwrap();
         let Some(job) = inner.jobs.get(&id).filter(|j| j.memory_accounting_pending) else {
-            return Ok(());
+            return;
         };
         let mut updated = job.clone();
+        drop(inner);
+        // Enforce the same deadline when the reader races the scheduler tick.
+        if Self::memory_summary_expired(&updated, self.now()) {
+            self.memory_peak_unavailable(updated, "final launcher summary timed out");
+            return;
+        }
+        if mem_peak_mib.is_none() {
+            self.memory_peak_unavailable(updated, "final launcher summary has no memory peak");
+            return;
+        }
         updated.mem_peak_mib = mem_peak_mib;
         updated.memory_accounting_pending = false;
-        drop(inner);
-        self.save(&updated)?;
-        inner = self.core.inner.lock().unwrap();
-        inner.jobs.insert(id, updated);
-        if mem_peak_mib.is_none() {
-            self.core
-                .health
-                .lock()
-                .unwrap()
-                .record(self.now(), |counts| {
-                    counts.memory_peak_unavailable += 1;
-                });
-            tracing::warn!(job_id = %id, "job memory peak unavailable in final launcher summary");
+        for _ in 0..accounting::MEMORY_PEAK_SAVE_ATTEMPTS {
+            if self.save(&updated).is_ok() {
+                self.core.inner.lock().unwrap().jobs.insert(id, updated);
+                return;
+            }
+            if Self::memory_summary_expired(&updated, self.now()) {
+                break;
+            }
         }
-        Ok(())
+        self.memory_peak_unavailable(updated, "memory peak persistence attempts exhausted");
+    }
+
+    fn memory_summary_expired(job: &Job, now: u64) -> bool {
+        job.terminal.is_some()
+            && job.finished_ms.is_some_and(|finished| {
+                now.saturating_sub(finished) >= accounting::FINAL_SUMMARY_GRACE_MS
+            })
+    }
+
+    // The caller owns the job's write lane, so a late reader cannot replace the
+    // null settlement or emit another Terminal after this transition.
+    fn memory_peak_unavailable(&self, mut job: Job, reason: &str) {
+        let id = job.id;
+        job.mem_peak_mib = None;
+        job.memory_accounting_pending = false;
+        let saved = self.save(&job);
+        // Job-record failures must not suppress an independently writable host
+        // lifecycle event. Pending reads are not serialized, so restart also
+        // observes the already-recorded terminal without waiting for a reader.
+        let event = if saved.is_err() {
+            self.core
+                .tenant_events
+                .as_ref()
+                .map_or(Ok(()), |log| log.observe(&job))
+        } else {
+            Ok(())
+        };
+        let mut inner = self.core.inner.lock().unwrap();
+        inner.jobs.insert(id, job);
+        if event.is_err() {
+            inner.memory_event_retries.insert(id, self.now() + 1000);
+        }
+        drop(inner);
+        self.core
+            .health
+            .lock()
+            .unwrap()
+            .record(self.now(), |counts| {
+                counts.memory_peak_unavailable += 1;
+            });
+        tracing::warn!(job_id = %id, reason, record_error = ?saved.err(), event_error = ?event.err(),
+            "job memory peak unavailable; settling without launcher accounting");
+    }
+
+    fn expire_memory_accounting(&self) {
+        let now = self.now();
+        let ids: Vec<_> = {
+            let inner = self.core.inner.lock().unwrap();
+            inner
+                .jobs
+                .values()
+                .filter(|job| {
+                    (job.memory_accounting_pending && Self::memory_summary_expired(job, now))
+                        || inner
+                            .memory_event_retries
+                            .get(&job.id)
+                            .is_some_and(|due| now >= *due)
+                })
+                .map(|job| job.id)
+                .collect()
+        };
+        for id in ids {
+            let log = self.job_log(id);
+            let Some(_write) = log.try_lock_write() else {
+                continue;
+            };
+            let job = self.core.inner.lock().unwrap().jobs.get(&id).cloned();
+            let Some(job) = job else { continue };
+            if job.memory_accounting_pending && Self::memory_summary_expired(&job, now) {
+                self.memory_peak_unavailable(job, "final launcher summary timed out");
+            } else {
+                // Only event-log durability is retried after null settlement,
+                // never the peak or the blocking reader. No worker sleeps here.
+                let saved = self
+                    .core
+                    .tenant_events
+                    .as_ref()
+                    .map_or(Ok(()), |log| log.observe(&job));
+                let mut inner = self.core.inner.lock().unwrap();
+                if saved.is_ok() {
+                    inner.memory_event_retries.remove(&id);
+                } else {
+                    inner.memory_event_retries.insert(id, now + 1000);
+                }
+            }
+        }
     }
 
     fn record_cpu_time(&self, id: Uuid, cpu_time_ns: u64) -> io::Result<()> {

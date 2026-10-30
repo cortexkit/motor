@@ -2,6 +2,9 @@ use super::*;
 use motor_protocol::{LeasePurpose, RefusedCause, TenantEventKind, VerifiedLease};
 use tokio::io::DuplexStream;
 
+#[path = "tenant_accounting.rs"]
+mod accounting;
+
 fn open(f: &Fixture) -> Runner {
     let mut config = f.config();
     config.manual_tick = true;
