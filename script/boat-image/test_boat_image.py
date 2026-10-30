@@ -144,7 +144,7 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(actual, {
             names[0]: ('rustup', 'toolchain', 'install', names[0], '--profile', 'minimal',
                        '--component', 'clippy', '--component', 'llvm-tools',
-                       '--component', 'rustfmt', *targets),
+                       '--component', 'rust-analyzer', '--component', 'rustfmt', *targets),
         })
         root = manifest['rustup_home'] + '/toolchains/'
         run.assert_any_call('cp', '-a', '--reflink=auto', root + names[0] + '/.', root + names[1])
@@ -188,8 +188,10 @@ class RecipeTests(unittest.TestCase):
             elif args[:3] == ('rustup', 'component', 'remove'):
                 state[args[4]]['components'].remove(args[5] + '-x86_64-unknown-linux-gnu')
             return ''
-        with patch.object(install, 'run', side_effect=run):
+        with patch.object(install, 'run', side_effect=run) as execute:
             install.install_rust(manifest, '/rustup-init')
+        self.assertNotIn('rust-analyzer-x86_64-unknown-linux-gnu', manifest['rust_toolchains'][stable]['components'])
+        execute.assert_any_call('rustup', 'component', 'remove', '--toolchain', stable, 'rust-analyzer')
         self.assertEqual(state[stable], manifest['rust_toolchains'][stable])
         self.assertEqual(state[numbered], manifest['rust_toolchains'][numbered])
 

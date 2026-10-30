@@ -5,8 +5,8 @@
     "wasm-opt uses apt binaryen (/usr/bin/wasm-opt) on the build server, where its major version is 120. Boat and tenant install the official Binaryen 120 x86_64 Linux release archive pinned by SHA-256 and remove the distro package. Parity checks the same major version and each role's executable path.",
     "Node's resolved installation directory may differ; its job-visible /usr/local/bin paths and Node/npm versions are exact. Bun is installed at /home/ubuntu/.bun/bin on the build server and Boat. The tenant image installs it at /usr/local/lib/motor/bun/bin, because a tenant VM's /home is the tenant's own workspace root, bound over the image's /home before the runner starts. The runner takes Bun, Node, npm and pnpm only from these per-role paths, never from HOME or PATH, and every role's jobs see Bun mounted at /home/ubuntu/.bun/bin (tools.bun.job_path).",
     "No global esbuild exists on the build server. ENGRAM provides ESBUILD_BIN from engram-worker/node_modules/.bin/esbuild using its repository lockfile install, and sets WASM_BINDGEN_BIN=wasm-bindgen and WASM_OPT_BIN=wasm-opt itself.",
-    "rust-analyzer, rls and cargo-miri are rustup proxies only in the measured state, not installed components. Jobs cannot install their missing components.",
-    "1.89.0 was present only in the old Boat pins, not on the measured build server; it is deliberately excluded. stable is a separate installed toolchain without clippy/rustfmt. Boat copies its matching pinned numbered release and removes unlisted components from that independent copy; it never installs the moving stable channel. No component superset exception is used, and the captured rustc version is exact.",
+    "rls and cargo-miri are rustup proxies only in the measured state, not installed components. Jobs cannot install their missing components.",
+    "1.89.0 was present only in the old Boat pins, not on the measured build server; it is deliberately excluded. stable is a separate installed toolchain without clippy/rustfmt/rust-analyzer. Boat copies its matching pinned numbered release and removes unlisted components from that independent copy; it never installs the moving stable channel. No component superset exception is used, and the captured rustc version is exact.",
     "Cargo executable hashes vary with native build inputs. Cargo binary versions and default pinned-variant identity are exact. Boat's patched sccache is identified by the build-input marker, recorded output hashes and a distinct stock binary, without starting a cache process; the build server's two sccache hashes are checked directly.",
     "The shared build server uses the host-wide prefrontal-build-slot compiler supervisor; its .cache file must point to the trusted /motor-tools/sccache wrapper, which reads the read-only shared compile cache. Boat and tenant jobs get no compile cache: no fill runs there, and an empty read-only cache breaks C builds that cc-rs routes through sccache. Neither image's jobs have RUSTC_WRAPPER, SCCACHE_DIR or /motor-tools on PATH. Tenant's immutable Rustup home is /usr/local/lib/motor/rustup and its mounted Cargo bin is /tenant/cargo-home/bin. Bun precedes Cargo on every role's job PATH. Inotify instance capacity must be at least 8192; watch/event limits are recorded because kernel RAM-based defaults differ."
   ],
@@ -646,6 +646,7 @@
         "cargo-x86_64-unknown-linux-gnu",
         "clippy-x86_64-unknown-linux-gnu",
         "llvm-tools-x86_64-unknown-linux-gnu",
+        "rust-analyzer-x86_64-unknown-linux-gnu",
         "rust-std-aarch64-apple-ios",
         "rust-std-aarch64-apple-ios-sim",
         "rust-std-aarch64-pc-windows-msvc",

@@ -29,6 +29,26 @@ place() {
 }
 
 if [ "$mode" = all ]; then
+# Job Rustup homes are read-only, so provision the default release's optional
+# components before installing Cargo tools that use that release.
+rust_components=$(python3 - "$here/toolchain.json" <<'PY'
+import json, sys
+manifest = json.load(open(sys.argv[1]))
+toolchain = manifest["rust_default"]
+host = toolchain.split("-", 1)[1]
+for installed in manifest["rust_toolchains"][toolchain]["components"]:
+    component = installed.removesuffix("-" + host)
+    if component in {"cargo", "rustc", "rust-std"} or component.startswith("rust-std-"):
+        continue
+    component = {"clippy-preview": "clippy", "rustfmt-preview": "rustfmt"}.get(component, component)
+    print(toolchain, component)
+PY
+)
+while read -r toolchain component; do
+  [ -n "$toolchain" ] || continue
+  rustup component add --toolchain "$toolchain" "$component"
+done <<< "$rust_components"
+
 tools=$(python3 -c '
 import json, sys
 for tool in json.load(open(sys.argv[1]))["cargo_installs"]:
