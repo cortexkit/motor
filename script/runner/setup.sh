@@ -31,6 +31,20 @@ sudo -n true
 mountpoint -q /srv/build
 test "$(findmnt -n -o FSTYPE /srv/build)" = xfs
 export DEBIAN_FRONTEND=noninteractive
+if [ -d /etc/needrestart ]; then
+  needrestart_config=$(sudo -n mktemp /srv/build/.motor-needrestart.XXXXXX)
+  trap 'sudo -n rm -f "$needrestart_config"' EXIT
+  sudo -n tee "$needrestart_config" >/dev/null <<'NEEDRESTART'
+# Never let package installs restart services on a hosted host: restarting
+# motor-vm-helper stops every tenant VM and ends all jobs on it. List only.
+$nrconf{restart} = "l";
+NEEDRESTART
+  if ! sudo -n cmp -s "$needrestart_config" /etc/needrestart/conf.d/90-motor-list-only.conf; then
+    sudo -n install -D -o root -g root -m 0644 "$needrestart_config" /etc/needrestart/conf.d/90-motor-list-only.conf
+  fi
+  sudo -n rm -f "$needrestart_config"
+  trap - EXIT
+fi
 sudo -n apt-get update
 # Workspace build.rs files invoke rustc and hash Cargo.lock, with no generators.
 # Bundled SQLite/crypto dependencies need the C toolchain. unzip is required by

@@ -21,6 +21,12 @@ DEST = '/etc/systemd/journald.conf.d/60-motor-retention.conf'
 # which sorts after names starting with a digit or a lowercase letter.
 BOAT_DEST = '/etc/systemd/journald.conf.d/zz-motor-retention.conf'
 INOTIFY = '/etc/sysctl.d/60-motor-inotify.conf'
+NEEDRESTART = '/etc/needrestart/conf.d/90-motor-list-only.conf'
+NEEDRESTART_POLICY = (
+    b'# Never let package installs restart services on a hosted host: restarting\n'
+    b'# motor-vm-helper stops every tenant VM and ends all jobs on it. List only.\n'
+    b'$nrconf{restart} = "l";\n'
+)
 
 
 def module(name, relative):
@@ -103,7 +109,7 @@ class JournalRetentionTests(unittest.TestCase):
                      self.assertRaisesRegex(ValueError, 'journald MaxRetentionSec'):
                     boat.install_journal_retention()
 
-    def shell(self, body, check=0, answers=''):
+    def shell(self, body, check=0, answers='', expected_problems=None):
         log = self.root / 'calls.jsonl'
         helper = self.root / 'install-fixture.py'
         helper.write_text('''import json, os, pathlib, subprocess, sys
@@ -123,19 +129,30 @@ sudo() { test "$1" = -n; shift; "$@"; }
 install() { python3 "$HELPER" install "$@"; }
 systemctl() { python3 "$HELPER" systemctl "$@"; }
 sysctl() { python3 "$HELPER" sysctl "$@"; }
+cmp() {
+  local args=("$@")
+  local last=$((${#args[@]} - 1))
+  if [[ "${args[$last]}" = /etc/* ]]; then args[$last]=$FIXTURE${args[$last]}; fi
+  command cmp "${args[@]}"
+}
 cd() { builtin cd "$CHECKOUT"; }
 bash() { test "$*" = 'script/runner/install-tools.sh build-server runtime-only'; }
 directory() { mkdir -p "$FIXTURE$1"; }
 ok() { :; }
-fail() { problems=$((problems + 1)); }
+fail() { echo "FAIL: $*" >&2; problems=$((problems + 1)); }
 attrs() { printf 'root:root %s\\n' "$(stat -c %a "$1")"; }
 checkout=$CHECKOUT
+scratch=$FIXTURE/staged
+mkdir -p "$scratch"
 problems=0 skipped=0
 '''
         env = dict(os.environ, HELPER=str(helper), FIXTURE=str(self.root),
                    CHECKOUT=str(ROOT), CALLS=str(log))
+        if expected_problems is not None:
+            body += f'\ntest "$problems" = {expected_problems}\n'
         result = subprocess.run(['bash', '-c', harness + f'check={check}\n' + body],
                                 input=answers, text=True, capture_output=True, env=env, cwd=ROOT)
+        self.shell_output = result.stdout + result.stderr
         self.assertEqual(0, result.returncode, result.stderr + result.stdout)
         return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
 
@@ -171,7 +188,8 @@ problems=0 skipped=0
         network = re.search(r'\nNETWORK_CONFIG=[^\n]*\n', script)
         self.assertIsNotNone(network)
         assert network is not None
-        return network[0] + place + functions[1] + '\nhost_configs\n'
+        body = network[0] + place + functions[1] + '\nhost_configs\n'
+        return body.replace('[ -d /etc/needrestart ]', '[ -d "$FIXTURE/etc/needrestart" ]')
 
     def test_hosted_installs_both_configs_and_applies_them(self):
         calls = self.shell(self.hosted_functions(), answers='y\ny\n')
@@ -187,6 +205,66 @@ problems=0 skipped=0
         self.assertEqual([], self.shell(self.hosted_functions(), check=1))
         self.assertEqual([], self.shell(self.hosted_functions(), answers='n\nn\n'))
         self.assertFalse((self.root / DEST.lstrip('/')).exists())
+
+    def needrestart_body(self, installer):
+        if installer == 'hosted':
+            for dest, source in ((DEST, SOURCE), (INOTIFY, 'script/runner/sysctl/60-motor-inotify.conf')):
+                path = self.root / dest.lstrip('/')
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes((ROOT / source).read_bytes())
+                path.chmod(0o644)
+            return self.hosted_functions()
+        script = (ROOT / 'script/runner/setup.sh').read_text()
+        body = script.split('export DEBIAN_FRONTEND=noninteractive\n', 1)[1].split('sudo -n apt-get update', 1)[0]
+        return body.replace('[ -d /etc/needrestart ]', '[ -d "$FIXTURE/etc/needrestart" ]').replace(
+            '/srv/build/.motor-needrestart.', str(self.root / '.motor-needrestart.'))
+
+    def test_needrestart_written_when_missing_and_unchanged_when_present(self):
+        for installer in ('hosted', 'runner'):
+            with self.subTest(installer=installer):
+                path = self.root / NEEDRESTART.lstrip('/')
+                if path.exists():
+                    path.unlink()
+                (self.root / 'etc/needrestart').mkdir(parents=True, exist_ok=True)
+                body = self.needrestart_body(installer)
+                calls = self.shell(body, answers='y\n', expected_problems=0)
+                writes = [call for call in calls if call[0] == 'install' and call[-1] == NEEDRESTART]
+                self.assertEqual(1, len(writes))
+                self.assertEqual(['-o', 'root', '-g', 'root'], writes[0][writes[0].index('-o'):writes[0].index('-m')])
+                self.assertEqual('644', writes[0][writes[0].index('-m') + 1].lstrip('0'))
+                self.assertEqual(NEEDRESTART_POLICY, path.read_bytes())
+                self.assertEqual(0o644, stat.S_IMODE(path.stat().st_mode))
+                before = path.stat()
+                (self.root / 'calls.jsonl').unlink()
+                calls = self.shell(body, expected_problems=0)
+                self.assertFalse(any(call[0] == 'install' and call[-1] == NEEDRESTART for call in calls))
+                self.assertEqual(NEEDRESTART_POLICY, path.read_bytes())
+                self.assertEqual((before.st_ino, before.st_mtime_ns), (path.stat().st_ino, path.stat().st_mtime_ns))
+                self.assertEqual([path], list(path.parent.iterdir()))
+
+    def test_needrestart_is_not_created_when_needrestart_is_absent(self):
+        for installer in ('hosted', 'runner'):
+            with self.subTest(installer=installer):
+                calls = self.shell(self.needrestart_body(installer), expected_problems=0)
+                self.assertFalse(any(call[0] == 'install' and call[-1] == NEEDRESTART for call in calls))
+                self.assertFalse((self.root / 'etc/needrestart').exists())
+
+    def test_hosted_check_reports_missing_or_different_needrestart_without_writing(self):
+        body = self.needrestart_body('hosted')
+        path = self.root / NEEDRESTART.lstrip('/')
+        path.parent.mkdir(parents=True)
+        for content, problem in ((None, 'missing'), (b'$nrconf{restart} = "a";\n', 'different from this checkout')):
+            with self.subTest(content=content):
+                if content is not None:
+                    path.write_bytes(content)
+                    path.chmod(0o644)
+                self.assertEqual([], self.shell(body, check=1, expected_problems=1))
+                self.assertIn(f'FAIL: {path} is {problem}', self.shell_output)
+                self.assertEqual(content, path.read_bytes() if path.exists() else None)
+        path.write_bytes(NEEDRESTART_POLICY)
+        before = path.stat()
+        self.assertEqual([], self.shell(body, check=1, expected_problems=0))
+        self.assertEqual(before.st_mtime_ns, path.stat().st_mtime_ns)
 
 
 if __name__ == '__main__':
