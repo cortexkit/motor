@@ -2,6 +2,21 @@ use std::io::{self, Read};
 
 const MAX_REPORT_BYTES: usize = 64 * 1024;
 
+// systemd-run prints its final summary as soon as the unit stops. A stuck
+// launcher must not keep the host's capacity and settlement waiting for EOF.
+pub(super) const FINAL_SUMMARY_GRACE_MS: u64 = 30_000;
+pub(super) const MEMORY_PEAK_SAVE_ATTEMPTS: usize = 3;
+
+pub(super) fn read_report(mut reader: impl Read) -> (Vec<u8>, io::Result<()>) {
+    let mut report = Vec::new();
+    let read = reader
+        .by_ref()
+        .take((MAX_REPORT_BYTES + 1) as u64)
+        .read_to_end(&mut report);
+    let drained = io::copy(&mut reader, &mut io::sink());
+    (report, read.and(drained).map(|_| ()))
+}
+
 /// Parse the launcher's final report, never the service's output or its journal.
 pub(super) fn read_cpu_time_ns(mut reader: impl Read, unit: &str) -> io::Result<u64> {
     let mut report = Vec::new();
