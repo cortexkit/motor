@@ -2473,6 +2473,20 @@ fn prepare_cargo_checkouts(
     Ok(())
 }
 
+fn known_checkout_git_commits(
+    workspace: crate::caller_path::JobTree<'_>,
+    tree: &str,
+    siblings: &[SiblingSnapshot],
+    snapshots: Option<&SnapshotSiblings<'_>>,
+) -> io::Result<Vec<String>> {
+    let mut commits = std::collections::BTreeSet::new();
+    prepare_cargo_checkouts(workspace, tree, siblings, snapshots, |checkout, tree| {
+        commits.extend(known_git_commits(checkout.host.as_path(), tree)?);
+        Ok(())
+    })?;
+    Ok(commits.into_iter().collect())
+}
+
 /// Populate sources as the trusted daemon, never as the cache-writing account.
 /// Writer inputs are its mirror-materialized tip, not the requesting branch.
 /// With `snapshots`, every fetch runs in a helper unit that shows the job's
@@ -2902,12 +2916,12 @@ impl Sandbox {
         } else {
             Vec::new()
         };
-        // Read the lockfiles' git commits before dissociating: the snapshot tree
-        // of a caller with uncommitted changes is reachable only through the
-        // mirror alternates, and the repack below keeps just what the
-        // checkout's own refs reach, so afterwards `tree` may no longer exist.
+        // Seed the private Cargo cache from every requested checkout, just as
+        // prefetch does; a sibling can lock Git commits the workspace never uses.
+        // Read before dissociating: an uncommitted snapshot tree may be reachable
+        // only through mirror alternates, which the repack below removes.
         let locked_git_commits = if tenant_vm {
-            known_git_commits(workspace, tree)?
+            known_checkout_git_commits(job_tree, tree, siblings, snapshots)?
         } else {
             Vec::new()
         };
