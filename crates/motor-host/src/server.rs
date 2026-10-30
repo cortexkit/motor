@@ -1390,7 +1390,8 @@ where
         streamed.store(true, Ordering::Release);
         // Split a borrow, not the stream itself: once the relay ends, `serve`
         // still needs the client stream to close it gracefully.
-        let (mut cr, mut cw) = tokio::io::split(&mut client);
+        let (mut cr, cw) = tokio::io::split(&mut client);
+        let cw = tokio::sync::Mutex::new(cw);
         let (gr, mut gw) = guest.split();
         // Buffered, so the output pump can tell which frames have already
         // arrived in full and take them as one batch.
@@ -1442,6 +1443,47 @@ where
                 }
             }
         };
+        // Bound read-ahead for real output without coupling transport-only
+        // heartbeats to the Host-state work in the ordered output pump.
+        let (guest_frames, mut frames) = tokio::sync::mpsc::channel(1);
+        let read_guest = async {
+            loop {
+                tokio::task::yield_now().await;
+                let mut batch = Vec::new();
+                let mut read_error = None;
+                let mut ended = false;
+                for _ in 0..RELAY_BATCH_FRAMES {
+                    match read_frame(&mut gr).await {
+                        Ok(frame) if frame["type"] == "heartbeat" && frame.get("seq").is_none() => {
+                            // Transport keepalives have no durable sequence. They
+                            // must remain writable while output or settlement
+                            // waits for the Host mutex or a journal sync.
+                            relay_trace.client_frame(&mut *cw.lock().await, &frame).await.at(Side::Client, "relay")?;
+                        }
+                        Ok(frame) => {
+                            ended = frame["type"] == "terminal";
+                            batch.push(frame);
+                        }
+                        Err(error) => {
+                            read_error = Some(error);
+                            ended = true;
+                        }
+                    }
+                    if ended || !buffered_frame_ready(gr.buffer()) {
+                        break;
+                    }
+                }
+                if (!batch.is_empty() || read_error.is_some())
+                    && guest_frames.send((batch, read_error)).await.is_err()
+                {
+                    break;
+                }
+                if ended {
+                    break;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        };
         let to_client = async {
             let mut cursor: u64 = 0;
             loop {
@@ -1449,10 +1491,8 @@ where
                 // shared task. Each turn handles at most one batch of guest
                 // frames before yielding; slow state work also yields while awaited.
                 tokio::task::yield_now().await;
-                // The pending read borrows the guest reader, so it lives only in
-                // this block; the batch below reads the reader's buffer.
                 let first = {
-                    let read = read_frame(&mut gr);
+                    let read = frames.recv();
                     tokio::pin!(read);
                     loop {
                         tokio::select! {
@@ -1464,7 +1504,7 @@ where
                                 let frames = relay_state(&runtime, &claims.jti, move |host, jti| host.host_settled_frames(jti, cursor.saturating_add(1))).await?;
                                 if let Some(frames) = frames {
                                     draining_terminal.store(true, Ordering::Release);
-                                    for frame in frames { relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?; }
+                                    for frame in frames { relay_trace.client_frame(&mut *cw.lock().await, &frame).await.at(Side::Client, "relay")?; }
                                     terminal_written.store(true, Ordering::Release);
                                     break None;
                                 }
@@ -1480,27 +1520,12 @@ where
                 // a second, so a replay or the burst after a cancel never reached
                 // its terminal before the client gave up. Only complete buffered
                 // frames join, so the batch never waits on the guest.
-                let mut batch = Vec::new();
-                let mut read_error = None;
-                match first {
-                    Ok(frame) => batch.push(frame),
-                    Err(error) => read_error = Some(error),
-                }
-                while read_error.is_none()
-                    && batch.len() < RELAY_BATCH_FRAMES
-                    && batch.last().is_some_and(|frame| frame["type"] != "terminal")
-                    && buffered_frame_ready(gr.buffer())
-                {
-                    match read_frame(&mut gr).await {
-                        Ok(frame) => batch.push(frame),
-                        Err(error) => read_error = Some(error),
-                    }
-                }
+                let Some((batch, read_error)) = first else { return Ok(()); };
                 let settled = relay_state(&runtime, &claims.jti, move |host, jti| host.host_settled_frames(jti, cursor.saturating_add(1))).await?;
                 if let Some(frames) = settled {
                     draining_terminal.store(true, Ordering::Release);
                     tracing::warn!(jti=claims.jti, "host_settled_runner_frame_ignored");
-                    for frame in frames { relay_trace.client_frame(&mut cw,&frame).await.at(Side::Client, "relay")?; }
+                    for frame in frames { relay_trace.client_frame(&mut *cw.lock().await,&frame).await.at(Side::Client, "relay")?; }
                     terminal_written.store(true, Ordering::Release);
                     return Ok::<(),anyhow::Error>(());
                 }
@@ -1518,7 +1543,7 @@ where
                     // forwarding while this connection waits for billing.
                     draining_terminal.store(true, Ordering::Release);
                     if runtime.sandbox_identity.is_some() {
-                        relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
+                        relay_trace.client_frame(&mut *cw.lock().await, &frame).await.at(Side::Client, "relay")?;
                         terminal_written.store(true, Ordering::Release);
                         return Ok::<(),anyhow::Error>(());
                     }
@@ -1535,13 +1560,13 @@ where
                         if let Some(value) = value { break value; }
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     };
-                    relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
-                    relay_trace.client_frame(&mut cw, &hosted).await.at(Side::Client, "relay")?;
+                    relay_trace.client_frame(&mut *cw.lock().await, &frame).await.at(Side::Client, "relay")?;
+                    relay_trace.client_frame(&mut *cw.lock().await, &hosted).await.at(Side::Client, "relay")?;
                     terminal_written.store(true, Ordering::Release);
                     tracing::debug!(jti = claims.jti, "connection_terminal_written");
                     return Ok::<(),anyhow::Error>(());
                 }
-                relay_trace.client_frame(&mut cw, &frame).await.at(Side::Client, "relay")?;
+                relay_trace.client_frame(&mut *cw.lock().await, &frame).await.at(Side::Client, "relay")?;
                 }
                 if let Some(error) = read_error {
                     return Err(error).at(Side::Guest, "relay");
@@ -1549,6 +1574,13 @@ where
             }
             #[allow(unreachable_code)]
             Ok::<(), anyhow::Error>(())
+        };
+        let to_client = async {
+            tokio::pin!(read_guest, to_client);
+            tokio::select! {
+                result = &mut to_client => result,
+                result = &mut read_guest => { result?; to_client.await }
+            }
         };
         tokio::select! { result = to_guest => { result?; }, result = to_client => { result?; } }
         Ok(())
