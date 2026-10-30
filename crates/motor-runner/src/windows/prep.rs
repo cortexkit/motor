@@ -735,18 +735,9 @@ fn fetch_manifest(
     manifest: &Path,
     fetch: &mut impl FnMut(&mut Command) -> io::Result<()>,
 ) -> io::Result<()> {
-    let mut command = cargo_command(
-        plan,
-        manifest,
-        &[
-            "fetch",
-            "--locked",
-            "--target",
-            "x86_64-pc-windows-msvc",
-            "--target",
-            "aarch64-pc-windows-msvc",
-        ],
-    );
+    // Unfiltered offline metadata needs every locked platform's crates, not just
+    // Windows dependencies. Fetching without a target also covers ARM64 Windows.
+    let mut command = cargo_command(plan, manifest, &["fetch", "--locked"]);
     command.args(["--config", "net.git-fetch-with-cli=true"]);
     crate::workspace::dependencies::configure_fetch_git(
         &mut command,
