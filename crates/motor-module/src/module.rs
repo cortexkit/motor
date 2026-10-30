@@ -13,10 +13,12 @@ use std::{
         Arc, Mutex, OnceLock,
     },
 };
+#[cfg(test)]
+use subc_client_rs::HealthStatus;
 use subc_client_rs::{
-    async_trait, BindDecision, ConnectionEnd, HandlerOutcome, HealthReport, HealthStatus,
-    ModuleHandle, ModuleHandler, RequestClass, RequestCtx, RequestPool, RequestPools,
-    RouteBindRequest, RouteHandle,
+    async_trait, BindDecision, ConnectionEnd, HandlerOutcome, HealthReport, ModuleHandle,
+    ModuleHandler, RequestClass, RequestCtx, RequestPool, RequestPools, RouteBindRequest,
+    RouteHandle,
 };
 use subc_protocol::{
     manifest::{
@@ -416,6 +418,7 @@ impl Handler {
     }
 
     pub fn new(config: Config) -> Self {
+        let health_cache = crate::health_cache::HealthCache::new(config.clone());
         Self {
             config,
             module_id: DEFAULT_MODULE_ID.into(),
@@ -433,7 +436,7 @@ impl Handler {
             storage_ready_deadline: STORAGE_READY_DEADLINE,
             #[cfg(test)]
             storage_gate: None,
-            health_cache: Arc::new(Mutex::new(crate::health_cache::HealthCache::default())),
+            health_cache: Arc::new(Mutex::new(health_cache)),
             health_sampler: Arc::new(Mutex::new(crate::health_cache::Sampler::default())),
             write_engram_catalog: false,
         }
@@ -619,6 +622,8 @@ impl Handler {
         }
         let motor = self.motor.get().expect("storage initialized").clone();
         let cache = Arc::clone(&self.health_cache);
+        let tokens = self.account_tokens.clone();
+        let config = self.config.clone();
         sampler.0 = Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(crate::health_cache::REFRESH_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -632,9 +637,33 @@ impl Handler {
                 .ok()
                 .and_then(Result::ok);
                 let windows = motor.windows_health().await;
+                let macos = motor.macos_health().await;
+                let jobs = tokio::time::timeout(
+                    crate::health_cache::SAMPLE_TIMEOUT,
+                    motor.machine_jobs_health(),
+                )
+                .await
+                .ok();
+                let account = if config.hosted_runners
+                    || !config.hosted_repositories.is_empty()
+                    || config.spill_to_hosted
+                {
+                    tokio::time::timeout(
+                        crate::health_cache::SAMPLE_TIMEOUT,
+                        crate::hosted::check::check(tokens.as_ref(), &config),
+                    )
+                    .await
+                    .ok()
+                    .map(crate::health_cache::account_health)
+                } else {
+                    None
+                };
                 let mut cache = cache.lock().unwrap();
                 cache.update(sample, std::time::Instant::now());
                 cache.windows = windows;
+                cache.macos = macos;
+                cache.jobs = jobs;
+                cache.account = account;
             }
         }));
     }
@@ -1051,50 +1080,21 @@ impl ModuleHandler for Handler {
                 .and_then(|ssh| ssh.health_refusal())
                 .map(str::to_owned)
         };
-        let mut report = self
-            .health_cache
-            .lock()
-            .unwrap()
-            .report(std::time::Instant::now());
-        if let Some(role) = self.motor.get().and_then(Motor::direct_linux_health_role) {
-            if let Some(detail) = report.detail.as_mut() {
-                if let Some(rest) = detail.strip_prefix("build server") {
-                    *detail = format!("build server (direct Linux: {role}){rest}");
-                }
+        let mut report = {
+            let cache = self.health_cache.lock().unwrap();
+            let now = std::time::Instant::now();
+            match reason.as_deref() {
+                Some(reason) => cache.report_with_refusal(now, Some(reason)),
+                None => cache.report(now),
             }
-            if let Some(metrics) = report.metrics.as_mut().and_then(Value::as_object_mut) {
-                metrics.insert("direct_linux_workload".into(), json!(role));
-            }
-        }
-        if let Some(hosted) = self.motor.get().and_then(|motor| motor.hosted_health()) {
-            if let Some(hosts) = hosted["hosted_hosts"].as_array() {
-                for host in hosts {
-                    let name = host["host"].as_str().unwrap_or("unknown");
-                    let outcome = host["last_lease_outcome"].as_str().unwrap_or("unknown");
-                    report.detail.get_or_insert_default().push_str(&format!(
-                        "; hosted {name}: last lease {outcome}, capacity unavailable"
-                    ));
-                }
-            }
-            if let Some(metrics) = report.metrics.as_mut().and_then(Value::as_object_mut) {
-                metrics.insert("hosted".into(), hosted);
-            }
-        }
-        // The detail line stays one sentence; the refusal counters are
-        // diagnostics, shown with `ck health ck-motor --verbose`.
+        };
+        // These counters describe this machine's module, not remote hosts.
         if let Some(serde_json::Value::Object(metrics)) = report.metrics.as_mut() {
             metrics.insert("request_pools".into(), self.pool_metrics());
             metrics.insert(
                 "unreachable_refusals_since_boot".into(),
                 crate::diagnostics::health_metrics(),
             );
-        }
-        if let Some(reason) = reason {
-            report.status = HealthStatus::Failing;
-            report.detail = Some(match report.detail.take() {
-                Some(detail) => format!("{reason}; {detail}"),
-                None => reason,
-            });
         }
         report
     }
@@ -1467,7 +1467,7 @@ mod health_tests {
     }
 
     #[tokio::test]
-    async fn health_lists_retained_host_leases_without_inventing_capacity() {
+    async fn health_hides_retained_host_leases_from_text_and_metrics() {
         let scratch = cortexkit_test_support::ScratchDir::new("motor-hosted-health");
         let calls = Arc::new(AtomicUsize::new(0));
         {
@@ -1500,32 +1500,25 @@ mod health_tests {
             Arc::new(CountingConnector(calls.clone())),
         )
         .unwrap();
-        let runner_health = motor.hosted_health().unwrap();
+        assert!(motor.hosted_health().unwrap()["hosted_hosts"].is_array());
         let handler = Handler::new(Config::default()).with_motor(motor);
         let report = handler.health().await;
         let detail = report.detail.unwrap();
-        assert!(
-            detail.contains("hosted ovh-2: last lease host_full, capacity unavailable"),
-            "{detail}"
-        );
-        assert!(
-            detail.contains("hosted other-host: last lease leased"),
-            "{detail}"
-        );
-        let hosted = &report.metrics.unwrap()["hosted"];
-        assert_eq!(hosted, &runner_health);
-        assert_eq!(hosted["hosted_hosts"].as_array().unwrap().len(), 2);
-        assert_eq!(hosted["hosted_hosts"][1]["host"], "ovh-2");
-        assert_eq!(hosted["hosted_hosts"][1]["last_lease_outcome"], "host_full");
-        assert_eq!(
-            hosted["hosted_hosts"][1].get("capacity"),
-            Some(&Value::Null)
-        );
-        assert_eq!(hosted["hosted_hosts_source"], "retained_leases");
-        assert!(hosted["hosted_hosts_missing"]
-            .as_str()
-            .unwrap()
-            .contains("live capacity"));
+        let metrics = report.metrics.unwrap();
+        let output = format!("{detail} {metrics}");
+        for private in [
+            "ovh-2",
+            "other-host",
+            "boat:test",
+            "tenant",
+            "host_full",
+            "hosted_hosts",
+            "slots",
+        ] {
+            assert!(!output.contains(private), "{output}");
+        }
+        assert!(metrics.get("hosted").is_none());
+        assert!(detail.contains("daemon running"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1559,8 +1552,11 @@ mod health_tests {
             "health.check must never connect to the runner"
         );
         assert_eq!(report.status, HealthStatus::Ok);
-        assert_eq!(report.metrics.unwrap()["build_server"]["permits_held"], 4);
-        assert!(report.detail.unwrap().starts_with("build server busy:"));
+        assert_eq!(
+            report.metrics.unwrap()["platforms"]["linux"]["status"],
+            "busy (queueing)"
+        );
+        assert!(report.detail.unwrap().contains("linux: busy (queueing)"));
         handler.start_health_sampler();
         tokio::time::timeout(Duration::from_secs(1), async {
             while calls.load(Ordering::SeqCst) == 0 {

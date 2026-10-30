@@ -33,6 +33,10 @@ impl Reporter {
         self.enabled
     }
 
+    pub(crate) fn current_phase(&self) -> Option<ProgressPhase> {
+        self.phase.borrow().as_ref().map(|phase| phase.kind.clone())
+    }
+
     pub(crate) fn phase(&self, kind: ProgressPhase) {
         self.phase.send_if_modified(|current| {
             if current.as_ref().is_some_and(|phase| phase.kind == kind) {
