@@ -2902,6 +2902,15 @@ impl Sandbox {
         } else {
             Vec::new()
         };
+        // Read the lockfiles' git commits before dissociating: the snapshot tree
+        // of a caller with uncommitted changes is reachable only through the
+        // mirror alternates, and the repack below keeps just what the
+        // checkout's own refs reach, so afterwards `tree` may no longer exist.
+        let locked_git_commits = if tenant_vm {
+            known_git_commits(workspace, tree)?
+        } else {
+            Vec::new()
+        };
         // Each checkout's Git metadata is read-only inside the job. Dissociate
         // it first so Git needs neither a mirror mount nor the daemon's home.
         for path in std::iter::once(workspace.to_path_buf()).chain(
@@ -2919,11 +2928,6 @@ impl Sandbox {
         // Each job gets a private root tree so its visible mount ancestors can
         // stay root-owned even when the host checkout lives under an operator's
         // writable home directory.
-        let locked_git_commits = if tenant_vm {
-            known_git_commits(workspace, tree)?
-        } else {
-            Vec::new()
-        };
         let runtime = std::sync::Arc::new(RuntimeDir(
             state.join("sandboxes").join(id.to_string()),
             std::sync::OnceLock::new(),
