@@ -209,12 +209,12 @@ class BaselineInputsTests(unittest.TestCase):
 
     def test_baseline_installs_checksum_pinned_bun_before_use(self):
         source = (HERE / "setup-job-baseline.ps1").read_text()
-        version = json.loads((HERE.parent / "runner/toolchain.json").read_text())["tools"]["bun"]["version"]
-        self.assertEqual(version, "1.4.2")
+        version = json.loads((HERE.parent / "runner/toolchain.json").read_text())["windows_tools"]["bun"]["version"]
+        self.assertEqual(version, "1.4.4")
         for expected in (f"$bunVersion = '{version}'",
-                         "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/SHASUMS256.txt",
-                         "$bunSha256 = 'ce4c17497b2f29712a99d3d53f028de28cd42e3bacb8589599e7f000e49b6405'",
-                         "Invoke-WebRequest 'https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-windows-x64.zip' -OutFile $bunArchive",
+                         "https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/SHASUMS256.txt",
+                         "$bunSha256 = 'cd2c0fccc78f3ede1f50ca827a15f063eda13d4d150a3d0674f4f6e323d864a5'",
+                         "Invoke-WebRequest 'https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-windows-x64.zip' -OutFile $bunArchive",
                          "if ((Get-FileHash -LiteralPath $bunArchive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $bunSha256) {\n        throw 'Bun archive SHA-256 mismatch'\n    }"):
             self.assertIn(expected, source)
         self.assertLess(source.index("Invoke-WebRequest 'https://github.com/oven-sh/bun/"), source.index("Get-FileHash -LiteralPath $bunArchive"))
@@ -249,9 +249,77 @@ class BaselineInputsTests(unittest.TestCase):
         root = HERE.parent.parent
         operator = (root / "crates/motor-runner/src/tests/windows_operator.rs").read_text()
         self.assertIn('git --version; bun --version; pwsh', operator)
-        self.assertIn('output.lines().any(|line| line.trim() == "1.4.2")', operator)
+        self.assertIn('output.lines().any(|line| line.trim() == "1.4.4")', operator)
         provision = (HERE.parent / "hyperv-spike/provision.ps1").read_text()
-        self.assertIn("Assert-Spike ($bootstrap -match 'Verified machine-wide Bun 1\\.4\\.2 with protected user read/execute access')", provision)
+        self.assertIn("Assert-Spike ($bootstrap -match 'Verified machine-wide Bun 1\\.4\\.4 with protected user read/execute access')", provision)
+
+    def test_baseline_installs_checksum_pinned_cmake_ninja_node_on_path_for_both_images(self):
+        source = (HERE / "setup-job-baseline.ps1").read_text()
+        tools = json.loads((HERE.parent / "runner/toolchain.json").read_text())["windows_tools"]
+        pins = {
+            "cmake": ("CMake", "4.4.5", "326c826486d46a23cf9d5a1c9ee3a567d427bdd02c4a34071937a2a675cff004"),
+            "ninja": ("Ninja", "1.13.2", "07fc8261b42b20e71d1720b39068c2e14ffcee6396b76fb7a795fb460b78dc65"),
+            "node": ("Node", "24.22.2", "ca1bff5d8ead13c9f2ea404a176db46bd430704d5b5113734049fa365e7799e2"),
+        }
+        for tool, (label, version, sha256) in pins.items():
+            with self.subTest(tool=tool):
+                pin = tools[tool]
+                self.assertEqual(pin["version"], version)
+                self.assertEqual(pin["sha256"], sha256)
+                path = f"${tool}Bin" if tool == "cmake" else f"${tool}Install"
+                verify = f"& {tool}.exe --version"
+                download = f"Invoke-WebRequest '{pin['url']}' -OutFile ${tool}Archive"
+                hash_check = f"Get-FileHash -LiteralPath ${tool}Archive -Algorithm SHA256"
+                mismatch = f"throw '{label} archive SHA-256 mismatch'"
+                extract = f"Expand-Archive -LiteralPath ${tool}Archive -DestinationPath ${tool}Install"
+                root_acl = f"& icacls ${tool}Install /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'"
+                owner = f"& icacls ${tool}Install /setowner '*S-1-5-32-544' /T /C /L /Q"
+                for expected in (
+                    f"${tool}Version = '{version}'", f"${tool}Sha256 = '{sha256}'",
+                    f"${tool}Install = '{pin['install_dir']}'", pin["digest_source"], download,
+                    f"if (({hash_check}).Hash.ToLowerInvariant() -cne ${tool}Sha256) {{\n        {mismatch}\n    }}",
+                    f"if (Test-Path -LiteralPath ${tool}Install) {{ throw '{label} destination already exists; use a fresh provisioning image' }}",
+                    extract, root_acl, owner,
+                    f'& icacls "${tool}Install\\*" /reset /T /C /L /Q',
+                    f"if ($LASTEXITCODE -ne 0) {{ throw '{label} root ACL setup failed' }}",
+                    f"if ($LASTEXITCODE -ne 0) {{ throw '{label} ACL inheritance reset failed' }}",
+                    f"if ($LASTEXITCODE -ne 0) {{ throw '{label} ownership setup failed' }}",
+                    f"Remove-Item -LiteralPath ${tool}Archive -Force -ErrorAction SilentlyContinue",
+                    f"[Environment]::SetEnvironmentVariable('Path', \"{path};$machinePath\", 'Machine')",
+                    f'$env:Path = "{path};" + $env:Path', verify,
+                ):
+                    self.assertIn(expected, source)
+                for before, after in ((download, hash_check), (mismatch, extract), (root_acl, extract),
+                                      (extract, owner), (owner, verify)):
+                    self.assertLess(source.index(before), source.index(after))
+        for expected in (
+            r'$cmakeBin = "$cmakeInstall\bin"',
+            r'Get-ChildItem -LiteralPath "$cmakeInstall\cmake-$cmakeVersion-windows-x86_64" -Force | Move-Item -Destination $cmakeInstall',
+            r'Get-ChildItem -LiteralPath "$nodeInstall\node-v$nodeVersion-win-x64" -Force | Move-Item -Destination $nodeInstall',
+            'if ($LASTEXITCODE -ne 0 -or ($installedCmakeVersion | Select-Object -First 1) -cne "cmake version $cmakeVersion") { throw',
+            'if ($LASTEXITCODE -ne 0 -or $installedNinjaVersion -cne $ninjaVersion) { throw',
+            'if ($LASTEXITCODE -ne 0 -or $installedNodeVersion -cne "v$nodeVersion") { throw',
+            "$npmVersion = '11.19.1'", '& npm.cmd --version',
+            'if ($LASTEXITCODE -ne 0 -or $installedNpmVersion -cne $npmVersion) { throw',
+            'SHASUMS256.txt.sig was verified with the nodejs/release-keys keyring',
+        ):
+            self.assertIn(expected, source)
+        self.assertEqual(tools["node"]["npm_version"], "11.19.1")
+        setup = source.split("$cmakeVersion = ", 1)[1].split("$bytes = ", 1)[0]
+        self.assertNotIn("$HyperVSpike", setup)
+        self.assertNotIn("$HasWinget", setup)
+
+    def test_hyperv_parent_requires_cmake_ninja_node_and_npm_build_verification(self):
+        provision = (HERE.parent / "hyperv-spike/provision.ps1").read_text()
+        baseline = (HERE / "setup-job-baseline.ps1").read_text()
+        for label, version in (("CMake", "4.4.5"), ("Ninja", "1.13.2"), ("Node", "24.22.2 and npm 11.19.1")):
+            message = f"Verified machine-wide {label} {version} with protected user read/execute access"
+            pattern = message.replace(".", "\\.")
+            self.assertIn(f"Assert-Spike ($bootstrap -match '{pattern}')", provision)
+            template = message.replace(version, {"CMake": "$cmakeVersion", "Ninja": "$ninjaVersion", "Node": "$nodeVersion and npm $npmVersion"}[label])
+            self.assertIn(f'Write-Host "{template}"', baseline)
+        seed = (HERE.parent / "hyperv-spike/seed.py").read_text()
+        self.assertIn('"setup-job-baseline.ps1"', seed)
 
     def test_baseline_installs_and_verifies_rustfmt_and_clippy_for_all_images(self):
         source = (HERE / "setup-job-baseline.ps1").read_text()

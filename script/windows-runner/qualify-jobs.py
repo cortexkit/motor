@@ -274,7 +274,7 @@ def require_gate_success(terminal):
         raise RuntimeError(f"gate failed: {terminal}")
 
 
-BUN_VERSION_CHECK = "bun_version=$(bun --version) && test \"${bun_version%$'\\r'}\" = \"1.4.2\""
+BUN_VERSION_CHECK = "bun_version=$(bun --version) && test \"${bun_version%$'\\r'}\" = \"1.4.4\""
 NEXTEST_VERSION_CHECK = "nextest_version=$(cargo nextest --version) && printf '%s\\n' \"$nextest_version\" && [[ \"$nextest_version\" == 'cargo-nextest 0.9.138 '* ]]"
 PYTHON_CHECK = (
     "python_version=$(python3 --version) && printf '%s\\n' \"$python_version\" && test \"${python_version%$'\\r'}\" = 'Python 3.14.8' && "

@@ -238,7 +238,7 @@ fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
         "{output}"
     );
     assert!(
-        output.lines().any(|line| line.trim() == "1.4.2"),
+        output.lines().any(|line| line.trim() == "1.4.4"),
         "{output}"
     );
     assert!(output.contains("Bun installation is read-only"), "{output}");

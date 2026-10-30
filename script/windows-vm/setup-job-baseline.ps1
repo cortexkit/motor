@@ -25,13 +25,13 @@ New-Item $motor -ItemType Directory -Force | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Motor directory ACL setup failed' }
 
 # Jobs are offline and cannot use the provisioning administrator's per-user Bun.
-# SHA-256 source: https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/SHASUMS256.txt
-$bunVersion = '1.4.2'
-$bunSha256 = 'ce4c17497b2f29712a99d3d53f028de28cd42e3bacb8589599e7f000e49b6405'
+# SHA-256 source: https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/SHASUMS256.txt
+$bunVersion = '1.4.4'
+$bunSha256 = 'cd2c0fccc78f3ede1f50ca827a15f063eda13d4d150a3d0674f4f6e323d864a5'
 $bunArchive = Join-Path $motor 'bun-windows-x64.zip'
 $bunInstall = 'C:\Program Files\Bun'
 try {
-    Invoke-WebRequest 'https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-windows-x64.zip' -OutFile $bunArchive -UseBasicParsing
+    Invoke-WebRequest 'https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-windows-x64.zip' -OutFile $bunArchive -UseBasicParsing
     if ((Get-FileHash -LiteralPath $bunArchive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $bunSha256) {
         throw 'Bun archive SHA-256 mismatch'
     }
@@ -177,6 +177,115 @@ if (-not (Test-Path -LiteralPath "$llvmBin\libclang.dll" -PathType Leaf)) { thro
 $installedClangVersion = & "$llvmBin\clang.exe" --version
 if ($LASTEXITCODE -ne 0 -or ($installedClangVersion | Select-Object -First 1) -cne "clang version $llvmVersion") { throw 'Machine-wide LLVM version verification failed' }
 Write-Host "Verified machine-wide LLVM $llvmVersion and libclang.dll with protected user read/execute access"
+
+# CMake sub-builds need Ninja to avoid the default MSBuild generator's parallel
+# build races. Offline jobs must find both tools without downloading them.
+# SHA-256 source: https://github.com/Kitware/CMake/releases/download/v4.4.5/cmake-4.4.5-SHA-256.txt
+$cmakeVersion = '4.4.5'
+$cmakeSha256 = '326c826486d46a23cf9d5a1c9ee3a567d427bdd02c4a34071937a2a675cff004'
+$cmakeArchive = Join-Path $motor 'cmake-4.4.5-windows-x86_64.zip'
+$cmakeInstall = 'C:\Program Files\CMake'
+try {
+    Invoke-WebRequest 'https://github.com/Kitware/CMake/releases/download/v4.4.5/cmake-4.4.5-windows-x86_64.zip' -OutFile $cmakeArchive -UseBasicParsing
+    if ((Get-FileHash -LiteralPath $cmakeArchive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $cmakeSha256) {
+        throw 'CMake archive SHA-256 mismatch'
+    }
+    if (Test-Path -LiteralPath $cmakeInstall) { throw 'CMake destination already exists; use a fresh provisioning image' }
+    New-Item $cmakeInstall -ItemType Directory | Out-Null
+    & icacls $cmakeInstall /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'
+    if ($LASTEXITCODE -ne 0) { throw 'CMake root ACL setup failed' }
+    Expand-Archive -LiteralPath $cmakeArchive -DestinationPath $cmakeInstall
+    # Keep CMake's modules and templates beside bin, not only cmake.exe.
+    Get-ChildItem -LiteralPath "$cmakeInstall\cmake-$cmakeVersion-windows-x86_64" -Force | Move-Item -Destination $cmakeInstall
+    Remove-Item -LiteralPath "$cmakeInstall\cmake-$cmakeVersion-windows-x86_64" -Force
+    & icacls "$cmakeInstall\*" /reset /T /C /L /Q
+    if ($LASTEXITCODE -ne 0) { throw 'CMake ACL inheritance reset failed' }
+    & icacls $cmakeInstall /setowner '*S-1-5-32-544' /T /C /L /Q
+    if ($LASTEXITCODE -ne 0) { throw 'CMake ownership setup failed' }
+} finally {
+    Remove-Item -LiteralPath $cmakeArchive -Force -ErrorAction SilentlyContinue
+}
+$cmakeBin = "$cmakeInstall\bin"
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+if (($machinePath -split ';' | ForEach-Object { $_.TrimEnd('\') }) -notcontains $cmakeBin) {
+    [Environment]::SetEnvironmentVariable('Path', "$cmakeBin;$machinePath", 'Machine')
+}
+$env:Path = "$cmakeBin;" + $env:Path
+$installedCmakeVersion = @(& cmake.exe --version)
+if ($LASTEXITCODE -ne 0 -or ($installedCmakeVersion | Select-Object -First 1) -cne "cmake version $cmakeVersion") { throw 'Machine-wide CMake version verification failed' }
+Write-Host "Verified machine-wide CMake $cmakeVersion with protected user read/execute access"
+
+# Ninja publishes no checksum file. This hash was computed from ninja-win.zip
+# and cross-checked against the GitHub API asset digest for release v1.13.2:
+# https://api.github.com/repos/ninja-build/ninja/releases/assets/318863577
+$ninjaVersion = '1.13.2'
+$ninjaSha256 = '07fc8261b42b20e71d1720b39068c2e14ffcee6396b76fb7a795fb460b78dc65'
+$ninjaArchive = Join-Path $motor 'ninja-win.zip'
+$ninjaInstall = 'C:\Program Files\Ninja'
+try {
+    Invoke-WebRequest 'https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip' -OutFile $ninjaArchive -UseBasicParsing
+    if ((Get-FileHash -LiteralPath $ninjaArchive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $ninjaSha256) {
+        throw 'Ninja archive SHA-256 mismatch'
+    }
+    if (Test-Path -LiteralPath $ninjaInstall) { throw 'Ninja destination already exists; use a fresh provisioning image' }
+    New-Item $ninjaInstall -ItemType Directory | Out-Null
+    & icacls $ninjaInstall /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'
+    if ($LASTEXITCODE -ne 0) { throw 'Ninja root ACL setup failed' }
+    Expand-Archive -LiteralPath $ninjaArchive -DestinationPath $ninjaInstall
+    & icacls "$ninjaInstall\*" /reset /T /C /L /Q
+    if ($LASTEXITCODE -ne 0) { throw 'Ninja ACL inheritance reset failed' }
+    & icacls $ninjaInstall /setowner '*S-1-5-32-544' /T /C /L /Q
+    if ($LASTEXITCODE -ne 0) { throw 'Ninja ownership setup failed' }
+} finally {
+    Remove-Item -LiteralPath $ninjaArchive -Force -ErrorAction SilentlyContinue
+}
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+if (($machinePath -split ';' | ForEach-Object { $_.TrimEnd('\') }) -notcontains $ninjaInstall) {
+    [Environment]::SetEnvironmentVariable('Path', "$ninjaInstall;$machinePath", 'Machine')
+}
+$env:Path = "$ninjaInstall;" + $env:Path
+$installedNinjaVersion = & ninja.exe --version
+if ($LASTEXITCODE -ne 0 -or $installedNinjaVersion -cne $ninjaVersion) { throw 'Machine-wide Ninja version verification failed' }
+Write-Host "Verified machine-wide Ninja $ninjaVersion with protected user read/execute access"
+
+# The official Node zip carries npm as well as node.exe for offline JS gates.
+# SHA-256 source: https://nodejs.org/dist/v24.22.2/SHASUMS256.txt
+# Its SHASUMS256.txt.sig was verified with the nodejs/release-keys keyring.
+$nodeVersion = '24.22.2'
+$npmVersion = '11.19.1'
+$nodeSha256 = 'ca1bff5d8ead13c9f2ea404a176db46bd430704d5b5113734049fa365e7799e2'
+$nodeArchive = Join-Path $motor 'node-v24.22.2-win-x64.zip'
+$nodeInstall = 'C:\Program Files\nodejs'
+try {
+    Invoke-WebRequest 'https://nodejs.org/dist/v24.22.2/node-v24.22.2-win-x64.zip' -OutFile $nodeArchive -UseBasicParsing
+    if ((Get-FileHash -LiteralPath $nodeArchive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $nodeSha256) {
+        throw 'Node archive SHA-256 mismatch'
+    }
+    if (Test-Path -LiteralPath $nodeInstall) { throw 'Node destination already exists; use a fresh provisioning image' }
+    New-Item $nodeInstall -ItemType Directory | Out-Null
+    & icacls $nodeInstall /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'
+    if ($LASTEXITCODE -ne 0) { throw 'Node root ACL setup failed' }
+    Expand-Archive -LiteralPath $nodeArchive -DestinationPath $nodeInstall
+    Get-ChildItem -LiteralPath "$nodeInstall\node-v$nodeVersion-win-x64" -Force | Move-Item -Destination $nodeInstall
+    Remove-Item -LiteralPath "$nodeInstall\node-v$nodeVersion-win-x64" -Force
+    & icacls "$nodeInstall\*" /reset /T /C /L /Q
+    if ($LASTEXITCODE -ne 0) { throw 'Node ACL inheritance reset failed' }
+    & icacls $nodeInstall /setowner '*S-1-5-32-544' /T /C /L /Q
+    if ($LASTEXITCODE -ne 0) { throw 'Node ownership setup failed' }
+} finally {
+    Remove-Item -LiteralPath $nodeArchive -Force -ErrorAction SilentlyContinue
+}
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+if (($machinePath -split ';' | ForEach-Object { $_.TrimEnd('\') }) -notcontains $nodeInstall) {
+    [Environment]::SetEnvironmentVariable('Path', "$nodeInstall;$machinePath", 'Machine')
+}
+$env:Path = "$nodeInstall;" + $env:Path
+$installedNodeVersion = & node.exe --version
+if ($LASTEXITCODE -ne 0 -or $installedNodeVersion -cne "v$nodeVersion") { throw 'Machine-wide Node version verification failed' }
+# Select the cmd shim explicitly so PowerShell execution policy cannot hide npm.
+$installedNpmVersion = & npm.cmd --version
+if ($LASTEXITCODE -ne 0 -or $installedNpmVersion -cne $npmVersion) { throw 'Machine-wide npm version verification failed' }
+Write-Host "Verified machine-wide Node $nodeVersion and npm $npmVersion with protected user read/execute access"
 
 $bytes = New-Object byte[] 48
 $rng = [Security.Cryptography.RandomNumberGenerator]::Create()

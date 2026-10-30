@@ -82,11 +82,11 @@ class QualificationReadinessTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("bash"), "requires Bash for the Git Bash version guard")
     def test_bun_version_check_rejects_wrong_missing_and_failed_bun(self):
-        for version, code in (("1.4.2", 0), ("1.4.2\r", 0), ("1.4.1", 0), ("1.4.20", 0), ("", 127), ("1.4.2", 1)):
+        for version, code in (("1.4.4", 0), ("1.4.4\r", 0), ("1.4.1", 0), ("1.4.2", 0), ("1.4.40", 0), ("", 127), ("1.4.4", 1)):
             with self.subTest(version=version, code=code):
                 command = f"bun() {{ printf '%s\\n' '{version}'; return {code}; }}; " + JOBS.BUN_VERSION_CHECK
                 result = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
-                self.assertEqual(result.returncode == 0, version.rstrip("\r") == "1.4.2" and code == 0, result.stderr)
+                self.assertEqual(result.returncode == 0, version.rstrip("\r") == "1.4.4" and code == 0, result.stderr)
 
     def test_real_jobs_check_nextest_even_with_a_custom_gate(self):
         source = (HERE / "qualify-jobs.py").read_text()
