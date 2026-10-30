@@ -145,6 +145,13 @@ impl HostedJobState {
             .as_ref()
             .is_some_and(|t| t.refusal_detail.as_deref() == Some(CANCEL_ACKNOWLEDGED))
     }
+    pub(crate) fn cancel_settlement_ready(&self) -> bool {
+        self.awaiting_cancel_terminal()
+            || self
+                .pending_finish
+                .as_ref()
+                .is_some_and(|finish| finish.outcome == "cancelled")
+    }
     pub(crate) fn booked_or_attempted(&self) -> bool {
         self.lease_attempted
             || self.placement.is_some()

@@ -55,14 +55,15 @@ impl Client {
         {
             return Ok(state.hosted_code.as_deref() == Some("hosted_sandbox_lost"));
         }
-        // Cancellation can be acknowledged while another flow holds an older
-        // unknown terminal. Prefer the durable known result under the finish lock.
+        // Acknowledgment may arrive while another owner holds an older unknown
+        // terminal. Preserve the shared result under the finish lock, but allow
+        // a real known terminal to replace an acknowledgment-only fallback.
         let terminal = terminal
             .filter(|t| !matches!(t.outcome, motor_protocol::Outcome::OutcomeUnknown))
-            .or(state
-                .terminal
-                .as_ref()
-                .filter(|t| !matches!(t.outcome, motor_protocol::Outcome::OutcomeUnknown)))
+            .or(state.terminal.as_ref().filter(|t| {
+                state.cancel_settlement_ready()
+                    || !matches!(t.outcome, motor_protocol::Outcome::OutcomeUnknown)
+            }))
             .or(terminal)
             .or(state.terminal.as_ref());
         let mut body = None;
@@ -78,7 +79,18 @@ impl Client {
                 }
                 if state.pending_finish.is_none() {
                     state.pending_finish = terminal.map(|terminal| {
-                        Finish::from_terminal(terminal, state.max_runtime_s.unwrap_or(0))
+                        let mut finish =
+                            Finish::from_terminal(terminal, state.max_runtime_s.unwrap_or(0));
+                        if state.awaiting_cancel_terminal()
+                            && matches!(terminal.outcome, motor_protocol::Outcome::OutcomeUnknown)
+                        {
+                            // A live stream may still supply real terminal timing.
+                            // Its cancel acknowledgment ends the booking even if
+                            // that terminal never arrives; it does not prove how
+                            // the command ended.
+                            finish.outcome = "cancelled".into();
+                        }
+                        finish
                     });
                 }
                 body = state.pending_finish.clone();

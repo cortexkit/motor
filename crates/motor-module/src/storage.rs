@@ -957,23 +957,49 @@ impl Storage {
     }
     pub(crate) fn cancel_acknowledged(&self, id: Uuid) -> io::Result<()> {
         self.update(|s| {
+            let streamed = s.active_jobs.contains_key(&id);
             let job = s.jobs.entry(id).or_default();
             if job.build_server_job_id.is_none() {
                 if let Some(hosted) = job.hosted.as_mut() {
-                    if !hosted.finish_done
-                        && hosted
-                            .terminal
-                            .as_ref()
-                            .is_none_or(|t| matches!(t.outcome, Outcome::OutcomeUnknown))
-                    {
-                        // The runner acknowledged cancellation, even if its final
-                        // frame is unavailable. Keep execution evidence unknown;
-                        // the observed start timestamp supplies only elapsed time.
-                        let mut terminal = TerminalRecord::new(id, Outcome::Cancelled, 0, 0, 0)
-                            .with_ran(Ran::Unknown("maybe".into()))
-                            .with_refusal_detail(crate::hosted::CANCEL_ACKNOWLEDGED);
+                    if !hosted.finish_done && hosted.terminal.is_none() {
+                        // The reply acknowledges queued, running and already-exited
+                        // jobs alike. Only a real terminal can prove cancellation
+                        // caused the command's outcome.
+                        let mut terminal =
+                            TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
+                                .with_ran(Ran::Unknown("maybe".into()))
+                                .with_refusal_detail(crate::hosted::CANCEL_ACKNOWLEDGED);
                         terminal.wall_ms = hosted.elapsed_ms();
                         hosted.terminal = Some(terminal);
+                    }
+                    // A new fallback on a live stream can still receive real
+                    // terminal timing. An existing unknown terminal must remain
+                    // unchanged, so retain its acknowledgment in the finish body
+                    // even when an attach is active.
+                    if (!streamed || !hosted.awaiting_cancel_terminal())
+                        && !hosted.finish_done
+                        && hosted.pending_finish.is_none()
+                        && hosted
+                            .placement
+                            .as_ref()
+                            .is_some_and(|p| p.host.starts_with("boat:"))
+                    {
+                        // Booking settlement is known even when execution outcome
+                        // is not. Retain its body separately from the caller's
+                        // terminal, including one already delivered as unknown.
+                        let terminal = hosted.terminal.as_ref().unwrap();
+                        let mut finish = crate::hosted::placement::Finish::from_terminal(
+                            terminal,
+                            hosted.max_runtime_s.unwrap_or(0),
+                        );
+                        finish.outcome = "cancelled".into();
+                        if finish.run_ms == 0 && matches!(terminal.outcome, Outcome::OutcomeUnknown)
+                        {
+                            finish.run_ms = hosted
+                                .elapsed_ms()
+                                .min(hosted.max_runtime_s.unwrap_or(0).saturating_mul(1000));
+                        }
+                        hosted.pending_finish = Some(finish);
                     }
                 }
             }

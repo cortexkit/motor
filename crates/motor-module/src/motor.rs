@@ -1882,20 +1882,25 @@ impl Motor {
             } else {
                 // Recheck after joining the delivery gate: an earlier attempt
                 // may already have acknowledged cancellation and settled Boat.
-                if self.hosted_state(id).is_some_and(|s| {
-                    s.awaiting_cancel_terminal()
+                if let Some(state) = self.hosted_state(id).filter(|s| {
+                    s.cancel_settlement_ready()
+                        || s.finish_done
                         || s.terminal
                             .as_ref()
                             .is_some_and(|t| !matches!(t.outcome, Outcome::OutcomeUnknown))
                 }) {
-                    self.storage.cancel_acknowledged(id)?;
+                    if state.awaiting_cancel_terminal() && !state.finish_done {
+                        self.storage.cancel_acknowledged(id)?;
+                    } else {
+                        self.storage.cancel(id, false)?;
+                    }
                     return Ok(());
                 }
                 let (tx, rx) = watch::channel(None);
                 deliveries.insert(id, rx.clone());
                 let motor = self.clone();
                 // Delivery outlives any one waiting caller, so detaching cannot
-                // strand another waiter or abandon a booked lease's cleanup.
+                // cancel the request another waiter still needs.
                 tokio::spawn(async move {
                     let result = motor
                         .send_cancel_once(id)
@@ -1903,12 +1908,6 @@ impl Motor {
                         .map_err(|error| (error.kind(), error.to_string()));
                     tx.send_replace(Some(result));
                     motor.hosted_cancels.lock().unwrap().remove(&id);
-                    if motor
-                        .hosted_state(id)
-                        .is_some_and(|s| s.placement.is_some_and(|p| p.host.starts_with("boat:")))
-                    {
-                        motor.recover_hosted(id);
-                    }
                 });
                 rx
             }
@@ -2196,6 +2195,8 @@ impl Motor {
             .is_some_and(|d| crate::hosted::now_s() >= d);
         if matches!(terminal.outcome, Outcome::OutcomeUnknown)
             && state.run_sent
+            && !state.cancel_settlement_ready()
+            && !state.finish_done
             && !host_expired
             && !*self.hosted_cleanup.shutdown.borrow()
             && state.hosted_code.as_deref() != Some("hosted_sandbox_lost")
@@ -2218,12 +2219,21 @@ impl Motor {
                     }));
             }
         }
-        // Another cancel caller or cleanup task may have recorded the result
-        // while this flow was attaching. Never settle or emit its stale unknown.
-        if let Some(recorded) = self.hosted_state(id).and_then(|s| s.terminal) {
-            if !matches!(recorded.outcome, Outcome::OutcomeUnknown) {
-                terminal = recorded;
-                cancel_unconfirmed = false;
+        // Another cancel caller or cleanup task may have recorded delivery while
+        // this flow was attaching. Share its terminal without claiming a second
+        // failed delivery after the booking has already been settled.
+        if let Some(recorded) = self.hosted_state(id) {
+            if recorded.cancel_settlement_ready()
+                || recorded.finish_done
+                || recorded
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|t| !matches!(t.outcome, Outcome::OutcomeUnknown))
+            {
+                if let Some(terminal_record) = recorded.terminal {
+                    terminal = terminal_record;
+                    cancel_unconfirmed = false;
+                }
             }
         }
         // Settling a Boat booking makes its runner impossible to reattach.
@@ -2796,6 +2806,14 @@ impl Motor {
         // it there, rather than opening a conflicting second connection.
         if self.hosted_state(id).is_some() && self.storage.has_live_stream(id) {
             return Ok(CancelReply::new(id));
+        }
+        // Own detached Boat cleanup before awaiting delivery. Internal delivery
+        // callers may still be reading a real terminal and own their settlement.
+        if self
+            .hosted_state(id)
+            .is_some_and(|s| s.placement.is_some_and(|p| p.host.starts_with("boat:")))
+        {
+            self.recover_hosted(id);
         }
         if self
             .send_cancel(id)

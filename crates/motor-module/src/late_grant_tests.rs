@@ -642,7 +642,7 @@ async fn acknowledged_cancel_recovery_settles_before_host_deadline() {
         terminal(motor.attach(AttachRequest::new(id, 0)).unwrap())
             .await
             .outcome,
-        Outcome::Cancelled
+        Outcome::OutcomeUnknown
     );
     motor.shutdown_hosted().await;
 }
@@ -686,7 +686,7 @@ async fn acknowledged_cancel_after_started_and_restart_retains_elapsed_time() {
     motor.wait_hosted_cleanup(id).await;
     let latest = now_ms() - started;
     let terminal = terminal(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
-    assert_eq!(terminal.outcome, Outcome::Cancelled);
+    assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
     assert_eq!(terminal.ran, Some(Ran::Unknown("maybe".into())));
     assert!(
         (earliest..=latest).contains(&terminal.wall_ms),
@@ -744,7 +744,7 @@ async fn concurrent_hosted_cancels_and_finish_share_acknowledged_result() {
     let Some(Ok(StreamRecord::Terminal(second))) = rx2.recv().await else {
         panic!("second finish did not deliver a terminal")
     };
-    assert_eq!(first.outcome, Outcome::Cancelled);
+    assert_eq!(first.outcome, Outcome::OutcomeUnknown);
     assert_eq!(first, second);
     motor.wait_hosted_cleanup(id).await;
     assert_settled(&h, &motor, id, "cancelled", 0);
@@ -757,7 +757,7 @@ async fn concurrent_hosted_cancels_and_finish_share_acknowledged_result() {
         terminal(motor.attach(AttachRequest::new(id, 0)).unwrap())
             .await
             .outcome,
-        Outcome::Cancelled
+        Outcome::OutcomeUnknown
     );
     assert_eq!(h.broker.requests.lock().unwrap().len(), before);
     motor.shutdown_hosted().await;
