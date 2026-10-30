@@ -76,6 +76,7 @@ impl CancellationFixture {
         let exited = Arc::new(AtomicBool::new(false));
         let writes = Arc::new(AtomicU64::new(0));
         let mut config = fixture.config();
+        config.manual_tick = true;
         let recorded_writes = writes.clone();
         config.before_job_write = Some(Arc::new(move |_| {
             recorded_writes.fetch_add(1, Ordering::SeqCst);
@@ -123,6 +124,36 @@ impl CancellationFixture {
     fn retry(&self, instant: Instant) {
         self.runner.enforce_kills(instant).unwrap();
     }
+}
+
+impl Drop for CancellationFixture {
+    fn drop(&mut self) {
+        // The fake backend never stops a process. Let cleanup observe its exit
+        // even when another runner handle keeps the core alive during teardown.
+        self.exited.store(true, Ordering::SeqCst);
+        // Explicit retries use an hour-ahead instant; teardown uses real time.
+        self.runner
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .kill_retries
+            .remove(&self.id);
+    }
+}
+
+#[test]
+fn cancellation_fixture_quiesces_with_a_live_runner_handle() {
+    let f = CancellationFixture::new();
+    f.runner.cancel(f.id).unwrap();
+    let runner = f.runner.clone();
+    let id = f.id;
+    // A scheduler tick can temporarily own the same strong reference while the
+    // fixture drops. Keep one here so cleanup cannot skip its quiescence check.
+    drop(f);
+    assert!(runner.core.inner.lock().unwrap().jobs[&id]
+        .terminal
+        .is_some());
 }
 
 #[test]
