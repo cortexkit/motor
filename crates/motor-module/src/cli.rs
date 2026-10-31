@@ -597,13 +597,23 @@ fn sweep_default_secrets(directory: &Path) -> std::io::Result<()> {
         if job_id.to_string() != name {
             continue;
         }
-        let metadata = fs::symlink_metadata(&path)?;
+        // Concurrent runs sweep the same directory, so another run can delete
+        // an expired file between this listing and the stat or removal below.
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         if metadata.file_type().is_file()
             && now
                 .duration_since(metadata.modified()?)
                 .is_ok_and(|age| age > JOB_SECRET_RETENTION)
         {
-            fs::remove_file(path)?;
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
     }
     Ok(())
@@ -2335,6 +2345,43 @@ mod tests {
         super::sweep_default_secrets(&directory).unwrap();
         assert!(!expired_path.exists());
         assert!(current_path.exists());
+    }
+
+    #[test]
+    fn concurrent_secret_sweeps_never_fail_on_files_another_sweep_removed() {
+        // Runs started together (a gate's Linux, Windows and macOS jobs) each
+        // sweep the shared directory; a file one removes must not fail another.
+        let scratch = cortexkit_test_support::ScratchDir::new("motor-cli-secret-race");
+        let directory = super::prepare_default_secret_directory_under(scratch.path()).unwrap();
+        for round in 0..20 {
+            for _ in 0..200 {
+                let path =
+                    super::default_secret_path(&directory, motor_protocol::Uuid::now_v7());
+                std::fs::write(&path, "old\n").unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(
+                        std::time::SystemTime::now()
+                            - super::JOB_SECRET_RETENTION
+                            - std::time::Duration::from_secs(1),
+                    ))
+                    .unwrap();
+            }
+            let results: Vec<_> = std::thread::scope(|scope| {
+                (0..8)
+                    .map(|_| scope.spawn(|| super::sweep_default_secrets(&directory)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect()
+            });
+            for result in results {
+                result.unwrap_or_else(|error| panic!("round {round}: {error}"));
+            }
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        }
     }
 
     #[test]
