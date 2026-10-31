@@ -154,6 +154,7 @@ pub(crate) fn capture_finished_workspace(
         prepared_javascript_directories: vec![],
     };
     execution::capture_changes(runtime, trees, &entry, request, &staged);
+    execution::capture_returns(runtime, trees, &entry, request, &staged);
     runtime.finish(&config.state_root, &entry);
     assert!(!staged.tree.exists());
 }
@@ -313,9 +314,26 @@ fn workspace_changes_prune_only_results_without_a_live_job() {
     let abandoned = uuid::Uuid::now_v7();
     runtime.record_changes(live, vec!["source".into()]);
     runtime.record_changes(abandoned, vec![]);
+    let motor_protocol::Frame::Run(mut request) = serde_json::from_str(include_str!(
+        "../../../../test-vectors/exec-remote-v1/frames/run.json"
+    ))
+    .unwrap() else {
+        unreachable!()
+    };
+    request.return_paths = vec![format!("{}/out", request.workspace_key)];
+    runtime.record_returns(
+        live,
+        crate::return_paths::unread(&request, Path::new("/unused")),
+    );
+    runtime.record_returns(
+        abandoned,
+        crate::return_paths::unread(&request, Path::new("/unused")),
+    );
     runtime.prune_finished(&BTreeSet::from([live]));
     assert_eq!(runtime.take_changes(live), Some(vec!["source".into()]));
     assert!(runtime.take_changes(abandoned).is_none());
+    assert!(runtime.take_returns(live).is_some());
+    assert!(runtime.take_returns(abandoned).is_none());
 }
 
 #[test]

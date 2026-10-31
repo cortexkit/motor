@@ -61,6 +61,16 @@ fn job_at(
     evidence: &Path,
     capture: Option<&str>,
 ) -> Output {
+    job_at_with_returns(command, env, workspace, evidence, capture, &[])
+}
+fn job_at_with_returns(
+    command: &str,
+    env: &[&str],
+    workspace: &str,
+    evidence: &Path,
+    capture: Option<&str>,
+    returns: &[&str],
+) -> Output {
     let normalized = std::fs::canonicalize(workspace).unwrap();
     assert_eq!(
         Path::new(workspace),
@@ -77,6 +87,9 @@ fn job_at(
         .arg("--record-file")
         .arg(evidence.join("records.jsonl"));
     client.args(["--cwd", workspace]);
+    for path in returns {
+        client.args(["--return-path", path]);
+    }
     if let Ok(sibling) = std::env::var("MOTOR_MACOS_QUALIFICATION_SIBLING") {
         client.args(["--sibling", &sibling]);
     }
@@ -532,6 +545,42 @@ fn macos_qualification_env() {
     assert!(!output
         .lines()
         .any(|line| line.starts_with("CARGO_TARGET_DIR=")));
+    clean();
+}
+
+#[test]
+#[ignore = "operator: installed daemon/client with macOS returned-file support"]
+fn macos_qualification_returned_file() {
+    let _lane = qualification_lock();
+    let workspace = required("MOTOR_MACOS_QUALIFICATION_WORKSPACE");
+    let name = format!("motor-return-{}.bin", uuid::Uuid::now_v7());
+    let path = Path::new(&workspace).join(&name);
+    assert!(!path.exists(), "artifact must exist only in the VM share");
+    let evidence = evidence_job("returned-file");
+    let output = job_at_with_returns(
+        &format!("printf returned-from-guest > '{name}'; printf output-before-returns"),
+        &[],
+        &workspace,
+        &evidence,
+        None,
+        &[path.to_str().unwrap()],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"returned-from-guest");
+    std::fs::remove_file(&path).unwrap();
+    let records = std::fs::read_to_string(evidence.join("records.jsonl")).unwrap();
+    let rows: Vec<serde_json::Value> = records
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let position = |kind| rows.iter().position(|row| row["type"] == kind).unwrap();
+    assert!(position("output") < position("return_chunk"));
+    assert!(position("return_chunk") < position("return_manifest"));
+    assert!(position("return_manifest") < position("terminal"));
     clean();
 }
 #[test]

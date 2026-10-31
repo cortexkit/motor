@@ -760,6 +760,9 @@ impl Config {
     pub(crate) fn vm_instance(&self) -> bool {
         self.windows_instance() || self.macos_instance()
     }
+    pub(crate) fn supports_returns(&self) -> bool {
+        self.backend == BackendKind::Host || (cfg!(unix) && self.macos_instance())
+    }
     fn cleanup_pending(&self, id: Uuid) -> bool {
         #[cfg(unix)]
         if self.macos_instance() {
@@ -3733,18 +3736,6 @@ impl Runner {
             if request.weight_hint.is_some_and(|hint| hint > 4) {
                 return Some((RefusalReason::RequestRejected, "macos_vcpu_limit".into()));
             }
-            if !paths::run(request).caller_return_paths.is_empty() {
-                return Some((
-                    RefusalReason::RequestRejected,
-                    "return_paths_unsupported".into(),
-                ));
-            }
-            if request.return_chunked {
-                return Some((
-                    RefusalReason::RequestRejected,
-                    "return_chunked_unsupported".into(),
-                ));
-            }
             if request.network.is_some() {
                 return Some((
                     RefusalReason::NetworkUnsupported,
@@ -3760,7 +3751,9 @@ impl Runner {
         ) {
             return Some((RefusalReason::RequestRejected, code.into()));
         }
-        if self.core.config.vm_instance() && !paths::run(request).caller_return_paths.is_empty() {
+        if !self.core.config.supports_returns()
+            && !paths::run(request).caller_return_paths.is_empty()
+        {
             return Some((
                 RefusalReason::RequestRejected,
                 "return_paths_unsupported".into(),
@@ -9097,19 +9090,38 @@ impl Runner {
                 tracing::warn!(%id, %write_error, "monitoring error retained in job record; replay diagnostic unavailable");
             }
         }
+        let job_directory = self.record_path(id).parent().unwrap().to_owned();
+        #[cfg(unix)]
+        let staged_returns = if self.core.config.macos_instance() {
+            self.core.config.macos_runtime.take_returns(id).or_else(|| {
+                job.request
+                    .as_ref()
+                    .filter(|r| !paths::run(r).caller_return_paths.is_empty())
+                    .map(|request| crate::return_paths::unread(request, &job_directory))
+            })
+        } else {
+            None
+        };
         let return_result = job
             .request
             .as_ref()
-            .filter(|r| !paths::run(r).caller_return_paths.is_empty() && !r.return_chunked)
+            .filter(|r| {
+                !paths::run(r).caller_return_paths.is_empty()
+                    && !r.return_chunked
+                    && !self.core.config.macos_instance()
+            })
             .map(|request| {
                 let seq = self.core.inner.lock().unwrap().jobs[&id].next_seq;
                 crate::return_paths::collect_authorized(&self.core.config, request, seq)
             });
-        let job_directory = self.record_path(id).parent().unwrap().to_owned();
         let returned = job
             .request
             .as_ref()
-            .filter(|r| !paths::run(r).caller_return_paths.is_empty() && r.return_chunked)
+            .filter(|r| {
+                !paths::run(r).caller_return_paths.is_empty()
+                    && r.return_chunked
+                    && !self.core.config.macos_instance()
+            })
             .map(|request| {
                 crate::return_paths::collect_chunked_authorized(
                     &self.core.config,
@@ -9117,6 +9129,12 @@ impl Runner {
                     &job_directory,
                 )
             });
+        #[cfg(unix)]
+        let (return_result, returned) = match staged_returns {
+            Some(crate::return_paths::Collection::Legacy(result)) => (Some(result), None),
+            Some(crate::return_paths::Collection::Chunked(collection)) => (None, Some(collection)),
+            None => (return_result, returned),
+        };
         self.finish_step(id, &job.kill, "returned files collected", finish_started);
         let log = self.job_log(id);
         // The last persistence error, logged at WARN only when it changes.

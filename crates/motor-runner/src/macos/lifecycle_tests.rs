@@ -75,6 +75,8 @@ fn new_runtime(host: Arc<Fake>) -> Arc<Runtime> {
         jobs: Mutex::default(),
         cancelled: Mutex::default(),
         changes: Mutex::default(),
+        returns: Mutex::default(),
+        workspace_reads: Mutex::default(),
         runner_lock: Mutex::default(),
         grace: Duration::from_millis(30),
         stop_timeout: Duration::from_millis(120),
@@ -116,6 +118,121 @@ fn make_paths(entry: &Entry) {
 fn assert_gone(entry: &Entry) {
     for path in entry.owned.lock().unwrap().record.paths.all() {
         assert!(!path.exists(), "{} survives", path.display());
+    }
+}
+
+#[test]
+fn returned_files_wait_for_stop_and_saved_proof_then_survive_cleanup() {
+    for failure in ["none", "stop", "disk", "proof-save"] {
+        for chunked in [false, true] {
+            let scratch = ScratchDir::new("macos-return-stop");
+            let root = scratch.join("state");
+            let host = Arc::new(Fake::default());
+            let runtime = new_runtime(host.clone());
+            let mut config = crate::engine::Config::new(&root, "macos");
+            config.macos_runtime = runtime.clone();
+            let entry = begin(&runtime, &root, 0);
+            let record = entry.owned.lock().unwrap().record.clone();
+            boot(&runtime, &host, &root, &entry, 100);
+            let tree = record.paths.tree.clone();
+            let workspace = tree.join("workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join("artifact"), b"x").unwrap();
+            let trees = crate::workspace::Trees {
+                state: root.join("macos"),
+                mirrors: root.join("mirrors"),
+                compacting: Default::default(),
+                mirror_locks: Default::default(),
+            };
+            let staged = super::super::Prepared {
+                cargo_home: tree.join("cargo-home"),
+                tree,
+                workspace,
+                siblings: vec![],
+                prepared_javascript_directories: vec![],
+            };
+            let motor_protocol::Frame::Run(mut request) = serde_json::from_str(include_str!(
+                "../../../../test-vectors/exec-remote-v1/frames/run.json"
+            ))
+            .unwrap() else {
+                unreachable!()
+            };
+            request.job_id = record.id;
+            request.workspace_key = record.workspace.clone();
+            request.return_paths = vec![format!("{}/artifact", record.workspace)];
+            request.return_chunked = chunked;
+            match failure {
+                "stop" => host.stop_failure.store(true, Ordering::Release),
+                "disk" => host.disk_held.store(true, Ordering::Release),
+                "proof-save" => {
+                    let path = Runtime::record_path(&root, record.id);
+                    std::fs::remove_file(&path).unwrap();
+                    std::fs::create_dir(&path).unwrap();
+                }
+                _ => {}
+            }
+            super::super::execution::capture_completion(&config, &trees, &entry, &request, &staged);
+            assert!(
+                entry.active.load(Ordering::Acquire),
+                "ownership retained through captures"
+            );
+            if failure == "none" {
+                let saved: Record =
+                    crate::storage::read_json(&Runtime::record_path(&root, record.id)).unwrap();
+                assert!(saved.stop_proven);
+                assert!(host.scans.load(Ordering::Acquire) > 0);
+                assert!(!runtime.host.alive(identity(100)).unwrap());
+                assert_eq!(
+                    *runtime.workspace_reads.lock().unwrap(),
+                    vec![(record.id, "changes"), (record.id, "returns")]
+                );
+                runtime.finish(&root, &entry);
+                assert!(!staged.workspace.exists());
+            } else {
+                assert!(!entry.owned.lock().unwrap().record.stop_proven);
+                assert!(
+                    runtime.workspace_reads.lock().unwrap().is_empty(),
+                    "failed stop must perform zero workspace reads"
+                );
+                assert!(runtime.take_changes(record.id).is_none());
+                assert!(staged.workspace.exists());
+            }
+            let collected = runtime.take_returns(record.id).unwrap();
+            assert!(runtime.take_returns(record.id).is_none());
+            match collected {
+                crate::return_paths::Collection::Legacy(result) if failure == "none" => {
+                    assert_eq!(result.returned_files.unwrap()[0].data, "eA==");
+                }
+                crate::return_paths::Collection::Legacy(result) => {
+                    assert_eq!(
+                        result.return_paths_failed.unwrap().cause,
+                        motor_protocol::ReturnFailureCause::ReadError
+                    );
+                    assert!(result.returned_files.is_none());
+                }
+                crate::return_paths::Collection::Chunked(collection) if failure == "none" => {
+                    assert_eq!(
+                        std::fs::read(
+                            trees
+                                .state
+                                .join("jobs")
+                                .join(record.id.to_string())
+                                .join(collection.directory)
+                                .join("chunk-0")
+                        )
+                        .unwrap(),
+                        b"x"
+                    );
+                }
+                crate::return_paths::Collection::Chunked(collection) => {
+                    assert!(collection.chunks.is_empty());
+                    assert_eq!(
+                        collection.files[0].cause(),
+                        Some(&motor_protocol::ReturnPathsFailureCause::ReadError)
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -835,6 +952,8 @@ fn helper_gets_gate_eof_grace_before_sigkill_escalation() {
             jobs: Mutex::default(),
             cancelled: Mutex::default(),
             changes: Mutex::default(),
+            returns: Mutex::default(),
+            workspace_reads: Mutex::default(),
             runner_lock: Mutex::default(),
             grace: Duration::from_millis(100),
             stop_timeout: Duration::from_secs(1),

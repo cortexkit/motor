@@ -231,6 +231,10 @@ fn collection_failures_keep_their_cause_and_byte_counts() {
             ReturnFailureCause::FrameLimit,
             shared::ReturnPathsFailureCause::FrameLimit,
         ),
+        (
+            ReturnFailureCause::ReadError,
+            shared::ReturnPathsFailureCause::ReadError,
+        ),
     ] {
         let record = return_record(
             stored(

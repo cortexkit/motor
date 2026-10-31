@@ -308,6 +308,9 @@ pub(crate) struct Runtime {
     // Cleanup can remove the tree and its entry before terminal publication.
     // Keep completed scans separately until the engine consumes them.
     changes: Mutex<BTreeMap<Uuid, Vec<String>>>,
+    returns: Mutex<BTreeMap<Uuid, crate::return_paths::Collection>>,
+    #[cfg(test)]
+    pub(super) workspace_reads: Mutex<Vec<(Uuid, &'static str)>>,
     runner_lock: Mutex<Option<ScopedLock>>,
     grace: Duration,
     stop_timeout: Duration,
@@ -319,6 +322,9 @@ impl Default for Runtime {
             host: Arc::new(Native),
             cancelled: Mutex::default(),
             changes: Mutex::default(),
+            returns: Mutex::default(),
+            #[cfg(test)]
+            workspace_reads: Mutex::default(),
             runner_lock: Mutex::default(),
             grace: Duration::from_millis(600),
             stop_timeout: Duration::from_millis(1400),
@@ -407,12 +413,22 @@ impl Runtime {
     pub(super) fn take_changes(&self, id: Uuid) -> Option<Vec<String>> {
         self.changes.lock().unwrap().remove(&id)
     }
+    pub(super) fn record_returns(&self, id: Uuid, returns: crate::return_paths::Collection) {
+        self.returns.lock().unwrap().insert(id, returns);
+    }
+    pub(crate) fn take_returns(&self, id: Uuid) -> Option<crate::return_paths::Collection> {
+        self.returns.lock().unwrap().remove(&id)
+    }
     pub fn prune_finished(&self, live: &std::collections::BTreeSet<Uuid>) {
         self.cancelled
             .lock()
             .unwrap()
             .retain(|id| live.contains(id));
         self.changes
+            .lock()
+            .unwrap()
+            .retain(|id, _| live.contains(id));
+        self.returns
             .lock()
             .unwrap()
             .retain(|id, _| live.contains(id));
@@ -573,9 +589,14 @@ impl Runtime {
             std::thread::park_timeout(Duration::from_millis(5));
         }
         let mut owned = entry.owned.lock().unwrap();
-        owned.record.stop_proven = true;
-        owned.record.proof_version = RELEASE_PROOF_VERSION;
-        Self::save(root, &owned.record)
+        // The change scan and returned-file collector trust the in-memory flag.
+        // A failed proof save must keep them from reading even a stopped VM's share.
+        let mut proven = owned.record.clone();
+        proven.stop_proven = true;
+        proven.proof_version = RELEASE_PROOF_VERSION;
+        Self::save(root, &proven)?;
+        owned.record = proven;
+        Ok(())
     }
     pub(super) fn cleanup(&self, root: &Path, entry: &Entry) -> io::Result<()> {
         let record = entry.owned.lock().unwrap().record.clone();
