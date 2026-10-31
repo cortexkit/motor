@@ -343,6 +343,7 @@ fn workspace_changes_ignore_guest_git_config_filters_hooks_and_gitdir_links() {
         .unwrap();
     let marker = f.scratch.join("host-code-executed");
     let hooks = f.scratch.join("hostile-hooks");
+    host::create_dir_all(&hooks).unwrap();
     tool(
         hooks.join("post-index-change"),
         &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
