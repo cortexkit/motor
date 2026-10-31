@@ -112,7 +112,7 @@ the host as a third account, `motor-prep`, before the VM boots.
   and fixed-length digests are compared in constant time. Invalid credentials
   and unknown job IDs receive identical refusals without runner I/O. The
   plaintext is sent only on the live submitting direct route, never in replay,
-  status, runner frames or module logs. AFT and Basal are unchanged. The CLI
+  status, runner frames or module logs. AFT is unchanged. The CLI
   saves the secret in a per-user `0700` directory under ck-motor's data root
   and prints only the job ID and secret-file path on stderr. The secret file is
   created exclusively with mode `0600`; `attach JOB_ID` discovers it by ID.

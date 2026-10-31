@@ -3,6 +3,8 @@ mod journal;
 #[cfg(test)]
 mod journal_tests;
 #[cfg(test)]
+pub(crate) mod legacy_fixtures;
+#[cfg(test)]
 mod submission_tests;
 #[cfg(test)]
 pub(crate) use journal::durable_value;
@@ -551,106 +553,6 @@ impl Storage {
             .map(|(id, job)| (*id, job.clone()))
             .collect()
     }
-    pub(crate) fn last_hosted(&self) -> Option<crate::HostedJobState> {
-        self.state
-            .lock()
-            .unwrap()
-            .jobs
-            .values()
-            .rev()
-            .filter_map(|j| j.hosted.clone())
-            .find(|h| h.booked_or_attempted())
-    }
-    /// Retained leases are the client's only host inventory; they are not live
-    /// capacity samples. Keep the newest job per first-party host for health.
-    pub(crate) fn last_hosted_per_host(&self) -> BTreeMap<String, (Uuid, crate::HostedJobState)> {
-        let state = self.state.lock().unwrap();
-        let mut hosts = BTreeMap::new();
-        for (id, job) in state.jobs.iter().rev() {
-            let Some(route) = &job.hosted else { continue };
-            let Some(placement) = &route.placement else {
-                continue;
-            };
-            if !placement.host.starts_with("boat:") {
-                hosts
-                    .entry(placement.host.clone())
-                    .or_insert_with(|| (*id, route.clone()));
-            }
-        }
-        hosts
-    }
-    pub(crate) fn hosted_routed_jobs_1h(&self) -> usize {
-        self.hosted_routed_jobs_1h_at(now_ms())
-    }
-    fn hosted_routed_jobs_1h_at(&self, now: u64) -> usize {
-        self.jobs_minted_in_last_hour(now, |job| {
-            job.hosted
-                .as_ref()
-                .is_some_and(|route| route.repository_routed)
-        })
-    }
-    /// Repository- or fleet-routed jobs in the last hour that the broker
-    /// answered `no_host_fits`, and that therefore ran on the build server.
-    pub(crate) fn hosted_no_host_fits_1h(&self) -> usize {
-        self.hosted_no_host_fits_1h_at(now_ms())
-    }
-    fn hosted_no_host_fits_1h_at(&self, now: u64) -> usize {
-        self.jobs_minted_in_last_hour(now, |job| {
-            job.routed_direct_reason.as_deref() == Some(NO_HOST_FITS)
-        })
-    }
-    /// Counts the jobs matching `matches` whose job ID was minted in the hour
-    /// before `now`. Job IDs are UUIDv7, so the ID carries its creation time.
-    fn jobs_minted_in_last_hour(&self, now: u64, matches: impl Fn(&Job) -> bool) -> usize {
-        self.state
-            .lock()
-            .unwrap()
-            .jobs
-            .iter()
-            .filter(|(id, job)| {
-                matches(job)
-                    && id.get_timestamp().is_some_and(|timestamp| {
-                        let (seconds, nanos) = timestamp.to_unix();
-                        let minted = seconds.saturating_mul(1000) + u64::from(nanos) / 1_000_000;
-                        now.checked_sub(minted)
-                            .is_some_and(|age| age < 60 * 60 * 1000)
-                    })
-            })
-            .count()
-    }
-    /// Durably send a repository- or fleet-routed job to the build server because the
-    /// broker answered `no_host_fits` before any placement. The hosted route
-    /// is removed, so nothing later releases or finishes a lease the broker
-    /// never booked, and a restart attaches to the build server instead of
-    /// asking for a lease again.
-    ///
-    /// The build server's queue-wait limit starts when it receives the Run
-    /// frame, and both it and ck-motor enforce the stored limit. The time
-    /// already spent asking for a lease is taken off that limit here, once,
-    /// so the job waits no longer in total than its limit allowed. It is
-    /// rounded down to whole seconds, and a positive limit stays at least one
-    /// second, because the build server reads zero as "refuse if it has to
-    /// queue at all".
-    pub(crate) fn routed_direct_no_host_fits(
-        &self,
-        id: Uuid,
-        spent_ms: u64,
-        hosted_max_vcpus: Option<u64>,
-    ) -> io::Result<()> {
-        self.update(|s| {
-            if let Some(job) = s.jobs.get_mut(&id) {
-                job.hosted = None;
-                job.routed_direct_reason = Some(NO_HOST_FITS.into());
-                job.routed_direct_hosted_max_vcpus = hosted_max_vcpus;
-                if job.queue_wait_limit_s > 0 {
-                    job.queue_wait_limit_s = job
-                        .queue_wait_limit_s
-                        .saturating_sub(spent_ms / 1000)
-                        .max(1);
-                }
-            }
-        })
-    }
     pub(crate) fn hosted_route(
         &self,
         id: Uuid,
@@ -1011,6 +913,26 @@ impl Storage {
             });
         })
     }
+    pub(crate) fn refused_authorized(
+        &self,
+        terminal: TerminalRecord,
+        direct_secret_hash: Option<[u8; 32]>,
+    ) -> io::Result<()> {
+        // Publish the refusal and its ownership together, so a follow-up can
+        // never mistake an unbound new job for a pre-cutover direct record.
+        self.update(|s| {
+            s.jobs.insert(
+                terminal.job_id,
+                Job {
+                    gate_job: direct_secret_hash.is_some(),
+                    direct_secret_hash,
+                    local_terminal: Some(terminal),
+                    terminal_observed_at_ms: Some(now_ms()),
+                    ..Job::default()
+                },
+            );
+        })
+    }
     pub(crate) fn cancel_acknowledged(&self, id: Uuid) -> io::Result<()> {
         self.update(|s| {
             let streamed = s.active_jobs.contains_key(&id);
@@ -1073,35 +995,6 @@ impl Storage {
                         .unwrap_or_default()
                         .max(now_ms().saturating_add(RETENTION_MS)),
                 );
-            }
-        })
-    }
-    /// Durably record the build-server ID of a resubmitted spill before its
-    /// Run frame is sent, so a restart attaches to that submission instead of
-    /// submitting again or reporting the withdrawn first submission.
-    /// A replacement default budget is measured from the original UUID's mint
-    /// time. Store only its remaining seconds in the existing budget field so
-    /// older clients enforce the same deadline after a restart.
-    pub(crate) fn resubmitted(
-        &self,
-        id: Uuid,
-        build_server_job_id: Uuid,
-        hosted_code: &str,
-        queue_budget_s: Option<u64>,
-    ) -> io::Result<()> {
-        self.update(|s| {
-            let job = s.jobs.entry(id).or_default();
-            if let Some(budget) = queue_budget_s.filter(|_| !job.gate_job) {
-                let submitted_ms = id.get_timestamp().map_or_else(now_ms, |stamp| {
-                    let (seconds, nanos) = stamp.to_unix();
-                    seconds.saturating_mul(1000) + u64::from(nanos) / 1_000_000
-                });
-                let spent_s = now_ms().saturating_sub(submitted_ms).div_ceil(1000);
-                job.queue_wait_limit_s = budget.saturating_sub(spent_s);
-            }
-            job.build_server_job_id = Some(build_server_job_id);
-            if let Some(route) = job.hosted.as_mut() {
-                route.hosted_code = Some(hosted_code.into());
             }
         })
     }
@@ -1645,7 +1538,7 @@ mod retention_renewal_tests {
     }
 
     #[test]
-    fn covered_retention_skips_io_but_new_deadlines_and_bindings_are_synchronous() {
+    fn covered_retention_skips_io_but_new_deadlines_and_cancellation_are_synchronous() {
         let scratch = cortexkit_test_support::ScratchDir::new("motor-retention-io");
         let storage = Storage::open(&scratch).unwrap();
         let id = Uuid::now_v7();
@@ -1681,15 +1574,11 @@ mod retention_renewal_tests {
             .retain_job_at(id, Some("changed".into()), start + 2)
             .is_err());
         assert!(storage.cancel(id, true).is_err());
-        assert!(storage
-            .resubmitted(id, Uuid::now_v7(), "unreachable", None)
-            .is_err());
         assert_eq!(storage.write_count.load(Ordering::SeqCst), before);
         let job = storage.job(id).unwrap();
         assert_eq!(job.retain_until_ms, Some(until));
         assert_eq!(job.workspace_key.as_deref(), Some("original"));
         assert!(!job.pending_cancel);
-        assert!(job.build_server_job_id.is_none());
 
         if let journal::Backend::Journal(j) = &mut *storage.persistence.backend.lock().unwrap() {
             j.set_append_readonly(false);
@@ -1806,109 +1695,6 @@ mod verified_tip_tests {
         }
         assert_eq!(storage.failed_tips.lock().unwrap().len(), MAX_FAILED_TIPS);
         assert!(!storage.tip_failed_recently(&key, now + Duration::from_secs(1)));
-    }
-}
-
-#[cfg(test)]
-mod hosted_routing_health_tests {
-    use super::*;
-
-    #[test]
-    fn hosted_routed_counter_only_counts_repository_routes_in_the_last_hour() {
-        let scratch = cortexkit_test_support::ScratchDir::new("hosted-route-health");
-        let storage = Storage::open(&scratch).unwrap();
-        let now = now_ms();
-        for (age, routed) in [(0, true), (3_599_999, true), (3_600_000, true), (0, false)] {
-            let minted = now - age;
-            let id = Uuid::new_v7(uuid::Timestamp::from_unix(
-                uuid::NoContext,
-                minted / 1000,
-                ((minted % 1000) * 1_000_000) as u32,
-            ));
-            storage.create(id, 30, None, None, false).unwrap();
-            storage
-                .hosted_route(
-                    id,
-                    crate::HostedJobState {
-                        repository_routed: routed,
-                        ..crate::HostedJobState::default()
-                    },
-                )
-                .unwrap();
-        }
-        assert_eq!(storage.hosted_routed_jobs_1h_at(now), 2);
-        assert_eq!(storage.hosted_routed_jobs_1h_at(now + 3_600_000), 0);
-        drop(storage);
-        let storage = Storage::open(&scratch).unwrap();
-        assert_eq!(storage.hosted_routed_jobs_1h_at(now), 2);
-    }
-
-    /// Sending a routed job to the build server removes its hosted route,
-    /// records why, and takes the whole seconds already spent off its
-    /// queue-wait limit exactly once; all of it survives reopening the store.
-    #[test]
-    fn no_host_fits_decision_trims_queue_wait_once_and_is_counted_for_an_hour() {
-        let scratch = cortexkit_test_support::ScratchDir::new("hosted-no-host-fits");
-        let storage = Storage::open(&scratch).unwrap();
-        let now = now_ms();
-        let mut ids = Vec::new();
-        for (age, limit, spent_ms, remaining, max_vcpus) in [
-            (0, 300, 2_999, 298, Some(21)),
-            (3_599_999, 2, 5_000, 1, None),
-            (3_600_000, 300, 0, 300, Some(8)),
-            (0, 0, 5_000, 0, None),
-        ] {
-            let minted = now - age;
-            let id = Uuid::new_v7(uuid::Timestamp::from_unix(
-                uuid::NoContext,
-                minted / 1000,
-                ((minted % 1000) * 1_000_000) as u32,
-            ));
-            storage.create(id, limit, None, None, false).unwrap();
-            storage
-                .hosted_route(
-                    id,
-                    crate::HostedJobState {
-                        repository_routed: true,
-                        lease_attempted: true,
-                        ..crate::HostedJobState::default()
-                    },
-                )
-                .unwrap();
-            storage
-                .routed_direct_no_host_fits(id, spent_ms, max_vcpus)
-                .unwrap();
-            ids.push((id, remaining, age, max_vcpus));
-        }
-        // Not a no_host_fits decision: a routed job still on its hosted route.
-        let routed = Uuid::new_v7(uuid::Timestamp::from_unix(
-            uuid::NoContext,
-            now / 1000,
-            ((now % 1000) * 1_000_000) as u32,
-        ));
-        storage.create(routed, 300, None, None, false).unwrap();
-        storage
-            .hosted_route(
-                routed,
-                crate::HostedJobState {
-                    repository_routed: true,
-                    ..crate::HostedJobState::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(storage.hosted_no_host_fits_1h_at(now), 3);
-        assert_eq!(storage.hosted_no_host_fits_1h_at(now + 3_600_000), 0);
-        drop(storage);
-        let storage = Storage::open(&scratch).unwrap();
-        assert_eq!(storage.hosted_no_host_fits_1h_at(now), 3);
-        assert_eq!(storage.hosted_routed_jobs_1h_at(now), 1);
-        for (id, remaining, age, max_vcpus) in ids {
-            let job = storage.job(id).unwrap();
-            assert!(job.hosted.is_none(), "age {age}");
-            assert_eq!(job.routed_direct_reason.as_deref(), Some("no_host_fits"));
-            assert_eq!(job.routed_direct_hosted_max_vcpus, max_vcpus, "age {age}");
-            assert_eq!(job.queue_wait_limit_s, remaining, "age {age}");
-        }
     }
 }
 

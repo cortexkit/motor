@@ -292,22 +292,15 @@ async fn macos_routes_directly_despite_all_hosted_settings_and_does_not_reserve_
         let peer = Arc::new(Peer::new());
         let config = Config {
             macos_runner: Some(runner()),
-            hosted_runners: mode == 0 || mode == 3,
+
             hosted_repositories: if mode == 1 || mode == 3 {
                 vec![repo.to_str().unwrap().into()]
             } else {
                 vec![]
             },
-            spill_to_hosted: true,
-            spill_after_s: 0,
+
             ..h.config()
         };
-        assert!(!crate::spill::eligible(
-            &config,
-            &request(&repo),
-            false,
-            true
-        ));
         let endpoint = config.macos_runner.clone().unwrap();
         let motor = Motor::with_connector(
             config,
@@ -356,7 +349,7 @@ async fn macos_hosted_test_is_refused_without_placement_or_direct_connection() {
     let peer = Arc::new(Peer::new());
     let config = Config {
         macos_runner: Some(runner()),
-        hosted_runners: true,
+
         hosted_repositories: vec![repo.to_str().unwrap().into()],
         ..h.config()
     };
@@ -593,7 +586,7 @@ async fn macos_status_stays_direct_when_linux_uses_hosted_status() {
     let config = Config {
         runner_instance: "test".into(),
         macos_runner: Some(runner()),
-        hosted_runners: true,
+
         ..Default::default()
     };
     let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();

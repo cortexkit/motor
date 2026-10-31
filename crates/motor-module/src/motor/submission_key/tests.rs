@@ -21,7 +21,7 @@ fn request(path: &Path) -> RunRequest {
 }
 
 fn motor(path: &Path, peer: ResubmitPeer) -> Motor {
-    Motor::with_connector(
+    Motor::with_test_fixture_direct_route(
         Config {
             runner_instance: "test".into(),
             ..Config::default()
@@ -380,7 +380,7 @@ async fn runner_acceptance_is_remembered_before_network_echo_refusal() {
     let repo = fixture_repo(scratch.path());
     let peer = ResubmitPeer::new();
     let log = peer.log.clone();
-    let motor = Motor::with_connector(
+    let motor = Motor::with_test_fixture_direct_route(
         Config {
             runner_instance: "test".into(),
             network_routing: true,
@@ -449,7 +449,7 @@ async fn durability_before_runner_submission() {
         root: root.clone(),
         observed: observed.clone(),
     };
-    let motor = Motor::with_connector(
+    let motor = Motor::with_test_fixture_direct_route(
         Config {
             runner_instance: "test".into(),
             ..Config::default()
@@ -495,60 +495,58 @@ async fn concurrent_resubmits_start_one_job() {
 }
 
 #[tokio::test]
-async fn keyed_spill_return_keeps_one_logical_job_across_restart() {
-    let broker = crate::hosted::test_http::Http::new(|path, _| {
-        if path == "/v1/leases" {
-            (503, serde_json::json!({"error":"no_capacity"}))
-        } else {
-            (404, serde_json::json!({"error":"job_unknown"}))
-        }
-    })
-    .await;
-    let scratch = ScratchDir::new("key-spill-return");
+async fn pre_cutover_keyed_resubmission_reattaches_its_stored_destination() {
+    let scratch = ScratchDir::new("key-pre-cutover-resubmission");
     let (_checkout, repo) = crate::hosted::boat_tests::committed_repo();
     let root = scratch.join("state");
     let config = Config {
         runner_instance: "test".into(),
-        broker_token_source: crate::BrokerTokenSource::Fake,
-        broker_url: Some(broker.url.clone()),
-        spill_to_hosted: true,
-        spill_after_s: 0,
         ..Config::default()
     };
     let peer = ResubmitPeer::new();
     let log = peer.log.clone();
     let motor = Motor::with_connector(config.clone(), &root, Arc::new(peer)).unwrap();
     let request = request(&repo).with_queue_wait_limit_s(30);
-    let stream = motor
-        .submit_agent(request.clone(), None, PRINCIPAL)
-        .await
-        .unwrap();
-    let id = stream.job_id;
-    let (_, concurrent) = tokio::join!(
-        records(stream),
-        motor.submit_agent(request.clone(), None, PRINCIPAL)
-    );
-    attached(&records(concurrent.unwrap()).await, id);
-    let destination = motor.storage.job(id).unwrap().build_server_job_id.unwrap();
-    assert_ne!(id, destination);
+    let id = Uuid::now_v7();
+    let destination = Uuid::now_v7();
+    seed(&motor, id, &request, true);
+    crate::storage::legacy_fixtures::seed_direct_route(
+        &motor.storage,
+        id,
+        crate::storage::legacy_fixtures::DirectRoute::SpillReturn {
+            runner_job_id: destination,
+            hosted_code: "hosted_capacity",
+        },
+    )
+    .unwrap();
+    log.lock().unwrap().completed.insert(destination);
     motor.close().await;
-    let peer = ResubmitPeer {
-        log: log.clone(),
-        end: crate::motor::queue_tests::ResubmitEnd::Exit,
-    };
-    let motor = Motor::with_connector(config, &root, Arc::new(peer)).unwrap();
-    let replay = records(motor.submit_agent(request, None, PRINCIPAL).await.unwrap()).await;
-    attached(&replay, id);
-    assert_eq!(
-        log.lock().unwrap().runs.len(),
-        2,
-        "only the withdrawn admission and its one return to the build server"
-    );
-    assert_eq!(log.lock().unwrap().attaches.last(), Some(&destination));
-    assert_eq!(
-        motor.storage.keyed_job(PRINCIPAL, KEY).unwrap().unwrap().0,
-        id
-    );
+
+    for _ in 0..2 {
+        let peer = ResubmitPeer {
+            log: log.clone(),
+            end: crate::motor::queue_tests::ResubmitEnd::Exit,
+        };
+        let motor = Motor::with_connector(config.clone(), &root, Arc::new(peer)).unwrap();
+        let replay = records(
+            motor
+                .submit_agent(request.clone(), None, PRINCIPAL)
+                .await
+                .unwrap(),
+        )
+        .await;
+        attached(&replay, id);
+        assert_eq!(log.lock().unwrap().attaches.last(), Some(&destination));
+        assert!(
+            log.lock().unwrap().runs.is_empty(),
+            "a stored resubmission must never run again"
+        );
+        assert_eq!(
+            motor.storage.keyed_job(PRINCIPAL, KEY).unwrap().unwrap().0,
+            id
+        );
+        motor.close().await;
+    }
 }
 
 #[tokio::test]
@@ -557,8 +555,7 @@ async fn keyed_hosted_route_reattaches_without_second_run() {
     let scratch = ScratchDir::new("key-hosted");
     let (_checkout, repo) = crate::hosted::boat_tests::committed_repo();
     let root = scratch.join("state");
-    let mut config = boat.config.clone();
-    config.hosted_runners = true;
+    let config = boat.config.clone();
     let motor =
         Motor::with_connector(config.clone(), &root, Arc::new(ResubmitPeer::new())).unwrap();
     let request = request(&repo);

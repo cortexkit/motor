@@ -290,6 +290,6 @@ systemctl --user status motor-runner@windows.service
 journalctl --user -u motor-runner@windows.service -n 50
 ```
 
-`runner.health` and `exec.status` with `platform: "windows"` report the
+`exec.status` with `platform: "windows"` reports the
 instance's units and its baseline toolchain. Test:
 `windows_health_and_status_use_the_instance_units_and_baseline_toolchain`.

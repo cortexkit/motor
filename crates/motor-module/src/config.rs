@@ -7,47 +7,40 @@ use std::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    #[serde(skip_serializing_if = "is_false")]
-    pub hosted_runners: bool,
-    /// Give the global hosted route capacity waits and pre-Run direct correction.
-    /// Gates use host-only leases and the tenant runner's priority lane. Jobs need
-    /// a 10..=21600 s timeout, 1..=64 vCPUs, and paths accepted by hosted::validate,
-    /// or stay direct. Without fleet routing, gates stay direct unless an
-    /// explicit repository route selects hosted routing.
-    /// hosted_runners still controls whether the global hosted route is enabled.
-    #[serde(skip_serializing_if = "is_false")]
-    pub hosted_fleet_routing: bool,
-    /// Main-checkout repository identities whose ordinary jobs use hosted leases.
+    /// Ignored legacy switches. All Linux jobs now use hosted leases, including
+    /// gate jobs, and a lease refusal never selects a direct Linux runner.
+    #[serde(skip_serializing)]
+    pub hosted_runners: serde::de::IgnoredAny,
+    #[serde(skip_serializing)]
+    pub hosted_fleet_routing: serde::de::IgnoredAny,
+    /// Main-checkout repository identities using repository-specific lease placement.
     /// Workspace paths are deliberately not matched: linked worktrees share the
     /// resolved repository_root of their main checkout. Windows and macOS stay direct.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosted_repositories: Vec<String>,
     /// Pin repository-routed leases to this broker placement hint. Spill and
-    /// fleet routes ignore it; hinted jobs never correct to the direct runner.
+    /// fleet routes ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hosted_repositories_placement_hint: Option<motor_lease::Placement>,
-    /// Move only proven capacity-permit waits to hosted runners. Defaults are
-    /// omitted so older clients with a closed Config schema can still load it.
-    #[serde(skip_serializing_if = "is_false")]
-    pub spill_to_hosted: bool,
+    /// Ignored legacy keys: Linux jobs now require a hosted lease and never
+    /// queue on a direct Linux runner before spilling to hosted capacity.
+    #[serde(skip_serializing)]
+    pub spill_to_hosted: serde::de::IgnoredAny,
     /// Ignored; kept so existing configs still parse.
     #[serde(skip_serializing)]
     pub shadow_to_hosted: serde::de::IgnoredAny,
-    /// Capacity-permit wait before attempting spill, in seconds (default 45).
-    #[serde(skip_serializing_if = "is_default_spill_after")]
-    pub spill_after_s: u64,
-    #[serde(skip_serializing_if = "is_default_spill_max_vcpus")]
-    pub spill_max_vcpus: u32,
-    /// The build server's broker host id. A spilled lease asks the broker to
-    /// avoid this host, so a job leaving the busy build server is never placed
-    /// back on it. Unset sends no host to avoid. Omitted when unset so older
-    /// clients with a closed Config schema can still load the file.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub spill_avoid_host: Option<String>,
+    #[serde(skip_serializing)]
+    pub spill_after_s: serde::de::IgnoredAny,
+    #[serde(skip_serializing)]
+    pub spill_max_vcpus: serde::de::IgnoredAny,
+    #[serde(skip_serializing)]
+    pub spill_avoid_host: serde::de::IgnoredAny,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub broker_url: Option<String>,
     #[serde(skip_serializing_if = "BrokerTokenSource::is_default")]
     pub broker_token_source: BrokerTokenSource,
+    /// Storage namespace and endpoint for persisted pre-cutover direct jobs.
+    /// New Linux jobs never select this instance.
     pub runner_instance: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub windows_runner_instance: Option<String>,
@@ -59,7 +52,8 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub macos_runner: Option<MacosRunner>,
     pub worktree_roots: Vec<PathBuf>,
-    pub queue_wait_limit_s: u64,
+    #[serde(skip_serializing)]
+    pub queue_wait_limit_s: serde::de::IgnoredAny,
     pub ssh_config_override: Option<PathBuf>,
     pub inject_tree_hash_mismatch: bool,
     pub inject_snapshot_failure: bool,
@@ -105,13 +99,6 @@ impl BrokerTokenSource {
 
 fn is_false(value: &bool) -> bool {
     !*value
-}
-
-fn is_default_spill_after(value: &u64) -> bool {
-    *value == 45
-}
-fn is_default_spill_max_vcpus(value: &u32) -> bool {
-    *value == 8
 }
 
 fn is_default_direct_timeout(value: &u64) -> bool {
@@ -303,15 +290,15 @@ impl Default for Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/share"));
         Self {
-            hosted_runners: false,
-            hosted_fleet_routing: false,
+            hosted_runners: serde::de::IgnoredAny,
+            hosted_fleet_routing: serde::de::IgnoredAny,
             hosted_repositories: Vec::new(),
             hosted_repositories_placement_hint: None,
-            spill_to_hosted: false,
+            spill_to_hosted: serde::de::IgnoredAny,
             shadow_to_hosted: serde::de::IgnoredAny,
-            spill_after_s: 45,
-            spill_max_vcpus: 8,
-            spill_avoid_host: None,
+            spill_after_s: serde::de::IgnoredAny,
+            spill_max_vcpus: serde::de::IgnoredAny,
+            spill_avoid_host: serde::de::IgnoredAny,
             broker_url: None,
             broker_token_source: BrokerTokenSource::CkAccount,
             runner_instance: "main".into(),
@@ -320,7 +307,7 @@ impl Default for Config {
             windows_runners: Vec::new(),
             macos_runner: None,
             worktree_roots: vec![data.join("cortexkit/alfonso/worktrees")],
-            queue_wait_limit_s: 300,
+            queue_wait_limit_s: serde::de::IgnoredAny,
             ssh_config_override: None,
             inject_tree_hash_mismatch: false,
             inject_snapshot_failure: false,
@@ -486,15 +473,6 @@ impl Config {
                 "hosted_repositories_placement_hint requires a valid host and non-null vm in the broker name grammar",
             ));
         }
-        if self
-            .spill_avoid_host
-            .as_deref()
-            .is_some_and(|host| !motor_lease::valid_name(host))
-        {
-            return Err(io::Error::other(
-                "spill_avoid_host must be 1-64 ASCII letters, digits, '.', '_' or '-'",
-            ));
-        }
         Ok(())
     }
 
@@ -504,12 +482,9 @@ impl Config {
     ) -> io::Result<RunnerTarget> {
         use motor_protocol::Platform;
         match platform {
-            None | Some(Platform::Linux) => Ok(RunnerTarget {
-                instance: self.runner_instance.clone(),
-                state_root: None,
-                windows: None,
-                macos: None,
-            }),
+            None | Some(Platform::Linux) => {
+                Err(io::Error::other("Linux jobs require a hosted lease"))
+            }
             Some(Platform::Windows) if !self.windows_runners.is_empty() => {
                 Ok(self.windows_runners[0].target())
             }
@@ -545,7 +520,13 @@ impl Config {
             }
         }
         if instance.is_none() || instance == Some(self.runner_instance.as_str()) {
-            return self.target(None);
+            // Only persisted pre-cutover jobs may use the former Linux instance.
+            return Ok(RunnerTarget {
+                instance: self.runner_instance.clone(),
+                state_root: None,
+                windows: None,
+                macos: None,
+            });
         }
         if instance == self.windows_runner_instance.as_deref() {
             return Ok(RunnerTarget {
@@ -593,5 +574,57 @@ mod tests {
             );
         }
         assert!(serde_json::from_str::<Config>(r#"{"unknown_config_key":true}"#).is_err());
+    }
+
+    #[test]
+    fn legacy_direct_linux_config_keys_load_but_cannot_select_a_runner() {
+        let scratch = cortexkit_test_support::ScratchDir::new("legacy-linux-config");
+        let path = scratch.join("config.jsonc");
+        std::fs::write(
+            &path,
+            r#"{
+            // Former direct-Linux routing settings remain loadable.
+            "runner_instance": "main",
+            "hosted_runners": false,
+            "hosted_fleet_routing": false,
+            "spill_to_hosted": true,
+            "spill_after_s": 45,
+            "spill_max_vcpus": 8,
+            "spill_avoid_host": "unused-host",
+            "queue_wait_limit_s": 300
+        }"#,
+        )
+        .unwrap();
+        let old_config = Config::load(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(old_config).unwrap(),
+            serde_json::to_value(Config::default()).unwrap()
+        );
+        for value in [
+            serde_json::json!(false),
+            serde_json::json!({"obsolete": true}),
+        ] {
+            let legacy = serde_json::json!({
+                "hosted_runners": value,
+                "hosted_fleet_routing": value,
+                "spill_to_hosted": value,
+                "spill_after_s": value,
+                "spill_max_vcpus": value,
+                "spill_avoid_host": value,
+                "queue_wait_limit_s": value,
+            });
+            std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+            let config = Config::load(&path).unwrap();
+            assert_eq!(
+                serde_json::to_value(&config).unwrap(),
+                serde_json::to_value(Config::default()).unwrap()
+            );
+            assert!(config.target(None).is_err());
+            assert!(config
+                .target(Some(&motor_protocol::Platform::Linux))
+                .is_err());
+        }
+        std::fs::write(&path, r#"{"hosted_runner_typo":true}"#).unwrap();
+        assert!(Config::load(&path).is_err());
     }
 }

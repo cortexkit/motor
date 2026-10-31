@@ -74,6 +74,8 @@ pub struct Motor {
     hosted_cleanup: Arc<hosted_cleanup::Cleanup>,
     #[cfg(test)]
     hosted_connector: Option<Arc<dyn Connector>>,
+    #[cfg(test)]
+    test_fixture_direct_route: bool,
     keyed_admissions: Arc<std::sync::Mutex<()>>,
     health_progress:
         Arc<std::sync::Mutex<std::collections::HashMap<Uuid, (Platform, progress::Reporter)>>>,
@@ -161,11 +163,27 @@ impl Motor {
             hosted_cleanup: Arc::default(),
             #[cfg(test)]
             hosted_connector: None,
+            #[cfg(test)]
+            test_fixture_direct_route: false,
             keyed_admissions: Arc::default(),
             health_probes: Arc::default(),
             health_progress: Arc::default(),
             wsl: crate::wsl::Checks::default(),
         })
+    }
+    #[cfg(test)]
+    pub(crate) fn test_fixture_direct_route(mut self) -> Self {
+        // Keep coverage of the shared direct protocol after removal of the Linux direct runner.
+        self.test_fixture_direct_route = true;
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn with_test_fixture_direct_route(
+        config: Config,
+        storage_root: &Path,
+        connector: Arc<dyn Connector>,
+    ) -> io::Result<Self> {
+        Self::with_connector(config, storage_root, connector).map(Self::test_fixture_direct_route)
     }
     pub fn with_account_tokens(mut self, tokens: Arc<crate::AccountTokens>) -> Self {
         self.account_tokens = Some(tokens);
@@ -298,7 +316,7 @@ impl Motor {
         request: RunRequest,
         identity: (Option<JobAttribution>, Option<[u8; 32]>),
         gate_job: bool,
-        allow_gate_spill: bool,
+        _allow_gate_spill: bool,
         hosted_test: bool,
         returns: crate::ReturnOptions,
     ) -> io::Result<JobStream> {
@@ -306,7 +324,7 @@ impl Motor {
             request,
             identity,
             gate_job,
-            allow_gate_spill,
+            _allow_gate_spill,
             hosted_test,
             returns,
             (None, "direct".into()),
@@ -318,12 +336,15 @@ impl Motor {
         mut request: RunRequest,
         identity: (Option<JobAttribution>, Option<[u8; 32]>),
         gate_job: bool,
-        allow_gate_spill: bool,
+        _allow_gate_spill: bool,
         hosted_test: bool,
         returns: crate::ReturnOptions,
         (key, caller): (Option<submission_key::KeyRecord>, String),
     ) -> io::Result<JobStream> {
         let (attribution, secret_hash) = identity;
+        let linux = matches!(request.platform, None | Some(Platform::Linux));
+        #[cfg(test)]
+        let linux = linux && !self.test_fixture_direct_route;
         let wsl_refusal = self.wsl.refusal(
             [
                 &request.workspace_key,
@@ -335,10 +356,7 @@ impl Motor {
             .map(Path::new),
         );
         let macos_not_hosted = hosted_test && request.platform == Some(Platform::Macos);
-        let fleet_refusal = if self.config.hosted_runners
-            && self.config.hosted_fleet_routing
-            && matches!(request.platform, None | Some(Platform::Linux))
-        {
+        let fleet_refusal = if linux {
             crate::hosted::validate(&request).err().map(|error| {
                 (
                     error.reason(),
@@ -370,28 +388,26 @@ impl Motor {
                     .iter()
                     .any(|listed| std::fs::canonicalize(listed).is_ok_and(|listed| listed == root))
             });
-        let spill_eligible = wsl_refusal.is_none()
-            && !hosted_test
-            && !repository_routed
-            && crate::spill::eligible(&self.config, &request, gate_job, allow_gate_spill);
         let wait = if gate_job {
             30 * 60
         } else {
-            request.queue_wait_limit_s.unwrap_or_else(|| {
-                if spill_eligible {
-                    self.config.queue_wait_limit_s
-                } else {
-                    // Jobs that cannot spill need time to reach their turn on the runner.
-                    (30 * 60).min(request.timeout.unwrap_or(30 * 60))
-                }
-            })
+            request
+                .queue_wait_limit_s
+                .unwrap_or_else(|| (30 * 60).min(request.timeout.unwrap_or(30 * 60)))
         };
-        let spill = spill_eligible && self.config.spill_after_s <= wait;
-        let instance = self
-            .config
-            .target(request.platform.as_ref())
-            .ok()
-            .map(|t| t.instance);
+        let instance = (!linux)
+            .then(|| {
+                self.config
+                    .target(request.platform.as_ref())
+                    .ok()
+                    .map(|t| t.instance)
+            })
+            .flatten();
+        #[cfg(test)]
+        let instance = instance.or_else(|| {
+            self.test_fixture_direct_route
+                .then(|| self.config.runner_instance.clone())
+        });
         // Own the route before publishing it: health may run on another thread
         // before the caller's stream and progress reporter have been created.
         let submission = self.submission(id);
@@ -409,6 +425,7 @@ impl Motor {
         if wsl_refusal.is_none() && hosted_test && !macos_not_hosted {
             let mut route = crate::HostedJobState::new(&self.config);
             route.hosted_test = true;
+            route.hosted_no_fallback = true;
             self.storage.hosted_route(id, route)?;
         } else if repository_routed {
             let mut route = crate::HostedJobState::new(&self.config);
@@ -419,17 +436,12 @@ impl Motor {
             self.storage.hosted_route(id, route)?;
             tracing::info!(job_id = %id, repo = %request.repository_root,
                 "routed to hosted (hosted_repositories)");
-        } else if wsl_refusal.is_none()
-            && fleet_refusal.is_none()
-            && self.config.hosted_runners
-            && matches!(request.platform, None | Some(Platform::Linux))
-            && (!gate_job || self.config.hosted_fleet_routing)
-        {
+        } else if linux {
             let mut route = crate::HostedJobState::new(&self.config);
-            route.fleet_routed = self.config.hosted_fleet_routing;
+            route.fleet_routed = true;
             // Gate priority belongs to the tenant's queue, not to shared Boat capacity.
             route.fleet_no_spill = route.fleet_routed && (gate_job || request.network.is_some());
-            route.hosted_no_fallback = route.fleet_routed;
+            route.hosted_no_fallback = true;
             self.storage.hosted_route(id, route)?;
         }
         self.storage
@@ -486,7 +498,7 @@ impl Motor {
                     id,
                     (request, returns, caller),
                     env_not_forwarded,
-                    (wait, spill),
+                    (wait, false),
                     &tx,
                     rx,
                 )
@@ -504,7 +516,14 @@ impl Motor {
     pub fn attach(&self, request: AttachRequest) -> io::Result<JobStream> {
         let id = request.job_id;
         self.storage.retain_job(id, None)?;
-        if self.hosted_state(id).is_none() {
+        if self.hosted_state(id).is_none()
+            && self.storage.job(id).is_none_or(|job| {
+                job.local_terminal.is_none()
+                    || job.runner_instance.is_some()
+                    || job.windows_runner.is_some()
+                    || job.hosted.is_some()
+            })
+        {
             self.connector_for_job(id)?;
         }
         let (stream, tx, rx) = self.stream(id);
@@ -574,18 +593,14 @@ impl Motor {
         secret_hash: Option<[u8; 32]>,
     ) -> io::Result<JobStream> {
         let id = Uuid::now_v7();
-        if secret_hash.is_some() {
-            self.storage
-                .create_authorized(id, 0, None, None, true, secret_hash)?;
-        }
+        let mut terminal = TerminalRecord::new(id, Outcome::RefusedBeforeStart { reason }, 0, 0, 0)
+            .with_ran(Ran::None);
+        terminal.refusal_detail = detail.map(bounded_detail);
+        self.storage
+            .refused_authorized(terminal.clone(), secret_hash)?;
         let (stream, tx, _) = self.stream(id);
-        if self.config.hosted_runners {
-            self.storage
-                .hosted_route(id, crate::HostedJobState::new(&self.config))?;
-        }
-        let motor = self.clone();
         tokio::spawn(async move {
-            if let Err(error) = motor.refused(id, reason, None, detail, &tx).await {
+            if let Err(error) = emit(&tx, StreamRecord::Terminal(terminal)).await {
                 let _ = tx.send(Err(error)).await;
             }
         });
@@ -694,6 +709,8 @@ impl Motor {
                     }
                 }
             }
+            // Validation details may append field diagnostics after a semicolon;
+            // keep the stored refusal code separate from that explanation.
             let code = detail
                 .as_deref()
                 .filter(|d| {
@@ -702,15 +719,23 @@ impl Motor {
                         || d.starts_with("return_chunked_")
                         || d.starts_with("lease_mismatch")
                 })
-                .and_then(|d| d.split(':').next())
+                .and_then(|d| d.split([':', ';']).next())
                 .unwrap_or("hosted_request_rejected")
                 .to_string();
             self.storage.hosted_update(id, |state| {
                 state.hosted_no_fallback = true;
                 state.hosted_code = Some(code.clone());
             })?;
+            let local_path_refusal = matches!(
+                terminal.outcome,
+                Outcome::RefusedBeforeStart {
+                    reason: RefusalReason::WorkspaceKeyRejected
+                }
+            ) && self
+                .hosted_state(id)
+                .is_some_and(|state| !state.booked_or_attempted());
             Some(match detail {
-                Some(d) if d.starts_with(&code) => d,
+                Some(d) if d.starts_with(&code) || local_path_refusal => d,
                 other => format!("{code}: {}", other.as_deref().unwrap_or("request refused")),
             })
         } else {
@@ -838,7 +863,11 @@ impl Motor {
                     .await;
             }
         }
-        if let Err(error) = self.config.target(request.platform.as_ref()) {
+        if let Err(error) = if matches!(request.platform, None | Some(Platform::Linux)) {
+            Ok(())
+        } else {
+            self.config.target(request.platform.as_ref()).map(|_| ())
+        } {
             return self
                 .refused(
                     id,
@@ -1042,7 +1071,7 @@ impl Motor {
         submission: (RunRequest, crate::ReturnOptions),
         env_not_forwarded: Vec<String>,
         wait: u64,
-        spill: bool,
+        _spill: bool,
         snapshots: Arc<Snapshots>,
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
         wake: watch::Receiver<bool>,
@@ -1052,7 +1081,7 @@ impl Motor {
             submission,
             env_not_forwarded,
             wait,
-            spill,
+            false,
             snapshots,
             tx,
             wake,
@@ -1069,7 +1098,7 @@ impl Motor {
         submission: (RunRequest, crate::ReturnOptions),
         env_not_forwarded: Vec<String>,
         wait: u64,
-        spill: bool,
+        _spill: bool,
         snapshots: Arc<Snapshots>,
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
         wake: watch::Receiver<bool>,
@@ -1101,7 +1130,7 @@ impl Motor {
         let spilled = self
             .hosted_state(id)
             .is_some_and(|route| route.spill_wait_ms.is_some());
-        let spill_after = (spill && !hosted && !resubmitted).then_some(self.config.spill_after_s);
+        let spill_after = None;
         let wait = windows_queue.as_ref().map_or(wait, |queue| {
             u64::try_from(
                 queue
@@ -1113,7 +1142,7 @@ impl Motor {
             .unwrap_or(u64::MAX)
             .min(wait)
         });
-        let wire_wait = spill_after.map_or(wait, |after| wait.min(after));
+        let wire_wait = wait;
         let connector = if hosted {
             None
         } else {
@@ -1169,66 +1198,19 @@ impl Motor {
                         request.weight_hint = Some(request.weight_hint.unwrap_or(2));
                         Ok(channel)
                     }
-                    Err(crate::hosted::Error::NoHostFits(max_vcpus))
-                        if self.hosted_state(id).is_some_and(|s| {
-                            s.capacity_routed()
-                                && !s.run_sent
-                                && s.repository_placement_hint.is_none()
-                        }) =>
-                    {
-                        // No hosted host can ever hold this job, so choosing
-                        // hosted for it was wrong from the start. This undoes
-                        // a routing decision before any placement; it is not
-                        // a hosted failure falling back. Nothing was booked,
-                        // so there is no lease to release or finish.
-                        let spent_ms =
-                            u64::try_from(spill_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        self.storage
-                            .routed_direct_no_host_fits(id, spent_ms, max_vcpus)?;
-                        tracing::info!(job_id = %id, vcpus = request.weight_hint.unwrap_or(2),
-                            max_vcpus = %max_vcpus.map_or_else(|| "unknown".to_owned(), |n| n.to_string()),
-                            "hosted no_host_fits; routing to build server");
-                        return Ok(true);
-                    }
                     Err(error) => {
+                        if matches!(error, crate::hosted::Error::Provisioning(_))
+                            && self.pending(id)
+                        {
+                            // A booking can arrive after cancellation. Preserve an unknown
+                            // outcome and settle it rather than starting a replacement job.
+                            return self.finish_hosted(id, true, tx).await.map(|_| false);
+                        }
                         if spilled && matches!(error, crate::hosted::Error::Provisioning(_)) {
                             let waited_ms = u64::try_from(spill_started.elapsed().as_millis())
                                 .unwrap_or(u64::MAX);
                             tracing::info!(job_id = %id, outcome = "provisioning_budget_exhausted",
                                 waited_ms, "spill provisioning budget exhausted");
-                        }
-                        // The hosted client never sends a Run frame, so this
-                        // failure proves the job did not start anywhere. A
-                        // closed account or a deliberately rejected request
-                        // must still stay final rather than bypass the refusal.
-                        // A lease body the broker could not parse (or that
-                        // ck-motor would not send) booked nothing, so it is
-                        // not among them: a spilled job goes back. So does a
-                        // spilled job the broker has no platform for: the
-                        // build server already queued it, so its platform runs
-                        // there, and the broker may say platform_unsupported
-                        // only because every overflow backend is offline.
-                        let final_refusal = matches!(
-                            error,
-                            crate::hosted::Error::AccountClosed
-                                | crate::hosted::Error::Rejected
-                                | crate::hosted::Error::BoatHostFull
-                        ) || (!spilled
-                            && matches!(error, crate::hosted::Error::Platform));
-                        if !final_refusal
-                            && self
-                                .return_spill(
-                                    id,
-                                    error.code(),
-                                    spill_started,
-                                    request
-                                        .queue_wait_limit_s
-                                        .is_none()
-                                        .then(|| (30 * 60).min(request.timeout.unwrap_or(30 * 60))),
-                                )
-                                .await?
-                        {
-                            return Ok(true);
                         }
                         match error {
                             crate::hosted::Error::Admitted
@@ -1379,12 +1361,6 @@ impl Motor {
                     .map(|_| false);
             }
             if !returns.return_paths.is_empty() && !channel.return_paths {
-                if self
-                    .return_spill(id, "return_paths_unsupported", spill_started, None)
-                    .await?
-                {
-                    return Ok(true);
-                }
                 return self
                     .refused(
                         id,
@@ -1416,12 +1392,6 @@ impl Motor {
             // return_result the caller did not ask for. Refuse first instead.
             if returns.return_chunked && !returns.return_paths.is_empty() && !channel.return_chunked
             {
-                if self
-                    .return_spill(id, "return_chunked_unsupported", spill_started, None)
-                    .await?
-                {
-                    return Ok(true);
-                }
                 return self
                     .refused(
                         id,
@@ -1441,12 +1411,6 @@ impl Motor {
                     .any(|platform| platform == required_platform)
             {
                 if explicit_windows && self.has_next_windows_runner(id) {
-                    return Ok(true);
-                }
-                if self
-                    .return_spill(id, "hosted_platform_unsupported", spill_started, None)
-                    .await?
-                {
                     return Ok(true);
                 }
                 return self
@@ -1471,19 +1435,6 @@ impl Motor {
                 .await
             {
                 Ok(h) => h,
-                // No Run frame was sent on this connection, so a spilled job
-                // goes back to the build server rather than reattaching to a
-                // runner that never received it.
-                Err(_) if self.spill_returnable(id) => {
-                    drop(channel);
-                    if self
-                        .return_spill(id, "hosted_connect_failed", spill_started, None)
-                        .await?
-                    {
-                        return Ok(true);
-                    }
-                    return self.follow_inner(id, 0, None, tx, wake, None).await;
-                }
                 Err(_)
                     if self
                         .hosted_state(id)
@@ -1532,15 +1483,7 @@ impl Motor {
             Ok(b) => b,
             Err(error) => {
                 self.log_hosted_failure(id, "transfer_bundles", &error);
-                // No Run frame was sent, so a spilled job goes back to the
-                // build server instead of failing for the caller.
                 drop(channel);
-                if self
-                    .return_spill(id, "hosted_transfer_bundles_failed", spill_started, None)
-                    .await?
-                {
-                    return Ok(true);
-                }
                 return self
                     .refused(id, RefusalReason::SnapshotFailed, Some(hash), None, tx)
                     .await
@@ -1552,12 +1495,6 @@ impl Motor {
             Err(error) => {
                 self.log_hosted_failure(id, "workspace_kind", &error);
                 drop(channel);
-                if self
-                    .return_spill(id, "hosted_workspace_kind_failed", spill_started, None)
-                    .await?
-                {
-                    return Ok(true);
-                }
                 return Err(error);
             }
         };
@@ -1627,8 +1564,6 @@ impl Motor {
         // From this point on even a failed write might have reached the runner.
         // Resubmission now requires a definitive before-start refusal; a lost
         // connection cannot prove that the command never ran.
-        // The hosted route records that durably first: it is what stops a
-        // spilled job from returning to the build server once it may have run.
         // A hosted Run is also fenced against shutdown, so the shutdown
         // inventory cannot miss a booking whose Run is about to be sent.
         let _booking_open = if hosted {
@@ -1651,12 +1586,6 @@ impl Motor {
             self.log_hosted_failure(id, "run_send", &error);
             drop(channel);
             drop(snapshots);
-            if self
-                .return_spill(id, "hosted_run_unacknowledged", spill_started, None)
-                .await?
-            {
-                return Ok(true);
-            }
             return self
                 .follow_attempt(id, 0, None, tx, wake, spill_after, windows_queue.as_mut())
                 .await;
@@ -1796,12 +1725,6 @@ impl Motor {
                 self.log_hosted_failure(id, "admission", incoming_cause(&other));
                 drop(channel);
                 drop(snapshots);
-                if self
-                    .return_spill(id, "hosted_run_unacknowledged", spill_started, None)
-                    .await?
-                {
-                    return Ok(true);
-                }
                 return self
                     .follow_attempt(id, 0, None, tx, wake, spill_after, windows_queue.as_mut())
                     .await;
@@ -2115,130 +2038,8 @@ impl Motor {
     fn build_server_id(&self, id: Uuid) -> Uuid {
         self.storage.runner_id(id)
     }
-    /// Whether a spilled job whose hosted route failed may go back to the build
-    /// server. A hosted runner, Boat or first-party, runs a command only from
-    /// the Run frame ck-motor sends it, and the route records `run_sent`
-    /// before that frame is written. Until then nothing has run anywhere,
-    /// whatever the broker booked. Jobs routed hosted by configuration never
-    /// fall back: only a spill records `spill_wait_ms`.
-    fn spill_returnable(&self, id: Uuid) -> bool {
-        self.hosted_state(id).is_some_and(|route| {
-            route.spill_wait_ms.is_some() && !route.run_sent && route.terminal.is_none()
-        })
-    }
-    /// Send a spilled job that never reached a hosted runner back to the build
-    /// server, rather than refusing a job that already gave up its place in
-    /// the queue or reattaching to a runner that never received it. Returns
-    /// false, changing nothing, when the job may not go back.
-    ///
-    /// The broker is told first so it stops holding a sandbox for the job: a
-    /// booked Boat job is settled with finish (release cannot end it), any
-    /// other lease is released. The new build-server ID is stored before the
-    /// caller's loop sends its Run frame, so a restart attaches to that ID
-    /// instead of losing the job or submitting it twice.
-    async fn return_spill(
-        &self,
-        id: Uuid,
-        cause: &str,
-        started: tokio::time::Instant,
-        default_queue_budget_s: Option<u64>,
-    ) -> io::Result<bool> {
-        if !self.spill_returnable(id) {
-            if self
-                .hosted_state(id)
-                .is_some_and(|route| route.spill_wait_ms.is_some())
-            {
-                tracing::info!(job_id = %id, outcome = "reattaching", cause,
-                    "spilled job's Run frame may have reached its hosted runner; reattaching, not resubmitting");
-            }
-            return Ok(false);
-        }
-        let route = self
-            .hosted_state(id)
-            .ok_or_else(|| io::Error::other("missing hosted route"))?;
-        let client = self.hosted_client(route.clone());
-        let boat = route
-            .placement
-            .as_ref()
-            .is_some_and(|p| p.host.starts_with("boat:"));
-        if boat {
-            client.finish_never_ran(id, &self.storage).await?;
-        } else if route.booked_or_attempted() {
-            let released = client.release_stored(id, &self.storage).await;
-            tracing::info!(job_id = %id, result = released.err().map_or("released", |e| e.code()),
-                "hosted release");
-            // Boat jobs are admitted at booking, so job_admitted means a Boat
-            // booking whose lease reply ck-motor never accepted. Settle it.
-            if released == Err(crate::hosted::Error::Admitted) && route.placement.is_none() {
-                client.finish_never_ran(id, &self.storage).await?;
-            }
-        }
-        let build_server_id = Uuid::now_v7();
-        let queue_budget_s = default_queue_budget_s
-            .filter(|_| matches!(cause, "hosted_capacity" | "hosted_provisioning"));
-        self.storage
-            .resubmitted(id, build_server_id, cause, queue_budget_s)?;
-        self.recover_hosted(id);
-        let spill_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        tracing::info!(
-            job_id = %id,
-            build_server_job_id = %build_server_id,
-            broker_code = cause,
-            outcome = "returned_to_build_server",
-            spill_ms,
-            "spill not placed; resubmitted to build server"
-        );
-        Ok(true)
-    }
     pub fn return_result(&self, id: Uuid) -> Option<ReturnResult> {
         self.storage.job(id).and_then(|j| j.return_result)
-    }
-    pub(crate) fn hosted_health(&self) -> Option<serde_json::Value> {
-        let routed = self.storage.hosted_routed_jobs_1h();
-        let no_host_fits = self.storage.hosted_no_host_fits_1h();
-        let host_leases = self.storage.last_hosted_per_host();
-        if !self.config.hosted_runners
-            && self.config.hosted_repositories.is_empty()
-            && routed == 0
-            && no_host_fits == 0
-            && host_leases.is_empty()
-        {
-            return None;
-        }
-        let last = self.storage.last_hosted();
-        let error = last.as_ref().and_then(|s| s.hosted_code.as_deref());
-        let hosts: Vec<_> = host_leases
-            .into_iter()
-            .map(|(host, (id, state))| {
-                let outcome = state
-                    .hosted_code
-                    .as_deref()
-                    .unwrap_or(if state.finish_done {
-                        "finished"
-                    } else if state.run_sent {
-                        "run_sent"
-                    } else {
-                        "leased"
-                    });
-                serde_json::json!({
-                    "host": host,
-                    "last_lease_job_id": id,
-                    "last_lease_outcome": outcome,
-                    "capacity": null,
-                })
-            })
-            .collect();
-        Some(serde_json::json!({
-            "hosted": self.config.hosted_runners,
-            "hosted_routed_jobs_1h": routed,
-            "hosted_no_host_fits_1h": no_host_fits,
-            "token_source": self.config.broker_token_source,
-            "broker_reachable": last.as_ref().and_then(|s| if s.hosted_code.as_deref() == Some("hosted_broker_unreachable") { Some(false) } else if s.placement.is_some() { Some(true) } else { None }),
-            "last_lease_error": error,
-            "hosted_hosts": hosts,
-            "hosted_hosts_source": "retained_leases",
-            "hosted_hosts_missing": "broker host inventory and live capacity are not exposed to ck-motor",
-        }))
     }
     async fn open_job_channel(&self, id: Uuid) -> Result<Channel, crate::hosted::Error> {
         self.open_job_channel_at(id, crate::hosted::now_s().saturating_mul(1000))
@@ -2471,9 +2272,9 @@ impl Motor {
         channel: Option<Channel>,
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
         wake: watch::Receiver<bool>,
-        spill_after: Option<u64>,
+        _spill_after: Option<u64>,
     ) -> io::Result<bool> {
-        self.follow_attempt(id, cursor, channel, tx, wake, spill_after, None)
+        self.follow_attempt(id, cursor, channel, tx, wake, None, None)
             .await
     }
     #[allow(clippy::too_many_arguments)]
@@ -2484,14 +2285,13 @@ impl Motor {
         mut channel: Option<Channel>,
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
         mut wake: watch::Receiver<bool>,
-        spill_after: Option<u64>,
+        _spill_after: Option<u64>,
         mut windows_queue: Option<&mut WindowsQueue>,
     ) -> io::Result<bool> {
         let hosted = self.hosted_state(id).is_some();
         // Frames to and from the build server carry its ID for the job; records
         // and storage keep the caller's.
         let build_server_id = self.build_server_id(id);
-        let mut spill_watch = spill_after.map(crate::spill::Watch::new);
         if self
             .hosted_state(id)
             .is_some_and(|s| s.billing != crate::BillingStatus::Pending && s.terminal.is_some())
@@ -2502,8 +2302,7 @@ impl Motor {
             .storage
             .job(id)
             .map(|j| j.queue_wait_limit_s)
-            .unwrap_or(self.config.queue_wait_limit_s);
-        let wait = spill_after.map_or(wait, |after| wait.min(after));
+            .unwrap_or(30 * 60);
         let mut backoff = 1;
         let mut withdraw_sent = false;
         let mut queue_deadline = None;
@@ -2567,9 +2366,6 @@ impl Motor {
                 }
             }
             if channel.is_none() {
-                if let Some(watch) = spill_watch.as_mut() {
-                    watch.disconnected();
-                }
                 queue_deadline = None;
                 if hosted && reattaches == 3 {
                     self.log_hosted_failure(id, "reattach", "attempt limit reached");
@@ -2674,11 +2470,7 @@ impl Motor {
                 _ = async { if let Some(deadline) = queue_deadline { tokio::time::sleep_until(deadline).await; } else { std::future::pending::<()>().await; } }, if !withdraw_sent => {
                     withdraw_sent = true;
                     queue_deadline = None;
-                    let spill = spill_watch.as_ref().is_some_and(|watch| watch.ready());
-                    if let Some(watch) = spill_watch.as_mut() {
-                        watch.withdraw_sent(spill);
-                    }
-                    if c.send(Frame::Withdraw { job_id: build_server_id, reason: None, spill }).await.is_err() { channel = None; }
+                    if c.send(Frame::Withdraw { job_id: build_server_id, reason: None, spill: false }).await.is_err() { channel = None; }
                     None
                 },
             };
@@ -2687,9 +2479,6 @@ impl Motor {
             };
             match incoming {
                 Ok(Incoming::Frame(Frame::Heartbeat { queue_wait_ms })) => {
-                    if let Some(watch) = spill_watch.as_mut() {
-                        watch.observe(queue_wait_ms);
-                    }
                     queue_deadline = queue_wait_ms.and_then(|elapsed| {
                         tokio::time::Instant::now().checked_add(Duration::from_millis(
                             wait.saturating_mul(1000).saturating_sub(elapsed),
@@ -2710,9 +2499,6 @@ impl Motor {
                             state.started_at_ms.get_or_insert(started_at_ms);
                         })?;
                     }
-                    if let Some(watch) = spill_watch.as_mut() {
-                        watch.started();
-                    }
                     queue_deadline = None;
                     if seq < cursor {
                         continue;
@@ -2726,9 +2512,6 @@ impl Motor {
                 Ok(Incoming::Frame(Frame::Output(output))) => {
                     windows_queue = None;
                     self.submission_ready(id);
-                    if let Some(watch) = spill_watch.as_mut() {
-                        watch.started();
-                    }
                     if output.seq < cursor {
                         continue;
                     }
@@ -2816,19 +2599,6 @@ impl Motor {
                     }
                     if hosted {
                         log_hosted_terminal(id, &terminal);
-                    }
-                    if !self.pending(id)
-                        && spill_watch
-                            .as_ref()
-                            .is_some_and(|watch| watch.withdrawn(&terminal))
-                    {
-                        let wait_ms = spill_watch.as_ref().unwrap().spill_wait_ms();
-                        tracing::info!(job_id = %id, wait_ms, "capacity permit wait spilled to hosted runner");
-                        let mut route = crate::HostedJobState::new(&self.config);
-                        route.spill_wait_ms = Some(wait_ms);
-                        route.avoid_host = self.config.spill_avoid_host.clone();
-                        self.storage.hosted_route(id, route)?;
-                        return Ok(true);
                     }
                     let boat = hosted
                         && self
@@ -2974,6 +2744,19 @@ impl Motor {
     /// a retry task sends it without depending on an attach caller staying alive.
     pub async fn cancel(&self, request: CancelRequest) -> io::Result<CancelReply> {
         let id = request.job_id;
+        // An unbound local refusal reached no runner. Bound direct records and
+        // unconfirmed cancellation still need their persisted follow-up route.
+        if self.storage.job(id).is_some_and(|job| {
+            job.runner_instance.is_none()
+                && job.windows_runner.is_none()
+                && !job.pending_cancel
+                && job
+                    .local_terminal
+                    .is_some_and(|terminal| terminal.ran == Some(Ran::None))
+                && self.hosted_state(id).is_none_or(|state| !state.run_sent)
+        }) {
+            return Ok(CancelReply::new(id));
+        }
         let started = tokio::time::Instant::now();
         let elapsed_ms = || started.elapsed().as_millis() as u64;
         tracing::info!(job_id = %id, "job cancel received from caller");
@@ -3070,7 +2853,10 @@ impl Motor {
         &self,
         platform: Option<&Platform>,
     ) -> io::Result<RunnerStatusReply> {
-        if self.config.hosted_runners && matches!(platform, None | Some(Platform::Linux)) {
+        let hosted = matches!(platform, None | Some(Platform::Linux));
+        #[cfg(test)]
+        let hosted = hosted && !self.test_fixture_direct_route;
+        if hosted {
             // This is the aggregate exec.status view, not a direct-runner probe.
             // Component health uses its own status request so an intentionally
             // skipped aggregate probe is never counted as a connection failure.
@@ -3086,7 +2872,15 @@ impl Motor {
         &self,
         platform: Option<&Platform>,
     ) -> io::Result<RunnerStatusReply> {
-        let connector = self.connector_for_target(self.config.target(platform)?);
+        let target = self.config.target(platform);
+        #[cfg(test)]
+        let target =
+            if self.test_fixture_direct_route && matches!(platform, None | Some(Platform::Linux)) {
+                self.config.stored_target(None)
+            } else {
+                target
+            };
+        let connector = self.connector_for_target(target?);
         Self::status_from_connector(connector.as_ref()).await
     }
     async fn status_from_connector(connector: &dyn Connector) -> io::Result<RunnerStatusReply> {
@@ -3155,12 +2949,22 @@ impl Motor {
     }
     pub async fn job_status(&self, id: Uuid) -> io::Result<JobStatusReply> {
         self.storage.retain_job(id, None)?;
-        // Direct clients need a stable result after runner eviction. Ordinary
-        // callers still inspect the runner for current unit and route diagnostics.
+        // A hosted refusal before Run has no runner job to inspect. Keep its
+        // recorded result after restart, as direct clients do after runner eviction.
+        // Other callers still inspect the runner for unit and route diagnostics.
+        let hosted_never_sent = self.hosted_state(id).is_some_and(|route| !route.run_sent);
         if let Some(terminal) = self
             .storage
             .job(id)
-            .filter(|job| job.direct_secret_hash.is_some() || job.health_retired())
+            .filter(|job| {
+                job.direct_secret_hash.is_some()
+                    || job.health_retired()
+                    || hosted_never_sent
+                    || (job.runner_instance.is_none()
+                        && job.windows_runner.is_none()
+                        && job.hosted.is_none()
+                        && job.local_terminal.is_some())
+            })
             .and_then(|job| job.remote_terminal.or(job.local_terminal))
         {
             return Ok(JobStatusReply {
@@ -3258,17 +3062,10 @@ impl Motor {
             .or(job.runner_instance)
     }
     pub async fn drop_workspace(&self, request: DropRequest) -> io::Result<DropReply> {
-        // Hosted hosts have no workspace-drop operation; their tenants evict idle
-        // workspaces. The direct runner may still hold gate or fallback workspaces,
-        // so always forward its drop and preserve its reply or connection error.
-        let mut channel = Channel::open(self.connector.as_ref(), Uuid::now_v7())
-            .await
-            .map_err(|r| io::Error::other(format!("{r:?}")))?;
-        channel.send(Frame::Drop(request)).await?;
-        match channel.next().await? {
-            Incoming::Frame(Frame::DropReply(reply)) => Ok(reply),
-            _ => Err(io::Error::other("expected drop_reply")),
-        }
+        // Linux workspaces belong to hosted tenants, which evict idle workspaces
+        // themselves. There is no single runner to forward a workspace drop to.
+        let _ = request;
+        Ok(DropReply::new(false, Vec::new()))
     }
     pub async fn prepare(&self, request: PrepareRequest) -> io::Result<PrepareReply> {
         let id = Uuid::now_v7();
@@ -3281,131 +3078,10 @@ impl Motor {
             return Ok(prepare_refused(id, RefusalReason::WorkspaceKeyRejected)
                 .with_refusal_detail(message));
         }
-        if self.config.hosted_runners {
-            // Prepare targets a single runner, but hosted jobs are placed at run time.
-            // A refused transfer is not a job and must not enter job storage.
-            return Ok(prepare_refused(id, RefusalReason::RequestRejected)
-                .with_refusal_detail("hosted_prepare_unsupported: hosted_no_fallback"));
-        }
-        let config = self.config.clone();
-        let r = request.clone();
-        if let Err(error) = tokio::task::spawn_blocking(move || {
-            snapshot::validate(
-                &config,
-                &r.workspace_key,
-                &r.repository_root,
-                &r.workspace_key,
-            )
-        })
-        .await
-        .map_err(io::Error::other)?
-        {
-            tracing::warn!(transfer_id = %id, check = %error, "workspace key refused");
-            return Ok(prepare_refused(id, RefusalReason::WorkspaceKeyRejected)
-                .with_refusal_detail(bounded_detail(error.to_string())));
-        }
-        let config = self.config.clone();
-        let r = request.clone();
-        let parent = self.spool_root.clone();
-        let storage = self.storage.clone();
-        let snapshots = tokio::task::spawn_blocking(move || {
-            Snapshots::build(
-                &config,
-                &r.workspace_key,
-                &r.repository_root,
-                &r.siblings,
-                &parent,
-                id,
-                Some(&r.base_commit),
-                &storage,
-            )
-        })
-        .await
-        .map_err(io::Error::other)?;
-        let snapshots = match snapshots {
-            Ok(s) => s,
-            Err(f) => {
-                let detail = snapshot_refusal_detail(f.check, &self.spool_root, []);
-                tracing::warn!(transfer_id = %id, check = detail, "snapshot refused");
-                return Ok(
-                    prepare_refused(id, RefusalReason::SnapshotFailed).with_refusal_detail(detail)
-                );
-            }
-        };
-        let mut channel = match open_for_request(self.connector.as_ref(), id).await {
-            Ok(c) => c,
-            Err((reason, detail, retry_after_ms)) => {
-                let mut reply = prepare_refused(id, reason);
-                reply.refusal_detail = detail.map(bounded_detail);
-                reply.retry_after_ms = retry_after_ms;
-                return Ok(reply);
-            }
-        };
-        if let Err(error) = snapshots.validate_sibling_paths(channel.sibling_paths) {
-            return Ok(prepare_refused(id, RefusalReason::WorkspaceKeyRejected)
-                .with_refusal_detail(bounded_detail(error.to_string())));
-        }
-        let held = match self
-            .have(
-                &mut channel,
-                snapshots.candidates(&self.storage.previous(&request.workspace_key)),
-                snapshots.git_dependencies.keys().cloned().collect(),
-                id,
-                UnreachableStep::Prepare,
-            )
-            .await
-        {
-            Ok(h) => h,
-            Err(_) => return Ok(prepare_refused(id, RefusalReason::Unreachable)),
-        };
-        let (snapshots, bundles) = tokio::task::spawn_blocking(move || {
-            let b = snapshots.transfer_bundles(id, &held.0, held.1.as_deref());
-            (snapshots, b)
-        })
-        .await
-        .map_err(io::Error::other)?;
-        let (bundles, git_dependencies, upload) = match bundles {
-            Ok(b) => b,
-            Err(_) => return Ok(prepare_refused(id, RefusalReason::SnapshotFailed)),
-        };
-        let frame = Frame::Prepare(Prepare {
-            transfer_id: id,
-            workspace_kind: Some(snapshot::workspace_kind(
-                &self.config,
-                &request.workspace_key,
-            )?),
-            workspace_key: request.workspace_key,
-            repository_root: request.repository_root,
-            base_commit: snapshots.main.commit.clone(),
-            integration_tip: snapshots.main.tip.clone().unwrap_or_default(),
-            siblings: snapshots.sibling_frames(),
-            bundles: bundles.clone(),
-            git_dependencies,
-        });
-        let result = async {
-            channel.send(frame).await?;
-            match channel.next().await? {
-                Incoming::Frame(Frame::PrepareAccepted { .. }) => {}
-                Incoming::Frame(Frame::Refusal(refusal)) => {
-                    log_refusal(id, &refusal);
-                    return Ok(prepare_runner_refused(id, &refusal));
-                }
-                _ => return Err(io::Error::other("expected prepare_accepted")),
-            }
-            self.upload(&channel, &snapshots, &upload, None).await?;
-            match channel.next().await? {
-                Incoming::Frame(Frame::Prepared { .. }) => {
-                    Ok(PrepareReply::new(id, PrepareOutcome::Prepared))
-                }
-                Incoming::Frame(Frame::Refusal(refusal)) => {
-                    log_refusal(id, &refusal);
-                    Ok(prepare_runner_refused(id, &refusal))
-                }
-                _ => Err(io::Error::other("prepare detached")),
-            }
-        }
-        .await;
-        Ok(result.unwrap_or_else(|_| prepare_refused(id, RefusalReason::TransferInterrupted)))
+        // Hosted jobs are placed when they run, so a prepare transfer cannot
+        // choose a runner in advance. A refused transfer is not a stored job.
+        Ok(prepare_refused(id, RefusalReason::RequestRejected)
+            .with_refusal_detail("hosted_prepare_unsupported: hosted_no_fallback"))
     }
     fn connector_for_target(&self, target: crate::config::RunnerTarget) -> Arc<dyn Connector> {
         Arc::new(InstanceConnector {
@@ -3414,16 +3090,16 @@ impl Motor {
         })
     }
     fn connector_for_job(&self, id: Uuid) -> io::Result<Arc<dyn Connector>> {
-        let job = self.storage.job(id);
-        if let Some(runner) = job.as_ref().and_then(|j| j.windows_runner.as_ref()) {
+        let job = self.storage.job(id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "job not recorded by this client")
+        })?;
+        if let Some(runner) = job.windows_runner.as_ref() {
             return Ok(self.connector_for_target(runner.target()));
         }
         // Each job record names the runner instance it was submitted to, so attach,
         // status and cancel reach the same instance after a restart. Records
         // written before that field existed were all submitted to the Linux runner.
-        let target = self
-            .config
-            .stored_target(job.as_ref().and_then(|j| j.runner_instance.as_deref()))?;
+        let target = self.config.stored_target(job.runner_instance.as_deref())?;
         Ok(self.connector_for_target(target))
     }
     fn has_next_windows_runner(&self, id: Uuid) -> bool {
@@ -3582,13 +3258,6 @@ fn runner_refusal_fields(refusal: &Refusal) -> (RefusalReason, Option<String>) {
             refusal.detail.clone().map(bounded_detail),
         )
     }
-}
-fn prepare_runner_refused(id: Uuid, refusal: &Refusal) -> PrepareReply {
-    let (reason, detail) = runner_refusal_fields(refusal);
-    let mut reply = prepare_refused(id, reason);
-    reply.refusal_detail = detail;
-    reply.retry_after_ms = refusal.retry_after_ms;
-    reply
 }
 async fn emit(tx: &mpsc::Sender<io::Result<StreamRecord>>, record: StreamRecord) -> io::Result<()> {
     // Caller disconnection is ordinary detach. The runner retains history; the

@@ -67,7 +67,6 @@ async fn runner_reported_outcome_unknown_logs_its_cause() {
 async fn outcome_unknown_without_a_runner_terminal_logs_that_none_arrived() {
     let scratch = cortexkit_test_support::ScratchDir::new("motor-outcome-unknown-no-terminal");
     let config = Config {
-        hosted_runners: true,
         ..Config::default()
     };
     let motor = Motor::with_connector(

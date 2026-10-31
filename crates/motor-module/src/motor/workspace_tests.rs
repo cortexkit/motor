@@ -62,13 +62,12 @@ impl Connector for DropPeer {
 }
 
 #[tokio::test]
-async fn hosted_drop_reaches_direct_runner_without_creating_jobs() {
+async fn linux_drop_is_a_typed_noop_without_creating_jobs() {
     let h = Harness::new(Behavior::Normal).await;
     let scratch = Scratch::new();
     for fleet in [false, true] {
         for dropped in [false, true] {
-            let mut config = h.config();
-            config.hosted_fleet_routing = fleet;
+            let config = h.config();
             let drops = Arc::new(Mutex::new(Vec::new()));
             let cancelled = vec![Uuid::now_v7()];
             let motor = Motor::with_connector(
@@ -84,11 +83,10 @@ async fn hosted_drop_reaches_direct_runner_without_creating_jobs() {
             let result = motor.drop_workspace(DropRequest::new(key)).await;
             assert_eq!(motor.storage.job_count(), 0);
             let reply = result.unwrap();
-            assert_eq!(reply.dropped, dropped);
-            assert_eq!(reply.cancelled_jobs, cancelled);
+            assert!(!reply.dropped);
+            assert!(reply.cancelled_jobs.is_empty());
             let drops = drops.lock().unwrap();
-            assert_eq!(drops.len(), 1);
-            assert_eq!(drops[0].workspace_key, key);
+            assert!(drops.is_empty());
         }
     }
     assert!(h.requests.lock().unwrap().is_empty());
@@ -96,55 +94,43 @@ async fn hosted_drop_reaches_direct_runner_without_creating_jobs() {
 }
 
 #[tokio::test]
-async fn hosted_prepare_refuses_without_creating_jobs() {
+async fn linux_prepare_refuses_without_creating_jobs() {
     let h = Harness::new(Behavior::Normal).await;
     let scratch = Scratch::new();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    for fleet in [false, true] {
-        let mut config = h.config();
-        config.hosted_fleet_routing = fleet;
-        let motor = Motor::with_connector(
-            config,
-            &scratch.0.join(format!("prepare-{fleet}")),
-            ssh.clone(),
-        )
+    let motor = Motor::with_connector(h.config(), &scratch.0.join("prepare"), ssh.clone()).unwrap();
+    let reply = motor
+        .prepare(PrepareRequest::new(
+            "/home/worktrees/project",
+            "/home/worktrees/project",
+            "HEAD",
+        ))
+        .await
         .unwrap();
-        let reply = motor
-            .prepare(PrepareRequest::new(
-                "/home/worktrees/project",
-                "/home/worktrees/project",
-                "HEAD",
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            reply.outcome,
-            PrepareOutcome::RefusedBeforeStart {
-                reason: RefusalReason::RequestRejected,
-            }
-        );
-        assert_eq!(
-            reply.refusal_detail(),
-            Some("hosted_prepare_unsupported: hosted_no_fallback")
-        );
-        assert!(motor.storage.job(reply.transfer_id).is_none());
-        assert_eq!(motor.storage.job_count(), 0);
-        assert!(!motor.spool_root.exists());
-    }
+    assert_eq!(
+        reply.outcome,
+        PrepareOutcome::RefusedBeforeStart {
+            reason: RefusalReason::RequestRejected
+        }
+    );
+    assert_eq!(
+        reply.refusal_detail(),
+        Some("hosted_prepare_unsupported: hosted_no_fallback")
+    );
+    assert!(motor.storage.job(reply.transfer_id).is_none());
+    assert_eq!(motor.storage.job_count(), 0);
+    assert!(!motor.spool_root.exists());
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
     assert!(h.requests.lock().unwrap().is_empty());
     assert!(h.frames.lock().unwrap().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
-async fn hosted_drop_preserves_direct_connection_error_without_creating_jobs() {
+async fn linux_drop_does_not_need_a_direct_connection() {
     let h = Harness::new(Behavior::Normal).await;
     let scratch = Scratch::new();
-    let mut errors = Vec::new();
     for (hosted, fleet) in [(false, false), (true, false), (true, true)] {
-        let mut config = h.config();
-        config.hosted_runners = hosted;
-        config.hosted_fleet_routing = fleet;
+        let config = h.config();
         let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
         let motor = Motor::with_connector(
             config,
@@ -152,17 +138,16 @@ async fn hosted_drop_preserves_direct_connection_error_without_creating_jobs() {
             ssh.clone(),
         )
         .unwrap();
-        let error = motor
+        let reply = motor
             .drop_workspace(DropRequest::new("/home/worktrees/project"))
             .await
-            .unwrap_err();
+            .unwrap();
         let attempts = ssh.0.load(Ordering::SeqCst);
-        assert!(attempts > 0);
+        assert_eq!(attempts, 0);
+        assert!(!reply.dropped);
+        assert!(reply.cancelled_jobs.is_empty());
         assert_eq!(motor.storage.job_count(), 0);
-        errors.push((error.kind(), error.to_string(), attempts));
     }
-    assert_eq!(errors[0], errors[1]);
-    assert_eq!(errors[0], errors[2]);
     assert!(h.requests.lock().unwrap().is_empty());
     assert!(h.frames.lock().unwrap().is_empty());
 }

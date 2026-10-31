@@ -55,7 +55,7 @@ recreate and share host checkouts; Windows uses mapped staging exports rather
 than Linux snapshot mounts. The client checks the runner's Hello before sending
 Have, Run, Prepare or bundles, so an unsupported layout refuses before start.
 Tests: `in_place_and_windows_siblings_still_require_neighbours`,
-`legacy_runner_refuses_non_neighbour_siblings_before_run_and_prepare`,
+`legacy_runner_refuses_non_neighbour_siblings_before_run`,
 `new_direct_client_negotiates_gate_mark_with_pinned_runner` (mixed-version gate).
 
 ## 2. What goes in
@@ -67,7 +67,7 @@ successful-result caching. Local refs alone cannot authorize a fill. A failed
 check leaves the fill tip empty and does not change or refuse the snapshot.
 See [compile-cache.md](compile-cache.md#verifying-the-fill-tip). Tests:
 `local_tip_ahead_of_remote_has_no_tip`, `unreachable_remote_has_no_tip`,
-`current_client_unverified_default_tip_runs_and_prepares_without_fills`.
+`current_client_unverified_default_tip_runs_without_fills`.
 
 The snapshot's tree starts from `HEAD` and then takes the working tree's
 current state:
@@ -271,6 +271,6 @@ by Git. Tests: `no_bundle_when_runner_holds_a_snapshot_with_the_tip_behind_it`,
 
 7.2. Git dependencies pinned in `Cargo.lock` are sent as separate bundles when
 the runner advertises support; older runners receive none. Tests:
-`run_and_prepare_lockfile_source_is_commit_not_worktree`,
+`run_lockfile_source_is_commit_not_worktree`,
 `old_runner_without_capability_receives_no_dependency_chunks`
 (`git_dependencies.rs`).

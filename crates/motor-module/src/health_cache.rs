@@ -1,5 +1,4 @@
 use crate::Config;
-use motor_protocol::RunnerHealth;
 use serde_json::{json, Value};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -14,7 +13,6 @@ pub(crate) struct HealthCache {
     created: Instant,
     last_success: Option<Instant>,
     last_refresh: Option<Instant>,
-    sample: Option<RunnerHealth>,
     failures: u32,
     pub(crate) config: Config,
     pub(crate) windows: Vec<Value>,
@@ -29,7 +27,6 @@ impl Default for HealthCache {
             created: Instant::now(),
             last_success: None,
             last_refresh: None,
-            sample: None,
             failures: 0,
             config: Config::default(),
             windows: Vec::new(),
@@ -68,15 +65,14 @@ impl HealthCache {
         }
     }
 
-    pub(crate) fn update(&mut self, sample: Option<RunnerHealth>, now: Instant) {
+    pub(crate) fn update(&mut self, refreshed: bool, now: Instant) {
         self.last_refresh = Some(now);
-        if sample.is_some() {
+        if refreshed {
             self.last_success = Some(now);
             self.failures = 0;
         } else {
             self.failures = self.failures.saturating_add(1);
         }
-        self.sample = sample;
     }
 
     pub(crate) fn report(&self, now: Instant) -> HealthReport {
@@ -94,20 +90,6 @@ impl HealthCache {
                 "unavailable",
                 Some("connection not confirmed; check network and retry"),
             )
-        };
-        let linux = if !fresh {
-            unavailable()
-        } else if let Some(sample) = &self.sample {
-            // Hourly percentiles describe jobs that already started, not the current queue.
-            // A long historical wait must not make an idle platform look busy.
-            let full = matches!((sample.permits_held, sample.permits_cap), (Some(held), Some(cap)) if held >= cap);
-            if sample.queue_depth > 0 || full {
-                availability("busy (queueing)", None)
-            } else {
-                availability("available", None)
-            }
-        } else {
-            unavailable()
         };
         let windows = if self
             .config
@@ -152,43 +134,35 @@ impl HealthCache {
         } else {
             unavailable()
         };
-        let hosted = self.config.hosted_runners
-            || !self.config.hosted_repositories.is_empty()
-            || self.config.spill_to_hosted;
         let mut connection = json!({
-            "runner": if fresh && self.sample.is_some() { "ok" } else { "unavailable" },
-            "broker": "not required",
-            "sign_in": "not required (direct runner)",
+            "broker": "unavailable",
+            "sign_in": "not confirmed; sign in with ck",
         });
+        connection["sign_in"] = self
+            .account
+            .as_ref()
+            .filter(|_| fresh)
+            .map_or(json!("not confirmed; sign in with ck"), |account| {
+                account["sign_in"].clone()
+            });
+        connection["broker"] = self
+            .account
+            .as_ref()
+            .filter(|_| fresh)
+            .map_or(json!("unavailable"), |account| account["broker"].clone());
+        let linux = if connection["sign_in"] != "signed in" {
+            availability("unavailable", Some("sign in with ck, then retry"))
+        } else if connection["broker"] != "ok" {
+            availability(
+                "unavailable",
+                Some("broker connection not confirmed; check network and retry"),
+            )
+        } else {
+            // The broker does not expose live fleet inventory to clients. A working
+            // connection can accept requests; local placement waits show queueing.
+            availability("available", Some("requests accepted"))
+        };
         let mut platforms = json!({"linux": linux, "windows": windows, "macos": macos});
-        if hosted {
-            connection["sign_in"] = self
-                .account
-                .as_ref()
-                .filter(|_| fresh)
-                .map_or(json!("not confirmed; sign in with ck"), |account| {
-                    account["sign_in"].clone()
-                });
-            connection["broker"] = self
-                .account
-                .as_ref()
-                .filter(|_| fresh)
-                .map_or(json!("unavailable"), |account| account["broker"].clone());
-            if self.config.hosted_runners {
-                platforms["linux"] = if connection["sign_in"] != "signed in" {
-                    availability("unavailable", Some("sign in with ck, then retry"))
-                } else if connection["broker"] != "ok" {
-                    availability(
-                        "unavailable",
-                        Some("broker connection not confirmed; check network and retry"),
-                    )
-                } else {
-                    // The broker does not expose live fleet inventory to clients. A working
-                    // connection can accept requests; local placement waits show queueing.
-                    availability("available", Some("requests accepted"))
-                };
-            }
-        }
         let jobs = self.jobs.as_ref().filter(|_| fresh);
         if let Some(jobs) = jobs {
             for platform in ["linux", "windows", "macos"] {
@@ -214,12 +188,6 @@ impl HealthCache {
             Some(reason) => format!("{reason}; {machine}: daemon running"),
             None => format!("{machine}: daemon running"),
         };
-        if !hosted {
-            detail.push_str(&format!(
-                "; Linux runner {}",
-                connection["runner"].as_str().unwrap()
-            ));
-        }
         detail.push_str(&format!(
             "; broker {}; sign-in: {}",
             connection["broker"].as_str().unwrap(),

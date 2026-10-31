@@ -56,7 +56,11 @@ impl Connector for ReplayPeer {
 
 async fn replay(from: u64, sessions: Vec<(u64, Vec<Frame>)>, id: Uuid) -> Vec<StreamRecord> {
     let scratch = ScratchDir::new("motor-started-replay");
-    let motor = Motor::with_connector(
+    crate::storage::Storage::open(&scratch)
+        .unwrap()
+        .create(id, 1800, None, None, false)
+        .unwrap();
+    let motor = Motor::with_test_fixture_direct_route(
         Config::default(),
         &scratch,
         Arc::new(ReplayPeer {

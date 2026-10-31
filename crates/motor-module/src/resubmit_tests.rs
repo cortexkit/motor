@@ -1,11 +1,8 @@
-//! A spilled job that never reached a hosted runner goes back to the build
-//! server; one whose Run frame may have reached a runner never does, and jobs
-//! routed hosted by configuration keep their typed refusals.
-use super::queue_tests::{
-    assert_one_build_server_job, assert_resubmitted_once, fixture_repo, run_spilled, ResubmitPeer,
-};
+//! Recovery of persisted hosted jobs and pre-cutover direct resubmissions.
+use super::queue_tests::{run_spilled, ResubmitPeer};
 use super::*;
 use crate::hosted::tests::harness::{Behavior, Harness};
+use crate::storage::legacy_fixtures::{seed_direct_route, DirectRoute};
 use cortexkit_test_support::ScratchDir;
 use std::sync::atomic::Ordering;
 
@@ -15,8 +12,7 @@ fn spill_config(broker_url: &str) -> Config {
         runner_instance: "test".into(),
         broker_token_source: crate::BrokerTokenSource::Fake,
         broker_url: Some(broker_url.into()),
-        spill_to_hosted: true,
-        spill_after_s: 0,
+
         ..Config::default()
     }
 }
@@ -70,6 +66,10 @@ fn start_spill(motor: &Motor, repo: &Path, wait: u64) -> JobStream {
     motor
         .storage
         .create(id, wait, None, Some("test".into()), false)
+        .unwrap();
+    motor
+        .storage
+        .hosted_route(id, crate::HostedJobState::new(&motor.config))
         .unwrap();
     let path = repo.to_str().unwrap();
     let mut request = RunRequest::new(path, path, path, "exit 7").with_timeout(30);
@@ -125,7 +125,7 @@ async fn attach_during_spill_provisioning_follows_boat_grant() {
     boat.hold_provisioning.store(true, Ordering::SeqCst);
     boat.strict_attach.store(true, Ordering::SeqCst);
     let scratch = ScratchDir::new("spill-attach-boat-grant");
-    let repo = fixture_repo(&scratch);
+    let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
     let peer = ResubmitPeer::new();
     let log = peer.log.clone();
     let motor = Motor::with_connector(
@@ -156,88 +156,8 @@ async fn attach_during_spill_provisioning_follows_boat_grant() {
     let records = terminal_of(attached).await;
     assert_attached_execution(&records, id, 23, b"same output\n");
     assert_eq!(boat.runs.load(Ordering::SeqCst), 1);
-    assert_eq!(log.lock().unwrap().runs, vec![(id, 0)]);
+    assert!(log.lock().unwrap().runs.is_empty());
     assert!(motor.storage.job(id).unwrap().build_server_job_id.is_none());
-}
-
-#[tokio::test]
-async fn attach_during_spill_provisioning_follows_timeout_resubmission() {
-    let broker = crate::hosted::test_http::Http::new(|path, _| {
-        if path == "/v1/leases" {
-            (
-                202,
-                serde_json::json!({"status":"provisioning", "retry_after_ms":5000}),
-            )
-        } else {
-            (404, serde_json::json!({"error":"job_unknown"}))
-        }
-    })
-    .await;
-    let scratch = ScratchDir::new("spill-attach-timeout");
-    let repo = fixture_repo(&scratch);
-    let peer = ResubmitPeer::new();
-    let log = peer.log.clone();
-    let motor = Motor::with_connector(
-        spill_config(&broker.url),
-        &scratch.join("state"),
-        Arc::new(peer),
-    )
-    .unwrap();
-    let original = start_spill(&motor, &repo, 14);
-    let id = original.job_id;
-    wait_for_provisioning(&motor, id, &broker.requests).await;
-    drop(original);
-    let attached = motor.attach(AttachRequest::new(id, 0)).unwrap();
-    let records = terminal_of(attached).await;
-    assert_attached_execution(&records, id, 7, b"build server output\n");
-    assert_resubmitted_once(id, &log.lock().unwrap(), 14);
-    assert!(!broker
-        .requests
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|(p, _)| p.ends_with("/reattach")));
-}
-
-#[tokio::test]
-async fn cancel_during_spill_provisioning_cancels_resubmitted_job_before_run() {
-    let broker = crate::hosted::test_http::Http::new(|path, _| {
-        if path == "/v1/leases" {
-            (
-                202,
-                serde_json::json!({"status":"provisioning", "retry_after_ms":5000}),
-            )
-        } else {
-            (404, serde_json::json!({"error":"job_unknown"}))
-        }
-    })
-    .await;
-    let scratch = ScratchDir::new("spill-cancel-timeout");
-    let repo = fixture_repo(&scratch);
-    let peer = ResubmitPeer::new();
-    let log = peer.log.clone();
-    let motor = Motor::with_connector(
-        spill_config(&broker.url),
-        &scratch.join("state"),
-        Arc::new(peer),
-    )
-    .unwrap();
-    let original = start_spill(&motor, &repo, 1);
-    let id = original.job_id;
-    wait_for_provisioning(&motor, id, &broker.requests).await;
-    drop(original);
-    let attached = motor.attach(AttachRequest::new(id, 0)).unwrap();
-    motor.cancel(CancelRequest::new(id)).await.unwrap();
-    let records = terminal_of(attached).await;
-    assert!(
-        matches!(records.as_slice(), [StreamRecord::Terminal(t)] if t.job_id == id && t.outcome == Outcome::Cancelled),
-        "{records:?}"
-    );
-    let log = log.lock().unwrap();
-    let resubmitted = assert_resubmitted_once(id, &log, 1);
-    assert_eq!(log.cancels, vec![resubmitted]);
-    assert!(log.cancelled_before_run.contains(&resubmitted));
-    assert!(!motor.pending(id));
 }
 
 #[tokio::test]
@@ -307,7 +227,7 @@ async fn attach_unknown_outcome_reports_unconfirmed_cancel_and_retries() {
 async fn unknown_outcome_defers_boat_finish_until_cancel_retry_is_acknowledged() {
     let boat = crate::hosted::boat_tests::Boat::new(0, false).await;
     let scratch = ScratchDir::new("spill-unknown-cancel-retry-boat");
-    let repo = fixture_repo(&scratch);
+    let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
     let config = spill_config(boat.config.broker_url.as_ref().unwrap());
     let motor = Motor::with_connector(
         config.clone(),
@@ -374,7 +294,7 @@ async fn unknown_outcome_defers_boat_finish_until_cancel_retry_is_acknowledged()
 async fn restart_retries_unknown_hosted_cancel_before_boat_finish() {
     let boat = crate::hosted::boat_tests::Boat::new(0, false).await;
     let scratch = ScratchDir::new("spill-unknown-cancel-restart");
-    let repo = fixture_repo(&scratch);
+    let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
     let config = spill_config(boat.config.broker_url.as_ref().unwrap());
     let motor = Motor::with_connector(
         config.clone(),
@@ -464,12 +384,10 @@ async fn configured_hosted_no_capacity_keeps_typed_refusal() {
     })
     .await;
     let scratch = ScratchDir::new("motor-configured-hosted-no-capacity");
-    let repo = fixture_repo(&scratch);
+    let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
     let peer = ResubmitPeer::new();
     let log = peer.log.clone();
     let config = Config {
-        hosted_runners: true,
-        spill_to_hosted: false,
         ..spill_config(&broker.url)
     };
     let motor =
@@ -485,7 +403,6 @@ async fn configured_hosted_no_capacity_keeps_typed_refusal() {
         .unwrap();
     let path = repo.to_str().unwrap();
     let request = RunRequest::new(path, path, path, "true").with_timeout(30);
-    let started = tokio::time::Instant::now();
     let error = match motor
         .hosted_client(motor.hosted_state(id).unwrap())
         .run(id, &request, &motor.storage)
@@ -505,10 +422,6 @@ async fn configured_hosted_no_capacity_keeps_typed_refusal() {
             .count(),
         3
     );
-    assert!(!motor
-        .return_spill(id, error.code(), started, None)
-        .await
-        .unwrap());
     let (tx, mut rx) = mpsc::channel(4);
     motor
         .refused_with_retry(
@@ -543,87 +456,6 @@ async fn configured_hosted_no_capacity_keeps_typed_refusal() {
     assert!(motor.storage.job(id).unwrap().build_server_job_id.is_none());
 }
 
-/// A first-party host received the lease's token but refused it, so no Run
-/// frame was ever sent: the spill goes back to the build server, and the lease
-/// is released.
-#[tokio::test]
-async fn spill_refused_by_hosted_runner_before_run_resubmits() {
-    let h = Harness::new(Behavior::Refuse("capacity")).await;
-    let scratch = ScratchDir::new("motor-spill-host-refused");
-    let repo = fixture_repo(&scratch);
-    let peer = ResubmitPeer::new();
-    let log = peer.log.clone();
-    let motor = Motor::with_connector(
-        spill_config(&h.route.broker_url),
-        &scratch.join("state"),
-        Arc::new(peer),
-    )
-    .unwrap();
-    let id = Uuid::now_v7();
-    let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(60)).await;
-    assert_one_build_server_job(id, &records);
-    let resubmitted = assert_resubmitted_once(id, &log.lock().unwrap(), 30);
-    assert_eq!(
-        motor.storage.job(id).unwrap().build_server_job_id,
-        Some(resubmitted)
-    );
-    assert!(h.tokens.load(Ordering::SeqCst) >= 1);
-    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
-    let requests = h.requests.lock().unwrap();
-    assert!(
-        requests.last().unwrap().ends_with("/release"),
-        "{requests:?}"
-    );
-    assert!(!requests.iter().any(|p| p.ends_with("/reattach")));
-}
-
-/// The hosted runner answered the have exchange, but ck-motor could not build
-/// the bundle for it, so no Run frame was sent: the spill goes back to the
-/// build server under a new ID rather than ending refused_before_start /
-/// snapshot_failed. The fixture holds a ref named `refs/ck-motor`, which
-/// makes every `refs/ck-motor/<id>/...` bundle ref impossible to create; the
-/// build server reports holding every commit, so it needs no bundle.
-#[tokio::test]
-async fn spill_whose_bundle_fails_before_run_resubmits() {
-    let h = Harness::new(Behavior::Normal).await;
-    let scratch = ScratchDir::new("motor-spill-bundle-failed");
-    let repo = fixture_repo(&scratch);
-    assert!(std::process::Command::new("git")
-        .current_dir(&repo)
-        .args(["update-ref", "refs/ck-motor", "HEAD"])
-        .status()
-        .unwrap()
-        .success());
-    let peer = ResubmitPeer::new();
-    let log = peer.log.clone();
-    let motor = Motor::with_connector(
-        spill_config(&h.route.broker_url),
-        &scratch.join("state"),
-        Arc::new(peer),
-    )
-    .unwrap();
-    let id = Uuid::now_v7();
-    let records = run_spilled(&motor, id, &repo, 30, Duration::from_secs(60)).await;
-    assert_one_build_server_job(id, &records);
-    let resubmitted = assert_resubmitted_once(id, &log.lock().unwrap(), 30);
-    let job = motor.storage.job(id).unwrap();
-    assert_eq!(job.build_server_job_id, Some(resubmitted));
-    // The hosted runner answered the have exchange and never got a Run frame.
-    assert!(h
-        .frames
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|f| matches!(f, Frame::Have { .. })));
-    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
-    let requests = h.requests.lock().unwrap();
-    assert!(
-        requests.last().unwrap().ends_with("/release"),
-        "{requests:?}"
-    );
-    assert!(!requests.iter().any(|p| p.ends_with("/reattach")));
-}
-
 /// Once the Run frame may have reached a hosted runner, a lost acknowledgement
 /// is followed by reattaching to that runner, never by a second submission.
 #[tokio::test]
@@ -631,7 +463,7 @@ async fn spill_whose_run_reached_hosted_runner_reattaches_not_resubmits() {
     let h = Harness::new(Behavior::DropRunAck).await;
     h.broker.lock().unwrap().knobs.max_s = Some(30);
     let scratch = ScratchDir::new("motor-spill-run-reached");
-    let repo = fixture_repo(&scratch);
+    let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
     let peer = ResubmitPeer::new();
     let log = peer.log.clone();
     let motor = Motor::with_connector(
@@ -646,7 +478,7 @@ async fn spill_whose_run_reached_hosted_runner_reattaches_not_resubmits() {
         matches!(records.last(), Some(StreamRecord::Terminal(t)) if t.job_id == id && t.outcome == Outcome::Exit { code: 23 }),
         "{records:?}"
     );
-    assert_eq!(log.lock().unwrap().runs, vec![(id, 0)]);
+    assert!(log.lock().unwrap().runs.is_empty());
     assert_eq!(h.runs.load(Ordering::SeqCst), 1);
     assert!(motor.storage.job(id).unwrap().build_server_job_id.is_none());
     let requests = h.requests.lock().unwrap();
@@ -680,10 +512,15 @@ async fn restart_between_resubmit_and_run_attaches_build_server_id() {
             route.lease_attempted = true;
             route.placement_attempts = 1;
             motor.storage.hosted_route(id, route).unwrap();
-            motor
-                .storage
-                .resubmitted(id, build_server_id, "hosted_capacity", None)
-                .unwrap();
+            seed_direct_route(
+                &motor.storage,
+                id,
+                DirectRoute::SpillReturn {
+                    runner_job_id: build_server_id,
+                    hosted_code: "hosted_capacity",
+                },
+            )
+            .unwrap();
         }
     }
     // The second job's Run frame reached the build server before the restart.
@@ -743,7 +580,7 @@ async fn spilled_account_closed_is_refused_and_never_resubmitted() {
     })
     .await;
     let scratch = ScratchDir::new("motor-spill-account-closed");
-    let repo = fixture_repo(&scratch);
+    let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
     let peer = ResubmitPeer::new();
     let log = peer.log.clone();
     let motor = Motor::with_connector(
@@ -773,8 +610,8 @@ async fn spilled_account_closed_is_refused_and_never_resubmitted() {
     // The build server saw only the first submission, which the spill
     // withdrew; nothing was submitted again.
     let log = log.lock().unwrap();
-    assert_eq!(log.runs, vec![(id, 0)]);
-    assert_eq!(log.withdraws, vec![id]);
+    assert!(log.runs.is_empty());
+    assert!(log.withdraws.is_empty());
     let requests = broker.requests.lock().unwrap();
     assert_eq!(
         requests

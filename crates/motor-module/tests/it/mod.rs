@@ -26,7 +26,6 @@ pub(crate) async fn reopen_motor(open: impl FnMut() -> io::Result<Motor>) -> Mot
 mod compatibility;
 mod detach;
 mod git_dependencies;
-mod health;
 mod operator_cli;
 pub(crate) mod placement;
 mod recovery;

@@ -28,7 +28,7 @@ components. They do not ship in this repository.
   "exec-remote-return/v1", "exec-remote-return/v2"]`, plus `exec-remote-windows/v1` when a Windows runner
   is configured and `exec-remote-net/v1` when `network_routing` is on.
 - Operations: `exec.run`, `exec.attach`, `exec.cancel`, `exec.status`,
-  `workspace.prepare`, `workspace.drop`, and the read-only `runner.health` report.
+  `workspace.prepare` and `workspace.drop`.
 - Requires SubC daemon **0.36.35 or newer**. The module uses subc-client-rs
   0.32.4 with subc-protocol 0.33.0, subc-transport 0.14.0 and subc-os 0.1.19.
   Install through the ck-motor card placed by SubC; replacing the binary does
@@ -71,8 +71,8 @@ use an explicit job ID; run mints it and registers the job before publishing
 acceptance.
 Callers learn the ID from the stream, not from submission order. Attach waits
 for submission to settle; explicit `exec.cancel` persists cancellation intent
-even while the runner is admitting the job. Workspace prepare/drop sequencing
-is the caller's responsibility: await prepare before a dependent run.
+even while the runner is admitting the job. Linux workspace lifecycle calls do
+not prepare a runner before a dependent run; placement happens when the job runs.
 
 AFT, the agent tool, currently uses one connection and one route per remote job
 (at most two or three calls in flight). Its live cancellation sends a Cancel
@@ -83,7 +83,7 @@ uses explicit `exec.cancel {job_id}` on a fresh connection. Neither pattern
 needs FIFO, and `stateless_parallel` avoids a latent bottleneck for other
 callers that multiplex jobs.
 
-`ck health motor` (verbose metrics) and `runner.health` include compact
+`ck health motor` verbose metrics include compact
 `request_pools.default` and `request_pools.long_held` objects with `in_use`,
 `limit`, `waiting`, and nullable `oldest_wait_ms`. These are live in-memory
 snapshots, not runner probes or per-request lists; they add only a few hundred
@@ -115,17 +115,20 @@ its machine-readable metrics. Tests:
 `machine_counts_only_its_jobs_per_platform_and_live_capacity_waits`,
 `windows_aggregates_all_endpoints_without_names_or_limits`.
 
-The separate `runner.health` operation is unchanged. Its hosted response still
-includes retained first-party lease observations in `hosted_hosts`, excluding
-external rental-provider placements (the Boat route), with null `capacity` and
-explicit source/missing-data markers;
-these are not live capacity samples. The direct Linux sampler remains active
-with hosted routing enabled, so existing health-status degradation still detects
-loss of that connection. The hosted-routing text leaves out the direct Linux
-runner's connection label rather than implying it checked a broker-selected
-runner. The Linux `exec.status` hosted placeholder is unchanged
-and is never used as a health sample. Test:
-`hosted_runner_health_and_sampler_use_direct_linux_runner`.
+Linux availability comes from the authenticated broker check; the sampler does
+not probe a direct Linux runner. Windows and macOS retain their own runner
+samples. The Linux aggregate `exec.status` placeholder is not a health sample.
+Test: `health_sampler_skips_direct_linux_and_keeps_windows_sampling`.
+
+For an admitted caller, Linux `workspace.prepare` returns `request_rejected`
+with `hosted_prepare_unsupported: hosted_no_fallback` after local WSL-path checks:
+the hosted runner is not selected until a job runs. The refused transfer creates
+no stored job and contacts no runner. Test:
+`linux_prepare_refuses_without_creating_jobs`.
+
+Linux `workspace.drop` is a typed no-op (`dropped: false`, no cancelled jobs):
+each server's tenant VM evicts its own workspaces. It does not contact a direct
+runner or create a job. Test: `linux_drop_is_a_typed_noop_without_creating_jobs`.
 
 If an authorized run or attach handler sees a long-held operation that the
 prefix classifier put in the default pool, it increments
@@ -163,12 +166,11 @@ The config file is JSONC. Unknown keys are refused. All keys are optional.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `runner_instance` | `main` | Runner instance for Linux jobs. |
+| `runner_instance` | `main` | Storage namespace and legacy runner instance for follow-ups to persisted pre-cutover direct jobs; never selects a runner for a new Linux job. |
 | `windows_runner_instance`, `windows_runner_state_root` | absent | Legacy Windows runner instance and absolute state root. Set both or neither; the instance must differ from `runner_instance`. Used when `windows_runners` is empty. |
 | `windows_runners` | `[]` (omitted) | Ordered Windows endpoints: `name`, `host`, `port` (22), `user`, pinned OpenSSH `host_key`, `instance`, `state_root` (absolute POSIX or drive-letter path), `max_concurrent` (1). Takes precedence over the legacy pair. See [windows-jobs.md](windows-jobs.md). |
 | `worktree_roots` | `$XDG_DATA_HOME/cortexkit/alfonso/worktrees` | Absolute roots under which linked worktrees are recognised as task workspaces. |
-| `queue_wait_limit_s` | `300` | Default queue-wait budget for a spill-eligible job; see below for jobs that cannot spill. |
-| `hosted_repositories` | `[]` (omitted) | Absolute main-checkout repository roots whose ordinary Linux jobs request hosted leases instead of the direct runner. See [repository routing](#hosted-repository-routing). |
+| `hosted_repositories` | `[]` (omitted) | Absolute main-checkout repository roots whose Linux leases use repository-specific placement policy. See [repository routing](#hosted-repository-routing). |
 | `hosted_repositories_placement_hint` | absent (omitted) | Optional `{ "host": "control-host", "vm": "t1" }` placement hint for repository-routed leases only. Both names must follow the broker grammar; `vm` cannot be null. Hinted jobs never fall back to the build server. |
 | `network_routing` | `false` | Forward a caller's request for outbound network. When off, such requests are refused with `network_unsupported`. |
 | `admit_direct_exec` | `false` | Admit direct local callers (`ck motor run`) for their own jobs. |
@@ -179,31 +181,19 @@ The config file is JSONC. Unknown keys are refused. All keys are optional.
 The three test controls are refused when `runner_instance` is `main`, so a
 production configuration cannot weaken authentication or fake failures.
 
-An ordinary job's explicit `queue_wait_limit_s` always wins. Without one,
-spill-eligible jobs use the configured default (five minutes); jobs that cannot
-spill use 30 minutes, capped by the job's execution timeout when present. This
-includes net jobs, Windows jobs, jobs above `spill_max_vcpus` (eight by default),
-and jobs excluded by any other spill eligibility or routing rule. The longer
-budget lets them retain their place in the build-server queue rather than
-rejoining at the back after a refusal. Gate jobs keep their fixed 30-minute
-budget, regardless of the request's queue limit or execution timeout. The
-resolved budget is stored per job in the checkpoint/journal and reused after a
-module restart.
+An ordinary job's explicit `queue_wait_limit_s` always wins. Without one, the
+budget is 30 minutes, capped by the job's execution timeout when present.
+Gate jobs keep their fixed 30-minute budget regardless of the request's queue
+limit or execution timeout. The resolved budget is stored per job and reused
+after restart. Test: `ordinary_two_vcpu_linux_job_defaults_to_thirty_minutes`.
 
-If a spill fails with `hosted_capacity` or `hosted_provisioning` before a hosted
-runner receives the job, an ordinary job using the default queue budget returns
-to the build server with the non-spill budget: 30 minutes from its original
-submission, capped by its execution timeout. Time already spent queuing and
-trying hosted capacity is deducted, rather than starting a fresh 30 minutes.
-The remaining seconds are stored with the new build-server ID in the existing
-`queue_wait_limit_s` field, so a restart (including an older module reading the
-store) retains that budget. The job cannot spill again on that attempt. A
-caller-set budget is not extended, and gate jobs keep their fixed budget.
-Refusals still include `spill_attempted=<code>` as described below. Tests:
-`failed_spill_default_budget_waits_past_five_minutes_and_starts`,
-`failed_spill_caller_budget_is_not_extended`,
-`failed_spill_default_budget_is_capped_by_timeout`,
-`failed_spill_budget_from_original_submission_survives_restart`.
+The legacy config keys `hosted_runners`, `hosted_fleet_routing`,
+`spill_to_hosted`, `spill_after_s`, `spill_max_vcpus`, `spill_avoid_host` and
+`queue_wait_limit_s` are accepted but ignored and never serialized, as is
+`shadow_to_hosted`. Every new Linux job requires a hosted lease; a refusal
+retains its typed reason rather than selecting a direct runner. Unrecognized
+keys still fail loading. Test:
+`legacy_direct_linux_config_keys_load_but_cannot_select_a_runner`.
 
 Source: `crates/motor-module/src/config.rs`.
 
@@ -216,7 +206,6 @@ operation separately. Binding to the module grants nothing by itself.
 | --- | --- |
 | AFT, the agent tool (`reserved:aft`) | `exec.run`, `exec.attach`, `exec.cancel`, `exec.status` |
 | The CortexKit core (`reserved:prefrontal-core`) | `workspace.prepare`, `workspace.drop` |
-| Basal's health flow | `runner.health` only |
 | A direct local caller, when `admit_direct_exec` is on | `exec.run`, and `exec.attach`, `exec.cancel`, `exec.status` for jobs its route started or whose secret it holds |
 | Any other reserved, direct, unverified or absent principal | Nothing; refused by name |
 
@@ -225,16 +214,16 @@ Tests (`crates/motor-module/tests/it/placement.rs`): `aft_bind_is_admitted`,
 `unverified_and_absent_principals_are_refused`,
 `core_bind_and_workspace_prepare_are_admitted`, `core_is_refused_exec_run`,
 `aft_is_refused_workspace_prepare`,
-`health_flow_reaches_only_the_read_only_health_report`,
+`removed_runner_health_is_refused_like_an_unknown_operation`,
 `other_reserved_principals_are_refused_at_bind`.
 
 The daemon's `health.check` reads an in-memory snapshot; it never connects to a
 runner or broker itself. The background sampler ticks every 15 seconds, with a
-ten-second direct Linux timeout and bounded platform, job-status and account
+bounded platform, job-status and account
 probes. The account probe uses the same non-booking credential check as
-`hosted.check`, without publishing token claims. Three consecutive direct Linux
-failures or two minutes without a successful direct Linux sample still degrade
-module health. Busy queues alone remain healthy, and startup and SSH credential
+`hosted.check`, without publishing token claims. Three consecutive account-probe
+timeouts or two minutes without a successful refresh degrade module health.
+Busy queues alone remain healthy, and startup and SSH credential
 failures still report failing health. Failing detail starts with the
 machine-readable reason followed by `; `, before the caller-machine summary,
 so the cause is visible first.
@@ -340,8 +329,7 @@ Only a transient signing failure (`runner_sign_unavailable`,
 `retry_after_ms` on its refusal. The hint is the time left in the agent's
 backoff for that failure: once it passes, the next job's sign request asks the
 vault again, so a caller can wait and retry remotely instead of running the job
-somewhere else. It does not promise the vault has recovered. Prepare replies
-carry the same hint.
+somewhere else. It does not promise the vault has recovered.
 
 | Code | `retry_after_ms` |
 | --- | --- |
@@ -357,7 +345,7 @@ when there is no hint, and older callers that know it read it as written. Tests:
 `transient_sign_failures_hint_the_time_left_in_their_backoff`,
 `repairable_sign_failures_carry_no_hint`,
 `transient_sign_refusal_hints_the_backoff_left_and_the_hint_shrinks`,
-`connector_retry_hint_reaches_run_and_prepare_refusals`,
+`connector_retry_hint_reaches_run_refusals`,
 `a_refusal_line_names_its_retry_hint_only_when_it_has_one`,
 `oldest_production_client_decodes_new_refusal_tags_as_unknown_with_detail`.
 
@@ -379,18 +367,9 @@ running the job somewhere else. The runner computes the hint, so it appears once
 the runner is deployed: `ck-motor` passes the hint through as the runner set
 it.
 
-A spilled job that no hosted runner received goes back to the build server
-under a new build-server ID. If the build server then refuses it, at admission
-or when its queue wait runs out, `ck-motor` appends
-`; spill_attempted=<code>` to the refusal detail, where `<code>` is the broker
-code that sent the job back (for example `hosted_capacity` or
-`hosted_provisioning`), so the caller knows the hosted route was already
-tried. If appending the note would exceed the refusal detail size limit, the
-build server's part is shortened to leave room for it. A job that ran gets no
-note, and a job that never spilled keeps the build server's refusal detail
-unchanged. Tests:
-`refusal_after_a_failed_spill_names_the_spill_attempt`,
-`spill_attempt_note_keeps_within_the_refusal_detail_limit`.
+Persisted pre-cutover direct jobs retain their runner binding for attach,
+status and cancellation, including an earlier spill attempt's refusal detail.
+Unknown job IDs never select the former Linux runner.
 
 Tests: `capacity_refusal_carries_the_recent_median_queue_wait_as_its_retry_hint`,
 `capacity_retry_hint_is_clamped_to_its_bounds`,
@@ -548,8 +527,8 @@ job and sends `Accepted` with `attached: true` and the existing job ID. A fresh
 admission omits `attached`. An absent replay cursor starts at the beginning;
 `resume_from_seq` is exclusive, unlike the inclusive `exec.attach.from_seq`.
 Returned-byte expiration and outcome-unknown rules remain those of ordinary
-attach. A spill that returns to the build server still has one key and one
-caller-visible job ID, even though its runner-side ID changes.
+attach. Persisted pre-cutover resubmissions retain their original key and
+caller-visible job ID, even when their stored runner-side ID differs.
 
 The SHA-256 digest uses RFC 8785 canonical JSON of the caller request, before
 snapshotting or converting return paths, with the key and replay cursor removed
@@ -607,8 +586,8 @@ These additions to AFT's `exec.run`, `exec.attach` and `exec.status` follow
 **Hosted usage.** A job whose Run frame went to a hosted runner (first-party or
 Boat) has `hosted` on its terminal record. It holds `placement`, the lease's
 host (for example `ovh-1` or `boat:<sandbox_id>`), and `billed_vcpu_ms` once
-billing has settled. Build-server jobs omit `hosted`, and so do spills that went
-back to the build server. ck-motor adds no wait for billing. The job stream
+billing has settled. Persisted pre-cutover direct jobs omit `hosted`.
+ck-motor adds no wait for billing. The job stream
 already holds a first-party hosted terminal up to five seconds for the host's
 settlement record, and settles a Boat job with the broker before sending its
 terminal record. If billing is still pending after that, `billed_vcpu_ms` is
@@ -820,8 +799,8 @@ frame: it is added after persistence, never replayed, logged, returned by
 status, or sent to AFT or Basal. The module hashes the presented secret and
 compares fixed-size digests in constant time before contacting the runner.
 Wrong, missing and malformed secrets receive the same refusal bytes and exit
-code as an unknown job ID; refused credentials do not cause runner I/O. AFT and
-Basal admission and operations are unchanged.
+code as an unknown job ID; refused credentials do not cause runner I/O. AFT
+admission and operations are unchanged.
 
 The following tests cover replay after a module restart, live streaming,
 secret non-disclosure, per-job authorization, cancellation, status and CLI
@@ -842,28 +821,26 @@ file. CLI unit tests: `secret_file_is_private_new_and_never_overwrites`,
 
 ## Hosted repository routing
 
-`hosted_repositories` selects repositories for a staged hosted rollout without
-changing other fleet traffic. Matching uses the resolved `repository_root`, not
+`hosted_repositories` selects repository-specific placement policy for Linux
+leases. All other Linux jobs also require hosted leases. Matching uses the resolved `repository_root`, not
 the workspace key: the main checkout, linked worker worktrees and linked gate
 checkouts share that identity. Independent clones have different identities and
 must be listed separately. Paths are canonicalized for comparison; entries must
 be absolute. The empty default is omitted from serialized Config so older clients
 with closed schemas can still read it.
 
-Both agent and direct jobs for a listed repository request a lease before any
-direct-runner submission. The lease sends `avoid_host: null` (ignoring
-`spill_avoid_host`) and `allow_spill: false`, restricting placement to registered
-hosts rather than Boat. These jobs never enter the spill path or fall back to the
-direct runner after a hosted failure; an unhinted `no_host_fits` answer, described below,
-is a routing correction, not a failure. Windows stays on its direct runner. Outbound-network jobs can use
+Both agent and direct jobs for a listed repository request a lease. The lease
+sends `avoid_host: null` and `allow_spill: false`, restricting placement to registered
+hosts rather than Boat. A hosted refusal never falls back to a direct Linux
+runner. Windows stays on its direct runner. Outbound-network jobs can use
 hosted leases: the request's `net` flag must match the signed lease claim, and
-`network_routing` must still be enabled. Unlisted jobs retain their existing
-direct and spill behavior; spilled leases send `allow_spill: true`.
+`network_routing` must still be enabled. Unlisted ordinary jobs use fleet leases;
+the broker decides whether their capacity can overflow to Boat.
 
 Set `hosted_repositories_placement_hint` to send exactly that `{host, vm}` hint
 on repository-routed leases, overriding any cached warm placement. The setting
 is omitted from serialized Config when unset, so older clients with closed
-schemas can still read the default config. Spill and fleet-routing leases
+schemas can still read the default config. Fleet-routing leases
 never inherit the setting, and placements from hinted jobs are not cached as warm
 hints for other jobs. The hint is saved with the job's route before leasing, so
 retries and restarts retain it even if the config changes. With a broker host
@@ -896,36 +873,18 @@ After that marker the existing hosted reattach/finish path governs an ambiguous
 submission.
 
 A broker answer of `no_host_fits` (HTTP 422, `{"error":"no_host_fits",
-"max_vcpus":N}`) means no host it could ever use holds the job's vCPUs, so a
-retry cannot succeed. For an unhinted repository-routed job that has not sent its Run
-frame, this undoes the routing choice rather than failing the job: ck-motor
-removes the job's hosted route, stores `routed_direct_reason: "no_host_fits"`
-on the job, logs one INFO event `hosted no_host_fits; routing to build server`
-with `job_id`, `vcpus` and `max_vcpus` (`unknown` when the broker omitted it),
-and submits the job to the build server like any unlisted job. The lease is not
-retried, and nothing is released or finished because nothing was booked. The
-stored decision survives restart, so a later attach reads the job from the build
-server. Time already spent waiting on the broker is taken off the job's
-queue-wait limit once, in whole seconds, and the reduced limit is both what the
-Run frame carries and what ck-motor enforces; a positive limit never drops below
-one second. The job does not spill. For spilled leases `no_host_fits` is an
-ordinary refusal: a spill goes back to the build server after one lease request.
-The error code decides;
-a missing or non-numeric `max_vcpus` is read as unknown. Each selected job logs one INFO event, `routed to hosted
-(hosted_repositories)`, with `job_id` and `repo` fields. Hosted health metrics
-include `hosted_routed_jobs_1h`, counting repository-selected jobs (including
-refusals) in the last hour, and `hosted_no_host_fits_1h`, counting
-repository-selected jobs sent to the build server after `no_host_fits` in the
-last hour (these are not in `hosted_routed_jobs_1h`); stored route decisions
-survive restart.
+"max_vcpus":N}`) means no eligible host can hold the job's vCPUs, so retrying
+cannot succeed. It is a typed `request_rejected` refusal with
+`hosted_no_host_fits` detail, never a correction to a direct Linux runner.
+Each repository-selected job logs `routed to hosted (hosted_repositories)` with
+`job_id` and `repo` fields.
 
 A lease refused with HTTP 403 `{"error":"account_closed"}` means the hosted
 account was closed for good: none of its jobs may run anywhere. On every route
-(configured, repository-routed, spilled or a direct hosted test) the
+(fleet, repository-routed or an explicit hosted test) the
 lease is not retried and the job is refused before start with
 `RequestRejected` and detail `hosted_account_closed: hosted account closed`,
-with no retry delay and no local or direct fallback. A spilled job is not sent
-back to the build server either, unlike after `no_capacity`. Only lease
+with no retry delay and no local or direct fallback. Only lease
 creation carries this code; a 403 elsewhere stays `hosted_auth`. A job the
 broker placed before the closure keeps its normal answers. Tests:
 `cloud_account_closed_lease_is_one_final_request_on_every_route`,
@@ -933,7 +892,7 @@ broker placed before the closure keeps its normal answers. Tests:
 `spilled_account_closed_is_refused_and_never_resubmitted`.
 
 Tests: `listed_main_and_linked_agent_and_direct_jobs_use_hosted_without_avoiding_a_host`,
-`unlisted_and_windows_jobs_keep_the_direct_path`,
+`unlisted_linux_uses_fleet_and_windows_keeps_the_direct_path`,
 `stage1_pre_run_failures_are_typed_and_never_submit_directly`,
 `stage1_lost_run_ack_reattaches_without_direct_fallback`,
 `stage1_no_capacity_retries_the_identical_body_then_runs_on_the_host`,
@@ -941,22 +900,16 @@ Tests: `listed_main_and_linked_agent_and_direct_jobs_use_hosted_without_avoiding
 `stage1_host_full_waits_and_asks_again_until_the_host_admits_the_job`,
 `stage1_host_full_until_the_queue_budget_ends_refuses_like_no_capacity`,
 `stage1_queue_budget_ending_during_a_lease_request_refuses_for_what_the_job_waited_on`,
-`stage1_no_host_fits_runs_on_the_build_server_once_and_fitting_jobs_stay_hosted`,
-`stage1_no_host_fits_decision_survives_restart_and_attaches_to_the_build_server`,
-`stage1_no_host_fits_after_a_capacity_wait_sends_the_remaining_queue_wait`,
-`spill_no_host_fits_resubmits_to_the_build_server_without_retrying`,
-`no_host_fits_decision_trims_queue_wait_once_and_is_counted_for_an_hour`,
-`unlisted_spill_eligible_job_still_withdraws_and_sends_allow_spill_true`, and
-`hosted_routed_counter_only_counts_repository_routes_in_the_last_hour`.
+`linux_exec_refusals_and_followups_never_reach_a_direct_runner`,
+`stage1_no_host_fits_decision_survives_restart_and_attaches_to_the_build_server`.
 Placement-hint coverage:
 `repository_placement_hint_config_roundtrips_absent_null_and_present`,
 `repository_placement_hint_rejects_invalid_names_and_null_vm`,
 `repository_routed_lease_carries_the_configured_hint_without_caching_it_for_other_routes`,
 `hinted_no_capacity_retries_the_identical_body_then_runs_without_fallback`,
 `hinted_no_capacity_exhausts_the_queue_budget_without_fallback`,
-`hinted_no_host_fits_refuses_without_build_server_correction`,
-`unlisted_spill_eligible_job_still_withdraws_and_sends_allow_spill_true`, and
-`fleet_linux_default_platform_jobs_allow_hosted_spill_but_gates_stay_direct`.
+`hinted_no_host_fits_refuses_without_build_server_correction`, and
+`fleet_linux_default_platform_jobs_allow_hosted_spill`.
 The canonical `no-spill-lease.json` fixture from `cortexkit-cloud` is pinned under
 `crates/motor-lease/contracts/cloud/`. Tests
 `cloud_no_spill_request_serializes_to_the_exact_canonical_bytes_and_hash`,
@@ -977,9 +930,7 @@ against both broker-supplied hashes. The separate tests
 `derived_non_null_placement_hint_lease_body_matches_the_cross_check_hash` cover
 the derived `staging-fra-1`/`t1` body; it is not a route-generated vector.
 CLOUD's `no-host-fits-lease.json` (from `cortexkit-cloud` `916347e`) is pinned
-beside it: `stage1_cloud_no_host_fits_reply_routes_the_job_to_the_build_server`
-sends its exact 422 reply bytes through ck-motor's broker client, and
-`cloud_no_host_fits_reply_bytes_match_fake` checks the fake broker gives the
-same answer.
+beside it: `cloud_no_host_fits_reply_bytes_match_fake` checks the fake broker
+gives the same answer.
 `python3 scripts/mixed-version.py` checks the default Config against the pinned
 older client.
