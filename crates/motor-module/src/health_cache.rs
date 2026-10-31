@@ -101,7 +101,9 @@ impl HealthCache {
             // Hourly percentiles describe jobs that already started, not the current queue.
             // A long historical wait must not make an idle platform look busy.
             let full = matches!((sample.permits_held, sample.permits_cap), (Some(held), Some(cap)) if held >= cap);
-            if sample.queue_depth > 0 || full {
+            if let Some(reason) = sample.admission_blocked.as_deref() {
+                availability("unavailable", Some(reason))
+            } else if sample.queue_depth > 0 || full {
                 availability("busy (queueing)", None)
             } else {
                 availability("available", None)
@@ -117,18 +119,25 @@ impl HealthCache {
             availability("unavailable", Some("not set up on this machine"))
         } else if !fresh {
             unavailable()
-        } else if self
-            .windows
-            .iter()
-            .any(|runner| runner["reachable"] == true && runner["busy"] == false)
-        {
+        } else if self.windows.iter().any(|runner| {
+            runner["reachable"] == true
+                && runner["busy"] == false
+                && runner["admission_blocked"].is_null()
+        }) {
             availability("available", None)
-        } else if self
+        } else if self.windows.iter().any(|runner| {
+            runner["reachable"] == true
+                && runner["busy"] == true
+                && runner["admission_blocked"].is_null()
+        }) {
+            availability("busy (queueing)", None)
+        } else if let Some(reason) = self
             .windows
             .iter()
-            .any(|runner| runner["reachable"] == true && runner["busy"] == true)
+            .filter(|runner| runner["reachable"] == true)
+            .find_map(|runner| runner["admission_blocked"].as_str())
         {
-            availability("busy (queueing)", None)
+            availability("unavailable", Some(reason))
         } else {
             unavailable()
         };
@@ -261,6 +270,13 @@ impl HealthCache {
                     ));
                 }
             }
+        }
+        if let Some(reason) = self
+            .windows
+            .iter()
+            .find_map(|runner| runner["admission_blocked"].as_str())
+        {
+            detail.push_str(&format!("; windows admission: {reason}"));
         }
         if jobs.is_none() {
             detail.push_str("; job state not confirmed yet");

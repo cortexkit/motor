@@ -236,6 +236,7 @@ function Invoke-RunnerHostUpdate {
         Assert-RunnerUpdateIdle $Root
         $serviceStopped = $true
         Stop-RunnerUpdateService
+        Close-RunnerQualificationGate $Root
         # Catch a VM created after the last live status probe; never reconcile
         # or delete job resources as part of a host update.
         Assert-RunnerUpdateIdle $Root
@@ -250,6 +251,7 @@ function Invoke-RunnerHostUpdate {
         Write-RunnerUpdateManifest $backup
         Set-RunnerUpdatePrivateFile "$backup\manifest.json"
         Set-RunnerUpdateServiceDefinition $definition $log
+        Assert-RunnerQualificationCapable $Root
         Start-Service -Name MotorRunner -ErrorAction Stop
         Wait-RunnerUpdateReady $Root $ReadyTimeoutSeconds
         if (Test-Path -LiteralPath $previous) {
@@ -269,6 +271,7 @@ function Invoke-RunnerHostUpdate {
                 Set-RunnerUpdateServiceDefinition $oldDefinition $log
             }
             if ($serviceStopped) {
+                Assert-RunnerQualificationCapable $Root
                 Start-Service -Name MotorRunner -ErrorAction Stop
                 Wait-RunnerUpdateReady $Root $ReadyTimeoutSeconds
             }
@@ -290,6 +293,6 @@ function Invoke-RunnerHostUpdate {
                 try { Remove-Item -LiteralPath $path -Recurse -Force } catch { Write-Warning "MotorRunner is ready, but scratch cleanup failed at $path; inspect it before the next update: $_" -WarningAction Continue }
             }
         }
-        Write-Host "Host payload ready. Previous payload retained at $previous; restore it with update.ps1 -Rollback."
+        Write-Host "Host payload ready; fleet admission remains closed until full qualification passes. Previous payload retained at $previous; restore it with update.ps1 -Rollback."
     }
 }

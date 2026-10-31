@@ -17,6 +17,30 @@ the host.
   local-only named pipe whose DACL names SYSTEM, Administrators and `motor-ssh`.
   Before sending job data, the bridge requires the kernel-reported pipe-server
   PID to match the running `MotorRunner` service's SCM process ID.
+- Install and host update create `state\ally\qualification-required` in the
+  protected service state before starting the service. While that marker exists,
+  ordinary jobs are refused before admission with `runner_full`, `ran: none`,
+  and `runner awaiting qualification`; ordered Windows clients try their next
+  runner. Status health reports the hold as `admission_blocked`, and module
+  health explains it even when another Windows runner is available. A restart,
+  drain or ordinary `resume` cannot clear it.
+- Full qualification runs locally as SYSTEM. Its bridge uses the separate
+  `ally-qualification` pipe, whose protected DACL grants only SYSTEM and
+  Administrators, never `motor-ssh`; both pipes reject remote pipe clients.
+  Qualification jobs can run while fleet admission is held. Only the final
+  successful full qualification resumes admission through this protected pipe.
+  Failed or diagnostic-only qualification leaves the marker in place.
+  An operator accepting responsibility for opening admission without a full
+  qualification can run this command in an **elevated** PowerShell shell:
+
+  ```powershell
+  & 'C:\ProgramData\MotorRunner\bin\motor-runner.exe' resume `
+    --instance ally-qualification --state-root 'C:\ProgramData\MotorRunner\state'
+  ```
+
+  The SSH forced command cannot select that pipe, and the SSH account cannot
+  connect to it even by supplying an instance name in a request. Ordinary
+  `resume` reports that admission is still refused while the marker exists.
 - `motor-ssh` is a dedicated non-admin account with exactly one supplied vault
   Ed25519 public key. An owned OpenSSH `Match User` block forces the bridge and
   disables password authentication, PTY, agent/TCP/X11 forwarding. Installation
@@ -397,8 +421,14 @@ an elevated administrator PowerShell shell (not SYSTEM). It refuses existing job
 VMs, active/queued service jobs, invalid release checksums, or a guest-agent hash
 different from the installed parent's pin. It swaps only `bin` and the service
 definition; state, registry cache, mirrors, sealed parent, accounts, SSH setup and
-their access control lists stay in place. A failed start/readiness check restores
-the old payload and exits nonzero. Restore the protected previous payload with
+their access control lists stay in place, with the qualification hold re-created.
+A failed start/readiness check restores the old payload and exits nonzero.
+Every automatic service start requires the binary to report
+`qualification-gate-v1`. An older restored binary without that capability is
+left stopped, because it cannot gate fleet admission. To deliberately accept
+ungated fleet jobs on that restored release, an operator can run
+`Start-Service -Name MotorRunner` in an elevated shell instead.
+Restore the protected previous payload with
 `update.ps1 -Rollback`. A guest-agent change requires the full uninstall,
 fresh-parent provisioning and reinstall path below, not a host-only update.
 
@@ -412,7 +442,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$src\script\windows-run
 Keep incoming fleet work paused until the command reports ready. Readiness uses
 the authenticated service bridge and Windows agent status, not just the Windows
 Service Control Manager's Running state; service startup still verifies the
-existing parent. No new parent is built.
+existing parent. No new parent is built. Ready does not open fleet admission:
+run the full `run-system.ps1` qualification after each install or update. Only
+its successful completion, or the elevated override above, removes the hold.
 The previous payload survives one successful swap; a later update replaces it.
 
 ## One removal

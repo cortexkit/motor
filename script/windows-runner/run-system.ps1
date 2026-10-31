@@ -34,8 +34,8 @@ try {
     }
     $code = [int](Get-Content "$Evidence\exit.txt" -Raw).Trim()
     Get-Content "$Evidence\qualification.log" | Out-Host
-    if ($code -ne 0) { throw "Qualification failed exit=$code; return the complete $Evidence directory" }
+    if ($code -ne 0) { throw "Qualification failed exit=$code; fleet admission remains closed. Return the complete $Evidence directory. Elevated override: & '$Root\bin\motor-runner.exe' resume --instance ally-qualification --state-root '$Root\state'" }
     if ($OfflineCargoOnly) { Write-Host "DIAGNOSTIC offline Cargo cache measurement collected; return $Evidence" }
     elseif ($LocalRegistryOnly) { Write-Host "DIAGNOSTIC local-registry proof collected; return $Evidence" }
-    else { Write-Host "PASS qualification completed; return the complete $Evidence directory before fleet enablement" }
+    else { Write-Host "PASS full qualification completed; fleet admission opened. Return the complete $Evidence directory" }
 } finally { Unregister-ScheduledTask $name -Confirm:$false -ErrorAction SilentlyContinue }

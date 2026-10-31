@@ -42,18 +42,11 @@ mod native {
     pub type Stream = NamedPipeServer;
     pub struct Listener {
         name: PathBuf,
-        sid: String,
+        sid: Option<String>,
         next: Mutex<NamedPipeServer>,
     }
-    fn pipe(name: &Path, sid: &str, first: bool) -> io::Result<NamedPipeServer> {
-        if !sid.starts_with("S-1-5-")
-            || !sid
-                .bytes()
-                .all(|b| b.is_ascii_digit() || b"S-".contains(&b))
-        {
-            return Err(io::Error::other("invalid SSH entry SID"));
-        }
-        let descriptor: Vec<_> = format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{sid})")
+    fn pipe(name: &Path, sid: Option<&str>, first: bool) -> io::Result<NamedPipeServer> {
+        let descriptor: Vec<_> = super::pipe_descriptor(sid)?
             .encode_utf16()
             .chain(Some(0))
             .collect();
@@ -88,16 +81,25 @@ mod native {
     }
     impl Listener {
         pub fn bind(name: &Path, sid: String) -> io::Result<Self> {
+            Self::bind_with_sid(name, Some(sid))
+        }
+        pub fn bind_qualification(name: &Path) -> io::Result<Self> {
+            Self::bind_with_sid(name, None)
+        }
+        pub fn is_qualification(&self) -> bool {
+            self.sid.is_none()
+        }
+        fn bind_with_sid(name: &Path, sid: Option<String>) -> io::Result<Self> {
             Ok(Self {
                 name: name.into(),
-                next: Mutex::new(pipe(name, &sid, true)?),
+                next: Mutex::new(pipe(name, sid.as_deref(), true)?),
                 sid,
             })
         }
         pub async fn accept(&self) -> io::Result<(Stream, ())> {
             let mut next = self.next.lock().await;
             next.connect().await?;
-            let replacement = pipe(&self.name, &self.sid, false)?;
+            let replacement = pipe(&self.name, self.sid.as_deref(), false)?;
             Ok((std::mem::replace(&mut *next, replacement), ()))
         }
     }
@@ -158,5 +160,36 @@ mod tests {
         assert!(!service_owns_pipe(42, Some(43), true));
         assert!(!service_owns_pipe(42, None, true));
         assert!(!service_owns_pipe(0, Some(0), true));
+    }
+}
+#[cfg(any(windows, test))]
+fn pipe_descriptor(sid: Option<&str>) -> std::io::Result<String> {
+    let mut descriptor = "D:P(A;;GA;;;SY)(A;;GA;;;BA)".to_owned();
+    if let Some(sid) = sid {
+        if !sid.starts_with("S-1-5-")
+            || !sid
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b"S-".contains(&b))
+        {
+            return Err(std::io::Error::other("invalid SSH entry SID"));
+        }
+        descriptor.push_str(&format!("(A;;GRGW;;;{sid})"));
+    }
+    Ok(descriptor)
+}
+
+#[cfg(test)]
+mod qualification_tests {
+    #[test]
+    fn qualification_pipe_descriptor_excludes_the_fleet_sid() {
+        let fleet_sid = "S-1-5-21-123-456-789-1001";
+        let descriptor = super::pipe_descriptor(None).unwrap();
+        assert_eq!(descriptor, "D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+        assert!(!descriptor.contains(fleet_sid));
+        assert_eq!(
+            super::pipe_descriptor(Some(fleet_sid)).unwrap(),
+            format!("{descriptor}(A;;GRGW;;;{fleet_sid})")
+        );
+        assert!(super::pipe_descriptor(Some("SY)(A;;GA;;;WD)")).is_err());
     }
 }

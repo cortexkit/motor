@@ -34,6 +34,7 @@ const HELD_OFFER_MS: u64 = 6 * 60 * 60 * 1000;
 
 #[path = "accounting.rs"]
 mod accounting;
+mod admission_gate;
 #[path = "disk.rs"]
 mod disk;
 #[path = "health.rs"]
@@ -3563,7 +3564,15 @@ impl Runner {
         }
     }
 
-    pub(crate) fn accept(&self, mut request: Run) -> io::Result<Admission> {
+    pub(crate) fn accept(&self, request: Run) -> io::Result<Admission> {
+        self.accept_from(request, false)
+    }
+
+    pub(crate) fn accept_for_qualification(&self, request: Run) -> io::Result<Admission> {
+        self.accept_from(request, true)
+    }
+
+    fn accept_from(&self, mut request: Run, qualification: bool) -> io::Result<Admission> {
         if self.core.quarantined.contains_key(&request.job_id) {
             return Ok(Admission::Duplicate);
         }
@@ -3581,7 +3590,9 @@ impl Runner {
             {
                 return Ok(Admission::Duplicate);
             }
-            let refusal = self.run_refusal(&inner, &request, &Default::default());
+            let refusal = self
+                .qualification_refusal(qualification)
+                .or_else(|| self.run_refusal(&inner, &request, &Default::default()));
             (self.protect_admission(&mut inner, &request), refusal)
         };
         // Admission reads inside the workspace (it resolves symlinks in the
@@ -3637,9 +3648,12 @@ impl Runner {
         // the files may be partly gone. Keep that setup refusal even when the
         // deletion has finished and no overlap is visible by this recheck;
         // otherwise the job would start on a half-deleted workspace.
-        let ordinary_refusal = self.run_refusal(&inner, &request, &access).or_else(|| {
-            initial_refusal.filter(|(reason, _)| *reason == RefusalReason::WorkspaceSetupFailed)
-        });
+        let ordinary_refusal = self
+            .qualification_refusal(qualification)
+            .or_else(|| self.run_refusal(&inner, &request, &access))
+            .or_else(|| {
+                initial_refusal.filter(|(reason, _)| *reason == RefusalReason::WorkspaceSetupFailed)
+            });
         let disk_refused = ordinary_refusal.is_none() && disk_full.is_some();
         let refusal = ordinary_refusal.or_else(|| {
             disk_full
@@ -5467,7 +5481,7 @@ impl Runner {
         StatusReply::new(
             queue_depth,
             running,
-            !self.core.config.backend_degraded(),
+            !self.core.config.backend_degraded() && !self.qualification_required(),
             crate::caller_path::entries(&inner.catalog.repositories)
                 .map(|(path, record)| (path.caller.text(), record))
                 .map(|(root, g)| {

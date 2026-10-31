@@ -227,7 +227,7 @@ impl Connector for RoutingPeer {
                                 "binding must be durable before Run"
                             );
                             assert_eq!(run.platform, windows.then_some(Platform::Windows));
-                            if matches!(behavior, 2 | 13) {
+                            if matches!(behavior, 2 | 13 | 17) {
                                 let _ = write_frame_async(
                                     &mut peer,
                                     &Frame::Refusal(Refusal {
@@ -239,6 +239,8 @@ impl Connector for RoutingPeer {
                                         detail: Some(
                                             if behavior == 2 {
                                                 "windows_slot_busy"
+                                            } else if behavior == 17 {
+                                                "runner awaiting qualification"
                                             } else {
                                                 "job exceeds runner capacity"
                                             }
@@ -675,6 +677,33 @@ async fn ordered_windows_busy_refusal_resubmits_but_lost_ack_and_started_never_m
             usize::from(behavior != 3)
         );
     }
+}
+
+#[tokio::test]
+async fn ordered_windows_awaiting_qualification_refusal_falls_through_without_failure() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    peer.ally_behavior.store(17, Ordering::SeqCst);
+    let motor = peer.motor(ordered(f.config.clone()));
+    let records = collect(
+        motor
+            .run(f.request("true").with_platform(Platform::Windows))
+            .unwrap(),
+    )
+    .await;
+    let visits = peer.visits.lock().unwrap();
+    assert_eq!(visits.first().unwrap().instance, "ally-windows");
+    assert!(visits.iter().any(|visit| visit.instance == "windows"));
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record, StreamRecord::Accepted(_)))
+            .count(),
+        1
+    );
+    assert!(
+        matches!(records.last(), Some(StreamRecord::Terminal(t)) if matches!(t.outcome, Outcome::Exit { code: 0 }) && t.ran == Some(Ran::Remote))
+    );
 }
 
 #[tokio::test]

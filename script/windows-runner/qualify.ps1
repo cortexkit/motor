@@ -6,7 +6,12 @@ if ($OfflineCargoOnly -and $LocalRegistryOnly) { throw 'Choose one Cargo cache d
 $Root = 'C:\ProgramData\MotorRunner'
 . "$PSScriptRoot\common.ps1"
 . "$PSScriptRoot\qualify-peer.ps1"
+. "$PSScriptRoot\accounts.ps1"
+. "$PSScriptRoot\parent-identity.ps1"
+. "$PSScriptRoot\service-definition.ps1"
 if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne 'S-1-5-18') { throw 'Use run-system.ps1; restricted process creation requires SYSTEM privileges' }
+Close-RunnerQualificationGate $Root
+Write-Host "Failed or partial qualification keeps fleet admission closed. Elevated override: & '$Root\bin\motor-runner.exe' resume --instance ally-qualification --state-root '$Root\state'"
 $env:HOME = "$Root\service-home"
 $env:Path = 'C:\Windows\System32;C:\Windows;C:\Program Files\Git\cmd;C:\Program Files\Git\bin'
 $exe = "$Root\bin\motor-runner.exe"
@@ -255,9 +260,12 @@ try {
     Write-Host "PASS final-nothing-left-behind parent-sha256=$parentHash"
     Copy-QualificationEvidence
     $evidenceCopied = $true
-    Set-Content "$Evidence\QUALIFIED-SINGLE-SLOT.txt" "Single slot only; parent SHA256=$parentHash; review raw evidence before enabling fleet routing" -Encoding ascii
+    Set-Content "$Evidence\QUALIFIED-SINGLE-SLOT.txt" "Single slot only; parent SHA256=$parentHash; all qualification checks passed" -Encoding ascii
+    Open-RunnerQualificationGate $Root
+    Write-Host 'PASS full qualification; fleet admission opened'
 } catch {
     $failure = $_
+    Close-RunnerQualificationGate $Root
     if (-not $stopInProgress) {
         try { Stop-RunnerServiceBounded } catch {
             Write-Warning "MotorRunner stop after qualification failure did not complete: $_" -WarningAction Continue

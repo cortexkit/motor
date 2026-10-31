@@ -118,6 +118,10 @@ async fn run(args: Vec<String>) -> io::Result<()> {
                 .await.map_err(io::Error::other)?
         }
         "check-options" => Ok(()),
+        "qualification-gate-version" => {
+            println!("qualification-gate-v1");
+            Ok(())
+        }
         #[cfg(windows)]
         "qualify-prep" => motor_runner::hyperv_qualify_prep(config),
         #[cfg(windows)]
@@ -323,7 +327,14 @@ async fn run(args: Vec<String>) -> io::Result<()> {
             } else {
                 serve(runner, listener).await?;
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(windows)]
+            {
+                let qualification_socket = std::path::PathBuf::from(format!(
+                    r"\\.\pipe\motor-runner-{}-qualification", runner.config().instance));
+                let qualification = motor_runner::local_transport::Listener::bind_qualification(&qualification_socket)?;
+                tokio::try_join!(serve(runner.clone(), listener), serve(runner, qualification))?;
+            }
+            #[cfg(target_os = "macos")]
             serve(runner, listener).await?;
             // A bounded drain must not wait indefinitely for a filesystem task
             // on Tokio's blocking pool while the runtime is being destroyed.

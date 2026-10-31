@@ -1,4 +1,28 @@
 # Keep fresh installs and host-only updates on the same SCM command and environment.
+function Close-RunnerQualificationGate([string]$Root) {
+    Assert-RunnerPrivateDirectory "$Root\state\ally"
+    $marker = [IO.File]::Open("$Root\state\ally\qualification-required", [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    try { $marker.Flush($true) } finally { $marker.Dispose() }
+    Write-Host 'Fleet admission closed: runner awaiting qualification. Only a full passing qualification or an elevated operator override opens it.'
+}
+
+function Get-RunnerQualificationGateVersion([string]$Root) {
+    $version = & "$Root\bin\motor-runner.exe" qualification-gate-version
+    if ($LASTEXITCODE -ne 0) { return '' }
+    return $version
+}
+
+function Assert-RunnerQualificationCapable([string]$Root) {
+    if ((Get-RunnerQualificationGateVersion $Root) -cne 'qualification-gate-v1') {
+        throw 'MotorRunner left stopped: this binary cannot gate fleet admission. Install a gate-capable release before starting it. To accept ungated fleet jobs deliberately, run from an elevated shell: Start-Service -Name MotorRunner'
+    }
+}
+
+function Open-RunnerQualificationGate([string]$Root) {
+    & "$Root\bin\motor-runner.exe" resume --instance ally-qualification --state-root "$Root\state"
+    if ($LASTEXITCODE -ne 0) { throw 'Qualification passed but fleet admission could not be opened; runner remains gated' }
+}
+
 function Get-RunnerMetricsArguments([string]$MetricsEndpoint, [string]$MetricsHostId) {
     if ([bool]$MetricsEndpoint -ne [bool]$MetricsHostId) { throw 'MetricsEndpoint and MetricsHostId must be supplied together' }
     if (-not $MetricsEndpoint) { return '' }
