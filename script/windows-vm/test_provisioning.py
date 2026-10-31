@@ -343,7 +343,8 @@ class BaselineInputsTests(unittest.TestCase):
             "@{name='jq';command='jq.exe';path='C:\\Program Files\\jq'}",
             "Test-Path -LiteralPath 'T:\\' -PathType Container",
             "fsutil.exe reparsepoint query 'T:\\'", "not a reparse point",
-            "(Get-Acl -LiteralPath 'T:\\').Sddl -cne (Get-Acl -LiteralPath 'C:\\t\\').Sddl",
+            # The round trip below proves both paths reach one volume root; the
+            # probe no longer compares ACLs, since C:\t\ reads the mount folder.
             "[IO.File]::WriteAllText(('T:\\'+$driveProbe),'drive cache')",
             "[IO.File]::ReadAllText(('C:\\t\\'+$driveProbe)) -cne 'drive cache'",
             "[IO.File]::WriteAllText(('C:\\t\\'+$driveProbe),'folder cache')",
