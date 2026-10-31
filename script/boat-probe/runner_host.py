@@ -43,6 +43,12 @@ PARITY_MANIFEST = PARITY_DIR / "toolchain.json"
 CARGO_OFFLINE_PROBE = ROOT / 'script/runner/cargo-offline-probe.py'
 GIT_PUSHURL_PROBE = ROOT / 'script/runner/git-pushurl-probe.py'
 WASM_OPT_PROBE = ROOT / 'script/runner/wasm-opt-probe.py'
+SANDBOX_PROBE = ROOT / 'script/runner/job-sandbox-probe.py'
+sandbox_spec = importlib.util.spec_from_file_location('boat_job_sandbox_probe', SANDBOX_PROBE)
+if sandbox_spec is None or sandbox_spec.loader is None:
+    raise ImportError('cannot load job sandbox probe')
+sandbox_probe = importlib.util.module_from_spec(sandbox_spec)
+sandbox_spec.loader.exec_module(sandbox_probe)
 ROOT_PATHS_SCRIPT = ROOT / 'script/tenant-image/guest/root_paths.py'
 # The live remote compile-cache check installs cache_live.MODES and reads the
 # job's own sccache statistics; the store is never the judge of itself.
@@ -741,6 +747,13 @@ def git_pushurl_check(parsed):
     except ValueError:
         return False, parsed
     return parsed['code'] == 0 and report.get('passed') is True, report
+
+
+def sandbox_job_check(parsed):
+    try:
+        return True, sandbox_probe.judge_job(parsed), None
+    except RuntimeError as error:
+        return False, parsed, str(error)
 
 
 def wasm_opt_check(parsed):
@@ -1545,6 +1558,7 @@ class RunnerHost:
                                          ('offline_cargo_seed', 'python3 -c ' + shlex.quote(CARGO_OFFLINE_PROBE.read_text())),
                                           ('git_worktree_pushurl_reset', 'python3 -c ' + shlex.quote(GIT_PUSHURL_PROBE.read_text())),
                                           ('wasm_opt_120_round_trip', 'python3 -c ' + shlex.quote(WASM_OPT_PROBE.read_text())),
+                                          ('job_sandbox', 'python3 -c ' + shlex.quote(SANDBOX_PROBE.read_text())),
                                          ("isolation", "python3 -c " + shlex.quote(job_script)),
                                         ('sigkill_job', 'kill -KILL $$'),
                                         ('job_stdin_eof', "python3 -c 'import os; print(\"boat-stdin-eof\" if os.read(0, 1) == b\"\" else \"unexpected-input\")'"),
@@ -1581,6 +1595,9 @@ class RunnerHost:
                             self.check(label + '.' + name, *git_pushurl_check(parsed))
                         elif name == 'wasm_opt_120_round_trip':
                             self.check(label + '.' + name, *wasm_opt_check(parsed))
+                        elif name == 'job_sandbox':
+                            passed, report, reason = sandbox_job_check(parsed)
+                            self.check(label + '.' + name, passed, report, reason=reason)
                         elif name == "isolation":
                             checks = isolation_result_checks(parsed, host, weight)
                             isolation = json.loads(parsed['stdout']) if parsed['code'] == 0 and not all(checks.values()) else {}

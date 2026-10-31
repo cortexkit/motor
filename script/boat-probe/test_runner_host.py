@@ -104,6 +104,24 @@ class RunnerHostTests(unittest.TestCase):
         self.assertIn("('wasm_opt_120_round_trip', 'python3 -c ' + shlex.quote(WASM_OPT_PROBE.read_text()))", phase)
         self.assertIn("label + '.' + name, *wasm_opt_check(parsed)", phase)
 
+    def test_sandbox_probe_runs_as_a_real_job_and_refuses_missing_psi(self):
+        captured = (host.SANDBOX_PROBE.parent / 'test-fixtures/job-sandbox-passing.json').read_text()
+        passed, observed, reason = host.sandbox_job_check(dict(code=0, stdout=captured))
+        self.assertTrue(passed)
+        self.assertIsNone(reason)
+        self.assertEqual('bash', observed['pid1']['comm'])
+        observed['system_pressure'] = dict(errno=2, error='No such file or directory')
+        passed, evidence, reason = host.sandbox_job_check(dict(code=0, stdout=json.dumps(observed)))
+        self.assertFalse(passed)
+        self.assertIn('PSI readable /proc/pressure/memory', reason)
+        self.assertIn('No such file or directory', reason)
+        self.assertIn('stdout', evidence)
+        self.assertFalse(host.sandbox_job_check(dict(code=1, stdout=captured))[0])
+        self.assertFalse(host.sandbox_job_check(dict(code=0, stdout='not JSON'))[0])
+        phase = __import__('inspect').getsource(host.RunnerHost._phase)
+        self.assertIn("('job_sandbox', 'python3 -c ' + shlex.quote(SANDBOX_PROBE.read_text()))", phase)
+        self.assertIn('passed, report, reason = sandbox_job_check(parsed)', phase)
+
     def test_parity_checker_remeasures_live_files_and_uses_operator_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp, 'wasm32-unknown-unknown')
