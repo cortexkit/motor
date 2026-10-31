@@ -229,7 +229,7 @@ async fn platform_connect(socket: &Path, kind: BackendKind, started: bool) -> Un
             br#"{"type":"hello","protocol_version":1,"started":true,"platforms":["windows"]}"#
                 .as_slice()
         }
-        (BackendKind::MacosVm, true) => br#"{"type":"hello","protocol_version":1,"started":true,"platforms":["macos"]}"#.as_slice(),
+        (BackendKind::MacosVm, true) => br#"{"type":"hello","protocol_version":1,"started":true,"return_paths":true,"return_chunked":true,"platforms":["macos"]}"#.as_slice(),
         _ => unreachable!(),
     };
     // The session's writer sends a heartbeat on its first tick, which can land
@@ -421,16 +421,6 @@ fn macos_capacity_roots_and_feature_refusals_are_backend_specific() {
     for (feature, detail, reason) in [
         ("weight", "macos_vcpu_limit", RefusalReason::RequestRejected),
         (
-            "paths",
-            "return_paths_unsupported",
-            RefusalReason::RequestRejected,
-        ),
-        (
-            "chunks",
-            "return_chunked_unsupported",
-            RefusalReason::RequestRejected,
-        ),
-        (
             "network",
             "network_unsupported",
             RefusalReason::NetworkUnsupported,
@@ -439,8 +429,6 @@ fn macos_capacity_roots_and_feature_refusals_are_backend_specific() {
         let mut request = macos_request(&f);
         match feature {
             "weight" => request.weight_hint = Some(5),
-            "paths" => request.return_paths = vec![format!("{}/file", request.workspace_key)],
-            "chunks" => request.return_chunked = true,
             _ => request.network = Some(Network::Outbound),
         }
         assert!(
@@ -449,6 +437,15 @@ fn macos_capacity_roots_and_feature_refusals_are_backend_specific() {
         let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
         assert_eq!(job.terminal.unwrap().refusal_detail(), Some(detail));
         assert!(job.started_ms.is_none());
+    }
+    for chunked in [false, true] {
+        let mut request = macos_request(&f);
+        request.return_paths = vec![format!("{}/file", request.workspace_key)];
+        request.return_chunked = chunked;
+        assert!(matches!(
+            runner.accept(request).unwrap(),
+            Admission::Accepted(_)
+        ));
     }
 }
 #[cfg(unix)]
@@ -629,4 +626,109 @@ fn macos_terminal_reports_workspace_changes_after_tree_cleanup() {
 fn macos_terminal_omits_workspace_changes_when_scan_fails() {
     let terminal = macos_terminal_after_workspace_scan(true);
     assert!(terminal.workspace_changes.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn macos_returns_replay_restart_and_expire_after_staging_deletion() {
+    use std::os::unix::process::ExitStatusExt;
+    for chunked in [false, true] {
+        let f = Fixture::new();
+        let mut config = platform_config(&f, BackendKind::MacosVm);
+        config.manual_tick = true;
+        let runner =
+            Runner::open_with_backend(config.clone(), Box::new(MacosTerminalBackend)).unwrap();
+        let mut request = macos_request(&f);
+        request.return_chunked = chunked;
+        request.return_paths = vec![format!("{}/artifact", request.workspace_key)];
+        runner.accept(request.clone()).unwrap();
+        {
+            let mut inner = runner.core.inner.lock().unwrap();
+            let job = inner.jobs.get_mut(&request.job_id).unwrap();
+            job.state = JobState::Running;
+            job.started_ms = Some(runner.now());
+            job.durable_output = true;
+            runner.save(job).unwrap();
+        }
+        runner
+            .output(request.job_id, OutputStream::Stdout, b"output")
+            .unwrap();
+        let workspace = config
+            .state_root
+            .join("jobs")
+            .join(request.job_id.to_string())
+            .join("Users/motor/project");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("artifact"), b"x").unwrap();
+        crate::macos::capture_finished_workspace(
+            runner.config(),
+            &runner.core.trees,
+            &request,
+            workspace.clone(),
+        );
+        assert!(!workspace.exists());
+        assert!(runner
+            .config()
+            .macos_runtime
+            .take_returns(Uuid::now_v7())
+            .is_none());
+        runner
+            .finish_execution(
+                request.job_id,
+                Ok(backend::ExecutionOutcome::Unix(
+                    std::process::ExitStatus::from_raw(23 << 8),
+                )),
+                false,
+            )
+            .unwrap();
+        assert!(
+            runner
+                .config()
+                .macos_runtime
+                .take_returns(request.job_id)
+                .is_none(),
+            "completion consumed once"
+        );
+        let frames = runner.replay(request.job_id, 0).unwrap();
+        assert!(matches!(&frames[0], Frame::Output(_)));
+        assert!(
+            matches!(frames.last(), Some(Frame::Terminal(t)) if t.outcome == Outcome::Exit { code: 23 })
+        );
+        if chunked {
+            let (files, manifest, seqs) = super::return_paths::assemble(&frames, &request);
+            assert_eq!(files, vec![Some(b"x".to_vec())]);
+            assert_eq!(seqs, vec![1]);
+            assert_eq!(manifest.seq, 2);
+        } else {
+            assert!(
+                matches!(&frames[1], Frame::ReturnResult(result) if result.seq == 1 && result.returned_files.as_ref().unwrap()[0].data == "eA==")
+            );
+        }
+        drop(runner);
+        let runner = Runner::open_with_backend(config, Box::new(MacosTerminalBackend)).unwrap();
+        assert_eq!(runner.replay(request.job_id, 0).unwrap(), frames);
+        if chunked {
+            let (finished, returned) = {
+                let inner = runner.core.inner.lock().unwrap();
+                let job = &inner.jobs[&request.job_id];
+                (job.finished_ms.unwrap(), job.returned.clone().unwrap())
+            };
+            let directory = runner
+                .record_path(request.job_id)
+                .parent()
+                .unwrap()
+                .join(returned.directory);
+            f.clock
+                .store(finished + RETURN_RETENTION_MS, Ordering::SeqCst);
+            runner.maintenance().unwrap();
+            assert!(!directory.exists());
+            let expired = runner.replay(request.job_id, 0).unwrap();
+            let (files, manifest, _) = super::return_paths::assemble(&expired, &request);
+            assert_eq!(files, vec![None]);
+            assert_eq!(
+                manifest.files[0].cause(),
+                Some(&ReturnPathsFailureCause::Expired)
+            );
+        }
+    }
 }

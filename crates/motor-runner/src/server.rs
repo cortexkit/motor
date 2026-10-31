@@ -522,8 +522,8 @@ async fn session(
     send(
         tx,
         Frame::Hello {
-            return_paths: !runner.config().vm_instance(),
-            return_chunked: !runner.config().vm_instance(),
+            return_paths: runner.config().supports_returns(),
+            return_chunked: runner.config().supports_returns(),
             sibling_paths: runner.config().sibling_snapshot_mode(),
             protocol_version: PROTOCOL_VERSION,
             started: supports_started,

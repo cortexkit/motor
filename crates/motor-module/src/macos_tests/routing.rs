@@ -23,6 +23,7 @@ type ConnectFuture<'a> =
 
 #[derive(Clone)]
 struct Peer {
+    returns: bool,
     platforms: Vec<String>,
     echo: Option<Platform>,
     frames: Arc<Mutex<Vec<Frame>>>,
@@ -33,6 +34,7 @@ struct Peer {
 impl Peer {
     fn new() -> Self {
         Self {
+            returns: false,
             platforms: vec!["macos".into()],
             echo: Some(Platform::Macos),
             frames: Default::default(),
@@ -64,8 +66,8 @@ impl Connector for Peer {
                         default_branch_tip: false,
                         gate_jobs: true,
                         platforms: state.platforms.clone(),
-                        return_paths: false,
-                        return_chunked: false,
+                        return_paths: state.returns,
+                        return_chunked: state.returns,
                         sibling_paths: true,
                     },
                 )
@@ -73,6 +75,7 @@ impl Connector for Peer {
                 .unwrap();
                 let mut remaining = 0;
                 let mut admitted = false;
+                let mut return_request = None;
                 while let Ok(Some(frame)) = read_frame_async(&mut peer).await {
                     state.frames.lock().unwrap().push(frame.clone());
                     match frame {
@@ -88,6 +91,7 @@ impl Connector for Peer {
                             .unwrap();
                         }
                         Frame::Run(run) => {
+                            return_request = Some(run.clone());
                             assert_eq!(run.platform, Some(Platform::Macos));
                             remaining = run.bundles.iter().map(|b| b.length).sum::<u64>();
                             assert!(remaining > 0, "the echo gate must protect a real upload");
@@ -161,12 +165,69 @@ impl Connector for Peer {
                         )
                         .await
                         .unwrap();
+                        let mut terminal_seq = 1;
+                        if let Some(run) = return_request
+                            .as_ref()
+                            .filter(|run: &&Run| !run.return_paths.is_empty())
+                        {
+                            let sha256 =
+                                "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881";
+                            if run.return_chunked {
+                                write_frame_async(
+                                    &mut peer,
+                                    &Frame::ReturnChunk(ReturnChunk::new(
+                                        id,
+                                        1,
+                                        0,
+                                        0,
+                                        BytePayload(b"x".to_vec()),
+                                    )),
+                                )
+                                .await
+                                .unwrap();
+                                write_frame_async(
+                                    &mut peer,
+                                    &Frame::ReturnManifest(ReturnManifest::new(
+                                        id,
+                                        2,
+                                        vec![ReturnManifestEntry::returned(
+                                            run.return_paths[0].clone(),
+                                            1,
+                                            sha256,
+                                        )
+                                        .with_chunks(1)],
+                                        1,
+                                        run.return_max_bytes,
+                                    )),
+                                )
+                                .await
+                                .unwrap();
+                                terminal_seq = 3;
+                            } else {
+                                write_frame_async(
+                                    &mut peer,
+                                    &Frame::ReturnResult(ReturnResult {
+                                        job_id: id,
+                                        seq: 1,
+                                        returned_files: Some(vec![ReturnedFile {
+                                            path: run.return_paths[0].clone(),
+                                            sha256: sha256.into(),
+                                            data: "eA==".into(),
+                                        }]),
+                                        return_paths_failed: None,
+                                    }),
+                                )
+                                .await
+                                .unwrap();
+                                terminal_seq = 2;
+                            }
+                        }
                         write_frame_async(
                             &mut peer,
                             &Frame::Terminal(TerminalRecord::new(
                                 id,
                                 Outcome::Signal { signal: 11 },
-                                1,
+                                terminal_seq,
                                 0,
                                 0,
                             )),
@@ -478,6 +539,50 @@ async fn macos_return_paths_are_refused_before_run() {
         .iter()
         .any(|f| matches!(f, Frame::Run(_))));
     motor.close().await;
+}
+
+#[tokio::test]
+async fn macos_capable_peer_returns_legacy_and_chunked_files() {
+    for chunked in [false, true] {
+        let (scratch, repo) = committed_repo();
+        let peer = Arc::new(Peer {
+            returns: true,
+            ..Peer::new()
+        });
+        let config = Config {
+            runner_instance: "test".into(),
+            macos_runner: Some(runner()),
+            ..Default::default()
+        };
+        let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
+        let returns = crate::ReturnOptions {
+            return_paths: vec![repo.join("result").to_str().unwrap().into()],
+            return_chunked: chunked,
+            ..Default::default()
+        };
+        let records = records(motor.run_with_returns(request(&repo), returns).unwrap()).await;
+        assert_eq!(terminal(&records).outcome, Outcome::Signal { signal: 11 });
+        assert!(peer.frames.lock().unwrap().iter().any(|frame| matches!(frame, Frame::Run(run) if run.return_chunked == chunked && run.return_paths.len() == 1)));
+        if chunked {
+            assert!(records
+                .iter()
+                .any(|record| matches!(record, StreamRecord::ReturnChunk(_))));
+            assert!(records
+                .iter()
+                .any(|record| matches!(record, StreamRecord::ReturnManifest(_))));
+        } else {
+            let result = motor.return_result(terminal(&records).job_id).unwrap();
+            assert_eq!(result.return_paths_failed, None);
+            let files = result.returned_files.unwrap();
+            assert_eq!(files[0].path, repo.join("result").to_str().unwrap());
+            assert_eq!(files[0].data, "eA==");
+            assert_eq!(
+                files[0].sha256,
+                "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
+            );
+        }
+        motor.close().await;
+    }
 }
 
 #[tokio::test]

@@ -215,6 +215,12 @@ pub(super) fn capture_changes(
     if !entry.owned.lock().unwrap().record.stop_proven {
         return;
     }
+    #[cfg(test)]
+    runtime
+        .workspace_reads
+        .lock()
+        .unwrap()
+        .push((request.job_id, "changes"));
     match trees.changes_for_request(
         &staged.workspace,
         &staged.prepared_javascript_directories,
@@ -223,6 +229,51 @@ pub(super) fn capture_changes(
         Ok(changes) => runtime.record_changes(request.job_id, changes),
         Err(error) => tracing::warn!(job_id = %request.job_id, %error, "scan_failed"),
     }
+}
+
+pub(super) fn capture_returns(
+    runtime: &Runtime,
+    trees: &Trees,
+    entry: &Entry,
+    request: &motor_protocol::Run,
+    staged: &Staged,
+) {
+    if crate::caller_path::run(request)
+        .caller_return_paths
+        .is_empty()
+    {
+        return;
+    }
+    let job_directory = trees.state.join("jobs").join(request.job_id.to_string());
+    let returns = if entry.owned.lock().unwrap().record.stop_proven {
+        #[cfg(test)]
+        runtime
+            .workspace_reads
+            .lock()
+            .unwrap()
+            .push((request.job_id, "returns"));
+        crate::return_paths::collect_staged(request, &staged.workspace, &job_directory)
+    } else {
+        crate::return_paths::unread(request, &job_directory)
+    };
+    runtime.record_returns(request.job_id, returns);
+}
+
+pub(super) fn capture_completion(
+    config: &Config,
+    trees: &Trees,
+    entry: &Entry,
+    request: &motor_protocol::Run,
+    staged: &Staged,
+) {
+    if let Err(error) = config.macos_runtime.stop(&config.state_root, entry) {
+        entry.failed.store(true, Ordering::Release);
+        tracing::warn!(%error, "macOS VM stop failed; retaining command outcome and resource ownership");
+    }
+    // Maintenance must retain staging and workspace ownership until both the
+    // change scan and the durable returned-file spool have finished.
+    capture_changes(&config.macos_runtime, trees, entry, request, staged);
+    capture_returns(&config.macos_runtime, trees, entry, request, staged);
 }
 
 pub(super) fn target_in(config: &Config, entry: &Entry, staged: &Staged) -> io::Result<()> {
@@ -441,14 +492,13 @@ fn start_io(
             if let Err(error) = &result {
                 let _ = ready_tx.try_send(Err(invalid(error.to_string())));
             }
-            let stopped = config.macos_runtime.stop(&config.state_root, &thread_entry);
-            if let Err(error) = stopped {
-                thread_entry.failed.store(true, Ordering::Release);
-                tracing::warn!(%error, "macOS VM stop failed; retaining command outcome and resource ownership");
-            }
-            // Keep the entry active until the scan finishes, so maintenance
-            // cannot delete the tree while Git is reading it.
-            capture_changes(&config.macos_runtime, &staging.trees, &thread_entry, &scan_request, &staged);
+            capture_completion(
+                &config,
+                &staging.trees,
+                &thread_entry,
+                &scan_request,
+                &staged,
+            );
             if !thread_entry.cancel.0.load(Ordering::Acquire)
                 && thread_entry.owned.lock().unwrap().record.stop_proven
             {
@@ -458,13 +508,16 @@ fn start_io(
             }
             drop(stdout_tx);
             drop(stderr_tx);
-            thread_entry.active.store(false,Ordering::Release);
+            thread_entry.active.store(false, Ordering::Release);
             let _ = result_tx.send(result);
             // Tree deletion may be slow. It retains the workspace and slot in
             // the runtime, but must not hold terminal delivery behind unlink IO.
-            let cleanup_runtime=config.macos_runtime.clone();
-            let cleanup_root=config.state_root.clone();
-            if let Err(error)=std::thread::Builder::new().name("macos-cleanup".into()).spawn(move||cleanup_runtime.finish(&cleanup_root,&thread_entry)) {
+            let cleanup_runtime = config.macos_runtime.clone();
+            let cleanup_root = config.state_root.clone();
+            if let Err(error) = std::thread::Builder::new()
+                .name("macos-cleanup".into())
+                .spawn(move || cleanup_runtime.finish(&cleanup_root, &thread_entry))
+            {
                 tracing::warn!(%error,"macOS cleanup thread unavailable; maintenance will retry");
             }
         })?;

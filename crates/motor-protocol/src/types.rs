@@ -609,6 +609,7 @@ pub enum ReturnFailureCause {
     Escape,
     NotRegular,
     FrameLimit,
+    ReadError,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -148,7 +148,10 @@ async fn return_paths_missing_escape_and_frame_limit_keep_real_remote_exit() {
 /// The returned-file records of one replay, checked with the shared
 /// caller-side checker: each path's verified bytes (`None` when it failed),
 /// the manifest, and the seqs of the chunks.
-fn assemble(frames: &[Frame], run: &Run) -> (Vec<Option<Vec<u8>>>, ReturnManifest, Vec<u64>) {
+pub(super) fn assemble(
+    frames: &[Frame],
+    run: &Run,
+) -> (Vec<Option<Vec<u8>>>, ReturnManifest, Vec<u64>) {
     let mut assembler = ReturnAssembler::new(&run.return_paths, run.return_max_bytes);
     let mut bytes = vec![Vec::new(); run.return_paths.len()];
     let mut seqs = Vec::new();

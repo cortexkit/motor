@@ -149,6 +149,58 @@ pub(crate) fn collect_authorized(config: &crate::Config, request: &Run, seq: u64
     collect_with_root(request, seq, collection_root(Some(config), request), || {})
 }
 
+/// Collection handed from VM shutdown to terminal persistence. Chunk bytes
+/// already live outside disposable staging; sequence numbers are assigned later.
+#[cfg(unix)]
+pub(crate) enum Collection {
+    Legacy(ReturnResult),
+    Chunked(ChunkedCollection),
+}
+
+#[cfg(unix)]
+pub(crate) fn collect_staged(
+    request: &Run,
+    staged_workspace: &Path,
+    job_directory: &Path,
+) -> Collection {
+    // The host descriptor pins the share, while absolute symlinks are interpreted
+    // in the guest namespace. Never open a guest absolute pathname on the host.
+    let root = open_mapped_directory(staged_workspace).map(|directory| {
+        (
+            directory,
+            PathBuf::from(
+                crate::caller_path::request(request)
+                    .caller_workspace_key
+                    .text(),
+            ),
+        )
+    });
+    collect_from_root(request, job_directory, root)
+}
+
+#[cfg(unix)]
+pub(crate) fn unread(request: &Run, job_directory: &Path) -> Collection {
+    collect_from_root(request, job_directory, Err(Cause::ReadError))
+}
+
+#[cfg(unix)]
+fn collect_from_root(
+    request: &Run,
+    job_directory: &Path,
+    root: Result<(File, PathBuf), Cause>,
+) -> Collection {
+    if request.return_chunked {
+        Collection::Chunked(collect_chunked_with_root(
+            request,
+            job_directory,
+            root,
+            |_| {},
+        ))
+    } else {
+        Collection::Legacy(collect_with_root(request, 0, root, || {}))
+    }
+}
+
 fn collection_root(
     config: Option<&crate::Config>,
     request: &Run,
@@ -554,6 +606,7 @@ fn shared_cause(cause: Cause) -> ReturnPathsFailureCause {
         Cause::Escape => ReturnPathsFailureCause::Escape,
         Cause::NotRegular => ReturnPathsFailureCause::NotRegular,
         Cause::FrameLimit => ReturnPathsFailureCause::FrameLimit,
+        Cause::ReadError => ReturnPathsFailureCause::ReadError,
     }
 }
 
@@ -686,6 +739,208 @@ mod tests {
                 sha256: "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881".into(),
                 data: "eA==".into(),
             }]
+        );
+    }
+
+    #[cfg(unix)]
+    fn staged_collection(run: &Run, host: &Path, job: &Path) -> ChunkedCollection {
+        let Collection::Chunked(collection) = collect_staged(run, host, job) else {
+            panic!("expected chunked collection")
+        };
+        collection
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_returns_use_share_not_canonical_checkout() {
+        let scratch = ScratchDir::new("staged-return-root");
+        let canonical = scratch.join("canonical");
+        let staged = scratch.join("staged");
+        let job = scratch.join("job");
+        for path in [&canonical, &staged, &job] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(staged.join("artifact"), b"x").unwrap();
+        assert!(!canonical.join("artifact").exists());
+        let mut run = request(&canonical, &[&canonical.join("artifact")], 1);
+        let Collection::Legacy(result) = collect_staged(&run, &staged, &job) else {
+            panic!("expected legacy collection")
+        };
+        assert_eq!(result.returned_files.unwrap()[0].data, "eA==");
+        run.return_chunked = true;
+        let collection = staged_collection(&run, &staged, &job);
+        assert_eq!(collection.total_bytes, 1);
+        assert_eq!(
+            collection.files[0].sha256(),
+            Some("2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881")
+        );
+        fs::remove_dir_all(&staged).unwrap();
+        assert_eq!(
+            fs::read(job.join(collection.directory).join("chunk-0")).unwrap(),
+            b"x"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_returns_hostile_links_never_spool_host_sentinel() {
+        use std::os::unix::fs::symlink;
+        let scratch = ScratchDir::new("staged-return-links");
+        let staged = scratch.join("staged");
+        let job = scratch.join("job");
+        fs::create_dir_all(&staged).unwrap();
+        fs::create_dir_all(&job).unwrap();
+        let sentinel = b"host-secret-must-not-be-returned";
+        fs::write(scratch.join("secret"), sentinel).unwrap();
+        fs::write(staged.join("out"), b"safe").unwrap();
+        let logical = Path::new("/Users/guest/workspace");
+        for (name, target) in [
+            ("absolute", scratch.join("secret")),
+            ("parent", PathBuf::from("../secret")),
+            ("dangling", scratch.join("absent")),
+            ("sibling", PathBuf::from("/Users/guest/sibling/secret")),
+            ("relative-ok", PathBuf::from("out")),
+            ("absolute-ok", logical.join("out")),
+        ] {
+            symlink(target, staged.join(name)).unwrap();
+        }
+        let names = [
+            "absolute",
+            "parent",
+            "dangling",
+            "sibling",
+            "relative-ok",
+            "absolute-ok",
+        ];
+        let paths: Vec<_> = names.iter().map(|name| logical.join(name)).collect();
+        let refs: Vec<_> = paths.iter().map(PathBuf::as_path).collect();
+        let mut run = request(logical, &refs, 1024);
+        run.return_chunked = true;
+        let collection = staged_collection(&run, &staged, &job);
+        for entry in &collection.files[..4] {
+            assert_eq!(entry.cause(), Some(&ReturnPathsFailureCause::Escape));
+        }
+        assert_eq!(collection.total_bytes, 8);
+        for entry in &collection.files[4..] {
+            assert_eq!(entry.size(), Some(4));
+            assert!(entry.sha256().is_some());
+        }
+        for index in 0..collection.chunks.len() {
+            let bytes = fs::read(
+                job.join(&collection.directory)
+                    .join(format!("chunk-{index}")),
+            )
+            .unwrap();
+            assert!(!bytes
+                .windows(sentinel.len())
+                .any(|window| window == sentinel));
+            assert_eq!(bytes, b"safe");
+        }
+        run.return_chunked = false;
+        for path in &paths[..4] {
+            run.return_paths = vec![path.to_str().unwrap().into()];
+            let Collection::Legacy(result) = collect_staged(&run, &staged, &job) else {
+                unreachable!()
+            };
+            failed(result, Cause::Escape, 0, 1024);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_returns_pin_root_and_refuse_symlink_replacement() {
+        use std::os::unix::fs::symlink;
+        let scratch = ScratchDir::new("staged-return-replacement");
+        let staged = scratch.join("staged");
+        let saved = scratch.join("saved");
+        let job = scratch.join("job");
+        fs::create_dir_all(&staged).unwrap();
+        fs::create_dir_all(&job).unwrap();
+        fs::write(staged.join("out"), b"safe").unwrap();
+        let logical = Path::new("/Users/guest/workspace");
+        let mut run = request(logical, &[&logical.join("out")], 4);
+        run.return_chunked = true;
+        let pinned = open_mapped_directory(&staged).unwrap();
+        fs::rename(&staged, &saved).unwrap();
+        symlink(&saved, &staged).unwrap();
+        let collection =
+            collect_chunked_with_root(&run, &job, Ok((pinned, logical.into())), |_| {});
+        assert_eq!(collection.total_bytes, 4);
+        let collection = staged_collection(&run, &staged, &job);
+        assert_eq!(
+            collection.files[0].cause(),
+            Some(&ReturnPathsFailureCause::Escape)
+        );
+        assert!(collection.chunks.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_returns_exact_ten_mib_and_over_cap_admission_without_read() {
+        let scratch = ScratchDir::new("staged-return-cap");
+        let staged = scratch.join("staged");
+        let job = scratch.join("job");
+        fs::create_dir_all(&staged).unwrap();
+        fs::create_dir_all(&job).unwrap();
+        let cap = RETURN_CHUNKED_MAX_BYTES_CAP;
+        File::create(staged.join("large"))
+            .unwrap()
+            .set_len(cap)
+            .unwrap();
+        File::create(staged.join("too-large"))
+            .unwrap()
+            .set_len(cap + 1)
+            .unwrap();
+        fs::write(staged.join("small"), b"x").unwrap();
+        let logical = Path::new("/Users/guest/workspace");
+        let mut run = request(
+            logical,
+            &[
+                &logical.join("too-large"),
+                &logical.join("large"),
+                &logical.join("small"),
+            ],
+            cap,
+        );
+        run.return_chunked = true;
+        let mut reads = Vec::new();
+        let root = open_mapped_directory(&staged).map(|file| (file, logical.into()));
+        let collection = collect_chunked_with_root(&run, &job, root, |index| reads.push(index));
+        assert_eq!(reads, vec![1]);
+        assert_eq!(collection.total_bytes, cap);
+        assert_eq!(
+            collection.files[0].cause(),
+            Some(&ReturnPathsFailureCause::OverCap)
+        );
+        assert_eq!(collection.files[1].size(), Some(cap));
+        assert_eq!(collection.chunks.len(), 20);
+        assert_eq!(
+            collection.files[2].cause(),
+            Some(&ReturnPathsFailureCause::OverCap)
+        );
+        run.return_paths.remove(1);
+        let collection = staged_collection(&run, &staged, &job);
+        assert_eq!(
+            collection.total_bytes, 1,
+            "later fitting files remain eligible"
+        );
+        assert_eq!(collection.chunks.len(), 1);
+        File::create(staged.join("legacy"))
+            .unwrap()
+            .set_len(motor_protocol::RETURN_MAX_BYTES)
+            .unwrap();
+        run.return_chunked = false;
+        run.return_max_bytes = motor_protocol::RETURN_MAX_BYTES;
+        run.return_paths = vec![logical.join("legacy").to_str().unwrap().into()];
+        let Collection::Legacy(result) = collect_staged(&run, &staged, &job) else {
+            unreachable!()
+        };
+        assert_eq!(
+            STANDARD
+                .decode(&result.returned_files.unwrap()[0].data)
+                .unwrap()
+                .len() as u64,
+            motor_protocol::RETURN_MAX_BYTES
         );
     }
 
