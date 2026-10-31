@@ -51,6 +51,40 @@ fn return_path_request_bounds_are_lexical_and_byte_counted() {
 }
 
 #[test]
+fn return_path_bounds_read_caller_paths_as_posix_on_every_host() {
+    // The Windows runner runs this check too. There `std::path` would call
+    // `/Users/a` relative and split on `\`, refusing every request.
+    for valid in [
+        "/workspace/out",
+        "/workspace//out",
+        "/workspace/./out",
+        "/workspace/out/",
+        "/workspace/dir\\name",
+    ] {
+        assert!(
+            validate_return_paths("/workspace", &[valid.into()], 1).is_ok(),
+            "{valid}"
+        );
+    }
+    for invalid in [
+        "/workspace/a/../b",
+        "/workspacex/out",
+        "workspace/out",
+        "C:\\workspace\\out",
+    ] {
+        assert_eq!(
+            validate_return_paths("/workspace", &[invalid.into()], 1),
+            Err("return_paths_exceeded"),
+            "{invalid}"
+        );
+    }
+    assert_eq!(
+        validate_return_paths("workspace", &["/workspace/out".into()], 1),
+        Err("return_paths_exceeded")
+    );
+}
+
+#[test]
 fn return_chunked_fields_are_additive_and_omitted_when_false() {
     let run_vector: serde_json::Value = serde_json::from_str(include_str!(
         "../../../../test-vectors/exec-remote-v1/frames/run.json"

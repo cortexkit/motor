@@ -578,8 +578,6 @@ pub fn validate_return_request(
     cap: u64,
     chunked: bool,
 ) -> Result<(), &'static str> {
-    use std::path::{Component, Path};
-    let root = Path::new(workspace);
     let limit = if chunked {
         RETURN_LARGE_MAX_BYTES_CAP
     } else {
@@ -588,20 +586,29 @@ pub fn validate_return_request(
     if cap > limit || paths.len() > 64 {
         return Err("return_paths_exceeded");
     }
+    let root = caller_components(workspace).ok_or("return_paths_exceeded")?;
     for path in paths {
-        let path_ref = Path::new(path);
-        if path.len() > 4096
-            || !path_ref.is_absolute()
-            || !root.is_absolute()
-            || !path_ref.starts_with(root)
-            || path_ref
-                .components()
-                .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
-        {
+        let inside = path.len() <= 4096
+            && caller_components(path).is_some_and(|parts| parts.starts_with(&root));
+        if !inside {
             return Err("return_paths_exceeded");
         }
     }
     Ok(())
+}
+
+/// Components of an absolute caller path, read as a POSIX path on every host.
+/// Caller paths are always POSIX (macOS, Linux or WSL), but this check also
+/// runs inside the Windows runner, where `std::path` would treat `/Users/a` as
+/// relative and `\` as a separator. Empty and `.` components are skipped, as
+/// `std::path` does on Unix; `None` for a relative path or any `..`.
+fn caller_components(path: &str) -> Option<Vec<&str>> {
+    let rest = path.strip_prefix('/')?;
+    let parts: Vec<&str> = rest
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    (!parts.contains(&"..")).then_some(parts)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
