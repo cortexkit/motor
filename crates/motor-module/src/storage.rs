@@ -1147,10 +1147,12 @@ impl Storage {
             if hosted.run_sent || hosted.terminal.is_some() {
                 return;
             }
+            // LostToRestart tells a caller that comes back that nothing ran and it
+            // may resubmit fresh; RequestRejected would tell it not to retry.
             let terminal = TerminalRecord::new(
                 id,
                 Outcome::RefusedBeforeStart {
-                    reason: RefusalReason::RequestRejected,
+                    reason: RefusalReason::LostToRestart,
                 },
                 0,
                 0,

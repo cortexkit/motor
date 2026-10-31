@@ -46,10 +46,14 @@ async fn detached_never_sent_hosted_job_is_refused_once_without_reattach_or_resu
     let terminal = job
         .local_terminal
         .expect("ownerless job must end before any reattach");
-    assert!(matches!(
+    // A returning caller must read this as safe to resubmit, not as a request
+    // to avoid, since nothing ran.
+    assert_eq!(
         terminal.outcome,
-        Outcome::RefusedBeforeStart { .. }
-    ));
+        Outcome::RefusedBeforeStart {
+            reason: motor_protocol::RefusalReason::LostToRestart
+        }
+    );
     assert_eq!(terminal.ran, Some(Ran::None));
     assert_eq!(terminal.wall_ms, 0);
     assert!(terminal
