@@ -142,16 +142,15 @@ dispatcher chooses among heads:
 3. Newer heads, rotating between workspaces by least recent dispatch.
 4. Background warm builds and cache fills, last.
 
-With global fleet routing enabled, gates take host-only leases with
+Linux gate submissions take host-only leases with
 `allow_spill: false` and carry the same `run.gate_job` mark through motor-host. The mark
 does not affect broker placement. Each tenant VM has its own runner and queue,
 so priority can reorder only that tenant's jobs, never another tenant's jobs.
-Without fleet routing, global gate submissions keep using the direct runner;
-explicit repository routes still take precedence. Gates retain their 30-minute
-queue budget and can correct to the direct runner on a pre-Run `no_host_fits`.
+Explicit repository routes still take precedence. Gates retain their 30-minute
+queue budget; `no_host_fits` returns a typed refusal rather than sending the job
+to a direct runner.
 Tests: `fleet_gate_takes_a_host_only_lease_and_sends_the_gate_mark`,
-`fleet_off_gate_uses_the_direct_runner_without_a_lease`,
-`fleet_gate_no_host_fits_corrects_to_the_direct_priority_lane`,
+`linux_exec_refusals_and_followups_never_reach_a_direct_runner`,
 `relay_preserves_gate_capability_and_run_mark_for_the_tenant`,
 `tenant_gated_run_gets_permits_before_an_older_queued_worker`.
 
@@ -289,7 +288,7 @@ Tests:
   `runner_disk_full`, with `free_bytes` and `floor_bytes` in the refusal. Tests:
   `disk_admission_refuses_typed_when_reflinks_reclaim_too_little`,
   `disk_full_wire_refusal_carries_tag_and_bytes_before_upload`,
-  `disk_full_reaches_run_and_prepare_callers_with_known_reason_and_detail`
+  `disk_full_reaches_run_callers_with_known_reason_and_detail`
   (`crates/motor-module/tests/it/recovery.rs`).
 - Cleanup never touches running or reserved workspaces, the workspace the
   incoming job needs, or its siblings. It removes only catalogued workspaces

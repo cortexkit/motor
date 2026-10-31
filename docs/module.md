@@ -71,8 +71,8 @@ use an explicit job ID; run mints it and registers the job before publishing
 acceptance.
 Callers learn the ID from the stream, not from submission order. Attach waits
 for submission to settle; explicit `exec.cancel` persists cancellation intent
-even while the runner is admitting the job. Workspace prepare/drop sequencing
-is the caller's responsibility: await prepare before a dependent run.
+even while the runner is admitting the job. Linux workspace lifecycle calls do
+not prepare a runner before a dependent run; placement happens when the job runs.
 
 AFT, the agent tool, currently uses one connection and one route per remote job
 (at most two or three calls in flight). Its live cancellation sends a Cancel
@@ -119,6 +119,12 @@ Linux availability comes from the authenticated broker check; the sampler does
 not probe a direct Linux runner. Windows and macOS retain their own runner
 samples. The Linux aggregate `exec.status` placeholder is not a health sample.
 Test: `health_sampler_skips_direct_linux_and_keeps_windows_sampling`.
+
+For an admitted caller, Linux `workspace.prepare` returns `request_rejected`
+with `hosted_prepare_unsupported: hosted_no_fallback` after local WSL-path checks:
+the hosted runner is not selected until a job runs. The refused transfer creates
+no stored job and contacts no runner. Test:
+`linux_prepare_refuses_without_creating_jobs`.
 
 Linux `workspace.drop` is a typed no-op (`dropped: false`, no cancelled jobs):
 each server's tenant VM evicts its own workspaces. It does not contact a direct
@@ -323,8 +329,7 @@ Only a transient signing failure (`runner_sign_unavailable`,
 `retry_after_ms` on its refusal. The hint is the time left in the agent's
 backoff for that failure: once it passes, the next job's sign request asks the
 vault again, so a caller can wait and retry remotely instead of running the job
-somewhere else. It does not promise the vault has recovered. Prepare replies
-carry the same hint.
+somewhere else. It does not promise the vault has recovered.
 
 | Code | `retry_after_ms` |
 | --- | --- |
@@ -340,7 +345,7 @@ when there is no hint, and older callers that know it read it as written. Tests:
 `transient_sign_failures_hint_the_time_left_in_their_backoff`,
 `repairable_sign_failures_carry_no_hint`,
 `transient_sign_refusal_hints_the_backoff_left_and_the_hint_shrinks`,
-`connector_retry_hint_reaches_run_and_prepare_refusals`,
+`connector_retry_hint_reaches_run_refusals`,
 `a_refusal_line_names_its_retry_hint_only_when_it_has_one`,
 `oldest_production_client_decodes_new_refusal_tags_as_unknown_with_detail`.
 
@@ -896,9 +901,7 @@ Tests: `listed_main_and_linked_agent_and_direct_jobs_use_hosted_without_avoiding
 `stage1_host_full_until_the_queue_budget_ends_refuses_like_no_capacity`,
 `stage1_queue_budget_ending_during_a_lease_request_refuses_for_what_the_job_waited_on`,
 `linux_exec_refusals_and_followups_never_reach_a_direct_runner`,
-`stage1_no_host_fits_decision_survives_restart_and_attaches_to_the_build_server`,
-`no_host_fits_decision_trims_queue_wait_once_and_is_counted_for_an_hour`, and
-`hosted_routed_counter_only_counts_repository_routes_in_the_last_hour`.
+`stage1_no_host_fits_decision_survives_restart_and_attaches_to_the_build_server`.
 Placement-hint coverage:
 `repository_placement_hint_config_roundtrips_absent_null_and_present`,
 `repository_placement_hint_rejects_invalid_names_and_null_vm`,
@@ -927,9 +930,7 @@ against both broker-supplied hashes. The separate tests
 `derived_non_null_placement_hint_lease_body_matches_the_cross_check_hash` cover
 the derived `staging-fra-1`/`t1` body; it is not a route-generated vector.
 CLOUD's `no-host-fits-lease.json` (from `cortexkit-cloud` `916347e`) is pinned
-beside it: `stage1_cloud_no_host_fits_reply_routes_the_job_to_the_build_server`
-sends its exact 422 reply bytes through ck-motor's broker client, and
-`cloud_no_host_fits_reply_bytes_match_fake` checks the fake broker gives the
-same answer.
+beside it: `cloud_no_host_fits_reply_bytes_match_fake` checks the fake broker
+gives the same answer.
 `python3 scripts/mixed-version.py` checks the default Config against the pinned
 older client.

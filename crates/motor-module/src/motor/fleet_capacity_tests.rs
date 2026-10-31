@@ -277,10 +277,6 @@ async fn fleet_burst_over_one_heartbeat_waits_through_host_full_and_no_capacity(
         settlement_requests.is_empty(),
         "unexpected broker requests: {settlement_requests:?}"
     );
-    assert_eq!(
-        motor.hosted_health().unwrap()["last_lease_error"],
-        serde_json::Value::Null
-    );
     assert!(!logs.text().contains("hosted job stopped"));
     assert_eq!(peer.0.load(Ordering::SeqCst), 0);
 }

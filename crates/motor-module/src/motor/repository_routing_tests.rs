@@ -205,7 +205,6 @@ async fn listed_main_and_linked_agent_and_direct_jobs_use_hosted_without_avoidin
     assert_eq!(bodies.iter().filter(|b| b["net"] == true).count(), 4);
     assert_eq!(h.runs.load(Ordering::SeqCst), 8);
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
-    assert_eq!(motor.hosted_health().unwrap()["hosted_routed_jobs_1h"], 8);
 }
 
 #[tokio::test]
@@ -236,7 +235,6 @@ async fn unlisted_linux_uses_fleet_and_windows_keeps_the_direct_path() {
     }
     assert_eq!(ssh.0.load(Ordering::SeqCst), 1);
     assert_eq!(h.lease_bodies.lock().unwrap().len(), 1);
-    assert_eq!(motor.hosted_health().unwrap()["hosted_routed_jobs_1h"], 0);
 }
 
 pub(super) struct DirectPeer(pub(super) AtomicUsize);
@@ -907,10 +905,12 @@ async fn stage1_no_host_fits_decision_survives_restart_and_attaches_to_the_build
                 false,
             )
             .unwrap();
-        motor
-            .storage
-            .routed_direct_no_host_fits(id, 0, Some(8))
-            .unwrap();
+        crate::storage::legacy_fixtures::seed_direct_route(
+            &motor.storage,
+            id,
+            crate::storage::legacy_fixtures::DirectRoute::NoHostFits { max_vcpus: Some(8) },
+        )
+        .unwrap();
         let (stream, tx, wake) = motor.stream(id);
         motor
             .run_job(
@@ -952,7 +952,6 @@ async fn stage1_no_host_fits_decision_survives_restart_and_attaches_to_the_build
     assert_eq!(log.attaches, vec![id]);
     assert_eq!(log.runs.len(), 1, "a restart never submits again");
     assert!(h.requests.lock().unwrap().is_empty());
-    assert_eq!(motor.hosted_health().unwrap()["hosted_no_host_fits_1h"], 1);
 }
 
 /// Keeps tokio's paused clock still until dropped, so only

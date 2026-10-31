@@ -94,40 +94,32 @@ async fn linux_drop_is_a_typed_noop_without_creating_jobs() {
 }
 
 #[tokio::test]
-async fn hosted_prepare_refuses_without_creating_jobs() {
+async fn linux_prepare_refuses_without_creating_jobs() {
     let h = Harness::new(Behavior::Normal).await;
     let scratch = Scratch::new();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
-    for fleet in [false, true] {
-        let config = h.config();
-        let motor = Motor::with_connector(
-            config,
-            &scratch.0.join(format!("prepare-{fleet}")),
-            ssh.clone(),
-        )
+    let motor = Motor::with_connector(h.config(), &scratch.0.join("prepare"), ssh.clone()).unwrap();
+    let reply = motor
+        .prepare(PrepareRequest::new(
+            "/home/worktrees/project",
+            "/home/worktrees/project",
+            "HEAD",
+        ))
+        .await
         .unwrap();
-        let reply = motor
-            .prepare(PrepareRequest::new(
-                "/home/worktrees/project",
-                "/home/worktrees/project",
-                "HEAD",
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            reply.outcome,
-            PrepareOutcome::RefusedBeforeStart {
-                reason: RefusalReason::RequestRejected,
-            }
-        );
-        assert_eq!(
-            reply.refusal_detail(),
-            Some("hosted_prepare_unsupported: hosted_no_fallback")
-        );
-        assert!(motor.storage.job(reply.transfer_id).is_none());
-        assert_eq!(motor.storage.job_count(), 0);
-        assert!(!motor.spool_root.exists());
-    }
+    assert_eq!(
+        reply.outcome,
+        PrepareOutcome::RefusedBeforeStart {
+            reason: RefusalReason::RequestRejected
+        }
+    );
+    assert_eq!(
+        reply.refusal_detail(),
+        Some("hosted_prepare_unsupported: hosted_no_fallback")
+    );
+    assert!(motor.storage.job(reply.transfer_id).is_none());
+    assert_eq!(motor.storage.job_count(), 0);
+    assert!(!motor.spool_root.exists());
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
     assert!(h.requests.lock().unwrap().is_empty());
     assert!(h.frames.lock().unwrap().is_empty());

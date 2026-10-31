@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::legacy_fixtures::{seed_direct_route, DirectRoute};
 use crate::transport::Duplex;
 use cortexkit_test_support::ScratchDir;
 use std::{
@@ -1096,10 +1097,15 @@ async fn spill_attempt_note_keeps_within_the_refusal_detail_limit() {
         route.hosted_code = Some("hosted_provisioning".into());
         motor.storage.hosted_route(id, route).unwrap();
     }
-    motor
-        .storage
-        .resubmitted(resubmitted, Uuid::now_v7(), "hosted_provisioning", None)
-        .unwrap();
+    seed_direct_route(
+        &motor.storage,
+        resubmitted,
+        DirectRoute::SpillReturn {
+            runner_job_id: Uuid::now_v7(),
+            hosted_code: "hosted_provisioning",
+        },
+    )
+    .unwrap();
     let note = "; spill_attempted=hosted_provisioning";
 
     let long = "é".repeat(REFUSAL_DETAIL_MAX_BYTES);

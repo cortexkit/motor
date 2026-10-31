@@ -60,7 +60,7 @@ fn lockfile_parses_queries_escapes_duplicates_and_multiple_commits() {
     );
 }
 #[tokio::test]
-async fn run_and_prepare_lockfile_source_is_commit_not_worktree() {
+async fn run_lockfile_source_is_commit_not_worktree() {
     let f = Fixture::new(Cut::None, 28).await;
     let url = "https://example.invalid/locked.git";
     let a = "a".repeat(40);
@@ -79,34 +79,27 @@ async fn run_and_prepare_lockfile_source_is_commit_not_worktree() {
             "locked",
         ],
     );
-    let base = git(&f.key, &["rev-parse", "HEAD"]);
-    for prepare in [false, true] {
-        fs::write(
-            f.key.join("Cargo.lock"),
-            lock(&[format!("git+{url}#{}", if prepare { &b } else { &a })]),
-        )
-        .unwrap();
-        let s = Snapshots::build(
-            &f.config,
-            f.key.to_str().unwrap(),
-            f.main.to_str().unwrap(),
-            &[],
-            &f.scratch.join("spool"),
-            Uuid::now_v7(),
-            prepare.then_some(base.as_str()),
-            &crate::storage::Storage::open(&f.scratch.join("capture-store")).unwrap(),
-        )
-        .unwrap_or_else(|_| panic!("snapshot failed"));
-        fs::write(f.key.join("Cargo.lock"), lock(&[format!("git+{url}#{b}")])).unwrap();
-        assert_eq!(
-            snapshot::lockfile_sources(&s.main.path, &s.main.commit).unwrap(),
-            BTreeMap::from([(url.into(), vec![a.clone()])])
-        );
-        assert_eq!(
-            s.git_dependencies,
-            BTreeMap::from([(url.into(), vec![a.clone()])])
-        );
-    }
+    fs::write(f.key.join("Cargo.lock"), lock(&[format!("git+{url}#{a}")])).unwrap();
+    let s = Snapshots::build(
+        &f.config,
+        f.key.to_str().unwrap(),
+        f.main.to_str().unwrap(),
+        &[],
+        &f.scratch.join("spool"),
+        Uuid::now_v7(),
+        None,
+        &crate::storage::Storage::open(&f.scratch.join("capture-store")).unwrap(),
+    )
+    .unwrap_or_else(|_| panic!("snapshot failed"));
+    fs::write(f.key.join("Cargo.lock"), lock(&[format!("git+{url}#{b}")])).unwrap();
+    assert_eq!(
+        snapshot::lockfile_sources(&s.main.path, &s.main.commit).unwrap(),
+        BTreeMap::from([(url.into(), vec![a.clone()])])
+    );
+    assert_eq!(
+        s.git_dependencies,
+        BTreeMap::from([(url.into(), vec![a.clone()])])
+    );
     assert!(
         snapshot::lockfile_sources(&f.main, &git(&f.main, &["rev-parse", "HEAD"]))
             .unwrap()
@@ -293,66 +286,52 @@ fn dependency_submodules_warning_names_url() {
 }
 
 #[tokio::test]
-async fn legacy_runner_capability_suppresses_run_and_prepare_dependency_frames() {
+async fn legacy_runner_capability_suppresses_run_dependency_frames() {
     use super::recovery::{collect, terminal};
     use std::sync::atomic::Ordering;
-    for preparing in [false, true] {
-        let f = Fixture::new(Cut::None, 28).await;
-        f.proxy.legacy_have.store(true, Ordering::SeqCst);
-        fs::write(
-            f.key.join("Cargo.lock"),
-            lock(&[format!(
-                "git+https://example.invalid/private.git#{}",
-                "a".repeat(40)
-            )]),
-        )
+    let f = Fixture::new(Cut::None, 28).await;
+    f.proxy.legacy_have.store(true, Ordering::SeqCst);
+    fs::write(
+        f.key.join("Cargo.lock"),
+        lock(&[format!(
+            "git+https://example.invalid/private.git#{}",
+            "a".repeat(40)
+        )]),
+    )
+    .unwrap();
+    git(&f.key, &["add", "Cargo.lock"]);
+    git(
+        &f.key,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "locked",
+        ],
+    );
+    let motor = f.motor();
+    let records = collect(motor.run(f.request("true")).unwrap()).await;
+    assert_eq!(terminal(&records).outcome, Outcome::Exit { code: 0 });
+    let frames = f.proxy.frames.lock().unwrap();
+    assert!(frames.iter().any(|frame| matches!(frame, Frame::Have { git_dependencies, .. } if git_dependencies == &["https://example.invalid/private.git"])));
+    let manifests = frames
+        .iter()
+        .find_map(|frame| match frame {
+            Frame::Run(r) => {
+                assert!(r.git_dependencies.is_empty());
+                Some(&r.bundles)
+            }
+            _ => None,
+        })
         .unwrap();
-        git(&f.key, &["add", "Cargo.lock"]);
-        git(
-            &f.key,
-            &[
-                "-c",
-                "user.name=test",
-                "-c",
-                "user.email=test@example.invalid",
-                "commit",
-                "-m",
-                "locked",
-            ],
-        );
-        let motor = f.motor();
-        if preparing {
-            let request: PrepareRequest = serde_json::from_value(serde_json::json!({"workspace_key": f.key, "repository_root": f.main, "base_commit": git(&f.key, &["rev-parse", "HEAD"]), "siblings": [f.sibling]})).unwrap();
-            assert_eq!(
-                motor.prepare(request).await.unwrap().outcome,
-                PrepareOutcome::Prepared
-            );
-        } else {
-            let records = collect(motor.run(f.request("true")).unwrap()).await;
-            assert_eq!(terminal(&records).outcome, Outcome::Exit { code: 0 });
-        }
-        let frames = f.proxy.frames.lock().unwrap();
-        assert!(frames.iter().any(|frame| matches!(frame, Frame::Have { git_dependencies, .. } if git_dependencies == &["https://example.invalid/private.git"])));
-        let manifests = frames
-            .iter()
-            .find_map(|frame| match frame {
-                Frame::Run(r) => {
-                    assert!(r.git_dependencies.is_empty());
-                    Some(&r.bundles)
-                }
-                Frame::Prepare(p) => {
-                    assert!(p.git_dependencies.is_empty());
-                    Some(&p.bundles)
-                }
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(manifests.len(), 2);
-        assert!(frames
-            .iter()
-            .any(|frame| matches!(frame, Frame::BundleChunk { index: 1, .. })));
-        assert!(!frames
-            .iter()
-            .any(|frame| matches!(frame, Frame::BundleChunk { index, .. } if *index >= 2)));
-    }
+    assert_eq!(manifests.len(), 2);
+    assert!(frames
+        .iter()
+        .any(|frame| matches!(frame, Frame::BundleChunk { index: 1, .. })));
+    assert!(!frames
+        .iter()
+        .any(|frame| matches!(frame, Frame::BundleChunk { index, .. } if *index >= 2)));
 }

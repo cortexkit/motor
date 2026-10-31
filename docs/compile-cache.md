@@ -187,7 +187,7 @@ the submitted job or prepare request; an empty integration tip skips fills.
 Tests: `child_is_noninteractive_and_preserves_home_and_path`,
 `auth_failure_is_negative_cached_and_logs_first_stderr_line_once`,
 `hung_remote_times_out_and_kills_helpers`, `unreachable_remote_has_no_tip`,
-`current_client_unverified_default_tip_runs_and_prepares_without_fills`.
+`current_client_unverified_default_tip_runs_without_fills`.
 
 ### What a fill builds
 

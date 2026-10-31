@@ -532,14 +532,18 @@ async fn core_bind_and_workspace_prepare_are_admitted() {
         )
         .await;
     assert_eq!(reply.header.ty, FrameType::Response);
-    // A typed workspace validation refusal proves dispatch reached prepare,
+    // A typed hosted-prepare refusal proves dispatch reached prepare,
     // without requiring a real remote runner for the admission contract.
     let reply: motor_protocol::PrepareReply = serde_json::from_slice(&reply.body).unwrap();
     assert_eq!(
         reply.outcome,
         motor_protocol::PrepareOutcome::RefusedBeforeStart {
-            reason: motor_protocol::RefusalReason::WorkspaceKeyRejected
+            reason: motor_protocol::RefusalReason::RequestRejected
         }
+    );
+    assert_eq!(
+        reply.refusal_detail(),
+        Some("hosted_prepare_unsupported: hosted_no_fallback")
     );
     rig.stop().await;
 }

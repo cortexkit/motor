@@ -2,6 +2,7 @@
 use super::queue_tests::{run_spilled, ResubmitPeer};
 use super::*;
 use crate::hosted::tests::harness::{Behavior, Harness};
+use crate::storage::legacy_fixtures::{seed_direct_route, DirectRoute};
 use cortexkit_test_support::ScratchDir;
 use std::sync::atomic::Ordering;
 
@@ -511,10 +512,15 @@ async fn restart_between_resubmit_and_run_attaches_build_server_id() {
             route.lease_attempted = true;
             route.placement_attempts = 1;
             motor.storage.hosted_route(id, route).unwrap();
-            motor
-                .storage
-                .resubmitted(id, build_server_id, "hosted_capacity", None)
-                .unwrap();
+            seed_direct_route(
+                &motor.storage,
+                id,
+                DirectRoute::SpillReturn {
+                    runner_job_id: build_server_id,
+                    hosted_code: "hosted_capacity",
+                },
+            )
+            .unwrap();
         }
     }
     // The second job's Run frame reached the build server before the restart.

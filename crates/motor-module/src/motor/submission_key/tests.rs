@@ -510,10 +510,15 @@ async fn pre_cutover_keyed_resubmission_reattaches_its_stored_destination() {
     let id = Uuid::now_v7();
     let destination = Uuid::now_v7();
     seed(&motor, id, &request, true);
-    motor
-        .storage
-        .resubmitted(id, destination, "hosted_capacity", None)
-        .unwrap();
+    crate::storage::legacy_fixtures::seed_direct_route(
+        &motor.storage,
+        id,
+        crate::storage::legacy_fixtures::DirectRoute::SpillReturn {
+            runner_job_id: destination,
+            hosted_code: "hosted_capacity",
+        },
+    )
+    .unwrap();
     log.lock().unwrap().completed.insert(destination);
     motor.close().await;
 

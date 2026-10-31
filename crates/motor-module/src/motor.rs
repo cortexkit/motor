@@ -2041,53 +2041,6 @@ impl Motor {
     pub fn return_result(&self, id: Uuid) -> Option<ReturnResult> {
         self.storage.job(id).and_then(|j| j.return_result)
     }
-    #[cfg(test)]
-    pub(crate) fn hosted_health(&self) -> Option<serde_json::Value> {
-        let routed = self.storage.hosted_routed_jobs_1h();
-        let no_host_fits = self.storage.hosted_no_host_fits_1h();
-        let host_leases = self.storage.last_hosted_per_host();
-        if self.config.hosted_repositories.is_empty()
-            && routed == 0
-            && no_host_fits == 0
-            && host_leases.is_empty()
-        {
-            return None;
-        }
-        let last = self.storage.last_hosted();
-        let error = last.as_ref().and_then(|s| s.hosted_code.as_deref());
-        let hosts: Vec<_> = host_leases
-            .into_iter()
-            .map(|(host, (id, state))| {
-                let outcome = state
-                    .hosted_code
-                    .as_deref()
-                    .unwrap_or(if state.finish_done {
-                        "finished"
-                    } else if state.run_sent {
-                        "run_sent"
-                    } else {
-                        "leased"
-                    });
-                serde_json::json!({
-                    "host": host,
-                    "last_lease_job_id": id,
-                    "last_lease_outcome": outcome,
-                    "capacity": null,
-                })
-            })
-            .collect();
-        Some(serde_json::json!({
-            "hosted": true,
-            "hosted_routed_jobs_1h": routed,
-            "hosted_no_host_fits_1h": no_host_fits,
-            "token_source": self.config.broker_token_source,
-            "broker_reachable": last.as_ref().and_then(|s| if s.hosted_code.as_deref() == Some("hosted_broker_unreachable") { Some(false) } else if s.placement.is_some() { Some(true) } else { None }),
-            "last_lease_error": error,
-            "hosted_hosts": hosts,
-            "hosted_hosts_source": "retained_leases",
-            "hosted_hosts_missing": "broker host inventory and live capacity are not exposed to ck-motor",
-        }))
-    }
     async fn open_job_channel(&self, id: Uuid) -> Result<Channel, crate::hosted::Error> {
         self.open_job_channel_at(id, crate::hosted::now_s().saturating_mul(1000))
             .await
@@ -3125,135 +3078,10 @@ impl Motor {
             return Ok(prepare_refused(id, RefusalReason::WorkspaceKeyRejected)
                 .with_refusal_detail(message));
         }
-        #[cfg(not(test))]
-        let hosted = true;
-        #[cfg(test)]
-        let hosted = !self.test_fixture_direct_route;
-        if hosted {
-            // Prepare targets a single runner, but hosted jobs are placed at run time.
-            // A refused transfer is not a job and must not enter job storage.
-            return Ok(prepare_refused(id, RefusalReason::RequestRejected)
-                .with_refusal_detail("hosted_prepare_unsupported: hosted_no_fallback"));
-        }
-        let config = self.config.clone();
-        let r = request.clone();
-        if let Err(error) = tokio::task::spawn_blocking(move || {
-            snapshot::validate(
-                &config,
-                &r.workspace_key,
-                &r.repository_root,
-                &r.workspace_key,
-            )
-        })
-        .await
-        .map_err(io::Error::other)?
-        {
-            tracing::warn!(transfer_id = %id, check = %error, "workspace key refused");
-            return Ok(prepare_refused(id, RefusalReason::WorkspaceKeyRejected)
-                .with_refusal_detail(bounded_detail(error.to_string())));
-        }
-        let config = self.config.clone();
-        let r = request.clone();
-        let parent = self.spool_root.clone();
-        let storage = self.storage.clone();
-        let snapshots = tokio::task::spawn_blocking(move || {
-            Snapshots::build(
-                &config,
-                &r.workspace_key,
-                &r.repository_root,
-                &r.siblings,
-                &parent,
-                id,
-                Some(&r.base_commit),
-                &storage,
-            )
-        })
-        .await
-        .map_err(io::Error::other)?;
-        let snapshots = match snapshots {
-            Ok(s) => s,
-            Err(f) => {
-                let detail = snapshot_refusal_detail(f.check, &self.spool_root, []);
-                tracing::warn!(transfer_id = %id, check = detail, "snapshot refused");
-                return Ok(
-                    prepare_refused(id, RefusalReason::SnapshotFailed).with_refusal_detail(detail)
-                );
-            }
-        };
-        let mut channel = match open_for_request(self.connector.as_ref(), id).await {
-            Ok(c) => c,
-            Err((reason, detail, retry_after_ms)) => {
-                let mut reply = prepare_refused(id, reason);
-                reply.refusal_detail = detail.map(bounded_detail);
-                reply.retry_after_ms = retry_after_ms;
-                return Ok(reply);
-            }
-        };
-        if let Err(error) = snapshots.validate_sibling_paths(channel.sibling_paths) {
-            return Ok(prepare_refused(id, RefusalReason::WorkspaceKeyRejected)
-                .with_refusal_detail(bounded_detail(error.to_string())));
-        }
-        let held = match self
-            .have(
-                &mut channel,
-                snapshots.candidates(&self.storage.previous(&request.workspace_key)),
-                snapshots.git_dependencies.keys().cloned().collect(),
-                id,
-                UnreachableStep::Prepare,
-            )
-            .await
-        {
-            Ok(h) => h,
-            Err(_) => return Ok(prepare_refused(id, RefusalReason::Unreachable)),
-        };
-        let (snapshots, bundles) = tokio::task::spawn_blocking(move || {
-            let b = snapshots.transfer_bundles(id, &held.0, held.1.as_deref());
-            (snapshots, b)
-        })
-        .await
-        .map_err(io::Error::other)?;
-        let (bundles, git_dependencies, upload) = match bundles {
-            Ok(b) => b,
-            Err(_) => return Ok(prepare_refused(id, RefusalReason::SnapshotFailed)),
-        };
-        let frame = Frame::Prepare(Prepare {
-            transfer_id: id,
-            workspace_kind: Some(snapshot::workspace_kind(
-                &self.config,
-                &request.workspace_key,
-            )?),
-            workspace_key: request.workspace_key,
-            repository_root: request.repository_root,
-            base_commit: snapshots.main.commit.clone(),
-            integration_tip: snapshots.main.tip.clone().unwrap_or_default(),
-            siblings: snapshots.sibling_frames(),
-            bundles: bundles.clone(),
-            git_dependencies,
-        });
-        let result = async {
-            channel.send(frame).await?;
-            match channel.next().await? {
-                Incoming::Frame(Frame::PrepareAccepted { .. }) => {}
-                Incoming::Frame(Frame::Refusal(refusal)) => {
-                    log_refusal(id, &refusal);
-                    return Ok(prepare_runner_refused(id, &refusal));
-                }
-                _ => return Err(io::Error::other("expected prepare_accepted")),
-            }
-            self.upload(&channel, &snapshots, &upload, None).await?;
-            match channel.next().await? {
-                Incoming::Frame(Frame::Prepared { .. }) => {
-                    Ok(PrepareReply::new(id, PrepareOutcome::Prepared))
-                }
-                Incoming::Frame(Frame::Refusal(refusal)) => {
-                    log_refusal(id, &refusal);
-                    Ok(prepare_runner_refused(id, &refusal))
-                }
-                _ => Err(io::Error::other("prepare detached")),
-            }
-        }
-        .await;
-        Ok(result.unwrap_or_else(|_| prepare_refused(id, RefusalReason::TransferInterrupted)))
+        // Hosted jobs are placed when they run, so a prepare transfer cannot
+        // choose a runner in advance. A refused transfer is not a stored job.
+        Ok(prepare_refused(id, RefusalReason::RequestRejected)
+            .with_refusal_detail("hosted_prepare_unsupported: hosted_no_fallback"))
     }
     fn connector_for_target(&self, target: crate::config::RunnerTarget) -> Arc<dyn Connector> {
         Arc::new(InstanceConnector {
@@ -3430,13 +3258,6 @@ fn runner_refusal_fields(refusal: &Refusal) -> (RefusalReason, Option<String>) {
             refusal.detail.clone().map(bounded_detail),
         )
     }
-}
-fn prepare_runner_refused(id: Uuid, refusal: &Refusal) -> PrepareReply {
-    let (reason, detail) = runner_refusal_fields(refusal);
-    let mut reply = prepare_refused(id, reason);
-    reply.refusal_detail = detail;
-    reply.retry_after_ms = refusal.retry_after_ms;
-    reply
 }
 async fn emit(tx: &mpsc::Sender<io::Result<StreamRecord>>, record: StreamRecord) -> io::Result<()> {
     // Caller disconnection is ordinary detach. The runner retains history; the

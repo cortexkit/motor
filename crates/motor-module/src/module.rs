@@ -1574,7 +1574,6 @@ mod health_tests {
             Arc::new(CountingConnector(calls.clone())),
         )
         .unwrap();
-        assert!(motor.hosted_health().unwrap()["hosted_hosts"].is_array());
         let handler = Handler::new(Config::default()).with_motor(motor);
         let report = handler.health().await;
         let detail = report.detail.unwrap();

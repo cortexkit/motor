@@ -40,7 +40,7 @@ async fn main_and_linked_workspaces_are_admitted_by_repository_identity() {
 }
 
 #[tokio::test]
-async fn head_run_and_prepare_send_head_kind_without_remapping_paths() {
+async fn head_run_sends_head_kind_without_remapping_paths() {
     use super::recovery::{collect, terminal};
     use motor_protocol::*;
     let f = Fixture::new(Cut::None, 28).await;
@@ -54,14 +54,8 @@ async fn head_run_and_prepare_send_head_kind_without_remapping_paths() {
     request.cwd = request.workspace_key.clone();
     let records = collect(motor.run(request.clone()).unwrap()).await;
     assert_eq!(terminal(&records).outcome, Outcome::Exit { code: 0 });
-    let prepare = serde_json::from_value(serde_json::json!({"workspace_key": request.workspace_key, "repository_root": request.repository_root, "base_commit": snapshot::git(&f.main, &["rev-parse", "HEAD"]).unwrap(), "siblings": request.siblings})).unwrap();
-    assert_eq!(
-        motor.prepare(prepare).await.unwrap().outcome,
-        PrepareOutcome::Prepared
-    );
     let frames = f.proxy.frames.lock().unwrap();
     assert!(frames.iter().any(|frame| matches!(frame, Frame::Run(r) if r.workspace_kind == Some(WorkspaceKind::Head) && r.workspace_key == request.workspace_key && r.cwd == request.cwd)));
-    assert!(frames.iter().any(|frame| matches!(frame, Frame::Prepare(r) if r.workspace_kind == Some(WorkspaceKind::Head) && r.workspace_key == request.workspace_key)));
 }
 
 #[tokio::test]
@@ -198,18 +192,6 @@ async fn oversized_untracked_content_is_refused_before_capture_or_upload() {
     assert_eq!(t.retry_after_ms(), None);
     assert_eq!(t.ran, Some(Ran::None));
     assert_eq!(t.tree_hash, None);
-    let prepare = serde_json::from_value(serde_json::json!({
-        "workspace_key": f.key, "repository_root": f.main, "base_commit": "HEAD", "siblings": []
-    }))
-    .unwrap();
-    let reply = motor.prepare(prepare).await.unwrap();
-    assert_eq!(
-        reply.outcome,
-        PrepareOutcome::RefusedBeforeStart {
-            reason: RefusalReason::SnapshotFailed
-        }
-    );
-    assert_eq!(reply.refusal_detail(), t.refusal_detail());
     assert!(f.proxy.frames.lock().unwrap().is_empty());
 
     file.set_len(1_073_741_825).unwrap();
@@ -555,28 +537,6 @@ async fn workspace_refusals_log_each_failed_check_without_changing_reason() {
         assert!(line.contains("WARN"));
         assert!(line.contains(&format!("job_id={id}")));
         assert!(line.contains(&format!("check={check}")), "{line}");
-        // Prepare has no cwd field; its cwd is the workspace key itself.
-        if cwd == key
-            || !Path::new(&key).is_absolute()
-            || key == text(&absent)
-            || root == text(&absent)
-        {
-            let prepare = serde_json::from_value(serde_json::json!({"workspace_key": key, "repository_root": root, "base_commit": "HEAD", "siblings": []})).unwrap();
-            let reply = motor.prepare(prepare).await.unwrap();
-            assert_eq!(reply.refusal_detail(), Some(check));
-            assert_eq!(reply.retry_after_ms(), None);
-            assert_eq!(
-                reply.outcome,
-                PrepareOutcome::RefusedBeforeStart {
-                    reason: RefusalReason::WorkspaceKeyRejected
-                }
-            );
-            let logs = captured.text();
-            let line = logs.lines().last().unwrap();
-            assert!(line.contains("WARN"));
-            assert!(line.contains(&format!("transfer_id={}", reply.transfer_id)));
-            assert!(line.contains(&format!("check={check}")), "{line}");
-        }
     }
     assert!(!captured.text().contains("private-command-never-logged"));
     assert!(f.proxy.frames.lock().unwrap().is_empty());
