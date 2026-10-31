@@ -2218,8 +2218,57 @@ impl Motor {
         }))
     }
     async fn open_job_channel(&self, id: Uuid) -> Result<Channel, crate::hosted::Error> {
+        self.open_job_channel_at(id, crate::hosted::now_s().saturating_mul(1000))
+            .await
+    }
+    async fn open_job_channel_at(
+        &self,
+        id: Uuid,
+        now: u64,
+    ) -> Result<Channel, crate::hosted::Error> {
+        if self.storage.job(id).is_some_and(|job| job.health_retired()) {
+            return Err(crate::hosted::Error::Finished);
+        }
         if let Some(state) = self.hosted_state(id) {
-            self.hosted_client(state).attach(id, &self.storage).await
+            // Old rows may lack the original token time. Use the same conservative
+            // legacy horizon as direct health retirement rather than renew it on attach.
+            let deadline = state.reattach_deadline_s().map_or_else(
+                || {
+                    self.storage
+                        .job(id)
+                        .map_or(u64::MAX, |job| health::deadline(id, &job))
+                },
+                |d| d.saturating_mul(1000),
+            );
+            let opened = self.hosted_client(state).attach(id, &self.storage).await;
+            let cause = match &opened {
+                Err(crate::hosted::Error::Finished) => Some(
+                    "broker reports the job finished; no result reached ck-motor",
+                ),
+                Err(crate::hosted::Error::AttachAuth)
+                    if now >= deadline => Some(
+                        "host refused reattach with auth past the job's deadline; no result reached ck-motor",
+                    ),
+                _ => None,
+            };
+            if let Some(cause) = cause {
+                match self.storage.retire_hosted_job(
+                    id,
+                    cause,
+                    now,
+                    matches!(opened, Err(crate::hosted::Error::Finished)),
+                ) {
+                    Ok(true) => {
+                        tracing::warn!(job_id = %id, cause, "retired abandoned hosted job");
+                        self.recover_hosted(id);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(job_id = %id, %error, "could not retain hosted retirement")
+                    }
+                }
+            }
+            opened
         } else {
             let connector = self
                 .connector_for_job(id)
@@ -2509,6 +2558,16 @@ impl Motor {
                 };
                 if let Err(error) = &opened {
                     self.log_hosted_failure(id, "reattach", error.code());
+                }
+                if let Some(terminal) = self
+                    .storage
+                    .job(id)
+                    .filter(|job| job.health_retired())
+                    .and_then(|job| job.local_terminal)
+                {
+                    return emit(tx, StreamRecord::Terminal(terminal))
+                        .await
+                        .map(|_| false);
                 }
                 if matches!(opened, Err(crate::hosted::Error::SandboxLost)) {
                     return self.lost_sandbox(id, tx).await.map(|_| false);

@@ -1118,26 +1118,69 @@ impl Storage {
         })
     }
     pub(crate) fn retire_health_job(&self, id: Uuid, cause: &str, now: u64) -> io::Result<bool> {
+        self.retire_abandoned_job(id, cause, now, false, false)
+    }
+    pub(crate) fn retire_hosted_job(
+        &self,
+        id: Uuid,
+        cause: &str,
+        now: u64,
+        broker_finished: bool,
+    ) -> io::Result<bool> {
+        self.retire_abandoned_job(id, cause, now, true, broker_finished)
+    }
+    fn retire_abandoned_job(
+        &self,
+        id: Uuid,
+        cause: &str,
+        now: u64,
+        hosted: bool,
+        broker_finished: bool,
+    ) -> io::Result<bool> {
         let mut retired = false;
         self.update(|s| {
-            if s.active_jobs.contains_key(&id) {
+            if s.active_jobs.contains_key(&id) && !hosted {
                 return;
             }
             let Some(job) = s.jobs.get_mut(&id) else {
                 return;
             };
-            if job.pending_cancel
-                || job.hosted.is_some()
+            if job.hosted.is_some() != hosted
+                || (job.pending_cancel && !hosted)
+                || job
+                    .hosted
+                    .as_ref()
+                    .is_some_and(|s| s.terminal.is_some() || s.finish_done)
                 || job.local_terminal.is_some()
                 || job.remote_terminal.is_some()
             {
                 return;
             }
-            job.local_terminal = Some(
-                TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
-                    .with_ran(Ran::Unknown("maybe".into()))
-                    .with_refusal_detail(format!("health_retired: {cause}")),
-            );
+            let mut terminal = TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0)
+                .with_ran(Ran::Unknown("maybe".into()))
+                .with_refusal_detail(format!("health_retired: {cause}"));
+            if let Some(hosted) = job.hosted.as_mut() {
+                terminal.wall_ms = hosted.elapsed_ms();
+                // No execution result remains available. The broker's job_finished
+                // refusal also marks finishing complete; an expired Boat job still
+                // needs its normal finish request, but never another attach or cancel.
+                hosted.terminal = Some(terminal.clone());
+                if broker_finished
+                    || hosted
+                        .placement
+                        .as_ref()
+                        .is_none_or(|p| !p.host.starts_with("boat:"))
+                {
+                    hosted.finish_done = true;
+                    hosted.pending_finish = None;
+                    if hosted.billing == crate::BillingStatus::Pending {
+                        hosted.billing = crate::BillingStatus::Unavailable;
+                    }
+                }
+                hosted.hosted_no_fallback = true;
+                job.pending_cancel = false;
+            }
+            job.local_terminal = Some(terminal);
             job.terminal_observed_at_ms = Some(now);
             job.retain_until_ms = Some(now.saturating_add(RETENTION_MS));
             retired = true;

@@ -56,6 +56,7 @@ pub enum Behavior {
     ConnectFailure,
     DropHave,
     Refuse(&'static str),
+    RefuseAttach(&'static str),
     RefuseHello(&'static str),
     DropTerminal,
     WrongHost,
@@ -281,20 +282,21 @@ impl Harness {
                             None
                         };
                         if let Some(reason) = queued.or(match behavior {
-                            Behavior::Refuse(reason) => Some(reason),
+                            Behavior::Refuse(reason) if purpose == Purpose::Run => Some(reason),
+                            Behavior::RefuseAttach(reason) if purpose == Purpose::Attach => {
+                                Some(reason)
+                            }
                             _ => None,
                         }) {
-                            if purpose == Purpose::Run {
-                                super::super::tls::write(
-                                    &mut tls,
-                                    &Prelude::LeaseRefused {
-                                        reason: reason.into(),
-                                    },
-                                )
-                                .await
-                                .unwrap();
-                                return;
-                            }
+                            super::super::tls::write(
+                                &mut tls,
+                                &Prelude::LeaseRefused {
+                                    reason: reason.into(),
+                                },
+                            )
+                            .await
+                            .unwrap();
+                            return;
                         }
                         // The tenant's admission gate. An admitted job's claim
                         // lasts until the job completes or its connection ends.
@@ -364,6 +366,22 @@ impl Harness {
                             let id = Uuid::parse_str(&claims.jti).unwrap();
                             match frame {
                                 Frame::Heartbeat { .. } => continue,
+                                Frame::JobStatus { job_id } => {
+                                    motor_protocol::write_frame_async(
+                                        &mut tls,
+                                        &Frame::JobStatusReply(motor_protocol::JobStatusReply {
+                                            job_id,
+                                            state: "running".into(),
+                                            waiting_on: None,
+                                            queue_wait_ms: None,
+                                            terminal: None,
+                                            unit: None,
+                                            unit_alive: Some(true),
+                                        }),
+                                    )
+                                    .await
+                                    .unwrap();
+                                }
                                 Frame::Have { repositories, .. } => {
                                     if matches!(behavior, Behavior::DropHave) {
                                         return;

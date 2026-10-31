@@ -169,6 +169,13 @@ impl HostedJobState {
         if !self.run_sent || !self.placement.as_ref()?.host.starts_with("boat:") {
             return None;
         }
+        self.reattach_deadline_s()
+    }
+
+    pub(crate) fn reattach_deadline_s(&self) -> Option<u64> {
+        if !self.run_sent {
+            return None;
+        }
         // Run is recorded only after its token's issue time is durable.
         // Attach refreshes neither that time nor the original request limit.
         // The requested limit is conservative if the broker granted less time.
@@ -242,6 +249,8 @@ impl HostedJobState {
 pub(crate) enum Error {
     Shutdown,
     Auth,
+    /// An attach token was issued, but the host explicitly refused it as auth.
+    AttachAuth,
     Expired,
     Spki,
     SshKey,
@@ -339,7 +348,7 @@ impl Error {
     pub(crate) fn code(self) -> &'static str {
         match self {
             Self::Shutdown => "hosted_shutdown",
-            Self::Auth => "hosted_auth",
+            Self::Auth | Self::AttachAuth => "hosted_auth",
             Self::Expired => "hosted_expired",
             Self::Spki => "hosted_spki_mismatch",
             Self::SshKey => "hosted_ssh_host_key_mismatch",
@@ -375,6 +384,7 @@ impl Error {
     pub(crate) fn reason(self) -> RefusalReason {
         match self {
             Self::Auth
+            | Self::AttachAuth
             | Self::Expired
             | Self::Spki
             | Self::SshKey
@@ -928,7 +938,7 @@ impl Client {
                     .and_then(|v| v.as_str())
                 {
                     Some("job_admitted") => Error::Admitted,
-                    Some("job_finished") => Error::Finished,
+                    Some("job_finished") if status == 409 => Error::Finished,
                     Some("no_capacity")
                         if status == 503
                             && path == "/v1/leases"
@@ -1038,7 +1048,11 @@ impl Client {
                 tracing::info!(job_id = %id, code = failure.error.code(), step = failure.step,
                     cause = failure.host_reason.as_deref().unwrap_or(failure.error.code()),
                     host_reason = failure.host_reason.as_deref().unwrap_or(""), "hosted attach failed");
-                failure.error
+                if failure.host_reason.as_deref() == Some("auth") {
+                    Error::AttachAuth
+                } else {
+                    failure.error
+                }
             })
     }
     #[cfg(test)]

@@ -10,6 +10,10 @@ const LEGACY_JOB_HORIZON_MS: u64 = 48 * 60 * 60 * 1000;
 const FAILURE_HORIZON_MS: u64 = 60 * 60 * 1000;
 const STALE_PROBE_INTERVAL_MS: u64 = 15 * 60 * 1000;
 
+#[cfg(test)]
+#[path = "health_hosted_tests.rs"]
+mod hosted_tests;
+
 #[derive(Default)]
 pub(super) struct Probe {
     failures: u32,
@@ -17,7 +21,7 @@ pub(super) struct Probe {
     next_probe_ms: u64,
 }
 
-fn deadline(id: Uuid, job: &crate::storage::Job) -> u64 {
+pub(super) fn deadline(id: Uuid, job: &crate::storage::Job) -> u64 {
     job.health_deadline_ms.unwrap_or_else(|| {
         id.get_timestamp().map_or(u64::MAX, |timestamp| {
             let (seconds, nanos) = timestamp.to_unix();
@@ -165,7 +169,7 @@ impl Motor {
                     && job.hosted.is_none()
                     && !self.storage.has_live_stream(*id)
                     && !active.contains_key(id);
-                if retirable
+                if (retirable || job.hosted.is_some())
                     && self
                         .health_probes
                         .lock()
@@ -183,7 +187,7 @@ impl Motor {
                     // Use a status frame directly so health neither renews job retention
                     // nor reports final usage and releases the broker's reservation.
                     let probe = async {
-                        let mut channel = motor.open_job_channel(id).await.ok()?;
+                        let mut channel = motor.open_job_channel_at(id, now).await.ok()?;
                         let runner_id = motor.build_server_id(id);
                         channel
                             .send(Frame::JobStatus { job_id: runner_id })
@@ -219,15 +223,31 @@ impl Motor {
                         } else if retirable && reply.state == "not_found" {
                             retire_cause = Some("runner no longer knows this job");
                         }
-                    } else if retirable {
+                    } else if retirable || self.hosted_state(id).is_some() {
                         let mut probes = self.health_probes.lock().unwrap();
                         let probe = probes.entry(id).or_insert_with(|| Probe {
                             first_failure_ms: now,
                             ..Probe::default()
                         });
                         probe.failures = probe.failures.saturating_add(1);
-                        probe.next_probe_ms = now.saturating_add(STALE_PROBE_INTERVAL_MS);
-                        if probe.failures >= 3
+                        // Hosted probes reattach through the broker. Back off even
+                        // before expiry so a missing host record cannot drive a
+                        // fresh broker request on every health tick.
+                        let interval = if let Some(hosted) = self.hosted_state(id) {
+                            let interval = 30_000u64
+                                .saturating_mul(1u64 << probe.failures.saturating_sub(1).min(5))
+                                .min(STALE_PROBE_INTERVAL_MS);
+                            hosted
+                                .reattach_deadline_s()
+                                .map(|d| d.saturating_mul(1000))
+                                .filter(|d| *d > now)
+                                .map_or(interval, |d| interval.min(d - now))
+                        } else {
+                            STALE_PROBE_INTERVAL_MS
+                        };
+                        probe.next_probe_ms = now.saturating_add(interval);
+                        if retirable
+                            && probe.failures >= 3
                             && now.saturating_sub(probe.first_failure_ms) >= FAILURE_HORIZON_MS
                             && now.saturating_sub(deadline) >= FAILURE_HORIZON_MS
                         {
