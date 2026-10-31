@@ -10,6 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 #[derive(Default)]
 struct Fake {
+    admin_reply: Mutex<Option<Value>>,
     fail: Mutex<Option<&'static str>>,
     quota_ceiling: Mutex<Option<u32>>,
     calls: Mutex<Vec<String>>,
@@ -79,7 +80,12 @@ impl Control for Fake {
             .lock()
             .unwrap()
             .push(format!("admin:{}", request["op"].as_str().unwrap()));
-        Ok(json!({"ok":true}))
+        Ok(self
+            .admin_reply
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(json!({"ok":true})))
     }
     fn suspend(&self, _: &str) -> Result<()> {
         self.calls.lock().unwrap().push("suspend".into());
@@ -91,6 +97,46 @@ impl Control for Fake {
     fn available_bytes(&self) -> Result<u64> {
         Ok(u64::MAX)
     }
+}
+
+#[test]
+fn remote_cache_admin_requires_idle_host_and_redacts_every_refusal() {
+    let (runtime, fake, _, _, _) = fixture();
+    let request = json!({"op":"set_remote_cache","config":"configuration", "read_key":"READ-SECRET", "write_key":"WRITE-SECRET"});
+    assert_eq!(
+        runtime.admin("tenant", &request).unwrap()["error"],
+        "remote_cache_host_not_idle"
+    );
+    assert!(fake.calls.lock().unwrap().is_empty());
+    runtime.host.lock().unwrap().set_draining(true).unwrap();
+    assert_eq!(
+        runtime.host_admin(&json!({"op":"host_status"})).unwrap()["active_leases"],
+        0
+    );
+    *fake.admin_reply.lock().unwrap() =
+        Some(json!({"ok":false,"error":"READ-SECRET WRITE-SECRET"}));
+    assert_eq!(
+        runtime
+            .admin("tenant", &json!({"op":"remote_cache_probe"}))
+            .unwrap()["error"],
+        "remote_cache_unsupported"
+    );
+    let reply = runtime.admin("tenant", &request).unwrap();
+    assert_eq!(
+        reply,
+        json!({"ok":false,"error":"remote_cache_busy_or_failed","runner_drained":true})
+    );
+    let reply = runtime.admin("tenant", &json!({"op":"set_remote_cache","config":"ok","read_key":{"READ-SECRET":"WRITE-SECRET"}})).unwrap();
+    assert_eq!(reply["error"], "remote_cache_invalid_request");
+    *fake.admin_reply.lock().unwrap() = Some(
+        json!({"ok":false,"error":"remote_cache_installed_cleanup_failed",
+        "directory":"READ-SECRET WRITE-SECRET","installed":true,"runner_healthy":true,"runner_drained":false}),
+    );
+    let reply = runtime.admin("tenant", &request).unwrap();
+    assert_eq!(reply["error"], "remote_cache_installed_cleanup_failed");
+    assert_eq!(reply["installed"], true);
+    assert!(!reply.to_string().contains("SECRET"));
+    assert!(!fake.calls.lock().unwrap().join(" ").contains("SECRET"));
 }
 
 #[tokio::test]

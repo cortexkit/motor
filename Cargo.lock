@@ -1115,6 +1115,7 @@ dependencies = [
  "tracing",
  "uuid",
  "x509-cert",
+ "zeroize",
 ]
 
 [[package]]
@@ -1212,6 +1213,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -1247,6 +1249,7 @@ dependencies = [
  "webpki-roots",
  "windows-service",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -3389,6 +3392,7 @@ version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 

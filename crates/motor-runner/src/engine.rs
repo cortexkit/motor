@@ -2946,6 +2946,52 @@ impl Runner {
     pub fn begin_drain(&self, deadline: Duration, exit_after: bool) {
         self.begin_drain_request(deadline, exit_after);
     }
+    /// Close admission without waiting for or changing any accepted work.
+    /// Even transient lifecycle markers block a credential rotation.
+    pub(crate) fn drain_if_idle(&self) -> (Option<String>, u64) {
+        let mut inner = self.core.inner.lock().unwrap();
+        let counts = [
+            (
+                "queued",
+                inner.jobs.values().filter(|job| job.pending()).count(),
+            ),
+            (
+                "running",
+                inner
+                    .jobs
+                    .values()
+                    .filter(|job| job.state == JobState::Running && !job.base)
+                    .count(),
+            ),
+            (
+                "fill",
+                inner
+                    .jobs
+                    .values()
+                    .filter(|job| job.terminal.is_none() && job.base)
+                    .count(),
+            ),
+            ("starting", inner.starting.len()),
+            ("reserved", inner.reserved.len()),
+            ("preparing", inner.preparing.len()),
+            ("admitting", inner.admitting.len()),
+            ("admission_save", inner.admission_saves.len()),
+            ("base_finish", inner.base_finishes.len()),
+            ("base_settle", inner.base_settling.len()),
+            ("finalizing", inner.finalizing.len()),
+            ("writer", usize::from(inner.writer.is_some())),
+        ];
+        if let Some((reason, count)) = counts.into_iter().find(|(_, count)| *count != 0) {
+            return (Some(reason.into()), count as u64);
+        }
+        // Admission and dispatch consult the deadline's presence under this
+        // lock; the atomic flag alone is only the external drain status.
+        inner.drain_deadline = Some(std::time::Instant::now());
+        self.core
+            .draining
+            .store(true, std::sync::atomic::Ordering::Release);
+        (None, 0)
+    }
     pub(crate) fn begin_drain_request(&self, deadline: Duration, exit_after: bool) -> DrainWaiter {
         let requested_deadline = std::time::Instant::now() + deadline;
         let mut inner = self.core.inner.lock().unwrap();

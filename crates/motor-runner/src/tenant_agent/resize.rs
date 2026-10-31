@@ -64,16 +64,51 @@ pub(super) async fn apply(text: String) -> io::Result<Value> {
     if !Path::new("/run/motor-tenant-generation").exists() {
         return Err(io::Error::other("resize requires tenant attachment"));
     }
-    activate(super::forward, || async move {
-        tokio::task::spawn_blocking(move || {
-            command("systemctl", &["stop", "motor-tenant-runner.service"])?;
-            let mut disk = Disk::new();
-            steps(|step| disk.run(step, &text))
-        })
-        .await
-        .map_err(io::Error::other)?
+    let previous = RunnerArgs::read_text(Path::new(ARGS))?;
+    reversible(
+        super::forward,
+        || async move { apply_arguments(text).await },
+        || async move { apply_arguments(previous).await },
+    )
+    .await
+}
+
+async fn apply_arguments(text: String) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        command("systemctl", &["stop", "motor-tenant-runner.service"])?;
+        let mut disk = Disk::new();
+        steps(|step| disk.run(step, &text))
     })
     .await
+    .map_err(io::Error::other)?
+}
+
+async fn reversible<F, Fut, A, AFut, R, RFut>(
+    control: F,
+    apply: A,
+    rollback: R,
+) -> io::Result<Value>
+where
+    F: FnMut(Frame) -> Fut,
+    Fut: Future<Output = io::Result<Value>>,
+    A: FnOnce() -> AFut,
+    AFut: Future<Output = io::Result<()>>,
+    R: FnOnce() -> RFut,
+    RFut: Future<Output = io::Result<()>>,
+{
+    let changed = std::sync::atomic::AtomicBool::new(false);
+    let result = activate(control, || async {
+        changed.store(true, std::sync::atomic::Ordering::Release);
+        apply().await
+    })
+    .await;
+    if result.is_err() && changed.load(std::sync::atomic::Ordering::Acquire) {
+        // A failed activation must not make its arguments the next boot's
+        // default. Restore the old file with fsync, rename and parent fsync,
+        // then start its runner before reporting the activation failure.
+        rollback().await?;
+    }
+    result
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -595,6 +630,46 @@ mod tests {
         );
         assert_eq!(reply["ok"], false);
         assert_eq!(reply["error"], "resize runner health unavailable");
+    }
+
+    #[tokio::test]
+    async fn resize_failed_start_or_health_restores_previous_arguments_but_busy_does_not_restart() {
+        for fail_start in [false, true] {
+            let arguments = RefCell::new("previous");
+            let mut controls = 0;
+            let result = reversible(
+                |_| {
+                    controls += 1;
+                    std::future::ready(Ok(if controls == 4 {
+                        json!({"ok":false})
+                    } else {
+                        idle()
+                    }))
+                },
+                || async {
+                    *arguments.borrow_mut() = "new";
+                    if fail_start {
+                        Err(io::Error::other("start failed"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || async {
+                    *arguments.borrow_mut() = "previous";
+                    Ok(())
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(*arguments.borrow(), "previous");
+        }
+        assert!(reversible(
+            |_| std::future::ready(Ok(json!({"ok":true,"queue_depth":1,"running_jobs":[]}))),
+            || async { panic!("busy runner must not be stopped") },
+            || async { panic!("busy runner must not be restarted") }
+        )
+        .await
+        .is_err());
     }
 
     #[test]

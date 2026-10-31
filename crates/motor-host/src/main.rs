@@ -41,6 +41,7 @@ struct Binding {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    disable_core_dumps()?;
     motor_protocol::logging::init("[motor-host]")?;
     match std::env::args().nth(1).as_deref() {
         Some("keygen") => return keygen(std::env::args().skip(2).collect()),
@@ -232,6 +233,37 @@ async fn main() -> Result<()> {
                 Err(_) => ingress.tls_closed(peer, "timed out"),
             }
         });
+    }
+}
+
+fn disable_core_dumps() -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod core_dump_tests {
+    use super::*;
+
+    #[test]
+    fn host_startup_disables_dumpability() {
+        // Isolate the irreversible process setting from other test threads.
+        unsafe {
+            let child = libc::fork();
+            assert!(child >= 0);
+            if child == 0 {
+                let ok = libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) == 0
+                    && disable_core_dumps().is_ok()
+                    && libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) == 0;
+                libc::_exit(if ok { 0 } else { 1 });
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(child, &mut status, 0), child);
+            assert_eq!(status, 0);
+        }
     }
 }
 

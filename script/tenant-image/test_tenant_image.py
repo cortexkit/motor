@@ -616,6 +616,7 @@ class ImageTests(unittest.TestCase):
 
     def test_agent_uses_immutable_tools_and_carries_runner_environment(self):
         unit = (HERE / "guest/motor-tenant-agent.service").read_text()
+        self.assertIn("LimitCORE=0\n", unit)
         self.assertIn("Environment=CARGO_HOME=/usr/local/lib/motor/cargo\n", unit)
         self.assertIn("Environment=RUSTUP_HOME=/usr/local/lib/motor/rustup\n", unit)
         # The runner finds its JavaScript tools at its role's fixed paths, not

@@ -646,7 +646,7 @@ fn usage_outbox_finals_advance_retry_bodies_are_unchanged_and_counter_is_durable
 }
 
 #[derive(Clone, Default)]
-struct Logs(Arc<Mutex<Vec<String>>>);
+pub(super) struct Logs(pub(super) Arc<Mutex<Vec<String>>>);
 impl tracing::Subscriber for Logs {
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
         true

@@ -9,10 +9,59 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 
 #[test]
+fn remote_cache_credentials_cross_only_the_helper_relay_and_fail_without_logging_bytes() {
+    let directory = scratch();
+    let path = directory.path().join("helper.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let worker = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap(),
+            json!({"op":"open_relay","tenant":"tenant","port":54})
+        );
+        assert!(!line.contains("SECRET"));
+        let (fd, mut guest) = UnixStream::pair().unwrap();
+        descriptor_reply(&stream, &fd);
+        let frame = read_json(&mut guest).unwrap();
+        assert_eq!(frame["op"], "set_remote_cache");
+        assert_eq!(frame["read_key"], "READ-SECRET");
+        // A malformed agent response can itself contain request material.
+        // Its parser error must be replaced before tracing sees it.
+        let bytes = b"{\"READ-SECRET WRITE-SECRET\": invalid}";
+        guest
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .unwrap();
+        guest.write_all(bytes).unwrap();
+    });
+    let helper = Helper {
+        socket: path,
+        storage: directory.path().to_owned(),
+        capacity: directory.path().join("capacity.json"),
+        guest_init: BTreeMap::new(),
+        vcpu_ceiling: BTreeMap::new(),
+    };
+    let logs = super::billing::Logs::default();
+    let captured = logs.0.clone();
+    tracing::subscriber::with_default(logs, || {
+        let error = helper.admin("tenant", &json!({"op":"set_remote_cache","config":"configuration","read_key":"READ-SECRET","write_key":"WRITE-SECRET"})).unwrap_err();
+        assert!(!format!("{error:#}").contains("SECRET"));
+    });
+    worker.join().unwrap();
+    let logs = captured.lock().unwrap().join("\n");
+    assert!(logs.contains("tenant_control_read_failed"));
+    assert!(!logs.contains("SECRET"));
+}
+
+#[test]
 fn fresh_attach_read_deadline_outlasts_guest_runner_readiness_wait() {
     let attach = control_read_deadline(&json!({"op":"attach_tenant"}));
     assert!(attach > std::time::Duration::from_secs(15 * 60));
     assert_eq!(attach, motor_protocol::TENANT_ATTACH_READ_DEADLINE);
+    assert!(control_read_deadline(&json!({"op":"set_remote_cache"})) > attach);
     assert!(
         attach > motor_protocol::TENANT_RUNNER_READINESS_WAIT,
         "host attach read deadline {attach:?} must exceed the guest readiness wait"

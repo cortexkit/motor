@@ -6,6 +6,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 pub const FRAME_LIMIT: usize = 1_048_576;
 
@@ -463,6 +464,10 @@ fn check_start_reply(reply: &Value) -> Result<()> {
 pub fn control_read_deadline(request: &Value) -> Duration {
     if request["recovery_required"] == true {
         motor_protocol::TENANT_ATTACH_READ_DEADLINE + motor_protocol::TENANT_RECOVERY_ALLOWANCE
+    } else if request["op"] == "set_remote_cache" {
+        // Stop plus restart can use the full runner readiness budget. Do not
+        // abandon a credential swap after the ordinary 30-second query window.
+        motor_protocol::TENANT_ATTACH_READ_DEADLINE + Duration::from_secs(120)
     } else if request["op"] == "attach_tenant" {
         motor_protocol::TENANT_ATTACH_READ_DEADLINE
     } else {
@@ -502,7 +507,13 @@ pub(crate) fn exchange_control(
     );
     write_json(&mut stream, request)
         .with_context(|| format!("tenant {tenant} control {operation} port54 write request"))?;
-    let result = read_json(&mut stream);
+    let result = read_json(&mut stream).map_err(|error| {
+        if operation == "set_remote_cache" {
+            anyhow!("remote_cache_invalid_reply")
+        } else {
+            error
+        }
+    });
     match result {
         Ok(reply) => {
             tracing::info!(
@@ -533,7 +544,7 @@ pub(crate) fn exchange_control(
 }
 
 pub fn write_json(writer: &mut impl Write, frame: &Value) -> Result<()> {
-    let bytes = serde_json::to_vec(frame)?;
+    let bytes = Zeroizing::new(serde_json::to_vec(frame)?);
     ensure!(bytes.len() <= FRAME_LIMIT, "frame too large");
     writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
     writer.write_all(&bytes)?;
@@ -546,7 +557,7 @@ pub fn read_json(reader: &mut impl Read) -> Result<Value> {
         .context("read guest JSON frame header")?;
     let length = u32::from_be_bytes(length) as usize;
     ensure!(length > 0 && length <= FRAME_LIMIT, "invalid frame length");
-    let mut bytes = vec![0; length];
+    let mut bytes = Zeroizing::new(vec![0; length]);
     reader
         .read_exact(&mut bytes)
         .context("read guest JSON frame body")?;

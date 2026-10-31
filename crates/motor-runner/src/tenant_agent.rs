@@ -17,6 +17,7 @@ mod diagnostics;
 pub(crate) mod dns;
 mod network;
 mod paths;
+mod remote_cache;
 mod resize;
 mod runner_socket;
 mod snapshot;
@@ -59,7 +60,7 @@ async fn read_json<S: AsyncRead + Unpin>(socket: &mut S) -> io::Result<Option<Va
     if len == 0 || len > MAX_FRAME_BYTES {
         return Err(io::Error::other("invalid agent frame length"));
     }
-    let mut data = vec![0; len];
+    let mut data = zeroize::Zeroizing::new(vec![0; len]);
     socket.read_exact(&mut data).await?;
     serde_json::from_slice(&data)
         .map(Some)
@@ -112,6 +113,14 @@ fn agent_result(result: io::Result<Value>) -> Value {
 }
 
 async fn dispatch_value(value: Value, attach: &tokio::sync::Mutex<()>) -> io::Result<Value> {
+    if value == json!({"op":"remote_cache_probe"}) {
+        return Ok(json!({"ok":true,"remote_cache_provisioning":1}));
+    }
+    if value["op"] == "set_remote_cache" {
+        let request = remote_cache::parse(value)?;
+        let _guard = attach.lock().await;
+        return remote_cache::apply(request).await;
+    }
     // Image capabilities can evolve without extending the shared job protocol.
     // Resize uses the same host-only agent listener as attachment and snapshots.
     if value["op"] == "apply_resize" {
@@ -280,6 +289,7 @@ async fn forward_socket(
             (&frame, &reply),
             (Frame::Cancel(_), Frame::CancelReply(_))
                 | (Frame::Drain { .. }, Frame::DrainReply { .. })
+                | (Frame::DrainIfIdle, Frame::DrainIfIdleReply { .. })
                 | (Frame::Resume, Frame::ResumeReply { .. })
                 | (Frame::Status, Frame::StatusReply(_))
         );
@@ -316,7 +326,33 @@ struct RunnerArgs {
 }
 impl RunnerArgs {
     fn read(path: &Path) -> io::Result<Self> {
-        Self::parse(&fs::read_to_string(path)?)
+        Self::parse(&Self::read_text(path)?)
+    }
+    fn read_text(path: &Path) -> io::Result<String> {
+        use std::{
+            io::Read,
+            os::unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(io::Error::other("unsafe tenant runner arguments"));
+        }
+        let mut text = String::new();
+        file.take(16 * 1024 + 1).read_to_string(&mut text)?;
+        if text.len() > 16 * 1024 {
+            return Err(io::Error::other(
+                "tenant runner arguments exceed 16384 bytes",
+            ));
+        }
+        Self::parse(&text).map_err(|_| io::Error::other("invalid tenant runner arguments"))?;
+        Ok(text)
     }
     fn parse(text: &str) -> io::Result<Self> {
         // Provisioning writes whitespace-separated options with fixed absolute
@@ -925,6 +961,7 @@ fn runner_command(
         "--service-type=exec",
         "--property=OOMScoreAdjust=-900",
         "--property=OOMPolicy=continue",
+        "--property=LimitCORE=0",
         "--setenv=CARGO_HOME=/tenant/cargo-home",
         "--property=PrivateMounts=yes",
         "--property=BindReadOnlyPaths=/run/motor-tenant-daemon/resolv.conf:/etc/resolv.conf",
@@ -941,6 +978,31 @@ fn runner_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runner_arguments_backup_refuses_links_and_oversize_before_rollback() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let scratch = cortexkit_test_support::ScratchDir::new("runner-args-backup");
+        let source = scratch.join("source");
+        fs::write(&source, "READ-SECRET").unwrap();
+        let link = scratch.join("runner-args");
+        symlink(&source, &link).unwrap();
+        assert!(RunnerArgs::read_text(&link).is_err());
+        fs::remove_file(&link).unwrap();
+        fs::write(&link, "x".repeat(16385)).unwrap();
+        fs::set_permissions(&link, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(RunnerArgs::read_text(&link)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("exceed"));
+        fs::write(&link, "READ-SECRET").unwrap();
+        assert_eq!(
+            RunnerArgs::read_text(&link).err().unwrap().to_string(),
+            "invalid tenant runner arguments"
+        );
+        assert_eq!(fs::read(&source).unwrap(), b"READ-SECRET");
+    }
 
     #[test]
     fn recovery_step_longer_than_120_seconds_fits_shared_attach_budget() {
@@ -1081,6 +1143,7 @@ mod tests {
         assert!(words.contains(&"--property=PrivateMounts=yes"));
         assert!(words.contains(&"--property=OOMScoreAdjust=-900"));
         assert!(words.contains(&"--property=OOMPolicy=continue"));
+        assert!(words.contains(&"--property=LimitCORE=0"));
         assert!(words.contains(
             &"--property=BindReadOnlyPaths=/run/motor-tenant-daemon/resolv.conf:/etc/resolv.conf"
         ));

@@ -237,6 +237,7 @@ class HostedHostConfigTests(CapacityConfigTests):
         config = hosted.host_config(HOST_ID)
         self.assertEqual(settings["ExecStart"], [f"{hosted.HOST_BINARY} /etc/motor-host/host.json"])
         self.assertEqual(settings["User"], ["motor-host"])
+        self.assertEqual(settings["LimitCORE"], ["0"])
         self.assertIn("motor-vm-helper.service", settings["Requires"][0].split())
         self.assertIn("motor-vm-helper.service", settings["After"][0].split())
         self.assertEqual(settings["ReadWritePaths"], [config["journal_dir"]])

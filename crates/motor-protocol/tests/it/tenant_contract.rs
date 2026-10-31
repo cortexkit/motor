@@ -2,6 +2,27 @@ use motor_protocol::*;
 use serde_json::json;
 
 #[test]
+fn idle_drain_frames_and_bounded_non_debug_cache_request_roundtrip() {
+    for value in [
+        json!({"type":"drain_if_idle"}),
+        json!({"type":"drain_if_idle_reply","blocked_by":null,"count":0}),
+        json!({"type":"drain_if_idle_reply","blocked_by":"finalizing","count":2}),
+    ] {
+        let frame: Frame = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(frame).unwrap(), value);
+    }
+    let value = json!({"op":"set_remote_cache","config":"{}","read_key":"{}"});
+    let request: RemoteCacheRequest = serde_json::from_value(value.clone()).unwrap();
+    assert!(request.valid());
+    assert_eq!(serde_json::to_value(request).unwrap(), value);
+    let request: RemoteCacheRequest = serde_json::from_value(
+        json!({"op":"set_remote_cache","config":"{}","read_key":"x".repeat(65537)}),
+    )
+    .unwrap();
+    assert!(!request.valid());
+}
+
+#[test]
 fn terminal_job_peak_is_an_optional_addition_to_lifecycle_events() {
     for peak in [None, Some(481)] {
         let mut value = json!({"type":"event","event_seq":3,"event":"terminal","jti":"00000000-0000-4000-8000-000000000001"});
