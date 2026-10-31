@@ -218,10 +218,11 @@ fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
     );
     source(&f);
     let probe = powershell(&baseline_environment_script());
+    let drive_probe = powershell(&jq_cache_drive_environment_script());
     let output = run(
         &runner,
         &f,
-        &format!("set -e; rustc -vV; cargo --version; cargo nextest --version; git --version; bun --version; pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; python3 --version; python --version; python3 -c \"import json, hashlib, subprocess, tomllib, compression.zstd\"; nats-server --version; rustc +stable --version; clang --version; jq --version; {probe}; cargo +stable run --offline; test -f target/debug/motor-qualification.exe"),
+        &format!("set -e; rustc -vV; cargo --version; cargo nextest --version; git --version; bun --version; pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; python3 --version; python --version; python3 -c \"import json, hashlib, subprocess, tomllib, compression.zstd\"; nats-server --version; rustc +stable --version; clang --version; jq --version; {probe}; {drive_probe}; cargo +stable run --offline; test -f target/debug/motor-qualification.exe"),
     );
     assert!(
         output
@@ -309,7 +310,7 @@ if($identity.Name.Split('\')[-1] -cne 'motor-job'){throw "unexpected job user: $
 if(([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'job user is an administrator'}
 if($env:LIBCLANG_PATH -cne 'C:\Program Files\LLVM\bin'){throw 'LIBCLANG_PATH does not name the protected LLVM bin directory'}
 if(-not (Test-Path -LiteralPath "$env:LIBCLANG_PATH\libclang.dll" -PathType Leaf)){throw 'libclang.dll is missing'}
-foreach($tool in @(@{name='PowerShell';command='pwsh.exe';path='C:\Program Files\PowerShell\7'},@{name='Bun';command='bun.exe';path='C:\Program Files\Bun'},@{name='jq';command='jq.exe';path='C:\Program Files\jq'},@{name='Python';command='python3.exe';path='C:\Python314'},@{name='NATS';command='nats-server.exe';path='C:\Program Files\NATS'},@{name='LLVM';command='clang.exe';path='C:\Program Files\LLVM\bin'})) {
+foreach($tool in @(@{name='PowerShell';command='pwsh.exe';path='C:\Program Files\PowerShell\7'},@{name='Bun';command='bun.exe';path='C:\Program Files\Bun'},@{name='Python';command='python3.exe';path='C:\Python314'},@{name='NATS';command='nats-server.exe';path='C:\Program Files\NATS'},@{name='LLVM';command='clang.exe';path='C:\Program Files\LLVM\bin'})) {
 $install=$tool.path
 if((Get-Command $tool.command -ErrorAction Stop).Source -cne (Join-Path $install $tool.command)){throw "$($tool.name) resolves outside the protected installation"}
 if($tool.name -eq 'LLVM'){$install=Split-Path -Parent $install}
@@ -327,9 +328,42 @@ foreach($file in Get-ChildItem -LiteralPath $install -File -Recurse -Force -Erro
 }
 Write-Output "$($tool.name) installation is read-only"
 }
+if($env:CARGO_TARGET_DIR -cne 'C:\t'){throw "unexpected target dir: $env:CARGO_TARGET_DIR"}
+$longOutput=Join-Path (Get-Location) 'target\debug\deps\motor_qualification-0123456789abcdef.exe'
+if($longOutput.Length -lt 260){throw "checkout fixture is not long enough: $longOutput"}
+$probe=Join-Path $env:CARGO_TARGET_DIR ('motor-cache-probe-'+[Guid]::NewGuid().ToString())
+[IO.File]::WriteAllText($probe,'same cache')
+$checkoutProbe=Join-Path (Join-Path (Get-Location) 'target') ([IO.Path]::GetFileName($probe))
+if([IO.File]::ReadAllText($checkoutProbe) -cne 'same cache'){throw 'checkout target does not reach the short cache mount'}
+Remove-Item -LiteralPath $probe
+Write-Output 'short target cache is writable'
+"#.into()
+}
+
+// UTF-16 base64 encoding expands each probe enough that combining all the
+// baseline checks in one invocation would exceed Windows' command-line budget.
+fn jq_cache_drive_environment_script() -> String {
+    r#"
+$ErrorActionPreference='Stop'
+foreach($tool in @(@{name='jq';command='jq.exe';path='C:\Program Files\jq'})) {
+$install=$tool.path
+if((Get-Command $tool.command -ErrorAction Stop).Source -cne (Join-Path $install $tool.command)){throw "$($tool.name) resolves outside the protected installation"}
+$directories=@((Get-Item -LiteralPath $install)) + @(Get-ChildItem -LiteralPath $install -Directory -Recurse -Force -ErrorAction Stop)
+foreach($directory in $directories) {
+ $probe=Join-Path $directory.FullName ('motor-write-probe-'+[Guid]::NewGuid().ToString())
+ $denied=$false
+ try {$file=[IO.File]::Open($probe,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write);$file.Dispose()} catch [UnauthorizedAccessException] {$denied=$true}
+ if(-not $denied){Remove-Item -LiteralPath $probe;throw "$($tool.name) directory is writable: $($directory.FullName)"}
+}
+foreach($file in Get-ChildItem -LiteralPath $install -File -Recurse -Force -ErrorAction Stop) {
+ $denied=$false
+ try {$handle=[IO.File]::Open($file.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite);$handle.Dispose()} catch [UnauthorizedAccessException] {$denied=$true}
+ if(-not $denied){throw "$($tool.name) file is writable: $($file.FullName)"}
+}
+Write-Output "$($tool.name) installation is read-only"
+}
 & jq.exe --version
 if($LASTEXITCODE -ne 0){throw 'native jq failed'}
-if($env:CARGO_TARGET_DIR -cne 'C:\t'){throw "unexpected target dir: $env:CARGO_TARGET_DIR"}
 if(-not (Test-Path -LiteralPath 'T:\' -PathType Container)){throw 'cache drive T: is missing'}
 if(((Get-Item -LiteralPath 'T:\' -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'cache drive root is a reparse point'}
 $reparseQuery=(& fsutil.exe reparsepoint query 'T:\' 2>&1 | Out-String)
@@ -343,14 +377,6 @@ try {
  if([IO.File]::ReadAllText(('T:\'+$driveProbe)) -cne 'folder cache'){throw 'cache folder write did not reach drive mount'}
 } finally {Remove-Item -LiteralPath ('T:\'+$driveProbe) -Force -ErrorAction SilentlyContinue}
 Write-Output 'cache drive aliases share permissions and data'
-$longOutput=Join-Path (Get-Location) 'target\debug\deps\motor_qualification-0123456789abcdef.exe'
-if($longOutput.Length -lt 260){throw "checkout fixture is not long enough: $longOutput"}
-$probe=Join-Path $env:CARGO_TARGET_DIR ('motor-cache-probe-'+[Guid]::NewGuid().ToString())
-[IO.File]::WriteAllText($probe,'same cache')
-$checkoutProbe=Join-Path (Join-Path (Get-Location) 'target') ([IO.Path]::GetFileName($probe))
-if([IO.File]::ReadAllText($checkoutProbe) -cne 'same cache'){throw 'checkout target does not reach the short cache mount'}
-Remove-Item -LiteralPath $probe
-Write-Output 'short target cache is writable'
 "#.into()
 }
 
@@ -1930,6 +1956,14 @@ fn baseline_environment_generated_powershell_has_balanced_braces() {
     let script = baseline_environment_script();
     assert_eq!(powershell_brace_balance(&script), Ok(()), "{script}");
     assert!(powershell(&script).len() < 8000);
+}
+
+#[test]
+fn jq_cache_drive_environment_generated_powershell_has_balanced_braces() {
+    let script = jq_cache_drive_environment_script();
+    assert_eq!(powershell_brace_balance(&script), Ok(()), "{script}");
+    let length = powershell(&script).len();
+    assert!(length < 8000, "encoded command has {length} characters");
 }
 
 #[test]
