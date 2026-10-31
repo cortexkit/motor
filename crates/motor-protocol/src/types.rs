@@ -586,6 +586,11 @@ pub fn validate_return_request(
     if cap > limit || paths.len() > 64 {
         return Err("return_paths_exceeded");
     }
+    // A request without return paths is not judged here; its workspace path
+    // gets its own check, with its own refusal.
+    if paths.is_empty() {
+        return Ok(());
+    }
     let root = caller_components(workspace).ok_or("return_paths_exceeded")?;
     for path in paths {
         let inside = path.len() <= 4096
