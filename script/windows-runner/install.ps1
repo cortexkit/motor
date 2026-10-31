@@ -17,6 +17,8 @@ Set-StrictMode -Version Latest
 . "$PSScriptRoot\accounts.ps1"
 . "$PSScriptRoot\guest-evidence.ps1"
 . "$PSScriptRoot\guest-agent-identity.ps1"
+# service-definition.ps1 calls Assert-RunnerPrivateDirectory, defined here.
+. "$PSScriptRoot\parent-identity.ps1"
 . "$PSScriptRoot\service-definition.ps1"
 $Root = 'C:\ProgramData\MotorRunner'
 $null = Get-RunnerMetricsArguments $MetricsEndpoint $MetricsHostId
