@@ -468,7 +468,9 @@ impl Config {
             writer_account: None,
             backend: BackendKind::Host,
             vm_config: None,
-            development_allow_host_backend: false,
+            // Library fixtures exercise the portable executor on native macOS.
+            // Non-test builds still require the explicit development opt-in.
+            development_allow_host_backend: cfg!(all(test, target_os = "macos")),
             #[cfg(unix)]
             macos: None,
             #[cfg(unix)]

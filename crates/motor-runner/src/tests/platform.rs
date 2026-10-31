@@ -9,9 +9,6 @@ fn platform_runner(f: &Fixture, kind: BackendKind) -> Runner {
 
 fn platform_config(f: &Fixture, kind: BackendKind) -> Config {
     let mut config = f.config();
-    // Admission tests inject a portable executor and never launch a job VM.
-    // Native macOS still requires the explicit opt-in for non-macOS backends.
-    config.development_allow_host_backend = true;
     if kind == BackendKind::WindowsVm {
         config = windows_instance::config(f);
     }
@@ -479,6 +476,8 @@ fn macos_backend_guard_requires_explicit_development_override() {
     for kind in [BackendKind::Host, BackendKind::Vm, BackendKind::WindowsVm] {
         let mut config = Config::new("unused", "guard");
         config.backend = kind;
+        // Exercise production's default rather than the library fixture opt-in.
+        config.development_allow_host_backend = false;
         assert!(config
             .configure_backend()
             .unwrap_err()
