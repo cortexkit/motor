@@ -3836,6 +3836,46 @@ mod delivery_tests {
     }
 
     #[tokio::test]
+    async fn closed_route_send_is_a_quiet_detach_without_terminal_acknowledgement() {
+        let scratch = ScratchDir::new("motor-closed-route-send");
+        let motor = Motor::open(Config::default(), &scratch).unwrap();
+        let stream = motor
+            .refuse_before_start(RefusalReason::RunnerFull, Some("test_capacity".into()))
+            .unwrap();
+        let id = stream.job_id;
+        let mut sends = 0;
+        crate::module::forward(std::future::pending(), stream, |_| {
+            sends += 1;
+            async { Err(io::Error::new(io::ErrorKind::NotConnected, "route closed")) }
+        })
+        .await
+        .expect("a withdrawn reply destination is not a job failure");
+        assert_eq!(sends, 1);
+        assert!(motor
+            .storage
+            .job(id)
+            .unwrap()
+            .terminal_delivered_at_ms
+            .is_none());
+        crate::module::forward(
+            std::future::pending(),
+            motor.attach(AttachRequest::new(id, 0)).unwrap(),
+            |record| async move {
+                assert!(matches!(record, StreamRecord::Terminal(_)));
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(motor
+            .storage
+            .job(id)
+            .unwrap()
+            .terminal_delivered_at_ms
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn terminal_delivery_is_durable_only_after_successful_forwarding() {
         let scratch = ScratchDir::new("motor-terminal-delivery");
         let motor = Motor::open(Config::default(), &scratch).unwrap();

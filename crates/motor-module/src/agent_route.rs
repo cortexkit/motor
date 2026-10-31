@@ -277,9 +277,7 @@ async fn pump_inner(
                 if !crate::motor::submission_key::after_cursor(&record, cursor) {
                     continue;
                 }
-                ctx.emit(serde_json::to_vec(&record).map_err(io::Error::other)?)
-                    .await
-                    .map_err(io::Error::other)?;
+                crate::module::reply(ctx, &record).await?;
             }
             Ok(())
         }

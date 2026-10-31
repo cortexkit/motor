@@ -252,3 +252,73 @@ async fn phase_changes_reset_elapsed_but_not_the_run_rate_limit() {
     finish.send(()).unwrap();
     task.await.unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn route_close_interrupts_blocked_progress_without_cancelling_submission() {
+    let _clock = HeldClock::new();
+    let scratch = cortexkit_test_support::ScratchDir::new("motor-progress-detach");
+    let motor = Motor::open(Config::default(), &scratch).unwrap();
+    let id = Uuid::now_v7();
+    motor.storage.create(id, 60, None, None, false).unwrap();
+    let (stream, tx, _) = motor.stream(id);
+    let reporter = progress::Reporter::new(true, 4);
+    reporter.phase(ProgressPhase::Connect);
+    let (_events, receive) = mpsc::channel(8);
+    let (finish, done) = tokio::sync::oneshot::channel();
+    let submission = tokio::spawn(async move {
+        reporter
+            .forward(
+                async {
+                    done.await.unwrap();
+                    Ok(())
+                },
+                receive,
+                &tx,
+            )
+            .await
+            .unwrap();
+    });
+    let (close, closed) = tokio::sync::oneshot::channel();
+    let (entered, sending) = tokio::sync::oneshot::channel();
+    let mut entered = Some(entered);
+    let writable = Arc::new(tokio::sync::Semaphore::new(0));
+    let sends = Arc::new(AtomicUsize::new(0));
+    let task_sends = sends.clone();
+    let task_writable = writable.clone();
+    let writer = tokio::spawn(crate::module::forward(
+        async { closed.await.unwrap() },
+        stream,
+        move |record| {
+            assert!(matches!(record, StreamRecord::Progress(_)));
+            let entered = entered.take().unwrap();
+            let writable = task_writable.clone();
+            let sends = task_sends.clone();
+            async move {
+                entered.send(()).unwrap();
+                let _permit = writable.acquire().await.unwrap();
+                sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        },
+    ));
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    sending.await.unwrap();
+    close.send(()).unwrap();
+    writable.add_permits(1);
+    writer.await.unwrap().unwrap();
+    assert_eq!(
+        sends.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no progress sends after close"
+    );
+    tokio::time::advance(Duration::from_secs(20)).await;
+    assert!(
+        !submission.is_finished(),
+        "route close must not cancel submission"
+    );
+    finish.send(()).unwrap();
+    submission.await.unwrap();
+    assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
+    motor.close().await;
+}

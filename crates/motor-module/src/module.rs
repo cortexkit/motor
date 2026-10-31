@@ -1348,10 +1348,19 @@ fn optional_platform(params: &serde_json::Value) -> io::Result<Option<motor_prot
         .map(|value| serde_json::from_value(value.clone()).map_err(io::Error::other))
         .transpose()
 }
-async fn reply(ctx: &RequestCtx, value: impl serde::Serialize) -> io::Result<()> {
-    ctx.emit(serde_json::to_vec(&value).map_err(io::Error::other)?)
-        .await
-        .map_err(io::Error::other)
+pub(crate) async fn reply(ctx: &RequestCtx, value: impl serde::Serialize) -> io::Result<()> {
+    let body = serde_json::to_vec(&value).map_err(io::Error::other)?;
+    tokio::select! {
+        biased;
+        _ = ctx.cancelled() => Err(io::Error::new(io::ErrorKind::NotConnected, "caller detached")),
+        result = ctx.emit(body) => result.map_err(|error| match error {
+            subc_client_rs::SubcModuleError::StaleRouteHandle(_)
+            | subc_client_rs::SubcModuleError::WriterClosed => {
+                io::Error::new(io::ErrorKind::NotConnected, error)
+            }
+            error => io::Error::other(error),
+        }),
+    }
 }
 /// Forward a job to an agent caller, whose resume cursor is `from_seq`.
 async fn pump(ctx: &RequestCtx, stream: JobStream, from_seq: u64) -> io::Result<()> {
@@ -1448,6 +1457,9 @@ where
     tokio::pin!(cancelled);
     loop {
         tokio::select! {
+            // A buffered record and route teardown can be ready together. Teardown
+            // wins so the detached caller does not keep draining the job stream.
+            biased;
             _ = &mut cancelled => {
                 eprintln!("ck-motor: caller_detached job_id={} job keeps running; attach to resume", stream.job_id);
                 return Ok(());
@@ -1456,7 +1468,23 @@ where
                 Some(record) => {
                     let record = record?;
                     let terminal = matches!(record, StreamRecord::Terminal(_));
-                    emit(record).await?;
+                    // Egress may be backpressured when the caller leaves. Keep
+                    // observing cancellation while sending, not just while receiving.
+                    let result = tokio::select! {
+                        biased;
+                        _ = &mut cancelled => {
+                            eprintln!("ck-motor: caller_detached job_id={} job keeps running; attach to resume", stream.job_id);
+                            return Ok(());
+                        }
+                        result = emit(record) => result,
+                    };
+                    if let Err(error) = result {
+                        if error.kind() == io::ErrorKind::NotConnected {
+                            eprintln!("ck-motor: caller_detached job_id={} job keeps running; attach to resume", stream.job_id);
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
                     if terminal {
                         stream.acknowledge_terminal()?;
                         return Ok(());
