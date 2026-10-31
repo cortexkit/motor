@@ -402,7 +402,8 @@ impl FakeBroker {
             return BrokerReply::error(400, "bad_request");
         };
         let claims = Claims {
-            workspace_key_hash: None,
+            workspace_key_hash: (!self.config.placement.host.starts_with("boat:"))
+                .then(|| job.request.workspace_key_hash.clone()),
             iss: ISSUER.into(),
             aud: self.config.placement.host.clone(),
             jti: job_id.into(),

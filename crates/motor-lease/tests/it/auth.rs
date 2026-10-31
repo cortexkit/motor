@@ -10,7 +10,7 @@ fn vectors() -> Value {
     let next = SigningKey::from_bytes(&[2; 32]);
     let requester = RequesterJwk::from_key(&SigningKey::from_bytes(&[3; 32]).verifying_key());
     let header = json!({"alg":"EdDSA","typ":"ck-job+jwt","kid":"current"});
-    let c = json!({"iss":ISSUER,"aud":"test-host","jti":"019e4567-89ab-7cde-8012-3456789abcde","sub":"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV","purpose":"run","iat":1700000000u64,"exp":1700000300u64,"vcpus":2,"mem_mib":16384,"platform":"linux-x64","net":false,"placement":{"host":"test-host","vm":"test-vm"},"max_s":30,"cnf":{"jkt":requester.thumbprint().unwrap()}});
+    let c = json!({"iss":ISSUER,"aud":"test-host","jti":"019e4567-89ab-7cde-8012-3456789abcde","sub":"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV","purpose":"run","iat":1700000000u64,"exp":1700000300u64,"vcpus":2,"mem_mib":16384,"platform":"linux-x64","net":false,"placement":{"host":"test-host","vm":"test-vm"},"max_s":30,"cnf":{"jkt":requester.thumbprint().unwrap()},"workspace_key_hash":base64url(&[5;32])});
     let token = |h: &Value, c: &Value, key: &SigningKey| {
         let input = format!(
             "{}.{}",
@@ -97,6 +97,39 @@ fn keys() -> KeySet {
     ))
     .unwrap();
     keys
+}
+
+#[test]
+fn host_tokens_require_workspace_hash_but_boat_tokens_do_not() {
+    let key = SigningKey::from_bytes(&[1; 32]);
+    for purpose in [Purpose::Run, Purpose::Attach] {
+        let mut c = claims();
+        c.purpose = purpose;
+        let token = sign_token(&c, "current", &key).unwrap();
+        assert_eq!(
+            check_token(&token, &keys(), &c.aud, None, purpose, c.iat).unwrap(),
+            c
+        );
+
+        c.workspace_key_hash = None;
+        let token = sign_token(&c, "current", &key).unwrap();
+        let refusal = check_token(&token, &keys(), &c.aud, None, purpose, c.iat).unwrap_err();
+        assert_eq!(refusal.error, AuthError::MissingWorkspaceKeyHash);
+        assert_eq!(refusal.check, "workspace_key_hash_missing");
+        assert_eq!(refusal.jti.as_deref(), Some(c.jti.as_str()));
+        assert_eq!(
+            verify_token(&token, &keys(), &c.aud, None, purpose, c.iat),
+            Err(AuthError::MissingWorkspaceKeyHash)
+        );
+
+        c.aud = "boat:sandbox-1".into();
+        c.placement.host = c.aud.clone();
+        let token = sign_token(&c, "current", &key).unwrap();
+        assert_eq!(
+            check_token(&token, &keys(), &c.aud, None, purpose, c.iat).unwrap(),
+            c
+        );
+    }
 }
 
 #[test]
