@@ -244,6 +244,20 @@ pub(super) fn prepare(
     execute_with_registry(&plan_path, |job_staging, _workspace, lockfile, routes| {
         super::trusted_prep::prepare_local_registry(config, job_staging, lockfile, routes)
     })?;
+    let checkouts = plan
+        .snapshots
+        .iter()
+        .map(|snapshot| mapped(&snapshot.destination).map(|path| staging.join(path)))
+        .collect::<io::Result<Vec<_>>>()?;
+    super::bun::prepare(
+        config,
+        staging,
+        crate::caller_path::request(request)
+            .caller_repository_root
+            .text(),
+        &checkouts,
+    )?;
+    build_tar(staging)?;
     let tar = staging.join("tree.tar");
     let mut file = File::open(&tar)
         .map_err(|error| super::vm::path_error("open trusted preparation tree", &tar, error))?;
@@ -1046,6 +1060,9 @@ pub(super) fn build_tar(staging: &Path) -> io::Result<()> {
     );
     let mut seen = BTreeSet::new();
     append(&mut builder, staging, &staging.join("m"), &mut seen)?;
+    if staging.join("bun-seed").exists() {
+        append(&mut builder, staging, &staging.join("bun-seed"), &mut seen)?;
+    }
     for name in [
         "config.toml",
         "gitconfig",

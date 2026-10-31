@@ -408,6 +408,14 @@ public static class MotorProfile {
 $jobProfile = [Environment]::ExpandEnvironmentVariables((Get-ItemProperty $profileKey).ProfileImagePath)
 $jobCargo = Join-Path $jobProfile '.cargo'
 New-Item $jobCargo,'C:\m','C:\t' -ItemType Directory -Force | Out-Null
+New-Item 'C:\motor-bun-seed','C:\motor-job' -ItemType Directory -Force | Out-Null
+# Seeds inherit read-only access for the job; Bun writes only its disposable copy.
+& icacls 'C:\motor-bun-seed' /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*${jobSid}:(OI)(CI)RX"
+if ($LASTEXITCODE -ne 0) { throw 'Bun seed ACL setup failed' }
+& icacls 'C:\motor-bun-seed' /setowner '*S-1-5-32-544'
+if ($LASTEXITCODE -ne 0) { throw 'Bun seed ownership setup failed' }
+& icacls 'C:\motor-job' /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*${jobSid}:(OI)(CI)M"
+if ($LASTEXITCODE -ne 0) { throw 'Bun disposable cache ACL setup failed' }
 & icacls 'C:\m' /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*${jobSid}:(OI)(CI)M"
 if ($LASTEXITCODE -ne 0) { throw 'Job source directory ACL setup failed' }
 & icacls $jobCargo /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*${jobSid}:(OI)(CI)M"

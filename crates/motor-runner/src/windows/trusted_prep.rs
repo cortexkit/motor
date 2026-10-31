@@ -424,6 +424,11 @@ fn run_offline_cargo(
     }
 }
 
+pub(super) fn download_bun(host: &str, path: &str, token: Option<&str>) -> io::Result<Vec<u8>> {
+    system::require_system()?;
+    local_registry::download_bun(host, path, token)
+}
+
 pub(super) fn prepare_local_registry(
     config: &Config,
     staging: &Path,

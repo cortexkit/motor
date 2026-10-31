@@ -13,6 +13,7 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
+pub mod bun;
 pub mod cache;
 pub mod cache_format;
 pub mod cache_steps;
@@ -20,7 +21,7 @@ pub mod environment;
 pub mod transport;
 
 /// Version of the Windows profile; the Windows agent sends it in its Hello.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 /// Version of the macOS profile, versioned independently of the Windows one.
 pub const MACOS_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -97,6 +98,9 @@ pub enum Frame {
         command: Command,
     },
     TreeReceived {},
+    BunPreparationFailed {
+        refusal: bun::Refusal,
+    },
     Start {},
     Started {},
     Output {
@@ -377,6 +381,10 @@ impl Protocol {
                 AwaitTreeReceived
             }
             (AwaitTreeReceived, Agent, TreeReceived {}) => Ready,
+            (AwaitTreeReceived, Agent, BunPreparationFailed { refusal }) => {
+                refusal.validate()?;
+                Failed
+            }
             (Ready, Host, Start {}) => AwaitStarted,
             (AwaitStarted, Agent, Started {}) => Running,
             (AwaitStarted | Running, Host, Cancel {}) => self.state,
@@ -562,9 +570,9 @@ pub fn validate_component(component: &str) -> io::Result<()> {
 pub fn validate_archive_path(path: &str) -> io::Result<()> {
     let path = path.strip_suffix('/').unwrap_or(path);
     let mut components = path.split('/');
-    if !matches!(components.next(), Some("m" | "cargo-home")) {
+    if !matches!(components.next(), Some("m" | "cargo-home" | "bun-seed")) {
         return Err(invalid(format!(
-            "archive path must be under m/ or cargo-home/: {path:?}"
+            "archive path must be under m/, cargo-home/ or bun-seed/: {path:?}"
         )));
     }
     for component in components {
@@ -655,6 +663,7 @@ impl Command {
             ("TMP", format!("{profile}\\AppData\\Local\\Temp")),
             ("TEMP", format!("{profile}\\AppData\\Local\\Temp")),
             ("CARGO_NET_OFFLINE", "true".into()),
+            ("BUN_INSTALL_CACHE_DIR", bun::CACHE_DIR.into()),
             ("CARGO_NET_GIT_FETCH_WITH_CLI", "true".into()),
             ("GIT_CONFIG_GLOBAL", format!("{cargo_home}\\gitconfig")),
             ("GIT_CONFIG_NOSYSTEM", "1".into()),
@@ -920,6 +929,8 @@ fn validate_archive(reader: &mut (impl Read + io::Seek), collection: bool) -> io
     let mut archive = tar::Archive::new(&mut *reader);
     let mut names = BTreeMap::<String, String>::new();
     let mut entries = std::collections::BTreeSet::new();
+    let mut bun_seed = false;
+    let mut bun_manifest = false;
     for entry in archive.entries()? {
         let entry = entry?;
         let bytes = entry.path_bytes();
@@ -932,6 +943,11 @@ fn validate_archive(reader: &mut (impl Read + io::Seek), collection: bool) -> io
             )));
         }
         validate_archive_path(path)?;
+        if path.trim_end_matches('/') == "bun-seed" || path.starts_with("bun-seed/") {
+            bun::validate_seed_member(path, kind.is_dir())?;
+            bun_seed = true;
+            bun_manifest |= path == "bun-seed/manifest.json";
+        }
         if collection && !path.starts_with("m/") {
             return Err(invalid(format!(
                 "collect member is not a source path: {path}"
@@ -947,7 +963,8 @@ fn validate_archive(reader: &mut (impl Read + io::Seek), collection: bool) -> io
             }
         }
         let path = path.trim_end_matches('/');
-        if !entry.header().entry_type().is_dir() && matches!(path, "m" | "cargo-home") {
+        if !entry.header().entry_type().is_dir() && matches!(path, "m" | "cargo-home" | "bun-seed")
+        {
             return Err(invalid(format!(
                 "archive prefix must be a directory: {path}"
             )));
@@ -969,6 +986,9 @@ fn validate_archive(reader: &mut (impl Read + io::Seek), collection: bool) -> io
                 )));
             }
         }
+    }
+    if bun_seed && !bun_manifest {
+        return Err(invalid("Bun seed digest manifest is missing"));
     }
     reader.rewind()
 }
@@ -1058,6 +1078,7 @@ pub fn unpack_tree(
         let mut dest = match components.next() {
             Some("m") => source_root.to_path_buf(),
             Some("cargo-home") => cargo_home.to_path_buf(),
+            Some("bun-seed") => continue,
             _ => unreachable!(),
         };
         let components: Vec<_> = components.collect();
@@ -1388,7 +1409,7 @@ mod tests {
     fn native_cache_timings_have_a_distinct_field_and_protocol_generation() {
         let value = serde_json::to_value(CacheTimings::default()).unwrap();
         assert!(value["native_attributes_ms"].is_u64());
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
     }
 
     #[test]
@@ -2597,6 +2618,7 @@ pub fn quote_windows_arg(argument: &str) -> String {
 pub enum Phase {
     Hello,
     Transfer,
+    BunPreparation,
     StartAcknowledgement,
     Running,
     Collect,
@@ -2630,6 +2652,9 @@ impl Bounds {
         self.phase = phase;
         self.deadline_ms = match phase {
             Phase::Running | Phase::Finished => None,
+            // Offline extraction/installation is a bounded preparation phase,
+            // not transport inactivity. Guest messages cannot extend this budget.
+            Phase::BunPreparation => Some(now_ms.saturating_add(600_000)),
             _ => Some(now_ms.saturating_add(REPLY_TIMEOUT_MS)),
         };
         Ok(())

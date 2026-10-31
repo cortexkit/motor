@@ -56,7 +56,10 @@ mod guest {
         fs::{File, OpenOptions},
         io::{self, Read, Write},
         mem::{size_of, size_of_val, zeroed},
-        os::windows::io::{AsRawHandle, FromRawHandle},
+        os::windows::{
+            fs::OpenOptionsExt,
+            io::{AsRawHandle, FromRawHandle},
+        },
         path::{Path, PathBuf},
         ptr::{null, null_mut},
         sync::{Arc, mpsc},
@@ -1478,6 +1481,86 @@ mod guest {
         }
     }
 
+    fn prepare_bun(
+        user: &User,
+        command: &Command,
+        stop: &Handle,
+    ) -> Result<(), motor_winagent::bun::Refusal> {
+        use motor_winagent::bun::{self, RefusalKind};
+        let fail =
+            |project: &str| bun::refuse(RefusalKind::BunOfflineInstallFailed, project, "", "");
+        let identity = user.impersonate().map_err(|_| fail(""))?;
+        let manifest = bun::prepare_cache(
+            Path::new(bun::SEED_DIR),
+            Path::new(SOURCE_ROOT),
+            Path::new(bun::CACHE_DIR),
+        )?;
+        let Some(manifest) = manifest else {
+            return Ok(());
+        };
+        bun::write_registry_config(&user.profile, &manifest.registries).map_err(|_| fail(""))?;
+        drop(identity);
+        let deadline = Instant::now() + Duration::from_secs(300);
+        for project in &manifest.projects {
+            let fail = |_path: &str| {
+                bun::refuse(
+                    RefusalKind::BunOfflineInstallFailed,
+                    &project.path,
+                    &project.name,
+                    &project.version,
+                )
+            };
+            let mut prep = command.clone();
+            prep.cwd = if project.path == "m" {
+                "/"
+            } else {
+                project.path.strip_prefix('m').unwrap()
+            }
+            .into();
+            prep.env.clear();
+            prep.command = "test \"$('C:/Program Files/Bun/bun.exe' --version)\" = 1.4.4 && 'C:/Program Files/Bun/bun.exe' install --offline --frozen-lockfile --ignore-scripts --backend=copyfile".into();
+            let (tx, rx) = mpsc::sync_channel(16);
+            let prep_stop = Arc::new(Handle::event().map_err(|_| fail(&project.path))?);
+            let job = Job::start(user, &prep, tx, prep_stop).map_err(|_| fail(&project.path))?;
+            let mut closed = 0;
+            loop {
+                if stop.signalled() || Instant::now() >= deadline {
+                    return Err(fail(&project.path));
+                }
+                let code = job.exit_code().map_err(|_| fail(&project.path))?;
+                if let Some(code) = code {
+                    if code != 0 {
+                        let _identity = user.impersonate().map_err(|_| fail(&project.path))?;
+                        bun::verify_installed(
+                            project,
+                            &PathBuf::from(mapped_cwd(&prep.cwd).map_err(|_| fail(&project.path))?),
+                        )
+                        .map_err(|failure| failure.registry(&manifest.registries))?;
+                        return Err(fail(&project.path));
+                    }
+                    if closed == 2 {
+                        break;
+                    }
+                }
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(Event::Output(..)) => (), // Untrusted package diagnostics never enter service logs.
+                    Ok(Event::PipeClosed) => closed += 1,
+                    Ok(_) => return Err(fail(&project.path)),
+                    Err(mpsc::RecvTimeoutError::Timeout) => (),
+                    Err(_) => return Err(fail(&project.path)),
+                }
+            }
+            drop(job);
+            let _identity = user.impersonate().map_err(|_| fail(&project.path))?;
+            bun::verify_installed(
+                project,
+                &PathBuf::from(mapped_cwd(&prep.cwd).map_err(|_| fail(&project.path))?),
+            )
+            .map_err(|failure| failure.registry(&manifest.registries))?;
+        }
+        Ok(())
+    }
+
     fn stage(
         protocol: &mut Protocol,
         rx: &mpsc::Receiver<Event>,
@@ -1493,6 +1576,7 @@ mod guest {
             .read(true)
             .write(true)
             .create_new(true)
+            .share_mode(FILE_SHARE_READ)
             .open(temp.join("motor-tree.tar"))?;
         diagnostic!("staging archive opened");
         let mut command = loop {
@@ -1506,10 +1590,74 @@ mod guest {
             }
         };
         archive.flush()?;
+        // The baseline supplies a service-owned seed root. Refuse an image that
+        // accidentally grants the job write access instead of silently seeding it.
+        let seed_probe = Path::new(motor_winagent::bun::SEED_DIR).join("write-probe");
+        let seed_readonly = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&seed_probe)
+        {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => true,
+            Ok(file) => {
+                drop(file);
+                let _ = std::fs::remove_file(&seed_probe);
+                false
+            }
+            Err(_) => false,
+        };
+        if !seed_readonly {
+            let refusal = motor_winagent::bun::refuse(
+                motor_winagent::bun::RefusalKind::BunProjectionInvalid,
+                "",
+                "",
+                "",
+            );
+            send(
+                protocol,
+                port,
+                &Frame::BunPreparationFailed {
+                    refusal: refusal.clone(),
+                },
+            )?;
+            return Err(refusal.into());
+        }
+        drop(_identity);
+        if motor_winagent::bun::unpack_seed(&mut archive, Path::new(motor_winagent::bun::SEED_DIR))
+            .is_err()
+        {
+            let refusal = motor_winagent::bun::refuse(
+                motor_winagent::bun::RefusalKind::BunProjectionInvalid,
+                "",
+                "",
+                "",
+            );
+            send(
+                protocol,
+                port,
+                &Frame::BunPreparationFailed {
+                    refusal: refusal.clone(),
+                },
+            )?;
+            return Err(refusal.into());
+        }
+        let identity = user.impersonate()?;
         unpack_tree(&mut archive, Path::new(SOURCE_ROOT), &home)?;
         // The archive's host paths do not exist in the VM; pin Cargo to the
         // absolute local-registry path under the guest user's CARGO_HOME.
         motor_winagent::rewrite_local_registry_config(&home)?;
+        drop(identity);
+        if let Err(refusal) = prepare_bun(user, &command, &port.stop) {
+            send(
+                protocol,
+                port,
+                &Frame::BunPreparationFailed {
+                    refusal: refusal.clone(),
+                },
+            )?;
+            return Err(refusal.into());
+        }
+        let _identity = user.impersonate()?;
         let before = inventory(Path::new(SOURCE_ROOT))?;
         command.command = motor_winagent::command_with_git_cache(
             &command.command,

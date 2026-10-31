@@ -163,6 +163,11 @@ fn allowlisted_download_limit(host: &str, path: &str) -> Option<usize> {
 fn require_success_status(status: u32) -> io::Result<()> {
     if status == 200 {
         Ok(())
+    } else if matches!(status, 401 | 403) {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "registry authorization refused",
+        ))
     } else {
         Err(io::Error::other(format!(
             "unexpected HTTP status {status}; redirects and non-success responses are refused"
@@ -214,7 +219,7 @@ fn download_allowlisted(
     host: &str,
     path: &str,
     size_limit: usize,
-    mut phase: impl FnMut(&str) -> io::Result<()>,
+    phase: impl FnMut(&str) -> io::Result<()>,
 ) -> io::Result<Vec<u8>> {
     let maximum = allowlisted_download_limit(host, path).ok_or_else(|| {
         invalid(format!(
@@ -226,6 +231,30 @@ fn download_allowlisted(
             "local-registry download size limit exceeds its host policy",
         ));
     }
+    download_https(host, path, size_limit, None, phase)
+}
+
+pub(super) fn download_bun(
+    host: &str,
+    path: &str,
+    authorization: Option<&str>,
+) -> io::Result<Vec<u8>> {
+    download_https(
+        host,
+        path,
+        motor_winagent::bun::MAX_BLOB_BYTES as usize,
+        authorization,
+        |_| Ok(()),
+    )
+}
+
+fn download_https(
+    host: &str,
+    path: &str,
+    size_limit: usize,
+    authorization: Option<&str>,
+    mut phase: impl FnMut(&str) -> io::Result<()>,
+) -> io::Result<Vec<u8>> {
     let timeout = download_timeout(host);
     let deadline = Instant::now() + timeout;
     let url = format!("https://{host}{path}");
@@ -282,8 +311,19 @@ fn download_allowlisted(
     .map_err(|error| download_error(host, path, "open request", error))?;
     phase(&format!("{url} send request"))?;
     check_download_deadline(deadline, timeout, host, path, "send request")?;
-    checked(unsafe { WinHttpSendRequest(request.0, null(), 0, null(), 0, 0, 0) })
-        .map_err(|error| download_error(host, path, "send request", error))?;
+    let headers = authorization.map(|token| wide(&format!("Authorization: Bearer {token}\r\n")));
+    checked(unsafe {
+        WinHttpSendRequest(
+            request.0,
+            headers.as_ref().map_or(null(), |h| h.as_ptr()),
+            headers.as_ref().map_or(0, |h| (h.len() - 1) as u32),
+            null(),
+            0,
+            0,
+            0,
+        )
+    })
+    .map_err(|error| download_error(host, path, "send request", error))?;
     phase(&format!("{url} receive response"))?;
     check_download_deadline(deadline, timeout, host, path, "receive response")?;
     checked(unsafe { WinHttpReceiveResponse(request.0, null_mut()) })
@@ -305,7 +345,7 @@ fn download_allowlisted(
     })
     .map_err(|error| download_error(host, path, "query status", error))?;
     require_success_status(status)
-        .map_err(|error| io::Error::other(format!("{error} from {url}")))?;
+        .map_err(|error| io::Error::new(error.kind(), format!("{error} from {url}")))?;
     phase(&format!("{url} query content length"))?;
     check_download_deadline(deadline, timeout, host, path, "query content length")?;
 
@@ -454,13 +494,16 @@ pub(super) fn locked_registry_packages(lockfile: &str) -> io::Result<Vec<Registr
 }
 
 fn verify_archive_checksum(bytes: &[u8], expected_checksum: &str) -> io::Result<String> {
-    let checksum = format!("{:x}", Sha256::digest(bytes));
-    if checksum != expected_checksum {
+    let integrity = motor_winagent::bun::Integrity {
+        algorithm: "sha256".into(),
+        hex: expected_checksum.into(),
+    };
+    if !integrity.verify(bytes) {
         return Err(invalid(format!(
-            "crate archive checksum mismatch: expected {expected_checksum}, got {checksum}"
+            "crate archive checksum mismatch: expected {expected_checksum}"
         )));
     }
-    Ok(checksum)
+    Ok(expected_checksum.into())
 }
 
 fn write_verified_archive(

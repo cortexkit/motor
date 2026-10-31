@@ -878,7 +878,17 @@ fn materialize_attempt(
                 })?;
             }
             io.send(&Frame::TreeEnd { command })?;
-            let _received = io.reply(&mut resources)?;
+            if tar
+                .parent()
+                .is_some_and(|path| path.join("bun-seed/manifest.json").is_file())
+            {
+                io.enter(Phase::BunPreparation)?;
+            }
+            match io.reply(&mut resources)? {
+                Frame::TreeReceived {} => (),
+                Frame::BunPreparationFailed { refusal } => return Err(refusal.into()),
+                _ => return Err(invalid("expected TreeReceived")),
+            }
             ready_tx
                 .send(Ok(()))
                 .map_err(|_| invalid("Windows setup owner disappeared"))?;
