@@ -76,7 +76,7 @@ pub struct Run {
     pub return_max_bytes: u64,
     /// Return the files as `ReturnChunk` frames followed by one
     /// `ReturnManifest`, instead of one `ReturnResult`, and allow
-    /// `return_max_bytes` up to `RETURN_CHUNKED_MAX_BYTES_CAP`. ck-motor sets it
+    /// an explicitly negotiated `return_max_bytes` up to `RETURN_LARGE_MAX_BYTES_CAP`. ck-motor sets it
     /// only for a runner whose Hello advertises `return_chunked`; an older
     /// runner ignores the field.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -442,6 +442,9 @@ define_frames! {
         /// `ReturnChunk` and `ReturnManifest` frames.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         return_chunked: bool,
+        /// Absent means `RETURN_CHUNKED_MAX_BYTES_CAP`; a larger ceiling requires reserved disk capacity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        return_chunked_max_bytes: Option<u64>,
         /// The runner mounts sibling snapshots below its configured workspace roots,
         /// not just beside the repository root. Absent on in-place and Windows runners.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -560,7 +563,7 @@ pub fn validate_return_paths(
 }
 
 /// `validate_return_paths` for a request that may set `return_chunked`, which
-/// raises the byte cap from `RETURN_MAX_BYTES` to `RETURN_CHUNKED_MAX_BYTES_CAP`.
+/// permits the large-return ceiling. Peers separately enforce the negotiated maximum.
 pub fn validate_return_request(
     workspace: &str,
     paths: &[String],
@@ -570,7 +573,7 @@ pub fn validate_return_request(
     use std::path::{Component, Path};
     let root = Path::new(workspace);
     let limit = if chunked {
-        RETURN_CHUNKED_MAX_BYTES_CAP
+        RETURN_LARGE_MAX_BYTES_CAP
     } else {
         RETURN_MAX_BYTES
     };

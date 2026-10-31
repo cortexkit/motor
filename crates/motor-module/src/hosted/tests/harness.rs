@@ -345,6 +345,7 @@ impl Harness {
                             &mut tls,
                             &Frame::Hello {
                                 return_paths: false,
+                                return_chunked_max_bytes: None,
                                 return_chunked: false,
                                 sibling_paths: false,
                                 protocol_version: if matches!(behavior, Behavior::WrongHello) {

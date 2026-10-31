@@ -67,6 +67,7 @@ impl Connector for Peer {
                         gate_jobs: true,
                         platforms: state.platforms.clone(),
                         return_paths: state.returns,
+                        return_chunked_max_bytes: None,
                         return_chunked: state.returns,
                         sibling_paths: true,
                     },

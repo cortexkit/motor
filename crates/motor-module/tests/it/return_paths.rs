@@ -142,6 +142,47 @@ async fn agent_run(motor: &Motor, mut request: RunRequest) -> Vec<StreamRecord> 
 }
 
 #[tokio::test]
+async fn return_large_old_hello_maximum_refuses_before_run_without_downgrading() {
+    let f = Fixture::new(Cut::None, 2).await;
+    let motor = f.motor();
+    let mut request = f
+        .request("touch should-not-run")
+        .with_return_paths(vec!["returned".into()])
+        .with_return_chunked(true)
+        .with_return_max_bytes(134_217_728);
+    let returns = crate::agent_route::take_return_request(&mut request).unwrap();
+    let stream = motor.run_agent(request, None, returns).unwrap();
+    let storage = stream.storage();
+    let records = crate::agent_route::agent_stream(stream, 0).await;
+    let terminal = terminal(&records);
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert!(matches!(
+        terminal.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RequestRejected
+        }
+    ));
+    let detail: serde_json::Value =
+        serde_json::from_str(terminal.refusal_detail.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        detail,
+        serde_json::json!({"field":"return_max_bytes","max_bytes":10_485_760})
+    );
+    assert_eq!(
+        storage.job(terminal.job_id).unwrap().return_cap_bytes,
+        Some(134_217_728)
+    );
+    assert!(!f
+        .proxy
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame, Frame::Run(_))));
+    assert!(!f.remote_key.join("should-not-run").exists());
+}
+
+#[tokio::test]
 async fn return_chunked_agent_caller_gets_a_verified_430_kb_file() {
     let f = Fixture::new(Cut::None, 2).await;
     let motor = f.motor();

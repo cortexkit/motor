@@ -206,6 +206,7 @@ async fn platform_connect(socket: &Path, kind: BackendKind, started: bool) -> Un
         &mut stream,
         &Frame::Hello {
             return_paths: false,
+            return_chunked_max_bytes: None,
             return_chunked: false,
             sibling_paths: false,
             protocol_version: PROTOCOL_VERSION,

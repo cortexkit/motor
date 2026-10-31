@@ -325,6 +325,7 @@ fn transport_spy_bundle_base64_name_collision_is_not_environment_metadata() {
     assert!(metadata.contains(r#""offset":42"#));
     let structured = [Frame::Hello {
         return_paths: false,
+        return_chunked_max_bytes: None,
         return_chunked: false,
         sibling_paths: false,
         protocol_version: PROTOCOL_VERSION,
@@ -568,6 +569,7 @@ impl Connector for DisconnectDuringHave {
                     &mut runner,
                     &Frame::Hello {
                         return_paths: false,
+                        return_chunked_max_bytes: None,
                         return_chunked: false,
                         sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,
@@ -907,6 +909,7 @@ impl Connector for FutureRecords {
                     &mut b,
                     &Frame::Hello {
                         return_paths: false,
+                        return_chunked_max_bytes: None,
                         return_chunked: false,
                         sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,
@@ -1021,6 +1024,7 @@ impl Connector for UnknownCursorRecovery {
                     &mut b,
                     &Frame::Hello {
                         return_paths: false,
+                        return_chunked_max_bytes: None,
                         return_chunked: false,
                         sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,
@@ -1181,6 +1185,7 @@ impl Connector for WireRecords {
                     &mut b,
                     &Frame::Hello {
                         return_paths: false,
+                        return_chunked_max_bytes: None,
                         return_chunked: false,
                         sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,

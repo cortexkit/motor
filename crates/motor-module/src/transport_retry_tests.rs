@@ -58,6 +58,7 @@ impl Connector for HelloConnector {
                         &mut runner,
                         &Frame::Hello {
                             return_paths: false,
+                            return_chunked_max_bytes: None,
                             return_chunked: false,
                             sibling_paths: false,
                             protocol_version,

@@ -523,6 +523,7 @@ async fn session(
         tx,
         Frame::Hello {
             return_paths: runner.config().supports_returns(),
+            return_chunked_max_bytes: runner.config().return_chunked_max_bytes,
             return_chunked: runner.config().supports_returns(),
             sibling_paths: runner.config().sibling_snapshot_mode(),
             protocol_version: PROTOCOL_VERSION,

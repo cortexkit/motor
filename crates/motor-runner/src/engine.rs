@@ -123,6 +123,9 @@ pub struct Config {
     pub state_root: PathBuf,
     pub build_slot_root: PathBuf,
     pub max_queue_depth: usize,
+    /// Absent keeps `RETURN_CHUNKED_MAX_BYTES_CAP`; larger limits require an explicit disk budget.
+    pub return_chunked_max_bytes: Option<u64>,
+    pub return_budget_bytes: Option<u64>,
     pub max_weight: u32,
     /// Keep the fleet's daemon-only core unless the operator explicitly opts out.
     pub reserve_daemon_core: bool,
@@ -460,6 +463,8 @@ impl Config {
             build_slot_root: state_root.join("build-slots"),
             state_root,
             max_queue_depth: 64,
+            return_chunked_max_bytes: None,
+            return_budget_bytes: None,
             max_weight: 28,
             reserve_daemon_core: true,
             rustc_slots: 24,
@@ -593,7 +598,32 @@ impl Config {
 
     /// Validate serve options without opening the state directory or taking locks.
     pub fn check_options(&self) -> io::Result<()> {
+        if let Some(max) = self.return_chunked_max_bytes {
+            if !(RETURN_CHUNKED_MAX_BYTES_CAP..=RETURN_LARGE_MAX_BYTES_CAP).contains(&max)
+                || !self.supports_returns()
+                || (max > RETURN_CHUNKED_MAX_BYTES_CAP
+                    && self
+                        .return_budget_bytes
+                        .is_none_or(|budget| budget < Self::return_charge(max)))
+            {
+                return Err(io::Error::other("return maximum requires a supported backend, 10..128 MiB and a budget covering one reservation"));
+            }
+        }
         paths::startup::options(self)
+    }
+
+    pub fn return_maximum(&self) -> u64 {
+        self.return_chunked_max_bytes
+            .unwrap_or(RETURN_CHUNKED_MAX_BYTES_CAP)
+    }
+
+    fn return_charge(cap: u64) -> u64 {
+        // Each chunk needs an inode and block rounding in addition to its raw bytes.
+        cap.saturating_add(
+            cap.div_ceil(RETURN_CHUNK_MAX_BYTES as u64)
+                .saturating_mul(8192),
+        )
+        .saturating_add(64 * 8192)
     }
     pub fn sccache_dir(&self) -> PathBuf {
         self.state_dir().join("sccache/fleet")
@@ -1915,7 +1945,7 @@ impl Runner {
         Self::open_with_backend(config, backend)
     }
     fn open_with_backend(mut config: Config, backend: Box<dyn Backend>) -> io::Result<Self> {
-        paths::startup::options(&config)?;
+        config.check_options()?;
         paths::owner::check(&config)?;
         #[cfg(target_os = "linux")]
         if config.boat_profile {
@@ -2256,8 +2286,29 @@ impl Runner {
                 continue;
             }
             match read_json::<Job>(&record) {
-                Ok(job) => {
+                Ok(mut job) => {
                     recover_output_tail(&path, &job);
+                    let has_returned = fs::read_dir(&path)?
+                        .collect::<io::Result<Vec<_>>>()?
+                        .iter()
+                        .any(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(crate::storage::RETURNED_DIRECTORY_PREFIX)
+                        });
+                    if config.return_budget_bytes.is_some()
+                        && job.return_reserved_bytes == 0
+                        && (has_returned || (job.terminal.is_none() && job.setup_ms.is_some()))
+                    {
+                        if let Some(request) = job.request.as_ref().filter(|r| {
+                            r.return_chunked && !paths::run(r).caller_return_paths.is_empty()
+                        }) {
+                            job.return_reserved_bytes =
+                                Config::return_charge(request.return_max_bytes);
+                            crate::storage::atomic_job_json(&record, &job)?;
+                        }
+                    }
                     jobs.insert(job.id, job);
                 }
                 Err(error) => {
@@ -3744,6 +3795,17 @@ impl Runner {
                     "network_unsupported".into(),
                 ));
             }
+        }
+        let max = if request.return_chunked {
+            self.core.config.return_maximum()
+        } else {
+            RETURN_MAX_BYTES
+        };
+        if request.return_max_bytes > max {
+            return Some((
+                RefusalReason::RequestRejected,
+                format!("return_max_bytes exceeds max_bytes={max}"),
+            ));
         }
         if let Err(code) = validate_return_request(
             paths::request(request).caller_workspace_key.text(),
@@ -5732,6 +5794,7 @@ impl Runner {
         matches!(
             waiting_on,
             "permits"
+                | "returned bytes budget"
                 | "gate job ahead"
                 | "cache fill ahead needs more free permits"
                 | "older job ahead needs more free permits"
@@ -5786,6 +5849,7 @@ impl Runner {
             && now.saturating_sub(head.queued_ms.unwrap_or(head.accepted_ms)) >= BACKFILL_GRACE_MS;
         (head.gate_job() || fill || aged)
             && (held.saturating_add(head.weight) > self.core.config.max_weight
+                || !self.return_budget_available(inner, head).unwrap_or(false)
                 || Self::start_deferred(inner, head.id, now))
     }
 
@@ -5876,6 +5940,8 @@ impl Runner {
                 // A job waiting out its start retry delay keeps its claim on
                 // capacity, as if it were waiting for permits.
                 "permits"
+            } else if !self.return_budget_available(inner, job).unwrap_or(false) {
+                "returned bytes budget"
             } else {
                 "queue order"
             },
@@ -5941,6 +6007,7 @@ impl Runner {
                         .fold(0u32, |sum, weight| sum.saturating_add(*weight));
                     let blocked_by_head = blockers.get(&id).is_some_and(Option::is_some);
                     !blocked_by_head
+                        && self.return_budget_available(inner, job).unwrap_or(false)
                         && !self.deleting(inner, paths::host_str(crate::caller_path::job_key(job)), &request.siblings)
                         && job.weight <= self.core.config.max_weight
                         && index
@@ -6266,6 +6333,64 @@ impl Runner {
             }
         }
     }
+
+    fn release_return_reservations(&self) {
+        let candidates: Vec<_> = self
+            .core
+            .inner
+            .lock()
+            .unwrap()
+            .jobs
+            .values()
+            .filter(|job| {
+                job.return_reserved_bytes != 0
+                    && job.terminal.is_some()
+                    && job.returned.as_ref().is_none_or(|r| r.expired)
+            })
+            .map(|job| job.id)
+            .collect();
+        for id in candidates {
+            let log = self.job_log(id);
+            let Some(_write) = log.try_lock_write() else {
+                continue;
+            };
+            let mut job = {
+                let inner = self.core.inner.lock().unwrap();
+                if inner.starting.contains(&id)
+                    || inner.finalizing.contains(&id)
+                    || log.retention.lock().unwrap().readers != 0
+                {
+                    continue;
+                }
+                let Some(job) = inner.jobs.get(&id) else {
+                    continue;
+                };
+                job.clone()
+            };
+            let directory = self.record_path(id).parent().unwrap().to_owned();
+            // Failed collections and interrupted expiry can leave unreferenced bytes.
+            // A saved expired flag alone is not evidence that disk space was reclaimed.
+            crate::storage::remove_unreferenced_returned(&directory, &job);
+            let Ok(entries) = fs::read_dir(&directory) else {
+                continue;
+            };
+            let gone = entries.into_iter().all(|entry| {
+                entry.is_ok_and(|entry| {
+                    !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(crate::storage::RETURNED_DIRECTORY_PREFIX)
+                })
+            });
+            if !gone {
+                continue;
+            }
+            job.return_reserved_bytes = 0;
+            if self.save(&job).is_ok() {
+                self.core.inner.lock().unwrap().jobs.insert(id, job);
+            }
+        }
+    }
     /// Also exposed to fake-clock tests; retention is relative to both terminal
     /// time and mint time, so recent unknown IDs can never rerun an expired job.
     pub fn maintenance(&self) -> io::Result<()> {
@@ -6318,6 +6443,7 @@ impl Runner {
             }
         }
         self.expire_returned_files();
+        self.release_return_reservations();
         self.maintain_build_folders();
         if !maintained? {
             return Ok(());
@@ -6352,7 +6478,8 @@ impl Runner {
             .jobs
             .values()
             .filter(|j| {
-                !inner.base_finishes.contains_key(&j.id)
+                j.return_reserved_bytes == 0
+                    && !inner.base_finishes.contains_key(&j.id)
                     && j.finished_ms.is_some_and(|t| {
                         self.now().saturating_sub(t.max(mint_ms(j.id))) >= RETENTION_MS
                     })
@@ -7127,6 +7254,37 @@ impl Runner {
         })
     }
 
+    fn return_budget_available(&self, inner: &Inner, job: &Job) -> io::Result<bool> {
+        let Some(budget) = self.core.config.return_budget_bytes else {
+            return Ok(true);
+        };
+        let Some(request) = job
+            .request
+            .as_ref()
+            .filter(|r| r.return_chunked && !paths::run(r).caller_return_paths.is_empty())
+        else {
+            return Ok(true);
+        };
+        if !self.core.quarantined.is_empty() {
+            return Ok(false);
+        }
+        let charge = Config::return_charge(request.return_max_bytes);
+        let used = inner
+            .jobs
+            .values()
+            .filter(|j| j.id != job.id)
+            .fold(0u64, |sum, j| sum.saturating_add(j.return_reserved_bytes));
+        let total = used.saturating_add(charge);
+        let free = (self.core.config.free_space_probe)(&self.core.trees.state)?;
+        Ok(total <= budget
+            && free
+                >= self
+                    .core
+                    .config
+                    .free_space_floor_bytes
+                    .saturating_add(total))
+    }
+
     fn dispatch(&self, inner: &mut Inner, now: u64) -> io::Result<()> {
         if inner.restoring_reserve {
             return Ok(());
@@ -7208,6 +7366,7 @@ impl Runner {
                 // permits: a gate or aged head still fences capacity.
                 if index.weight.saturating_add(job.weight) > self.core.config.max_weight
                     || Self::start_deferred(inner, id, now)
+                    || !self.return_budget_available(inner, job)?
                 {
                     // Gates, the fill that may start and aged heads stop
                     // backfill only for capacity, after their checkout
@@ -7305,6 +7464,12 @@ impl Runner {
             cpus = ?placement.cpus, windows_active = ?placement.windows_active,
             avoided_cpus = ?placement.avoided_cpus, "placed job CPUs");
         queued_job.cpus = placement.cpus;
+        if self.core.config.return_budget_bytes.is_some()
+            && r.return_chunked
+            && !paths::run(&r).caller_return_paths.is_empty()
+        {
+            queued_job.return_reserved_bytes = Config::return_charge(r.return_max_bytes);
+        }
         let setup_ms = self.now();
         queued_job.setup_ms = Some(setup_ms);
         queued_job.stop_queue_wait(setup_ms);

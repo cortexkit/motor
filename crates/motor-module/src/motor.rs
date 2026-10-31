@@ -438,6 +438,9 @@ impl Motor {
             self.storage
                 .return_requested(id, returns.return_paths.clone())?;
         }
+        if !returns.return_paths.is_empty() {
+            self.storage.return_cap(id, returns.return_max_bytes)?;
+        }
         let (stream, tx, rx) = self.stream(id);
         let motor = self.clone();
         tokio::spawn(async move {
@@ -1358,6 +1361,23 @@ impl Motor {
                     .await
                     .map(|_| false);
             }
+            let mut cap_request = request.clone();
+            cap_request.return_chunked = returns.return_chunked;
+            cap_request.return_max_bytes = Some(returns.return_max_bytes);
+            if let Err(detail) =
+                motor_protocol::check_return_cap(&cap_request, channel.return_chunked_max_bytes)
+            {
+                return self
+                    .refused(
+                        id,
+                        RefusalReason::RequestRejected,
+                        Some(snapshots.main.tree_hash.clone()),
+                        Some(serde_json::to_string(&detail).map_err(io::Error::other)?),
+                        tx,
+                    )
+                    .await
+                    .map(|_| false);
+            }
             if !returns.return_paths.is_empty() && !channel.return_paths {
                 if self
                     .return_spill(id, "return_paths_unsupported", spill_started, None)
@@ -1379,6 +1399,7 @@ impl Motor {
             // Direct CLI callers can consume either return format. Negotiate
             // before sending Run, without resubmitting a command that ran.
             if returns.return_chunked
+                && returns.return_max_bytes <= motor_protocol::RETURN_CHUNKED_MAX_BYTES_CAP
                 && !channel.return_chunked
                 && self
                     .storage
@@ -3688,6 +3709,7 @@ mod delivery_tests {
                         &mut peer,
                         &Frame::Hello {
                             return_paths: false,
+                            return_chunked_max_bytes: None,
                             return_chunked: false,
                             sibling_paths: false,
                             protocol_version: PROTOCOL_VERSION,

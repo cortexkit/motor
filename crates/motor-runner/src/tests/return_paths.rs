@@ -386,5 +386,208 @@ fn return_chunked_cap_above_ten_mib_and_unchunked_above_256_kib_are_refused() {
             runner.accept(request.clone()).unwrap(),
             Admission::Refused(RefusalReason::RequestRejected)
         ));
+        let inner = runner.core.inner.lock().unwrap();
+        let terminal = inner.jobs[&request.job_id].terminal.as_ref().unwrap();
+        assert_eq!(terminal.ran, Some(Ran::None));
+        let limit = if chunked {
+            RETURN_CHUNKED_MAX_BYTES_CAP
+        } else {
+            RETURN_MAX_BYTES
+        };
+        assert!(terminal
+            .refusal_detail
+            .as_ref()
+            .unwrap()
+            .contains(&format!("max_bytes={limit}")));
     }
+}
+
+fn large_config(f: &Fixture) -> Config {
+    let mut config = f.config();
+    config.manual_tick = true;
+    config.base_commands.clear();
+    config.return_chunked_max_bytes = Some(RETURN_LARGE_MAX_BYTES_CAP);
+    config.return_budget_bytes = Some(Config::return_charge(RETURN_LARGE_MAX_BYTES_CAP));
+    config.free_space_probe = Arc::new(|_| Ok(u64::MAX));
+    config
+}
+
+#[test]
+fn return_large_configuration_and_runner_ceiling_are_explicit() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    assert_eq!(config.return_chunked_max_bytes, None);
+    assert_eq!(config.return_maximum(), 10_485_760);
+    config.return_chunked_max_bytes = Some(134_217_728);
+    assert!(
+        config.check_options().is_err(),
+        "large returns need a budget"
+    );
+    config.return_budget_bytes = Some(Config::return_charge(134_217_728));
+    assert!(config.check_options().is_ok());
+    let runner = Runner::open(config).unwrap();
+    let (mut request, _) = f.run("touch should-not-run");
+    request.return_chunked = true;
+    request.return_max_bytes = 134_217_729;
+    assert!(matches!(
+        runner.accept(request.clone()).unwrap(),
+        Admission::Refused(RefusalReason::RequestRejected)
+    ));
+    let inner = runner.core.inner.lock().unwrap();
+    let terminal = inner.jobs[&request.job_id].terminal.as_ref().unwrap();
+    assert_eq!(terminal.ran, Some(Ran::None));
+    assert!(terminal
+        .refusal_detail
+        .as_deref()
+        .unwrap()
+        .contains("max_bytes=134217728"));
+}
+
+#[tokio::test]
+async fn return_budget_free_space_floor_waits_and_queue_wait_expires() {
+    let f = Fixture::new();
+    let mut config = large_config(&f);
+    config.free_space_floor_bytes = 4096;
+    let free = Arc::new(AtomicU64::new(Config::return_charge(134_217_728) + 4095));
+    let probe = free.clone();
+    config.free_space_probe = Arc::new(move |_| Ok(probe.load(Ordering::SeqCst)));
+    let runner = Runner::open(config).unwrap();
+    let (mut request, bytes) = chunked_request(&f, "printf x > one", &["one"]);
+    request.return_max_bytes = 134_217_728;
+    request.queue_wait_limit_s = 1;
+    f.submit(&runner, &request, &bytes);
+    runner.tick().unwrap();
+    assert!(runner.core.inner.lock().unwrap().jobs[&request.job_id]
+        .setup_ms
+        .is_none());
+    f.clock.fetch_add(1001, Ordering::SeqCst);
+    runner.tick().unwrap();
+    assert_eq!(
+        runner.withdraw(request.job_id).unwrap(),
+        WithdrawOutcome::Withdrawn
+    );
+    let refused = terminal(&runner, request.job_id).await;
+    assert!(matches!(
+        refused.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::QueueWaitExceeded
+        }
+    ));
+}
+
+fn verify_large_pages(runner: &Runner, request: &Run, expected: u64) -> usize {
+    let mut assembler = Some(ReturnAssembler::new(
+        &request.return_paths,
+        request.return_max_bytes,
+    ));
+    let mut cursor = 0;
+    let mut pages = 0;
+    let mut total = 0;
+    loop {
+        let page = runner.replay(request.job_id, cursor).unwrap();
+        assert!(!page.is_empty());
+        pages += 1;
+        let mut terminal = false;
+        for frame in page {
+            match frame {
+                Frame::Started { seq, .. } => cursor = seq + 1,
+                Frame::Output(output) => cursor = output.seq + 1,
+                Frame::ReturnChunk(chunk) => {
+                    let bytes = assembler.as_mut().unwrap().accept_chunk(&chunk).unwrap();
+                    assert!(bytes.iter().all(|byte| *byte == 0));
+                    total += bytes.len() as u64;
+                    cursor = chunk.seq + 1;
+                }
+                Frame::ReturnManifest(manifest) => {
+                    assert_eq!(manifest.total_bytes, expected);
+                    assert!(assembler
+                        .take()
+                        .unwrap()
+                        .finish(&manifest)
+                        .unwrap()
+                        .iter()
+                        .all(|file| file.is_returned()));
+                    cursor = manifest.seq + 1;
+                }
+                Frame::Terminal(t) => {
+                    assert_eq!(t.outcome, Outcome::Exit { code: 0 });
+                    terminal = true;
+                }
+                _ => {}
+            }
+        }
+        if terminal {
+            break;
+        }
+    }
+    assert_eq!(total, expected);
+    pages
+}
+
+#[tokio::test]
+async fn large_returns_ninety_mb_and_exact_ceiling_replay_across_pages_and_restart() {
+    for sizes in [[45_000_000u64, 45_000_000], [67_108_864, 67_108_864]] {
+        let f = Fixture::new();
+        let config = large_config(&f);
+        let runner = Runner::open(config.clone()).unwrap();
+        let command = format!(
+            "head -c {} /dev/zero > one; head -c {} /dev/zero > two",
+            sizes[0], sizes[1]
+        );
+        let (mut request, bytes) = chunked_request(&f, &command, &["one", "two"]);
+        request.return_max_bytes = RETURN_LARGE_MAX_BYTES_CAP;
+        f.submit(&runner, &request, &bytes);
+        runner.tick().unwrap();
+        terminal(&runner, request.job_id).await;
+        assert!(verify_large_pages(&runner, &request, sizes.iter().sum()) > 64);
+        drop(runner);
+        let runner = reopen(config);
+        assert!(verify_large_pages(&runner, &request, sizes.iter().sum()) > 64);
+    }
+}
+
+#[tokio::test]
+async fn return_reservation_waits_for_deletion_and_survives_restart_and_replay_lease() {
+    let f = Fixture::new();
+    let config = large_config(&f);
+    let runner = Runner::open(config.clone()).unwrap();
+    let (mut first, bytes) = chunked_request(&f, "printf x > one", &["one"]);
+    first.return_max_bytes = RETURN_LARGE_MAX_BYTES_CAP;
+    f.submit(&runner, &first, &bytes);
+    runner.tick().unwrap();
+    terminal(&runner, first.job_id).await;
+    assert_eq!(
+        runner.core.inner.lock().unwrap().jobs[&first.job_id].return_reserved_bytes,
+        Config::return_charge(RETURN_LARGE_MAX_BYTES_CAP)
+    );
+    drop(runner);
+    let runner = reopen(config);
+    let (mut second, bytes) = chunked_request(&f, "printf y > two", &["two"]);
+    second.return_max_bytes = RETURN_LARGE_MAX_BYTES_CAP;
+    second.queue_wait_limit_s = 7200;
+    f.submit(&runner, &second, &bytes);
+    runner.tick().unwrap();
+    assert!(runner.core.inner.lock().unwrap().jobs[&second.job_id]
+        .setup_ms
+        .is_none());
+    let log = runner.job_log(first.job_id);
+    let lease = log.lease(Vec::new());
+    let finished = runner.core.inner.lock().unwrap().jobs[&first.job_id]
+        .finished_ms
+        .unwrap();
+    f.clock
+        .store(finished + RETURN_RETENTION_MS, Ordering::SeqCst);
+    runner.maintenance().unwrap();
+    assert_ne!(
+        runner.core.inner.lock().unwrap().jobs[&first.job_id].return_reserved_bytes,
+        0
+    );
+    drop(lease);
+    runner.maintenance().unwrap();
+    assert_eq!(
+        runner.core.inner.lock().unwrap().jobs[&first.job_id].return_reserved_bytes,
+        0
+    );
+    runner.tick().unwrap();
+    terminal(&runner, second.job_id).await;
 }

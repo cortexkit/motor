@@ -663,6 +663,8 @@ the manifest at its original seq, with each returned entry turned into
 before the manifest; callers that set `return_chunked` accept it. The job
 record itself still lives for the usual 24 hours.
 
+The runner's `--return-budget-bytes` budget covers chunked returned files only; legacy `return_result` data keeps its existing 256 KiB cap and job-history retention.
+
 ck-motor lists `exec-remote-return/v2` next to v1, and a caller sets
 `return_chunked` only for a module that lists it. The runner advertises
 support with `return_chunked` in its Hello. A runner without it (an older

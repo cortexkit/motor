@@ -613,7 +613,7 @@ fn shared_cause(cause: Cause) -> ReturnPathsFailureCause {
 }
 
 /// Read exactly `size` bytes of `file` into chunk files, appending to
-/// `chunks`. A short read, or any byte past `size`, means the file changed.
+/// `chunks`. Metadata detects growth without reading beyond the admitted size.
 fn read_chunks(
     mut file: &File,
     size: u64,
@@ -646,11 +646,8 @@ fn read_chunks(
         });
         offset += length as u64;
     }
-    // One more byte, never more, shows growth while staying within the
-    // admitted size plus one.
-    let grew = !matches!(fill(&mut file, &mut [0u8; 1]), Ok(0));
     let resized = !file.metadata().is_ok_and(|m| m.len() == size);
-    if grew || resized {
+    if resized {
         return Ok(Read::Changed);
     }
     Ok(Read::Returned {
@@ -1304,6 +1301,41 @@ mod tests {
             Some((ReturnPathsFailureCause::OverCap, Some(1)))
         );
         assert_eq!(manifest.total_bytes, cap);
+    }
+
+    #[test]
+    fn large_return_over_cap_is_not_read_and_growth_never_reads_past_admitted_size() {
+        use std::io::Seek;
+        let dir = ScratchDir::new("return-large-read-bound");
+        let root = dir.join("workspace");
+        let job = dir.join("job");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&job).unwrap();
+        let cap = motor_protocol::RETURN_LARGE_MAX_BYTES_CAP;
+        let path = root.join("oversized");
+        File::create(&path).unwrap().set_len(cap + 1).unwrap();
+        let run = chunked(&root, &[&path], cap);
+        let collection = collect_chunked_with_root(&run, &job, open_directory(&root), |_| {
+            panic!("over-cap file was read")
+        });
+        assert!(collection.chunks.is_empty());
+        assert!(matches!(
+            collection.files[0].outcome,
+            ReturnManifestOutcome::Failed {
+                cause: ReturnPathsFailureCause::OverCap,
+                ..
+            }
+        ));
+
+        let mut file = File::open(&path).unwrap();
+        let chunks_dir = job.join("chunks");
+        fs::create_dir_all(&chunks_dir).unwrap();
+        let mut chunks = Vec::new();
+        assert!(matches!(
+            read_chunks(&file, cap, 0, &chunks_dir, &mut chunks).unwrap(),
+            Read::Changed
+        ));
+        assert_eq!(file.stream_position().unwrap(), cap);
     }
 
     #[test]
