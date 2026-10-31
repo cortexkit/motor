@@ -149,8 +149,10 @@ pub(crate) fn collect_authorized(config: &crate::Config, request: &Run, seq: u64
     collect_with_root(request, seq, collection_root(Some(config), request), || {})
 }
 
-/// Collection handed from VM shutdown to terminal persistence. Chunk bytes
-/// already live outside disposable staging; sequence numbers are assigned later.
+/// Collection handed from VM shutdown to the engine's finished job-record save.
+/// Chunk bytes already live outside disposable staging; sequence numbers are
+/// assigned when the engine saves the chunk metadata, manifest and terminal
+/// record together.
 #[cfg(unix)]
 pub(crate) enum Collection {
     Legacy(ReturnResult),

@@ -589,6 +589,8 @@ impl Runtime {
             std::thread::park_timeout(Duration::from_millis(5));
         }
         let mut owned = entry.owned.lock().unwrap();
+        // The change scan and returned-file collector trust the in-memory flag.
+        // A failed proof save must keep them from reading even a stopped VM's share.
         let mut proven = owned.record.clone();
         proven.stop_proven = true;
         proven.proof_version = RELEASE_PROOF_VERSION;
