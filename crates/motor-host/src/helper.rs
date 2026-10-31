@@ -6,6 +6,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 pub const FRAME_LIMIT: usize = 1_048_576;
 
@@ -543,7 +544,7 @@ pub(crate) fn exchange_control(
 }
 
 pub fn write_json(writer: &mut impl Write, frame: &Value) -> Result<()> {
-    let bytes = serde_json::to_vec(frame)?;
+    let bytes = Zeroizing::new(serde_json::to_vec(frame)?);
     ensure!(bytes.len() <= FRAME_LIMIT, "frame too large");
     writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
     writer.write_all(&bytes)?;
@@ -556,7 +557,7 @@ pub fn read_json(reader: &mut impl Read) -> Result<Value> {
         .context("read guest JSON frame header")?;
     let length = u32::from_be_bytes(length) as usize;
     ensure!(length > 0 && length <= FRAME_LIMIT, "invalid frame length");
-    let mut bytes = vec![0; length];
+    let mut bytes = Zeroizing::new(vec![0; length]);
     reader
         .read_exact(&mut bytes)
         .context("read guest JSON frame body")?;

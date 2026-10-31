@@ -1069,18 +1069,19 @@ impl Runtime {
 
     fn remote_cache_admin(&self, tenant: &str, request: &Value) -> Result<Value> {
         let op = request["op"].as_str().unwrap_or("");
-        if op == "set_remote_cache" {
+        let _credentials = if op == "set_remote_cache" {
             // Never format serde errors: unknown fields and invalid values can
             // contain credentials, even when decoding fails.
-            let valid =
-                serde_json::from_value::<motor_protocol::RemoteCacheRequest>(request.clone())
-                    .is_ok_and(|request| request.valid());
-            if !valid {
+            let credentials = motor_protocol::RemoteCacheRequest::parse(request);
+            if !credentials.as_ref().is_some_and(|request| request.valid()) {
                 return Ok(json!({"ok":false,"error":"remote_cache_invalid_request"}));
             }
+            credentials
         } else if request != &json!({"op":op}) {
             return Ok(json!({"ok":false,"error":"remote_cache_invalid_request"}));
-        }
+        } else {
+            None
+        };
         if op == "activate_runner_args" {
             return Ok(match self.control.wake(tenant, None) {
                 Ok(_) => json!({"ok":true}),
@@ -1105,6 +1106,28 @@ impl Runtime {
                 json!({"ok":false,"error":"remote_cache_unsupported"})
             }
             Ok(reply) if reply["ok"] == true => json!({"ok":true}),
+            Ok(reply)
+                if matches!(
+                    reply["error"].as_str(),
+                    Some(
+                        "remote_cache_installed_cleanup_failed"
+                            | "remote_cache_debris_cleanup_failed"
+                            | "remote_cache_debris_refused"
+                    )
+                ) =>
+            {
+                let directory = reply["directory"]
+                    .as_str()
+                    .filter(|name| {
+                        name.strip_prefix(".cache-provisioning-")
+                            .is_some_and(|suffix| motor_protocol::Uuid::parse_str(suffix).is_ok())
+                    })
+                    .unwrap_or("unrecognized .cache-provisioning-* entry");
+                json!({"ok":false,"error":reply["error"].as_str().unwrap(),"directory":directory,
+                    "installed":reply["error"] == "remote_cache_installed_cleanup_failed",
+                    "runner_healthy":reply["runner_healthy"].as_bool().unwrap_or(false),
+                    "runner_drained":reply["runner_drained"].as_bool().unwrap_or(true)})
+            }
             Ok(reply) if reply["error"] == "remote_cache_busy" => {
                 let cause = reply["cause"]
                     .as_str()
@@ -1921,7 +1944,7 @@ fn buffered_frame_ready(buffer: &[u8]) -> bool {
 pub async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Result<Value> {
     let n = reader.read_u32().await? as usize;
     ensure!(n > 0 && n <= FRAME_LIMIT, "invalid frame length");
-    let mut bytes = vec![0; n];
+    let mut bytes = zeroize::Zeroizing::new(vec![0; n]);
     reader.read_exact(&mut bytes).await?;
     Ok(serde_json::from_slice(&bytes)?)
 }
@@ -1956,16 +1979,21 @@ pub async fn admin_socket(runtime: Arc<Runtime>, path: &std::path::Path) -> Resu
         let runtime = runtime.clone();
         tokio::spawn(async move {
             let result = async {
-                let mut frame = read_frame(&mut stream).await?;
-                let result = if frame.get("tenant").is_some() {
-                    let tenant = frame["tenant"].as_str().context("tenant")?.to_owned();
+                let mut frame = motor_protocol::SecretJson::new(read_frame(&mut stream).await?);
+                let result = if frame.value().get("tenant").is_some() {
+                    let tenant = frame.value()["tenant"]
+                        .as_str()
+                        .context("tenant")?
+                        .to_owned();
                     frame
+                        .value_mut()
                         .as_object_mut()
                         .context("admin object")?
                         .remove("tenant");
-                    tokio::task::spawn_blocking(move || runtime.admin(&tenant, &frame)).await??
+                    tokio::task::spawn_blocking(move || runtime.admin(&tenant, frame.value()))
+                        .await??
                 } else {
-                    tokio::task::spawn_blocking(move || runtime.host_admin(&frame)).await??
+                    tokio::task::spawn_blocking(move || runtime.host_admin(frame.value())).await??
                 };
                 write_frame(&mut stream, &result).await
             }

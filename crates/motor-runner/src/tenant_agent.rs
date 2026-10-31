@@ -60,7 +60,7 @@ async fn read_json<S: AsyncRead + Unpin>(socket: &mut S) -> io::Result<Option<Va
     if len == 0 || len > MAX_FRAME_BYTES {
         return Err(io::Error::other("invalid agent frame length"));
     }
-    let mut data = vec![0; len];
+    let mut data = zeroize::Zeroizing::new(vec![0; len]);
     socket.read_exact(&mut data).await?;
     serde_json::from_slice(&data)
         .map(Some)
@@ -961,6 +961,7 @@ fn runner_command(
         "--service-type=exec",
         "--property=OOMScoreAdjust=-900",
         "--property=OOMPolicy=continue",
+        "--property=LimitCORE=0",
         "--setenv=CARGO_HOME=/tenant/cargo-home",
         "--property=PrivateMounts=yes",
         "--property=BindReadOnlyPaths=/run/motor-tenant-daemon/resolv.conf:/etc/resolv.conf",
@@ -1142,6 +1143,7 @@ mod tests {
         assert!(words.contains(&"--property=PrivateMounts=yes"));
         assert!(words.contains(&"--property=OOMScoreAdjust=-900"));
         assert!(words.contains(&"--property=OOMPolicy=continue"));
+        assert!(words.contains(&"--property=LimitCORE=0"));
         assert!(words.contains(
             &"--property=BindReadOnlyPaths=/run/motor-tenant-daemon/resolv.conf:/etc/resolv.conf"
         ));

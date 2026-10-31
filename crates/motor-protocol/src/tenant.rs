@@ -3,6 +3,7 @@
 use crate::Uuid;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Trusted control-channel provisioning, never a job frame. Deliberately not
 /// Debug: these strings contain credentials. Decode errors must be discarded.
@@ -10,13 +11,110 @@ use std::time::Duration;
 #[serde(deny_unknown_fields)]
 pub struct RemoteCacheRequest {
     pub op: String,
-    pub config: String,
-    pub read_key: String,
+    pub config: Zeroizing<String>,
+    pub read_key: Zeroizing<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub write_key: Option<String>,
+    pub write_key: Option<Zeroizing<String>>,
+}
+
+/// Owns a parsed administrative frame until its string allocations can be
+/// erased. It has no Debug implementation because malformed fields may also
+/// contain credentials. Borrow it for decoding rather than cloning its Value.
+pub struct SecretJson(serde_json::Value);
+
+impl SecretJson {
+    pub fn new(value: serde_json::Value) -> Self {
+        Self(value)
+    }
+    pub fn value(&self) -> &serde_json::Value {
+        &self.0
+    }
+    pub fn value_mut(&mut self) -> &mut serde_json::Value {
+        &mut self.0
+    }
+}
+
+impl Drop for SecretJson {
+    fn drop(&mut self) {
+        erase_json(&mut self.0);
+    }
+}
+
+fn erase_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => text.zeroize(),
+        serde_json::Value::Array(values) => values.iter_mut().for_each(erase_json),
+        serde_json::Value::Object(values) => {
+            for (mut key, mut value) in std::mem::take(values) {
+                key.zeroize();
+                erase_json(&mut value);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod secret_json_tests {
+    use super::*;
+
+    #[test]
+    fn administrative_frames_erase_nested_strings_and_malformed_field_names() {
+        let mut value =
+            serde_json::json!({"READ-SECRET":["WRITE-SECRET", {"nested":"another-secret"}]});
+        erase_json(&mut value);
+        assert_eq!(value, serde_json::json!({}));
+        let mut value = serde_json::json!(["READ-SECRET", ["WRITE-SECRET"]]);
+        erase_json(&mut value);
+        assert_eq!(value, serde_json::json!(["", [""]]));
+    }
+
+    #[test]
+    fn provisioning_requests_keep_each_file_in_a_zeroizing_buffer() {
+        let request: RemoteCacheRequest = serde_json::from_value(serde_json::json!({
+            "op":"set_remote_cache","config":"{}","read_key":"READ-SECRET","write_key":"WRITE-SECRET"
+        })).unwrap();
+        fn zeroizing(_: &Zeroizing<String>) {}
+        zeroizing(&request.config);
+        zeroizing(&request.read_key);
+        zeroizing(request.write_key.as_ref().unwrap());
+        assert!(request.valid());
+    }
 }
 
 impl RemoteCacheRequest {
+    /// Inspect types before copying: a serde type error can allocate an error
+    /// string quoting the credential it rejected.
+    pub fn parse(value: &serde_json::Value) -> Option<Self> {
+        let object = value.as_object()?;
+        if value["op"] != "set_remote_cache"
+            || object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "op" | "config" | "read_key" | "write_key"))
+        {
+            return None;
+        }
+        let config = value["config"].as_str()?;
+        let read_key = value["read_key"].as_str()?;
+        let write_key = match object.get("write_key") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(value.as_str()?),
+        };
+        if [Some(config), Some(read_key), write_key]
+            .into_iter()
+            .flatten()
+            .any(|file| file.is_empty() || file.len() > 64 * 1024)
+        {
+            return None;
+        }
+        Some(Self {
+            op: "set_remote_cache".into(),
+            config: config.to_owned().into(),
+            read_key: read_key.to_owned().into(),
+            write_key: write_key.map(|key| key.to_owned().into()),
+        })
+    }
+
     pub fn valid(&self) -> bool {
         self.op == "set_remote_cache"
             && [&self.config, &self.read_key]

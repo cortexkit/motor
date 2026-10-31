@@ -8,6 +8,8 @@ import shutil
 import socket
 import stat
 import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -1397,6 +1399,80 @@ class ProvisionTests(unittest.TestCase):
             return {"ok": True}
         p.set_remote_cache_files("a", p.read_remote_cache(self.root / "cache-input", SUB), recovered, lambda _line: None)
         self.assertTrue(json.loads((p.PROVISION / "a.json").read_text())["remote_cache"])
+
+    def test_set_remote_cache_disables_core_dumps_before_reading_source(self):
+        source = str(Path(__file__).with_name("provision.py"))
+        missing = str(self.root / "missing-source")
+        program = f'''import runpy, resource
+from pathlib import Path
+provision = runpy.run_path({source!r})
+real_setrlimit = resource.setrlimit
+calls = []
+def observed_setrlimit(kind, limits):
+    calls.append((kind, limits))
+    real_setrlimit(kind, limits)
+resource.setrlimit = observed_setrlimit
+try:
+    provision["set_remote_cache"]("a", Path({missing!r}))
+except (OSError, ValueError):
+    pass
+assert resource.getrlimit(resource.RLIMIT_CORE) == (0, 0)
+assert calls == [(resource.RLIMIT_CORE, (0, 0))]
+'''
+        subprocess.run([sys.executable, "-c", program], check=True, capture_output=True, text=True)
+
+    def test_set_remote_cache_refuses_all_suspend_artifacts_before_probe_and_keys(self):
+        _, home = self.existing_cache_tenant()
+        for name in ("key.json", "suspend.vmstate", "suspend.memory", "partial-snapshot"):
+            path = home / "suspend" / name
+            path.write_text("old-memory")
+            exchange = mock.Mock(side_effect=AssertionError("no probe or keys may be sent"))
+            with self.assertRaisesRegex(ValueError, "remote_cache_suspend_snapshot_exists"):
+                p.set_remote_cache_files("a", p.read_remote_cache(self.root / "cache-input", SUB), exchange, print)
+            exchange.assert_not_called()
+            self.assertEqual(path.read_text(), "old-memory")
+            path.unlink()
+
+    def test_set_remote_cache_rechecks_suspend_artifacts_after_probe_before_keys(self):
+        _, home = self.existing_cache_tenant()
+        calls = []
+        def exchange(frame):
+            calls.append(frame["op"])
+            if frame["op"] == "host_status":
+                return {"ok": True, "draining": True, "active_leases": 0}
+            (home / "suspend/suspend.memory").write_text("old-memory")
+            return {"ok": True}
+        with self.assertRaisesRegex(ValueError, "remote_cache_suspend_snapshot_exists"):
+            p.set_remote_cache_files("a", p.read_remote_cache(self.root / "cache-input", SUB), exchange, print)
+        self.assertEqual(calls, ["host_status", "remote_cache_probe"])
+
+    def test_set_remote_cache_reports_cleanup_outcomes_without_echoing_key_material(self):
+        _, home = self.existing_cache_tenant()
+        directory = ".cache-provisioning-00000000-0000-4000-8000-000000000001"
+        code = "remote_cache_installed_cleanup_failed"
+        def exchange(frame):
+            if frame["op"] == "host_status":
+                return {"ok": True, "draining": True, "active_leases": 0}
+            if frame["op"] == "set_remote_cache":
+                return {"ok": False, "error": code, "directory": directory,
+                        "runner_healthy": True, "detail": "READ-SECRET WRITE-SECRET"}
+            return {"ok": True}
+        with self.assertRaisesRegex(ValueError, "new key files installed; leftover cleanup failed") as error:
+            p.set_remote_cache_files("a", p.read_remote_cache(self.root / "cache-input", SUB), exchange, print)
+        self.assertIn(directory, str(error.exception))
+        self.assertNotIn("SECRET", str(error.exception))
+        self.assertFalse((home / "runner-args.staged").exists())
+        for code in ("remote_cache_debris_refused", "remote_cache_debris_cleanup_failed"):
+            with self.assertRaisesRegex(ValueError, f"{code}: no new key files installed") as error:
+                p.set_remote_cache_files("a", p.read_remote_cache(self.root / "cache-input", SUB), exchange, print)
+            self.assertIn(directory, str(error.exception))
+            self.assertNotIn("SECRET", str(error.exception))
+
+    def test_remote_cache_documentation_distinguishes_withdrawal_and_provider_revocation(self):
+        text = " ".join(Path(__file__).with_name("README.md").read_text().split())
+        self.assertIn("does not revoke it at the bucket", text)
+        self.assertIn("rotating or deleting it at the storage provider", text)
+        self.assertIn("A fill in progress makes the command refuse", text)
 
 
 if __name__ == "__main__":

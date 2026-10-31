@@ -122,8 +122,13 @@ stops its idle runner, atomically replaces the complete directory, and restarts
 it. The host never mounts the guest-written tenant disk. Runner arguments then
 activate through the existing staged-activation path, preserving the tenant
 disk and warm workspaces. The host stays drained until the operator undrains it.
-Rotation uses the same command; omit `write-key` from the source directory to
-withdraw it. If argument activation fails, the command attempts to restore the
+For rotation, run `provision.py set-remote-cache` again. A fill in progress makes the command refuse;
+retry after the fill finishes. Omitting `write-key` stops this tenant from using
+that key but does not revoke it at the bucket. Revoke the key by rotating or
+deleting it at the storage provider. The command also refuses an existing
+suspend snapshot, which can retain an old key in guest memory: wake the tenant
+to consume the snapshot, then retry while it remains running.
+If argument activation fails, the command attempts to restore the
 previous arguments and reports whether the runner recovered; newly delivered
 key files remain installed. Retry the command before undraining.
 

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import shutil
 import socket
 import stat
@@ -439,6 +440,7 @@ def cache_admin(request):
 
 
 def set_remote_cache(tenant, directory, exchange=None, output=print):
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     tenant = component(tenant)
     trusted(directory)
     if not directory.is_dir() or stat.S_IMODE(directory.stat().st_mode) != 0o700:
@@ -461,6 +463,7 @@ def set_remote_cache_files(tenant, files, exchange, output):
     placement drained and do not run host-hinted canaries during this command.
     """
     home = ROOT / "tenants" / tenant
+    refuse_cache_suspend(home)
     provision_path, registry_path = PROVISION / f"{tenant}.json", REGISTRY / f"{tenant}.json"
     original = json.loads(provision_path.read_text())
     old = checked(original, allow_old_headroom=True)
@@ -487,6 +490,7 @@ def set_remote_cache_files(tenant, files, exchange, output):
 
     if control("remote_cache_probe").get("ok") is not True:
         raise ValueError("remote_cache_unsupported: roll the guest image before provisioning")
+    refuse_cache_suspend(home)
     try:
         payload = {"config": files["config.json"].decode("utf-8"), "read_key": files["read-key"].decode("utf-8")}
         if "write-key" in files:
@@ -498,6 +502,15 @@ def set_remote_cache_files(tenant, files, exchange, output):
     manifest = remote_cache_manifest(files)
     files.clear()
     if applied.get("ok") is not True:
+        if applied.get("error") in ("remote_cache_installed_cleanup_failed", "remote_cache_debris_refused", "remote_cache_debris_cleanup_failed"):
+            directory = applied.get("directory")
+            if not isinstance(directory, str) or not re.fullmatch(r"\.cache-provisioning-[0-9a-fA-F-]{36}", directory):
+                directory = "unrecognized .cache-provisioning-* entry"
+            state = "runner healthy" if applied.get("runner_healthy") is True else "runner recovery unconfirmed"
+            code = applied["error"]
+            if code == "remote_cache_installed_cleanup_failed":
+                raise ValueError(f"{code}: new key files installed; leftover cleanup failed for {directory}; {state}; host remains drained; retry cleanup with set-remote-cache")
+            raise ValueError(f"{code}: no new key files installed; debris {directory}; {state}; host remains drained")
         cause = applied.get("cause")
         if applied.get("error") == "remote_cache_busy" and cause in {
                 "queued", "running", "fill", "starting", "reserved", "preparing", "admitting",
@@ -524,6 +537,14 @@ def set_remote_cache_files(tenant, files, exchange, output):
         state = "previous runner arguments restored and runner healthy" if restored else "previous arguments staged; runner recovery unconfirmed"
         raise ValueError(f"remote_cache_activation_failed: new key files installed; {state}; host remains drained; rerun set-remote-cache")
     output(f"{tenant}: remote cache files installed; --remote-cache true active; host remains drained")
+
+
+def refuse_cache_suspend(home):
+    """A full VM snapshot can retain a gateway's pre-rotation key in memory."""
+    suspend = home / "suspend"
+    info = suspend.lstat()
+    if not stat.S_ISDIR(info.st_mode) or any(suspend.iterdir()):
+        raise ValueError("remote_cache_suspend_snapshot_exists: wake the tenant to consume its snapshot, then retry while it remains running")
 
 
 def read_remote_cache(directory, sub):

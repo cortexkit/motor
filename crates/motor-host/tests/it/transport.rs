@@ -128,6 +128,14 @@ fn remote_cache_admin_requires_idle_host_and_redacts_every_refusal() {
     );
     let reply = runtime.admin("tenant", &json!({"op":"set_remote_cache","config":"ok","read_key":{"READ-SECRET":"WRITE-SECRET"}})).unwrap();
     assert_eq!(reply["error"], "remote_cache_invalid_request");
+    *fake.admin_reply.lock().unwrap() = Some(
+        json!({"ok":false,"error":"remote_cache_installed_cleanup_failed",
+        "directory":"READ-SECRET WRITE-SECRET","installed":true,"runner_healthy":true,"runner_drained":false}),
+    );
+    let reply = runtime.admin("tenant", &request).unwrap();
+    assert_eq!(reply["error"], "remote_cache_installed_cleanup_failed");
+    assert_eq!(reply["installed"], true);
+    assert!(!reply.to_string().contains("SECRET"));
     assert!(!fake.calls.lock().unwrap().join(" ").contains("SECRET"));
 }
 

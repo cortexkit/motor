@@ -7,10 +7,39 @@ use std::{
 };
 
 const DESTINATION: &str = "cache-provisioning";
+const DEBRIS_PREFIX: &str = ".cache-provisioning-";
+
+#[derive(Debug)]
+struct CleanupFailure {
+    directory: String,
+    installed: bool,
+    refused: bool,
+}
+
+impl CleanupFailure {
+    fn code(&self) -> &'static str {
+        if self.installed {
+            "remote_cache_installed_cleanup_failed"
+        } else if self.refused {
+            "remote_cache_debris_refused"
+        } else {
+            "remote_cache_debris_cleanup_failed"
+        }
+    }
+}
+
+impl std::fmt::Display for CleanupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code(), self.directory)
+    }
+}
+
+impl std::error::Error for CleanupFailure {}
 
 pub(super) fn parse(value: Value) -> io::Result<RemoteCacheRequest> {
-    let request: RemoteCacheRequest = serde_json::from_value(value)
-        .map_err(|_| io::Error::other("remote_cache_invalid_request"))?;
+    let value = SecretJson::new(value);
+    let request = RemoteCacheRequest::parse(value.value())
+        .ok_or_else(|| io::Error::other("remote_cache_invalid_request"))?;
     if !request.valid() {
         return Err(io::Error::other("remote_cache_invalid_request"));
     }
@@ -18,6 +47,12 @@ pub(super) fn parse(value: Value) -> io::Result<RemoteCacheRequest> {
 }
 
 pub(super) async fn apply(request: RemoteCacheRequest) -> io::Result<Value> {
+    if unsafe { libc::geteuid() != 0 || libc::getegid() != 0 } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "remote_cache_requires_root",
+        ));
+    }
     if snapshot::frozen() || !Path::new("/run/motor-tenant-generation").exists() {
         return Err(io::Error::other("remote_cache_not_attached"));
     }
@@ -80,6 +115,17 @@ where
     let resumed = control(Frame::Resume)
         .await
         .is_ok_and(|value| value["ok"] == true && value["resumed"] == true);
+    if let Some(failure) = result
+        .as_ref()
+        .err()
+        .and_then(|error| error.get_ref())
+        .and_then(|error| error.downcast_ref::<CleanupFailure>())
+    {
+        return Ok(
+            json!({"ok":false,"error":failure.code(),"directory":failure.directory,
+            "installed":failure.installed,"runner_healthy":healthy,"runner_drained":!resumed}),
+        );
+    }
     if result.is_err() || !healthy || !resumed {
         return Ok(
             json!({"ok":false,"error":"remote_cache_apply_failed","runner_drained":!resumed}),
@@ -115,7 +161,41 @@ fn install_before_swap(
     request: RemoteCacheRequest,
     before_swap: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
+    install_with_cleanup(parent, request, before_swap, remove_debris)
+}
+
+fn remove_debris(parent: &fs::File, name: &std::ffi::OsStr) -> io::Result<()> {
+    // Keep traversal anchored to the pinned parent. remove_dir_all does not
+    // follow nested symlinks or move deep subtrees outside this debris name.
+    fs::remove_dir_all(PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(name))
+}
+
+fn install_with_cleanup(
+    parent: &paths::Directory,
+    request: RemoteCacheRequest,
+    before_swap: impl FnOnce() -> io::Result<()>,
+    mut remove: impl FnMut(&fs::File, &std::ffi::OsStr) -> io::Result<()>,
+) -> io::Result<()> {
     let root = parent.fd_path();
+    let parent_file = fs::File::open(&root)?;
+    // Inspect every candidate before removing any. The production parent is
+    // root-owned and private; no tenant job can exchange these directory names.
+    let debris = fs::read_dir(&root)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<io::Result<Vec<_>>>()?;
+    let debris: Vec<_> = debris
+        .into_iter()
+        .filter(|name| {
+            name.as_encoded_bytes()
+                .starts_with(DEBRIS_PREFIX.as_bytes())
+        })
+        .collect();
+    for name in &debris {
+        checked_debris(&root, name, false)?;
+    }
+    for name in &debris {
+        cleanup(&root, &parent_file, name, false, &mut remove)?;
+    }
     let destination = root.join(DESTINATION);
     let existing = match fs::symlink_metadata(&destination) {
         Ok(_) => Some(paths::Directory::open(&destination, unsafe {
@@ -124,10 +204,10 @@ fn install_before_swap(
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
-    // Unique directories also leave crash debris unreferenced. Never reuse a
-    // partially written set. Only the canonical name is read after restart.
-    let temporary = root.join(format!(".cache-provisioning-{}", uuid::Uuid::now_v7()));
+    let temporary_name = format!("{DEBRIS_PREFIX}{}", uuid::Uuid::now_v7());
+    let temporary = root.join(&temporary_name);
     fs::DirBuilder::new().mode(0o700).create(&temporary)?;
+    let mut installed = false;
     let result = (|| {
         let directory = OpenOptions::new()
             .read(true)
@@ -163,15 +243,48 @@ fn install_before_swap(
         } else {
             fs::rename(&temporary, &destination)?;
         }
+        installed = true;
         fs::File::open(&root)?.sync_all()
     })();
     // After exchange this is the old directory; before exchange it is only the
     // incomplete new one. remove_dir_all does not traverse symlinks in either.
-    if temporary.exists() {
-        let _ = fs::remove_dir_all(&temporary);
-        let _ = fs::File::open(&root).and_then(|file| file.sync_all());
+    if existing.is_some() || !installed {
+        cleanup(
+            &root,
+            &parent_file,
+            std::ffi::OsStr::new(&temporary_name),
+            installed,
+            &mut remove,
+        )?;
     }
     result
+}
+
+fn cleanup_failure(name: &std::ffi::OsStr, installed: bool, refused: bool) -> io::Error {
+    io::Error::other(CleanupFailure {
+        directory: name.to_string_lossy().into_owned(),
+        installed,
+        refused,
+    })
+}
+
+fn checked_debris(root: &Path, name: &std::ffi::OsStr, installed: bool) -> io::Result<()> {
+    paths::Directory::open(&root.join(name), unsafe { libc::geteuid() })
+        .map(|_| ())
+        .map_err(|_| cleanup_failure(name, installed, true))
+}
+
+fn cleanup(
+    root: &Path,
+    parent: &fs::File,
+    name: &std::ffi::OsStr,
+    installed: bool,
+    remove: &mut impl FnMut(&fs::File, &std::ffi::OsStr) -> io::Result<()>,
+) -> io::Result<()> {
+    checked_debris(root, name, installed)?;
+    remove(parent, name)
+        .and_then(|()| parent.sync_all())
+        .map_err(|_| cleanup_failure(name, installed, false))
 }
 
 fn own(file: &fs::File) -> io::Result<()> {
@@ -211,9 +324,9 @@ mod tests {
     fn request(write: bool) -> RemoteCacheRequest {
         RemoteCacheRequest {
             op: "set_remote_cache".into(),
-            config: "configuration".into(),
-            read_key: "private-read-credential".into(),
-            write_key: write.then(|| "private-write-credential".into()),
+            config: "configuration".to_owned().into(),
+            read_key: "private-read-credential".to_owned().into(),
+            write_key: write.then(|| "private-write-credential".to_owned().into()),
         }
     }
 
@@ -233,7 +346,7 @@ mod tests {
         let old = fs::File::open(destination.join("read-key")).unwrap();
         let old_inode = old.metadata().unwrap().ino();
         let mut next = request(false);
-        next.read_key = "rotated".into();
+        next.read_key = "rotated".to_owned().into();
         install(&parent, next).unwrap();
         assert_ne!(
             old_inode,
@@ -275,7 +388,7 @@ mod tests {
         let destination = parent.fd_path().join(DESTINATION);
         let old_config = fs::read(destination.join("config.json")).unwrap();
         let mut next = request(false);
-        next.config = "new-configuration".into();
+        next.config = "new-configuration".to_owned().into();
         assert!(
             install_before_swap(&parent, next, || Err(io::Error::other("injected failure")))
                 .is_err()
@@ -286,6 +399,113 @@ mod tests {
         );
         assert!(destination.join("write-key").exists());
         assert_eq!(fs::read_dir(parent.fd_path()).unwrap().count(), 1);
+    }
+
+    fn debris_name() -> String {
+        format!("{DEBRIS_PREFIX}{}", uuid::Uuid::now_v7())
+    }
+
+    #[test]
+    fn remote_cache_sweeps_crash_debris_through_parent_without_following_nested_links() {
+        let scratch = ScratchDir::new("remote-cache-sweep");
+        let parent = parent(&scratch);
+        let root = parent.fd_path();
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), "untouched").unwrap();
+        let old = root.join(debris_name());
+        fs::create_dir(&old).unwrap();
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(old.join("write-key"), "old-credential").unwrap();
+        symlink(&outside, old.join("link")).unwrap();
+        install(&parent, request(false)).unwrap();
+        assert!(!old.exists());
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"untouched");
+        assert!(!root.join(DESTINATION).join("write-key").exists());
+    }
+
+    #[test]
+    fn remote_cache_refuses_link_or_file_debris_instead_of_removing_it() {
+        for link in [false, true] {
+            let scratch = ScratchDir::new("remote-cache-unsafe-debris");
+            let parent = parent(&scratch);
+            let root = parent.fd_path();
+            let outside = root.join("outside");
+            fs::create_dir(&outside).unwrap();
+            let debris = root.join(debris_name());
+            if link {
+                symlink(&outside, &debris).unwrap();
+            } else {
+                fs::write(&debris, "untouched").unwrap();
+            }
+            let error = install(&parent, request(false)).unwrap_err();
+            assert!(error
+                .to_string()
+                .starts_with("remote_cache_debris_refused:"));
+            assert!(fs::symlink_metadata(&debris).is_ok());
+            assert!(!root.join(DESTINATION).exists());
+        }
+    }
+
+    #[test]
+    #[ignore = "operator-only: root is required to create foreign-owned crash debris"]
+    fn remote_cache_refuses_crash_debris_owned_by_another_account() {
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            0,
+            "run this test as operator root"
+        );
+        let scratch = ScratchDir::new("remote-cache-foreign-debris");
+        let parent = parent(&scratch);
+        let debris = parent.fd_path().join(debris_name());
+        fs::create_dir(&debris).unwrap();
+        std::os::unix::fs::chown(&debris, Some(65534), Some(65534)).unwrap();
+        let error = install(&parent, request(false)).unwrap_err();
+        assert!(error
+            .to_string()
+            .starts_with("remote_cache_debris_refused:"));
+        assert_eq!(fs::symlink_metadata(&debris).unwrap().uid(), 65534);
+        assert!(!parent.fd_path().join(DESTINATION).exists());
+    }
+
+    #[tokio::test]
+    async fn remote_cache_reports_installed_set_and_leftover_name_if_old_cleanup_fails() {
+        let scratch = ScratchDir::new("remote-cache-cleanup-failure");
+        let parent = parent(&scratch);
+        install(&parent, request(true)).unwrap();
+        let reply = activate(
+            |frame| {
+                std::future::ready(Ok(match frame {
+                    Frame::DrainIfIdle => json!({"ok":true,"blocked_by":null,"count":0}),
+                    Frame::Status => json!({"ok":true,"health":{}}),
+                    Frame::Resume => json!({"ok":true,"resumed":true}),
+                    _ => unreachable!(),
+                }))
+            },
+            || async {
+                install_with_cleanup(
+                    &parent,
+                    request(false),
+                    || Ok(()),
+                    |_, _| Err(io::Error::other("READ-SECRET")),
+                )
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["error"], "remote_cache_installed_cleanup_failed");
+        assert_eq!(reply["installed"], true);
+        let name = reply["directory"].as_str().unwrap();
+        assert!(name.starts_with(DEBRIS_PREFIX));
+        assert!(parent.fd_path().join(name).join("write-key").exists());
+        assert!(!parent
+            .fd_path()
+            .join(DESTINATION)
+            .join("write-key")
+            .exists());
+        assert!(!reply.to_string().contains("SECRET"));
+        install(&parent, request(false)).unwrap();
+        assert!(!parent.fd_path().join(name).exists());
     }
 
     #[test]
