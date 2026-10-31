@@ -25,6 +25,27 @@ fn parses_real_locks_without_host_platform_filtering() {
     .is_empty());
 }
 
+#[test]
+fn workspace_optional_closure_uses_the_workspace_placement_not_only_the_root() {
+    let sri = "sha256-LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=";
+    let lock = serde_json::json!({
+        "lockfileVersion": 1,
+        "workspaces": {
+            "": {"optionalDependencies": {"native": "1.0.0"}},
+            "packages/plugin": {"name": "@app/plugin", "optionalDependencies": {"native": "2.0.0"}}
+        },
+        "packages": {
+            "@app/plugin": ["@app/plugin@workspace:packages/plugin"],
+            "native": ["native@1.0.0", "", {"os": "win32", "cpu": "x64"}, sri],
+            "@app/plugin/native": ["native@2.0.0", "", {"os": "win32", "cpu": "x64"}, sri]
+        }
+    })
+    .to_string();
+    let packages = read_lock("m/project", &lock).unwrap();
+    assert_eq!(packages.len(), 2);
+    assert!(packages.iter().all(|row| row.package.windows));
+}
+
 pub(super) fn package() -> Package {
     Package {
         placement: "@private/win".into(),

@@ -468,15 +468,39 @@ pub fn read_lock(project: &str, text: &str) -> Result<Vec<LockedPackage>, Refusa
         .filter(|map| map.contains_key(""))
         .ok_or_else(invalid)?;
     {
-        for workspace in workspaces.values() {
+        for (workspace_path, workspace) in workspaces {
             if !workspace.is_object() {
                 return Err(invalid());
             }
-            pending.extend(
-                edges(workspace)
-                    .into_iter()
-                    .map(|name| (String::new(), name)),
-            );
+            let resolution = format!("workspace:{workspace_path}");
+            let mut parents = if workspace_path.is_empty() {
+                vec![String::new()]
+            } else {
+                rows.iter()
+                    .filter_map(|(placement, row)| {
+                        resolution_parts(row[0].as_str()?)
+                            .filter(|(_, version)| *version == resolution)
+                            .map(|_| placement.clone())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if parents.is_empty() {
+                parents.push(
+                    workspace
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| valid_name(name))
+                        .ok_or_else(invalid)?
+                        .into(),
+                );
+            }
+            for parent in parents {
+                pending.extend(
+                    edges(workspace)
+                        .into_iter()
+                        .map(|name| (parent.clone(), name)),
+                );
+            }
         }
     }
     let mut reachable = std::collections::BTreeSet::new();
