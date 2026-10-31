@@ -30,10 +30,14 @@ pub(crate) struct Runtime {
     #[cfg(any(windows, test))]
     pub(super) slot_owners: super::slot::Owners,
     guest_agent_readiness: Mutex<Option<WindowsGuestAgentReadiness>>,
+    returns: Mutex<std::collections::BTreeMap<Uuid, crate::return_paths::Collection>>,
     #[cfg(test)]
     pub(crate) cache_timings: Mutex<std::collections::BTreeMap<Uuid, motor_winagent::CacheTimings>>,
 }
 impl Runtime {
+    pub(crate) fn take_returns(&self, id: Uuid) -> Option<crate::return_paths::Collection> {
+        self.returns.lock().unwrap().remove(&id)
+    }
     #[cfg(any(windows, test))]
     pub(super) fn finish_prepare<T>(
         &self,
@@ -797,6 +801,7 @@ fn materialize_attempt(
         source_commit: setup.request.snapshot_commit.clone(),
         env,
     };
+    let return_request = setup.request.clone();
     let thread_control = control.clone();
     let thread = std::thread::spawn(move || {
         *thread_control.worker.lock().unwrap() = Some(std::thread::current());
@@ -891,6 +896,32 @@ fn materialize_attempt(
                 Frame::BunPreparationFailed { refusal } => return Err(refusal.into()),
                 _ => return Err(invalid("expected TreeReceived")),
             }
+            let returning = !crate::caller_path::run(&return_request)
+                .caller_return_paths
+                .is_empty();
+            if returning {
+                let workspace = crate::caller_path::request(&return_request)
+                    .caller_workspace_key
+                    .text();
+                let paths = crate::caller_path::run(&return_request)
+                    .caller_return_paths
+                    .iter()
+                    .map(|path| {
+                        // An invalid relative name is deliberately sent as invalid,
+                        // so the guest reports a per-file Escape without opening it.
+                        path.strip_prefix(workspace)
+                            .and_then(|p| p.strip_prefix('/'))
+                            .unwrap_or(":")
+                            .to_owned()
+                    })
+                    .collect();
+                io.send(&Frame::RequestReturns {
+                    request: motor_winagent::returned::Request {
+                        paths,
+                        max_bytes: return_request.return_max_bytes,
+                    },
+                })?;
+            }
             ready_tx
                 .send(Ok(()))
                 .map_err(|_| invalid("Windows setup owner disappeared"))?;
@@ -926,16 +957,37 @@ fn materialize_attempt(
                 }
             };
             io.enter(Phase::Collect)?;
-            io.send(&Frame::Collect {})?;
-            let mut collected = Vec::new();
-            let deleted = loop {
-                match io.reply(&mut resources)? {
-                    Frame::Collected { bytes } => collected.extend(bytes),
-                    Frame::CollectEnd { deleted } => break deleted,
-                    _ => return Err(invalid("unexpected collect frame")),
+            if returning {
+                let job_directory = thread_config.state_dir().join("jobs").join(id.to_string());
+                let mut collection =
+                    crate::return_paths::StreamedCollection::new(&return_request, &job_directory)?;
+                io.send(&Frame::CollectReturns {})?;
+                loop {
+                    match io.reply(&mut resources)? {
+                        Frame::ReturnChunk { bytes } => collection.push(&bytes)?,
+                        Frame::ReturnFileEnd { outcome } => collection.end_file(outcome)?,
+                        Frame::ReturnEnd {} => break,
+                        _ => return Err(invalid("unexpected requested-file frame")),
+                    }
                 }
-            };
-            super::prep::store_collection(&thread_config, id, &collected, &deleted)?;
+                thread_config
+                    .windows_runtime
+                    .returns
+                    .lock()
+                    .unwrap()
+                    .insert(id, collection.finish()?);
+            } else {
+                io.send(&Frame::Collect {})?;
+                let mut collected = super::prep::LegacyCollection::new(&thread_config, id)?;
+                let deleted = loop {
+                    match io.reply(&mut resources)? {
+                        Frame::Collected { bytes } => collected.write_all(&bytes)?,
+                        Frame::CollectEnd { deleted } => break deleted,
+                        _ => return Err(invalid("unexpected collect frame")),
+                    }
+                };
+                collected.finish(&deleted)?;
+            }
             io.enter(Phase::Dismount)?;
             io.send(&Frame::Dismount {})?;
             let _dismounted = io.reply(&mut resources)?;

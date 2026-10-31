@@ -1207,13 +1207,83 @@ fn append(
     Ok(())
 }
 
+pub(crate) struct LegacyCollection<'a> {
+    config: &'a Config,
+    id: Uuid,
+    partial: PathBuf,
+    file: Option<fs::File>,
+    manifest_written: bool,
+    published: bool,
+}
+
+impl<'a> LegacyCollection<'a> {
+    pub(crate) fn new(config: &'a Config, id: Uuid) -> io::Result<Self> {
+        let directory = config.state_dir().join("jobs").join(id.to_string());
+        fs::create_dir_all(&directory)?;
+        let partial = directory.join("windows-changes.tar.partial");
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)?;
+        Ok(Self {
+            config,
+            id,
+            partial,
+            file: Some(file),
+            manifest_written: false,
+            published: false,
+        })
+    }
+
+    pub(crate) fn finish(mut self, deleted: &[String]) -> io::Result<()> {
+        let file = self.file.take().unwrap();
+        file.sync_all()?;
+        drop(file);
+        store_collection(self.config, self.id, &self.partial, deleted)?;
+        self.manifest_written = true;
+        let final_path = self.partial.with_file_name("windows-changes.tar");
+        crate::filesystem::rename(&self.partial, &final_path)?;
+        self.published = true;
+        crate::filesystem::sync_directory(final_path.parent().unwrap())
+    }
+}
+
+impl Write for LegacyCollection<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.file.as_mut().unwrap().write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.as_mut().unwrap().flush()
+    }
+}
+
+impl Drop for LegacyCollection<'_> {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if !self.published {
+            // A frame, disk or validation error must never leave an archive
+            // visible under the completed collection name.
+            for path in std::iter::once(self.partial.clone()).chain(
+                self.manifest_written
+                    .then(|| self.partial.with_file_name("windows-changes.json")),
+            ) {
+                if let Err(error) = fs::remove_file(&path) {
+                    if error.kind() != io::ErrorKind::NotFound {
+                        tracing::warn!(job_id = %self.id, %error, path = %path.display(), "cannot remove incomplete Windows source collection");
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn store_collection(
     config: &Config,
     id: Uuid,
-    bytes: &[u8],
+    archive: &Path,
     deleted: &[String],
 ) -> io::Result<()> {
-    motor_winagent::validate_collection(&mut io::Cursor::new(bytes))?;
+    motor_winagent::validate_collection(&mut fs::File::open(archive)?)?;
     for path in deleted {
         motor_winagent::validate_archive_path(path)?;
         if !path.starts_with("m/") {
@@ -1223,7 +1293,7 @@ pub(crate) fn store_collection(
         }
     }
     let mut paths = deleted.to_vec();
-    for entry in tar::Archive::new(io::Cursor::new(bytes)).entries()? {
+    for entry in tar::Archive::new(fs::File::open(archive)?).entries()? {
         let entry = entry?;
         let path = entry
             .path()?
@@ -1246,9 +1316,6 @@ pub(crate) fn store_collection(
     let job = config.state_dir().join("jobs").join(id.to_string());
     fs::create_dir_all(&job)
         .map_err(|error| super::vm::path_error("create collection directory", &job, error))?;
-    let tar_path = job.join("windows-changes.tar");
-    fs::write(&tar_path, bytes)
-        .map_err(|error| super::vm::path_error("write collection tree", &tar_path, error))?;
     let manifest_path = job.join("windows-changes.json");
     atomic_json(&manifest_path, &paths)
         .map_err(|error| super::vm::path_error("write collection manifest", &manifest_path, error))
@@ -1270,8 +1337,14 @@ mod trusted_cargo_config_tests {
             .append_link(&mut header, "m/escape", "/etc/shadow")
             .unwrap();
         let bytes = builder.into_inner().unwrap();
-        super::store_collection(&config, id, &bytes, &["m/deleted".into()]).unwrap();
         let job = config.state_dir().join("jobs").join(id.to_string());
+        let archive = job.join("windows-changes.tar");
+        let mut collection = super::LegacyCollection::new(&config, id).unwrap();
+        collection.write_all(&bytes).unwrap();
+        assert!(!archive.exists());
+        assert!(job.join("windows-changes.tar.partial").exists());
+        collection.finish(&["m/deleted".into()]).unwrap();
+        assert!(!job.join("windows-changes.tar.partial").exists());
         assert_eq!(
             std::fs::read(job.join("windows-changes.tar")).unwrap(),
             bytes
@@ -1282,9 +1355,60 @@ mod trusted_cargo_config_tests {
         assert_eq!(manifest, ["m/deleted", "m/escape"]);
         for path in ["../outside", "cargo-home/escape", "m/../escape", "m/a\\b"] {
             assert!(
-                super::store_collection(&config, Uuid::now_v7(), &bytes, &[path.into()]).is_err()
+                super::store_collection(&config, Uuid::now_v7(), &archive, &[path.into()]).is_err()
             );
         }
+    }
+
+    #[test]
+    fn legacy_collection_validates_before_publication_and_cleans_rejected_partial() {
+        let root = ScratchDir::new("windows-invalid-collection");
+        let config = Config::new(root.path().join("state"), "invalid");
+        let id = Uuid::now_v7();
+        let job = config.state_dir().join("jobs").join(id.to_string());
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        header.set_mode(0o644);
+        builder
+            .append_link(&mut header, "m/hardlink", "m/target")
+            .unwrap();
+        let mut collection = super::LegacyCollection::new(&config, id).unwrap();
+        collection
+            .write_all(&builder.into_inner().unwrap())
+            .unwrap();
+        assert!(job.join("windows-changes.tar.partial").exists());
+        assert!(!job.join("windows-changes.tar").exists());
+        assert!(!job.join("windows-changes.json").exists());
+        assert!(collection.finish(&[]).is_err());
+        assert!(
+            !job.join("windows-changes.tar").exists(),
+            "unvalidated archive was published"
+        );
+        assert!(!job.join("windows-changes.tar.partial").exists());
+        assert!(!job.join("windows-changes.json").exists());
+    }
+
+    #[test]
+    fn legacy_collection_interrupted_stream_removes_its_owned_partial() {
+        let root = ScratchDir::new("windows-interrupted-collection");
+        let config = Config::new(root.path().join("state"), "interrupted");
+        let id = Uuid::now_v7();
+        let job = config.state_dir().join("jobs").join(id.to_string());
+        let mut collection = super::LegacyCollection::new(&config, id).unwrap();
+        collection.write_all(b"interrupted archive").unwrap();
+        assert!(
+            super::LegacyCollection::new(&config, id).is_err(),
+            "partial creation must not overwrite a live stream"
+        );
+        assert_eq!(
+            fs::read(job.join("windows-changes.tar.partial")).unwrap(),
+            b"interrupted archive"
+        );
+        drop(collection);
+        assert!(!job.join("windows-changes.tar.partial").exists());
+        assert!(!job.join("windows-changes.tar").exists());
     }
     use super::*;
     use cortexkit_test_support::ScratchDir;

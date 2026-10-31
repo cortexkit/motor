@@ -793,7 +793,9 @@ impl Config {
         self.windows_instance() || self.macos_instance()
     }
     pub(crate) fn supports_returns(&self) -> bool {
-        self.backend == BackendKind::Host || (cfg!(unix) && self.macos_instance())
+        self.backend == BackendKind::Host
+            || self.windows_instance()
+            || (cfg!(unix) && self.macos_instance())
     }
     fn cleanup_pending(&self, id: Uuid) -> bool {
         #[cfg(unix)]
@@ -6390,7 +6392,10 @@ impl Runner {
             .filter(|job| {
                 job.return_reserved_bytes != 0
                     && job.terminal.is_some()
-                    && job.returned.as_ref().is_none_or(|r| r.expired)
+                    && job
+                        .returned
+                        .as_ref()
+                        .is_none_or(|r| r.expired || r.chunks.is_empty())
             })
             .map(|job| job.id)
             .collect();
@@ -6401,15 +6406,16 @@ impl Runner {
             };
             let mut job = {
                 let inner = self.core.inner.lock().unwrap();
-                if inner.starting.contains(&id)
-                    || inner.finalizing.contains(&id)
-                    || log.retention.lock().unwrap().readers != 0
-                {
-                    continue;
-                }
                 let Some(job) = inner.jobs.get(&id) else {
                     continue;
                 };
+                if inner.starting.contains(&id)
+                    || inner.finalizing.contains(&id)
+                    || (job.returned.as_ref().is_some_and(|r| !r.chunks.is_empty())
+                        && log.retention.lock().unwrap().readers != 0)
+                {
+                    continue;
+                }
                 job.clone()
             };
             let directory = self.record_path(id).parent().unwrap().to_owned();
@@ -9340,16 +9346,35 @@ impl Runner {
             }
         }
         let job_directory = self.record_path(id).parent().unwrap().to_owned();
-        #[cfg(unix)]
-        let staged_returns = if self.core.config.macos_instance() {
-            self.core.config.macos_runtime.take_returns(id).or_else(|| {
-                job.request
-                    .as_ref()
-                    .filter(|r| !paths::run(r).caller_return_paths.is_empty())
-                    .map(|request| crate::return_paths::unread(request, &job_directory))
-            })
+        let staged_returns = if self.core.config.windows_instance() {
+            self.core
+                .config
+                .windows_runtime
+                .take_returns(id)
+                .or_else(|| {
+                    job.request
+                        .as_ref()
+                        .filter(|r| !paths::run(r).caller_return_paths.is_empty())
+                        .map(|request| crate::return_paths::unread(request, &job_directory))
+                })
         } else {
-            None
+            #[cfg(unix)]
+            {
+                if self.core.config.macos_instance() {
+                    self.core.config.macos_runtime.take_returns(id).or_else(|| {
+                        job.request
+                            .as_ref()
+                            .filter(|r| !paths::run(r).caller_return_paths.is_empty())
+                            .map(|request| crate::return_paths::unread(request, &job_directory))
+                    })
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
         };
         let return_result = job
             .request
@@ -9358,6 +9383,7 @@ impl Runner {
                 !paths::run(r).caller_return_paths.is_empty()
                     && !r.return_chunked
                     && !self.core.config.macos_instance()
+                    && !self.core.config.windows_instance()
             })
             .map(|request| {
                 let seq = self.core.inner.lock().unwrap().jobs[&id].next_seq;
@@ -9370,6 +9396,7 @@ impl Runner {
                 !paths::run(r).caller_return_paths.is_empty()
                     && r.return_chunked
                     && !self.core.config.macos_instance()
+                    && !self.core.config.windows_instance()
             })
             .map(|request| {
                 crate::return_paths::collect_chunked_authorized(
@@ -9378,7 +9405,6 @@ impl Runner {
                     &job_directory,
                 )
             });
-        #[cfg(unix)]
         let (return_result, returned) = match staged_returns {
             Some(crate::return_paths::Collection::Legacy(result)) => (Some(result), None),
             Some(crate::return_paths::Collection::Chunked(collection)) => (None, Some(collection)),
@@ -9663,6 +9689,7 @@ impl Runner {
             self.log_remote_cache_totals(id);
             self.guard_build_folder(paths::request(&request).caller_workspace_key.text());
         }
+        self.release_return_reservations();
         self.prune_refs()?;
         Ok(())
     }

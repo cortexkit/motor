@@ -10,15 +10,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().skip(1).eq(["--build-info"]) {
         if cfg!(feature = "hyperv-runner") {
             println!(
-                "motor-winagent hyperv-runner agent_diag=3 transport=hvsock peer=parent nonce=dvd protocol=4"
+                "motor-winagent hyperv-runner agent_diag=3 transport=hvsock peer=parent nonce=dvd protocol={}",
+                motor_winagent::PROTOCOL_VERSION
             );
         } else if cfg!(feature = "hyperv-hvsock") {
             println!(
-                "motor-winagent hyperv-spike agent_diag=3 transport=hvsock peer=parent protocol=4"
+                "motor-winagent hyperv-spike agent_diag=3 transport=hvsock peer=parent protocol={}",
+                motor_winagent::PROTOCOL_VERSION
             );
         } else {
             println!(
-                "motor-winagent hyperv-spike agent_diag=3 transport=com partial_read=4096,250ms queue_config=0,2097152 protocol=4"
+                "motor-winagent hyperv-spike agent_diag=3 transport=com partial_read=4096,250ms queue_config=0,2097152 protocol={}",
+                motor_winagent::PROTOCOL_VERSION
             );
         }
         return Ok(());
@@ -47,7 +50,7 @@ mod guest {
         Command, Frame, Inventory, JOB_USER, PROTOCOL_VERSION, Peer, Protocol, SERVICE_NAME,
         Stream, cache_has_modify_grant,
         cache_steps::{CacheLimits, CacheReporter, CacheStep, watch_cache},
-        collect_changes,
+        collect_changes_to,
         environment::{encode_block, git_native_bin, read_user_environment},
         inventory, mapped_cwd, read_frame, unpack_tree, write_frame,
     };
@@ -1727,8 +1730,15 @@ mod guest {
         port: &mut Port,
         user: &User,
         command: &Command,
-    ) -> io::Result<()> {
-        if receive(protocol, rx, &port.stop)? != (Frame::Start {}) {
+    ) -> io::Result<Option<motor_winagent::returned::Request>> {
+        let mut gate = receive(protocol, rx, &port.stop)?;
+        let returns = if let Frame::RequestReturns { request } = gate {
+            gate = receive(protocol, rx, &port.stop)?;
+            Some(request)
+        } else {
+            None
+        };
+        if gate != (Frame::Start {}) {
             return Err(invalid("expected the execution gate"));
         }
         let mut job = Job::start(user, command, tx, port.stop.clone())?;
@@ -1784,7 +1794,7 @@ mod guest {
             },
         )?;
         job.stop_on_drop = false;
-        Ok(())
+        Ok(returns)
     }
 
     fn enable_privilege(name: &str) -> io::Result<()> {
@@ -1899,24 +1909,61 @@ mod guest {
             },
         )?;
         let (command, before) = stage(&mut protocol, &rx, &mut port, &user)?;
-        execute(&mut protocol, &rx, tx, &mut port, &user, &command)?;
-        if receive(&mut protocol, &rx, &port.stop)? != (Frame::Collect {}) {
-            return Err(invalid("expected collect"));
-        }
-        let (bytes, deleted) = {
+        let returns = execute(&mut protocol, &rx, tx, &mut port, &user, &command)?;
+        let collect = receive(&mut protocol, &rx, &port.stop)?;
+        if let Some(request) = returns {
+            if collect != (Frame::CollectReturns {}) {
+                return Err(invalid("expected requested-file collection"));
+            }
+            // Every pathname and read, including the workspace ancestors, runs
+            // with the job token. The service's SYSTEM token is never used.
             let _identity = user.impersonate()?;
-            collect_changes(Path::new(SOURCE_ROOT), &before)?
-        };
-        for chunk in bytes.chunks(CHUNK_BYTES) {
-            send(
-                &mut protocol,
-                &mut port,
-                &Frame::Collected {
-                    bytes: chunk.to_vec(),
-                },
+            motor_winagent::returned::collect(
+                Path::new(SOURCE_ROOT),
+                command
+                    .workspace
+                    .strip_prefix('/')
+                    .ok_or_else(|| invalid("invalid workspace"))?,
+                &request,
+                |frame| send(&mut protocol, &mut port, &frame),
             )?;
+        } else {
+            if collect != (Frame::Collect {}) {
+                return Err(invalid("expected collect"));
+            }
+            struct Chunks<'a> {
+                protocol: &'a mut Protocol,
+                port: &'a mut Port,
+            }
+            impl Write for Chunks<'_> {
+                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                    let n = bytes.len().min(CHUNK_BYTES);
+                    send(
+                        self.protocol,
+                        self.port,
+                        &Frame::Collected {
+                            bytes: bytes[..n].to_vec(),
+                        },
+                    )?;
+                    Ok(n)
+                }
+                fn flush(&mut self) -> io::Result<()> {
+                    Ok(())
+                }
+            }
+            let deleted = {
+                let _identity = user.impersonate()?;
+                collect_changes_to(
+                    Path::new(SOURCE_ROOT),
+                    &before,
+                    Chunks {
+                        protocol: &mut protocol,
+                        port: &mut port,
+                    },
+                )?
+            };
+            send(&mut protocol, &mut port, &Frame::CollectEnd { deleted })?;
         }
-        send(&mut protocol, &mut port, &Frame::CollectEnd { deleted })?;
         if receive(&mut protocol, &rx, &port.stop)? != (Frame::Dismount {}) {
             return Err(invalid("expected dismount"));
         }

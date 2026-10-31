@@ -227,7 +227,7 @@ async fn platform_connect(socket: &Path, kind: BackendKind, started: bool) -> Un
                 .as_slice()
         }
         (BackendKind::WindowsVm, true) => {
-            br#"{"type":"hello","protocol_version":1,"started":true,"platforms":["windows"]}"#
+            br#"{"type":"hello","protocol_version":1,"started":true,"return_paths":true,"return_chunked":true,"platforms":["windows"]}"#
                 .as_slice()
         }
         (BackendKind::MacosVm, true) => br#"{"type":"hello","protocol_version":1,"started":true,"return_paths":true,"return_chunked":true,"platforms":["macos"]}"#.as_slice(),

@@ -33,6 +33,8 @@ mod local_path;
 pub(crate) mod prep;
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) mod prep_error;
+#[cfg(test)]
+pub(crate) mod returned_tests;
 #[cfg(any(windows, test))]
 mod slot;
 #[cfg(test)]

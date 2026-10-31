@@ -591,3 +591,93 @@ async fn return_reservation_waits_for_deletion_and_survives_restart_and_replay_l
     runner.tick().unwrap();
     terminal(&runner, second.job_id).await;
 }
+
+#[tokio::test]
+async fn return_empty_terminal_collection_releases_its_reservation_without_retention_wait() {
+    let f = Fixture::new();
+    let runner = Runner::open(large_config(&f)).unwrap();
+    let (mut request, bytes) = chunked_request(&f, "true", &["missing"]);
+    request.return_max_bytes = RETURN_LARGE_MAX_BYTES_CAP;
+    f.submit(&runner, &request, &bytes);
+    runner.tick().unwrap();
+    terminal(&runner, request.job_id).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if runner.core.inner.lock().unwrap().jobs[&request.job_id].return_reserved_bytes == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("empty terminal return reservation was not released at completion");
+    let stored: Job = read_json(&runner.record_path(request.job_id)).unwrap();
+    assert_eq!(stored.return_reserved_bytes, 0);
+    let returned = stored.returned.as_ref().unwrap();
+    assert!(
+        !returned.expired,
+        "metadata-only failures must remain replayable"
+    );
+    assert!(returned.chunks.is_empty());
+    assert_eq!(
+        returned.manifest.files[0].cause(),
+        Some(&ReturnPathsFailureCause::Missing)
+    );
+    let directory = runner
+        .record_path(request.job_id)
+        .parent()
+        .unwrap()
+        .to_owned();
+    assert!(!directory.join(&returned.directory).exists());
+    assert!(runner.replay(request.job_id, 0).unwrap().iter().any(|frame| matches!(frame, Frame::ReturnManifest(manifest) if manifest.files[0].cause() == Some(&ReturnPathsFailureCause::Missing))));
+}
+
+#[test]
+fn return_empty_reservation_waits_for_orphan_deletion_but_not_metadata_replay() {
+    let f = Fixture::new();
+    let runner = Runner::open(large_config(&f)).unwrap();
+    let (mut request, _) = chunked_request(&f, "true", &["missing"]);
+    request.return_max_bytes = RETURN_LARGE_MAX_BYTES_CAP;
+    let id = request.job_id;
+    let directory = runner.record_path(id).parent().unwrap().to_owned();
+    fs::create_dir_all(&directory).unwrap();
+    let crate::return_paths::Collection::Chunked(collection) =
+        crate::return_paths::unread(&request, &directory)
+    else {
+        panic!("expected chunked collection");
+    };
+    let empty_directory = directory.join(&collection.directory);
+    fs::create_dir(&empty_directory).unwrap();
+    let mut job = Job::new(id, Some(request), f.clock.load(Ordering::SeqCst), 0, 4);
+    job.returned = Some(collection.commit(id, &mut job.next_seq));
+    job.return_reserved_bytes = Config::return_charge(RETURN_LARGE_MAX_BYTES_CAP);
+    job.terminal(Outcome::Exit { code: 0 }, f.clock.load(Ordering::SeqCst));
+    runner.save(&job).unwrap();
+    runner.core.inner.lock().unwrap().jobs.insert(id, job);
+    let blocker = directory.join("returned-blocker");
+    fs::write(&blocker, "unindexed payload").unwrap();
+    let log = runner.job_log(id);
+    let _metadata_reader = log.lease(Vec::new());
+    runner.release_return_reservations();
+    assert!(
+        !empty_directory.exists(),
+        "empty referenced directories must be removed immediately"
+    );
+    assert!(
+        blocker.exists(),
+        "a file cannot be removed by directory cleanup"
+    );
+    assert_ne!(
+        runner.core.inner.lock().unwrap().jobs[&id].return_reserved_bytes,
+        0
+    );
+    fs::remove_file(blocker).unwrap();
+    runner.release_return_reservations();
+    assert_eq!(
+        runner.core.inner.lock().unwrap().jobs[&id].return_reserved_bytes,
+        0
+    );
+    let stored: Job = read_json(&runner.record_path(id)).unwrap();
+    assert_eq!(stored.return_reserved_bytes, 0);
+    assert!(!stored.returned.unwrap().expired);
+}
