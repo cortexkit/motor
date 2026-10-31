@@ -2577,6 +2577,7 @@ impl Motor {
                     if terminal.ran == Some(Ran::None)
                         && matches!(&terminal.outcome, Outcome::RefusedBeforeStart { reason }
                             if *reason == RefusalReason::Unreachable
+                                || (*reason == RefusalReason::RunnerFull && self.has_next_windows_runner(id))
                                 || (matches!(reason, RefusalReason::RunnerFull | RefusalReason::WorkspaceSetupFailed)
                                     && windows_slot_busy(terminal.refusal_detail.as_deref())))
                         && !self.pending(id)
@@ -2929,7 +2930,8 @@ impl Motor {
             .and_then(Result::ok);
             samples.push(
                 serde_json::json!({"name": name, "reachable": status.is_some(),
-                "busy": status.as_ref().map(|s| windows_busy(s, max)), "max_concurrent": max}),
+                "busy": status.as_ref().map(|s| windows_busy(s, max)), "max_concurrent": max,
+                "admission_blocked": status.as_ref().and_then(|s| s.health.as_ref()).and_then(|h| h.admission_blocked.as_deref())}),
             );
         }
         samples
@@ -3129,10 +3131,14 @@ fn windows_slot_busy(detail: Option<&str>) -> bool {
 
 fn windows_busy(status: &RunnerStatusReply, max_concurrent: usize) -> bool {
     status
-        .running_jobs
-        .len()
-        .saturating_add(status.queue_depth as usize)
-        >= max_concurrent
+        .health
+        .as_ref()
+        .is_some_and(|health| health.admission_blocked.is_some())
+        || status
+            .running_jobs
+            .len()
+            .saturating_add(status.queue_depth as usize)
+            >= max_concurrent
         || status.health.as_ref().is_some_and(
             |h| matches!((h.permits_held, h.permits_cap), (Some(held), Some(cap)) if held >= cap),
         )

@@ -61,6 +61,7 @@ foreach ($directory in @('bin','baselines','vm\jobs','vm\caches','vm\cache-locks
 Protect-RunnerPath "$Root\state" $nativeLogPath
 Protect-RunnerPath "$Root\state\ally" $nativeLogPath
 Protect-RunnerPath "$Root\state\ally\local-registry-cache" $nativeLogPath
+Close-RunnerQualificationGate $Root
 Protect-RunnerPath "$Root\staging" $nativeLogPath
 Copy-Item "$Bundle\bin\*" "$Root\bin" -Recurse
 Copy-Item "$Bundle\prep-toolchain" $Root -Recurse
@@ -240,9 +241,11 @@ $descriptor.DiscretionaryAcl.InsertAce($descriptor.DiscretionaryAcl.Count, $ace)
 $updatedSddl = $descriptor.GetSddlForm([Security.AccessControl.AccessControlSections]::All)
 $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('sdset', 'MotorRunner', $updatedSddl) -Operation 'set runner service security descriptor' -LogPath $nativeLogPath
 New-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\MotorRunner' -Name Environment -PropertyType MultiString -Value $serviceDefinition.environment -Force | Out-Null
-$null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('failure', 'MotorRunner', 'reset=', '86400', 'actions=', 'restart/5000/restart/15000/restart/60000') -Operation 'configure runner service recovery' -LogPath $nativeLogPath
-$null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('failureflag', 'MotorRunner', '1') -Operation 'enable runner recovery on service failure' -LogPath $nativeLogPath
-if (-not $NoStart) { Start-Service MotorRunner }
+Set-RunnerServiceRecovery $nativeLogPath
+if (-not $NoStart) {
+    Assert-RunnerQualificationCapable $Root
+    Start-Service MotorRunner
+}
 Write-Host "EVIDENCE sealed-parent SHA256=$parentHash path=$parent"
 Write-Host 'Installed with one slot, AC-only admission. Fleet routing remains disabled until qualification evidence is reviewed.'
 Get-Content 'C:\ProgramData\ssh\ssh_host_ed25519_key.pub'

@@ -100,6 +100,42 @@ fn windows_aggregates_all_endpoints_without_names_or_limits() {
 }
 
 #[test]
+fn windows_health_explains_qualification_hold_without_exposing_endpoint_names() {
+    let now = Instant::now();
+    let mut cache = HealthCache::default();
+    cache.config.windows_runner_instance = Some("windows".into());
+    cache.config.windows_runner_state_root = Some("state".into());
+    cache.update(true, now);
+    cache.windows = vec![
+        json!({"name": "private-endpoint", "reachable": true, "busy": true,
+        "admission_blocked": "runner awaiting qualification"}),
+    ];
+    let report = cache.report(now);
+    assert_eq!(
+        report.metrics.as_ref().unwrap()["platforms"]["windows"]["status"],
+        "unavailable"
+    );
+    assert!(report
+        .detail
+        .as_ref()
+        .unwrap()
+        .contains("runner awaiting qualification"));
+    assert!(!report.detail.unwrap().contains("private-endpoint"));
+    cache
+        .windows
+        .push(json!({"reachable": true, "busy": false}));
+    let report = cache.report(now);
+    assert_eq!(
+        report.metrics.as_ref().unwrap()["platforms"]["windows"]["status"],
+        "available"
+    );
+    assert!(report
+        .detail
+        .unwrap()
+        .contains("runner awaiting qualification"));
+}
+
+#[test]
 fn macos_availability_uses_its_own_sample_and_reports_missing_configuration() {
     let now = Instant::now();
     let mut cache = HealthCache::default();

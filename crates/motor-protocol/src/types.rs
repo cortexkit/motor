@@ -200,6 +200,9 @@ pub struct WindowsGuestAgentReadiness {
 /// usage is rebuilt from retained records.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunnerHealth {
+    /// A durable admission hold; absent when ordinary jobs may be admitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_blocked: Option<String>,
     pub runner_version: String,
     pub since_ms: u64,
     pub window_minutes: u32,

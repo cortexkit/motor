@@ -59,6 +59,8 @@ mod nested_workspaces;
 mod platform_refusal;
 #[path = "tests/publication.rs"]
 mod publication;
+#[path = "tests/qualification_gate.rs"]
+mod qualification_gate;
 #[path = "tests/refusals.rs"]
 mod refusals;
 #[cfg(target_os = "linux")]

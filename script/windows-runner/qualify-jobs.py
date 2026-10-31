@@ -62,7 +62,7 @@ class Channel:
         self.log_path = log
         self.log = log.open("wb")
         try:
-            self.process = subprocess.Popen([str(runner), "connect", "--instance", "ally", "--state-root", str(root / "state")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log)
+            self.process = subprocess.Popen([str(runner), "connect", "--instance", "ally-qualification", "--state-root", str(root / "state")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log)
         except Exception:
             self.log.close()
             raise

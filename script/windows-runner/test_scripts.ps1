@@ -79,6 +79,19 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         if (-not $ScratchRoot) { $ScratchRoot = Join-Path (Get-Location).Path 'target\scratch' }
         $fixture = Join-Path $ScratchRoot ('motor-update-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $fixture -Force | Out-Null
+        $script:updateStartMode = 'auto'
+        function Set-Service {
+            param([string]$Name, [string]$StartupType)
+            if ($Name -cne 'MotorRunner' -or $StartupType -cne 'Disabled') { throw 'Unexpected fixture service configuration' }
+            $script:updateStartMode = 'disabled'
+        }
+        $capabilityProbe = Join-Path $fixture 'capability-probe'
+        New-Item -ItemType Directory -Path "$capabilityProbe\bin" -Force | Out-Null
+        [IO.File]::WriteAllText("$capabilityProbe\bin\motor-runner.exe", 'not-an-executable')
+        $capabilityFailure = $null
+        try { Assert-RunnerQualificationCapable $capabilityProbe } catch { $capabilityFailure = [string]$_ }
+        if ($capabilityFailure -notmatch 'cannot gate fleet admission' -or $capabilityFailure -notmatch 'Set-Service -Name MotorRunner -StartupType Automatic; Start-Service -Name MotorRunner' -or $script:updateStartMode -cne 'disabled') { throw "FAIL non-runnable-binary-has-no-gate-capability: $capabilityFailure" }
+        Write-Host 'PASS non-runnable-binary-has-no-gate-capability'
         $script:updateServiceState = 'Running'
         $script:updateStops = 0
         $script:updateStarts = 0
@@ -90,12 +103,32 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         $script:updateReady = $true
         $script:updateRoot = ''
         $script:updateDefinition = $null
+        $script:updateUnsupportedOld = $false
+        # The payload files stand in for binaries. Only their version response is
+        # simulated; filesystem protection and marker writes use the real helpers.
+        function Get-RunnerQualificationGateVersion([string]$Root) {
+            if ($script:updateUnsupportedOld -and [IO.File]::ReadAllText("$Root\bin\motor-runner.exe") -ceq 'old-runner') { return '' }
+            return 'qualification-gate-v1'
+        }
         function Import-Module([string]$Name) { if ($Name -cne 'Hyper-V') { throw "Unexpected fixture module $Name" } }
         function Get-VM { return $script:updateVms }
         function Get-Service { param([string]$Name) if ($Name -cne 'MotorRunner') { throw 'Unexpected fixture service' }; return [pscustomobject]@{Status=$script:updateServiceState} }
         function Stop-RunnerUpdateService { $script:updateStops++; $script:updateServiceState = 'Stopped' }
+        $nativeFixtureCommand = ${function:Invoke-RunnerNative}
+        $script:updateRecoveryCalls = [Collections.Generic.List[object]]::new()
+        function Invoke-RunnerNative {
+            param([string]$FilePath, [string[]]$ArgumentList, [string]$Operation, [string]$LogPath, [int]$TimeoutSeconds = 180)
+            if ([IO.Path]::GetFileName($FilePath) -ieq 'sc.exe') {
+                if ($Operation -notin @('configure runner service recovery', 'enable runner recovery on service failure')) { throw "Unexpected fixture SCM operation: $Operation" }
+                $script:updateRecoveryCalls.Add($ArgumentList)
+                return [pscustomobject]@{exit_code=0;stdout='';stderr=''}
+            }
+            & $nativeFixtureCommand @PSBoundParameters
+        }
         function Start-Service {
             param([string]$Name)
+            if (-not (Test-Path -LiteralPath "$script:updateRoot\state\ally\qualification-required")) { throw 'FAIL update-started-without-qualification-gate' }
+            if ($script:updateStartMode -eq 'disabled') { throw 'FAIL update-started-disabled-service' }
             $script:updateStarts++
             if ($script:updateFailNew -and [IO.File]::ReadAllText("$script:updateRoot\bin\motor-runner.exe") -ceq 'new-runner') { throw 'fixture new service failed to start' }
             $script:updateServiceState = 'Running'
@@ -104,10 +137,13 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
             return [pscustomobject]@{running_jobs=$script:updateJobs; queue_depth=$script:updateQueue; health=[pscustomobject]@{windows_guest_agent=[pscustomobject]@{ready=$script:updateReady}}}
         }
         function Get-RunnerUpdateServiceDefinition { return $script:updateDefinition }
-        function Set-RunnerUpdateServiceDefinition($Definition, [string]$LogPath) { $script:updateSets++; $script:updateDefinition = $Definition }
-        $checks = 0
+        function Set-RunnerUpdateServiceDefinition($Definition, [string]$LogPath) {
+            $script:updateSets++; $script:updateDefinition = $Definition
+            $script:updateStartMode = $Definition.start
+        }
+        $checks = 1
         try {
-            foreach ($case in @('vm-present','job-present','queue-present','agent-mismatch','checksum-mismatch','swap','start-failure','readiness-failure','manual-rollback','metrics-preserve','metrics-replace','metrics-disable')) {
+            foreach ($case in @('vm-present','job-present','queue-present','agent-mismatch','checksum-mismatch','swap','recover-disabled','start-failure','legacy-start-failure','readiness-failure','manual-rollback','legacy-manual-rollback','metrics-preserve','metrics-replace','metrics-disable')) {
                 if ($UpdateCase -and $case -cne $UpdateCase) { continue }
                 $caseRoot = Join-Path $fixture $case
                 $installed = Join-Path $caseRoot 'installed'
@@ -116,6 +152,8 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
                 $nativeLog = Join-Path $caseRoot 'fixture-native.jsonl'
                 Protect-RunnerPath $installed $nativeLog
                 Protect-RunnerPath "$installed\bin" $nativeLog
+                Protect-RunnerPath "$installed\state" $nativeLog
+                Protect-RunnerPath "$installed\state\ally" $nativeLog
                 # Stand-in for the SSH bridge account's read grant, which update must
                 # keep. Real icacls refuses a SID that no account maps to (exit 1332),
                 # so use the built-in Guests group: always present, otherwise absent here.
@@ -147,11 +185,15 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
                 $binAcl = (Get-Acl -LiteralPath "$installed\bin").Sddl
                 $script:updateRoot = $installed
                 $script:updateServiceState = 'Running'
+                $script:updateStartMode = 'auto'
                 $script:updateStops = 0; $script:updateStarts = 0; $script:updateSets = 0
                 $script:updateVms = @(); $script:updateJobs = @(); $script:updateQueue = 0
-                $script:updateFailNew = $case -eq 'start-failure'
+                $script:updateFailNew = $case -in @('start-failure','legacy-start-failure')
+                $script:updateUnsupportedOld = $case -like 'legacy-*'
                 $script:updateReady = $true
                 $script:updateDefinition = [pscustomobject]@{binary='old-service-command';display_name='old-service';start='auto';dependencies=@('vmms');environment=@('HOME=old-home')}
+                $script:updateRecoveryCalls.Clear()
+                if ($case -eq 'recover-disabled') { $script:updateServiceState = 'Stopped'; $script:updateStartMode = 'disabled'; $script:updateDefinition.start = 'disabled' }
                 if ($case -like 'metrics-*') { $script:updateDefinition.binary += ' --metrics-push --metrics-endpoint https://old.example --metrics-host-id old-monitor' }
                 function Get-RunnerUpdateStatus {
                     return [pscustomobject]@{running_jobs=$script:updateJobs; queue_depth=$script:updateQueue; health=[pscustomobject]@{windows_guest_agent=[pscustomobject]@{ready=$script:updateReady}}}
@@ -179,12 +221,15 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
                         'checksum-mismatch' { 'Release hash mismatch: bin/motor-runner.exe' }
                     }
                     if ($failure -notmatch $expected -or $script:updateStops -or $script:updateStarts -or $script:updateSets -or (Test-Path -LiteralPath "$installed\payload-next") -or (Test-Path -LiteralPath "$installed\payload-backup") -or [IO.File]::ReadAllText("$installed\bin\motor-runner.exe") -cne 'old-runner') { throw "FAIL update-$case-refuses-before-writes: $failure" }
+                } elseif ($case -eq 'legacy-start-failure') {
+                    if ($failure -notmatch 'cannot gate fleet admission' -or $failure -notmatch 'Start-Service -Name MotorRunner' -or $script:updateServiceState -cne 'Stopped' -or $script:updateStartMode -cne 'disabled' -or $script:updateStarts -ne 1 -or [IO.File]::ReadAllText("$installed\bin\motor-runner.exe") -cne 'old-runner') { throw "FAIL update-legacy-rollback-left-stopped: $failure" }
                 } elseif ($case -in @('start-failure','readiness-failure')) {
                     $expected = if ($case -eq 'start-failure') { 'fixture new service failed to start' } else { 'did not report ready' }
                     if ($failure -notmatch $expected -or $failure -notmatch 'previous payload restored' -or $script:updateStarts -ne 2 -or $script:updateServiceState -cne 'Running' -or $script:updateDefinition.binary -cne 'old-service-command' -or [IO.File]::ReadAllText("$installed\bin\motor-runner.exe") -cne 'old-runner' -or [IO.File]::ReadAllText("$installed\bin\hyperv.ps1") -cne 'old-script') { throw "FAIL update-$case-rolls-back: $failure" }
                 } else {
                     if ($failure -or [IO.File]::ReadAllText("$installed\bin\motor-runner.exe") -cne 'new-runner' -or [IO.File]::ReadAllText("$installed\bin\hyperv.ps1") -cne 'new-script' -or [IO.File]::ReadAllText("$installed\payload-previous\bin\motor-runner.exe") -cne 'old-runner' -or $script:updateServiceState -cne 'Running' -or $script:updateDefinition.binary -notlike '*motor-runner.exe* service *') { throw "FAIL update-$case-swap: $failure" }
                     if ((Get-Acl -LiteralPath "$installed\bin").Sddl -cne $binAcl) { throw "FAIL update-$case-preserves-bridge-acl" }
+                    if ($script:updateStartMode -cne 'auto' -or $script:updateRecoveryCalls.Count -ne 2 -or ($script:updateRecoveryCalls[0] -join ' ') -cne 'failure MotorRunner reset= 86400 actions= restart/5000/restart/15000/restart/60000' -or ($script:updateRecoveryCalls[1] -join ' ') -cne 'failureflag MotorRunner 1') { throw "FAIL update-$case-restores-automatic-start-and-recovery" }
                     if ($case -eq 'metrics-preserve' -and -not $script:updateDefinition.binary.EndsWith(' --metrics-push --metrics-endpoint https://old.example --metrics-host-id old-monitor')) { throw 'FAIL update-metrics-preserve' }
                     if ($case -eq 'metrics-replace' -and -not $script:updateDefinition.binary.EndsWith(' --metrics-push --metrics-endpoint https://new.example --metrics-host-id new-monitor')) { throw 'FAIL update-metrics-replace' }
                     if ($case -eq 'metrics-disable' -and $script:updateDefinition.binary -match '--metrics-') { throw 'FAIL update-metrics-disable' }
@@ -195,7 +240,13 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
                         Invoke-RunnerHostUpdate -Root $installed -Rollback -ReadyTimeoutSeconds 1
                         if ([IO.File]::ReadAllText("$installed\bin\motor-runner.exe") -cne 'old-runner' -or [IO.File]::ReadAllText("$installed\payload-previous\bin\motor-runner.exe") -cne 'new-runner' -or $script:updateDefinition.binary -cne 'old-service-command') { throw 'FAIL update-manual-rollback-restores-previous-payload-and-service' }
                     }
+                    if ($case -eq 'legacy-manual-rollback') {
+                        $rollbackFailure = $null
+                        try { Invoke-RunnerHostUpdate -Root $installed -Rollback -ReadyTimeoutSeconds 1 } catch { $rollbackFailure = [string]$_ }
+                        if ($rollbackFailure -notmatch 'cannot gate fleet admission' -or $script:updateStarts -ne 2 -or [IO.File]::ReadAllText("$installed\bin\motor-runner.exe") -cne 'new-runner') { throw "FAIL update-legacy-manual-rollback-refused: $rollbackFailure" }
+                    }
                 }
+                if ($case -notin @('vm-present','job-present','queue-present','agent-mismatch','checksum-mismatch') -and -not (Test-Path -LiteralPath "$installed\state\ally\qualification-required")) { throw "FAIL update-$case-lost-qualification-gate" }
                 foreach ($path in $preserved) {
                     $full = Join-Path $installed $path
                     if ([IO.File]::ReadAllText($full) -cne $before[$path][0] -or (Get-Acl -LiteralPath $full).Sddl -cne $before[$path][1]) { throw "FAIL update-$case-preserves-$path" }

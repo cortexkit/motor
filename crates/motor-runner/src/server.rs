@@ -1,6 +1,6 @@
 #[path = "server_activity.rs"]
 mod activity;
-use crate::local_transport::{Listener as UnixListener, Stream as UnixStream};
+use crate::local_transport::Listener as UnixListener;
 use crate::{
     engine::{
         transfer_refusal, transfer_refusal_detail, workspace_setup_detail, Admission, QueueProgress,
@@ -129,12 +129,16 @@ pub(crate) async fn tenant_channel<S: AsyncRead + AsyncWrite + Unpin + Send + 's
         changed: tokio::sync::Notify::new(),
         stop_write: tokio::sync::Notify::new(),
     });
-    channel_stream(runner, socket, accepted, Some(ctx)).await
+    channel_stream(runner, socket, accepted, Some(ctx), false).await
 }
 
 /// The daemon owns no TCP listener. Connections use the pinned framed protocol;
 /// heartbeats are transport-only and never enter retained job history.
 pub async fn serve(runner: Runner, listener: UnixListener) -> io::Result<()> {
+    #[cfg(windows)]
+    let qualification = listener.is_qualification();
+    #[cfg(unix)]
+    let qualification = false;
     let mut channels = tokio::task::JoinSet::new();
     let mut poll = tokio::time::interval(Duration::from_millis(25));
     loop {
@@ -153,7 +157,7 @@ pub async fn serve(runner: Runner, listener: UnixListener) -> io::Result<()> {
         let runner = runner.clone();
         channels.spawn(
             async move {
-                if let Err(error) = channel(runner, socket, accepted).await {
+                if let Err(error) = local_channel(runner, socket, accepted, qualification).await {
                     tracing::warn!(%error, "runner channel detached");
                 }
             }
@@ -432,12 +436,13 @@ async fn next(rx: &mut mpsc::Receiver<Frame>) -> Option<Frame> {
     None
 }
 
-async fn channel(
+pub(crate) async fn local_channel<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     runner: Runner,
-    socket: UnixStream,
+    socket: S,
     accepted: std::time::Instant,
+    qualification: bool,
 ) -> io::Result<()> {
-    channel_stream(runner, socket, accepted, None).await
+    channel_stream(runner, socket, accepted, None, qualification).await
 }
 
 async fn channel_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
@@ -445,6 +450,7 @@ async fn channel_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     socket: S,
     accepted: std::time::Instant,
     tenant: Option<Arc<TenantConnection>>,
+    qualification: bool,
 ) -> io::Result<()> {
     let (read, write) = tokio::io::split(socket);
     let (in_tx, mut rx) = mpsc::channel(8);
@@ -461,7 +467,10 @@ async fn channel_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         accepted,
         &mut progress,
         &live_job,
-        tenant.as_ref(),
+        Peer {
+            tenant: tenant.as_ref(),
+            qualification,
+        },
     )
     .await;
     if let Some(ctx) = &tenant {
@@ -493,6 +502,11 @@ async fn channel_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     result
 }
 
+struct Peer<'a> {
+    tenant: Option<&'a Arc<TenantConnection>>,
+    qualification: bool,
+}
+
 async fn session(
     runner: Runner,
     rx: &mut mpsc::Receiver<Frame>,
@@ -500,7 +514,10 @@ async fn session(
     accepted: std::time::Instant,
     progress: &mut watch::Receiver<Activity>,
     live_job: &watch::Sender<Option<QueueProgress>>,
-    tenant: Option<&Arc<TenantConnection>>,
+    Peer {
+        tenant,
+        qualification,
+    }: Peer<'_>,
 ) -> io::Result<()> {
     let Some(Frame::Hello {
         protocol_version,
@@ -591,7 +608,15 @@ async fn session(
                 }
                 request.gate_job &= supports_gate_jobs;
                 let admitted = request.clone();
-                match locked(&runner, move |r| r.accept(admitted)).await? {
+                match locked(&runner, move |r| {
+                    if qualification {
+                        r.accept_for_qualification(admitted)
+                    } else {
+                        r.accept(admitted)
+                    }
+                })
+                .await?
+                {
                     Admission::Duplicate => {
                         if let Some(ctx) = tenant {
                             ctx.operation_refused("run", "job_already_has_record");
@@ -727,7 +752,23 @@ async fn session(
             }
             Frame::Prepare(request) => {
                 let req = request.clone();
-                let _transfer = match locked(&runner, move |r| r.admit_prepare(&req)).await? {
+                let _transfer = match locked(&runner, move |r| {
+                    if !qualification {
+                        if let Some(detail) = r.admission_blocked() {
+                            return Ok(Err(Refusal {
+                                job_id: None,
+                                transfer_id: Some(req.transfer_id),
+                                reason: RefusalReason::RunnerFull,
+                                disk_full: None,
+                                retry_after_ms: None,
+                                detail: Some(detail),
+                            }));
+                        }
+                    }
+                    r.admit_prepare(&req)
+                })
+                .await?
+                {
                     Ok(guard) => guard,
                     Err(refusal) => {
                         tracing::warn!(
@@ -883,12 +924,15 @@ async fn session(
                 return Ok(());
             }
             Frame::Resume => {
-                locked(&runner, |r| {
+                let resumed = locked(&runner, move |r| {
+                    if qualification {
+                        r.resume_qualification()?;
+                    }
                     r.resume();
-                    Ok(())
+                    Ok(!r.qualification_required())
                 })
                 .await?;
-                send(tx, Frame::ResumeReply { resumed: true }).await?;
+                send(tx, Frame::ResumeReply { resumed }).await?;
                 return Ok(());
             }
             Frame::DrainIfIdle => {

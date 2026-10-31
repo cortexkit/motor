@@ -19,7 +19,7 @@ class InstallScriptTests(unittest.TestCase):
         helpers = (HERE / 'service-definition.ps1').read_text()
         self.assertIn('Get-RunnerServiceDefinition $Root $MetricsEndpoint $MetricsHostId', install)
         self.assertIn('Assert-RunnerServiceCommand $serviceDefinition.binary', install)
-        self.assertIn('if (-not $NoStart) { Start-Service MotorRunner }', install)
+        self.assertIn('if (-not $NoStart) {\n    Assert-RunnerQualificationCapable $Root\n    Start-Service MotorRunner\n}', install)
         for script in (install, update):
             key_path = script.split('if ($PrintMetricsKey)', 1)[1].split('return', 1)[0]
             self.assertIn('Invoke-RunnerMetricsKey $Root', key_path)

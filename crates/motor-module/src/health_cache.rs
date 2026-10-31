@@ -99,18 +99,25 @@ impl HealthCache {
             availability("unavailable", Some("not set up on this machine"))
         } else if !fresh {
             unavailable()
-        } else if self
-            .windows
-            .iter()
-            .any(|runner| runner["reachable"] == true && runner["busy"] == false)
-        {
+        } else if self.windows.iter().any(|runner| {
+            runner["reachable"] == true
+                && runner["busy"] == false
+                && runner["admission_blocked"].is_null()
+        }) {
             availability("available", None)
-        } else if self
+        } else if self.windows.iter().any(|runner| {
+            runner["reachable"] == true
+                && runner["busy"] == true
+                && runner["admission_blocked"].is_null()
+        }) {
+            availability("busy (queueing)", None)
+        } else if let Some(reason) = self
             .windows
             .iter()
-            .any(|runner| runner["reachable"] == true && runner["busy"] == true)
+            .filter(|runner| runner["reachable"] == true)
+            .find_map(|runner| runner["admission_blocked"].as_str())
         {
-            availability("busy (queueing)", None)
+            availability("unavailable", Some(reason))
         } else {
             unavailable()
         };
@@ -229,6 +236,13 @@ impl HealthCache {
                     ));
                 }
             }
+        }
+        if let Some(reason) = self
+            .windows
+            .iter()
+            .find_map(|runner| runner["admission_blocked"].as_str())
+        {
+            detail.push_str(&format!("; windows admission: {reason}"));
         }
         if jobs.is_none() {
             detail.push_str("; job state not confirmed yet");

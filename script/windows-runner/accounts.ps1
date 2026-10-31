@@ -102,6 +102,16 @@ function ConvertTo-RunnerNativeArgument {
     return $builder.ToString()
 }
 
+function Get-RunnerQualificationGateVersion([string]$Root) {
+    try {
+        $version = & "$Root\bin\motor-runner.exe" qualification-gate-version
+        if ($LASTEXITCODE -ne 0) { return '' }
+        return $version
+    } catch {
+        return ''
+    }
+}
+
 function Invoke-RunnerNative {
     param(
         [Parameter(Mandatory)][string]$FilePath,

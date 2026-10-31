@@ -946,6 +946,7 @@ impl Runner {
                 (!self.core.config.vm_instance()).then(|| self.remote_cache_health(now));
             let mut counters = self.core.health.lock().unwrap();
             RunnerHealth {
+                admission_blocked: self.admission_blocked(),
                 runner_version: env!("CARGO_PKG_VERSION").into(),
                 since_ms: counters.since_ms,
                 window_minutes: health::WINDOW_MINUTES,
