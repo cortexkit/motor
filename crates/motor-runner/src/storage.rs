@@ -237,6 +237,13 @@ pub(crate) struct Job {
     /// The launcher's final displayed peak, conservatively rounded up to MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_peak_mib: Option<u64>,
+    /// Sampled cgroup peak of anonymous, shared and kernel memory; excludes file
+    /// cache. Telemetry only, not an admission, placement or billing input.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::working_memory::WorkingPeak::is_unknown"
+    )]
+    pub mem_working_peak_mib: crate::working_memory::WorkingPeak,
     /// A live accounting reader will finish the terminal lifecycle event. A
     /// restart loses that reader, so recovered records default to no pending read.
     #[serde(skip)]
@@ -353,6 +360,7 @@ impl Job {
             reservation_use: None,
             execution_ended_ms: None,
             mem_peak_mib: None,
+            mem_working_peak_mib: Default::default(),
             memory_accounting_pending: false,
             sibling_sources: None,
             prepared_javascript_directories: Vec::new(),

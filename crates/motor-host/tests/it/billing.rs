@@ -159,6 +159,47 @@ fn an_unstarted_job_cannot_report_a_memory_peak() {
 }
 
 #[test]
+fn guest_working_peak_is_local_display_only_and_never_sent_to_broker() {
+    for peak in [None, Some(513), Some(1 << 53)] {
+        let mut h = host();
+        started(&mut h, JOB, 1);
+        let mut ended = event(3, TenantEventKind::Terminal, Some(JOB), None);
+        ended.mem_peak_mib = Some(1600);
+        ended.mem_working_peak_mib = peak;
+        h.event("tenant", &ended, MS + 3000).unwrap();
+        h.receive_terminal(JOB, terminal(JOB, "exit"), MS + 3000)
+            .unwrap();
+        h.terminal_delivered(JOB, MS + 3000).unwrap();
+        let expected = peak.filter(|value| *value < (1 << 53));
+        let local = &h.snapshot.billing[JOB];
+        assert_eq!(local.mem_working_peak_mib, expected);
+        let json = serde_json::to_value(local).unwrap();
+        assert_eq!(
+            json.get("mem_working_peak_mib").is_some(),
+            expected.is_some()
+        );
+        if let Some(expected) = expected {
+            assert_eq!(json["mem_working_peak_mib"], expected);
+        }
+        let restored: motor_host::billing::JobBilling = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.mem_working_peak_mib, expected);
+        let request = h
+            .snapshot
+            .outbox
+            .iter()
+            .find(|r| r.path.ends_with("/usage"))
+            .unwrap();
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(body.get("mem_working_peak_mib").is_none());
+        assert_eq!(body["mem_peak_mib"], 1600);
+        assert_eq!(body["vcpus"], 1);
+        assert_eq!(body["started_at_ms"], MS);
+        assert_eq!(body["ended_at_ms"], MS + 3000);
+        assert!(serde_json::from_slice::<motor_lease::Usage>(&request.body).is_ok());
+    }
+}
+
+#[test]
 fn observed_usage_ignores_guest_clocks_caps_and_maps_all_outcomes() {
     for (outcome, killed, expected) in [
         ("exit", None, UsageOutcome::Exit),

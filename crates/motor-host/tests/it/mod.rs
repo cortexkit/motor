@@ -93,6 +93,7 @@ fn event(
         cause,
         setup: None,
         mem_peak_mib: None,
+        mem_working_peak_mib: None,
     }
 }
 fn disk_host(path: &std::path::Path) -> Host {

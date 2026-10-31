@@ -198,6 +198,11 @@ pub struct TenantEvent {
     /// Final job-unit peak from the trusted launcher summary, rounded up to MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_peak_mib: Option<u64>,
+    /// Guest-sampled peak of anonymous, shared and kernel memory, rounded up to
+    /// MiB. Untrusted display-only telemetry, never used for admission, placement
+    /// or billing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_working_peak_mib: Option<u64>,
 }
 
 /// Trusted operation names only; never command arguments, paths or peer text.

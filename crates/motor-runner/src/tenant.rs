@@ -51,6 +51,7 @@ impl Events {
             cause,
             setup: None,
             mem_peak_mib: None,
+            mem_working_peak_mib: None,
         });
     }
 }
@@ -118,6 +119,7 @@ impl EventLog {
         if terminal {
             state.push(TenantEventKind::Terminal, Some(job.id), None);
             state.pending.back_mut().unwrap().mem_peak_mib = job.mem_peak_mib;
+            state.pending.back_mut().unwrap().mem_working_peak_mib = job.mem_working_peak_mib.get();
         }
         atomic_json_private(&self.path, &state)?;
         *guard = state;
@@ -323,6 +325,7 @@ mod tests {
                 cause: None,
                 setup: None,
                 mem_peak_mib: None,
+                mem_working_peak_mib: None,
             }
         );
     }

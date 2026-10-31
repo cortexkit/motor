@@ -55,6 +55,7 @@ fn pinned_tenant_frames_are_inline_and_integer_only() {
         cause: Some(RefusedCause::Mismatch),
         setup: None,
         mem_peak_mib: None,
+        mem_working_peak_mib: None,
     });
     assert_eq!(
         serde_json::to_value(event).unwrap(),
@@ -67,6 +68,7 @@ fn pinned_tenant_frames_are_inline_and_integer_only() {
         cause: None,
         setup: None,
         mem_peak_mib: None,
+        mem_working_peak_mib: None,
     });
     assert_eq!(
         serde_json::to_value(idle).unwrap(),
@@ -76,6 +78,37 @@ fn pinned_tenant_frames_are_inline_and_integer_only() {
         serde_json::to_value(Frame::Ack { event_seq: 2 }).unwrap(),
         json!({"type":"ack","event_seq":2})
     );
+}
+
+#[test]
+fn working_peak_is_additive_for_old_lifecycle_readers() {
+    #[derive(serde::Deserialize)]
+    struct OldEvent {
+        event_seq: u64,
+        event: TenantEventKind,
+        jti: Option<Uuid>,
+        cause: Option<RefusedCause>,
+        setup: Option<TenantSetupPhase>,
+        mem_peak_mib: Option<u64>,
+    }
+    for peak in [None, Some(513)] {
+        let mut value = json!({"type":"event","event_seq":3,"event":"terminal","jti":"00000000-0000-4000-8000-000000000001","mem_peak_mib":1600});
+        if let Some(peak) = peak {
+            value["mem_working_peak_mib"] = json!(peak);
+        }
+        let old: OldEvent = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(old.event_seq, 3);
+        assert_eq!(old.event, TenantEventKind::Terminal);
+        assert!(old.jti.is_some());
+        assert_eq!(old.cause, None);
+        assert_eq!(old.setup, None);
+        assert_eq!(old.mem_peak_mib, Some(1600));
+        let Frame::Event(new) = serde_json::from_value::<Frame>(value.clone()).unwrap() else {
+            panic!("event expected")
+        };
+        assert_eq!(new.mem_working_peak_mib, peak);
+        assert_eq!(serde_json::to_value(Frame::Event(new)).unwrap(), value);
+    }
 }
 
 #[test]

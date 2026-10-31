@@ -789,6 +789,11 @@ impl Host {
                             billing.terminal_live = live_event;
                             billing.ended_observed_ms = Some(now_ms);
                             billing.mem_peak_mib = event.mem_peak_mib.filter(|v| *v < (1 << 53));
+                            billing.mem_working_peak_mib =
+                                event.mem_working_peak_mib.filter(|v| *v < (1 << 53));
+                            tracing::info!(job_id = %job, vcpus = next.leases[&job].claims.vcpus,
+                                mem_working_peak_mib = ?billing.mem_working_peak_mib,
+                                mem_peak_mib = ?billing.mem_peak_mib, "job memory peaks (guest-reported)");
                         }
                     }
                     TenantEventKind::Refused

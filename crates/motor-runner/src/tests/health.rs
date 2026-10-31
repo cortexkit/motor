@@ -968,3 +968,90 @@ fn launcher_accounting_diagnostics(
         report.map(|report| String::from_utf8_lossy(&report).into_owned()).unwrap_or_else(|| "not yet captured".into()),
         runner_diagnostics(runner))
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires root operator, motor-job account, sudo and real systemd cgroups"]
+async fn isolated_working_memory_peak_excludes_large_file_cache() {
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "run as the root operator, outside a remote job"
+    );
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.manual_tick = true;
+    config.isolate_jobs = true;
+    config.cpu_topology = None;
+    config.disable_warm_builds = true;
+    let runner = Runner::open(config).unwrap();
+    let (request, bytes) = f.run(
+        r#"python3 - <<'PY'
+import mmap, os, time
+heap = mmap.mmap(-1, 512 * 1024 * 1024, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+for page in range(0, len(heap), 4096):
+    heap[page] = 1
+time.sleep(3)
+print('anonymous-ready', flush=True)
+time.sleep(3)
+with open('working-set-cache', 'w+b', buffering=0) as cache:
+    block = bytes(1024 * 1024)
+    for _ in range(1024):
+        cache.write(block)
+    os.fsync(cache.fileno())
+    os.posix_fadvise(cache.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    cache.seek(0)
+    while cache.readinto(bytearray(1024 * 1024)):
+        pass
+    group = open('/proc/self/cgroup').read().strip().split('0::')[1]
+    stats = dict(line.split() for line in open('/sys/fs/cgroup' + group + '/memory.stat'))
+    print('file-cache-bytes=' + stats['file'], flush=True)
+    time.sleep(3)
+os.unlink('working-set-cache')
+PY"#,
+    );
+    f.submit(&runner, &request, &bytes);
+    until(|| job_output(&runner, request.job_id).contains("anonymous-ready")).await;
+    let before = runner.core.inner.lock().unwrap().jobs[&request.job_id]
+        .mem_working_peak_mib
+        .get()
+        .expect("sampler must observe the anonymous allocation");
+    assert!((512..=640).contains(&before), "anonymous peak {before} MiB");
+    assert_eq!(
+        terminal(&runner, request.job_id).await.outcome,
+        Outcome::Exit { code: 0 }
+    );
+    until(|| {
+        !read_json::<Job>(&runner.record_path(request.job_id))
+            .unwrap()
+            .memory_accounting_pending
+    })
+    .await;
+    let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
+    let peak = job
+        .mem_working_peak_mib
+        .get()
+        .expect("working peak must be durable");
+    assert!((512..=640).contains(&peak), "working peak {peak} MiB");
+    assert!(
+        peak <= before + 64,
+        "file cache raised working peak: {before} -> {peak} MiB"
+    );
+    let output = job_output(&runner, request.job_id);
+    let file: u64 = output
+        .lines()
+        .find_map(|line| line.strip_prefix("file-cache-bytes="))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        file >= 768 << 20,
+        "test must charge substantial file cache: {file} bytes"
+    );
+    assert!(
+        job.mem_peak_mib.is_some_and(|total| total > peak + 512),
+        "systemd peak should still include file cache: {:?}",
+        job.mem_peak_mib
+    );
+    eprintln!("job={} vcpus={} mem_working_peak_mib={peak} anonymous_peak_mib={before} mem_peak_mib={:?} file_cache_bytes={file}", job.id, job.weight, job.mem_peak_mib);
+}

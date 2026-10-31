@@ -120,6 +120,7 @@ fn finished_successful_unit_keeps_final_summary_peak_in_durable_lifecycle() {
             unit: Some(id),
         });
         job.memory_accounting_pending = true;
+        job.mem_working_peak_mib = serde_json::from_value(serde_json::json!(3)).unwrap();
         job.execution_ended_ms = Some(now + 100);
         job.terminal_ended(Outcome::Exit { code: 0 }, now + 100);
         runner.tenant_events().unwrap().admit(id).unwrap();
@@ -135,12 +136,14 @@ fn finished_successful_unit_keeps_final_summary_peak_in_durable_lifecycle() {
         runner.collect_accounting(id, report.as_bytes());
         let disk: Job = read_json(&runner.record_path(id)).unwrap();
         assert_eq!(disk.mem_peak_mib, expected);
+        assert_eq!(disk.mem_working_peak_mib.get(), Some(3));
         assert!(!disk.memory_accounting_pending);
         assert_eq!(disk.terminal.unwrap().outcome, Outcome::Exit { code: 0 });
         let events = pending(&runner);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event, TenantEventKind::Terminal);
         assert_eq!(events[0].mem_peak_mib, expected);
+        assert_eq!(events[0].mem_working_peak_mib, Some(3));
         let counts = runner.core.health.lock().unwrap().counts(runner.now());
         assert_eq!(
             counts.memory_peak_unavailable,
@@ -198,6 +201,31 @@ async fn tenant_first_frame_is_strict_and_local_ssh_still_uses_hello() {
         }
     }
     task.abort();
+}
+
+#[test]
+fn working_peak_job_json_is_optional_and_ignored_by_old_record_readers() {
+    #[derive(serde::Deserialize)]
+    struct OldJob {
+        id: Uuid,
+        terminal: Option<TerminalRecord>,
+    }
+    let id = Uuid::now_v7();
+    let mut job = Job::new(id, None, 1, 0, 1);
+    job.terminal_ended(Outcome::Exit { code: 0 }, 2);
+    let old_json = serde_json::to_value(&job).unwrap();
+    assert!(old_json.get("mem_working_peak_mib").is_none());
+    assert!(serde_json::from_value::<Job>(old_json)
+        .unwrap()
+        .mem_working_peak_mib
+        .is_unknown());
+    job.mem_working_peak_mib = serde_json::from_value(serde_json::json!(513)).unwrap();
+    let new_json = serde_json::to_value(&job).unwrap();
+    assert_eq!(new_json["mem_working_peak_mib"], 513);
+    assert!(new_json["terminal"].get("mem_working_peak_mib").is_none());
+    let old: OldJob = serde_json::from_value(new_json).unwrap();
+    assert_eq!(old.id, id);
+    assert_eq!(old.terminal.unwrap(), job.terminal.unwrap());
 }
 
 #[tokio::test]

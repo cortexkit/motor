@@ -43,6 +43,10 @@ pub struct JobBilling {
     /// Legacy VM samples retained for snapshot rollback, never job settlement.
     pub memory_peak_bytes: u64,
     pub mem_peak_mib: Option<u64>,
+    /// Untrusted guest telemetry, retained for display only. Deliberately not
+    /// copied into Usage, admission or placement calculations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_working_peak_mib: Option<u64>,
     pub metrics_observed: bool,
     pub egress_start: Option<u64>,
     pub egress_end: u64,

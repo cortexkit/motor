@@ -3151,11 +3151,22 @@ impl Runner {
         let mut job = job.clone();
         job.mappings = paths::job_mappings(&job, &self.core.config.caller_roots);
         let job = &job;
+        if job.terminal.is_some() {
+            job.mem_working_peak_mib.stop();
+        }
         #[cfg(test)]
         if let Some(write) = &self.core.config.before_job_write {
             write(&self.record_path(job.id))?;
         }
         crate::storage::atomic_job_json(&self.record_path(job.id), job)?;
+        if job.terminal.is_some()
+            && !job.memory_accounting_pending
+            && job.mem_working_peak_mib.log_once()
+        {
+            tracing::info!(job_id = %job.id, vcpus = job.weight,
+                mem_working_peak_mib = ?job.mem_working_peak_mib.get(),
+                mem_peak_mib = ?job.mem_peak_mib, "job memory peaks");
+        }
         if let Some(log) = &self.core.tenant_events {
             log.observe(job)?;
         }
@@ -8179,6 +8190,7 @@ impl Runner {
             return Ok(());
         }
         let output = output.unwrap();
+        self.start_working_memory(id);
         let stdout = output.stdout;
         let stderr = output.stderr;
         let runner = self.clone();
@@ -8448,6 +8460,7 @@ impl Runner {
             format!("runner recovery: job_id={id} outcome_unknown unit={unit} unit_alive={alive}; runner will not retry the job automatically; query exec.status or exec.attach by job_id\n").as_bytes())
     }
     fn follow_unit(&self, id: Uuid) -> io::Result<()> {
+        self.start_working_memory(id);
         use std::io::{Seek, SeekFrom};
         let (process, durable) = {
             let inner = self.core.inner.lock().unwrap();
@@ -8924,6 +8937,22 @@ impl Runner {
             .map(|unit| self.core.backend.unit_name(&self.core.config, unit))
     }
 
+    fn start_working_memory(&self, id: Uuid) {
+        #[cfg(target_os = "linux")]
+        if !self.core.config.windows_instance()
+            && (self.core.config.isolate_jobs || self.core.config.boat_profile)
+        {
+            let inner = self.core.inner.lock().unwrap();
+            if let Some(job) = inner.jobs.get(&id) {
+                if let Some(unit) = job.process.and_then(|process| process.unit) {
+                    job.mem_working_peak_mib
+                        .start(&self.core.backend.unit_name(&self.core.config, unit));
+                }
+            }
+        }
+        let _ = id;
+    }
+
     fn spawn_accounting_reader(
         &self,
         id: Uuid,
@@ -9172,6 +9201,7 @@ impl Runner {
         });
         self.finish_step(id, &job.kill, "finalization claimed", finish_started);
         let ended_ms = self.now();
+        job.mem_working_peak_mib.stop();
         let evidence = self.execution_evidence(&job);
         let oom_stopped = evidence.oom_killed()
             || self
