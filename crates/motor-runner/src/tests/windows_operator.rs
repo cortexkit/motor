@@ -500,6 +500,60 @@ fn baseline_qualification_commands() -> [String; 3] {
     ]
 }
 
+fn realistic_bun_checkout_command() -> String {
+    // Retrying in the command exposes Bun's full diagnostics only to the caller,
+    // while preparation retains a bounded stderr tail for ordinary jobs.
+    "set -e; cargo metadata --offline --format-version 1 --no-deps >/dev/null; \
+     if test -d fixture/node_modules; then echo 'prepared modules present'; else echo 'prepared modules absent'; fi; \
+     echo 'realistic checkout command ran'; set +e; \
+     (cd fixture && 'C:/Program Files/Bun/bun.exe' install --offline --frozen-lockfile --ignore-scripts --backend=copyfile); \
+     result=$?; printf 'diagnostic install exit=%s\\n' \"$result\"; exit 0"
+        .into()
+}
+
+#[test]
+#[ignore = "trusted operator: sealed Windows baseline, dedicated accounts, KVM and systemd required"]
+fn windows_qualification_realistic_checkout_bun_failure_is_nonfatal() {
+    let runner = operator();
+    let f = Fixture::new();
+    source(&f);
+    fs::write(
+        f.main.join("Cargo.toml"),
+        "[package]\nname='motor-qualification'\nversion='0.1.0'\nedition='2021'\n\
+         [features]\nqualification=[]\n\
+         [dev-dependencies]\nmotor-qualification={path='.',features=['qualification']}\n",
+    )
+    .unwrap();
+    fs::write(f.main.join("src/lib.rs"), "pub fn qualification() {}\n").unwrap();
+    fs::create_dir_all(f.main.join("fixture")).unwrap();
+    fs::write(
+        f.main.join("fixture/package.json"),
+        include_str!("../../../../script/runner/network-fixture/package.json"),
+    )
+    .unwrap();
+    fs::write(
+        f.main.join("fixture/bun.lock"),
+        include_str!("../../../../script/runner/network-fixture/bun.lock"),
+    )
+    .unwrap();
+    git(&f.main, &["add", "."]);
+    git(
+        &f.main,
+        &["commit", "-m", "realistic Cargo and Bun checkout"],
+    );
+    let output = run(&runner, &f, &realistic_bun_checkout_command());
+    eprintln!("{output}");
+    assert!(
+        output.contains("realistic checkout command ran"),
+        "{output}"
+    );
+    assert!(output.contains("diagnostic install exit="), "{output}");
+    if output.contains("bun install skipped for ") {
+        assert!(output.contains("prepared modules absent"), "{output}");
+    }
+    no_units(&runner);
+}
+
 fn baseline_environment_script() -> String {
     r#"
 $ErrorActionPreference='Stop'
@@ -2154,7 +2208,10 @@ fn offline_canary_generated_powershell_has_balanced_braces() {
 #[test]
 fn baseline_qualification_commands_fit_the_guest_command_limit() {
     // The guest's job launcher truncates a command past 8,191 characters.
-    for command in baseline_qualification_commands() {
+    for command in baseline_qualification_commands()
+        .into_iter()
+        .chain([realistic_bun_checkout_command()])
+    {
         assert!(
             command.len() < 8000,
             "job command has {} characters",

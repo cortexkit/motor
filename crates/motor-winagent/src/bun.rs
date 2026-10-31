@@ -10,7 +10,9 @@ use sha2::{Digest, Sha256, Sha512};
 mod expansion;
 mod graph;
 mod hash;
+mod preparation;
 pub use expansion::ExpansionBudget;
+pub use preparation::{DiagnosticTail, finish_install, skip_project, skip_unprepared};
 #[cfg(windows)]
 pub mod protection;
 
@@ -38,6 +40,19 @@ pub enum RefusalKind {
     BunOfflineInstallFailed,
 }
 
+impl RefusalKind {
+    /// Invalid or untrusted inputs are refusals; availability is only a convenience.
+    pub fn is_security(self) -> bool {
+        !matches!(
+            self,
+            Self::BunCredentialsUnavailable
+                | Self::BunFetchUnavailable
+                | Self::BunCacheMissing
+                | Self::BunOfflineInstallFailed
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Refusal {
@@ -59,6 +74,12 @@ impl std::fmt::Display for Refusal {
 }
 impl std::error::Error for Refusal {}
 impl Refusal {
+    pub fn warning(&self) -> String {
+        format!(
+            "bun install skipped for {}: {:?} package={}@{}\n",
+            self.project, self.kind, self.package, self.version
+        )
+    }
     pub fn registry(mut self, registries: &BTreeMap<String, String>) -> Self {
         if let Some(registry) = self
             .package
@@ -469,6 +490,7 @@ pub struct Project {
     pub name: String,
     pub version: String,
     pub packages: Vec<Package>,
+    pub skipped: Option<Refusal>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -925,7 +947,7 @@ pub fn prepare_cache_with_budget(
     };
     let mut keys = BTreeMap::<String, Integrity>::new();
     let mut projects = std::collections::BTreeSet::new();
-    for project in &manifest.projects {
+    for project in &mut manifest.projects {
         let invalid = || {
             refuse(
                 RefusalKind::BunProjectionInvalid,
@@ -970,6 +992,13 @@ pub fn prepare_cache_with_budget(
         {
             return Err(invalid());
         }
+        if let Some(refusal) = &project.skipped {
+            refusal.validate().map_err(|_| invalid())?;
+            if refusal.kind.is_security() || refusal.project != project.path {
+                return Err(invalid());
+            }
+            continue;
+        }
         for package in &project.packages {
             let fail = || projection_error(&project.path, package).registry(&manifest.registries);
             if !package.integrity.valid() {
@@ -978,16 +1007,22 @@ pub fn prepare_cache_with_budget(
             if !package.windows {
                 continue;
             }
-            let bytes = read_bounded(&seed.join(package.integrity.blob_path()), MAX_BLOB_BYTES)
-                .map_err(|_| {
-                    refuse(
-                        RefusalKind::BunCacheMissing,
-                        &project.path,
-                        &package.name,
-                        &package.version,
-                    )
-                    .registry(&manifest.registries)
-                })?;
+            let bytes =
+                match read_bounded(&seed.join(package.integrity.blob_path()), MAX_BLOB_BYTES) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        project.skipped = Some(
+                            refuse(
+                                RefusalKind::BunCacheMissing,
+                                &project.path,
+                                &package.name,
+                                &package.version,
+                            )
+                            .registry(&manifest.registries),
+                        );
+                        break;
+                    }
+                };
             if !package.integrity.verify(&bytes) {
                 return Err(refuse(
                     RefusalKind::BunIntegrityMismatch,
@@ -1039,7 +1074,15 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
             return Ok(());
         }
         let canonical = path.canonicalize()?;
-        if !canonical.starts_with(root) || !seen.insert(canonical) {
+        if !canonical.starts_with(root) {
+            return Err(io::Error::other(refuse(
+                RefusalKind::BunProjectionInvalid,
+                "",
+                "",
+                "",
+            )));
+        }
+        if !seen.insert(canonical) {
             return Ok(());
         }
         for entry in std::fs::read_dir(path)? {
@@ -1066,7 +1109,12 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
         installed: &mut Vec<(Value, std::path::PathBuf)>,
     ) -> io::Result<()> {
         if !path.canonicalize()?.starts_with(root) {
-            return Err(io::Error::other("installed package outside checkout"));
+            return Err(io::Error::other(refuse(
+                RefusalKind::BunProjectionInvalid,
+                "",
+                "",
+                "",
+            )));
         }
         if let Ok(bytes) = read_bounded(&path.join("package.json"), MAX_LOCK_BYTES as u64) {
             if let Ok(value) = serde_json::from_slice(&bytes) {
@@ -1083,8 +1131,20 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
         let root = directory
             .canonicalize()
             .map_err(|_| refuse(RefusalKind::BunOfflineInstallFailed, &project.path, "", ""))?;
-        walk_modules(&modules, &root, &mut Default::default(), &mut installed)
-            .map_err(|_| refuse(RefusalKind::BunOfflineInstallFailed, &project.path, "", ""))?;
+        walk_modules(&modules, &root, &mut Default::default(), &mut installed).map_err(
+            |error| {
+                refuse(
+                    if error.get_ref().is_some_and(|error| error.is::<Refusal>()) {
+                        RefusalKind::BunProjectionInvalid
+                    } else {
+                        RefusalKind::BunOfflineInstallFailed
+                    },
+                    &project.path,
+                    "",
+                    "",
+                )
+            },
+        )?;
     }
     for package in project.packages.iter().filter(|p| p.windows) {
         let fail = || {
@@ -1112,7 +1172,8 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
         {
             let bin = bin.strip_prefix("./").unwrap_or(bin);
             for component in bin.split('/') {
-                crate::validate_component(component).map_err(|_| fail())?;
+                crate::validate_component(component)
+                    .map_err(|_| projection_error(&project.path, package))?;
             }
             if !root.join(bin).is_file() {
                 return Err(fail());
@@ -1120,7 +1181,8 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
         }
         if let Some(bin_dir) = &package.bin_dir {
             for component in bin_dir.strip_prefix("./").unwrap_or(bin_dir).split('/') {
-                crate::validate_component(component).map_err(|_| fail())?;
+                crate::validate_component(component)
+                    .map_err(|_| projection_error(&project.path, package))?;
             }
             if !root.join(bin_dir).is_dir() {
                 return Err(fail());

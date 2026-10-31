@@ -8,7 +8,7 @@ function Convert-RunnerPeerHello([byte[]]$Bytes, [string]$Nonce) {
     $text = [Text.UTF8Encoding]::new($false, $true).GetString($Bytes, 4, [int]$length)
     $hello = ConvertFrom-Json -InputObject $text
     $keys = @($hello.PSObject.Properties.Name | Sort-Object)
-    if (($keys -join ',') -cne 'kind,nonce,version' -or $hello.kind -cne 'hello' -or ($hello.version -isnot [int] -and $hello.version -isnot [long]) -or $hello.version -ne 6 -or $hello.nonce -cne $Nonce) { throw 'Invalid peer qualification Hello version, shape or nonce' }
+    if (($keys -join ',') -cne 'kind,nonce,version' -or $hello.kind -cne 'hello' -or ($hello.version -isnot [int] -and $hello.version -isnot [long]) -or $hello.version -ne 7 -or $hello.nonce -cne $Nonce) { throw 'Invalid peer qualification Hello version, shape or nonce' }
     return $hello
 }
 

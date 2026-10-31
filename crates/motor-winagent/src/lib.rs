@@ -22,7 +22,7 @@ pub mod returned;
 pub mod transport;
 
 /// Version of the Windows profile; the Windows agent sends it in its Hello.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 /// Version of the macOS profile, versioned independently of the Windows one.
 pub const MACOS_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -1494,7 +1494,7 @@ mod tests {
     fn native_cache_timings_have_a_distinct_field_and_protocol_generation() {
         let value = serde_json::to_value(CacheTimings::default()).unwrap();
         assert!(value["native_attributes_ms"].is_u64());
-        assert_eq!(PROTOCOL_VERSION, 6);
+        assert_eq!(PROTOCOL_VERSION, 7);
     }
 
     #[test]

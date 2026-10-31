@@ -136,16 +136,6 @@ fn resolve<'a>(
     let credential_file = if let Some(configured) = configured {
         // Grants are checked even on a verified cache hit, so revocation does not
         // depend on registry availability or on removing shared cached bytes.
-        if configured.credential_file.is_none() {
-            let mut refusal = fail(
-                RefusalKind::BunCredentialsUnavailable,
-                project,
-                package,
-                &origin,
-            );
-            refusal.package = scope.unwrap().into();
-            return Err(refusal);
-        }
         if !configured.repositories.iter().any(|r| r == repository) {
             return Err(fail(
                 RefusalKind::BunRegistryUnauthorized,
@@ -190,6 +180,14 @@ fn resolve<'a>(
     {
         return Err(fail(
             RefusalKind::BunRegistryUnauthorized,
+            project,
+            package,
+            &origin,
+        ));
+    }
+    if configured.is_some() && credential_file.is_none() {
+        return Err(fail(
+            RefusalKind::BunCredentialsUnavailable,
             project,
             package,
             &origin,
@@ -510,7 +508,7 @@ fn validate_registry_inputs(
                     let scope = format!("@{}", scope.trim_start_matches('@'));
                     let Some(policy) = registries.scopes.get(&scope) else {
                         return Err(bun::refuse(
-                            RefusalKind::BunCredentialsUnavailable,
+                            RefusalKind::BunRegistryUnauthorized,
                             project,
                             &scope,
                             "",
@@ -681,8 +679,14 @@ fn prepare_impl(
         validate_registry_inputs(&project, directory, registries)?;
         // Resolve and authorize every row before the first download, including
         // optional/disabled rows and rows whose integrity-keyed cached blob is already present.
+        let mut skipped = None;
         for row in &rows {
-            resolve(registries, repository, &project, row)?;
+            if let Err(refusal) = resolve(registries, repository, &project, row) {
+                if refusal.kind.is_security() {
+                    return Err(refusal.into());
+                }
+                skipped.get_or_insert(refusal);
+            }
         }
         let package_json =
             bounded_file(&directory.join("package.json"), bun::MAX_LOCK_BYTES as u64)
@@ -709,6 +713,7 @@ fn prepare_impl(
             name,
             version,
             rows,
+            skipped,
         ));
     }
     if projects.is_empty() {
@@ -725,10 +730,13 @@ fn prepare_impl(
     };
     let deadline = Instant::now() + Duration::from_secs(600);
     let mut seed_bytes = 0u64;
-    for (project, lock_sha256, manifest_sha256, name, version, rows) in projects {
-        let mut packages = Vec::new();
-        for row in rows {
-            let target = resolve(registries, repository, &project, &row)?;
+    for (project, lock_sha256, manifest_sha256, name, version, rows, mut skipped) in projects {
+        let packages = rows.iter().map(|row| row.package.clone()).collect();
+        for row in &rows {
+            if skipped.is_some() {
+                break;
+            }
+            let target = resolve(registries, repository, &project, row)?;
             if let Some(scope) = row
                 .package
                 .name
@@ -753,23 +761,23 @@ fn prepare_impl(
             if let Some(path) = target.credential_file {
                 let credentials = config.state_dir().join("bun-credentials");
                 if credential_path(&credentials, path).is_err() {
-                    return Err(fail(
+                    skipped = Some(fail(
                         RefusalKind::BunCredentialsUnavailable,
                         &project,
                         &row.package,
                         &target.origin,
-                    )
-                    .into());
+                    ));
+                    break;
                 }
             }
             if Instant::now() >= deadline {
-                return Err(fail(
+                skipped = Some(fail(
                     RefusalKind::BunFetchUnavailable,
                     &project,
                     &row.package,
                     &target.origin,
-                )
-                .into());
+                ));
+                break;
             }
             let mut unused = Lease::default();
             let reference = if row.package.windows {
@@ -777,31 +785,49 @@ fn prepare_impl(
             } else {
                 &mut unused
             };
-            let bytes = store::get(
+            let bytes = match store::get(
                 &cache,
                 &target.provenance,
                 &row.package.integrity,
                 registries.cas_quota_bytes,
                 reference,
                 || download(&target),
-            )
-            .map_err(|kind| fail(kind, &project, &row.package, &target.origin))?;
+            ) {
+                Ok(bytes) => bytes,
+                Err(kind) => {
+                    let refusal = fail(kind, &project, &row.package, &target.origin);
+                    if kind.is_security() {
+                        return Err(refusal.into());
+                    }
+                    skipped = Some(refusal);
+                    break;
+                }
+            };
             let dest = seed.join(row.package.integrity.blob_path());
             if row.package.windows && !dest.exists() {
                 seed_bytes += bytes.len() as u64;
                 if seed_bytes > 8 * 1024 * 1024 * 1024 {
-                    return Err(fail(
+                    skipped = Some(fail(
                         RefusalKind::BunFetchUnavailable,
                         &project,
                         &row.package,
                         &target.origin,
-                    )
-                    .into());
+                    ));
+                    break;
                 }
-                fs::create_dir_all(dest.parent().unwrap())?;
-                fs::write(dest, bytes)?;
+                if fs::create_dir_all(dest.parent().unwrap())
+                    .and_then(|()| fs::write(dest, bytes))
+                    .is_err()
+                {
+                    skipped = Some(fail(
+                        RefusalKind::BunCacheMissing,
+                        &project,
+                        &row.package,
+                        &target.origin,
+                    ));
+                    break;
+                }
             }
-            packages.push(row.package);
         }
         manifest.projects.push(Project {
             path: project,
@@ -810,6 +836,7 @@ fn prepare_impl(
             name,
             version,
             packages,
+            skipped,
         });
     }
     fs::write(seed.join("manifest.json"), serde_json::to_vec(&manifest)?)?;

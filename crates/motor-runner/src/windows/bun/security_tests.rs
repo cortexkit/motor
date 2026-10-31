@@ -110,6 +110,7 @@ fn cache_refusal_cleans_prior_packages_and_honors_early_deadline() {
         bun_version: bun::BUN_VERSION.into(),
         registries: BTreeMap::new(),
         projects: vec![Project {
+            skipped: None,
             path: "m/project".into(),
             lock_sha256: hex_sha256(lock.as_bytes()),
             manifest_sha256: hex_sha256(b"{}"),

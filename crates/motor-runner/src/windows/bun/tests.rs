@@ -108,7 +108,7 @@ fn private_credentials_grants_and_locked_url_policy_are_checked_before_cache_acc
         .err()
         .unwrap();
     assert_eq!(refusal.kind, RefusalKind::BunCredentialsUnavailable);
-    assert_eq!(refusal.package, "@private");
+    assert_eq!(refusal.package, "@private/win");
     config.scopes.get_mut("@private").unwrap().credential_file = Some("host-only-token".into());
     assert_eq!(
         resolve(&config, "/other-repo", "m/project", &row())
@@ -365,6 +365,93 @@ fn config(root: &Path) -> crate::engine::Config {
         "layout_root": root, "baseline": "base", "memory_mib": 4096, "cpu_set": [0], "toolchain_version": "test"
     })).unwrap()));
     config
+}
+
+#[cfg(unix)]
+#[test]
+fn host_operational_failures_skip_guest_install_but_security_failures_refuse() {
+    let scratch = ScratchDir::new("bun-host-skips");
+    let config = config(scratch.path());
+    let staging = scratch.join("staging");
+    let checkout = staging.join("m/project");
+    fs::create_dir_all(&checkout).unwrap();
+    fs::write(
+        checkout.join("package.json"),
+        r#"{"name":"project","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let lock = r#"{"lockfileVersion":1,"workspaces":{"":{"dependencies":{"p":"1.0.0"}}},"packages":{"p":["p@1.0.0","",{},"sha256-LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ="]}}"#;
+    fs::write(checkout.join("bun.lock"), lock).unwrap();
+    for (index, kind) in [
+        RefusalKind::BunFetchUnavailable,
+        RefusalKind::BunCredentialsUnavailable,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        prepare_with_fetch(
+            &config,
+            &staging,
+            "/repo",
+            std::slice::from_ref(&checkout),
+            |_| Err(kind),
+        )
+        .unwrap();
+        let seed = staging.join("bun-seed");
+        let mut manifest: Manifest =
+            serde_json::from_slice(&fs::read(seed.join("manifest.json")).unwrap()).unwrap();
+        let failure = manifest.projects[0].skipped.as_ref().unwrap();
+        assert_eq!(failure.kind, kind);
+        assert_eq!(failure.package, "p");
+        let prepared = bun::prepare_cache(
+            &seed,
+            &staging.join("m"),
+            &scratch.join(format!("cache-{index}")),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(prepared.projects[0].skipped.as_ref().unwrap().kind, kind);
+
+        manifest.projects[0].skipped = None;
+        fs::write(
+            seed.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let prepared = bun::prepare_cache(
+            &seed,
+            &staging.join("m"),
+            &scratch.join(format!("missing-{index}")),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            prepared.projects[0].skipped.as_ref().unwrap().kind,
+            RefusalKind::BunCacheMissing
+        );
+    }
+    let error = prepare_with_fetch(
+        &config,
+        &staging,
+        "/repo",
+        std::slice::from_ref(&checkout),
+        |_| Ok(b"corrupt".to_vec()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("BunIntegrityMismatch"));
+    fs::write(
+        checkout.join("bun.lock"),
+        lock.replace(
+            "\"p@1.0.0\",\"\"",
+            "\"p@1.0.0\",\"https://unauthorized.test/p.tgz\"",
+        ),
+    )
+    .unwrap();
+    let error = prepare_with_fetch(&config, &staging, "/repo", &[checkout], |_| {
+        panic!("unauthorized registry was fetched")
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("BunRegistryUnauthorized"));
 }
 
 #[cfg(unix)]

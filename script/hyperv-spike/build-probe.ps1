@@ -34,6 +34,6 @@ try {
     $destination = Join-Path $Root 'hyperv-spike-trace.exe'
     Copy-Item (Join-Path $Root 'probe-build\x86_64-pc-windows-msvc\release\examples\hyperv-spike.exe') $destination -Force
     $version = Invoke-SpikeNative $destination @('--version') $Root 'probe-version'
-    Assert-Spike ($version.exitCode -eq 0 -and $version.stdout -match 'protocol 6 trace=3') 'traced-host-probe' "$($version.stdout.Trim()) SHA256=$((Get-FileHash $destination).Hash)"
+    Assert-Spike ($version.exitCode -eq 0 -and $version.stdout -match 'protocol 7 trace=3') 'traced-host-probe' "$($version.stdout.Trim()) SHA256=$((Get-FileHash $destination).Hash)"
     Write-Host "PASS measurement-only-client path=$destination (parent and guest agent untouched)"
 } finally { if ($lock) { $lock.Dispose() } }

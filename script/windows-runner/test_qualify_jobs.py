@@ -467,7 +467,8 @@ class QualificationReadinessTests(unittest.TestCase):
                                  "requested-return-ads-refused", "no-requested-returns-preserves-changed-source"])
         operator = (HERE.parents[1] / "crates/motor-runner/src/tests/windows_operator.rs").read_text()
         checks = re.findall(r"^(?:async )?fn (windows_qualification_\w+)\(", operator, re.MULTILINE)
-        self.assertEqual(len(checks), 17)
+        self.assertEqual(len(checks), 18)
+        self.assertIn("windows_qualification_realistic_checkout_bun_failure_is_nonfatal", checks)
         for name in names:
             self.assertIn("windows_qualification_" + name.replace("-", "_"), checks)
         ads = next(case for case in JOBS.RETURN_QUALIFICATION_CASES if case[0] == "requested-return-ads-refused")

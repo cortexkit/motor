@@ -191,6 +191,7 @@ fn missing_optional_windows_package_and_bin_are_named_refusals() {
         name: "root".into(),
         version: "1.0.0".into(),
         packages: vec![package()],
+        skipped: None,
     };
     let refusal = verify_installed(&project, scratch.path()).unwrap_err();
     assert_eq!(refusal.kind, RefusalKind::BunOfflineInstallFailed);
@@ -211,6 +212,103 @@ fn missing_optional_windows_package_and_bin_are_named_refusals() {
     );
     std::fs::write(installed.join("tool.exe"), b"binary").unwrap();
     verify_installed(&project, scratch.path()).unwrap();
+}
+
+#[test]
+fn operational_install_and_verification_failures_skip_and_remove_partial_modules() {
+    let scratch = ScratchDir::new("bun-install-skips");
+    let project = Project {
+        path: "m/project".into(),
+        lock_sha256: String::new(),
+        manifest_sha256: String::new(),
+        name: "root".into(),
+        version: "1.0.0".into(),
+        packages: vec![package()],
+        skipped: None,
+    };
+    let nested = scratch.join("workspace/node_modules/partial");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("unverified"), "partial install").unwrap();
+    let failure = refuse(
+        RefusalKind::BunOfflineInstallFailed,
+        "m/project",
+        "root",
+        "1.0.0",
+    );
+    let warning = finish_install(&project, scratch.path(), Err(failure))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        warning.warning(),
+        "bun install skipped for m/project: BunOfflineInstallFailed package=root@1.0.0\n"
+    );
+    assert!(!scratch.join("workspace/node_modules").exists());
+
+    let modules = scratch.join("node_modules/partial");
+    std::fs::create_dir_all(&modules).unwrap();
+    let warning = finish_install(&project, scratch.path(), Ok(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(warning.package, "@private/win");
+    assert!(!scratch.join("node_modules").exists());
+
+    for kind in [
+        RefusalKind::BunLockInvalid,
+        RefusalKind::BunSourceUnsupported,
+        RefusalKind::BunIntegrityMissing,
+        RefusalKind::BunIntegrityMismatch,
+        RefusalKind::BunRegistryUnauthorized,
+        RefusalKind::BunProjectionInvalid,
+    ] {
+        assert!(kind.is_security());
+        let failure = refuse(kind, "m/project", "root", "1.0.0");
+        assert_eq!(
+            finish_install(&project, scratch.path(), Err(failure))
+                .unwrap_err()
+                .kind,
+            kind
+        );
+    }
+}
+
+#[test]
+fn bun_stderr_tail_is_bounded_and_has_no_control_characters() {
+    let mut tail = DiagnosticTail::default();
+    tail.push(&vec![b'a'; 4096]);
+    tail.push(b"\nerror: frozen lockfile\r\n\x1b\x00\t");
+    let line = tail.line();
+    assert!(line.len() <= 2048);
+    assert!(line.contains("error: frozen lockfile"));
+    assert!(!line.chars().any(char::is_control));
+    assert!(line.starts_with('a'));
+    tail.push(&vec![0xff; 4096]);
+    assert!(tail.line().len() <= 2048);
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_package_path_escape_is_a_security_refusal() {
+    let scratch = ScratchDir::new("bun-installed-escape");
+    let directory = scratch.join("project");
+    let outside = scratch.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(directory.join("node_modules/@private")).unwrap();
+    std::os::unix::fs::symlink(&outside, directory.join("node_modules/@private/win")).unwrap();
+    let project = Project {
+        path: "m/project".into(),
+        lock_sha256: String::new(),
+        manifest_sha256: String::new(),
+        name: "root".into(),
+        version: "1.0.0".into(),
+        packages: vec![package()],
+        skipped: None,
+    };
+    assert_eq!(
+        finish_install(&project, &directory, Ok(()))
+            .unwrap_err()
+            .kind,
+        RefusalKind::BunProjectionInvalid
+    );
 }
 
 #[test]

@@ -1521,24 +1521,30 @@ mod guest {
         user: &User,
         command: &Command,
         stop: &Handle,
-    ) -> Result<(), motor_winagent::bun::Refusal> {
+    ) -> Result<Vec<String>, motor_winagent::bun::Refusal> {
         use motor_winagent::bun::{self, RefusalKind};
         let deadline = Instant::now() + Duration::from_secs(300);
         let budget = bun::ExpansionBudget::new(4 * 1024 * 1024 * 1024, 250_000, deadline);
         let fail =
             |project: &str| bun::refuse(RefusalKind::BunOfflineInstallFailed, project, "", "");
         let identity = user.impersonate().map_err(|_| fail(""))?;
-        let manifest = bun::prepare_cache_with_budget(
+        let manifest = match bun::prepare_cache_with_budget(
             Path::new(bun::SEED_DIR),
             Path::new(SOURCE_ROOT),
             Path::new(bun::CACHE_DIR),
             &budget,
-        )?;
-        let Some(manifest) = manifest else {
-            return Ok(());
+        ) {
+            Ok(manifest) => manifest,
+            Err(refusal) => return bun::skip_unprepared(Path::new(SOURCE_ROOT), refusal),
         };
-        bun::write_registry_config(&user.profile, &manifest.registries).map_err(|_| fail(""))?;
+        let Some(manifest) = manifest else {
+            return Ok(Vec::new());
+        };
+        if bun::write_registry_config(&user.profile, &manifest.registries).is_err() {
+            return bun::skip_unprepared(Path::new(SOURCE_ROOT), fail(""));
+        }
         drop(identity);
+        let mut warnings = Vec::new();
         for project in &manifest.projects {
             let fail = |_path: &str| {
                 bun::refuse(
@@ -1555,48 +1561,73 @@ mod guest {
                 project.path.strip_prefix('m').unwrap()
             }
             .into();
+            let directory = PathBuf::from(mapped_cwd(&prep.cwd).map_err(|_| fail(&project.path))?);
+            if let Some(refusal) = &project.skipped {
+                let _identity = user.impersonate().map_err(|_| fail(&project.path))?;
+                warnings.push(bun::skip_project(&directory, refusal.clone())?.warning());
+                continue;
+            }
             prep.env.clear();
             prep.command = "test \"$('C:/Program Files/Bun/bun.exe' --version)\" = 1.4.4 && 'C:/Program Files/Bun/bun.exe' install --offline --frozen-lockfile --ignore-scripts --backend=copyfile".into();
-            let (tx, rx) = mpsc::sync_channel(16);
-            let prep_stop = Arc::new(Handle::event().map_err(|_| fail(&project.path))?);
-            let job = Job::start(user, &prep, tx, prep_stop).map_err(|_| fail(&project.path))?;
-            let mut closed = 0;
-            loop {
-                if stop.signalled() || Instant::now() >= deadline {
-                    return Err(fail(&project.path));
-                }
-                let code = job.exit_code().map_err(|_| fail(&project.path))?;
-                if let Some(code) = code {
-                    if code != 0 {
-                        let _identity = user.impersonate().map_err(|_| fail(&project.path))?;
-                        bun::verify_installed(
-                            project,
-                            &PathBuf::from(mapped_cwd(&prep.cwd).map_err(|_| fail(&project.path))?),
-                        )
-                        .map_err(|failure| failure.registry(&manifest.registries))?;
-                        return Err(fail(&project.path));
+            let mut diagnostics = bun::DiagnosticTail::default();
+            let result = (|| {
+                let (tx, rx) = mpsc::sync_channel(16);
+                let prep_stop = Arc::new(Handle::event().map_err(|_| fail(&project.path))?);
+                let job =
+                    Job::start(user, &prep, tx, prep_stop).map_err(|_| fail(&project.path))?;
+                let mut closed = 0;
+                let mut code = None;
+                let result = loop {
+                    if stop.signalled() || Instant::now() >= deadline {
+                        break Err(fail(&project.path));
                     }
-                    if closed == 2 {
-                        break;
+                    match job.exit_code() {
+                        Ok(Some(exit)) if code.is_none() => {
+                            code = Some(exit);
+                            if job.terminate(exit).is_err() {
+                                break Err(fail(&project.path));
+                            }
+                        }
+                        Err(_) => break Err(fail(&project.path)),
+                        _ => (),
                     }
-                }
-                match rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(Event::Output(..)) => (), // Untrusted package diagnostics never enter service logs.
-                    Ok(Event::PipeClosed) => closed += 1,
-                    Ok(_) => return Err(fail(&project.path)),
-                    Err(mpsc::RecvTimeoutError::Timeout) => (),
-                    Err(_) => return Err(fail(&project.path)),
+                    if let Some(code) = code
+                        && closed == 2
+                    {
+                        break if code == 0 {
+                            Ok(())
+                        } else {
+                            Err(fail(&project.path))
+                        };
+                    }
+                    match rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(Event::Output(Stream::Stderr, bytes)) => diagnostics.push(&bytes),
+                        Ok(Event::Output(..)) => (),
+                        Ok(Event::PipeClosed) => closed += 1,
+                        Ok(_) => break Err(fail(&project.path)),
+                        Err(mpsc::RecvTimeoutError::Timeout) => (),
+                        Err(_) => break Err(fail(&project.path)),
+                    }
+                };
+                // Finish containment before removing any partial dependency tree.
+                let containment =
+                    || bun::refuse(RefusalKind::BunProjectionInvalid, &project.path, "", "");
+                job.terminate(1).map_err(|_| containment())?;
+                job.wait_empty().map_err(|_| containment())?;
+                drop(rx);
+                drop(job);
+                result
+            })();
+            let _identity = user.impersonate().map_err(|_| fail(&project.path))?;
+            if let Some(refusal) = bun::finish_install(project, &directory, result)? {
+                warnings.push(refusal.registry(&manifest.registries).warning());
+                let tail = diagnostics.line();
+                if !tail.is_empty() {
+                    warnings.push(format!("bun stderr: {tail}\n"));
                 }
             }
-            drop(job);
-            let _identity = user.impersonate().map_err(|_| fail(&project.path))?;
-            bun::verify_installed(
-                project,
-                &PathBuf::from(mapped_cwd(&prep.cwd).map_err(|_| fail(&project.path))?),
-            )
-            .map_err(|failure| failure.registry(&manifest.registries))?;
         }
-        Ok(())
+        Ok(warnings)
     }
 
     fn stage(
@@ -1604,7 +1635,7 @@ mod guest {
         rx: &mpsc::Receiver<Event>,
         port: &mut Port,
         user: &User,
-    ) -> io::Result<(Command, Inventory)> {
+    ) -> io::Result<(Command, Inventory, Vec<String>)> {
         let _identity = user.impersonate()?;
         let home = user.profile.join(".cargo");
         let temp = user.profile.join("AppData/Local/Temp");
@@ -1685,16 +1716,19 @@ mod guest {
         // absolute local-registry path under the guest user's CARGO_HOME.
         motor_winagent::rewrite_local_registry_config(&home)?;
         drop(identity);
-        if let Err(refusal) = prepare_bun(user, &command, &port.stop) {
-            send(
-                protocol,
-                port,
-                &Frame::BunPreparationFailed {
-                    refusal: refusal.clone(),
-                },
-            )?;
-            return Err(refusal.into());
-        }
+        let warnings = match prepare_bun(user, &command, &port.stop) {
+            Ok(warnings) => warnings,
+            Err(refusal) => {
+                send(
+                    protocol,
+                    port,
+                    &Frame::BunPreparationFailed {
+                        refusal: refusal.clone(),
+                    },
+                )?;
+                return Err(refusal.into());
+            }
+        };
         let _identity = user.impersonate()?;
         let before = inventory(Path::new(SOURCE_ROOT))?;
         command.command = motor_winagent::command_with_git_cache(
@@ -1720,7 +1754,7 @@ mod guest {
         std::fs::remove_file(temp.join("motor-tree.tar"))?;
         send(protocol, port, &Frame::TreeReceived {})?;
         diagnostic!("staging TreeReceived sent");
-        Ok((command, before))
+        Ok((command, before, warnings))
     }
 
     fn execute(
@@ -1730,6 +1764,7 @@ mod guest {
         port: &mut Port,
         user: &User,
         command: &Command,
+        warnings: Vec<String>,
     ) -> io::Result<Option<motor_winagent::returned::Request>> {
         let mut gate = receive(protocol, rx, &port.stop)?;
         let returns = if let Frame::RequestReturns { request } = gate {
@@ -1743,6 +1778,16 @@ mod guest {
         }
         let mut job = Job::start(user, command, tx, port.stop.clone())?;
         send(protocol, port, &Frame::Started {})?;
+        for warning in warnings {
+            send(
+                protocol,
+                port,
+                &Frame::Output {
+                    stream: Stream::Stderr,
+                    bytes: warning.into_bytes(),
+                },
+            )?;
+        }
         let mut code = None;
         let mut closed = 0;
         loop {
@@ -1908,8 +1953,8 @@ mod guest {
                 timings: cache.timings.clone(),
             },
         )?;
-        let (command, before) = stage(&mut protocol, &rx, &mut port, &user)?;
-        let returns = execute(&mut protocol, &rx, tx, &mut port, &user, &command)?;
+        let (command, before, warnings) = stage(&mut protocol, &rx, &mut port, &user)?;
+        let returns = execute(&mut protocol, &rx, tx, &mut port, &user, &command, warnings)?;
         let collect = receive(&mut protocol, &rx, &port.stop)?;
         if let Some(request) = returns {
             if collect != (Frame::CollectReturns {}) {
