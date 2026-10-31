@@ -259,6 +259,7 @@ class BaselineInputsTests(unittest.TestCase):
         pins = {
             "cmake": ("CMake", "4.4.5", "326c826486d46a23cf9d5a1c9ee3a567d427bdd02c4a34071937a2a675cff004"),
             "ninja": ("Ninja", "1.13.2", "07fc8261b42b20e71d1720b39068c2e14ffcee6396b76fb7a795fb460b78dc65"),
+            "jq": ("jq", "1.8.2", "a6fc67fedaf9128a3309a1e2ebb8b986aeccf70122ee46d2cb4849e423f0c627"),
             "node": ("Node", "24.22.2", "ca1bff5d8ead13c9f2ea404a176db46bd430704d5b5113734049fa365e7799e2"),
         }
         for tool, (label, version, sha256) in pins.items():
@@ -272,6 +273,8 @@ class BaselineInputsTests(unittest.TestCase):
                 hash_check = f"Get-FileHash -LiteralPath ${tool}Archive -Algorithm SHA256"
                 mismatch = f"throw '{label} archive SHA-256 mismatch'"
                 extract = f"Expand-Archive -LiteralPath ${tool}Archive -DestinationPath ${tool}Install"
+                if tool == "jq":
+                    extract = 'Move-Item -LiteralPath $jqArchive -Destination "$jqInstall\\jq.exe"'
                 root_acl = f"& icacls ${tool}Install /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'"
                 owner = f"& icacls ${tool}Install /setowner '*S-1-5-32-544' /T /C /L /Q"
                 for expected in (
@@ -298,6 +301,7 @@ class BaselineInputsTests(unittest.TestCase):
             r'Get-ChildItem -LiteralPath "$nodeInstall\node-v$nodeVersion-win-x64" -Force | Move-Item -Destination $nodeInstall',
             'if ($LASTEXITCODE -ne 0 -or ($installedCmakeVersion | Select-Object -First 1) -cne "cmake version $cmakeVersion") { throw',
             'if ($LASTEXITCODE -ne 0 -or $installedNinjaVersion -cne $ninjaVersion) { throw',
+            'if ($LASTEXITCODE -ne 0 -or $installedJqVersion -cne "jq-$jqVersion") { throw',
             'if ($LASTEXITCODE -ne 0 -or $installedNodeVersion -cne "v$nodeVersion") { throw',
             "$npmVersion = '11.19.1'", '& npm.cmd --version',
             'if ($LASTEXITCODE -ne 0 -or $installedNpmVersion -cne $npmVersion) { throw',
@@ -312,14 +316,29 @@ class BaselineInputsTests(unittest.TestCase):
     def test_hyperv_parent_requires_cmake_ninja_node_and_npm_build_verification(self):
         provision = (HERE.parent / "hyperv-spike/provision.ps1").read_text()
         baseline = (HERE / "setup-job-baseline.ps1").read_text()
-        for label, version in (("CMake", "4.4.5"), ("Ninja", "1.13.2"), ("Node", "24.22.2 and npm 11.19.1")):
+        for label, version in (("CMake", "4.4.5"), ("Ninja", "1.13.2"), ("jq", "1.8.2"), ("Node", "24.22.2 and npm 11.19.1")):
             message = f"Verified machine-wide {label} {version} with protected user read/execute access"
             pattern = message.replace(".", "\\.")
             self.assertIn(f"Assert-Spike ($bootstrap -match '{pattern}')", provision)
-            template = message.replace(version, {"CMake": "$cmakeVersion", "Ninja": "$ninjaVersion", "Node": "$nodeVersion and npm $npmVersion"}[label])
+            template = message.replace(version, {"CMake": "$cmakeVersion", "Ninja": "$ninjaVersion", "jq": "$jqVersion", "Node": "$nodeVersion and npm $npmVersion"}[label])
             self.assertIn(f'Write-Host "{template}"', baseline)
         seed = (HERE.parent / "hyperv-spike/seed.py").read_text()
         self.assertIn('"setup-job-baseline.ps1"', seed)
+
+    def test_windows_qualification_checks_native_jq_and_cache_drive_alias(self):
+        source = (HERE.parent.parent / "crates/motor-runner/src/tests/windows_operator.rs").read_text()
+        for expected in (
+            "jq --version;", "& jq.exe --version", 'line.trim() == "jq-1.8.2"',
+            "@{name='jq';command='jq.exe';path='C:\\Program Files\\jq'}",
+            "Test-Path -LiteralPath 'T:\\' -PathType Container",
+            "fsutil.exe reparsepoint query 'T:\\'", "not a reparse point",
+            "(Get-Acl -LiteralPath 'T:\\').Sddl -cne (Get-Acl -LiteralPath 'C:\\t\\').Sddl",
+            "[IO.File]::WriteAllText(('T:\\'+$driveProbe),'drive cache')",
+            "[IO.File]::ReadAllText(('C:\\t\\'+$driveProbe)) -cne 'drive cache'",
+            "[IO.File]::WriteAllText(('C:\\t\\'+$driveProbe),'folder cache')",
+            "[IO.File]::ReadAllText(('T:\\'+$driveProbe)) -cne 'folder cache'",
+        ):
+            self.assertIn(expected, source)
 
     def test_baseline_installs_and_verifies_rustfmt_and_clippy_for_all_images(self):
         source = (HERE / "setup-job-baseline.ps1").read_text()

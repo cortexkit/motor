@@ -867,10 +867,43 @@ mod guest {
             })?;
             let folder_acl_ms = folder_acl_started.elapsed().as_millis();
             reporter.step(CacheStep::MountPoint, || unsafe {
+                // Query the global DOS namespace before adding a persistent
+                // drive mount. Never replace a drive that belongs to the image.
+                let mut target = [0u16; 1024];
+                if QueryDosDeviceW(
+                    wide("T:").as_ptr(),
+                    target.as_mut_ptr(),
+                    target.len() as u32,
+                ) != 0
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "cache drive T: is already in use",
+                    ));
+                }
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(ERROR_FILE_NOT_FOUND as i32) {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("cache drive T: availability check failed: {error}"),
+                    ));
+                }
                 win32(SetVolumeMountPointW(
                     wide(CACHE_MOUNT).as_ptr(),
                     wide(&volume).as_ptr(),
+                ))?;
+                // Mount Manager exposes the same root (and ACL) to every logon
+                // session; a process-local DOS device would hide it from jobs.
+                win32(SetVolumeMountPointW(
+                    wide("T:\\").as_ptr(),
+                    wide(&volume).as_ptr(),
                 ))
+                .map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("cache drive T: mount failed: {error}"),
+                    )
+                })
             })?;
             let mountpoint_ms = mountpoint_started.elapsed().as_millis();
             let mut cache = Self {

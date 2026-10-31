@@ -387,6 +387,12 @@ value or Cargo's `--target-dir` selects a different path. Tests:
 `windows_qualification_baseline_machine_wide_toolchain_and_msvc_build`
 (operator-only for the last test).
 
+The same cache volume is also available as the drive `T:\`.
+A job that needs a build folder with no reparse point in its path can set
+`CARGO_TARGET_DIR` to a folder on `T:\`, such as `T:\cargo-target`.
+The checkout's `target` junction still points to `C:\t`, and both paths show
+the same volume with the same permissions.
+
 A disk is keyed by the workspace, the baseline name
 and the toolchain version, so a new baseline or toolchain starts cold.
 

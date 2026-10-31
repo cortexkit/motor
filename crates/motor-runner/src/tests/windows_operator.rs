@@ -221,7 +221,7 @@ fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
     let output = run(
         &runner,
         &f,
-        &format!("set -e; rustc -vV; cargo --version; cargo nextest --version; git --version; bun --version; pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; python3 --version; python --version; python3 -c \"import json, hashlib, subprocess, tomllib, compression.zstd\"; nats-server --version; rustc +stable --version; clang --version; {probe}; cargo +stable run --offline; test -f target/debug/motor-qualification.exe"),
+        &format!("set -e; rustc -vV; cargo --version; cargo nextest --version; git --version; bun --version; pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; python3 --version; python --version; python3 -c \"import json, hashlib, subprocess, tomllib, compression.zstd\"; nats-server --version; rustc +stable --version; clang --version; jq --version; {probe}; cargo +stable run --offline; test -f target/debug/motor-qualification.exe"),
     );
     assert!(
         output
@@ -242,6 +242,15 @@ fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
         "{output}"
     );
     assert!(output.contains("Bun installation is read-only"), "{output}");
+    assert!(
+        output
+            .lines()
+            .filter(|line| line.trim() == "jq-1.8.2")
+            .count()
+            == 2,
+        "{output}"
+    );
+    assert!(output.contains("jq installation is read-only"), "{output}");
     assert_eq!(
         output
             .lines()
@@ -272,6 +281,10 @@ fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
         output.contains("short target cache is writable"),
         "{output}"
     );
+    assert!(
+        output.contains("cache drive aliases share permissions and data"),
+        "{output}"
+    );
     assert!(output.contains("release: 1.99.0"));
     assert!(output.contains("host: x86_64-pc-windows-msvc"));
     assert!(output.contains("MSVC binary ran"));
@@ -296,7 +309,7 @@ if($identity.Name.Split('\')[-1] -cne 'motor-job'){throw "unexpected job user: $
 if(([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'job user is an administrator'}
 if($env:LIBCLANG_PATH -cne 'C:\Program Files\LLVM\bin'){throw 'LIBCLANG_PATH does not name the protected LLVM bin directory'}
 if(-not (Test-Path -LiteralPath "$env:LIBCLANG_PATH\libclang.dll" -PathType Leaf)){throw 'libclang.dll is missing'}
-foreach($tool in @(@{name='PowerShell';command='pwsh.exe';path='C:\Program Files\PowerShell\7'},@{name='Bun';command='bun.exe';path='C:\Program Files\Bun'},@{name='Python';command='python3.exe';path='C:\Python314'},@{name='NATS';command='nats-server.exe';path='C:\Program Files\NATS'},@{name='LLVM';command='clang.exe';path='C:\Program Files\LLVM\bin'})) {
+foreach($tool in @(@{name='PowerShell';command='pwsh.exe';path='C:\Program Files\PowerShell\7'},@{name='Bun';command='bun.exe';path='C:\Program Files\Bun'},@{name='jq';command='jq.exe';path='C:\Program Files\jq'},@{name='Python';command='python3.exe';path='C:\Python314'},@{name='NATS';command='nats-server.exe';path='C:\Program Files\NATS'},@{name='LLVM';command='clang.exe';path='C:\Program Files\LLVM\bin'})) {
 $install=$tool.path
 if((Get-Command $tool.command -ErrorAction Stop).Source -cne (Join-Path $install $tool.command)){throw "$($tool.name) resolves outside the protected installation"}
 if($tool.name -eq 'LLVM'){$install=Split-Path -Parent $install}
@@ -314,7 +327,22 @@ foreach($file in Get-ChildItem -LiteralPath $install -File -Recurse -Force -Erro
 }
 Write-Output "$($tool.name) installation is read-only"
 }
+& jq.exe --version
+if($LASTEXITCODE -ne 0){throw 'native jq failed'}
 if($env:CARGO_TARGET_DIR -cne 'C:\t'){throw "unexpected target dir: $env:CARGO_TARGET_DIR"}
+if(-not (Test-Path -LiteralPath 'T:\' -PathType Container)){throw 'cache drive T: is missing'}
+if(((Get-Item -LiteralPath 'T:\' -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'cache drive root is a reparse point'}
+$reparseQuery=(& fsutil.exe reparsepoint query 'T:\' 2>&1 | Out-String)
+if($LASTEXITCODE -eq 0 -or $reparseQuery -notmatch 'not a reparse point'){throw "cache drive reparse query failed: $reparseQuery"}
+if((Get-Acl -LiteralPath 'T:\').Sddl -cne (Get-Acl -LiteralPath 'C:\t\').Sddl){throw 'cache drive and folder permissions differ'}
+$driveProbe='motor-drive-probe-'+[Guid]::NewGuid().ToString()
+try {
+ [IO.File]::WriteAllText(('T:\'+$driveProbe),'drive cache')
+ if([IO.File]::ReadAllText(('C:\t\'+$driveProbe)) -cne 'drive cache'){throw 'cache drive write did not reach folder mount'}
+ [IO.File]::WriteAllText(('C:\t\'+$driveProbe),'folder cache')
+ if([IO.File]::ReadAllText(('T:\'+$driveProbe)) -cne 'folder cache'){throw 'cache folder write did not reach drive mount'}
+} finally {Remove-Item -LiteralPath ('T:\'+$driveProbe) -Force -ErrorAction SilentlyContinue}
+Write-Output 'cache drive aliases share permissions and data'
 $longOutput=Join-Path (Get-Location) 'target\debug\deps\motor_qualification-0123456789abcdef.exe'
 if($longOutput.Length -lt 260){throw "checkout fixture is not long enough: $longOutput"}
 $probe=Join-Path $env:CARGO_TARGET_DIR ('motor-cache-probe-'+[Guid]::NewGuid().ToString())

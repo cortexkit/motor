@@ -180,6 +180,58 @@ foreach ($code in @(0, 1)) {
 $checks++
 Write-Host 'PASS python_stdlib_guard_rejects_failure'
 
+$jqInstall = @($ast.EndBlock.Statements | Where-Object {
+    $_ -is [Management.Automation.Language.TryStatementAst] -and $_.Extent.Text.Contains('-OutFile $jqArchive')
+})
+Assert ($jqInstall.Count -eq 1) 'jq must install unconditionally for QEMU and Hyper-V images'
+$jqSetup = $jqInstall[0].Extent.Text
+Assert ($jqSetup.IndexOf('-OutFile $jqArchive') -lt $jqSetup.IndexOf('Get-FileHash -LiteralPath $jqArchive')) 'jq hash must follow download'
+Assert ($jqSetup.IndexOf("throw 'jq archive SHA-256 mismatch'") -lt $jqSetup.IndexOf('Move-Item -LiteralPath $jqArchive')) 'jq hash must be verified before installation'
+Assert ($jqSetup.IndexOf('& icacls $jqInstall /inheritance:r') -lt $jqSetup.IndexOf('Move-Item -LiteralPath $jqArchive')) 'jq root must be protected before installation'
+$jqHashGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text.Contains('Get-FileHash -LiteralPath $jqArchive')}, $true)
+Assert ($null -ne $jqHashGuard) 'missing jq hash guard'
+$jqArchive = 'jq-fixture.exe'
+$jqSha256 = 'a6fc67fedaf9128a3309a1e2ebb8b986aeccf70122ee46d2cb4849e423f0c627'
+function Get-FileHash {
+    param($LiteralPath, $Algorithm)
+    Assert ($LiteralPath -eq $jqArchive -and $Algorithm -eq 'SHA256') 'jq hashed the wrong file or algorithm'
+    [pscustomobject]@{ Hash = $fixtureHash }
+}
+try {
+    foreach ($fixtureHash in @($jqSha256.ToUpperInvariant(), ('0' * 64))) {
+        $threw = $false
+        try { Invoke-Expression $jqHashGuard.Extent.Text } catch {
+            Assert ($_.ToString().Contains('jq archive SHA-256 mismatch')) "unexpected jq hash error: $_"
+            $threw = $true
+        }
+        Assert ($threw -eq ($fixtureHash -eq ('0' * 64))) 'jq accepted a wrong hash or rejected the pinned hash'
+    }
+} finally { Remove-Item Function:\Get-FileHash }
+$checks++
+Write-Host 'PASS jq_unconditional_protected_install_and_hash_guard'
+
+$jqVersionGuard = $ast.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text.Contains('$installedJqVersion -cne')}, $true)
+Assert ($null -ne $jqVersionGuard) 'missing jq version guard'
+$jqVersion = '1.8.2'
+foreach ($case in @(
+    @{Version='jq-1.8.2'; Code=0; Reject=$false},
+    @{Version='jq-1.8.1'; Code=0; Reject=$true},
+    @{Version='jq-1.8.20'; Code=0; Reject=$true},
+    @{Version=''; Code=127; Reject=$true},
+    @{Version='jq-1.8.2'; Code=1; Reject=$true}
+)) {
+    $installedJqVersion = $case.Version
+    $LASTEXITCODE = $case.Code
+    $threw = $false
+    try { Invoke-Expression $jqVersionGuard.Extent.Text } catch {
+        Assert ($_.ToString().Contains('Machine-wide jq version verification failed')) "unexpected jq version error: $_"
+        $threw = $true
+    }
+    Assert ($threw -eq $case.Reject) "wrong jq version guard result: $($case.Version), exit $($case.Code)"
+}
+$checks++
+Write-Host 'PASS jq_version_guard_rejects_wrong_missing_and_failed_tools'
+
 $natsInstall = @($ast.EndBlock.Statements | Where-Object {
     $_ -is [Management.Automation.Language.TryStatementAst] -and $_.Extent.Text.Contains('-OutFile $natsArchive')
 })

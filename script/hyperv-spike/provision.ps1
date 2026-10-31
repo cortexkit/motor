@@ -137,6 +137,7 @@ try {
         Assert-Spike ($bootstrap -match 'Verified machine-wide LLVM 21\.1\.8 and libclang\.dll with protected user read/execute access') 'verified-machine-llvm-version' '21.1.8'
         Assert-Spike ($bootstrap -match 'Verified machine-wide CMake 4\.4\.5 with protected user read/execute access') 'verified-machine-cmake-version' '4.4.5'
         Assert-Spike ($bootstrap -match 'Verified machine-wide Ninja 1\.13\.2 with protected user read/execute access') 'verified-machine-ninja-version' '1.13.2'
+        Assert-Spike ($bootstrap -match 'Verified machine-wide jq 1\.8\.2 with protected user read/execute access') 'verified-machine-jq-version' '1.8.2'
         Assert-Spike ($bootstrap -match 'Verified machine-wide Node 24\.22\.2 and npm 11\.19\.1 with protected user read/execute access') 'verified-machine-node-npm-versions' '24.22.2 / 11.19.1'
         Assert-Spike ($bootstrap -match 'Verified machine-wide Rust stable 1\.99\.0 with matching components and targets') 'verified-machine-rust-stable' '1.99.0'
         $agent = [IO.Path]::Combine($volume, 'ProgramData\Motor\motor-winagent.exe')

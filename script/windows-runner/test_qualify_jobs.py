@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Qualification readiness tests with mocked service states and in-memory pipes."""
+import base64
 import contextlib
 import importlib.util
 import io
@@ -76,6 +77,31 @@ class Clock:
 
 
 class QualificationReadinessTests(unittest.TestCase):
+    def test_real_jobs_check_jq_and_cache_drive_even_with_a_custom_gate(self):
+        source = (HERE / "qualify-jobs.py").read_text()
+        self.assertIn('+ JQ_VERSION_CHECK + " || exit $?; " + ', source)
+        self.assertIn('+ CACHE_DRIVE_CHECK + " || exit $?; " + ', source)
+        script = base64.b64decode(JOBS.CACHE_DRIVE_CHECK.split()[-1]).decode("utf-16le")
+        for required in (
+            "& jq.exe --version", "'jq-1.8.2'", "'C:\\Program Files\\jq\\jq.exe'",
+            "Test-Path -LiteralPath 'T:\\' -PathType Container",
+            "fsutil.exe reparsepoint query 'T:\\'", "not a reparse point",
+            "(Get-Acl -LiteralPath 'T:\\').Sddl -cne (Get-Acl -LiteralPath 'C:\\t\\').Sddl",
+            "[IO.File]::WriteAllText(('T:\\'+$probe),'drive cache')",
+            "[IO.File]::ReadAllText(('C:\\t\\'+$probe)) -cne 'drive cache'",
+            "[IO.File]::WriteAllText(('C:\\t\\'+$probe),'folder cache')",
+            "[IO.File]::ReadAllText(('T:\\'+$probe)) -cne 'folder cache'",
+        ):
+            self.assertIn(required, script)
+
+    @unittest.skipUnless(shutil.which("bash"), "requires Bash for the Git Bash version guard")
+    def test_jq_version_check_rejects_wrong_missing_and_failed_jq(self):
+        for version, code in (("jq-1.8.2", 0), ("jq-1.8.2\r", 0), ("jq-1.8.1", 0), ("jq-1.8.20", 0), ("", 127), ("jq-1.8.2", 1)):
+            with self.subTest(version=version, code=code):
+                command = f"jq() {{ printf '%s\\n' '{version}'; return {code}; }}; " + JOBS.JQ_VERSION_CHECK
+                result = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, version.rstrip("\r") == "jq-1.8.2" and code == 0, result.stderr)
+
     def test_real_jobs_check_bun_even_with_a_custom_gate(self):
         source = (HERE / "qualify-jobs.py").read_text()
         self.assertIn('command = BUN_VERSION_CHECK + " || exit $?; " + ', source)

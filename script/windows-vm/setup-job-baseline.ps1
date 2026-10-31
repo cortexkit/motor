@@ -248,6 +248,38 @@ $installedNinjaVersion = & ninja.exe --version
 if ($LASTEXITCODE -ne 0 -or $installedNinjaVersion -cne $ninjaVersion) { throw 'Machine-wide Ninja version verification failed' }
 Write-Host "Verified machine-wide Ninja $ninjaVersion with protected user read/execute access"
 
+# Native children need jq on machine PATH, not a Git Bash-only shim.
+# SHA-256 source: https://raw.githubusercontent.com/jqlang/jq/master/sig/v1.8.2/sha256sum.txt
+$jqVersion = '1.8.2'
+$jqSha256 = 'a6fc67fedaf9128a3309a1e2ebb8b986aeccf70122ee46d2cb4849e423f0c627'
+$jqArchive = Join-Path $motor 'jq-windows-amd64.exe'
+$jqInstall = 'C:\Program Files\jq'
+try {
+    Invoke-WebRequest 'https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-windows-amd64.exe' -OutFile $jqArchive -UseBasicParsing
+    if ((Get-FileHash -LiteralPath $jqArchive -Algorithm SHA256).Hash.ToLowerInvariant() -cne $jqSha256) {
+        throw 'jq archive SHA-256 mismatch'
+    }
+    if (Test-Path -LiteralPath $jqInstall) { throw 'jq destination already exists; use a fresh provisioning image' }
+    New-Item $jqInstall -ItemType Directory | Out-Null
+    & icacls $jqInstall /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'
+    if ($LASTEXITCODE -ne 0) { throw 'jq root ACL setup failed' }
+    Move-Item -LiteralPath $jqArchive -Destination "$jqInstall\jq.exe"
+    & icacls "$jqInstall\*" /reset /T /C /L /Q
+    if ($LASTEXITCODE -ne 0) { throw 'jq ACL inheritance reset failed' }
+    & icacls $jqInstall /setowner '*S-1-5-32-544' /T /C /L /Q
+    if ($LASTEXITCODE -ne 0) { throw 'jq ownership setup failed' }
+} finally {
+    Remove-Item -LiteralPath $jqArchive -Force -ErrorAction SilentlyContinue
+}
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+if (($machinePath -split ';' | ForEach-Object { $_.TrimEnd('\') }) -notcontains $jqInstall) {
+    [Environment]::SetEnvironmentVariable('Path', "$jqInstall;$machinePath", 'Machine')
+}
+$env:Path = "$jqInstall;" + $env:Path
+$installedJqVersion = & jq.exe --version
+if ($LASTEXITCODE -ne 0 -or $installedJqVersion -cne "jq-$jqVersion") { throw 'Machine-wide jq version verification failed' }
+Write-Host "Verified machine-wide jq $jqVersion with protected user read/execute access"
+
 # The official Node zip carries npm as well as node.exe for offline JS gates.
 # SHA-256 source: https://nodejs.org/dist/v24.22.2/SHASUMS256.txt
 # Its SHASUMS256.txt.sig was verified with the nodejs/release-keys keyring.

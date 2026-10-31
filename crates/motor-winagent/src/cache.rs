@@ -736,6 +736,28 @@ mod tests {
     }
 
     #[test]
+    fn cache_mount_adds_persistent_drive_without_replacing_an_existing_drive() {
+        // These source checks fence the privileged API choice on non-Windows
+        // hosts; real-image qualification checks the job user's view and ACL.
+        let source = include_str!("main.rs");
+        let mount = source.split_once("let folder_acl_ms = ").unwrap().1;
+        let mount = mount.split_once("let mountpoint_ms = ").unwrap().0;
+        assert!(mount.contains("QueryDosDeviceW("));
+        assert!(mount.contains("wide(\"T:\").as_ptr()"));
+        assert!(mount.contains("cache drive T: is already in use"));
+        assert!(mount.contains("ERROR_FILE_NOT_FOUND as i32"));
+        assert!(mount.contains("wide(CACHE_MOUNT).as_ptr()"));
+        assert!(mount.contains("wide(\"T:\\\\\").as_ptr()"));
+        assert_eq!(mount.matches("SetVolumeMountPointW(").count(), 2);
+        assert_eq!(mount.matches("wide(&volume).as_ptr()").count(), 2);
+        assert!(
+            mount.find("QueryDosDeviceW").unwrap() < mount.find("SetVolumeMountPointW").unwrap()
+        );
+        assert!(!mount.contains("DefineDosDevice"));
+        assert!(!mount.contains("DeleteVolumeMountPoint"));
+    }
+
+    #[test]
     fn reused_cache_missing_grant_never_updates_acl() {
         assert!(!super::cache_acl_update(true, false).unwrap());
         assert!(!super::cache_acl_update(true, true).unwrap());
