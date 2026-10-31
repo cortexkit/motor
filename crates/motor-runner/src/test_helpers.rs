@@ -11,6 +11,43 @@ use std::{
 
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
+/// Keep scratch ownership while exposing a path accepted by no-follow staging.
+/// macOS's default scratch base contains the /tmp or /var symlink; resolving
+/// only this trusted fixture root leaves staging's own symlink checks intact.
+pub(crate) struct CanonicalScratchDir {
+    _owned: cortexkit_test_support::ScratchDir,
+    path: std::path::PathBuf,
+}
+
+impl CanonicalScratchDir {
+    pub(crate) fn new(prefix: &str) -> Self {
+        let owned = cortexkit_test_support::ScratchDir::new(prefix);
+        let path = fs::canonicalize(owned.path()).expect("canonical scratch root");
+        Self {
+            _owned: owned,
+            path,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl std::ops::Deref for CanonicalScratchDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.path()
+    }
+}
+
+impl AsRef<Path> for CanonicalScratchDir {
+    fn as_ref(&self) -> &Path {
+        self.path()
+    }
+}
+
 fn wait_until_stopped(child: &mut Child) -> io::Result<()> {
     let pid = child.id() as libc::pid_t;
     let deadline = Instant::now() + Duration::from_secs(5);

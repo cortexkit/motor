@@ -1,7 +1,8 @@
 use super::*;
-use cortexkit_test_support::ScratchDir;
+use crate::test_helpers::CanonicalScratchDir as ScratchDir;
 use std::{
     fs as host,
+    io::Write,
     os::unix::fs::{symlink, PermissionsExt},
 };
 
@@ -180,10 +181,18 @@ fn caller_paths_are_strict_and_never_touched() {
     }
     r.cwd = r.workspace_key.clone();
     let caller = f.scratch.join("caller-must-not-exist");
-    r.workspace_key = caller.to_string_lossy().into();
+    // A scratch directory under /Users is a valid logical root on macOS.
+    // Keep the caller path invalid independently of the scratch location.
+    r.workspace_key = format!("{}/./caller-must-not-exist", f.scratch.display());
     r.repository_root = r.workspace_key.clone();
     r.cwd = r.workspace_key.clone();
-    assert!(f.staging.prepare(&r, Cancellation::default()).is_err());
+    assert!(f
+        .staging
+        .prepare(&r, Cancellation::default())
+        .err()
+        .expect("invalid caller path must be refused before staging")
+        .to_string()
+        .contains("macos_path_invalid"));
     assert!(!caller.exists());
     assert!(!f.staging.state.join("jobs").exists());
 }
@@ -751,35 +760,112 @@ fn concurrent_sibling_versions_survive_canonical_and_cache_eviction() {
     );
 }
 
-fn real_tool(name: &str) -> Tool {
-    let output = if matches!(name, "cargo" | "rustc") {
-        Command::new("rustup")
+fn installed_tool(
+    name: &str,
+    path: &std::ffi::OsStr,
+    home: Option<&std::ffi::OsStr>,
+    install: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let mut dirs: Vec<_> = std::env::split_paths(path).collect();
+    dirs.extend(install.map(|p| Path::new(p).join("bin")));
+    dirs.extend(home.map(|p| {
+        Path::new(p).join(if name == "bun" {
+            ".bun/bin"
+        } else {
+            ".cargo/bin"
+        })
+    }));
+    dirs.into_iter().map(|p| p.join(name)).find(|p| {
+        host::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    })
+}
+
+fn real_tool(name: &str) -> Result<Tool, String> {
+    let rust = matches!(name, "cargo" | "rustc");
+    let executable = if rust { "rustup" } else { name };
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    let home = std::env::var_os("HOME");
+    let install = std::env::var_os(if rust { "CARGO_HOME" } else { "BUN_INSTALL" });
+    let binary = installed_tool(executable, &path_env, home.as_deref(), install.as_deref())
+        .ok_or_else(|| format!("{executable} not found in PATH or its user install directory"))?;
+    // Pin standalone binaries because rustup proxies need the caller's home
+    // and toolchain selection, which staging's cleared environment omits.
+    let path = if rust {
+        let output = Command::new(binary)
             .args(["which", name])
             .output()
-            .unwrap()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "rustup which {name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        PathBuf::from(
+            String::from_utf8(output.stdout)
+                .map_err(|e| e.to_string())?
+                .trim(),
+        )
     } else {
-        Command::new("/bin/sh")
-            .args(["-c", &format!("command -v {name}")])
-            .output()
-            .unwrap()
+        binary
     };
-    assert!(
-        output.status.success(),
-        "required test tool {name} is unavailable"
-    );
-    let path = host::canonicalize(String::from_utf8(output.stdout).unwrap().trim()).unwrap();
-    Tool {
+    let path = host::canonicalize(path).map_err(|e| e.to_string())?;
+    Ok(Tool {
         sha256: format!("{:x}", Sha256::digest(host::read(&path).unwrap())),
         path,
+    })
+}
+
+fn real_tools<const N: usize>(test: &str, names: [&str; N]) -> Option<[Tool; N]> {
+    let tools = names
+        .into_iter()
+        .map(|name| {
+            real_tool(name).map_err(|error| format!("required tool {name} is unavailable: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>();
+    match tools {
+        Ok(tools) => tools.try_into().ok(),
+        Err(error) => {
+            // Direct stderr also stays visible under libtest's output capture.
+            writeln!(std::io::stderr().lock(), "SKIP {test}: {error}").unwrap();
+            None
+        }
+    }
+}
+
+#[test]
+fn real_tool_discovery_checks_user_install_when_path_omits_it() {
+    let scratch = ScratchDir::new("macos-tool-discovery");
+    for (name, relative) in [("bun", ".bun/bin"), ("rustup", ".cargo/bin")] {
+        let directory = scratch.join(relative);
+        host::create_dir_all(&directory).unwrap();
+        let binary = directory.join(name);
+        tool(binary.clone(), "#!/bin/sh\nexit 0\n");
+        let path = std::env::join_paths([scratch.join("empty-path")]).unwrap();
+        assert_eq!(
+            installed_tool(name, &path, Some(scratch.as_os_str()), None),
+            Some(binary)
+        );
+        assert!(installed_tool(name, &path, None, None).is_none());
+        assert_eq!(
+            installed_tool(name, &path, None, directory.parent().map(Path::as_os_str)),
+            Some(directory.join(name))
+        );
     }
 }
 
 #[test]
 fn real_cargo_and_bun_ignore_hostile_config_and_lifecycle_scripts() {
+    let Some([cargo, rustc, bun]) = real_tools(
+        "real_cargo_and_bun_ignore_hostile_config_and_lifecycle_scripts",
+        ["cargo", "rustc", "bun"],
+    ) else {
+        return;
+    };
     let mut f = Fixture::new();
-    f.staging.tools.cargo = real_tool("cargo");
-    f.staging.tools.rustc = real_tool("rustc");
-    f.staging.tools.bun = real_tool("bun");
+    f.staging.tools.cargo = cargo;
+    f.staging.tools.rustc = rustc;
+    f.staging.tools.bun = bun;
     let marker = f.scratch.join("hostile-marker");
     let provider = f.scratch.join("credential-provider");
     tool(
@@ -826,9 +912,15 @@ fn real_cargo_and_bun_ignore_hostile_config_and_lifecycle_scripts() {
 
 #[test]
 fn bundled_private_commit_with_unreachable_url_preps_offline_and_missing_commit_refuses() {
+    let Some([cargo, rustc]) = real_tools(
+        "bundled_private_commit_with_unreachable_url_preps_offline_and_missing_commit_refuses",
+        ["cargo", "rustc"],
+    ) else {
+        return;
+    };
     let mut f = Fixture::new();
-    f.staging.tools.cargo = real_tool("cargo");
-    f.staging.tools.rustc = real_tool("rustc");
+    f.staging.tools.cargo = cargo;
+    f.staging.tools.rustc = rustc;
     let private = f.scratch.join("private");
     host::create_dir_all(&private).unwrap();
     git(&private, &["init"]);
@@ -907,11 +999,17 @@ fn bundled_private_commit_with_unreachable_url_preps_offline_and_missing_commit_
 
 #[test]
 fn ssh_git_source_with_bundled_commit_passes_preflight_and_password_is_refused() {
+    let Some([cargo, rustc]) = real_tools(
+        "ssh_git_source_with_bundled_commit_passes_preflight_and_password_is_refused",
+        ["cargo", "rustc"],
+    ) else {
+        return;
+    };
     // An ssh source with a username is only an identifier that Cargo rewrites
     // to the uploaded bundle's local mirror; a password must never reach the job.
     let mut f = Fixture::new();
-    f.staging.tools.cargo = real_tool("cargo");
-    f.staging.tools.rustc = real_tool("rustc");
+    f.staging.tools.cargo = cargo;
+    f.staging.tools.rustc = rustc;
     let private = f.scratch.join("private-ssh");
     host::create_dir_all(&private).unwrap();
     git(&private, &["init"]);

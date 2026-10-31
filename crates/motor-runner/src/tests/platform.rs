@@ -9,6 +9,9 @@ fn platform_runner(f: &Fixture, kind: BackendKind) -> Runner {
 
 fn platform_config(f: &Fixture, kind: BackendKind) -> Config {
     let mut config = f.config();
+    // Admission tests inject a portable executor and never launch a job VM.
+    // Native macOS still requires the explicit opt-in for non-macOS backends.
+    config.development_allow_host_backend = true;
     if kind == BackendKind::WindowsVm {
         config = windows_instance::config(f);
     }

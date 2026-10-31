@@ -575,7 +575,7 @@ mod audit_tests {
     use super::*;
     #[test]
     fn deep_node_modules_are_refused_before_unbounded_walk() {
-        let scratch = cortexkit_test_support::ScratchDir::new("deep-module-validation");
+        let scratch = crate::test_helpers::CanonicalScratchDir::new("deep-module-validation");
         let root = scratch.join("tree");
         let modules = root.join("node_modules");
         let mut dir = Dir::open(&modules, true).unwrap();
@@ -605,7 +605,7 @@ mod audit_tests {
     }
     #[test]
     fn package_workspace_string_cannot_leave_validated_prep_roots() {
-        let scratch = cortexkit_test_support::ScratchDir::new("package-workspace-preflight");
+        let scratch = crate::test_helpers::CanonicalScratchDir::new("package-workspace-preflight");
         let root = scratch.join("tree");
         std::fs::create_dir(&root).unwrap();
         for workspace in ["/outside", "../../outside", "../outside"] {
