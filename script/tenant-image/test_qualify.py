@@ -30,6 +30,22 @@ def frames():
 
 
 class QualificationTests(unittest.TestCase):
+    def test_sandbox_probe_is_a_real_leased_job_and_refuses_missing_psi(self):
+        captured = (q.SANDBOX_PROBE.parent / "test-fixtures/job-sandbox-passing.json").read_bytes()
+        terminal = dict(type="terminal", outcome=dict(type="exit", code=0))
+        observed = q.assert_sandbox_job([output("stdout", captured[:40]), output("stdout", captured[40:]), terminal])
+        self.assertEqual("bash", observed["pid1"]["comm"])
+        observed["system_pressure"] = dict(errno=2, error="No such file or directory")
+        with self.assertRaisesRegex(RuntimeError, "PSI readable /proc/pressure/memory"):
+            q.assert_sandbox_job([output("stdout", json.dumps(observed).encode()), terminal])
+        with self.assertRaisesRegex(RuntimeError, "probe job completion"):
+            q.assert_sandbox_job([output("stdout", captured), dict(type="terminal", outcome=dict(type="exit", code=1))])
+        source = __import__("inspect").getsource(q.Harness.execute)
+        self.assertIn('self.step("job sandbox", lambda: assert_sandbox_job(self.job(4, "python3 job-sandbox-probe.py")))', source)
+        self.assertIn('shutil.copyfile(SANDBOX_PROBE, fixture / SANDBOX_PROBE.name)',
+                      __import__("inspect").getsource(q.Harness.job))
+        self.assertIn("job sandbox", q.STEPS)
+
     def test_qualification_cannot_check_an_image_with_different_parity_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -31,6 +31,7 @@ from discard_fixture import allocated, assert_reclaimed, without_discard
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 PARITY_FILES = tuple((REPO / "script/runner/parity-files.txt").read_text().splitlines())
+SANDBOX_PROBE = REPO / "script/runner/job-sandbox-probe.py"
 ROOT = Path("/var/lib/motor-vm")
 REGISTRY = Path("/etc/motor-vm-helper/tenants")
 BINDINGS = Path("/etc/motor-host/tenants.json")
@@ -58,7 +59,7 @@ JAVASCRIPT_MANAGERS = ("bun", "npm", "pnpm")
 TEST = "isolation::tests::hosted_job_cannot_open_vsock"
 WORKSPACE = "/Users/qualification/probe"
 STEPS = ("preflight", "provision and boot", "live inventory", "tenant inventory", "name service",
-          "tool trees", "root paths", "toolchain parity", "javascript setup", "trusted cargo fetch", "vsock isolation", "first job", "warm target reuse", "suspend", "restore", "post-restore job",
+          "tool trees", "root paths", "toolchain parity", "javascript setup", "trusted cargo fetch", "vsock isolation", "first job", "job sandbox", "warm target reuse", "suspend", "restore", "post-restore job",
           "cold discard", "warm discard", "guest units", "teardown")
 
 
@@ -68,6 +69,9 @@ def module(name, path):
     loaded = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(loaded)
     return loaded
+
+
+SANDBOX = module("tenant_job_sandbox_probe", SANDBOX_PROBE)
 
 
 def b64(data):
@@ -302,6 +306,20 @@ def assert_job(frames, code, expected_stdout, expected_stderr):
     if match is None:
         raise RuntimeError(f"missing exact target path and inode: {out!r}")
     return match.groups()
+
+
+def assert_sandbox_job(frames):
+    streams = {"stdout": bytearray(), "stderr": bytearray()}
+    terminals = []
+    for item in frames:
+        if item["type"] == "output":
+            streams[item["stream"]].extend(base64.b64decode(item["bytes"], validate=True))
+        if item["type"] == "terminal":
+            terminals.append(item["outcome"])
+    if len(terminals) != 1 or terminals[0].get("type") != "exit":
+        raise RuntimeError(f"job sandbox probe completion: terminals={terminals}, streams={streams}")
+    return SANDBOX.judge_job(dict(code=terminals[0]["code"],
+                                 **{key: bytes(value).decode() for key, value in streams.items()}))
 
 
 class Harness:
@@ -644,6 +662,7 @@ class Harness:
             (fixture / "input").write_text("tenant image qualification\n")
             for name in PARITY_FILES:
                 shutil.copyfile(REPO / "script/runner" / name, fixture / name)
+            shutil.copyfile(SANDBOX_PROBE, fixture / SANDBOX_PROBE.name)
             stage_javascript_fixtures(fixture)
             self.run("git", "-C", fixture, "add", ".")
             self.run("git", "-C", fixture, "-c", "user.name=Qualification", "-c", "user.email=qualification@example.invalid",
@@ -896,6 +915,9 @@ class Harness:
                 return assert_job(frames, 23 if number == 1 else 0,
                                   f"QUALIFY_STDOUT_{number}\n".encode(), f"QUALIFY_STDERR_{number}\n".encode())
             first = self.step("first job", lambda: [v.decode() for v in result(self.first_frames, 1)])
+            # Inventory and kernel config cannot establish what an isolated job
+            # actually sees. Submit through the same lease and TLS path as work.
+            self.step("job sandbox", lambda: assert_sandbox_job(self.job(4, "python3 job-sandbox-probe.py")))
             self.step("cold discard", lambda: self.isolated_discard("cold"))
             def warm():
                 second = [v.decode() for v in result(self.job(2), 2)]
