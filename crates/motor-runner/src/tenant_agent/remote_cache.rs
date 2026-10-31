@@ -300,8 +300,11 @@ fn exchange(left: &Path, right: &Path) -> io::Result<()> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
     let left = CString::new(left.as_os_str().as_bytes())?;
     let right = CString::new(right.as_os_str().as_bytes())?;
+    // Call the syscall directly: the musl libc crate has no renameat2 wrapper,
+    // and the static musl runner is built from this same code.
     if unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             left.as_ptr(),
             libc::AT_FDCWD,
