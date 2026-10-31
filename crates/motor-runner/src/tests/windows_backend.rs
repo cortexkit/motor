@@ -853,7 +853,8 @@ async fn windows_return_reservation_uses_shared_spool_and_releases_only_after_de
     };
     assert_eq!(fs::read(spool.join("chunk-0")).unwrap(), b"guest return");
     drop(runner);
-    let runner = Runner::open_with_backend(config, Box::new(FakeHost)).unwrap();
+    // The dropped runner's background threads can hold the daemon lock briefly.
+    let runner = reopen_with(|| Runner::open_with_backend(config.clone(), Box::new(FakeHost)));
     assert_eq!(
         runner.core.inner.lock().unwrap().jobs[&first.job_id].return_reserved_bytes,
         charge
