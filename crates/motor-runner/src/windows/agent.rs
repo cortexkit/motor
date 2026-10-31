@@ -744,7 +744,7 @@ fn materialize_attempt(
             .text(),
     )
     .map_err(|error| super::vm::path_error("prepare job staging", &staging, error))?;
-    let tar = super::prep::prepare(config, trees, setup, &resources.staging).map_err(|error| {
+    let prepared_tree = super::prep::prepare(config, trees, setup, &resources.staging).map_err(|error| {
         if super::prep_error::is_reported(&error) {
             error
         } else {
@@ -753,6 +753,8 @@ fn materialize_attempt(
             super::vm::path_error("materialize job staging", &resources.staging, error)
         }
     })?;
+    let tar = prepared_tree.path;
+    resources.bun_lease = Some(prepared_tree.lease);
     if control.cancel.load(Ordering::Acquire) > 0 {
         return Err(invalid("Windows setup cancelled"));
     }

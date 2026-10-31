@@ -2,22 +2,37 @@
 
 #[cfg(windows)]
 use motor_winagent::bun::protection;
-use motor_winagent::bun::{self, Integrity, Manifest, Package, Project, Refusal, RefusalKind};
-use serde::Deserialize;
+#[cfg(test)]
+use motor_winagent::bun::Integrity;
+use motor_winagent::bun::{self, Manifest, Package, Project, Refusal, RefusalKind};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(all(test, unix))]
+use std::io::Write;
 use std::time::{Duration, Instant};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{self, Read, Write},
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 use url::Url;
+mod store;
+pub(super) use store::Lease;
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct RegistryConfig {
     pub scopes: BTreeMap<String, Scope>,
+    pub cas_quota_bytes: u64,
+}
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        Self {
+            scopes: BTreeMap::new(),
+            cas_quota_bytes: store::DEFAULT_QUOTA,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -74,6 +89,7 @@ struct FetchTarget<'a> {
     url: Url,
     origin: String,
     credential_file: Option<&'a Path>,
+    provenance: store::Provenance,
 }
 
 fn resolve<'a>(
@@ -83,6 +99,21 @@ fn resolve<'a>(
     row: &bun::LockedPackage,
 ) -> Result<FetchTarget<'a>, Refusal> {
     let package = &row.package;
+    if !bun::valid_name(&package.name)
+        || package.version.len() > 256
+        || !package
+            .version
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_digit())
+        || !package
+            .version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b))
+        || !package.integrity.valid()
+    {
+        return Err(bun::refuse(RefusalKind::BunLockInvalid, project, "", ""));
+    }
     let scope = package
         .name
         .strip_prefix('@')
@@ -127,14 +158,22 @@ fn resolve<'a>(
     } else {
         None
     };
+    let basename = package.name.rsplit('/').next().unwrap();
+    let expected = registry
+        .join(&format!(
+            "{}/-/{}-{}.tgz",
+            package.name, basename, package.version
+        ))
+        .map_err(|_| {
+            fail(
+                RefusalKind::BunRegistryUnauthorized,
+                project,
+                package,
+                &origin,
+            )
+        })?;
     let url = if row.url.is_empty() {
-        let basename = package.name.rsplit('/').next().unwrap();
-        registry
-            .join(&format!(
-                "{}/-/{}-{}.tgz",
-                package.name, basename, package.version
-            ))
-            .ok()
+        Some(expected.clone())
     } else {
         Url::parse(&row.url).ok()
     }
@@ -145,8 +184,7 @@ fn resolve<'a>(
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
-        || !url.path().starts_with(registry.path())
-        || !url.path().ends_with(".tgz")
+        || url.path() != expected.path()
         || url.path().contains('%')
         || url.path().contains('\\')
     {
@@ -158,6 +196,12 @@ fn resolve<'a>(
         ));
     }
     Ok(FetchTarget {
+        provenance: store::Provenance {
+            registry: registry.to_string(),
+            origin: origin.clone(),
+            scope: scope.map(str::to_owned),
+            credentialed: credential_file.is_some(),
+        },
         url,
         origin,
         credential_file,
@@ -262,13 +306,10 @@ fn fetch(target: &FetchTarget<'_>) -> Result<Vec<u8>, RefusalKind> {
         let response = request
             .send()
             .map_err(|_| RefusalKind::BunFetchUnavailable)?;
-        if matches!(response.status().as_u16(), 401 | 403) {
-            return Err(RefusalKind::BunRegistryUnauthorized);
-        }
-        if response.status().as_u16() != 200
-            || response
-                .content_length()
-                .is_some_and(|n| n > bun::MAX_BLOB_BYTES)
+        fetch_status(response.status().as_u16())?;
+        if response
+            .content_length()
+            .is_some_and(|n| n > bun::MAX_BLOB_BYTES)
         {
             return Err(RefusalKind::BunFetchUnavailable);
         }
@@ -281,6 +322,14 @@ fn fetch(target: &FetchTarget<'_>) -> Result<Vec<u8>, RefusalKind> {
             return Err(RefusalKind::BunFetchUnavailable);
         }
         Ok(bytes)
+    }
+}
+
+pub(super) fn fetch_status(status: u16) -> Result<(), RefusalKind> {
+    match status {
+        200 => Ok(()),
+        401 | 403 | 404 => Err(RefusalKind::BunRegistryUnauthorized),
+        _ => Err(RefusalKind::BunFetchUnavailable),
     }
 }
 
@@ -308,59 +357,26 @@ fn protected_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn verified_blob(
     cache: &Path,
     integrity: &Integrity,
-    mut download: impl FnMut() -> Result<Vec<u8>, RefusalKind>,
+    download: impl FnMut() -> Result<Vec<u8>, RefusalKind>,
 ) -> Result<Vec<u8>, RefusalKind> {
-    let directory = cache.join(&integrity.algorithm);
-    protected_directory(&directory).map_err(|_| RefusalKind::BunCacheMissing)?;
-    let path = directory.join(&integrity.hex);
-    #[cfg(windows)]
-    if path.exists() {
-        protection::check(&path, 0).map_err(|_| RefusalKind::BunCacheMissing)?;
-    }
-    let bytes = match bounded_file(&path, bun::MAX_BLOB_BYTES) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => download()?,
-        Err(_) => return Err(RefusalKind::BunCacheMissing),
+    let source = store::Provenance {
+        registry: "https://registry.npmjs.org/".into(),
+        origin: "https://registry.npmjs.org".into(),
+        scope: None,
+        credentialed: false,
     };
-    if !integrity.verify(&bytes) {
-        let quarantine = cache.join("quarantine");
-        protected_directory(&quarantine).map_err(|_| RefusalKind::BunCacheMissing)?;
-        let bad = quarantine.join(format!("{}-{}", integrity.hex, uuid::Uuid::now_v7()));
-        fs::write(bad, &bytes).map_err(|_| RefusalKind::BunCacheMissing)?;
-        if path.exists() {
-            fs::remove_file(path).map_err(|_| RefusalKind::BunCacheMissing)?;
-        }
-        return Err(RefusalKind::BunIntegrityMismatch);
-    }
-    if !path.exists() {
-        let temporary = directory.join(format!(".{}", uuid::Uuid::now_v7()));
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(|_| RefusalKind::BunCacheMissing)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|_| RefusalKind::BunCacheMissing)?;
-        }
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|_| RefusalKind::BunCacheMissing)?;
-        // A concurrent publisher may win; a hard link never replaces an existing
-        // integrity-keyed cache object, unlike rename on Unix. Every reader verifies independently.
-        match fs::hard_link(&temporary, &path) {
-            Ok(()) => (),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
-            Err(_) => return Err(RefusalKind::BunCacheMissing),
-        }
-        fs::remove_file(temporary).map_err(|_| RefusalKind::BunCacheMissing)?;
-    }
-    Ok(bytes)
+    store::get(
+        cache,
+        &source,
+        integrity,
+        store::DEFAULT_QUOTA,
+        &mut Lease::default(),
+        download,
+    )
 }
 
 fn discover(path: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
@@ -374,7 +390,10 @@ fn discover(path: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
             .collect::<io::Result<Vec<_>>>()?;
         entries.sort();
         for entry in entries {
-            if entry.file_name().is_some_and(|name| name == "node_modules") {
+            if entry
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("node_modules"))
+            {
                 continue;
             }
             discover(&entry, files)?;
@@ -387,28 +406,84 @@ fn discover(path: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParsedLock {
+    digest: String,
+    rows: Vec<bun::LockedPackage>,
+    locals: Vec<String>,
+}
+fn parse_lock(project: &str, bytes: &[u8]) -> io::Result<ParsedLock> {
+    let invalid = || bun::refuse(RefusalKind::BunLockInvalid, project, "", "");
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid())?;
+    let rows = bun::read_lock(project, text)?;
+    let value = bun::text_json(text).map_err(|_| invalid())?;
+    let mut locals = Vec::new();
+    for row in value["packages"].as_object().ok_or_else(invalid)?.values() {
+        let resolution = row[0].as_str().ok_or_else(invalid)?;
+        let at = resolution[usize::from(resolution.starts_with('@'))..]
+            .find('@')
+            .ok_or_else(invalid)?
+            + usize::from(resolution.starts_with('@'));
+        for prefix in ["file:", "link:", "workspace:", "portal:"] {
+            if let Some(local) = resolution[at + 1..].strip_prefix(prefix) {
+                locals.push(local.to_owned());
+            }
+        }
+    }
+    Ok(ParsedLock {
+        digest: hex_sha256(bytes),
+        rows,
+        locals,
+    })
+}
+
+/// On Linux the credential-free motor-prep systemd service parses these inputs
+/// with a 2 GiB memory limit before the host fetcher handles their bounded output.
+#[cfg(any(unix, test))]
+pub(super) fn write_parsed_locks(staging: &Path) -> io::Result<()> {
+    let mut files = Vec::new();
+    discover(&staging.join("m"), &mut files)?;
+    let mut parsed = BTreeMap::new();
+    let mut input_bytes = 0usize;
+    for lock in files
+        .iter()
+        .filter(|path| path.file_name().is_some_and(|n| n == "bun.lock"))
+    {
+        let bytes = bounded_file(lock, bun::MAX_LOCK_BYTES as u64)?;
+        input_bytes = input_bytes.saturating_add(bytes.len());
+        if input_bytes > bun::MAX_LOCK_BYTES {
+            return Err(bun::refuse(RefusalKind::BunLockInvalid, "", "", "").into());
+        }
+        let project = lock
+            .parent()
+            .unwrap()
+            .strip_prefix(staging)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        parsed.insert(project.clone(), parse_lock(&project, &bytes)?);
+    }
+    let bytes = serde_json::to_vec(&parsed)?;
+    if bytes.len() > 2 * bun::MAX_LOCK_BYTES {
+        return Err(bun::refuse(RefusalKind::BunLockInvalid, "", "", "").into());
+    }
+    fs::write(staging.join("bun-parsed.json"), bytes)
+}
+
 fn validate_local(
     project: &str,
     directory: &Path,
     checkout: &Path,
-    lock: &str,
+    locals: &[String],
+    files: &[PathBuf],
 ) -> Result<(), Refusal> {
     let fail = || bun::refuse(RefusalKind::BunSourceUnsupported, project, "", "");
-    let value = bun::text_json(lock).map_err(|_| fail())?;
-    for row in value["packages"].as_object().ok_or_else(fail)?.values() {
-        let resolution = row[0].as_str().ok_or_else(fail)?;
-        let start = usize::from(resolution.starts_with('@'));
-        let at = resolution[start..].find('@').ok_or_else(fail)? + start;
-        let version = &resolution[at + 1..];
-        for prefix in ["file:", "link:", "workspace:", "portal:"] {
-            if let Some(local) = version.strip_prefix(prefix) {
-                let target = directory.join(local).canonicalize().map_err(|_| fail())?;
-                if !target.starts_with(checkout.canonicalize().map_err(|_| fail())?)
-                    || !target.is_dir()
-                {
-                    return Err(fail());
-                }
-            }
+    for local in locals {
+        let target = super::local_path::resolve(directory, &[checkout.to_path_buf()], local)
+            .map_err(|_| fail())?;
+        if !files.contains(&target.join("package.json")) {
+            return Err(fail());
         }
     }
     Ok(())
@@ -497,17 +572,50 @@ pub(super) fn prepare(
     staging: &Path,
     repository: &str,
     checkouts: &[PathBuf],
-) -> io::Result<()> {
-    prepare_with_fetch(config, staging, repository, checkouts, fetch)
+) -> io::Result<Lease> {
+    #[cfg(target_os = "linux")]
+    let parsed = Some(
+        match bounded_file(
+            &staging.join("bun-parsed.json"),
+            (2 * bun::MAX_LOCK_BYTES) as u64,
+        ) {
+            Ok(bytes) => serde_json::from_slice::<BTreeMap<String, ParsedLock>>(&bytes)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) => return Err(error),
+        },
+    );
+    #[cfg(not(target_os = "linux"))]
+    let parsed = None;
+    prepare_impl(
+        config,
+        staging,
+        repository,
+        checkouts,
+        fetch,
+        parsed.as_ref(),
+    )
 }
 
+#[cfg(test)]
 fn prepare_with_fetch(
     config: &crate::engine::Config,
     staging: &Path,
     repository: &str,
     checkouts: &[PathBuf],
+    download: impl FnMut(&FetchTarget<'_>) -> Result<Vec<u8>, RefusalKind>,
+) -> io::Result<Lease> {
+    prepare_impl(config, staging, repository, checkouts, download, None)
+}
+
+fn prepare_impl(
+    config: &crate::engine::Config,
+    staging: &Path,
+    repository: &str,
+    checkouts: &[PathBuf],
     mut download: impl FnMut(&FetchTarget<'_>) -> Result<Vec<u8>, RefusalKind>,
-) -> io::Result<()> {
+    parsed: Option<&BTreeMap<String, ParsedLock>>,
+) -> io::Result<Lease> {
+    let mut lease = Lease::default();
     let registries = &config.windows.as_ref().unwrap().bun;
     let cache = config.state_dir().join("bun-cas");
     let mut files = Vec::new();
@@ -538,6 +646,7 @@ fn prepare_with_fetch(
         }
     }
     let mut projects = Vec::new();
+    let mut input_bytes = 0usize;
     for lock in &locks {
         let directory = lock.parent().unwrap();
         let project = directory
@@ -550,14 +659,28 @@ fn prepare_with_fetch(
             return Err(invalid().into());
         }
         let bytes = bounded_file(lock, bun::MAX_LOCK_BYTES as u64).map_err(|_| invalid())?;
-        let text = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
-        let rows = bun::read_lock(&project, text)?;
+        input_bytes = input_bytes.saturating_add(bytes.len());
+        if input_bytes > bun::MAX_LOCK_BYTES {
+            return Err(invalid().into());
+        }
+        let owned;
+        let parsed = if let Some(parsed) = parsed {
+            let entry = parsed.get(&project).ok_or_else(invalid)?;
+            if entry.digest != hex_sha256(&bytes) {
+                return Err(invalid().into());
+            }
+            entry
+        } else {
+            owned = parse_lock(&project, &bytes)?;
+            &owned
+        };
+        let rows = parsed.rows.clone();
         let checkout = checkouts
             .iter()
             .filter(|root| directory.starts_with(root))
             .max_by_key(|p| p.components().count())
             .ok_or_else(invalid)?;
-        validate_local(&project, directory, checkout, text)?;
+        validate_local(&project, directory, checkout, &parsed.locals, &files)?;
         validate_registry_inputs(&project, directory, registries)?;
         // Resolve and authorize every row before the first download, including
         // optional/disabled rows and rows whose integrity-keyed cached blob is already present.
@@ -592,11 +715,11 @@ fn prepare_with_fetch(
         ));
     }
     if projects.is_empty() {
-        return Ok(());
+        return Ok(lease);
     }
     protected_directory(&cache)?;
     let seed = staging.join("bun-seed");
-    fs::create_dir(&seed)?;
+    protected_directory(&seed)?;
     let mut manifest = Manifest {
         format: 1,
         bun_version: bun::BUN_VERSION.into(),
@@ -651,10 +774,23 @@ fn prepare_with_fetch(
                 )
                 .into());
             }
-            let bytes = verified_blob(&cache, &row.package.integrity, || download(&target))
-                .map_err(|kind| fail(kind, &project, &row.package, &target.origin))?;
+            let mut unused = Lease::default();
+            let reference = if row.package.windows {
+                &mut lease
+            } else {
+                &mut unused
+            };
+            let bytes = store::get(
+                &cache,
+                &target.provenance,
+                &row.package.integrity,
+                registries.cas_quota_bytes,
+                reference,
+                || download(&target),
+            )
+            .map_err(|kind| fail(kind, &project, &row.package, &target.origin))?;
             let dest = seed.join(row.package.integrity.blob_path());
-            if !dest.exists() {
+            if row.package.windows && !dest.exists() {
                 seed_bytes += bytes.len() as u64;
                 if seed_bytes > 8 * 1024 * 1024 * 1024 {
                     return Err(fail(
@@ -680,7 +816,7 @@ fn prepare_with_fetch(
         });
     }
     fs::write(seed.join("manifest.json"), serde_json::to_vec(&manifest)?)?;
-    Ok(())
+    Ok(lease)
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -689,5 +825,7 @@ fn hex_sha256(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod guest_tests;
+#[cfg(test)]
+mod security_tests;
 #[cfg(test)]
 mod tests;

@@ -1487,20 +1487,22 @@ mod guest {
         stop: &Handle,
     ) -> Result<(), motor_winagent::bun::Refusal> {
         use motor_winagent::bun::{self, RefusalKind};
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let budget = bun::ExpansionBudget::new(4 * 1024 * 1024 * 1024, 250_000, deadline);
         let fail =
             |project: &str| bun::refuse(RefusalKind::BunOfflineInstallFailed, project, "", "");
         let identity = user.impersonate().map_err(|_| fail(""))?;
-        let manifest = bun::prepare_cache(
+        let manifest = bun::prepare_cache_with_budget(
             Path::new(bun::SEED_DIR),
             Path::new(SOURCE_ROOT),
             Path::new(bun::CACHE_DIR),
+            &budget,
         )?;
         let Some(manifest) = manifest else {
             return Ok(());
         };
         bun::write_registry_config(&user.profile, &manifest.registries).map_err(|_| fail(""))?;
         drop(identity);
-        let deadline = Instant::now() + Duration::from_secs(300);
         for project in &manifest.projects {
             let fail = |_path: &str| {
                 bun::refuse(

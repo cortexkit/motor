@@ -161,17 +161,15 @@ fn allowlisted_download_limit(host: &str, path: &str) -> Option<usize> {
 }
 
 fn require_success_status(status: u32) -> io::Result<()> {
-    if status == 200 {
-        Ok(())
-    } else if matches!(status, 401 | 403) {
-        Err(io::Error::new(
+    match super::super::bun::fetch_status(u16::try_from(status).unwrap_or(0)) {
+        Ok(()) => Ok(()),
+        Err(motor_winagent::bun::RefusalKind::BunRegistryUnauthorized) => Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "registry authorization refused",
-        ))
-    } else {
-        Err(io::Error::other(format!(
+        )),
+        Err(_) => Err(io::Error::other(format!(
             "unexpected HTTP status {status}; redirects and non-success responses are refused"
-        )))
+        ))),
     }
 }
 

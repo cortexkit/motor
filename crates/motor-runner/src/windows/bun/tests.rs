@@ -9,6 +9,17 @@ fn integrity(bytes: &[u8]) -> Integrity {
         hex: hex_sha256(bytes),
     }
 }
+fn public_source() -> store::Provenance {
+    store::Provenance {
+        registry: "https://registry.npmjs.org/".into(),
+        origin: "https://registry.npmjs.org".into(),
+        scope: None,
+        credentialed: false,
+    }
+}
+fn blob(root: &Path, source: &store::Provenance, hash: &Integrity) -> PathBuf {
+    source.partition(root).join(&hash.algorithm).join(&hash.hex)
+}
 
 #[test]
 fn integrity_mismatch_is_refused_and_quarantined() {
@@ -21,13 +32,24 @@ fn integrity_mismatch_is_refused_and_quarantined() {
     )
     .unwrap_err();
     assert_eq!(error, RefusalKind::BunIntegrityMismatch);
-    assert!(!scratch.join(format!("sha256/{}", expected.hex)).exists());
+    assert!(!blob(scratch.path(), &public_source(), &expected).exists());
     let quarantined = fs::read_dir(scratch.join("quarantine"))
         .unwrap()
         .collect::<io::Result<Vec<_>>>()
         .unwrap();
     assert_eq!(quarantined.len(), 1);
-    assert_eq!(fs::read(quarantined[0].path()).unwrap(), b"corrupt tarball");
+    let diagnostic = fs::read(quarantined[0].path()).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&diagnostic).unwrap();
+    assert_eq!(value["size"], 15);
+    assert_eq!(value["expected"]["hex"], expected.hex);
+    assert!(!diagnostic
+        .windows(15)
+        .any(|part| part == b"corrupt tarball"));
+    verified_blob(scratch.path(), &expected, || {
+        Ok(b"second rejected body".to_vec())
+    })
+    .unwrap_err();
+    assert_eq!(fs::read_dir(scratch.join("quarantine")).unwrap().count(), 1);
 }
 
 #[test]
@@ -42,7 +64,11 @@ fn warm_blobs_are_reverified_and_do_not_need_a_registry() {
         .unwrap(),
         b"good tarball"
     );
-    fs::write(scratch.join(format!("sha256/{}", expected.hex)), b"bit rot").unwrap();
+    fs::write(
+        blob(scratch.path(), &public_source(), &expected),
+        b"bit rot",
+    )
+    .unwrap();
     assert_eq!(
         verified_blob(scratch.path(), &expected, || panic!(
             "corruption must be refused"
@@ -97,6 +123,9 @@ fn private_credentials_grants_and_locked_url_policy_are_checked_before_cache_acc
         "https://npm.example.test/p.tgz?token=secret",
         "https://other.test/p.tgz",
         "https://npm.example.test/%2e%2e/p.tgz",
+        "https://npm.example.test/@other/win/-/win-1.0.0.tgz",
+        "https://npm.example.test/@private/other/-/other-1.0.0.tgz",
+        "https://npm.example.test/@private/win/-/win-2.0.0.tgz",
     ] {
         let mut row = row();
         row.url = url.into();
@@ -105,6 +134,225 @@ fn private_credentials_grants_and_locked_url_policy_are_checked_before_cache_acc
         assert!(!refusal.to_string().contains("secret"));
         assert_eq!(refusal.registry_origin, "https://npm.example.test");
     }
+}
+
+#[test]
+fn publication_provenance_prevents_public_sri_alias_hits() {
+    let scratch = ScratchDir::new("bun-provenance-alias");
+    let body = b"private compressed payload";
+    let expected = integrity(body);
+    let mut private = public_source();
+    private.scope = Some("@private".into());
+    private.credentialed = true;
+    let mut lease = Lease::default();
+    store::get(
+        scratch.path(),
+        &private,
+        &expected,
+        1024,
+        &mut lease,
+        || Ok(body.to_vec()),
+    )
+    .unwrap();
+    for source in [
+        public_source(),
+        store::Provenance {
+            scope: Some("@private".into()),
+            ..public_source()
+        },
+    ] {
+        let error = store::get(
+            scratch.path(),
+            &source,
+            &expected,
+            1024,
+            &mut Lease::default(),
+            || Err(RefusalKind::BunRegistryUnauthorized),
+        )
+        .unwrap_err();
+        assert_eq!(error, RefusalKind::BunRegistryUnauthorized);
+        assert!(!blob(scratch.path(), &source, &expected).exists());
+    }
+    let record: serde_json::Value = serde_json::from_slice(
+        &fs::read(private.partition(scratch.path()).join("provenance.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["scope"], "@private");
+    assert_eq!(record["credentialed"], true);
+}
+
+#[test]
+fn quota_refuses_before_write_while_all_objects_are_leased() {
+    let scratch = ScratchDir::new("bun-quota-active");
+    let source = public_source();
+    let a = integrity(b"aaaa");
+    let b = integrity(b"bbbb");
+    let mut running = Lease::default();
+    store::get(scratch.path(), &source, &a, 4, &mut running, || {
+        Ok(b"aaaa".to_vec())
+    })
+    .unwrap();
+    assert_eq!(
+        store::get(
+            scratch.path(),
+            &source,
+            &b,
+            4,
+            &mut Lease::default(),
+            || Ok(b"bbbb".to_vec())
+        )
+        .unwrap_err(),
+        RefusalKind::BunCacheMissing
+    );
+    assert!(blob(scratch.path(), &source, &a).exists());
+    assert!(!blob(scratch.path(), &source, &b).exists());
+    drop(running);
+    store::get(
+        scratch.path(),
+        &source,
+        &b,
+        4,
+        &mut Lease::default(),
+        || Ok(b"bbbb".to_vec()),
+    )
+    .unwrap();
+    assert!(!blob(scratch.path(), &source, &a).exists());
+}
+
+#[test]
+fn quota_evicts_lru_not_recent_verified_hit() {
+    let scratch = ScratchDir::new("bun-quota-lru");
+    let source = public_source();
+    for body in [b"aaaa", b"bbbb"] {
+        store::get(
+            scratch.path(),
+            &source,
+            &integrity(body),
+            8,
+            &mut Lease::default(),
+            || Ok(body.to_vec()),
+        )
+        .unwrap();
+    }
+    store::get(
+        scratch.path(),
+        &source,
+        &integrity(b"aaaa"),
+        8,
+        &mut Lease::default(),
+        || panic!("warm hit fetched"),
+    )
+    .unwrap();
+    store::get(
+        scratch.path(),
+        &source,
+        &integrity(b"cccc"),
+        8,
+        &mut Lease::default(),
+        || Ok(b"cccc".to_vec()),
+    )
+    .unwrap();
+    assert!(blob(scratch.path(), &source, &integrity(b"aaaa")).exists());
+    assert!(!blob(scratch.path(), &source, &integrity(b"bbbb")).exists());
+    assert!(blob(scratch.path(), &source, &integrity(b"cccc")).exists());
+}
+
+#[test]
+fn registry_missing_and_unauthorized_are_indistinguishable() {
+    assert_eq!(fetch_status(401), Err(RefusalKind::BunRegistryUnauthorized));
+    assert_eq!(fetch_status(403), fetch_status(401));
+    assert_eq!(fetch_status(404), fetch_status(401));
+}
+
+#[test]
+fn uppercase_node_modules_is_not_a_host_project_input() {
+    let scratch = ScratchDir::new("bun-case-project");
+    let modules = scratch.join("NODE_MODULES/hostile");
+    fs::create_dir_all(&modules).unwrap();
+    fs::write(modules.join("bun.lock"), "invalid").unwrap();
+    let mut files = Vec::new();
+    discover(scratch.path(), &mut files).unwrap();
+    assert!(files.is_empty());
+}
+
+#[test]
+fn malformed_digest_is_refused_without_any_store_access() {
+    let scratch = ScratchDir::new("bun-malformed-digest");
+    let root = scratch.join("absent-store");
+    let bad = Integrity {
+        algorithm: "../outside".into(),
+        hex: "digest".into(),
+    };
+    assert_eq!(
+        store::get(
+            &root,
+            &public_source(),
+            &bad,
+            1024,
+            &mut Lease::default(),
+            || panic!("invalid digest reached fetch")
+        )
+        .unwrap_err(),
+        RefusalKind::BunLockInvalid
+    );
+    assert!(!root.exists());
+}
+
+#[test]
+fn local_inputs_are_lexical_and_require_discovered_manifests() {
+    let checkout = PathBuf::from("unmaterialized-checkout");
+    let project = checkout.join("project");
+    let files = vec![checkout.join("vendor/package.json")];
+    validate_local(
+        "m/project",
+        &project,
+        &checkout,
+        &["../vendor".into()],
+        &files,
+    )
+    .unwrap();
+    assert!(validate_local(
+        "m/project",
+        &project,
+        &checkout,
+        &["../absent".into()],
+        &files
+    )
+    .is_err());
+    for local in [
+        r"\\evil\share",
+        "C:/host",
+        "",
+        "/host",
+        r"foo\bar",
+        "../../outside",
+    ] {
+        assert!(validate_local("m/project", &project, &checkout, &[local.into()], &files).is_err());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn host_requires_the_memory_limited_units_parsed_plan() {
+    let scratch = ScratchDir::new("bun-parser-unit");
+    let config = config(scratch.path());
+    let staging = scratch.join("staging");
+    let checkout = staging.join("m/project");
+    fs::create_dir_all(&checkout).unwrap();
+    fs::write(checkout.join("package.json"), "{}").unwrap();
+    fs::write(
+        checkout.join("bun.lock"),
+        r#"{"lockfileVersion":1,"workspaces":{"":{}},"packages":{}}"#,
+    )
+    .unwrap();
+    assert!(
+        prepare(&config, &staging, "/repo", std::slice::from_ref(&checkout))
+            .unwrap_err()
+            .to_string()
+            .contains("BunLockInvalid")
+    );
+    write_parsed_locks(&staging).unwrap();
+    prepare(&config, &staging, "/repo", &[checkout]).unwrap();
 }
 
 #[cfg(unix)]
@@ -248,13 +496,22 @@ fn fake_registry_roundtrip_keeps_credentials_off_the_archive_and_guest_manifest(
         .unwrap()
         .unwrap();
     assert_eq!(manifest.projects[0].packages.len(), 2);
+    let linux = manifest.projects[0]
+        .packages
+        .iter()
+        .find(|p| p.name == "@private/linux")
+        .unwrap();
+    assert!(
+        !seed.join(linux.integrity.blob_path()).exists(),
+        "foreign-platform bytes crossed into the guest"
+    );
     assert!(guest
         .join("bun-cache/@private/win@1.0.0@@npm.example.test@@@1/package.json")
         .is_file());
     assert!(!guest
         .join("bun-cache/@private/linux@1.0.0@@npm.example.test@@@1")
         .exists());
-    let unverified = guest.join("source/project/node_modules/@private/win");
+    let unverified = guest.join("source/project/NODE_MODULES/@private/win");
     fs::create_dir_all(&unverified).unwrap();
     fs::write(
         unverified.join("package.json"),
@@ -267,7 +524,7 @@ fn fake_registry_roundtrip_keeps_credentials_off_the_archive_and_guest_manifest(
             .kind,
         RefusalKind::BunProjectionInvalid
     );
-    fs::remove_dir_all(guest.join("source/project/node_modules")).unwrap();
+    fs::remove_dir_all(guest.join("source/project/NODE_MODULES")).unwrap();
     let win = manifest.projects[0]
         .packages
         .iter()

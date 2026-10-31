@@ -7,7 +7,10 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
+mod expansion;
+mod graph;
 mod hash;
+pub use expansion::ExpansionBudget;
 #[cfg(windows)]
 pub mod protection;
 
@@ -187,7 +190,7 @@ pub struct Package {
     pub bin_dir: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LockedPackage {
     pub package: Package,
     pub url: String,
@@ -328,7 +331,8 @@ impl<'de> Deserialize<'de> for UniqueValue {
 
 pub fn valid_name(name: &str) -> bool {
     let parts: Vec<_> = name.split('/').collect();
-    (parts.len() == 1 || (parts.len() == 2 && parts[0].starts_with('@')))
+    name.len() <= 214
+        && (parts.len() == 1 || (parts.len() == 2 && parts[0].starts_with('@')))
         && parts.iter().all(|part| {
             let part = part.strip_prefix('@').unwrap_or(part);
             !part.is_empty()
@@ -444,96 +448,7 @@ pub fn read_lock(project: &str, text: &str) -> Result<Vec<LockedPackage>, Refusa
             url: url.into(),
         });
     }
-    let mut pending: Vec<(String, String)> = Vec::new();
-    let edges = |metadata: &Value| -> Vec<String> {
-        [
-            "dependencies",
-            "devDependencies",
-            "optionalDependencies",
-            "peerDependencies",
-        ]
-        .iter()
-        .flat_map(|group| {
-            metadata
-                .get(group)
-                .and_then(Value::as_object)
-                .into_iter()
-                .flat_map(|map| map.keys().cloned())
-        })
-        .collect()
-    };
-    let workspaces = lock
-        .get("workspaces")
-        .and_then(Value::as_object)
-        .filter(|map| map.contains_key(""))
-        .ok_or_else(invalid)?;
-    {
-        for (workspace_path, workspace) in workspaces {
-            if !workspace.is_object() {
-                return Err(invalid());
-            }
-            let resolution = format!("workspace:{workspace_path}");
-            let mut parents = if workspace_path.is_empty() {
-                vec![String::new()]
-            } else {
-                rows.iter()
-                    .filter_map(|(placement, row)| {
-                        resolution_parts(row[0].as_str()?)
-                            .filter(|(_, version)| *version == resolution)
-                            .map(|_| placement.clone())
-                    })
-                    .collect::<Vec<_>>()
-            };
-            if parents.is_empty() {
-                parents.push(
-                    workspace
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .filter(|name| valid_name(name))
-                        .ok_or_else(invalid)?
-                        .into(),
-                );
-            }
-            for parent in parents {
-                pending.extend(
-                    edges(workspace)
-                        .into_iter()
-                        .map(|name| (parent.clone(), name)),
-                );
-            }
-        }
-    }
-    let mut reachable = std::collections::BTreeSet::new();
-    while let Some((mut parent, name)) = pending.pop() {
-        let placement = loop {
-            let candidate = if parent.is_empty() {
-                name.clone()
-            } else {
-                format!("{parent}/{name}")
-            };
-            if rows.contains_key(&candidate) {
-                break Some(candidate);
-            }
-            if parent.is_empty() {
-                break None;
-            }
-            parent = parent.rsplit_once('/').map_or("", |p| p.0).into();
-        };
-        let Some(placement) = placement else { continue };
-        if !reachable.insert(placement.clone()) {
-            continue;
-        }
-        let row = &rows[&placement];
-        let metadata = if row[1].is_object() { &row[1] } else { &row[2] };
-        if !platform(metadata, "os", "win32") || !platform(metadata, "cpu", "x64") {
-            continue;
-        }
-        pending.extend(
-            edges(metadata)
-                .into_iter()
-                .map(|name| (placement.clone(), name)),
-        );
-    }
+    let reachable = graph::reachable(&lock, rows).map_err(|_| invalid())?;
     for row in &mut packages {
         row.package.windows &= reachable.contains(&row.package.placement);
     }
@@ -704,14 +619,47 @@ fn projection_error(project: &str, package: &Package) -> Refusal {
 /// Preflight the full tar before writing: implicit directory prefixes also take
 /// part in collision detection, and neither links nor tar permissions are used.
 pub fn expand_tarball(bytes: &[u8], destination: &std::path::Path) -> io::Result<()> {
-    use std::io::Read;
-    let mut expanded = Vec::new();
-    flate2::read::GzDecoder::new(bytes)
-        .take(1024 * 1024 * 1024 + 1)
-        .read_to_end(&mut expanded)?;
-    if expanded.len() > 1024 * 1024 * 1024 {
-        return Err(io::Error::other("Bun tarball expansion limit"));
+    expand_tarball_with_budget(bytes, destination, &ExpansionBudget::default())
+}
+pub fn expand_tarball_with_budget(
+    bytes: &[u8],
+    destination: &std::path::Path,
+    budget: &ExpansionBudget,
+) -> io::Result<()> {
+    let mut raw = tar::Archive::new(budget.reader(flate2::read::GzDecoder::new(bytes), true));
+    for entry in raw.entries()?.raw(true) {
+        let mut entry = entry?;
+        let metadata = matches!(
+            entry.header().entry_type().as_byte(),
+            b'L' | b'K' | b'x' | b'g'
+        );
+        budget.entry(metadata.then_some(entry.size()))?;
+        if !metadata
+            && !entry.header().entry_type().is_file()
+            && !entry.header().entry_type().is_dir()
+        {
+            return Err(io::Error::other("npm link or special file"));
+        }
+        if metadata {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            if matches!(entry.header().entry_type().as_byte(), b'x' | b'g')
+                && [
+                    b"GNU.sparse".as_slice(),
+                    b"SCHILY.realsize".as_slice(),
+                    b" size=".as_slice(),
+                ]
+                .iter()
+                .any(|key| bytes.windows(key.len()).any(|part| part == *key))
+            {
+                return Err(io::Error::other("unsupported npm size or sparse metadata"));
+            }
+        } else {
+            io::copy(&mut entry, &mut io::sink())?;
+        }
     }
+    io::copy(&mut raw.into_inner(), &mut io::sink())?;
     fn relative(path: &str, directory: bool) -> io::Result<Option<&str>> {
         let path = path.trim_end_matches('/');
         let (prefix, rest) = path
@@ -726,7 +674,9 @@ pub fn expand_tarball(bytes: &[u8], destination: &std::path::Path) -> io::Result
     }
     let mut names = BTreeMap::<String, (String, bool)>::new();
     let mut files = std::collections::BTreeSet::new();
-    for entry in tar::Archive::new(expanded.as_slice()).entries()? {
+    for entry in
+        tar::Archive::new(budget.reader(flate2::read::GzDecoder::new(bytes), false)).entries()?
+    {
         let entry = entry?;
         let raw = entry.path_bytes();
         let path = std::str::from_utf8(&raw).map_err(|_| io::Error::other("non-UTF8 npm path"))?;
@@ -740,11 +690,17 @@ pub fn expand_tarball(bytes: &[u8], destination: &std::path::Path) -> io::Result
         let mut prefix = String::new();
         for component in relative.split('/') {
             crate::validate_component(component)?;
+            if component.encode_utf16().count() > 255 || relative.encode_utf16().count() > 32_700 {
+                return Err(io::Error::other("Bun Windows path length"));
+            }
             if !prefix.is_empty() {
                 prefix.push('/');
             }
             prefix.push_str(component);
             let file = kind.is_file() && prefix == relative;
+            if !names.contains_key(&prefix.to_uppercase()) {
+                budget.path(prefix.len())?;
+            }
             if let Some((previous, was_file)) =
                 names.insert(prefix.to_uppercase(), (prefix.clone(), file))
             {
@@ -761,7 +717,9 @@ pub fn expand_tarball(bytes: &[u8], destination: &std::path::Path) -> io::Result
         return Err(io::Error::other("npm package.json missing"));
     }
     std::fs::create_dir_all(destination)?;
-    for entry in tar::Archive::new(expanded.as_slice()).entries()? {
+    for entry in
+        tar::Archive::new(budget.reader(flate2::read::GzDecoder::new(bytes), false)).entries()?
+    {
         let mut entry = entry?;
         let path = entry.path_bytes();
         let Some(relative) = relative(
@@ -802,16 +760,23 @@ fn read_bounded(path: &std::path::Path, limit: u64) -> io::Result<Vec<u8>> {
 
 fn source_projects(
     source: &std::path::Path,
+    budget: &ExpansionBudget,
 ) -> Result<std::collections::BTreeSet<String>, Refusal> {
     fn walk(
         path: &std::path::Path,
         source: &std::path::Path,
         projects: &mut std::collections::BTreeSet<String>,
+        budget: &ExpansionBudget,
     ) -> Result<(), Refusal> {
         let invalid = || refuse(RefusalKind::BunProjectionInvalid, "", "", "");
         for entry in std::fs::read_dir(path).map_err(|_| invalid())? {
+            budget.check().map_err(|_| invalid())?;
             let entry = entry.map_err(|_| invalid())?;
-            if entry.file_name() == "node_modules" {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("node_modules")
+            {
                 continue;
             }
             let metadata = std::fs::symlink_metadata(entry.path()).map_err(|_| invalid())?;
@@ -819,7 +784,7 @@ fn source_projects(
                 return Err(invalid());
             }
             if metadata.is_dir() {
-                walk(&entry.path(), source, projects)?;
+                walk(&entry.path(), source, projects, budget)?;
             } else if entry.file_name() == "bun.lock" || entry.file_name() == "bun.lockb" {
                 let relative = path
                     .strip_prefix(source)
@@ -840,16 +805,21 @@ fn source_projects(
         Ok(())
     }
     let mut projects = Default::default();
-    walk(source, source, &mut projects)?;
+    walk(source, source, &mut projects, budget)?;
     Ok(projects)
 }
 
-fn clean_install_inputs(directory: &std::path::Path) -> io::Result<()> {
+fn clean_install_inputs(directory: &std::path::Path, budget: &ExpansionBudget) -> io::Result<()> {
     for entry in std::fs::read_dir(directory)? {
+        budget.check()?;
         let entry = entry?;
         // A committed node_modules could make Bun accept unverified files as an
         // existing install. Only the verified seed may supply installed packages.
-        if entry.file_name() == "node_modules" {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("node_modules")
+        {
             return Err(io::Error::other("pre-existing node_modules in Bun project"));
         }
         let metadata = std::fs::symlink_metadata(entry.path())?;
@@ -857,7 +827,7 @@ fn clean_install_inputs(directory: &std::path::Path) -> io::Result<()> {
             return Err(io::Error::other("reparse point in Bun project"));
         }
         if metadata.is_dir() {
-            clean_install_inputs(&entry.path())?;
+            clean_install_inputs(&entry.path(), budget)?;
         }
     }
     Ok(())
@@ -868,8 +838,30 @@ pub fn prepare_cache(
     source: &std::path::Path,
     cache: &std::path::Path,
 ) -> Result<Option<Manifest>, Refusal> {
+    prepare_cache_with_budget(seed, source, cache, &ExpansionBudget::default())
+}
+
+struct DisposableCache<'a> {
+    path: &'a std::path::Path,
+    keep: bool,
+}
+impl Drop for DisposableCache<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_dir_all(self.path);
+        }
+    }
+}
+
+pub fn prepare_cache_with_budget(
+    seed: &std::path::Path,
+    source: &std::path::Path,
+    cache: &std::path::Path,
+    budget: &ExpansionBudget,
+) -> Result<Option<Manifest>, Refusal> {
     let invalid = || refuse(RefusalKind::BunProjectionInvalid, "", "", "");
-    let input_projects = source_projects(source)?;
+    budget.check().map_err(|_| invalid())?;
+    let input_projects = source_projects(source, budget)?;
     let bytes = match read_bounded(&seed.join("manifest.json"), MAX_LOCK_BYTES as u64) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -906,6 +898,7 @@ pub fn prepare_cache(
             project
                 .packages
                 .iter()
+                .filter(|p| p.windows)
                 .map(|package| package.integrity.blob_path())
         })
         .collect();
@@ -929,6 +922,10 @@ pub fn prepare_cache(
     // A fresh cache cannot contain stale or attacker-supplied junctions. It is
     // intentionally writable because Bun applies patches and creates temp files.
     std::fs::create_dir(cache).map_err(|_| invalid())?;
+    let mut cleanup = DisposableCache {
+        path: cache,
+        keep: false,
+    };
     let mut keys = BTreeMap::<String, Integrity>::new();
     let mut projects = std::collections::BTreeSet::new();
     for project in &manifest.projects {
@@ -946,7 +943,7 @@ pub fn prepare_cache(
         } else {
             project.path.strip_prefix("m/").ok_or_else(invalid)?
         };
-        clean_install_inputs(&source.join(relative)).map_err(|_| invalid())?;
+        clean_install_inputs(&source.join(relative), budget).map_err(|_| invalid())?;
         if !projects.insert(project.path.to_uppercase()) {
             return Err(invalid());
         }
@@ -981,6 +978,9 @@ pub fn prepare_cache(
             if !package.integrity.valid() {
                 return Err(fail());
             }
+            if !package.windows {
+                continue;
+            }
             let bytes = read_bounded(&seed.join(package.integrity.blob_path()), MAX_BLOB_BYTES)
                 .map_err(|_| {
                     refuse(
@@ -1011,7 +1011,7 @@ pub fn prepare_cache(
                 continue;
             }
             let destination = cache.join(&key);
-            expand_tarball(&bytes, &destination).map_err(|_| fail())?;
+            expand_tarball_with_budget(&bytes, &destination, budget).map_err(|_| fail())?;
             let metadata: Value = serde_json::from_slice(
                 &read_bounded(&destination.join("package.json"), MAX_LOCK_BYTES as u64)
                     .map_err(|_| fail())?,
@@ -1025,6 +1025,7 @@ pub fn prepare_cache(
     manifest.projects.sort_by(|a, b| {
         (a.path.split('/').count(), &a.path).cmp(&(b.path.split('/').count(), &b.path))
     });
+    cleanup.keep = true;
     Ok(Some(manifest))
 }
 
