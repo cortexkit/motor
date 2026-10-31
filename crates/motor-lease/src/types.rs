@@ -117,7 +117,8 @@ pub struct Claims {
     pub workspace_key_hash: Option<String>,
 }
 
-// Missing claims support older brokers; an explicit null is not a hash.
+// Boat sandbox job tokens omit the hash; registered hosts require it during verification.
+// An explicit null is not a hash on either path.
 fn present_workspace_hash<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {

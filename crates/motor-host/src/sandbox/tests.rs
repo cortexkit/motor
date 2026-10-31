@@ -110,6 +110,7 @@ impl Fixture {
             unix_ms() / 1000,
         )
         .unwrap();
+        assert_eq!(claims.workspace_key_hash, None);
         (lease.job_token, claims)
     }
     async fn connect(&self) -> (tokio::net::TcpStream, tokio::task::JoinHandle<Result<()>>) {

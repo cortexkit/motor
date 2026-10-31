@@ -24,6 +24,19 @@ fn seed(text: &str) -> SigningKey {
     SigningKey::from_bytes(&bytes.try_into().unwrap())
 }
 
+// Retain legacy contract vectors on disk while exercising their other claims
+// under the current registered-host requirement.
+fn with_workspace_hash(token: &str, hash: &str, kid: &str, key: &SigningKey) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let payload = URL_SAFE_NO_PAD
+        .decode(token.split('.').nth(1).unwrap())
+        .unwrap();
+    let mut claims: Claims = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(claims.workspace_key_hash, None);
+    claims.workspace_key_hash = Some(hash.into());
+    sign_token(&claims, kid, key).unwrap()
+}
+
 #[test]
 fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
     use metrics::*;
@@ -219,15 +232,20 @@ fn cloud_long_lease_token_accepts_six_hours_but_boat_keeps_two() {
     .unwrap();
     let reply = &v["lease"]["reply"]["body"];
     let now = v["clock_ms"].as_u64().unwrap() / 1000;
-    let mut claims = verify_token(
-        reply["job_token"].as_str().unwrap(),
-        &keys,
-        "host-a",
-        None,
-        Purpose::Run,
-        now,
-    )
-    .unwrap();
+    let legacy = reply["job_token"].as_str().unwrap();
+    assert_eq!(
+        verify_token(legacy, &keys, "host-a", None, Purpose::Run, now),
+        Err(AuthError::MissingWorkspaceKeyHash)
+    );
+    let token = with_workspace_hash(
+        legacy,
+        v["lease"]["request"]["body"]["workspace_key_hash"]
+            .as_str()
+            .unwrap(),
+        kid,
+        &key,
+    );
+    let mut claims = verify_token(&token, &keys, "host-a", None, Purpose::Run, now).unwrap();
     assert_eq!(claims.max_s, 21600);
     assert_eq!(reply["reserved_vcpu_ms"], 43_200_000);
     claims.max_s = 21601;
@@ -275,18 +293,21 @@ fn check_cloud_job_tokens(name: &str) {
         let token = entry["job_token"].as_str().unwrap();
         let claims: Claims = serde_json::from_str(entry["claims"].as_str().unwrap()).unwrap();
         let clock = v["clock_ms"].as_u64().unwrap() / 1000;
-        assert_eq!(
-            verify_token(
-                token,
-                &keys,
-                &claims.placement.host,
-                Some(&claims.jti),
-                purpose,
-                clock
-            )
-            .unwrap(),
-            claims
+        let verified = verify_token(
+            token,
+            &keys,
+            &claims.placement.host,
+            Some(&claims.jti),
+            purpose,
+            clock,
         );
+        if claims.workspace_key_hash.is_some() {
+            assert_eq!(verified.unwrap(), claims);
+        } else {
+            // Keep checking the broker's exact legacy bytes without accepting
+            // a host credential from before workspace hashes became required.
+            assert_eq!(verified, Err(AuthError::MissingWorkspaceKeyHash));
+        }
         assert_eq!(
             verify_token(
                 token,
@@ -379,6 +400,7 @@ fn cloud_boat_token_verifies_for_its_sandbox_identity() {
     let host = reply["placement"]["host"].as_str().unwrap();
     let job = reply["job_id"].as_str().unwrap();
     let claims = check_token(token, &keys, host, Some(job), Purpose::Run, 1900000010).unwrap();
+    assert_eq!(claims.workspace_key_hash, None);
     assert_eq!(claims.mem_mib, boat["boat_sizes"][0]["mem_mib"]);
     assert_ne!(claims.mem_mib, memory_max_mib(claims.vcpus));
     assert!(boat_memory_range(claims.vcpus).contains(&claims.mem_mib));
@@ -465,8 +487,12 @@ fn cloud_host_signature_bytes_header_and_verification_match() {
 
 #[test]
 fn cloud_lease_reattach_release_and_nullable_usage_settlement_match_fake() {
-    let v = vector("lease.json");
-    let tokens = vector("job-tokens.json");
+    let mut v = vector("lease.json");
+    let tokens = vector("job-tokens-workspace.json");
+    // The lease response predates hash emission. Keep its other fields exact,
+    // but compare current issuance against the pinned hash-bearing tokens.
+    v["reply"]["body"]["job_token"] = tokens["tokens"]["run"]["job_token"].clone();
+    v["reattach"]["reply"]["body"]["job_token"] = tokens["tokens"]["attach"]["job_token"].clone();
     let mut broker = FakeBroker::new(
         "cloud-vector",
         FakeConfig {
@@ -597,11 +623,25 @@ fn cloud_lease_reattach_release_and_nullable_usage_settlement_match_fake() {
 /// CLOUD's `settled-reattach.json`: a registered host settles a job by usage
 /// report, and a later reattach still gets 200 with an `attach` token and the
 /// lease's unchanged fields. Seeded with the vector's keys and clocks, the fake
-/// returns the same statuses and JSON bodies for the lease, the settlement and
-/// the reattach, and the reattach leaves the settlement as it was.
+/// returns the same statuses and JSON bodies apart from the now-required token
+/// hash, and the reattach leaves the settlement as it was.
 #[test]
 fn cloud_settled_reattach_reply_matches_fake() {
-    let v = vector("settled-reattach.json");
+    let mut v = vector("settled-reattach.json");
+    let hash = v["lease"]["request"]["body"]["workspace_key_hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let key = seed(v["test_only_job_seed_hex"].as_str().unwrap());
+    for phase in ["lease", "reattach"] {
+        let token = with_workspace_hash(
+            v[phase]["reply"]["body"]["job_token"].as_str().unwrap(),
+            &hash,
+            v["key_id"].as_str().unwrap(),
+            &key,
+        );
+        v[phase]["reply"]["body"]["job_token"] = json!(token);
+    }
     let lease_reply = &v["lease"]["reply"]["body"];
     let mut broker = FakeBroker::new(
         "cloud-vector",

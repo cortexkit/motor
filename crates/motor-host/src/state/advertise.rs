@@ -295,14 +295,14 @@ impl Host {
     }
     /// Whether a running tenant needs a new memory sample.
     pub(crate) fn memory_probe_due(&self, tenant: &str, now_ms: u64, force: bool) -> bool {
-        // Only a VM with known hashes needs an extra membership probe before
-        // a lifecycle heartbeat. Other VMs retain the memory renewal cadence.
+        // A delivered job can leave a warm workspace. Refresh the guest's held
+        // workspace list before a lifecycle heartbeat even if memory is fresh.
         let force = force
-            && self.snapshot.leases.values().any(|lease| {
-                lease.tenant == tenant
-                    && lease.delivered
-                    && lease.claims.workspace_key_hash.is_some()
-            });
+            && self
+                .snapshot
+                .leases
+                .values()
+                .any(|lease| lease.tenant == tenant && lease.delivered);
         self.is_ready(tenant)
             && !self.is_suspending(tenant)
             && self.start_refusal(tenant).is_none()

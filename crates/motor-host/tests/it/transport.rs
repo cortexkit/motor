@@ -3,6 +3,7 @@ use anyhow::{bail, Result};
 use ed25519_dalek::{Signer, SigningKey};
 use motor_host::helper::{read_json, write_json, Control};
 use motor_host::server::{read_frame, serve, unix_ms, write_frame, Runtime};
+use motor_host::state::{Error, Refusal};
 use motor_lease::{Challenge, Jwks, JwksKey, RequesterJwk};
 use serde_json::{json, Value};
 use std::os::unix::net::UnixStream;
@@ -571,6 +572,36 @@ async fn peer(fake: &Fake) -> UnixStream {
     })
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn host_run_and_attach_require_workspace_hash_before_challenge() {
+    for purpose in [Purpose::Run, Purpose::Attach] {
+        let (runtime, fake, broker, requester, mut c) = fixture();
+        c.purpose = purpose;
+        let jwk = RequesterJwk::from_key(&requester.verifying_key());
+        let token = motor_lease::sign_token(&c, "key", &broker).unwrap();
+        assert_eq!(runtime.authenticate(&token, &jwk, c.iat).unwrap(), c);
+
+        c.workspace_key_hash = None;
+        let token = motor_lease::sign_token(&c, "key", &broker).unwrap();
+        let refusal = runtime.authenticate(&token, &jwk, c.iat).unwrap_err();
+        assert!(matches!(refusal.error, Error::Refused(Refusal::Auth)));
+        assert_eq!(refusal.check, "workspace_key_hash_missing");
+        assert_eq!(refusal.jti.as_deref(), Some(c.jti.as_str()));
+
+        let (mut client, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(serve(runtime.clone(), server));
+        assert_eq!(
+            hello(&mut client, &broker, &requester, &c).await,
+            json!({"type":"lease_refused","reason":"auth"})
+        );
+        task.await.unwrap().unwrap();
+        assert!(fake.calls.lock().unwrap().is_empty());
+        let host = runtime.host.lock().unwrap();
+        assert!(host.snapshot.leases.is_empty());
+        assert!(host.snapshot.zero_usage.is_empty());
+    }
 }
 
 #[tokio::test]

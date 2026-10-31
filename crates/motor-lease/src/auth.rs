@@ -15,6 +15,7 @@ use crate::{
 pub enum AuthError {
     Auth,
     Expired,
+    MissingWorkspaceKeyHash,
     CounterOverflow,
 }
 impl fmt::Display for AuthError {
@@ -22,6 +23,7 @@ impl fmt::Display for AuthError {
         f.write_str(match self {
             Self::Auth => "auth",
             Self::Expired => "expired",
+            Self::MissingWorkspaceKeyHash => "missing workspace_key_hash",
             Self::CounterOverflow => "host counter overflow",
         })
     }
@@ -331,6 +333,10 @@ pub fn check_token(
         ("platform", !valid_name(&claims.platform)),
         ("cnf", decode::<32>(&claims.cnf.jkt).is_err()),
         (
+            "workspace_key_hash_missing",
+            !boat && claims.workspace_key_hash.is_none(),
+        ),
+        (
             "workspace_key_hash",
             claims.workspace_key_hash.as_deref().is_some_and(|hash| {
                 hash.len() != 43
@@ -342,7 +348,12 @@ pub fn check_token(
     ]
     .into_iter()
     .find_map(|(check, failed)| failed.then_some(check));
-    let error = if let Some(check) = failed {
+    let error = if failed == Some("workspace_key_hash_missing") {
+        Some((
+            AuthError::MissingWorkspaceKeyHash,
+            "workspace_key_hash_missing",
+        ))
+    } else if let Some(check) = failed {
         Some((AuthError::Auth, check))
     } else if now_s >= claims.exp {
         // An already expired credential cannot open a new connection, even
