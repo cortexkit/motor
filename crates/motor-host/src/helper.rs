@@ -14,6 +14,10 @@ pub trait Control: Send + Sync {
     fn metrics(&self, _tenant: &str) -> Result<crate::billing::Metrics> {
         anyhow::bail!("tenant metrics unavailable")
     }
+    /// Trusted registry quota, used only to bound display-only guest disk reports.
+    fn disk_quota_bytes(&self, _tenant: &str) -> Result<u64> {
+        anyhow::bail!("tenant disk quota unavailable")
+    }
     fn stop(&self, _tenant: &str) -> Result<()> {
         anyhow::bail!("tenant stop unavailable")
     }
@@ -202,6 +206,12 @@ fn exchange_helper_with_deadline(
 }
 
 impl Control for Helper {
+    fn disk_quota_bytes(&self, tenant: &str) -> Result<u64> {
+        let (reply, _) = self.request(json!({"op":"tenant_metrics", "tenant":tenant}))?;
+        reply["disk_quota_bytes"]
+            .as_u64()
+            .context("tenant disk quota")
+    }
     fn metrics(&self, tenant: &str) -> Result<crate::billing::Metrics> {
         let (reply, _) = self.request(json!({"op":"tenant_metrics", "tenant":tenant}))?;
         Ok(crate::billing::Metrics {

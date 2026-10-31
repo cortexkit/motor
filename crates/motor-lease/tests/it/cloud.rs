@@ -69,6 +69,8 @@ fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
             jobs_running: 12,
             recovery: None,
             detail: None,
+            disk_free_gib: None,
+            disk_total_gib: None,
         }],
         runners: vec![Runner {
             name: "direct".into(),
@@ -108,7 +110,16 @@ fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
             field: Some("at_ms".into()),
         },
         MetricsReply::Accepted,
+        MetricsReply::Accepted,
+        MetricsReply::Accepted,
+        MetricsReply::BadRequest {
+            field: Some("tenants[0].disk_total_gib".into()),
+        },
+        MetricsReply::BadRequest {
+            field: Some("tenants[0].disk_free_gib".into()),
+        },
     ];
+    assert_eq!(v["cases"].as_array().unwrap().len(), expected.len());
     for (case, reply) in v["cases"].as_array().unwrap().iter().zip(expected) {
         let request = &case["request"];
         let headers = &request["headers"];
@@ -151,10 +162,20 @@ fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
 fn cloud_host_metrics_invalid_samples_are_not_signed() {
     let v = vector("host-metrics.json");
     let now = v["clock_ms"].as_u64().unwrap();
-    for index in [0, 3, 4] {
+    for index in [0, 3, 4, 6, 7, 8, 9] {
         let sample: metrics::HostMetrics =
             serde_json::from_str(v["cases"][index]["request"]["body"].as_str().unwrap()).unwrap();
-        assert_eq!(sample.encode(now).is_ok(), index == 0);
+        let encoded = sample.encode(now);
+        assert_eq!(encoded.is_ok(), matches!(index, 0 | 6 | 7));
+        if let Ok(encoded) = encoded {
+            assert_eq!(
+                encoded,
+                v["cases"][index]["request"]["body"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes()
+            );
+        }
     }
     assert!(serde_json::from_str::<metrics::HostMetrics>(
         v["cases"][2]["request"]["body"].as_str().unwrap()
@@ -174,6 +195,36 @@ fn cloud_host_metrics_invalid_samples_are_not_signed() {
     sample.tenants[0].state = metrics::TenantState::Ready;
     sample.tenants[0].detail = Some("job output\nwith control".into());
     assert!(sample.encode(now).is_err());
+}
+
+#[test]
+fn cloud_guest_disk_pair_requires_both_keys_and_safe_ordered_integers() {
+    let v = vector("host-metrics.json");
+    let now = v["clock_ms"].as_u64().unwrap();
+    let base: Value =
+        serde_json::from_str(v["cases"][0]["request"]["body"].as_str().unwrap()).unwrap();
+    for (free, total, valid) in [
+        (Some(json!(0)), Some(json!(0)), true),
+        (Some(Value::Null), Some(json!(600)), true),
+        (Some(json!(80)), Some(Value::Null), true),
+        (None, Some(json!(600)), false),
+        (Some(Value::Null), None, false),
+        (Some(json!(-1)), Some(json!(600)), false),
+        (Some(json!(1.5)), Some(json!(600)), false),
+        (Some(json!(0)), Some(json!(MAX_SAFE_INTEGER + 1)), false),
+        (Some(json!(601)), Some(json!(600)), false),
+    ] {
+        let mut body = base.clone();
+        if let Some(free) = free {
+            body["tenants"][0]["disk_free_gib"] = free;
+        }
+        if let Some(total) = total {
+            body["tenants"][0]["disk_total_gib"] = total;
+        }
+        let accepted = serde_json::from_value::<metrics::HostMetrics>(body)
+            .is_ok_and(|m| m.encode(now).is_ok());
+        assert_eq!(accepted, valid);
+    }
 }
 
 fn canonical_lease_hash(body_bytes: &str) -> String {

@@ -38,6 +38,8 @@ fn accepted_record() -> HostMetrics {
             jobs_running: 12,
             recovery: None,
             detail: None,
+            disk_free_gib: None,
+            disk_total_gib: None,
         }],
         runners: vec![Runner {
             name: "direct".into(),
@@ -63,9 +65,18 @@ fn monitor_signing_bytes_match_cloud_vector() {
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
         .collect();
     let key = SigningKey::from_bytes(&bytes.try_into().unwrap());
-    for (index, load1) in [(0, Some(12.4)), (5, None)] {
+    for (index, load1, disk) in [
+        (0, Some(12.4), None),
+        (5, None, None),
+        (6, Some(12.4), Some((Some(80), Some(600)))),
+        (7, Some(12.4), Some((None, None))),
+    ] {
         let mut record = accepted_record();
         record.cpu.load1 = load1;
+        if let Some((free, total)) = disk {
+            record.tenants[0].disk_free_gib = Some(free);
+            record.tenants[0].disk_total_gib = Some(total);
+        }
         let case = &vector["cases"][index];
         let request = &case["request"];
         let timestamp = request["headers"]["CK-Timestamp"]

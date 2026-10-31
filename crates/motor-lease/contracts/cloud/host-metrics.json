@@ -117,6 +117,82 @@
         "status": 204,
         "body": ""
       }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/hosts/metrics-vector/metrics",
+        "body": "{\"at_ms\":1800000000000,\"cpu\":{\"threads\":32,\"busy_pct\":41,\"load1\":12.4},\"mem\":{\"total_mib\":128000,\"avail_mib\":22000},\"disks\":[{\"mount\":\"/\",\"total_gib\":900,\"free_gib\":310}],\"tenants\":[{\"vm\":\"vm-1\",\"state\":\"ready\",\"vcpus\":30,\"mem_mib\":106496,\"slots_total\":90,\"slots_used\":41,\"jobs_running\":12,\"recovery\":null,\"detail\":null,\"disk_free_gib\":80,\"disk_total_gib\":600}],\"runners\":[{\"name\":\"direct\",\"state\":\"ready\",\"slots_total\":16,\"slots_used\":3,\"queued\":0,\"oldest_wait_s\":0,\"detail\":null}]}",
+        "headers": {
+          "Content-Type": "application/json",
+          "CK-Host": "metrics-vector",
+          "CK-Timestamp": "1800000000000",
+          "CK-Counter": "7",
+          "CK-Signature": "2c78e0286571ac62b601d0300cefef4be5bdd67ff58a03c5f89c01fde42551323158300d5e836968993022da88d5a0ee8642b551b2651a91ac9711de4903230f"
+        }
+      },
+      "signed_string": "ck-host-v1\nPOST\n/v1/hosts/metrics-vector/metrics\n59407af52b5604ebf92049afd802e732b2f3bb504d9367a401562ef51140d606\n1800000000000\n7",
+      "reply": {
+        "status": 204,
+        "body": ""
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/hosts/metrics-vector/metrics",
+        "body": "{\"at_ms\":1800000000000,\"cpu\":{\"threads\":32,\"busy_pct\":41,\"load1\":12.4},\"mem\":{\"total_mib\":128000,\"avail_mib\":22000},\"disks\":[{\"mount\":\"/\",\"total_gib\":900,\"free_gib\":310}],\"tenants\":[{\"vm\":\"vm-1\",\"state\":\"ready\",\"vcpus\":30,\"mem_mib\":106496,\"slots_total\":90,\"slots_used\":41,\"jobs_running\":12,\"recovery\":null,\"detail\":null,\"disk_free_gib\":null,\"disk_total_gib\":null}],\"runners\":[{\"name\":\"direct\",\"state\":\"ready\",\"slots_total\":16,\"slots_used\":3,\"queued\":0,\"oldest_wait_s\":0,\"detail\":null}]}",
+        "headers": {
+          "Content-Type": "application/json",
+          "CK-Host": "metrics-vector",
+          "CK-Timestamp": "1800000000000",
+          "CK-Counter": "8",
+          "CK-Signature": "8f3c8b7da8734e120740d102c747e0a35208f47e03900fa05aba96ce7a48c18b3da56558cce33da3f6eaabf3593dc558c3a9952b5f4095e3b613c44f758a040a"
+        }
+      },
+      "signed_string": "ck-host-v1\nPOST\n/v1/hosts/metrics-vector/metrics\n122c5a9ccf18790c93b1cd7d905766bd698bb9382211d48a971dd0318a4e9957\n1800000000000\n8",
+      "reply": {
+        "status": 204,
+        "body": ""
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/hosts/metrics-vector/metrics",
+        "body": "{\"at_ms\":1800000000000,\"cpu\":{\"threads\":32,\"busy_pct\":41,\"load1\":12.4},\"mem\":{\"total_mib\":128000,\"avail_mib\":22000},\"disks\":[{\"mount\":\"/\",\"total_gib\":900,\"free_gib\":310}],\"tenants\":[{\"vm\":\"vm-1\",\"state\":\"ready\",\"vcpus\":30,\"mem_mib\":106496,\"slots_total\":90,\"slots_used\":41,\"jobs_running\":12,\"recovery\":null,\"detail\":null,\"disk_free_gib\":80}],\"runners\":[{\"name\":\"direct\",\"state\":\"ready\",\"slots_total\":16,\"slots_used\":3,\"queued\":0,\"oldest_wait_s\":0,\"detail\":null}]}",
+        "headers": {
+          "Content-Type": "application/json",
+          "CK-Host": "metrics-vector",
+          "CK-Timestamp": "1800000000000",
+          "CK-Counter": "9",
+          "CK-Signature": "4323e2f88a653f4ab1b4cd9eeb0568a8fd927ac6b1a46044c7f8e3c0f4b1f94eec17ef9db91d766f2f32a0b4c794ad6ca7429c3b1d85f5973c3ae9efeea2a40d"
+        }
+      },
+      "signed_string": "ck-host-v1\nPOST\n/v1/hosts/metrics-vector/metrics\ne5a8219b4fa7dc94b466a7e1da24c3229aef2275ff61515b93beeda8ba04bfc9\n1800000000000\n9",
+      "reply": {
+        "status": 400,
+        "body": "{\"error\":\"bad_request\",\"field\":\"tenants[0].disk_total_gib\"}"
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/hosts/metrics-vector/metrics",
+        "body": "{\"at_ms\":1800000000000,\"cpu\":{\"threads\":32,\"busy_pct\":41,\"load1\":12.4},\"mem\":{\"total_mib\":128000,\"avail_mib\":22000},\"disks\":[{\"mount\":\"/\",\"total_gib\":900,\"free_gib\":310}],\"tenants\":[{\"vm\":\"vm-1\",\"state\":\"ready\",\"vcpus\":30,\"mem_mib\":106496,\"slots_total\":90,\"slots_used\":41,\"jobs_running\":12,\"recovery\":null,\"detail\":null,\"disk_free_gib\":601,\"disk_total_gib\":600}],\"runners\":[{\"name\":\"direct\",\"state\":\"ready\",\"slots_total\":16,\"slots_used\":3,\"queued\":0,\"oldest_wait_s\":0,\"detail\":null}]}",
+        "headers": {
+          "Content-Type": "application/json",
+          "CK-Host": "metrics-vector",
+          "CK-Timestamp": "1800000000000",
+          "CK-Counter": "10",
+          "CK-Signature": "2a9655070cff6980cee4643a6a56e2883c9e9a5be197022510e63dc3759cea7da7446cc6ce9602a50b2a865fe2a10d139cee3e9a4175efab296807f64734d800"
+        }
+      },
+      "signed_string": "ck-host-v1\nPOST\n/v1/hosts/metrics-vector/metrics\n7482b0f1e491259b1c4b3a373a529ba42434ee4a619052af2a6db63e9625c120\n1800000000000\n10",
+      "reply": {
+        "status": 400,
+        "body": "{\"error\":\"bad_request\",\"field\":\"tenants[0].disk_free_gib\"}"
+      }
     }
   ]
 }
