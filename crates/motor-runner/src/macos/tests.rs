@@ -367,7 +367,9 @@ fn workspace_changes_ignore_guest_git_config_filters_hooks_and_gitdir_links() {
             hooks.display()
         ),
     );
-    write(&staged.workspace.join("source"), "job edit\n");
+    // Equal-size edits make Git hash the file instead of reporting a size-only
+    // change without consulting the clean filter.
+    write(&staged.workspace.join("source"), "job edit!\n");
     let scan = || {
         f.staging
             .trees
