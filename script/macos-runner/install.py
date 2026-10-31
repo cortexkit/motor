@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from urllib.parse import urlsplit
 
 import image as image_recipe
 import parity
@@ -64,12 +65,86 @@ def ssh_block(keys=SSH_ROOT / "authorized_keys"):
             f"    AuthorizedKeysFile {keys}\n    PubkeyAuthentication yes\nMatch all\n" + END + "\n")
 
 
-def agent(runner, state_root, instance, vm_config):
+def metrics_flags(endpoint=None, host_id=None):
+    if endpoint is None and host_id is None:
+        return []
+    if not endpoint or not host_id:
+        raise ValueError("metrics endpoint and host id must be supplied together")
+    try:
+        url = urlsplit(endpoint)
+        valid = (re.fullmatch(r"https://[A-Za-z0-9.\-:\[\]]+/?", endpoint) and
+                 url.hostname and url.path in ("", "/") and
+                 (url.port is None or 1 <= url.port <= 65535))
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError("metrics endpoint must be an HTTPS origin")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", host_id):
+        raise ValueError("metrics host id must match [A-Za-z0-9._-]{1,64}")
+    return ["--metrics-push", "--metrics-endpoint", endpoint, "--metrics-host-id", host_id]
+
+
+def metrics_settings(argv):
+    values = []
+    for flag in ("--metrics-endpoint", "--metrics-host-id"):
+        if flag not in argv:
+            values.append(None)
+        elif argv.count(flag) != 1 or argv.index(flag) + 1 >= len(argv):
+            raise ValueError("invalid LaunchAgent metrics flag: " + flag)
+        else:
+            values.append(argv[argv.index(flag) + 1])
+    flags = metrics_flags(*values)
+    if argv.count("--metrics-push") != bool(flags):
+        raise ValueError("incomplete LaunchAgent metrics settings")
+    return values
+
+
+def metrics_report(argv):
+    endpoint, host_id = metrics_settings(argv)
+    return {"enabled": bool(endpoint), "endpoint": endpoint, "host_id": host_id,
+            "flags": metrics_flags(endpoint, host_id)}
+
+
+def installed_metrics_key():
+    argv = plistlib.loads(PLIST.read_bytes())["ProgramArguments"]
+    identity = []
+    for flag in ("--instance", "--state-root"):
+        if argv.count(flag) != 1 or argv.index(flag) + 1 >= len(argv):
+            raise ValueError("LaunchAgent requires one " + flag)
+        identity.extend([flag, argv[argv.index(flag) + 1]])
+    print(run(*as_motor(argv[0], "metrics-key", *identity)).strip())
+
+
+def stage_metrics(endpoint, host_id):
+    flags = metrics_flags(endpoint, host_id)
+    plist = plistlib.loads(PLIST.read_bytes())
+    argv = plist["ProgramArguments"]
+    metrics_settings(argv)
+    clean = []
+    index = 0
+    while index < len(argv):
+        if argv[index] == "--metrics-push":
+            index += 1
+        elif argv[index] in ("--metrics-endpoint", "--metrics-host-id"):
+            index += 2
+        else:
+            clean.append(argv[index])
+            index += 1
+    plist["ProgramArguments"] = clean + flags
+    private_write(PLIST, plistlib.dumps(plist))
+    os.chown(PLIST, 0, 0)
+    PLIST.chmod(0o644)
+    print(json.dumps({"metrics": metrics_report(plist["ProgramArguments"]),
+                      "status": "staged for next planned LaunchAgent reload or host restart; LaunchAgent was not stopped or started"}, indent=2))
+
+
+def agent(runner, state_root, instance, vm_config, metrics_endpoint=None, metrics_host_id=None):
     return {
         "Label": LABEL, "LimitLoadToSessionType": "Aqua",
         "ProgramArguments": [str(runner), "serve", "--instance", instance,
                              "--state-root", str(state_root), "--backend", "macos-vm",
-                             "--vm-config", str(vm_config), "--max-weight", "8"],
+                             "--vm-config", str(vm_config), "--max-weight", "8",
+                             *metrics_flags(metrics_endpoint, metrics_host_id)],
         "EnvironmentVariables": {"HOME": "/Users/motor", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
         "RunAtLoad": True, "KeepAlive": True, "Umask": 0o077,
         "StandardOutPath": str(state_root / "daemon.stdout"),
@@ -368,7 +443,7 @@ def keychain_errors():
 
 
 def check_install(state_root, image, instance, manifest, config=CONFIG, plist_path=PLIST,
-                  sshd=SSHD, ssh_root=SSH_ROOT):
+                  sshd=SSHD, ssh_root=SSH_ROOT, metrics_endpoint=None, metrics_host_id=None):
     errors = []
     account = pwd.getpwnam("motor")
     try:
@@ -400,7 +475,14 @@ def check_install(state_root, image, instance, manifest, config=CONFIG, plist_pa
         errors.append("VM helper lacks virtualization entitlement")
     plist = plistlib.loads(plist_path.read_bytes())
     errors.extend(plist_errors(plist))
-    expected = agent(Path(installed["runner"]), state_root, instance, config / "vm.toml")
+    try:
+        current_metrics = metrics_settings(plist.get("ProgramArguments", []))
+    except ValueError as error:
+        errors.append(str(error))
+        current_metrics = [None, None]
+    if metrics_endpoint is not None or metrics_host_id is not None:
+        current_metrics = [metrics_endpoint, metrics_host_id]
+    expected = agent(Path(installed["runner"]), state_root, instance, config / "vm.toml", *current_metrics)
     if plist != expected:
         errors.append("LaunchAgent differs from installed configuration")
     if LEGACY_PLIST.exists():
@@ -517,7 +599,8 @@ def install(args, manifest):
     login_changed = configure_login(account)
     if login_changed:
         print("Restart required: the auto-login user changed to motor. The installer will not restart the host.")
-    private_write(PLIST, plistlib.dumps(agent(CONFIG / "motor-runner", args.state_root, args.instance, CONFIG / "vm.toml")))
+    private_write(PLIST, plistlib.dumps(agent(CONFIG / "motor-runner", args.state_root, args.instance, CONFIG / "vm.toml",
+                                           args.metrics_endpoint, args.metrics_host_id)))
     os.chown(PLIST, 0, 0)
     PLIST.chmod(0o644)
     installed["auto_login_managed"] = True
@@ -531,7 +614,7 @@ def install(args, manifest):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", nargs="?", choices=("install", "uninstall"), default="install")
+    parser.add_argument("operation", nargs="?", choices=("install", "uninstall", "metrics-key", "metrics-config"), default="install")
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--manifest", type=Path, default=HERE / "toolchain.json")
     parser.add_argument("--state-root", type=Path, default=Path("/Users/motor/.motor"))
@@ -539,12 +622,31 @@ def main():
     parser.add_argument("--instance", default="macos")
     parser.add_argument("--runner", type=Path)
     parser.add_argument("--vm-helper", type=Path)
+    parser.add_argument("--metrics-endpoint", help="HTTPS origin; requires --metrics-host-id (off by default)")
+    parser.add_argument("--metrics-host-id", help="monitor host id: [A-Za-z0-9._-]{1,64}")
+    parser.add_argument("--disable-metrics", action="store_true", help="metrics-config: stage metrics removal")
     parser.add_argument("--tool-bundle", type=Path)
     parser.add_argument("--runner-key", type=Path,
                         help="ck-motor's vault SSH public key line (its agent's identity.pub)")
     args = parser.parse_args()
+    try:
+        metrics_flags(args.metrics_endpoint, args.metrics_host_id)
+        if args.disable_metrics and (args.operation != "metrics-config" or args.metrics_endpoint):
+            raise ValueError("--disable-metrics is exclusive to metrics-config without a metrics pair")
+    except ValueError as error:
+        parser.error(str(error))
     if sys.platform != "darwin" or os.geteuid() != 0:
         parser.error("run on the VM host with sudo from rentamac")
+    if args.operation in ("metrics-key", "metrics-config"):
+        if args.check:
+            parser.error("--check requires install")
+        if args.operation == "metrics-key":
+            installed_metrics_key()
+        else:
+            if not args.metrics_endpoint and not args.disable_metrics:
+                parser.error("metrics-config requires a metrics pair or --disable-metrics")
+            stage_metrics(args.metrics_endpoint, args.metrics_host_id)
+        return 0
     if args.operation == "uninstall":
         if args.check:
             parser.error("--check and uninstall are exclusive")
@@ -557,8 +659,13 @@ def main():
     pinlock.require_ready(manifest)
     parity.validate(manifest, json.loads((HERE.parent / "runner/toolchain.json").read_text()))
     if args.check:
-        errors = check_install(args.state_root, args.image, args.instance, manifest)
-        print(json.dumps({"passed": not errors, "checks": 15, "errors": errors}, indent=2))
+        errors = check_install(args.state_root, args.image, args.instance, manifest,
+                               metrics_endpoint=args.metrics_endpoint, metrics_host_id=args.metrics_host_id)
+        try:
+            metrics = metrics_report(plistlib.loads(PLIST.read_bytes()).get("ProgramArguments", []))
+        except ValueError as error:
+            metrics = {"error": str(error)}
+        print(json.dumps({"passed": not errors, "checks": 15, "errors": errors, "metrics": metrics}, indent=2))
         return int(bool(errors))
     if os.environ.get("SUDO_USER") != "rentamac":
         parser.error("first install and updates must be invoked by rentamac using sudo")

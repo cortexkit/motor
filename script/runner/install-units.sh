@@ -10,6 +10,64 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 dest=$HOME/.config/systemd/user
 changed=0
+metrics_endpoint='' metrics_host_id='' metrics_key=false
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --metrics-endpoint|--metrics-host-id)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || { echo "$1 requires a value" >&2; exit 1; }
+      case "$1" in
+        --metrics-endpoint) metrics_endpoint=$2 ;;
+        --metrics-host-id) metrics_host_id=$2 ;;
+      esac
+      shift 2 ;;
+    --metrics-key) metrics_key=true; shift ;;
+    --help)
+      echo 'Usage: install-units.sh [--metrics-endpoint HTTPS_ORIGIN --metrics-host-id ID] [--metrics-key]'
+      echo 'Metrics apply only to motor-runner@windows, at its next planned restart.'
+      echo '--metrics-key prints its public key without installing units or starting a service.'
+      exit 0 ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+python3 - "$metrics_endpoint" "$metrics_host_id" <<'PY'
+import re
+import sys
+from urllib.parse import urlsplit
+endpoint, host_id = sys.argv[1:]
+if bool(endpoint) != bool(host_id):
+    sys.exit('metrics endpoint and host id must be supplied together')
+if endpoint:
+    try:
+        url = urlsplit(endpoint)
+        valid = (re.fullmatch(r'https://[A-Za-z0-9.\-:\[\]]+/?', endpoint) and
+                 url.hostname and url.path in ('', '/') and
+                 (url.port is None or 1 <= url.port <= 65535))
+    except ValueError:
+        valid = False
+    if not valid:
+        sys.exit('metrics endpoint must be an HTTPS origin')
+    if not re.fullmatch(r'[A-Za-z0-9._-]{1,64}', host_id):
+        sys.exit('metrics host id must match [A-Za-z0-9._-]{1,64}')
+PY
+metrics_args=()
+if [ -n "$metrics_endpoint" ]; then
+  metrics_args=(--metrics-push --metrics-endpoint "$metrics_endpoint" --metrics-host-id "$metrics_host_id")
+fi
+if [ "$metrics_key" = true ]; then
+  mapfile -d '' -t command < <(
+    python3 "$here/deploy_canary.py" --repository-unit-command "$here/units" windows)
+  [ "${#command[@]}" -gt 0 ] || { echo 'Cannot extract Windows runner command' >&2; exit 1; }
+  identity=()
+  for ((i=1; i<${#command[@]}; i++)); do
+    case "${command[i]}" in
+      --instance|--state-root) identity+=("${command[i]}" "${command[i+1]}"); ((i+=1)) ;;
+      --instance=*|--state-root=*) identity+=("${command[i]}") ;;
+    esac
+  done
+  exec "${RUNNER_BINARY_windows:-${command[0]}}" metrics-key "${identity[@]}"
+fi
+rendered=
+trap '[ -z "$rendered" ] || rm -f "$rendered"' EXIT
 check_instance() {
   local instance=$1 binary override refusal state_root i flagged=false ever_enabled=false
   local -a command options
@@ -18,6 +76,7 @@ check_instance() {
     python3 "$here/deploy_canary.py" --repository-unit-command "$here/units" "$instance")
   [ "${#command[@]}" -gt 0 ] || { echo "skipped $rel: cannot extract $instance serve arguments" >&2; return 1; }
   options=("${command[@]:1}")
+  if [ "$instance" = windows ]; then options+=("${metrics_args[@]}"); fi
   state_root=${RUNNER_STATE_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/motor-runner}
   if [ "$instance" = windows ]; then
     state_root=${RUNNER_STATE_ROOT:-/srv/build/motor-windows/windows/state}
@@ -57,6 +116,14 @@ check_instance() {
 # own stdin instead of consuming the next file name.
 while IFS= read -r -d '' -u 3 file; do
   rel=${file#"$here/units/"}
+  if [ "$rel" = motor-runner@windows.service.d/windows.conf ] && [ "${#metrics_args[@]}" -gt 0 ]; then
+    rendered=$(mktemp "${TMPDIR:?TMPDIR must name the shared scratch root}/motor-units.XXXXXX")
+    while IFS= read -r line; do
+      if [[ "$line" = ExecStart=*' serve '* ]]; then line+=" ${metrics_args[*]}"; fi
+      printf '%s\n' "$line"
+    done < "$file" > "$rendered"
+    file=$rendered
+  fi
   privileged=0
   case "$rel" in
     system/motor-jobs.slice)
@@ -87,6 +154,7 @@ while IFS= read -r -d '' -u 3 file; do
     diff -u "$target" "$file" || true
   else
     echo "(new file)"
+    diff -u /dev/null "$file" || true
   fi
   # End of input counts as "no" for this and later files. Under set -e a
   # failing read would otherwise exit here, skipping the daemon-reload below
