@@ -2249,6 +2249,12 @@ impl Motor {
                     if now >= deadline => Some(
                         "host refused reattach with auth past the job's deadline; no result reached ck-motor",
                     ),
+                // Provisioning may return job_unknown before any lease is granted.
+                // Only the original deadline makes a missing broker record final.
+                Err(crate::hosted::Error::ReattachUnknown)
+                    if now >= deadline => Some(
+                        "broker no longer knows the job past its deadline; no result reached ck-motor",
+                    ),
                 _ => None,
             };
             if let Some(cause) = cause {
@@ -2256,7 +2262,10 @@ impl Motor {
                     id,
                     cause,
                     now,
-                    matches!(opened, Err(crate::hosted::Error::Finished)),
+                    matches!(
+                        opened,
+                        Err(crate::hosted::Error::Finished | crate::hosted::Error::ReattachUnknown)
+                    ),
                 ) {
                     Ok(true) => {
                         tracing::warn!(job_id = %id, cause, "retired abandoned hosted job");

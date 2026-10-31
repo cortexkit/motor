@@ -332,6 +332,19 @@ fn hosted_busy_text_only_includes_nonzero_counts() {
 }
 
 #[test]
+fn unconfirmed_jobs_hint_names_the_supported_per_job_status_command() {
+    let now = Instant::now();
+    let mut cache = hosted_text_cache(now);
+    cache.jobs.as_mut().unwrap()["linux"]["unknown"] = json!(3);
+    let detail = cache.report(now).detail.unwrap();
+    assert!(
+        detail.contains("3 job states not confirmed; ck motor attach JOB_ID --status"),
+        "{detail}"
+    );
+    assert!(!detail.contains("ck motor status"), "{detail}");
+}
+
+#[test]
 fn unavailable_connection_text_omits_job_counts_without_hiding_metrics() {
     let now = Instant::now();
     let mut cache = hosted_text_cache(now);

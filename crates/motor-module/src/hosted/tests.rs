@@ -105,6 +105,11 @@ fn hosted_refusals_use_legacy_reason_and_distinct_codes() {
             "hosted_broker_unreachable",
         ),
         (
+            Error::ReattachUnknown,
+            RefusalReason::Unreachable,
+            "hosted_broker_unreachable",
+        ),
+        (
             Error::NoTimeout,
             RefusalReason::RequestRejected,
             "hosted_no_timeout",
@@ -173,6 +178,52 @@ async fn refused_lease_release_job_unknown_is_not_unreachable() {
             format!("/v1/leases/{id}/release"),
             "/missing".to_string()
         ]
+    );
+}
+
+#[tokio::test]
+async fn job_unknown_is_distinct_only_for_404_reattach() {
+    let h = Harness::new(Behavior::Normal).await;
+    for (status, code, path, expected) in [
+        (
+            404,
+            "job_unknown",
+            "/v1/leases/job/reattach",
+            Error::ReattachUnknown,
+        ),
+        (
+            404,
+            "job_unknown",
+            "/v1/leases/job/release",
+            Error::NotGranted,
+        ),
+        (404, "job_unknown", "/v1/leases", Error::Broker),
+        (404, "job_unknown", "/v1/leases/job/finish", Error::Broker),
+        (404, "job_unknown", "/missing", Error::Broker),
+        (503, "job_unknown", "/v1/leases/job/reattach", Error::Broker),
+        (404, "other", "/v1/leases/job/reattach", Error::Broker),
+    ] {
+        let http =
+            super::test_http::Http::new(move |_, _| (status, serde_json::json!({"error": code})))
+                .await;
+        let mut route = h.route.clone();
+        route.broker_url = http.url.clone();
+        let client = Client::new(route);
+        assert_eq!(
+            client
+                .post::<_, serde_json::Value>(path, &serde_json::json!({}))
+                .await,
+            Err(expected),
+            "{status} {code} {path}",
+        );
+    }
+    assert_eq!(
+        Error::ReattachUnknown.retry_after_ms(),
+        Error::Broker.retry_after_ms()
+    );
+    assert_eq!(
+        Error::ReattachUnknown.replaceable(),
+        Error::Broker.replaceable()
     );
 }
 

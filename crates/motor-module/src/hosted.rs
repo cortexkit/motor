@@ -277,6 +277,8 @@ pub(crate) enum Error {
     StorageFull,
     Connect,
     Broker,
+    /// A reattach returned 404 job_unknown, which can also mean provisioning.
+    ReattachUnknown,
     NoTimeout,
     Short,
     Path,
@@ -362,7 +364,7 @@ impl Error {
             Self::InternalFailure => "hosted_internal_failure",
             Self::StorageFull => "hosted_storage_full",
             Self::Connect => "hosted_connect_failed",
-            Self::Broker => "hosted_broker_unreachable",
+            Self::Broker | Self::ReattachUnknown => "hosted_broker_unreachable",
             Self::NoTimeout => "hosted_no_timeout",
             Self::Short => "hosted_max_s_too_short",
             Self::Path => "hosted_path_outside_roots",
@@ -397,9 +399,11 @@ impl Error {
             | Self::Capacity
             | Self::NoCapacity(_)
             | Self::StorageFull => RefusalReason::RunnerFull,
-            Self::Connect | Self::Broker | Self::AccountTransient(_) | Self::Provisioning(_) => {
-                RefusalReason::Unreachable
-            }
+            Self::Connect
+            | Self::Broker
+            | Self::ReattachUnknown
+            | Self::AccountTransient(_)
+            | Self::Provisioning(_) => RefusalReason::Unreachable,
             Self::Platform => RefusalReason::PlatformUnsupported,
             // RequestRejected tells the caller to avoid the request rather
             // than repeat it, which is what a closed account needs.
@@ -962,6 +966,9 @@ impl Client {
                     Some("job_unknown") if status == 404 && path.ends_with("/release") => {
                         Error::NotGranted
                     }
+                    Some("job_unknown") if status == 404 && path.ends_with("/reattach") => {
+                        Error::ReattachUnknown
+                    }
                     Some("budget_exhausted") => Error::Budget,
                     Some("platform_unsupported") => Error::Platform,
                     Some("sandbox_lost") if status == 409 => Error::SandboxLost,
@@ -1243,7 +1250,7 @@ impl Client {
                         // A direct hosted test reports the broker's answer at
                         // once rather than waiting for capacity to appear.
                         Error::Capacity | Error::HostFull if hosted_test => return Err(error),
-                        Error::Broker if attempt < 2 => continue,
+                        Error::Broker | Error::ReattachUnknown if attempt < 2 => continue,
                         error if error.replaceable() && attempt < 2 => continue,
                         error => return Err(error),
                     }

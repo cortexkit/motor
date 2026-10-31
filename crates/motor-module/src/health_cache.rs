@@ -257,7 +257,7 @@ impl HealthCache {
                 let unknown = jobs[platform]["unknown"].as_u64().unwrap_or(0);
                 if unknown > 0 {
                     detail.push_str(&format!(
-                        ", {unknown} job states not confirmed; check ck motor status"
+                        ", {unknown} job states not confirmed; ck motor attach JOB_ID --status"
                     ));
                 }
             }

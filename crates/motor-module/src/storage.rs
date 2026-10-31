@@ -1125,9 +1125,9 @@ impl Storage {
         id: Uuid,
         cause: &str,
         now: u64,
-        broker_finished: bool,
+        broker_done: bool,
     ) -> io::Result<bool> {
-        self.retire_abandoned_job(id, cause, now, true, broker_finished)
+        self.retire_abandoned_job(id, cause, now, true, broker_done)
     }
     fn retire_abandoned_job(
         &self,
@@ -1135,7 +1135,7 @@ impl Storage {
         cause: &str,
         now: u64,
         hosted: bool,
-        broker_finished: bool,
+        broker_done: bool,
     ) -> io::Result<bool> {
         let mut retired = false;
         self.update(|s| {
@@ -1161,11 +1161,11 @@ impl Storage {
                 .with_refusal_detail(format!("health_retired: {cause}"));
             if let Some(hosted) = job.hosted.as_mut() {
                 terminal.wall_ms = hosted.elapsed_ms();
-                // No execution result remains available. The broker's job_finished
-                // refusal also marks finishing complete; an expired Boat job still
-                // needs its normal finish request, but never another attach or cancel.
+                // No execution result remains available. A finished or forgotten
+                // broker record cannot accept a finish request; an expired Boat job
+                // still needs its normal finish, but never another attach or cancel.
                 hosted.terminal = Some(terminal.clone());
-                if broker_finished
+                if broker_done
                     || hosted
                         .placement
                         .as_ref()
