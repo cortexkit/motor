@@ -135,7 +135,7 @@ pub fn run(config: &Config) -> io::Result<()> {
         .enable_all()
         .build()?;
     let mut sampler = sample::Sampler::default();
-    let mut last_error: Option<&'static str> = None;
+    let mut failures = Failures::default();
     let mut deadline = std::time::Instant::now();
     loop {
         let now = unix_ms();
@@ -143,21 +143,19 @@ pub fn run(config: &Config) -> io::Result<()> {
             Ok(Some(mut record)) => {
                 match runtime.block_on(local_runner(config)) {
                     Ok(mut runner) => {
-                        if let Some(code) = last_error {
-                            runner.detail = Some(code.to_owned());
-                        }
+                        failures.annotate(&mut runner);
                         record.runners.push(runner);
                     }
-                    Err(_) => last_error = Some("runner_health_unavailable"),
+                    Err(_) => failures.note("runner_health_unavailable"),
                 }
                 if send(&client, &config.metrics, &key, &mut counter, &record).is_err() {
-                    last_error = Some("metrics_push_failed");
+                    failures.note("metrics_push_failed");
                     tracing::debug!(code = "metrics_push_failed", "monitor_metrics_dropped");
                 }
             }
             Ok(None) => {}
             Err(_) => {
-                last_error = Some("host_sample_failed");
+                failures.note("host_sample_failed");
                 tracing::debug!(code = "host_sample_failed", "monitor_metrics_dropped");
             }
         }
@@ -168,6 +166,24 @@ pub fn run(config: &Config) -> io::Result<()> {
             deadline += Duration::from_secs(60);
         }
         std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+    }
+}
+
+/// A failure since the last record that reached the broker. The next record
+/// reports it once; a later record reports only failures that happened after
+/// it, so a recovered push doesn't keep showing an old error.
+#[derive(Default)]
+struct Failures(Option<&'static str>);
+
+impl Failures {
+    fn note(&mut self, code: &'static str) {
+        self.0 = Some(code);
+    }
+
+    fn annotate(&mut self, runner: &mut Runner) {
+        if let Some(code) = self.0.take() {
+            runner.detail = Some(code.to_owned());
+        }
     }
 }
 

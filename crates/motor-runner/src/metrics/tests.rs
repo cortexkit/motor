@@ -250,6 +250,32 @@ fn monitor_runner_mapping_exports_only_contract_counters_and_fixed_errors() {
 }
 
 #[test]
+fn monitor_failure_detail_is_reported_once_then_clears() {
+    let status = motor_protocol::StatusReply::new(4, vec![], true, vec![], "rustc");
+    let health: motor_protocol::RunnerHealth = serde_json::from_value(json!({
+        "runner_version": "test", "since_ms": 0, "window_minutes": 60, "free_bytes": 123,
+        "queue_depth": 0, "running": [], "counts": motor_protocol::HealthCounts::default(),
+        "permits_cap": 4, "permits_held": 0, "oldest_wait_s": 0
+    }))
+    .unwrap();
+    let reply = motor_protocol::RunnerStatusReply {
+        status,
+        disk: None,
+        health: Some(Box::new(health)),
+    };
+    let mut failures = Failures::default();
+    failures.note("metrics_push_failed");
+    let mut after_failure = runner_record(&reply).unwrap();
+    failures.annotate(&mut after_failure);
+    assert_eq!(after_failure.detail.as_deref(), Some("metrics_push_failed"));
+    // That record reached the broker; the next one must not repeat the error.
+    let mut recovered = runner_record(&reply).unwrap();
+    failures.annotate(&mut recovered);
+    assert_eq!(recovered.detail, None);
+    assert_eq!(recovered.state, RunnerState::Ready);
+}
+
+#[test]
 fn monitor_sender_uses_metrics_only_and_burns_refused_counters_without_retry() {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
