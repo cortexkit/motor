@@ -463,6 +463,10 @@ fn check_start_reply(reply: &Value) -> Result<()> {
 pub fn control_read_deadline(request: &Value) -> Duration {
     if request["recovery_required"] == true {
         motor_protocol::TENANT_ATTACH_READ_DEADLINE + motor_protocol::TENANT_RECOVERY_ALLOWANCE
+    } else if request["op"] == "set_remote_cache" {
+        // Stop plus restart can use the full runner readiness budget. Do not
+        // abandon a credential swap after the ordinary 30-second query window.
+        motor_protocol::TENANT_ATTACH_READ_DEADLINE + Duration::from_secs(120)
     } else if request["op"] == "attach_tenant" {
         motor_protocol::TENANT_ATTACH_READ_DEADLINE
     } else {
@@ -502,7 +506,13 @@ pub(crate) fn exchange_control(
     );
     write_json(&mut stream, request)
         .with_context(|| format!("tenant {tenant} control {operation} port54 write request"))?;
-    let result = read_json(&mut stream);
+    let result = read_json(&mut stream).map_err(|error| {
+        if operation == "set_remote_cache" {
+            anyhow!("remote_cache_invalid_reply")
+        } else {
+            error
+        }
+    });
     match result {
         Ok(reply) => {
             tracing::info!(

@@ -4,6 +4,28 @@ use crate::Uuid;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// Trusted control-channel provisioning, never a job frame. Deliberately not
+/// Debug: these strings contain credentials. Decode errors must be discarded.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteCacheRequest {
+    pub op: String,
+    pub config: String,
+    pub read_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_key: Option<String>,
+}
+
+impl RemoteCacheRequest {
+    pub fn valid(&self) -> bool {
+        self.op == "set_remote_cache"
+            && [&self.config, &self.read_key]
+                .into_iter()
+                .chain(self.write_key.iter())
+                .all(|file| !file.is_empty() && file.len() <= 64 * 1024)
+    }
+}
+
 /// Upper bound on runner startup, including cleanup of old state on the disk.
 /// The agent checks process liveness throughout the wait and reports progress.
 pub const TENANT_RUNNER_READINESS_WAIT: Duration = Duration::from_secs(15 * 60);

@@ -409,6 +409,121 @@ REMOTE_CACHE_DIRECTORIES = (("state", 0o755), ("main", 0o700), ("cache-provision
 # contents, so check-installed can report it without mounting the tenant disk.
 REMOTE_CACHE_MANIFEST = "remote-cache.json"
 REMOTE_CACHE_MAX_FILE = 64 * 1024
+ADMIN_SOCKET = Path("/run/motor-host/admin.sock")
+
+
+def cache_admin(request):
+    """A bounded control exchange; neither requests nor replies are printed."""
+    body = json.dumps(request).encode()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(20 * 60)
+        connection.connect(str(ADMIN_SOCKET))
+        connection.sendall(struct.pack(">I", len(body)) + body)
+
+        def exact(length):
+            data = b""
+            while len(data) < length:
+                chunk = connection.recv(length - len(data))
+                if not chunk:
+                    raise ValueError("remote_cache_admin_disconnected")
+                data += chunk
+            return data
+
+        length, = struct.unpack(">I", exact(4))
+        if not 0 < length <= 1048576:
+            raise ValueError("remote_cache_invalid_reply")
+        try:
+            return json.loads(exact(length))
+        except ValueError:
+            raise ValueError("remote_cache_invalid_reply") from None
+
+
+def set_remote_cache(tenant, directory, exchange=None, output=print):
+    tenant = component(tenant)
+    trusted(directory)
+    if not directory.is_dir() or stat.S_IMODE(directory.stat().st_mode) != 0o700:
+        raise ValueError("remote cache source must be a root-only mode-0700 directory")
+    for entry in directory.iterdir():
+        trusted(entry)
+    with (ROOT / "provision.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        refuse_resize_journal()
+        config = checked(json.loads((PROVISION / f"{tenant}.json").read_text()), allow_old_headroom=True)
+        files = read_remote_cache(directory, config["sub"])
+        set_remote_cache_files(tenant, files, cache_admin if exchange is None else exchange, output)
+
+
+def set_remote_cache_files(tenant, files, exchange, output):
+    """Publish validated files through the agent, then activate nonsecret intent.
+
+    On activation failure a second staged activation restores the previous
+    arguments. The newly delivered keys remain installed. Keep normal fleet
+    placement drained and do not run host-hinted canaries during this command.
+    """
+    home = ROOT / "tenants" / tenant
+    provision_path, registry_path = PROVISION / f"{tenant}.json", REGISTRY / f"{tenant}.json"
+    original = json.loads(provision_path.read_text())
+    old = checked(original, allow_old_headroom=True)
+    record = json.loads(registry_path.read_text())
+    if old["tenant"] != tenant or any(record.get(key) != value for key, value in old.items() if key in record):
+        raise ValueError("provisioning record and helper registry differ")
+    new = dict(original, remote_cache=True)
+    staged = home / "runner-args.staged"
+    activation = staged_activation(runner_args(checked(new, allow_old_headroom=True)), False)
+    previous_activation = staged_activation(runner_args(old), False)
+    if staged.exists() or staged.is_symlink():
+        if not stat.S_ISREG(staged.lstat().st_mode) or staged.read_text() not in (activation, previous_activation):
+            raise ValueError("remote_cache_other_activation_pending")
+    status = exchange({"op": "host_status"})
+    if status.get("ok") is not True or status.get("draining") is not True or status.get("active_leases") != 0:
+        raise ValueError("remote_cache_host_not_idle: drain the host and wait for zero active leases")
+
+    def control(op, **fields):
+        try:
+            reply = exchange(dict(tenant=tenant, op=op, **fields))
+        except Exception:
+            return {"ok": False}
+        return reply
+
+    if control("remote_cache_probe").get("ok") is not True:
+        raise ValueError("remote_cache_unsupported: roll the guest image before provisioning")
+    try:
+        payload = {"config": files["config.json"].decode("utf-8"), "read_key": files["read-key"].decode("utf-8")}
+        if "write-key" in files:
+            payload["write_key"] = files["write-key"].decode("utf-8")
+    except UnicodeError:
+        raise ValueError("remote_cache_invalid_utf8") from None
+    applied = control("set_remote_cache", **payload)
+    del payload
+    manifest = remote_cache_manifest(files)
+    files.clear()
+    if applied.get("ok") is not True:
+        cause = applied.get("cause")
+        if applied.get("error") == "remote_cache_busy" and cause in {
+                "queued", "running", "fill", "starting", "reserved", "preparing", "admitting",
+                "admission_save", "base_finish", "base_settle", "finalizing", "writer"}:
+            count = applied.get("count")
+            count = count if type(count) is int and count >= 0 else 0
+            raise ValueError(f"remote_cache_busy: {cause} count={count}; files, records and runner arguments unchanged")
+        state = "admission reopened" if applied.get("runner_drained") is False else "runner drained or unavailable"
+        raise ValueError(f"remote_cache_apply_failed: key swap may have completed; records and runner arguments unchanged; {state}; host remains drained")
+    try:
+        durable_write(staged, activation, 0o600)
+        # The helper registry's closed schema has no cache switch. It consumes
+        # staged arguments; only the provisioning record retains the flag.
+        atomic_pair([(provision_path, json.dumps(new, indent=2) + "\n"),
+                     (registry_path, json.dumps(record, indent=2) + "\n")])
+        atomic(home / REMOTE_CACHE_MANIFEST, manifest)
+    except Exception:
+        raise ValueError("remote_cache_publish_failed: new key files installed; argument activation may be pending; host remains drained; rerun set-remote-cache") from None
+    if control("activate_runner_args").get("ok") is not True:
+        durable_write(staged, previous_activation, 0o600)
+        restored = control("activate_runner_args").get("ok") is True
+        atomic_pair([(provision_path, json.dumps(original, indent=2) + "\n"),
+                     (registry_path, json.dumps(record, indent=2) + "\n")])
+        state = "previous runner arguments restored and runner healthy" if restored else "previous arguments staged; runner recovery unconfirmed"
+        raise ValueError(f"remote_cache_activation_failed: new key files installed; {state}; host remains drained; rerun set-remote-cache")
+    output(f"{tenant}: remote cache files installed; --remote-cache true active; host remains drained")
 
 
 def read_remote_cache(directory, sub):
@@ -435,7 +550,19 @@ def read_remote_cache(directory, sub):
             raise ValueError(f"{name} is larger than {REMOTE_CACHE_MAX_FILE} bytes")
         if name != "config.json" and info.st_mode & 0o077:
             raise ValueError(f"{name} must be readable by its owner alone")
-        data = path.read_bytes()
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as source:
+                info = os.fstat(source.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError(f"{name} is not a regular file")
+                if name != "config.json" and info.st_mode & 0o077:
+                    raise ValueError(f"{name} must be readable by its owner alone")
+                data = source.read(REMOTE_CACHE_MAX_FILE + 1)
+        except OSError:
+            raise ValueError(f"{name} cannot be read safely") from None
+        if len(data) > REMOTE_CACHE_MAX_FILE:
+            raise ValueError(f"{name} is larger than {REMOTE_CACHE_MAX_FILE} bytes")
         try:
             value = json.loads(data)
         except ValueError:
@@ -2023,6 +2150,9 @@ def main():
                         "holding the runner's remote compile cache config.json and read-key, and optionally the "
                         "tenant's write-key; they are installed on the new tenant disk only")
     commands = parser.add_subparsers(dest="command")
+    cache = commands.add_parser("set-remote-cache", help="deliver compile-cache files to an existing idle tenant")
+    cache.add_argument("tenant")
+    cache.add_argument("--remote-cache-dir", type=Path, required=True, dest="cache_directory")
     commands.add_parser("apply-jobs-slice", help="validate capacity and apply the direct jobs slice limits")
     switch = commands.add_parser("switch-image", help="change an existing tenant's immutable image; "
                                  f"stop both services first: {STOP_COMMAND}")
@@ -2059,6 +2189,15 @@ def main():
             parser.error("apply-jobs-slice does not take --config")
         trusted(ROOT)
         apply_jobs_slice()
+        return
+    if args.command == "set-remote-cache":
+        if args.config is not None:
+            parser.error("set-remote-cache takes a tenant, not --config")
+        tenant = component(args.tenant)
+        for path in (ROOT, REGISTRY, PROVISION, ROOT / "tenants", ROOT / "tenants" / tenant,
+                     PROVISION / f"{tenant}.json", REGISTRY / f"{tenant}.json"):
+            trusted(path)
+        set_remote_cache(tenant, args.cache_directory)
         return
     if args.command == "repair-from-registry":
         if args.config is not None:

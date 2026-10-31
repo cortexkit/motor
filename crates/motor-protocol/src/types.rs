@@ -527,6 +527,11 @@ define_frames! {
         deadline_s: u64,
         exit_after: bool,
     },
+    DrainIfIdle,
+    DrainIfIdleReply {
+        blocked_by: Option<String>,
+        count: u64,
+    },
     DrainReply {
         timed_out: bool,
         /// Linux unit-backed jobs left running for recovery after the swap.

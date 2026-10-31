@@ -1242,6 +1242,8 @@ class ProvisionTests(unittest.TestCase):
             (lambda d: (d / "write-key").chmod(0o440), "owner alone"),
             (raw("write-key", '{"secret_access_key": "WRITE-SECRET" broken'), "not valid JSON"),
             (raw("write-key", '{"secret_access_key": "WRITE-SECRET"}'), "exactly the keys"),
+            (raw("write-key", "WRITE-SECRET" + "x" * 65536), "larger than"),
+            (lambda d: ((d / "read-key").unlink(), (d / "read-key").symlink_to(d / "write-key")), "regular file"),
         ]
         for change, message in cases:
             with self.subTest(message=message):
@@ -1291,6 +1293,110 @@ class ProvisionTests(unittest.TestCase):
         manifest.write_text(json.dumps({"config.json": "0444", "read-key": "0644"}))
         with self.assertRaisesRegex(ValueError, "runner's modes"):
             hosted.remote_cache_report(c, p)
+
+    def existing_cache_tenant(self):
+        c, _ = self.provision_with_cache()
+        c.pop("remote_cache")
+        (p.PROVISION / "a.json").write_text(json.dumps(c))
+        return c, self.root / "tenants/a"
+
+    def test_set_remote_cache_delivers_keys_and_uses_staged_activation_without_touching_disk(self):
+        old, home = self.existing_cache_tenant()
+        disk = home / "disk.img"
+        disk.write_bytes(b"warm-workspaces")
+        calls, output = [], []
+        def exchange(frame):
+            calls.append(frame["op"])
+            if frame["op"] == "host_status":
+                return {"ok": True, "draining": True, "active_leases": 0}
+            if frame["op"] == "set_remote_cache":
+                self.assertIn("READ-SECRET", frame["read_key"])
+                self.assertIn("WRITE-SECRET", frame["write_key"])
+            if frame["op"] == "activate_runner_args":
+                staged = json.loads((home / "runner-args.staged").read_text())
+                self.assertIn(" --remote-cache true ", staged["runner_args"])
+                self.assertFalse(staged["quota_grew"])
+                (home / "runner-args.staged").unlink()
+            return {"ok": True}
+        files = p.read_remote_cache(self.root / "cache-input", SUB)
+        p.set_remote_cache_files("a", files, exchange, output.append)
+        self.assertEqual(calls, ["host_status", "remote_cache_probe", "set_remote_cache", "activate_runner_args"])
+        self.assertFalse(files)
+        record = json.loads((p.PROVISION / "a.json").read_text())
+        self.assertTrue(record["remote_cache"])
+        self.assertEqual(hosted.registry_disagreements(record, json.loads((p.REGISTRY / "a.json").read_text()), p), [])
+        self.assertIn("fills its own cache", hosted.remote_cache_report(record, p))
+        self.assertIn("--remote-cache true", p.runner_args(p.resize_target(record, {"max_weight": 2})))
+        for path in [p.PROVISION / "a.json", p.REGISTRY / "a.json", home / p.REMOTE_CACHE_MANIFEST]:
+            self.assertNotIn("SECRET", path.read_text())
+        self.assertNotIn("SECRET", "\n".join(output))
+        self.assertEqual(disk.read_bytes(), b"warm-workspaces")
+
+    def test_set_remote_cache_refuses_undrained_host_active_leases_and_old_agent_before_sending_keys(self):
+        _, home = self.existing_cache_tenant()
+        for status, probe, expected in [
+                ({"ok": True, "draining": False, "active_leases": 0}, True, "host_not_idle"),
+                ({"ok": True, "draining": True, "active_leases": 1}, True, "host_not_idle"),
+                ({"ok": True, "draining": True, "active_leases": 0}, False, "unsupported")]:
+            calls = []
+            before = (p.PROVISION / "a.json").read_bytes()
+            def exchange(frame):
+                calls.append(frame["op"])
+                return status if frame["op"] == "host_status" else {"ok": probe, "error": "READ-SECRET"}
+            with self.assertRaisesRegex(ValueError, expected) as error:
+                p.set_remote_cache_files("a", p.read_remote_cache(self.root / "cache-input", SUB), exchange, print)
+            self.assertNotIn("SECRET", str(error.exception))
+            self.assertNotIn("set_remote_cache", calls)
+            self.assertEqual((p.PROVISION / "a.json").read_bytes(), before)
+            self.assertFalse((home / "runner-args.staged").exists())
+
+    def test_set_remote_cache_activation_failure_restores_previous_arguments_and_reports_new_keys(self):
+        old, home = self.existing_cache_tenant()
+        activations = []
+        def exchange(frame):
+            if frame["op"] == "host_status":
+                return {"ok": True, "draining": True, "active_leases": 0}
+            if frame["op"] == "activate_runner_args":
+                activations.append(json.loads((home / "runner-args.staged").read_text())["runner_args"])
+                if len(activations) == 1:
+                    return {"ok": False, "error": "READ-SECRET WRITE-SECRET"}
+                (home / "runner-args.staged").unlink()
+            return {"ok": True}
+        with self.assertRaisesRegex(ValueError, "new key files installed; previous runner arguments restored and runner healthy") as error:
+            p.set_remote_cache_files("a", p.read_remote_cache(self.root / "cache-input", SUB), exchange, print)
+        self.assertNotIn("SECRET", str(error.exception))
+        self.assertEqual(activations, [p.runner_args(dict(old, remote_cache=True)), p.runner_args(old)])
+        self.assertEqual(json.loads((p.PROVISION / "a.json").read_text()), old)
+
+    def test_set_remote_cache_busy_failure_names_cause_count_without_echoing_keys(self):
+        _, _ = self.existing_cache_tenant()
+        def exchange(frame):
+            if frame["op"] == "host_status":
+                return {"ok": True, "draining": True, "active_leases": 0}
+            if frame["op"] == "set_remote_cache":
+                return {"ok": False, "error": "remote_cache_busy", "cause": "finalizing", "count": 2, "detail": "READ-SECRET"}
+            return {"ok": True}
+        with self.assertRaisesRegex(ValueError, "finalizing count=2") as error:
+            p.set_remote_cache_files("a", p.read_remote_cache(self.root / "cache-input", SUB), exchange, print)
+        self.assertNotIn("SECRET", str(error.exception))
+
+    def test_set_remote_cache_retry_can_consume_a_pending_previous_argument_rollback(self):
+        old, home = self.existing_cache_tenant()
+        def refused_activation(frame):
+            if frame["op"] == "host_status":
+                return {"ok": True, "draining": True, "active_leases": 0}
+            return {"ok": frame["op"] != "activate_runner_args"}
+        with self.assertRaisesRegex(ValueError, "previous arguments staged; runner recovery unconfirmed"):
+            p.set_remote_cache_files("a", p.read_remote_cache(self.root / "cache-input", SUB), refused_activation, print)
+        self.assertEqual(json.loads((home / "runner-args.staged").read_text())["runner_args"], p.runner_args(old))
+        def recovered(frame):
+            if frame["op"] == "host_status":
+                return {"ok": True, "draining": True, "active_leases": 0}
+            if frame["op"] in {"remote_cache_probe", "activate_runner_args"}:
+                (home / "runner-args.staged").unlink(missing_ok=True)
+            return {"ok": True}
+        p.set_remote_cache_files("a", p.read_remote_cache(self.root / "cache-input", SUB), recovered, lambda _line: None)
+        self.assertTrue(json.loads((p.PROVISION / "a.json").read_text())["remote_cache"])
 
 
 if __name__ == "__main__":

@@ -101,16 +101,31 @@ fill. The record's `remote_cache` field and the directory are both required or b
 anything else is refused before any write. Error messages name a file, never
 its contents.
 
-The files are written once, into the new tenant disk at its single host mount,
+At install the files are written into the new tenant disk at its single host mount,
 as `state/main/cache-provisioning/` (directory 0700, `config.json` 0444, keys
 0400, all root-owned, as the guest runner requires). The host keeps only
 `/var/lib/motor-vm/tenants/<tenant>/remote-cache.json`, which lists the file
 names and modes. `hosted-host/hosted_host.py check-installed` reads that list,
 never the keys. `switch-image` and `resize` keep the disk and its files.
 `remote_cache` stays out of the helper registry, and resize renders
-`--remote-cache true` again from the record. Replacing the files (a key
-rotation, or adding or withdrawing a write key) currently needs a reinstall of
-the tenant: there is not yet a channel that delivers them to an existing guest.
+`--remote-cache true` again from the provisioning record.
+
+For an existing tenant, use `sudo python3 provision.py set-remote-cache <tenant>
+--remote-cache-dir /absolute/root-only-dir`. The source directory must be mode
+0700. The host must be drained with zero active leases, and the guest runner
+must have no accepted work or active cache fill. A busy refusal names the kind
+of work and its count; wait for it to finish and retry. An older guest agent is
+refused as `remote_cache_unsupported` before any files or records change.
+
+The trusted control channel delivers the files to the guest, which briefly
+stops its idle runner, atomically replaces the complete directory, and restarts
+it. The host never mounts the guest-written tenant disk. Runner arguments then
+activate through the existing staged-activation path, preserving the tenant
+disk and warm workspaces. The host stays drained until the operator undrains it.
+Rotation uses the same command; omit `write-key` from the source directory to
+withdraw it. If argument activation fails, the command attempts to restore the
+previous arguments and reports whether the runner recovered; newly delivered
+key files remain installed. Retry the command before undraining.
 
 Choose a cpuset excluding the host runner's reserved Windows CPUs. Each tap
 index must be unique and reserves a dedicated no-login uid `400000 + index`;

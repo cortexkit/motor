@@ -891,6 +891,12 @@ async fn session(
                 send(tx, Frame::ResumeReply { resumed: true }).await?;
                 return Ok(());
             }
+            Frame::DrainIfIdle => {
+                let (blocked_by, count) =
+                    locked(&runner, |runner| Ok(runner.drain_if_idle())).await?;
+                send(tx, Frame::DrainIfIdleReply { blocked_by, count }).await?;
+                return Ok(());
+            }
             Frame::Drain {
                 deadline_s,
                 exit_after,

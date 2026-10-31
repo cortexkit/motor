@@ -1012,9 +1012,11 @@ impl Runtime {
             }
             _ => None,
         };
-        Ok(json!({"ok":true,"draining":host.snapshot.draining,
+        Ok(
+            json!({"ok":true,"draining":host.snapshot.draining,"active_leases":host.snapshot.leases.len(),
             "broker_draining":host.broker_draining,
-            "broker_heartbeat_at_ms":host.broker_heartbeat_at_ms,"set_at_ms":set_at_ms}))
+            "broker_heartbeat_at_ms":host.broker_heartbeat_at_ms,"set_at_ms":set_at_ms}),
+        )
     }
     pub fn admin(&self, tenant: &str, request: &Value) -> Result<Value> {
         ensure!(
@@ -1026,6 +1028,20 @@ impl Runtime {
                 .any(|t| t.tenant == tenant),
             "unknown tenant"
         );
+        if matches!(
+            request["op"].as_str(),
+            Some("remote_cache_probe" | "set_remote_cache" | "activate_runner_args")
+        ) {
+            let operations = self.tenant_operations(tenant)?;
+            let _operation = operations.lock().expect("tenant operations lock");
+            {
+                let host = self.host.lock().expect("host lock");
+                if !host.snapshot.draining || !host.snapshot.leases.is_empty() {
+                    return Ok(json!({"ok":false,"error":"remote_cache_host_not_idle"}));
+                }
+            }
+            return self.remote_cache_admin(tenant, request);
+        }
         ensure!(
             matches!(
                 request["op"].as_str(),
@@ -1049,6 +1065,74 @@ impl Runtime {
         let operations = self.tenant_operations(tenant)?;
         let _operation = operations.lock().expect("tenant operations lock");
         self.control.admin(tenant, &serde_json::to_value(request)?)
+    }
+
+    fn remote_cache_admin(&self, tenant: &str, request: &Value) -> Result<Value> {
+        let op = request["op"].as_str().unwrap_or("");
+        if op == "set_remote_cache" {
+            // Never format serde errors: unknown fields and invalid values can
+            // contain credentials, even when decoding fails.
+            let valid =
+                serde_json::from_value::<motor_protocol::RemoteCacheRequest>(request.clone())
+                    .is_ok_and(|request| request.valid());
+            if !valid {
+                return Ok(json!({"ok":false,"error":"remote_cache_invalid_request"}));
+            }
+        } else if request != &json!({"op":op}) {
+            return Ok(json!({"ok":false,"error":"remote_cache_invalid_request"}));
+        }
+        if op == "activate_runner_args" {
+            return Ok(match self.control.wake(tenant, None) {
+                Ok(_) => json!({"ok":true}),
+                Err(_) => json!({"ok":false,"error":"remote_cache_activation_failed"}),
+            });
+        }
+        if op == "remote_cache_probe" && self.control.wake(tenant, None).is_err() {
+            return Ok(json!({"ok":false,"error":"remote_cache_agent_unavailable"}));
+        }
+        let reply = self.control.admin(tenant, request);
+        // Even an old or failing agent must not echo request material to the
+        // operator. Only fixed error names cross the admin boundary.
+        Ok(match reply {
+            Ok(reply)
+                if op == "remote_cache_probe"
+                    && reply["ok"] == true
+                    && reply["remote_cache_provisioning"] == 1 =>
+            {
+                json!({"ok":true,"remote_cache_provisioning":1})
+            }
+            _ if op == "remote_cache_probe" => {
+                json!({"ok":false,"error":"remote_cache_unsupported"})
+            }
+            Ok(reply) if reply["ok"] == true => json!({"ok":true}),
+            Ok(reply) if reply["error"] == "remote_cache_busy" => {
+                let cause = reply["cause"]
+                    .as_str()
+                    .filter(|cause| {
+                        matches!(
+                            *cause,
+                            "queued"
+                                | "running"
+                                | "fill"
+                                | "starting"
+                                | "reserved"
+                                | "preparing"
+                                | "admitting"
+                                | "admission_save"
+                                | "base_finish"
+                                | "base_settle"
+                                | "finalizing"
+                                | "writer"
+                        )
+                    })
+                    .unwrap_or("status_unavailable");
+                json!({"ok":false,"error":"remote_cache_busy","cause":cause,"count":reply["count"].as_u64().unwrap_or(0)})
+            }
+            Ok(reply) if reply["error"] == "remote_cache_apply_failed" => {
+                json!({"ok":false,"error":"remote_cache_apply_failed","runner_drained":reply["runner_drained"].as_bool().unwrap_or(true)})
+            }
+            _ => json!({"ok":false,"error":"remote_cache_busy_or_failed","runner_drained":true}),
+        })
     }
     fn deliver(
         self: &Arc<Self>,

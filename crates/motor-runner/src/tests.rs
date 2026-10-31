@@ -1126,6 +1126,46 @@ fn drain_deadline_bounds_an_incomplete_upload_and_hold_keeps_admission_closed() 
 }
 
 #[test]
+fn drain_if_idle_refuses_accepted_work_and_transient_markers_without_closing_admission() {
+    let f = Fixture::new();
+    let runner = manual_tick_runner(&f, 4);
+    let id = Uuid::now_v7();
+    for kind in ["starting", "finalizing"] {
+        {
+            let mut inner = runner.core.inner.lock().unwrap();
+            if kind == "starting" {
+                inner.starting.insert(id);
+            } else {
+                inner.finalizing.insert(id);
+            }
+        }
+        assert_eq!(runner.drain_if_idle(), (Some(kind.into()), 1));
+        assert!(!runner.is_draining());
+        let mut inner = runner.core.inner.lock().unwrap();
+        inner.starting.clear();
+        inner.finalizing.clear();
+    }
+    let (request, _) = f.run("true");
+    runner.accept(request).unwrap();
+    assert_eq!(runner.drain_if_idle(), (Some("queued".into()), 1));
+    assert!(!runner.is_draining());
+}
+
+#[test]
+fn drain_if_idle_atomically_closes_admission_until_resume() {
+    let f = Fixture::new();
+    let runner = manual_tick_runner(&f, 4);
+    assert_eq!(runner.drain_if_idle(), (None, 0));
+    let (request, _) = f.run("true");
+    assert!(matches!(
+        runner.accept(request).unwrap(),
+        Admission::Refused(RefusalReason::RunnerDraining)
+    ));
+    runner.resume();
+    assert!(!runner.is_draining());
+}
+
+#[test]
 fn exit_after_drain_observes_deadline_without_a_client_request() {
     let f = Fixture::new();
     let runner = Runner::open(f.config()).unwrap();
