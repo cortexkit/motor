@@ -225,6 +225,7 @@ fn identity_prepared_bind_list_case(enabled: bool) {
             None,
             &JavascriptTools::for_config(&config),
             None,
+            false,
         )
         .unwrap();
         let normalize = |text: &str| {

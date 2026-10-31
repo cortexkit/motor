@@ -52,6 +52,98 @@ pub(crate) fn dependency_commits(
     grouped
 }
 
+#[cfg(target_os = "linux")]
+fn snapshot_lockfiles(repository: &Path, commit: &str) -> io::Result<Vec<String>> {
+    let entries = git(repository, &["ls-tree", "-rz", commit])?;
+    let files: BTreeMap<_, _> = entries
+        .split('\0')
+        .filter_map(|entry| {
+            let (header, path) = entry.split_once('\t')?;
+            Some((
+                path,
+                header.starts_with("100644 blob ") || header.starts_with("100755 blob "),
+            ))
+        })
+        .collect();
+    let mut locks =
+        vec![git(repository, &["show", &format!("{commit}:Cargo.lock")]).unwrap_or_default()];
+    let mut count = usize::from(files.contains_key("Cargo.lock"));
+    for (path, regular) in &files {
+        let path = Path::new(path);
+        if path == Path::new("Cargo.lock")
+            || path.file_name().is_none_or(|name| name != "Cargo.lock")
+        {
+            continue;
+        }
+        count += 1;
+        if count > 128
+            || !regular
+            || files.get(path.with_file_name("Cargo.toml").to_str().unwrap_or("")) != Some(&true)
+        {
+            continue;
+        }
+        let lock = git(
+            repository,
+            &["show", &format!("{commit}:{}", path.display())],
+        )?;
+        // Nested graphs are optional prefetches; a malformed experimental lock
+        // must not make mirror route selection fail.
+        if locked_dependencies(&lock).is_ok() {
+            locks.push(lock);
+        }
+    }
+    Ok(locks)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn fetch_context(workspace: &Path, routes: &BTreeMap<String, PathBuf>) -> String {
+    fn manifest_sources(value: &toml::Value, sources: &mut BTreeSet<(String, String)>) {
+        if let Some(table) = value.as_table() {
+            if let Some(url) = table
+                .get("git")
+                .and_then(toml::Value::as_str)
+                .filter(|url| valid_url(url))
+            {
+                let selector = ["rev", "branch", "tag"]
+                    .into_iter()
+                    .find_map(|key| {
+                        table
+                            .get(key)
+                            .and_then(toml::Value::as_str)
+                            .map(|v| format!("{key} {v}"))
+                    })
+                    .unwrap_or_else(|| "default branch".into());
+                sources.insert((url.to_owned(), selector));
+            }
+            for child in table.values() {
+                manifest_sources(child, sources);
+            }
+        }
+    }
+    let mut sources = BTreeSet::new();
+    if let Ok(manifest) = fs::read_to_string(workspace.join("Cargo.toml")) {
+        if let Ok(value) = toml::from_str(&manifest) {
+            manifest_sources(&value, &mut sources);
+        }
+    }
+    if let Ok(lock) = fs::read_to_string(workspace.join("Cargo.lock")) {
+        for (url, commit, _) in locked_sources(&lock).unwrap_or_default() {
+            sources.insert((url, format!("locked commit {commit}")));
+        }
+    }
+    sources
+        .into_iter()
+        .map(|(url, selector)| {
+            let transport = match routes.get(&url) {
+                Some(mirror) => format!("routed to local mirror {}", mirror.display()),
+                None => "upstream; no local mirror rewrite".into(),
+            };
+            format!("git dependency {url} {selector} ({transport})")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 impl Trees {
     #[cfg(target_os = "linux")]
     pub(crate) fn checkout_dependency_lockfiles(
@@ -67,12 +159,8 @@ impl Trees {
                     s.commit.as_str(),
                 )
             }))
-            .map(|(repository, commit)| {
-                git(
-                    &self.mirror(repository),
-                    &["show", &format!("{commit}:Cargo.lock")],
-                )
-                .unwrap_or_default()
+            .flat_map(|(repository, commit)| {
+                snapshot_lockfiles(&self.mirror(repository), commit).unwrap_or_default()
             })
             .collect()
     }

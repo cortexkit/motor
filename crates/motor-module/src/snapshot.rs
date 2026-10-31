@@ -1209,10 +1209,56 @@ pub(crate) fn lockfile_sources(
     commit: &str,
 ) -> io::Result<BTreeMap<String, Vec<String>>> {
     let object = format!("{commit}:Cargo.lock");
-    if git(path, &["cat-file", "-e", &object]).is_err() {
-        return Ok(BTreeMap::new());
+    let mut sources = if git(path, &["cat-file", "-e", &object]).is_ok() {
+        parse_lockfile(&git(path, &["show", &object])?)?
+    } else {
+        BTreeMap::new()
+    };
+    let entries = git(path, &["ls-tree", "-rz", commit])?;
+    let files: BTreeMap<_, _> = entries
+        .split('\0')
+        .filter_map(|entry| {
+            let (header, path) = entry.split_once('\t')?;
+            Some((
+                path,
+                header.starts_with("100644 blob ") || header.starts_with("100755 blob "),
+            ))
+        })
+        .collect();
+    let mut count = usize::from(files.contains_key("Cargo.lock"));
+    for (lock, regular) in &files {
+        let lock = Path::new(lock);
+        if lock == Path::new("Cargo.lock")
+            || lock.file_name().is_none_or(|name| name != "Cargo.lock")
+        {
+            continue;
+        }
+        count += 1;
+        // Match the runner's bounded nested-prefetch discovery: both files
+        // must be regular blobs in the captured snapshot, not later edits.
+        if count > 128
+            || !regular
+            || files.get(lock.with_file_name("Cargo.toml").to_str().unwrap_or("")) != Some(&true)
+        {
+            continue;
+        }
+        let content = git(path, &["show", &format!("{commit}:{}", lock.display())])?;
+        match parse_lockfile(&content) {
+            Ok(nested) => {
+                for (url, commits) in nested {
+                    sources.entry(url).or_default().extend(commits);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(lockfile = %lock.display(), %error, "skipping malformed optional nested Cargo.lock")
+            }
+        }
     }
-    parse_lockfile(&git(path, &["show", &object])?)
+    for commits in sources.values_mut() {
+        commits.sort();
+        commits.dedup();
+    }
+    Ok(sources)
 }
 
 pub(crate) fn cached_commit(home: &Path, url: &str, commit: &str) -> Option<PathBuf> {
@@ -1860,6 +1906,80 @@ mod tests {
             .transfer_bundles(Uuid::now_v7(), &[], Some(&held))
             .unwrap();
         assert!(dependencies[0].bundle.is_none());
+    }
+
+    #[test]
+    fn nested_lockfile_commits_are_shipped_from_main_and_siblings() {
+        let (scratch, checkout, spool, _) = repository();
+        let (_other, sibling, _, _) = repository();
+        let (_dep, dependency, _, a) = repository();
+        fs::write(dependency.join("source.txt"), "second commit").unwrap();
+        let b = prepare_commit(&dependency, &a);
+        git(&dependency, &["update-ref", "refs/heads/nested", &b]).unwrap();
+        let home = scratch.join("cargo-home");
+        let cache = home.join("git/db/nested-test");
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        git(
+            &dependency,
+            &["clone", "--bare", ".", text(&cache).unwrap()],
+        )
+        .unwrap();
+        let url = "https://example.invalid/nested.git";
+        for (root, commit) in [(&checkout, &a), (&sibling, &b)] {
+            fs::create_dir(root.join("nested")).unwrap();
+            fs::write(root.join("nested/Cargo.toml"), "[workspace]\n").unwrap();
+            fs::write(root.join("nested/Cargo.lock"), format!("version=4\n[[package]]\nname='dependency'\nversion='0.1.0'\nsource='git+{url}#{commit}'\n")).unwrap();
+            fs::create_dir(root.join("orphan")).unwrap();
+            fs::write(
+                root.join("orphan/Cargo.lock"),
+                "invalid lock without manifest",
+            )
+            .unwrap();
+        }
+        let storage = Storage::open(&scratch.join("store")).unwrap();
+        let snapshots = Snapshots::build(
+            &Config::default(),
+            text(&checkout).unwrap(),
+            text(&checkout).unwrap(),
+            &[text(&sibling).unwrap().to_owned()],
+            &spool,
+            Uuid::now_v7(),
+            None,
+            &storage,
+        )
+        .unwrap_or_else(|e| panic!("{}", e.check));
+        let mut expected = vec![a, b];
+        expected.sort();
+        assert_eq!(snapshots.git_dependencies.get(url), Some(&expected));
+        let mut upload = Vec::new();
+        let declarations = dependency_bundles(
+            &snapshots.git_dependencies,
+            Some(&[]),
+            &home,
+            &snapshots.spool.0,
+            &mut upload,
+            Uuid::now_v7(),
+        )
+        .unwrap();
+        assert_eq!(
+            declarations
+                .iter()
+                .flat_map(|d| d.commits.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(upload.len(), 2);
+        for declaration in declarations {
+            let manifest = declaration.bundle.expect("nested commit bundle");
+            let bundle = snapshots.spool.0.join(format!("bundle-{}", manifest.index));
+            assert_eq!(
+                git(&checkout, &["bundle", "list-heads", text(&bundle).unwrap()]).unwrap(),
+                format!(
+                    "{} refs/ck-motor/dep/{}",
+                    declaration.commits[0], declaration.commits[0]
+                )
+            );
+        }
     }
 
     #[test]

@@ -2436,7 +2436,7 @@ fn known_checkout_git_commits(
 /// With `snapshots`, every fetch runs in a helper unit that shows the job's
 /// sibling snapshots at the siblings' paths.
 #[allow(clippy::too_many_arguments)]
-fn prefetch_cargo_dependencies<'a>(
+pub(crate) fn prefetch_cargo_dependencies<'a>(
     writer: bool,
     tenant_vm: bool,
     state: &Path,
@@ -2507,14 +2507,37 @@ fn prefetch_cargo_dependencies<'a>(
                     _ => run_cargo_fetch_on_host(command, fetch),
                 },
             )
+            .map_err(|error| {
+                let context = workspace::dependencies::fetch_context(
+                    job_tree.host.as_path(),
+                    dependency_routes,
+                );
+                io::Error::new(error.kind(), format!("{context}; {error}"))
+            })
         })
     })
     .map_err(|error| io::Error::other(fetch_failure(stage, &error.to_string())))
 }
 
-/// A stale lockfile is the caller's to fix, and it can't be fixed remotely:
-/// a job's changes to tracked files never come back to the caller's checkout.
-/// Say so, rather than leaving only Cargo's `--locked` message.
+/// Network jobs fetch their own sources without mirror rewrites. A locked
+/// prefetch only warms their cache; it must neither refuse the job nor repair
+/// the submitted lockfile before the job's command runs.
+pub(crate) fn cargo_prefetch_admission(
+    id: Uuid,
+    network: bool,
+    result: io::Result<()>,
+) -> io::Result<()> {
+    match result {
+        Err(error) if network => {
+            tracing::warn!(job_id = %id, %error, "dependency prefetch skipped; this job fetches what it needs itself");
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+/// Offline jobs need a matching lockfile before they start. Preparation leaves
+/// the submitted lockfile untouched, even when a network job can update it later.
 fn fetch_failure(stage: &str, error: &str) -> String {
     // Cargo has worded this both "needs to be updated but --locked was passed to
     // prevent this" and "cannot update the lock file ... because --locked was
@@ -2522,8 +2545,8 @@ fn fetch_failure(stage: &str, error: &str) -> String {
     if error.contains("--locked was passed to prevent this") {
         format!(
             "{stage}: {error}; Cargo.lock doesn't match Cargo.toml: update it in your \
-             own checkout (cargo update runs there, not in a remote job, whose file \
-             changes don't come back), then retry"
+             own checkout before an offline job, then retry; preparation leaves the \
+             submitted lockfile unchanged"
         )
     } else {
         format!("{stage}: {error}")
@@ -2678,6 +2701,7 @@ impl Sandbox {
             None,
             &JavascriptTools::for_role(ToolchainRole::BuildServer),
             None,
+            false,
         )
     }
 
@@ -2702,6 +2726,7 @@ impl Sandbox {
         snapshots: Option<&SnapshotSiblings<'_>>,
         javascript: &JavascriptTools,
         remote: Option<&Transport>,
+        network: bool,
     ) -> io::Result<Self> {
         Self::prepare_role(
             id,
@@ -2721,6 +2746,7 @@ impl Sandbox {
             snapshots,
             javascript,
             remote,
+            network,
         )
     }
 
@@ -2764,6 +2790,7 @@ impl Sandbox {
             None,
             javascript,
             remote,
+            false,
         )
         .map(|sandbox| sandbox.with_boat_profile(boat_profile, true, None))
     }
@@ -2787,6 +2814,7 @@ impl Sandbox {
         snapshots: Option<&SnapshotSiblings<'_>>,
         javascript: &JavascriptTools,
         remote: Option<&Transport>,
+        network: bool,
     ) -> io::Result<Self> {
         // Every filesystem step uses the host checkout; bind destinations,
         // safe.directory entries and the prefetch view use the caller path.
@@ -2818,17 +2846,21 @@ impl Sandbox {
                 host_inputs::environment("RUSTUP_HOME")
                     .ok_or_else(|| io::Error::other("RUSTUP_HOME unset"))?,
             );
-            prefetch_cargo_dependencies(
-                writer,
-                tenant_vm,
-                state,
-                job_tree,
-                tree,
-                siblings,
-                dependency_routes,
-                &cargo,
-                &rustup,
-                snapshots,
+            cargo_prefetch_admission(
+                id,
+                network,
+                prefetch_cargo_dependencies(
+                    writer,
+                    tenant_vm,
+                    state,
+                    job_tree,
+                    tree,
+                    siblings,
+                    dependency_routes,
+                    &cargo,
+                    &rustup,
+                    snapshots,
+                ),
             )?;
         }
         // A snapshot's JavaScript dependencies were installed and its Git

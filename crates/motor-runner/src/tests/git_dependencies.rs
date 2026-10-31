@@ -101,6 +101,53 @@ fn sibling_git_lockfile_pins_routed_bundle_aliases() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn nested_lockfiles_in_main_and_sibling_block_incomplete_mirror_routes() {
+    for sibling in [false, true] {
+        let f = Fixture::new();
+        let checkout = if sibling { &f.sibling } else { &f.main };
+        let a = git(&f.main, &["rev-parse", "HEAD"]);
+        let (b, _) = commit(&f.main, "unshipped dependency");
+        let root_lock = lock_sources(&[format!("git+{URL}?rev={a}#{a}")]);
+        fs::write(checkout.join("Cargo.lock"), &root_lock).unwrap();
+        fs::create_dir(checkout.join("nested")).unwrap();
+        fs::write(checkout.join("nested/Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(
+            checkout.join("nested/Cargo.lock"),
+            lock_sources(&[format!("git+{URL}?rev={b}#{b}")]),
+        )
+        .unwrap();
+        commit(checkout, "nested lock");
+        let mut config = f.config();
+        config.manual_tick = true;
+        let runner = Runner::open(config).unwrap();
+        let (request, bytes) = f.run("true");
+        let (dependency, bundle) = dep_bundle(&f, &f.main, &a, 2, &[]);
+        import(
+            &runner,
+            &stage(&f, &dependency, &bundle),
+            std::slice::from_ref(&dependency),
+        );
+        upload_and_fetch(&runner, &request, &bytes);
+        let locks = runner.core.trees.checkout_dependency_lockfiles(
+            &request.repository_root,
+            &request.snapshot_commit,
+            &request.siblings,
+        );
+        let (routes, missing) = runner
+            .core
+            .trees
+            .dependency_fetch_routes_for_lockfiles(&[dependency], &locks)
+            .unwrap();
+        assert!(
+            !routes.contains_key(URL),
+            "nested commit B is absent (sibling={sibling})"
+        );
+        assert!(missing.iter().any(|s| s.contains(&b)), "{missing:?}");
+    }
+}
+
+#[test]
 fn dependency_bad_commit_and_local_urls_are_refused() {
     for oid in [
         "ABC",
@@ -467,6 +514,235 @@ fn lock_sources(sources: &[String]) -> String {
             format!("[[package]]\nname = \"p{i}\"\nversion = \"0.1.0\"\nsource = {source:?}\n")
         })
         .collect()
+}
+
+#[cfg(target_os = "linux")]
+struct GitHttpServer {
+    url: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl GitHttpServer {
+    fn new(repository: &Path) -> Self {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            },
+        };
+        git(repository, &["update-server-info"]);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let root = repository.join(".git");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::park_timeout(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) => panic!("HTTP fixture: {e}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0; 8192];
+                let n = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..n]);
+                let path = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .split('?')
+                    .next()
+                    .unwrap();
+                assert!(!path.contains(".."));
+                let bytes = fs::read(root.join(path.trim_start_matches('/')));
+                let (status, body) = match bytes {
+                    Ok(bytes) => ("200 OK", bytes),
+                    Err(_) => ("404 Not Found", Vec::new()),
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(&body);
+            }
+        });
+        Self {
+            url,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for GitHttpServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn stale_locked_mirror_does_not_refuse_network_cargo_update() {
+    stale_locked_mirror(false);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn stale_locked_mirror_offline_refusal_names_manifest_commit_and_mirror() {
+    stale_locked_mirror(true);
+}
+
+#[cfg(target_os = "linux")]
+fn stale_locked_mirror(offline: bool) {
+    let f = Fixture::new();
+    let source = f.scratch.join("upstream");
+    fs::create_dir_all(source.join("src")).unwrap();
+    git(&source, &["init"]);
+    fs::write(
+        source.join("Cargo.toml"),
+        "[package]\nname='tiny_dep'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    fs::write(source.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+    let (a, _) = commit(&source, "A");
+    let mut config = f.config();
+    config.manual_tick = true;
+    let runner = Runner::open(config).unwrap();
+    let (mut dependency, bytes) = dep_bundle(&f, &source, &a, 0, &[]);
+    let server = GitHttpServer::new(&source);
+    dependency.url = server.url.clone();
+    dependency.bundle.as_mut().unwrap().repository = server.url.clone();
+    import(
+        &runner,
+        &stage(&f, &dependency, &bytes),
+        std::slice::from_ref(&dependency),
+    );
+    let (b, _) = commit(&source, "B");
+    git(&source, &["update-server-info"]);
+    let workspace = f.scratch.join("app");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::write(workspace.join("src/lib.rs"), "").unwrap();
+    fs::write(workspace.join("Cargo.toml"), format!("[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\ntiny_dep={{git='{}',rev='{b}'}}\n", server.url)).unwrap();
+    let lock = format!("version=4\n[[package]]\nname='app'\nversion='0.1.0'\ndependencies=['tiny_dep']\n[[package]]\nname='tiny_dep'\nversion='0.1.0'\nsource='git+{}?rev={a}#{a}'\n", server.url);
+    fs::write(workspace.join("Cargo.lock"), &lock).unwrap();
+    let (routes, missing) = runner
+        .core
+        .trees
+        .dependency_fetch_routes(&[dependency], &lock)
+        .unwrap();
+    assert!(missing.is_empty());
+    assert!(routes.contains_key(&server.url));
+    runner
+        .core
+        .trees
+        .refresh_dependency_aliases(&lock, &routes)
+        .unwrap();
+    let cargo = f.scratch.join("cargo");
+    fs::create_dir(&cargo).unwrap();
+    let rustup = PathBuf::from(std::env::var_os("RUSTUP_HOME").unwrap());
+    // Cargo's GitHub fast path requests the SHA directly. Exercise that exact
+    // transport too: loopback HTTP sources use Cargo's generic ref discovery.
+    let direct_home = f.scratch.join("direct-fetch");
+    fs::create_dir(&direct_home).unwrap();
+    git(&direct_home, &["init", "--bare"]);
+    let mut direct = Command::new("git");
+    direct.arg("-C").arg(&direct_home).args([
+        "fetch",
+        "--no-tags",
+        &server.url,
+        &format!("+{b}:refs/commit/{b}"),
+    ]);
+    configure_fetch_git(
+        &mut direct,
+        &runner.core.trees.state.join("fetch-home"),
+        &routes,
+    )
+    .unwrap();
+    let raw = direct.output().unwrap();
+    assert!(!raw.status.success());
+    assert!(
+        String::from_utf8_lossy(&raw.stderr).contains("not our ref"),
+        "{}",
+        String::from_utf8_lossy(&raw.stderr)
+    );
+    let output = fetch_command(
+        &runner.core.trees.state,
+        &workspace,
+        &routes,
+        &cargo,
+        &rustup,
+    )
+    .unwrap()
+    .env("CARGO_NET_OFFLINE", "false")
+    .env("CARGO_NET_RETRY", "0")
+    .output()
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("not found") || stderr.contains("not our ref"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(&b), "{stderr}");
+    let result = crate::isolation::prefetch_cargo_dependencies(
+        false,
+        true,
+        &runner.core.trees.state,
+        &workspace,
+        "HEAD",
+        &[],
+        &routes,
+        &cargo,
+        &rustup,
+        None,
+    );
+    let result = crate::isolation::cargo_prefetch_admission(Uuid::now_v7(), !offline, result);
+    assert_eq!(
+        fs::read_to_string(workspace.join("Cargo.lock")).unwrap(),
+        lock,
+        "prefetch must never change the caller's lock"
+    );
+    if offline {
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains(&server.url)
+                && error.contains(&format!("rev {b} (routed to local mirror")),
+            "{error}"
+        );
+    } else {
+        result.expect("network prefetch must not refuse the job");
+        let mut job = Command::new("cargo");
+        job.args(["update", "-p", "tiny_dep"])
+            .current_dir(&workspace)
+            .env("CARGO_HOME", &cargo)
+            .env("RUSTUP_HOME", &rustup)
+            .env("CARGO_NET_OFFLINE", "false")
+            .env("CARGO_NET_GIT_FETCH_WITH_CLI", "true");
+        configure_fetch_git(&mut job, &f.scratch.join("empty-home"), &BTreeMap::new()).unwrap();
+        let output = job.output().unwrap();
+        assert!(
+            output.status.success(),
+            "job: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(fs::read_to_string(workspace.join("Cargo.lock"))
+            .unwrap()
+            .contains(&format!("#{b}")));
+    }
 }
 #[test]
 fn dependency_aliases_refresh_stale_tips_and_refuse_conflicts_and_bad_refs() {

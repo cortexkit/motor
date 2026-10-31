@@ -808,8 +808,16 @@ impl Backend for HostBackend {
                 &r.snapshot_commit,
                 &r.siblings,
             );
-            let (routes, missing) =
-                trees.dependency_fetch_routes_for_lockfiles(&r.git_dependencies, &lockfiles)?;
+            let (mut routes, missing) = match trees
+                .dependency_fetch_routes_for_lockfiles(&r.git_dependencies, &lockfiles)
+            {
+                Ok(routes) => routes,
+                Err(error) if !s.base && r.network == Some(Network::Outbound) => {
+                    tracing::warn!(job_id = %s.id, %error, "dependency mirror route selection unavailable; prefetch will use upstream sources");
+                    (BTreeMap::new(), Vec::new())
+                }
+                Err(error) => return Err(error),
+            };
             if s.base && !missing.is_empty() {
                 return Err(invalid(missing.join("; ")));
             }
@@ -823,7 +831,15 @@ impl Backend for HostBackend {
                     crate::setup_log::lock_wait("dependency_mirror", || lock.lock().unwrap())
                 })
                 .collect();
-            trees.refresh_dependency_aliases_for_lockfiles(&lockfiles, &routes)?;
+            if let Err(error) = trees.refresh_dependency_aliases_for_lockfiles(&lockfiles, &routes)
+            {
+                if !s.base && r.network == Some(Network::Outbound) {
+                    tracing::warn!(job_id = %s.id, %error, "dependency mirror aliases unavailable; prefetch will use upstream sources");
+                    routes.clear();
+                } else {
+                    return Err(error);
+                }
+            }
             // In snapshot mode the sandbox mounts each sibling's snapshot at
             // the sibling's path, and the Cargo prefetch sees the same view.
             let snapshots =
@@ -914,6 +930,7 @@ impl Backend for HostBackend {
                             snapshots.as_ref(),
                             &crate::isolation::JavascriptTools::for_config(config),
                             remote.as_ref(),
+                            r.network == Some(Network::Outbound),
                         )
                     }
                     // When a job ends, the engine checks whether systemd stopped its

@@ -300,6 +300,7 @@ fn prepare_job_with_shared_cache(
         None,
         &JavascriptTools::for_role(ToolchainRole::BuildServer),
         remote,
+        false,
     )
     .unwrap_or_else(|error| panic!("prepare job sandbox: {error}"))
 }
@@ -403,6 +404,7 @@ fn ccache_outputs_are_preallocated_bound_and_granted_for_jobs_and_no_cargo_fills
                     None,
                     &JavascriptTools::for_role(ToolchainRole::BuildServer),
                     Some(&remote),
+                    false,
                 )
                 .unwrap();
                 let stats = sandbox.runtime.0.join("output/ccache-stats");

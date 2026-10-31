@@ -124,6 +124,7 @@ fn mapped_job_binds_host_trees_at_caller_paths_and_never_names_h() {
             Some(&snapshots),
             &JavascriptTools::for_role(ToolchainRole::BuildServer),
             None,
+            false,
         )
         .unwrap();
         let w = |path: &Path| word(path).unwrap();

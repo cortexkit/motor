@@ -542,6 +542,7 @@ fn with_prepared_boat_sandbox(writer: bool, inspect: impl FnOnce(&Fixture, Sandb
                     None,
                     &javascript,
                     None,
+                    false,
                 )
                 .map(|sandbox| sandbox.with_boat_profile(true, true, Some(14 << 30)))
             }
@@ -2737,6 +2738,7 @@ fn isolated_tenant_prepare_reads_snapshot_lockfile_before_dissociating_checkout(
         None,
         &JavascriptTools::for_role(ToolchainRole::BuildServer),
         None,
+        false,
     )
     .expect("tenant preparation must read the snapshot before removing mirror alternates");
     assert!(!alternates.exists());
