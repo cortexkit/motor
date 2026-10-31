@@ -6,7 +6,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
@@ -45,36 +45,6 @@ impl std::ops::Deref for CanonicalScratchDir {
 impl AsRef<Path> for CanonicalScratchDir {
     fn as_ref(&self) -> &Path {
         self.path()
-    }
-}
-
-fn wait_until_stopped(child: &mut Child) -> io::Result<()> {
-    let pid = child.id() as libc::pid_t;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let mut status = 0;
-        let result = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
-        if result == pid {
-            return if libc::WIFSTOPPED(status) {
-                Ok(())
-            } else {
-                Err(io::Error::other(
-                    "executable writer exited before its staging barrier",
-                ))
-            };
-        }
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        } else if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "executable writer did not reach its staging barrier",
-            ));
-        }
-        thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -163,16 +133,45 @@ fn write_test_executable_with(
     let temporary = parent.join(format!(".{name}.{}.{sequence}.tmp", std::process::id()));
 
     // Keep the writable file handle in a helper process so subprocesses launched by other test threads cannot inherit it.
-    let mut writer = Command::new("/bin/sh")
+    // The helper holds it until it reads a release line on descriptor 4. A
+    // self-SIGSTOP barrier released by SIGCONT used to stand here, but on macOS
+    // under load the writer could stay stopped inside its own kill after the
+    // parent had seen it stop and sent SIGCONT, hanging the test for good.
+    let (mut release, child_release) = std::os::unix::net::UnixStream::pair()?;
+    let child_fd = {
+        use std::os::fd::AsRawFd;
+        child_release.as_raw_fd()
+    };
+    let mut command = Command::new("/bin/sh");
+    command
         .arg("-c")
-        .arg("umask 022; set -C; exec 3>\"$2\"; /bin/cat >&3 || exit; printf 'ready\\n'; kill -STOP $$; exec 3>&-; /bin/chmod 755 \"$2\" && /bin/mv -f \"$2\" \"$1\"")
+        .arg("umask 022; set -C; exec 3>\"$2\"; /bin/cat >&3 || exit; printf 'ready\\n'; read -r _ <&4; exec 3>&- 4<&-; /bin/chmod 755 \"$2\" && /bin/mv -f \"$2\" \"$1\"")
         .arg("sh")
         .arg(path)
         .arg(&temporary)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+        .stderr(Stdio::inherit());
+    // SAFETY: between fork and exec the closure only calls dup2 or fcntl,
+    // which are async-signal-safe, and reads errno on failure.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(move || {
+            // std opens the socket close-on-exec; dup2 clears that on the copy.
+            // If it already sits at 4, clear the flag in place instead.
+            let result = if child_fd == 4 {
+                libc::fcntl(4, libc::F_SETFD, 0)
+            } else {
+                libc::dup2(child_fd, 4)
+            };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut writer = command.spawn()?;
+    drop(child_release);
 
     let write_result = writer.stdin.as_mut().unwrap().write_all(contents);
     drop(writer.stdin.take());
@@ -202,18 +201,13 @@ fn write_test_executable_with(
     // must depend on this child's exit rather than pipe EOF.
     drop(writer.stdout.take());
 
-    if let Err(error) = wait_until_stopped(&mut writer) {
+    let hook_result = while_unpublished(path);
+    // Release with an explicit line, not by closing: another thread's fork may
+    // hold a copy of this end, so EOF could arrive late or never.
+    if let Err(error) = release.write_all(b"\n") {
         let _ = writer.kill();
         let _ = writer.wait();
         let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-
-    let hook_result = while_unpublished(path);
-    if unsafe { libc::kill(writer.id() as i32, libc::SIGCONT) } != 0 {
-        let error = io::Error::last_os_error();
-        let _ = writer.kill();
-        let _ = writer.wait();
         return Err(error);
     }
     if let Err(error) = wait_for_executable_writer(writer) {
