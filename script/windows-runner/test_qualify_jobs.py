@@ -482,17 +482,22 @@ class QualificationReadinessTests(unittest.TestCase):
     def return_frames(self, job="job", path="/qualification/file.bin", cause=None) -> list[dict[str, Any]]:
         if cause is not None:
             return [dict(type="return_manifest", job_id=job, seq=1, cap_bytes=4096, total_bytes=0,
-                         files=[dict(path=path, cause=cause, size=0)])]
+                         files=[dict(path=path, cause=cause, size=0, chunks=0)])]
         data = b"motor requested return qualification"
+        # Shaped like the runner's real frames, which state each entry's chunk count.
         return [dict(type="return_chunk", job_id=job, seq=1, path_index=0, offset=0, data=base64.b64encode(data).decode()),
                 dict(type="return_manifest", job_id=job, seq=2, cap_bytes=4096, total_bytes=len(data),
-                     files=[dict(path=path, size=len(data), sha256=JOBS.hashlib.sha256(data).hexdigest())])]
+                     files=[dict(path=path, size=len(data), sha256=JOBS.hashlib.sha256(data).hexdigest(), chunks=1)])]
 
     def test_return_checker_requires_exact_bytes_and_sha256(self):
         JOBS.check_requested_return(self.return_frames(), "job", "/qualification/file.bin", None)
-        for bad in ("bytes", "digest", "offset", "job", "path", "after-manifest"):
+        for bad in ("bytes", "digest", "offset", "job", "path", "after-manifest", "chunk-count", "no-chunk-count"):
             frames = self.return_frames()
-            if bad == "bytes":
+            if bad == "chunk-count":
+                frames[1]["files"][0]["chunks"] = 2
+            elif bad == "no-chunk-count":
+                del frames[1]["files"][0]["chunks"]
+            elif bad == "bytes":
                 frames[0]["data"] = base64.b64encode(b"wrong bytes").decode()
             elif bad == "digest":
                 frames[1]["files"][0]["sha256"] = "0" * 64

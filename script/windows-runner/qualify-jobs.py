@@ -430,10 +430,14 @@ def check_requested_return(frames, job, path, cause):
         raise RuntimeError("requested return did not echo its path")
     chunks = [frame for frame in returned if frame["type"] == "return_chunk"]
     entry = files[0]
+    # The runner states each entry's chunk count, as the exec-remote contract
+    # requires of a producer that states it for any entry.
+    if entry.get("chunks") != len(chunks):
+        raise RuntimeError("requested return manifest chunk count differs from received chunks")
     if cause is not None:
         if chunks or manifest.get("total_bytes") != 0:
             raise RuntimeError("outside or ADS bytes reached the host")
-        if entry.get("cause") != cause or set(entry) - {"path", "cause", "size"}:
+        if entry.get("cause") != cause or set(entry) - {"path", "cause", "size", "chunks"}:
             raise RuntimeError("requested path did not fail with the typed escape cause")
         return manifest
     data = bytearray()
@@ -453,7 +457,7 @@ def check_requested_return(frames, job, path, cause):
     digest = hashlib.sha256(RETURN_QUALIFICATION_BYTES).hexdigest()
     if bytes(data) != RETURN_QUALIFICATION_BYTES or hashlib.sha256(data).hexdigest() != digest:
         raise RuntimeError("requested return bytes or SHA-256 differ from the fixture")
-    if entry != dict(path=path, size=len(data), sha256=digest) or manifest.get("total_bytes") != len(data):
+    if entry != dict(path=path, size=len(data), sha256=digest, chunks=len(chunks)) or manifest.get("total_bytes") != len(data):
         raise RuntimeError("requested return manifest size or SHA-256 differs from received bytes")
     return manifest
 
