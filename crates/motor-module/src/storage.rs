@@ -173,11 +173,13 @@ impl PartialEq for Job {
 impl Job {
     pub(crate) fn health_retired(&self) -> bool {
         self.local_terminal.as_ref().is_some_and(|terminal| {
-            matches!(terminal.outcome, Outcome::OutcomeUnknown)
-                && terminal
-                    .refusal_detail
-                    .as_deref()
-                    .is_some_and(|detail| detail.starts_with("health_retired: "))
+            matches!(
+                terminal.outcome,
+                Outcome::OutcomeUnknown | Outcome::RefusedBeforeStart { .. }
+            ) && terminal
+                .refusal_detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("health_retired: "))
         })
     }
     /// For a job sent to the build server because the broker answered
@@ -527,10 +529,13 @@ impl Storage {
                 job.local_terminal.is_none()
                     && job.remote_terminal.is_none()
                     && job.terminal_observed_at_ms.is_none()
-                    && job
-                        .hosted
-                        .as_ref()
-                        .is_none_or(|hosted| hosted.terminal.is_none() && !hosted.finish_done)
+                    && job.hosted.as_ref().is_none_or(|hosted| {
+                        // Settlement after restart may finish before health can
+                        // record the refusal for a command that was never sent.
+                        hosted.terminal.is_none()
+                            && (!hosted.finish_done
+                                || (!hosted.run_sent && job.build_server_job_id.is_none()))
+                    })
             })
             .map(|(id, job)| (*id, job.clone()))
             .collect()
@@ -1119,6 +1124,56 @@ impl Storage {
     }
     pub(crate) fn retire_health_job(&self, id: Uuid, cause: &str, now: u64) -> io::Result<bool> {
         self.retire_abandoned_job(id, cause, now, false, false)
+    }
+    pub(crate) fn retire_unstarted_hosted_job(&self, id: Uuid, now: u64) -> io::Result<bool> {
+        let mut retired = false;
+        self.update(|s| {
+            if s.active_jobs.contains_key(&id) {
+                return;
+            }
+            let Some(job) = s.jobs.get_mut(&id) else {
+                return;
+            };
+            if job.pending_cancel
+                || job.build_server_job_id.is_some()
+                || job.local_terminal.is_some()
+                || job.remote_terminal.is_some()
+            {
+                return;
+            }
+            let Some(hosted) = job.hosted.as_mut() else {
+                return;
+            };
+            if hosted.run_sent || hosted.terminal.is_some() {
+                return;
+            }
+            let terminal = TerminalRecord::new(
+                id,
+                Outcome::RefusedBeforeStart {
+                    reason: RefusalReason::RequestRejected,
+                },
+                0,
+                0,
+                0,
+            )
+            .with_ran(Ran::None)
+            .with_refusal_detail(
+                "health_retired: never started: the caller detached while it waited for a host",
+            );
+            // `hosted.run_sent` is persisted before sending Run. With no submission
+            // owner, an unset flag proves nothing ran, even if a lease reply was lost.
+            // Leave attempted bookings for the usual release/never-ran finish.
+            if !hosted.booked_or_attempted() {
+                hosted.finish_done = true;
+            }
+            hosted.terminal = Some(terminal.clone());
+            hosted.hosted_no_fallback = true;
+            job.local_terminal = Some(terminal);
+            job.terminal_observed_at_ms = Some(now);
+            job.retain_until_ms = Some(now.saturating_add(RETENTION_MS));
+            retired = true;
+        })?;
+        Ok(retired)
     }
     pub(crate) fn retire_hosted_job(
         &self,

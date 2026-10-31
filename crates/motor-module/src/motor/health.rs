@@ -163,6 +163,27 @@ impl Motor {
                     }
                     continue;
                 }
+                if job.hosted_route().is_some_and(|hosted| !hosted.run_sent) {
+                    // A host cannot know this command before Run. Reattaching
+                    // cannot confirm it; only a live local owner can still send
+                    // it. Retire ownerless submissions without a broker probe.
+                    match self.retire_unstarted_hosted(*id, now) {
+                        Ok(true) => {
+                            self.health_probes.lock().unwrap().remove(id);
+                            self.recover_hosted(*id);
+                        }
+                        Ok(false) => {
+                            let count = jobs[platform]["unknown"].as_u64().unwrap();
+                            jobs[platform]["unknown"] = json!(count + 1);
+                        }
+                        Err(error) => {
+                            tracing::warn!(job_id = %id, %error, "could not retain never-started hosted refusal");
+                            let count = jobs[platform]["unknown"].as_u64().unwrap();
+                            jobs[platform]["unknown"] = json!(count + 1);
+                        }
+                    }
+                    continue;
+                }
                 let deadline = deadline(*id, job);
                 let retirable = now >= deadline
                     && !job.pending_cancel

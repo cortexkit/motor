@@ -392,6 +392,9 @@ impl Motor {
             .target(request.platform.as_ref())
             .ok()
             .map(|t| t.instance);
+        // Own the route before publishing it: health may run on another thread
+        // before the caller's stream and progress reporter have been created.
+        let submission = self.submission(id);
         self.storage
             .create_authorized(id, wait, attribution, instance, gate_job, secret_hash)?;
         self.storage.health_deadline(id, request.timeout)?;
@@ -437,7 +440,6 @@ impl Motor {
         }
         let (stream, tx, rx) = self.stream(id);
         let motor = self.clone();
-        let submission = self.submission(id);
         tokio::spawn(async move {
             let _submission = submission;
             if let Some(message) = wsl_refusal {

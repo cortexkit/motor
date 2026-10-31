@@ -20,6 +20,29 @@ impl Default for Cleanup {
 }
 
 impl Motor {
+    pub(super) fn retire_unstarted_hosted(&self, id: Uuid, now: u64) -> io::Result<bool> {
+        // Keep ownership gates closed until the terminal is durable. In
+        // particular, settlement recovery and a submission waiting for capacity
+        // still own the booking even when no caller stream is attached.
+        let progress = self.health_progress.lock().unwrap();
+        let submissions = self.submissions.lock().unwrap();
+        let cleanup = self.hosted_cleanup.tasks.lock().unwrap();
+        let deliveries = self.hosted_cancels.lock().unwrap();
+        let cancels = self.cancels_in_flight.lock().unwrap();
+        if progress.contains_key(&id)
+            || submissions.contains_key(&id)
+            || cleanup
+                .as_ref()
+                .and_then(|tasks| tasks.get(&id))
+                .is_some_and(|task| !task.is_finished())
+            || deliveries.contains_key(&id)
+            || cancels.contains_key(&id)
+        {
+            return Ok(false);
+        }
+        self.storage.retire_unstarted_hosted_job(id, now)
+    }
+
     #[cfg(test)]
     pub(super) async fn wait_hosted_cleanup(&self, id: Uuid) {
         let task = self
