@@ -596,6 +596,7 @@ class ProvisionTests(unittest.TestCase):
         args = p.runner_args(config())
         for option in ["--max-weight 2", "--rustc-slots 2", "--sccache-size-gib 5", "--free-space-floor-bytes 2147483648", "--owned-workspace-root /Users", "--owned-workspace-root /home"]:
             self.assertIn(option, args)
+        self.assertIn("--workspace-root /home --owned-workspace-root /home", args)
 
     def test_new_base_space_is_checked_before_any_mutation(self):
         c = config()

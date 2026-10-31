@@ -1191,6 +1191,7 @@ mod tests {
             TEST_ARGS.replace("--max-weight 2", "--max-weight 0"),
             TEST_ARGS.replace("--backend host", "--backend vm"),
             TEST_ARGS.replace("/Users", "/tmp"),
+            format!("{TEST_ARGS} --caller-root /home=/tenant/state/callers/home"),
         ] {
             assert!(RunnerArgs::parse(&invalid).is_err());
         }

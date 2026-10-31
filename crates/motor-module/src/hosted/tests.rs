@@ -656,6 +656,105 @@ async fn hosted_invalid_requests_refuse_before_snapshot_lease_or_ssh() {
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn hosted_home_requests_refuse_escaping_symlinks_before_snapshot_or_contact() {
+    let h = Harness::new(Behavior::Normal).await;
+    let (scratch, repo) = super::boat_tests::committed_repo();
+    let escape = repo.join("escape");
+    std::os::unix::fs::symlink("/", &escape).unwrap();
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let state = scratch.0.join("state");
+    let motor = crate::Motor::with_connector(h.config(), &state, ssh.clone()).unwrap();
+    for field in ["workspace_key", "repository_root", "cwd", "sibling"] {
+        let mut request = RunRequest::new("/home/u/repo", "/home/u/repo", "/home/u/repo", "true")
+            .with_timeout(60);
+        let path = escape.to_str().unwrap().to_owned();
+        match field {
+            "workspace_key" => request.workspace_key = path,
+            "repository_root" => request.repository_root = path,
+            "cwd" => request.cwd = path,
+            _ => request.siblings.push(path),
+        }
+        assert_eq!(validate(&request), Err(Error::Path), "{field}");
+        let stream = motor.run(request).unwrap();
+        let id = stream.job_id;
+        assert!(matches!(
+            terminal(stream).await.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::RequestRejected
+            }
+        ));
+        let route = motor.hosted_state(id).unwrap();
+        assert!(route.hosted_no_fallback && !route.lease_attempted);
+        assert_eq!(
+            route.hosted_code.as_deref(),
+            Some("hosted_path_outside_roots")
+        );
+    }
+    assert!(!state.join("spools").exists());
+    assert!(h.requests.lock().unwrap().is_empty());
+    assert!(h.frames.lock().unwrap().is_empty());
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+}
+
+// This test sends leases for a real checkout and literal siblings; executing /home checkouts needs a tenant VM test.
+#[tokio::test]
+async fn hosted_home_and_mixed_siblings_preserve_lease_body_and_spill_policy() {
+    let h = Harness::new(Behavior::Normal).await;
+    let (scratch, repo) = super::boat_tests::committed_repo();
+    let storage = Arc::new(Storage::open(&scratch.0.join("state")).unwrap());
+    for policy in ["fleet", "hosted", "gate", "network", "repository"] {
+        for timeout in [7200, 7201] {
+            let mut baseline = None;
+            for siblings in [
+                vec!["/Users/u/lib".into()],
+                vec!["/home/u/lib".into()],
+                vec!["/Users/u/lib".into(), "/home/u/lib".into()],
+            ] {
+                let id = Uuid::now_v7();
+                let mut route = h.route.clone();
+                route.fleet_routed = matches!(policy, "fleet" | "gate" | "network");
+                route.fleet_no_spill = matches!(policy, "gate" | "network");
+                route.repository_routed = policy == "repository";
+                route.hosted_test = policy == "hosted";
+                storage
+                    .create(id, 30, None, None, policy == "gate")
+                    .unwrap();
+                storage.hosted_route(id, route.clone()).unwrap();
+                let mut request = Harness::request(&repo)
+                    .with_timeout(timeout)
+                    .with_siblings(siblings);
+                if policy == "network" {
+                    request = request.with_network(Network::Outbound);
+                }
+                validate(&request).unwrap();
+                let (channel, _) = Client::new(route)
+                    .run(id, &request, &storage)
+                    .await
+                    .unwrap();
+                assert_eq!(channel.platforms, vec!["linux"]);
+                let mut body: serde_json::Value =
+                    serde_json::from_slice(h.lease_bodies.lock().unwrap().last().unwrap()).unwrap();
+                assert_eq!(
+                    body["allow_spill"],
+                    timeout == 7200 && matches!(policy, "fleet" | "hosted")
+                );
+                let fields = body.as_object_mut().unwrap();
+                fields.remove("job_id");
+                fields.remove("requester_jwk");
+                if let Some(expected) = &baseline {
+                    assert_eq!(&body, expected, "{policy}, {timeout}");
+                } else {
+                    baseline = Some(body);
+                }
+            }
+        }
+    }
+    assert_eq!(h.lease_bodies.lock().unwrap().len(), 30);
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn return_paths_hosted_limits_refuse_before_lease_and_keep_no_fallback() {
     let h = Harness::new(Behavior::Normal).await;
@@ -937,6 +1036,34 @@ fn cloud_hmac_and_client_request_bodies_match_canonical_lease_vector() {
     )
     .unwrap();
     assert_eq!(serde_json::to_value(&body).unwrap(), v["request"]["body"]);
+    // Path hashes are supplied separately; caller and sibling roots must not change the other lease fields.
+    for prefix in ["/Users", "/home"] {
+        for siblings in [
+            vec![format!("{prefix}/test/lib")],
+            vec!["/Users/test/lib".into(), "/home/test/lib".into()],
+        ] {
+            let mut equivalent = request.clone();
+            equivalent.workspace_key = format!("{prefix}/test/workspace");
+            equivalent.repository_root = format!("{prefix}/test/workspace/repo");
+            equivalent.cwd = format!("{prefix}/test/workspace");
+            equivalent.siblings = siblings;
+            validate(&equivalent).unwrap();
+            let equivalent_body = lease_body(
+                id,
+                &equivalent,
+                (body.workspace_key_hash.clone(), body.repo_hash.clone()),
+                body.placement_hint.clone(),
+                body.avoid_host.clone(),
+                body.requester_jwk.clone(),
+                body.allow_spill,
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(equivalent_body).unwrap(),
+                v["request"]["body"]
+            );
+        }
+    }
     // The broker's lease hash takes the fields in this order, and
     // `avoid_host` comes right after `placement_hint`. ck-motor sends
     // `allow_spill` where the hash places it, before `requester_jwk`; the

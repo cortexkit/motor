@@ -114,6 +114,59 @@ async fn fleet_linux_default_platform_jobs_allow_hosted_spill() {
     assert_eq!(peer.0.load(Ordering::SeqCst), 0);
 }
 
+// These missing checkout paths check routing before snapshotting; executing /home checkouts needs a tenant VM test.
+#[tokio::test]
+async fn home_and_users_requests_select_hosted_routes_without_direct_contact() {
+    let h = Harness::new(Behavior::CompleteRun).await;
+    let scratch = crate::hosted::tests::harness::Scratch::new();
+    let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
+    let motor = Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
+    for prefix in ["/Users", "/home"] {
+        for mixed in [false, true] {
+            for entry in ["run", "agent", "gate", "hosted"] {
+                let root = format!("{prefix}/missing-{}/repo", Uuid::now_v7());
+                let mut request = RunRequest::new(&root, &root, &root, "true")
+                    .with_timeout(60)
+                    .with_siblings(vec![format!("{prefix}/u/lib")]);
+                if mixed {
+                    request.siblings = vec!["/Users/u/lib".into(), "/home/u/lib".into()];
+                }
+                crate::hosted::validate(&request).unwrap();
+                let stream = match entry {
+                    "run" => motor.run(request),
+                    "agent" => motor.run_agent(request, None, Default::default()),
+                    "gate" => motor.run_direct_authorized(
+                        request,
+                        None,
+                        Default::default(),
+                        true,
+                        false,
+                        [7; 32],
+                    ),
+                    _ => motor.run_direct_hosted(request, None, Default::default()),
+                }
+                .unwrap();
+                let id = stream.job_id;
+                let (_, terminal) = records(stream).await;
+                assert!(matches!(
+                    terminal.outcome,
+                    Outcome::RefusedBeforeStart { .. }
+                ));
+                let route = motor.hosted_state(id).unwrap();
+                assert!(route.hosted_no_fallback);
+                assert_eq!(route.hosted_test, entry == "hosted");
+                assert_eq!(route.fleet_routed, entry != "hosted");
+                assert_eq!(route.fleet_no_spill, entry == "gate");
+                assert!(!route.repository_routed && !route.lease_attempted);
+                assert!(motor.storage.job(id).unwrap().runner_instance.is_none());
+            }
+        }
+    }
+    assert_eq!(peer.0.load(Ordering::SeqCst), 0);
+    assert!(h.requests.lock().unwrap().is_empty());
+    assert!(h.frames.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn fleet_workspace_with_a_recorded_placement_leaves_affinity_to_the_broker() {
     let h = Harness::new(Behavior::CompleteRun).await;
@@ -236,15 +289,17 @@ async fn fleet_invalid_linux_requests_are_refused_without_direct_fallback() {
         request.weight_hint = Some(vcpus);
         cases.push((request, "vcpus", "1..=64"));
     }
-    for field in ["workspace_key", "repository_root", "cwd", "sibling"] {
-        let mut request = request(&repo);
-        match field {
-            "workspace_key" => request.workspace_key = "/tmp/werni".into(),
-            "repository_root" => request.repository_root = "/tmp/werni".into(),
-            "cwd" => request.cwd = "/tmp/werni".into(),
-            _ => request.siblings.push("/tmp/werni".into()),
+    for path in ["/tmp/werni", "/home2/werni"] {
+        for field in ["workspace_key", "repository_root", "cwd", "sibling"] {
+            let mut request = request(&repo);
+            match field {
+                "workspace_key" => request.workspace_key = path.into(),
+                "repository_root" => request.repository_root = path.into(),
+                "cwd" => request.cwd = path.into(),
+                _ => request.siblings.push(path.into()),
+            }
+            cases.push((request, field, path));
         }
-        cases.push((request, field, "/tmp/werni"));
     }
     for (request, field, remedy) in cases {
         for (platform, gate) in [(None, false), (Some(Platform::Linux), true)] {
@@ -274,7 +329,7 @@ async fn fleet_invalid_linux_requests_are_refused_without_direct_fallback() {
             let detail = terminal.refusal_detail.unwrap();
             assert!(detail.contains(field), "{detail}");
             assert!(detail.contains(remedy), "{detail}");
-            if remedy == "/tmp/werni" {
+            if remedy.starts_with('/') {
                 assert!(detail.contains("under /Users or /home"), "{detail}");
             }
         }
