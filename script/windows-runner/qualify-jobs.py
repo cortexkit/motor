@@ -71,7 +71,7 @@ class Channel:
         self.stopped = threading.Event()
         try:
             threading.Thread(target=self.read, daemon=True).start()
-            self.send({"type": "hello", "protocol_version": 1, "started": True, "gate_jobs": True})
+            self.send({"type": "hello", "protocol_version": 1, "started": True, "gate_jobs": True, "return_paths": True, "return_chunked": True})
             hello = self.until("hello", timeout=hello_timeout)
             if hello.get("protocol_version") != 1 or hello.get("platforms") != ["windows"]:
                 raise RuntimeError(f"wrong runner Hello version/platform: {hello}")
@@ -148,7 +148,7 @@ class Channel:
             except (OSError, ValueError):
                 return
 
-    def until(self, kind, output=None, timeout: float = 900):
+    def until(self, kind, output=None, timeout: float = 900, frames=None):
         deadline = time.monotonic() + timeout
         while True:
             if time.monotonic() >= deadline:
@@ -161,6 +161,8 @@ class Channel:
                 raise RunnerBridgeUnavailable(self.bridge_failure(str(value))) from value
             if isinstance(value, Exception):
                 raise value
+            if frames is not None:
+                frames.append(value)
             if value["type"] == "refusal":
                 raise RuntimeError(f"runner refused qualification: {value}")
             if value["type"] == "output" and output is not None:
@@ -399,9 +401,116 @@ def qualify_preparation_cases(root, runner, evidence):
     run_preparation_case(root, runner, evidence, "no-lockfile", repo, commit, tree, "sh run.sh")
 
 
+RETURN_QUALIFICATION_BYTES = b"motor requested return qualification"
+
+
+def returned_file_script(path):
+    data = base64.b64encode(RETURN_QUALIFICATION_BYTES).decode("ascii")
+    return f"$ErrorActionPreference='Stop'; [IO.File]::WriteAllBytes('{path}',[Convert]::FromBase64String('{data}'))"
+
+
+RETURN_QUALIFICATION_CASES = (
+    ("requested-return-exact-bytes", returned_file_script("returned-file.bin"), "returned-file.bin", None),
+    ("requested-return-junction-refused", r"$ErrorActionPreference='Stop'; New-Item -ItemType Junction -Path 'return-junction' -Target $env:WINDIR -ErrorAction Stop | Out-Null; if(-not (Test-Path -LiteralPath 'return-junction\win.ini' -PathType Leaf)){throw 'outside junction canary missing'}", "return-junction/win.ini", "escape"),
+    ("requested-return-ads-refused", "$ErrorActionPreference='Stop'; [IO.File]::WriteAllText('file.txt','ordinary file'); Set-Content -LiteralPath 'file.txt' -Stream 'hidden' -Value 'ADS must not be returned' -ErrorAction Stop; if((Get-Item -LiteralPath 'file.txt' -Stream 'hidden' -ErrorAction Stop).Length -le 0){throw 'ADS canary missing'}", "file.txt:hidden", "escape"),
+    ("no-requested-returns-preserves-changed-source", returned_file_script("returned-legacy.txt"), None, None),
+)
+
+
+def check_requested_return(frames, job, path, cause):
+    returned = [frame for frame in frames if frame["type"].startswith("return_")]
+    manifests = [frame for frame in returned if frame["type"] == "return_manifest"]
+    if len(manifests) != 1 or any(frame["type"] not in ("return_chunk", "return_manifest") for frame in returned):
+        raise RuntimeError("requested return did not deliver exactly one chunked manifest")
+    manifest = manifests[0]
+    if any(frame.get("job_id") != job for frame in returned) or manifest.get("cap_bytes") != 4096:
+        raise RuntimeError("requested return has the wrong job or cap")
+    files = manifest.get("files")
+    if not isinstance(files, list) or len(files) != 1 or files[0].get("path") != path:
+        raise RuntimeError("requested return did not echo its path")
+    chunks = [frame for frame in returned if frame["type"] == "return_chunk"]
+    entry = files[0]
+    if cause is not None:
+        if chunks or manifest.get("total_bytes") != 0:
+            raise RuntimeError("outside or ADS bytes reached the host")
+        if entry.get("cause") != cause or set(entry) - {"path", "cause", "size"}:
+            raise RuntimeError("requested path did not fail with the typed escape cause")
+        return manifest
+    data = bytearray()
+    previous_seq = 0
+    for frame in returned:
+        if not isinstance(frame.get("seq"), int) or frame["seq"] <= previous_seq:
+            raise RuntimeError("requested return sequences are not increasing")
+        previous_seq = frame["seq"]
+        if frame["type"] == "return_manifest":
+            if frame is not returned[-1]:
+                raise RuntimeError("requested return delivered chunks after the manifest")
+            continue
+        chunk = base64.b64decode(frame["data"], validate=True)
+        if frame.get("path_index") != 0 or frame.get("offset") != len(data) or not chunk or len(data) + len(chunk) > 4096:
+            raise RuntimeError("requested return chunks have an invalid index, offset or size")
+        data.extend(chunk)
+    digest = hashlib.sha256(RETURN_QUALIFICATION_BYTES).hexdigest()
+    if bytes(data) != RETURN_QUALIFICATION_BYTES or hashlib.sha256(data).hexdigest() != digest:
+        raise RuntimeError("requested return bytes or SHA-256 differ from the fixture")
+    if entry != dict(path=path, size=len(data), sha256=digest) or manifest.get("total_bytes") != len(data):
+        raise RuntimeError("requested return manifest size or SHA-256 differs from received bytes")
+    return manifest
+
+
+def check_legacy_return(root, job, workspace, frames):
+    if any(frame["type"].startswith("return_") for frame in frames):
+        raise RuntimeError("job without requested returns delivered returned-file frames")
+    member_name = f"m{workspace}/returned-legacy.txt"
+    directory = root / "state/ally/jobs" / job
+    with tarfile.open(directory / "windows-changes.tar") as archive:
+        member = archive.extractfile(member_name)
+        if member is None or member.read() != RETURN_QUALIFICATION_BYTES:
+            raise RuntimeError("legacy changed-source file is missing or corrupt")
+    changes = json.loads((directory / "windows-changes.json").read_text())
+    if member_name not in changes:
+        raise RuntimeError("legacy changed-source manifest omitted the created file")
+
+
+def qualify_return_cases(root, runner, evidence):
+    repo = evidence / "return-fixture"
+    commit, tree = no_lockfile_fixture(repo)
+    bundle = evidence / "return-fixture.bundle"
+    fixture_bundle(repo, bundle, commit)
+    data = bundle.read_bytes()
+    for name, script, relative, cause in RETURN_QUALIFICATION_CASES:
+        workspace = f"/qualification/{name}"
+        requested_path = None if relative is None else f"{workspace}/{relative}"
+        job = str(uuid.uuid4())
+        channel = Channel(runner, root, evidence / f"bridge-{name}.log")
+        try:
+            command = "powershell.exe -NoProfile -EncodedCommand " + base64.b64encode(script.encode("utf-16le")).decode("ascii")
+            request = dict(type="run", job_id=job, gate_job=True, platform="windows", workspace_key=workspace, repository_root=workspace, cwd=workspace, command=command, env={}, weight_hint=4, timeout=120, queue_wait_limit_s=60, snapshot_commit=commit, tree_hash=tree, integration_tip=commit, siblings=[], git_dependencies=[], bundles=[dict(index=0, repository=workspace, length=len(data), sha256=hashlib.sha256(data).hexdigest())])
+            if requested_path is not None:
+                request.update(return_paths=[requested_path], return_chunked=True, return_max_bytes=4096)
+            channel.send(request)
+            channel.until("accepted")
+            for offset in range(0, len(data), 65536):
+                channel.send(dict(type="bundle_chunk", index=0, offset=offset, data=base64.b64encode(data[offset:offset+65536]).decode()))
+            output = bytearray()
+            frames = []
+            terminal = channel.until("terminal", output, frames=frames)
+            require_gate_success(terminal)
+            if requested_path is None:
+                check_legacy_return(root, job, workspace, frames)
+            else:
+                manifest = check_requested_return(frames, job, requested_path, cause)
+                (evidence / f"return-manifest-{name}.json").write_text(json.dumps(manifest, indent=2))
+            (evidence / f"terminal-{name}.json").write_text(json.dumps(terminal, indent=2))
+            print(f"PASS {name} job={job}", flush=True)
+        finally:
+            channel.close()
+
+
 def run(root, runner, evidence, gate):
     require_runner_service()
     qualify_preparation_cases(root, runner, evidence)
+    qualify_return_cases(root, runner, evidence)
     repo = evidence / "fixture"
     commit, tree = fixture(repo)
     bundle = evidence / "fixture.bundle"

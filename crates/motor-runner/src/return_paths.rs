@@ -700,8 +700,10 @@ pub(crate) struct StreamedCollection {
     hasher: Sha256,
     current: u64,
     total: u64,
+    discarded: u64,
     first: usize,
     finished: bool,
+    failed: bool,
 }
 
 impl StreamedCollection {
@@ -718,18 +720,23 @@ impl StreamedCollection {
             hasher: Sha256::new(),
             current: 0,
             total: 0,
+            discarded: 0,
             first: 0,
             finished: false,
+            failed: false,
         })
     }
 
     pub(crate) fn push(&mut self, mut bytes: &[u8]) -> io::Result<()> {
-        if self.outcomes.len()
-            >= crate::caller_path::run(&self.request)
-                .caller_return_paths
-                .len()
-            || self.total + self.current + bytes.len() as u64 > self.request.return_max_bytes
+        if self.failed
+            || self.outcomes.len()
+                >= crate::caller_path::run(&self.request)
+                    .caller_return_paths
+                    .len()
+            || self.total + self.discarded + self.current + bytes.len() as u64
+                > self.request.return_max_bytes
         {
+            self.failed = true;
             return Err(io::Error::other(
                 "guest exceeded returned-file cap or count",
             ));
@@ -773,17 +780,20 @@ impl StreamedCollection {
         outcome: motor_winagent::returned::Outcome,
     ) -> io::Result<()> {
         use motor_winagent::returned::{Failure, Outcome};
-        if self.outcomes.len()
-            >= crate::caller_path::run(&self.request)
-                .caller_return_paths
-                .len()
+        if self.failed
+            || self.outcomes.len()
+                >= crate::caller_path::run(&self.request)
+                    .caller_return_paths
+                    .len()
         {
+            self.failed = true;
             return Err(io::Error::other("too many returned-file outcomes"));
         }
         let outcome = match outcome {
             Outcome::Returned { size, sha256 } => {
                 if size != self.current || sha256 != format!("{:x}", self.hasher.clone().finalize())
                 {
+                    self.failed = true;
                     return Err(io::Error::other(
                         "guest returned-file digest or size mismatch",
                     ));
@@ -793,6 +803,7 @@ impl StreamedCollection {
                 ReturnManifestOutcome::Returned { size, sha256 }
             }
             Outcome::Failed { cause, size } => {
+                self.discarded += self.current;
                 for position in self.first..self.chunks.len() {
                     fs::remove_file(
                         self.job_directory
@@ -820,10 +831,11 @@ impl StreamedCollection {
     }
 
     pub(crate) fn finish(mut self) -> io::Result<Collection> {
-        if self.outcomes.len()
-            != crate::caller_path::run(&self.request)
-                .caller_return_paths
-                .len()
+        if self.failed
+            || self.outcomes.len()
+                != crate::caller_path::run(&self.request)
+                    .caller_return_paths
+                    .len()
             || self.current != 0
         {
             return Err(io::Error::other("incomplete guest returned-file stream"));
@@ -1090,6 +1102,51 @@ mod tests {
         assert!(sink.push(b"abc").is_err());
         assert_eq!(sink.current, 0);
         assert!(sink.chunks.is_empty());
+    }
+
+    #[test]
+    fn windows_return_discarded_chunks_spend_the_spool_allowance_and_poison_overflow() {
+        let job = ScratchDir::new("windows-return-discard-budget");
+        let cap = 2 * RETURN_CHUNK_MAX_BYTES as u64;
+        let run = request(
+            Path::new("/workspace"),
+            &[
+                Path::new("/workspace/one"),
+                Path::new("/workspace/two"),
+                Path::new("/workspace/three"),
+            ],
+            cap,
+        );
+        let mut sink = StreamedCollection::new(&run, job.path()).unwrap();
+        let directory = job.path().join(&sink.directory);
+        for _ in 0..2 {
+            sink.push(&vec![0; RETURN_CHUNK_MAX_BYTES]).unwrap();
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+            sink.end_file(motor_winagent::returned::Outcome::Failed {
+                cause: motor_winagent::returned::Failure::ReadError,
+                size: Some(RETURN_CHUNK_MAX_BYTES as u64),
+            })
+            .unwrap();
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        }
+        assert_eq!(sink.total, 0);
+        assert!(
+            sink.push(&[1]).is_err(),
+            "discarded bytes must remain charged against the stream cap"
+        );
+        assert!(
+            sink.end_file(motor_winagent::returned::Outcome::Failed {
+                cause: motor_winagent::returned::Failure::ReadError,
+                size: None,
+            })
+            .is_err(),
+            "a poisoned stream must not accept another file outcome"
+        );
+        assert!(
+            sink.finish().is_err(),
+            "an over-cap stream must not publish a partial manifest"
+        );
+        assert!(!directory.exists());
     }
 
     #[test]

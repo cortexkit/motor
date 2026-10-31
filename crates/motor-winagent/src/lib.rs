@@ -259,6 +259,7 @@ pub struct Protocol {
     returns: Option<returned::Request>,
     return_index: usize,
     return_committed: u64,
+    return_discarded: u64,
     return_current: u64,
 }
 
@@ -283,6 +284,7 @@ impl Protocol {
             returns: None,
             return_index: 0,
             return_committed: 0,
+            return_discarded: 0,
             return_current: 0,
         })
     }
@@ -423,7 +425,10 @@ impl Protocol {
                 if self.return_index >= request.paths.len()
                     || bytes.is_empty()
                     || bytes.len() > returned::CHUNK_BYTES
-                    || self.return_committed + self.return_current + bytes.len() as u64
+                    || self.return_committed
+                        + self.return_discarded
+                        + self.return_current
+                        + bytes.len() as u64
                         > request.max_bytes
                 {
                     return Err(invalid("returned-file chunk exceeds negotiated limits"));
@@ -443,6 +448,8 @@ impl Protocol {
                         return Err(invalid("invalid returned-file size or digest"));
                     }
                     self.return_committed += size;
+                } else {
+                    self.return_discarded += self.return_current;
                 }
                 self.return_index += 1;
                 self.return_current = 0;
@@ -1632,6 +1639,48 @@ mod tests {
                 .is_err(),
             "no implicit default cap"
         );
+    }
+
+    #[test]
+    fn requested_returns_discarded_chunks_still_spend_the_wire_allowance() {
+        let mut protocol = Protocol::new("boot-a").unwrap();
+        for (peer, frame) in transcript().into_iter().take(4) {
+            protocol.accept(peer, &frame).unwrap();
+        }
+        for (peer, frame) in [
+            (
+                Peer::Host,
+                Frame::RequestReturns {
+                    request: returned::Request {
+                        paths: vec!["one".into(), "two".into()],
+                        max_bytes: 2,
+                    },
+                },
+            ),
+            (Peer::Host, Frame::Start {}),
+            (Peer::Agent, Frame::Started {}),
+            (Peer::Agent, Frame::Exit { code: 0 }),
+            (Peer::Host, Frame::CollectReturns {}),
+            (Peer::Agent, Frame::ReturnChunk { bytes: vec![1, 2] }),
+            (
+                Peer::Agent,
+                Frame::ReturnFileEnd {
+                    outcome: returned::Outcome::Failed {
+                        cause: returned::Failure::ReadError,
+                        size: Some(2),
+                    },
+                },
+            ),
+        ] {
+            protocol.accept(peer, &frame).unwrap();
+        }
+        assert!(
+            protocol
+                .accept(Peer::Agent, &Frame::ReturnChunk { bytes: vec![3] })
+                .is_err()
+        );
+        assert_eq!(protocol.state(), State::Failed);
+        assert!(protocol.accept(Peer::Agent, &Frame::ReturnEnd {}).is_err());
     }
     fn transcript() -> Vec<(Peer, Frame)> {
         vec![

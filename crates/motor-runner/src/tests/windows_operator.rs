@@ -65,8 +65,24 @@ fn source(f: &Fixture) {
     git(&f.main, &["commit", "-m", "qualification crate"]);
 }
 fn prepare(runner: &Runner, f: &Fixture, command: &str) -> (Setup, Prepared) {
+    prepare_with_returns(runner, f, command, &[])
+}
+fn prepare_with_returns(
+    runner: &Runner,
+    f: &Fixture,
+    command: &str,
+    paths: &[&str],
+) -> (Setup, Prepared) {
     let (mut request, _) = f.run(command);
     request.platform = Some(Platform::Windows);
+    if !paths.is_empty() {
+        request.return_paths = paths
+            .iter()
+            .map(|path| format!("{}/{path}", request.workspace_key))
+            .collect();
+        request.return_chunked = true;
+        request.return_max_bytes = 4096;
+    }
     for (repo, local) in [
         (&request.repository_root, &f.main),
         (&request.siblings[0].canonical_path, &f.sibling),
@@ -82,13 +98,35 @@ fn prepare(runner: &Runner, f: &Fixture, command: &str) -> (Setup, Prepared) {
         recorded: BTreeMap::new(),
         snapshots: None,
     };
+    // Direct backend image tests bypass job admission. Create the durable job
+    // directory before the agent transport stores returned files or source changes.
+    fs::create_dir_all(
+        runner
+            .config()
+            .state_dir()
+            .join("jobs")
+            .join(setup.id.to_string()),
+    )
+    .unwrap();
     let prepared = WindowsBackend
         .materialize(runner.config(), &runner.core.trees, &setup)
         .unwrap();
     (setup, prepared)
 }
 fn launch(runner: &Runner, f: &Fixture, command: &str) -> (Setup, backend::Launch) {
-    let (setup, prepared) = prepare(runner, f, command);
+    launch_with_returns(runner, f, command, &[])
+}
+fn launch_with_returns(
+    runner: &Runner,
+    f: &Fixture,
+    command: &str,
+    paths: &[&str],
+) -> (Setup, backend::Launch) {
+    let (setup, prepared) = if paths.is_empty() {
+        prepare(runner, f, command)
+    } else {
+        prepare_with_returns(runner, f, command, paths)
+    };
     let mut launch = WindowsBackend
         .launch(runner.config(), &runner.core.trees, &setup, &prepared, 4)
         .unwrap();
@@ -174,6 +212,155 @@ fn direct_collection_can_be_read_after_finish_before_owner_cleanup() {
     assert_eq!(fs::read(&archive).unwrap(), b"collected link records");
     drop(execution);
     assert!(!directory.exists());
+}
+
+const RETURN_QUALIFICATION_BYTES: &[u8] = b"motor requested return qualification";
+
+fn returned_file_script(path: &str) -> String {
+    use base64::Engine;
+    format!(
+        "$ErrorActionPreference='Stop'; [IO.File]::WriteAllBytes('{path}',[Convert]::FromBase64String('{}'))",
+        base64::engine::general_purpose::STANDARD.encode(RETURN_QUALIFICATION_BYTES)
+    )
+}
+
+fn qualify_requested_return(script: &str, path: &str, expected: Option<&[u8]>) {
+    let f = Fixture::new();
+    source(&f);
+    let runner = operator();
+    let (setup, mut launch) = launch_with_returns(&runner, &f, &powershell(script), &[path]);
+    finish_execution(launch.execution.as_mut(), path);
+    let directory = runner
+        .config()
+        .state_dir()
+        .join("jobs")
+        .join(setup.id.to_string());
+    let Some(crate::return_paths::Collection::Chunked(collection)) =
+        runner.config().windows_runtime.take_returns(setup.id)
+    else {
+        panic!("guest did not deliver requested-file collection for {path}");
+    };
+    assert_eq!(collection.files.len(), 1);
+    assert_eq!(collection.files[0].path(), setup.request.return_paths[0]);
+    if let Some(expected) = expected {
+        let mut bytes = Vec::new();
+        for (position, chunk) in collection.chunks.iter().enumerate() {
+            assert_eq!(chunk.path_index, 0);
+            assert_eq!(chunk.offset, bytes.len() as u64);
+            let data = fs::read(
+                directory
+                    .join(&collection.directory)
+                    .join(format!("chunk-{position}")),
+            )
+            .unwrap();
+            assert_eq!(data.len() as u64, chunk.length);
+            bytes.extend(data);
+        }
+        assert_eq!(bytes, expected);
+        let digest = format!("{:x}", Sha256::digest(expected));
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), digest);
+        assert_eq!(collection.total_bytes, expected.len() as u64);
+        assert_eq!(
+            collection.files[0].outcome(),
+            &ReturnManifestOutcome::Returned {
+                size: expected.len() as u64,
+                sha256: digest,
+            }
+        );
+    } else {
+        assert_eq!(
+            collection.files[0].cause(),
+            Some(&ReturnPathsFailureCause::Escape)
+        );
+        assert_eq!(collection.total_bytes, 0);
+        assert!(
+            collection.chunks.is_empty(),
+            "outside or ADS bytes reached the host spool"
+        );
+        assert_eq!(
+            fs::read_dir(directory.join(&collection.directory))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+    assert!(!directory.join("windows-changes.tar").exists());
+    drop(launch);
+    assert!(!directory.exists());
+}
+
+#[test]
+#[ignore = "trusted operator: sealed Windows baseline, dedicated accounts, KVM and systemd required"]
+fn windows_qualification_requested_return_exact_bytes() {
+    qualify_requested_return(
+        &returned_file_script("returned-file.bin"),
+        "returned-file.bin",
+        Some(RETURN_QUALIFICATION_BYTES),
+    );
+}
+
+#[test]
+#[ignore = "trusted operator: sealed Windows baseline, dedicated accounts, KVM and systemd required"]
+fn windows_qualification_requested_return_junction_refused() {
+    qualify_requested_return(
+        r#"$ErrorActionPreference='Stop'; New-Item -ItemType Junction -Path 'return-junction' -Target $env:WINDIR -ErrorAction Stop | Out-Null; if(-not (Test-Path -LiteralPath 'return-junction\win.ini' -PathType Leaf)){throw 'outside junction canary missing'}"#,
+        "return-junction/win.ini",
+        None,
+    );
+}
+
+#[test]
+#[ignore = "trusted operator: sealed Windows baseline, dedicated accounts, KVM and systemd required"]
+fn windows_qualification_requested_return_ads_refused() {
+    qualify_requested_return(
+        r#"$ErrorActionPreference='Stop'; [IO.File]::WriteAllText('file.txt','ordinary file'); Set-Content -LiteralPath 'file.txt' -Stream 'hidden' -Value 'ADS must not be returned' -ErrorAction Stop; if((Get-Item -LiteralPath 'file.txt' -Stream 'hidden' -ErrorAction Stop).Length -le 0){throw 'ADS canary missing'}"#,
+        "file.txt:hidden",
+        None,
+    );
+}
+
+#[test]
+#[ignore = "trusted operator: sealed Windows baseline, dedicated accounts, KVM and systemd required"]
+fn windows_qualification_no_requested_returns_preserves_changed_source() {
+    let f = Fixture::new();
+    source(&f);
+    let runner = operator();
+    let (setup, mut launch) = launch(
+        &runner,
+        &f,
+        &powershell(&returned_file_script("returned-legacy.txt")),
+    );
+    finish_execution(
+        launch.execution.as_mut(),
+        "legacy changed-source collection",
+    );
+    assert!(setup.request.return_paths.is_empty());
+    assert!(runner
+        .config()
+        .windows_runtime
+        .take_returns(setup.id)
+        .is_none());
+    let directory = runner
+        .config()
+        .state_dir()
+        .join("jobs")
+        .join(setup.id.to_string());
+    let member = format!("m{}/returned-legacy.txt", setup.request.workspace_key);
+    let mut archive =
+        tar::Archive::new(fs::File::open(directory.join("windows-changes.tar")).unwrap());
+    let mut found = false;
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry.path().unwrap() == Path::new(&member) {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, RETURN_QUALIFICATION_BYTES);
+            found = true;
+        }
+    }
+    assert!(found, "legacy changed-source tar omitted the created file");
+    let changes: Vec<String> = read_json(&directory.join("windows-changes.json")).unwrap();
+    assert!(changes.contains(&member));
 }
 fn cancel(runner: &Runner, setup: &Setup, hard: bool) {
     let mut job = Job::new(setup.id, Some(setup.request.clone()), 0, 0, 4);

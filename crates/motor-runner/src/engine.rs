@@ -6346,7 +6346,10 @@ impl Runner {
             .filter(|job| {
                 job.return_reserved_bytes != 0
                     && job.terminal.is_some()
-                    && job.returned.as_ref().is_none_or(|r| r.expired)
+                    && job
+                        .returned
+                        .as_ref()
+                        .is_none_or(|r| r.expired || r.chunks.is_empty())
             })
             .map(|job| job.id)
             .collect();
@@ -6357,15 +6360,16 @@ impl Runner {
             };
             let mut job = {
                 let inner = self.core.inner.lock().unwrap();
-                if inner.starting.contains(&id)
-                    || inner.finalizing.contains(&id)
-                    || log.retention.lock().unwrap().readers != 0
-                {
-                    continue;
-                }
                 let Some(job) = inner.jobs.get(&id) else {
                     continue;
                 };
+                if inner.starting.contains(&id)
+                    || inner.finalizing.contains(&id)
+                    || (job.returned.as_ref().is_some_and(|r| !r.chunks.is_empty())
+                        && log.retention.lock().unwrap().readers != 0)
+                {
+                    continue;
+                }
                 job.clone()
             };
             let directory = self.record_path(id).parent().unwrap().to_owned();
@@ -9639,6 +9643,7 @@ impl Runner {
             self.log_remote_cache_totals(id);
             self.guard_build_folder(paths::request(&request).caller_workspace_key.text());
         }
+        self.release_return_reservations();
         self.prune_refs()?;
         Ok(())
     }

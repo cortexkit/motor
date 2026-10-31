@@ -7,9 +7,11 @@ import io
 import json
 from pathlib import Path
 import queue
+import re
 import shutil
 import struct
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -458,6 +460,143 @@ class QualificationReadinessTests(unittest.TestCase):
         for outcome in ({"type": "windows_exit", "code": 1}, {"type": "exit", "code": 0}, None):
             with self.assertRaisesRegex(RuntimeError, "gate failed"):
                 JOBS.require_gate_success({"outcome": outcome})
+
+    def test_both_qualification_harnesses_list_all_four_return_cases(self):
+        names = [case[0] for case in JOBS.RETURN_QUALIFICATION_CASES]
+        self.assertEqual(names, ["requested-return-exact-bytes", "requested-return-junction-refused",
+                                 "requested-return-ads-refused", "no-requested-returns-preserves-changed-source"])
+        operator = (HERE.parents[1] / "crates/motor-runner/src/tests/windows_operator.rs").read_text()
+        checks = re.findall(r"^(?:async )?fn (windows_qualification_\w+)\(", operator, re.MULTILINE)
+        self.assertEqual(len(checks), 17)
+        for name in names:
+            self.assertIn("windows_qualification_" + name.replace("-", "_"), checks)
+        ads = next(case for case in JOBS.RETURN_QUALIFICATION_CASES if case[0] == "requested-return-ads-refused")
+        for witness in ("Set-Content -LiteralPath 'file.txt' -Stream 'hidden'", "Get-Item -LiteralPath 'file.txt' -Stream 'hidden'"):
+            self.assertIn(witness, ads[1])
+            self.assertIn(witness, operator)
+        run_source = (HERE / "qualify-jobs.py").read_text().split("def run(root, runner, evidence, gate):", 1)[1]
+        self.assertLess(run_source.index("qualify_return_cases(root, runner, evidence)"), run_source.index("for iteration in range(5)"))
+        self.assertEqual(JOBS.RETURN_QUALIFICATION_BYTES, b"motor requested return qualification")
+
+    def return_frames(self, job="job", path="/qualification/file.bin", cause=None) -> list[dict[str, Any]]:
+        if cause is not None:
+            return [dict(type="return_manifest", job_id=job, seq=1, cap_bytes=4096, total_bytes=0,
+                         files=[dict(path=path, cause=cause, size=0)])]
+        data = b"motor requested return qualification"
+        return [dict(type="return_chunk", job_id=job, seq=1, path_index=0, offset=0, data=base64.b64encode(data).decode()),
+                dict(type="return_manifest", job_id=job, seq=2, cap_bytes=4096, total_bytes=len(data),
+                     files=[dict(path=path, size=len(data), sha256=JOBS.hashlib.sha256(data).hexdigest())])]
+
+    def test_return_checker_requires_exact_bytes_and_sha256(self):
+        JOBS.check_requested_return(self.return_frames(), "job", "/qualification/file.bin", None)
+        for bad in ("bytes", "digest", "offset", "job", "path", "after-manifest"):
+            frames = self.return_frames()
+            if bad == "bytes":
+                frames[0]["data"] = base64.b64encode(b"wrong bytes").decode()
+            elif bad == "digest":
+                frames[1]["files"][0]["sha256"] = "0" * 64
+            elif bad == "offset":
+                frames[0]["offset"] = 1
+            elif bad == "job":
+                frames[0]["job_id"] = "another-job"
+            elif bad == "path":
+                frames[1]["files"][0]["path"] = "/another/file"
+            else:
+                frames.reverse()
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                JOBS.check_requested_return(frames, "job", "/qualification/file.bin", None)
+
+    def test_escape_checker_refuses_any_chunks_and_requires_typed_cause(self):
+        for path in ("/qualification/return-junction/win.ini", "/qualification/file.txt:hidden"):
+            JOBS.check_requested_return(self.return_frames(path=path, cause="escape"), "job", path, "escape")
+            for bad in ("bytes", "cause", "inline-data"):
+                frames = self.return_frames(path=path, cause="escape")
+                if bad == "bytes":
+                    frames.insert(0, dict(type="return_chunk", job_id="job", seq=0, path_index=0, offset=0, data="b3V0c2lkZQ=="))
+                elif bad == "cause":
+                    frames[0]["files"][0]["cause"] = "missing"
+                else:
+                    frames[0]["files"][0]["data"] = "b3V0c2lkZQ=="
+                with self.subTest(path=path, bad=bad), self.assertRaises(RuntimeError):
+                    JOBS.check_requested_return(frames, "job", path, "escape")
+
+    def legacy_collection(self, job, workspace):
+        directory = self.root / "state/ally/jobs" / job
+        directory.mkdir(parents=True)
+        name = f"m{workspace}/returned-legacy.txt"
+        with tarfile.open(directory / "windows-changes.tar", "w") as archive:
+            member = tarfile.TarInfo(name)
+            member.size = len(JOBS.RETURN_QUALIFICATION_BYTES)
+            archive.addfile(member, io.BytesIO(JOBS.RETURN_QUALIFICATION_BYTES))
+        (directory / "windows-changes.json").write_text(json.dumps([name]))
+        return directory
+
+    def test_no_requested_returns_requires_legacy_archive_and_change_manifest(self):
+        directory = self.legacy_collection("legacy", "/qualification/legacy")
+        JOBS.check_legacy_return(self.root, "legacy", "/qualification/legacy", [])
+        with self.assertRaisesRegex(RuntimeError, "returned-file frames"):
+            JOBS.check_legacy_return(self.root, "legacy", "/qualification/legacy", self.return_frames())
+        (directory / "windows-changes.json").write_text("[]")
+        with self.assertRaisesRegex(RuntimeError, "omitted"):
+            JOBS.check_legacy_return(self.root, "legacy", "/qualification/legacy", [])
+
+    def test_return_cases_submit_real_commands_paths_and_validate_received_frames(self):
+        channels = []
+
+        def channel(*_args):
+            bridge = Mock()
+
+            def until(kind, output=None, frames=None):
+                if kind == "accepted":
+                    return {}
+                self.assertEqual(kind, "terminal")
+                request = bridge.send.call_args_list[0].args[0]
+                name = request["workspace_key"].rsplit("/", 1)[1]
+                case = next(case for case in JOBS.RETURN_QUALIFICATION_CASES if case[0] == name)
+                if case[2] is None:
+                    self.legacy_collection(request["job_id"], request["workspace_key"])
+                else:
+                    assert frames is not None
+                    frames.extend(self.return_frames(request["job_id"], request["return_paths"][0], case[3]))
+                return dict(outcome=dict(type="windows_exit", code=0))
+
+            bridge.until.side_effect = until
+            channels.append(bridge)
+            return bridge
+
+        with patch.object(JOBS, "no_lockfile_fixture", return_value=("commit", "tree")), \
+                patch.object(JOBS, "fixture_bundle", side_effect=lambda repo, bundle, commit: bundle.write_bytes(b"bundle")), \
+                patch.object(JOBS, "Channel", side_effect=channel):
+            JOBS.qualify_return_cases(self.root, self.runner, self.root)
+        self.assertEqual(len(channels), 4)
+        for bridge, case in zip(channels, JOBS.RETURN_QUALIFICATION_CASES):
+            request = bridge.send.call_args_list[0].args[0]
+            self.assertEqual(request["platform"], "windows")
+            self.assertEqual(request["workspace_key"], f"/qualification/{case[0]}")
+            script = base64.b64decode(request["command"].split("-EncodedCommand ", 1)[1]).decode("utf-16le")
+            self.assertEqual(script, case[1])
+            if case[2] is None:
+                for field in ("return_paths", "return_chunked", "return_max_bytes"):
+                    self.assertNotIn(field, request)
+            else:
+                self.assertEqual(request["return_paths"], [request["workspace_key"] + "/" + case[2]])
+                self.assertIs(request["return_chunked"], True)
+                self.assertEqual(request["return_max_bytes"], 4096)
+            chunks = [call.args[0] for call in bridge.send.call_args_list[1:]]
+            payload = b"".join(base64.b64decode(chunk["data"]) for chunk in chunks)
+            self.assertEqual(payload, b"bundle")
+            self.assertEqual(request["bundles"][0]["sha256"], JOBS.hashlib.sha256(payload).hexdigest())
+            bridge.close.assert_called_once()
+
+    def test_return_case_without_manifest_fails_and_closes_bridge(self):
+        channel = Mock()
+        channel.until.return_value = dict(outcome=dict(type="windows_exit", code=0))
+        with patch.object(JOBS, "no_lockfile_fixture", return_value=("commit", "tree")), \
+                patch.object(JOBS, "fixture_bundle", side_effect=lambda repo, bundle, commit: bundle.write_bytes(b"bundle")), \
+                patch.object(JOBS, "Channel", return_value=channel):
+            with self.assertRaisesRegex(RuntimeError, "exactly one chunked manifest"):
+                JOBS.qualify_return_cases(self.root, self.runner, self.root)
+        channel.close.assert_called_once()
 
     def test_preparation_cases_submit_tagged_dependency_and_run_sh_only_snapshot(self):
         def git(repo, *args):

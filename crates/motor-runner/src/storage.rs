@@ -821,12 +821,13 @@ fn return_reservation_is_zero(bytes: &u64) -> bool {
 
 /// Remove returned-file directories the record does not reference: a
 /// collection interrupted before its record was saved, or bytes whose expiry
-/// was saved before their deletion finished.
+/// was saved before their deletion finished. Empty collections retain only
+/// their manifest, so their payload directory is unreferenced immediately.
 pub(crate) fn remove_unreferenced_returned(directory: &Path, job: &Job) {
     let kept = job
         .returned
         .as_ref()
-        .filter(|returned| !returned.expired)
+        .filter(|returned| !returned.expired && !returned.chunks.is_empty())
         .map(|returned| returned.directory.as_str());
     let Ok(entries) = fs::read_dir(directory) else {
         return;

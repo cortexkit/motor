@@ -155,22 +155,33 @@ pub fn collect_before_read(
         validate_relative(workspace).map_err(|_| invalid("invalid workspace"))?;
     }
     let workspace = directories(root, workspace);
-    let mut committed = 0;
+    let mut read_bytes = 0u64;
     let mut buffer = vec![0; CHUNK_BYTES];
     for (index, path) in request.paths.iter().enumerate() {
         let mut size = 0;
+        let mut measured_size = None;
         let mut transport_error = None;
         let result = (|| -> Result<String, Failure> {
             let (workspace, _ancestors) = workspace.as_ref().map_err(|cause| *cause)?;
             let (mut file, _parents) = open(workspace, path)?;
             let before = file.metadata().map_err(path_error)?;
+            measured_size = Some(before.len());
+            // Reject known oversize files before touching their payload. Failed
+            // reads also spend the collection allowance, not just returned files.
+            if read_bytes > request.max_bytes
+                || before.len() > request.max_bytes.saturating_sub(read_bytes)
+            {
+                return Err(Failure::OverCap);
+            }
             let id = identity(&file).map_err(path_error)?;
             before_read(index);
             let mut hash = Sha256::new();
             loop {
                 // One lookahead byte distinguishes EOF from a file exceeding
                 // the cap. It is counted, but never sent or stored on the host.
-                let want = (request.max_bytes - committed - size)
+                let want = request
+                    .max_bytes
+                    .saturating_sub(read_bytes)
                     .min(CHUNK_BYTES as u64)
                     .max(1) as usize;
                 let n = file
@@ -180,7 +191,8 @@ pub fn collect_before_read(
                     break;
                 }
                 size += n as u64;
-                if committed + size > request.max_bytes {
+                read_bytes += n as u64;
+                if read_bytes > request.max_bytes {
                     let after = file.metadata().map_err(path_error)?;
                     if before.len() != after.len()
                         || before.modified().ok() != after.modified().ok()
@@ -213,13 +225,14 @@ pub fn collect_before_read(
             return Err(error);
         }
         let outcome = match result {
-            Ok(sha256) => {
-                committed += size;
-                Outcome::Returned { size, sha256 }
-            }
+            Ok(sha256) => Outcome::Returned { size, sha256 },
             Err(cause) => Outcome::Failed {
                 cause,
-                size: Some(size),
+                size: if cause == Failure::OverCap {
+                    measured_size
+                } else {
+                    Some(size)
+                },
             },
         };
         send(Frame::ReturnFileEnd { outcome })?;

@@ -122,13 +122,13 @@ fn returned_files_count_reads_and_refuse_per_file_over_cap_missing_and_changed()
     fs::write(scratch.0.join("vanished"), [5; 1]).unwrap();
     let (results, _) = outcomes(
         &scratch,
-        &["large", "small", "total", "missing", "changed", "vanished"],
+        &["large", "small", "total", "missing", "vanished", "changed"],
         4,
         |index| {
-            if index == 4 {
+            if index == 5 {
                 fs::write(scratch.0.join("changed"), [9; 2]).unwrap();
             }
-            if index == 5 {
+            if index == 4 {
                 fs::remove_file(scratch.0.join("vanished")).unwrap();
             }
         },
@@ -137,7 +137,7 @@ fn returned_files_count_reads_and_refuse_per_file_over_cap_missing_and_changed()
         results[0],
         Outcome::Failed {
             cause: Failure::OverCap,
-            size: Some(5)
+            size: Some(9)
         }
     ));
     assert!(matches!(results[1], Outcome::Returned { size: 2, .. }));
@@ -166,6 +166,59 @@ fn returned_files_count_reads_and_refuse_per_file_over_cap_missing_and_changed()
         results[5],
         Outcome::Failed {
             cause: Failure::ReadError,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn returned_known_oversize_repeated_paths_are_refused_without_payload_reads() {
+    let scratch = Scratch::new();
+    let cap = 64 * 1024;
+    fs::File::create(scratch.0.join("oversize"))
+        .unwrap()
+        .set_len(cap + 1)
+        .unwrap();
+    let mut reads = 0;
+    let paths = vec!["oversize"; 64];
+    let (results, sent) = outcomes(&scratch, &paths, cap, |_| reads += 1);
+    assert_eq!(
+        reads, 0,
+        "oversize files must fail before the payload-read seam"
+    );
+    assert_eq!(sent, 0);
+    assert_eq!(results.len(), 64);
+    assert!(results.iter().all(|outcome| matches!(
+        outcome,
+        Outcome::Failed {
+            cause: Failure::OverCap,
+            size: Some(65537)
+        }
+    )));
+}
+
+#[cfg(unix)]
+#[test]
+fn returned_failed_reads_spend_the_collection_allowance() {
+    let scratch = Scratch::new();
+    for path in ["one", "two", "three"] {
+        fs::write(scratch.0.join(path), [0]).unwrap();
+    }
+    let mut reads = Vec::new();
+    let paths = ["one", "two", "three"];
+    let (results, sent) = outcomes(&scratch, &paths, 3, |index| {
+        reads.push(index);
+        fs::write(scratch.0.join(paths[index]), [1, 2]).unwrap();
+    });
+    assert_eq!(
+        sent, 3,
+        "discarded data must not grant another read allowance"
+    );
+    assert_eq!(reads, [0, 1]);
+    assert!(matches!(
+        results[2],
+        Outcome::Failed {
+            cause: Failure::OverCap,
             ..
         }
     ));

@@ -978,12 +978,7 @@ fn materialize_attempt(
                     .insert(id, collection.finish()?);
             } else {
                 io.send(&Frame::Collect {})?;
-                let collection = thread_config
-                    .state_dir()
-                    .join("jobs")
-                    .join(id.to_string())
-                    .join("windows-changes.tar");
-                let mut collected = fs::File::create(&collection)?;
+                let mut collected = super::prep::LegacyCollection::new(&thread_config, id)?;
                 let deleted = loop {
                     match io.reply(&mut resources)? {
                         Frame::Collected { bytes } => collected.write_all(&bytes)?,
@@ -991,9 +986,7 @@ fn materialize_attempt(
                         _ => return Err(invalid("unexpected collect frame")),
                     }
                 };
-                collected.sync_all()?;
-                drop(collected);
-                super::prep::store_collection(&thread_config, id, &collection, &deleted)?;
+                collected.finish(&deleted)?;
             }
             io.enter(Phase::Dismount)?;
             io.send(&Frame::Dismount {})?;
