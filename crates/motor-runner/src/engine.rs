@@ -5830,12 +5830,12 @@ impl Runner {
     /// is waiting out its start retry delay (such a head keeps its claim on
     /// capacity, as if it were waiting for permits). A head whose earlier
     /// attempt is still being cleaned up is skipped like a checkout conflict
-    /// and stops nothing.
+    /// and stops nothing. Return-budget waits also leave CPU permits unfenced.
     fn holds_back_later_heads(&self, inner: &Inner, head: &Job, held: u32, now: u64) -> bool {
         if inner.terminal_saves.contains(&head.id) {
             return true;
         }
-        if self.core.config.cleanup_pending(head.id) {
+        if self.core.config.cleanup_pending(head.id) || !self.return_budget_available(inner, head) {
             return false;
         }
         let fill = head.base
@@ -5849,7 +5849,6 @@ impl Runner {
             && now.saturating_sub(head.queued_ms.unwrap_or(head.accepted_ms)) >= BACKFILL_GRACE_MS;
         (head.gate_job() || fill || aged)
             && (held.saturating_add(head.weight) > self.core.config.max_weight
-                || !self.return_budget_available(inner, head).unwrap_or(false)
                 || Self::start_deferred(inner, head.id, now))
     }
 
@@ -5940,7 +5939,7 @@ impl Runner {
                 // A job waiting out its start retry delay keeps its claim on
                 // capacity, as if it were waiting for permits.
                 "permits"
-            } else if !self.return_budget_available(inner, job).unwrap_or(false) {
+            } else if !self.return_budget_available(inner, job) {
                 "returned bytes budget"
             } else {
                 "queue order"
@@ -6007,7 +6006,7 @@ impl Runner {
                         .fold(0u32, |sum, weight| sum.saturating_add(*weight));
                     let blocked_by_head = blockers.get(&id).is_some_and(Option::is_some);
                     !blocked_by_head
-                        && self.return_budget_available(inner, job).unwrap_or(false)
+                        && self.return_budget_available(inner, job)
                         && !self.deleting(inner, paths::host_str(crate::caller_path::job_key(job)), &request.siblings)
                         && job.weight <= self.core.config.max_weight
                         && index
@@ -7254,35 +7253,61 @@ impl Runner {
         })
     }
 
-    fn return_budget_available(&self, inner: &Inner, job: &Job) -> io::Result<bool> {
-        let Some(budget) = self.core.config.return_budget_bytes else {
-            return Ok(true);
-        };
-        let Some(request) = job
-            .request
+    fn return_budget_charge(&self, job: &Job) -> Option<u64> {
+        self.core.config.return_budget_bytes?;
+        job.request
             .as_ref()
             .filter(|r| r.return_chunked && !paths::run(r).caller_return_paths.is_empty())
-        else {
-            return Ok(true);
+            .map(|request| Config::return_charge(request.return_max_bytes))
+    }
+
+    fn return_budget_available(&self, inner: &Inner, job: &Job) -> bool {
+        let Some(charge) = self.return_budget_charge(job) else {
+            return true;
         };
+        let budget = self.core.config.return_budget_bytes.unwrap();
         if !self.core.quarantined.is_empty() {
-            return Ok(false);
+            return false;
         }
-        let charge = Config::return_charge(request.return_max_bytes);
-        let used = inner
+        let (used, unwritten) = inner
             .jobs
             .values()
-            .filter(|j| j.id != job.id)
-            .fold(0u64, |sum, j| sum.saturating_add(j.return_reserved_bytes));
-        let total = used.saturating_add(charge);
-        let free = (self.core.config.free_space_probe)(&self.core.trees.state)?;
-        Ok(total <= budget
-            && free
-                >= self
-                    .core
-                    .config
-                    .free_space_floor_bytes
-                    .saturating_add(total))
+            .filter(|j| j.id != job.id && j.return_reserved_bytes != 0)
+            .fold((0u64, 0u64), |(used, unwritten), j| {
+                let written = j.returned.as_ref().map_or(0, |returned| {
+                    returned
+                        .chunks
+                        .iter()
+                        .fold(0u64, |sum, chunk| sum.saturating_add(chunk.length))
+                });
+                (
+                    used.saturating_add(j.return_reserved_bytes),
+                    unwritten.saturating_add(j.return_reserved_bytes.saturating_sub(written)),
+                )
+            });
+        if used.saturating_add(charge) > budget {
+            return false;
+        }
+        let free = match (self.core.config.free_space_probe)(&self.core.trees.state) {
+            Ok(free) => free,
+            Err(error) => {
+                if !job
+                    .return_probe_error_logged
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    tracing::warn!(job_id = %job.id, %error, "cannot probe returned-file disk capacity; job remains queued");
+                }
+                return false;
+            }
+        };
+        // Committed chunks already reduced free space. In-flight writes remain
+        // fully reserved until publication; filesystem overhead stays reserved until deletion.
+        free >= self
+            .core
+            .config
+            .free_space_floor_bytes
+            .saturating_add(charge)
+            .saturating_add(unwritten)
     }
 
     fn dispatch(&self, inner: &mut Inner, now: u64) -> io::Result<()> {
@@ -7301,6 +7326,7 @@ impl Runner {
                 break;
             }
             let mut next = None;
+            let mut return_budget_blocked = false;
             for id in index.heads(inner, now) {
                 if inner.terminal_saves.contains(&id) {
                     // This head's withdrawal is being saved. Until it is
@@ -7361,12 +7387,22 @@ impl Runner {
                 if job.weight > self.core.config.max_weight {
                     continue;
                 }
+                if self.return_budget_charge(job).is_some() {
+                    if return_budget_blocked {
+                        continue;
+                    }
+                    if !self.return_budget_available(inner, job) {
+                        // Preserve return-budget order without idling unrelated CPUs:
+                        // later plain jobs can start, but smaller returns cannot starve this head.
+                        return_budget_blocked = true;
+                        continue;
+                    }
+                }
                 // A job whose last start failed waits out its retry delay
                 // (at most START_RETRY_MAX_MS) as if it were waiting for
                 // permits: a gate or aged head still fences capacity.
                 if index.weight.saturating_add(job.weight) > self.core.config.max_weight
                     || Self::start_deferred(inner, id, now)
-                    || !self.return_budget_available(inner, job)?
                 {
                     // Gates, the fill that may start and aged heads stop
                     // backfill only for capacity, after their checkout

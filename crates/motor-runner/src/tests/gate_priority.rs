@@ -264,6 +264,171 @@ fn capacity_blocked_gate_still_fences_smaller_workers() {
     );
 }
 
+fn returned_budget_config(f: &Fixture) -> Config {
+    let mut config = f.config();
+    config.manual_tick = true;
+    config.disable_warm_builds = true;
+    config.max_weight = 64;
+    config.cpu_topology = Some(CpuTopology::new((0..65).map(|cpu| vec![cpu]).collect()).unwrap());
+    config.return_chunked_max_bytes = Some(RETURN_LARGE_MAX_BYTES_CAP);
+    config.return_budget_bytes =
+        Some(Config::return_charge(RETURN_LARGE_MAX_BYTES_CAP) + Config::return_charge(1));
+    config.free_space_probe = Arc::new(|_| Ok(u64::MAX));
+    config
+}
+
+fn assert_return_budget_head_fences_only_other_returns(gate: bool) {
+    let f = Fixture::new();
+    let runner = Runner::open(returned_budget_config(&f)).unwrap();
+    let (request, _) = f.run("true");
+    let now = runner.now();
+    let queued = if gate { now } else { now - BACKFILL_GRACE_MS };
+    let mut retained = job(&request, "retained", 2, 0, false, now);
+    retained.terminal(Outcome::Exit { code: 0 }, now);
+    retained.return_reserved_bytes = Config::return_charge(RETURN_LARGE_MAX_BYTES_CAP);
+    let mut head = job(&request, &f.key, 8, 1, gate, queued);
+    let small_key = f.scratch.join("remote/worktrees/small-return");
+    let mut small = job(&request, text(&small_key), 2, 2, false, now);
+    for (job, cap) in [(&mut head, RETURN_LARGE_MAX_BYTES_CAP), (&mut small, 1)] {
+        let request = job.request.as_mut().unwrap();
+        request.siblings.clear();
+        request.return_chunked = true;
+        request.return_max_bytes = cap;
+        request.return_paths = vec![format!("{}/returned", request.workspace_key)];
+    }
+    let plain_key = f.scratch.join("remote/worktrees/plain");
+    let mut plain = job(&request, text(&plain_key), 2, 3, false, now);
+    plain.request.as_mut().unwrap().siblings.clear();
+    let (head_id, small_id, plain_id) = (head.id, small.id, plain.id);
+    let mut inner = runner.core.inner.lock().unwrap();
+    for job in [retained, head, small, plain] {
+        inner.jobs.insert(job.id, job);
+    }
+    runner.dispatch(&mut inner, now).unwrap();
+    assert_eq!(
+        inner.starting,
+        BTreeSet::from([plain_id]),
+        "a return-budget wait must not fence jobs that only need CPUs"
+    );
+    assert!(inner.jobs[&head_id].setup_ms.is_none());
+    assert!(
+        inner.jobs[&small_id].setup_ms.is_none(),
+        "a fitting smaller return must not overtake the blocked return head"
+    );
+    assert!(
+        !runner.holds_back_later_heads(&inner, &inner.jobs[&head_id], 63, now),
+        "a return-budget wait must not reserve CPU permits, even when CPUs are also short"
+    );
+}
+
+#[test]
+fn return_budget_blocked_gate_allows_plain_jobs_but_fences_smaller_returns() {
+    assert_return_budget_head_fences_only_other_returns(true);
+}
+
+#[test]
+fn return_budget_blocked_aged_job_allows_plain_jobs_but_fences_smaller_returns() {
+    assert_return_budget_head_fences_only_other_returns(false);
+}
+
+#[test]
+fn return_budget_probe_failure_waits_without_stalling_plain_dispatch() {
+    let f = Fixture::new();
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe = failed.clone();
+    let mut config = returned_budget_config(&f);
+    config.free_space_probe = Arc::new(move |_| {
+        if probe.load(Ordering::SeqCst) {
+            Err(io::Error::other("probe unavailable"))
+        } else {
+            Ok(u64::MAX)
+        }
+    });
+    let runner = Runner::open(config).unwrap();
+    let (request, _) = f.run("true");
+    let now = runner.now();
+    let mut returning = job(&request, &f.key, 8, 1, true, now);
+    let r = returning.request.as_mut().unwrap();
+    r.siblings.clear();
+    r.return_chunked = true;
+    r.return_max_bytes = RETURN_LARGE_MAX_BYTES_CAP;
+    r.return_paths = vec![format!("{}/returned", f.key)];
+    let plain_key = f.scratch.join("remote/worktrees/plain");
+    let mut plain = job(&request, text(&plain_key), 2, 2, false, now);
+    plain.request.as_mut().unwrap().siblings.clear();
+    let (return_id, plain_id) = (returning.id, plain.id);
+    assert!(!returning.return_probe_error_logged.load(Ordering::Relaxed));
+    let mut inner = runner.core.inner.lock().unwrap();
+    inner.jobs.insert(return_id, returning);
+    inner.jobs.insert(plain_id, plain);
+    failed.store(true, Ordering::SeqCst);
+    runner.dispatch(&mut inner, now).unwrap();
+    assert_eq!(inner.starting, BTreeSet::from([plain_id]));
+    assert!(inner.jobs[&return_id].setup_ms.is_none());
+    assert!(inner.jobs[&return_id]
+        .return_probe_error_logged
+        .load(Ordering::Relaxed));
+    runner.dispatch(&mut inner, now).unwrap();
+    assert_eq!(inner.starting, BTreeSet::from([plain_id]));
+}
+
+#[test]
+fn return_budget_free_space_subtracts_committed_chunk_bytes_only() {
+    let f = Fixture::new();
+    let charge = Config::return_charge(RETURN_LARGE_MAX_BYTES_CAP);
+    let written = 2 * RETURN_CHUNK_MAX_BYTES as u64;
+    let floor = 4096;
+    let boundary = floor + 2 * charge - written;
+    let free = Arc::new(AtomicU64::new(boundary));
+    let probe = free.clone();
+    let mut config = returned_budget_config(&f);
+    config.return_budget_bytes = Some(2 * charge);
+    config.free_space_floor_bytes = floor;
+    config.free_space_probe = Arc::new(move |_| Ok(probe.load(Ordering::SeqCst)));
+    let runner = Runner::open(config).unwrap();
+    let (request, _) = f.run("true");
+    let now = runner.now();
+    let mut retained = job(&request, "retained", 2, 0, false, now);
+    retained.terminal(Outcome::Exit { code: 0 }, now);
+    retained.return_reserved_bytes = charge;
+    retained.returned = Some(crate::storage::ReturnedFiles {
+        directory: "returned-committed".into(),
+        chunks: (0..2)
+            .map(|i| crate::storage::ReturnedChunk {
+                seq: i + 1,
+                path_index: 0,
+                offset: i * RETURN_CHUNK_MAX_BYTES as u64,
+                length: RETURN_CHUNK_MAX_BYTES as u64,
+            })
+            .collect(),
+        manifest: ReturnManifest::new(
+            retained.id,
+            3,
+            vec![ReturnManifestEntry::returned("returned", written, "0".repeat(64)).with_chunks(2)],
+            written,
+            RETURN_LARGE_MAX_BYTES_CAP,
+        ),
+        expired: false,
+    });
+    let retained_id = retained.id;
+    let mut next = job(&request, &f.key, 2, 1, false, now);
+    let r = next.request.as_mut().unwrap();
+    r.return_chunked = true;
+    r.return_max_bytes = RETURN_LARGE_MAX_BYTES_CAP;
+    r.return_paths = vec![format!("{}/returned", f.key)];
+    let mut inner = runner.core.inner.lock().unwrap();
+    inner.jobs.insert(retained_id, retained);
+    assert!(runner.return_budget_available(&inner, &next));
+    free.store(boundary - 1, Ordering::SeqCst);
+    assert!(!runner.return_budget_available(&inner, &next));
+    free.store(boundary, Ordering::SeqCst);
+    inner.jobs.get_mut(&retained_id).unwrap().returned = None;
+    assert!(
+        !runner.return_budget_available(&inner, &next),
+        "unpublished writes must remain reserved until their sizes are committed"
+    );
+}
+
 #[test]
 fn large_retained_table_and_blocked_heads_use_a_bounded_number_of_scheduler_scans() {
     let f = Fixture::new();

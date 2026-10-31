@@ -171,6 +171,9 @@ pub(crate) struct Job {
     /// Runtime marker indicating whether this job has entered the live queue.
     #[serde(skip, default = "empty_queue_clock_initialized")]
     pub queue_wait_clock_initialized: Arc<AtomicBool>,
+    /// A failed disk probe is reported once per queued job, not on every scheduler tick.
+    #[serde(skip)]
+    pub return_probe_error_logged: Arc<AtomicBool>,
     #[serde(default)]
     pub setup_ms: Option<u64>,
     pub finished_ms: Option<u64>,
@@ -318,6 +321,7 @@ impl Job {
             queue_entry: empty_queue_entry(),
             queue_elapsed: empty_queue_elapsed(),
             queue_wait_clock_initialized: empty_queue_clock_initialized(),
+            return_probe_error_logged: Arc::new(AtomicBool::new(false)),
             setup_ms: None,
             finished_ms: None,
             started_ms: None,
