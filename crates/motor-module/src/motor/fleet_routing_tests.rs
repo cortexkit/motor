@@ -8,39 +8,44 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn config(h: &Harness) -> Config {
     Config {
-        hosted_fleet_routing: true,
         network_routing: true,
         ..h.config()
     }
 }
 
-#[test]
-fn fleet_config_defaults_off_and_roundtrips() {
-    let default: Config = serde_json::from_str("{}").unwrap();
-    assert!(!default.hosted_fleet_routing);
-    assert!(serde_json::to_value(&default)
-        .unwrap()
-        .get("hosted_fleet_routing")
-        .is_none());
-    let config: Config = serde_json::from_str(r#"{"hosted_fleet_routing":true}"#).unwrap();
-    config.validate().unwrap();
-    let restored: Config = serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
-    assert!(restored.hosted_fleet_routing);
-    assert!(!restored.hosted_runners);
-    let mut old_wire = serde_json::to_value(crate::HostedJobState::default()).unwrap();
-    assert!(old_wire
-        .as_object_mut()
-        .unwrap()
-        .remove("fleet_routed")
-        .is_none());
-    assert!(old_wire
-        .as_object_mut()
-        .unwrap()
-        .remove("fleet_no_spill")
-        .is_none());
-    let old_route: crate::HostedJobState = serde_json::from_value(old_wire).unwrap();
-    assert!(!old_route.fleet_routed);
-    assert!(!old_route.fleet_no_spill);
+#[tokio::test]
+async fn an_early_refusal_is_local_before_its_first_stream_record() {
+    let scratch = cortexkit_test_support::ScratchDir::new("local-refusal-followups");
+    let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
+    let mut motor = Motor::open(Config::default(), &scratch).unwrap();
+    motor.set_connector(peer.clone());
+    let stream = motor
+        .refuse_before_start(
+            RefusalReason::RequestRejected,
+            Some("invalid_request".into()),
+        )
+        .unwrap();
+    let id = stream.job_id;
+    let status = motor.job_status(id).await.unwrap();
+    assert_eq!(
+        status.terminal.as_ref().unwrap().refusal_detail.as_deref(),
+        Some("invalid_request")
+    );
+    assert_eq!(
+        records(motor.attach(AttachRequest::new(id, 0)).unwrap())
+            .await
+            .1,
+        status.terminal.unwrap()
+    );
+    motor.cancel(CancelRequest::new(id)).await.unwrap();
+    assert_eq!(
+        records(stream).await.1.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RequestRejected
+        }
+    );
+    assert_eq!(peer.0.load(Ordering::SeqCst), 0);
+    motor.close().await;
 }
 
 #[tokio::test]
@@ -49,8 +54,6 @@ async fn fleet_linux_default_platform_jobs_allow_hosted_spill() {
     let (scratch, repo) = committed_repo();
     let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
     let mut config = config(&h);
-    config.spill_to_hosted = true;
-    config.spill_after_s = 0;
     config.hosted_repositories_placement_hint = Some(control_placement());
     let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
     for (platform, timeout) in [(None, 10), (Some(Platform::Linux), 7200)] {
@@ -178,68 +181,6 @@ async fn fleet_gate_takes_a_host_only_lease_and_sends_the_gate_mark() {
 }
 
 #[tokio::test]
-async fn fleet_off_gate_uses_the_direct_runner_without_a_lease() {
-    for hosted_runners in [false, true] {
-        let h = Harness::new(Behavior::CompleteRun).await;
-        let (scratch, repo) = committed_repo();
-        let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
-        let config = Config {
-            hosted_runners,
-            hosted_fleet_routing: false,
-            ..config(&h)
-        };
-        let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
-        let stream = motor
-            .run_direct_authorized(
-                request(&repo),
-                None,
-                Default::default(),
-                false,
-                false,
-                [7; 32],
-            )
-            .unwrap();
-        let id = stream.job_id;
-        let (_, terminal) = records(stream).await;
-        assert_eq!(terminal.outcome, Outcome::Exit { code: 17 });
-        assert!(motor.hosted_state(id).is_none());
-        assert_eq!(motor.storage.job(id).unwrap().queue_wait_limit_s, 30 * 60);
-        assert!(lease_bodies(&h).is_empty());
-        assert_eq!(peer.0.load(Ordering::SeqCst), 1);
-    }
-}
-
-#[tokio::test]
-async fn fleet_gate_no_host_fits_corrects_to_the_direct_priority_lane() {
-    let h = Harness::new(Behavior::CompleteRun).await;
-    h.broker.lock().unwrap().knobs.refusal = Some((422, "no_host_fits".into()));
-    let (scratch, repo) = committed_repo();
-    let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
-    let stream = motor
-        .run_direct_authorized(
-            request(&repo),
-            None,
-            Default::default(),
-            false,
-            false,
-            [7; 32],
-        )
-        .unwrap();
-    let id = stream.job_id;
-    let (_, terminal) = records(stream).await;
-    assert_eq!(terminal.outcome, Outcome::Exit { code: 17 });
-    assert!(motor.hosted_state(id).is_none());
-    let job = motor.storage.job(id).unwrap();
-    assert!(job.gate_job);
-    assert_eq!(job.routed_direct_reason.as_deref(), Some("no_host_fits"));
-    assert_eq!(job.queue_wait_limit_s, 30 * 60);
-    assert_eq!(lease_bodies(&h)[0]["allow_spill"], false);
-    assert_eq!(peer.0.load(Ordering::SeqCst), 1);
-    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
 async fn fleet_non_linux_platforms_never_request_a_lease() {
     let h = Harness::new(Behavior::CompleteRun).await;
     let (scratch, repo) = committed_repo();
@@ -363,7 +304,7 @@ async fn absent_fleet_key_preserves_global_hosted_validation_refusals() {
             Outcome::RefusedBeforeStart { .. }
         ));
         let route = motor.hosted_state(id).unwrap();
-        assert!(!route.fleet_routed && !route.lease_attempted);
+        assert!(route.fleet_routed && !route.lease_attempted);
     }
     assert!(lease_bodies(&h).is_empty());
     let stream = motor.run(request(&repo)).unwrap();
@@ -371,7 +312,7 @@ async fn absent_fleet_key_preserves_global_hosted_validation_refusals() {
     let (_, terminal) = records(stream).await;
     assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
     let route = motor.hosted_state(id).unwrap();
-    assert!(!route.fleet_routed && !route.repository_routed && route.run_sent);
+    assert!(route.fleet_routed && !route.repository_routed && route.run_sent);
     assert_eq!(lease_bodies(&h).len(), 1);
     assert_eq!(lease_bodies(&h)[0]["allow_spill"], true);
     assert_eq!(h.runs.load(Ordering::SeqCst), 1);
@@ -482,54 +423,104 @@ async fn fleet_network_keeps_the_opt_in_before_capture_or_contact() {
 }
 
 #[tokio::test]
-async fn fleet_no_host_fits_corrects_only_before_run_and_never_other_refusals() {
-    for (code, status, run_sent) in [
-        ("no_host_fits", 422, false),
-        ("no_host_fits", 422, true),
-        ("account_closed", 403, false),
-        ("unauthorized", 403, false),
-        ("platform_unsupported", 422, false),
+async fn linux_exec_refusals_and_followups_never_reach_a_direct_runner() {
+    for (code, status, reason, detail_code) in [
+        (
+            "no_host_fits",
+            422,
+            RefusalReason::RequestRejected,
+            "hosted_no_host_fits",
+        ),
+        (
+            "account_closed",
+            403,
+            RefusalReason::RequestRejected,
+            "hosted_account_closed",
+        ),
+        (
+            "unauthorized",
+            403,
+            RefusalReason::RunnerAuthenticationFailed,
+            "hosted_auth",
+        ),
+        (
+            "platform_unsupported",
+            422,
+            RefusalReason::PlatformUnsupported,
+            "hosted_platform_unsupported",
+        ),
     ] {
-        let h = Harness::new(Behavior::CompleteRun).await;
-        h.broker.lock().unwrap().knobs.refusal = Some((status, code.into()));
-        let (scratch, repo) = committed_repo();
-        let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
-        let motor =
-            Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
-        let stream = motor.run(request(&repo)).unwrap();
-        let id = stream.job_id;
-        if run_sent {
-            // Model a persisted route that may already have run: a broker refusal
-            // must not cause a second submission to the direct runner.
-            motor
-                .storage
-                .hosted_update(id, |state| state.run_sent = true)
-                .unwrap();
-        }
-        let (_, terminal) = records(stream).await;
-        let corrected = code == "no_host_fits" && !run_sent;
-        if corrected {
-            assert_eq!(terminal.outcome, Outcome::Exit { code: 17 });
-            assert!(motor.hosted_state(id).is_none());
+        for gate in [false, true] {
+            let h = Harness::new(Behavior::CompleteRun).await;
+            h.broker.lock().unwrap().knobs.refusal = Some((status, code.into()));
+            let (scratch, repo) = committed_repo();
+            let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
+            let root = scratch.0.join("state");
+            let config = config(&h);
+            let mut motor = Motor::open(config.clone(), &root).unwrap();
+            motor.set_connector(peer.clone());
+            let mut request = request(&repo);
+            request.platform = Some(Platform::Linux);
+            let stream = if gate {
+                motor.run_direct_authorized(
+                    request,
+                    None,
+                    Default::default(),
+                    false,
+                    false,
+                    [7; 32],
+                )
+            } else {
+                motor.run(request)
+            }
+            .unwrap();
+            let id = stream.job_id;
+            let (_, terminal) = records(stream).await;
             assert_eq!(
-                motor
-                    .storage
-                    .job(id)
-                    .unwrap()
-                    .routed_direct_reason
-                    .as_deref(),
-                Some("no_host_fits")
+                terminal.outcome,
+                Outcome::RefusedBeforeStart {
+                    reason: reason.clone()
+                },
+                "{code}: {terminal:?}"
             );
-        } else {
             assert!(
-                matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }),
+                terminal
+                    .refusal_detail
+                    .as_deref()
+                    .unwrap()
+                    .contains(detail_code),
                 "{code}: {terminal:?}"
             );
             assert!(motor.hosted_state(id).is_some());
+            assert!(motor.storage.job(id).unwrap().runner_instance.is_none());
+            assert!(motor
+                .storage
+                .job(id)
+                .unwrap()
+                .routed_direct_reason
+                .is_none());
+            motor.close().await;
+
+            let mut motor = Motor::open(config, &root).unwrap();
+            motor.set_connector(peer.clone());
+            assert_eq!(
+                records(motor.attach(AttachRequest::new(id, 0)).unwrap())
+                    .await
+                    .1,
+                terminal
+            );
+            assert_eq!(motor.job_status(id).await.unwrap().terminal, Some(terminal));
+            motor.cancel(CancelRequest::new(id)).await.unwrap();
+            assert_eq!(motor.status().await.rustc_version, "hosted");
+            let missing = Uuid::now_v7();
+            assert!(motor.attach(AttachRequest::new(missing, 0)).is_err());
+            assert!(motor.job_status(missing).await.is_err());
+            assert!(motor.cancel(CancelRequest::new(missing)).await.is_err());
+            assert_eq!(peer.0.load(Ordering::SeqCst), 0);
+            assert_eq!(lease_bodies(&h).len(), 1);
+            assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+            motor.close().await;
         }
-        assert_eq!(peer.0.load(Ordering::SeqCst), usize::from(corrected));
-        assert_eq!(lease_bodies(&h).len(), 1);
-        assert_eq!(h.runs.load(Ordering::SeqCst), 0);
     }
 }
 
@@ -640,39 +631,4 @@ async fn fleet_capacity_budget_ends_with_a_retryable_refusal_not_a_lost_job() {
     assert_eq!(lease_bodies(&h).len(), 1);
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
     assert_eq!(peer.0.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn rollback_fragment_routes_bounded_and_unbounded_jobs_direct_without_leases() {
-    let h = Harness::new(Behavior::CompleteRun).await;
-    let (scratch, repo) = committed_repo();
-    let rollback: Config = serde_json::from_str(
-        r#"{
-        "hosted_runners": false,
-        "hosted_repositories": [],
-        "spill_to_hosted": false,
-        "hosted_fleet_routing": false
-    }"#,
-    )
-    .unwrap();
-    let config = Config {
-        broker_url: h.config().broker_url,
-        broker_token_source: crate::BrokerTokenSource::Fake,
-        runner_instance: "test".into(),
-        ..rollback
-    };
-    let peer = Arc::new(DirectPeer(AtomicUsize::new(0)));
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), peer.clone()).unwrap();
-    for timeout in [Some(600), None] {
-        let mut request = request(&repo);
-        request.timeout = timeout;
-        let stream = motor.run(request).unwrap();
-        let id = stream.job_id;
-        let (_, terminal) = records(stream).await;
-        assert_eq!(terminal.outcome, Outcome::Exit { code: 17 });
-        assert!(motor.hosted_state(id).is_none());
-    }
-    assert_eq!(peer.0.load(Ordering::SeqCst), 2);
-    assert!(lease_bodies(&h).is_empty());
-    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
 }

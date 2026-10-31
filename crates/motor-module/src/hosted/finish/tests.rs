@@ -55,7 +55,7 @@ async fn boat_finish_nonretry_statuses_and_restart_resume() {
     let scratch = ScratchDir::new("boat-finish");
     let root = scratch.join("state");
     let storage = Storage::open(&root).unwrap();
-    let mut config = Config {
+    let config = Config {
         runner_instance: "test".into(),
         broker_token_source: BrokerTokenSource::Fake,
         broker_url: Some(http.url.clone()),
@@ -101,7 +101,6 @@ async fn boat_finish_nonretry_statuses_and_restart_resume() {
     status.store(200, Ordering::SeqCst);
     // Reopening the real Motor and installing account credentials performs the
     // same restart recovery used by the module, even with hosted routing off.
-    config.hosted_runners = false;
     let vault = crate::hosted::account::tests::FakeVault::new(vec![]);
     let motor = crate::Motor::open(config, &root)
         .unwrap()

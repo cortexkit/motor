@@ -1134,6 +1134,41 @@ fn write_job(peer: &RoutingPeer, id: Uuid, instance: Option<&str>, pending: bool
     .unwrap();
 }
 
+#[tokio::test]
+async fn a_terminal_windows_refusal_keeps_its_stored_followup_route() {
+    let f = Fixture::new(Cut::None, 28).await;
+    let peer = RoutingPeer::new(&f);
+    let id = Uuid::now_v7();
+    write_job(&peer, id, Some("windows"), false);
+    {
+        let storage = crate::storage::Storage::open(&peer.module_state).unwrap();
+        storage
+            .local_terminal(
+                TerminalRecord::new(
+                    id,
+                    Outcome::RefusedBeforeStart {
+                        reason: RefusalReason::RunnerFull,
+                    },
+                    0,
+                    0,
+                    0,
+                )
+                .with_ran(Ran::None),
+            )
+            .unwrap();
+    }
+    let motor = peer.motor(configured(f.config.clone()));
+    motor.cancel(CancelRequest::new(id)).await.unwrap();
+    motor.job_status(id).await.unwrap();
+    assert!(peer
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame, Frame::Cancel(request) if request.job_id == id)));
+    peer.assert_windows_only();
+}
+
 async fn response_bytes(result: io::Result<HandlerOutcome>) -> Vec<u8> {
     let HandlerOutcome::Response(bytes) = result.unwrap() else {
         panic!("expected response")
@@ -1368,7 +1403,9 @@ async fn windows_wrong_or_absent_accepted_echo_is_forwarded_and_cancelled() {
 async fn linux_run_omits_platform_and_forwards_linux_echo() {
     let f = Fixture::new(Cut::None, 28).await;
     let peer = RoutingPeer::new(&f);
-    let motor = peer.motor(configured(f.config.clone()));
+    let motor = peer
+        .motor(configured(f.config.clone()))
+        .test_fixture_direct_route();
     for platform in [None, Some(Platform::Linux)] {
         let mut request = f.request("true");
         request.platform = platform;
@@ -1394,7 +1431,7 @@ async fn linux_run_omits_platform_and_forwards_linux_echo() {
 }
 
 #[tokio::test]
-async fn legacy_record_with_pending_cancel_and_missing_record_stay_on_linux() {
+async fn legacy_record_with_pending_cancel_stays_on_linux_and_missing_records_are_refused() {
     let f = Fixture::new(Cut::None, 28).await;
     let peer = RoutingPeer::new(&f);
     let id = Uuid::now_v7();
@@ -1404,10 +1441,12 @@ async fn legacy_record_with_pending_cancel_and_missing_record_stay_on_linux() {
     assert!(!motor.pending(id));
     assert_eq!(motor.job_status(id).await.unwrap().state, "e2e");
     motor.cancel(CancelRequest::new(id)).await.unwrap();
+    let visits = peer.visits.lock().unwrap().len();
     let absent = Uuid::now_v7();
-    collect(motor.attach(AttachRequest::new(absent, 0)).unwrap()).await;
-    assert_eq!(motor.job_status(absent).await.unwrap().state, "e2e");
-    motor.cancel(CancelRequest::new(absent)).await.unwrap();
+    assert!(motor.attach(AttachRequest::new(absent, 0)).is_err());
+    assert!(motor.job_status(absent).await.is_err());
+    assert!(motor.cancel(CancelRequest::new(absent)).await.is_err());
+    assert_eq!(peer.visits.lock().unwrap().len(), visits);
     assert!(peer
         .visits
         .lock()
@@ -1484,7 +1523,7 @@ async fn detached_windows_cancel_retry_keeps_the_persisted_instance() {
 }
 
 #[tokio::test]
-async fn platform_reports_select_windows_and_default_linux_reply_bytes_are_unchanged() {
+async fn platform_reports_select_windows_and_linux_uses_a_hosted_placeholder() {
     let f = Fixture::new(Cut::None, 28).await;
     let peer = RoutingPeer::new(&f);
     let motor = peer.motor(configured(f.config.clone()));
@@ -1492,19 +1531,25 @@ async fn platform_reports_select_windows_and_default_linux_reply_bytes_are_uncha
         let bytes = response_bytes(crate::module::status_reply(&motor, &params).await).await;
         assert_eq!(
             bytes,
-            serde_json::to_vec(&peer.linux_status.status).unwrap()
-        );
-        let bytes =
-            response_bytes(crate::module::runner_health_reply_for(&motor, &params).await).await;
-        assert_eq!(
-            bytes,
-            serde_json::to_vec(&peer.linux_status.health).unwrap()
+            serde_json::to_vec(&StatusReply::new(
+                0,
+                Vec::new(),
+                false,
+                Vec::new(),
+                "hosted"
+            ))
+            .unwrap()
         );
     }
     for (params, expected) in [
         (
             json!({"disk":true}),
-            serde_json::to_vec(&peer.linux_status).unwrap(),
+            serde_json::to_vec(&RunnerStatusReply {
+                status: StatusReply::new(0, Vec::new(), false, Vec::new(), "hosted"),
+                disk: None,
+                health: None,
+            })
+            .unwrap(),
         ),
         (
             json!({"platform":"windows"}),
@@ -1520,15 +1565,8 @@ async fn platform_reports_select_windows_and_default_linux_reply_bytes_are_uncha
             expected
         );
     }
-    assert_eq!(
-        response_bytes(
-            crate::module::runner_health_reply_for(&motor, &json!({"platform":"windows"})).await
-        )
-        .await,
-        serde_json::to_vec(&peer.windows_status.health).unwrap()
-    );
     let visits = peer.visits.lock().unwrap();
-    assert!(visits
+    assert!(!visits
         .iter()
         .any(|v| v.instance == "e2e" && v.root.is_none()));
     assert!(visits
@@ -1537,12 +1575,10 @@ async fn platform_reports_select_windows_and_default_linux_reply_bytes_are_uncha
 }
 
 #[tokio::test]
-async fn hosted_runner_health_and_sampler_use_direct_linux_runner() {
+async fn health_sampler_skips_direct_linux_and_keeps_windows_sampling() {
     let f = Fixture::new(Cut::None, 28).await;
     let peer = RoutingPeer::new(&f);
     let mut config = configured(f.config.clone());
-    config.hosted_runners = true;
-    config.hosted_fleet_routing = false;
     config.broker_url = Some("https://unused.invalid".into());
     {
         let storage = crate::storage::Storage::open(&peer.module_state).unwrap();
@@ -1565,16 +1601,6 @@ async fn hosted_runner_health_and_sampler_use_direct_linux_runner() {
     assert_eq!(placeholder.status.rustc_version, "hosted");
     assert!(placeholder.health.is_none());
     assert!(peer.visits.lock().unwrap().is_empty());
-    let expected = peer.linux_status.health.as_deref().unwrap().clone();
-    assert_eq!(motor.runner_health().await.unwrap(), expected);
-    assert!(peer
-        .visits
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|visit| { visit.instance == config.runner_instance && visit.root.is_none() }));
-    peer.visits.lock().unwrap().clear();
-    peer.frames.lock().unwrap().clear();
     let handler = crate::module::Handler::new(config.clone()).with_motor(motor);
     handler.start_health_sampler_for_test();
     let report = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -1584,7 +1610,7 @@ async fn hosted_runner_health_and_sampler_use_direct_linux_runner() {
             if report
                 .metrics
                 .as_ref()
-                .is_some_and(|metrics| metrics["connection"]["runner"] == "ok")
+                .is_some_and(|metrics| metrics["platforms"]["windows"]["status"] == "available")
             {
                 break report;
             }
@@ -1618,7 +1644,7 @@ async fn hosted_runner_health_and_sampler_use_direct_linux_runner() {
             "{detail} {metrics}"
         );
     }
-    assert!(peer
+    assert!(!peer
         .visits
         .lock()
         .unwrap()
@@ -1661,15 +1687,6 @@ async fn windows_reports_error_when_unconfigured_or_unreachable_without_linux_fa
                 .await
                 .is_err()
         );
-        let HandlerOutcome::Error { code, message } =
-            crate::module::runner_health_reply_for(&motor, &json!({"platform":"windows"}))
-                .await
-                .unwrap()
-        else {
-            panic!("must fail")
-        };
-        assert_eq!(code, "runner_health_unavailable");
-        assert!(message.contains("windows"));
         if !configured_windows {
             assert!(peer.visits.lock().unwrap().is_empty());
         }
@@ -1755,7 +1772,6 @@ async fn hosted_switch_keeps_windows_on_its_direct_stored_route() {
     let f = Fixture::new(Cut::None, 28).await;
     let peer = RoutingPeer::new(&f);
     let mut config = configured(f.config.clone());
-    config.hosted_runners = true;
     config.broker_url = Some("https://unused.invalid".into());
     let motor = peer.motor(config.clone());
     let stream = motor
@@ -1768,7 +1784,6 @@ async fn hosted_switch_keeps_windows_on_its_direct_stored_route() {
         .any(|r| matches!(r, StreamRecord::Accepted(_))));
     assert!(motor.hosted_state(id).is_none());
     drop(motor);
-    config.hosted_runners = false;
     let restarted = super::reopen_motor(|| {
         Motor::with_connector(config.clone(), &peer.module_state, peer.clone())
     })

@@ -30,10 +30,6 @@ async fn wsl_agent_exec_run_refuses_every_field_before_all_route_states() {
             Probe::Release,
         ] {
             let mut config = h.config();
-            config.hosted_runners = matches!(route, "hosted" | "fleet");
-            config.hosted_fleet_routing = route == "fleet";
-            config.spill_to_hosted = true;
-            config.spill_after_s = 0;
             if route == "repository" {
                 config.hosted_repositories = vec![repo.display().to_string()];
             }
@@ -63,7 +59,7 @@ async fn wsl_agent_exec_run_refuses_every_field_before_all_route_states() {
                         motor.run_agent(request, None, returns).unwrap()
                     };
                     let id = stream.job_id;
-                    assert!(stream.hosted_state().is_none(), "{route} {probe:?} {field}");
+                    assert!(stream.hosted_state().is_some(), "{route} {probe:?} {field}");
                     let records = agent_stream(stream, 0).await;
                     assert_eq!(records.len(), 1, "{route} {probe:?} {field}");
                     let StreamRecord::Terminal(terminal) = &records[0] else {
@@ -86,7 +82,7 @@ async fn wsl_agent_exec_run_refuses_every_field_before_all_route_states() {
                         ),
                         (0, 0, 0)
                     );
-                    assert!(motor.hosted_state(id).is_none());
+                    assert!(!motor.hosted_state(id).unwrap().lease_attempted);
                     assert!(!state.join("spools").exists());
                 }
             }
@@ -109,8 +105,7 @@ async fn wsl_prepare_refuses_every_field_before_hosted_route_and_snapshot() {
             Probe::DistroName,
             Probe::Release,
         ] {
-            let mut config = h.config();
-            config.hosted_runners = hosted;
+            let config = h.config();
             let state = scratch.0.join(format!("wsl-prepare-{hosted}-{probe:?}"));
             let mut motor = Motor::with_connector(config, &state, peer.clone()).unwrap();
             motor.wsl = Checks::test(probe).with_canonicalize(aliases);
@@ -150,8 +145,6 @@ async fn wsl_non_drive_paths_use_normal_validation_including_fleet_path_refusals
     let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
     for route in ["off", "hosted", "fleet", "repository", "forced"] {
         let mut config = h.config();
-        config.hosted_runners = matches!(route, "hosted" | "fleet");
-        config.hosted_fleet_routing = route == "fleet";
         if route == "repository" {
             config.hosted_repositories = vec![repo.display().to_string()];
         }
@@ -198,10 +191,7 @@ async fn wsl_non_drive_paths_use_normal_validation_including_fleet_path_refusals
                 assert!(detail.contains(path), "{detail}");
                 assert!(detail.contains("under /Users or /home"), "{detail}");
             }
-            assert_eq!(
-                motor.hosted_state(id).is_some(),
-                matches!(route, "hosted" | "repository" | "forced")
-            );
+            assert!(motor.hosted_state(id).is_some());
 
             let reply = motor
                 .prepare(PrepareRequest::new(path, &root, "HEAD"))
@@ -209,19 +199,16 @@ async fn wsl_non_drive_paths_use_normal_validation_including_fleet_path_refusals
                 .unwrap();
             assert!(!reply.refusal_detail().unwrap().contains("Under WSL"));
             assert!(motor.hosted_state(reply.transfer_id).is_none());
-            if matches!(route, "hosted" | "fleet") {
-                assert_eq!(
-                    reply.refusal_detail(),
-                    Some("hosted_prepare_unsupported: hosted_no_fallback")
-                );
-            } else {
-                assert_eq!(
-                    reply.outcome,
-                    PrepareOutcome::RefusedBeforeStart {
-                        reason: RefusalReason::WorkspaceKeyRejected,
-                    }
-                );
-            }
+            assert_eq!(
+                reply.refusal_detail(),
+                Some("hosted_prepare_unsupported: hosted_no_fallback")
+            );
+            assert_eq!(
+                reply.outcome,
+                PrepareOutcome::RefusedBeforeStart {
+                    reason: RefusalReason::RequestRejected
+                }
+            );
         }
     }
     assert_eq!(peer.0.load(Ordering::SeqCst), 0);

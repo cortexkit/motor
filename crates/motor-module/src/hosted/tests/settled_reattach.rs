@@ -12,7 +12,6 @@ async fn stream_lost_after_host_settled_reattaches_and_replays_the_real_terminal
     let (scratch, repo) = committed_repo();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
     let config = Config {
-        hosted_runners: false,
         hosted_repositories: vec![repo.to_str().unwrap().into()],
         ..h.config()
     };

@@ -7,11 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn config(h: &Harness, repo: &Path) -> Config {
     Config {
-        hosted_runners: false,
         hosted_repositories: vec![repo.to_str().unwrap().into()],
-        spill_to_hosted: true,
-        spill_after_s: 0,
-        spill_avoid_host: Some("test-host".into()),
+
         network_routing: true,
         ..h.config()
     }
@@ -63,7 +60,10 @@ fn hosted_repositories_roundtrips_and_default_is_omitted() {
     );
     let restored: Config = serde_json::from_value(wire).unwrap();
     assert_eq!(restored.hosted_repositories, config.hosted_repositories);
-    assert!(!restored.hosted_runners);
+    assert!(serde_json::to_value(&restored)
+        .unwrap()
+        .get("hosted_runners")
+        .is_none());
 }
 
 #[test]
@@ -140,15 +140,7 @@ async fn repository_routed_lease_carries_the_configured_hint_without_caching_it_
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
     drop(motor);
 
-    let restored = Motor::with_connector(
-        Config {
-            hosted_fleet_routing: true,
-            ..h.config()
-        },
-        &root,
-        ssh.clone(),
-    )
-    .unwrap();
+    let restored = Motor::with_connector(Config { ..h.config() }, &root, ssh.clone()).unwrap();
     let state = restored.hosted_state(id).unwrap();
     assert_eq!(state.repository_placement_hint, Some(control_placement()));
     assert_eq!(
@@ -217,11 +209,10 @@ async fn listed_main_and_linked_agent_and_direct_jobs_use_hosted_without_avoidin
 }
 
 #[tokio::test]
-async fn unlisted_and_windows_jobs_keep_the_direct_path() {
+async fn unlisted_linux_uses_fleet_and_windows_keeps_the_direct_path() {
     let h = Harness::new(Behavior::CompleteRun).await;
     let (scratch, repo) = committed_repo();
     let mut config = config(&h, &repo);
-    config.spill_to_hosted = false;
     config.windows_runner_instance = Some("windows-test".into());
     config.windows_runner_state_root = Some("/home/test/windows".into());
     let ssh = Arc::new(DirectPeer(AtomicUsize::new(0)));
@@ -231,14 +222,20 @@ async fn unlisted_and_windows_jobs_keep_the_direct_path() {
         request(&unlisted),
         request(&repo).with_platform(Platform::Windows),
     ] {
+        let windows = request.platform == Some(Platform::Windows);
         let stream = motor.run(request).unwrap();
         let id = stream.job_id;
         let (_, terminal) = records(stream).await;
-        assert_eq!(terminal.outcome, Outcome::Exit { code: 17 });
-        assert!(motor.hosted_state(id).is_none());
+        assert_eq!(
+            terminal.outcome,
+            Outcome::Exit {
+                code: if windows { 17 } else { 23 }
+            }
+        );
+        assert_eq!(motor.hosted_state(id).is_none(), windows);
     }
-    assert_eq!(ssh.0.load(Ordering::SeqCst), 2);
-    assert!(h.lease_bodies.lock().unwrap().is_empty());
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 1);
+    assert_eq!(h.lease_bodies.lock().unwrap().len(), 1);
     assert_eq!(motor.hosted_health().unwrap()["hosted_routed_jobs_1h"], 0);
 }
 
@@ -821,32 +818,6 @@ async fn stage1_no_capacity_and_provisioning_share_one_bounded_queue_deadline() 
 }
 
 #[tokio::test]
-async fn unlisted_spill_eligible_job_still_withdraws_and_sends_allow_spill_true() {
-    let h = Harness::new(Behavior::CompleteRun).await;
-    h.broker.lock().unwrap().knobs.refusal = Some((503, "no_capacity".into()));
-    let (scratch, repo) = committed_repo();
-    let (_listed_scratch, listed) = committed_repo();
-    let peer = super::queue_tests::ResubmitPeer::new();
-    let log = peer.log.clone();
-    let mut config = config(&h, &listed);
-    config.hosted_repositories_placement_hint = Some(control_placement());
-    let motor = Motor::with_connector(config, &scratch.0.join("state"), Arc::new(peer)).unwrap();
-    let mut request = request(&repo);
-    request.queue_wait_limit_s = Some(300);
-    let stream = motor.run(request).unwrap();
-    let id = stream.job_id;
-    let (_, terminal) = records(stream).await;
-    assert!(matches!(terminal.outcome, Outcome::Exit { .. }));
-    super::queue_tests::assert_resubmitted_once(id, &log.lock().unwrap(), 300);
-    let bodies = lease_bodies(&h);
-    assert_eq!(bodies.len(), 1, "Spill does not retry no_capacity");
-    assert_eq!(bodies[0]["allow_spill"], true);
-    assert_eq!(bodies[0]["avoid_host"], "test-host");
-    assert_eq!(bodies[0]["placement_hint"], serde_json::Value::Null);
-    assert_eq!(motor.hosted_health().unwrap()["hosted_routed_jobs_1h"], 0);
-}
-
-#[tokio::test]
 async fn stage1_cloud_no_spill_reply_honors_retry_after_and_preserves_the_stored_request() {
     let vector: serde_json::Value = serde_json::from_str(include_str!(
         "../../../motor-lease/contracts/cloud/no-spill-lease.json"
@@ -911,76 +882,6 @@ pub(super) fn lease_settlement_requests(h: &Harness) -> Vec<String> {
         .collect()
 }
 
-/// A routed job asking for more vCPUs than any hosted host holds gets one
-/// lease request answered `no_host_fits`, then runs on the build server with
-/// its real exit code. Nothing was booked, so nothing is released or finished.
-/// A job that fits keeps the hosted route.
-#[tokio::test(start_paused = true)]
-async fn stage1_no_host_fits_runs_on_the_build_server_once_and_fitting_jobs_stay_hosted() {
-    let clock = HeldClock::new();
-    let h = Harness::new(Behavior::CompleteRun).await;
-    h.broker.lock().unwrap().knobs.max_vcpus = Some(8);
-    let (scratch, repo) = committed_repo();
-    let peer = super::queue_tests::ResubmitPeer::new();
-    let log = peer.log.clone();
-    let motor =
-        Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), Arc::new(peer)).unwrap();
-
-    let mut large = request(&repo);
-    large.weight_hint = Some(16);
-    let stream = motor.run(large).unwrap();
-    let id = stream.job_id;
-    let job = tokio::spawn(records(stream));
-    until("the build-server Run", || {
-        !log.lock().unwrap().runs.is_empty()
-    })
-    .await;
-    // Freeze the budget through routing, then let the direct peer's simulated
-    // queue timer run so it can send Started and Terminal.
-    drop(clock);
-    let (output, terminal) = job.await.unwrap();
-    assert_eq!(terminal.outcome, Outcome::Exit { code: 7 });
-    assert_eq!(output, b"build server output\n");
-    let bodies = lease_bodies(&h);
-    assert_eq!(bodies.len(), 1, "no_host_fits is never retried");
-    assert_eq!(bodies[0]["vcpus"], 16);
-    assert_eq!(bodies[0]["allow_spill"], false);
-    assert_eq!(*h.requests.lock().unwrap(), vec!["/v1/leases".to_owned()]);
-    assert!(lease_settlement_requests(&h).is_empty());
-    {
-        let log = log.lock().unwrap();
-        // Routing used none of the request's 30-second queue-wait budget.
-        assert_eq!(log.runs, vec![(id, 30)]);
-        assert!(log.withdraws.is_empty());
-    }
-    assert!(motor.hosted_state(id).is_none());
-    let job = motor.storage.job(id).unwrap();
-    assert!(job.hosted.is_none());
-    assert_eq!(job.routed_direct_reason.as_deref(), Some("no_host_fits"));
-    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
-
-    let _hosted_clock = HeldClock::new();
-    let mut fitting = request(&repo);
-    fitting.weight_hint = Some(8);
-    let stream = motor.run(fitting).unwrap();
-    let fitting_id = stream.job_id;
-    let (_, terminal) = records(stream).await;
-    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
-    let state = motor.hosted_state(fitting_id).unwrap();
-    assert!(state.repository_routed && state.run_sent);
-    assert_eq!(lease_bodies(&h)[1]["vcpus"], 8);
-    assert_eq!(h.runs.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        log.lock().unwrap().runs.len(),
-        1,
-        "the fitting job never reached the build server"
-    );
-
-    let health = motor.hosted_health().unwrap();
-    assert_eq!(health["hosted_no_host_fits_1h"], 1);
-    assert_eq!(health["hosted_routed_jobs_1h"], 1);
-}
-
 /// The decision to run on the build server is stored before the Run frame is
 /// sent. After a restart, with the repository still listed, attaching to the
 /// job reads its output from the build server and never asks the broker again.
@@ -995,10 +896,33 @@ async fn stage1_no_host_fits_decision_survives_restart_and_attaches_to_the_build
         let motor =
             Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), Arc::new(peer))
                 .unwrap();
-        let mut large = request(&repo);
-        large.weight_hint = Some(16);
-        let stream = motor.run(large).unwrap();
-        let id = stream.job_id;
+        let id = Uuid::now_v7();
+        motor
+            .storage
+            .create(
+                id,
+                30,
+                None,
+                Some(motor.config.runner_instance.clone()),
+                false,
+            )
+            .unwrap();
+        motor
+            .storage
+            .routed_direct_no_host_fits(id, 0, Some(8))
+            .unwrap();
+        let (stream, tx, wake) = motor.stream(id);
+        motor
+            .run_job(
+                id,
+                (request(&repo), Default::default()),
+                Vec::new(),
+                (30, false),
+                &tx,
+                wake,
+            )
+            .await
+            .unwrap();
         assert_eq!(records(stream).await.1.outcome, Outcome::Exit { code: 7 });
         motor.close().await;
         id
@@ -1027,142 +951,7 @@ async fn stage1_no_host_fits_decision_survives_restart_and_attaches_to_the_build
     let log = log.lock().unwrap();
     assert_eq!(log.attaches, vec![id]);
     assert_eq!(log.runs.len(), 1, "a restart never submits again");
-    assert_eq!(*h.requests.lock().unwrap(), vec!["/v1/leases".to_owned()]);
-    assert_eq!(motor.hosted_health().unwrap()["hosted_no_host_fits_1h"], 1);
-}
-
-/// For a spilled job `no_host_fits` is an ordinary refusal before the Run
-/// frame: the job goes back to the build server after one lease request, and
-/// it does not count as a repository-routed decision.
-#[tokio::test]
-async fn spill_no_host_fits_resubmits_to_the_build_server_without_retrying() {
-    let h = Harness::new(Behavior::CompleteRun).await;
-    h.broker.lock().unwrap().knobs.max_vcpus = Some(1);
-    let (scratch, repo) = committed_repo();
-    let (_listed_scratch, listed) = committed_repo();
-    let peer = super::queue_tests::ResubmitPeer::new();
-    let log = peer.log.clone();
-    let motor = Motor::with_connector(
-        config(&h, &listed),
-        &scratch.0.join("state"),
-        Arc::new(peer),
-    )
-    .unwrap();
-    let stream = motor.run(request(&repo)).unwrap();
-    let id = stream.job_id;
-    let (_, terminal) = records(stream).await;
-    assert_eq!(terminal.outcome, Outcome::Exit { code: 7 });
-    super::queue_tests::assert_resubmitted_once(id, &log.lock().unwrap(), 300);
-    let bodies = lease_bodies(&h);
-    assert_eq!(bodies.len(), 1, "spill does not retry no_host_fits");
-    assert_eq!(bodies[0]["allow_spill"], true);
-    assert_eq!(
-        motor
-            .storage
-            .job(id)
-            .unwrap()
-            .hosted
-            .unwrap()
-            .hosted_code
-            .as_deref(),
-        Some("hosted_no_host_fits")
-    );
-    assert_eq!(motor.hosted_health().unwrap()["hosted_no_host_fits_1h"], 0);
-}
-
-/// Time spent waiting on the broker before `no_host_fits` is taken off the
-/// queue-wait limit the build server receives, once: here a one-second
-/// `no_capacity` wait leaves 299 of the default 300 seconds.
-#[tokio::test]
-async fn stage1_no_host_fits_after_a_capacity_wait_sends_the_remaining_queue_wait() {
-    let h = Harness::new(Behavior::CompleteRun).await;
-    h.broker.lock().unwrap().knobs.max_vcpus = Some(8);
-    h.lease_replies.lock().unwrap().push_back((
-        503,
-        serde_json::json!({"error":"no_capacity"}),
-        "1",
-    ));
-    let (scratch, repo) = committed_repo();
-    let peer = super::queue_tests::ResubmitPeer::new();
-    let log = peer.log.clone();
-    let motor =
-        Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), Arc::new(peer)).unwrap();
-    let mut large = request(&repo);
-    large.weight_hint = Some(16);
-    large.queue_wait_limit_s = Some(300);
-    let stream = motor.run(large).unwrap();
-    let id = stream.job_id;
-    let (_, terminal) = records(stream).await;
-    assert_eq!(terminal.outcome, Outcome::Exit { code: 7 });
-    assert_eq!(lease_bodies(&h).len(), 2);
-    let limit = motor.storage.job(id).unwrap().queue_wait_limit_s;
-    assert!((297..300).contains(&limit), "{limit}");
-    assert_eq!(log.lock().unwrap().runs, vec![(id, limit)]);
-}
-
-/// CLOUD's pinned `no_host_fits` reply, byte for byte and without
-/// Retry-After, goes through ck-motor's real broker response parser: the
-/// routed 16-vCPU job asks once and then runs on the build server.
-#[tokio::test(start_paused = true)]
-async fn stage1_cloud_no_host_fits_reply_routes_the_job_to_the_build_server() {
-    // Loopback I/O and filesystem work must not spend the queue budget whose
-    // exact remaining value is asserted below.
-    let clock = HeldClock::new();
-    let vector: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../motor-lease/contracts/cloud/no-host-fits-lease.json"
-    ))
-    .unwrap();
-    let reply = &vector["reply"];
-    assert_eq!(reply["headers"]["Retry-After"], serde_json::Value::Null);
-    // The harness writes the stubbed body with serde_json, so these are the
-    // exact bytes CLOUD recorded.
-    assert_eq!(
-        serde_json::to_string(&reply["body"]).unwrap(),
-        reply["body_bytes"]
-    );
-    let h = Harness::new(Behavior::CompleteRun).await;
-    h.lease_replies.lock().unwrap().push_back((
-        reply["status"].as_u64().unwrap() as u16,
-        reply["body"].clone(),
-        "",
-    ));
-    let (scratch, repo) = committed_repo();
-    let peer = super::queue_tests::ResubmitPeer::new();
-    let log = peer.log.clone();
-    let motor =
-        Motor::with_connector(config(&h, &repo), &scratch.0.join("state"), Arc::new(peer)).unwrap();
-    let mut large = request(&repo);
-    large.weight_hint = Some(vector["request"]["body"]["vcpus"].as_u64().unwrap() as u32);
-    let stream = motor.run(large).unwrap();
-    let id = stream.job_id;
-    let job = tokio::spawn(records(stream));
-    until("the build-server Run", || {
-        !log.lock().unwrap().runs.is_empty()
-    })
-    .await;
-    // The Run now contains the frozen queue budget. Allow the direct peer's
-    // simulated queue timer to advance before awaiting its terminal record.
-    drop(clock);
-    let (_, terminal) = job.await.unwrap();
-    assert_eq!(terminal.outcome, Outcome::Exit { code: 7 });
-    let bodies = lease_bodies(&h);
-    assert_eq!(bodies.len(), 1);
-    assert_eq!(bodies[0]["vcpus"], vector["request"]["body"]["vcpus"]);
-    assert_eq!(
-        bodies[0]["allow_spill"],
-        vector["request"]["body"]["allow_spill"]
-    );
-    assert_eq!(*h.requests.lock().unwrap(), vec!["/v1/leases".to_owned()]);
-    assert_eq!(log.lock().unwrap().runs, vec![(id, 30)]);
-    assert_eq!(
-        motor
-            .storage
-            .job(id)
-            .unwrap()
-            .routed_direct_reason
-            .as_deref(),
-        Some("no_host_fits")
-    );
+    assert!(h.requests.lock().unwrap().is_empty());
     assert_eq!(motor.hosted_health().unwrap()["hosted_no_host_fits_1h"], 1);
 }
 

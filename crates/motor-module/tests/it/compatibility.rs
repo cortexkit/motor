@@ -230,7 +230,7 @@ async fn refuse_non_neighbour_before_transfer(motor: &crate::Motor, f: &Fixture)
 #[tokio::test]
 async fn legacy_runner_refuses_non_neighbour_siblings_before_run_and_prepare() {
     let f = Fixture::new(Cut::None, 28).await;
-    let motor = crate::Motor::with_connector(
+    let motor = crate::Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("module-state"),
         Arc::new(RunnerHello {
@@ -276,7 +276,7 @@ async fn new_direct_client_negotiates_gate_mark_with_pinned_runner() {
     assert_eq!(ready, "ready\n", "pinned runner failed before serving");
     f.use_external_runner_socket(socket);
     let hello = Arc::new(Mutex::new(None));
-    let motor = crate::Motor::with_connector(
+    let motor = crate::Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("module-state"),
         Arc::new(RunnerHello {
@@ -384,7 +384,7 @@ async fn new_agent_chunked_return_is_refused_by_pinned_runner_before_run() {
     assert_eq!(ready, "ready\n", "pinned runner failed before serving");
     f.use_external_runner_socket(socket);
     let hello = Arc::new(Mutex::new(None));
-    let motor = crate::Motor::with_connector(
+    let motor = crate::Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("module-state"),
         Arc::new(RunnerHello {
@@ -442,7 +442,7 @@ async fn new_agent_chunked_return_is_refused_by_pinned_runner_before_run() {
 async fn legacy_runner_hello_omits_direct_gate_mark() {
     let f = Fixture::new(Cut::None, 28).await;
     let hello = Arc::new(Mutex::new(None));
-    let motor = crate::Motor::with_connector(
+    let motor = crate::Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("module-state"),
         Arc::new(RunnerHello {

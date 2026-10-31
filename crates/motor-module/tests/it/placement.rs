@@ -269,6 +269,7 @@ impl Rig {
     /// Serves `handler` against a fake daemon and sends it HELLO_ACK, without
     /// waiting for anything the handler does after that.
     async fn start(handler: Handler, module_id: &str) -> Self {
+        let handler = handler.test_fixture_direct_route();
         let scratch = SocketScratch::new("mp");
         let path = scratch.join("connection.json");
         let root = scratch.join("s.ck-motor");
@@ -634,19 +635,6 @@ async fn remaining_cross_principal_and_unknown_operations_are_refused_before_par
             vec!["exec.attach", "exec.cancel", "exec.status", "unknown"],
         ),
         ("aft", Value::Null, vec!["workspace.drop", "unknown"]),
-        (
-            "basal",
-            flow_scope("motor-build-server-health", "prefrontal-core", true),
-            vec![
-                "exec.run",
-                "exec.attach",
-                "exec.cancel",
-                "exec.status",
-                "workspace.prepare",
-                "workspace.drop",
-                "unknown",
-            ],
-        ),
     ] {
         let mut rig = Rig::with_module_id(
             Arc::new(CredentialFailure(CredentialErrorClass::CredentialAbsent)),
@@ -668,24 +656,16 @@ async fn remaining_cross_principal_and_unknown_operations_are_refused_before_par
     }
 }
 #[tokio::test]
-async fn health_flow_reaches_only_the_read_only_health_report() {
+async fn removed_runner_health_is_refused_like_an_unknown_operation() {
     let mut rig = Rig::new(CredentialErrorClass::CredentialAbsent).await;
     assert_eq!(
-        rig.bind(
-            basal(),
-            flow_scope("motor-build-server-health", "prefrontal-core", true)
-        )
-        .await
-        .header
-        .ty,
+        rig.bind(aft(), Value::Null).await.header.ty,
         FrameType::Response
     );
-    // No runner is reachable in this rig, so the handler itself answers with
-    // its structured unavailability error rather than a permission refusal.
-    let reply = rig.request("runner.health", json!({})).await;
-    assert_eq!(reply.header.ty, FrameType::Error);
-    let error: Value = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(error["code"], "runner_health_unavailable");
+    for op in ["runner.health", "unknown"] {
+        let reply = rig.request(op, Value::Null).await;
+        assert_op_refused(&reply, "ck-motor", "aft", op);
+    }
     rig.stop().await;
 }
 fn absent_credentials() -> Arc<dyn CredentialResolver> {
@@ -731,8 +711,7 @@ async fn binds_are_answered_while_storage_opens_and_requests_wait_for_it() {
     rig.stop().await;
 }
 /// A request is refused with the typed, retryable `motor_unavailable` once it
-/// has waited the storage deadline, and this holds for the Basal health flow's
-/// `runner.health` too.
+/// has waited the storage deadline.
 #[tokio::test]
 async fn a_request_is_refused_as_unavailable_when_storage_misses_the_deadline() {
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -743,17 +722,11 @@ async fn a_request_is_refused_as_unavailable_when_storage_misses_the_deadline() 
         .with_storage_ready_deadline(deadline);
     let mut rig = Rig::start(handler, "ck-motor").await;
     assert_eq!(
-        rig.bind(
-            basal(),
-            flow_scope("motor-build-server-health", "prefrontal-core", true)
-        )
-        .await
-        .header
-        .ty,
+        rig.bind(aft(), Value::Null).await.header.ty,
         FrameType::Response
     );
     let started = std::time::Instant::now();
-    let reply = rig.request("runner.health", json!({})).await;
+    let reply = rig.request("exec.status", json!({})).await;
     assert!(started.elapsed() >= deadline, "refused before the deadline");
     assert_eq!(reply.header.ty, FrameType::Error);
     let error: Value = serde_json::from_slice(&reply.body).unwrap();
@@ -768,12 +741,13 @@ async fn a_request_is_refused_as_unavailable_when_storage_misses_the_deadline() 
     rig.stop().await;
 }
 #[tokio::test]
-async fn basal_routes_other_than_the_health_flow_are_refused_at_bind() {
+async fn basal_routes_including_the_retired_health_flow_are_refused_at_bind() {
     // Basal itself, another flow, a stamp core wasn't authorized to set, and a
     // stamp owned by another module all carry the basal principal.
     for scope in [
         Value::Null,
         flow_scope("some-other-flow", "prefrontal-core", true),
+        flow_scope("motor-build-server-health", "prefrontal-core", true),
         flow_scope("motor-build-server-health", "prefrontal-core", false),
         flow_scope("motor-build-server-health", "basal", true),
     ] {
@@ -1667,11 +1641,6 @@ mod request_pools {
         assert_eq!(metrics["request_pools"]["long_held_fallbacks_total"], 2);
         assert_eq!(metrics["request_pools"]["default"]["in_use"], 2);
         assert_eq!(metrics["request_pools"]["long_held"]["in_use"], 0);
-        send_body(&mut rig.daemon, 102, aft_body("runner.health", json!({}))).await;
-        let health = reply_on(&mut rig, 102).await;
-        assert_eq!(health.header.ty, FrameType::Response);
-        let health: Value = serde_json::from_slice(&health.body).unwrap();
-        assert_eq!(health["request_pools"]["long_held_fallbacks_total"], 2);
         let text = logs.text();
         let warnings: Vec<_> = text
             .lines()
@@ -1804,22 +1773,7 @@ mod request_pools {
         .await;
         assert_eq!(reply_on(&mut rig, 200).await.header.ty, FrameType::Response);
         assert_streams_held(&rig, 80).await;
-        send(
-            &mut rig.daemon,
-            FrameType::Request,
-            7,
-            201,
-            json!({"op":"runner.health", "params":{}}),
-        )
-        .await;
-        let health = reply_on(&mut rig, 201).await;
-        assert_eq!(
-            health.header.ty,
-            FrameType::Response,
-            "runner.health error: {}",
-            String::from_utf8_lossy(&health.body)
-        );
-        let health: Value = serde_json::from_slice(&health.body).unwrap();
+        let health = rig.handler.health().await.metrics.unwrap();
         assert_eq!(health["request_pools"]["long_held"]["in_use"], 80);
         assert_eq!(health["request_pools"]["long_held"]["limit"], 256);
         assert_eq!(health["request_pools"]["default"]["limit"], 64);

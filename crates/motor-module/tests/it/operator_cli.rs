@@ -216,7 +216,7 @@ impl Daemon {
         // The motor is opened here against the in-process runner, so the
         // handler never opens storage or SSH from the hello acknowledgement.
         let motor = super::reopen_motor(|| {
-            crate::Motor::with_connector(
+            crate::Motor::with_test_fixture_direct_route(
                 f.config.clone(),
                 &f.scratch.join("module-state"),
                 Arc::new(f.proxy.clone()),
@@ -1300,7 +1300,10 @@ async fn hosted_check_is_direct_only_and_mints_through_real_module_with_hosted_o
     use crate::hosted::account::tests::{refusal, token, FakeVault};
     let f = Fixture::new(Cut::None, 28).await;
     let config = direct_config(&f);
-    assert!(!config.hosted_runners);
+    assert!(serde_json::to_value(&config)
+        .unwrap()
+        .get("hosted_runners")
+        .is_none());
     let payload = motor_lease::base64url(
         &serde_json::to_vec(
             &json!({"aud":"cortexkit-runners", "account":"01KXOPERATOR", "device":"d", "jti":"j", "iat":1,"exp":u64::MAX}),

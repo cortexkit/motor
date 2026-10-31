@@ -60,7 +60,7 @@ async fn snapshots_preserve_head_real_index_status_and_refs_on_success_and_failu
     // Injecting commit-tree failure happens after hashing, and must not mutate
     // the real index even though it already holds staged content.
     f.config.inject_snapshot_failure = true;
-    let failed = Motor::with_connector(
+    let failed = Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("failure-state"),
         Arc::new(f.proxy.clone()),
@@ -436,7 +436,7 @@ fn test_control_fields_are_refused_at_main_config_load_even_if_disabled() {
     }
     fs::write(&path, "{\"runner_instance\":\"bad;command\"}").unwrap();
     assert!(Config::load(&path).is_err());
-    fs::write(&path, "{\"queue_wait_limit_s\":\"wrong type\"}").unwrap();
+    fs::write(&path, "{\"direct_exec_max_timeout_secs\":\"wrong type\"}").unwrap();
     assert!(Config::load(&path).is_err());
     fs::write(&path, "{\"unknown\":true}").unwrap();
     assert!(Config::load(&path).is_err());
@@ -604,7 +604,7 @@ async fn run_have_failure_records_only_the_run_have_step() {
     let other_step = UnreachableStep::Prepare;
     let before = unreachable_count(step);
     let other_before = unreachable_count(other_step);
-    let motor = Motor::with_connector(
+    let motor = Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("run-have-failure-state"),
         Arc::new(DisconnectDuringHave),
@@ -628,7 +628,7 @@ async fn prepare_have_failure_records_only_the_prepare_step() {
     let other_step = UnreachableStep::HaveExchange;
     let before = unreachable_count(step);
     let other_before = unreachable_count(other_step);
-    let motor = Motor::with_connector(
+    let motor = Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("prepare-have-failure-state"),
         Arc::new(DisconnectDuringHave),
@@ -775,7 +775,7 @@ async fn hello_times_out_at_fifteen_seconds_and_ssh_connect_timeout_is_ten() {
     assert!(args.last().unwrap().contains("--instance main --job "));
 }
 #[tokio::test]
-async fn prepare_status_drop_and_incremental_bundles_use_runner_replies() {
+async fn prepare_status_and_incremental_bundles_use_runner_replies_while_linux_drop_is_noop() {
     let f = Fixture::new(Cut::None, 28).await;
     let motor = f.motor();
     let prepare: PrepareRequest = serde_json::from_value(serde_json::json!({"workspace_key":f.key,"repository_root":f.main,"base_commit":git(&f.key,&["rev-parse","HEAD"]),"siblings":[f.sibling]})).unwrap();
@@ -797,8 +797,9 @@ async fn prepare_status_drop_and_incremental_bundles_use_runner_replies() {
         .drop_workspace(DropRequest::new(f.key.to_str().unwrap()))
         .await
         .unwrap();
-    assert!(drop.dropped);
-    assert!(!f.remote_key.exists());
+    assert!(!drop.dropped);
+    assert!(drop.cancelled_jobs.is_empty());
+    assert!(f.remote_key.exists());
     assert!(
         !motor
             .drop_workspace(DropRequest::new(f.key.to_str().unwrap()))
@@ -980,8 +981,13 @@ impl Connector for FutureRecords {
 #[tokio::test]
 async fn unknown_records_advance_cursor_without_fallback_or_premature_terminal() {
     let scratch = ScratchDir::new("motor-future");
+    let id = Uuid::now_v7();
+    crate::storage::Storage::open(&scratch)
+        .unwrap()
+        .create(id, 1800, None, None, false)
+        .unwrap();
     let frames = Arc::new(Mutex::new(Vec::new()));
-    let motor = Motor::with_connector(
+    let motor = Motor::with_test_fixture_direct_route(
         Config::default(),
         &scratch,
         Arc::new(FutureRecords {
@@ -989,7 +995,7 @@ async fn unknown_records_advance_cursor_without_fallback_or_premature_terminal()
         }),
     )
     .unwrap();
-    let records = collect(motor.attach(AttachRequest::new(Uuid::now_v7(), 0)).unwrap()).await;
+    let records = collect(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
     assert_eq!(records.len(), 2);
     assert!(matches!(records[0], StreamRecord::Output(_)));
     assert!(!matches!(
@@ -1099,8 +1105,13 @@ impl Connector for UnknownCursorRecovery {
 
 async fn assert_unknown_record_recovery(unknown: serde_json::Value, expected_cursor: u64) {
     let scratch = ScratchDir::new("motor-unknown-cursor");
+    let id = Uuid::now_v7();
+    crate::storage::Storage::open(&scratch)
+        .unwrap()
+        .create(id, 1800, None, None, false)
+        .unwrap();
     let attaches = Arc::new(Mutex::new(Vec::new()));
-    let motor = Motor::with_connector(
+    let motor = Motor::with_test_fixture_direct_route(
         Config::default(),
         &scratch,
         Arc::new(UnknownCursorRecovery {
@@ -1110,7 +1121,6 @@ async fn assert_unknown_record_recovery(unknown: serde_json::Value, expected_cur
         }),
     )
     .unwrap();
-    let id = Uuid::now_v7();
     let records = collect(motor.attach(AttachRequest::new(id, 6)).unwrap()).await;
     let requests = attaches.lock().unwrap();
     assert_eq!(requests.len(), 2);
@@ -1269,14 +1279,12 @@ fn manifest_advertises_exact_capability_and_all_operations() {
     for name in crate::module::OPERATIONS {
         assert!(bytes.contains(name));
     }
-    let health = value["provides"]
+    assert!(!value["provides"]
         .as_array()
         .unwrap()
         .iter()
         .flat_map(|role| role["operations"].as_array().into_iter().flatten())
-        .find(|op| op["name"] == "runner.health")
-        .expect("runner.health is advertised");
-    assert_eq!(health["kind"], "query");
+        .any(|op| op["name"] == "runner.health"));
 }
 
 #[test]
@@ -1325,9 +1333,10 @@ async fn second_worktree_bytes(f: &Fixture, history: Option<&[u8]>) -> (u64, u64
     let first_branch = commit(&f.key, "unmerged first worktree");
     let first = collect(motor.run(f.request("true")).unwrap()).await;
     assert_eq!(terminal(&first).outcome, Outcome::Exit { code: 0 });
+    // Reset the fixture's remote workspace directly; Linux workspace.drop is a no-op.
     assert!(
-        motor
-            .drop_workspace(DropRequest::new(f.key.to_str().unwrap()))
+        f.runner
+            .drop_workspace(f.remote_key.to_str().unwrap())
             .await
             .unwrap()
             .dropped
@@ -1424,7 +1433,7 @@ async fn first_tip_prepare_publishes_status_without_generation_seeding() {
         git(&f.main, &["branch", "-f", "main", &tip]);
     }
     let tip = git(&f.main, &["rev-parse", "refs/heads/main"]);
-    let motor = Motor::with_connector(
+    let motor = Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("module-state"),
         Arc::new(DefaultBranchFixtureTransport {

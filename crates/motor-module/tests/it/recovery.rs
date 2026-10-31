@@ -427,7 +427,7 @@ impl Fixture {
         }
     }
     pub fn motor(&self) -> Motor {
-        Motor::with_connector(
+        Motor::with_test_fixture_direct_route(
             self.config.clone(),
             &self.scratch.join("module-state"),
             Arc::new(self.proxy.clone()),
@@ -905,7 +905,7 @@ async fn cancel_before_seen_survives_module_restart_and_attach_cancel() {
     // Reopen the actual module storage once detached consumers release the
     // single-writer lease. Nothing in memory is handed to the new instance.
     let restarted = super::reopen_motor(|| {
-        Motor::with_connector(
+        Motor::with_test_fixture_direct_route(
             f.config.clone(),
             &f.scratch.join("module-state"),
             Arc::new(f.proxy.clone()),
@@ -1433,12 +1433,15 @@ async fn fleet_invalid_vcpus_are_refused_naming_the_field_without_direct_admissi
     )
     .await;
     let broker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    f.config.hosted_runners = true;
-    f.config.hosted_fleet_routing = true;
     f.config.broker_url = Some(format!("http://{}", broker.local_addr().unwrap()));
     f.config.broker_token_source = crate::BrokerTokenSource::Fake;
     std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
-    let motor = f.motor();
+    let motor = Motor::with_connector(
+        f.config.clone(),
+        &f.scratch.join("module-state"),
+        Arc::new(f.proxy.clone()),
+    )
+    .unwrap();
     let marker = f.scratch.join("unexpected-start");
     for claim in [0, 65] {
         let mut request = f.request(&format!("touch '{}'", marker.display()));
@@ -1449,7 +1452,7 @@ async fn fleet_invalid_vcpus_are_refused_naming_the_field_without_direct_admissi
         request.weight_hint = Some(claim);
         let stream = motor.run(request).unwrap();
         let id = stream.job_id;
-        assert!(stream.hosted_state().is_none());
+        assert!(stream.hosted_state().is_some());
         let records = collect(stream).await;
         let terminal = terminal(&records);
         assert_eq!(
@@ -1555,7 +1558,7 @@ impl Connector for AuthenticationFaultConnector {
 async fn assert_grouped_authentication_fault(code: &'static str) {
     let f = Fixture::new(Cut::None, 28).await;
     let connector = Arc::new(AuthenticationFaultConnector(code));
-    let motor = Motor::with_connector(
+    let motor = Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("fault-state"),
         connector.clone(),
@@ -1644,7 +1647,7 @@ authentication_fault_test!(
 #[tokio::test]
 async fn future_connector_fault_keeps_unknown_reason_without_private_cause() {
     let f = Fixture::new(Cut::None, 28).await;
-    let motor = Motor::with_connector(
+    let motor = Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("future-fault-state"),
         Arc::new(AuthenticationFaultConnector("future_connector_fault")),
@@ -1693,7 +1696,7 @@ async fn authentication_fault_after_connect_keeps_safe_code_in_run_refusal() {
         }
     }
     let f = Fixture::new(Cut::None, 28).await;
-    let motor = Motor::with_connector(
+    let motor = Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("late-fault-state"),
         Arc::new(LateFault(std::sync::atomic::AtomicBool::new(false))),
@@ -1742,7 +1745,7 @@ async fn connector_retry_hint_reaches_run_and_prepare_refusals() {
     }
     let f = Fixture::new(Cut::None, 28).await;
     for late in [false, true] {
-        let motor = Motor::with_connector(
+        let motor = Motor::with_test_fixture_direct_route(
             f.config.clone(),
             &f.scratch.join(format!("hinted-fault-{late}")),
             Arc::new(HintedFault {

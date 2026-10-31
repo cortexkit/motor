@@ -2,7 +2,7 @@
 //! pending. Whatever the broker answers afterwards, every booking it grants
 //! must be settled with exactly one finish or release, and the caller keeps
 //! the result it was already given.
-use super::queue_tests::{fixture_repo, ResubmitPeer};
+use super::queue_tests::ResubmitPeer;
 use super::*;
 use crate::hosted::test_http::Requests;
 use cortexkit_test_support::ScratchDir;
@@ -14,8 +14,7 @@ fn spill_config(broker_url: &str) -> Config {
         runner_instance: "test".into(),
         broker_token_source: crate::BrokerTokenSource::Fake,
         broker_url: Some(broker_url.into()),
-        spill_to_hosted: true,
-        spill_after_s: 0,
+
         ..Config::default()
     }
 }
@@ -76,6 +75,9 @@ async fn start_spill(motor: &Motor, repo: &Path, wait: u64) -> JobStream {
         .storage
         .create(id, wait, None, Some("test".into()), false)
         .unwrap();
+    let mut route = crate::HostedJobState::new(&motor.config);
+    route.spill_wait_ms = Some(0);
+    motor.storage.hosted_route(id, route).unwrap();
     let path = repo.to_str().unwrap();
     let request = RunRequest::new(path, path, path, "sleep 7200").with_timeout(7_200);
     let (stream, tx, wake) = motor.stream(id);
@@ -109,7 +111,7 @@ async fn cancel_without_a_granted_lease_settles_the_never_ran_booking_once() {
     let boat = crate::hosted::boat_tests::Boat::new(0, false).await;
     boat.hold_provisioning.store(true, Ordering::SeqCst);
     let scratch = ScratchDir::new("cancel-no-lease");
-    let repo = fixture_repo(&scratch);
+    let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
     let motor = Motor::with_connector(
         spill_config(boat.config.broker_url.as_ref().unwrap()),
         &scratch.join("state"),

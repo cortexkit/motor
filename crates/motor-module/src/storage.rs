@@ -551,6 +551,7 @@ impl Storage {
             .map(|(id, job)| (*id, job.clone()))
             .collect()
     }
+    #[cfg(test)]
     pub(crate) fn last_hosted(&self) -> Option<crate::HostedJobState> {
         self.state
             .lock()
@@ -563,6 +564,7 @@ impl Storage {
     }
     /// Retained leases are the client's only host inventory; they are not live
     /// capacity samples. Keep the newest job per first-party host for health.
+    #[cfg(test)]
     pub(crate) fn last_hosted_per_host(&self) -> BTreeMap<String, (Uuid, crate::HostedJobState)> {
         let state = self.state.lock().unwrap();
         let mut hosts = BTreeMap::new();
@@ -579,9 +581,11 @@ impl Storage {
         }
         hosts
     }
+    #[cfg(test)]
     pub(crate) fn hosted_routed_jobs_1h(&self) -> usize {
         self.hosted_routed_jobs_1h_at(now_ms())
     }
+    #[cfg(test)]
     fn hosted_routed_jobs_1h_at(&self, now: u64) -> usize {
         self.jobs_minted_in_last_hour(now, |job| {
             job.hosted
@@ -591,9 +595,11 @@ impl Storage {
     }
     /// Repository- or fleet-routed jobs in the last hour that the broker
     /// answered `no_host_fits`, and that therefore ran on the build server.
+    #[cfg(test)]
     pub(crate) fn hosted_no_host_fits_1h(&self) -> usize {
         self.hosted_no_host_fits_1h_at(now_ms())
     }
+    #[cfg(test)]
     fn hosted_no_host_fits_1h_at(&self, now: u64) -> usize {
         self.jobs_minted_in_last_hour(now, |job| {
             job.routed_direct_reason.as_deref() == Some(NO_HOST_FITS)
@@ -601,6 +607,7 @@ impl Storage {
     }
     /// Counts the jobs matching `matches` whose job ID was minted in the hour
     /// before `now`. Job IDs are UUIDv7, so the ID carries its creation time.
+    #[cfg(test)]
     fn jobs_minted_in_last_hour(&self, now: u64, matches: impl Fn(&Job) -> bool) -> usize {
         self.state
             .lock()
@@ -631,6 +638,7 @@ impl Storage {
     /// rounded down to whole seconds, and a positive limit stays at least one
     /// second, because the build server reads zero as "refuse if it has to
     /// queue at all".
+    #[cfg(test)]
     pub(crate) fn routed_direct_no_host_fits(
         &self,
         id: Uuid,
@@ -1011,6 +1019,26 @@ impl Storage {
             });
         })
     }
+    pub(crate) fn refused_authorized(
+        &self,
+        terminal: TerminalRecord,
+        direct_secret_hash: Option<[u8; 32]>,
+    ) -> io::Result<()> {
+        // Publish the refusal and its ownership together, so a follow-up can
+        // never mistake an unbound new job for a pre-cutover direct record.
+        self.update(|s| {
+            s.jobs.insert(
+                terminal.job_id,
+                Job {
+                    gate_job: direct_secret_hash.is_some(),
+                    direct_secret_hash,
+                    local_terminal: Some(terminal),
+                    terminal_observed_at_ms: Some(now_ms()),
+                    ..Job::default()
+                },
+            );
+        })
+    }
     pub(crate) fn cancel_acknowledged(&self, id: Uuid) -> io::Result<()> {
         self.update(|s| {
             let streamed = s.active_jobs.contains_key(&id);
@@ -1082,6 +1110,7 @@ impl Storage {
     /// A replacement default budget is measured from the original UUID's mint
     /// time. Store only its remaining seconds in the existing budget field so
     /// older clients enforce the same deadline after a restart.
+    #[cfg(test)]
     pub(crate) fn resubmitted(
         &self,
         id: Uuid,

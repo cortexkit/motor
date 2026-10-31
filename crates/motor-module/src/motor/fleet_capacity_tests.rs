@@ -14,16 +14,10 @@ use crate::hosted::{
         harness::{Behavior, Harness, NoSsh},
     },
 };
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Mutex,
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn config(h: &Harness) -> Config {
-    Config {
-        hosted_fleet_routing: true,
-        ..h.config()
-    }
+    Config { ..h.config() }
 }
 
 /// Tenant 1's advertisement while stopped, in MiB: its 78 GiB of guest RAM
@@ -380,115 +374,13 @@ async fn fleet_without_capacity_refuses_at_the_queue_budget_not_after_three_plac
     assert_eq!(peer.0.load(Ordering::SeqCst), 0);
 }
 
-/// Job ids and claimed vCPUs of the Run frames a build-server double received.
-type RunLog = Arc<Mutex<Vec<(Uuid, Option<u32>)>>>;
-
-/// A build server that serves Linux claims of up to 16 vCPUs and refuses a
-/// larger one before start with `runner_full`, naming its limit, as it does
-/// when Linux jobs are confined to a CPU list under `--max-weight 16`.
-#[derive(Default)]
-struct SixteenVcpuRunner {
-    /// Each Run frame received: job id and claimed vCPUs.
-    runs: RunLog,
-    /// Replaces the refusal detail, to exercise the detail size limit.
-    detail: Mutex<Option<String>>,
-}
-type Connection<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = io::Result<Box<dyn crate::Duplex>>> + Send + 'a>,
->;
-impl Connector for SixteenVcpuRunner {
-    fn connect_to<'a>(
-        &'a self,
-        id: Uuid,
-        _instance: &'a str,
-        _state_root: Option<&'a str>,
-    ) -> Connection<'a> {
-        self.connect(id)
-    }
-    fn connect(&self, id: Uuid) -> Connection<'_> {
-        let detail = self.detail.lock().unwrap().clone();
-        let runs = self.runs.clone();
-        Box::pin(async move {
-            let (client, mut peer) = tokio::io::duplex(65536);
-            tokio::spawn(async move {
-                assert!(matches!(
-                    read_frame_async(&mut peer).await.unwrap(),
-                    Some(Frame::Hello { .. })
-                ));
-                write_frame_async(
-                    &mut peer,
-                    &Frame::Hello {
-                        protocol_version: PROTOCOL_VERSION,
-                        started: true,
-                        default_branch_tip: false,
-                        gate_jobs: true,
-                        platforms: vec!["linux".into()],
-                        return_paths: true,
-                        return_chunked_max_bytes: None,
-                        return_chunked: false,
-                        sibling_paths: false,
-                    },
-                )
-                .await
-                .unwrap();
-                while let Some(frame) = read_frame_async(&mut peer).await.unwrap() {
-                    match frame {
-                        Frame::Heartbeat { .. } => {}
-                        Frame::Have { repositories, .. } => {
-                            write_frame_async(
-                                &mut peer,
-                                &Frame::HaveReply {
-                                    repositories,
-                                    git_dependencies: Some(vec![]),
-                                },
-                            )
-                            .await
-                            .unwrap();
-                        }
-                        Frame::Run(run) => {
-                            let claim = run.weight_hint.unwrap_or(2);
-                            assert!(claim > 16, "only oversized claims reach this runner");
-                            runs.lock().unwrap().push((id, run.weight_hint));
-                            let refusal = Refusal {
-                                job_id: Some(id),
-                                transfer_id: None,
-                                reason: RefusalReason::RunnerFull,
-                                disk_full: None,
-                                retry_after_ms: None,
-                                detail: Some(detail.unwrap_or_else(|| {
-                                    format!("vcpu request {claim} is outside the supported range 1..=16 (Linux job claim limit)")
-                                })),
-                            };
-                            write_frame_async(&mut peer, &Frame::Refusal(refusal))
-                                .await
-                                .unwrap();
-                            return;
-                        }
-                        other => panic!("unexpected direct frame: {other:?}"),
-                    }
-                }
-            });
-            Ok(Box::new(client) as Box<dyn crate::Duplex>)
-        })
-    }
-}
-
-/// A 22-vCPU fleet job gets the broker's 422 `no_host_fits`, is corrected to
-/// the build server before any Run, and is refused there before start with
-/// `runner_full`. The refusal names both limits: the build server's 16 and
-/// `hosted max_vcpus 21` from the broker's answer, or `unknown` when the
-/// answer named no number. A job outside the lease time limit is rejected
-/// naming timeout_s, without contacting either runner. None of these jobs
-/// waits or is submitted twice.
+/// Requests that cannot fit are refused by the broker, never tried on another Linux endpoint.
 #[tokio::test]
-async fn invalid_fleet_timeouts_are_refused_while_valid_oversized_jobs_name_capacity_limits() {
-    let detail_max = motor_protocol::REFUSAL_DETAIL_MAX_BYTES;
-    let long = "é".repeat(detail_max);
-    for (claim, timeout, stub_without_max, long_detail, leases, suffix) in [
-        (22, 600, false, false, 1, Some("; hosted max_vcpus 21")),
-        (22, 600, true, false, 1, Some("; hosted max_vcpus unknown")),
-        (17, 21601, false, false, 0, None),
-        (22, 600, false, true, 1, Some("; hosted max_vcpus 21")),
+async fn invalid_fleet_timeouts_and_no_host_fits_are_typed_without_a_direct_probe() {
+    for (claim, timeout, stub_without_max, leases) in [
+        (22, 600, false, 1),
+        (22, 600, true, 1),
+        (17, 21601, false, 0),
     ] {
         let h = Harness::new(Behavior::CompleteRun).await;
         h.broker.lock().unwrap().knobs.max_vcpus = Some(21);
@@ -500,10 +392,7 @@ async fn invalid_fleet_timeouts_are_refused_while_valid_oversized_jobs_name_capa
             ));
         }
         let (scratch, repo) = committed_repo();
-        let peer = Arc::new(SixteenVcpuRunner::default());
-        if long_detail {
-            *peer.detail.lock().unwrap() = Some(long.clone());
-        }
+        let peer = Arc::new(NoSsh(AtomicUsize::new(0)));
         let motor =
             Motor::with_connector(config(&h), &scratch.0.join("state"), peer.clone()).unwrap();
         let mut request = request(&repo);
@@ -515,51 +404,39 @@ async fn invalid_fleet_timeouts_are_refused_while_valid_oversized_jobs_name_capa
         assert_eq!(
             terminal.outcome,
             Outcome::RefusedBeforeStart {
-                reason: if suffix.is_some() {
-                    RefusalReason::RunnerFull
-                } else {
-                    RefusalReason::RequestRejected
-                }
+                reason: RefusalReason::RequestRejected
             }
         );
         assert_eq!(terminal.ran, Some(Ran::None));
         let detail = terminal.refusal_detail.unwrap();
-        match suffix {
-            Some(suffix) => {
-                assert!(detail.ends_with(suffix), "{detail}");
-                assert!(detail.len() <= detail_max);
-                if long_detail {
-                    assert!(detail.starts_with("éé"), "{detail}");
-                } else {
-                    assert!(detail.contains("1..=16"), "{detail}");
-                }
-                let job = motor.storage.job(id).unwrap();
-                assert_eq!(job.routed_direct_reason.as_deref(), Some("no_host_fits"));
-            }
-            None => {
-                assert!(detail.contains("timeout_s"), "{detail}");
-                assert!(detail.contains("10..=21600"), "{detail}");
-                assert!(motor
-                    .storage
-                    .job(id)
-                    .unwrap()
-                    .routed_direct_reason
-                    .is_none());
-            }
-        }
-        assert!(motor.hosted_state(id).is_none());
-        if suffix.is_some() {
-            assert_eq!(*peer.runs.lock().unwrap(), vec![(id, Some(claim))]);
+        if leases == 1 {
+            assert_eq!(detail, "hosted_no_host_fits");
         } else {
-            assert!(peer.runs.lock().unwrap().is_empty());
+            assert!(detail.contains("timeout_s"), "{detail}");
+            assert!(detail.contains("10..=21600"), "{detail}");
         }
+        assert!(motor
+            .storage
+            .job(id)
+            .unwrap()
+            .routed_direct_reason
+            .is_none());
+        assert!(motor.hosted_state(id).is_some());
+        assert_eq!(peer.0.load(Ordering::SeqCst), 0);
         let bodies = lease_bodies(&h);
         assert_eq!(bodies.len(), leases);
         if leases == 1 {
             assert_eq!(bodies[0]["vcpus"], 22);
         }
         assert_eq!(h.runs.load(Ordering::SeqCst), 0);
-        assert!(lease_settlement_requests(&h).is_empty());
+        assert_eq!(
+            lease_settlement_requests(&h),
+            if leases == 1 {
+                vec![format!("/v1/leases/{id}/release")]
+            } else {
+                Vec::new()
+            }
+        );
     }
 }
 

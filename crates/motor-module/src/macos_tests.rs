@@ -18,14 +18,14 @@ fn runner() -> MacosRunner {
 }
 
 #[test]
-fn macos_config_defaults_preserve_legacy_bytes_and_omit_every_endpoint_default() {
+fn macos_config_defaults_omit_endpoint_defaults_and_retired_linux_keys() {
     let config = Config {
         worktree_roots: vec!["/worktrees".into()],
         ..Default::default()
     };
     assert_eq!(
         serde_json::to_string(&config).unwrap(),
-        r#"{"runner_instance":"main","worktree_roots":["/worktrees"],"queue_wait_limit_s":300,"ssh_config_override":null,"inject_tree_hash_mismatch":false,"inject_snapshot_failure":false}"#
+        r#"{"runner_instance":"main","worktree_roots":["/worktrees"],"ssh_config_override":null,"inject_tree_hash_mismatch":false,"inject_snapshot_failure":false}"#
     );
     assert_eq!(
         serde_json::to_value(MacosRunner::default()).unwrap(),

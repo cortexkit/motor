@@ -26,7 +26,7 @@ use subc_protocol::{
         ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
         StorageScope, TrustTier,
     },
-    scope::{ScopeStamp, FLOW_SCOPES_CAPABILITY},
+    scope::FLOW_SCOPES_CAPABILITY,
     ModuleHelloAckBody, Principal,
 };
 
@@ -131,25 +131,9 @@ pub const OPERATIONS: &[&str] = &[
     "exec.attach",
     "exec.cancel",
     "exec.status",
-    "runner.health",
     "workspace.prepare",
     "workspace.drop",
 ];
-/// The one flow admitted to ck-motor: it reads `runner.health` every half hour
-/// and wakes MOTOR when the build server's health changes. Its source lives in
-/// `.cortexkit/flows/motor-build-server-health/`.
-pub(crate) const HEALTH_FLOW_ID: &str = "motor-build-server-health";
-
-/// A flow route is the health flow when the daemon stamped it with a scope that
-/// prefrontal-core owns and was authorized to set, naming that flow. The stamp
-/// is the daemon's, so a flow can't claim another flow's id.
-fn is_health_flow(scope: Option<&ScopeStamp>) -> bool {
-    scope.is_some_and(|scope| {
-        matches!(&scope.owner, Principal::Reserved { module_id } if module_id == "prefrontal-core")
-            && scope.owner_authorized
-            && scope.attributes.flow_id.as_deref() == Some(HEALTH_FLOW_ID)
-    })
-}
 
 /// Advertised only when the Windows runner is configured; AFT sends
 /// `runon: "windows"` only to a module that lists it. The daemon refuses a
@@ -224,7 +208,7 @@ pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest 
                 .iter()
                 .map(|name| ManagementOperation {
                     name: (*name).into(),
-                    kind: if matches!(*name, "exec.status" | "runner.health") {
+                    kind: if *name == "exec.status" {
                         ManagementOperationKind::Query
                     } else {
                         ManagementOperationKind::Mutate
@@ -346,6 +330,8 @@ pub struct Handler {
     /// a permit, so tests can observe requests that arrive during the open.
     #[cfg(test)]
     storage_gate: Option<Arc<tokio::sync::Semaphore>>,
+    #[cfg(test)]
+    test_fixture_direct_route: bool,
     health_cache: Arc<Mutex<crate::health_cache::HealthCache>>,
     health_sampler: Arc<Mutex<crate::health_cache::Sampler>>,
     write_engram_catalog: bool,
@@ -439,6 +425,8 @@ impl Handler {
             storage_ready_deadline: STORAGE_READY_DEADLINE,
             #[cfg(test)]
             storage_gate: None,
+            #[cfg(test)]
+            test_fixture_direct_route: false,
             health_cache: Arc::new(Mutex::new(health_cache)),
             health_sampler: Arc::new(Mutex::new(crate::health_cache::Sampler::default())),
             write_engram_catalog: false,
@@ -446,6 +434,11 @@ impl Handler {
     }
     pub fn with_engram_catalog(mut self) -> Self {
         self.write_engram_catalog = true;
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn test_fixture_direct_route(mut self) -> Self {
+        self.test_fixture_direct_route = true;
         self
     }
     pub fn with_module_id(mut self, module_id: impl Into<String>) -> Self {
@@ -561,6 +554,10 @@ impl Handler {
             let opened = tokio::task::spawn_blocking(move || Motor::open(config, &path)).await;
             match opened.unwrap_or_else(|error| Err(io::Error::other(error))) {
                 Ok(mut motor) => {
+                    #[cfg(test)]
+                    if self.test_fixture_direct_route {
+                        motor = motor.test_fixture_direct_route();
+                    }
                     if let Some(tokens) = &self.account_tokens {
                         motor = motor.with_account_tokens(tokens.clone());
                     }
@@ -632,13 +629,6 @@ impl Handler {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                let sample = tokio::time::timeout(
-                    crate::health_cache::SAMPLE_TIMEOUT,
-                    motor.runner_health(),
-                )
-                .await
-                .ok()
-                .and_then(Result::ok);
                 let windows = motor.windows_health().await;
                 let macos = motor.macos_health().await;
                 let jobs = tokio::time::timeout(
@@ -647,22 +637,15 @@ impl Handler {
                 )
                 .await
                 .ok();
-                let account = if config.hosted_runners
-                    || !config.hosted_repositories.is_empty()
-                    || config.spill_to_hosted
-                {
-                    tokio::time::timeout(
-                        crate::health_cache::SAMPLE_TIMEOUT,
-                        crate::hosted::check::check(tokens.as_ref(), &config),
-                    )
-                    .await
-                    .ok()
-                    .map(crate::health_cache::account_health)
-                } else {
-                    None
-                };
+                let account = tokio::time::timeout(
+                    crate::health_cache::SAMPLE_TIMEOUT,
+                    crate::hosted::check::check(tokens.as_ref(), &config),
+                )
+                .await
+                .ok()
+                .map(crate::health_cache::account_health);
                 let mut cache = cache.lock().unwrap();
-                cache.update(sample, std::time::Instant::now());
+                cache.update(account.is_some(), std::time::Instant::now());
                 cache.windows = windows;
                 cache.macos = macos;
                 cache.jobs = jobs;
@@ -1023,14 +1006,6 @@ impl ModuleHandler for Handler {
         match request.principal.as_ref() {
             Some(Principal::Reserved { module_id })
                 if module_id == "aft" || module_id == "prefrontal-core" => {}
-            // Basal runs every scheduled flow, so all their routes share the
-            // reserved:basal principal and it can't tell flows apart. The
-            // daemon also stamps each route with the scope it was opened under,
-            // which names the flow and can't be forged by the flow. Only the
-            // build-server health flow is admitted, and the request handler
-            // then allows it the read-only runner.health report only.
-            Some(Principal::Reserved { module_id })
-                if module_id == "basal" && is_health_flow(request.scope.as_ref()) => {}
             Some(Principal::Direct) if self.config.admit_direct_exec => {}
             Some(Principal::Direct) => {
                 return BindDecision::reject(
@@ -1047,7 +1022,7 @@ impl ModuleHandler for Handler {
             Some(Principal::Reserved { module_id }) => {
                 return BindDecision::reject(
                     "motor_principal_refused",
-                    format!("{} refuses reserved:{module_id}; only reserved:aft, reserved:prefrontal-core and the {HEALTH_FLOW_ID} flow may bind", self.module_id),
+                    format!("{} refuses reserved:{module_id}; only reserved:aft and reserved:prefrontal-core may bind", self.module_id),
                 )
             }
         }
@@ -1125,7 +1100,10 @@ impl ModuleHandler for Handler {
                 _ => {
                     return Ok(HandlerOutcome::Error {
                         code: "motor_route_not_admitted".into(),
-                        message: format!("{} requires an admitted reserved:aft, reserved:prefrontal-core or reserved:basal route", self.module_id),
+                        message: format!(
+                        "{} requires an admitted reserved:aft or reserved:prefrontal-core route",
+                        self.module_id
+                    ),
                     })
                 }
             };
@@ -1133,24 +1111,31 @@ impl ModuleHandler for Handler {
             // the daemon-attested route principal before parsing any op params.
             let permitted = match envelope.op.as_str() {
                 "exec.run" | "exec.attach" | "exec.cancel" | "exec.status" => module_id == "aft",
-                "runner.health" => {
-                    module_id == "aft" || module_id == "prefrontal-core" || module_id == "basal"
-                }
                 "workspace.prepare" | "workspace.drop" => module_id == "prefrontal-core",
                 _ => false,
             };
             if !permitted {
                 return Ok(HandlerOutcome::Error {
                     code: "motor_op_not_permitted_for_principal".into(),
-                    message: format!("{} refuses {} for reserved:{module_id}", self.module_id, envelope.op),
+                    message: format!(
+                        "{} refuses {} for reserved:{module_id}",
+                        self.module_id, envelope.op
+                    ),
                 });
             }
             self.record_pool_fallback(&envelope.op, &body);
             let motor = self.ready().await?;
             let principal = format!("reserved:{module_id}");
-            if matches!(envelope.op.as_str(), "exec.attach" | "exec.cancel" | "exec.status") {
-                if let Some(id) = envelope.params.get("job_id")
-                    .and_then(Value::as_str).and_then(|id| id.parse().ok()) {
+            if matches!(
+                envelope.op.as_str(),
+                "exec.attach" | "exec.cancel" | "exec.status"
+            ) {
+                if let Some(id) = envelope
+                    .params
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| id.parse().ok())
+                {
                     if !motor.submission_owned(id, &principal) {
                         return Ok(HandlerOutcome::Error {
                             code: "motor_job_not_found".into(),
@@ -1163,10 +1148,12 @@ impl ModuleHandler for Handler {
                 "exec.run" => {
                     let mut request: RunRequest = match serde_json::from_value(envelope.params) {
                         Ok(request) => request,
-                        Err(error) => return Ok(HandlerOutcome::Error {
-                            code: "invalid_params".into(),
-                            message: error.to_string(),
-                        }),
+                        Err(error) => {
+                            return Ok(HandlerOutcome::Error {
+                                code: "invalid_params".into(),
+                                message: error.to_string(),
+                            })
+                        }
                     };
                     if let Some(refusal) = return_cap_refusal(&self.config, &request) {
                         return Ok(refusal);
@@ -1228,19 +1215,7 @@ impl ModuleHandler for Handler {
                         .cancel(serde_json::from_value(envelope.params).map_err(io::Error::other)?)
                         .await?,
                 ),
-                "exec.status" => {
-                    status_reply(motor, &envelope.params).await
-                },
-                "runner.health" => {
-                    let outcome = runner_health_reply_for(motor, &envelope.params).await?;
-                    if let HandlerOutcome::Response(body) = outcome {
-                        let mut health: Value = serde_json::from_slice(&body).map_err(io::Error::other)?;
-                        health["request_pools"] = self.pool_metrics();
-                        response(health)
-                    } else {
-                        Ok(outcome)
-                    }
-                },
+                "exec.status" => status_reply(motor, &envelope.params).await,
                 "workspace.prepare" => response(
                     motor
                         .prepare(serde_json::from_value(envelope.params).map_err(io::Error::other)?)
@@ -1384,28 +1359,6 @@ pub(crate) async fn status_reply(
         response(motor.disk_status().await)
     } else {
         response(motor.status().await)
-    }
-}
-#[cfg(test)]
-pub(crate) async fn runner_health_reply(motor: &Motor) -> io::Result<HandlerOutcome> {
-    runner_health_reply_for(motor, &json!({})).await
-}
-pub(crate) async fn runner_health_reply_for(
-    motor: &Motor,
-    params: &serde_json::Value,
-) -> io::Result<HandlerOutcome> {
-    let platform = optional_platform(params)?;
-    if platform != Some(motor_protocol::Platform::Windows) {
-        if let Some(health) = motor.hosted_health() {
-            return response(health);
-        }
-    }
-    match motor.runner_health_for(platform.as_ref()).await {
-        Ok(health) => response(health),
-        Err(error) => Ok(HandlerOutcome::Error {
-            code: "runner_health_unavailable".into(),
-            message: error.to_string(),
-        }),
     }
 }
 fn optional_platform(params: &serde_json::Value) -> io::Result<Option<motor_protocol::Platform>> {
@@ -1574,7 +1527,6 @@ mod health_tests {
         future::Future,
         pin::Pin,
         sync::atomic::{AtomicUsize, Ordering},
-        time::Duration,
     };
 
     struct CountingConnector(Arc<AtomicUsize>);
@@ -1651,23 +1603,23 @@ mod health_tests {
         let mut motor = Motor::open(Config::default(), &scratch).unwrap();
         motor.set_connector(Arc::new(CountingConnector(calls.clone())));
         let handler = Handler::new(Config::default()).with_motor(motor);
-        let sample: RunnerHealth = serde_json::from_value(json!({
-            "runner_version": "cached", "since_ms": 0, "window_minutes": 60,
-            "free_bytes": 100, "queue_depth": 2, "running": [],
-            "counts": {"accepted": 0, "refusals": {}, "evictions": 0, "eviction_bytes": 0,
-                "eviction_failures": 0, "soft_goal_unmet_passes": 0, "skipped_recent": 0},
-            "permits_held": 4, "permits_cap": 8,
-            "queue_wait_1h": {"p50_ms": 1000, "p90_ms": 90000, "refusals": 1}
-        }))
-        .unwrap();
         handler
             .health_cache
             .lock()
             .unwrap()
-            .update(Some(sample), std::time::Instant::now());
-        let report = tokio::time::timeout(Duration::from_millis(100), handler.health())
-            .await
-            .unwrap();
+            .update(true, std::time::Instant::now());
+        {
+            let mut cache = handler.health_cache.lock().unwrap();
+            cache.account = Some(json!({"sign_in":"signed in", "broker":"ok"}));
+            cache.jobs = Some(json!({"linux":{"waiting_for_capacity":1}}));
+        }
+        let mut health = Box::pin(handler.health());
+        let std::task::Poll::Ready(report) = health
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+        else {
+            panic!("cached health must return without waiting for I/O");
+        };
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
@@ -1679,9 +1631,10 @@ mod health_tests {
             "busy (queueing)"
         );
         assert!(report.detail.unwrap().contains("linux: busy"));
+        handler.health_cache.lock().unwrap().account = None;
         handler.start_health_sampler();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while calls.load(Ordering::SeqCst) == 0 {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while handler.health_cache.lock().unwrap().account.is_none() {
                 tokio::task::yield_now().await;
             }
         })
@@ -1690,8 +1643,8 @@ mod health_tests {
         handler.shutdown().await;
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            1,
-            "the background sampler owns runner calls"
+            0,
+            "the background sampler must not probe direct Linux"
         );
     }
 }
