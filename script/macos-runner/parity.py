@@ -59,8 +59,14 @@ def tree_digest(directory):
 # Build-server components the current macOS image does not carry yet. Each one
 # reaches macOS with the next macOS image build, and is removed from this set
 # then. llvm-tools was added to the build server on 27 Oct 2026 for iOS cross
-# builds, which macOS VMs build with Xcode's own tools instead.
-PENDING_MACOS_COMPONENTS = {"llvm-tools"}
+# builds, which macOS VMs build with Xcode's own tools instead. rust-analyzer
+# was added on 30 Oct 2026 for a Linux job that runs it.
+PENDING_MACOS_COMPONENTS = {"llvm-tools", "rust-analyzer"}
+
+# Build-server toolchains the current macOS image does not carry yet, removed
+# here with the next macOS image build. 1.92.0 was added to the build server on
+# 30 Oct 2026 for a Linux minimum-supported-Rust-version check.
+PENDING_MACOS_TOOLCHAINS = {"1.92.0"}
 
 
 def macos_components(server_components):
@@ -86,6 +92,8 @@ def validate(manifest, server):
     expected = {}
     for name, spec in server["rust_toolchains"].items():
         version = name.removesuffix("-x86_64-unknown-linux-gnu")
+        if version in PENDING_MACOS_TOOLCHAINS:
+            continue
         components = macos_components(spec["components"])
         expected[version + "-" + HOST] = {
             "rustc": spec["rustc"], "targets": [HOST], "components": components}

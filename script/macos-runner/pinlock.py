@@ -16,6 +16,8 @@ AGENT_COMMIT = "27b3c6cecc2d4f1b439434d246fc41d6a6249804"
 def seed(server):
     chains = {}
     for name, spec in server["rust_toolchains"].items():
+        if name.removesuffix("-x86_64-unknown-linux-gnu") in parity.PENDING_MACOS_TOOLCHAINS:
+            continue
         name = name.replace("x86_64-unknown-linux-gnu", parity.HOST)
         chains[name] = {
             "rustc": spec["rustc"],

@@ -109,6 +109,16 @@ class ParityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "differ from build-server"):
             parity.validate(self.manifest, server)
 
+    def test_pending_toolchain_is_skipped_but_any_other_new_toolchain_is_not(self):
+        server = copy.deepcopy(SERVER)
+        chains = server["rust_toolchains"]
+        base = chains["1.99.0-x86_64-unknown-linux-gnu"]
+        chains["1.92.0-x86_64-unknown-linux-gnu"] = dict(base, rustc="rustc 1.92.0 (ded5c06cf 2025-12-08)")
+        parity.validate(self.manifest, server)
+        chains["1.93.0-x86_64-unknown-linux-gnu"] = dict(base, rustc="rustc 1.93.0 (aaaaaaaaa 2026-01-22)")
+        with self.assertRaisesRegex(ValueError, "differ from build-server"):
+            parity.validate(self.manifest, server)
+
     def test_macos_pin_drift_compares_with_sealed_manifest(self):
         self.manifest["sources"]["bash"]["sha256"] = "b" * 64
         errors = parity.differences(self.manifest, self.actual, job=True)
