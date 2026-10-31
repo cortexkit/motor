@@ -18,6 +18,8 @@ use std::{
 pub(crate) mod dependencies;
 #[cfg(test)]
 mod fetch_tests;
+#[cfg(unix)]
+mod guest_scan;
 mod transfer;
 pub(crate) use dependencies::validate_dependencies;
 pub(crate) use transfer::bounded_fetch_detail;
@@ -189,6 +191,46 @@ fn change_scan_git(path: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+struct ChangeScan<'a> {
+    path: &'a Path,
+    #[cfg(unix)]
+    guest: Option<&'a guest_scan::Repository>,
+}
+
+impl<'a> ChangeScan<'a> {
+    fn trusted(path: &'a Path) -> Self {
+        Self {
+            path,
+            #[cfg(unix)]
+            guest: None,
+        }
+    }
+    fn command(&self) -> Command {
+        #[cfg(unix)]
+        if let Some(repository) = self.guest {
+            return repository.command(self.path);
+        }
+        change_scan_command(self.path)
+    }
+    fn git(&self, args: &[&str]) -> io::Result<Vec<u8>> {
+        let output = self.command().args(args).output()?;
+        if !output.status.success() {
+            return Err(invalid(String::from_utf8_lossy(&output.stderr)));
+        }
+        Ok(output.stdout)
+    }
+    fn untrusted(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.guest.is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
 struct SnapshotEntry {
     mode: String,
     blob: String,
@@ -257,7 +299,8 @@ fn change_path(name: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(name).into_owned())
 }
 
-fn matches_snapshot(path: &Path, name: &Path, entry: &SnapshotEntry) -> io::Result<bool> {
+fn matches_snapshot(scan: &ChangeScan<'_>, name: &Path, entry: &SnapshotEntry) -> io::Result<bool> {
+    let path = scan.path;
     let full = path.join(name);
     let metadata = match fs::symlink_metadata(&full) {
         Ok(metadata) => metadata,
@@ -274,7 +317,7 @@ fn matches_snapshot(path: &Path, name: &Path, entry: &SnapshotEntry) -> io::Resu
     let blob = match entry.mode.as_str() {
         "120000" if metadata.is_symlink() => {
             let target = fs::read_link(&full)?;
-            let mut command = change_scan_command(path);
+            let mut command = scan.command();
             command.args(["hash-object", "--stdin"]);
             let output = git_input(command, target.as_os_str().as_encoded_bytes())?;
             if !output.status.success() {
@@ -292,7 +335,8 @@ fn matches_snapshot(path: &Path, name: &Path, entry: &SnapshotEntry) -> io::Resu
                 }
             }
             // --path selects the same clean filters and attributes as Git status.
-            let output = change_scan_command(path)
+            let output = scan
+                .command()
                 .args(["hash-object", "--path"])
                 .arg(name)
                 .arg("--")
@@ -308,6 +352,11 @@ fn matches_snapshot(path: &Path, name: &Path, entry: &SnapshotEntry) -> io::Resu
             // submodule has no checkout to compare; populated ones must be clean.
             if !full.join(".git").exists() {
                 return Ok(true);
+            }
+            if scan.untrusted() {
+                // Inspecting a populated guest submodule would load its Git
+                // metadata. Report it changed rather than executing its config.
+                return Ok(false);
             }
             if !change_scan_git(&full, &["status", "--porcelain", "--untracked-files=all"])?
                 .is_empty()
@@ -1718,6 +1767,16 @@ impl Trees {
         )
     }
 
+    #[cfg(unix)]
+    pub(crate) fn changes_for_guest(
+        &self,
+        path: &Path,
+        prepared_javascript_directories: &[PathBuf],
+        request: &Run,
+    ) -> io::Result<Vec<String>> {
+        guest_scan::changes(self, path, prepared_javascript_directories, request)
+    }
+
     /// Paths the job changed in its workspace: modified, deleted, staged and
     /// new untracked files, relative to the supplied snapshot when available.
     /// Writes under ignored paths such as target/ are not
@@ -1730,10 +1789,24 @@ impl Trees {
         prepared_javascript_directories: &[PathBuf],
         baseline: Option<ChangeBaseline<'_>>,
     ) -> io::Result<Vec<String>> {
-        let status = change_scan_git(
-            path,
-            &["status", "--porcelain", "-z", "--untracked-files=all"],
-        )?;
+        self.changes_with_scan(
+            ChangeScan::trusted(path),
+            prepared_javascript_directories,
+            baseline,
+        )
+    }
+
+    fn changes_with_scan(
+        &self,
+        scan: ChangeScan<'_>,
+        prepared_javascript_directories: &[PathBuf],
+        baseline: Option<ChangeBaseline<'_>>,
+    ) -> io::Result<Vec<String>> {
+        let mut args = vec!["status", "--porcelain", "-z", "--untracked-files=all"];
+        if scan.untrusted() {
+            args.push("--ignore-submodules=all");
+        }
+        let status = scan.git(&args)?;
         let mut records = status.split(|b| *b == 0);
         let prepared_modules: Vec<_> = prepared_javascript_directories
             .iter()
@@ -1773,7 +1846,7 @@ impl Trees {
         // still returned by status, without hashing the rest of the workspace.
         for (name, entry) in snapshot {
             let relative = change_path(&name);
-            if !excluded(&relative) && !matches_snapshot(path, &relative, &entry)? {
+            if !excluded(&relative) && !matches_snapshot(&scan, &relative, &entry)? {
                 changes.push(String::from_utf8_lossy(&name).into_owned());
             }
         }

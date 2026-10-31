@@ -98,10 +98,11 @@ impl Backend for MacosBackend {
         process: Option<platform::ProcessIdentity>,
     ) -> io::Result<Option<bool>> {
         Ok(process.and_then(|p| p.unit).map(|id| {
-            config
-                .macos_runtime
-                .entry(id)
-                .is_some_and(|e| !e.owned.lock().unwrap().record.stop_proven)
+            config.macos_runtime.entry(id).is_some_and(|e| {
+                // A kill monitor must not finalize the job while its stopped
+                // share is still being scanned or spooled for completion.
+                e.active.load(Ordering::Acquire) || !e.owned.lock().unwrap().record.stop_proven
+            })
         }))
     }
     fn collect_changes(
@@ -221,10 +222,10 @@ pub(super) fn capture_changes(
         .lock()
         .unwrap()
         .push((request.job_id, "changes"));
-    match trees.changes_for_request(
+    match trees.changes_for_guest(
         &staged.workspace,
         &staged.prepared_javascript_directories,
-        Some(request),
+        request,
     ) {
         Ok(changes) => runtime.record_changes(request.job_id, changes),
         Err(error) => tracing::warn!(job_id = %request.job_id, %error, "scan_failed"),

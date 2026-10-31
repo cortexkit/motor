@@ -31,6 +31,8 @@ mod tests;
 use fs::Dir;
 #[cfg(test)]
 pub(crate) use tests::capture_finished_workspace;
+#[cfg(test)]
+pub(crate) use tests::capture_finished_workspace_after_stop;
 
 /// Maximum preparation runtime: ten minutes, including time spent waiting for locks.
 pub const PREP_TIMEOUT: Duration = Duration::from_secs(600);
