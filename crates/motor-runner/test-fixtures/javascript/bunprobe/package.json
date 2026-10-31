@@ -1,0 +1,9 @@
+{
+  "name": "windows-bun-probe",
+  "private": true,
+  "dependencies": {
+    "onnxruntime-node": "1.30.0",
+    "sharp": "^0.34.0",
+    "@biomejs/biome": "^2.0.0"
+  }
+}

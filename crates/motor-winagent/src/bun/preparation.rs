@@ -1,6 +1,57 @@
 //! Operational preparation failures must not leave a partial dependency tree.
-use super::{Project, Refusal, RefusalKind, is_node_modules, refuse};
+use super::{Check, Project, Refusal, RefusalKind, is_node_modules, refuse};
 use std::{io, path::Path};
+
+pub enum InstallEvent {
+    Stderr(Vec<u8>),
+    Output,
+    PipeClosed,
+}
+
+/// Pipe EOF is independent of process signalling. Once both readers finish,
+/// keep polling the process instead of interpreting channel disconnect as exit.
+pub fn wait_install(
+    project: &Project,
+    mut poll: impl FnMut() -> Result<Option<u32>, Check>,
+    mut terminate: impl FnMut(u32) -> Result<(), Check>,
+    mut receive: impl FnMut() -> Result<Option<InstallEvent>, Check>,
+    diagnostics: &mut DiagnosticTail,
+) -> Result<(), Refusal> {
+    let fail = |check| {
+        refuse(
+            RefusalKind::BunOfflineInstallFailed,
+            &project.path,
+            &project.name,
+            &project.version,
+        )
+        .at(check)
+    };
+    let (mut code, mut closed) = (None, 0);
+    loop {
+        if let Some(exit) = poll().map_err(fail)?
+            && code.is_none()
+        {
+            code = Some(exit);
+            terminate(exit).map_err(fail)?;
+        }
+        if closed == 2 {
+            if let Some(code) = code {
+                return if code == 0 {
+                    Ok(())
+                } else {
+                    Err(fail(Check::NonzeroExit))
+                };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        match receive().map_err(fail)? {
+            Some(InstallEvent::Stderr(bytes)) => diagnostics.push(&bytes),
+            Some(InstallEvent::Output) | None => (),
+            Some(InstallEvent::PipeClosed) => closed += 1,
+        }
+    }
+}
 
 /// Keep only a small stderr tail. Package diagnostics are never service logs.
 #[derive(Default)]

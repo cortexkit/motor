@@ -22,7 +22,7 @@ pub mod returned;
 pub mod transport;
 
 /// Version of the Windows profile; the Windows agent sends it in its Hello.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 /// Version of the macOS profile, versioned independently of the Windows one.
 pub const MACOS_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -1494,7 +1494,26 @@ mod tests {
     fn native_cache_timings_have_a_distinct_field_and_protocol_generation() {
         let value = serde_json::to_value(CacheTimings::default()).unwrap();
         assert!(value["native_attributes_ms"].is_u64());
-        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_VERSION, 8);
+    }
+
+    #[test]
+    fn windows_v7_agent_is_rejected_before_preparation() {
+        let mut protocol = Protocol::new("boot-nonce").unwrap();
+        let error = protocol
+            .accept(
+                Peer::Agent,
+                &Frame::Hello {
+                    version: 7,
+                    nonce: "boot-nonce".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported agent protocol version 7")
+        );
     }
 
     #[test]

@@ -367,6 +367,362 @@ fn config(root: &Path) -> crate::engine::Config {
     config
 }
 
+/// Preserve a real lock's graph and platform metadata, substituting small,
+/// integrity-checked archives so cache/projection failures need no registry.
+#[cfg(unix)]
+fn real_lock_registry(lock: &str) -> (String, BTreeMap<String, Vec<u8>>) {
+    use base64::Engine;
+    let mut lock = bun::text_json(lock).unwrap();
+    let mut archives = BTreeMap::new();
+    for row in lock["packages"].as_object_mut().unwrap().values_mut() {
+        let resolution = row[0].as_str().unwrap();
+        let at = resolution.rfind('@').unwrap();
+        let (name, version) = (&resolution[..at], &resolution[at + 1..]);
+        let mut metadata = row[2].clone();
+        metadata["name"] = name.into();
+        metadata["version"] = version.into();
+        metadata["scripts"] = serde_json::json!({"preinstall":"echo ran > lifecycle-ran"});
+        let mut tar = tar::Builder::new(Vec::new());
+        let bytes = serde_json::to_vec(&metadata).unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        tar.append_data(&mut header, "package/package.json", bytes.as_slice())
+            .unwrap();
+        let bins: Vec<_> = match &metadata["bin"] {
+            serde_json::Value::String(bin) => vec![bin.as_str()],
+            serde_json::Value::Object(bins) => bins
+                .values()
+                .filter_map(serde_json::Value::as_str)
+                .collect(),
+            _ => Vec::new(),
+        };
+        for bin in bins {
+            let bytes = b"#!/usr/bin/env node\n";
+            header.set_mode(0o755);
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            tar.append_data(
+                &mut header,
+                format!("package/{}", bin.trim_start_matches("./")),
+                &bytes[..],
+            )
+            .unwrap();
+        }
+        let mut compressed = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        compressed.write_all(&tar.into_inner().unwrap()).unwrap();
+        let bytes = compressed.finish().unwrap();
+        let path = format!(
+            "/{name}/-/{}-{version}.tgz",
+            name.rsplit('/').next().unwrap()
+        );
+        row[3] = format!(
+            "sha256-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&bytes))
+        )
+        .into();
+        archives.insert(path, bytes);
+    }
+    (lock.to_string(), archives)
+}
+
+#[cfg(unix)]
+fn stage_real_project(staging: &Path, name: &str, manifest: &str, lock: &str) -> PathBuf {
+    let checkout = staging.join("m").join(name);
+    fs::create_dir_all(&checkout).unwrap();
+    fs::write(checkout.join("package.json"), manifest).unwrap();
+    fs::write(checkout.join("bun.lock"), lock).unwrap();
+    checkout
+}
+
+#[cfg(unix)]
+#[test]
+fn probe_missing_transitives_do_not_publish_a_partial_seed() {
+    let scratch = ScratchDir::new("bun-probe-partial");
+    let config = config(scratch.path());
+    let staging = scratch.join("staging");
+    let original = include_str!("../../../test-fixtures/javascript/bunprobe/bun.lock");
+    let parsed = bun::read_lock("m/probe", original).unwrap();
+    for name in [
+        "@biomejs/biome",
+        "onnxruntime-node",
+        "gopd",
+        "escape-string-regexp",
+        "type-fest",
+        "define-data-property",
+        "has-property-descriptors",
+        "object-keys",
+        "es-define-property",
+        "es-errors",
+    ] {
+        assert!(
+            parsed
+                .iter()
+                .any(|row| row.package.name == name && row.package.windows),
+            "{name} was dropped from the Windows graph"
+        );
+    }
+    let (lock, archives) = real_lock_registry(original);
+    let checkout = stage_real_project(
+        &staging,
+        "probe",
+        include_str!("../../../test-fixtures/javascript/bunprobe/package.json"),
+        &lock,
+    );
+    let mut fetched = Vec::new();
+    prepare_with_fetch(
+        &config,
+        &staging,
+        "/repo",
+        std::slice::from_ref(&checkout),
+        |target| {
+            fetched.push(target.url.path().to_owned());
+            if target.url.path().starts_with("/gopd/") {
+                Err(RefusalKind::BunFetchUnavailable)
+            } else {
+                Ok(archives[target.url.path()].clone())
+            }
+        },
+    )
+    .unwrap();
+    assert!(fetched.iter().any(|p| p.starts_with("/@biomejs/biome/")));
+    let seed = staging.join("bun-seed");
+    let manifest: Manifest =
+        serde_json::from_slice(&fs::read(seed.join("manifest.json")).unwrap()).unwrap();
+    let refusal = manifest.projects[0].skipped.as_ref().unwrap();
+    assert_eq!(refusal.package, "gopd");
+    assert_eq!(refusal.check, Some(bun::Check::Download));
+    assert!(refusal.missing.iter().any(|p| p.name == "gopd"));
+    assert!(refusal.missing.len() <= 5);
+    for row in &manifest.projects[0].packages {
+        assert!(
+            !seed.join(row.integrity.blob_path()).exists(),
+            "incomplete project published {}",
+            row.name
+        );
+    }
+    let cache = scratch.join("guest-cache");
+    let prepared = bun::prepare_cache(&seed, &staging.join("m"), &cache)
+        .unwrap()
+        .unwrap();
+    assert!(prepared.projects[0].skipped.is_some());
+    assert_eq!(fs::read_dir(cache).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn probe_complete_windows_graph_installs_offline_without_scripts() {
+    let scratch = ScratchDir::new("bun-probe-complete");
+    let config = config(scratch.path());
+    let staging = scratch.join("staging");
+    let (lock, archives) = real_lock_registry(include_str!(
+        "../../../test-fixtures/javascript/bunprobe/bun.lock"
+    ));
+    let checkout = stage_real_project(
+        &staging,
+        "probe",
+        include_str!("../../../test-fixtures/javascript/bunprobe/package.json"),
+        &lock,
+    );
+    let mut fetched = std::collections::BTreeSet::new();
+    prepare_with_fetch(
+        &config,
+        &staging,
+        "/repo",
+        std::slice::from_ref(&checkout),
+        |target| {
+            fetched.insert(target.url.path().to_owned());
+            Ok(archives[target.url.path()].clone())
+        },
+    )
+    .unwrap();
+    let cache = scratch.join("cache");
+    let manifest = bun::prepare_cache(&staging.join("bun-seed"), &staging.join("m"), &cache)
+        .unwrap()
+        .unwrap();
+    let project = &manifest.projects[0];
+    assert!(project.skipped.is_none());
+    assert_eq!(
+        fetched.len(),
+        project.packages.iter().filter(|p| p.windows).count()
+    );
+    for package in project.packages.iter().filter(|p| p.windows) {
+        assert!(
+            cache
+                .join(bun::cache_key(package, &manifest.registries).unwrap())
+                .join("package.json")
+                .is_file(),
+            "{} was not projected",
+            package.name
+        );
+    }
+    let output = std::process::Command::new("bun")
+        .args([
+            "install",
+            "--offline",
+            "--frozen-lockfile",
+            "--ignore-scripts",
+            "--backend=copyfile",
+            "--os=win32",
+            "--cpu=x64",
+        ])
+        .env("BUN_INSTALL_CACHE_DIR", &cache)
+        .current_dir(&checkout)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    bun::verify_installed(project, &checkout).unwrap();
+    assert!(!checkout.join("lifecycle-ran").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn network_foreign_optional_archives_are_not_required_but_windows_is() {
+    let scratch = ScratchDir::new("bun-network-platform");
+    let config = config(scratch.path());
+    let staging = scratch.join("staging");
+    let original = include_str!("../../../../../script/runner/network-fixture/bun.lock");
+    let (lock, archives) = real_lock_registry(original);
+    let rows = bun::read_lock("m/network", &lock).unwrap();
+    let checkout = stage_real_project(
+        &staging,
+        "network",
+        include_str!("../../../../../script/runner/network-fixture/package.json"),
+        &lock,
+    );
+    let allowed: std::collections::BTreeSet<_> = rows
+        .iter()
+        .filter(|r| r.package.windows)
+        .map(|r| {
+            resolve(&RegistryConfig::default(), "/repo", "m/network", r)
+                .unwrap()
+                .url
+                .path()
+                .to_owned()
+        })
+        .collect();
+    prepare_with_fetch(
+        &config,
+        &staging,
+        "/repo",
+        std::slice::from_ref(&checkout),
+        |target| {
+            if allowed.contains(target.url.path()) {
+                Ok(archives[target.url.path()].clone())
+            } else {
+                Err(RefusalKind::BunCacheMissing)
+            }
+        },
+    )
+    .unwrap();
+    let seed = staging.join("bun-seed");
+    let manifest: Manifest =
+        serde_json::from_slice(&fs::read(seed.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        manifest.projects[0].skipped.is_none(),
+        "{:?}",
+        manifest.projects[0].skipped
+    );
+    let foreign = rows
+        .iter()
+        .find(|r| r.package.name == "@esbuild/aix-ppc64")
+        .unwrap();
+    let windows = rows
+        .iter()
+        .find(|r| r.package.name == "@esbuild/win32-x64")
+        .unwrap();
+    assert!(!seed.join(foreign.package.integrity.blob_path()).exists());
+    let prepared = bun::prepare_cache(&seed, &staging.join("m"), &scratch.join("complete-cache"))
+        .unwrap()
+        .unwrap();
+    assert!(prepared.projects[0].skipped.is_none());
+    fs::remove_file(seed.join(windows.package.integrity.blob_path())).unwrap();
+    let prepared = bun::prepare_cache(&seed, &staging.join("m"), &scratch.join("missing-cache"))
+        .unwrap()
+        .unwrap();
+    let refusal = prepared.projects[0].skipped.as_ref().unwrap();
+    assert_eq!(refusal.kind, RefusalKind::BunCacheMissing);
+    assert_eq!(refusal.package, "@esbuild/win32-x64");
+    assert_eq!(refusal.missing[0].name, "@esbuild/win32-x64");
+    assert_eq!(
+        fs::read_dir(scratch.join("missing-cache")).unwrap().count(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn probe_guest_missing_transitives_and_late_reads_leave_no_cache_prefix() {
+    let scratch = ScratchDir::new("bun-probe-guest-partial");
+    let config = config(scratch.path());
+    let staging = scratch.join("staging");
+    let (lock, archives) = real_lock_registry(include_str!(
+        "../../../test-fixtures/javascript/bunprobe/bun.lock"
+    ));
+    let checkout = stage_real_project(
+        &staging,
+        "probe",
+        include_str!("../../../test-fixtures/javascript/bunprobe/package.json"),
+        &lock,
+    );
+    prepare_with_fetch(&config, &staging, "/repo", &[checkout], |target| {
+        Ok(archives[target.url.path()].clone())
+    })
+    .unwrap();
+    let seed = staging.join("bun-seed");
+    let rows = bun::read_lock("m/probe", &lock).unwrap();
+    let mut removed = Vec::new();
+    for name in ["gopd", "escape-string-regexp", "type-fest"] {
+        let package = &rows
+            .iter()
+            .find(|r| r.package.name == name)
+            .unwrap()
+            .package;
+        let path = seed.join(package.integrity.blob_path());
+        removed.push((path.clone(), fs::read(&path).unwrap()));
+        fs::remove_file(path).unwrap();
+    }
+    let cache = scratch.join("missing-cache");
+    let manifest = bun::prepare_cache(&seed, &staging.join("m"), &cache)
+        .unwrap()
+        .unwrap();
+    let refusal = manifest.projects[0].skipped.as_ref().unwrap();
+    assert_eq!(refusal.check, Some(bun::Check::SeedBlobs));
+    assert_eq!(
+        refusal
+            .missing
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>(),
+        ["escape-string-regexp", "gopd", "type-fest"]
+    );
+    assert_eq!(fs::read_dir(cache).unwrap().count(), 0);
+    for (path, bytes) in removed {
+        fs::write(path, bytes).unwrap();
+    }
+    let late = rows.iter().find(|r| r.package.name == "type-fest").unwrap();
+    // A sparse oversized blob passes existence preflight but fails bounded read.
+    fs::File::create(seed.join(late.package.integrity.blob_path()))
+        .unwrap()
+        .set_len(bun::MAX_BLOB_BYTES + 1)
+        .unwrap();
+    let cache = scratch.join("late-read-cache");
+    let manifest = bun::prepare_cache(&seed, &staging.join("m"), &cache)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        manifest.projects[0].skipped.as_ref().unwrap().check,
+        Some(bun::Check::CacheRead)
+    );
+    assert_eq!(fs::read_dir(cache).unwrap().count(), 0);
+}
+
 #[cfg(unix)]
 #[test]
 fn host_operational_failures_skip_guest_install_but_security_failures_refuse() {
@@ -506,7 +862,7 @@ fn fake_registry_roundtrip_keeps_credentials_off_the_archive_and_guest_manifest(
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
-        for _ in 0..2 {
+        for _ in 0..1 {
             let (mut stream, _) = listener.accept().unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))

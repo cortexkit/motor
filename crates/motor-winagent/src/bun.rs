@@ -12,7 +12,9 @@ mod graph;
 mod hash;
 mod preparation;
 pub use expansion::ExpansionBudget;
-pub use preparation::{DiagnosticTail, finish_install, skip_project, skip_unprepared};
+pub use preparation::{
+    DiagnosticTail, InstallEvent, finish_install, skip_project, skip_unprepared, wait_install,
+};
 #[cfg(windows)]
 pub mod protection;
 
@@ -53,6 +55,55 @@ impl RefusalKind {
     }
 }
 
+/// Fixed diagnostics cross the trust boundary; never serialize host I/O errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Check {
+    Lock,
+    Source,
+    Integrity,
+    Registry,
+    Credentials,
+    Download,
+    FetchDeadline,
+    CacheLock,
+    CacheRead,
+    CacheProvenance,
+    CacheProtection,
+    CacheQuota,
+    CachePublish,
+    SeedWrite,
+    SeedBudget,
+    SeedManifest,
+    SeedBlobs,
+    Projection,
+    Identity,
+    RegistryConfig,
+    WorkingDirectory,
+    ProcessStart,
+    ExitPoll,
+    JobTerminate,
+    Cancelled,
+    InstallDeadline,
+    PipeRead,
+    PipesDisconnected,
+    NonzeroExit,
+    InstalledTree,
+    InstalledPackage,
+    InstalledBin,
+    InstalledBinDirectory,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MissingPackage {
+    pub name: String,
+    pub version: String,
+}
+
+fn missing_empty(packages: &[MissingPackage]) -> bool {
+    packages.is_empty()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Refusal {
@@ -61,24 +112,59 @@ pub struct Refusal {
     pub package: String,
     pub version: String,
     pub registry_origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<Check>,
+    #[serde(default, skip_serializing_if = "missing_empty")]
+    pub missing: Box<[MissingPackage]>,
 }
 
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{:?}: project={} package={} version={} registry={}",
-            self.kind, self.project, self.package, self.version, self.registry_origin
+            "{:?}: project={} package={} version={} registry={} check={:?}",
+            self.kind, self.project, self.package, self.version, self.registry_origin, self.check
         )
     }
 }
 impl std::error::Error for Refusal {}
 impl Refusal {
     pub fn warning(&self) -> String {
+        let identity = if self.package.is_empty() {
+            String::new()
+        } else if self.version.is_empty() {
+            format!(" package={}", self.package)
+        } else {
+            format!(" package={}@{}", self.package, self.version)
+        };
+        let missing = if self.missing.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " missing=[{}]",
+                self.missing
+                    .iter()
+                    .map(|p| format!("{}@{}", p.name, p.version))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let check = self
+            .check
+            .map(|check| format!("{check:?}"))
+            .unwrap_or_else(|| "Unspecified".into());
         format!(
-            "bun install skipped for {}: {:?} package={}@{}\n",
-            self.project, self.kind, self.package, self.version
+            "bun install skipped for {}: {:?}{} check={}{}\n",
+            self.project, self.kind, identity, check, missing
         )
+    }
+    pub fn at(mut self, check: Check) -> Self {
+        self.check = Some(check);
+        self
+    }
+    pub fn missing_packages(mut self, packages: impl IntoIterator<Item = MissingPackage>) -> Self {
+        self.missing = packages.into_iter().take(5).collect();
+        self
     }
     pub fn registry(mut self, registries: &BTreeMap<String, String>) -> Self {
         if let Some(registry) = self
@@ -96,6 +182,20 @@ impl Refusal {
         self
     }
     pub fn validate(&self) -> io::Result<()> {
+        if self.missing.len() > 5
+            || self.missing.iter().any(|p| {
+                !valid_name(&p.name)
+                    || p.name.len() > 214
+                    || p.version.is_empty()
+                    || p.version.len() > 256
+                    || !p
+                        .version
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b))
+            })
+        {
+            return Err(io::Error::other("invalid Bun missing package diagnostics"));
+        }
         for field in [
             &self.project,
             &self.package,
@@ -150,6 +250,20 @@ pub fn refuse(kind: RefusalKind, project: &str, package: &str, version: &str) ->
         } else {
             "https://registry.npmjs.org".into()
         },
+        check: Some(match kind {
+            RefusalKind::BunLockInvalid => Check::Lock,
+            RefusalKind::BunSourceUnsupported => Check::Source,
+            RefusalKind::BunIntegrityMissing | RefusalKind::BunIntegrityMismatch => {
+                Check::Integrity
+            }
+            RefusalKind::BunCredentialsUnavailable => Check::Credentials,
+            RefusalKind::BunRegistryUnauthorized => Check::Registry,
+            RefusalKind::BunFetchUnavailable => Check::Download,
+            RefusalKind::BunCacheMissing => Check::SeedBlobs,
+            RefusalKind::BunProjectionInvalid => Check::Projection,
+            RefusalKind::BunOfflineInstallFailed => Check::InstalledTree,
+        }),
+        missing: Box::default(),
     }
 }
 
@@ -885,7 +999,9 @@ pub fn prepare_cache_with_budget(
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             if let Some(project) = input_projects.first() {
-                return Err(refuse(RefusalKind::BunCacheMissing, project, "", ""));
+                return Err(
+                    refuse(RefusalKind::BunCacheMissing, project, "", "").at(Check::SeedManifest)
+                );
             }
             return Ok(None);
         }
@@ -999,6 +1115,34 @@ pub fn prepare_cache_with_budget(
             }
             continue;
         }
+        // Do not expand a prefix of an incomplete project. Bun's offline lookup
+        // can otherwise reach only direct dependencies and fail on a later edge.
+        let missing: Vec<_> = project
+            .packages
+            .iter()
+            .filter(|p| p.windows)
+            .filter(|p| !seed.join(p.integrity.blob_path()).is_file())
+            .take(5)
+            .map(|p| MissingPackage {
+                name: p.name.clone(),
+                version: p.version.clone(),
+            })
+            .collect();
+        if let Some(first) = missing.first() {
+            project.skipped = Some(
+                refuse(
+                    RefusalKind::BunCacheMissing,
+                    &project.path,
+                    &first.name,
+                    &first.version,
+                )
+                .at(Check::SeedBlobs)
+                .registry(&manifest.registries)
+                .missing_packages(missing),
+            );
+            continue;
+        }
+        let mut created_keys = Vec::new();
         for package in &project.packages {
             let fail = || projection_error(&project.path, package).registry(&manifest.registries);
             if !package.integrity.valid() {
@@ -1018,7 +1162,12 @@ pub fn prepare_cache_with_budget(
                                 &package.name,
                                 &package.version,
                             )
-                            .registry(&manifest.registries),
+                            .at(Check::CacheRead)
+                            .registry(&manifest.registries)
+                            .missing_packages([MissingPackage {
+                                name: package.name.clone(),
+                                version: package.version.clone(),
+                            }]),
                         );
                         break;
                     }
@@ -1031,9 +1180,6 @@ pub fn prepare_cache_with_budget(
                     &package.version,
                 )
                 .registry(&manifest.registries));
-            }
-            if !package.windows {
-                continue;
             }
             let key = cache_key(package, &manifest.registries).map_err(|_| fail())?;
             if let Some(previous) = keys.insert(key.to_uppercase(), package.integrity.clone()) {
@@ -1051,6 +1197,25 @@ pub fn prepare_cache_with_budget(
             .map_err(|_| fail())?;
             if metadata["name"] != package.name || metadata["version"] != package.version {
                 return Err(fail());
+            }
+            created_keys.push(key);
+        }
+        // A bounded read can still fail after the existence preflight. Preserve
+        // entries shared with earlier complete projects, not this failed prefix.
+        if project.skipped.is_some() {
+            for key in created_keys {
+                std::fs::remove_dir_all(cache.join(&key)).map_err(|_| invalid())?;
+                keys.remove(&key.to_uppercase());
+                if let Some((scope, _)) = key.split_once('/') {
+                    let directory = cache.join(scope);
+                    if std::fs::read_dir(&directory)
+                        .map_err(|_| invalid())?
+                        .next()
+                        .is_none()
+                    {
+                        std::fs::remove_dir(directory).map_err(|_| invalid())?;
+                    }
+                }
             }
         }
     }
@@ -1128,9 +1293,10 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
     if modules.exists() {
         // Isolated linker junctions stay inside the checkout; inspect each real
         // directory once and never traverse out to an unrelated disk or share.
-        let root = directory
-            .canonicalize()
-            .map_err(|_| refuse(RefusalKind::BunOfflineInstallFailed, &project.path, "", ""))?;
+        let root = directory.canonicalize().map_err(|_| {
+            refuse(RefusalKind::BunOfflineInstallFailed, &project.path, "", "")
+                .at(Check::InstalledTree)
+        })?;
         walk_modules(&modules, &root, &mut Default::default(), &mut installed).map_err(
             |error| {
                 refuse(
@@ -1160,7 +1326,7 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
             .find(|(metadata, _)| {
                 metadata["name"] == package.name && metadata["version"] == package.version
             })
-            .ok_or_else(fail)?;
+            .ok_or_else(|| fail().at(Check::InstalledPackage))?;
         let bins: Vec<&str> = match &metadata["bin"] {
             Value::String(s) => vec![s],
             Value::Object(map) => map.values().filter_map(Value::as_str).collect(),
@@ -1176,7 +1342,7 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
                     .map_err(|_| projection_error(&project.path, package))?;
             }
             if !root.join(bin).is_file() {
-                return Err(fail());
+                return Err(fail().at(Check::InstalledBin));
             }
         }
         if let Some(bin_dir) = &package.bin_dir {
@@ -1185,7 +1351,7 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
                     .map_err(|_| projection_error(&project.path, package))?;
             }
             if !root.join(bin_dir).is_dir() {
-                return Err(fail());
+                return Err(fail().at(Check::InstalledBinDirectory));
             }
         }
     }

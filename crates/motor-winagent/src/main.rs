@@ -1522,12 +1522,14 @@ mod guest {
         command: &Command,
         stop: &Handle,
     ) -> Result<Vec<String>, motor_winagent::bun::Refusal> {
-        use motor_winagent::bun::{self, RefusalKind};
+        use motor_winagent::bun::{self, Check, InstallEvent, RefusalKind};
         let deadline = Instant::now() + Duration::from_secs(300);
         let budget = bun::ExpansionBudget::new(4 * 1024 * 1024 * 1024, 250_000, deadline);
         let fail =
             |project: &str| bun::refuse(RefusalKind::BunOfflineInstallFailed, project, "", "");
-        let identity = user.impersonate().map_err(|_| fail(""))?;
+        let identity = user
+            .impersonate()
+            .map_err(|_| fail("").at(Check::Identity))?;
         let manifest = match bun::prepare_cache_with_budget(
             Path::new(bun::SEED_DIR),
             Path::new(SOURCE_ROOT),
@@ -1541,7 +1543,10 @@ mod guest {
             return Ok(Vec::new());
         };
         if bun::write_registry_config(&user.profile, &manifest.registries).is_err() {
-            return bun::skip_unprepared(Path::new(SOURCE_ROOT), fail(""));
+            return bun::skip_unprepared(
+                Path::new(SOURCE_ROOT),
+                fail("").at(Check::RegistryConfig),
+            );
         }
         drop(identity);
         let mut warnings = Vec::new();
@@ -1561,69 +1566,83 @@ mod guest {
                 project.path.strip_prefix('m').unwrap()
             }
             .into();
-            let directory = PathBuf::from(mapped_cwd(&prep.cwd).map_err(|_| fail(&project.path))?);
+            let directory = PathBuf::from(
+                mapped_cwd(&prep.cwd)
+                    .map_err(|_| fail(&project.path).at(Check::WorkingDirectory))?,
+            );
             if let Some(refusal) = &project.skipped {
-                let _identity = user.impersonate().map_err(|_| fail(&project.path))?;
+                let _identity = user
+                    .impersonate()
+                    .map_err(|_| fail(&project.path).at(Check::Identity))?;
                 warnings.push(bun::skip_project(&directory, refusal.clone())?.warning());
                 continue;
             }
             prep.env.clear();
             prep.command = "test \"$('C:/Program Files/Bun/bun.exe' --version)\" = 1.4.4 && 'C:/Program Files/Bun/bun.exe' install --offline --frozen-lockfile --ignore-scripts --backend=copyfile".into();
             let mut diagnostics = bun::DiagnosticTail::default();
+            let mut started = false;
             let result = (|| {
                 let (tx, rx) = mpsc::sync_channel(16);
-                let prep_stop = Arc::new(Handle::event().map_err(|_| fail(&project.path))?);
-                let job =
-                    Job::start(user, &prep, tx, prep_stop).map_err(|_| fail(&project.path))?;
-                let mut closed = 0;
-                let mut code = None;
-                let result = loop {
-                    if stop.signalled() || Instant::now() >= deadline {
-                        break Err(fail(&project.path));
-                    }
-                    match job.exit_code() {
-                        Ok(Some(exit)) if code.is_none() => {
-                            code = Some(exit);
-                            if job.terminate(exit).is_err() {
-                                break Err(fail(&project.path));
-                            }
+                let prep_stop = Arc::new(
+                    Handle::event().map_err(|_| fail(&project.path).at(Check::ProcessStart))?,
+                );
+                let job = Job::start(user, &prep, tx, prep_stop)
+                    .map_err(|_| fail(&project.path).at(Check::ProcessStart))?;
+                started = true;
+                let result = bun::wait_install(
+                    project,
+                    || {
+                        if stop.signalled() {
+                            return Err(Check::Cancelled);
                         }
-                        Err(_) => break Err(fail(&project.path)),
-                        _ => (),
-                    }
-                    if let Some(code) = code
-                        && closed == 2
-                    {
-                        break if code == 0 {
-                            Ok(())
-                        } else {
-                            Err(fail(&project.path))
-                        };
-                    }
-                    match rx.recv_timeout(Duration::from_millis(50)) {
-                        Ok(Event::Output(Stream::Stderr, bytes)) => diagnostics.push(&bytes),
-                        Ok(Event::Output(..)) => (),
-                        Ok(Event::PipeClosed) => closed += 1,
-                        Ok(_) => break Err(fail(&project.path)),
-                        Err(mpsc::RecvTimeoutError::Timeout) => (),
-                        Err(_) => break Err(fail(&project.path)),
-                    }
-                };
+                        if Instant::now() >= deadline {
+                            return Err(Check::InstallDeadline);
+                        }
+                        job.exit_code().map_err(|_| Check::ExitPoll)
+                    },
+                    |exit| job.terminate(exit).map_err(|_| Check::JobTerminate),
+                    || match rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(Event::Output(Stream::Stderr, bytes)) => {
+                            Ok(Some(InstallEvent::Stderr(bytes)))
+                        }
+                        Ok(Event::Output(..)) => Ok(Some(InstallEvent::Output)),
+                        Ok(Event::PipeClosed) => Ok(Some(InstallEvent::PipeClosed)),
+                        Ok(_) => Err(Check::PipeRead),
+                        Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+                        Err(_) => Err(Check::PipesDisconnected),
+                    },
+                    &mut diagnostics,
+                );
                 // Finish containment before removing any partial dependency tree.
                 let containment =
                     || bun::refuse(RefusalKind::BunProjectionInvalid, &project.path, "", "");
                 job.terminate(1).map_err(|_| containment())?;
                 job.wait_empty().map_err(|_| containment())?;
+                // On timeout/read errors the install loop may leave diagnostics
+                // queued. Drain after containment, with a separate bounded wait.
+                let drain_deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < drain_deadline {
+                    match rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(Event::Output(Stream::Stderr, bytes)) => diagnostics.push(&bytes),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        _ => (),
+                    }
+                }
                 drop(rx);
                 drop(job);
                 result
             })();
-            let _identity = user.impersonate().map_err(|_| fail(&project.path))?;
+            let _identity = user
+                .impersonate()
+                .map_err(|_| fail(&project.path).at(Check::Identity))?;
             if let Some(refusal) = bun::finish_install(project, &directory, result)? {
                 warnings.push(refusal.registry(&manifest.registries).warning());
                 let tail = diagnostics.line();
-                if !tail.is_empty() {
-                    warnings.push(format!("bun stderr: {tail}\n"));
+                if started {
+                    warnings.push(format!(
+                        "bun stderr: {}\n",
+                        if tail.is_empty() { "<empty>" } else { &tail }
+                    ));
                 }
             }
         }

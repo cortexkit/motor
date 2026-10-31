@@ -1,6 +1,6 @@
 //! Provenance-partitioned host storage with serialized quota enforcement.
 use super::{bounded_file, protected_directory};
-use motor_winagent::bun::{Integrity, RefusalKind};
+use motor_winagent::bun::{Check, Integrity, RefusalKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -209,38 +209,52 @@ fn mismatch(
     )
 }
 
+#[cfg(test)]
 pub(super) fn get(
     root: &Path,
     source: &Provenance,
     integrity: &Integrity,
     quota: u64,
     lease: &mut Lease,
-    mut download: impl FnMut() -> Result<Vec<u8>, RefusalKind>,
+    download: impl FnMut() -> Result<Vec<u8>, RefusalKind>,
 ) -> Result<Vec<u8>, RefusalKind> {
+    get_checked(root, source, integrity, quota, lease, download).map_err(|e| e.0)
+}
+
+pub(super) fn get_checked(
+    root: &Path,
+    source: &Provenance,
+    integrity: &Integrity,
+    quota: u64,
+    lease: &mut Lease,
+    mut download: impl FnMut() -> Result<Vec<u8>, RefusalKind>,
+) -> Result<Vec<u8>, (RefusalKind, Check)> {
     if !integrity.valid() {
-        return Err(RefusalKind::BunLockInvalid);
+        return Err((RefusalKind::BunLockInvalid, Check::Lock));
     }
-    let cache_error = |_| RefusalKind::BunCacheMissing;
-    let publication = lock(root).map_err(cache_error)?;
+    let cache_error = |_| (RefusalKind::BunCacheMissing, Check::CachePublish);
+    let publication = lock(root).map_err(|_| (RefusalKind::BunCacheMissing, Check::CacheLock))?;
     let partition = source.partition(root);
     let directory = partition.join(&integrity.algorithm);
     let path = directory.join(&integrity.hex);
     if path.exists() {
-        provenance(root, source, false).map_err(cache_error)?;
+        provenance(root, source, false)
+            .map_err(|_| (RefusalKind::BunCacheMissing, Check::CacheProvenance))?;
         #[cfg(windows)]
-        super::protection::check(&path, 0).map_err(cache_error)?;
+        super::protection::check(&path, 0)
+            .map_err(|_| (RefusalKind::BunCacheMissing, Check::CacheProtection))?;
     }
     let cached = match bounded_file(&path, motor_winagent::bun::MAX_BLOB_BYTES) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(_) => return Err(RefusalKind::BunCacheMissing),
+        Err(_) => return Err((RefusalKind::BunCacheMissing, Check::CacheRead)),
     };
     drop(publication);
     let bytes = match cached {
         Some(bytes) => bytes,
-        None => download()?,
+        None => download().map_err(|kind| (kind, Check::Download))?,
     };
-    let _publication = lock(root).map_err(cache_error)?;
+    let _publication = lock(root).map_err(|_| (RefusalKind::BunCacheMissing, Check::CacheLock))?;
     if !integrity.verify(&bytes) {
         mismatch(root, source, integrity, &bytes).map_err(cache_error)?;
         if path.exists() {
@@ -249,16 +263,19 @@ pub(super) fn get(
                 let _ = fs::remove_file(&path);
             }
         }
-        return Err(RefusalKind::BunIntegrityMismatch);
+        return Err((RefusalKind::BunIntegrityMismatch, Check::Integrity));
     }
     let reference = if path.exists() {
         let reference = pin(&path).map_err(cache_error)?;
         fs2::FileExt::lock_shared(&reference).map_err(cache_error)?;
-        make_room(root, quota, 0, false).map_err(cache_error)?;
+        make_room(root, quota, 0, false)
+            .map_err(|_| (RefusalKind::BunCacheMissing, Check::CacheQuota))?;
         reference
     } else {
-        make_room(root, quota, bytes.len() as u64, true).map_err(cache_error)?;
-        provenance(root, source, true).map_err(cache_error)?;
+        make_room(root, quota, bytes.len() as u64, true)
+            .map_err(|_| (RefusalKind::BunCacheMissing, Check::CacheQuota))?;
+        provenance(root, source, true)
+            .map_err(|_| (RefusalKind::BunCacheMissing, Check::CacheProvenance))?;
         protected_directory(&directory).map_err(cache_error)?;
         let reference = pin(&path).map_err(cache_error)?;
         fs2::FileExt::lock_shared(&reference).map_err(cache_error)?;

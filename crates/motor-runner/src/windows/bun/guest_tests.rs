@@ -1,4 +1,183 @@
 use cortexkit_test_support::ScratchDir;
+
+#[test]
+fn local_fixture_pipe_eof_before_exit_is_not_install_failure() {
+    let project = Project {
+        path: "m/local".into(),
+        name: "runner-bun-fixture".into(),
+        version: "1.0.0".into(),
+        lock_sha256: String::new(),
+        manifest_sha256: String::new(),
+        skipped: None,
+        packages: read_lock(
+            "m/local",
+            include_str!("../../../test-fixtures/javascript/bun/bun.lock"),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|p| p.package)
+        .collect(),
+    };
+    // Local rows are tracked inputs, not registry identities. This verifier
+    // has no registry package to reject and cannot blame runner-bun-fixture
+    // itself when a local install succeeds.
+    assert!(project.packages.is_empty());
+    let scratch = ScratchDir::new("bun-local-eof");
+    verify_installed(&project, scratch.path()).unwrap();
+    let mut polls = 0;
+    let mut pipes = 0;
+    wait_install(
+        &project,
+        || {
+            polls += 1;
+            Ok((polls == 4).then_some(0))
+        },
+        |code| {
+            assert_eq!(code, 0);
+            Ok(())
+        },
+        || {
+            pipes += 1;
+            if pipes <= 2 {
+                Ok(Some(InstallEvent::PipeClosed))
+            } else {
+                Err(Check::PipesDisconnected)
+            }
+        },
+        &mut DiagnosticTail::default(),
+    )
+    .unwrap();
+    assert_eq!(pipes, 2);
+    assert_eq!(polls, 4);
+    #[cfg(unix)]
+    {
+        for (path, contents) in [
+            (
+                "package.json",
+                include_str!("../../../test-fixtures/javascript/bun/package.json"),
+            ),
+            (
+                "bun.lock",
+                include_str!("../../../test-fixtures/javascript/bun/bun.lock"),
+            ),
+            (
+                "vendor/fixture-dep/package.json",
+                include_str!(
+                    "../../../test-fixtures/javascript/bun/vendor/fixture-dep/package.json"
+                ),
+            ),
+            (
+                "vendor/fixture-dep/index.js",
+                include_str!("../../../test-fixtures/javascript/bun/vendor/fixture-dep/index.js"),
+            ),
+            (
+                "vendor/fixture-dep/cli.js",
+                include_str!("../../../test-fixtures/javascript/bun/vendor/fixture-dep/cli.js"),
+            ),
+        ] {
+            let path = scratch.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        let output = std::process::Command::new("bun")
+            .args([
+                "install",
+                "--offline",
+                "--frozen-lockfile",
+                "--ignore-scripts",
+                "--backend=copyfile",
+            ])
+            .env("BUN_INSTALL_CACHE_DIR", scratch.join("cache"))
+            .current_dir(scratch.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        verify_installed(&project, scratch.path()).unwrap();
+        assert!(scratch
+            .join("node_modules/fixture-dep/package.json")
+            .is_file());
+        assert!(!scratch.join("lifecycle-ran").exists());
+    }
+}
+
+#[test]
+fn install_failures_name_exit_pipe_and_deadline_checks() {
+    let project = Project {
+        path: "m/probe".into(),
+        name: "windows-bun-probe".into(),
+        version: String::new(),
+        lock_sha256: String::new(),
+        manifest_sha256: String::new(),
+        packages: Vec::new(),
+        skipped: None,
+    };
+    for check in [Check::InstallDeadline, Check::Cancelled, Check::ExitPoll] {
+        let refusal = wait_install(
+            &project,
+            || Err(check),
+            |_| panic!(),
+            || panic!(),
+            &mut DiagnosticTail::default(),
+        )
+        .unwrap_err();
+        assert_eq!(refusal.check, Some(check));
+        assert!(!refusal.warning().contains("windows-bun-probe@"));
+    }
+    let mut tail = DiagnosticTail::default();
+    let mut events = [
+        InstallEvent::Stderr(b"error: --offline: gopd is not in the cache".to_vec()),
+        InstallEvent::PipeClosed,
+        InstallEvent::PipeClosed,
+    ]
+    .into_iter();
+    let refusal = wait_install(
+        &project,
+        || Ok(Some(1)),
+        |_| Ok(()),
+        || Ok(events.next()),
+        &mut tail,
+    )
+    .unwrap_err();
+    assert_eq!(refusal.check, Some(Check::NonzeroExit));
+    assert!(tail.line().contains("gopd"));
+    let refusal = wait_install(
+        &project,
+        || Ok(None),
+        |_| panic!(),
+        || Err(Check::PipesDisconnected),
+        &mut tail,
+    )
+    .unwrap_err();
+    assert_eq!(refusal.check, Some(Check::PipesDisconnected));
+}
+
+#[test]
+fn refusal_diagnostics_are_bounded_and_validated() {
+    let mut refusal = refuse(RefusalKind::BunCacheMissing, "m/probe", "gopd", "1.2.0")
+        .missing_packages((0..8).map(|i| MissingPackage {
+            name: format!("p{i}"),
+            version: "1.0.0".into(),
+        }));
+    assert_eq!(refusal.missing.len(), 5);
+    refusal.validate().unwrap();
+    let encoded = serde_json::to_vec(&refusal).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Refusal>(&encoded).unwrap(),
+        refusal
+    );
+    refusal.missing[0].name = "bad\nname".into();
+    assert!(refusal.validate().is_err());
+    refusal.missing = Box::default();
+    refusal.check = None;
+    let encoded = serde_json::to_value(&refusal).unwrap();
+    assert!(encoded.get("missing").is_none());
+    assert!(encoded.get("check").is_none());
+    assert!(serde_json::from_value::<Refusal>(encoded).is_ok());
+}
 use motor_winagent::bun::*;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -240,7 +419,7 @@ fn operational_install_and_verification_failures_skip_and_remove_partial_modules
         .unwrap();
     assert_eq!(
         warning.warning(),
-        "bun install skipped for m/project: BunOfflineInstallFailed package=root@1.0.0\n"
+        "bun install skipped for m/project: BunOfflineInstallFailed package=root@1.0.0 check=InstalledTree\n"
     );
     assert!(!scratch.join("workspace/node_modules").exists());
 

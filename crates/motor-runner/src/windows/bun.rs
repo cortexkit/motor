@@ -732,7 +732,10 @@ fn prepare_impl(
     let mut seed_bytes = 0u64;
     for (project, lock_sha256, manifest_sha256, name, version, rows, mut skipped) in projects {
         let packages = rows.iter().map(|row| row.package.clone()).collect();
-        for row in &rows {
+        // Authorize all rows above, but only acquire packages Bun can install on
+        // Windows. Foreign optional archives must not consume its fetch budget
+        // or prevent a later Windows transitive dependency from being seeded.
+        for row in rows.iter().filter(|row| row.package.windows) {
             if skipped.is_some() {
                 break;
             }
@@ -771,31 +774,28 @@ fn prepare_impl(
                 }
             }
             if Instant::now() >= deadline {
-                skipped = Some(fail(
-                    RefusalKind::BunFetchUnavailable,
-                    &project,
-                    &row.package,
-                    &target.origin,
-                ));
+                skipped = Some(
+                    fail(
+                        RefusalKind::BunFetchUnavailable,
+                        &project,
+                        &row.package,
+                        &target.origin,
+                    )
+                    .at(bun::Check::FetchDeadline),
+                );
                 break;
             }
-            let mut unused = Lease::default();
-            let reference = if row.package.windows {
-                &mut lease
-            } else {
-                &mut unused
-            };
-            let bytes = match store::get(
+            let bytes = match store::get_checked(
                 &cache,
                 &target.provenance,
                 &row.package.integrity,
                 registries.cas_quota_bytes,
-                reference,
+                &mut lease,
                 || download(&target),
             ) {
                 Ok(bytes) => bytes,
-                Err(kind) => {
-                    let refusal = fail(kind, &project, &row.package, &target.origin);
+                Err((kind, check)) => {
+                    let refusal = fail(kind, &project, &row.package, &target.origin).at(check);
                     if kind.is_security() {
                         return Err(refusal.into());
                     }
@@ -804,30 +804,51 @@ fn prepare_impl(
                 }
             };
             let dest = seed.join(row.package.integrity.blob_path());
-            if row.package.windows && !dest.exists() {
+            if !dest.exists() {
                 seed_bytes += bytes.len() as u64;
                 if seed_bytes > 8 * 1024 * 1024 * 1024 {
-                    skipped = Some(fail(
-                        RefusalKind::BunFetchUnavailable,
-                        &project,
-                        &row.package,
-                        &target.origin,
-                    ));
+                    skipped = Some(
+                        fail(
+                            RefusalKind::BunFetchUnavailable,
+                            &project,
+                            &row.package,
+                            &target.origin,
+                        )
+                        .at(bun::Check::SeedBudget),
+                    );
                     break;
                 }
                 if fs::create_dir_all(dest.parent().unwrap())
                     .and_then(|()| fs::write(dest, bytes))
                     .is_err()
                 {
-                    skipped = Some(fail(
-                        RefusalKind::BunCacheMissing,
-                        &project,
-                        &row.package,
-                        &target.origin,
-                    ));
+                    skipped = Some(
+                        fail(
+                            RefusalKind::BunCacheMissing,
+                            &project,
+                            &row.package,
+                            &target.origin,
+                        )
+                        .at(bun::Check::SeedWrite),
+                    );
                     break;
                 }
             }
+        }
+        if let Some(refusal) = skipped.take() {
+            skipped = Some(
+                refusal.missing_packages(
+                    rows.iter()
+                        .filter(|row| {
+                            row.package.windows
+                                && !seed.join(row.package.integrity.blob_path()).exists()
+                        })
+                        .map(|row| bun::MissingPackage {
+                            name: row.package.name.clone(),
+                            version: row.package.version.clone(),
+                        }),
+                ),
+            );
         }
         manifest.projects.push(Project {
             path: project,
@@ -838,6 +859,34 @@ fn prepare_impl(
             packages,
             skipped,
         });
+    }
+    // Keep verified host blobs for a retry, but never publish a partial set of
+    // a project's package blobs as an installable guest cache.
+    let needed: std::collections::BTreeSet<_> = manifest
+        .projects
+        .iter()
+        .filter(|p| p.skipped.is_none())
+        .flat_map(|p| {
+            p.packages
+                .iter()
+                .filter(|p| p.windows)
+                .map(|p| p.integrity.blob_path())
+        })
+        .collect();
+    if seed.join("blobs").exists() {
+        for algorithm in fs::read_dir(seed.join("blobs"))? {
+            for blob in fs::read_dir(algorithm?.path())? {
+                let path = blob?.path();
+                let relative = path
+                    .strip_prefix(&seed)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if !needed.contains(&relative) {
+                    fs::remove_file(path)?;
+                }
+            }
+        }
     }
     fs::write(seed.join("manifest.json"), serde_json::to_vec(&manifest)?)?;
     Ok(lease)
