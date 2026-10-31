@@ -56,15 +56,23 @@ class JobSandboxProbeTests(unittest.TestCase):
                     self.refused(changed, "root-owned cgroup directory .*")
 
     def test_memory_pressure_is_the_only_job_owned_control_file_with_mode_0644(self):
-        for field, value in (("uid", 0), ("gid", 0), ("mode", 0o600)):
-            with self.subTest(field=field):
+        # A mixed or foreign owner, or a different mode, is refused.
+        for changes in (dict(uid=0), dict(gid=0), dict(uid=1234, gid=1234), dict(mode=0o600)):
+            with self.subTest(changes=changes):
                 changed = copy.deepcopy(self.passing)
-                changed["files"]["memory.pressure"][field] = value
-                self.refused(changed, "memory.pressure ownership and mode 0644")
+                changed["files"]["memory.pressure"].update(changes)
+                self.refused(changed, "memory.pressure owned by the job account or root, mode 0644")
         for owner in (999, 1234):
             changed = copy.deepcopy(self.passing)
             changed["files"]["memory.max"]["uid"] = owner
             self.refused(changed, "root-owned cgroup control file memory.max")
+
+    def test_root_owned_memory_pressure_is_accepted(self):
+        # Some hosts' systemd leaves memory.pressure root-owned (seen on Boat);
+        # the contract accepts it, since the read-only mount still holds.
+        changed = copy.deepcopy(self.passing)
+        changed["files"]["memory.pressure"].update(uid=0, gid=0)
+        probe.judge(json.dumps(changed))
 
     def test_cgroup_write_must_fail_because_mount_is_read_only(self):
         for write in (dict(wrote=True), dict(errno=errno.EACCES, error="Permission denied"),

@@ -116,14 +116,16 @@ def judge(output):
             "motor-job identity", identity)
 
     # Check the exception explicitly, not a guessed uid or a file-count threshold:
-    # systemd assigns only memory.pressure to the account, with mode 0644.
+    # systemd assigns only memory.pressure to the account, with mode 0644. Some
+    # hosts' systemd leaves it root-owned (seen on Boat), which the contract also
+    # accepts: the read-only mount checked below keeps it unwritable either way.
     files = seen.get("files")
     require(isinstance(files, dict) and bool(files) and "error" not in files,
             "cgroup control-file ownership", files)
     pressure = files.get("memory.pressure")
-    require(isinstance(pressure, dict) and pressure.get("uid") == uid
-            and pressure.get("gid") == gid and pressure.get("mode") == 0o644,
-            "memory.pressure ownership and mode 0644", pressure)
+    require(isinstance(pressure, dict) and pressure.get("mode") == 0o644
+            and (pressure.get("uid"), pressure.get("gid")) in ((uid, gid), (0, 0)),
+            "memory.pressure owned by the job account or root, mode 0644", pressure)
     for name, owner in files.items():
         if name != "memory.pressure":
             require(isinstance(owner, dict) and owner.get("uid") == 0 and owner.get("gid") == 0,

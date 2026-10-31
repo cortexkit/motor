@@ -399,8 +399,10 @@ these hold, and callers may rely on them:
 - That cgroup is not delegated to the job: its directory and control files are
   owned by root, so the job cannot change its own limits. The one exception is
   `memory.pressure`, which systemd gives to the job account (mode 0644) so a
-  process can watch its own memory pressure; it changes no limit. Both parent
-  slices, `motor.slice` and `motor-jobs.slice`, are owned by root.
+  process can watch its own memory pressure; it changes no limit. Some hosts'
+  systemd leaves it owned by root instead (Boat sandboxes have been seen to), which
+  is also valid: either way the cgroup mount is read-only, so the job cannot write
+  it. Both parent slices, `motor.slice` and `motor-jobs.slice`, are owned by root.
 - PID 1 in the job's PID namespace (4.1) is the bash wrapper, running as the job
   account.
 - The job account is `motor-job` (2.1). The tenant image recipe pins it to the
