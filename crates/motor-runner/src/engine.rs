@@ -8699,6 +8699,24 @@ impl Runner {
         self.record_memory_peak(id, mem_peak_mib);
     }
 
+    /// The `MemoryMax` a Linux job unit with `weight` vCPUs is launched with,
+    /// computed as `isolation.rs` does at launch: the per-vCPU limit (or the
+    /// Boat sandbox budget), clamped to the jobs slice. Uses the slice ceiling
+    /// last cached, which changes only when an operator resizes the slice.
+    fn job_unit_memory_max(&self, weight: u32) -> u64 {
+        #[cfg(test)]
+        let requested = crate::backend::memory_max(weight, self.core.config.memory_floor_gib);
+        #[cfg(not(test))]
+        let requested = crate::backend::memory_max(weight);
+        let requested = self.core.config.boat_memory_max_bytes.unwrap_or(requested);
+        let slice = self
+            .core
+            .slice_budget
+            .load(std::sync::atomic::Ordering::Relaxed);
+        crate::job_memory_budget::JobMemoryBudget::from_max(slice)
+            .map_or(requested, |slice| requested.min(slice.max))
+    }
+
     fn record_memory_peak(&self, id: Uuid, mem_peak_mib: Option<u64>) {
         let log = self.job_log(id);
         let _write = log.lock_write();
@@ -8713,11 +8731,16 @@ impl Runner {
             self.memory_peak_unavailable(updated, "final launcher summary timed out");
             return;
         }
-        if mem_peak_mib.is_none() {
+        let Some(mem_peak_mib) = mem_peak_mib else {
             self.memory_peak_unavailable(updated, "final launcher summary has no memory peak");
             return;
-        }
-        updated.mem_peak_mib = mem_peak_mib;
+        };
+        // The summary reader takes the top of systemd's displayed tenth-of-a-unit
+        // interval so it never understates. A job held at its limit would then
+        // report up to 0.1 GiB above a limit the kernel never let it pass, so
+        // the peak is clamped to the limit the unit was launched with.
+        let limit_mib = self.job_unit_memory_max(updated.weight).div_ceil(1 << 20);
+        updated.mem_peak_mib = Some(mem_peak_mib.min(limit_mib));
         updated.memory_accounting_pending = false;
         for _ in 0..accounting::MEMORY_PEAK_SAVE_ATTEMPTS {
             if self.save(&updated).is_ok() {

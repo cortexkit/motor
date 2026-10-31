@@ -99,6 +99,11 @@ fn pending(runner: &Runner) -> Vec<motor_protocol::TenantEvent> {
 fn finished_successful_unit_keeps_final_summary_peak_in_durable_lifecycle() {
     for (memory_line, expected) in [
         ("Memory peak: 4.2M (swap: 0B)\n", Some(5)),
+        // Below the limit, the top of the displayed interval stands: 1.6 GiB.
+        ("Memory peak: 1.5G\n", Some(1639)),
+        // A 1-vCPU job's unit limit is the 16 GiB floor. Held at it, systemd
+        // shows "16.0G"; the interval's top (16487 MiB) is clamped to 16384.
+        ("Memory peak: 16.0G\n", Some(16384)),
         ("", None),
         ("Memory peak: n/a\n", None),
     ] {
