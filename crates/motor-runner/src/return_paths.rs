@@ -20,6 +20,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+// Leave descriptor headroom for serving connections and other jobs, including
+// on hosts whose service limit is only 256. Expanded link paths also need a
+// work limit: repeatedly entering and leaving a directory need not grow depth.
+#[cfg(unix)]
+const MAX_RETURN_DIRECTORY_DESCRIPTORS: usize = 64;
+#[cfg(unix)]
+const MAX_RETURN_PATH_COMPONENTS: usize = 4096;
+
 // Resolve symlinks first for an explicit escape result, then walk the resolved
 // path through directory descriptors without following replacements. No target
 // outside the workspace is opened, even if a command left a racing descendant.
@@ -28,13 +36,32 @@ use std::{
 // workspace, including a dangling link whose outside target does not exist.
 #[cfg(unix)]
 fn open_file(root: &Path, directory: &File, relative: &Path) -> Result<File, Cause> {
+    walk_file(root, directory, relative, |_, _| {})
+}
+
+#[cfg(unix)]
+fn walk_file(
+    root: &Path,
+    directory: &File,
+    relative: &Path,
+    mut observe: impl FnMut(usize, usize),
+) -> Result<File, Cause> {
     let mut directories = vec![directory.try_clone().map_err(|_| Cause::Missing)?];
     let mut pending: std::collections::VecDeque<_> = relative
         .components()
         .map(|c| c.as_os_str().to_owned())
         .collect();
     let mut links = 0;
+    let mut processed = 0;
+    observe(processed, directories.len());
     while let Some(component) = pending.pop_front() {
+        // Complexity limits are confinement limits, not a claim that the target
+        // is missing or non-regular. Stop before opening another component.
+        if processed >= MAX_RETURN_PATH_COMPONENTS {
+            return Err(Cause::Escape);
+        }
+        processed += 1;
+        observe(processed, directories.len());
         if component == "." {
             continue;
         }
@@ -99,7 +126,11 @@ fn open_file(root: &Path, directory: &File, relative: &Path) -> Result<File, Cau
         if !metadata.is_dir() {
             return Err(Cause::NotRegular);
         }
+        if directories.len() >= MAX_RETURN_DIRECTORY_DESCRIPTORS {
+            return Err(Cause::Escape);
+        }
         directories.push(file);
+        observe(processed, directories.len());
     }
     Err(Cause::NotRegular)
 }
@@ -693,6 +724,7 @@ fn same_file(_: &File, _: Result<File, Cause>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::CanonicalScratchDir;
     use cortexkit_test_support::ScratchDir;
     use motor_protocol::{ReturnAssembler, RETURN_CHUNKED_MAX_BYTES_CAP};
 
@@ -745,6 +777,77 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn return_paths_resolver_bounds_live_directory_stack() {
+        use std::os::unix::fs::symlink;
+        let scratch = ScratchDir::new("return-paths-depth-budget");
+        let root = scratch.path();
+        let mut parent = root.to_owned();
+        // Each short link expands into forty real directories, so checking only
+        // the caller pathname length or the number of links cannot bound FDs.
+        for link in ["first", "second"] {
+            let mut next = parent.clone();
+            for _ in 0..40 {
+                next.push("d");
+                fs::create_dir(&next).unwrap();
+            }
+            let target =
+                PathBuf::from("d/".repeat(40)).join(if link == "first" { "second" } else { "out" });
+            symlink(target, parent.join(link)).unwrap();
+            parent = next;
+        }
+        fs::write(parent.join("out"), b"unreachable").unwrap();
+        let (directory, _) = open_directory(root).unwrap();
+        let mut max_depth = 0;
+        let mut processed = 0;
+        let result = walk_file(root, &directory, Path::new("first"), |work, depth| {
+            max_depth = max_depth.max(depth);
+            processed = work;
+        });
+        assert_eq!(result.unwrap_err(), Cause::Escape);
+        assert_eq!(max_depth, MAX_RETURN_DIRECTORY_DESCRIPTORS);
+        assert!(
+            processed < MAX_RETURN_PATH_COMPONENTS,
+            "the depth limit fires first"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn return_paths_resolver_bounds_total_component_expansion() {
+        use std::os::unix::fs::symlink;
+        let scratch = ScratchDir::new("return-paths-work-budget");
+        let root = scratch.path();
+        fs::create_dir(root.join("d")).unwrap();
+        for index in 0..24 {
+            let next = if index == 23 {
+                "out".into()
+            } else {
+                format!("link-{}", index + 1)
+            };
+            symlink(
+                format!("{}{next}", "d/../".repeat(100)),
+                root.join(format!("link-{index}")),
+            )
+            .unwrap();
+        }
+        fs::write(root.join("out"), b"unreachable").unwrap();
+        let (directory, _) = open_directory(root).unwrap();
+        let mut max_depth = 0;
+        let mut processed = 0;
+        let result = walk_file(root, &directory, Path::new("link-0"), |work, depth| {
+            max_depth = max_depth.max(depth);
+            processed = work;
+        });
+        assert_eq!(result.unwrap_err(), Cause::Escape);
+        assert_eq!(processed, MAX_RETURN_PATH_COMPONENTS);
+        assert_eq!(
+            max_depth, 2,
+            "component expansion need not grow the descriptor stack"
+        );
+    }
+
+    #[cfg(unix)]
     fn staged_collection(run: &Run, host: &Path, job: &Path) -> ChunkedCollection {
         let Collection::Chunked(collection) = collect_staged(run, host, job) else {
             panic!("expected chunked collection")
@@ -755,7 +858,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn staged_returns_use_share_not_canonical_checkout() {
-        let scratch = ScratchDir::new("staged-return-root");
+        let scratch = CanonicalScratchDir::new("staged-return-root");
         let canonical = scratch.join("canonical");
         let staged = scratch.join("staged");
         let job = scratch.join("job");
@@ -787,7 +890,7 @@ mod tests {
     #[test]
     fn staged_returns_hostile_links_never_spool_host_sentinel() {
         use std::os::unix::fs::symlink;
-        let scratch = ScratchDir::new("staged-return-links");
+        let scratch = CanonicalScratchDir::new("staged-return-links");
         let staged = scratch.join("staged");
         let job = scratch.join("job");
         fs::create_dir_all(&staged).unwrap();
@@ -852,7 +955,7 @@ mod tests {
     #[test]
     fn staged_returns_pin_root_and_refuse_symlink_replacement() {
         use std::os::unix::fs::symlink;
-        let scratch = ScratchDir::new("staged-return-replacement");
+        let scratch = CanonicalScratchDir::new("staged-return-replacement");
         let staged = scratch.join("staged");
         let saved = scratch.join("saved");
         let job = scratch.join("job");
@@ -879,7 +982,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn staged_returns_exact_ten_mib_and_over_cap_admission_without_read() {
-        let scratch = ScratchDir::new("staged-return-cap");
+        let scratch = CanonicalScratchDir::new("staged-return-cap");
         let staged = scratch.join("staged");
         let job = scratch.join("job");
         fs::create_dir_all(&staged).unwrap();

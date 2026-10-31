@@ -136,13 +136,28 @@ pub(crate) fn capture_finished_workspace(
     request: &Run,
     workspace: PathBuf,
 ) {
+    capture_finished_workspace_after_stop(config, trees, request, workspace, || {});
+}
+
+pub(crate) fn capture_finished_workspace_after_stop(
+    config: &crate::engine::Config,
+    trees: &Trees,
+    request: &Run,
+    workspace: PathBuf,
+    after_stop: impl FnOnce(),
+) {
     let runtime = &config.macos_runtime;
     let entry = runtime
         .begin(&config.state_root, request.job_id, &request.workspace_key)
         .unwrap();
     // No VM is started by these tests; model the stop proof produced by the
     // execution worker before it scans and releases the staged tree.
-    entry.owned.lock().unwrap().record.stop_proven = true;
+    {
+        let mut owned = entry.owned.lock().unwrap();
+        owned.record.stop_proven = true;
+        lifecycle::Runtime::save(&config.state_root, &owned.record).unwrap();
+    }
+    after_stop();
     let tree = config
         .state_root
         .join("jobs")
@@ -243,10 +258,10 @@ fn workspace_changes_compare_macos_staging_with_the_callers_snapshot() {
             .join("Users/motor/project")
     );
     let changes = || {
-        f.staging.trees.changes_for_request(
+        f.staging.trees.changes_for_guest(
             &staged.workspace,
             &staged.prepared_javascript_directories,
-            Some(&request),
+            &request,
         )
     };
     assert_eq!(changes().unwrap(), Vec::<String>::new());
@@ -261,7 +276,7 @@ fn workspace_changes_compare_macos_staging_with_the_callers_snapshot() {
     let mut legacy = f
         .staging
         .trees
-        .changes_for_request(&staged.workspace, &[], Some(&request))
+        .changes_for_guest(&staged.workspace, &[], &request)
         .unwrap();
     legacy.sort();
     assert_eq!(legacy, edited);
@@ -314,6 +329,108 @@ fn workspace_changes_failed_macos_scan_is_unavailable_not_empty() {
     host::remove_dir_all(&staged.workspace).unwrap();
     execution::capture_changes(runtime, &f.staging.trees, &entry, &request, &staged);
     assert!(runtime.take_changes(request.job_id).is_none());
+}
+
+#[test]
+fn workspace_changes_ignore_guest_git_config_filters_hooks_and_gitdir_links() {
+    let f = Fixture::new();
+    write(&f.source.join("source"), "committed\n");
+    write(&f.source.join(".gitattributes"), "source filter=hostile\n");
+    let request = f.request();
+    let staged = f
+        .staging
+        .prepare(&request, Cancellation::default())
+        .unwrap();
+    let marker = f.scratch.join("host-code-executed");
+    let hooks = f.scratch.join("hostile-hooks");
+    tool(
+        hooks.join("post-index-change"),
+        &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    );
+    let include = f.scratch.join("guest-include");
+    write(
+        &include,
+        &format!(
+            "[filter \"hostile\"]\nclean = touch '{}'; cat\n",
+            marker.display()
+        ),
+    );
+    let config = staged.workspace.join(".git/config");
+    let original = host::read_to_string(&config).unwrap();
+    write(
+        &config,
+        &format!(
+            "{original}\n[include]\npath = {}\n[core]\nfsmonitor = touch '{}'\nhooksPath = {}\n",
+            include.display(),
+            marker.display(),
+            hooks.display()
+        ),
+    );
+    write(&staged.workspace.join("source"), "job edit\n");
+    let scan = || {
+        f.staging
+            .trees
+            .changes_for_guest(&staged.workspace, &[], &request)
+            .unwrap()
+    };
+    assert_eq!(scan(), ["source"]);
+    assert!(
+        !marker.exists(),
+        "the host must not execute guest Git configuration"
+    );
+
+    let host_metadata = f.scratch.join("host-git-metadata");
+    host::rename(staged.workspace.join(".git"), &host_metadata).unwrap();
+    symlink(&host_metadata, staged.workspace.join(".git")).unwrap();
+    assert_eq!(scan(), ["source"]);
+    host::remove_file(staged.workspace.join(".git")).unwrap();
+    write(
+        &staged.workspace.join(".git"),
+        &format!("gitdir: {}\n", host_metadata.display()),
+    );
+    assert_eq!(scan(), ["source"]);
+    assert!(!marker.exists());
+    let durable = f
+        .staging
+        .trees
+        .state
+        .join("jobs")
+        .join(request.job_id.to_string());
+    assert!(
+        host::read_dir(durable).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_str()
+            .unwrap()
+            .starts_with("change-scan-")),
+        "private scan metadata is removed after use"
+    );
+}
+
+#[test]
+fn workspace_changes_do_not_enter_guest_submodule_metadata() {
+    let f = Fixture::new();
+    let module = f.source.join("module");
+    host::create_dir_all(&module).unwrap();
+    git(&module, &["init"]);
+    write(&module.join("source"), "submodule\n");
+    commit(&module);
+    let request = f.request();
+    let marker = f.scratch.join("submodule-code-executed");
+    write(
+        &module.join(".git/config"),
+        &format!(
+            "[core]\nrepositoryformatversion = 0\nfsmonitor = touch '{}'\n",
+            marker.display()
+        ),
+    );
+    let error = f
+        .staging
+        .trees
+        .changes_for_guest(&f.source, &[], &request)
+        .unwrap_err();
+    assert!(error.to_string().contains("guest submodule metadata"));
+    assert!(!marker.exists());
 }
 
 #[test]

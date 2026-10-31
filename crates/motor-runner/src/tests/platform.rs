@@ -530,15 +530,15 @@ impl Backend for MacosTerminalBackend {
     ) -> io::Result<backend::Launch> {
         unreachable!("terminal tests do not launch a VM")
     }
-    fn cancel(&self, _: &Config, _: &Job, _: bool) -> io::Result<()> {
-        Ok(())
+    fn cancel(&self, config: &Config, job: &Job, hard: bool) -> io::Result<()> {
+        crate::macos::MacosBackend.cancel(config, job, hard)
     }
     fn unit_alive(
         &self,
-        _: &Config,
-        _: Option<platform::ProcessIdentity>,
+        config: &Config,
+        process: Option<platform::ProcessIdentity>,
     ) -> io::Result<Option<bool>> {
-        Ok(None)
+        crate::macos::MacosBackend.unit_alive(config, process)
     }
     fn collect_changes(
         &self,
@@ -732,5 +732,121 @@ fn macos_returns_replay_restart_and_expire_after_staging_deletion() {
                 Some(&ReturnPathsFailureCause::Expired)
             );
         }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn macos_kill_after_stop_waits_for_capture_handoff_without_orphan_spool() {
+    use std::os::unix::process::ExitStatusExt;
+    for deadline in [false, true] {
+        let f = Fixture::new();
+        let mut config = platform_config(&f, BackendKind::MacosVm);
+        config.manual_tick = true;
+        let runner = Runner::open_with_backend(config, Box::new(MacosTerminalBackend)).unwrap();
+        let mut request = macos_request(&f);
+        request.return_chunked = true;
+        request.return_paths = vec![format!("{}/artifact", request.workspace_key)];
+        request.timeout = deadline.then_some(1);
+        runner.accept(request.clone()).unwrap();
+        let process = platform::ProcessIdentity {
+            pid: 0,
+            start: 0,
+            unit: Some(request.job_id),
+        };
+        {
+            let mut inner = runner.core.inner.lock().unwrap();
+            let job = inner.jobs.get_mut(&request.job_id).unwrap();
+            job.state = JobState::Running;
+            job.started_ms = Some(runner.now());
+            job.process = Some(process);
+            runner.save(job).unwrap();
+        }
+        let mirror = runner
+            .core
+            .trees
+            .ensure_mirror(&request.repository_root)
+            .unwrap();
+        git(&mirror, &["fetch", text(&f.main), "HEAD:refs/heads/main"]);
+        let workspace = runner
+            .config()
+            .state_root
+            .join("jobs")
+            .join(request.job_id.to_string())
+            .join("Users/motor/project");
+        fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+        git(
+            &f.main,
+            &["clone", "--no-local", text(&f.main), text(&workspace)],
+        );
+        fs::write(workspace.join("source"), "job edit\n").unwrap();
+        fs::write(workspace.join("artifact"), b"x").unwrap();
+        runner
+            .output(request.job_id, OutputStream::Stdout, b"output")
+            .unwrap();
+
+        crate::macos::capture_finished_workspace_after_stop(
+            runner.config(),
+            &runner.core.trees,
+            &request,
+            workspace.clone(),
+            || {
+                if deadline {
+                    f.clock.fetch_add(1000, Ordering::SeqCst);
+                    runner.enforce_kills(std::time::Instant::now()).unwrap();
+                } else {
+                    runner.cancel(request.job_id).unwrap();
+                    runner.cancel(request.job_id).unwrap();
+                    runner.enforce_kills(std::time::Instant::now()).unwrap();
+                }
+                assert_eq!(
+                    runner.unit_alive(Some(process)).unwrap(),
+                    Some(true),
+                    "a stopped VM still owns pending captures"
+                );
+                let inner = runner.core.inner.lock().unwrap();
+                assert!(inner.jobs[&request.job_id].kill.is_some());
+                assert!(inner.jobs[&request.job_id].terminal.is_none());
+                assert!(!inner.finalizing.contains(&request.job_id));
+            },
+        );
+        assert!(!workspace.exists());
+        assert_eq!(runner.unit_alive(Some(process)).unwrap(), Some(false));
+        runner
+            .finish_execution(
+                request.job_id,
+                Ok(backend::ExecutionOutcome::Unix(
+                    std::process::ExitStatus::from_raw(0),
+                )),
+                false,
+            )
+            .unwrap();
+        let frames = runner.replay(request.job_id, 0).unwrap();
+        let (files, _, _) = super::return_paths::assemble(&frames, &request);
+        assert_eq!(files, vec![Some(b"x".to_vec())]);
+        let Frame::Terminal(terminal) = frames.last().unwrap() else {
+            unreachable!()
+        };
+        let mut changes = terminal.workspace_changes.clone().unwrap();
+        changes.sort();
+        assert_eq!(changes, ["artifact", "source"]);
+        let disk: Job = read_json(&runner.record_path(request.job_id)).unwrap();
+        let directory = disk.returned.unwrap().directory;
+        let mut spools: Vec<_> = fs::read_dir(runner.record_path(request.job_id).parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_str().unwrap().to_owned())
+            .filter(|name| name.starts_with(RETURNED_DIRECTORY_PREFIX))
+            .collect();
+        spools.sort();
+        assert_eq!(
+            spools,
+            vec![directory],
+            "every spool belongs to the finished record"
+        );
+        assert!(runner
+            .config()
+            .macos_runtime
+            .take_returns(request.job_id)
+            .is_none());
     }
 }
