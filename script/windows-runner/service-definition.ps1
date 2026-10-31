@@ -61,8 +61,44 @@ function Set-RunnerMetricsCommand([string]$Binary, [string]$MetricsEndpoint, [st
 }
 
 function Invoke-RunnerMetricsKey([string]$Root) {
-    & "$Root\bin\motor-runner.exe" metrics-key --instance ally --state-root "$Root\state"
-    if ($LASTEXITCODE -ne 0) { throw "metrics-key failed with exit code $LASTEXITCODE" }
+    # Monitor storage belongs to the LocalSystem service, not the elevated operator.
+    # The wrapper and captured key must stay private to SYSTEM and Administrators.
+    $evidence = 'C:\motor-runner-evidence\metrics-key-' + [Guid]::NewGuid().ToString('N')
+    if (Test-Path -LiteralPath $evidence) { throw 'Fresh metrics-key evidence directory required' }
+    New-Item -ItemType Directory -Path $evidence -ErrorAction Stop | Out-Null
+    & icacls.exe $evidence /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot protect metrics-key evidence directory' }
+    $wrapper = "$evidence\run.cmd"
+    # Batch expansion must not reinterpret percent signs in an installation path.
+    $batchRoot = $Root.Replace('%', '%%')
+    @"
+@echo off
+setlocal DisableDelayedExpansion
+"$batchRoot\bin\motor-runner.exe" metrics-key --instance ally --state-root "$batchRoot\state" > "$evidence\metrics-key.log" 2>&1
+set "runner_exit=%errorlevel%"
+>"$evidence\exit.tmp" echo %runner_exit%
+move /y "$evidence\exit.tmp" "$evidence\exit.txt" >nul
+exit /b %runner_exit%
+"@ | Set-Content -LiteralPath $wrapper -Encoding ascii -ErrorAction Stop
+    $name = 'MotorRunnerMetricsKey-' + [Guid]::NewGuid().ToString('N')
+    try {
+        $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" -Argument "/d /c `"$wrapper`"" -ErrorAction Stop
+        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ErrorAction Stop
+        Register-ScheduledTask -TaskName $name -Action $action -Settings $settings -User SYSTEM -RunLevel Highest -Force -ErrorAction Stop | Out-Null
+        Start-ScheduledTask $name -ErrorAction Stop
+        $deadline = [DateTime]::UtcNow.AddMinutes(1)
+        while (-not (Test-Path -LiteralPath "$evidence\exit.txt")) {
+            if ([DateTime]::UtcNow -ge $deadline) {
+                Stop-ScheduledTask $name -ErrorAction SilentlyContinue
+                throw "metrics-key timeout; preserve $evidence"
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        $code = [int](Get-Content -LiteralPath "$evidence\exit.txt" -Raw -ErrorAction Stop).Trim()
+        $output = @(Get-Content -LiteralPath "$evidence\metrics-key.log" -ErrorAction Stop)
+        if ($code -ne 0) { throw "metrics-key failed with exit code ${code}:`n$($output -join [Environment]::NewLine)" }
+        $output
+    } finally { Unregister-ScheduledTask $name -Confirm:$false -ErrorAction SilentlyContinue }
 }
 
 function Assert-RunnerServiceCommand([string]$Expected) {

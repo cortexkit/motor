@@ -1,5 +1,5 @@
 # Windows PowerShell parser, policy, and temporary-VHD fixtures. Never boots a VM.
-param([switch]$UpdateOnly, [string]$UpdateCase = '', [string]$ScratchRoot = $env:TMPDIR)
+param([switch]$UpdateOnly, [string]$UpdateCase = '', [string]$ScratchRoot = $env:TMPDIR, [switch]$MetricsKeyOnly)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 # Any failure that escapes a check reports its script line and stack, so even
@@ -56,6 +56,82 @@ foreach ($file in $files) {
     Write-Host 'PASS metrics-default-render-validation-preserve-replace-disable-verification'
 }
 $count++
+$count += & {
+    $keyAst = (Get-Command Invoke-RunnerMetricsKey).ScriptBlock.Ast
+    $commands = @($keyAst.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] }, $true))
+    $registration = @($commands | Where-Object { $_.GetCommandName() -eq 'Register-ScheduledTask' })
+    $directKey = @($commands | Where-Object { $_.Extent.Text -match 'motor-runner\.exe.*\smetrics-key\b' })
+    if ($registration.Count -ne 1 -or $registration[0].Extent.Text -notmatch '-User SYSTEM\b' -or $directKey.Count) { throw 'FAIL metrics-key-system-task-private-output-and-exit: key must run in a SYSTEM scheduled task, never as the caller' }
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and (-not $UpdateOnly -or $MetricsKeyOnly)) {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run metrics-key fixtures in an elevated administrator shell' }
+        if (-not $ScratchRoot) { $ScratchRoot = Join-Path (Get-Location).Path 'target\scratch' }
+        $fixture = Join-Path $ScratchRoot ('metrics key %PATH% & fixture-' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path "$fixture\bin","$fixture\state" -Force | Out-Null
+        $fixtureKey = 'fixture-key-' + [Guid]::NewGuid().ToString('N')
+        [IO.File]::WriteAllText("$fixture\state\key.txt", $fixtureKey)
+        $captures = @()
+        try {
+            # The stand-in executable uses the real task identity and checks the
+            # real arguments; Task Scheduler and filesystem ACLs are not mocked.
+            Add-Type -OutputAssembly "$fixture\bin\motor-runner.exe" -OutputType ConsoleApplication -TypeDefinition @'
+using System;
+using System.IO;
+using System.Security.Principal;
+public static class MetricsKeyFixture {
+    public static int Main(string[] args) {
+        if (WindowsIdentity.GetCurrent().User.Value != "S-1-5-18") {
+            Console.Error.WriteLine("fixture requires SYSTEM"); return 19;
+        }
+        if (args.Length != 5 || args[0] != "metrics-key" || args[1] != "--instance" || args[2] != "ally" || args[3] != "--state-root") {
+            Console.Error.WriteLine("unexpected metrics-key arguments"); return 20;
+        }
+        string key = File.ReadAllText(Path.Combine(args[4], "key.txt"));
+        if (File.Exists(Path.Combine(args[4], "fail"))) {
+            Console.Error.WriteLine("fixture metrics failure " + key); return 23;
+        }
+        Console.WriteLine(key); return 0;
+    }
+}
+'@
+            $output = @(Invoke-RunnerMetricsKey $fixture)
+            if ($output.Count -ne 1 -or $output[0] -cne $fixtureKey) { throw "FAIL metrics-key-system-task-private-output-and-exit: unexpected key output: $output" }
+            [IO.File]::WriteAllText("$fixture\state\fail", '')
+            $failure = $null
+            try { Invoke-RunnerMetricsKey $fixture } catch { $failure = [string]$_ }
+            if ($failure -notlike "*metrics-key failed with exit code 23:*fixture metrics failure $fixtureKey*") { throw "FAIL metrics-key-system-task-private-output-and-exit: $failure" }
+        } finally {
+            # Select only captures belonging to this fixture, even if another
+            # operator printed a real key while the checks were running.
+            $captures = @(Get-ChildItem 'C:\motor-runner-evidence' -Directory -Filter 'metrics-key-*' | Where-Object {
+                $cmd = Join-Path $_.FullName 'run.cmd'
+                (Test-Path -LiteralPath $cmd) -and ([IO.File]::ReadAllText($cmd).Contains($fixture.Replace('%', '%%')))
+            })
+            try {
+                if ($captures.Count -ne 2) { throw "FAIL metrics-key-system-task-private-output-and-exit: expected two private captures, got $($captures.Count)" }
+                foreach ($capture in $captures) {
+                    foreach ($item in @($capture) + @(Get-ChildItem -LiteralPath $capture.FullName)) {
+                        $acl = Get-Acl -LiteralPath $item.FullName
+                        if ($item.PSIsContainer -and -not $acl.AreAccessRulesProtected) { throw 'FAIL metrics-key-system-task-private-output-and-exit: evidence DACL inherits access' }
+                        $sids = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+                        if (($sids -join ',') -cne 'S-1-5-18,S-1-5-32-544') { throw "FAIL metrics-key-system-task-private-output-and-exit: evidence accessible to $sids" }
+                    }
+                    $tasks = @(Get-ScheduledTask | Where-Object { $_.TaskName -like 'MotorRunnerMetricsKey-*' -and ($_.Actions.Arguments -join ' ').Contains($capture.FullName) })
+                    if ($tasks.Count) { throw 'FAIL metrics-key-system-task-private-output-and-exit: scheduled task was not unregistered' }
+                }
+            } finally {
+                foreach ($capture in $captures) { Remove-Item -LiteralPath $capture.FullName -Recurse -Force }
+                Remove-Item -LiteralPath $fixture -Recurse -Force
+            }
+        }
+    }
+    Write-Host 'PASS metrics-key-system-task-private-output-and-exit'
+    return 1
+}
+if ($MetricsKeyOnly) {
+    Write-Host "PASS $count PowerShell parser/metrics checks"
+    return
+}
 if ($UpdateOnly -and $UpdateCase -eq 'vm-present') {
     & {
         . "$PSScriptRoot\update-functions.ps1"
