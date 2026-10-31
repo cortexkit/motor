@@ -404,13 +404,14 @@ fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
         ["long_checkout_component_01234567890123456789012345"; 4].join("/")
     );
     source(&f);
-    let probe = powershell(&baseline_environment_script());
-    let drive_probe = powershell(&jq_cache_drive_environment_script());
-    let output = run(
-        &runner,
-        &f,
-        &format!("set -e; rustc -vV; cargo --version; cargo nextest --version; git --version; bun --version; pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; python3 --version; python --version; python3 -c \"import json, hashlib, subprocess, tomllib, compression.zstd\"; nats-server --version; rustc +stable --version; clang --version; jq --version; {probe}; {drive_probe}; cargo +stable run --offline; test -f target/debug/motor-qualification.exe"),
-    );
+    // Each command runs in its own job VM: the guest starts a job's command
+    // through a launcher limited to 8,191 characters, so two encoded probes in
+    // one command truncate the second.
+    let output = baseline_qualification_commands()
+        .iter()
+        .map(|command| run(&runner, &f, command))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         output
             .lines()
@@ -487,6 +488,16 @@ fn windows_qualification_baseline_machine_wide_toolchain_and_msvc_build() {
         "{output}"
     );
     no_units(&runner);
+}
+
+/// The baseline qualification's job commands: tool versions and the MSVC build,
+/// then each encoded environment probe in a command of its own.
+fn baseline_qualification_commands() -> [String; 3] {
+    [
+        "set -e; rustc -vV; cargo --version; cargo nextest --version; git --version; bun --version; pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'; python3 --version; python --version; python3 -c \"import json, hashlib, subprocess, tomllib, compression.zstd\"; nats-server --version; rustc +stable --version; clang --version; jq --version; cargo +stable run --offline; test -f target/debug/motor-qualification.exe".into(),
+        powershell(&baseline_environment_script()),
+        powershell(&jq_cache_drive_environment_script()),
+    ]
 }
 
 fn baseline_environment_script() -> String {
@@ -2133,6 +2144,18 @@ fn offline_canary_generated_powershell_has_balanced_braces() {
         assert!(
             command.len() < 8000,
             "encoded canary invocation is {} bytes",
+            command.len()
+        );
+    }
+}
+
+#[test]
+fn baseline_qualification_commands_fit_the_guest_command_limit() {
+    // The guest's job launcher truncates a command past 8,191 characters.
+    for command in baseline_qualification_commands() {
+        assert!(
+            command.len() < 8000,
+            "job command has {} characters",
             command.len()
         );
     }
