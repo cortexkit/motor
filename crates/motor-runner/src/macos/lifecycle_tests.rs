@@ -1,5 +1,5 @@
 use super::*;
-use cortexkit_test_support::ScratchDir;
+use crate::test_helpers::CanonicalScratchDir as ScratchDir;
 use std::sync::Barrier;
 
 #[derive(Default)]
@@ -942,7 +942,13 @@ fn recovery_skips_temporary_and_stray_record_files() {
 
 #[test]
 fn helper_gets_gate_eof_grace_before_sigkill_escalation() {
-    use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+    use std::{
+        io::Read,
+        os::{
+            fd::AsRawFd,
+            unix::{fs::PermissionsExt, process::ExitStatusExt},
+        },
+    };
     for ignore_eof in [false, true] {
         let scratch = ScratchDir::new("macos-helper-grace");
         let root = scratch.join("state");
@@ -967,10 +973,10 @@ fn helper_gets_gate_eof_grace_before_sigkill_escalation() {
         std::fs::write(
             &script,
             if ignore_eof {
-                "#!/bin/sh\nwhile :; do :; done\n".to_string()
+                "#!/bin/sh\nprintf 'ready\\n'\nwhile :; do :; done\n".to_string()
             } else {
                 format!(
-                    "#!/bin/sh\nIFS= read -r gate\nprintf stopped > '{}'\nexit 0\n",
+                    "#!/bin/sh\nprintf 'ready\\n'\nIFS= read -r gate\nprintf stopped > '{}'\nexit 0\n",
                     marker.display()
                 )
             },
@@ -993,10 +999,27 @@ fn helper_gets_gate_eof_grace_before_sigkill_escalation() {
         .unwrap();
         {
             let mut owned = entry.owned.lock().unwrap();
-            owned.helper = Some(
+            let mut helper =
                 motor_macvm::spawn_job_helper(&script, &plan, owned.slot.as_ref().unwrap())
-                    .unwrap(),
-            );
+                    .unwrap();
+            // Measure gate shutdown, not the host's time to launch the shell.
+            // Bound readiness as well so a broken fixture cannot hang the suite.
+            let mut poll = libc::pollfd {
+                fd: helper.reports.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let mut ready = [0; 6];
+            let readable = unsafe { libc::poll(&mut poll, 1, 10_000) };
+            if readable != 1
+                || helper.reports.read_exact(&mut ready).is_err()
+                || &ready != b"ready\n"
+            {
+                let _ = helper.child.kill();
+                let status = helper.child.wait();
+                panic!("helper did not become ready: poll={readable}, status={status:?}");
+            }
+            owned.helper = Some(helper);
         }
         let now = Instant::now();
         runtime.finish(&root, &entry);
@@ -1016,7 +1039,7 @@ fn helper_gets_gate_eof_grace_before_sigkill_escalation() {
             assert_eq!(status.signal(), Some(libc::SIGKILL));
             assert!(now.elapsed() >= Duration::from_millis(100));
         } else {
-            assert!(status.success());
+            assert!(status.success(), "EOF-aware helper exited with {status:?}");
             assert!(marker.exists());
         }
     }

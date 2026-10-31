@@ -6,7 +6,9 @@ fn scratch() -> PathBuf {
     let path = cortexkit_test_support::scratch_root()
         .join(format!("monitor-{}", motor_protocol::Uuid::now_v7()));
     std::fs::create_dir_all(&path).unwrap();
-    path
+    // Identity storage deliberately refuses symlink ancestors. The shared
+    // scratch helper may select /tmp, which is a symlink on macOS.
+    std::fs::canonicalize(path).unwrap()
 }
 
 fn accepted_record() -> HostMetrics {
@@ -149,6 +151,23 @@ fn monitor_identity_is_stable_and_counter_is_durable_exclusive_and_fail_closed()
         .write_all(&[0])
         .unwrap();
     assert!(identity::Counter::open(&journal).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn monitor_identity_accepts_canonical_scratch_but_refuses_symlinked_ancestors() {
+    use std::os::unix::fs::symlink;
+    let root = scratch();
+    let real = root.join("real");
+    std::fs::create_dir(&real).unwrap();
+    let alias = root.join("alias");
+    symlink(&real, &alias).unwrap();
+    assert!(public_key(&Config::new(&alias, "metrics")).is_err());
+    assert!(!real.join("metrics/monitor/host-key").exists());
+    assert_eq!(
+        public_key(&Config::new(&real, "metrics")).unwrap().len(),
+        64
+    );
 }
 
 #[cfg(unix)]

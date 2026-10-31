@@ -5,6 +5,12 @@ status-level = "slow"
 final-status-level = "slow"
 slow-timeout = { period = "120s", terminate-after = 2, grace-period = "60s" }
 
+# These tests can skip at runtime when optional host tools are absent. Keep
+# their output visible so an unavailable prerequisite is never a silent pass.
+[[profile.default.overrides]]
+filter = 'package(=motor-runner) and (test(=macos::tests::real_cargo_and_bun_ignore_hostile_config_and_lifecycle_scripts) or test(=macos::tests::bundled_private_commit_with_unreachable_url_preps_offline_and_missing_commit_refuses) or test(=macos::tests::ssh_git_source_with_bundled_commit_passes_preflight_and_password_is_refused))'
+success-output = "immediate"
+
 # The real-server harness includes two 90 s restart probes, full builds, and
 # several 30-minute rebuild polls. It is ignored in every ordinary test lane.
 [[profile.default.overrides]]

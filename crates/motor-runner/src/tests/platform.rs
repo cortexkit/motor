@@ -473,6 +473,8 @@ fn macos_backend_guard_requires_explicit_development_override() {
     for kind in [BackendKind::Host, BackendKind::Vm, BackendKind::WindowsVm] {
         let mut config = Config::new("unused", "guard");
         config.backend = kind;
+        // Exercise production's default rather than the library fixture opt-in.
+        config.development_allow_host_backend = false;
         assert!(config
             .configure_backend()
             .unwrap_err()
