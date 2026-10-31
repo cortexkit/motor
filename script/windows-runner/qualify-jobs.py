@@ -280,6 +280,9 @@ BUN_VERSION_CHECK = "bun_version=$(bun --version) && test \"${bun_version%$'\\r'
 JQ_VERSION_CHECK = "jq_version=$(jq --version) && printf '%s\\n' \"$jq_version\" && test \"${jq_version%$'\\r'}\" = 'jq-1.8.2'"
 # Run the alias and native lookup probes inside the standard user's logon
 # session; an elevated provisioning shell cannot prove that jobs see the drive.
+# The round trip below proves T:\ and C:\t\ reach the same volume root, so the
+# job's rights through both are that root's ACL. Get-Acl on C:\t\ reads the
+# mount folder on C: instead, so comparing the two ACLs fails on a correct image.
 CACHE_DRIVE_SCRIPT = r"""
 $ErrorActionPreference='Stop'
 if((Get-Command jq.exe -ErrorAction Stop).Source -cne 'C:\Program Files\jq\jq.exe'){throw 'jq resolves outside the protected installation'}
@@ -289,7 +292,6 @@ if(-not (Test-Path -LiteralPath 'T:\' -PathType Container)){throw 'cache drive T
 if(((Get-Item -LiteralPath 'T:\' -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'cache drive root is a reparse point'}
 $query=(& fsutil.exe reparsepoint query 'T:\' 2>&1 | Out-String)
 if($LASTEXITCODE -eq 0 -or $query -notmatch 'not a reparse point'){throw "cache drive reparse query failed: $query"}
-if((Get-Acl -LiteralPath 'T:\').Sddl -cne (Get-Acl -LiteralPath 'C:\t\').Sddl){throw 'cache drive and folder permissions differ'}
 $probe='motor-drive-probe-'+[Guid]::NewGuid().ToString()
 try {
  [IO.File]::WriteAllText(('T:\'+$probe),'drive cache')
@@ -297,7 +299,7 @@ try {
  [IO.File]::WriteAllText(('C:\t\'+$probe),'folder cache')
  if([IO.File]::ReadAllText(('T:\'+$probe)) -cne 'folder cache'){throw 'cache folder write did not reach drive mount'}
 } finally {Remove-Item -LiteralPath ('T:\'+$probe) -Force -ErrorAction SilentlyContinue}
-Write-Output 'cache drive aliases share permissions and data; native jq verified'
+Write-Output 'cache drive aliases reach the same volume; native jq verified'
 """
 CACHE_DRIVE_CHECK = "pwsh -NoProfile -NonInteractive -EncodedCommand " + base64.b64encode(CACHE_DRIVE_SCRIPT.encode("utf-16le")).decode("ascii")
 NEXTEST_VERSION_CHECK = "nextest_version=$(cargo nextest --version) && printf '%s\\n' \"$nextest_version\" && [[ \"$nextest_version\" == 'cargo-nextest 0.9.138 '* ]]"

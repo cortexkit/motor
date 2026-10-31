@@ -88,13 +88,15 @@ class QualificationReadinessTests(unittest.TestCase):
             "& jq.exe --version", "'jq-1.8.2'", "'C:\\Program Files\\jq\\jq.exe'",
             "Test-Path -LiteralPath 'T:\\' -PathType Container",
             "fsutil.exe reparsepoint query 'T:\\'", "not a reparse point",
-            "(Get-Acl -LiteralPath 'T:\\').Sddl -cne (Get-Acl -LiteralPath 'C:\\t\\').Sddl",
             "[IO.File]::WriteAllText(('T:\\'+$probe),'drive cache')",
             "[IO.File]::ReadAllText(('C:\\t\\'+$probe)) -cne 'drive cache'",
             "[IO.File]::WriteAllText(('C:\\t\\'+$probe),'folder cache')",
             "[IO.File]::ReadAllText(('T:\\'+$probe)) -cne 'folder cache'",
         ):
             self.assertIn(required, script)
+        # The mount folder's ACL is not the volume root's, so comparing them
+        # fails on a correct image; the round trip above is the proof.
+        self.assertNotIn("Get-Acl", script)
 
     @unittest.skipUnless(shutil.which("bash"), "requires Bash for the Git Bash version guard")
     def test_jq_version_check_rejects_wrong_missing_and_failed_jq(self):
