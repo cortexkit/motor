@@ -204,6 +204,7 @@ pub enum Reply {
     TenantMetrics {
         memory_bytes: u64,
         egress_bytes: u64,
+        disk_quota_bytes: u64,
     },
     Removed {
         quarantine: String,

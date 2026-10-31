@@ -101,7 +101,7 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "4676345c5f0ba8576799847bd1efee289c784fc44b2e5295e1c1e2de20ab01aa",
+            "609c46e61313f162f1135ba8fcbd9aa1dc14bc5ba33492354075e52366cf7a5a",
         ),
         (
             "host-draining.json",
@@ -109,7 +109,7 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         ),
         (
             "host-metrics.json",
-            "c1a3daf40d39f5c96ee98ad5766f18cb9af336b488b2a34d431e50405d8acf9a",
+            "77a92ef5cc8ede142b84671697f672078c2c3346f8d758e84fe012582b88c91c",
         ),
         (
             "bad-request.json",

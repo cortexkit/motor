@@ -952,6 +952,16 @@ impl Runner {
                 window_minutes: health::WINDOW_MINUTES,
                 free_bytes,
                 queue_depth,
+                guest_disk: {
+                    #[cfg(target_os = "linux")]
+                    {
+                        super::guest_disk::report(&self.core.guest_disk)
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        None
+                    }
+                },
                 running,
                 oldest_wait_s: Some(oldest_wait_s),
                 failed_job_units,

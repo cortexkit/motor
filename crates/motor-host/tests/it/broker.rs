@@ -339,6 +339,79 @@ fn metrics_sample_reports_real_host_counters_and_safe_recovery_latch() {
     );
 }
 
+struct DiskGuest(Mutex<Value>);
+impl Control for DiskGuest {
+    fn adopt(&self, tenant: &str) -> Result<bool> {
+        NoVm.adopt(tenant)
+    }
+    fn wake(&self, tenant: &str, generation: Option<u64>) -> Result<u64> {
+        NoVm.wake(tenant, generation)
+    }
+    fn quota(&self, tenant: &str, vcpus: u32) -> Result<()> {
+        NoVm.quota(tenant, vcpus)
+    }
+    fn relay(&self, tenant: &str, port: u32) -> Result<std::os::unix::net::UnixStream> {
+        NoVm.relay(tenant, port)
+    }
+    fn admin(&self, _: &str, _: &Value) -> Result<Value> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+    fn suspend(&self, tenant: &str) -> Result<()> {
+        NoVm.suspend(tenant)
+    }
+    fn available_bytes(&self) -> Result<u64> {
+        NoVm.available_bytes()
+    }
+    fn disk_quota_bytes(&self, _: &str) -> Result<u64> {
+        Ok(50 * (1 << 30) + 400)
+    }
+}
+
+#[test]
+fn hostile_guest_disk_is_clamped_in_push_and_cannot_change_admission() {
+    let ms = NOW * 1000;
+    let control = Arc::new(DiskGuest(Mutex::new(json!({"ok":true,"health":{}}))));
+    let mut h = host();
+    h.guest_ready("tenant", 1).unwrap();
+    let before = serde_json::to_value(&h.snapshot).unwrap();
+    let runtime = Runtime::new("host".into(), h, control.clone());
+    let mut sampler = motor_host::metrics::Sampler::default();
+    for (free, total, expected) in [
+        (u64::MAX, u64::MAX, (50, 50)),
+        (u64::MAX, 1 << 30, (1, 1)),
+        (10 * (1 << 30) + 17, 52 * (1 << 30), (10, 50)),
+        (0, 0, (0, 0)),
+    ] {
+        *control.0.lock().unwrap() = json!({"ok":true,"health":{"guest_disk":{
+            "free_bytes":free,"total_bytes":total,"age_ms":0}}});
+        let sample = sampler
+            .sample(&runtime, std::path::Path::new("/"), ms)
+            .unwrap();
+        let push: Value = serde_json::from_slice(&sample.encode(ms).unwrap()).unwrap();
+        assert_eq!(push["tenants"][0]["disk_free_gib"], expected.0);
+        assert_eq!(push["tenants"][0]["disk_total_gib"], expected.1);
+        let h = runtime.host.lock().unwrap();
+        assert_eq!(serde_json::to_value(&h.snapshot).unwrap(), before);
+        assert!(!h.storage_refusing());
+        assert_eq!(h.quota("tenant", ms), 1);
+    }
+    let mut h = runtime.host.lock().unwrap();
+    assert!(matches!(
+        h.claim(claims(JOB), ms).unwrap().1,
+        motor_host::state::Admission::Ready
+    ));
+    let mut oversized = claims(JOB2);
+    oversized.vcpus = 3;
+    assert!(h.claim(oversized, ms).is_err());
+    h.guest_unready("tenant");
+    drop(h);
+    let sample = sampler
+        .sample(&runtime, std::path::Path::new("/"), ms)
+        .unwrap();
+    assert!(sample.tenants[0].disk_free_gib.is_none());
+    assert!(sample.tenants[0].disk_total_gib.is_none());
+}
+
 #[test]
 fn signed_sender_heartbeats_at_fifteen_seconds_and_on_change_and_resigns_unchanged_usage_after_lost_reply(
 ) {

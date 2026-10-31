@@ -52,6 +52,19 @@ pub struct Tenant {
     pub recovery: Option<Recovery>,
     #[serde(deserialize_with = "required_nullable")]
     pub detail: Option<String>,
+    // The outer option preserves omission; the inner option preserves null.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_nullable"
+    )]
+    pub disk_free_gib: Option<Option<u64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_nullable"
+    )]
+    pub disk_total_gib: Option<Option<u64>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +112,12 @@ fn required_nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     Option::<T>::deserialize(d)
 }
 
+fn optional_nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(d).map(Some)
+}
+
 fn text(value: &str, max: usize) -> bool {
     !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
 }
@@ -126,6 +145,14 @@ impl HostMetrics {
             return Err("disks.mount");
         }
         for t in &self.tenants {
+            if t.disk_free_gib.is_some() != t.disk_total_gib.is_some()
+                || t.disk_free_gib
+                    .flatten()
+                    .zip(t.disk_total_gib.flatten())
+                    .is_some_and(|(free, total)| free > total)
+            {
+                return Err("tenants.disk");
+            }
             if !crate::valid_name(&t.vm)
                 || t.detail.as_ref().is_some_and(|d| !text(d, 200))
                 || (t.state == TenantState::Recovering) != t.recovery.is_some()

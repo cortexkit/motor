@@ -1364,3 +1364,26 @@ fn spill_withdrawal_fields_are_additive_and_omitted_at_default() {
     assert_eq!(wait.spill_withdrawals, 0);
     assert_eq!(serde_json::to_value(wait).unwrap(), legacy);
 }
+
+#[test]
+fn guest_disk_health_is_additive_and_old_guests_omit_it() {
+    let old = vector("frames", "status-health-spill-withdrawals");
+    let Frame::StatusReply(reply) = serde_json::from_value(old.clone()).unwrap() else {
+        panic!("expected health reply");
+    };
+    assert!(reply.health.as_ref().unwrap().guest_disk.is_none());
+    assert!(serde_json::to_value(reply).unwrap()["health"]
+        .get("guest_disk")
+        .is_none());
+    let mut new = old;
+    new["health"]["guest_disk"] = serde_json::json!({
+        "free_bytes":17,"total_bytes":31,"age_ms":250});
+    let Frame::StatusReply(reply) = serde_json::from_value(new).unwrap() else {
+        panic!("expected health reply");
+    };
+    let disk = reply.health.unwrap().guest_disk.unwrap();
+    assert_eq!(
+        (disk.free_bytes, disk.total_bytes, disk.age_ms),
+        (17, 31, 250)
+    );
+}

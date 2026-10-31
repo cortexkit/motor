@@ -589,7 +589,7 @@ failures are 401 `host_auth_failed`. Size is checked before authentication, sche
 The route never updates heartbeat, placement capacity, availability or admission state. Missing
 metrics never prevents a placement host from receiving jobs.
 
-The strict body has exactly these members (nested objects are strict too):
+The strict body has these members (nested objects are strict too); only the tenant disk pair is optional:
 
 ```json
 {
@@ -598,7 +598,8 @@ The strict body has exactly these members (nested objects are strict too):
   "mem": { "total_mib": 128000, "avail_mib": 22000 },
   "disks": [{ "mount": "/", "total_gib": 900, "free_gib": 310 }],
   "tenants": [{ "vm": "vm-1", "state": "ready", "vcpus": 30, "mem_mib": 106496,
-    "slots_total": 90, "slots_used": 41, "jobs_running": 12, "recovery": null, "detail": null }],
+    "slots_total": 90, "slots_used": 41, "jobs_running": 12, "recovery": null, "detail": null,
+    "disk_free_gib": 80, "disk_total_gib": 600 }],
   "runners": [{ "name": "direct", "state": "ready", "slots_total": 16, "slots_used": 3,
     "queued": 0, "oldest_wait_s": 0, "detail": null }]
 }
@@ -608,12 +609,17 @@ The strict body has exactly these members (nested objects are strict too):
 - `cpu.busy_pct` is an integer 0..100; `cpu.load1` is a non-negative finite number with at most two
   decimal places, or null when the platform has no load average (for example, Windows). The
   `load1` key is always required; Linux and macOS send a number. Decimal notation is allowed
-  here, unlike other routes. All other numeric fields are
+  here, unlike other routes. All other non-null numeric fields are
   non-negative safe integers. Exponent notation is not accepted.
 - Each array has at most eight entries and may be empty. `mount` is 1..128 UTF-8 bytes with no
   Unicode control characters. `vm` matches `^[A-Za-z0-9._-]{1,64}$`.
 - Tenant `state` is `ready`, `starting`, `recovering` or `stopped`. `recovery` must be null except
   for `recovering`, when it is `{ "step": string (1..64 characters), "since_ms": int, "attempts": int }`.
+- Tenant `disk_free_gib` and `disk_total_gib` describe the guest filesystem, not the host's disks.
+  Older hosts may omit both; otherwise both keys must be present, each a non-negative safe integer
+  or null when unavailable. If both are non-null, free must not exceed total. A missing partner
+  returns 400 with `field: "tenants[i].disk_free_gib"` or `"tenants[i].disk_total_gib"` naming the
+  missing member; free above total names `"tenants[i].disk_free_gib"` (with the actual array index).
 - Runner `name` matches `^[a-z0-9-]{1,32}$`; its `state` is `ready`, `draining`, `stopped` or `error`.
 - Every `detail` is null or 1..200 UTF-8 bytes without Unicode control characters. It contains
   only host-generated errors or step names, never job or guest output. Do not include account,
@@ -627,10 +633,11 @@ slots, and maximum summed tenant slots used and jobs running. Disk free space is
 across the body's disks, or NULL with no disks; a bucket retains the minimum non-null sample.
 Load retains the maximum non-null sample, or NULL when every sample in the bucket has null load.
 `last_body` is the last accepted body serialized in the schema's key order without whitespace.
-States and per-disk details are available in that body, not separate rollup columns.
+States, per-disk details and tenant guest disk figures are available in that body, not separate rollup columns.
 
-`test-vectors/runners/host-metrics.json` pins accepted signed pushes with numeric and null load, the 413 boundary, and
-bad-enum, overlong-detail and stale-clock refusals, produced by the real signer and parser.
+`test-vectors/runners/host-metrics.json` pins accepted signed pushes with numeric and null load,
+numeric and null tenant guest disks, the 413 boundary, and bad-enum, overlong-detail, stale-clock,
+unpaired guest-disk and free-above-total refusals, produced by the real signer and parser.
 
 ### POST /v1/hosts/{host_id}/heartbeat
 

@@ -37,6 +37,9 @@ mod accounting;
 mod admission_gate;
 #[path = "disk.rs"]
 mod disk;
+#[cfg(target_os = "linux")]
+#[path = "guest_disk.rs"]
+mod guest_disk;
 #[path = "health.rs"]
 mod health;
 #[path = "migration.rs"]
@@ -1537,6 +1540,8 @@ struct Core {
     /// Admission/prepare take this before claiming state, never while holding inner.
     reserve_restore: Mutex<()>,
     tenant_events: Option<Arc<crate::tenant::EventLog>>,
+    #[cfg(target_os = "linux")]
+    guest_disk: Mutex<Option<(std::time::Instant, motor_protocol::GuestDisk)>>,
     /// Set while a tenant VM queues no fills for want of a write key, so the
     /// reason is logged once when that starts rather than at every tick.
     tenant_fills_off_logged: std::sync::atomic::AtomicBool,
@@ -2694,6 +2699,8 @@ impl Runner {
                 catalog_generation: std::sync::atomic::AtomicU64::new(0),
                 catalog_written: Mutex::new(CatalogWritten::default()),
                 health,
+                #[cfg(target_os = "linux")]
+                guest_disk: Mutex::new(None),
                 repository_usage: Mutex::new(repository_usage),
                 slice_budget: std::sync::atomic::AtomicU64::new(
                     crate::job_memory_budget::NO_JOB_MEMORY_BUDGET,
@@ -2777,6 +2784,10 @@ impl Runner {
         #[cfg(test)]
         if runner.core.config.manual_tick {
             return Ok(runner);
+        }
+        #[cfg(target_os = "linux")]
+        if runner.core.config.tenant_vm {
+            guest_disk::start(&runner);
         }
         if runner.core.config.disk_reserve_bytes > 0 {
             if let Err(error) = runner.disk_upkeep() {

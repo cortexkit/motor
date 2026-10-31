@@ -457,6 +457,7 @@ impl<B: Backend> Controller<B> {
                 return Ok(Response::new(Reply::TenantMetrics {
                     memory_bytes,
                     egress_bytes,
+                    disk_quota_bytes: r.disk_quota_bytes,
                 }));
             }
             Operation::Relay(port) => {

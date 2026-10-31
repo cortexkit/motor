@@ -209,6 +209,9 @@ pub struct RunnerHealth {
     /// Null means the state-filesystem probe failed, not zero free space.
     pub free_bytes: Option<u64>,
     pub queue_depth: u32,
+    /// Display-only space on the tenant workspace filesystem, not an admission signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_disk: Option<GuestDisk>,
     pub running: Vec<HealthRunningJob>,
     /// Age of the oldest pending job, including uploads; zero for an empty queue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -256,6 +259,14 @@ pub struct RunnerHealth {
     pub windows_guest_agent: Option<WindowsGuestAgentReadiness>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_cache: Option<RemoteCacheHealth>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuestDisk {
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+    /// Monotonic age at report generation; hosts discard samples over 60 seconds old.
+    pub age_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

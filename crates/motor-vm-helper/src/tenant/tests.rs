@@ -925,7 +925,8 @@ fn tenant_metrics_are_read_only_bound_to_registry_and_reject_paths() {
         c.handle("a", Operation::Metrics).unwrap().reply,
         Reply::TenantMetrics {
             memory_bytes: 1048576,
-            egress_bytes: 123
+            egress_bytes: 123,
+            disk_quota_bytes: 21474836480
         }
     ));
     assert_eq!(c.0.calls, ["registry", "metrics"]);

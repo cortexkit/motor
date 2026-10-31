@@ -135,6 +135,8 @@ impl Sampler {
                             .count() as u64,
                         recovery,
                         detail: detail.map(str::to_owned),
+                        disk_free_gib: None,
+                        disk_total_gib: None,
                     },
                     ready,
                 )
@@ -150,6 +152,12 @@ impl Sampler {
                     .control
                     .admin(&binding.tenant, &serde_json::json!({"op":"status"}))
                 {
+                    if let Ok(quota) = runtime.control.disk_quota_bytes(&binding.tenant) {
+                        if let Some((free, total)) = guest_disk(&reply, quota) {
+                            tenant.disk_free_gib = Some(Some(free));
+                            tenant.disk_total_gib = Some(Some(total));
+                        }
+                    }
                     if let Some(runner) = runner(&reply, format!("vm-{}", index + 1)) {
                         tenant.slots_total = runner.slots_total;
                         tenant.slots_used = runner.slots_used;
@@ -163,6 +171,22 @@ impl Sampler {
             sample.tenants.push(tenant);
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn guest_disk(reply: &serde_json::Value, quota: u64) -> Option<(u64, u64)> {
+    if reply["ok"] != true || quota == 0 {
+        return None;
+    }
+    let disk = &reply["health"]["guest_disk"];
+    if disk["age_ms"].as_u64()? > 60_000 {
+        return None;
+    }
+    // Guest input is display-only. The helper's registry, not the guest,
+    // bounds the figures; none of these values enter Host admission state.
+    let total = disk["total_bytes"].as_u64()?.min(quota);
+    let free = disk["free_bytes"].as_u64()?.min(total);
+    Some((free / (1 << 30), total / (1 << 30)))
 }
 
 #[cfg(target_os = "linux")]
@@ -263,6 +287,28 @@ fn disk(mount: &Path) -> Result<Disk> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_disk_ignores_old_guests_stale_reports_and_malformed_values() {
+        use serde_json::json;
+        let mut reply = json!({"ok":true,"health":{}});
+        assert_eq!(guest_disk(&reply, 100), None);
+        reply["health"]["guest_disk"] = json!({"free_bytes":51,"total_bytes":99,"age_ms":60_000});
+        assert_eq!(guest_disk(&reply, 100), Some((0, 0)));
+        assert_eq!(guest_disk(&reply, 0), None);
+        for disk in [
+            json!({"free_bytes":51,"total_bytes":99,"age_ms":60_001}),
+            json!({"free_bytes":-1,"total_bytes":99,"age_ms":0}),
+            json!({"free_bytes":1.5,"total_bytes":99,"age_ms":0}),
+            json!({"free_bytes":51,"total_bytes":null,"age_ms":0}),
+            json!({"free_bytes":51,"total_bytes":99}),
+        ] {
+            reply["health"]["guest_disk"] = disk;
+            assert_eq!(guest_disk(&reply, 100), None);
+        }
+        reply["ok"] = false.into();
+        assert_eq!(guest_disk(&reply, 100), None);
+    }
 
     #[test]
     fn proc_counters_use_available_memory_and_do_not_double_count_guest_cpu() {
