@@ -277,6 +277,7 @@ fn verify_qualification_guest(
 }
 
 pub(crate) struct Resources {
+    pub(super) bun_lease: Option<super::bun::Lease>,
     config: Config,
     pub(super) id: Uuid,
     pub(super) staging: PathBuf,
@@ -318,6 +319,7 @@ impl Resources {
             cleaned: false,
             cleanup_attempted: false,
             cleanup_on_drop: true,
+            bun_lease: None,
             _slot: Some(slot),
         };
         Ok(resources)
@@ -449,10 +451,59 @@ impl Drop for Resources {
                     cleaned: false,
                     cleanup_attempted: true,
                     cleanup_on_drop: false,
+                    bun_lease: self.bun_lease.take(),
                     _slot: self._slot.take(),
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    use cortexkit_test_support::ScratchDir;
+    #[test]
+    fn deferred_cleanup_keeps_package_leases() {
+        let scratch = ScratchDir::new("hyperv-deferred-bun-lease");
+        let path = scratch.join("reference");
+        let reference = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        fs2::FileExt::lock_shared(&reference).unwrap();
+        let probe = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let config = Config::new(scratch.join("state"), "lease");
+        let runtime = config.windows_runtime.clone();
+        let id = Uuid::now_v7();
+        let resources = Resources {
+            config,
+            id,
+            staging: scratch.join("staging"),
+            child: Monitor(None),
+            workspace: String::new(),
+            vm_id: None,
+            attached: false,
+            cleaned: false,
+            cleanup_attempted: true,
+            cleanup_on_drop: true,
+            _slot: None,
+            bun_lease: Some(super::super::bun::Lease::for_test(reference)),
+        };
+        drop(resources);
+        assert!(runtime.cleanup_pending(id));
+        assert!(
+            fs2::FileExt::try_lock_exclusive(&probe).is_err(),
+            "deferred VM lost its package reference"
+        );
+        drop(runtime);
+        fs2::FileExt::try_lock_exclusive(&probe).unwrap();
     }
 }
 pub(crate) fn cleanup_orphans(config: &Config) -> io::Result<()> {

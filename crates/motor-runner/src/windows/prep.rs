@@ -55,12 +55,17 @@ fn snapshot_error(
     )
 }
 
+pub(super) struct PreparedTree {
+    pub path: PathBuf,
+    pub lease: super::bun::Lease,
+}
+
 pub(super) fn prepare(
     config: &Config,
     trees: &Trees,
     setup: &Setup,
     staging: &Path,
-) -> io::Result<PathBuf> {
+) -> io::Result<PreparedTree> {
     #[cfg(windows)]
     super::ensure_parent_guard(config)?;
     let request = &setup.request;
@@ -244,12 +249,26 @@ pub(super) fn prepare(
     execute_with_registry(&plan_path, |job_staging, _workspace, lockfile, routes| {
         super::trusted_prep::prepare_local_registry(config, job_staging, lockfile, routes)
     })?;
+    let checkouts = plan
+        .snapshots
+        .iter()
+        .map(|snapshot| mapped(&snapshot.destination).map(|path| staging.join(path)))
+        .collect::<io::Result<Vec<_>>>()?;
+    let lease = super::bun::prepare(
+        config,
+        staging,
+        crate::caller_path::request(request)
+            .caller_repository_root
+            .text(),
+        &checkouts,
+    )?;
+    build_tar(staging)?;
     let tar = staging.join("tree.tar");
     let mut file = File::open(&tar)
         .map_err(|error| super::vm::path_error("open trusted preparation tree", &tar, error))?;
     motor_winagent::validate_tree(&mut file)
         .map_err(|error| super::vm::path_error("validate trusted preparation tree", &tar, error))?;
-    Ok(tar)
+    Ok(PreparedTree { path: tar, lease })
 }
 
 #[cfg(unix)]
@@ -664,7 +683,11 @@ fn validate_staged_manifests(
         return Err(invalid("root Cargo.lock is not a tracked regular file"));
     }
     for root in roots {
-        validate_manifests(root, roots, &plan.routes)?;
+        let files = regular_files
+            .iter()
+            .map(|name| plan.staging.join(name))
+            .collect();
+        validate_manifests(root, roots, &plan.routes, &files)?;
     }
     for name in ["cargo-home", "home", "fetch-temp"] {
         let path = plan.staging.join(name);
@@ -725,6 +748,7 @@ pub(crate) fn execute_with_fetch(
     }
     super::prep_error::step("stage dependencies", &plan.staging, || {
         stage_links_as_text(&plan.staging)?;
+        super::bun::write_parsed_locks(&plan.staging)?;
         build_tar(&plan.staging)
     })
 }
@@ -917,16 +941,17 @@ fn validate_manifests(
     root: &Path,
     roots: &[PathBuf],
     routes: &BTreeMap<String, PathBuf>,
+    files: &BTreeSet<PathBuf>,
 ) -> io::Result<()> {
     for entry in fs::read_dir(root)? {
         let path = entry?.path();
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.is_dir() {
-            validate_manifests(&path, roots, routes)?;
+            validate_manifests(&path, roots, routes, files)?;
         } else if path.file_name().is_some_and(|n| n == "Cargo.toml") {
             let value: toml::Value =
                 toml::from_str(&fs::read_to_string(&path)?).map_err(invalid)?;
-            validate_dependencies(&value, path.parent().unwrap(), roots, routes)?;
+            validate_dependencies(&value, path.parent().unwrap(), roots, routes, files)?;
         }
     }
     Ok(())
@@ -936,6 +961,7 @@ fn validate_dependencies(
     manifest: &Path,
     roots: &[PathBuf],
     routes: &BTreeMap<String, PathBuf>,
+    files: &BTreeSet<PathBuf>,
 ) -> io::Result<()> {
     if let Some(table) = value.as_table() {
         for (key, value) in table {
@@ -943,9 +969,9 @@ fn validate_dependencies(
                 key.as_str(),
                 "dependencies" | "dev-dependencies" | "build-dependencies" | "patch" | "replace"
             ) {
-                check_sources(value, manifest, roots, routes)?;
+                check_sources(value, manifest, roots, routes, files)?;
             } else {
-                validate_dependencies(value, manifest, roots, routes)?;
+                validate_dependencies(value, manifest, roots, routes, files)?;
             }
         }
     }
@@ -956,25 +982,13 @@ fn check_sources(
     manifest: &Path,
     roots: &[PathBuf],
     routes: &BTreeMap<String, PathBuf>,
+    files: &BTreeSet<PathBuf>,
 ) -> io::Result<()> {
     if let Some(table) = value.as_table() {
         if let Some(path) = table.get("path").and_then(toml::Value::as_str) {
-            let path = manifest.join(path);
-            let resolved = path
-                .canonicalize()
-                .map_err(|_| invalid(format!("missing path dependency: {}", path.display())))?;
-            #[cfg(unix)]
-            let inside = roots.iter().any(|root| resolved.starts_with(root));
-            #[cfg(windows)]
-            let inside = roots.iter().any(|root| {
-                root.canonicalize()
-                    .is_ok_and(|root| resolved.starts_with(root))
-            });
-            if !inside {
-                return Err(invalid(format!(
-                    "outside path dependency: {}",
-                    path.display()
-                )));
+            let resolved = super::local_path::resolve(manifest, roots, path)?;
+            if !files.contains(&resolved.join("Cargo.toml")) {
+                return Err(invalid("path dependency has no tracked Cargo.toml"));
             }
         }
         if let Some(url) = table.get("git").and_then(toml::Value::as_str) {
@@ -990,10 +1004,69 @@ fn check_sources(
             }
         }
         for value in table.values() {
-            check_sources(value, manifest, roots, routes)?;
+            check_sources(value, manifest, roots, routes, files)?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod security_path_tests {
+    use super::*;
+    #[test]
+    fn cargo_path_sources_use_tracked_lexical_paths_without_opening_them() {
+        let root = PathBuf::from("unmaterialized-checkout");
+        let files = BTreeSet::from([root.join("vendor/Cargo.toml")]);
+        let routes = BTreeMap::new();
+        let value: toml::Value = toml::from_str("path = '../vendor'").unwrap();
+        check_sources(
+            &value,
+            &root.join("project"),
+            std::slice::from_ref(&root),
+            &routes,
+            &files,
+        )
+        .unwrap();
+        for local in [
+            r"\\evil\share",
+            "C:/host",
+            "",
+            "/host",
+            r"foo\bar",
+            "../../outside",
+            "../missing",
+        ] {
+            let value: toml::Value =
+                toml::from_str(&format!("path = {}", serde_json::to_string(local).unwrap()))
+                    .unwrap();
+            assert!(check_sources(
+                &value,
+                &root.join("project"),
+                std::slice::from_ref(&root),
+                &routes,
+                &files
+            )
+            .is_err());
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn rebuilding_archive_does_not_truncate_prep_owned_link_targets() {
+        use cortexkit_test_support::ScratchDir;
+        let scratch = ScratchDir::new("windows-archive-link");
+        let staging = scratch.join("staging");
+        fs::create_dir_all(staging.join("m/project")).unwrap();
+        fs::write(staging.join("m/project/file"), b"source").unwrap();
+        let victim = scratch.join("victim");
+        fs::write(&victim, b"host file must survive").unwrap();
+        fs::hard_link(&victim, staging.join("tree.tar")).unwrap();
+        build_tar(&staging).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"host file must survive");
+        fs::remove_file(staging.join("tree.tar")).unwrap();
+        std::os::unix::fs::symlink(&victim, staging.join("tree.tar")).unwrap();
+        build_tar(&staging).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"host file must survive");
+    }
 }
 
 /// Replace every link under the fetched dependency trees with a file holding
@@ -1040,12 +1113,24 @@ fn replace_links(directory: &Path) -> io::Result<()> {
 
 pub(super) fn build_tar(staging: &Path) -> io::Result<()> {
     let archive = staging.join("tree.tar");
-    let mut builder = tar::Builder::new(
-        File::create(&archive)
-            .map_err(|error| error_at_path("create transfer archive", &archive, error))?,
-    );
+    let temporary = staging.join(format!(".tree-{}.tar", Uuid::now_v7()));
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(&temporary)
+        .map_err(|error| error_at_path("create fresh transfer archive", &temporary, error))?;
+    let mut verification = file.try_clone()?;
+    let mut builder = tar::Builder::new(file);
     let mut seen = BTreeSet::new();
     append(&mut builder, staging, &staging.join("m"), &mut seen)?;
+    if staging.join("bun-seed").exists() {
+        append(&mut builder, staging, &staging.join("bun-seed"), &mut seen)?;
+    }
     for name in [
         "config.toml",
         "gitconfig",
@@ -1066,11 +1151,9 @@ pub(super) fn build_tar(staging: &Path) -> io::Result<()> {
         .finish()
         .map_err(|error| error_at_path("finish writing transfer archive", &archive, error))?;
     drop(builder);
-    motor_winagent::validate_tree(
-        &mut File::open(&archive).map_err(|error| {
-            error_at_path("open transfer archive for validation", &archive, error)
-        })?,
-    )
+    motor_winagent::validate_tree(&mut verification)?;
+    // Replacing a name never truncates a prep-owned symlink or hard-link target.
+    fs::rename(&temporary, &archive)
 }
 fn append(
     builder: &mut tar::Builder<File>,

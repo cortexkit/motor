@@ -41,6 +41,7 @@ pub(crate) type VmHook =
     std::sync::Arc<dyn Fn(&[String], &str, &Path) -> io::Result<Box<dyn UnitChild>> + Send + Sync>;
 
 pub(super) struct Resources {
+    pub(super) bun_lease: Option<super::bun::Lease>,
     config: Config,
     pub(super) id: Uuid,
     workspace: String,
@@ -177,6 +178,7 @@ impl Resources {
             // is not cleaned up yet, and its overlay, socket and staging must
             // not be deleted by this one's failure.
             cleanup_on_drop: false,
+            bun_lease: None,
             child: Box::new(NotBooted),
             #[cfg(test)]
             _slot: config
@@ -444,11 +446,63 @@ impl Drop for Resources {
             cleaned: false,
             cleanup_attempted: true,
             cleanup_on_drop: false,
+            bun_lease: self.bun_lease.take(),
             child: std::mem::replace(&mut self.child, Box::new(NotBooted)),
             #[cfg(test)]
             _slot: self._slot.take(),
         };
         runtime.defer_cleanup(pending);
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    use cortexkit_test_support::ScratchDir;
+    #[test]
+    fn deferred_cleanup_keeps_package_leases() {
+        let scratch = ScratchDir::new("qemu-deferred-bun-lease");
+        let path = scratch.join("reference");
+        let reference = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        fs2::FileExt::lock_shared(&reference).unwrap();
+        let probe = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let config = Config::new(scratch.join("state"), "lease");
+        let runtime = config.windows_runtime.clone();
+        let id = Uuid::now_v7();
+        let resources = Resources {
+            config,
+            id,
+            workspace: String::new(),
+            staging: scratch.join("staging"),
+            overlay: PathBuf::new(),
+            cache: PathBuf::new(),
+            socket_dir: PathBuf::new(),
+            booted: false,
+            attached: false,
+            cleaned: false,
+            cleanup_attempted: true,
+            cleanup_on_drop: true,
+            child: Box::new(NotBooted),
+            _slot: None,
+            bun_lease: Some(super::super::bun::Lease::for_test(reference)),
+        };
+        drop(resources);
+        assert!(runtime.cleanup_pending(id));
+        assert!(
+            fs2::FileExt::try_lock_exclusive(&probe).is_err(),
+            "deferred VM lost its package reference"
+        );
+        drop(runtime);
+        fs2::FileExt::try_lock_exclusive(&probe).unwrap();
     }
 }
 

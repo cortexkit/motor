@@ -234,6 +234,17 @@ class BaselineInputsTests(unittest.TestCase):
         self.assertLess(source.index("& icacls $bunInstall /inheritance:r"), source.index("Expand-Archive -LiteralPath $bunArchive"))
         self.assertLess(source.index("& icacls $bunInstall /setowner"), source.index('& "$bunInstall\\bun.exe" --version'))
 
+    def test_bun_seed_is_read_only_and_disposable_cache_is_writable_for_the_job(self):
+        source = (HERE / "setup-job-baseline.ps1").read_text()
+        for path, access in ((r"C:\motor-bun-seed", "RX"), (r"C:\motor-job", "M")):
+            self.assertIn(
+                f"& icacls '{path}' /inheritance:r /grant:r "
+                "'*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "
+                f'"*${{jobSid}}:(OI)(CI){access}"', source)
+        self.assertIn("throw 'Bun seed ACL setup failed'", source)
+        self.assertIn("& icacls 'C:\\motor-bun-seed' /setowner '*S-1-5-32-544'", source)
+        self.assertIn("throw 'Bun disposable cache ACL setup failed'", source)
+
     def test_job_baseline_owns_bun_for_both_guest_install_paths(self):
         guest = (HERE / "setup-guest.ps1").read_text()
         self.assertIn("if ($JobBaseline) {\n    Write-Host 'Job baseline: machine-wide pinned Bun is installed by setup-job-baseline.ps1.'\n} elseif ($null -eq (Get-Command bun", guest)

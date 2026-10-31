@@ -17,6 +17,7 @@ mod engine;
 mod filesystem;
 #[cfg(target_os = "linux")]
 mod isolation;
+mod javascript;
 pub mod local_transport;
 #[cfg(unix)]
 pub mod macos;

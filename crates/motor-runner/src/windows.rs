@@ -20,6 +20,7 @@ use std::{
 use std::{os::unix::fs::PermissionsExt, path::Component};
 
 mod agent;
+mod bun;
 mod caches;
 #[cfg(unix)]
 mod host;
@@ -28,6 +29,7 @@ mod host;
 mod host;
 #[cfg(windows)]
 mod hvsock;
+mod local_path;
 pub(crate) mod prep;
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) mod prep_error;
@@ -122,6 +124,8 @@ pub(crate) type CommandHook =
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct VmConfig {
+    #[serde(default)]
+    pub bun: bun::RegistryConfig,
     pub layout_root: PathBuf,
     pub baseline: String,
     #[serde(default = "default_quota")]
