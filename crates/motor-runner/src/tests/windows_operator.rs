@@ -540,6 +540,9 @@ Write-Output 'short target cache is writable'
 
 // UTF-16 base64 encoding expands each probe enough that combining all the
 // baseline checks in one invocation would exceed Windows' command-line budget.
+// The round trip below proves T:\ and C:\t\ reach the same volume root, so the
+// job's rights through both are that root's ACL. Get-Acl on C:\t\ reads the
+// mount folder on C: instead, so comparing the two ACLs fails on a correct image.
 fn jq_cache_drive_environment_script() -> String {
     r#"
 $ErrorActionPreference='Stop'
@@ -566,7 +569,6 @@ if(-not (Test-Path -LiteralPath 'T:\' -PathType Container)){throw 'cache drive T
 if(((Get-Item -LiteralPath 'T:\' -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'cache drive root is a reparse point'}
 $reparseQuery=(& fsutil.exe reparsepoint query 'T:\' 2>&1 | Out-String)
 if($LASTEXITCODE -eq 0 -or $reparseQuery -notmatch 'not a reparse point'){throw "cache drive reparse query failed: $reparseQuery"}
-if((Get-Acl -LiteralPath 'T:\').Sddl -cne (Get-Acl -LiteralPath 'C:\t\').Sddl){throw 'cache drive and folder permissions differ'}
 $driveProbe='motor-drive-probe-'+[Guid]::NewGuid().ToString()
 try {
  [IO.File]::WriteAllText(('T:\'+$driveProbe),'drive cache')
