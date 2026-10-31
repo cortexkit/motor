@@ -524,6 +524,14 @@ fn windows_qualification_realistic_checkout_bun_failure_is_nonfatal() {
          [dev-dependencies]\nmotor-qualification={path='.',features=['qualification']}\n",
     )
     .unwrap();
+    // The lockfile Cargo itself generates for this self dev-dependency. The
+    // runner fetches with --locked, so a stale one fails preparation.
+    fs::write(
+        f.main.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"motor-qualification\"\nversion = \"0.1.0\"\n\
+         dependencies = [\n \"motor-qualification\",\n]\n",
+    )
+    .unwrap();
     fs::write(f.main.join("src/lib.rs"), "pub fn qualification() {}\n").unwrap();
     fs::create_dir_all(f.main.join("fixture")).unwrap();
     fs::write(
