@@ -18,10 +18,11 @@ pub mod cache;
 pub mod cache_format;
 pub mod cache_steps;
 pub mod environment;
+pub mod returned;
 pub mod transport;
 
 /// Version of the Windows profile; the Windows agent sends it in its Hello.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 /// Version of the macOS profile, versioned independently of the Windows one.
 pub const MACOS_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -102,6 +103,9 @@ pub enum Frame {
         refusal: bun::Refusal,
     },
     Start {},
+    RequestReturns {
+        request: returned::Request,
+    },
     Started {},
     Output {
         stream: Stream,
@@ -117,6 +121,14 @@ pub enum Frame {
     },
     Cancel {},
     Collect {},
+    CollectReturns {},
+    ReturnChunk {
+        bytes: Vec<u8>,
+    },
+    ReturnFileEnd {
+        outcome: returned::Outcome,
+    },
+    ReturnEnd {},
     Collected {
         bytes: Vec<u8>,
     },
@@ -227,6 +239,7 @@ pub enum State {
     Running,
     Exited,
     Collecting,
+    Returning,
     CollectionComplete,
     AwaitDismounted,
     Complete,
@@ -243,6 +256,10 @@ pub struct Protocol {
     collected_bytes: usize,
     cache_reported: bool,
     cache_progress_frames: u32,
+    returns: Option<returned::Request>,
+    return_index: usize,
+    return_committed: u64,
+    return_current: u64,
 }
 
 impl Protocol {
@@ -263,6 +280,10 @@ impl Protocol {
             collected_bytes: 0,
             cache_reported: false,
             cache_progress_frames: 0,
+            returns: None,
+            return_index: 0,
+            return_committed: 0,
+            return_current: 0,
         })
     }
 
@@ -386,11 +407,52 @@ impl Protocol {
                 Failed
             }
             (Ready, Host, Start {}) => AwaitStarted,
+            (Ready, Host, RequestReturns { request }) if self.returns.is_none() => {
+                request.validate()?;
+                self.returns = Some(request.clone());
+                Ready
+            }
             (AwaitStarted, Agent, Started {}) => Running,
             (AwaitStarted | Running, Host, Cancel {}) => self.state,
             (Running, Agent, Output { .. }) => Running,
             (Running, Agent, Exit { .. }) => Exited,
-            (Exited, Host, Collect {}) => Collecting,
+            (Exited, Host, Collect {}) if self.returns.is_none() => Collecting,
+            (Exited, Host, CollectReturns {}) if self.returns.is_some() => Returning,
+            (Returning, Agent, ReturnChunk { bytes }) => {
+                let request = self.returns.as_ref().unwrap();
+                if self.return_index >= request.paths.len()
+                    || bytes.is_empty()
+                    || bytes.len() > returned::CHUNK_BYTES
+                    || self.return_committed + self.return_current + bytes.len() as u64
+                        > request.max_bytes
+                {
+                    return Err(invalid("returned-file chunk exceeds negotiated limits"));
+                }
+                self.return_current += bytes.len() as u64;
+                Returning
+            }
+            (Returning, Agent, ReturnFileEnd { outcome }) => {
+                if self.return_index >= self.returns.as_ref().unwrap().paths.len() {
+                    return Err(invalid("unexpected returned-file outcome"));
+                }
+                if let returned::Outcome::Returned { size, sha256 } = outcome {
+                    if *size != self.return_current
+                        || sha256.len() != 64
+                        || !sha256.bytes().all(|b| b.is_ascii_hexdigit())
+                    {
+                        return Err(invalid("invalid returned-file size or digest"));
+                    }
+                    self.return_committed += size;
+                }
+                self.return_index += 1;
+                self.return_current = 0;
+                Returning
+            }
+            (Returning, Agent, ReturnEnd {})
+                if self.return_index == self.returns.as_ref().unwrap().paths.len() =>
+            {
+                CollectionComplete
+            }
             (Collecting, Agent, Frame::Collected { bytes }) => {
                 if bytes.len() > MAX_COLLECT_BYTES - self.collected_bytes {
                     return Err(invalid("collect output exceeds 16 MiB"));
@@ -1230,25 +1292,30 @@ pub fn inventory(root: &std::path::Path) -> io::Result<Inventory> {
 
 /// Collection is a tar of new/changed files plus an explicit deletion list.
 /// Bound the tar builder as well as the host's incoming collection counter.
-pub fn collect_changes(
+pub fn collect_changes_to(
     root: &std::path::Path,
     before: &Inventory,
-) -> io::Result<(Vec<u8>, Vec<String>)> {
-    struct CollectBuffer(Vec<u8>);
-    impl Write for CollectBuffer {
+    writer: impl Write,
+) -> io::Result<Vec<String>> {
+    struct CollectWriter<W> {
+        writer: W,
+        count: usize,
+    }
+    impl<W: Write> Write for CollectWriter<W> {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if bytes.len() > MAX_COLLECT_BYTES - self.0.len() {
+            if bytes.len() > MAX_COLLECT_BYTES - self.count {
                 return Err(invalid("collect output exceeds 16 MiB"));
             }
-            self.0.extend_from_slice(bytes);
-            Ok(bytes.len())
+            let n = self.writer.write(bytes)?;
+            self.count += n;
+            Ok(n)
         }
         fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+            self.writer.flush()
         }
     }
     let after = inventory(root)?;
-    let mut builder = tar::Builder::new(CollectBuffer(Vec::new()));
+    let mut builder = tar::Builder::new(CollectWriter { writer, count: 0 });
     builder.follow_symlinks(false);
     for (path, hash) in &after {
         if before.get(path) != Some(hash) {
@@ -1276,7 +1343,18 @@ pub fn collect_changes(
         .filter(|path| !after.contains_key(*path))
         .cloned()
         .collect();
-    Ok((builder.into_inner()?.0, deleted))
+    builder.into_inner()?.flush()?;
+    Ok(deleted)
+}
+
+#[cfg(test)]
+fn collect_changes(
+    root: &std::path::Path,
+    before: &Inventory,
+) -> io::Result<(Vec<u8>, Vec<String>)> {
+    let mut bytes = Vec::new();
+    let deleted = collect_changes_to(root, before, &mut bytes)?;
+    Ok((bytes, deleted))
 }
 
 fn append_source_link(
@@ -1409,7 +1487,7 @@ mod tests {
     fn native_cache_timings_have_a_distinct_field_and_protocol_generation() {
         let value = serde_json::to_value(CacheTimings::default()).unwrap();
         assert!(value["native_attributes_ms"].is_u64());
-        assert_eq!(PROTOCOL_VERSION, 5);
+        assert_eq!(PROTOCOL_VERSION, 6);
     }
 
     #[test]
@@ -1498,6 +1576,62 @@ mod tests {
             version: PROTOCOL_VERSION,
             nonce: "boot-a".into(),
         }
+    }
+    #[test]
+    fn requested_returns_are_negotiated_before_start_and_bound_the_stream() {
+        fn ready() -> Protocol {
+            let mut protocol = Protocol::new("boot-a").unwrap();
+            for (peer, frame) in transcript().into_iter().take(4) {
+                protocol.accept(peer, &frame).unwrap();
+            }
+            protocol
+        }
+        let request = Frame::RequestReturns {
+            request: returned::Request {
+                paths: vec!["artifact".into()],
+                max_bytes: 2,
+            },
+        };
+        let mut protocol = ready();
+        protocol.accept(Peer::Host, &request).unwrap();
+        for (peer, frame) in [
+            (Peer::Host, Frame::Start {}),
+            (Peer::Agent, Frame::Started {}),
+            (Peer::Agent, Frame::Exit { code: 0 }),
+            (Peer::Host, Frame::CollectReturns {}),
+            (Peer::Agent, Frame::ReturnChunk { bytes: vec![1, 2] }),
+        ] {
+            protocol.accept(peer, &frame).unwrap();
+        }
+        assert!(
+            protocol
+                .accept(Peer::Agent, &Frame::ReturnChunk { bytes: vec![3] })
+                .is_err()
+        );
+        let mut protocol = ready();
+        protocol.accept(Peer::Host, &Frame::Start {}).unwrap();
+        assert!(
+            protocol.accept(Peer::Host, &request).is_err(),
+            "cap cannot change after Start"
+        );
+        let mut protocol = ready();
+        protocol.accept(Peer::Host, &request).unwrap();
+        assert!(
+            protocol.accept(Peer::Host, &request).is_err(),
+            "request cannot be replaced"
+        );
+        let mut protocol = ready();
+        protocol.accept(Peer::Host, &Frame::Start {}).unwrap();
+        protocol.accept(Peer::Agent, &Frame::Started {}).unwrap();
+        protocol
+            .accept(Peer::Agent, &Frame::Exit { code: 0 })
+            .unwrap();
+        assert!(
+            protocol
+                .accept(Peer::Host, &Frame::CollectReturns {})
+                .is_err(),
+            "no implicit default cap"
+        );
     }
     fn transcript() -> Vec<(Peer, Frame)> {
         vec![

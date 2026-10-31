@@ -42,7 +42,7 @@ try {
     Assert-Spike ((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory -ge 10GB/1KB) 'free-memory-at-least-10GiB' (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory
     Assert-Spike (@(Get-ChildItem $Root -Filter 'job-*.vhdx').Count -eq 0) 'no-orphan-job-disk' $Root
     $version = Invoke-SpikeNative $client @('--version') $batch 'client-version'
-    Assert-Spike ($version.exitCode -eq 0 -and $version.stdout -match 'protocol 4 trace=3') 'probe-version' ((Get-FileHash $client).Hash)
+    Assert-Spike ($version.exitCode -eq 0 -and $version.stdout -match 'protocol 6 trace=3') 'probe-version' ((Get-FileHash $client).Hash)
     $python = $null
     if ($Transport -eq 'hvsock') {
         # Require the client that caps each connect attempt. An uncapped connect

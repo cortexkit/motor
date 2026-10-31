@@ -96,6 +96,7 @@ struct Agent {
     clock: AtomicU64,
     tree: Mutex<Vec<u8>>,
     env: Mutex<BTreeMap<String, String>>,
+    returns: Mutex<Option<motor_winagent::returned::Request>>,
     units: Mutex<Vec<Vec<String>>>,
     exit_reply: Mutex<Option<ExitReply>>,
 }
@@ -304,7 +305,7 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                         &mut port,
                         &AgentFrame::Hello {
                             version: if fault == Fault::Version {
-                                motor_winagent::PROTOCOL_VERSION + 1
+                                5
                             } else {
                                 motor_winagent::PROTOCOL_VERSION
                             },
@@ -394,10 +395,15 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                 }
                 session.send(&mut port, &AgentFrame::TreeReceived {})?;
                 a.phase.store(3, Ordering::SeqCst);
-                assert!(matches!(
-                    session.receive(&mut port)?,
-                    Some(AgentFrame::Start {})
-                ));
+                let mut gate = session.receive(&mut port)?.unwrap();
+                let returns = if let AgentFrame::RequestReturns { request } = gate {
+                    *a.returns.lock().unwrap() = Some(request.clone());
+                    gate = session.receive(&mut port)?.unwrap();
+                    Some(request)
+                } else {
+                    None
+                };
+                assert_eq!(gate, AgentFrame::Start {});
                 if fault == Fault::Start {
                     stall(&a, &s, 4);
                     return Ok(());
@@ -442,10 +448,7 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                     )?;
                 }
                 session.send(&mut port, &AgentFrame::Exit { code })?;
-                assert!(matches!(
-                    session.receive(&mut port)?,
-                    Some(AgentFrame::Collect {})
-                ));
+                let collect = session.receive(&mut port)?.unwrap();
                 if fault == Fault::Collect {
                     stall(&a, &s, 6);
                     return Ok(());
@@ -462,15 +465,39 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                     stall(&a, &s, 6);
                     return Ok(());
                 }
-                let name = format!("m{}/changed.rs", command.workspace);
-                let changed = archive(&name, b"guest change");
-                session.send(&mut port, &AgentFrame::Collected { bytes: changed })?;
-                session.send(
-                    &mut port,
-                    &AgentFrame::CollectEnd {
-                        deleted: vec![format!("m{}/deleted.rs", command.workspace)],
-                    },
-                )?;
+                if let Some(request) = returns {
+                    assert_eq!(collect, AgentFrame::CollectReturns {});
+                    for _ in request.paths {
+                        let bytes = b"guest return";
+                        session.send(
+                            &mut port,
+                            &AgentFrame::ReturnChunk {
+                                bytes: bytes.to_vec(),
+                            },
+                        )?;
+                        session.send(
+                            &mut port,
+                            &AgentFrame::ReturnFileEnd {
+                                outcome: motor_winagent::returned::Outcome::Returned {
+                                    size: bytes.len() as u64,
+                                    sha256: format!("{:x}", sha2::Sha256::digest(bytes)),
+                                },
+                            },
+                        )?;
+                    }
+                    session.send(&mut port, &AgentFrame::ReturnEnd {})?;
+                } else {
+                    assert_eq!(collect, AgentFrame::Collect {});
+                    let name = format!("m{}/changed.rs", command.workspace);
+                    let changed = archive(&name, b"guest change");
+                    session.send(&mut port, &AgentFrame::Collected { bytes: changed })?;
+                    session.send(
+                        &mut port,
+                        &AgentFrame::CollectEnd {
+                            deleted: vec![format!("m{}/deleted.rs", command.workspace)],
+                        },
+                    )?;
+                }
                 assert!(matches!(
                     session.receive(&mut port)?,
                     Some(AgentFrame::Dismount {})
@@ -777,6 +804,165 @@ async fn windows_backend_sends_configured_runner_instance_in_job_environment() {
 }
 
 #[tokio::test]
+async fn windows_return_reservation_uses_shared_spool_and_releases_only_after_deletion() {
+    let f = Fixture::new();
+    source(&f);
+    let (mut config, agent) = configure(&f, Fault::None, 0);
+    config.manual_tick = true;
+    config.base_commands.clear();
+    config.return_chunked_max_bytes = Some(RETURN_LARGE_MAX_BYTES_CAP);
+    assert!(
+        config.check_options().is_err(),
+        "Windows must not advertise 128 MiB without a reservation budget"
+    );
+    config.return_budget_bytes = Some(Config::return_charge(RETURN_LARGE_MAX_BYTES_CAP));
+    config.free_space_probe = Arc::new(|_| Ok(u64::MAX));
+    let runner = Runner::open_with_backend(config.clone(), Box::new(FakeHost)).unwrap();
+    let (mut first, bytes) = request(&f);
+    first.return_paths = vec![format!("{}/artifact", first.workspace_key)];
+    first.return_max_bytes = RETURN_LARGE_MAX_BYTES_CAP;
+    first.return_chunked = true;
+    f.submit(&runner, &first, &bytes);
+    runner.tick().unwrap();
+    assert_eq!(
+        terminal(&runner, first.job_id).await.outcome,
+        Outcome::WindowsExit { code: 0 }
+    );
+    let negotiated = agent.returns.lock().unwrap().clone().unwrap();
+    assert_eq!(negotiated.paths, ["artifact"]);
+    assert_eq!(negotiated.max_bytes, RETURN_LARGE_MAX_BYTES_CAP);
+    let charge = Config::return_charge(RETURN_LARGE_MAX_BYTES_CAP);
+    let spool = {
+        let inner = runner.core.inner.lock().unwrap();
+        let job = &inner.jobs[&first.job_id];
+        assert_eq!(job.return_reserved_bytes, charge);
+        let returned = job.returned.as_ref().unwrap();
+        assert_eq!(returned.chunks.len(), 1);
+        assert_eq!(
+            returned.manifest.files[0].outcome(),
+            &ReturnManifestOutcome::Returned {
+                size: 12,
+                sha256: format!("{:x}", Sha256::digest(b"guest return")),
+            }
+        );
+        runner
+            .record_path(first.job_id)
+            .parent()
+            .unwrap()
+            .join(&returned.directory)
+    };
+    assert_eq!(fs::read(spool.join("chunk-0")).unwrap(), b"guest return");
+    drop(runner);
+    let runner = Runner::open_with_backend(config, Box::new(FakeHost)).unwrap();
+    assert_eq!(
+        runner.core.inner.lock().unwrap().jobs[&first.job_id].return_reserved_bytes,
+        charge
+    );
+    let (mut second, bytes) = request(&f);
+    second.return_paths = first.return_paths.clone();
+    second.return_max_bytes = RETURN_LARGE_MAX_BYTES_CAP;
+    second.return_chunked = true;
+    second.queue_wait_limit_s = 7200;
+    f.submit(&runner, &second, &bytes);
+    runner.tick().unwrap();
+    assert!(runner.core.inner.lock().unwrap().jobs[&second.job_id]
+        .setup_ms
+        .is_none());
+    let log = runner.job_log(first.job_id);
+    let lease = log.lease(Vec::new());
+    let finished = runner.core.inner.lock().unwrap().jobs[&first.job_id]
+        .finished_ms
+        .unwrap();
+    f.clock
+        .store(finished + RETURN_RETENTION_MS, Ordering::SeqCst);
+    runner.maintenance().unwrap();
+    assert_eq!(
+        runner.core.inner.lock().unwrap().jobs[&first.job_id].return_reserved_bytes,
+        charge
+    );
+    assert!(spool.exists());
+    drop(lease);
+    runner.maintenance().unwrap();
+    assert!(!spool.exists());
+    assert_eq!(
+        runner.core.inner.lock().unwrap().jobs[&first.job_id].return_reserved_bytes,
+        0
+    );
+    runner.tick().unwrap();
+    assert_eq!(
+        terminal(&runner, second.job_id).await.outcome,
+        Outcome::WindowsExit { code: 0 }
+    );
+}
+
+#[tokio::test]
+async fn windows_return_version_five_guest_is_refused_before_start() {
+    let f = Fixture::new();
+    source(&f);
+    let (config, agent) = configure(&f, Fault::Version, 0);
+    let runner = Runner::open_with_backend(config, Box::new(FakeHost)).unwrap();
+    let (mut run, bytes) = request(&f);
+    run.return_paths = vec![format!("{}/artifact", run.workspace_key)];
+    run.return_chunked = true;
+    f.submit(&runner, &run, &bytes);
+    let result = terminal(&runner, run.job_id).await;
+    assert!(matches!(result.outcome, Outcome::RefusedBeforeStart { .. }));
+    assert!(result
+        .refusal_detail
+        .as_deref()
+        .unwrap()
+        .contains("unsupported agent protocol version 5"));
+    assert_eq!(agent.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn windows_hello_only_advertises_explicit_budgeted_large_return_maximum() {
+    for maximum in [None, Some(RETURN_LARGE_MAX_BYTES_CAP)] {
+        let f = Fixture::new();
+        let (mut config, _) = configure(&f, Fault::None, 0);
+        config.return_chunked_max_bytes = maximum;
+        if maximum.is_some() {
+            assert!(config.check_options().is_err());
+            config.return_budget_bytes = Some(Config::return_charge(RETURN_LARGE_MAX_BYTES_CAP));
+        }
+        let runner = Runner::open_with_backend(config, Box::new(FakeHost)).unwrap();
+        let (socket, server) = listener(&f, &runner);
+        let mut stream = tokio::net::UnixStream::connect(&*socket).await.unwrap();
+        write_frame_async(
+            &mut stream,
+            &Frame::Hello {
+                return_paths: false,
+                return_chunked_max_bytes: None,
+                return_chunked: false,
+                sibling_paths: false,
+                protocol_version: PROTOCOL_VERSION,
+                started: true,
+                default_branch_tip: false,
+                gate_jobs: false,
+                platforms: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let Frame::Hello {
+            return_paths,
+            return_chunked,
+            return_chunked_max_bytes,
+            platforms,
+            ..
+        } = read_next(&mut stream).await
+        else {
+            panic!("expected hello");
+        };
+        assert!(return_paths && return_chunked);
+        assert_eq!(return_chunked_max_bytes, maximum);
+        assert_eq!(platforms, ["windows"]);
+        drop(stream);
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn windows_backend_streams_collects_and_preserves_full_width_status_at_wire_seam() {
     for code in [0, 256, 0x7FFF_FFFF, 0xFFFF_FFFF, 0xC000_0005] {
         let f = Fixture::new();
@@ -892,10 +1078,18 @@ fn windows_backend_reports_workspace_changes_relative_to_checkout_root() {
             builder.append_data(&mut header, name, &b"x"[..]).unwrap();
         }
         let bytes = builder.into_inner().unwrap();
+        let job_directory = runner
+            .config()
+            .state_dir()
+            .join("jobs")
+            .join(id.to_string());
+        fs::create_dir_all(&job_directory).unwrap();
+        let archive = job_directory.join("windows-changes.tar");
+        fs::write(&archive, bytes).unwrap();
         prep::store_collection(
             runner.config(),
             id,
-            &bytes,
+            &archive,
             &[
                 format!("{member}/gone.txt"),
                 "m/Users/u/sibling/gone.txt".into(),

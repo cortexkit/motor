@@ -849,7 +849,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         $nonce = $peerNonce
         $victimVm = [Guid]'11111111-2222-3333-4444-555555555555'
         $attackerVm = [Guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
-        $frameText = ConvertTo-Json -InputObject ([ordered]@{kind='hello'; nonce=$nonce; version=4}) -Compress
+        $frameText = ConvertTo-Json -InputObject ([ordered]@{kind='hello'; nonce=$nonce; version=6}) -Compress
         $framePayload = [Text.UTF8Encoding]::new($false, $true).GetBytes($frameText)
         $frameLength = $framePayload.Length
         $frame = [byte[]]::new($frameLength + 4)

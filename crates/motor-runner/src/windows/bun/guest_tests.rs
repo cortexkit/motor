@@ -258,7 +258,7 @@ fn bun_failure_is_only_legal_before_tree_received_and_version_four_is_named() {
         .accept(
             Peer::Agent,
             &Frame::Hello {
-                version: 5,
+                version: motor_winagent::PROTOCOL_VERSION,
                 nonce: "nonce".into(),
             },
         )

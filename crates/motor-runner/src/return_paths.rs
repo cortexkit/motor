@@ -184,7 +184,6 @@ pub(crate) fn collect_authorized(config: &crate::Config, request: &Run, seq: u64
 /// Chunk bytes already live outside disposable staging; sequence numbers are
 /// assigned when the engine saves the chunk metadata, manifest and terminal
 /// record together.
-#[cfg(unix)]
 pub(crate) enum Collection {
     Legacy(ReturnResult),
     Chunked(ChunkedCollection),
@@ -211,12 +210,10 @@ pub(crate) fn collect_staged(
     collect_from_root(request, job_directory, root)
 }
 
-#[cfg(unix)]
 pub(crate) fn unread(request: &Run, job_directory: &Path) -> Collection {
     collect_from_root(request, job_directory, Err(Cause::ReadError))
 }
 
-#[cfg(unix)]
 fn collect_from_root(
     request: &Run,
     job_directory: &Path,
@@ -666,9 +663,7 @@ fn read_chunks(
         let data = &buffer[..length];
         hasher.update(data);
         let position = chunks.len();
-        let mut chunk = File::create(chunk_directory.join(format!("chunk-{position}")))?;
-        chunk.write_all(data)?;
-        chunk.sync_all()?;
+        store_chunk(chunk_directory, position, data)?;
         chunks.push(ReturnedChunk {
             seq: 0,
             path_index,
@@ -684,6 +679,250 @@ fn read_chunks(
     Ok(Read::Returned {
         sha256: format!("{:x}", hasher.finalize()),
     })
+}
+
+fn store_chunk(directory: &Path, position: usize, data: &[u8]) -> io::Result<()> {
+    let mut chunk = File::create(directory.join(format!("chunk-{position}")))?;
+    chunk.write_all(data)?;
+    chunk.sync_all()
+}
+
+/// Receives a guest stream into the same durable spool as the host collector.
+/// Incomplete files and abandoned streams are deleted before their reservation
+/// can be released by the engine's existing cleanup pass.
+pub(crate) struct StreamedCollection {
+    request: Run,
+    job_directory: PathBuf,
+    directory: String,
+    chunks: Vec<ReturnedChunk>,
+    outcomes: Vec<Option<ReturnManifestOutcome>>,
+    buffer: Vec<u8>,
+    hasher: Sha256,
+    current: u64,
+    total: u64,
+    first: usize,
+    finished: bool,
+}
+
+impl StreamedCollection {
+    pub(crate) fn new(request: &Run, job_directory: &Path) -> io::Result<Self> {
+        let directory = format!("{RETURNED_DIRECTORY_PREFIX}{}", Uuid::now_v7());
+        fs::create_dir_all(job_directory.join(&directory))?;
+        Ok(Self {
+            request: request.clone(),
+            job_directory: job_directory.to_owned(),
+            directory,
+            chunks: Vec::new(),
+            outcomes: Vec::new(),
+            buffer: Vec::with_capacity(RETURN_CHUNK_MAX_BYTES),
+            hasher: Sha256::new(),
+            current: 0,
+            total: 0,
+            first: 0,
+            finished: false,
+        })
+    }
+
+    pub(crate) fn push(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+        if self.outcomes.len()
+            >= crate::caller_path::run(&self.request)
+                .caller_return_paths
+                .len()
+            || self.total + self.current + bytes.len() as u64 > self.request.return_max_bytes
+        {
+            return Err(io::Error::other(
+                "guest exceeded returned-file cap or count",
+            ));
+        }
+        self.hasher.update(bytes);
+        self.current += bytes.len() as u64;
+        while !bytes.is_empty() {
+            let n = bytes.len().min(RETURN_CHUNK_MAX_BYTES - self.buffer.len());
+            self.buffer.extend_from_slice(&bytes[..n]);
+            bytes = &bytes[n..];
+            if self.buffer.len() == RETURN_CHUNK_MAX_BYTES {
+                self.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let position = self.chunks.len();
+        store_chunk(
+            &self.job_directory.join(&self.directory),
+            position,
+            &self.buffer,
+        )?;
+        let offset = self.chunks[self.first..].iter().map(|c| c.length).sum();
+        self.chunks.push(ReturnedChunk {
+            seq: 0,
+            path_index: self.outcomes.len() as u32,
+            offset,
+            length: self.buffer.len() as u64,
+        });
+        self.buffer.clear();
+        Ok(())
+    }
+
+    pub(crate) fn end_file(
+        &mut self,
+        outcome: motor_winagent::returned::Outcome,
+    ) -> io::Result<()> {
+        use motor_winagent::returned::{Failure, Outcome};
+        if self.outcomes.len()
+            >= crate::caller_path::run(&self.request)
+                .caller_return_paths
+                .len()
+        {
+            return Err(io::Error::other("too many returned-file outcomes"));
+        }
+        let outcome = match outcome {
+            Outcome::Returned { size, sha256 } => {
+                if size != self.current || sha256 != format!("{:x}", self.hasher.clone().finalize())
+                {
+                    return Err(io::Error::other(
+                        "guest returned-file digest or size mismatch",
+                    ));
+                }
+                self.flush()?;
+                self.total += size;
+                ReturnManifestOutcome::Returned { size, sha256 }
+            }
+            Outcome::Failed { cause, size } => {
+                for position in self.first..self.chunks.len() {
+                    fs::remove_file(
+                        self.job_directory
+                            .join(&self.directory)
+                            .join(format!("chunk-{position}")),
+                    )?;
+                }
+                self.chunks.truncate(self.first);
+                self.buffer.clear();
+                let cause = match cause {
+                    Failure::OverCap => ReturnPathsFailureCause::OverCap,
+                    Failure::Missing => ReturnPathsFailureCause::Missing,
+                    Failure::Escape => ReturnPathsFailureCause::Escape,
+                    Failure::NotRegular => ReturnPathsFailureCause::NotRegular,
+                    Failure::ReadError => ReturnPathsFailureCause::ReadError,
+                };
+                ReturnManifestOutcome::Failed { cause, size }
+            }
+        };
+        self.outcomes.push(Some(outcome));
+        self.first = self.chunks.len();
+        self.current = 0;
+        self.hasher = Sha256::new();
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> io::Result<Collection> {
+        if self.outcomes.len()
+            != crate::caller_path::run(&self.request)
+                .caller_return_paths
+                .len()
+            || self.current != 0
+        {
+            return Err(io::Error::other("incomplete guest returned-file stream"));
+        }
+        crate::filesystem::sync_directory(&self.job_directory.join(&self.directory))?;
+        crate::filesystem::sync_directory(&self.job_directory)?;
+        let collection = finish(
+            &self.request,
+            self.directory.clone(),
+            std::mem::take(&mut self.chunks),
+            std::mem::take(&mut self.outcomes),
+            self.total,
+        );
+        if self.request.return_chunked {
+            self.finished = true;
+            Ok(Collection::Chunked(collection))
+        } else {
+            let result = legacy_from_chunks(&self.request, &self.job_directory, &collection);
+            // Drop removes the temporary spool; legacy inline results are
+            // bounded by the legacy frame limit.
+            Ok(Collection::Legacy(result))
+        }
+    }
+}
+
+impl Drop for StreamedCollection {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = fs::remove_dir_all(self.job_directory.join(&self.directory));
+        }
+    }
+}
+
+fn legacy_from_chunks(request: &Run, job: &Path, collection: &ChunkedCollection) -> ReturnResult {
+    let mut result = ReturnResult {
+        job_id: request.job_id,
+        seq: 0,
+        returned_files: None,
+        return_paths_failed: None,
+    };
+    let files = (|| -> Result<Vec<ReturnedFile>, Cause> {
+        // Bound even temporary raw and base64 allocations before reading disk.
+        if collection.total_bytes > (MAX_FRAME_BYTES / 4 * 3) as u64 {
+            return Err(Cause::FrameLimit);
+        }
+        let mut files = Vec::new();
+        for (index, entry) in collection.files.iter().enumerate() {
+            let sha256 = match entry.outcome() {
+                ReturnManifestOutcome::Returned { sha256, .. } => sha256.clone(),
+                ReturnManifestOutcome::Failed { cause, .. } => {
+                    return Err(match cause {
+                        ReturnPathsFailureCause::OverCap => Cause::OverCap,
+                        ReturnPathsFailureCause::Missing => Cause::Missing,
+                        ReturnPathsFailureCause::Escape => Cause::Escape,
+                        ReturnPathsFailureCause::NotRegular => Cause::NotRegular,
+                        _ => Cause::ReadError,
+                    })
+                }
+                _ => return Err(Cause::ReadError),
+            };
+            let mut bytes = Vec::new();
+            for (position, chunk) in collection
+                .chunks
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.path_index == index as u32)
+            {
+                let mut file = File::open(
+                    job.join(&collection.directory)
+                        .join(format!("chunk-{position}")),
+                )
+                .map_err(|_| Cause::ReadError)?;
+                (&mut file)
+                    .take(chunk.length)
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| Cause::ReadError)?;
+            }
+            files.push(ReturnedFile {
+                path: crate::caller_path::run(request).caller_return_paths[index].clone(),
+                sha256,
+                data: STANDARD.encode(bytes),
+            });
+        }
+        Ok(files)
+    })();
+    match files {
+        Ok(files) => {
+            result.returned_files = Some(files);
+            set_seq(&mut result, 0, request.return_max_bytes);
+        }
+        Err(cause) => {
+            result.return_paths_failed = Some(ReturnPathsFailed {
+                measured_bytes: collection.total_bytes,
+                cap_bytes: request.return_max_bytes,
+                cause,
+            })
+        }
+    }
+    result
 }
 
 /// Read until `buffer` is full or the file ends; returns the bytes read.
@@ -724,6 +963,164 @@ mod tests {
     use crate::test_helpers::CanonicalScratchDir;
     use cortexkit_test_support::ScratchDir;
     use motor_protocol::{ReturnAssembler, RETURN_CHUNKED_MAX_BYTES_CAP};
+
+    #[test]
+    fn windows_return_stream_128_mib_has_bounded_guest_and_host_memory() {
+        #[cfg(windows)]
+        let _identity = crate::windows::returned_tests::impersonate_self();
+        #[cfg(target_os = "linux")]
+        {
+            const CHILD: &str = "MOTOR_RETURN_MEMORY_CHILD";
+            if std::env::var_os(CHILD).is_none() {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "return_paths::tests::windows_return_stream_128_mib_has_bounded_guest_and_host_memory", "--nocapture", "--test-threads=1"])
+                    .env(CHILD, "1").output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
+            // An accidental whole-file Vec cannot fit, in either collector.
+            // Use a subprocess so the address-space policy cannot affect peers.
+            let limit = libc::rlimit {
+                rlim_cur: 32 * 1024 * 1024,
+                rlim_max: 32 * 1024 * 1024,
+            };
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_DATA, &limit) }, 0);
+        }
+        let source = ScratchDir::new("windows-return-source");
+        let job = ScratchDir::new("windows-return-spool");
+        let cap = 128 * 1024 * 1024;
+        File::create(source.path().join("artifact"))
+            .unwrap()
+            .set_len(cap)
+            .unwrap();
+        let mut run = request(
+            Path::new("/workspace"),
+            &[Path::new("/workspace/artifact")],
+            cap,
+        );
+        run.return_chunked = true;
+        let mut sink = StreamedCollection::new(&run, job.path()).unwrap();
+        let mut guest_chunks = 0;
+        motor_winagent::returned::collect(
+            source.path(),
+            "",
+            &motor_winagent::returned::Request {
+                paths: vec!["artifact".into()],
+                max_bytes: cap,
+            },
+            |frame| {
+                match frame {
+                    motor_winagent::Frame::ReturnChunk { bytes } => {
+                        assert!(bytes.len() <= 64 * 1024);
+                        assert!(bytes.capacity() <= 64 * 1024);
+                        guest_chunks += 1;
+                        sink.push(&bytes)?;
+                        assert!(sink.buffer.capacity() <= RETURN_CHUNK_MAX_BYTES);
+                    }
+                    motor_winagent::Frame::ReturnFileEnd { outcome } => sink.end_file(outcome)?,
+                    motor_winagent::Frame::ReturnEnd {} => (),
+                    _ => panic!("unexpected return frame"),
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(guest_chunks, 2048);
+        let Collection::Chunked(collection) = sink.finish().unwrap() else {
+            panic!("expected chunk spool");
+        };
+        assert_eq!(collection.total_bytes, cap);
+        assert_eq!(
+            collection.chunks.len(),
+            cap.div_ceil(RETURN_CHUNK_MAX_BYTES as u64) as usize
+        );
+        assert_eq!(
+            collection.files[0].outcome(),
+            &ReturnManifestOutcome::Returned {
+                size: cap,
+                sha256: "254bcc3fc4f27172636df4bf32de9f107f620d559b20d760197e452b97453917".into(),
+            }
+        );
+        assert_eq!(collection.chunks.iter().map(|c| c.length).sum::<u64>(), cap);
+        assert!(collection
+            .chunks
+            .iter()
+            .all(|c| c.length <= RETURN_CHUNK_MAX_BYTES as u64));
+    }
+
+    #[test]
+    fn windows_return_stream_failed_file_is_deleted_and_abandoned_spool_is_removed() {
+        let job = ScratchDir::new("windows-return-rollback");
+        let mut run = request(
+            Path::new("/workspace"),
+            &[Path::new("/workspace/bad"), Path::new("/workspace/good")],
+            1024 * 1024,
+        );
+        run.return_chunked = true;
+        let mut sink = StreamedCollection::new(&run, job.path()).unwrap();
+        let directory = job.path().join(&sink.directory);
+        sink.push(&vec![0; RETURN_CHUNK_MAX_BYTES]).unwrap();
+        sink.end_file(motor_winagent::returned::Outcome::Failed {
+            cause: motor_winagent::returned::Failure::ReadError,
+            size: Some(RETURN_CHUNK_MAX_BYTES as u64),
+        })
+        .unwrap();
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        sink.push(b"good").unwrap();
+        assert!(sink
+            .end_file(motor_winagent::returned::Outcome::Returned {
+                size: 4,
+                sha256: "invalid".into()
+            })
+            .is_err());
+        drop(sink);
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn windows_return_spool_enforces_cap_independently_of_guest() {
+        let job = ScratchDir::new("windows-return-cap");
+        let run = request(Path::new("/workspace"), &[Path::new("/workspace/file")], 2);
+        let mut sink = StreamedCollection::new(&run, job.path()).unwrap();
+        assert!(sink.push(b"abc").is_err());
+        assert_eq!(sink.current, 0);
+        assert!(sink.chunks.is_empty());
+    }
+
+    #[test]
+    fn windows_return_stream_keeps_bounded_legacy_inline_contract() {
+        let job = ScratchDir::new("windows-return-inline");
+        let run = request(
+            Path::new("/workspace"),
+            &[Path::new("/workspace/file")],
+            1024 * 1024,
+        );
+        for length in [2, MAX_FRAME_BYTES] {
+            let mut sink = StreamedCollection::new(&run, job.path()).unwrap();
+            let directory = job.path().join(&sink.directory);
+            let bytes = vec![b'x'; length];
+            sink.push(&bytes).unwrap();
+            sink.end_file(motor_winagent::returned::Outcome::Returned {
+                size: length as u64,
+                sha256: format!("{:x}", Sha256::digest(&bytes)),
+            })
+            .unwrap();
+            let Collection::Legacy(result) = sink.finish().unwrap() else {
+                panic!("expected legacy result");
+            };
+            if length == 2 {
+                assert_eq!(result.returned_files.unwrap()[0].data, "eHg=");
+            } else {
+                assert_eq!(result.return_paths_failed.unwrap().cause, Cause::FrameLimit);
+            }
+            assert!(!directory.exists());
+        }
+    }
 
     fn collect(request: &Run) -> ReturnResult {
         super::collect(request, 0)

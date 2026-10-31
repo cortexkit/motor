@@ -1210,10 +1210,10 @@ fn append(
 pub(crate) fn store_collection(
     config: &Config,
     id: Uuid,
-    bytes: &[u8],
+    archive: &Path,
     deleted: &[String],
 ) -> io::Result<()> {
-    motor_winagent::validate_collection(&mut io::Cursor::new(bytes))?;
+    motor_winagent::validate_collection(&mut fs::File::open(archive)?)?;
     for path in deleted {
         motor_winagent::validate_archive_path(path)?;
         if !path.starts_with("m/") {
@@ -1223,7 +1223,7 @@ pub(crate) fn store_collection(
         }
     }
     let mut paths = deleted.to_vec();
-    for entry in tar::Archive::new(io::Cursor::new(bytes)).entries()? {
+    for entry in tar::Archive::new(fs::File::open(archive)?).entries()? {
         let entry = entry?;
         let path = entry
             .path()?
@@ -1246,9 +1246,6 @@ pub(crate) fn store_collection(
     let job = config.state_dir().join("jobs").join(id.to_string());
     fs::create_dir_all(&job)
         .map_err(|error| super::vm::path_error("create collection directory", &job, error))?;
-    let tar_path = job.join("windows-changes.tar");
-    fs::write(&tar_path, bytes)
-        .map_err(|error| super::vm::path_error("write collection tree", &tar_path, error))?;
     let manifest_path = job.join("windows-changes.json");
     atomic_json(&manifest_path, &paths)
         .map_err(|error| super::vm::path_error("write collection manifest", &manifest_path, error))
@@ -1270,8 +1267,11 @@ mod trusted_cargo_config_tests {
             .append_link(&mut header, "m/escape", "/etc/shadow")
             .unwrap();
         let bytes = builder.into_inner().unwrap();
-        super::store_collection(&config, id, &bytes, &["m/deleted".into()]).unwrap();
         let job = config.state_dir().join("jobs").join(id.to_string());
+        std::fs::create_dir_all(&job).unwrap();
+        let archive = job.join("windows-changes.tar");
+        std::fs::write(&archive, &bytes).unwrap();
+        super::store_collection(&config, id, &archive, &["m/deleted".into()]).unwrap();
         assert_eq!(
             std::fs::read(job.join("windows-changes.tar")).unwrap(),
             bytes
@@ -1282,7 +1282,7 @@ mod trusted_cargo_config_tests {
         assert_eq!(manifest, ["m/deleted", "m/escape"]);
         for path in ["../outside", "cargo-home/escape", "m/../escape", "m/a\\b"] {
             assert!(
-                super::store_collection(&config, Uuid::now_v7(), &bytes, &[path.into()]).is_err()
+                super::store_collection(&config, Uuid::now_v7(), &archive, &[path.into()]).is_err()
             );
         }
     }
