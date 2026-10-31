@@ -24,28 +24,6 @@ fn hosted_config_defaults_omit_all_keys_and_fake_is_forbidden_on_main() {
 }
 
 #[test]
-fn spill_avoid_host_follows_the_broker_host_id_grammar() {
-    let mut config = Config::default();
-    for good in [
-        "build-server-1",
-        "a",
-        "Host_2.example",
-        "a".repeat(64).as_str(),
-    ] {
-        config.spill_avoid_host = Some(good.to_string());
-        assert!(config.validate().is_ok(), "{good}");
-        assert_eq!(
-            serde_json::to_value(&config).unwrap()["spill_avoid_host"],
-            good
-        );
-    }
-    for bad in ["", "boat:test", "a b", "host/1", "a".repeat(65).as_str()] {
-        config.spill_avoid_host = Some(bad.to_string());
-        assert!(config.validate().is_err(), "{bad:?}");
-    }
-}
-
-#[test]
 fn hosted_paths_are_component_bounded() {
     for path in ["/Users/a/repo", "/home/a/repo"] {
         assert!(allowed_path(Path::new(path)));
@@ -257,10 +235,12 @@ fn hosted_cutover_config_is_opt_in_and_roundtrips_without_changing_ssh_defaults(
     }))
     .unwrap();
     config.validate().unwrap();
-    assert!(config.hosted_runners);
+    assert!(serde_json::to_value(&config)
+        .unwrap()
+        .get("hosted_runners")
+        .is_none());
     assert_eq!(config.broker_token_source, BrokerTokenSource::CkAccount);
     let mut off = config.clone();
-    off.hosted_runners = false;
     off.broker_url = None;
     assert_eq!(
         serde_json::to_value(&off).unwrap(),

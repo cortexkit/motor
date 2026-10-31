@@ -40,10 +40,7 @@ async fn host_full_replaces_onto_second_or_third_host_with_one_job_and_reservati
                 .push_back(third.broker.clone());
         }
         let (scratch, repo) = committed_repo();
-        let config = Config {
-            hosted_fleet_routing: true,
-            ..first.config()
-        };
+        let config = Config { ..first.config() };
         let motor = Motor::with_connector(
             config,
             &scratch.0.join("state"),
@@ -186,10 +183,7 @@ async fn binding_repository_hint_never_attempts_replace() {
 async fn long_hosted_leases_disable_boat_and_queue_on_no_capacity() {
     let h = Harness::new(Behavior::CompleteRun).await;
     let (scratch, repo) = committed_repo();
-    let config = Config {
-        hosted_fleet_routing: true,
-        ..h.config()
-    };
+    let config = Config { ..h.config() };
     let motor = Motor::with_connector(
         config,
         &scratch.0.join("state"),

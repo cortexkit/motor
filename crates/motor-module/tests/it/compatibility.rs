@@ -207,30 +207,17 @@ async fn refuse_non_neighbour_before_transfer(motor: &crate::Motor, f: &Fixture)
         .as_deref()
         .unwrap()
         .contains("does not advertise sibling_paths"));
-    let reply = motor.prepare(serde_json::from_value(serde_json::json!({
-        "workspace_key": f.key, "repository_root": f.main, "base_commit": "HEAD", "siblings": [path]
-    })).unwrap()).await.unwrap();
-    assert!(matches!(
-        reply.outcome,
-        PrepareOutcome::RefusedBeforeStart {
-            reason: RefusalReason::WorkspaceKeyRejected
-        }
-    ));
-    assert!(reply
-        .refusal_detail()
-        .unwrap()
-        .contains("does not advertise sibling_paths"));
     assert!(!f.proxy.frames.lock().unwrap().iter().any(|frame| matches!(
         frame,
-        Frame::Run(_) | Frame::Prepare(_) | Frame::Have { .. } | Frame::BundleChunk { .. }
+        Frame::Run(_) | Frame::Have { .. } | Frame::BundleChunk { .. }
     )));
     assert!(!f.remote_key.join("should-not-run").exists());
 }
 
 #[tokio::test]
-async fn legacy_runner_refuses_non_neighbour_siblings_before_run_and_prepare() {
+async fn legacy_runner_refuses_non_neighbour_siblings_before_run() {
     let f = Fixture::new(Cut::None, 28).await;
-    let motor = crate::Motor::with_connector(
+    let motor = crate::Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("module-state"),
         Arc::new(RunnerHello {
@@ -276,7 +263,7 @@ async fn new_direct_client_negotiates_gate_mark_with_pinned_runner() {
     assert_eq!(ready, "ready\n", "pinned runner failed before serving");
     f.use_external_runner_socket(socket);
     let hello = Arc::new(Mutex::new(None));
-    let motor = crate::Motor::with_connector(
+    let motor = crate::Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("module-state"),
         Arc::new(RunnerHello {
@@ -384,7 +371,7 @@ async fn new_agent_chunked_return_is_refused_by_pinned_runner_before_run() {
     assert_eq!(ready, "ready\n", "pinned runner failed before serving");
     f.use_external_runner_socket(socket);
     let hello = Arc::new(Mutex::new(None));
-    let motor = crate::Motor::with_connector(
+    let motor = crate::Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("module-state"),
         Arc::new(RunnerHello {
@@ -442,7 +429,7 @@ async fn new_agent_chunked_return_is_refused_by_pinned_runner_before_run() {
 async fn legacy_runner_hello_omits_direct_gate_mark() {
     let f = Fixture::new(Cut::None, 28).await;
     let hello = Arc::new(Mutex::new(None));
-    let motor = crate::Motor::with_connector(
+    let motor = crate::Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("module-state"),
         Arc::new(RunnerHello {
@@ -551,15 +538,6 @@ async fn current_client_root_and_linked_branch_fill_only_remote_confirmed_defaul
         f.request("test \"$(cat Cargo.lock)\" = '# unmerged lockfile'"),
     )
     .await;
-    let prepared = motor
-        .prepare(PrepareRequest::new(
-            f.key.to_str().unwrap(),
-            f.main.to_str().unwrap(),
-            linked_feature,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(prepared.outcome, PrepareOutcome::Prepared);
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if f.jobs()
@@ -596,9 +574,6 @@ async fn current_client_root_and_linked_branch_fill_only_remote_confirmed_defaul
         .collect();
     assert_eq!(runs.len(), 2);
     assert!(runs.iter().all(|run| run.integration_tip == tip));
-    assert!(frames
-        .iter()
-        .any(|frame| matches!(frame, Frame::Prepare(request) if request.integration_tip == tip)));
 }
 
 #[tokio::test]
@@ -608,25 +583,12 @@ async fn current_client_without_default_branch_sends_empty_tips_and_never_fills(
     let motor = f.motor();
     successful_run(&motor, f.request("true")).await;
     assert_eq!(f.recorded_run().integration_tip, "");
-    let base = crate::snapshot::git(&f.key, &["rev-parse", "HEAD"]).unwrap();
-    let prepared = motor
-        .prepare(PrepareRequest::new(
-            f.key.to_str().unwrap(),
-            f.main.to_str().unwrap(),
-            base,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(prepared.outcome, PrepareOutcome::Prepared);
-    assert!(f.proxy.frames.lock().unwrap().iter().any(
-        |frame| matches!(frame, Frame::Prepare(request) if request.integration_tip.is_empty())
-    ));
     idle(&f).await;
     assert!(f.jobs().iter().all(|job| job["base"] != true));
 }
 
 #[tokio::test]
-async fn current_client_unverified_default_tip_runs_and_prepares_without_fills() {
+async fn current_client_unverified_default_tip_runs_without_fills() {
     let f = Fixture::new(Cut::None, 28).await;
     crate::snapshot::git(&f.main, &["branch", "-m", "main"]).unwrap();
     let remote = f.scratch.join("origin.git");
@@ -651,36 +613,12 @@ async fn current_client_unverified_default_tip_runs_and_prepares_without_fills()
     let ahead = commit_checkout(&f.main);
     crate::snapshot::git(&f.main, &["update-ref", "refs/remotes/origin/main", &ahead]).unwrap();
     let motor = f.motor();
-    let base = crate::snapshot::git(&f.key, &["rev-parse", "HEAD"]).unwrap();
     for offline in [false, true] {
         if offline {
             fs::rename(&remote, remote.with_extension("offline")).unwrap();
         }
         successful_run(&motor, f.request("true")).await;
         assert_eq!(f.recorded_run().integration_tip, "");
-        let prepared = motor
-            .prepare(PrepareRequest::new(
-                f.key.to_str().unwrap(),
-                f.main.to_str().unwrap(),
-                base.clone(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(prepared.outcome, PrepareOutcome::Prepared);
-    }
-    {
-        let frames = f.proxy.frames.lock().unwrap();
-        let prepares: Vec<_> = frames
-            .iter()
-            .filter_map(|frame| match frame {
-                Frame::Prepare(request) => Some(request),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(prepares.len(), 2);
-        assert!(prepares
-            .iter()
-            .all(|request| request.integration_tip.is_empty()));
     }
     idle(&f).await;
     assert!(f.jobs().iter().all(|job| job["base"] != true));

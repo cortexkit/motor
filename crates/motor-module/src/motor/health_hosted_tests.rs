@@ -320,10 +320,15 @@ async fn never_sent_hosted_job_with_a_local_owner_is_not_retired_or_probed() {
             motor.storage.cancel(id, true).unwrap();
         }
         if owner == "archived_spill" {
-            motor
-                .storage
-                .resubmitted(id, Uuid::now_v7(), "hosted_connect_failed", None)
-                .unwrap();
+            crate::storage::legacy_fixtures::seed_direct_route(
+                &motor.storage,
+                id,
+                crate::storage::legacy_fixtures::DirectRoute::SpillReturn {
+                    runner_job_id: Uuid::now_v7(),
+                    hosted_code: "hosted_connect_failed",
+                },
+            )
+            .unwrap();
             assert!(!motor
                 .retire_unstarted_hosted(id, crate::hosted::now_s() * 1000)
                 .unwrap());

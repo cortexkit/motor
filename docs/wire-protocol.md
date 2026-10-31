@@ -115,7 +115,7 @@ Current `ck-motor` clients report a nonempty `run.integration_tip` or
 the configured origin's default branch, or reusing a bounded successful check.
 A mismatch or unavailable remote leaves that tip empty without refusing normal
 work. Tests: `current_client_root_and_linked_branch_fill_only_remote_confirmed_default_tip`,
-`current_client_unverified_default_tip_runs_and_prepares_without_fills`
+`current_client_unverified_default_tip_runs_without_fills`
 (`crates/motor-module/tests/it/compatibility.rs`). See
 [compile-cache.md](compile-cache.md#verifying-the-fill-tip) for verification,
 credentials, caching and the accepted origin-URL limit. This is a client policy,

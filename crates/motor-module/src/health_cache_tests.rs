@@ -1,30 +1,20 @@
 use super::*;
 
-fn sample() -> RunnerHealth {
-    serde_json::from_value(json!({
-        "runner_version": "test", "since_ms": 0, "window_minutes": 60,
-        "free_bytes": 123456, "queue_depth": 4, "running": [],
-        "counts": {"accepted": 0, "refusals": {}, "evictions": 0, "eviction_bytes": 0,
-            "eviction_failures": 0, "soft_goal_unmet_passes": 0, "skipped_recent": 0},
-        "load_1m": 1.25, "threads": 300, "mem_available_bytes": 987654,
-        "permits_held": 12, "permits_cap": 80,
-        "queue_wait_1h": {"p50_ms": 2000, "p90_ms": 190000, "refusals": 4}
-    }))
-    .unwrap()
-}
-
 #[test]
-fn idle_runner_does_not_report_historical_queue_wait_as_current_capacity() {
+fn linux_availability_requires_the_broker_not_a_runner_sample() {
     let now = Instant::now();
-    let mut sample = sample();
-    sample.queue_depth = 0;
-    sample.permits_held = Some(0);
-    sample.queue_wait_1h.as_mut().unwrap().p90_ms = 95 * 60_000;
     let mut cache = HealthCache::default();
-    cache.update(Some(sample), now);
+    cache.update(true, now);
+    assert_eq!(
+        cache.report(now).metrics.unwrap()["platforms"]["linux"]["status"],
+        "unavailable"
+    );
+    cache.account = Some(json!({"sign_in": "signed in", "broker": "ok"}));
     let report = cache.report(now);
-    let detail = report.detail.unwrap();
-    assert!(!detail.contains("95m"), "{detail}");
+    assert!(!report.detail.unwrap().contains("Linux runner"));
+    assert!(report.metrics.as_ref().unwrap()["connection"]
+        .get("runner")
+        .is_none());
     assert_eq!(
         report.metrics.unwrap()["platforms"]["linux"]["status"],
         "available"
@@ -35,7 +25,9 @@ fn idle_runner_does_not_report_historical_queue_wait_as_current_capacity() {
 fn busy_platform_is_healthy_without_host_telemetry() {
     let now = Instant::now();
     let mut cache = HealthCache::default();
-    cache.update(Some(sample()), now);
+    cache.update(true, now);
+    cache.account = Some(json!({"sign_in": "signed in", "broker": "ok"}));
+    cache.jobs = Some(json!({"linux": {"waiting_for_capacity": 1}}));
     let report = cache.report(now);
     assert_eq!(report.status, HealthStatus::Ok);
     assert!(report.detail.as_ref().unwrap().contains("linux: busy"));
@@ -77,7 +69,7 @@ fn windows_aggregates_all_endpoints_without_names_or_limits() {
     let mut cache = HealthCache::default();
     cache.config.windows_runner_instance = Some("windows".into());
     cache.config.windows_runner_state_root = Some("state".into());
-    cache.update(Some(sample()), now);
+    cache.update(true, now);
     cache.windows = vec![
         json!({"name": "Ally", "reachable": false, "busy": null, "max_concurrent": 97}),
         json!({"name": "ovh-2", "reachable": true, "busy": true, "max_concurrent": 53}),
@@ -113,7 +105,7 @@ fn windows_health_explains_qualification_hold_without_exposing_endpoint_names() 
     let mut cache = HealthCache::default();
     cache.config.windows_runner_instance = Some("windows".into());
     cache.config.windows_runner_state_root = Some("state".into());
-    cache.update(Some(sample()), now);
+    cache.update(true, now);
     cache.windows = vec![
         json!({"name": "private-endpoint", "reachable": true, "busy": true,
         "admission_blocked": "runner awaiting qualification"}),
@@ -147,7 +139,7 @@ fn windows_health_explains_qualification_hold_without_exposing_endpoint_names() 
 fn macos_availability_uses_its_own_sample_and_reports_missing_configuration() {
     let now = Instant::now();
     let mut cache = HealthCache::default();
-    cache.update(Some(sample()), now);
+    cache.update(true, now);
     assert_eq!(
         cache.report(now).metrics.unwrap()["platforms"]["macos"]["reason"],
         "not set up on this machine"
@@ -170,8 +162,7 @@ fn macos_availability_uses_its_own_sample_and_reports_missing_configuration() {
 fn hosted_requires_sign_in_and_broker_and_uses_local_capacity_waits() {
     let now = Instant::now();
     let mut cache = HealthCache::default();
-    cache.config.hosted_runners = true;
-    cache.update(Some(sample()), now);
+    cache.update(true, now);
     assert_eq!(
         cache.report(now).metrics.unwrap()["platforms"]["linux"]["status"],
         "unavailable"
@@ -204,7 +195,7 @@ fn hosted_requires_sign_in_and_broker_and_uses_local_capacity_waits() {
 fn idle_cache_stales_after_two_minutes_and_recovers() {
     let now = Instant::now();
     let mut cache = HealthCache::default();
-    cache.update(Some(sample()), now);
+    cache.update(true, now);
     assert_eq!(
         cache.report(now + Duration::from_secs(119)).status,
         HealthStatus::Ok
@@ -216,7 +207,7 @@ fn idle_cache_stales_after_two_minutes_and_recovers() {
         "unavailable"
     );
     assert!(!stale.detail.unwrap().contains("sample stale"));
-    cache.update(Some(sample()), now + STALE_AFTER);
+    cache.update(true, now + STALE_AFTER);
     assert_eq!(cache.report(now + STALE_AFTER).status, HealthStatus::Ok);
 }
 
@@ -224,9 +215,9 @@ fn idle_cache_stales_after_two_minutes_and_recovers() {
 fn unreachable_samples_and_three_failures_degrade_and_recover() {
     let now = Instant::now();
     let mut cache = HealthCache::default();
-    cache.update(Some(sample()), now);
+    cache.update(true, now);
     for failure in 1..=3 {
-        cache.update(None, now + Duration::from_secs(15 * failure));
+        cache.update(false, now + Duration::from_secs(15 * failure));
         let report = cache.report(now + Duration::from_secs(15 * failure));
         assert_eq!(
             report.status,
@@ -237,11 +228,11 @@ fn unreachable_samples_and_three_failures_degrade_and_recover() {
             }
         );
         assert_eq!(
-            report.metrics.unwrap()["connection"]["runner"],
+            report.metrics.unwrap()["platforms"]["linux"]["status"],
             "unavailable"
         );
     }
-    cache.update(Some(sample()), now + Duration::from_secs(46));
+    cache.update(true, now + Duration::from_secs(46));
     assert_eq!(
         cache.report(now + Duration::from_secs(46)).status,
         HealthStatus::Ok
@@ -299,7 +290,7 @@ fn account_summary_excludes_claims_and_distinguishes_auth_from_connection() {
 fn local_failure_preserves_failing_status_and_marks_platforms_unavailable() {
     let now = Instant::now();
     let mut cache = HealthCache::default();
-    cache.update(Some(sample()), now);
+    cache.update(true, now);
     let report = cache.report_with_refusal(now, Some("storage_lease_busy"));
     assert_eq!(report.status, HealthStatus::Failing);
     assert!(report.detail.unwrap().contains("storage_lease_busy"));
@@ -312,8 +303,7 @@ fn local_failure_preserves_failing_status_and_marks_platforms_unavailable() {
 
 fn hosted_text_cache(now: Instant) -> HealthCache {
     let mut cache = HealthCache::default();
-    cache.config.hosted_runners = true;
-    cache.update(Some(sample()), now);
+    cache.update(true, now);
     cache.account = Some(json!({"sign_in": "signed in", "broker": "ok"}));
     cache.jobs = Some(json!({
         "linux": {"running": 0, "waiting_for_capacity": 0, "unknown": 0},
@@ -399,32 +389,23 @@ fn unavailable_connection_text_omits_job_counts_without_hiding_metrics() {
 }
 
 #[test]
-fn linux_connection_label_is_explicit_and_only_shown_for_direct_routing() {
+fn linux_health_never_mentions_a_direct_runner() {
     let now = Instant::now();
     let mut cache = HealthCache::default();
-    cache.update(Some(sample()), now);
-    assert!(cache
-        .report(now)
-        .detail
-        .unwrap()
-        .contains("; Linux runner ok;"));
-    for route in ["global", "repository", "spill"] {
-        cache.config.hosted_runners = route == "global";
-        cache.config.hosted_repositories = if route == "repository" {
-            vec!["repository".into()]
-        } else {
-            Vec::new()
-        };
-        cache.config.spill_to_hosted = route == "spill";
+    cache.update(true, now);
+    cache.account = Some(json!({"sign_in": "signed in", "broker": "ok"}));
+    for repositories in [Vec::new(), vec!["repository".into()]] {
+        cache.config.hosted_repositories = repositories;
         let report = cache.report(now);
-        // The detail opens with the caller's hostname, which can itself contain
-        // "runner" (CI hosts do), so check only the text after it.
+        // The caller's hostname may itself contain "runner"; inspect only the summary.
         let detail = report.detail.unwrap();
         let summary = detail
             .strip_prefix(&format!("{}: ", machine_name()))
             .unwrap_or(&detail);
         assert!(!summary.contains("runner"), "{detail}");
-        assert_eq!(report.metrics.unwrap()["connection"]["runner"], "ok");
+        let connection = report.metrics.unwrap()["connection"].clone();
+        assert!(connection.get("runner").is_none());
+        assert_eq!(connection["broker"], "ok");
     }
 }
 

@@ -77,8 +77,6 @@ async fn boat_host_full_finishes_lost_then_runs_a_fresh_booking_for_the_same_cal
     let (scratch, repo) = committed_repo();
     let motor = Motor::with_connector(
         Config {
-            hosted_runners: true,
-            hosted_fleet_routing: true,
             ..boat.config.clone()
         },
         &scratch.0.join("state"),
@@ -158,8 +156,6 @@ async fn boat_host_full_stops_after_three_grants_or_the_queue_budget() {
         let (scratch, repo) = committed_repo();
         let motor = Motor::with_connector(
             Config {
-                hosted_runners: true,
-                hosted_fleet_routing: true,
                 ..boat.config.clone()
             },
             &scratch.0.join("state"),

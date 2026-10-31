@@ -271,6 +271,7 @@ function Invoke-RunnerHostUpdate {
                 Set-RunnerUpdateServiceDefinition $oldDefinition $log
             }
             if ($serviceStopped) {
+                Close-RunnerQualificationGate $Root
                 Assert-RunnerQualificationCapable $Root
                 Start-Service -Name MotorRunner -ErrorAction Stop
                 Wait-RunnerUpdateReady $Root $ReadyTimeoutSeconds

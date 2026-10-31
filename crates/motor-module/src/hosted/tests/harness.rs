@@ -766,7 +766,6 @@ impl Harness {
     }
     pub fn config(&self) -> Config {
         Config {
-            hosted_runners: true,
             runner_instance: "test".into(),
             broker_url: Some(self.route.broker_url.clone()),
             broker_token_source: BrokerTokenSource::Fake,

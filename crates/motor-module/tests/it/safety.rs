@@ -60,7 +60,7 @@ async fn snapshots_preserve_head_real_index_status_and_refs_on_success_and_failu
     // Injecting commit-tree failure happens after hashing, and must not mutate
     // the real index even though it already holds staged content.
     f.config.inject_snapshot_failure = true;
-    let failed = Motor::with_connector(
+    let failed = Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("failure-state"),
         Arc::new(f.proxy.clone()),
@@ -82,12 +82,6 @@ async fn snapshots_preserve_head_real_index_status_and_refs_on_success_and_failu
     assert!(detail.contains("invalid-tree"), "{detail}");
     assert!(!detail.contains('\n'), "{detail}");
     assert!(detail.len() <= REFUSAL_DETAIL_MAX_BYTES);
-    let prepare = serde_json::from_value(serde_json::json!({
-        "workspace_key": f.key, "repository_root": f.main, "base_commit": "HEAD", "siblings": []
-    }))
-    .unwrap();
-    let reply = failed.prepare(prepare).await.unwrap();
-    assert_eq!(reply.refusal_detail(), Some(detail));
     assert_eq!(before, state(&f.key));
     assert_eq!(sibling_before, state(&f.sibling));
     assert!(!f.remote_key.join("marker").exists());
@@ -436,7 +430,7 @@ fn test_control_fields_are_refused_at_main_config_load_even_if_disabled() {
     }
     fs::write(&path, "{\"runner_instance\":\"bad;command\"}").unwrap();
     assert!(Config::load(&path).is_err());
-    fs::write(&path, "{\"queue_wait_limit_s\":\"wrong type\"}").unwrap();
+    fs::write(&path, "{\"direct_exec_max_timeout_secs\":\"wrong type\"}").unwrap();
     assert!(Config::load(&path).is_err());
     fs::write(&path, "{\"unknown\":true}").unwrap();
     assert!(Config::load(&path).is_err());
@@ -604,7 +598,7 @@ async fn run_have_failure_records_only_the_run_have_step() {
     let other_step = UnreachableStep::Prepare;
     let before = unreachable_count(step);
     let other_before = unreachable_count(other_step);
-    let motor = Motor::with_connector(
+    let motor = Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("run-have-failure-state"),
         Arc::new(DisconnectDuringHave),
@@ -615,37 +609,6 @@ async fn run_have_failure_records_only_the_run_have_step() {
     assert_eq!(
         terminal(&records).outcome,
         Outcome::RefusedBeforeStart {
-            reason: RefusalReason::Unreachable
-        }
-    );
-    assert_step_incremented(step, before);
-    assert_eq!(unreachable_count(other_step), other_before);
-}
-#[tokio::test]
-async fn prepare_have_failure_records_only_the_prepare_step() {
-    let f = Fixture::new(Cut::None, 28).await;
-    let step = UnreachableStep::Prepare;
-    let other_step = UnreachableStep::HaveExchange;
-    let before = unreachable_count(step);
-    let other_before = unreachable_count(other_step);
-    let motor = Motor::with_connector(
-        f.config.clone(),
-        &f.scratch.join("prepare-have-failure-state"),
-        Arc::new(DisconnectDuringHave),
-    )
-    .unwrap();
-    let request: PrepareRequest = serde_json::from_value(serde_json::json!({
-        "workspace_key": f.key,
-        "repository_root": f.main,
-        "base_commit": git(&f.key, &["rev-parse", "HEAD"]),
-        "siblings": [f.sibling]
-    }))
-    .unwrap();
-
-    let reply = motor.prepare(request).await.unwrap();
-    assert_eq!(
-        reply.outcome,
-        PrepareOutcome::RefusedBeforeStart {
             reason: RefusalReason::Unreachable
         }
     );
@@ -775,14 +738,9 @@ async fn hello_times_out_at_fifteen_seconds_and_ssh_connect_timeout_is_ten() {
     assert!(args.last().unwrap().contains("--instance main --job "));
 }
 #[tokio::test]
-async fn prepare_status_drop_and_incremental_bundles_use_runner_replies() {
+async fn status_and_incremental_bundles_use_runner_replies_while_linux_drop_is_noop() {
     let f = Fixture::new(Cut::None, 28).await;
     let motor = f.motor();
-    let prepare: PrepareRequest = serde_json::from_value(serde_json::json!({"workspace_key":f.key,"repository_root":f.main,"base_commit":git(&f.key,&["rev-parse","HEAD"]),"siblings":[f.sibling]})).unwrap();
-    assert_eq!(
-        motor.prepare(prepare).await.unwrap().outcome,
-        PrepareOutcome::Prepared
-    );
     let first = collect(motor.run(f.request("true")).unwrap()).await;
     assert_eq!(terminal(&first).ran, Some(Ran::Remote));
     fs::write(f.key.join("source"), "next\n").unwrap();
@@ -797,8 +755,9 @@ async fn prepare_status_drop_and_incremental_bundles_use_runner_replies() {
         .drop_workspace(DropRequest::new(f.key.to_str().unwrap()))
         .await
         .unwrap();
-    assert!(drop.dropped);
-    assert!(!f.remote_key.exists());
+    assert!(!drop.dropped);
+    assert!(drop.cancelled_jobs.is_empty());
+    assert!(f.remote_key.exists());
     assert!(
         !motor
             .drop_workspace(DropRequest::new(f.key.to_str().unwrap()))
@@ -980,8 +939,13 @@ impl Connector for FutureRecords {
 #[tokio::test]
 async fn unknown_records_advance_cursor_without_fallback_or_premature_terminal() {
     let scratch = ScratchDir::new("motor-future");
+    let id = Uuid::now_v7();
+    crate::storage::Storage::open(&scratch)
+        .unwrap()
+        .create(id, 1800, None, None, false)
+        .unwrap();
     let frames = Arc::new(Mutex::new(Vec::new()));
-    let motor = Motor::with_connector(
+    let motor = Motor::with_test_fixture_direct_route(
         Config::default(),
         &scratch,
         Arc::new(FutureRecords {
@@ -989,7 +953,7 @@ async fn unknown_records_advance_cursor_without_fallback_or_premature_terminal()
         }),
     )
     .unwrap();
-    let records = collect(motor.attach(AttachRequest::new(Uuid::now_v7(), 0)).unwrap()).await;
+    let records = collect(motor.attach(AttachRequest::new(id, 0)).unwrap()).await;
     assert_eq!(records.len(), 2);
     assert!(matches!(records[0], StreamRecord::Output(_)));
     assert!(!matches!(
@@ -1099,8 +1063,13 @@ impl Connector for UnknownCursorRecovery {
 
 async fn assert_unknown_record_recovery(unknown: serde_json::Value, expected_cursor: u64) {
     let scratch = ScratchDir::new("motor-unknown-cursor");
+    let id = Uuid::now_v7();
+    crate::storage::Storage::open(&scratch)
+        .unwrap()
+        .create(id, 1800, None, None, false)
+        .unwrap();
     let attaches = Arc::new(Mutex::new(Vec::new()));
-    let motor = Motor::with_connector(
+    let motor = Motor::with_test_fixture_direct_route(
         Config::default(),
         &scratch,
         Arc::new(UnknownCursorRecovery {
@@ -1110,7 +1079,6 @@ async fn assert_unknown_record_recovery(unknown: serde_json::Value, expected_cur
         }),
     )
     .unwrap();
-    let id = Uuid::now_v7();
     let records = collect(motor.attach(AttachRequest::new(id, 6)).unwrap()).await;
     let requests = attaches.lock().unwrap();
     assert_eq!(requests.len(), 2);
@@ -1269,14 +1237,12 @@ fn manifest_advertises_exact_capability_and_all_operations() {
     for name in crate::module::OPERATIONS {
         assert!(bytes.contains(name));
     }
-    let health = value["provides"]
+    assert!(!value["provides"]
         .as_array()
         .unwrap()
         .iter()
         .flat_map(|role| role["operations"].as_array().into_iter().flatten())
-        .find(|op| op["name"] == "runner.health")
-        .expect("runner.health is advertised");
-    assert_eq!(health["kind"], "query");
+        .any(|op| op["name"] == "runner.health"));
 }
 
 #[test]
@@ -1325,9 +1291,10 @@ async fn second_worktree_bytes(f: &Fixture, history: Option<&[u8]>) -> (u64, u64
     let first_branch = commit(&f.key, "unmerged first worktree");
     let first = collect(motor.run(f.request("true")).unwrap()).await;
     assert_eq!(terminal(&first).outcome, Outcome::Exit { code: 0 });
+    // Reset the fixture's remote workspace directly; Linux workspace.drop is a no-op.
     assert!(
-        motor
-            .drop_workspace(DropRequest::new(f.key.to_str().unwrap()))
+        f.runner
+            .drop_workspace(f.remote_key.to_str().unwrap())
             .await
             .unwrap()
             .dropped
@@ -1414,133 +1381,4 @@ async fn measure_second_worktree_bytes() {
     let f = Fixture::with_main(Cut::None, 28, Some(&source)).await;
     let (first, second) = second_worktree_bytes(&f, None).await;
     println!("motor transfer bytes: first job {first}, second job with one changed file {second}");
-}
-
-#[tokio::test]
-async fn first_tip_prepare_publishes_status_without_generation_seeding() {
-    let f = Fixture::new(Cut::None, 28).await;
-    let tip = git(&f.main, &["rev-parse", "HEAD"]);
-    if git(&f.main, &["branch", "--show-current"]) != "main" {
-        git(&f.main, &["branch", "-f", "main", &tip]);
-    }
-    let tip = git(&f.main, &["rev-parse", "refs/heads/main"]);
-    let motor = Motor::with_connector(
-        f.config.clone(),
-        &f.scratch.join("module-state"),
-        Arc::new(DefaultBranchFixtureTransport {
-            inner: f.proxy.clone(),
-            tip: tip.clone(),
-        }),
-    )
-    .unwrap();
-    let prepare: PrepareRequest = serde_json::from_value(serde_json::json!({
-        "workspace_key": f.key, "repository_root": f.main,
-        "base_commit": tip, "siblings": [f.sibling]
-    }))
-    .unwrap();
-    assert_eq!(
-        motor.prepare(prepare).await.unwrap().outcome,
-        PrepareOutcome::Prepared
-    );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let status = motor.status().await;
-        if let Some(repository) = status
-            .repositories
-            .iter()
-            .find(|repository| repository.published_commit.as_deref() == Some(tip.as_str()))
-        {
-            assert_eq!(repository.last_rebuild_result, Some(RebuildResult::Ok));
-            assert!(repository.warm_target_age_s.is_some());
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "first integration tip never published: {status:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(
-        fs::read_dir(f.remote_key.join("target")).unwrap().count(),
-        0
-    );
-}
-
-// This relay stands in for the client-tip slice's production behavior: advertise
-// the default-branch capability and send the fixture's explicitly pinned local
-// main tip. All other client bytes and every server byte pass through unchanged.
-struct DefaultBranchFixtureTransport {
-    inner: Arc<super::recovery::Proxy>,
-    tip: String,
-}
-impl Connector for DefaultBranchFixtureTransport {
-    fn connect(
-        &self,
-        id: Uuid,
-    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + '_>> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        Box::pin(async move {
-            let upstream = self.inner.connect(id).await?;
-            let (client, relay) = tokio::io::duplex(65536);
-            let tip = self.tip.clone();
-            tokio::spawn(async move {
-                let (mut client_read, mut client_write) = tokio::io::split(relay);
-                let (mut server_read, mut server_write) = tokio::io::split(upstream);
-                let send = async {
-                    loop {
-                        let mut length = [0; 4];
-                        if client_read.read(&mut length[..1]).await? == 0 {
-                            server_write.shutdown().await?;
-                            return Ok::<_, io::Error>(());
-                        }
-                        client_read.read_exact(&mut length[1..]).await?;
-                        let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
-                        client_read.read_exact(&mut bytes).await?;
-                        let frame: Frame = serde_json::from_slice(&bytes)?;
-                        let replacement = match frame {
-                            Frame::Hello {
-                                default_branch_tip: false,
-                                gate_jobs: false,
-                                ..
-                            } => {
-                                let mut text = String::from_utf8(bytes).unwrap();
-                                assert!(!text.contains("\"default_branch_tip\""));
-                                assert!(text.ends_with('}'));
-                                text.insert_str(text.len() - 1, ",\"default_branch_tip\":true");
-                                bytes = text.into_bytes();
-                                None
-                            }
-                            Frame::Prepare(prepare) => Some((
-                                format!(
-                                    "\"integration_tip\":{}",
-                                    serde_json::to_string(&prepare.integration_tip)?
-                                ),
-                                format!("\"integration_tip\":{}", serde_json::to_string(&tip)?),
-                            )),
-                            Frame::Run(run) => Some((
-                                format!(
-                                    "\"integration_tip\":{}",
-                                    serde_json::to_string(&run.integration_tip)?
-                                ),
-                                format!("\"integration_tip\":{}", serde_json::to_string(&tip)?),
-                            )),
-                            _ => None,
-                        };
-                        if let Some((old, new)) = replacement {
-                            let text = String::from_utf8(bytes).unwrap();
-                            assert_eq!(text.matches(&old).count(), 1);
-                            bytes = text.replacen(&old, &new, 1).into_bytes();
-                        }
-                        server_write
-                            .write_all(&(bytes.len() as u32).to_be_bytes())
-                            .await?;
-                        server_write.write_all(&bytes).await?;
-                    }
-                };
-                let receive = tokio::io::copy(&mut server_read, &mut client_write);
-                let _ = tokio::try_join!(send, receive);
-            });
-            Ok(Box::new(client) as Box<dyn Duplex>)
-        })
-    }
 }

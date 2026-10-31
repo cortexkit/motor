@@ -324,8 +324,7 @@ impl Boat {
             runner_instance: "test".into(),
             broker_token_source: BrokerTokenSource::Fake,
             broker_url: Some(http.url.clone()),
-            spill_to_hosted: true,
-            spill_after_s: 0,
+
             ..Config::default()
         };
         Self {
@@ -407,6 +406,7 @@ async fn boat_provisioning_retry_and_reattach_refresh_endpoint_and_pin() {
     assert!(
         matches!(channel.next().await.unwrap(),crate::transport::Incoming::Frame(Frame::Terminal(t)) if t.outcome==Outcome::Exit{code:23})
     );
+    assert_eq!(boat.attaches.load(Ordering::SeqCst), 1);
     assert_eq!(
         boat.requests
             .lock()
@@ -640,7 +640,7 @@ async fn cloud_boat_vectors_match_client_request_lease_and_finish_types() {
         runner_instance: "boat-vector-test".into(),
         broker_token_source: BrokerTokenSource::Fake,
         broker_url: Some(finish_http.url.clone()),
-        spill_to_hosted: true,
+
         ..Config::default()
     };
     let scratch = cortexkit_test_support::ScratchDir::new("boat-vector-finish");
@@ -692,7 +692,7 @@ async fn cloud_boat_sandbox_lost_vector_maps_to_client_error() {
         runner_instance: "boat-vector-loss-test".into(),
         broker_token_source: BrokerTokenSource::Fake,
         broker_url: Some(http.url.clone()),
-        spill_to_hosted: true,
+
         ..Config::default()
     };
     let result = Client::new(HostedJobState::new(&config))
@@ -741,7 +741,7 @@ async fn cloud_boat_provisioning_response_retries_then_parses_booked_lease() {
         runner_instance: "boat-vector-provisioning-test".into(),
         broker_token_source: BrokerTokenSource::Fake,
         broker_url: Some(http.url.clone()),
-        spill_to_hosted: true,
+
         ..Config::default()
     };
     std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
@@ -775,7 +775,7 @@ async fn cloud_boat_unknown_success_shape_is_a_typed_broker_error() {
         runner_instance: "boat-invalid-success-test".into(),
         broker_token_source: BrokerTokenSource::Fake,
         broker_url: Some(http.url.clone()),
-        spill_to_hosted: true,
+
         ..Config::default()
     };
     let result = Client::new(HostedJobState::new(&config))
@@ -800,7 +800,7 @@ async fn cloud_boat_provisioning_budget_exhaustion_is_retryable_and_bounded() {
         runner_instance: "boat-vector-budget-test".into(),
         broker_token_source: BrokerTokenSource::Fake,
         broker_url: Some(http.url.clone()),
-        spill_to_hosted: true,
+
         ..Config::default()
     };
     let route = HostedJobState {
@@ -946,7 +946,6 @@ async fn spilled_lease_avoids_the_build_server_and_every_re_request_repeats_it()
     // An ordinary hosted route avoids no host, even when the spill key is set.
     let ordinary = Boat::new(0, true).await;
     let config = Config {
-        spill_avoid_host: Some("build-server-1".into()),
         ..ordinary.config.clone()
     };
     let storage = Arc::new(Storage::open(&scratch.join("ordinary")).unwrap());
@@ -964,7 +963,6 @@ async fn spilled_lease_avoids_the_build_server_and_every_re_request_repeats_it()
     // provisioning twice, so the first run sends three lease requests.
     let boat = Boat::new(2, true).await;
     let config = Config {
-        spill_avoid_host: Some("build-server-1".into()),
         ..boat.config.clone()
     };
     let storage = Arc::new(Storage::open(&scratch.join("spilled")).unwrap());
@@ -972,7 +970,7 @@ async fn spilled_lease_avoids_the_build_server_and_every_re_request_repeats_it()
     storage.create(id, 300, None, None, false).unwrap();
     let mut route = HostedJobState::new(&config);
     route.spill_wait_ms = Some(45_000);
-    route.avoid_host = config.spill_avoid_host.clone();
+    route.avoid_host = Some("build-server-1".into());
     storage.hosted_route(id, route.clone()).unwrap();
     let (channel, _) = Client::new(route)
         .run(id, &request, &storage)
@@ -1102,15 +1100,16 @@ fn broker_config(http: &Http) -> Config {
 }
 
 #[tokio::test]
-async fn direct_hosted_route_is_only_for_its_job_and_its_refusal_never_falls_back() {
+async fn explicit_hosted_test_does_not_disable_fleet_for_other_linux_jobs() {
     let http = no_capacity_broker().await;
     let scratch = cortexkit_test_support::ScratchDir::new("direct-hosted-route");
     let config = Config {
-        spill_to_hosted: true,
-        spill_avoid_host: Some("build-server-1".into()),
         ..broker_config(&http)
     };
-    assert!(!config.hosted_runners);
+    assert!(serde_json::to_value(&config)
+        .unwrap()
+        .get("hosted_runners")
+        .is_none());
     let ssh = Arc::new(tests::harness::NoSsh(AtomicUsize::new(0)));
     let motor = crate::Motor::with_connector(config, &scratch.join("state"), ssh.clone()).unwrap();
     // A path outside the hosted roots refuses before any lease or snapshot.
@@ -1136,11 +1135,11 @@ async fn direct_hosted_route_is_only_for_its_job_and_its_refusal_never_falls_bac
         Some("hosted_path_outside_roots")
     );
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
-    // The next job is not hosted: hosted routing stayed off.
+    // An explicit hosted test does not change the next job's normal fleet route.
     let stream = motor.run_direct(request, None).unwrap();
     let id = stream.job_id;
     records(stream).await;
-    assert!(motor.hosted_state(id).is_none());
+    assert!(motor.hosted_state(id).unwrap().fleet_routed);
     assert!(http.requests.lock().unwrap().is_empty());
 }
 
@@ -1188,15 +1187,8 @@ async fn direct_hosted_job_runs_on_a_lease_avoiding_no_host_with_hosted_routing_
     let h = Harness::new(Behavior::DropRunAck).await;
     h.broker.lock().unwrap().knobs.max_s = Some(30);
     let (scratch, repo) = committed_repo();
-    // `test-host` is the fake broker's only host. Configuring it as the host
-    // a spill avoids shows this job avoids no host: a lease avoiding it would
-    // have no capacity.
-    let config = Config {
-        hosted_runners: false,
-        spill_to_hosted: true,
-        spill_avoid_host: Some("test-host".into()),
-        ..h.config()
-    };
+    // Explicit hosted test leases leave `avoid_host` unset.
+    let config = Config { ..h.config() };
     let ssh = Arc::new(tests::harness::NoSsh(AtomicUsize::new(0)));
     let motor =
         crate::Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();

@@ -427,7 +427,7 @@ impl Fixture {
         }
     }
     pub fn motor(&self) -> Motor {
-        Motor::with_connector(
+        Motor::with_test_fixture_direct_route(
             self.config.clone(),
             &self.scratch.join("module-state"),
             Arc::new(self.proxy.clone()),
@@ -905,7 +905,7 @@ async fn cancel_before_seen_survives_module_restart_and_attach_cancel() {
     // Reopen the actual module storage once detached consumers release the
     // single-writer lease. Nothing in memory is handed to the new instance.
     let restarted = super::reopen_motor(|| {
-        Motor::with_connector(
+        Motor::with_test_fixture_direct_route(
             f.config.clone(),
             &f.scratch.join("module-state"),
             Arc::new(f.proxy.clone()),
@@ -1162,19 +1162,6 @@ async fn draining_retry_hint_is_decoded_and_logged_by_ck_motor() {
             reason: RefusalReason::RunnerDraining
         }
     ));
-    let prepare = serde_json::from_value(serde_json::json!({
-        "workspace_key": f.key, "repository_root": f.main, "base_commit": "HEAD", "siblings": []
-    }))
-    .unwrap();
-    let reply = motor.prepare(prepare).await.unwrap();
-    assert_eq!(
-        reply.outcome,
-        PrepareOutcome::RefusedBeforeStart {
-            reason: RefusalReason::RunnerDraining
-        }
-    );
-    assert_eq!(reply.refusal_detail(), Some("runner_draining"));
-    assert_eq!(reply.retry_after_ms(), Some(5_000));
 }
 
 #[tokio::test]
@@ -1219,7 +1206,7 @@ async fn queued_drain_retry_hint_reaches_ck_motor_callers() {
 }
 
 #[tokio::test]
-async fn disk_full_reaches_run_and_prepare_callers_with_known_reason_and_detail() {
+async fn disk_full_reaches_run_callers_with_known_reason_and_detail() {
     let f = Fixture::new(Cut::DiskFull, 28).await;
     let motor = f.motor();
     let records = collect(motor.run(f.request("true")).unwrap()).await;
@@ -1236,19 +1223,6 @@ async fn disk_full_reaches_run_and_prepare_callers_with_known_reason_and_detail(
     );
     assert_eq!(t.retry_after_ms(), Some(1200));
     assert_eq!(t.ran, Some(Ran::None));
-    let prepare = serde_json::from_value(serde_json::json!({
-        "workspace_key": f.key, "repository_root": f.main, "base_commit": "HEAD", "siblings": []
-    }))
-    .unwrap();
-    let reply = motor.prepare(prepare).await.unwrap();
-    assert_eq!(
-        reply.outcome,
-        PrepareOutcome::RefusedBeforeStart {
-            reason: RefusalReason::RunnerDiskFull
-        }
-    );
-    assert_eq!(reply.refusal_detail(), t.refusal_detail());
-    assert_eq!(reply.retry_after_ms(), Some(1200));
     assert!(!f
         .proxy
         .frames
@@ -1308,7 +1282,7 @@ async fn refused_snapshot_retry_after_maintenance_sends_no_bundle() {
 }
 
 #[tokio::test]
-async fn capped_unavailable_tips_do_not_resend_a_prepared_worktrees_history() {
+async fn capped_unavailable_tips_do_not_resend_a_worktrees_previous_run_history() {
     use rand::{rngs::StdRng, RngCore, SeedableRng};
     use sha2::{Digest, Sha256};
     let f = Fixture::new(Cut::None, 28).await;
@@ -1331,25 +1305,10 @@ async fn capped_unavailable_tips_do_not_resend_a_prepared_worktrees_history() {
     let base = git(&f.main, &["rev-parse", "HEAD"]);
     git(&f.key, &["reset", "--hard", &base]);
     let motor = f.motor();
-    let prepare = PrepareRequest::new(text(&f.key), text(&f.main), &base)
-        .with_siblings(vec![text(&f.sibling)]);
     assert_eq!(
-        motor.prepare(prepare.clone()).await.unwrap().outcome,
-        PrepareOutcome::Prepared
+        terminal(&collect(motor.run(f.request("true")).unwrap()).await).outcome,
+        Outcome::Exit { code: 0 }
     );
-    f.proxy.frames.lock().unwrap().clear();
-    assert_eq!(
-        motor.prepare(prepare).await.unwrap().outcome,
-        PrepareOutcome::Prepared
-    );
-    assert!(f
-        .proxy
-        .frames
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|f| matches!(f, Frame::Prepare(p) if p.bundles.is_empty())));
-
     let remote_root = f
         .remote_key
         .parent()
@@ -1390,7 +1349,7 @@ async fn capped_unavailable_tips_do_not_resend_a_prepared_worktrees_history() {
         );
     }
     // Remove the old tip ref just as maintenance can when another branch is
-    // current. The prepared workspace still holds its snapshot and all history.
+    // current. The previous Run's workspace still holds its snapshot and history.
     git(&mirror, &["update-ref", "-d", &format!("refs/tips/{base}")]);
     fs::write(f.main.join("source"), "new integration commit\n").unwrap();
     git(&f.main, &["add", "."]);
@@ -1433,12 +1392,15 @@ async fn fleet_invalid_vcpus_are_refused_naming_the_field_without_direct_admissi
     )
     .await;
     let broker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    f.config.hosted_runners = true;
-    f.config.hosted_fleet_routing = true;
     f.config.broker_url = Some(format!("http://{}", broker.local_addr().unwrap()));
     f.config.broker_token_source = crate::BrokerTokenSource::Fake;
     std::env::set_var("MOTOR_FAKE_BROKER_TOKEN", "hosted-test-bearer");
-    let motor = f.motor();
+    let motor = Motor::with_connector(
+        f.config.clone(),
+        &f.scratch.join("module-state"),
+        Arc::new(f.proxy.clone()),
+    )
+    .unwrap();
     let marker = f.scratch.join("unexpected-start");
     for claim in [0, 65] {
         let mut request = f.request(&format!("touch '{}'", marker.display()));
@@ -1449,7 +1411,7 @@ async fn fleet_invalid_vcpus_are_refused_naming_the_field_without_direct_admissi
         request.weight_hint = Some(claim);
         let stream = motor.run(request).unwrap();
         let id = stream.job_id;
-        assert!(stream.hosted_state().is_none());
+        assert!(stream.hosted_state().is_some());
         let records = collect(stream).await;
         let terminal = terminal(&records);
         assert_eq!(
@@ -1507,38 +1469,6 @@ async fn oversized_vcpu_refusal_detail_reaches_the_run_terminal() {
     assert_eq!(terminal.ran, Some(Ran::None));
 }
 
-#[tokio::test]
-async fn prepare_setup_failure_keeps_typed_reason_step_and_detail() {
-    let f = Fixture::new(Cut::None, 28).await;
-    crate::snapshot::git(&f.main, &["branch", "-m", "feature"]).unwrap();
-    fs::create_dir_all(f.remote_key.parent().unwrap()).unwrap();
-    fs::write(&f.remote_key, "not a directory").unwrap();
-    let reply = f
-        .motor()
-        .prepare(PrepareRequest::new(
-            text(&f.key),
-            text(&f.main),
-            git(&f.main, &["rev-parse", "HEAD"]),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        reply.outcome,
-        PrepareOutcome::RefusedBeforeStart {
-            reason: RefusalReason::WorkspaceSetupFailed
-        }
-    );
-    let detail = reply
-        .refusal_detail()
-        .expect("missing Prepare setup detail");
-    assert!(
-        detail.starts_with("prepare workspace: materialize prepared workspace:"),
-        "{detail}"
-    );
-    assert!(detail.contains("destination path"), "{detail}");
-    assert_eq!(reply.retry_after_ms(), None);
-}
-
 struct AuthenticationFaultConnector(&'static str);
 impl Connector for AuthenticationFaultConnector {
     fn refusal(&self) -> Option<&'static str> {
@@ -1555,7 +1485,7 @@ impl Connector for AuthenticationFaultConnector {
 async fn assert_grouped_authentication_fault(code: &'static str) {
     let f = Fixture::new(Cut::None, 28).await;
     let connector = Arc::new(AuthenticationFaultConnector(code));
-    let motor = Motor::with_connector(
+    let motor = Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("fault-state"),
         connector.clone(),
@@ -1573,22 +1503,6 @@ async fn assert_grouped_authentication_fault(code: &'static str) {
     assert_eq!(t.retry_after_ms(), None);
     assert_eq!(t.ran, Some(Ran::None));
     assert!(!f.remote_key.join("auth-marker").exists());
-    let reply = motor
-        .prepare(PrepareRequest::new(
-            text(&f.key),
-            text(&f.main),
-            git(&f.main, &["rev-parse", "HEAD"]),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        reply.outcome,
-        PrepareOutcome::RefusedBeforeStart {
-            reason: RefusalReason::RunnerAuthenticationFailed
-        }
-    );
-    assert_eq!(reply.refusal_detail(), Some(code));
-    assert_eq!(reply.retry_after_ms(), None);
     assert_eq!(connector.refusal(), Some(code));
 }
 
@@ -1644,7 +1558,7 @@ authentication_fault_test!(
 #[tokio::test]
 async fn future_connector_fault_keeps_unknown_reason_without_private_cause() {
     let f = Fixture::new(Cut::None, 28).await;
-    let motor = Motor::with_connector(
+    let motor = Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("future-fault-state"),
         Arc::new(AuthenticationFaultConnector("future_connector_fault")),
@@ -1658,21 +1572,6 @@ async fn future_connector_fault_keeps_unknown_reason_without_private_cause() {
         }
     );
     assert_eq!(terminal(&records).refusal_detail(), None);
-    let reply = motor
-        .prepare(PrepareRequest::new(
-            text(&f.key),
-            text(&f.main),
-            git(&f.main, &["rev-parse", "HEAD"]),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        reply.outcome,
-        PrepareOutcome::RefusedBeforeStart {
-            reason: RefusalReason::Unknown("future_connector_fault".into())
-        }
-    );
-    assert_eq!(reply.refusal_detail(), None);
 }
 
 #[tokio::test]
@@ -1693,7 +1592,7 @@ async fn authentication_fault_after_connect_keeps_safe_code_in_run_refusal() {
         }
     }
     let f = Fixture::new(Cut::None, 28).await;
-    let motor = Motor::with_connector(
+    let motor = Motor::with_test_fixture_direct_route(
         f.config.clone(),
         &f.scratch.join("late-fault-state"),
         Arc::new(LateFault(std::sync::atomic::AtomicBool::new(false))),
@@ -1715,9 +1614,9 @@ async fn authentication_fault_after_connect_keeps_safe_code_in_run_refusal() {
 // The connector decides which of its refusals are transient; the motor copies
 // that hint onto the refusal unchanged, both when the connector refuses before
 // the job opens a channel and when the refusal appears while it does, for a
-// run's terminal record and for a Prepare reply alike.
+// run's terminal record.
 #[tokio::test]
-async fn connector_retry_hint_reaches_run_and_prepare_refusals() {
+async fn connector_retry_hint_reaches_run_refusals() {
     struct HintedFault {
         /// Refuse only once a connect has been tried, as when SSH reaches the
         /// signing agent and the vault fails to sign.
@@ -1742,7 +1641,7 @@ async fn connector_retry_hint_reaches_run_and_prepare_refusals() {
     }
     let f = Fixture::new(Cut::None, 28).await;
     for late in [false, true] {
-        let motor = Motor::with_connector(
+        let motor = Motor::with_test_fixture_direct_route(
             f.config.clone(),
             &f.scratch.join(format!("hinted-fault-{late}")),
             Arc::new(HintedFault {
@@ -1762,15 +1661,5 @@ async fn connector_retry_hint_reaches_run_and_prepare_refusals() {
         );
         assert_eq!(t.refusal_detail(), Some("runner_sign_unavailable"));
         assert_eq!(t.retry_after_ms(), Some(1234), "late={late}");
-        let reply = motor
-            .prepare(PrepareRequest::new(
-                text(&f.key),
-                text(&f.main),
-                git(&f.main, &["rev-parse", "HEAD"]),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(reply.refusal_detail(), Some("runner_sign_unavailable"));
-        assert_eq!(reply.retry_after_ms(), Some(1234), "late={late}");
     }
 }

@@ -59,12 +59,7 @@ fn wsl_checks_both_alias_directions_but_reports_supplied_spelling() {
 }
 
 #[test]
-fn home_jobs_are_eligible_for_spill_like_users_jobs() {
-    let config = crate::Config {
-        spill_to_hosted: true,
-        spill_avoid_host: Some("build-server".into()),
-        ..Default::default()
-    };
+fn home_jobs_are_valid_hosted_requests_like_users_jobs() {
     for prefix in ["/Users", "/home"] {
         let request = motor_protocol::RunRequest::new(
             format!("{prefix}/u/project"),
@@ -75,10 +70,5 @@ fn home_jobs_are_eligible_for_spill_like_users_jobs() {
         .with_timeout(60)
         .with_siblings(vec![format!("{prefix}/u/lib")]);
         assert!(crate::hosted::validate(&request).is_ok(), "{prefix}");
-        assert!(
-            crate::spill::eligible(&config, &request, false, false),
-            "{prefix}"
-        );
-        assert!(!crate::spill::eligible(&config, &request, true, false));
     }
 }

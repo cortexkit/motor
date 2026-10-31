@@ -141,7 +141,9 @@ async fn refused_cancel_preserves_the_stop_error_and_pending_intent() {
     let peer = Arc::new(CancelPeer::default());
     peer.refuse_cancel.store(true, Ordering::SeqCst);
     peer.cancel_release.notify_one();
-    let motor = Motor::with_connector(Config::default(), &scratch, Arc::new(Peer(peer))).unwrap();
+    let motor =
+        Motor::with_test_fixture_direct_route(Config::default(), &scratch, Arc::new(Peer(peer)))
+            .unwrap();
     let id = Uuid::now_v7();
     motor.storage.create(id, 60, None, None, false).unwrap();
     motor.storage.cancel(id, true).unwrap();
@@ -161,8 +163,12 @@ async fn refused_cancel_keeps_the_attached_connection_for_the_eventual_terminal(
     let scratch = ScratchDir::new("motor-cancel-attached-refusal");
     let peer = Arc::new(CancelPeer::default());
     peer.attach_refusal.store(true, Ordering::SeqCst);
-    let motor =
-        Motor::with_connector(Config::default(), &scratch, Arc::new(Peer(peer.clone()))).unwrap();
+    let motor = Motor::with_test_fixture_direct_route(
+        Config::default(),
+        &scratch,
+        Arc::new(Peer(peer.clone())),
+    )
+    .unwrap();
     let id = Uuid::now_v7();
     motor.storage.create(id, 60, None, None, false).unwrap();
     let delivering = motor.deliver_cancel(id);
@@ -191,8 +197,12 @@ async fn refused_cancel_keeps_the_attached_connection_for_the_eventual_terminal(
 async fn job_stream_keeps_its_connection_while_cancel_is_delivered() {
     let scratch = ScratchDir::new("motor-cancel-delivery");
     let peer = Arc::new(CancelPeer::default());
-    let motor =
-        Motor::with_connector(Config::default(), &scratch, Arc::new(Peer(peer.clone()))).unwrap();
+    let motor = Motor::with_test_fixture_direct_route(
+        Config::default(),
+        &scratch,
+        Arc::new(Peer(peer.clone())),
+    )
+    .unwrap();
     let id = Uuid::now_v7();
     motor.storage.create(id, 60, None, None, false).unwrap();
     let mut stream = motor.attach(AttachRequest::new(id, 0)).unwrap();

@@ -127,6 +127,8 @@ function Get-RunnerQualificationGateVersion([string]$Root) {
                 $nativeLog = Join-Path $caseRoot 'fixture-native.jsonl'
                 Protect-RunnerPath $installed $nativeLog
                 Protect-RunnerPath "$installed\bin" $nativeLog
+                Protect-RunnerPath "$installed\state" $nativeLog
+                Protect-RunnerPath "$installed\state\ally" $nativeLog
                 # Stand-in for the SSH bridge account's read grant, which update must
                 # keep. Real icacls refuses a SID that no account maps to (exit 1332),
                 # so use the built-in Guests group: always present, otherwise absent here.

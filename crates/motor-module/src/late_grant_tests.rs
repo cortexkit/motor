@@ -1,6 +1,6 @@
 //! Late grants use the real broker protocol and an in-process runner transport.
 //! Gates hold the grant, Have reply and admission independently of wall time.
-use super::queue_tests::{fixture_repo, ResubmitPeer};
+use super::queue_tests::ResubmitPeer;
 use super::*;
 use crate::hosted::test_http::Http;
 use cortexkit_test_support::ScratchDir;
@@ -419,13 +419,12 @@ impl Job {
 
     async fn start(h: &Harness) -> Self {
         let scratch = ScratchDir::new("late-boat-grant");
-        let repo = fixture_repo(&scratch);
+        let (repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
         let config = Config {
             runner_instance: "test".into(),
             broker_token_source: crate::BrokerTokenSource::Fake,
             broker_url: Some(h.broker.url.clone()),
-            spill_to_hosted: true,
-            spill_after_s: 0,
+
             ..Config::default()
         };
         let mut motor = Motor::with_connector(
@@ -440,12 +439,16 @@ impl Job {
             .storage
             .create(id, 300, None, Some("test".into()), false)
             .unwrap();
+        let mut route = crate::HostedJobState::new(&motor.config);
+        route.spill_wait_ms = Some(0);
+        motor.storage.hosted_route(id, route).unwrap();
         let path = repo.to_str().unwrap();
         let request = RunRequest::new(path, path, path, "sleep 7200").with_timeout(7200);
         let (stream, tx, wake) = motor.stream(id);
         let job = motor.clone();
         let submission = motor.submission(id);
         let owner = tokio::spawn(async move {
+            let _repo_scratch = repo_scratch;
             let _submission = submission;
             job.run_job(
                 id,
