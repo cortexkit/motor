@@ -22,12 +22,28 @@ class AdmissionGateTests(unittest.TestCase):
         starts = update.split("Start-Service -Name MotorRunner")
         self.assertEqual(len(starts), 3)
         for prefix in starts[:-1]:
-            self.assertTrue(prefix.rstrip().endswith("Assert-RunnerQualificationCapable $Root"))
+            self.assertTrue(prefix.rstrip().endswith("Set-RunnerServiceRecovery $log"))
+            self.assertIn("Assert-RunnerQualificationCapable $Root", prefix)
         helpers = (HERE / "service-definition.ps1").read_text()
-        self.assertIn("qualification-gate-version", helpers)
+        native = (HERE / "accounts.ps1").read_text()
+        self.assertIn("qualification-gate-version", native)
+        self.assertIn("} catch {\n        return ''", native)
         self.assertIn("-cne 'qualification-gate-v1'", helpers)
-        self.assertIn("MotorRunner left stopped", helpers)
+        self.assertIn("MotorRunner left stopped with startup disabled", helpers)
+        self.assertIn("Set-Service -Name MotorRunner -StartupType Disabled -ErrorAction Stop", helpers)
+        self.assertIn("Set-Service -Name MotorRunner -StartupType Automatic; Start-Service", helpers)
         self.assertIn("Start-Service -Name MotorRunner", helpers)
+
+    def test_gate_capable_install_and_update_restore_startup_and_recovery(self):
+        install = (HERE / "install.ps1").read_text()
+        update = (HERE / "update-functions.ps1").read_text()
+        helpers = (HERE / "service-definition.ps1").read_text()
+        self.assertIn("-StartupType Automatic", install)
+        self.assertIn("Set-RunnerServiceRecovery $nativeLogPath", install)
+        self.assertIn("start = 'auto'", helpers)
+        self.assertIn("Set-RunnerServiceRecovery $log", update)
+        self.assertIn("'restart/5000/restart/15000/restart/60000'", helpers)
+        self.assertIn("@('failureflag', 'MotorRunner', '1')", helpers)
 
     def test_only_full_success_opens_gate_after_all_checks_and_evidence(self):
         qualify = (HERE / "qualify.ps1").read_text()

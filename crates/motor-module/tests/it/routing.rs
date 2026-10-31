@@ -279,7 +279,7 @@ impl Connector for RoutingPeer {
                                     write_frame_async(&mut peer, &Frame::Terminal(terminal)).await;
                                 return;
                             }
-                            if matches!(behavior, 8..=11 | 14..=16) {
+                            if matches!(behavior, 8..=11 | 14..=16 | 19) {
                                 let mut terminal = TerminalRecord::new(id, Outcome::RefusedBeforeStart {
                                     reason: if behavior == 8 { RefusalReason::WorkspaceSetupFailed }
                                         else if behavior == 14 { RefusalReason::Unreachable }
@@ -288,7 +288,9 @@ impl Connector for RoutingPeer {
                                     10 => Ran::Unknown("maybe".into()),
                                     11 => Ran::Remote,
                                     _ => Ran::None,
-                                }).with_refusal_detail(if behavior == 8 {
+                                }).with_refusal_detail(if behavior == 19 {
+                                    "runner awaiting qualification".into()
+                                } else if behavior == 8 {
                                     format!(r"prepare job staging C:\ProgramData\MotorRunner\staging\{id}: windows_slot_busy")
                                 } else { format!("windows_slot_busy: held by {id} since earlier") });
                                 terminal.retry_after_ms = Some(6_000);
@@ -364,6 +366,21 @@ impl Connector for RoutingPeer {
                                         OutputStream::Stdout,
                                         BytePayload(b"first".to_vec()),
                                     )),
+                                )
+                                .await;
+                            } else if behavior == 18 {
+                                let _ = write_frame_async(
+                                    &mut peer,
+                                    &Frame::Terminal(
+                                        TerminalRecord::new(
+                                            id,
+                                            Outcome::Exit { code: 0 },
+                                            request.from_seq,
+                                            0,
+                                            0,
+                                        )
+                                        .with_ran(Ran::Remote),
+                                    ),
                                 )
                                 .await;
                             } else {
@@ -681,29 +698,32 @@ async fn ordered_windows_busy_refusal_resubmits_but_lost_ack_and_started_never_m
 
 #[tokio::test]
 async fn ordered_windows_awaiting_qualification_refusal_falls_through_without_failure() {
-    let f = Fixture::new(Cut::None, 28).await;
-    let peer = RoutingPeer::new(&f);
-    peer.ally_behavior.store(17, Ordering::SeqCst);
-    let motor = peer.motor(ordered(f.config.clone()));
-    let records = collect(
-        motor
-            .run(f.request("true").with_platform(Platform::Windows))
-            .unwrap(),
-    )
-    .await;
-    let visits = peer.visits.lock().unwrap();
-    assert_eq!(visits.first().unwrap().instance, "ally-windows");
-    assert!(visits.iter().any(|visit| visit.instance == "windows"));
-    assert_eq!(
-        records
-            .iter()
-            .filter(|record| matches!(record, StreamRecord::Accepted(_)))
-            .count(),
-        1
-    );
-    assert!(
-        matches!(records.last(), Some(StreamRecord::Terminal(t)) if matches!(t.outcome, Outcome::Exit { code: 0 }) && t.ran == Some(Ran::Remote))
-    );
+    for behavior in [17, 19] {
+        let f = Fixture::new(Cut::None, 28).await;
+        let peer = RoutingPeer::new(&f);
+        peer.ally_behavior.store(behavior, Ordering::SeqCst);
+        peer.last_behavior.store(18, Ordering::SeqCst);
+        let motor = peer.motor(ordered(f.config.clone()));
+        let records = collect(
+            motor
+                .run(f.request("true").with_platform(Platform::Windows))
+                .unwrap(),
+        )
+        .await;
+        let visits = peer.visits.lock().unwrap();
+        assert_eq!(visits.first().unwrap().instance, "ally-windows");
+        assert!(visits.iter().any(|visit| visit.instance == "windows"));
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, StreamRecord::Accepted(_)))
+                .count(),
+            1
+        );
+        assert!(
+            matches!(records.last(), Some(StreamRecord::Terminal(t)) if matches!(t.outcome, Outcome::Exit { code: 0 }) && t.ran == Some(Ran::Remote))
+        );
+    }
 }
 
 #[tokio::test]

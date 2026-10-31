@@ -425,9 +425,14 @@ their access control lists stay in place, with the qualification hold re-created
 A failed start/readiness check restores the old payload and exits nonzero.
 Every automatic service start requires the binary to report
 `qualification-gate-v1`. An older restored binary without that capability is
-left stopped, because it cannot gate fleet admission. To deliberately accept
+left stopped with startup disabled, because it cannot gate fleet admission.
+Disabling startup also prevents a reboot or Service Control Manager recovery from starting that
+ungated release. To deliberately accept
 ungated fleet jobs on that restored release, an operator can run
-`Start-Service -Name MotorRunner` in an elevated shell instead.
+`Set-Service -Name MotorRunner -StartupType Automatic; Start-Service -Name MotorRunner`
+in an elevated shell instead. A later gate-capable install or host update restores
+Automatic startup and the configured restart recovery actions, but still requires
+qualification before fleet admission opens.
 Restore the protected previous payload with
 `update.ps1 -Rollback`. A guest-agent change requires the full uninstall,
 fresh-parent provisioning and reinstall path below, not a host-only update.

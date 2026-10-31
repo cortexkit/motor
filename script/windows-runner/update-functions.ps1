@@ -252,6 +252,7 @@ function Invoke-RunnerHostUpdate {
         Set-RunnerUpdatePrivateFile "$backup\manifest.json"
         Set-RunnerUpdateServiceDefinition $definition $log
         Assert-RunnerQualificationCapable $Root
+        Set-RunnerServiceRecovery $log
         Start-Service -Name MotorRunner -ErrorAction Stop
         Wait-RunnerUpdateReady $Root $ReadyTimeoutSeconds
         if (Test-Path -LiteralPath $previous) {
@@ -273,6 +274,7 @@ function Invoke-RunnerHostUpdate {
             if ($serviceStopped) {
                 Close-RunnerQualificationGate $Root
                 Assert-RunnerQualificationCapable $Root
+                Set-RunnerServiceRecovery $log
                 Start-Service -Name MotorRunner -ErrorAction Stop
                 Wait-RunnerUpdateReady $Root $ReadyTimeoutSeconds
             }

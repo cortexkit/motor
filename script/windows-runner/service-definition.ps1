@@ -6,16 +6,16 @@ function Close-RunnerQualificationGate([string]$Root) {
     Write-Host 'Fleet admission closed: runner awaiting qualification. Only a full passing qualification or an elevated operator override opens it.'
 }
 
-function Get-RunnerQualificationGateVersion([string]$Root) {
-    $version = & "$Root\bin\motor-runner.exe" qualification-gate-version
-    if ($LASTEXITCODE -ne 0) { return '' }
-    return $version
-}
-
 function Assert-RunnerQualificationCapable([string]$Root) {
     if ((Get-RunnerQualificationGateVersion $Root) -cne 'qualification-gate-v1') {
-        throw 'MotorRunner left stopped: this binary cannot gate fleet admission. Install a gate-capable release before starting it. To accept ungated fleet jobs deliberately, run from an elevated shell: Start-Service -Name MotorRunner'
+        Set-Service -Name MotorRunner -StartupType Disabled -ErrorAction Stop
+        throw 'MotorRunner left stopped with startup disabled: this binary cannot gate fleet admission. Install a gate-capable release before starting it. To accept ungated fleet jobs deliberately, run from an elevated shell: Set-Service -Name MotorRunner -StartupType Automatic; Start-Service -Name MotorRunner'
     }
+}
+
+function Set-RunnerServiceRecovery([string]$LogPath) {
+    $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('failure', 'MotorRunner', 'reset=', '86400', 'actions=', 'restart/5000/restart/15000/restart/60000') -Operation 'configure runner service recovery' -LogPath $LogPath
+    $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('failureflag', 'MotorRunner', '1') -Operation 'enable runner recovery on service failure' -LogPath $LogPath
 }
 
 function Open-RunnerQualificationGate([string]$Root) {

@@ -241,8 +241,7 @@ $descriptor.DiscretionaryAcl.InsertAce($descriptor.DiscretionaryAcl.Count, $ace)
 $updatedSddl = $descriptor.GetSddlForm([Security.AccessControl.AccessControlSections]::All)
 $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('sdset', 'MotorRunner', $updatedSddl) -Operation 'set runner service security descriptor' -LogPath $nativeLogPath
 New-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\MotorRunner' -Name Environment -PropertyType MultiString -Value $serviceDefinition.environment -Force | Out-Null
-$null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('failure', 'MotorRunner', 'reset=', '86400', 'actions=', 'restart/5000/restart/15000/restart/60000') -Operation 'configure runner service recovery' -LogPath $nativeLogPath
-$null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('failureflag', 'MotorRunner', '1') -Operation 'enable runner recovery on service failure' -LogPath $nativeLogPath
+Set-RunnerServiceRecovery $nativeLogPath
 if (-not $NoStart) {
     Assert-RunnerQualificationCapable $Root
     Start-Service MotorRunner

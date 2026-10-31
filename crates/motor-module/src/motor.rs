@@ -2577,6 +2577,7 @@ impl Motor {
                     if terminal.ran == Some(Ran::None)
                         && matches!(&terminal.outcome, Outcome::RefusedBeforeStart { reason }
                             if *reason == RefusalReason::Unreachable
+                                || (*reason == RefusalReason::RunnerFull && self.has_next_windows_runner(id))
                                 || (matches!(reason, RefusalReason::RunnerFull | RefusalReason::WorkspaceSetupFailed)
                                     && windows_slot_busy(terminal.refusal_detail.as_deref())))
                         && !self.pending(id)
