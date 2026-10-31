@@ -778,6 +778,7 @@ fn cancel_installed(id: uuid::Uuid) -> std::io::Result<()> {
             default_branch_tip: false,
             gate_jobs: false,
             return_paths: false,
+            return_chunked_max_bytes: None,
             return_chunked: false,
             sibling_paths: false,
             platforms: vec!["macos".into()],

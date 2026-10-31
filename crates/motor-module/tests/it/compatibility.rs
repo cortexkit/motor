@@ -855,7 +855,15 @@ async fn legacy_client_hello_projects_started_and_replay_cursors() {
 async fn oldest_production_client_receives_output_and_terminal_after_started() {
     let helper = std::env::var_os("MOTOR_COMPAT_CLIENT")
         .expect("run python3 scripts/mixed-version.py to build the real pinned client");
-    let f = Fixture::new(Cut::None, 28).await;
+    let f = Fixture::with_runner_config(Cut::None, 28, None, |config| {
+        config.return_chunked_max_bytes = Some(134_217_728);
+        config.return_budget_bytes = Some(512 * 1024 * 1024);
+    })
+    .await;
+    assert_eq!(
+        f.runner.config().return_chunked_max_bytes,
+        Some(134_217_728)
+    );
     // A client that supports cache fills sends the repository's default-branch tip,
     // and the runner then queues a cache fill job. Renaming the only branch to
     // `feature` leaves no main, master or origin/HEAD, so the pinned client sends no

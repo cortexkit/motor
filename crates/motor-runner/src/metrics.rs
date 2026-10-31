@@ -265,6 +265,7 @@ async fn local_runner(config: &Config) -> io::Result<Runner> {
             &mut socket,
             &Frame::Hello {
                 return_paths: false,
+                return_chunked_max_bytes: None,
                 return_chunked: false,
                 sibling_paths: false,
                 protocol_version: PROTOCOL_VERSION,

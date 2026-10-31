@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::{
     ffi::CString,
     fs::File,
-    io::{self, Write},
+    io::{self, Seek, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::ffi::OsStrExt,
@@ -19,8 +19,8 @@ pub(super) struct Returns {
     workspace_from_job: bool,
     cap: u64,
     assembler: Option<motor_protocol::ReturnAssembler>,
-    chunks: Vec<Vec<u8>>,
-    result: Option<Vec<Result<Vec<u8>, String>>>,
+    chunks: Vec<Option<Staged>>,
+    result: Option<Vec<Result<Staged, String>>>,
     invalid: Option<String>,
 }
 
@@ -49,6 +49,12 @@ impl Returns {
         }
     }
 
+    pub(super) fn job_cap(&mut self, cap: u64) {
+        if !self.from_run && self.assembler.is_none() && cap <= shared::RETURN_LARGE_MAX_BYTES_CAP {
+            self.cap = cap;
+        }
+    }
+
     pub(super) fn job_workspace(&mut self, workspace: &str) {
         if self.from_run || self.workspace_from_job {
             return;
@@ -73,12 +79,27 @@ impl Returns {
             return;
         }
         let assembler = self.assembler.get_or_insert_with(|| {
-            self.chunks = vec![Vec::new(); self.requested.len()];
+            self.chunks = (0..self.requested.len()).map(|_| None).collect();
             motor_protocol::ReturnAssembler::new(&self.requested, self.cap)
         });
         match assembler.accept_chunk(chunk) {
-            Ok(bytes) => self.chunks[chunk.path_index as usize].extend_from_slice(bytes),
+            Ok(bytes) => {
+                let index = chunk.path_index as usize;
+                let written = (|| {
+                    if self.chunks[index].is_none() {
+                        self.chunks[index] = Some(Staged::new(self.root.as_deref())?);
+                    }
+                    self.chunks[index].as_mut().unwrap().write(bytes)
+                })();
+                if let Err(error) = written {
+                    self.invalid = Some(error);
+                }
+            }
             Err(error) => self.invalid = Some(format!("read_error ({error})")),
+        }
+        if self.invalid.is_some() {
+            self.chunks.clear();
+            self.result = None;
         }
     }
 
@@ -112,11 +133,21 @@ impl Returns {
                     verified
                         .into_iter()
                         .map(|entry| match entry.outcome() {
-                            shared::ReturnManifestOutcome::Returned { .. } => Ok(self
-                                .chunks
-                                .get_mut(entry.path_index() as usize)
-                                .map(std::mem::take)
-                                .unwrap_or_default()),
+                            shared::ReturnManifestOutcome::Returned { size, sha256 } => {
+                                let mut staged = self
+                                    .chunks
+                                    .get_mut(entry.path_index() as usize)
+                                    .and_then(Option::take)
+                                    .map(Ok)
+                                    .unwrap_or_else(|| Staged::new(self.root.as_deref()))?;
+                                if staged.size != *size
+                                    || format!("{:x}", staged.hash.clone().finalize()) != *sha256
+                                {
+                                    return Err("read_error (staging digest mismatch)".into());
+                                }
+                                staged.file.rewind().map_err(|e| e.to_string())?;
+                                Ok(staged)
+                            }
                             shared::ReturnManifestOutcome::Failed { cause, .. } => {
                                 Err(String::from(cause.clone()))
                             }
@@ -127,6 +158,7 @@ impl Returns {
             }
             Err(error) => self.invalid = Some(format!("read_error ({error})")),
         }
+        self.chunks.clear();
     }
 
     pub(super) fn legacy(&mut self, result: &shared::ReturnResult) {
@@ -148,7 +180,10 @@ impl Returns {
                         if format!("{:x}", Sha256::digest(file.data())) != file.sha256() {
                             return Err("read_error (digest mismatch)".into());
                         }
-                        Ok(file.data().to_vec())
+                        let mut staged = Staged::new(self.root.as_deref())?;
+                        staged.write(file.data())?;
+                        staged.file.rewind().map_err(|e| e.to_string())?;
+                        Ok(staged)
                     })
                     .collect(),
             );
@@ -169,13 +204,13 @@ impl Returns {
                 Some(cause) => Err(cause.clone()),
                 None => result,
             }
-            .and_then(|data| {
+            .and_then(|mut data| {
                 let root = self
                     .root
                     .as_deref()
                     .ok_or_else(|| "escape (local workspace unavailable)".to_string())?;
-                install(root, Path::new(path), &data)?;
-                Ok(data.len())
+                install(root, Path::new(path), &mut data.file)?;
+                Ok(data.size)
             });
             match result {
                 Ok(size) => {
@@ -191,6 +226,62 @@ impl Returns {
                 }
             }
         }
+    }
+}
+
+struct Staged {
+    file: File,
+    hash: Sha256,
+    size: u64,
+}
+
+impl Staged {
+    fn new(root: Option<&Path>) -> Result<Self, String> {
+        let root = root.ok_or_else(|| "escape (local workspace unavailable)".to_string())?;
+        let create = || -> io::Result<File> {
+            let directory = open_root(root)?;
+            let temporary = CString::new(format!(
+                ".ck-motor-stage-{}",
+                motor_protocol::Uuid::now_v7()
+            ))
+            .unwrap();
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    temporary.as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600 as libc::c_uint,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let file = unsafe { File::from_raw_fd(fd) };
+            // Unlink while the descriptor is open: disconnect, reset and process death
+            // discard staging automatically, without ever exposing an incomplete target.
+            if unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(file)
+        };
+        Ok(Self {
+            file: create().map_err(|e| format!("read_error ({e})"))?,
+            hash: Sha256::new(),
+            size: 0,
+        })
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.file
+            .write_all(bytes)
+            .map_err(|e| format!("read_error ({e})"))?;
+        self.hash.update(bytes);
+        self.size += bytes.len() as u64;
+        Ok(())
     }
 }
 
@@ -227,15 +318,20 @@ fn open_directory(parent: &File, name: &CString) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-pub(super) fn install(root: &Path, path: &Path, data: &[u8]) -> Result<(), String> {
-    let relative = relative_path(root, path)?;
-    let install = || -> io::Result<()> {
-        let mut directory = File::open("/")?;
-        for component in root.components() {
-            if let Component::Normal(component) = component {
-                directory = open_directory(&directory, &name(component)?)?;
-            }
+fn open_root(root: &Path) -> io::Result<File> {
+    let mut directory = File::open("/")?;
+    for component in root.components() {
+        if let Component::Normal(component) = component {
+            directory = open_directory(&directory, &name(component)?)?;
         }
+    }
+    Ok(directory)
+}
+
+pub(super) fn install(root: &Path, path: &Path, mut data: impl io::Read) -> Result<(), String> {
+    let relative = relative_path(root, path)?;
+    let mut install = || -> io::Result<()> {
+        let mut directory = open_root(root)?;
         for component in relative.parent().unwrap().components() {
             let Component::Normal(component) = component else {
                 continue;
@@ -303,7 +399,7 @@ pub(super) fn install(root: &Path, path: &Path, data: &[u8]) -> Result<(), Strin
                     return Err(io::Error::last_os_error());
                 }
             }
-            file.write_all(data)?;
+            io::copy(&mut data, &mut file)?;
             file.sync_all()?;
             // renameat replaces the directory entry, never the target of a
             // symlink swapped in after the no-follow destination check.
@@ -328,4 +424,118 @@ pub(super) fn install(root: &Path, path: &Path, data: &[u8]) -> Result<(), Strin
         result
     };
     install().map_err(|error| format!("read_error (local write refused: {error})"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_cli_returns_use_disk_staging_and_install_only_after_terminal() {
+        let scratch = cortexkit_test_support::ScratchDir::new("cli-large-returns");
+        let root = scratch.path().canonicalize().unwrap();
+        let destination = root.join("returned");
+        std::fs::write(&destination, b"original").unwrap();
+        let path = destination.to_string_lossy().into_owned();
+        let mut returns = Returns::new(
+            Some(root.clone()),
+            None,
+            shared::RETURN_CHUNKED_MAX_BYTES_CAP,
+        );
+        returns.requested(vec![path.clone()]);
+        returns.job_cap(shared::RETURN_LARGE_MAX_BYTES_CAP);
+        let id = motor_protocol::Uuid::now_v7();
+        let bytes = vec![7; shared::RETURN_CHUNK_MAX_BYTES];
+        let mut hash = Sha256::new();
+        for i in 0..256u64 {
+            returns.chunk(&shared::ReturnChunk::new(
+                id,
+                i + 1,
+                0,
+                i * bytes.len() as u64,
+                shared::BytePayload(bytes.clone()),
+            ));
+            hash.update(&bytes);
+        }
+        assert!(returns.invalid.is_none());
+        assert_eq!(
+            returns.chunks[0]
+                .as_ref()
+                .unwrap()
+                .file
+                .metadata()
+                .unwrap()
+                .len(),
+            134_217_728
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        let manifest = shared::ReturnManifest::new(
+            id,
+            257,
+            vec![shared::ReturnManifestEntry::returned(
+                path.clone(),
+                134_217_728,
+                format!("{:x}", hash.finalize()),
+            )
+            .with_chunks(256)],
+            134_217_728,
+            134_217_728,
+        );
+        returns.manifest(&manifest, 0);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        let mut err = Vec::new();
+        returns.finish(&mut err);
+        assert!(String::from_utf8(err).unwrap().contains("134217728 bytes"));
+        assert_eq!(std::fs::metadata(&destination).unwrap().len(), 134_217_728);
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            1,
+            "staging files have no directory entries"
+        );
+    }
+
+    #[test]
+    fn reset_expiry_and_invalid_manifest_discard_cli_staging() {
+        let scratch = cortexkit_test_support::ScratchDir::new("cli-return-reset");
+        let root = scratch.path().canonicalize().unwrap();
+        let destination = root.join("returned");
+        let path = destination.to_string_lossy().into_owned();
+        let id = motor_protocol::Uuid::now_v7();
+        let mut returns = Returns::new(Some(root.clone()), Some(vec![path.clone()]), 134_217_728);
+        let chunk = shared::ReturnChunk::new(id, 1, 0, 0, shared::BytePayload(b"discard".to_vec()));
+        returns.chunk(&chunk);
+        returns.restart();
+        assert!(returns.chunks.is_empty());
+        returns.chunk(&chunk);
+        let manifest = shared::ReturnManifest::new(
+            id,
+            2,
+            vec![shared::ReturnManifestEntry::failed(
+                path.clone(),
+                shared::ReturnPathsFailureCause::Expired,
+            )
+            .with_size(7)
+            .with_chunks(1)],
+            0,
+            134_217_728,
+        );
+        returns.manifest(&manifest, 0);
+        assert!(returns.chunks.is_empty());
+        returns.finish(&mut Vec::new());
+        assert!(!destination.exists());
+        returns.restart();
+        returns.chunk(&chunk);
+        let bad = shared::ReturnManifest::new(
+            id,
+            2,
+            vec![shared::ReturnManifestEntry::returned(path, 7, "0".repeat(64)).with_chunks(1)],
+            7,
+            134_217_728,
+        );
+        returns.manifest(&bad, 0);
+        assert!(returns.chunks.is_empty());
+        returns.finish(&mut Vec::new());
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
+    }
 }

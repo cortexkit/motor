@@ -61,6 +61,7 @@ async fn network_admission_refuses_before_upload_with_missing_prerequisite() {
                 &mut stream,
                 &Frame::Hello {
                     return_paths: false,
+                    return_chunked_max_bytes: None,
                     return_chunked: false,
                     sibling_paths: false,
                     protocol_version: PROTOCOL_VERSION,

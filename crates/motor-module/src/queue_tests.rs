@@ -168,6 +168,7 @@ impl Connector for ClockPeer {
                     &mut peer,
                     &Frame::Hello {
                         return_paths: false,
+                        return_chunked_max_bytes: None,
                         return_chunked: false,
                         sibling_paths: false,
                         protocol_version: PROTOCOL_VERSION,
@@ -409,6 +410,7 @@ impl Connector for SpillPeer {
                         platforms: vec!["linux".into()],
                         default_branch_tip: false,
                         return_paths: false,
+                        return_chunked_max_bytes: None,
                         return_chunked: false,
                         sibling_paths: false,
                     },
@@ -852,6 +854,7 @@ impl Connector for ResubmitPeer {
                     platforms: vec!["linux".into()],
                     default_branch_tip: false,
                     return_paths: false,
+                    return_chunked_max_bytes: None,
                     return_chunked: false,
                     sibling_paths: false,
                 };
@@ -2347,6 +2350,7 @@ impl Connector for QueuedPeer {
                 let _ = read_frame_async(&mut peer).await.unwrap();
                 let hello = Frame::Hello {
                     return_paths: false,
+                    return_chunked_max_bytes: None,
                     return_chunked: false,
                     sibling_paths: false,
                     protocol_version: PROTOCOL_VERSION,

@@ -33,7 +33,7 @@ x509-cert = "0.2"
 cortexkit-claustrum-client = "=0.1.0"
 # Named directly only for the caller-facing returned-file records, which
 # motor-protocol shadows with its own runner-protocol types of the same names.
-cortexkit-exec-remote-types = "=0.2.15"
+cortexkit-exec-remote-types = "=0.2.16"
 cortexkit-store-types = { workspace = true }
 subc-protocol = { workspace = true }
 subc-client-rs = { workspace = true }

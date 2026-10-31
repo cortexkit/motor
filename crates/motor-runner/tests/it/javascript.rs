@@ -101,6 +101,7 @@ async fn javascript_frame_reader_skips_heartbeats_without_swallowing_other_frame
     let frames = [
         Frame::Hello {
             return_paths: false,
+            return_chunked_max_bytes: None,
             return_chunked: false,
             sibling_paths: false,
             protocol_version: PROTOCOL_VERSION,
@@ -169,6 +170,7 @@ pub(super) async fn submit_with_capability(
         &mut stream,
         &Frame::Hello {
             return_paths: false,
+            return_chunked_max_bytes: None,
             return_chunked: false,
             sibling_paths: false,
             protocol_version: PROTOCOL_VERSION,

@@ -133,6 +133,7 @@ async fn connected_channel() -> (Channel, tokio::io::DuplexStream) {
         write_frame_async(
             &mut peer,
             &Frame::Hello {
+                return_chunked_max_bytes: None,
                 protocol_version: PROTOCOL_VERSION,
                 started: true,
                 return_paths: false,

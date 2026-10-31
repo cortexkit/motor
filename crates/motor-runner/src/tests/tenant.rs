@@ -38,6 +38,7 @@ fn hello() -> Frame {
 fn hello_with_gate_jobs(gate_jobs: bool) -> Frame {
     Frame::Hello {
         return_paths: false,
+        return_chunked_max_bytes: None,
         return_chunked: false,
         sibling_paths: false,
         protocol_version: motor_protocol::PROTOCOL_VERSION,

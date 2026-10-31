@@ -142,6 +142,7 @@ impl Endpoint {
             assert_eq!(verified["type"], "verified_lease");
             assert_eq!(read_frame(&mut runner).await.unwrap()["type"], "hello");
             let hello = motor_protocol::Frame::Hello {
+                return_chunked_max_bytes: None,
                 protocol_version: motor_protocol::PROTOCOL_VERSION,
                 started: true,
                 default_branch_tip: true,

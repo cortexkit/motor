@@ -1323,6 +1323,7 @@ pub(crate) struct Channel {
     pub return_paths: bool,
     /// The runner's Hello advertised chunked returned files.
     pub return_chunked: bool,
+    pub return_chunked_max_bytes: u64,
     pub gate_jobs: bool,
     pub sibling_paths: bool,
     pub platforms: Vec<String>,
@@ -1357,6 +1358,7 @@ impl Channel {
             &mut pipe,
             &Frame::Hello {
                 return_paths: false,
+                return_chunked_max_bytes: None,
                 return_chunked: false,
                 sibling_paths: false,
                 protocol_version: PROTOCOL_VERSION,
@@ -1394,6 +1396,7 @@ impl Channel {
                     gate_jobs,
                     return_paths,
                     return_chunked,
+                    return_chunked_max_bytes,
                     sibling_paths,
                     ..
                 } => {
@@ -1402,6 +1405,8 @@ impl Channel {
                     channel.gate_jobs = gate_jobs;
                     channel.return_paths = return_paths;
                     channel.return_chunked = return_chunked;
+                    channel.return_chunked_max_bytes = return_chunked_max_bytes
+                        .unwrap_or(motor_protocol::RETURN_CHUNKED_MAX_BYTES_CAP);
                     channel.sibling_paths = sibling_paths;
                     channel.fill_tips = fill_tips;
                     channel.enable_heartbeats();
@@ -1470,7 +1475,7 @@ impl Channel {
                     advance(UnreachableStep::HelloSend);
                     let mut channel = Self::new(pipe);
                     channel
-                        .send(Frame::Hello { return_paths: false, return_chunked: false, sibling_paths: false, protocol_version: PROTOCOL_VERSION,
+                        .send(Frame::Hello { return_paths: false, return_chunked_max_bytes: None, return_chunked: false, sibling_paths: false, protocol_version: PROTOCOL_VERSION,
                         started: true,
                         default_branch_tip: true,
                         gate_jobs: true,
@@ -1483,13 +1488,14 @@ impl Channel {
                     match channel.next().await.map_err(|error| {
                         AttemptFailure::Step(UnreachableStep::HelloRecv, error.to_string())
                     })? {
-                        Incoming::Frame(Frame::Hello { protocol_version, platforms, gate_jobs, return_paths, return_chunked, sibling_paths, .. })
+                        Incoming::Frame(Frame::Hello { protocol_version, platforms, gate_jobs, return_paths, return_chunked, return_chunked_max_bytes, sibling_paths, .. })
                             if protocol_version == PROTOCOL_VERSION =>
                         {
                             channel.platforms = platforms;
                             channel.gate_jobs = gate_jobs;
                             channel.return_paths = return_paths;
                             channel.return_chunked = return_chunked;
+                            channel.return_chunked_max_bytes = return_chunked_max_bytes.unwrap_or(motor_protocol::RETURN_CHUNKED_MAX_BYTES_CAP);
                             channel.sibling_paths = sibling_paths;
                             channel.fill_tips = true;
                             channel.enable_heartbeats();
@@ -1642,6 +1648,7 @@ impl Channel {
             gate_jobs: false,
             return_paths: false,
             return_chunked: false,
+            return_chunked_max_bytes: motor_protocol::RETURN_CHUNKED_MAX_BYTES_CAP,
             sibling_paths: false,
             platforms: Vec::new(),
             fill_tips: false,
@@ -1727,6 +1734,7 @@ mod hello_tests {
                         default_branch_tip: true,
                         gate_jobs: true,
                         return_paths: false,
+                        return_chunked_max_bytes: None,
                         return_chunked: false,
                         sibling_paths: true,
                         platforms: vec!["linux".into()],
@@ -1764,6 +1772,7 @@ mod hello_tests {
                 &mut peer,
                 &Frame::Hello {
                     return_paths: false,
+                    return_chunked_max_bytes: None,
                     return_chunked: false,
                     sibling_paths: false,
                     protocol_version: PROTOCOL_VERSION,
@@ -1797,6 +1806,7 @@ mod hello_tests {
                     &mut peer,
                     &Frame::Hello {
                         return_paths: false,
+                        return_chunked_max_bytes: None,
                         return_chunked: false,
                         sibling_paths: capable,
                         protocol_version: PROTOCOL_VERSION,

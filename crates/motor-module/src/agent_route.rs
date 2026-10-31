@@ -40,8 +40,8 @@ pub(crate) enum ReturnRequestError {
 /// contract requires an over-cap value to be refused whether or not paths
 /// accompany it.
 ///
-/// With `return_chunked`, the cap may be up to `RETURN_CHUNKED_MAX_BYTES_CAP`
-/// and defaults to it, and the runner answers with `return_chunk` records and
+/// With `return_chunked`, the cap may be up to `RETURN_LARGE_MAX_BYTES_CAP`
+/// and defaults to 10 MiB, and the runner answers with `return_chunk` records and
 /// one `return_manifest` instead of a `return_result`.
 ///
 /// Returns the runner-side options and what to store with the job, or `None`
@@ -52,10 +52,10 @@ pub(crate) fn take_return_request(
     let paths = std::mem::take(&mut request.return_paths);
     let cap = request.return_max_bytes.take();
     let chunked = std::mem::take(&mut request.return_chunked);
-    // Chunked return raises the cap to 10 MiB; without it the 256 KiB cap of
+    // Submission checks authorize the negotiated maximum; without chunking the 256 KiB cap of
     // a single return_result record stays.
     let limit = if chunked {
-        shared::RETURN_CHUNKED_MAX_BYTES_CAP
+        shared::RETURN_LARGE_MAX_BYTES_CAP
     } else {
         shared::RETURN_MAX_BYTES_CAP
     };

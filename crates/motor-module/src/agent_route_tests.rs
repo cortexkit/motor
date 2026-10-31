@@ -98,7 +98,7 @@ fn chunked_request_raises_the_cap_to_ten_mib_and_keeps_the_paths_as_sent() {
         let mut over = request()
             .with_return_paths(paths)
             .with_return_chunked(true)
-            .with_return_max_bytes(shared::RETURN_CHUNKED_MAX_BYTES_CAP + 1);
+            .with_return_max_bytes(shared::RETURN_LARGE_MAX_BYTES_CAP + 1);
         assert!(matches!(
             take_return_request(&mut over),
             Err(ReturnRequestError::InvalidParams(message)) if message.contains("return_max_bytes")

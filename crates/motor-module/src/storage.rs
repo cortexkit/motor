@@ -64,6 +64,8 @@ pub(crate) struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_requested: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_cap_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_secret_hash: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gate_job: bool,
@@ -128,6 +130,7 @@ impl PartialEq for Job {
             return_result,
             return_cwd,
             return_requested,
+            return_cap_bytes,
             direct_secret_hash,
             gate_job,
             runner_instance,
@@ -151,6 +154,7 @@ impl PartialEq for Job {
             && return_result == &other.return_result
             && return_cwd == &other.return_cwd
             && return_requested == &other.return_requested
+            && return_cap_bytes == &other.return_cap_bytes
             && direct_secret_hash == &other.direct_secret_hash
             && gate_job == &other.gate_job
             && runner_instance == &other.runner_instance
@@ -194,6 +198,7 @@ impl Job {
             && self.return_result.is_none()
             && self.return_cwd.is_none()
             && self.return_requested.is_none()
+            && self.return_cap_bytes.is_none()
             && self.direct_secret_hash.is_none()
             && self.health_deadline_ms.is_none()
             && self.remote_terminal.is_none()
@@ -493,6 +498,12 @@ impl Storage {
     pub(crate) fn return_requested(&self, id: Uuid, paths: Vec<String>) -> io::Result<()> {
         self.update(|state| {
             state.jobs.entry(id).or_default().return_requested = Some(paths);
+        })
+    }
+
+    pub(crate) fn return_cap(&self, id: Uuid, cap: u64) -> io::Result<()> {
+        self.update(|state| {
+            state.jobs.entry(id).or_default().return_cap_bytes = Some(cap);
         })
     }
     pub(crate) fn hosted_update(

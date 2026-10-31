@@ -14,7 +14,7 @@ use std::{
 pub const RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 pub const REPLAY_BYTES: u64 = 64 * 1024 * 1024;
 /// How long chunked returned files stay available for replay after the job
-/// ends. They can be 10 MiB per job, so they are not kept for the whole job
+/// ends. They can be 128 MiB per job, so they are not kept for the whole job
 /// history; a later replay sends the manifest with `expired` entries instead.
 pub const RETURN_RETENTION_MS: u64 = 60 * 60 * 1000;
 /// Prefix of the job-directory subdirectory that holds one collection's
@@ -171,6 +171,9 @@ pub(crate) struct Job {
     /// Runtime marker indicating whether this job has entered the live queue.
     #[serde(skip, default = "empty_queue_clock_initialized")]
     pub queue_wait_clock_initialized: Arc<AtomicBool>,
+    /// A failed disk probe is reported once per queued job, not on every scheduler tick.
+    #[serde(skip)]
+    pub return_probe_error_logged: Arc<AtomicBool>,
     #[serde(default)]
     pub setup_ms: Option<u64>,
     pub finished_ms: Option<u64>,
@@ -184,6 +187,9 @@ pub(crate) struct Job {
     pub return_result: Option<ReturnResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub returned: Option<ReturnedFiles>,
+    /// Charged at dispatch and retained until all returned directories are deleted.
+    #[serde(default, skip_serializing_if = "return_reservation_is_zero")]
+    pub return_reserved_bytes: u64,
     pub chunks: Chunks,
     pub next_seq: u64,
     pub output_bytes: u64,
@@ -315,6 +321,7 @@ impl Job {
             queue_entry: empty_queue_entry(),
             queue_elapsed: empty_queue_elapsed(),
             queue_wait_clock_initialized: empty_queue_clock_initialized(),
+            return_probe_error_logged: Arc::new(AtomicBool::new(false)),
             setup_ms: None,
             finished_ms: None,
             started_ms: None,
@@ -323,6 +330,7 @@ impl Job {
             terminal: None,
             return_result: None,
             returned: None,
+            return_reserved_bytes: 0,
             chunks: Chunks::default(),
             next_seq: 0,
             output_bytes: 0,
@@ -805,6 +813,10 @@ pub(crate) fn recover_output_tail(directory: &Path, job: &Job) {
         }
     }
     remove_unreferenced_returned(directory, job);
+}
+
+fn return_reservation_is_zero(bytes: &u64) -> bool {
+    *bytes == 0
 }
 
 /// Remove returned-file directories the record does not reference: a

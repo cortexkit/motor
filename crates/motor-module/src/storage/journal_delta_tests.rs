@@ -203,6 +203,7 @@ fn typed_delta_compares_every_serialized_job_field() {
     });
     rich.return_cwd = Some("/workspace".into());
     rich.return_requested = Some(vec!["result.txt".into()]);
+    rich.return_cap_bytes = Some(134_217_728);
     rich.gate_job = true;
     rich.windows_runner = Some(crate::WindowsRunner::default());
     rich.pending_cancel = true;

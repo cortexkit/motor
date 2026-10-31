@@ -111,7 +111,7 @@ fn return_chunked_raises_the_cap_only_with_the_opt_in() {
         validate_return_request("/workspace", &paths, RETURN_CHUNKED_MAX_BYTES_CAP, true).is_ok()
     );
     assert_eq!(
-        validate_return_request("/workspace", &paths, RETURN_CHUNKED_MAX_BYTES_CAP + 1, true),
+        validate_return_request("/workspace", &paths, RETURN_LARGE_MAX_BYTES_CAP + 1, true),
         Err("return_paths_exceeded")
     );
     let many = vec!["/workspace/out".to_string(); 65];

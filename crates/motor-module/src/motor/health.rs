@@ -470,6 +470,7 @@ mod tests {
                         &Frame::Hello {
                             protocol_version: PROTOCOL_VERSION,
                             return_paths: false,
+                            return_chunked_max_bytes: None,
                             return_chunked: false,
                             sibling_paths: false,
                             started: false,

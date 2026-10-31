@@ -182,6 +182,9 @@ pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest 
         motor_protocol::SUBMISSION_KEY_CAPABILITY.into(),
         motor_protocol::PROGRESS_CAPABILITY.into(),
     ];
+    if config.return_large {
+        provides.push(motor_protocol::RETURN_LARGE_CAPABILITY.into());
+    }
     if !config.windows_runners.is_empty()
         || (config.windows_runner_instance.is_some() && config.windows_runner_state_root.is_some())
     {
@@ -792,6 +795,9 @@ impl Handler {
                     }
                 };
                 let motor = self.initialized()?;
+                if let Some(refusal) = return_cap_refusal(&self.config, &request) {
+                    return Ok(refusal);
+                }
                 let secret = crate::direct_secret::DirectSecret::mint()?;
                 if request.submission_key.is_some() {
                     let stream = motor.refuse_authorized(
@@ -1162,6 +1168,9 @@ impl ModuleHandler for Handler {
                             message: error.to_string(),
                         }),
                     };
+                    if let Some(refusal) = return_cap_refusal(&self.config, &request) {
+                        return Ok(refusal);
+                    }
                     if request.submission_key.is_some() {
                         let cursor = request.resume_from_seq;
                         let stream = tokio::select! {
@@ -1264,6 +1273,64 @@ impl ModuleHandler for Handler {
         }
     }
 }
+fn return_cap_refusal(config: &Config, request: &RunRequest) -> Option<HandlerOutcome> {
+    // The rollout switch commits all Linux and macOS placements to the same ceiling.
+    // Selected runners still enforce their own advertised maximum before execution.
+    let max = if config.return_large && request.platform != Some(motor_protocol::Platform::Windows)
+    {
+        motor_protocol::RETURN_LARGE_MAX_BYTES_CAP
+    } else {
+        motor_protocol::RETURN_CHUNKED_MAX_BYTES_CAP
+    };
+    motor_protocol::check_return_cap(request, max)
+        .err()
+        .map(|detail| HandlerOutcome::ErrorWithDetail {
+            code: "invalid_params".into(),
+            message: "return_max_bytes exceeds the runner maximum".into(),
+            detail: serde_json::to_value(detail).expect("return cap refusal serializes"),
+        })
+}
+
+#[cfg(test)]
+mod return_large_tests {
+    use super::*;
+
+    #[test]
+    fn large_return_submit_refusal_has_exact_detail_and_no_job_id() {
+        let mut config = Config::default();
+        let request = RunRequest::new("task", "/repo", "/repo", "true")
+            .with_return_chunked(true)
+            .with_return_max_bytes(134_217_728);
+        let Some(HandlerOutcome::ErrorWithDetail { code, detail, .. }) =
+            return_cap_refusal(&config, &request)
+        else {
+            panic!("v2 must refuse")
+        };
+        assert_eq!(code, "invalid_params");
+        assert_eq!(
+            detail,
+            serde_json::json!({"field":"return_max_bytes","max_bytes":10485760})
+        );
+        config.return_large = true;
+        assert!(return_cap_refusal(&config, &request).is_none());
+        let request = request.with_return_max_bytes(134_217_729);
+        let Some(HandlerOutcome::ErrorWithDetail { code, detail, .. }) =
+            return_cap_refusal(&config, &request)
+        else {
+            panic!("ceiling must refuse")
+        };
+        assert_eq!(code, "invalid_params");
+        assert_eq!(
+            detail,
+            serde_json::json!({"field":"return_max_bytes","max_bytes":134217728})
+        );
+        assert!(serde_json::to_value(Config::default())
+            .unwrap()
+            .get("return_large")
+            .is_none());
+    }
+}
+
 pub(crate) fn response(value: impl serde::Serialize) -> io::Result<HandlerOutcome> {
     Ok(HandlerOutcome::Response(
         serde_json::to_vec(&value).map_err(io::Error::other)?,
@@ -1411,6 +1478,7 @@ async fn pump_direct_secret(
         let return_workspace = return_paths
             .as_ref()
             .and_then(|_| storage.job(id)?.workspace_key);
+        let return_cap = storage.job(id).and_then(|j| j.return_cap_bytes);
         async move {
             let mut value = serde_json::to_value(record).map_err(io::Error::other)?;
             if let Some(direct_job) = direct_job {
@@ -1424,6 +1492,9 @@ async fn pump_direct_secret(
             }
             if let Some(paths) = return_paths {
                 value["return_paths"] = serde_json::to_value(paths).map_err(io::Error::other)?;
+            }
+            if let Some(cap) = return_cap {
+                value["return_cap_bytes"] = serde_json::json!(cap);
             }
             if let Some(workspace) = return_workspace {
                 value["return_workspace"] =

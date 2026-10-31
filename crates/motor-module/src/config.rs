@@ -78,6 +78,9 @@ pub struct Config {
     // pinned production ck-motor can load a config written by this version.
     #[serde(skip_serializing_if = "is_false")]
     pub admit_direct_exec: bool,
+    /// Enable only after every Linux and macOS runner reserves 128 MiB of disk for returned files.
+    #[serde(skip_serializing_if = "is_false")]
+    pub return_large: bool,
     /// The longest timeout, in seconds, a direct `exec.run` may ask for. A
     /// disconnected caller may never return with its secret, so every direct
     /// job must end on its own: ck-motor refuses a direct
@@ -323,6 +326,7 @@ impl Default for Config {
             inject_snapshot_failure: false,
             network_routing: false,
             admit_direct_exec: false,
+            return_large: false,
             direct_exec_max_timeout_secs: DEFAULT_DIRECT_EXEC_MAX_TIMEOUT_SECS,
         }
     }

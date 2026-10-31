@@ -90,6 +90,7 @@ impl Connector for Runner {
                         platforms: vec!["linux".into()],
                         default_branch_tip: false,
                         return_paths: false,
+                        return_chunked_max_bytes: None,
                         return_chunked: false,
                         sibling_paths: false,
                     },

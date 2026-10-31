@@ -392,9 +392,9 @@ fn validate_return_args(args: &RunArgs) -> Result<(), String> {
     }
     if args
         .return_max_bytes
-        .is_some_and(|cap| cap > cortexkit_exec_remote_types::RETURN_CHUNKED_MAX_BYTES_CAP)
+        .is_some_and(|cap| cap > cortexkit_exec_remote_types::RETURN_LARGE_MAX_BYTES_CAP)
     {
-        return Err("--return-max-bytes exceeds the 10485760 byte cap".into());
+        return Err("--return-max-bytes exceeds the 134217728 byte cap".into());
     }
     Ok(())
 }
@@ -1476,6 +1476,13 @@ async fn consume<C: ExecClient + ?Sized>(
             .as_object_mut()
             .and_then(|record| record.remove("hosted"))
             .and_then(|v| serde_json::from_value::<crate::HostedJobState>(v).ok());
+        if let Some(cap) = value
+            .as_object_mut()
+            .and_then(|record| record.remove("return_cap_bytes"))
+            .and_then(|v| v.as_u64())
+        {
+            session.returns.job_cap(cap);
+        }
         if let Some(paths) = value
             .as_object_mut()
             .and_then(|record| record.remove("return_paths"))
