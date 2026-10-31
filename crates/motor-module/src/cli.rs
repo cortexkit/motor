@@ -2355,8 +2355,7 @@ mod tests {
         let directory = super::prepare_default_secret_directory_under(scratch.path()).unwrap();
         for round in 0..20 {
             for _ in 0..200 {
-                let path =
-                    super::default_secret_path(&directory, motor_protocol::Uuid::now_v7());
+                let path = super::default_secret_path(&directory, motor_protocol::Uuid::now_v7());
                 std::fs::write(&path, "old\n").unwrap();
                 std::fs::File::options()
                     .write(true)
