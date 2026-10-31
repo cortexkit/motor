@@ -24,7 +24,7 @@ class InstallScriptTests(unittest.TestCase):
             key_path = script.split('if ($PrintMetricsKey)', 1)[1].split('return', 1)[0]
             self.assertIn('Invoke-RunnerMetricsKey $Root', key_path)
             self.assertNotIn('Start-Service', key_path)
-        self.assertIn('metrics-key --instance ally --state-root "$Root\\state"', helpers)
+        self.assertIn('metrics-key --instance ally --state-root "$batchRoot\\state"', helpers)
         stage = update.split('if ($StageMetrics)', 1)[1].split('return', 1)[0]
         self.assertIn('Set-RunnerMetricsCommand', stage)
         self.assertIn('Set-RunnerUpdateServiceDefinition', stage)
@@ -33,6 +33,31 @@ class InstallScriptTests(unittest.TestCase):
         fixtures = (HERE / 'test_scripts.ps1').read_text()
         for case in ('metrics-preserve', 'metrics-replace', 'metrics-disable'):
             self.assertIn("'" + case + "'", fixtures)
+
+    def test_metrics_key_uses_private_bounded_system_task(self):
+        helpers = (HERE / 'service-definition.ps1').read_text()
+        key = helpers.split('function Invoke-RunnerMetricsKey', 1)[1].split('function Assert-RunnerServiceCommand', 1)[0]
+        self.assertIn('Register-ScheduledTask', key)
+        self.assertIn('-User SYSTEM -RunLevel Highest', key)
+        self.assertIn('New-ScheduledTaskAction', key)
+        self.assertIn('System32\\cmd.exe', key)
+        self.assertIn('\\run.cmd', key)
+        self.assertIn('C:\\motor-runner-evidence\\metrics-key-', key)
+        self.assertIn('[Guid]::NewGuid()', key)
+        self.assertIn("/inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'", key)
+        self.assertLess(key.index('Cannot protect metrics-key evidence'), key.index('Set-Content'))
+        self.assertNotRegex(key, r'&\s*"\$Root\\bin\\motor-runner.exe"\s+metrics-key')
+        self.assertIn('metrics-key --instance ally --state-root "$batchRoot\\state"', key)
+        self.assertIn('2>&1', key)
+        self.assertIn('set "runner_exit=%errorlevel%"', key)
+        self.assertIn('exit /b %runner_exit%', key)
+        self.assertIn('$deadline = [DateTime]::UtcNow.AddMinutes(1)', key)
+        self.assertIn('[DateTime]::UtcNow -ge $deadline', key)
+        self.assertIn('Stop-ScheduledTask $name', key)
+        self.assertIn('$code = [int](Get-Content', key)
+        self.assertIn('metrics-key failed with exit code ${code}:', key)
+        self.assertIn('$output -join [Environment]::NewLine', key)
+        self.assertIn('finally { Unregister-ScheduledTask $name -Confirm:$false', key)
 
     def test_update_vm_present_refuses_before_writes(self):
         update = (HERE / 'update-functions.ps1').read_text()
