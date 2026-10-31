@@ -1,5 +1,5 @@
 use super::*;
-use cortexkit_test_support::ScratchDir;
+use crate::test_helpers::CanonicalScratchDir as ScratchDir;
 const NONCE: &str = "0123456789abcdef0123456789abcdef";
 fn transport(root: &Path, running: bool) -> (Transport, UnixStream) {
     let runtime = Runtime::default();
