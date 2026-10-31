@@ -114,6 +114,7 @@ function Set-RunnerUpdateServiceDefinition($Definition, [string]$LogPath) {
     # bridge's query-only service DACL and the existing recovery policy.
     $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('config','MotorRunner','binPath=', $Definition.binary, 'DisplayName=', $Definition.display_name, 'start=', $Definition.start, 'depend=', ($Definition.dependencies -join '/')) -Operation 'configure runner host payload' -LogPath $LogPath
     Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\MotorRunner' -Name Environment -Value ([string[]]$Definition.environment)
+    Assert-RunnerServiceCommand $Definition.binary
 }
 
 function Assert-RunnerUpdateTree([string]$Path) {
@@ -151,7 +152,11 @@ function Write-RunnerUpdateManifest([string]$Directory) {
 }
 
 function Invoke-RunnerHostUpdate {
-    param([string]$Root, [string]$Bundle, [switch]$Rollback, [int]$ReadyTimeoutSeconds = 300)
+    param([string]$Root, [string]$Bundle, [switch]$Rollback, [int]$ReadyTimeoutSeconds = 300,
+          [string]$MetricsEndpoint = '', [string]$MetricsHostId = '', [switch]$DisableMetrics)
+    . "$PSScriptRoot\service-definition.ps1"
+    $null = Get-RunnerMetricsArguments $MetricsEndpoint $MetricsHostId
+    if ($DisableMetrics -and ($MetricsEndpoint -or $MetricsHostId)) { throw 'DisableMetrics cannot be combined with metrics settings' }
     Assert-RunnerPrivateDirectory $Root
     if ((Get-Content -LiteralPath "$Root\.motor-runner-root" -Raw).Trim() -cne 'motor-runner-hyperv-v1') { throw 'Installed runner root marker is missing or invalid' }
     Assert-RunnerUpdateTree "$Root\bin"
@@ -185,7 +190,12 @@ function Invoke-RunnerHostUpdate {
         foreach ($name in @('common.ps1','process.ps1')) { $payload["bin/$name"] = "script/hyperv-spike/$name" }
         foreach ($path in $payload.Values) { if (-not $files.ContainsKey($path)) { throw "Release manifest omits host payload: $path" } }
         . "$source\script\windows-runner\service-definition.ps1"
-        $definition = Get-RunnerServiceDefinition $Root
+        $metrics = Get-RunnerMetricsSettings (Get-RunnerUpdateServiceDefinition).binary
+        if ($DisableMetrics -or $MetricsEndpoint) { $metrics = @{MetricsEndpoint=$MetricsEndpoint; MetricsHostId=$MetricsHostId} }
+        $definition = Get-RunnerServiceDefinition $Root @metrics
+    }
+    if ($Rollback -and ($DisableMetrics -or $MetricsEndpoint)) {
+        $definition.binary = Set-RunnerMetricsCommand $definition.binary $MetricsEndpoint $MetricsHostId
     }
     foreach ($path in @('bin/motor-runner.exe','bin/motor-winagent.exe')) {
         if (-not $payload.ContainsKey($path) -or -not $files.ContainsKey($payload[$path])) { throw "Release manifest omits $path" }

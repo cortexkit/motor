@@ -1,9 +1,14 @@
 <# Install from a verified release bundle in elevated Windows PowerShell 5.1. #>
+[CmdletBinding(DefaultParameterSetName='Install')]
 param(
-    [Parameter(Mandatory)][string]$Bundle,
-    [Parameter(Mandatory)][string]$ParentPath,
-    [Parameter(Mandatory)][string]$VaultPublicKeyFile,
-    [Parameter(Mandatory)][switch]$LicenseAcknowledged,
+    [Parameter(Mandatory, ParameterSetName='Install')][string]$Bundle,
+    [Parameter(Mandatory, ParameterSetName='Install')][string]$ParentPath,
+    [Parameter(Mandatory, ParameterSetName='Install')][string]$VaultPublicKeyFile,
+    [Parameter(Mandatory, ParameterSetName='Install')][switch]$LicenseAcknowledged,
+    [Parameter(Mandatory, ParameterSetName='Key')][switch]$PrintMetricsKey,
+    [ValidateNotNullOrEmpty()][string]$MetricsEndpoint = '',
+    [ValidateNotNullOrEmpty()][string]$MetricsHostId = '',
+    [switch]$NoStart,
     [switch]$AdoptSpikeRegistration,
     [switch]$AdoptProvisioningRoot
 )
@@ -14,6 +19,12 @@ Set-StrictMode -Version Latest
 . "$PSScriptRoot\guest-agent-identity.ps1"
 . "$PSScriptRoot\service-definition.ps1"
 $Root = 'C:\ProgramData\MotorRunner'
+$null = Get-RunnerMetricsArguments $MetricsEndpoint $MetricsHostId
+if ($PrintMetricsKey) {
+    Assert-RunnerPrivateDirectory $Root
+    Invoke-RunnerMetricsKey $Root
+    return
+}
 $nativeLogPath = Join-Path $Root 'installation-native.jsonl'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $admin = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -214,8 +225,9 @@ cpu_set = [0, 1, 2, 3]
 concurrent_jobs = 1
 toolchain_version = 'rustc 1.99.0 (Windows MSVC)'
 "@ | Set-Content "$Root\vm.toml" -Encoding ascii
-$serviceDefinition = Get-RunnerServiceDefinition $Root
+$serviceDefinition = Get-RunnerServiceDefinition $Root $MetricsEndpoint $MetricsHostId
 New-Service -Name MotorRunner -BinaryPathName $serviceDefinition.binary -DisplayName $serviceDefinition.display_name -StartupType Automatic -DependsOn $serviceDefinition.dependencies | Out-Null
+Assert-RunnerServiceCommand $serviceDefinition.binary
 # The bridge authenticates the pipe against SCM's registered process ID. Grant
 # only SERVICE_QUERY_STATUS to its SID, never service control/configuration.
 $sddlResult = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('sdshow', 'MotorRunner') -Operation 'read runner service security descriptor' -LogPath $nativeLogPath
@@ -230,7 +242,7 @@ $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -Argumen
 New-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\MotorRunner' -Name Environment -PropertyType MultiString -Value $serviceDefinition.environment -Force | Out-Null
 $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('failure', 'MotorRunner', 'reset=', '86400', 'actions=', 'restart/5000/restart/15000/restart/60000') -Operation 'configure runner service recovery' -LogPath $nativeLogPath
 $null = Invoke-RunnerNative -FilePath "$env:SystemRoot\System32\sc.exe" -ArgumentList @('failureflag', 'MotorRunner', '1') -Operation 'enable runner recovery on service failure' -LogPath $nativeLogPath
-Start-Service MotorRunner
+if (-not $NoStart) { Start-Service MotorRunner }
 Write-Host "EVIDENCE sealed-parent SHA256=$parentHash path=$parent"
 Write-Host 'Installed with one slot, AC-only admission. Fleet routing remains disabled until qualification evidence is reviewed.'
 Get-Content 'C:\ProgramData\ssh\ssh_host_ed25519_key.pub'

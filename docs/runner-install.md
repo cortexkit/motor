@@ -601,3 +601,36 @@ checkout on the server.
 `setup.sh`'s host changes (packages, firewall, SSH policy, `/Users` bind mount,
 caller-root directories) are not reversed by any script. Retiring a mapping is a
 separate, explicit step ([section 9.4](#94-forget-caller-root)).
+
+## Optional outbound monitor metrics
+
+Monitor metrics are off by default. The Windows-VM instance managed by
+`script/runner/install-units.sh` can send signed, outbound-only monitor samples
+every 60 seconds. The signing key stays under the runner's private state folder,
+`STATE_ROOT/windows/monitor/host-key`; it is separate from job and placement keys.
+Supply both an HTTPS origin (no credentials, path, query or fragment) and a host
+id matching `[A-Za-z0-9._-]{1,64}`:
+
+Export `TMPDIR` pointing to the shared scratch directory before rendering units.
+
+```sh
+bash script/runner/install-units.sh \
+  --metrics-endpoint https://metrics.example --metrics-host-id monitor-1
+```
+
+The installer shows the rendered flags in its diff and asks before installing.
+Only `motor-runner@windows` gets the metrics flags; other instances are unchanged.
+It reloads systemd's unit definitions but never restarts the runner. Accept the
+Windows drop-in and restart through `script/runner/deploy.sh` at the next planned
+deployment; that script drains the running daemon before swapping its binary. Omitting the pair renders the repository's metrics-disabled default.
+
+Print (or create once) the stable public key as 64 hex characters, without
+installing units or starting the service:
+
+```sh
+bash script/runner/install-units.sh --metrics-key
+```
+
+Run as the same operator account as the service. The key command uses the
+Windows instance's binary, instance and state-root flags from the versioned
+unit, so register that public key with the metrics receiver before the restart.

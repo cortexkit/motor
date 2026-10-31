@@ -13,6 +13,27 @@ LOCAL_USER_DESCRIPTION_MAX = 48
 
 
 class InstallScriptTests(unittest.TestCase):
+    def test_metrics_install_update_key_and_stage_paths_are_wired(self):
+        install = (HERE / 'install.ps1').read_text()
+        update = (HERE / 'update.ps1').read_text()
+        helpers = (HERE / 'service-definition.ps1').read_text()
+        self.assertIn('Get-RunnerServiceDefinition $Root $MetricsEndpoint $MetricsHostId', install)
+        self.assertIn('Assert-RunnerServiceCommand $serviceDefinition.binary', install)
+        self.assertIn('if (-not $NoStart) { Start-Service MotorRunner }', install)
+        for script in (install, update):
+            key_path = script.split('if ($PrintMetricsKey)', 1)[1].split('return', 1)[0]
+            self.assertIn('Invoke-RunnerMetricsKey $Root', key_path)
+            self.assertNotIn('Start-Service', key_path)
+        self.assertIn('metrics-key --instance ally --state-root "$Root\\state"', helpers)
+        stage = update.split('if ($StageMetrics)', 1)[1].split('return', 1)[0]
+        self.assertIn('Set-RunnerMetricsCommand', stage)
+        self.assertIn('Set-RunnerUpdateServiceDefinition', stage)
+        self.assertNotIn('Start-Service', stage)
+        self.assertNotIn('Stop-RunnerUpdateService', stage)
+        fixtures = (HERE / 'test_scripts.ps1').read_text()
+        for case in ('metrics-preserve', 'metrics-replace', 'metrics-disable'):
+            self.assertIn("'" + case + "'", fixtures)
+
     def test_update_vm_present_refuses_before_writes(self):
         update = (HERE / 'update-functions.ps1').read_text()
         guard = update.split('function Assert-RunnerUpdateIdle', 1)[1].split('function Wait-RunnerUpdateReady', 1)[0]

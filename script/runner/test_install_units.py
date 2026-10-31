@@ -28,6 +28,66 @@ def strip_caller_roots(units):
 
 
 class InstallUnitsTests(unittest.TestCase):
+    def test_metrics_are_opt_in_rendered_in_diff_and_key_uses_service_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = root / 'bin'
+            tools.mkdir()
+            log = root / 'commands'
+            for name in ('sudo', 'systemctl'):
+                tool = tools / name
+                tool.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$UNIT_TEST_LOG"\n')
+                tool.chmod(0o755)
+            env = dict(os.environ, HOME=str(root / 'home'), TMPDIR=str(root),
+                       PATH=str(tools) + ':' + os.environ['PATH'], UNIT_TEST_LOG=str(log))
+            for name in ('main', 'e2e', 'windows'):
+                binary = tools / ('runner-' + name)
+                binary.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$UNIT_TEST_LOG"\n'
+                                  'if [ "$1" = metrics-key ]; then printf "%064d\\n" 0; fi\n')
+                binary.chmod(0o755)
+                env['RUNNER_BINARY_' + name] = str(binary)
+            script = ['bash', str(HERE / 'install-units.sh')]
+            default = subprocess.run(script, input='y\n' * 20, text=True, capture_output=True, env=env)
+            self.assertEqual(default.returncode, 0, default.stderr)
+            dest = root / 'home/.config/systemd/user'
+            unit = dest / 'motor-runner@windows.service.d/windows.conf'
+            self.assertNotIn('--metrics-', unit.read_text())
+            enabled = subprocess.run(script + ['--metrics-endpoint', 'https://metrics.example:8443',
+                                              '--metrics-host-id', 'monitor-1'],
+                                     input='y\n' * 20, text=True, capture_output=True, env=env)
+            self.assertEqual(enabled.returncode, 0, enabled.stderr)
+            flags = '--metrics-push --metrics-endpoint https://metrics.example:8443 --metrics-host-id monitor-1'
+            self.assertIn(flags, unit.read_text())
+            self.assertIn('+ExecStart=', enabled.stdout)
+            self.assertIn(flags, enabled.stdout)
+            self.assertIn('check-options --instance windows', log.read_text())
+            self.assertNotIn('--metrics-', (dest / 'motor-runner.service').read_text())
+            self.assertNotIn('restart', log.read_text())
+            log.write_text('')
+            key = subprocess.run(script + ['--metrics-key'], text=True, capture_output=True, env=env)
+            self.assertEqual(key.returncode, 0, key.stderr)
+            self.assertEqual(key.stdout.strip(), '0' * 64)
+            self.assertEqual(log.read_text().strip(),
+                             'metrics-key --instance windows --state-root /srv/build/motor-windows/windows/state')
+
+    def test_metrics_refuse_partial_or_invalid_configuration_before_install(self):
+        invalid = [ ['--metrics-endpoint', 'https://metrics.example'], ['--metrics-host-id', 'monitor-1'] ]
+        for endpoint in ('http://metrics.example', 'https://metrics.example/path',
+                         'https://user@metrics.example', 'https://metrics.example?query',
+                         'https://metrics.example#fragment', 'https://metrics.example:99999',
+                         'https://metrics.example\\evil', 'https://metrics.example/\n'):
+            invalid.append(['--metrics-endpoint', endpoint, '--metrics-host-id', 'monitor-1'])
+        for host_id in ('bad id', 'bad/id', 'x' * 65):
+            invalid.append(['--metrics-endpoint', 'https://metrics.example', '--metrics-host-id', host_id])
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, HOME=directory)
+            for args in invalid:
+                with self.subTest(args=args):
+                    result = subprocess.run(['bash', str(HERE / 'install-units.sh'), *args],
+                                            input='', text=True, capture_output=True, env=env)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse((Path(directory) / '.config').exists())
+
     def test_system_policy_is_installed_privileged_and_user_units_stay_in_home(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

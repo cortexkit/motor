@@ -219,6 +219,59 @@ class ParityTests(unittest.TestCase):
 
 
 class InstallerTests(unittest.TestCase):
+    def test_metrics_default_off_and_opt_in_arguments(self):
+        args = (Path('/runner'), Path('/state'), 'macos', Path('/vm.toml'))
+        plain = install.agent(*args)['ProgramArguments']
+        self.assertFalse(any(arg.startswith('--metrics-') for arg in plain))
+        enabled = install.agent(*args, 'https://metrics.example:8443', 'monitor-1')['ProgramArguments']
+        self.assertEqual(enabled, plain + ['--metrics-push', '--metrics-endpoint',
+                                         'https://metrics.example:8443', '--metrics-host-id', 'monitor-1'])
+        self.assertEqual(install.metrics_settings(enabled), ['https://metrics.example:8443', 'monitor-1'])
+
+    def test_metrics_refuse_half_or_invalid_configuration(self):
+        pairs = [('https://metrics.example', None), (None, 'monitor-1')]
+        pairs += [(endpoint, 'monitor-1') for endpoint in (
+            'http://metrics.example', 'https://metrics.example/path', 'https://user@metrics.example',
+            'https://metrics.example?query', 'https://metrics.example#fragment',
+            'https://metrics.example:99999', 'https://metrics.example\\evil', 'https://metrics.example/\n')]
+        pairs += [('https://metrics.example', host_id) for host_id in ('bad id', 'bad/id', 'x' * 65)]
+        for endpoint, host_id in pairs:
+            with self.subTest(endpoint=endpoint, host_id=host_id), self.assertRaises(ValueError):
+                install.agent(Path('/runner'), Path('/state'), 'macos', Path('/vm.toml'), endpoint, host_id)
+
+    def test_metrics_stage_key_and_check_report_use_installed_arguments_without_start(self):
+        output = io.StringIO()
+        with patch.object(install, 'PLIST', self.plist), patch.object(install.os, 'chown'), \
+                patch.object(install.os, 'fchown'), patch('sys.stdout', output), \
+                patch.object(install, 'run', return_value='a' * 64 + '\n') as run:
+            before = plistlib.loads(self.plist.read_bytes())
+            install.stage_metrics('https://metrics.example', 'monitor-1')
+            self.assertFalse(run.called)
+            staged = plistlib.loads(self.plist.read_bytes())
+            flags = ['--metrics-push', '--metrics-endpoint', 'https://metrics.example', '--metrics-host-id', 'monitor-1']
+            self.assertEqual(staged['ProgramArguments'], before['ProgramArguments'] + flags)
+            self.assertEqual(json.loads(output.getvalue())['metrics']['flags'], flags)
+            with patch.object(install, 'run', side_effect=self.command):
+                self.assertEqual(self.check(), [])
+            output.truncate(0)
+            output.seek(0)
+            install.installed_metrics_key()
+            self.assertEqual(output.getvalue().strip(), 'a' * 64)
+            run.assert_called_once_with('/usr/bin/sudo', '-H', '-u', 'motor', str(self.config / 'motor-runner'),
+                                        'metrics-key', '--instance', 'macos', '--state-root', str(self.state))
+            run.reset_mock()
+            with patch.object(install.sys, 'platform', 'darwin'), patch.object(install.os, 'geteuid', return_value=0), \
+                    patch.object(install.sys, 'argv', ['install.py', '--check', '--image', str(self.image),
+                                                     '--state-root', str(self.state)]), \
+                    patch.object(install, 'CONFIG', self.config), patch.object(install, 'check_install', return_value=[]):
+                output.truncate(0)
+                output.seek(0)
+                self.assertEqual(install.main(), 0)
+                self.assertEqual(json.loads(output.getvalue())['metrics']['flags'], flags)
+            install.stage_metrics(None, None)
+            self.assertEqual(plistlib.loads(self.plist.read_bytes()), before)
+            self.assertFalse(run.called)
+
     def setUp(self):
         self.scratch = tempfile.TemporaryDirectory()
         self.addCleanup(self.scratch.cleanup)
@@ -419,7 +472,8 @@ class InstallerTests(unittest.TestCase):
         key = self.root / "identity.pub"
         key.write_text("ssh-ed25519 AAAA\n")
         args = SimpleNamespace(state_root=self.state, image=self.image, tool_bundle=bundle, manifest=manifest_path,
-                               runner=runner, vm_helper=helper, runner_key=key, instance="macos")
+                               runner=runner, vm_helper=helper, runner_key=key, instance="macos",
+                               metrics_endpoint='https://metrics.example', metrics_host_id='monitor-1')
         account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
         install.LEGACY_PLIST.touch()
         output = io.StringIO()
@@ -449,6 +503,8 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(call.args, ("/usr/bin/codesign", "--force", "--sign", "-", "--entitlements",
                                          HERE / "virtualization.entitlements", self.config / "motor-macvm"))
         self.assertEqual(install.plist_errors(plistlib.loads(self.plist.read_bytes())), [])
+        self.assertEqual(plistlib.loads(self.plist.read_bytes())['ProgramArguments'][-5:],
+                         ['--metrics-push', '--metrics-endpoint', 'https://metrics.example', '--metrics-host-id', 'monitor-1'])
 
     def test_runtime_config_cannot_select_an_unchecked_helper_or_tool(self):
         path = self.config / "vm.toml"

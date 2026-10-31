@@ -24,6 +24,38 @@ foreach ($file in $files) {
     $count++
 }
 . "$PSScriptRoot\accounts.ps1"
+. "$PSScriptRoot\service-definition.ps1"
+& {
+    $root = 'C:\Runner With Spaces'
+    $plain = Get-RunnerServiceDefinition $root
+    if ($plain.binary -match '--metrics-') { throw 'FAIL metrics-default-off' }
+    $flags = ' --metrics-push --metrics-endpoint https://metrics.example:8443 --metrics-host-id monitor-1'
+    $enabled = Get-RunnerServiceDefinition $root 'https://metrics.example:8443' 'monitor-1'
+    if ($enabled.binary -cne ($plain.binary + $flags)) { throw 'FAIL metrics-render-command' }
+    foreach ($pair in @(
+        @('https://metrics.example', ''), @('', 'monitor-1'),
+        @('http://metrics.example', 'monitor-1'), @('https://metrics.example/path', 'monitor-1'),
+        @('https://user@metrics.example', 'monitor-1'), @('https://metrics.example?x', 'monitor-1'),
+        @('https://metrics.example#x', 'monitor-1'), @('https://metrics.example:99999', 'monitor-1'),
+        @('https://metrics.example', 'bad id'), @('https://metrics.example', ('x' * 65)))) {
+        $refused = $false
+        try { $null = Get-RunnerServiceDefinition $root $pair[0] $pair[1] } catch { $refused = $true }
+        if (-not $refused) { throw "FAIL metrics-invalid-pair: $pair" }
+    }
+    $settings = Get-RunnerMetricsSettings $enabled.binary
+    $preserved = Get-RunnerServiceDefinition $root @settings
+    if ($preserved.binary -cne $enabled.binary) { throw 'FAIL metrics-preserve' }
+    if ((Set-RunnerMetricsCommand $enabled.binary '' '') -cne $plain.binary) { throw 'FAIL metrics-disable' }
+    $replaced = Set-RunnerMetricsCommand $enabled.binary 'https://new.example' 'monitor-2'
+    if ($replaced -cne ($plain.binary + ' --metrics-push --metrics-endpoint https://new.example --metrics-host-id monitor-2')) { throw 'FAIL metrics-replace' }
+    function Get-ItemProperty { return [pscustomobject]@{ImagePath=$enabled.binary} }
+    Assert-RunnerServiceCommand $enabled.binary
+    $refused = $false
+    try { Assert-RunnerServiceCommand $plain.binary } catch { $refused = $true }
+    if (-not $refused) { throw 'FAIL metrics-verification-checks-flags' }
+    Write-Host 'PASS metrics-default-render-validation-preserve-replace-disable-verification'
+}
+$count++
 if ($UpdateOnly -and $UpdateCase -eq 'vm-present') {
     & {
         . "$PSScriptRoot\update-functions.ps1"
@@ -75,7 +107,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         function Set-RunnerUpdateServiceDefinition($Definition, [string]$LogPath) { $script:updateSets++; $script:updateDefinition = $Definition }
         $checks = 0
         try {
-            foreach ($case in @('vm-present','job-present','queue-present','agent-mismatch','checksum-mismatch','swap','start-failure','readiness-failure','manual-rollback')) {
+            foreach ($case in @('vm-present','job-present','queue-present','agent-mismatch','checksum-mismatch','swap','start-failure','readiness-failure','manual-rollback','metrics-preserve','metrics-replace','metrics-disable')) {
                 if ($UpdateCase -and $case -cne $UpdateCase) { continue }
                 $caseRoot = Join-Path $fixture $case
                 $installed = Join-Path $caseRoot 'installed'
@@ -120,6 +152,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
                 $script:updateFailNew = $case -eq 'start-failure'
                 $script:updateReady = $true
                 $script:updateDefinition = [pscustomobject]@{binary='old-service-command';display_name='old-service';start='auto';dependencies=@('vmms');environment=@('HOME=old-home')}
+                if ($case -like 'metrics-*') { $script:updateDefinition.binary += ' --metrics-push --metrics-endpoint https://old.example --metrics-host-id old-monitor' }
                 function Get-RunnerUpdateStatus {
                     return [pscustomobject]@{running_jobs=$script:updateJobs; queue_depth=$script:updateQueue; health=[pscustomobject]@{windows_guest_agent=[pscustomobject]@{ready=$script:updateReady}}}
                 }
@@ -133,7 +166,10 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
                     }
                 }
                 $failure = $null
-                try { Invoke-RunnerHostUpdate -Root $installed -Bundle $bundle -ReadyTimeoutSeconds 1 } catch { $failure = [string]$_ }
+                $metricsOptions = @{}
+                if ($case -eq 'metrics-replace') { $metricsOptions = @{MetricsEndpoint='https://new.example'; MetricsHostId='new-monitor'} }
+                if ($case -eq 'metrics-disable') { $metricsOptions = @{DisableMetrics=$true} }
+                try { Invoke-RunnerHostUpdate -Root $installed -Bundle $bundle -ReadyTimeoutSeconds 1 @metricsOptions } catch { $failure = [string]$_ }
                 if ($case -in @('vm-present','job-present','queue-present','agent-mismatch','checksum-mismatch')) {
                     $expected = switch ($case) {
                         'vm-present' { 'blocked by job VM\(s\): motor-ally-blocking-job' }
@@ -149,6 +185,9 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
                 } else {
                     if ($failure -or [IO.File]::ReadAllText("$installed\bin\motor-runner.exe") -cne 'new-runner' -or [IO.File]::ReadAllText("$installed\bin\hyperv.ps1") -cne 'new-script' -or [IO.File]::ReadAllText("$installed\payload-previous\bin\motor-runner.exe") -cne 'old-runner' -or $script:updateServiceState -cne 'Running' -or $script:updateDefinition.binary -notlike '*motor-runner.exe* service *') { throw "FAIL update-$case-swap: $failure" }
                     if ((Get-Acl -LiteralPath "$installed\bin").Sddl -cne $binAcl) { throw "FAIL update-$case-preserves-bridge-acl" }
+                    if ($case -eq 'metrics-preserve' -and -not $script:updateDefinition.binary.EndsWith(' --metrics-push --metrics-endpoint https://old.example --metrics-host-id old-monitor')) { throw 'FAIL update-metrics-preserve' }
+                    if ($case -eq 'metrics-replace' -and -not $script:updateDefinition.binary.EndsWith(' --metrics-push --metrics-endpoint https://new.example --metrics-host-id new-monitor')) { throw 'FAIL update-metrics-replace' }
+                    if ($case -eq 'metrics-disable' -and $script:updateDefinition.binary -match '--metrics-') { throw 'FAIL update-metrics-disable' }
                     foreach ($item in @(Get-Item -LiteralPath "$installed\bin") + @(Get-ChildItem -LiteralPath "$installed\bin" -Recurse)) {
                         if ((Get-Acl -LiteralPath $item.FullName).GetOwner([Security.Principal.SecurityIdentifier]).Value -cne 'S-1-5-32-544') { throw "FAIL update-$case-administrators-owner: $($item.FullName)" }
                     }

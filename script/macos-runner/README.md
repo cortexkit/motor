@@ -367,3 +367,42 @@ Provision the installed private ck-motor service with vault SSH signing
 access for the `motor` runner route. That service setup, cold-cache provisioning
 and live network observation remain owner work; never open state permissions or
 evict shared live caches to make a lane start.
+
+## Optional outbound monitor metrics
+
+Metrics are off by default. Add `--metrics-endpoint https://metrics.example
+--metrics-host-id monitor-1` to the normal install command to enable signed,
+outbound-only monitor samples every 60 seconds. Supply both parameters or
+neither: the endpoint must be an HTTPS origin without credentials, a path, query
+or fragment; the id must match `[A-Za-z0-9._-]{1,64}`. A full install renders the
+metrics-disabled default when neither is supplied.
+
+Once installed, print (or create once) the stable public key as 64 hex characters
+without loading or starting the LaunchAgent:
+
+```sh
+sudo python3 script/macos-runner/install.py metrics-key
+```
+
+The command reads the installed LaunchAgent's runner binary, `--instance` and
+`--state-root` and runs `motor-runner metrics-key` as `motor`, keeping the signing
+key under the same private state folder as the service:
+`STATE_ROOT/INSTANCE/monitor/host-key`. Register only the public key with the
+receiver.
+
+For an existing installation, stage only the metrics flags for the next planned
+LaunchAgent reload or host restart, without stopping or starting it or replacing binaries:
+
+```sh
+sudo python3 script/macos-runner/install.py metrics-config \
+  --metrics-endpoint https://metrics.example --metrics-host-id monitor-1
+```
+
+Use `metrics-config --disable-metrics` to stage removal. The normal `--check`
+command reports the installed metrics flags, validates them, and includes them
+in its LaunchAgent comparison; an optional metrics pair on `--check` also checks
+that the installed pair matches the requested one. A staged setting is not a
+claim that the currently running process has restarted with it.
+Reload at the planned maintenance window by booting out and bootstrapping the
+LaunchAgent through the normal install/restart procedure, or restart the host;
+`launchctl kickstart` alone does not reload edited plist arguments.

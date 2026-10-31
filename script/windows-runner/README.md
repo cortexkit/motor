@@ -444,3 +444,40 @@ host-side preparation and final sealing, so record end-to-end duration when upgr
 The provisioning scratch parent/logs under `C:\motor-spike\hyperv-ally` are also removed when
 explicitly adopted with `-AdoptProvisioningRoot` as above. Archive those logs before uninstalling.
 Historical or unadopted spike roots are never deleted implicitly. Hyper-V itself is left installed.
+
+## Optional outbound monitor metrics
+
+Metrics are off by default. Add `-MetricsEndpoint https://metrics.example
+-MetricsHostId monitor-1` to the normal `install.ps1` command to enable signed,
+outbound-only monitor samples every 60 seconds. Both parameters are required
+together: the endpoint must be an HTTPS origin without credentials, a path,
+query or fragment; the id must match `[A-Za-z0-9._-]{1,64}`. Service-command
+verification prints and checks the metrics flags too. `-NoStart` on a fresh
+install leaves the service stopped so it can first start at a planned restart.
+
+From an elevated administrator shell in a verified release checkout, print the
+stable public key as 64 hex characters without starting the service:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File script\windows-runner\install.ps1 -PrintMetricsKey
+```
+
+The command uses `metrics-key --instance ally --state-root
+C:\ProgramData\MotorRunner\state`, exactly like the service's identity flags.
+The signing key stays under the runner's private state folder at
+`C:\ProgramData\MotorRunner\state\ally\monitor\host-key`. Register only the
+public key with the receiver, never copy the private key.
+
+For an existing installation, stage just the metrics service command without
+stopping or starting the service or changing its payload:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File script\windows-runner\update.ps1 -StageMetrics -MetricsEndpoint https://metrics.example -MetricsHostId monitor-1
+```
+
+The setting applies at the next planned service restart. Use `-StageMetrics
+-DisableMetrics` to stage removal instead. Ordinary `update.ps1 -Bundle ...`
+updates retain the existing metrics pair unless both new metrics parameters or
+`-DisableMetrics` are supplied. Rollback restores the saved service command
+(including its metrics settings), unless explicitly overridden with those same
+parameters. `update.ps1 -PrintMetricsKey` is also available after installation.
