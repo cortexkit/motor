@@ -984,6 +984,11 @@ async fn isolated_working_memory_peak_excludes_large_file_cache() {
     config.isolate_jobs = true;
     config.cpu_topology = None;
     config.disable_warm_builds = true;
+    // Keep the real slice ceiling, but leave the declared minimum unset so the
+    // fixture does not depend on jobs_min_bytes in /etc/motor-host/capacity.json.
+    config.slice_budget_probe = Some(Arc::new(|| {
+        Ok((crate::systemd::read_job_memory_budget()?.max, None))
+    }));
     let runner = Runner::open(config).unwrap();
     let (request, bytes) = f.run(
         r#"python3 - <<'PY'
