@@ -14,6 +14,9 @@ pub(super) fn resolve(directory: &Path, roots: &[PathBuf], local: &str) -> io::R
     for component in Path::new(local).components() {
         match component {
             Component::Normal(name) => target.push(name),
+            // `path = "."` is Cargo's common self dev-dependency for test
+            // features; a `.` component stays in the same folder.
+            Component::CurDir => (),
             Component::ParentDir if target.pop() => (),
             _ => return Err(io::Error::other("invalid local dependency component")),
         }
@@ -57,5 +60,21 @@ mod tests {
             .unwrap(),
             root.join("vendor/lib")
         );
+    }
+
+    #[test]
+    fn local_paths_accept_the_current_folder() {
+        let root = PathBuf::from("checkout");
+        let project = root.join("project");
+        for (raw, expected) in [
+            (".", project.clone()),
+            ("./vendor/lib", project.join("vendor/lib")),
+        ] {
+            assert_eq!(
+                resolve(&project, std::slice::from_ref(&root), raw).unwrap(),
+                expected,
+                "{raw}"
+            );
+        }
     }
 }
