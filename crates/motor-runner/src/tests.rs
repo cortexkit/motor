@@ -5307,7 +5307,7 @@ fn terminal_transition_clears_published_queue_entry() {
 
 /// Exercise the engine through an injected implementation, rather than testing
 /// only the host adapter (which would also pass if the engine bypassed it).
-struct RecordingBackend(Arc<Mutex<Vec<(Uuid, &'static str)>>>);
+struct RecordingBackend(Arc<Mutex<Vec<(Uuid, &'static str)>>>, PathBuf);
 
 impl Backend for RecordingBackend {
     fn materialize(&self, config: &Config, trees: &Trees, setup: &Setup) -> io::Result<Prepared> {
@@ -5327,6 +5327,9 @@ impl Backend for RecordingBackend {
     }
     fn cancel(&self, config: &Config, job: &Job, hard: bool) -> io::Result<()> {
         self.0.lock().unwrap().push((job.id, "cancel"));
+        // The portable non-Linux host adapter deliberately does not signal
+        // process groups. Let this routing fixture stop cooperatively instead.
+        fs::write(&self.1, b"")?;
         backend::HostBackend.cancel(config, job, hard)
     }
     fn unit_alive(
@@ -5367,8 +5370,14 @@ async fn engine_routes_all_five_operations_through_the_backend() {
     fs::create_dir_all(&directory).unwrap();
     atomic_json(&directory.join("record.json"), &interrupted).unwrap();
     let events = Arc::new(Mutex::new(Vec::new()));
-    let runner =
-        Runner::open_with_backend(config, Box::new(RecordingBackend(events.clone()))).unwrap();
+    let runner = Runner::open_with_backend(
+        config,
+        Box::new(RecordingBackend(
+            events.clone(),
+            Path::new(&f.key).join("backend-stop"),
+        )),
+    )
+    .unwrap();
     assert_eq!(
         events.lock().unwrap().as_slice(),
         &[(interrupted.id, "reconcile")]
@@ -5379,7 +5388,8 @@ async fn engine_routes_all_five_operations_through_the_backend() {
     );
     // Keep the process alive until cancel even if the test is descheduled after
     // observing the marker; a fixed sleep can finish before cancel is delivered.
-    let (request, bytes) = f.run("touch backend-ready; while :; do sleep 1; done");
+    let (request, bytes) =
+        f.run("touch backend-ready; while test ! -f backend-stop; do sleep 0.01; done");
     f.submit(&runner, &request, &bytes);
     until(|| Path::new(&f.key).join("backend-ready").exists()).await;
     runner.cancel(request.job_id).unwrap();

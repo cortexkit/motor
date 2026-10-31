@@ -171,14 +171,14 @@ fn write_test_executable_with(
         .arg(&temporary)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()?;
 
     let write_result = writer.stdin.as_mut().unwrap().write_all(contents);
     drop(writer.stdin.take());
     if let Err(error) = write_result {
         let _ = writer.kill();
-        let _ = writer.wait_with_output();
+        let _ = writer.wait();
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
@@ -186,20 +186,25 @@ fn write_test_executable_with(
     let mut ready = [0; 6];
     if let Err(error) = writer.stdout.as_mut().unwrap().read_exact(&mut ready) {
         let _ = writer.kill();
-        let _ = writer.wait_with_output();
+        let _ = writer.wait();
         return Err(error);
     }
     if &ready != b"ready\n" {
         let _ = writer.kill();
-        let _ = writer.wait_with_output();
+        let _ = writer.wait();
         return Err(io::Error::other(
             "executable writer did not hold its staging file",
         ));
     }
 
+    // Only the fixed readiness report matters. A concurrent pre-exec fork can
+    // retain the pipe's write end even after the writer exits, so publication
+    // must depend on this child's exit rather than pipe EOF.
+    drop(writer.stdout.take());
+
     if let Err(error) = wait_until_stopped(&mut writer) {
         let _ = writer.kill();
-        let _ = writer.wait_with_output();
+        let _ = writer.wait();
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
@@ -208,18 +213,56 @@ fn write_test_executable_with(
     if unsafe { libc::kill(writer.id() as i32, libc::SIGCONT) } != 0 {
         let error = io::Error::last_os_error();
         let _ = writer.kill();
-        let _ = writer.wait_with_output();
+        let _ = writer.wait();
         return Err(error);
     }
-    let output = writer.wait_with_output()?;
-    if !output.status.success() {
+    if let Err(error) = wait_for_executable_writer(writer) {
         let _ = fs::remove_file(&temporary);
-        return Err(io::Error::other(format!(
-            "executable writer failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
+        return Err(error);
     }
     hook_result
+}
+
+fn wait_for_executable_writer(mut writer: Child) -> io::Result<()> {
+    let status = writer.wait()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "executable writer failed: {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod pipe_tests {
+    use super::*;
+    use std::{
+        os::{fd::OwnedFd, unix::net::UnixStream},
+        process::ChildStdout,
+        sync::mpsc,
+    };
+
+    #[test]
+    fn executable_writer_reaping_does_not_wait_for_inherited_report_pipe() {
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let (report, inherited_writer) = UnixStream::pair().unwrap();
+        // Model a report pipe whose writer survived in an unrelated fork. The
+        // actual child exits immediately, but EOF cannot arrive until release.
+        writer.stdout = Some(ChildStdout::from(OwnedFd::from(report)));
+        let (finished, result) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            finished.send(wait_for_executable_writer(writer)).unwrap();
+        });
+        let before_release = result.recv_timeout(Duration::from_secs(2));
+        drop(inherited_writer);
+        waiter.join().unwrap();
+        before_release
+            .expect("writer exit must not depend on report-pipe EOF")
+            .unwrap();
+    }
 }
 
 // The race it proves needs Linux's ETXTBSY behaviour, so the module is Linux-only.

@@ -1665,6 +1665,8 @@ async fn compiler_cache_emptied_by_a_failed_eviction_is_filled_again() {
 /// A compiler cache emptied while the runner was down (by hand, or by an
 /// eviction that moved it aside and did not live to save the catalog) holds
 /// none of the recorded fills; one that still holds entries keeps them.
+// Shared compiler-cache reset in Runner::open is compiled only for Linux.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn restart_forgets_fills_of_an_emptied_compiler_cache() {
     let f = Fixture::new();
