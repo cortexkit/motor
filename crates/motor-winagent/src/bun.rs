@@ -19,6 +19,11 @@ pub const CACHE_DIR: &str = "C:\\motor-job\\bun-cache";
 pub const MAX_LOCK_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_BLOB_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Use archive validation's Unicode case folding for the reserved directory name.
+pub fn is_node_modules(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().to_uppercase() == "NODE_MODULES"
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RefusalKind {
     BunLockInvalid,
@@ -772,11 +777,7 @@ fn source_projects(
         for entry in std::fs::read_dir(path).map_err(|_| invalid())? {
             budget.check().map_err(|_| invalid())?;
             let entry = entry.map_err(|_| invalid())?;
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case("node_modules")
-            {
+            if is_node_modules(&entry.file_name()) {
                 continue;
             }
             let metadata = std::fs::symlink_metadata(entry.path()).map_err(|_| invalid())?;
@@ -815,11 +816,7 @@ fn clean_install_inputs(directory: &std::path::Path, budget: &ExpansionBudget) -
         let entry = entry?;
         // A committed node_modules could make Bun accept unverified files as an
         // existing install. Only the verified seed may supply installed packages.
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .eq_ignore_ascii_case("node_modules")
-        {
+        if is_node_modules(&entry.file_name()) {
             return Err(io::Error::other("pre-existing node_modules in Bun project"));
         }
         let metadata = std::fs::symlink_metadata(entry.path())?;

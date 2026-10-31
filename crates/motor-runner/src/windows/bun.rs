@@ -390,10 +390,7 @@ fn discover(path: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
             .collect::<io::Result<Vec<_>>>()?;
         entries.sort();
         for entry in entries {
-            if entry
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("node_modules"))
-            {
+            if entry.file_name().is_some_and(bun::is_node_modules) {
                 continue;
             }
             discover(&entry, files)?;

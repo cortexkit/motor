@@ -267,12 +267,15 @@ fn registry_missing_and_unauthorized_are_indistinguishable() {
 #[test]
 fn uppercase_node_modules_is_not_a_host_project_input() {
     let scratch = ScratchDir::new("bun-case-project");
-    let modules = scratch.join("NODE_MODULES/hostile");
-    fs::create_dir_all(&modules).unwrap();
-    fs::write(modules.join("bun.lock"), "invalid").unwrap();
-    let mut files = Vec::new();
-    discover(scratch.path(), &mut files).unwrap();
-    assert!(files.is_empty());
+    for (index, name) in ["NODE_MODULES", "node_moduleſ"].iter().enumerate() {
+        let root = scratch.join(index.to_string());
+        let modules = root.join(name).join("hostile");
+        fs::create_dir_all(&modules).unwrap();
+        fs::write(modules.join("bun.lock"), "invalid").unwrap();
+        let mut files = Vec::new();
+        discover(&root, &mut files).unwrap();
+        assert!(files.is_empty());
+    }
 }
 
 #[test]
@@ -511,20 +514,27 @@ fn fake_registry_roundtrip_keeps_credentials_off_the_archive_and_guest_manifest(
     assert!(!guest
         .join("bun-cache/@private/linux@1.0.0@@npm.example.test@@@1")
         .exists());
-    let unverified = guest.join("source/project/NODE_MODULES/@private/win");
-    fs::create_dir_all(&unverified).unwrap();
-    fs::write(
-        unverified.join("package.json"),
-        r#"{"name":"@private/win","version":"1.0.0"}"#,
-    )
-    .unwrap();
-    assert_eq!(
-        bun::prepare_cache(&seed, &guest.join("source"), &guest.join("stale-cache"))
+    for (index, name) in ["NODE_MODULES", "node_moduleſ"].iter().enumerate() {
+        let modules = guest.join("source/project").join(name);
+        let unverified = modules.join("@private/win");
+        fs::create_dir_all(&unverified).unwrap();
+        fs::write(
+            unverified.join("package.json"),
+            r#"{"name":"@private/win","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            bun::prepare_cache(
+                &seed,
+                &guest.join("source"),
+                &guest.join(format!("stale-cache-{index}"))
+            )
             .unwrap_err()
             .kind,
-        RefusalKind::BunProjectionInvalid
-    );
-    fs::remove_dir_all(guest.join("source/project/NODE_MODULES")).unwrap();
+            RefusalKind::BunProjectionInvalid
+        );
+        fs::remove_dir_all(modules).unwrap();
+    }
     let win = manifest.projects[0]
         .packages
         .iter()

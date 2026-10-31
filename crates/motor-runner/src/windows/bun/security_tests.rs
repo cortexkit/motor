@@ -155,15 +155,19 @@ fn cache_refusal_cleans_prior_packages_and_honors_early_deadline() {
 #[test]
 fn uppercase_node_modules_is_not_a_guest_project_input() {
     let scratch = ScratchDir::new("bun-guest-case");
-    let source = scratch.join("source");
-    let ignored = source.join("NODE_MODULES/hostile");
-    fs::create_dir_all(&ignored).unwrap();
-    fs::write(ignored.join("bun.lock"), "invalid").unwrap();
-    assert!(
-        bun::prepare_cache(&scratch.join("seed"), &source, &scratch.join("cache"))
-            .unwrap()
-            .is_none()
-    );
+    for (index, name) in ["NODE_MODULES", "node_moduleſ"].iter().enumerate() {
+        let source = scratch.join(format!("source-{index}"));
+        let ignored = source.join(name).join("hostile");
+        fs::create_dir_all(&ignored).unwrap();
+        fs::write(ignored.join("bun.lock"), "invalid").unwrap();
+        assert!(bun::prepare_cache(
+            &scratch.join("seed"),
+            &source,
+            &scratch.join(format!("cache-{index}"))
+        )
+        .unwrap()
+        .is_none());
+    }
 }
 
 #[test]
