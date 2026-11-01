@@ -347,6 +347,7 @@ async fn hosted_wrong_spki_sends_no_token_and_does_not_replace() {
                 timeout_s: 30,
                 requester_jwk: motor_lease::RequesterJwk::from_key(&key.verifying_key()),
                 allow_spill: Some(true),
+                mem_mib: None,
             },
         )
         .await
@@ -718,6 +719,33 @@ async fn hosted_invalid_requests_refuse_before_snapshot_lease_or_ssh() {
     assert!(motor.hosted_state(reply.transfer_id).is_none());
     motor.status().await;
     assert_eq!(h.requests.lock().unwrap().len(), 0);
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn hosted_invalid_memory_refuses_before_snapshot_lease_or_ssh() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = Scratch::new();
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let motor =
+        crate::Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    for memory in [0, 1025, 4097, 9_007_199_254_740_992] {
+        let mut request =
+            RunRequest::new("/home/missing", "/home/missing", "/home/missing", "true")
+                .with_timeout(30);
+        request.memory_mib = Some(memory);
+        let t = terminal(motor.run(request).unwrap()).await;
+        assert_eq!(
+            t.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::RequestRejected
+            }
+        );
+        assert_eq!(t.ran, Some(Ran::None));
+        let detail = t.refusal_detail.unwrap();
+        assert!(detail.contains(&format!("memory_mib={memory}")), "{detail}");
+    }
+    assert!(h.requests.lock().unwrap().is_empty());
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
 }
 
@@ -1190,20 +1218,17 @@ async fn hosted_job_released_stops_reattaching_without_resubmitting() {
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
 }
 
-// The wire body places requester_jwk last. Remove exactly that member to
-// project its serialized fields into the broker's ordinary lease-hash input.
+// Remove requester_jwk wherever it appears: the unstated legacy body puts it
+// last, while stated-memory bodies append mem_mib after allow_spill.
 // Hashing is a broker operation; this projection is only used by contract tests.
 pub(crate) fn canonical_lease_bytes(body: &motor_lease::LeaseRequest) -> String {
     let wire = serde_json::to_string(body).unwrap();
     let requester = format!(
-        ",\"requester_jwk\":{}}}",
+        ",\"requester_jwk\":{}",
         serde_json::to_string(&body.requester_jwk).unwrap()
     );
-    format!(
-        "{}}}",
-        wire.strip_suffix(&requester)
-            .expect("requester key is the final wire member")
-    )
+    assert!(wire.contains(&requester));
+    wire.replacen(&requester, "", 1)
 }
 
 fn assert_client_lease_body_and_hash(body_bytes: &str, expected_hash: &str) {
@@ -1405,6 +1430,129 @@ fn cloud_no_host_fits_request_matches_the_vector_body_and_hash() {
     );
 }
 
+#[test]
+fn cloud_stated_memory_lease_body_hash_and_stored_bytes_match_vectors() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/stated-memory-lease.json"
+    ))
+    .unwrap();
+    let malformed: LeaseRequest =
+        serde_json::from_value(vector["malformed"]["request"]["body"].clone()).unwrap();
+    assert_eq!(invalid_lease_field(&malformed), Some("mem_mib"));
+    let mut null_memory = vector["stated"]["request"]["body"].clone();
+    null_memory["mem_mib"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<LeaseRequest>(null_memory).is_err());
+    for name in ["stated", "raised", "no_host_fits"] {
+        let exchange = &vector[name];
+        let expected = &exchange["request"]["body"];
+        let mut request = RunRequest::new(
+            "/home/test/repo",
+            "/home/test/repo",
+            "/home/test/repo",
+            "true",
+        )
+        .with_platform(Platform::Linux)
+        .with_timeout(100)
+        .with_weight_hint(4);
+        request.network = Some(Network::Outbound);
+        request.memory_mib = expected["mem_mib"].as_u64();
+        let body = lease_body(
+            Uuid::parse_str(expected["job_id"].as_str().unwrap()).unwrap(),
+            &request,
+            (
+                expected["workspace_key_hash"].as_str().unwrap().into(),
+                expected["repo_hash"].as_str().unwrap().into(),
+            ),
+            serde_json::from_value(expected["placement_hint"].clone()).unwrap(),
+            None,
+            serde_json::from_value(expected["requester_jwk"].clone()).unwrap(),
+            Some(false),
+        )
+        .unwrap();
+        // Encode the vector's fields in its recorded order, independently of
+        // LeaseRequest's serializer. The vector has no compact body_bytes member.
+        let fields = [
+            "job_id",
+            "vcpus",
+            "platform",
+            "net",
+            "workspace_key_hash",
+            "repo_hash",
+            "placement_hint",
+            "avoid_host",
+            "timeout_s",
+            "requester_jwk",
+            "allow_spill",
+            "mem_mib",
+        ];
+        let members: Vec<_> = fields
+            .into_iter()
+            .map(|field| {
+                let value = if field == "requester_jwk" {
+                    let jwk: RequesterJwk =
+                        serde_json::from_value(expected[field].clone()).unwrap();
+                    serde_json::to_string(&jwk).unwrap()
+                } else {
+                    serde_json::to_string(&expected[field]).unwrap()
+                };
+                format!("\"{field}\":{value}")
+            })
+            .collect();
+        let wire = serde_json::to_vec(&body).unwrap();
+        assert_eq!(
+            wire,
+            format!("{{{}}}", members.join(",")).as_bytes(),
+            "{name}"
+        );
+        assert_eq!(
+            motor_lease::sha256_hex(canonical_lease_bytes(&body).as_bytes()),
+            exchange["lease_hash"],
+            "{name}"
+        );
+        assert_eq!(invalid_lease_field(&body), None);
+        let mut state = HostedJobState::new(&Config::default());
+        state.lease_request = Some(body.clone());
+        let restored: HostedJobState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&restored.lease_request.unwrap()).unwrap(),
+            wire
+        );
+        if name != "no_host_fits" {
+            use base64::Engine;
+            let token = exchange["reply"]["body"]["job_token"].as_str().unwrap();
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(token.split('.').nth(1).unwrap())
+                .unwrap();
+            let mut claims: motor_lease::Claims = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(resource_mismatch(&claims, &body, false), None, "{name}");
+            claims.mem_mib += 1024;
+            assert_eq!(
+                resource_mismatch(&claims, &body, false).unwrap().0,
+                "mem_mib"
+            );
+        }
+    }
+}
+
+#[test]
+fn hosted_capabilities_do_not_advertise_memory_enforcement() {
+    let manifest = serde_json::to_value(crate::module::manifest("ck-motor")).unwrap();
+    assert!(!manifest["capabilities"]["provides"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value == "exec-remote-memory/v1"));
+}
+
+#[test]
+fn lease_without_stated_memory_keeps_legacy_serialized_bytes() {
+    let legacy = r#"{"job_id":"019e4567-89ab-7cde-8012-3456789abcd8","vcpus":2,"platform":"linux-x64","net":true,"workspace_key_hash":"WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW","repo_hash":"RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR","placement_hint":null,"avoid_host":null,"timeout_s":100,"allow_spill":true,"requester_jwk":{"kty":"OKP","crv":"Ed25519","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}"#;
+    let body: LeaseRequest = serde_json::from_str(legacy).unwrap();
+    assert_eq!(body.mem_mib, None);
+    assert_eq!(serde_json::to_string(&body).unwrap(), legacy);
+}
+
 #[tokio::test]
 async fn stored_legacy_cached_hint_is_replayed_without_changing_the_lease_hash() {
     let h = Harness::new(Behavior::Normal).await;
@@ -1534,6 +1682,50 @@ async fn stored_allow_spill_presence_and_value_survive_lease_re_requests() {
             allow_spill
         );
         assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn stored_stated_memory_survives_restart_and_request_changes() {
+    for memory in [None, Some(2048), Some(12288)] {
+        let h = Harness::new(Behavior::Normal).await;
+        // Refuse at placement: runner-side stated-memory enforcement is not
+        // enabled yet, and this test covers only the persisted lease identity.
+        h.broker.lock().unwrap().knobs.max_vcpus = Some(1);
+        let scratch = Scratch::new();
+        let id = Uuid::now_v7();
+        let mut request = Harness::request(&scratch.0);
+        request.memory_mib = memory;
+        let body = lease_body(
+            id,
+            &request,
+            (
+                motor_lease::base64url(&[1; 32]),
+                motor_lease::base64url(&[2; 32]),
+            ),
+            None,
+            None,
+            motor_lease::RequesterJwk::from_key(&SigningKey::from_bytes(&[3; 32]).verifying_key()),
+            Some(true),
+        )
+        .unwrap();
+        let expected = canonical_lease_bytes(&body);
+        let mut route = h.route.clone();
+        route.lease_request = Some(body);
+        drop(stored(&scratch, id, route));
+        // A changed caller request after restart cannot alter a saved lease's identity.
+        request.memory_mib = Some(32768);
+        let storage = Arc::new(Storage::open(&scratch.0.join("state")).unwrap());
+        let route = storage.job(id).unwrap().hosted.unwrap();
+        assert_eq!(
+            Client::new(route).run(id, &request, &storage).await.err(),
+            Some(Error::NoHostFits(Some(1)))
+        );
+        let bodies = h.lease_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        let sent: LeaseRequest = serde_json::from_slice(&bodies[0]).unwrap();
+        assert_eq!(sent.mem_mib, memory);
+        assert_eq!(canonical_lease_bytes(&sent), expected);
     }
 }
 

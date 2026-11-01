@@ -54,8 +54,9 @@
     },
     "body": {
       "error": "no_host_fits",
-      "max_vcpus": 8
+      "max_vcpus": 8,
+      "max_mem_mib": 28672
     },
-    "body_bytes": "{\"error\":\"no_host_fits\",\"max_vcpus\":8}"
+    "body_bytes": "{\"error\":\"no_host_fits\",\"max_vcpus\":8,\"max_mem_mib\":28672}"
   }
 }

@@ -216,9 +216,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-exec-remote-types"
-version = "0.2.16"
+version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b138ac9a94a7b7d0b0959c734f9bdec61f8bc5b38a4f7e2611244b1ed32d19e"
+checksum = "0319ce6c871eb5f386501d5546815df60ca43a807d130b69a060431b2b131607"
 dependencies = [
  "base64 0.22.1",
  "serde",

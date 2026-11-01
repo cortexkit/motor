@@ -125,7 +125,7 @@ fn present_workspace_hash<'de, D: serde::Deserializer<'de>>(
     String::deserialize(deserializer).map(Some)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LeaseRequest {
     pub job_id: String,
@@ -158,12 +158,59 @@ pub struct LeaseRequest {
     )]
     pub allow_spill: Option<bool>,
     pub requester_jwk: RequesterJwk,
+    /// Original whole-GiB statement; the broker applies the per-vCPU floor.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_memory"
+    )]
+    pub mem_mib: Option<u64>,
+}
+
+impl Serialize for LeaseRequest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut body = serializer.serialize_struct(
+            "LeaseRequest",
+            10 + usize::from(self.allow_spill.is_some()) + usize::from(self.mem_mib.is_some()),
+        )?;
+        body.serialize_field("job_id", &self.job_id)?;
+        body.serialize_field("vcpus", &self.vcpus)?;
+        body.serialize_field("platform", &self.platform)?;
+        body.serialize_field("net", &self.net)?;
+        body.serialize_field("workspace_key_hash", &self.workspace_key_hash)?;
+        body.serialize_field("repo_hash", &self.repo_hash)?;
+        body.serialize_field("placement_hint", &self.placement_hint)?;
+        body.serialize_field("avoid_host", &self.avoid_host)?;
+        body.serialize_field("timeout_s", &self.timeout_s)?;
+        // Keep the historical member order for unstated leases, including
+        // stored requests. Stated leases use the contract's new wire order.
+        if self.mem_mib.is_some() {
+            body.serialize_field("requester_jwk", &self.requester_jwk)?;
+        }
+        if let Some(allow_spill) = self.allow_spill {
+            body.serialize_field("allow_spill", &allow_spill)?;
+        }
+        if self.mem_mib.is_none() {
+            body.serialize_field("requester_jwk", &self.requester_jwk)?;
+        }
+        if let Some(mem_mib) = self.mem_mib {
+            body.serialize_field("mem_mib", &mem_mib)?;
+        }
+        body.end()
+    }
 }
 
 fn optional_boolean<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<bool>, D::Error> {
     bool::deserialize(deserializer).map(Some)
+}
+
+fn optional_memory<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
