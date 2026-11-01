@@ -60,6 +60,11 @@ fn validate_runner_args(text: &str) -> Result<()> {
             "--free-space-floor-bytes" => {
                 floor = Some(value.parse::<u64>().map_err(|e| Error(e.to_string()))?)
             }
+            // Provisioning sets an eviction goal above the floor (a share of
+            // the tenant disk); the guest's RunnerArgs::parse accepts it too.
+            "--free-space-eviction-bytes" => {
+                value.parse::<u64>().map_err(|e| Error(e.to_string()))?;
+            }
             "--workspace-root" => roots.push(std::path::PathBuf::from(value)),
             "--owned-workspace-root" => owned.push(std::path::PathBuf::from(value)),
             "--state-root" if value == "/tenant/state" => {}

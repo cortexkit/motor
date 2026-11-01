@@ -43,6 +43,19 @@ fn staged_vector_and_guest_argument_grammar_are_strict_and_bounded() {
     // A tenant installed with remote cache files runs with the switch on;
     // nothing else follows the option.
     validate_runner_args(&format!("{} --remote-cache true", activation.runner_args)).unwrap();
+    // Provisioning writes an eviction goal; it must be a byte count.
+    validate_runner_args(&format!(
+        "{} --free-space-eviction-bytes 375809638400",
+        activation.runner_args
+    ))
+    .unwrap();
+    for value in ["-1", "35%", ""] {
+        let args = format!(
+            "{} --free-space-eviction-bytes {value}",
+            activation.runner_args
+        );
+        assert!(validate_runner_args(&args).is_err(), "{args}");
+    }
     for value in ["false", "yes", ""] {
         let args = format!("{} --remote-cache {value}", activation.runner_args);
         assert!(validate_runner_args(&args).is_err(), "{args}");
