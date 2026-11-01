@@ -53,6 +53,178 @@ fn graph_rejects_workspace_alias_multiplication_and_excess_workspaces() {
     );
 }
 
+/// A pax record as `<len> <key>=<value>\n`, where `len` counts the whole record.
+fn pax_record(key: &str, value: &str) -> String {
+    let body = format!(" {key}={value}\n");
+    let mut length = body.len() + 1;
+    while length.to_string().len() + body.len() != length {
+        length += 1;
+    }
+    format!("{length}{body}")
+}
+
+/// npm's tar shape for a long file name: a pax `x` header carrying `path`
+/// (and, from npm, `size`) before a ustar member with a truncated name.
+fn pax_tar(long_name: &str, contents: &[u8], extra: &[(&str, String)]) -> Vec<u8> {
+    let mut tar = tar::Builder::new(Vec::new());
+    let json = br#"{"name":"pax","version":"1.0.0"}"#;
+    let mut header = tar::Header::new_ustar();
+    header.set_mode(0o644);
+    header.set_size(json.len() as u64);
+    header.set_path("package/package.json").unwrap();
+    header.set_cksum();
+    tar.append(&header, &json[..]).unwrap();
+    let mut pax = pax_record("path", &format!("package/{long_name}"));
+    for (key, value) in extra {
+        pax.push_str(&pax_record(key, value));
+    }
+    let mut header = tar::Header::new_ustar();
+    header.set_entry_type(tar::EntryType::XHeader);
+    header.set_size(pax.len() as u64);
+    header.set_path("PaxHeader/long").unwrap();
+    header.set_cksum();
+    tar.append(&header, pax.as_bytes()).unwrap();
+    let mut header = tar::Header::new_ustar();
+    header.set_mode(0o644);
+    header.set_size(contents.len() as u64);
+    header.set_path("package/truncated").unwrap();
+    header.set_cksum();
+    tar.append(&header, contents).unwrap();
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gzip.write_all(&tar.into_inner().unwrap()).unwrap();
+    gzip.finish().unwrap()
+}
+
+/// npm writes a pax `size` beside every long `path` (seen on
+/// @mistralai/mistralai 2.2.6). An equal size is the header's own and must
+/// expand; a different size, or sparse-file records, stay refused.
+#[test]
+fn pax_size_equal_to_the_header_expands_and_others_are_refused() {
+    let scratch = ScratchDir::new("bun-pax-size");
+    let long = "getchatcompletionfieldoptionscountsv1observabilitychatcompletionfieldsfieldnameoptionscountsrequest.d.ts";
+    let budget = || ExpansionBudget::new(1 << 30, 1000, Instant::now() + Duration::from_secs(30));
+    let equal = pax_tar(
+        long,
+        b"export {};\n",
+        &[("size", "11".into()), ("mtime", "1.5".into())],
+    );
+    let destination = scratch.join("equal");
+    expand_tarball_with_budget(&equal, &destination, &budget()).unwrap();
+    assert_eq!(
+        std::fs::read(destination.join(long)).unwrap(),
+        b"export {};\n"
+    );
+    for (case, extra) in [
+        ("differs", vec![("size", "12".to_string())]),
+        ("sparse", vec![("GNU.sparse.size", "11".to_string())]),
+        ("realsize", vec![("SCHILY.realsize", "11".to_string())]),
+    ] {
+        let destination = scratch.join(case);
+        assert!(
+            expand_tarball_with_budget(
+                &pax_tar(long, b"export {};\n", &extra),
+                &destination,
+                &budget()
+            )
+            .is_err(),
+            "{case} must be refused"
+        );
+        assert!(!destination.exists(), "{case} wrote files");
+    }
+}
+
+fn tar_of(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut tar = tar::Builder::new(Vec::new());
+    for (path, contents) in members {
+        let mut header = tar::Header::new_ustar();
+        header.set_mode(0o644);
+        header.set_size(contents.len() as u64);
+        // set_path refuses `.` components, which real npm tarballs contain.
+        header.as_mut_bytes()[..path.len()].copy_from_slice(path.as_bytes());
+        header.set_cksum();
+        tar.append(&header, *contents).unwrap();
+    }
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gzip.write_all(&tar.into_inner().unwrap()).unwrap();
+    gzip.finish().unwrap()
+}
+
+/// agent-base 7.1.4 packs `package/./dist/index.js` and an identical
+/// `package/dist/index.js`. `.` is the same folder and an identical repeat is
+/// harmless; a repeat with other bytes, or `..`, stays refused.
+#[test]
+fn dot_components_and_identical_repeats_expand_but_divergent_ones_do_not() {
+    let scratch = ScratchDir::new("bun-dot-members");
+    let budget = || ExpansionBudget::new(1 << 30, 1000, Instant::now() + Duration::from_secs(30));
+    let json: &[u8] = br#"{"name":"dot","version":"1.0.0"}"#;
+    let same = tar_of(&[
+        ("package/package.json", json),
+        ("package/./dist/index.js", b"one"),
+        ("package/dist/index.js", b"one"),
+    ]);
+    let destination = scratch.join("same");
+    expand_tarball_with_budget(&same, &destination, &budget()).unwrap();
+    assert_eq!(
+        std::fs::read(destination.join("dist/index.js")).unwrap(),
+        b"one"
+    );
+    for (case, members) in [
+        (
+            "differs",
+            vec![
+                ("package/package.json", json),
+                ("package/./dist/index.js", &b"one"[..]),
+                ("package/dist/index.js", &b"two"[..]),
+            ],
+        ),
+        (
+            "parent",
+            vec![
+                ("package/package.json", json),
+                ("package/../escape.js", &b"x"[..]),
+            ],
+        ),
+    ] {
+        let destination = scratch.join(case);
+        assert!(
+            expand_tarball_with_budget(&tar_of(&members), &destination, &budget()).is_err(),
+            "{case} must be refused"
+        );
+    }
+    assert!(!scratch.join("escape.js").exists());
+}
+
+/// Operator check against real registry tarballs: expands every `*.tgz` in
+/// `MOTOR_BUN_TARBALL_DIR` under one job budget and lists the ones refused.
+#[test]
+#[ignore = "needs MOTOR_BUN_TARBALL_DIR with real npm tarballs"]
+fn real_npm_tarballs_expand_under_one_job_budget() {
+    let directory = std::env::var("MOTOR_BUN_TARBALL_DIR").unwrap();
+    let scratch = ScratchDir::new("bun-real-tarballs");
+    let budget = ExpansionBudget::default();
+    let mut refused = Vec::new();
+    let mut count = 0;
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "tgz") {
+            continue;
+        }
+        count += 1;
+        let bytes = std::fs::read(&path).unwrap();
+        let destination = scratch.join(format!("p{count}"));
+        if let Err(error) = expand_tarball_with_budget(&bytes, &destination, &budget) {
+            refused.push(format!("{}: {error}", path.display()));
+        }
+    }
+    assert!(count > 0, "no tarballs found");
+    assert!(
+        refused.is_empty(),
+        "{} of {count} refused:\n{}",
+        refused.len(),
+        refused.join("\n")
+    );
+}
+
 #[test]
 fn expansion_budget_is_cumulative_across_tarballs() {
     let scratch = ScratchDir::new("bun-stream-budget");

@@ -748,6 +748,28 @@ pub fn unpack_seed(
     Ok(())
 }
 
+/// Splits pax extended-header data into `(key, value)` records, each written
+/// as `<decimal length> <key>=<value>\n` with the length counting the whole
+/// record. Anything malformed is refused rather than skipped.
+fn pax_records(mut data: &[u8]) -> io::Result<Vec<(&[u8], &[u8])>> {
+    let invalid = || io::Error::other("malformed npm pax header");
+    let mut records = Vec::new();
+    while !data.is_empty() {
+        let space = data.iter().position(|b| *b == b' ').ok_or_else(invalid)?;
+        let length: usize = std::str::from_utf8(&data[..space])
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .filter(|n| *n > space + 1 && *n <= data.len())
+            .ok_or_else(invalid)?;
+        let record = &data[space + 1..length];
+        let record = record.strip_suffix(b"\n").ok_or_else(invalid)?;
+        let equals = record.iter().position(|b| *b == b'=').ok_or_else(invalid)?;
+        records.push((&record[..equals], &record[equals + 1..]));
+        data = &data[length..];
+    }
+    Ok(records)
+}
+
 fn projection_error(project: &str, package: &Package) -> Refusal {
     refuse(
         RefusalKind::BunProjectionInvalid,
@@ -768,12 +790,15 @@ pub fn expand_tarball_with_budget(
     budget: &ExpansionBudget,
 ) -> io::Result<()> {
     let mut raw = tar::Archive::new(budget.reader(flate2::read::GzDecoder::new(bytes), true));
+    // A pax `size` record overrides the next member's header size. npm's tar
+    // writes one beside every long `path` record, equal to the header size, so
+    // an equal size is accepted; a differing one would make this raw pass and
+    // the later pax-aware passes read different member lengths.
+    let mut pax_size: Option<u64> = None;
     for entry in raw.entries()?.raw(true) {
         let mut entry = entry?;
-        let metadata = matches!(
-            entry.header().entry_type().as_byte(),
-            b'L' | b'K' | b'x' | b'g'
-        );
+        let kind = entry.header().entry_type().as_byte();
+        let metadata = matches!(kind, b'L' | b'K' | b'x' | b'g');
         budget.entry(metadata.then_some(entry.size()))?;
         if !metadata
             && !entry.header().entry_type().is_file()
@@ -785,31 +810,61 @@ pub fn expand_tarball_with_budget(
             use std::io::Read;
             let mut bytes = Vec::new();
             entry.read_to_end(&mut bytes)?;
-            if matches!(entry.header().entry_type().as_byte(), b'x' | b'g')
-                && [
-                    b"GNU.sparse".as_slice(),
-                    b"SCHILY.realsize".as_slice(),
-                    b" size=".as_slice(),
-                ]
-                .iter()
-                .any(|key| bytes.windows(key.len()).any(|part| part == *key))
-            {
-                return Err(io::Error::other("unsupported npm size or sparse metadata"));
+            if matches!(kind, b'x' | b'g') {
+                for (key, value) in pax_records(&bytes)? {
+                    match key {
+                        b"size" if kind == b'x' => {
+                            let size = std::str::from_utf8(value)
+                                .ok()
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .ok_or_else(|| io::Error::other("invalid npm pax size"))?;
+                            pax_size = Some(size);
+                        }
+                        _ if key == b"size"
+                            || key.starts_with(b"GNU.sparse")
+                            || key == b"SCHILY.realsize" =>
+                        {
+                            return Err(io::Error::other(
+                                "unsupported npm size or sparse metadata",
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
             }
         } else {
+            if pax_size
+                .take()
+                .is_some_and(|size| size != entry.header().size().unwrap_or(u64::MAX))
+            {
+                return Err(io::Error::other("npm pax size differs from its header"));
+            }
             io::copy(&mut entry, &mut io::sink())?;
         }
     }
+    if pax_size.is_some() {
+        return Err(io::Error::other("npm pax size without a member"));
+    }
     io::copy(&mut raw.into_inner(), &mut io::sink())?;
-    fn relative(path: &str, directory: bool) -> io::Result<Option<&str>> {
+    // `.` components name the same folder and are dropped: several published
+    // packages (agent-base 7.1.4 and its proxy-agent siblings) pack
+    // `package/./dist/index.js` beside an identical `package/dist/index.js`.
+    // `..` and every other invalid component stay refused.
+    fn relative(path: &str, directory: bool) -> io::Result<Option<String>> {
         let path = path.trim_end_matches('/');
         let (prefix, rest) = path
             .split_once('/')
             .map_or((path, None), |(p, r)| (p, Some(r)));
         crate::validate_component(prefix)?;
+        let rest = rest.map(|rest| {
+            rest.split('/')
+                .filter(|component| *component != ".")
+                .collect::<Vec<_>>()
+                .join("/")
+        });
         match rest {
-            Some(rest) => Ok(Some(rest)),
-            None if directory => Ok(None),
+            Some(rest) if !rest.is_empty() => Ok(Some(rest)),
+            _ if directory => Ok(None),
             _ => Err(io::Error::other("npm member has no archive prefix")),
         }
     }
@@ -845,13 +900,17 @@ pub fn expand_tarball_with_budget(
             if let Some((previous, was_file)) =
                 names.insert(prefix.to_uppercase(), (prefix.clone(), file))
             {
-                if previous != prefix || was_file || file {
+                // The same file named twice is checked byte for byte when
+                // extracted; any other overlap (case, file over folder) is not.
+                let same_file = previous == prefix && was_file && file;
+                if !same_file && (previous != prefix || was_file || file) {
                     return Err(io::Error::other("npm path collision"));
                 }
             }
         }
-        if !files.insert(relative.to_owned()) || files.len() > 100_000 {
-            return Err(io::Error::other("duplicate npm member or entry limit"));
+        files.insert(relative);
+        if files.len() > 100_000 {
+            return Err(io::Error::other("npm entry limit"));
         }
     }
     if !files.contains("package.json") {
@@ -861,6 +920,7 @@ pub fn expand_tarball_with_budget(
     for entry in
         tar::Archive::new(budget.reader(flate2::read::GzDecoder::new(bytes), false)).entries()?
     {
+        use std::io::Read as _;
         let mut entry = entry?;
         let path = entry.path_bytes();
         let Some(relative) = relative(
@@ -875,11 +935,25 @@ pub fn expand_tarball_with_budget(
             std::fs::create_dir_all(dest)?;
         } else {
             std::fs::create_dir_all(dest.parent().unwrap())?;
-            let mut out = std::fs::OpenOptions::new()
+            match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(dest)?;
-            io::copy(&mut entry, &mut out)?;
+                .open(&dest)
+            {
+                Ok(mut out) => {
+                    io::copy(&mut entry, &mut out)?;
+                }
+                // A repeated member was written earlier from this archive;
+                // keep it only if this copy is byte-identical.
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let mut again = Vec::new();
+                    entry.read_to_end(&mut again)?;
+                    if std::fs::read(&dest)? != again {
+                        return Err(io::Error::other("npm duplicate member differs"));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
     Ok(())
