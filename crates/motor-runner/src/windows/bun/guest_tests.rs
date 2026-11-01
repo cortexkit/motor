@@ -225,6 +225,70 @@ fn workspace_optional_closure_uses_the_workspace_placement_not_only_the_root() {
     assert!(packages.iter().all(|row| row.package.windows));
 }
 
+/// A dependency of a scoped package resolves one level up at the root, not
+/// inside the scope: `@npmcli/run-script` -> `node-gyp` is the top-level
+/// `node-gyp`, not the unrelated `@npmcli/node-gyp` (a large real bun.lock
+/// lost node-gyp and its dependencies this way). Nested placements under a
+/// scoped parent climb past both of its segments too.
+#[test]
+fn scoped_parents_climb_whole_package_names() {
+    let sri = "sha256-LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=";
+    let lock = serde_json::json!({
+        "lockfileVersion": 1,
+        "workspaces": {"": {"dependencies": {"@npmcli/run-script": "10.0.4", "a": "1.0.0"}}},
+        "packages": {
+            "@npmcli/run-script": ["@npmcli/run-script@10.0.4", "", {"dependencies": {"@npmcli/node-gyp": "5.0.0", "node-gyp": "12.4.0"}}, sri],
+            "@npmcli/node-gyp": ["@npmcli/node-gyp@5.0.0", "", {}, sri],
+            "node-gyp": ["node-gyp@12.4.0", "", {"dependencies": {"env-paths": "2.2.1"}}, sri],
+            "env-paths": ["env-paths@2.2.1", "", {}, sri],
+            "a": ["a@1.0.0", "", {"dependencies": {"@s/b": "1.0.0"}}, sri],
+            "a/@s/b": ["@s/b@1.0.0", "", {"dependencies": {"c": "1.0.0"}}, sri],
+            "a/c": ["c@1.0.0", "", {}, sri]
+        }
+    })
+    .to_string();
+    let packages = read_lock("m/project", &lock).unwrap();
+    let windows = |placement: &str| {
+        packages
+            .iter()
+            .find(|row| row.package.placement == placement)
+            .unwrap()
+            .package
+            .windows
+    };
+    for placement in [
+        "@npmcli/run-script",
+        "@npmcli/node-gyp",
+        "node-gyp",
+        "env-paths",
+        "a",
+        "a/@s/b",
+        "a/c",
+    ] {
+        assert!(windows(placement), "{placement} must be reachable");
+    }
+}
+
+/// Operator check against a real bun.lock: every package named in
+/// `MOTOR_BUN_EXPECT` (comma-separated) is staged for Windows.
+#[test]
+#[ignore = "needs MOTOR_BUN_LOCK and MOTOR_BUN_EXPECT"]
+fn real_bun_lock_stages_expected_packages_for_windows() {
+    let lock = std::fs::read_to_string(std::env::var("MOTOR_BUN_LOCK").unwrap()).unwrap();
+    let packages = read_lock("m/project", &lock).unwrap();
+    let missing: Vec<String> = std::env::var("MOTOR_BUN_EXPECT")
+        .unwrap()
+        .split(',')
+        .filter(|name| {
+            !packages
+                .iter()
+                .any(|row| row.package.name == *name && row.package.windows)
+        })
+        .map(str::to_owned)
+        .collect();
+    assert!(missing.is_empty(), "not staged for Windows: {missing:?}");
+}
+
 pub(super) fn package() -> Package {
     Package {
         placement: "@private/win".into(),

@@ -59,6 +59,22 @@ impl Work {
     }
 }
 
+/// The placement one `node_modules` level up. A placement joins package names
+/// with `/`, and a scoped name (`@scope/name`) spans two segments, so cutting
+/// at the last `/` would land inside it: from `@npmcli/run-script` a
+/// dependency on `node-gyp` would resolve to the unrelated `@npmcli/node-gyp`.
+fn enclosing_placement(placement: &str) -> &str {
+    let segments: Vec<&str> = placement.split('/').collect();
+    let drop = if segments.len() >= 2 && segments[segments.len() - 2].starts_with('@') {
+        2
+    } else {
+        1
+    };
+    let keep = segments.len().saturating_sub(drop);
+    let length = segments[..keep].iter().map(|s| s.len() + 1).sum::<usize>();
+    &placement[..length.saturating_sub(1)]
+}
+
 pub(super) fn reachable(lock: &Value, rows: &Map<String, Value>) -> Result<BTreeSet<String>, ()> {
     let workspaces = lock
         .get("workspaces")
@@ -111,7 +127,7 @@ pub(super) fn reachable(lock: &Value, rows: &Map<String, Value>) -> Result<BTree
             if parent.is_empty() {
                 break None;
             }
-            parent = parent.rsplit_once('/').map_or("", |p| p.0).into();
+            parent = enclosing_placement(&parent).into();
         };
         let Some(placement) = placement else { continue };
         if !reachable.insert(placement.clone()) {
