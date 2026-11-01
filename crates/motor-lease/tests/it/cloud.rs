@@ -230,17 +230,14 @@ fn cloud_guest_disk_pair_requires_both_keys_and_safe_ordered_integers() {
 fn canonical_lease_hash(body_bytes: &str) -> String {
     let body: LeaseRequest = serde_json::from_str(body_bytes).unwrap();
     let wire = serde_json::to_string(&body).unwrap();
-    // LeaseRequest orders the hash members before requester_jwk. Requester keys
-    // can rotate without changing a lease, so the broker excludes the final key.
+    // Requester keys can rotate without changing a lease. The optional memory
+    // statement stays last in the hash, after removing the requester member.
     let requester = format!(
-        ",\"requester_jwk\":{}}}",
+        ",\"requester_jwk\":{}",
         serde_json::to_string(&body.requester_jwk).unwrap()
     );
-    let canonical = format!(
-        "{}}}",
-        wire.strip_suffix(&requester)
-            .expect("requester key is the final wire member")
-    );
+    assert!(wire.contains(&requester));
+    let canonical = wire.replacen(&requester, "", 1);
     sha256_hex(canonical.as_bytes())
 }
 
@@ -667,7 +664,7 @@ fn cloud_lease_reattach_release_and_nullable_usage_settlement_match_fake() {
     missing.as_object_mut().unwrap().remove("mem_peak_mib");
     assert!(serde_json::from_value::<Usage>(missing).is_err());
     let mut unexpected = v["request"]["body"].clone();
-    unexpected["mem_mib"] = json!(16384);
+    unexpected["memory_mib"] = json!(16384);
     assert!(serde_json::from_value::<LeaseRequest>(unexpected).is_err());
 }
 
@@ -862,6 +859,7 @@ fn cloud_no_host_fits_reply_bytes_match_fake() {
     )
     .unwrap();
     broker.knobs.max_vcpus = Some(host["max_job_vcpus"].as_u64().unwrap() as u32);
+    broker.knobs.max_mem_mib = host["max_job_mem_mib"].as_u64();
     let request: LeaseRequest = serde_json::from_value(v["request"]["body"].clone()).unwrap();
     assert_eq!(request.allow_spill, Some(false));
     // Send CLOUD's recorded request bytes, not a re-serialization of them.

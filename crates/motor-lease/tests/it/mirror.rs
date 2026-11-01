@@ -66,6 +66,7 @@ fn cloud_final_files_match_their_manifest_digests() {
         "cloud/bad-request.json",
         "cloud/no-spill-lease.json",
         "cloud/no-host-fits-lease.json",
+        "cloud/stated-memory-lease.json",
         "cloud/explicit-only-leases.json",
         "cloud/boat-lease.json",
         "cloud/job-tokens.json",
@@ -101,7 +102,7 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "609c46e61313f162f1135ba8fcbd9aa1dc14bc5ba33492354075e52366cf7a5a",
+            "cc66d64d66685c34a378ce4c7ed8f04cb07b39d03112f5c65727342c5bc8a98c",
         ),
         (
             "host-draining.json",
@@ -117,7 +118,11 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         ),
         (
             "no-host-fits-lease.json",
-            "a9b710bf74e5e5b385cbeff3119fbeb17e58ff1a314389bf3f29edc34e1f1c2c",
+            "99bb8a43fd54ae8a709670b13df9f2e1b5a1fde0be2d9ae5b526b7d13ff46a26",
+        ),
+        (
+            "stated-memory-lease.json",
+            "c82ae45c2974f948605eab5244154be67a84115056c62eda66667f96d57bc288",
         ),
         (
             "no-spill-lease.json",

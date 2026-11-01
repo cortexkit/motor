@@ -126,7 +126,7 @@ request bytes, not canonical JSON.
 ### Error catalog
 
 Every error body is exactly `{"error":"<code>"}`, with no other member, except `no_host_fits`,
-which is exactly `{"error":"no_host_fits","max_vcpus":<integer>}` in that member order, and
+which is exactly `{"error":"no_host_fits","max_vcpus":<integer>,"max_mem_mib":<integer>}` in that member order, and
 `bad_request`, which may also carry `field` as described below.
 
 **The `bad_request` field.** A 400 `bad_request` raised while validating a request body carries an
@@ -172,7 +172,7 @@ retryable transport failures; so are a usage report's `job_conflict` (the job wa
 from that host) and a replace's 409 refusals. `sandbox_lost` is final for that job: its Boat sandbox stopped or
 failed under the lease, and ck-motor must start a new `job_id`. `no_host_fits` is final for that
 lease body: retrying it never succeeds while the registry is unchanged, so the client routes the
-job elsewhere or asks for at most `max_vcpus`. `account_closed` is final for that account: it was
+job elsewhere or reduces its vCPUs or memory using the reported ceilings. `account_closed` is final for that account: it was
 closed (the customer left) and gets no new lease, ever; see [Account closure](#account-closure).
 Host retries after a consumed counter must use a new counter.
 
@@ -189,31 +189,42 @@ The exact body fields, in canonical order, are:
 
 ```text
 {job_id, vcpus, platform, net, workspace_key_hash, repo_hash,
- placement_hint, avoid_host, timeout_s, requester_jwk, allow_spill}
+ placement_hint, avoid_host, timeout_s, requester_jwk, allow_spill[, mem_mib]}
 ```
 
-`allow_spill` is a required boolean, described under "Per-lease spill policy" below. No other
+`allow_spill` is a required boolean, described under "Per-lease spill policy" below. `mem_mib` is
+optional; the brackets above denote optional presence, not JSON syntax. No other
 members are accepted.
 
 The canonical lease hash uses this exact member order:
 
 ```text
-{ job_id, vcpus, platform, net, workspace_key_hash, repo_hash, placement_hint, avoid_host, timeout_s, allow_spill }
+{ job_id, vcpus, platform, net, workspace_key_hash, repo_hash, placement_hint, avoid_host, timeout_s, allow_spill[, mem_mib] }
 ```
 
 It omits `requester_jwk`. `allow_spill` goes immediately after `timeout_s` with its exact boolean
-value (`true` and `false` hash differently).
+value (`true` and `false` hash differently). Only when present, the original stated `mem_mib`
+is appended after `allow_spill`, before applying the memory floor. Without it, canonical bytes
+and hashes are unchanged. A re-request must repeat its presence and exact value, even when two
+values would give the same effective memory; otherwise it gets the existing 409 `job_conflict`.
 `test-vectors/runners/no-spill-lease.json` records `canonical_lease_bytes`, the exact canonical
 JSON string hashed, for clients to byte-compare. A re-request must repeat the same `allow_spill`
 value or receive 409 `job_conflict` wherever a differing lease hash conflicts.
 
 `vcpus` is 1–64 and `timeout_s` 10–21600 (6 hours). A Boat sandbox takes only a lease whose
 `timeout_s` is at most `BOAT_MAX_TIMEOUT_S` (7200 unless the operator lowers it); a longer lease
-runs only on a registered host (see [Boat placements](#boat-placements)). `net` is boolean. There is no client `mem_mib` field:
-the broker derives memory as `min(16384, max(4096, 3584 × vcpus))` MiB (3584 MiB per vCPU, at
-least 4 GiB and at most 16 GiB) for placement and the token's `mem_mib`, which is the host runner's
-per-job memory cap. Hosts must also accept the previous token figure, `max(16384, 3584 × vcpus)`,
-until the operator removes it.
+runs only on a registered host (see [Boat placements](#boat-placements)). `net` is boolean.
+Optional `mem_mib` is a positive safe integer multiple of 1024 (whole GiB). A wrong type, zero,
+negative or non-multiple is 400 `bad_request` with `field: "mem_mib"`; the common strict JSON
+rules still reject fractional/exponent spellings and unsafe numbers as `field: "body"` before
+schema validation. When stated, effective memory is `max(mem_mib, 2048 × vcpus)` MiB: smaller
+figures are raised to 2 GiB per vCPU, not refused. When absent, the unchanged default is
+`min(16384, max(4096, 3584 × vcpus))` MiB (3584 MiB per vCPU, at least 4 GiB and at most 16 GiB).
+Registered-host placement, the in-flight ledger, the persisted job and the token's `mem_mib`
+(the host runner's per-job cap) all use the effective figure. Re-signs, attaches and moves retain
+the job's stored memory rather than rebuilding it from vCPUs. Hosts must also accept tokens using
+the previous figure, `max(16384, 3584 × vcpus)`, until the operator ends support for those older
+tokens.
 `placement_hint` is JSON `null` or exactly `{host, vm}`, both strings following the common name
 grammar, except that `host` may also carry the `boat:` prefix of a Boat placement, so a client can
 send back the placement it was last given. A matching selectable warm placement is preferred; an
@@ -230,11 +241,11 @@ No other host or Boat is allowed, even with `allow_spill: true`.
 
 Binding refusals apply in this order:
 
-1. A binding host on the wrong platform is **422** `{"error":"no_host_fits","max_vcpus":0}`.
+1. A binding host on the wrong platform is **422** `{"error":"no_host_fits","max_vcpus":0,"max_mem_mib":0}`.
 2. A retired or avoided binding host gives the existing retryable **503**
    `{"error":"no_capacity"}` with `Retry-After: 5`.
 3. For any other active binding host whose recorded ceilings cannot ever fit the lease, the reply
-   is **422** `no_host_fits`, with `max_vcpus` computed from that host alone and no `Retry-After`,
+   is **422** `no_host_fits`, with both ceilings computed from that host alone and no `Retry-After`,
    even if its snapshot is full or stale. Unknown ceilings cannot establish a permanent refusal.
 4. Otherwise, a full, stale, unhealthy, wrong-generation or missing snapshot gives **503**
    `no_capacity` with `Retry-After: 5`.
@@ -283,24 +294,34 @@ After authentication and schema validation, checks proceed in this order:
    spill path in [Boat placements](#boat-placements), and so is `no_host_fits` when a Boat size
    fits the lease.
 
-   **Never fits (`no_host_fits`).** The candidates are every `status = 'active'` host of the
+   **Never fits (`no_host_fits`).** The candidates are every `role = 'placement'`, `status = 'active'` host of the
    lease's platform except explicit-only hosts and the one `avoid_host` names. Health, heartbeat
    age, generation and free
    capacity are ignored: they are temporary, so a host that could fit when idle and healthy
    keeps the answer at `no_capacity`. A candidate can fit when its registry per-job ceilings are
-   both recorded and `max_job_vcpus ≥ vcpus` and `max_job_mem_mib ≥ min(16384, max(4096, 3584 × vcpus))`.
+   both recorded and `max_job_vcpus ≥ vcpus` and `max_job_mem_mib ≥ effective memory`.
+   Selection also enforces each known ceiling, even if the heartbeat reports more free capacity.
    If any candidate's ceiling is unrecorded (NULL), the broker never concludes "never fits" and
    answers exactly as without this rule. With at least one candidate, all ceilings recorded and
-   none able to fit, the reply is **422** `{"error":"no_host_fits","max_vcpus":N}` with no
+   none able to fit, the reply is **422** `{"error":"no_host_fits","max_vcpus":N,"max_mem_mib":M}` with no
    `Retry-After`. Without any candidate (no active host has the platform, or only the avoided host
    does, or all are explicit-only without a binding hint) the codes above apply unchanged. When
    the lease allows spill, Boat is available for its
    platform (enabled, configured, with a current image, and `timeout_s` at most
    `BOAT_MAX_TIMEOUT_S`) and a Boat size fits, the lease spills
    instead. `N` is the largest vCPU count that could be placed: for each candidate, the largest
-   `v` whose `v` and `min(16384, max(4096, 3584 × v))` both fit its ceilings (0 if none), maximized over
-   candidates; when the lease allows spill and Boat is available for its platform, also the
-   largest Boat size's `vcpus`. A `no_host_fits` refusal makes no Boat call and leaves no
+   `v` whose `v` and effective memory at `v` both fit its ceilings (0 if none), maximized over
+   candidates, keeping the original stated memory if present. When spill is allowed and Boat is
+   available as above, also maximize over Boat sizes: without stated memory a size contributes
+   its `vcpus`; with stated memory it contributes the largest `v ≤ size.vcpus` for which
+   `max(stated, 2048 × v) ≤ size.mem_mib`, or 0 if none.
+   `M` is independently the largest `max_job_mem_mib` among those candidate hosts and, only when
+   spill is allowed and Boat is available as above, the largest configured usable `mem_mib` among
+   its sizes. Do not filter these memory ceilings by the requested vCPUs or memory; the two
+   reported maxima may describe different candidates and do not promise that their combination
+   fits. A binding wrong-platform host has no eligible candidate and reports both as 0.
+   Every `no_host_fits` reply includes both members, including vCPU-only refusals.
+   A `no_host_fits` refusal makes no Boat call and leaves no
    `TenantDO` job row, reservation, provisioning hold, pool claim or spill record, so a
    re-request of the same body gets the same answer. `test-vectors/runners/no-host-fits-lease.json`
    pins one such request and its exact reply bytes.
@@ -663,7 +684,7 @@ warm affinity, and ordinary Boat spill proceeds normally. A lease whose `placeme
 names the draining host is a canary: the hint is binding, exactly as for `explicit_only`. It can
 use that host, including a cold VM, but waits if the host is full or otherwise unavailable; it
 never falls back to another host or Boat. Draining hosts still count for the registry's
-`no_host_fits` / `max_vcpus` ceiling check because draining is temporary. A job only a draining
+`no_host_fits` ceiling check (both maxima) because draining is temporary. A job only a draining
 host can fit receives retryable `no_capacity` with `Retry-After`, not `no_host_fits` (and may
 spill when allowed). The independent operator `explicit_only` override is unchanged.
 
@@ -672,7 +693,8 @@ host holding more than 64 reports only the 64 most recent workspaces.
 
 `free_vcpus` and `free_mem_mib` answer one question for placement: can this host take one more job
 of a given size now? The broker places a lease on a host only if `free_vcpus ≥ vcpus` and
-`free_mem_mib ≥ min(16384, max(4096, 3584 × vcpus))`. It reads them for nothing else: billing, `no_host_fits`
+`free_mem_mib ≥ effective memory`, after the ledger's subtraction, and each known per-job ceiling
+also fits the request. It reads free capacity for nothing else: billing, `no_host_fits`
 and pricing use the registry ceilings and the usage reports instead. A host reports them for the
 machine that runs its jobs:
 
@@ -729,11 +751,18 @@ time and snapshots.
 The exact body, also its canonical hash order, is:
 
 ```text
-{job_id, vcpus, started_at_ms, ended_at_ms, mem_peak_mib, egress_bytes, outcome}
+{job_id, vcpus, started_at_ms, ended_at_ms, mem_peak_mib, egress_bytes, outcome[, mem_working_peak_mib]}
 ```
 
-`vcpus` is 1–64. Times, `mem_peak_mib` and `egress_bytes` are non-negative safe integers;
-`ended_at_ms ≥ started_at_ms`. `outcome` is exactly `exit`, `signal`, `timeout`, `cancelled` or
+`vcpus` is 1–64. Times are non-negative safe integers; `ended_at_ms ≥ started_at_ms`.
+`mem_peak_mib` and `egress_bytes` are non-negative safe integers or null when not attributable.
+`mem_peak_mib` remains the job's peak memory including file cache. The optional
+`mem_working_peak_mib` is the job's real working-set peak in MiB: anonymous + shmem + kernel
+memory, sampled from the job cgroup's `memory.stat`, excluding file cache. It is a non-negative
+safe integer or null when not attributable, and older hosts may omit it. When present it is
+appended after `outcome` in the canonical hash order, including an explicit null; omission keeps
+the original hash bytes. Changing, adding or removing the member on a replay is a
+409 `usage_conflict`. `outcome` is exactly `exit`, `signal`, `timeout`, `cancelled` or
 `lost`. Outcome and memory/egress measurements are audit-only. The host must cap its own report
 at `max_s` (`ended_at_ms − started_at_ms ≤ max_s × 1000`); independently the broker caps
 settlement at the reservation even if the host over-reports.
@@ -863,7 +892,7 @@ the broker returns that refusal unchanged (including its status, body and Retry-
 claims or creates a Boat sandbox, makes no Boat calls and leaves no spill record for that lease.
 For example, a full registered fleet returns 503 `no_capacity` with Retry-After `5`, and a job
 larger than every registered host's per-job ceiling returns 422 `no_host_fits` whose
-`max_vcpus` counts registered hosts only.
+`max_vcpus` and `max_mem_mib` count registered hosts only.
 `true` allows ordinary spill behavior. This is per lease, not per tenant, so
 callers sharing a fleet account can choose independently.
 It does not override the Boat enablement, platform, size or budget gates.
@@ -873,11 +902,14 @@ most `BOAT_MAX_TIMEOUT_S` (default 7200; the deploy preflight requires 10 to 720
 own auto-stop is capped at three hours and must outlast the run and its deadline grace), and
 `BOAT_SIZES`
 (the usable `{type, vcpus, mem_mib}` measured inside each Boat size) has a size with
-`vcpus ≥ job.vcpus`; the smallest such size is used. Memory does not decide eligibility. No
+`vcpus ≥ job.vcpus`; without a stated `mem_mib`, the smallest such size is used, unchanged.
+With stated memory, a size must also have usable `mem_mib ≥ max(stated, 2048 × job.vcpus)`;
+the smallest qualifying size is used. In both cases the Boat token keeps that size's configured
+usable memory, not the registered-host allocation, because the job owns the sandbox. No
 fitting size is 503 `no_capacity`, or 422 `no_host_fits` when no registered host could ever fit
 the lease either (see step 3 of the lease order). A lease above `BOAT_MAX_TIMEOUT_S` never goes to
 Boat: it gets the registered-host answer unchanged, 503 `no_capacity` when no host
-has room now, or 422 `no_host_fits` with `max_vcpus` counting registered hosts only when no host's
+has room now, or 422 `no_host_fits` with both ceilings counting registered hosts only when no host's
 ceiling could ever fit it.
 
 **Order.** The budget candidate is computed first, exactly as for hosts; below 10 seconds the
@@ -1097,7 +1129,8 @@ inputs and appending the lease's workspace hash after `purpose`. The existing ve
 switch off. `test-vectors/runners/lease.json` pins the lease request and exact reply, including
 the lease id and SPKI hash.
 `test-vectors/runners/host-signature.json` pins the exact host signature input and signature.
-`test-vectors/runners/usage-settlement.json` pins the report and settlement reply.
+`test-vectors/runners/usage-settlement.json` pins the report and settlement reply, plus accepted
+reports with a working-set peak and with an explicit null working-set peak.
 `test-vectors/runners/settled-reattach.json` pins a reattach for a job its host already settled by
 usage report: the 200 `attach` reply with the lease's unchanged fields, and the identical tenant
 read before and after it.
@@ -1109,6 +1142,10 @@ authorized_keys line.
 `test-vectors/runners/no-spill-lease.json` and `test-vectors/runners/no-host-fits-lease.json`
 pin the registered-host-only refusals: a full host's 503 `no_capacity`, and the 422
 `no_host_fits` for a job above the only host's per-job ceiling.
+
+`test-vectors/runners/stated-memory-lease.json` pins 4-vCPU leases stating 12288 MiB and 2048 MiB
+(tokens carry 12288 and 8192 respectively), their lease hashes, a malformed `mem_mib` refusal and
+a `no_host_fits` reply carrying `max_mem_mib`.
 
 `test-vectors/runners/account-closure.json` pins a closed account: its lease refused with the
 final 403 `account_closed` (no `Retry-After`), and a signed heartbeat whose snapshot reports warm

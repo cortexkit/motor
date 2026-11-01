@@ -29,6 +29,8 @@ pub struct Knobs {
     /// lease asking for more is answered 422 `no_host_fits` with this number
     /// as `max_vcpus`, before any reservation is made.
     pub max_vcpus: Option<u32>,
+    /// Memory ceiling reported alongside a permanent vCPU refusal.
+    pub max_mem_mib: Option<u64>,
     /// Account subjects (`acct:<ULID>`) whose accounts are closed. A new lease
     /// for the configured subject is then refused 403 `account_closed`, while
     /// jobs it already holds keep their normal answers; heartbeat replies list
@@ -218,6 +220,12 @@ impl FakeBroker {
     }
 
     fn lease(&mut self, request: LeaseRequest, now_s: u64) -> BrokerReply {
+        if request
+            .mem_mib
+            .is_some_and(|mib| mib == 0 || mib > 9_007_199_254_740_991 || mib % 1024 != 0)
+        {
+            return BrokerReply::json(400, json!({"error": "bad_request", "field": "mem_mib"}));
+        }
         // The broker requires an explicit spill policy on every lease body and
         // refuses one without it before looking up or claiming the job.
         if request.allow_spill.is_none()
@@ -266,7 +274,8 @@ impl FakeBroker {
             if let Some(max_vcpus) = self.knobs.max_vcpus.filter(|max| request.vcpus > *max) {
                 return BrokerReply::json(
                     422,
-                    json!({"error": "no_host_fits", "max_vcpus": max_vcpus}),
+                    json!({"error": "no_host_fits", "max_vcpus": max_vcpus,
+                        "max_mem_mib": self.knobs.max_mem_mib.unwrap_or_else(|| job_memory_mib(max_vcpus))}),
                 );
             }
             // The fake serves a single host. When the lease avoids it, nothing
@@ -412,7 +421,10 @@ impl FakeBroker {
             iat,
             exp,
             vcpus: job.request.vcpus,
-            mem_mib: job_memory_mib(job.request.vcpus),
+            mem_mib: job.request.mem_mib.map_or_else(
+                || job_memory_mib(job.request.vcpus),
+                |stated| stated.max(2048 * u64::from(job.request.vcpus)),
+            ),
             platform: job.request.platform.clone(),
             net: job.request.net,
             placement: self.config.placement.clone(),
@@ -642,6 +654,9 @@ fn lease_identity(request: &LeaseRequest) -> Value {
     });
     if let Some(allow_spill) = request.allow_spill {
         identity["allow_spill"] = json!(allow_spill);
+    }
+    if let Some(mem_mib) = request.mem_mib {
+        identity["mem_mib"] = json!(mem_mib);
     }
     identity
 }

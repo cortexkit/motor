@@ -502,6 +502,12 @@ pub(crate) fn validate(request: &RunRequest) -> Result<(), Error> {
     if !LEASE_VCPUS.contains(&lease_vcpus(request)) {
         return Err(Error::RequestInvalid(RequestField::new("vcpus")));
     }
+    if request
+        .memory_mib
+        .is_some_and(|mib| mib == 0 || mib > 9_007_199_254_740_991 || mib % 1024 != 0)
+    {
+        return Err(Error::RequestInvalid(RequestField::new("memory_mib")));
+    }
     let paths = [
         &request.workspace_key,
         &request.repository_root,
@@ -530,6 +536,10 @@ pub(crate) fn validation_detail(request: &RunRequest, error: Error) -> String {
                 LEASE_VCPUS.end()
             )
         }
+        Error::RequestInvalid(Some(field)) if field.as_str() == "memory_mib" => format!(
+            "memory_mib={}: set a positive whole number of GiB (a multiple of 1024 MiB)",
+            request.memory_mib.unwrap_or_default()
+        ),
         Error::Path => {
             let invalid = [
                 ("workspace_key", &request.workspace_key),
@@ -594,7 +604,8 @@ fn spill_wait_budget_ms(job: &crate::storage::Job) -> u64 {
 }
 /// The first leased resource whose token claim differs from what ck-motor
 /// requested, as (field, expected, actual). A first-party host's token states
-/// one of the broker's per-job figures, the ones
+/// the broker-raised statement when memory was specified, otherwise one of
+/// the broker's default per-job figures, the ones
 /// [`motor_lease::first_party_mem_mib_accepted`] admits. A Boat token states
 /// the whole sandbox's usable memory, which must lie in
 /// [`motor_lease::boat_memory_range`]. Each check is the one the host or
@@ -607,9 +618,15 @@ fn resource_mismatch(
     let (memory_ok, expected) = if boat {
         let range = motor_lease::boat_memory_range(body.vcpus);
         (
-            range.contains(&claims.mem_mib),
+            range.contains(&claims.mem_mib)
+                && body
+                    .mem_mib
+                    .is_none_or(|mib| claims.mem_mib >= mib.max(2048 * u64::from(body.vcpus))),
             format!("{}..={}", range.start(), range.end()),
         )
+    } else if let Some(stated) = body.mem_mib {
+        let effective = stated.max(2048 * u64::from(body.vcpus));
+        (claims.mem_mib == effective, effective.to_string())
     } else {
         (
             motor_lease::first_party_mem_mib_accepted(body.vcpus, claims.mem_mib),
@@ -688,6 +705,11 @@ pub(crate) fn invalid_lease_field(body: &LeaseRequest) -> Option<&'static str> {
         Some("requester_jwk")
     } else if body.allow_spill.is_none() {
         Some("allow_spill")
+    } else if body
+        .mem_mib
+        .is_some_and(|mib| mib == 0 || mib > 9_007_199_254_740_991 || mib % 1024 != 0)
+    {
+        Some("mem_mib")
     } else {
         None
     }
@@ -750,6 +772,7 @@ fn lease_body(
         timeout_s: request.timeout.ok_or(Error::NoTimeout)?,
         requester_jwk,
         allow_spill,
+        mem_mib: request.memory_mib,
     })
 }
 fn reattach_body(key: &SigningKey) -> ReattachRequest {
