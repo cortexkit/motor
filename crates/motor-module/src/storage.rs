@@ -1107,7 +1107,6 @@ impl Storage {
                 return;
             };
             if job.hosted.is_some() != hosted
-                || (job.pending_cancel && !hosted)
                 || job
                     .hosted
                     .as_ref()
@@ -1139,8 +1138,10 @@ impl Storage {
                     }
                 }
                 hosted.hosted_no_fallback = true;
-                job.pending_cancel = false;
             }
+            // Callers retire only past the job's deadline, when the runner has
+            // already ended it, so an undelivered cancel is moot.
+            job.pending_cancel = false;
             job.local_terminal = Some(terminal);
             job.terminal_observed_at_ms = Some(now);
             job.retain_until_ms = Some(now.saturating_add(RETENTION_MS));

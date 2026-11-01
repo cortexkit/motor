@@ -185,8 +185,10 @@ impl Motor {
                     continue;
                 }
                 let deadline = deadline(*id, job);
+                // An undelivered cancel doesn't keep a direct job here: past its
+                // deadline the runner has already ended it, so the cancel can't
+                // matter, and probing it would continue forever.
                 let retirable = now >= deadline
-                    && !job.pending_cancel
                     && job.hosted.is_none()
                     && !self.storage.has_live_stream(*id)
                     && !active.contains_key(id);
@@ -448,6 +450,39 @@ mod tests {
             .machine_jobs_health_at(now + FAILURE_HORIZON_MS + 15_000)
             .await;
         assert_eq!(visits.load(std::sync::atomic::Ordering::SeqCst), attempts);
+    }
+
+    #[tokio::test]
+    async fn expired_direct_job_with_undelivered_cancel_backs_off_and_retires() {
+        // A cancel recorded for a direct job whose runner is gone must not
+        // keep the job probed every health tick forever.
+        let scratch = cortexkit_test_support::ScratchDir::new("health-pending-cancel");
+        let visits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let motor = Motor::with_connector(
+            crate::Config::default(),
+            &scratch,
+            Arc::new(UnreachablePeer(visits.clone())),
+        )
+        .unwrap();
+        let id = Uuid::now_v7();
+        motor.storage.create(id, 60, None, None, false).unwrap();
+        motor.storage.cancel(id, true).unwrap();
+        let now = crate::hosted::now_s() * 1000 + LEGACY_JOB_HORIZON_MS + 1000;
+        motor.machine_jobs_health_at(now).await;
+        let attempts = visits.load(std::sync::atomic::Ordering::SeqCst);
+        motor.machine_jobs_health_at(now + 15_000).await;
+        assert_eq!(visits.load(std::sync::atomic::Ordering::SeqCst), attempts);
+        motor.machine_jobs_health_at(now + 15 * 60_000).await;
+        motor.machine_jobs_health_at(now + 30 * 60_000).await;
+        motor.machine_jobs_health_at(now + FAILURE_HORIZON_MS).await;
+        let job = motor.storage.job(id).unwrap();
+        assert!(!job.pending_cancel);
+        assert!(job
+            .local_terminal
+            .unwrap()
+            .refusal_detail
+            .unwrap()
+            .contains("runner unreachable past the job's deadline"));
     }
     impl crate::Connector for StatusPeer {
         fn connect(
