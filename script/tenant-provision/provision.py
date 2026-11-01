@@ -42,6 +42,13 @@ U32_MAX = 2**32 - 1
 # Between it and the runner's higher eviction threshold the runner deletes idle
 # workspaces and caches by design; nothing fails there.
 RUNNER_DEFAULT_FLOOR = 128 * 1024**3
+# The tenant runner starts evicting idle workspaces once free space drops below
+# this share of its disk (its refusal floor stays at a tenth). While one host
+# drains for an update, the other carries every job; on 31 Oct that wrote
+# 10-13 GiB a minute into one tenant, faster than eviction starting at twice
+# the floor could keep up. A larger buffer costs warm workspaces, which matter
+# little: on 31 Oct a cold placement ran a median 3 s longer than a warm one.
+EVICTION_GOAL_PERCENT = 35
 # The VMM ranks below jobs (+900) and above runners (-900) with the kernel's
 # OOM killer, so a host OOM prefers a job over the tenant's VM.
 VMM_OOM_SCORE_ADJ = -500
@@ -387,6 +394,7 @@ def runner_args(c):
             f"--max-weight {weight} --rustc-slots {weight} "
             f"--sccache-size-gib {min(200, c['disk_quota_bytes'] // (4 * 1024**3))} "
             f"--free-space-floor-bytes {c['disk_quota_bytes'] // 10} "
+            f"--free-space-eviction-bytes {c['disk_quota_bytes'] * EVICTION_GOAL_PERCENT // 100} "
             f"{cache}"
             "--workspace-root /Users --owned-workspace-root /Users "
             "--workspace-root /home --owned-workspace-root /home\n")

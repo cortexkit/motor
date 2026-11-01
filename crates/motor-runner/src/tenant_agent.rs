@@ -387,6 +387,11 @@ impl RunnerArgs {
                 "--free-space-floor-bytes" => {
                     floor = Some(value.parse().map_err(io::Error::other)?)
                 }
+                // Provisioning sets the eviction goal above the floor so a host
+                // can carry the fleet's writes while the other drains.
+                "--free-space-eviction-bytes" => {
+                    value.parse::<u64>().map_err(io::Error::other)?;
+                }
                 "--workspace-root" => roots.push(PathBuf::from(value)),
                 "--owned-workspace-root" => owned.push(PathBuf::from(value)),
                 "--state-root" if value == "/tenant/state" => {}
@@ -1172,6 +1177,26 @@ mod tests {
             .any(|words| words == ["--remote-cache", "true"]));
         for value in ["false", "1", ""] {
             let invalid = format!("{TEST_ARGS} --remote-cache {value}");
+            assert!(RunnerArgs::parse(&invalid).is_err(), "{invalid}");
+        }
+    }
+
+    /// Provisioning's eviction goal reaches the runner unchanged; a value that
+    /// isn't a byte count is refused.
+    #[test]
+    fn eviction_goal_is_passed_to_the_runner() {
+        let with_goal = format!("{TEST_ARGS} --free-space-eviction-bytes 7516192768");
+        let args = RunnerArgs::parse(&with_goal).unwrap();
+        let command = runner_command(&args, Path::new("/usr/local/bin/motor-runner"), &[]);
+        let words: Vec<_> = command
+            .get_args()
+            .map(|word| word.to_str().unwrap())
+            .collect();
+        assert!(words
+            .windows(2)
+            .any(|words| words == ["--free-space-eviction-bytes", "7516192768"]));
+        for value in ["-1", "35%", ""] {
+            let invalid = format!("{TEST_ARGS} --free-space-eviction-bytes {value}");
             assert!(RunnerArgs::parse(&invalid).is_err(), "{invalid}");
         }
     }

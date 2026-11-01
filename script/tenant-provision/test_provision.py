@@ -594,7 +594,7 @@ class ProvisionTests(unittest.TestCase):
 
     def test_runner_args_small_disk_uses_bytes_and_quarter_cache(self):
         args = p.runner_args(config())
-        for option in ["--max-weight 2", "--rustc-slots 2", "--sccache-size-gib 5", "--free-space-floor-bytes 2147483648", "--owned-workspace-root /Users", "--owned-workspace-root /home"]:
+        for option in ["--max-weight 2", "--rustc-slots 2", "--sccache-size-gib 5", "--free-space-floor-bytes 2147483648", "--free-space-eviction-bytes 7516192768", "--owned-workspace-root /Users", "--owned-workspace-root /home"]:
             self.assertIn(option, args)
         self.assertIn("--workspace-root /home --owned-workspace-root /home", args)
 
