@@ -41,28 +41,31 @@ impl Check {
     }
 }
 
-// This check deliberately has no access to job storage or the hosted switch.
-// Only the vault mints the bearer; neither it nor broker response text is returned.
-pub(crate) async fn check(tokens: Option<&Arc<AccountTokens>>, config: &crate::Config) -> Check {
-    let token = match tokens {
-        Some(tokens) => tokens.bearer().await,
-        None => Err(Error::AccountNotFound),
-    };
-    let token = match token {
-        Ok(token) => token,
-        Err(error) => return Check::refusal(error),
-    };
-    let claims = token
+fn token_claims(token: &str) -> Option<Claims> {
+    token
         .split('.')
         .nth(1)
         .and_then(|payload| URL_SAFE_NO_PAD.decode(payload).ok())
-        .and_then(|payload| serde_json::from_slice::<Claims>(&payload).ok());
-    let Some(claims) = claims.filter(|c| {
-        c.aud == "cortexkit-runners"
-            && !c.account.is_empty()
-            && c.iat < c.exp
-            && c.exp > super::now_s()
-    }) else {
+        .and_then(|payload| serde_json::from_slice::<Claims>(&payload).ok())
+        .filter(|c| {
+            c.aud == "cortexkit-runners"
+                && !c.account.is_empty()
+                && c.iat < c.exp
+                && c.exp > super::now_s()
+        })
+}
+
+// This check deliberately has no access to job storage or the hosted switch.
+// Only the vault mints the bearer; neither it nor broker response text is returned.
+pub(crate) async fn check(tokens: Option<&Arc<AccountTokens>>, config: &crate::Config) -> Check {
+    let Some(tokens) = tokens else {
+        return Check::refusal(Error::AccountNotFound);
+    };
+    let mut token = match tokens.bearer().await {
+        Ok(token) => token,
+        Err(error) => return Check::refusal(error),
+    };
+    let Some(mut claims) = token_claims(&token) else {
         return Check::refusal(Error::AccountInvalid);
     };
     let broker_status = if let Some(url) = &config.broker_url {
@@ -71,14 +74,35 @@ pub(crate) async fn check(tokens: Option<&Arc<AccountTokens>>, config: &crate::C
             .timeout(super::account::BROKER_TIMEOUT)
             .build()
         {
-            Ok(client) => client
-                .post(format!("{}/v1/leases", url.trim_end_matches('/')))
-                .bearer_auth(&token)
-                .json(&serde_json::json!({}))
-                .send()
-                .await
-                .ok()
-                .map(|reply| reply.status().as_u16()),
+            Ok(client) => {
+                let mut status = None;
+                for attempt in 0..2 {
+                    status = client
+                        .post(format!("{}/v1/leases", url.trim_end_matches('/')))
+                        .bearer_auth(&token)
+                        .json(&serde_json::json!({}))
+                        .send()
+                        .await
+                        .ok()
+                        .map(|reply| reply.status().as_u16());
+                    if status != Some(401) {
+                        break;
+                    }
+                    tokens.invalidate(&token).await;
+                    if attempt == 1 {
+                        return Check::refusal(Error::AccountInvalid);
+                    }
+                    token = match tokens.bearer().await {
+                        Ok(token) => token,
+                        Err(error) => return Check::refusal(error),
+                    };
+                    claims = match token_claims(&token) {
+                        Some(claims) => claims,
+                        None => return Check::refusal(Error::AccountInvalid),
+                    };
+                }
+                status
+            }
             Err(_) => None,
         }
     } else {

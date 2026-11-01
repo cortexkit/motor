@@ -1,14 +1,17 @@
-//! Account bearers are requested per broker call. Only the vault owns their cache.
+//! Cache the short-lived account bearer in this process's memory only, with at
+//! least 90 seconds left for broker calls. ck-motor already holds this bearer
+//! while making a call; refresh tokens stay in the vault, never in this cache.
 use super::Error;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{future::Future, io, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 use subc_client_rs::{CallOptions, ConsumerIdentity, ConsumerOptions, SubcConsumer};
 use subc_protocol::{BindIdentity, RouteTarget};
+use tokio::sync::Mutex;
 
 pub(super) const BROKER_TIMEOUT: Duration = Duration::from_secs(15);
 // Cover the HTTP deadline with room for dispatch between the vault and broker.
-const MIN_TTL_MS: u64 = 30_000;
+const MIN_TTL_MS: u64 = 90_000;
 const AUDIENCE: &str = "cortexkit-runners";
 
 type Reply<'a> = Pin<Box<dyn Future<Output = io::Result<Value>> + Send + 'a>>;
@@ -17,9 +20,10 @@ pub(crate) trait Target: Send + Sync {
 }
 
 /// The account-token transport, separate from SSH credentials and saved routes.
-/// It holds no bearer; every broker request consults the vault again.
+/// Its bearer cache is memory-only and shared by callers in this process.
 pub struct AccountTokens {
     target: Arc<dyn Target>,
+    cached: Mutex<Option<Token>>,
 }
 impl AccountTokens {
     pub fn new(connection: PathBuf, workspace: PathBuf, module_id: String) -> Self {
@@ -29,13 +33,23 @@ impl AccountTokens {
                 workspace,
                 module_id,
             }),
+            cached: Mutex::new(None),
         }
     }
     #[cfg(test)]
     pub(crate) fn with_target(target: Arc<dyn Target>) -> Self {
-        Self { target }
+        Self {
+            target,
+            cached: Mutex::new(None),
+        }
     }
     pub(crate) async fn bearer(&self) -> Result<String, Error> {
+        // Hold the lock through refresh so concurrent callers share one fetch.
+        let mut cached = self.cached.lock().await;
+        if let Some(token) = cached.as_ref().filter(|token| token.fresh()) {
+            return Ok(token.jwt.clone());
+        }
+        *cached = None;
         let reply = self
             .target
             .request(json!({
@@ -49,7 +63,17 @@ impl AccountTokens {
                 }
                 _ => Error::AccountTransient(None),
             })?;
-        decode(reply)
+        let token = decode(reply)?;
+        let bearer = token.jwt.clone();
+        *cached = Some(token);
+        Ok(bearer)
+    }
+    pub(super) async fn invalidate(&self, bearer: &str) {
+        let mut cached = self.cached.lock().await;
+        // A delayed 401 must not discard a different caller's refreshed bearer.
+        if cached.as_ref().is_some_and(|token| token.jwt == bearer) {
+            *cached = None;
+        }
     }
 }
 
@@ -122,7 +146,16 @@ struct Token {
     audience: String,
     account: String,
 }
-fn decode(reply: Value) -> Result<String, Error> {
+impl Token {
+    fn fresh(&self) -> bool {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        u128::from(self.expires_at_ms) >= now_ms + u128::from(MIN_TTL_MS)
+    }
+}
+fn decode(reply: Value) -> Result<Token, Error> {
     let result = reply.get("result").ok_or(Error::AccountInvalid)?;
     if let Some(error) = result.get("error") {
         if !error.get("code").is_some_and(Value::is_string) {
@@ -140,10 +173,6 @@ fn decode(reply: Value) -> Result<String, Error> {
         });
     }
     let token: Token = serde_json::from_value(result.clone()).map_err(|_| Error::AccountInvalid)?;
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
     if token.audience != AUDIENCE
         || token.account.is_empty()
         || token.jwt.is_empty()
@@ -151,11 +180,11 @@ fn decode(reply: Value) -> Result<String, Error> {
             .jwt
             .bytes()
             .any(|byte| byte.is_ascii_control() || byte == b' ')
-        || u128::from(token.expires_at_ms) < now_ms + u128::from(MIN_TTL_MS)
+        || !token.fresh()
     {
         return Err(Error::AccountInvalid);
     }
-    Ok(token.jwt)
+    Ok(token)
 }
 
 #[cfg(test)]

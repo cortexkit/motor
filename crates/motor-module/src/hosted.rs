@@ -853,12 +853,12 @@ impl Client {
             }
         }
     }
-    async fn post_authorized<T: Serialize, R: serde::de::DeserializeOwned>(
+    async fn post_once<T: Serialize>(
         &self,
         path: &str,
         body: &T,
-        bearer: String,
-    ) -> Result<R, Error> {
+        bearer: &str,
+    ) -> Result<reqwest::Response, Error> {
         *self.broker_failure.lock().unwrap() = Some("broker HTTP request pending".into());
         *self.broker_status.lock().unwrap() = None;
         let reply = self
@@ -886,6 +886,40 @@ impl Client {
             http_status = reply.status().as_u16(),
             "hosted broker replied"
         );
+        Ok(reply)
+    }
+    async fn post_with_refresh<T: Serialize>(
+        &self,
+        path: &str,
+        body: &T,
+        mut bearer: String,
+    ) -> Result<reqwest::Response, Error> {
+        let mut reply = self.post_once(path, body, &bearer).await?;
+        if self.route.token_source == BrokerTokenSource::CkAccount
+            && reply.status() == reqwest::StatusCode::UNAUTHORIZED
+        {
+            let tokens = self.account_tokens.as_ref().ok_or(Error::AccountNotFound)?;
+            tokens.invalidate(&bearer).await;
+            drop(reply);
+            bearer = tokens.bearer().await?;
+            reply = self.post_once(path, body, &bearer).await?;
+            if reply.status() == reqwest::StatusCode::UNAUTHORIZED {
+                tokens.invalidate(&bearer).await;
+                *self.broker_status.lock().unwrap() = Some(401);
+                *self.broker_failure.lock().unwrap() =
+                    Some("HTTP 401, account bearer rejected".into());
+                return Err(Error::AccountInvalid);
+            }
+        }
+        Ok(reply)
+    }
+    async fn post_authorized<T: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &T,
+        bearer: String,
+    ) -> Result<R, Error> {
+        let reply = self.post_with_refresh(path, body, bearer).await?;
         if reply.status().as_u16() == 202 && path == "/v1/leases" {
             let provisioning: ProvisioningReply = reply.json().await.map_err(|_| Error::Broker)?;
             return if provisioning.status == "provisioning" {
