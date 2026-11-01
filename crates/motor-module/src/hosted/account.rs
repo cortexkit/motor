@@ -68,6 +68,14 @@ impl AccountTokens {
         *cached = Some(token);
         Ok(bearer)
     }
+    /// A bearer fetched from the vault now, ignoring the cache, for the operator
+    /// check: it must report what the vault answers today, so a revoked grant
+    /// can't look healthy until a cached bearer expires. The result is cached
+    /// for later broker calls.
+    pub(super) async fn fresh_bearer(&self) -> Result<String, Error> {
+        self.cached.lock().await.take();
+        self.bearer().await
+    }
     pub(super) async fn invalidate(&self, bearer: &str) {
         let mut cached = self.cached.lock().await;
         // A delayed 401 must not discard a different caller's refreshed bearer.

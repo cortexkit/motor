@@ -61,7 +61,7 @@ pub(crate) async fn check(tokens: Option<&Arc<AccountTokens>>, config: &crate::C
     let Some(tokens) = tokens else {
         return Check::refusal(Error::AccountNotFound);
     };
-    let mut token = match tokens.bearer().await {
+    let mut token = match tokens.fresh_bearer().await {
         Ok(token) => token,
         Err(error) => return Check::refusal(error),
     };
