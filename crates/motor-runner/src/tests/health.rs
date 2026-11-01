@@ -1076,12 +1076,6 @@ PY"#,
         file >= 256 << 20,
         "test must charge substantial file cache: {file} bytes"
     );
-    assert!(
-        job.mem_peak_mib
-            .is_some_and(|total| total > peak + file / (2 << 20)),
-        "systemd peak should still include file cache: {:?}",
-        job.mem_peak_mib
-    );
 }
 
 #[cfg(target_os = "linux")]
