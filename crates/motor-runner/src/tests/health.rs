@@ -1016,17 +1016,37 @@ os.unlink('working-set-cache')
 PY"#,
     );
     f.submit(&runner, &request, &bytes);
-    until(|| job_output(&runner, request.job_id).contains("anonymous-ready")).await;
+    runner.tick().unwrap();
+    until_memory_job_with_diagnostics(&runner, request.job_id, "anonymous allocation", || {
+        job_output(&runner, request.job_id).contains("anonymous-ready")
+            || runner.core.inner.lock().unwrap().jobs[&request.job_id]
+                .terminal
+                .is_some()
+    })
+    .await;
+    assert!(
+        job_output(&runner, request.job_id).contains("anonymous-ready"),
+        "job ended before allocating: {}",
+        memory_job_diagnostics(&runner, request.job_id)
+    );
     let before = runner.core.inner.lock().unwrap().jobs[&request.job_id]
         .mem_working_peak_mib
         .get()
         .expect("sampler must observe the anonymous allocation");
     assert!((512..=640).contains(&before), "anonymous peak {before} MiB");
+    until_memory_job_with_diagnostics(&runner, request.job_id, "terminal", || {
+        runner.core.inner.lock().unwrap().jobs[&request.job_id]
+            .terminal
+            .is_some()
+    })
+    .await;
     assert_eq!(
         terminal(&runner, request.job_id).await.outcome,
-        Outcome::Exit { code: 0 }
+        Outcome::Exit { code: 0 },
+        "{}",
+        memory_job_diagnostics(&runner, request.job_id)
     );
-    until(|| {
+    until_memory_job_with_diagnostics(&runner, request.job_id, "launcher summary", || {
         !read_json::<Job>(&runner.record_path(request.job_id))
             .unwrap()
             .memory_accounting_pending
@@ -1059,4 +1079,52 @@ PY"#,
         job.mem_peak_mib
     );
     eprintln!("job={} vcpus={} mem_working_peak_mib={peak} anonymous_peak_mib={before} mem_peak_mib={:?} file_cache_bytes={file}", job.id, job.weight, job.mem_peak_mib);
+}
+
+#[cfg(target_os = "linux")]
+async fn until_memory_job_with_diagnostics(
+    runner: &Runner,
+    id: Uuid,
+    phase: &str,
+    mut predicate: impl FnMut() -> bool,
+) {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while !predicate() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "memory job timed out during {phase}: {}",
+            memory_job_diagnostics(runner, id)
+        )
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn memory_job_diagnostics(runner: &Runner, id: Uuid) -> String {
+    let live = {
+        let inner = runner.core.inner.lock().unwrap();
+        let job = &inner.jobs[&id];
+        format!("state={:?} terminal={:?} mem_working_peak_mib={:?} mem_peak_mib={:?} monitoring_error={:?}",
+            job.state, job.terminal, job.mem_working_peak_mib.get(), job.mem_peak_mib, job.monitoring_error)
+    };
+    let recorded = read_json::<Job>(&runner.record_path(id)).map(|job| {
+        (
+            job.mem_working_peak_mib.get(),
+            job.mem_peak_mib,
+            job.memory_accounting_pending,
+        )
+    });
+    let output = job_output(runner, id);
+    let tail: String = output
+        .chars()
+        .rev()
+        .take(4096)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("job={id} {live}; recorded[working,existing,pending]={recorded:?}; stdout/stderr tail={tail:?}; {}", runner_diagnostics(runner))
 }
