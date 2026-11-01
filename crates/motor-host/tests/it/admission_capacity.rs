@@ -18,6 +18,161 @@ fn refused<T: std::fmt::Debug>(result: Result<T, Error>, reason: Refusal) {
     );
 }
 
+fn admit(h: &mut Host, c: Claims, seq: u64, now: u64) {
+    let job = c.jti.clone();
+    let tenant = h.binding(&c).unwrap().tenant.clone();
+    let (id, _) = h.claim(c, now).unwrap();
+    h.delivered(id).unwrap();
+    h.event(
+        &tenant,
+        &event(seq, TenantEventKind::Admitted, Some(&job), None),
+        now,
+    )
+    .unwrap();
+}
+
+#[test]
+fn workspace_blocked_admitted_leases_release_permits_until_unblocked_or_started() {
+    let now = NOW * 1000;
+    for transition in [TenantEventKind::Terminal, TenantEventKind::Started] {
+        let mut h = permit_host();
+        h.guest_ready("tenant", 1).unwrap();
+        let mut first = claims(JOB);
+        first.vcpus = 8;
+        admit(&mut h, first, 1, now);
+        h.event(
+            "tenant",
+            &event(2, TenantEventKind::Started, Some(JOB), None),
+            now,
+        )
+        .unwrap();
+        let mut second = claims(JOB2);
+        second.vcpus = 12;
+        let (id, _) = h.claim(second, now).unwrap();
+        assert_eq!(h.share("tenant", now), 20, "Reserved still counts");
+        assert_eq!(h.heartbeat(now, 123, true).free_vcpus, 44);
+        h.delivered(id).unwrap();
+        h.event(
+            "tenant",
+            &event(3, TenantEventKind::Admitted, Some(JOB2), None),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            h.share("tenant", now),
+            8,
+            "workspace waiter holds no permits"
+        );
+        assert_eq!(h.quota("tenant", now), 8);
+        assert_eq!(h.heartbeat(now, 123, true).free_vcpus, 56);
+
+        // A Started lease still owns its workspace after its counted deadline.
+        assert_eq!(h.share("tenant", now + 30_000), 0);
+        assert_eq!(h.heartbeat(now + 30_000, 123, true).free_vcpus, 64);
+
+        let (job, expected) = match transition {
+            TenantEventKind::Terminal => (JOB, 12),
+            TenantEventKind::Started => (JOB2, 20),
+            _ => unreachable!(),
+        };
+        h.event("tenant", &event(4, transition, Some(job), None), now + 1)
+            .unwrap();
+        assert_eq!(h.share("tenant", now + 1), expected);
+        assert_eq!(h.quota("tenant", now + 1), expected);
+        assert_eq!(
+            h.heartbeat(now + 1, 123, true).free_vcpus,
+            u64::from(64 - expected)
+        );
+    }
+}
+
+#[test]
+fn workspace_blocking_requires_a_known_matching_hash_on_the_same_tenant() {
+    let now = NOW * 1000;
+    let hash = claims(JOB).workspace_key_hash;
+    for (first_hash, second_hash, first_tenant, expected) in [
+        (hash.clone(), hash.clone(), "tenant", 8),
+        (
+            hash.clone(),
+            Some(motor_lease::base64url(&[6; 32])),
+            "tenant",
+            20,
+        ),
+        (hash.clone(), None, "tenant", 20),
+        (None, None, "tenant", 20),
+        (None, hash.clone(), "tenant", 20),
+        (hash.clone(), hash, "other", 12),
+    ] {
+        let mut h = permit_host();
+        let mut first = claims(JOB);
+        first.vcpus = 8;
+        first.workspace_key_hash = first_hash;
+        if first_tenant == "other" {
+            let mut other = h.tenants["vm"].clone();
+            other.tenant = "other".into();
+            other.sub = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAW".into();
+            other.max_weight = Some(8);
+            first.sub = other.sub.clone();
+            first.placement.vm = Some("other-vm".into());
+            h.tenants.insert("other-vm".into(), other);
+        }
+        admit(&mut h, first, 1, now);
+        h.event(
+            first_tenant,
+            &event(2, TenantEventKind::Started, Some(JOB), None),
+            now,
+        )
+        .unwrap();
+        let mut second = claims(JOB2);
+        second.vcpus = 12;
+        second.workspace_key_hash = second_hash;
+        admit(&mut h, second, 3, now);
+        assert_eq!(h.share("tenant", now), expected);
+        assert_eq!(
+            h.heartbeat(now, 123, true).free_vcpus,
+            u64::from(64 - expected)
+        );
+    }
+}
+
+#[test]
+fn workspace_waiters_do_not_bypass_admission_budget_checks() {
+    let mut h = permit_host();
+    h.tenants.get_mut("vm").unwrap().max_weight = Some(24);
+    let now = NOW * 1000;
+    let mut first = claims(JOB);
+    first.vcpus = 8;
+    admit(&mut h, first, 1, now);
+    h.event(
+        "tenant",
+        &event(2, TenantEventKind::Started, Some(JOB), None),
+        now,
+    )
+    .unwrap();
+    let mut second = claims(JOB2);
+    second.vcpus = 12;
+    admit(&mut h, second, 3, now);
+    let mut third = claims(JOB3);
+    third.vcpus = 16;
+    h.claim(third.clone(), now).unwrap();
+    assert_eq!(h.pending(JOB3).unwrap(), Admission::Ready);
+    refused(
+        h.claim(claims("00000000-0000-7000-8000-000000000004"), now),
+        Refusal::HostFull,
+    );
+    h.event(
+        "tenant",
+        &event(4, TenantEventKind::Terminal, Some(JOB), None),
+        now,
+    )
+    .unwrap();
+    refused(h.pending(JOB3), Refusal::HostFull);
+    third.iat += 1;
+    third.exp += 1;
+    refused(h.claim(third, now), Refusal::HostFull);
+    assert_eq!(h.heartbeat(now, 123, true).free_vcpus, 0);
+}
+
 #[test]
 fn permit_admission_accepts_exact_budget_but_not_an_oversized_claim() {
     let mut h = permit_host();

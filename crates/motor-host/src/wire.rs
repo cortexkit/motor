@@ -139,6 +139,7 @@ mod tests {
                 tenant: "acct:01KXJJHK4V6DB42W1YAN2XD9QN".into(),
                 workspace_key_hash: "A".repeat(43),
                 vm: "vm-1".into(),
+                busy: false,
             }],
             running: vec![RunningJob {
                 job_id: "01a157b7-aab9-77d0-a79e-29ae3760e3e8".into(),

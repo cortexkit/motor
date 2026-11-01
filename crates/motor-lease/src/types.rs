@@ -317,12 +317,24 @@ pub struct RunningJob {
     pub elapsed_ms: u64,
 }
 
+// Busy marks a warm workspace with an Admitted or Started lease. Enable its
+// serialization only after the deployed broker accepts the field and the
+// published contract and vectors in contracts/cloud/ have been re-pinned with
+// their hashes in contracts/digest-manifest.json.
+const WARM_BUSY_WIRE_ENABLED: bool = false;
+
+fn omit_warm_busy(busy: &bool) -> bool {
+    !WARM_BUSY_WIRE_ENABLED || !busy
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WarmVm {
     pub tenant: String,
     pub workspace_key_hash: String,
     pub vm: String,
+    #[serde(default, skip_serializing_if = "omit_warm_busy")]
+    pub busy: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -374,4 +386,27 @@ pub struct UsageReply {
     pub job_id: String,
     pub settled_vcpu_ms: u64,
     pub released_vcpu_ms: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn warm_busy_is_optional_and_withheld_from_the_current_wire_contract() {
+        let legacy = json!({
+            "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "workspace_key_hash": "A".repeat(43),
+            "vm": "vm",
+        });
+        let mut warm: WarmVm = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(!warm.busy);
+        assert_eq!(serde_json::to_value(&warm).unwrap(), legacy);
+        warm.busy = true;
+        assert_eq!(serde_json::to_value(&warm).unwrap(), legacy);
+        let mut with_busy = legacy;
+        with_busy["busy"] = json!(true);
+        assert!(serde_json::from_value::<WarmVm>(with_busy).unwrap().busy);
+    }
 }

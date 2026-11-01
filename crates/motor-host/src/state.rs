@@ -383,9 +383,31 @@ impl Host {
         self.snapshot
             .leases
             .values()
-            .filter(|l| l.tenant == tenant && counted(l, now_ms))
+            .filter(|l| l.tenant == tenant && self.counted(l, now_ms))
             .map(|l| l.claims.vcpus)
             .try_fold(0u32, u32::checked_add)
+    }
+    fn counted(&self, lease: &Lease, now_ms: u64) -> bool {
+        match lease.state {
+            LeaseState::Reserved => true,
+            LeaseState::Admitted => {
+                // Without a workspace hash, blocking cannot be established, so
+                // the lease still counts. A queued job holds no runner permits
+                // while another job on its tenant owns the same workspace.
+                let Some(hash) = &lease.claims.workspace_key_hash else {
+                    return true;
+                };
+                !self.snapshot.leases.values().any(|other| {
+                    other.tenant == lease.tenant
+                        && other.state == LeaseState::Started
+                        && other.claims.workspace_key_hash.as_ref() == Some(hash)
+                })
+            }
+            LeaseState::Started => lease.started_at_ms.is_some_and(|s| {
+                now_ms < s.saturating_add(lease.claims.max_s.saturating_mul(1000))
+            }),
+            _ => false,
+        }
     }
     /// The VM's CPU quota in vCPUs, from its counted lease claims, capped at
     /// the tenant's ceiling and never below one. A guest's fill report does
@@ -575,7 +597,7 @@ impl Host {
             }
             let previous_share = old
                 .as_ref()
-                .filter(|l| counted(l, now_ms))
+                .filter(|l| self.counted(l, now_ms))
                 .map_or(0, |l| l.claims.vcpus);
             let share = self
                 .checked_share(&tenant.tenant, now_ms)
@@ -1066,15 +1088,6 @@ impl Host {
             delay_ms,
             "suspend_backoff"
         );
-    }
-}
-fn counted(l: &Lease, now_ms: u64) -> bool {
-    match l.state {
-        LeaseState::Reserved | LeaseState::Admitted => true,
-        LeaseState::Started => l
-            .started_at_ms
-            .is_some_and(|s| now_ms < s.saturating_add(l.claims.max_s.saturating_mul(1000))),
-        _ => false,
     }
 }
 fn same_reservation(a: &Claims, b: &Claims) -> bool {

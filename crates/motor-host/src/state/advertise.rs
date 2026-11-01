@@ -3,7 +3,7 @@
 //! refused start. The broker places leases only on hosts whose `free_vcpus` and
 //! `free_mem_mib` cover the job, so these values decide where work goes, while
 //! [`Host::claim`] stays the real admission gate.
-use super::{Host, Tenant};
+use super::{Host, LeaseState, Tenant};
 use crate::capacity::Capacity;
 
 /// A guest memory sample older than this is not used (two heartbeat intervals).
@@ -421,6 +421,14 @@ impl Host {
                         tenant: lease.claims.sub.clone(),
                         workspace_key_hash: hash.clone(),
                         vm: vm.clone(),
+                        busy: self.snapshot.leases.values().any(|active| {
+                            active.tenant == *tenant
+                                && active.claims.workspace_key_hash.as_ref() == Some(hash)
+                                && matches!(
+                                    active.state,
+                                    LeaseState::Admitted | LeaseState::Started
+                                )
+                        }),
                     },
                 ));
             }

@@ -571,6 +571,85 @@ fn heartbeat_uses_pinned_interim_values_and_released_is_reserved() {
 }
 
 #[test]
+fn warm_workspace_busy_tracks_active_leases_on_its_tenant_and_hash() {
+    use motor_host::state::LeaseState;
+    let hash = claims(JOB).workspace_key_hash;
+    for (state, active_hash, tenant, expected) in [
+        (LeaseState::Reserved, hash.clone(), "tenant", false),
+        (LeaseState::Released, hash.clone(), "tenant", false),
+        (LeaseState::Ended, hash.clone(), "tenant", false),
+        (LeaseState::Admitted, hash.clone(), "tenant", true),
+        (LeaseState::Started, hash.clone(), "tenant", true),
+        (
+            LeaseState::Admitted,
+            Some(motor_lease::base64url(&[6; 32])),
+            "tenant",
+            false,
+        ),
+        (LeaseState::Started, None, "tenant", false),
+        (LeaseState::Admitted, hash.clone(), "other", false),
+        (LeaseState::Started, hash, "other", false),
+    ] {
+        let mut h = host();
+        h.guest_ready("tenant", 1).unwrap();
+        admitted(&mut h, JOB, 1);
+        h.event(
+            "tenant",
+            &event(2, TenantEventKind::Terminal, Some(JOB), None),
+            MS,
+        )
+        .unwrap();
+        let mut other = h.tenants["vm"].clone();
+        other.tenant = "other".into();
+        other.sub = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAW".into();
+        h.tenants.insert("other-vm".into(), other);
+        let mut c = claims(JOB2);
+        c.workspace_key_hash = active_hash;
+        if tenant == "other" {
+            c.sub = h.tenants["other-vm"].sub.clone();
+            c.placement.vm = Some("other-vm".into());
+        }
+        let (id, _) = h.claim(c, MS).unwrap();
+        if state == LeaseState::Released {
+            h.close(id).unwrap();
+        } else if state != LeaseState::Reserved {
+            h.delivered(id).unwrap();
+            h.event(
+                tenant,
+                &event(3, TenantEventKind::Admitted, Some(JOB2), None),
+                MS,
+            )
+            .unwrap();
+            if let Some(kind) = match state {
+                LeaseState::Started => Some(TenantEventKind::Started),
+                LeaseState::Ended => Some(TenantEventKind::Terminal),
+                _ => None,
+            } {
+                h.event(tenant, &event(4, kind, Some(JOB2), None), MS)
+                    .unwrap();
+            }
+        }
+        h.record_warm(
+            "tenant",
+            MS,
+            vec![motor_protocol::HeldWorkspace {
+                job_id: JOB.parse().unwrap(),
+                used_ms: MS,
+            }],
+        );
+        let heartbeat = h.heartbeat(MS, 0, true);
+        assert_eq!(heartbeat.warm.len(), 1);
+        assert_eq!(heartbeat.warm[0].busy, expected, "{state:?} on {tenant}");
+        assert!(
+            serde_json::to_value(&heartbeat).unwrap()["warm"][0]
+                .get("busy")
+                .is_none(),
+            "busy is computed locally but withheld from the current broker contract"
+        );
+    }
+}
+
+#[test]
 fn warm_workspaces_join_admitted_hashes_order_cap_and_forget_evictions() {
     use motor_protocol::HeldWorkspace;
     let mut h = host();

@@ -1515,6 +1515,61 @@ async fn slow_suspend_does_not_block_other_tenant_admission_or_connection_close(
 }
 
 #[test]
+fn starting_a_workspace_waiter_refreshes_the_applied_vm_quota() {
+    let (runtime, fake, _, _, c) = fixture();
+    let now = unix_ms();
+    {
+        let mut host = runtime.host.lock().unwrap();
+        host.tenants.get_mut("vm").unwrap().vcpu_ceiling = 24;
+        host.guest_ready("tenant", 1).unwrap();
+        for (job, weight, seq) in [(JOB, 8, 1), (JOB2, 12, 3)] {
+            let mut c = c.clone();
+            c.jti = job.into();
+            c.vcpus = weight;
+            c.mem_mib = 3584 * u64::from(weight);
+            let (id, _) = host.claim(c, now).unwrap();
+            host.delivered(id).unwrap();
+            host.event(
+                "tenant",
+                &event(seq, TenantEventKind::Admitted, Some(job), None),
+                now,
+            )
+            .unwrap();
+            if job == JOB {
+                host.event(
+                    "tenant",
+                    &event(2, TenantEventKind::Started, Some(JOB), None),
+                    now,
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(host.quota("tenant", now), 8);
+    }
+    runtime.tick(now).unwrap();
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .event(
+            "tenant",
+            &event(4, TenantEventKind::Started, Some(JOB2), None),
+            now,
+        )
+        .unwrap();
+    runtime.tick(now).unwrap();
+    let writes: Vec<_> = fake
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| call.starts_with("quota:"))
+        .cloned()
+        .collect();
+    assert_eq!(writes, ["quota:8", "quota:20"]);
+}
+
+#[test]
 fn superseded_quota_generation_cannot_override_a_newer_write() {
     let (runtime, fake, _, _, mut c) = fixture();
     let (older, newer, id) = {
