@@ -78,7 +78,7 @@ async fn account_vault_transport_uses_authenticated_claustrum_route_and_exact_en
         assert_eq!(
             serde_json::from_slice::<Value>(&request.body).unwrap(),
             json!({
-                "method":"credential.account_token", "params":{"audience":"cortexkit-runners", "min_ttl_ms":30000}
+                "method":"credential.account_token", "params":{"audience":"cortexkit-runners", "min_ttl_ms":90000}
             })
         );
         response(
@@ -96,9 +96,9 @@ async fn account_vault_transport_uses_authenticated_claustrum_route_and_exact_en
         module_id: "ck-motor".into(),
     };
     let reply = tokio::time::timeout(Duration::from_secs(10), vault.request_with_nonce(json!({
-        "method":"credential.account_token", "params":{"audience":"cortexkit-runners", "min_ttl_ms":30000}
+        "method":"credential.account_token", "params":{"audience":"cortexkit-runners", "min_ttl_ms":90000}
     }), "test-launch-nonce")).await.unwrap().unwrap();
-    assert_eq!(decode(reply).unwrap(), "wire.fixture.jwt");
+    assert_eq!(decode(reply).unwrap().jwt, "wire.fixture.jwt");
     tokio::time::timeout(Duration::from_secs(2), daemon)
         .await
         .unwrap()

@@ -130,6 +130,9 @@ impl Client {
                 }
                 Err(error) => {
                     tracing::warn!(job_id = %id, step = "finish", cause = error.code(), detail = ?self.broker_failure.lock().unwrap(), attempt, "Boat finish failed; retry remains pending");
+                    if error == Error::AccountInvalid {
+                        break;
+                    }
                 }
             }
         }
@@ -165,21 +168,9 @@ impl Client {
                 error.code()
             ));
         })?;
-        *self.broker_failure.lock().unwrap() = Some("finish HTTP request pending".into());
         let reply = self
-            .http
-            .post(format!(
-                "{}/v1/leases/{id}/finish",
-                self.route.broker_url.trim_end_matches('/')
-            ))
-            .bearer_auth(bearer)
-            .json(body)
-            .send()
-            .await
-            .map_err(|error| {
-                *self.broker_failure.lock().unwrap() = Some(format!("transport: {error}"));
-                Error::Broker
-            })?;
+            .post_with_refresh(&format!("/v1/leases/{id}/finish"), body, bearer)
+            .await?;
         let status = reply.status().as_u16();
         tracing::info!(job_id = %id, outcome = %body.outcome, run_ms = body.run_ms,
             http_status = status, "Boat finish replied");
