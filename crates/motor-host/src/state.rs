@@ -492,6 +492,21 @@ impl Host {
         {
             return refuse(Refusal::Auth);
         }
+        if claims.purpose == Purpose::Attach {
+            // A connection task drops its watch receiver before its blocking
+            // guard cleanup removes the record. Only that dead relay may be
+            // swept; a concurrent Attach with a receiver still refuses below.
+            self.connections.retain(|connection| {
+                let dead = connection.job == claims.jti
+                    && connection.purpose == Purpose::Attach
+                    && connection.updates.is_closed();
+                if dead {
+                    tracing::info!(job_id = %connection.job, connection_id = connection.id,
+                        "swept dead attach connection");
+                }
+                !dead
+            });
+        }
         let live = self
             .connections
             .iter()

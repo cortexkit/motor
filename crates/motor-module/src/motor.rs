@@ -2457,6 +2457,10 @@ impl Motor {
             let c = channel.as_mut().unwrap();
             let incoming = tokio::select! {
                 biased;
+                _ = tx.closed() => {
+                    self.log_hosted_failure(id, "follow", "caller detached");
+                    return Err(io::Error::other("caller detached"));
+                },
                 frame = c.next_job() => Some(frame),
                 _ = async { if let Some(deadline) = host_deadline { tokio::time::sleep_until(deadline).await; } else { std::future::pending::<()>().await; } } => {
                     self.log_hosted_failure(id, "follow", "host deadline passed without a terminal");

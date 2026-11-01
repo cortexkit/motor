@@ -71,10 +71,53 @@ fn every_run_checks_host_full_without_summing_memory_caps_and_attach_is_free() {
     let mut attach = claims(JOB);
     attach.purpose = Purpose::Attach;
     let (attach_id, _) = h.claim(attach.clone(), NOW * 1000).unwrap();
+    let _attach_watch = h.watch_connection(attach_id).unwrap();
     refused(h.claim(attach, NOW * 1000), Refusal::Auth);
     h.close(attach_id).unwrap();
     assert!(h.snapshot.zero_usage.is_empty());
     assert_eq!(h.share("tenant", NOW * 1000), 2);
+}
+#[test]
+fn running_job_reattaches_after_attach_task_drops_before_connection_cleanup() {
+    let mut h = host();
+    h.guest_ready("tenant", 1).unwrap();
+    let (run, _) = h.claim(claims(JOB), NOW * 1000).unwrap();
+    let _run_watch = h.watch_connection(run).unwrap();
+    h.delivered(run).unwrap();
+    for (seq, kind) in [TenantEventKind::Admitted, TenantEventKind::Started]
+        .into_iter()
+        .enumerate()
+    {
+        h.event(
+            "tenant",
+            &event(seq as u64 + 1, kind, Some(JOB), None),
+            NOW * 1000,
+        )
+        .unwrap();
+    }
+    let mut attach = claims(JOB);
+    attach.purpose = Purpose::Attach;
+    let (mut previous, _) = h.claim(attach.clone(), NOW * 1000).unwrap();
+    let mut watch = h.watch_connection(previous).unwrap();
+    h.delivered(previous).unwrap();
+    for _ in 0..3 {
+        refused(h.claim(attach.clone(), NOW * 1000), Refusal::Auth);
+        // The connection task has ended, but its blocking guard cleanup has
+        // not run yet. Its watch receiver is no longer keeping the relay alive.
+        drop(watch);
+        let (next, admission) = h.claim(attach.clone(), NOW * 1000).unwrap();
+        watch = h.watch_connection(next).unwrap();
+        assert_eq!(admission, Admission::Ready);
+        assert!(!h.connection_live(previous));
+        h.delivered(next).unwrap();
+        h.close(previous).unwrap();
+        assert!(h.connection_live(next));
+        assert!(h.connection_live(run));
+        assert_eq!(h.snapshot.leases[JOB].state, LeaseState::Started);
+        assert_eq!(h.share("tenant", NOW * 1000), 1);
+        assert!(h.snapshot.zero_usage.is_empty());
+        previous = next;
+    }
 }
 #[test]
 fn strictly_newer_replacement_waits_for_refused_and_counts_share_once() {

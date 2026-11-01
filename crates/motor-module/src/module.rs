@@ -844,6 +844,10 @@ impl Handler {
                     return Ok(direct_job_not_found(&self.module_id));
                 }
                 let request: AttachRequest = parse(envelope.params)?;
+                if motor.hosted_state(request.job_id).is_some() {
+                    tracing::info!(job_id = %request.job_id, caller_principal = "direct",
+                        route_id = ?route, "hosted caller attach requested");
+                }
                 pump_direct(&ctx, self.initialized()?.attach(request)?)
                     .await
                     .map(|()| HandlerOutcome::Streamed)
@@ -1205,6 +1209,10 @@ impl ModuleHandler for Handler {
                 "exec.attach" => {
                     let request: AttachRequest =
                         serde_json::from_value(envelope.params).map_err(io::Error::other)?;
+                    if motor.hosted_state(request.job_id).is_some() {
+                        tracing::info!(job_id = %request.job_id, caller_principal = %principal,
+                            route_id = ?ctx.route_handle(), "hosted caller attach requested");
+                    }
                     let from_seq = request.from_seq;
                     pump(&ctx, motor.attach(request)?, from_seq)
                         .await
