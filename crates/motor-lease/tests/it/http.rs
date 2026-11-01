@@ -334,7 +334,10 @@ fn fake_binary_max_vcpus_flag_answers_no_host_fits_over_http() {
     request.vcpus = 16;
     assert_eq!(
         server.post("/v1/leases", &request),
-        (422, json!({"error":"no_host_fits","max_vcpus":8}))
+        (
+            422,
+            json!({"error":"no_host_fits","max_vcpus":8,"max_mem_mib":16384})
+        )
     );
     request.vcpus = 8;
     assert_eq!(server.post("/v1/leases", &request).0, 201);

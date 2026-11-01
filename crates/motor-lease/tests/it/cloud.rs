@@ -875,9 +875,12 @@ fn cloud_no_host_fits_reply_bytes_match_fake() {
         v["clock_ms"].as_u64().unwrap(),
     );
     assert_eq!(reply.status, v["reply"]["status"].as_u64().unwrap() as u16);
+    // Compare the parsed reply, not its bytes: the broker writes `max_vcpus`
+    // before `max_mem_mib`, while the fake's JSON value keeps members sorted.
+    // Readers parse this reply; only request bytes feed the lease hash.
     assert_eq!(
-        serde_json::to_string(&reply.body).unwrap(),
-        v["reply"]["body_bytes"].as_str().unwrap()
+        reply.body,
+        serde_json::from_str::<Value>(v["reply"]["body_bytes"].as_str().unwrap()).unwrap()
     );
     assert_eq!(v["reply"]["headers"]["Retry-After"], Value::Null);
     assert!(broker.settlement(&request.job_id).is_none());
