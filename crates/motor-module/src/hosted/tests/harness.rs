@@ -72,6 +72,8 @@ pub enum Behavior {
     /// the live connection after `UNKNOWN_WALL_MS`, with no detail, as
     /// motor-runner does.
     UnknownTerminal,
+    /// Attach stays quiet until `run_gate` opens, then sends output and terminal.
+    QuietAttach,
 }
 
 /// Wall time of the `UnknownTerminal` job's terminal.
@@ -115,6 +117,9 @@ pub struct Harness {
     /// While false, a `CompleteRun` host holds each admitted job after
     /// `Accepted`, so it keeps its claim on the tenant, until set true.
     pub run_gate: Arc<tokio::sync::watch::Sender<bool>>,
+    /// QuietAttach counts: admitted connections, closed connections (including
+    /// idle closes), and protocol Attach frames received, in that order.
+    pub attach_lifecycle: Arc<tokio::sync::watch::Sender<(usize, usize, usize)>>,
     /// The 1-based number of the `/v1/leases` request the broker reads and
     /// records but never answers, holding its connection open as a broker
     /// that stopped responding would; 0 answers every request.
@@ -201,11 +206,13 @@ impl Harness {
         let host_refusals = Arc::new(Mutex::new(VecDeque::<&'static str>::new()));
         let capacity = Arc::new(Mutex::new(None::<TenantCapacity>));
         let run_gate = Arc::new(tokio::sync::watch::Sender::new(true));
+        let attach_lifecycle = Arc::new(tokio::sync::watch::Sender::new((0, 0, 0)));
         let host_task = tokio::spawn({
             let broker = broker.clone();
             let host_refusals = host_refusals.clone();
             let capacity = capacity.clone();
             let run_gate = run_gate.clone();
+            let attach_lifecycle = attach_lifecycle.clone();
             let tokens = tokens.clone();
             let iats = iats.clone();
             let runs = runs.clone();
@@ -223,6 +230,7 @@ impl Harness {
                     let host_refusals = host_refusals.clone();
                     let capacity = capacity.clone();
                     let run_gate = run_gate.clone();
+                    let attach_lifecycle = attach_lifecycle.clone();
                     let broker = broker.clone();
                     tokio::spawn(async move {
                         let Ok(mut tls) = acceptor.accept(socket).await else {
@@ -276,6 +284,26 @@ impl Harness {
                         Nonces::default()
                             .verify(&challenge, &claims, &requester_jwk, &sig, now_s())
                             .unwrap();
+                        let _attach = if matches!(behavior, Behavior::QuietAttach)
+                            && purpose == Purpose::Attach
+                        {
+                            let (opened, closed, _) = *attach_lifecycle.borrow();
+                            if opened != closed {
+                                super::super::tls::write(
+                                    &mut tls,
+                                    &Prelude::LeaseRefused {
+                                        reason: "auth".into(),
+                                    },
+                                )
+                                .await
+                                .unwrap();
+                                return;
+                            }
+                            attach_lifecycle.send_modify(|(opened, _, _)| *opened += 1);
+                            Some(QuietAttachGuard(attach_lifecycle.clone()))
+                        } else {
+                            None
+                        };
                         let queued = if purpose == Purpose::Run {
                             host_refusals.lock().unwrap().pop_front()
                         } else {
@@ -490,6 +518,31 @@ impl Harness {
                                     return;
                                 }
                                 Frame::Attach(attach) => {
+                                    if matches!(behavior, Behavior::QuietAttach) {
+                                        attach_lifecycle
+                                            .send_modify(|(_, _, following)| *following += 1);
+                                        let mut gate = run_gate.subscribe();
+                                        loop {
+                                            tokio::select! {
+                                                _ = gate.wait_for(|open| *open) => break,
+                                                frame = motor_protocol::read_frame_async(&mut tls) => {
+                                                    if !matches!(frame, Ok(Some(Frame::Heartbeat { .. }))) {
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        motor_protocol::write_frame_async(
+                                            &mut tls,
+                                            &Frame::Output(Output::new(
+                                                0,
+                                                OutputStream::Stdout,
+                                                BytePayload(b"live after reattach\n".to_vec()),
+                                            )),
+                                        )
+                                        .await
+                                        .unwrap();
+                                    }
                                     if matches!(behavior, Behavior::SettleThenDrop) {
                                         replay_settled(&mut tls, &claims, attach.from_seq).await;
                                         return;
@@ -760,6 +813,7 @@ impl Harness {
             host_refusals,
             capacity,
             run_gate,
+            attach_lifecycle,
             unanswered_lease,
             tasks: vec![host_task, http_task],
         }
@@ -796,6 +850,13 @@ impl Drop for HeldClaim {
         if let Some(tenant) = self.0.lock().unwrap().as_mut() {
             tenant.end(&self.1);
         }
+    }
+}
+
+struct QuietAttachGuard(Arc<tokio::sync::watch::Sender<(usize, usize, usize)>>);
+impl Drop for QuietAttachGuard {
+    fn drop(&mut self) {
+        self.0.send_modify(|(_, closed, _)| *closed += 1);
     }
 }
 

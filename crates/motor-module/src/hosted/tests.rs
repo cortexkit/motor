@@ -552,6 +552,71 @@ async fn hosted_route_survives_switch_flip_restart_cancel_status_and_attach() {
 }
 
 #[tokio::test]
+async fn hosted_quiet_caller_detach_closes_relay_and_next_caller_gets_live_output_and_terminal() {
+    let h = Harness::new(Behavior::QuietAttach).await;
+    h.run_gate.send_replace(false);
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    seed_running(&h, &scratch, None, id).await;
+    Storage::open(&scratch.0.join("state"))
+        .unwrap()
+        .hosted_update(id, |s| s.run_sent = true)
+        .unwrap();
+    let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let motor =
+        crate::Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
+    let mut lifecycle = h.attach_lifecycle.subscribe();
+    let mut first = motor.attach(AttachRequest::new(id, 0)).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), lifecycle.wait_for(|s| s.2 == 1))
+        .await
+        .expect("first caller must reach the host")
+        .unwrap();
+    tokio::task::yield_now().await;
+    // Closing the caller's receiver must not depend on also dropping the
+    // separate cancellation wake sender stored in JobStream.
+    first.records.close();
+    tokio::time::timeout(Duration::from_secs(5), lifecycle.wait_for(|s| s.1 == 1))
+        .await
+        .expect("quiet detached caller must close its host relay")
+        .unwrap();
+    drop(first);
+
+    let mut second = motor.attach(AttachRequest::new(id, 0)).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), lifecycle.wait_for(|s| s.2 == 2))
+        .await
+        .expect("new caller must reach the host")
+        .unwrap();
+    h.run_gate.send_replace(true);
+    let record = tokio::time::timeout(Duration::from_secs(5), second.records.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let StreamRecord::Output(output) = record else {
+        panic!("expected live output, got {record:?}");
+    };
+    assert_eq!(output.seq, 0);
+    assert_eq!(output.stream, OutputStream::Stdout);
+    assert_eq!(output.bytes.0, b"live after reattach\n");
+    assert_eq!(terminal(second).await.outcome, Outcome::Exit { code: 23 });
+    assert_eq!(
+        motor.hosted_state(id).unwrap().billing,
+        BillingStatus::Available
+    );
+    assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        h.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.ends_with("/reattach"))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn hosted_terminal_disconnect_reattaches_three_times_and_preserves_exit_pending() {
     let h = Harness::new(Behavior::DropTerminal).await;
     let scratch = Scratch::new();
