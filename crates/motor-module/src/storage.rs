@@ -1187,13 +1187,19 @@ mod retention_tests {
         state.prune(now + RETENTION_MS);
         assert!(!state.jobs.contains_key(&id));
         drop(state);
-        for protection in ["active", "cancel", "hosted"] {
+        // Health retires only past the job's deadline, when the runner has
+        // already ended it, so an undelivered cancel no longer protects it.
+        let cancelled = Uuid::now_v7();
+        storage.create(cancelled, 60, None, None, false).unwrap();
+        storage.cancel(cancelled, true).unwrap();
+        assert!(storage
+            .retire_health_job(cancelled, "runner no longer knows this job", now)
+            .unwrap());
+        assert!(!storage.job(cancelled).unwrap().pending_cancel);
+        for protection in ["active", "hosted"] {
             let id = Uuid::now_v7();
             storage.create(id, 60, None, None, false).unwrap();
             let lease = (protection == "active").then(|| storage.lease_job(id));
-            if protection == "cancel" {
-                storage.cancel(id, true).unwrap();
-            }
             if protection == "hosted" {
                 storage.hosted_route(id, Default::default()).unwrap();
             }
