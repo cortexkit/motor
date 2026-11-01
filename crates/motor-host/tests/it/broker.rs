@@ -77,10 +77,12 @@ fn host_drain_echo_parses_pinned_replies_and_records_receipt_time() {
         "../../../motor-lease/contracts/cloud/host-draining.json"
     ))
     .unwrap();
+    // Only the drain exchanges (no warm workspaces) drive the echo sequence.
     let replies: Vec<String> = vector["exchanges"]
         .as_array()
         .unwrap()
         .iter()
+        .filter(|exchange| exchange["request"]["body"]["warm"] == json!([]))
         .map(|exchange| exchange["reply"]["body_bytes"].as_str().unwrap().to_owned())
         .chain([
             r#"{"ignored":[],"closed_subjects":[],"draining":false}"#.into(),

@@ -317,23 +317,17 @@ pub struct RunningJob {
     pub elapsed_ms: u64,
 }
 
-// Busy marks a warm workspace with an Admitted or Started lease. Enable its
-// serialization only after the deployed broker accepts the field and the
-// published contract and vectors in contracts/cloud/ have been re-pinned with
-// their hashes in contracts/digest-manifest.json.
-const WARM_BUSY_WIRE_ENABLED: bool = false;
-
-fn omit_warm_busy(busy: &bool) -> bool {
-    !WARM_BUSY_WIRE_ENABLED || !busy
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WarmVm {
     pub tenant: String,
     pub workspace_key_hash: String,
     pub vm: String,
-    #[serde(default, skip_serializing_if = "omit_warm_busy")]
+    /// True while a lease on this workspace is Admitted or Started on the host,
+    /// so the broker places the workspace's next job on another host when one
+    /// fits. Absent means false; hosts send it only when true, which keeps an
+    /// idle entry's bytes as they were before the field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub busy: bool,
 }
 
@@ -394,7 +388,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn warm_busy_is_optional_and_withheld_from_the_current_wire_contract() {
+    fn warm_busy_is_optional_and_sent_only_when_true() {
         let legacy = json!({
             "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
             "workspace_key_hash": "A".repeat(43),
@@ -404,9 +398,16 @@ mod tests {
         assert!(!warm.busy);
         assert_eq!(serde_json::to_value(&warm).unwrap(), legacy);
         warm.busy = true;
-        assert_eq!(serde_json::to_value(&warm).unwrap(), legacy);
-        let mut with_busy = legacy;
+        let mut with_busy = legacy.clone();
         with_busy["busy"] = json!(true);
+        assert_eq!(serde_json::to_value(&warm).unwrap(), with_busy);
         assert!(serde_json::from_value::<WarmVm>(with_busy).unwrap().busy);
+        let mut explicit_false = legacy;
+        explicit_false["busy"] = json!(false);
+        assert!(
+            !serde_json::from_value::<WarmVm>(explicit_false)
+                .unwrap()
+                .busy
+        );
     }
 }

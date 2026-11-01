@@ -14,7 +14,14 @@ fn host_drain_heartbeat_body_matches_pinned_cloud_bytes() {
         Snapshot::default(),
         Box::<MemoryJournal>::default(),
     );
-    for exchange in vector["exchanges"].as_array().unwrap() {
+    // The drain exchanges carry no warm workspaces; the busy exchanges are
+    // checked by the test below.
+    for exchange in vector["exchanges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|exchange| exchange["request"]["body"]["warm"] == serde_json::json!([]))
+    {
         let expected = &exchange["request"];
         let draining = expected["body"]["draining"].as_bool().unwrap_or(false);
         h.set_draining(draining).unwrap();
@@ -33,6 +40,37 @@ fn host_drain_heartbeat_body_matches_pinned_cloud_bytes() {
         };
         assert_eq!(serde_json::to_vec(&heartbeat).unwrap(), bytes.as_bytes());
     }
+}
+
+/// CLOUD's busy exchanges decode, and a host writes them back byte for byte,
+/// except that an explicit `"busy":false` is omitted (absent means false),
+/// as with `draining`. Which leases make an entry busy is tested in billing.rs.
+#[test]
+fn warm_busy_heartbeat_bytes_match_pinned_cloud_vectors() {
+    let vector: Value = serde_json::from_str(include_str!(
+        "../../../motor-lease/contracts/cloud/host-draining.json"
+    ))
+    .unwrap();
+    let mut seen = [false; 2];
+    for exchange in vector["exchanges"].as_array().unwrap() {
+        let Some(busy) = exchange["request"]["body"]["warm"][0]["busy"].as_bool() else {
+            continue;
+        };
+        seen[usize::from(busy)] = true;
+        let bytes = exchange["request"]["body_bytes"].as_str().unwrap();
+        let decoded: motor_lease::Heartbeat = serde_json::from_str(bytes).unwrap();
+        assert_eq!(decoded.warm[0].busy, busy);
+        let expected = if busy {
+            bytes.to_owned()
+        } else {
+            bytes.replace(",\"busy\":false", "")
+        };
+        assert_eq!(
+            String::from_utf8(serde_json::to_vec(&decoded).unwrap()).unwrap(),
+            expected
+        );
+    }
+    assert_eq!(seen, [true, true], "both busy exchanges are pinned");
 }
 
 #[test]

@@ -640,11 +640,11 @@ fn warm_workspace_busy_tracks_active_leases_on_its_tenant_and_hash() {
         let heartbeat = h.heartbeat(MS, 0, true);
         assert_eq!(heartbeat.warm.len(), 1);
         assert_eq!(heartbeat.warm[0].busy, expected, "{state:?} on {tenant}");
-        assert!(
-            serde_json::to_value(&heartbeat).unwrap()["warm"][0]
-                .get("busy")
-                .is_none(),
-            "busy is computed locally but withheld from the current broker contract"
+        // The wire carries `busy` only when it is true.
+        assert_eq!(
+            serde_json::to_value(&heartbeat).unwrap()["warm"][0].get("busy"),
+            expected.then_some(&serde_json::Value::Bool(true)),
+            "{state:?} on {tenant}"
         );
     }
 }

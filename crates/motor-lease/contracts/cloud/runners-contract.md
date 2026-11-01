@@ -665,7 +665,7 @@ unpaired guest-disk and free-above-total refusals, produced by the real signer a
 The exact body is:
 
 ```text
-{free_vcpus, free_mem_mib, queued, warm:[{tenant, workspace_key_hash, vm}],
+{free_vcpus, free_mem_mib, queued, warm:[{tenant, workspace_key_hash, vm, busy?}],
  running:[{job_id, state, elapsed_ms}], healthy, draining?}
 ```
 
@@ -690,6 +690,27 @@ spill when allowed). The independent operator `explicit_only` override is unchan
 
 `warm` lists the tenant workspaces the host holds **now**, after eviction, most-recent first. A
 host holding more than 64 reports only the 64 most recent workspaces.
+
+Each warm entry may include the boolean `busy`: `true` while a lease for that tenant and workspace
+is `admitted` or `started` on the host. Absent means `false`. A non-boolean is 400 `bad_request`
+with `field: "warm.busy"`; other unknown entry members remain refused. The exact body bytes,
+including `busy` when sent, are covered by the existing host signature. The counter replay rule
+is unchanged: an authenticated malformed body consumes its counter too.
+
+For the same tenant and `workspace_key_hash`, placement prefers warm-idle hosts, then other
+fitting hosts that are not busy, and finally busy hosts only if nothing else fits. Within each
+tier the existing order is most effective free vCPUs, then most effective free memory, then
+bytewise host id; a matching non-binding warm hint still wins within the warm-idle tier, never
+over a less-busy tier. A matching entry with `busy: true` makes the workspace busy on the whole
+host, even if another entry for that workspace says false. The broker also treats a workspace
+as busy while its live in-flight ledger entry holds the same tenant and workspace on that host,
+including before the first heartbeat reports it and while it reports `reserved`. A reported
+reservation still intends to run that checkout, so its ledger entry keeps the workspace busy
+even if the warm entry says false or omits `busy`. Admission removes the ledger entry; the host's
+`busy` flag then carries the state. Older entries without workspace identity still hold capacity
+but do not mark any workspace busy. A busy-only fallback is placed rather than refused. Binding
+hints to explicit-only or draining hosts still restrict placement to that host, and `avoid_host`
+still excludes its host unconditionally.
 
 `free_vcpus` and `free_mem_mib` answer one question for placement: can this host take one more job
 of a given size now? The broker places a lease on a host only if `free_vcpus ≥ vcpus` and
@@ -798,16 +819,18 @@ have a snapshot for their current registry generation, and have sufficient **eff
 vCPUs and memory (below). Explicit-only hosts are excluded unless named by the binding hint
 described under [POST /v1/leases](#post-v1leases); a binding hint restricts every selection step
 to that one host. Selectable hosts are ordered by most effective free vCPUs, then most effective
-free memory, then bytewise host id. Prefer the placement hint if it names a selectable warm entry
-matching tenant and `workspace_key_hash`. Otherwise take the first host in that order holding a
-matching warm entry, with its bytewise lowest matching VM id. Without a warm match, take the first
-selectable host in that order with `vm: null`. `repo_hash`, `net` and `queued` do not affect
-placement.
+free memory, then bytewise host id. Apply the heartbeat section's workspace-busy tiers: warm-idle,
+other idle, then busy only as a last resort. Prefer a matching warm hint within the warm-idle
+tier; otherwise use the first host in its tier with its bytewise lowest matching VM id, or
+`vm: null` without a warm match. For a busy fallback, hosts stay in capacity order; if the chosen
+host's warm entries include the hinted VM, that VM is retained. `repo_hash`, `net` and `queued`
+do not affect placement.
 
 **In-flight ledger.** A heartbeat's free figures don't count a job placed on the host since that
 sample. So that a burst of placements inside one heartbeat interval spreads over hosts instead of
 filling one, the placement object keeps a ledger: when it answers a placement a lease will use
-(a new lease, or a replace) with host H, it records `{job_id, host: H, vcpus, mem_mib}` in the
+(a new lease, or a replace) with host H, it records
+`{job_id, host: H, tenant, workspace_key_hash, vcpus, mem_mib}` in the
 same storage transaction as the decision. A host's effective free vCPUs and memory are its last
 accepted heartbeat's `free_vcpus` and `free_mem_mib` minus the resources its live entries still
 hold. A job listed in that host's latest accepted `running` list in any state (`reserved`,
