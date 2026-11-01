@@ -1029,10 +1029,11 @@ PY"#,
         "job ended before allocating: {}",
         memory_job_diagnostics(&runner, request.job_id)
     );
-    let before = runner.core.inner.lock().unwrap().jobs[&request.job_id]
-        .mem_working_peak_mib
-        .get()
-        .expect("sampler must observe the anonymous allocation");
+    let before = {
+        let inner = runner.core.inner.lock().unwrap();
+        inner.jobs[&request.job_id].mem_working_peak_mib.get()
+    };
+    let before = before.expect("sampler must observe the anonymous allocation");
     assert!((512..=640).contains(&before), "anonymous peak {before} MiB");
     until_memory_job_with_diagnostics(&runner, request.job_id, "terminal", || {
         runner.core.inner.lock().unwrap().jobs[&request.job_id]
@@ -1046,10 +1047,10 @@ PY"#,
         "{}",
         memory_job_diagnostics(&runner, request.job_id)
     );
+    // The launcher summary can arrive after Terminal. Its pending marker is
+    // runtime-only, so wait on the live job before inspecting durable peaks.
     until_memory_job_with_diagnostics(&runner, request.job_id, "launcher summary", || {
-        !read_json::<Job>(&runner.record_path(request.job_id))
-            .unwrap()
-            .memory_accounting_pending
+        !runner.core.inner.lock().unwrap().jobs[&request.job_id].memory_accounting_pending
     })
     .await;
     let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
@@ -1073,12 +1074,12 @@ PY"#,
         file >= 768 << 20,
         "test must charge substantial file cache: {file} bytes"
     );
+    eprintln!("job={} vcpus={} mem_working_peak_mib={peak} anonymous_peak_mib={before} mem_peak_mib={:?} file_cache_bytes={file}", job.id, job.weight, job.mem_peak_mib);
     assert!(
         job.mem_peak_mib.is_some_and(|total| total > peak + 512),
         "systemd peak should still include file cache: {:?}",
         job.mem_peak_mib
     );
-    eprintln!("job={} vcpus={} mem_working_peak_mib={peak} anonymous_peak_mib={before} mem_peak_mib={:?} file_cache_bytes={file}", job.id, job.weight, job.mem_peak_mib);
 }
 
 #[cfg(target_os = "linux")]
@@ -1107,16 +1108,11 @@ fn memory_job_diagnostics(runner: &Runner, id: Uuid) -> String {
     let live = {
         let inner = runner.core.inner.lock().unwrap();
         let job = &inner.jobs[&id];
-        format!("state={:?} terminal={:?} mem_working_peak_mib={:?} mem_peak_mib={:?} monitoring_error={:?}",
-            job.state, job.terminal, job.mem_working_peak_mib.get(), job.mem_peak_mib, job.monitoring_error)
+        format!("state={:?} terminal={:?} mem_working_peak_mib={:?} mem_peak_mib={:?} accounting_pending={} monitoring_error={:?}",
+            job.state, job.terminal, job.mem_working_peak_mib.get(), job.mem_peak_mib, job.memory_accounting_pending, job.monitoring_error)
     };
-    let recorded = read_json::<Job>(&runner.record_path(id)).map(|job| {
-        (
-            job.mem_working_peak_mib.get(),
-            job.mem_peak_mib,
-            job.memory_accounting_pending,
-        )
-    });
+    let recorded = read_json::<Job>(&runner.record_path(id))
+        .map(|job| (job.mem_working_peak_mib.get(), job.mem_peak_mib));
     let output = job_output(runner, id);
     let tail: String = output
         .chars()
@@ -1126,5 +1122,8 @@ fn memory_job_diagnostics(runner: &Runner, id: Uuid) -> String {
         .into_iter()
         .rev()
         .collect();
-    format!("job={id} {live}; recorded[working,existing,pending]={recorded:?}; stdout/stderr tail={tail:?}; {}", runner_diagnostics(runner))
+    format!(
+        "job={id} {live}; recorded[working,existing]={recorded:?}; stdout/stderr tail={tail:?}; {}",
+        runner_diagnostics(runner)
+    )
 }
