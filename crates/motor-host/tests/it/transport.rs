@@ -100,6 +100,62 @@ impl Control for Fake {
     }
 }
 
+/// A drained host whose leases have all ended is idle, even while the ended
+/// leases are still kept as usage evidence; an unended one keeps it busy.
+#[test]
+fn remote_cache_idle_check_counts_only_unended_leases() {
+    let (runtime, fake, _, _, c) = fixture();
+    let now = unix_ms();
+    {
+        let mut host = runtime.host.lock().unwrap();
+        host.guest_ready("tenant", 1).unwrap();
+        let (id, _) = host.claim(c, now).unwrap();
+        host.delivered(id).unwrap();
+        host.event(
+            "tenant",
+            &event(1, TenantEventKind::Admitted, Some(JOB), None),
+            now,
+        )
+        .unwrap();
+        host.set_draining(true).unwrap();
+    }
+    // Setup wakes the tenant; only the admin calls below matter here.
+    fake.calls.lock().unwrap().clear();
+    let status = |runtime: &Runtime| runtime.host_admin(&json!({"op":"host_status"})).unwrap();
+    assert_eq!(status(&runtime)["active_leases"], 1);
+    let probe = json!({"op":"remote_cache_probe"});
+    assert_eq!(
+        runtime.admin("tenant", &probe).unwrap()["error"],
+        "remote_cache_host_not_idle"
+    );
+    assert!(
+        fake.calls.lock().unwrap().is_empty(),
+        "a busy host sends nothing"
+    );
+    runtime
+        .host
+        .lock()
+        .unwrap()
+        .event(
+            "tenant",
+            &event(2, TenantEventKind::Terminal, Some(JOB), None),
+            now,
+        )
+        .unwrap();
+    assert_eq!(
+        runtime.host.lock().unwrap().snapshot.leases.len(),
+        1,
+        "ended lease is kept"
+    );
+    assert_eq!(status(&runtime)["active_leases"], 0);
+    runtime.admin("tenant", &probe).unwrap();
+    assert_eq!(
+        fake.calls.lock().unwrap().last().map(String::as_str),
+        Some("admin:remote_cache_probe"),
+        "the idle host forwards the probe to the guest"
+    );
+}
+
 #[test]
 fn remote_cache_admin_requires_idle_host_and_redacts_every_refusal() {
     let (runtime, fake, _, _, _) = fixture();

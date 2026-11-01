@@ -30,6 +30,17 @@ impl LifecycleStream {
     }
 }
 
+/// Leases that can still put a job in the guest. Ended and Released leases
+/// stay in the store for about an hour as usage evidence, so counting every
+/// stored lease made a drained host look busy long after its last job.
+fn active_leases(host: &Host) -> usize {
+    host.snapshot
+        .leases
+        .values()
+        .filter(|l| !matches!(l.state, LeaseState::Ended | LeaseState::Released))
+        .count()
+}
+
 pub fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1013,7 +1024,7 @@ impl Runtime {
             _ => None,
         };
         Ok(
-            json!({"ok":true,"draining":host.snapshot.draining,"active_leases":host.snapshot.leases.len(),
+            json!({"ok":true,"draining":host.snapshot.draining,"active_leases":active_leases(&host),
             "broker_draining":host.broker_draining,
             "broker_heartbeat_at_ms":host.broker_heartbeat_at_ms,"set_at_ms":set_at_ms}),
         )
@@ -1036,7 +1047,7 @@ impl Runtime {
             let _operation = operations.lock().expect("tenant operations lock");
             {
                 let host = self.host.lock().expect("host lock");
-                if !host.snapshot.draining || !host.snapshot.leases.is_empty() {
+                if !host.snapshot.draining || active_leases(&host) != 0 {
                     return Ok(json!({"ok":false,"error":"remote_cache_host_not_idle"}));
                 }
             }
