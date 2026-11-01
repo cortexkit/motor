@@ -5,10 +5,17 @@
 - Build and test on the build server: pass `runon: "linux,4c"` to the worker's
   `bash` tool, replacing `4` with the vCPU count in the brief. Never build on the
   local Mac, except native macOS clippy and macOS unit tests that start no VM.
-- Run `scripts/gate.sh` before delivery. For a change confined to part of the
-  code, run at least `scripts/gate.sh --fast` and the lanes covering the touched
-  crates; `scripts/gate.sh --help` lists the lanes. The full gate runs CI's
-  ordinary checks, not the privileged operator suite.
+- Before delivery run `scripts/gate.sh --fast` (format, pins, safety checks),
+  clippy with `-D warnings` for the crates you touched, and only the tests for
+  what you changed: select them by the test modules that cover the changed
+  files (for example `-E 'test(/^tests::broker::/)'`), not by a keyword that
+  may miss them. Never run a whole crate or workspace suite or the full gate;
+  the parent runs the full suites once over several merged deliveries.
+- A failure that looks unrelated: rerun that one test by name on the base
+  commit, never the suite.
+- A filtered run that takes longer than about 15 minutes means the filter is
+  too broad. Don't wait on it in 30-minute `bash_watch` loops, and keep the
+  normal build directory (a fresh `CARGO_TARGET_DIR` forces a cold build).
 - For a bug fix, show once that the new regression test fails without the fix.
 
 ## Pre-approved: proceed without asking
