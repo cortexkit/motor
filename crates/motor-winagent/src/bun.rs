@@ -121,7 +121,9 @@ pub struct Refusal {
     pub project: String,
     pub package: String,
     pub version: String,
-    pub registry_origin: String,
+    /// Boxed like `detail` so a refusal stays small enough to return by value.
+    #[serde(default, skip_serializing_if = "detail_empty")]
+    pub registry_origin: Box<str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<Check>,
     /// What the failing check found, as a path relative to the job checkout.
@@ -209,7 +211,7 @@ impl Refusal {
         {
             if let Ok(url) = url::Url::parse(registry) {
                 if url.scheme() == "https" {
-                    self.registry_origin = url.origin().ascii_serialization();
+                    self.registry_origin = url.origin().ascii_serialization().into();
                 }
             }
         }
@@ -234,7 +236,7 @@ impl Refusal {
             &self.project,
             &self.package,
             &self.version,
-            &self.registry_origin,
+            &*self.registry_origin,
             &*self.detail,
         ] {
             if field.len() > 4096 || field.chars().any(char::is_control) {
@@ -281,7 +283,7 @@ pub fn refuse(kind: RefusalKind, project: &str, package: &str, version: &str) ->
             String::new()
         },
         registry_origin: if package.is_empty() {
-            String::new()
+            Box::default()
         } else {
             "https://registry.npmjs.org".into()
         },
