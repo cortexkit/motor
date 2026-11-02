@@ -298,9 +298,10 @@ fn metrics_sample_reports_real_host_counters_and_safe_recovery_latch() {
     let first = sampler
         .sample(&runtime, std::path::Path::new("/"), ms)
         .unwrap();
-    assert!(first.cpu.threads > 0);
-    assert!(first.mem.total_mib > 0);
-    assert!(first.mem.avail_mib <= first.mem.total_mib);
+    assert!(first.cpu.as_ref().unwrap().threads > 0);
+    let mem = first.mem.as_ref().unwrap();
+    assert!(mem.total_mib > 0);
+    assert!(mem.avail_mib <= mem.total_mib);
     assert_eq!(first.disks[0].mount, "/");
     assert!(first.disks[0].total_gib > 0);
     assert_eq!(first.tenants[0].state, TenantState::Stopped);

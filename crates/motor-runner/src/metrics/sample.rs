@@ -1,3 +1,4 @@
+use crate::BackendKind;
 use motor_lease::metrics::{Cpu, Disk, HostMetrics, Memory};
 use std::io;
 
@@ -7,7 +8,23 @@ pub(super) struct Sampler {
 }
 
 impl Sampler {
-    pub(super) fn sample(&mut self, at_ms: u64) -> io::Result<Option<HostMetrics>> {
+    pub(super) fn sample(
+        &mut self,
+        at_ms: u64,
+        backend: BackendKind,
+    ) -> io::Result<Option<HostMetrics>> {
+        // The Windows VM backend on Unix shares a machine with motor-host.
+        // Native Windows (Hyper-V) runners report their own machine's figures.
+        if backend == BackendKind::WindowsVm && !cfg!(windows) {
+            return Ok(Some(HostMetrics {
+                at_ms,
+                cpu: None,
+                mem: None,
+                disks: vec![],
+                tenants: vec![],
+                runners: vec![],
+            }));
+        }
         let (mut cpu, mem, disks, total, idle) = platform()?;
         let Some((old_total, old_idle)) = self.previous.replace((total, idle)) else {
             return Ok(None);
@@ -24,8 +41,8 @@ impl Sampler {
             .min(100);
         Ok(Some(HostMetrics {
             at_ms,
-            cpu,
-            mem,
+            cpu: Some(cpu),
+            mem: Some(mem),
             disks,
             tenants: vec![],
             runners: vec![],
@@ -216,4 +233,62 @@ fn platform() -> io::Result<(Cpu, Memory, Vec<Disk>, u64, u64)> {
         ticks(kernel) + ticks(user),
         ticks(idle),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn windows_vm_monitor_body_matches_cloud_vector_without_host_figures() {
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../motor-lease/contracts/cloud/host-metrics.json"
+        ))
+        .unwrap();
+        let case = &vector["cases"][10];
+        assert_eq!(case["reply"]["status"], 204);
+        let body = case["request"]["body"].as_str().unwrap();
+        let expected: HostMetrics = serde_json::from_str(body).unwrap();
+        let mut sampler = Sampler {
+            previous: Some((0, 0)),
+        };
+        let mut record = sampler
+            .sample(expected.at_ms, BackendKind::WindowsVm)
+            .unwrap()
+            .unwrap();
+        assert!(record.tenants.is_empty());
+        assert!(record.runners.is_empty());
+        record.tenants = expected.tenants;
+        record.runners = expected.runners;
+        assert_eq!(record.encode(record.at_ms).unwrap(), body.as_bytes());
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value.get("cpu"), Some(&serde_json::Value::Null));
+        assert_eq!(value.get("mem"), Some(&serde_json::Value::Null));
+        assert_eq!(value.get("disks"), Some(&serde_json::json!([])));
+    }
+
+    #[test]
+    fn other_backends_keep_real_host_figures() {
+        for backend in [BackendKind::Host, BackendKind::Vm, BackendKind::MacosVm]
+            .into_iter()
+            .chain(cfg!(windows).then_some(BackendKind::WindowsVm))
+        {
+            let mut sampler = Sampler {
+                previous: Some((0, 0)),
+            };
+            let record = sampler.sample(1_800_000_000_000, backend).unwrap().unwrap();
+            let cpu = record.cpu.as_ref().unwrap();
+            let mem = record.mem.as_ref().unwrap();
+            assert!(cpu.threads > 0);
+            assert!(cpu.busy_pct <= 100);
+            assert!(mem.total_mib > 0);
+            assert!(mem.avail_mib <= mem.total_mib);
+            assert!(!record.disks.is_empty());
+            let value: serde_json::Value =
+                serde_json::from_slice(&record.encode(record.at_ms).unwrap()).unwrap();
+            assert!(value["cpu"].is_object());
+            assert!(value["mem"].is_object());
+        }
+    }
 }

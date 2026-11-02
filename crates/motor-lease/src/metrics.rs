@@ -7,8 +7,10 @@ pub const MAX_BODY_BYTES: usize = 16 * 1024;
 #[serde(deny_unknown_fields)]
 pub struct HostMetrics {
     pub at_ms: u64,
-    pub cpu: Cpu,
-    pub mem: Memory,
+    #[serde(deserialize_with = "required_nullable")]
+    pub cpu: Option<Cpu>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub mem: Option<Memory>,
     pub disks: Vec<Disk>,
     pub tenants: Vec<Tenant>,
     pub runners: Vec<Runner>,
@@ -129,13 +131,14 @@ impl HostMetrics {
         if self.at_ms.abs_diff(now_ms) > 300_000 {
             return Err("at_ms");
         }
-        if self.cpu.busy_pct > 100
-            || self.cpu.load1.is_some_and(|load| {
-                !load.is_finite()
-                    || load < 0.0
-                    || (load * 100.0 - (load * 100.0).round()).abs() > 0.000001
-            })
-        {
+        if self.cpu.as_ref().is_some_and(|cpu| {
+            cpu.busy_pct > 100
+                || cpu.load1.is_some_and(|load| {
+                    !load.is_finite()
+                        || load < 0.0
+                        || (load * 100.0 - (load * 100.0).round()).abs() > 0.000001
+                })
+        }) {
             return Err("cpu");
         }
         if self.disks.len() > 8 || self.tenants.len() > 8 || self.runners.len() > 8 {

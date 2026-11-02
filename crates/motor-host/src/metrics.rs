@@ -36,7 +36,7 @@ impl Sampler {
             .parse()?;
         let mut sample = HostMetrics {
             at_ms: now_ms,
-            cpu: Cpu {
+            cpu: Some(Cpu {
                 threads: stat
                     .lines()
                     .filter(|l| {
@@ -50,8 +50,8 @@ impl Sampler {
                     .unwrap_or(0)
                     .min(100),
                 load1: Some((load * 100.0).round() / 100.0),
-            },
-            mem: memory(&std::fs::read_to_string("/proc/meminfo")?)?,
+            }),
+            mem: Some(memory(&std::fs::read_to_string("/proc/meminfo")?)?),
             disks: vec![disk(Path::new("/"))?],
             tenants: vec![],
             runners: vec![],
