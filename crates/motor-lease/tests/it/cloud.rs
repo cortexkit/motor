@@ -38,6 +38,40 @@ fn with_workspace_hash(token: &str, hash: &str, kid: &str, key: &SigningKey) -> 
 }
 
 #[test]
+fn cloud_stated_memory_tokens_accept_the_stated_and_raised_figures() {
+    let v = vector("stated-memory-lease.json");
+    let key = seed(v["test_only_job_seed_hex"].as_str().unwrap());
+    let kid = v["key_id"].as_str().unwrap();
+    let mut keys = KeySet::default();
+    keys.refresh(Ok(Jwks {
+        keys: vec![JwksKey::from_key(kid, &key.verifying_key())],
+    }))
+    .unwrap();
+    for (name, expected) in [("stated", 12288), ("raised", 8192)] {
+        let token = v[name]["reply"]["body"]["job_token"].as_str().unwrap();
+        let now = v["clock_ms"].as_u64().unwrap() / 1000;
+        // The canonical vector predates mandatory workspace hashes; its signed
+        // memory must pass before the missing-hash refusal.
+        assert_eq!(
+            check_token(token, &keys, "host-a", None, Purpose::Run, now)
+                .unwrap_err()
+                .check,
+            "workspace_key_hash_missing"
+        );
+        let token = with_workspace_hash(
+            token,
+            v[name]["request"]["body"]["workspace_key_hash"]
+                .as_str()
+                .unwrap(),
+            kid,
+            &key,
+        );
+        let claims = verify_token(&token, &keys, "host-a", None, Purpose::Run, now).unwrap();
+        assert_eq!(claims.mem_mib, expected);
+    }
+}
+
+#[test]
 fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
     use metrics::*;
     let v = vector("host-metrics.json");
@@ -490,6 +524,10 @@ fn cloud_boat_token_verifies_for_its_sandbox_identity() {
     let mut first_party = claims;
     first_party.aud = "host-a".into();
     first_party.placement.host = "host-a".into();
+    // Whole-GiB Boat memory can also be a valid first-party size. A fractional
+    // GiB within Boat's range must still be refused by a first-party host.
+    first_party.mem_mib -= 1;
+    assert!(boat_memory_range(first_party.vcpus).contains(&first_party.mem_mib));
     let resigned = sign_token(
         &first_party,
         tokens["key_id"].as_str().unwrap(),

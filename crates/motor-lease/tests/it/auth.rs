@@ -708,7 +708,7 @@ fn refused_tokens_name_their_first_failed_check() {
     );
     assert_eq!(check(&valid, "other-host", now), refused("aud", &job));
     let mut wrong = c.clone();
-    wrong.mem_mib = 14336;
+    wrong.mem_mib = 14337;
     let wrong = sign_token(&wrong, "current", &key).unwrap();
     assert_eq!(check(&wrong, "test-host", now), refused("mem_mib", &job));
     assert_eq!(
@@ -721,31 +721,22 @@ fn refused_tokens_name_their_first_failed_check() {
     );
 }
 
-/// A first-party host accepts exactly the broker's two per-job figures: the
-/// current one (3.5 GiB per vCPU, 4 GiB to 16 GiB) and the previous
-/// `max(16 GiB, 3.5 GiB per vCPU)`, which the runners contract keeps valid
-/// until the operator retires it. Anything else is refused as `mem_mib`.
+/// Both retained formulas remain valid, including half-GiB values and values
+/// below the new default. Other memory must be whole GiB at the 2 GiB/vCPU floor.
 #[test]
-fn first_party_host_accepts_the_current_and_previous_memory_figures_only() {
+fn first_party_host_accepts_stated_memory_and_both_retained_formulas() {
     let key = SigningKey::from_bytes(&[1; 32]);
     let host = claims().aud;
-    for (vcpus, current) in [
-        (1, 4096),
-        (2, 7168),
-        (3, 10752),
-        (4, 14336),
-        (5, 16384),
-        (21, 16384),
-    ] {
-        assert_eq!(job_memory_mib(vcpus), current, "{vcpus} vCPUs");
+    for vcpus in 1..=16 {
         let mut c = claims();
         c.vcpus = vcpus;
         for (mem_mib, accepted) in [
-            (current, true),
+            (2048 * u64::from(vcpus), true),
+            (job_memory_mib(vcpus), true),
             (memory_max_mib(vcpus), true),
-            (current - 1, false),
-            (current + 1, false),
-            (memory_max_mib(vcpus) + 1, false),
+            (65536, true),
+            (2048 * u64::from(vcpus) - 1024, false),
+            (2048 * u64::from(vcpus) + 1, false),
         ] {
             c.mem_mib = mem_mib;
             let token = sign_token(&c, "current", &key).unwrap();

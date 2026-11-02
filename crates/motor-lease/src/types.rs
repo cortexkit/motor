@@ -38,13 +38,13 @@ pub fn job_memory_mib(vcpus: u32) -> u64 {
     (u64::from(vcpus) * 3584).clamp(4096, 16384)
 }
 
-/// Whether a first-party job token's `mem_mib` is a figure the broker signs for
-/// `vcpus`: the current [`job_memory_mib`], or [`memory_max_mib`], which the
-/// broker signed before and the runners contract keeps valid until the
-/// operator retires it. Hosts and ck-motor apply this same check, or a granted
-/// lease is refused at connect.
+/// Whether a first-party token carries whole-GiB memory at the 2 GiB/vCPU
+/// floor, or either retained broker formula. Hosts additionally bound stated
+/// memory by the placed tenant's RAM minus its configured reserve.
 pub fn first_party_mem_mib_accepted(vcpus: u32, mem_mib: u64) -> bool {
-    mem_mib == job_memory_mib(vcpus) || mem_mib == memory_max_mib(vcpus)
+    mem_mib == job_memory_mib(vcpus)
+        || mem_mib == memory_max_mib(vcpus)
+        || (mem_mib.is_multiple_of(1024) && mem_mib >= 2048 * u64::from(vcpus))
 }
 
 /// The smallest memory per leased vCPU a Boat token may state. Below 1 GiB per

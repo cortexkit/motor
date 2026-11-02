@@ -360,6 +360,53 @@ fn fixture() -> (Arc<Runtime>, Arc<Fake>, SigningKey, SigningKey, Claims) {
     let (runtime, broker, requester, c) = fixture_with_control(fake.clone());
     (runtime, fake, broker, requester, c)
 }
+
+#[test]
+fn stated_token_memory_uses_the_placed_tenants_ram_minus_heartbeat_reserve() {
+    let (runtime, _, signer, requester, mut c) = fixture();
+    let jwk = RequesterJwk::from_key(&requester.verifying_key());
+    {
+        let mut host = runtime.host.lock().unwrap();
+        host.tenants.get_mut("vm").unwrap().guest_ram_mib = 77_313;
+        host.observe_storage(
+            Ok(motor_host::capacity::Capacity {
+                windows_vm_bytes: 0,
+                host_reserve_bytes: 0,
+                jobs_min_bytes: 1,
+                storage_margin_bytes: 0,
+                growth_allowance_bytes: 0,
+                tenant_memory_reserve_bytes: 2048 * 1_048_576 + 1,
+            }),
+            Ok(u64::MAX),
+        );
+        // Round the byte reserve up: the ceiling is 75,264 MiB, not whole GiB.
+        assert_eq!(
+            host.stated_memory_ceiling_mib(&host.tenants["vm"]),
+            Some(75_264)
+        );
+    }
+    for vcpus in 1..=16 {
+        c.vcpus = vcpus;
+        for (memory, accepted) in [
+            (2048 * u64::from(vcpus), true),
+            (motor_lease::job_memory_mib(vcpus), true),
+            (motor_lease::memory_max_mib(vcpus), true),
+            (74_752, true),
+            (75_776, false),
+            (2048 * u64::from(vcpus) - 1024, false),
+            (2048 * u64::from(vcpus) + 1, false),
+        ] {
+            c.mem_mib = memory;
+            let token = motor_lease::sign_token(&c, "key", &signer).unwrap();
+            let result = runtime.authenticate(&token, &jwk, c.iat);
+            assert_eq!(
+                result.map(|_| ()).map_err(|r| r.check),
+                if accepted { Ok(()) } else { Err("mem_mib") },
+                "{vcpus} vCPUs, {memory} MiB"
+            );
+        }
+    }
+}
 pub(super) fn fixture_with_control(
     control: Arc<dyn Control>,
 ) -> (Arc<Runtime>, SigningKey, SigningKey, Claims) {
