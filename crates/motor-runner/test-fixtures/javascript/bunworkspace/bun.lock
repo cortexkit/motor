@@ -1,0 +1,28 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "runner-bun-workspace-fixture",
+    },
+    "packages/member": {
+      "name": "runner-bun-member-fixture",
+      "version": "1.0.0",
+      "dependencies": {
+        "memberdep": "file:vendor/memberdep",
+        "rootdep": "workspace:*",
+      },
+    },
+    "vendor/rootdep": {
+      "name": "rootdep",
+      "version": "1.0.0",
+    },
+  },
+  "packages": {
+    "rootdep": ["rootdep@workspace:vendor/rootdep"],
+
+    "runner-bun-member-fixture": ["runner-bun-member-fixture@workspace:packages/member"],
+
+    "runner-bun-member-fixture/memberdep": ["memberdep@file:packages/member/vendor/memberdep", {}],
+  }
+}

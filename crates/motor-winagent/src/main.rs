@@ -1542,6 +1542,7 @@ mod guest {
         let Some(manifest) = manifest else {
             return Ok(Vec::new());
         };
+        let members = manifest.members.clone();
         if bun::write_registry_config(&user.profile, &manifest.registries).is_err() {
             return bun::skip_unprepared(
                 Path::new(SOURCE_ROOT),
@@ -1614,10 +1615,17 @@ mod guest {
                     &mut diagnostics,
                 );
                 // Finish containment before removing any partial dependency tree.
-                let containment =
-                    || bun::refuse(RefusalKind::BunProjectionInvalid, &project.path, "", "");
-                job.terminate(1).map_err(|_| containment())?;
-                job.wait_empty().map_err(|_| containment())?;
+                // The refusal names the step that failed so a live report can tell
+                // it apart from an install tree that left the checkout.
+                let containment = |check: Check| {
+                    bun::refuse(RefusalKind::BunProjectionInvalid, &project.path, "", "")
+                        .at(check)
+                        .detail("the job's processes did not stop")
+                };
+                job.terminate(1)
+                    .map_err(|_| containment(Check::JobTerminate))?;
+                job.wait_empty()
+                    .map_err(|_| containment(Check::JobWaitEmpty))?;
                 // On timeout/read errors the install loop may leave diagnostics
                 // queued. Drain after containment, with a separate bounded wait.
                 let drain_deadline = Instant::now() + Duration::from_secs(2);
@@ -1644,6 +1652,15 @@ mod guest {
                         if tail.is_empty() { "<empty>" } else { &tail }
                     ));
                 }
+            } else {
+                // Installed here, so this is where its members' unused lockfiles
+                // are reported.
+                warnings.extend(
+                    members
+                        .iter()
+                        .filter(|member| member.starts_with(&format!("{}/", project.path)))
+                        .map(|member| bun::workspace_member_warning(member, &project.path)),
+                );
             }
         }
         Ok(warnings)

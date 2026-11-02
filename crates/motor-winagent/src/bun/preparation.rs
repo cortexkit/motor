@@ -122,6 +122,7 @@ pub fn finish_install(
     }
 }
 
+
 pub fn skip_unprepared(source: &Path, failure: Refusal) -> Result<Vec<String>, Refusal> {
     if failure.kind.is_security() {
         return Err(failure);
@@ -131,20 +132,25 @@ pub fn skip_unprepared(source: &Path, failure: Refusal) -> Result<Vec<String>, R
         250_000,
         std::time::Instant::now() + std::time::Duration::from_secs(300),
     );
-    let projects = super::source_projects(source, &budget)?;
-    projects
-        .into_iter()
-        .map(|project| {
-            let directory = source.join(project.strip_prefix("m/").unwrap_or(""));
-            let invalid = || refuse(RefusalKind::BunProjectionInvalid, &project, "", "");
-            super::clean_install_inputs(&directory, &budget).map_err(|_| invalid())?;
-            let lock =
-                super::read_bounded(&directory.join("bun.lock"), super::MAX_LOCK_BYTES as u64)
-                    .map_err(|_| invalid())?;
-            super::read_lock(&project, std::str::from_utf8(&lock).map_err(|_| invalid())?)?;
-            let mut refusal = failure.clone();
-            refusal.project = project;
-            skip_project(&directory, refusal).map(|refusal| refusal.warning())
-        })
-        .collect()
+    let mut warnings = Vec::new();
+    for (project, owner) in super::source_projects(source, &budget)? {
+        let directory = source.join(project.strip_prefix("m/").unwrap_or(""));
+        let invalid = || refuse(RefusalKind::BunProjectionInvalid, &project, "", "");
+        super::clean_install_inputs(&directory, &budget).map_err(|_| invalid())?;
+        let lock =
+            super::read_bounded(&directory.join("bun.lock"), super::MAX_LOCK_BYTES as u64)
+                .map_err(|_| invalid())?;
+        super::read_lock(&project, std::str::from_utf8(&lock).map_err(|_| invalid())?)?;
+        if let Some(owner) = owner {
+            // Bun installs this directory as part of the enclosing workspace and
+            // never reads its own lockfile. Say so instead of preparing a tree
+            // Bun will not build.
+            warnings.push(super::workspace_member_warning(&project, &owner));
+            continue;
+        }
+        let mut refusal = failure.clone();
+        refusal.project = project;
+        warnings.push(skip_project(&directory, refusal)?.warning());
+    }
+    Ok(warnings)
 }
