@@ -14,6 +14,16 @@ pub(crate) fn linked_sources(
     })
 }
 
+/// Break hard links that workspace preparation created after the checkout was
+/// transferred. Bun installs a `file:` dependency by hard-linking its tracked
+/// files into `node_modules`, and a sealed inode would freeze that name too, so
+/// each sealed path gets its own inode first. `node_modules` keeps the old one.
+pub(crate) fn planned_sources(plan: &Plan, tree: &[u8], mirror: &Path) -> io::Result<()> {
+    refresh(plan, tree, |oid| {
+        crate::workspace::snapshot_blob(mirror, oid)
+    })
+}
+
 fn refresh(plan: &Plan, tree: &[u8], blob: impl Fn(&str) -> io::Result<Vec<u8>>) -> io::Result<()> {
     let root = open_mount(&plan.workspace)?;
     let entries: BTreeMap<_, _> = tree

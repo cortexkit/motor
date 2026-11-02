@@ -155,6 +155,63 @@ fn assert_clear(path: &Path) {
     );
 }
 
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// Bun installs a `file:` dependency by hard-linking its tracked files into
+/// `node_modules` after the checkout was transferred. Sealing must give the
+/// tracked path its own inode rather than refuse the job or freeze the alias.
+#[tokio::test]
+#[ignore = "requires root with CAP_LINUX_IMMUTABLE, file handles and a real motor-job system unit"]
+async fn isolated_source_seal_survives_bun_file_dependency_hard_links() {
+    let f = Fixture::new();
+    copy_tree(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("test-fixtures/javascript/bunworkspace"),
+        &f.main,
+    );
+    commit(&f.main, "first\n");
+    let mut config = isolated_config(&f);
+    config.manual_tick = true;
+    let runner = Runner::open(config).unwrap();
+    let source = "packages/member/vendor/memberdep/index.js";
+    let (run, bytes) = f.run(&format!(
+        r#"
+        set -e
+        test "$(stat -c %h {source})" = 1
+        if echo edited >> {source}; then exit 11; fi
+        find . -path '*node_modules*' -name index.js -path '*memberdep*' > target/aliases
+        while read -r alias; do echo edited >> "$alias"; done < target/aliases
+    "#
+    ));
+    f.submit(&runner, &run, &bytes);
+    runner.tick().unwrap();
+    let terminal = terminal(&runner, run.job_id).await;
+    assert_eq!(
+        terminal.outcome,
+        Outcome::Exit { code: 0 },
+        "{:?}; {}",
+        terminal.refusal_detail,
+        job_output(&runner, run.job_id)
+    );
+    assert_eq!(terminal.source_read_only(), Some(true));
+    let aliases = fs::read_to_string(Path::new(&f.key).join("target/aliases")).unwrap();
+    assert!(
+        !aliases.trim().is_empty(),
+        "preparation installed no node_modules copy of memberdep, so this test proves nothing"
+    );
+    assert_clear(&Path::new(&f.key).join(source));
+}
+
 #[tokio::test]
 #[ignore = "requires root with CAP_LINUX_IMMUTABLE, file handles and a real motor-job system unit"]
 async fn isolated_source_seal_refuses_edits_and_workspace_is_reusable() {

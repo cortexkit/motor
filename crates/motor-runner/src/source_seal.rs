@@ -124,6 +124,11 @@ impl<'a> Sources<'a> {
                     "compute sealed set",
                     plan(snapshot.config, snapshot.request, prepared, &tree),
                 )?;
+                step(
+                    &root,
+                    "rematerialize sources linked by preparation",
+                    refresh::planned_sources(&plan, &tree, &mirror),
+                )?;
                 plan.unit = id;
                 let job_id = snapshot.request.job_id;
                 snapshot
