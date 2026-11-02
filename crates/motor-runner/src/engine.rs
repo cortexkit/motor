@@ -4598,10 +4598,11 @@ impl Runner {
             return false;
         }
         #[cfg(target_os = "linux")]
-        if siblings
-            .iter()
-            .any(|s| inner.source_seals.blocks_caller(&s.canonical_path))
-        {
+        if siblings.iter().any(|s| {
+            inner
+                .source_seals
+                .blocks_caller(paths::sibling(s).caller.text())
+        }) {
             return true;
         }
         Self::scheduler_jobs(inner)
@@ -10653,7 +10654,7 @@ impl DispatchIndex {
                 if self
                     .sealed_paths
                     .iter()
-                    .any(|path| Self::overlap(&sibling.canonical_path, path))
+                    .any(|path| Self::overlap(paths::sibling(sibling).caller.text(), path))
                 {
                     return true;
                 }
