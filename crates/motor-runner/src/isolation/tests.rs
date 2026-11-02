@@ -3681,3 +3681,23 @@ test "$(tr -d ' \n' <"$1/exit")" = 23
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A lockfile with several git dependencies yields a long route list. The
+/// refusal detail is cut at a fixed size, so Cargo's own failure has to come
+/// first or the cut removes it and leaves only the routes.
+#[test]
+fn fetch_failure_keeps_cargo_error_ahead_of_route_list() {
+    let routes = "git dependency https://example.invalid/dep locked commit 0 (routed to local mirror runner state/git-deps/x.git); "
+        .repeat(20);
+    let error = with_fetch_context(
+        io::Error::other("tenant dependency preparation failed: online fetch: boom"),
+        &routes,
+    );
+    let detail = error.to_string();
+    let cut = &detail[..motor_protocol::REFUSAL_DETAIL_MAX_BYTES.min(detail.len())];
+    assert!(
+        cut.starts_with("tenant dependency preparation failed: online fetch: boom; "),
+        "{cut}"
+    );
+    assert!(detail.ends_with(&routes), "{detail}");
+}

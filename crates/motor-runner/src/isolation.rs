@@ -2512,11 +2512,18 @@ pub(crate) fn prefetch_cargo_dependencies<'a>(
                     job_tree.host.as_path(),
                     dependency_routes,
                 );
-                io::Error::new(error.kind(), format!("{context}; {error}"))
+                with_fetch_context(error, &context)
             })
         })
     })
     .map_err(|error| io::Error::other(fetch_failure(stage, &error.to_string())))
+}
+
+/// The failure comes first: refusal details are cut to a fixed size, and a
+/// lockfile with several git dependencies yields a route list long enough to
+/// push Cargo's own error past the cut.
+fn with_fetch_context(error: io::Error, context: &str) -> io::Error {
+    io::Error::new(error.kind(), format!("{error}; {context}"))
 }
 
 /// Network jobs fetch their own sources without mirror rewrites. A locked
