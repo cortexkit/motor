@@ -1102,14 +1102,23 @@ impl Runtime {
         } else {
             None
         };
+        // Wake errors come from the helper and the guest agent, never from the
+        // request, so they are safe to log. The admin reply keeps a fixed name;
+        // the operator reads the cause from this host's journal.
         if op == "activate_runner_args" {
             return Ok(match self.control.wake(tenant, None) {
                 Ok(_) => json!({"ok":true}),
-                Err(_) => json!({"ok":false,"error":"remote_cache_activation_failed"}),
+                Err(error) => {
+                    tracing::error!(tenant, detail = %format!("{error:#}"), "remote_cache_activation_failed");
+                    json!({"ok":false,"error":"remote_cache_activation_failed"})
+                }
             });
         }
-        if op == "remote_cache_probe" && self.control.wake(tenant, None).is_err() {
-            return Ok(json!({"ok":false,"error":"remote_cache_agent_unavailable"}));
+        if op == "remote_cache_probe" {
+            if let Err(error) = self.control.wake(tenant, None) {
+                tracing::error!(tenant, detail = %format!("{error:#}"), "remote_cache_agent_unavailable");
+                return Ok(json!({"ok":false,"error":"remote_cache_agent_unavailable"}));
+            }
         }
         let reply = self.control.admin(tenant, request);
         // Even an old or failing agent must not echo request material to the
