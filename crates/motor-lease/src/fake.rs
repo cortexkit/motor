@@ -526,6 +526,10 @@ impl FakeBroker {
             || usage.ended_at_ms > MAX_SAFE_INTEGER
             || usage.ended_at_ms < usage.started_at_ms
             || usage.mem_peak_mib.is_some_and(|v| v > MAX_SAFE_INTEGER)
+            || usage
+                .mem_working_peak_mib
+                .flatten()
+                .is_some_and(|v| v > MAX_SAFE_INTEGER)
             || usage.egress_bytes.is_some_and(|v| v > MAX_SAFE_INTEGER)
         {
             return BrokerReply::error(400, "bad_request");

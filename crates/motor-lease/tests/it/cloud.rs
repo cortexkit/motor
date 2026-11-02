@@ -728,6 +728,60 @@ fn cloud_lease_reattach_release_and_nullable_usage_settlement_match_fake() {
     assert!(serde_json::from_value::<LeaseRequest>(unexpected).is_err());
 }
 
+#[test]
+fn cloud_working_peak_usage_bytes_signatures_and_settlement_match() {
+    let v = vector("usage-settlement.json");
+    for case in v["working_peak_cases"].as_array().unwrap() {
+        let mut broker = FakeBroker::new(
+            "working-peak-vector",
+            FakeConfig {
+                placement: Placement {
+                    host: "host-a".into(),
+                    vm: None,
+                },
+                ..config()
+            },
+        )
+        .unwrap();
+        let key = seed(case["seed_hex"].as_str().unwrap());
+        broker.register_host("host-a".into(), key.verifying_key());
+        let now = case["clock_ms"].as_u64().unwrap();
+        let mut request = lease_request();
+        request.timeout_s = 12;
+        issued(&mut broker, &request, now - 9000);
+        let usage: Usage = serde_json::from_value(case["request"]["body"].clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            case["request"]["body"]
+        );
+        let body = serde_json::to_vec(&usage).unwrap();
+        let path = case["request"]["pathname"].as_str().unwrap();
+        let headers = &case["request"]["headers"];
+        let timestamp = headers["CK-Timestamp"].as_str().unwrap().parse().unwrap();
+        let counter = headers["CK-Counter"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            host_message_bytes("POST", path, &body, timestamp, counter),
+            case["signed_string"].as_str().unwrap().as_bytes()
+        );
+        let signed =
+            HostHeaders::sign("host-a", "POST", path, &body, timestamp, counter, &key).unwrap();
+        assert_eq!(signed.signature, headers["CK-Signature"]);
+        let reply = broker.handle(
+            BrokerRequest {
+                content_type: Some("application/json"),
+                method: "POST",
+                path,
+                bearer: None,
+                host_headers: Some(&signed),
+                body: &body,
+            },
+            now,
+        );
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.body, case["reply"]["body"]);
+    }
+}
+
 /// CLOUD's `settled-reattach.json`: a registered host settles a job by usage
 /// report, and a later reattach still gets 200 with an `attach` token and the
 /// lease's unchanged fields. Seeded with the vector's keys and clocks, the fake

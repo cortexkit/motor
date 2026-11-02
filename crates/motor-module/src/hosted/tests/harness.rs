@@ -920,6 +920,7 @@ async fn settle_then_drop<W: tokio::io::AsyncWrite + Unpin>(
         mem_peak_mib: None,
         egress_bytes: None,
         outcome: UsageOutcome::Exit,
+        mem_working_peak_mib: None,
     };
     let body = serde_json::to_vec(&usage).unwrap();
     let path = "/v1/hosts/test-host/usage";

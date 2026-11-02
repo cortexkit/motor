@@ -43,8 +43,8 @@ pub struct JobBilling {
     /// Legacy VM samples retained for snapshot rollback, never job settlement.
     pub memory_peak_bytes: u64,
     pub mem_peak_mib: Option<u64>,
-    /// Untrusted guest telemetry, retained for display only. Deliberately not
-    /// copied into Usage, admission or placement calculations.
+    /// Untrusted guest telemetry, reported for display only. Never used for
+    /// billing, admission or placement calculations.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mem_working_peak_mib: Option<u64>,
     pub metrics_observed: bool,
@@ -132,6 +132,7 @@ pub(crate) fn finalize_ready(next: &mut Snapshot, now_ms: u64) {
                     .saturating_sub(b.egress_start.unwrap_or(b.egress_end)),
             ),
             outcome,
+            mem_working_peak_mib: lease.started_at_ms.and(b.mem_working_peak_mib).map(Some),
         };
         let billed = u64::from(usage.vcpus)
             .saturating_mul(end.saturating_sub(start))

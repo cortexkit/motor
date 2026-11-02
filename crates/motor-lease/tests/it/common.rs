@@ -119,6 +119,7 @@ pub fn usage() -> Usage {
         mem_peak_mib: Some(42),
         egress_bytes: Some(0),
         outcome: UsageOutcome::Exit,
+        mem_working_peak_mib: None,
     }
 }
 pub fn issued(b: &mut FakeBroker, request: &LeaseRequest, now: u64) -> LeaseResponse {

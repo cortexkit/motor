@@ -159,7 +159,7 @@ fn an_unstarted_job_cannot_report_a_memory_peak() {
 }
 
 #[test]
-fn guest_working_peak_is_local_display_only_and_never_sent_to_broker() {
+fn guest_working_peak_is_reported_without_changing_billing() {
     for peak in [None, Some(513), Some(1 << 53)] {
         let mut h = host();
         started(&mut h, JOB, 1);
@@ -190,11 +190,26 @@ fn guest_working_peak_is_local_display_only_and_never_sent_to_broker() {
             .find(|r| r.path.ends_with("/usage"))
             .unwrap();
         let body: Value = serde_json::from_slice(&request.body).unwrap();
-        assert!(body.get("mem_working_peak_mib").is_none());
+        assert_eq!(
+            body["mem_working_peak_mib"],
+            serde_json::to_value(expected).unwrap()
+        );
+        assert_eq!(
+            body.get("mem_working_peak_mib").is_some(),
+            expected.is_some()
+        );
+        assert_eq!(
+            local.usage.as_ref().unwrap().mem_working_peak_mib,
+            expected.map(Some)
+        );
         assert_eq!(body["mem_peak_mib"], 1600);
         assert_eq!(body["vcpus"], 1);
         assert_eq!(body["started_at_ms"], MS);
         assert_eq!(body["ended_at_ms"], MS + 3000);
+        assert_eq!(
+            local.hosted_terminal.as_ref().unwrap()["billed_vcpu_ms"],
+            3000
+        );
         assert!(serde_json::from_slice::<motor_lease::Usage>(&request.body).is_ok());
     }
 }

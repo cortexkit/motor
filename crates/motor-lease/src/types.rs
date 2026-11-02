@@ -366,6 +366,20 @@ pub struct Usage {
     #[serde(deserialize_with = "required_nullable")]
     pub egress_bytes: Option<u64>,
     pub outcome: UsageOutcome,
+    /// Optional telemetry: preserve absent legacy reports and explicit null
+    /// peaks separately so canonical usage bytes and signatures round-trip.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_nullable"
+    )]
+    pub mem_working_peak_mib: Option<Option<u64>>,
+}
+
+fn present_nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 fn required_nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
