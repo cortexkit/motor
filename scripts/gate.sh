@@ -282,8 +282,8 @@ for lane in "${lanes[@]}"; do
     elif [ "$lane" = remote-serial ]; then
       ck motor run --vcpus 16 --cwd "$root" -- "$serial_body" >"$logs/$lane.log" 2>&1 || code=$?
     elif [ "$lane" = mixed-version ]; then
-      cwd="$lane_root/$lane"
-      $serial && cwd=$root
+      # Serial mode makes no lane clones, so lane_root is unset there.
+      if $serial; then cwd=$root; else cwd="$lane_root/$lane"; fi
       ck motor run --vcpus 16 --net --cwd "$cwd" -- "$body" >"$logs/$lane.log" 2>&1 || code=$?
     else
       ck motor run --vcpus 16 --cwd "$lane_root/$lane" -- "$body" >"$logs/$lane.log" 2>&1 || code=$?

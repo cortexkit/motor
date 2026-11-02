@@ -121,14 +121,17 @@ if os.environ.get('EXECUTE_REMOTE'):
         self.assertFalse(self.lanes.exists())
 
     def test_all_remote_lanes_start_in_parallel_and_report_failure(self):
-        result = self.run_gate(EXPECT_PARALLEL="5", FAIL_LANE="windows-clippy")
+        result = self.run_gate(EXPECT_PARALLEL="6", FAIL_LANE="windows-clippy")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        for lane in ("linux-lint", "linux-tests", "musl", "script-tests"):
+        for lane in ("linux-lint", "linux-tests", "mixed-version", "musl", "script-tests"):
             self.assertIn(f"gate {lane} PASS", result.stdout)
         self.assertIn("gate windows-clippy FAIL exit=8", result.stdout)
-        self.assertEqual(len(self.commands("ck")), 5)
+        self.assertEqual(len(self.commands("ck")), 6)
         for command in self.commands("ck"):
             self.assertEqual(command[1:5], ["motor", "run", "--vcpus", "16"])
+        # Only the old-client check downloads; every other lane stays offline.
+        online = [c for c in self.commands("ck") if "--net" in c]
+        self.assertEqual([Path(c[c.index("--cwd") + 1]).name for c in online], ["mixed-version"])
 
     def test_selected_lane_keeps_source_history_and_reuses_checkout(self):
         self.put("tracked", "original")
@@ -173,6 +176,15 @@ if os.environ.get('EXECUTE_REMOTE'):
         self.assertIn("gate linux-lint FAIL exit=7", result.stdout)
         self.assertIn("gate windows-clippy PASS", result.stdout)
         self.assertEqual(len(self.commands("ck")), 1)
+
+    def test_serial_mode_runs_the_old_client_check_as_its_own_network_job(self):
+        result = self.run_gate("--serial", "--lane", "linux-lint", "--lane", "mixed-version")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commands = self.commands("ck")
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(sum("--net" in c for c in commands), 1)
+        serial = next(c for c in commands if "--net" not in c)
+        self.assertNotIn("mixed-version.py", serial[-1])
         command = self.commands("ck")[0]
         self.assertEqual(command[command.index("--cwd") + 1], str(self.root))
         self.assertFalse(self.lanes.exists())
