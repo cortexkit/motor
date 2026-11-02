@@ -154,7 +154,7 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         ),
         (
             "usage-settlement.json",
-            "4f53e2eb16dd586308f31f9a9ffe986c1f214a65aa45dd973f2a3de1f63084b7",
+            "5af0bad18551107865747a1bdbdb70f4b0556effe7311ff79687b36b034ee54b",
         ),
         (
             "settled-reattach.json",
