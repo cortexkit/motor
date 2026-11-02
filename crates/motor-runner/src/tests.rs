@@ -75,6 +75,9 @@ mod return_paths;
 mod sibling_eviction;
 #[path = "tests/sibling_snapshots.rs"]
 mod sibling_snapshots;
+#[cfg(target_os = "linux")]
+#[path = "tests/source_seal.rs"]
+mod source_seal;
 #[path = "tests/started.rs"]
 mod started;
 #[path = "tests/state_lock.rs"]

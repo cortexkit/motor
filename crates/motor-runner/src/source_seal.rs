@@ -61,8 +61,17 @@ impl<'a> Sources<'a> {
                         .caller_repository_root
                         .text(),
                 );
-                let tree = crate::workspace::snapshot_tree(&mirror, &snapshot.request.tree_hash)?;
-                let mut plan = plan(snapshot.config, snapshot.request, prepared, &tree)?;
+                let tree = step(
+                    &mirror,
+                    "enumerate snapshot",
+                    crate::workspace::snapshot_tree(&mirror, &snapshot.request.tree_hash),
+                )?;
+                let root = paths::host_run(snapshot.config, snapshot.request).host_workspace;
+                let mut plan = step(
+                    &root,
+                    "compute sealed set",
+                    plan(snapshot.config, snapshot.request, prepared, &tree),
+                )?;
                 plan.unit = id;
                 let job_id = snapshot.request.job_id;
                 snapshot
@@ -287,13 +296,21 @@ impl Runtime {
         // An intent covers the helper's pre-record interval across daemon
         // crashes. A per-job kernel lock serializes a surviving old helper
         // with startup unseal, and a late helper must still find this intent.
-        if let Err(error) = crate::storage::atomic_json_private(&intent_path(state, id), &plan) {
+        if let Err(error) = step(
+            &intent_path(state, id),
+            "sync seal intent",
+            crate::storage::atomic_json_private(&intent_path(state, id), &plan),
+        ) {
             if !intent_path(state, id).try_exists().unwrap_or(true) {
                 self.0.lock().unwrap().remove(&id);
             }
             return Err(error);
         }
-        let result = privileged("seal", state, id, Some(&plan));
+        let result = step(
+            &plan.workspace,
+            "apply source seal",
+            privileged("seal", state, id, Some(&plan)),
+        );
         if let Err(error) = result {
             if record_path(state, id).try_exists().unwrap_or(true)
                 || intent_path(state, id).try_exists().unwrap_or(true)

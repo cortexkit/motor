@@ -20,10 +20,10 @@ pub(crate) enum Policy {
 pub(crate) const HELPER: &str = "/usr/local/libexec/motor-runner-permissions";
 
 pub(crate) fn digest() -> String {
-    format!(
-        "{:x}",
-        sha2::Sha256::digest(include_bytes!("permissions.rs"))
-    )
+    let mut hash = sha2::Sha256::new();
+    hash.update(include_bytes!("permissions.rs"));
+    hash.update(include_bytes!("source_seal.rs"));
+    format!("{hash:x}", hash = hash.finalize())
 }
 
 pub(crate) fn check_install() -> io::Result<()> {
@@ -67,6 +67,23 @@ pub(crate) fn check_install() -> io::Result<()> {
             .output()?;
         if !output.status.success() {
             return Err(io::Error::other("operator sudo policy must allow the fixed physical-chmod command forms before deploy"));
+        }
+    }
+    for action in ["seal", "unseal"] {
+        let output = Command::new("/usr/bin/sudo")
+            .args([
+                "-n",
+                "-l",
+                HELPER,
+                action,
+                "00000000-0000-0000-0000-000000000000",
+                "/srv/build/tmp",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(
+                "operator sudo policy must allow the fixed seal and unseal forms before deploy",
+            ));
         }
     }
     Ok(())
@@ -151,7 +168,7 @@ fn open_at(parent: RawFd, name: &std::ffi::OsStr, directory: bool) -> io::Result
 /// physical directory. The root itself may be a directory (repaired recursively)
 /// or a regular file (only that inode is repaired), as `chmod -R` accepted both.
 /// A symlink or special-inode root is refused before any mode changes.
-fn physical_root(path: &Path) -> io::Result<OwnedFd> {
+pub(crate) fn physical_root(path: &Path) -> io::Result<OwnedFd> {
     if !path.is_absolute() || path.parent().is_none() {
         return Err(io::Error::other(
             "permission tree must be absolute and not filesystem root",
@@ -187,6 +204,21 @@ fn physical_root(path: &Path) -> io::Result<OwnedFd> {
         )));
     }
     Ok(root)
+}
+
+pub(crate) fn seal_command(
+    action: &str,
+    state: &Path,
+    id: motor_protocol::Uuid,
+) -> io::Result<Command> {
+    if !matches!(action, "seal" | "unseal") || !state.is_absolute() {
+        return Err(io::Error::other("invalid source seal helper form"));
+    }
+    let mut command = Command::new("/usr/bin/sudo");
+    command
+        .args(["-n", HELPER, action, &id.to_string()])
+        .arg(state);
+    Ok(command)
 }
 
 struct Frame {

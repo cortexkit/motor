@@ -36,7 +36,9 @@ class PermissionsPolicyTests(unittest.TestCase):
         row = next(line for line in rendered.splitlines() if 'NOPASSWD:' in line)
         self.assertEqual(row.split('NOPASSWD: ',1)[1].split(', '), [
             '/usr/local/libexec/motor-runner-permissions physical-chmod owner-rwX -- *',
-            '/usr/local/libexec/motor-runner-permissions physical-chmod private-rwX -- *'])
+            '/usr/local/libexec/motor-runner-permissions physical-chmod private-rwX -- *',
+            '/usr/local/libexec/motor-runner-permissions seal * *',
+            '/usr/local/libexec/motor-runner-permissions unseal * *'])
         for operator in ('motor-job','motor-cache','alias','root','ubuntu\nALL=(ALL) ALL'):
             with self.subTest(operator=operator), self.assertRaises(ValueError):
                 policy.render(template, operator, accounts.__getitem__)

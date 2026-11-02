@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render only the two fixed native permission grants for a trusted operator."""
+"""Render only the fixed native permission grants for a trusted operator."""
 import pwd
 import re
 from pathlib import Path
@@ -7,7 +7,8 @@ import sys
 
 HELPER = '/usr/local/libexec/motor-runner-permissions'
 ROW = ('@OPERATOR@ ALL=(root) NOPASSWD: ' + HELPER + ' physical-chmod owner-rwX -- *, '
-       + HELPER + ' physical-chmod private-rwX -- *')
+       + HELPER + ' physical-chmod private-rwX -- *, '
+       + HELPER + ' seal * *, ' + HELPER + ' unseal * *')
 
 
 def uid(name):
@@ -31,7 +32,7 @@ def render(template, operator, lookup=uid):
             raise ValueError('sandbox UID aliases must never receive the helper grant')
     rows = [line for line in template.splitlines() if line.strip() and not line.lstrip().startswith('#')]
     if rows != [ROW]:
-        raise ValueError('sudoers template differs from the two fixed native operations')
+        raise ValueError('sudoers template differs from the fixed native operations')
     return template.replace('@OPERATOR@', operator)
 
 

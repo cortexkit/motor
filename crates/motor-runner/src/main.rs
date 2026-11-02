@@ -54,6 +54,13 @@ async fn run(args: Vec<String>) -> io::Result<()> {
         return motor_runner::physical_chmod(&args[1..]);
     }
     #[cfg(target_os = "linux")]
+    if args
+        .first()
+        .is_some_and(|arg| matches!(arg.as_str(), "seal" | "unseal"))
+    {
+        return motor_runner::source_seal_helper(&args[0], &args[1..]);
+    }
+    #[cfg(target_os = "linux")]
     if args == ["permission-helper-digest"] {
         println!("{}", motor_runner::permission_helper_digest());
         return Ok(());

@@ -132,6 +132,7 @@ pub(crate) fn garbage(config: &Config, path: HostPath<'_>) -> io::Result<Retired
 /// done, so a rerun after a kill converges.
 #[cfg(target_os = "linux")]
 pub(crate) fn sweep(config: &Config, root: &CallerRoot) -> io::Result<()> {
+    config.source_seals.check_host(&root.host_root)?;
     use std::{
         ffi::CString,
         os::{fd::AsRawFd, unix::ffi::OsStrExt},
@@ -231,6 +232,7 @@ pub(crate) fn detach(
         os::unix::{ffi::OsStrExt, fs::MetadataExt},
     };
     let path = path.as_path();
+    config.source_seals.check_host(path)?;
     if path == root.host_root || !startup::canonical_spelling(&path.to_string_lossy()) {
         return Err(io::Error::other("invalid mapped deletion path"));
     }

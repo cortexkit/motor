@@ -357,6 +357,7 @@ impl crate::backend::IsolationLauncher for UncachedIsolationLauncher {
         env: &[(String, String)],
         _cpus: &[u32],
         _requested_vcpus: u32,
+        #[cfg(target_os = "linux")] _sources: crate::source_seal::Sources<'_>,
     ) -> io::Result<crate::platform::Launch> {
         if let Some(state) = &self.boat_disk {
             use std::os::unix::fs::MetadataExt;

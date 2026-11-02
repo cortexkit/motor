@@ -289,6 +289,13 @@ fn snapshot_entries(
     Ok(entries)
 }
 
+/// Enumerate the entire snapshot from the trusted object repository, never
+/// from Git configuration or an index in a job-owned checkout.
+#[cfg(target_os = "linux")]
+pub(crate) fn snapshot_tree(objects: &Path, tree: &str) -> io::Result<Vec<u8>> {
+    change_scan_git(objects, &["ls-tree", "-rz", "--full-tree", tree])
+}
+
 fn change_path(name: &[u8]) -> PathBuf {
     #[cfg(unix)]
     {
