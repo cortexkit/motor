@@ -3535,6 +3535,17 @@ impl Sandbox {
         let memory_max = crate::backend::memory_max(resources.vcpus, self.memory_floor_gib);
         #[cfg(not(test))]
         let memory_max = crate::backend::memory_max(resources.vcpus);
+        // Only a tenant job receives a host-verified cap. Build-server, Boat
+        // and dependency-writer units keep their existing limits. The slice
+        // clamp below applies to it like any other limit.
+        let memory_max = if self.tenant_vm && !self.boat_profile && !self.writer {
+            resources
+                .memory_mib
+                .map(|mib| mib.saturating_mul(1 << 20))
+                .unwrap_or(memory_max)
+        } else {
+            memory_max
+        };
         // A job's limit is a ceiling, while the shared slice's is a budget: a
         // request larger than the slice can never be honoured, so the unit asks
         // for the slice's own `MemoryMax` instead. An overrun still ends as an
@@ -3549,16 +3560,6 @@ impl Sandbox {
                 .unwrap()
                 .map_or(crate::systemd::NO_JOB_MEMORY_BUDGET, |budget| budget.max),
         );
-        // Only a tenant job receives a host-verified cap. Build-server, Boat
-        // and dependency-writer units keep their existing limits.
-        let memory_max = if self.tenant_vm && !self.boat_profile && !self.writer {
-            resources
-                .memory_mib
-                .map(|mib| mib.saturating_mul(1 << 20))
-                .unwrap_or(memory_max)
-        } else {
-            memory_max
-        };
         cmd.arg(format!("--property=MemoryMax={memory_max}"));
         // Match the host's executable /dev/shm policy while bounding this
         // job's private tmpfs to the same memory limit as the service.

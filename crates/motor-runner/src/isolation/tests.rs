@@ -131,6 +131,39 @@ fn tenant_unit_uses_host_memory_and_keeps_other_target_limits() {
 }
 
 #[test]
+fn tenant_host_memory_is_clamped_to_the_jobs_slice() {
+    let f = Fixture::new();
+    // A host-verified figure above the slice's MemoryMax can never be honoured,
+    // so the unit asks for the slice's ceiling, as a vCPU-derived limit does.
+    let slice = crate::systemd::JobMemoryBudget::from_max(8 << 30).unwrap();
+    let memory_max = |stated: u64| {
+        f.command_sandbox()
+            .in_tenant_vm(true)
+            .with_slice_budget(slice)
+            .command_for_resources(
+                "true",
+                &f.workspace,
+                &[],
+                true,
+                &[1],
+                crate::backend::JobResources {
+                    vcpus: 2,
+                    memory_mib: Some(stated),
+                },
+            )
+            .unwrap()
+            .get_args()
+            .filter_map(|arg| arg.to_str())
+            .find_map(|arg| arg.strip_prefix("--property=MemoryMax="))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+    };
+    assert_eq!(memory_max(16 << 10), 8 << 30);
+    assert_eq!(memory_max(4 << 10), 4 << 30);
+}
+
+#[test]
 fn memory_limit_gib_formats_floor_and_scaled_limits() {
     for (vcpus, limit) in [
         (1, "16"),
