@@ -63,8 +63,10 @@ where
     F: FnMut(Frame) -> Fut,
     Fut: Future<Output = io::Result<Value>>,
 {
-    // A stop discards guest memory, so disposable fills may be interrupted.
-    // Suspend preserves memory and must still refuse every running job.
+    // A stop discards guest memory, so the runner's own compile-cache fills
+    // (trusted background builds of a repository's default branch, retried at
+    // the next start) may be interrupted; only caller work blocks it. Suspend
+    // preserves memory and must still refuse every running job, fills included.
     let check = if kind == SnapshotKind::Stop {
         super::resize::busy
     } else {
