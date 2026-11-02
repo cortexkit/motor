@@ -1004,7 +1004,7 @@ impl Snapshots {
                     revisions.push(tip);
                 }
                 if let Ok(ancestors) = git(&s.path, &revisions) {
-                    commits.extend(ancestors.lines().map(str::to_owned));
+                    commits.extend(sampled_ancestry(ancestors.lines()));
                 }
                 let mut seen = std::collections::BTreeSet::new();
                 commits.retain(|c| seen.insert(c.clone()));
@@ -1154,6 +1154,26 @@ impl Snapshots {
         )?;
         Ok((workspace, dependencies, upload))
     }
+}
+
+/// Ancestors offered in a Have frame: every one of the newest
+/// `DENSE_ANCESTORS`, then one at each power-of-two step further back. Offering
+/// the whole history made the frame grow with the repository: about 24,000
+/// commits fill the 1 MiB frame limit, so a large checkout or sibling could not
+/// run at all. Any held ancestor is a valid bundle prerequisite, and with
+/// power-of-two spacing the newest held one found is at most about twice as far
+/// back as the nearest, so a bundle carries at most about twice the history it
+/// strictly needs.
+const DENSE_ANCESTORS: usize = 64;
+
+fn sampled_ancestry<'a>(ancestors: impl Iterator<Item = &'a str>) -> Vec<String> {
+    ancestors
+        .enumerate()
+        .filter(|(index, _)| {
+            *index < DENSE_ANCESTORS || (index - DENSE_ANCESTORS + 1).is_power_of_two()
+        })
+        .map(|(_, commit)| commit.to_owned())
+        .collect()
 }
 
 fn cargo_home() -> io::Result<PathBuf> {
@@ -1455,6 +1475,86 @@ mod tests {
         .unwrap();
         git(checkout, &["reset", "--mixed", parent]).unwrap();
         commit
+    }
+
+    /// A large history no longer fills the Have frame: offered ancestors are
+    /// the newest 64 plus one per power-of-two step, so 1,000,000 commits stay
+    /// far under the 1 MiB frame limit that 24,000 used to exceed.
+    #[test]
+    fn offered_ancestry_is_dense_then_exponential_and_bounded() {
+        let ids: Vec<String> = (0..1_000_000).map(|i| format!("{i:040x}")).collect();
+        let sampled = sampled_ancestry(ids.iter().map(String::as_str));
+        assert_eq!(&sampled[..DENSE_ANCESTORS], &ids[..DENSE_ANCESTORS]);
+        let expected: Vec<&String> = (0..)
+            .map(|k: u32| DENSE_ANCESTORS - 1 + (1usize << k))
+            .take_while(|index| *index < ids.len())
+            .map(|index| &ids[index])
+            .collect();
+        assert_eq!(
+            sampled[DENSE_ANCESTORS..].iter().collect::<Vec<_>>(),
+            expected
+        );
+        let frame = serde_json::to_vec(&RepositoryCandidates {
+            repository: "/Users/u/repo".into(),
+            commits: sampled,
+        })
+        .unwrap();
+        assert!(frame.len() < 8 * 1024, "{}", frame.len());
+    }
+
+    /// A runner holding only an older, sampled ancestor still gets a bundle
+    /// it can apply: that ancestor is a valid prerequisite.
+    #[test]
+    fn bundle_against_a_sampled_old_ancestor_applies_to_a_mirror_holding_only_it() {
+        let (scratch, checkout, spool, first) = repository();
+        let mut chain = vec![first];
+        for i in 0..200 {
+            fs::write(checkout.join("source.txt"), format!("{i}\n")).unwrap();
+            let next = prepare_commit(&checkout, chain.last().unwrap());
+            git(&checkout, &["reset", "--hard", &next]).unwrap();
+            chain.push(next);
+        }
+        let snapshots = build_snapshots(&checkout, &checkout, &spool);
+        let offered = &snapshots.candidates(&BTreeMap::new())[0].commits;
+        assert!(offered.len() < 80, "{}", offered.len());
+        // 64 dense ancestors then +1, +2, +4, +8, +16, +32, +64: the 128th
+        // ancestor of HEAD is offered, the 100th is not.
+        let old = &chain[chain.len() - 1 - 127];
+        assert!(offered.contains(old));
+        assert!(!offered.contains(&chain[chain.len() - 1 - 99]));
+        let held = [held(&snapshots.main.repository, &[old.as_str()])];
+        let manifests = snapshots.bundle(Uuid::now_v7(), &held).unwrap();
+        assert_eq!(manifests.len(), 1);
+        let mirror = scratch.join("mirror");
+        fs::create_dir_all(&mirror).unwrap();
+        git(&mirror, &["init", "--bare", "-q"]).unwrap();
+        git(
+            &mirror,
+            &[
+                "fetch",
+                text(&checkout).unwrap(),
+                &format!("{old}:refs/held"),
+            ],
+        )
+        .unwrap();
+        git(
+            &mirror,
+            &[
+                "fetch",
+                text(&snapshots.spool.0.join("bundle-0")).unwrap(),
+                "refs/ck-motor/*:refs/ck-motor/*",
+            ],
+        )
+        .unwrap();
+        git(
+            &mirror,
+            &[
+                "cat-file",
+                "-e",
+                &format!("{}^{{tree}}", snapshots.main.commit),
+            ],
+        )
+        .unwrap();
     }
 
     fn build_snapshots(checkout: &Path, root: &Path, spool: &Path) -> Snapshots {
