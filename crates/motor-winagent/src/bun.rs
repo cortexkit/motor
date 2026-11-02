@@ -120,7 +120,10 @@ pub struct Refusal {
     pub kind: RefusalKind,
     pub project: String,
     pub package: String,
-    pub version: String,
+    /// Boxed like `registry_origin` and `detail` so a refusal stays small enough
+    /// to return by value from every preparation step.
+    #[serde(default, skip_serializing_if = "detail_empty")]
+    pub version: Box<str>,
     /// Boxed like `detail` so a refusal stays small enough to return by value.
     #[serde(default, skip_serializing_if = "detail_empty")]
     pub registry_origin: Box<str>,
@@ -280,7 +283,7 @@ pub fn refuse(kind: RefusalKind, project: &str, package: &str, version: &str) ->
         {
             version.into()
         } else {
-            String::new()
+            Box::default()
         },
         registry_origin: if package.is_empty() {
             Box::default()
