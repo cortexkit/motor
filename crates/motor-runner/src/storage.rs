@@ -265,7 +265,8 @@ pub(crate) struct Job {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prepared_javascript_directories: Vec<PathBuf>,
     /// Whether source inode protection was applied before this command started.
-    #[serde(default)]
+    /// Omitted when false, so records of unsealed jobs keep their earlier bytes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub source_read_only: bool,
 }
 
