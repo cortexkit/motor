@@ -97,6 +97,8 @@ def install_job_packages(pins, manifest):
     Path("/etc/apt/sources.list").write_text(
         f"deb https://snapshot.debian.org/archive/debian/{pins['debian_snapshot']}/ {pins['debian_suite']} main\n")
     Path("/etc/apt/apt.conf.d/99snapshot").write_text('Acquire::Check-Valid-Until "false";\n')
+    # Tenant jobs build the static runner too; their role includes musl-tools
+    # so apt supplies musl-gcc and its matching libc development files.
     packages = sorted(set(manifest["apt_packages"]["required"] + manifest["apt_packages"]["by_role"]["tenant"]))
     os.environ["DEBIAN_FRONTEND"] = "noninteractive"
     run("apt-get", "update")

@@ -455,6 +455,8 @@ class ParityTests(unittest.TestCase):
                                                              spec.get('realpath_suffix_by_role', {}).get(role, '')),
                         'version': spec.get('version', spec.get('observed_build_server_version')), 'exit_code': 0}
                  for name, spec in manifest['tools'].items()}
+        if 'musl-gcc' in tools:
+            tools['musl-gcc']['version'] = 'x86_64-linux-gnu-gcc (Ubuntu 13.2.0-23ubuntu4) 13.2.0'
         tools.update({name: {'path': path, 'version': name[3:] + ' (GNU coreutils) 9.7', 'exit_code': 0}
                       for name, path in manifest['gnu_coreutils'].items()})
         for name, row in tools.items():
@@ -494,6 +496,17 @@ class ParityTests(unittest.TestCase):
                                             if spec['path'].startswith('/usr/local/bin/')),
                 'mountinfo': '1 0 0:0 / ' + manifest['rustup_home'] + ' ro - ext4 /dev/example rw',
                 'cargo_registry': self.registry()}
+
+    def observed_host(self, role):
+        actual = self.observed(role)
+        actual.update(self.manifest['layout_by_role'].get(role, {}).get('host', {}))
+        if role in ('boat', 'tenant'):
+            actual['sccache_artifacts'] = {
+                'inputs_sha256': self.manifest['sccache']['inputs_sha256'],
+                'binaries': {name: actual['cargo_binaries'][name]['sha256']
+                             for name in self.manifest['sccache']['build_server_sha256']},
+            }
+        return actual
 
     def test_fchmodat2_enosys_fails_every_role_and_mode(self):
         for role in ('build-server', 'boat', 'tenant'):
@@ -958,21 +971,52 @@ class ParityTests(unittest.TestCase):
                     self.assertIn('missing apt package: ' + name,
                                   parity.differences(self.manifest, actual, role=role))
 
-    def test_musl_tools_is_required_only_on_the_build_server(self):
+    def test_musl_tools_is_required_on_every_linux_role(self):
         manifest = self.manifest
-        self.assertIn('musl-tools', manifest['apt_packages']['by_role']['build-server'])
         self.assertNotIn('musl-tools', manifest['apt_packages']['required'])
         setup = (parity.HERE / 'setup.sh').read_text()
         self.assertIn('build-essential clang lld musl-tools pkg-config', setup)
-        server = self.observed('build-server')
-        server['apt_packages'].pop('musl-tools')
-        self.assertIn('missing apt package: musl-tools',
-                      parity.differences(manifest, server, role='build-server'))
-        for role in ('boat', 'tenant'):
+        for role in ('build-server', 'boat', 'tenant'):
             with self.subTest(role=role):
-                self.assertNotIn('musl-tools', manifest['apt_packages']['by_role'][role])
-                self.assertNotIn('missing apt package: musl-tools',
-                                 parity.differences(manifest, self.observed(role), role=role))
+                self.assertIn('musl-tools', manifest['apt_packages']['by_role'][role])
+                actual = self.observed_host(role)
+                self.assertEqual([], parity.differences(manifest, actual, role=role))
+                del actual['apt_packages']['musl-tools']
+                self.assertIn('missing apt package: musl-tools',
+                              parity.differences(manifest, actual, role=role))
+
+    def test_musl_gcc_is_required_on_every_linux_host_and_job_path(self):
+        self.assertIn('musl-gcc', self.manifest['tools'])
+        self.assertEqual('/usr/bin/musl-gcc', self.manifest['tools']['musl-gcc']['path'])
+        for role in ('build-server', 'boat', 'tenant'):
+            for job in (False, True):
+                for drift in ('missing', 'path', 'exit_code', 'version'):
+                    with self.subTest(role=role, job=job, drift=drift):
+                        actual = self.observed(role, job=True) if job else self.observed_host(role)
+                        actual['syscalls']['clone3.invalid']['errno'] = errno.ENOSYS if job else errno.EINVAL
+                        self.assertEqual([], parity.differences(self.manifest, actual, role, job,
+                                                               gnu_test_sha256='package-qualified-test'))
+                        if drift == 'missing':
+                            actual['tools']['musl-gcc'] = None
+                        else:
+                            actual['tools']['musl-gcc'][drift] = {
+                                'path': '/usr/local/bin/musl-gcc',
+                                'exit_code': 1,
+                                'version': 'not a compiler',
+                            }[drift]
+                        errors = parity.differences(self.manifest, actual, role, job,
+                                                   gnu_test_sha256='package-qualified-test')
+                        self.assertTrue(any('musl-gcc' in error for error in errors), errors)
+
+    def test_musl_gcc_accepts_distribution_compiler_versions(self):
+        for role, version in (
+                ('build-server', 'x86_64-linux-gnu-gcc (Ubuntu 15.2.0-13ubuntu3) 15.2.0'),
+                ('boat', 'x86_64-linux-gnu-gcc (Ubuntu 13.2.0-23ubuntu4) 13.2.0'),
+                ('tenant', 'x86_64-linux-gnu-gcc (Debian 14.2.0-19) 14.2.0')):
+            with self.subTest(role=role):
+                actual = self.observed(role, job=True)
+                actual['tools']['musl-gcc']['version'] = version
+                self.assertTrue(self.report(actual, role=role, job=True)['passed'])
 
     def test_build_server_job_visible_tools_are_in_the_catalogue(self):
         actual = self.observed()

@@ -1327,7 +1327,8 @@ class AptInstallTests(unittest.TestCase):
         self.assertEqual(inventory['apt_held_packages'], {'openssh-server': '1:9.6p1-3ubuntu13.8'})
         command = next(call.args for call in run.call_args_list if call.args[:2] == ('apt-get', 'install'))
         self.assertNotIn('openssh-server', command)
-        for package in manifest['apt_packages']['required']:
+        self.assertIn('musl-tools', command)
+        for package in manifest['apt_packages']['required'] + manifest['apt_packages']['by_role']['boat']:
             if package != 'openssh-server':
                 self.assertIn(package, command)
 

@@ -77,6 +77,7 @@ class ImageTests(unittest.TestCase):
         expected = set(manifest['apt_packages']['required'] + manifest['apt_packages']['by_role']['tenant'])
         self.assertEqual(set(install[4:]), expected)
         self.assertIn('libwebkit2gtk-4.1-dev', install[4:])
+        self.assertIn('musl-tools', install[4:])
 
     def test_default_build_output_uses_root_trusted_vm_bind_view(self):
         with mock.patch.object(sys, "argv", ["build.py", "build", "test-version", "--runner", "/runner", "--build-budget-gib", "1"]), mock.patch.object(image, "build") as build:
