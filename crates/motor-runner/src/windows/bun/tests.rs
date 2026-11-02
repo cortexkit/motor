@@ -132,7 +132,7 @@ fn private_credentials_grants_and_locked_url_policy_are_checked_before_cache_acc
         let refusal = resolve(&config, "/repo", "m/project", &row).err().unwrap();
         assert_eq!(refusal.kind, RefusalKind::BunRegistryUnauthorized);
         assert!(!refusal.to_string().contains("secret"));
-        assert_eq!(refusal.registry_origin, "https://npm.example.test");
+        assert_eq!(&*refusal.registry_origin, "https://npm.example.test");
     }
 }
 
@@ -987,7 +987,7 @@ fn fake_registry_roundtrip_keeps_credentials_off_the_archive_and_guest_manifest(
         bun::prepare_cache(&seed, &guest.join("source"), &guest.join("corrupt-cache")).unwrap_err();
     assert_eq!(refusal.kind, RefusalKind::BunIntegrityMismatch);
     assert_eq!(refusal.package, "@private/win");
-    assert_eq!(refusal.registry_origin, "https://npm.example.test");
+    assert_eq!(&*refusal.registry_origin, "https://npm.example.test");
     let warm = scratch.join("warm");
     let warm_checkout = warm.join("m/project");
     fs::create_dir_all(&warm_checkout).unwrap();
