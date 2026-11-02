@@ -141,15 +141,24 @@ pub async fn serve(runner: Runner, listener: UnixListener) -> io::Result<()> {
     let qualification = false;
     let mut channels = tokio::task::JoinSet::new();
     let mut poll = tokio::time::interval(Duration::from_millis(25));
+    let mut service_stop = runner.service_stop_signal();
     loop {
+        if *service_stop.borrow() {
+            break;
+        }
         let (socket, _) = tokio::select! {
-            socket = listener.accept() => socket?,
-            Some(_) = channels.join_next(), if !channels.is_empty() => continue,
+            biased;
+            _ = service_stop.changed() => break,
             _ = poll.tick() => {
                 if runner.is_draining() && runner.drain_should_exit() { break; }
                 continue;
-            }
+            },
+            Some(_) = channels.join_next(), if !channels.is_empty() => continue,
+            socket = listener.accept() => socket?,
         };
+        if *service_stop.borrow() {
+            break;
+        }
         let accepted = std::time::Instant::now();
         let connection_id = Uuid::now_v7();
         let span = tracing::info_span!("runner connection", %connection_id);
@@ -164,11 +173,45 @@ pub async fn serve(runner: Runner, listener: UnixListener) -> io::Result<()> {
             .instrument(span),
         );
     }
+    // Close both the owner and qualification listeners before waiting on jobs
+    // or clients. Health probes must not prolong a service stop.
+    drop(listener);
     // Let terminal and drain acknowledgements flush before closing connections.
-    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+    if tokio::time::timeout(Duration::from_secs(2), async {
         while channels.join_next().await.is_some() {}
     })
-    .await;
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            wait = "connections",
+            count = channels.len(),
+            grace_ms = 2000,
+            "runner stop closing connections after grace period"
+        );
+        channels.abort_all();
+    }
+    // A drain deadline (including a previously completed hold-only drain) is
+    // not permission to abandon an unrecoverable Windows execution or an
+    // in-flight record save. Only client connections have a fixed stop grace.
+    let started = std::time::Instant::now();
+    let mut next_log = started + Duration::from_secs(5);
+    while *service_stop.borrow() {
+        let waits = runner.service_stop_blockers();
+        if waits.is_empty() {
+            break;
+        }
+        if std::time::Instant::now() >= next_log {
+            tracing::warn!(
+                wait = "engine",
+                ?waits,
+                elapsed_ms = started.elapsed().as_millis(),
+                "runner service stop waiting for accepted work"
+            );
+            next_log = std::time::Instant::now() + Duration::from_secs(5);
+        }
+        poll.tick().await;
+    }
     Ok(())
 }
 

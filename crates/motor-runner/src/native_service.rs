@@ -22,6 +22,7 @@ use windows_sys::Win32::System::Power::{
     SYSTEM_POWER_STATUS,
 };
 static STOP: AtomicBool = AtomicBool::new(false);
+static STOP_RUNNER: Mutex<Option<Runner>> = Mutex::new(None);
 const NAME: &str = "MotorRunner";
 define_windows_service!(service_entry, service_main);
 pub(super) fn dispatch() -> io::Result<()> {
@@ -46,7 +47,7 @@ fn service_status(state: ServiceState, code: u32) -> ServiceStatus {
         },
         exit_code: ServiceExitCode::Win32(code),
         checkpoint: if stopping { 1 } else { 0 },
-        wait_hint: Duration::from_secs(if stopping { 60 } else { 35 }),
+        wait_hint: Duration::from_secs(if stopping { 10 } else { 0 }),
         process_id: None,
     }
 }
@@ -56,20 +57,26 @@ fn service_main(_: Vec<OsString>) {
     let service_status_handle =
         match service_control_handler::register(NAME, move |event| match event {
             ServiceControl::Stop | ServiceControl::Shutdown => {
-                // Runner::open can be hashing the parent on a synchronous control call.
+                // Runner::open can be hashing the sealed VM baseline image on
+                // a synchronous control call.
                 // Publish StopPending and request cancellation before Runner::open returns.
-                STOP.store(true, Ordering::Release);
-                motor_runner::request_windows_service_stop();
-                tracing::info!(
-                    service_state = "StopPending",
-                    "native runner service received stop control"
-                );
                 if let Ok(slot) = callback_status.lock() {
                     if let Some(handle) = slot.as_ref() {
                         let _ =
                             handle.set_service_status(service_status(ServiceState::StopPending, 0));
                     }
                 }
+                STOP.store(true, Ordering::Release);
+                motor_runner::request_windows_service_stop();
+                if let Ok(slot) = STOP_RUNNER.lock() {
+                    if let Some(runner) = slot.as_ref() {
+                        runner.request_service_stop();
+                    }
+                }
+                tracing::info!(
+                    service_state = "StopPending",
+                    "native runner service received stop control"
+                );
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -109,10 +116,55 @@ fn service_main(_: Vec<OsString>) {
     let args = std::iter::once("serve".to_owned())
         .chain(std::env::args().skip(2))
         .collect();
+    let finished = Arc::new(AtomicBool::new(false));
+    let progress_finished = Arc::clone(&finished);
+    let progress_status = Arc::clone(&status_slot);
+    std::thread::spawn(move || {
+        let mut checkpoint = 1;
+        while !progress_finished.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_secs(5));
+            if !STOP.load(Ordering::Acquire) {
+                continue;
+            }
+            if let Ok(slot) = progress_status.lock() {
+                if progress_finished.load(Ordering::Acquire) {
+                    break;
+                }
+                if let Some(handle) = slot.as_ref() {
+                    checkpoint += 1;
+                    let mut status = service_status(ServiceState::StopPending, 0);
+                    status.checkpoint = checkpoint;
+                    let _ = handle.set_service_status(status);
+                    tracing::warn!(
+                        wait = "runner",
+                        checkpoint,
+                        "native runner service still stopping; accepted work may hold exit"
+                    );
+                }
+            }
+        }
+    });
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .and_then(|runtime| runtime.block_on(super::run(args)));
+        .and_then(|runtime| {
+            let result = runtime.block_on(super::run(args));
+            if let Ok(mut slot) = STOP_RUNNER.lock() {
+                slot.take();
+            }
+            // Accepted jobs have settled before run returns. Detached filesystem
+            // work must not keep the service in StopPending during runtime drop.
+            let started = std::time::Instant::now();
+            runtime.shutdown_timeout(Duration::from_secs(1));
+            if started.elapsed() >= Duration::from_secs(1) {
+                tracing::warn!(
+                    wait = "runtime_shutdown",
+                    "runner runtime shutdown grace expired"
+                );
+            }
+            result
+        });
+    finished.store(true, Ordering::Release);
     let stopping = STOP.load(Ordering::Acquire);
     if let Err(error) = &result {
         if !stopping {
@@ -135,6 +187,12 @@ fn on_ac() -> io::Result<bool> {
     Ok(power.ACLineStatus == 1)
 }
 pub(super) fn watch_power_and_stop(runner: Runner) -> io::Result<()> {
+    *STOP_RUNNER.lock().unwrap() = Some(runner.clone());
+    // Stop can arrive while Runner::open is still validating the sealed VM
+    // baseline image.
+    if STOP.load(Ordering::Acquire) {
+        runner.request_service_stop();
+    }
     let mut battery_drain = !on_ac()?;
     if battery_drain {
         runner.begin_drain(Duration::ZERO, false);
@@ -144,7 +202,7 @@ pub(super) fn watch_power_and_stop(runner: Runner) -> io::Result<()> {
     std::thread::spawn(move || {
         loop {
             if STOP.load(Ordering::Acquire) {
-                runner.begin_drain(Duration::from_secs(25), true);
+                runner.request_service_stop();
                 break;
             }
             let ac = on_ac().unwrap_or(false);
