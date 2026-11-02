@@ -536,10 +536,16 @@ fn isolated_helper_refuses_root_owned_source_and_runner_forged_record() {
     fs::write(plan.workspace.join("source"), b"root source").unwrap();
     plan.files = vec!["source".into()];
     fs::write(intent_path(&state, id), serde_json::to_vec(&plan).unwrap()).unwrap();
-    assert!(seal(&state, id, plan.clone())
-        .unwrap_err()
-        .to_string()
-        .contains("non-root owner"));
+    let job = crate::isolation::job_identity().unwrap().uid;
+    assert!(seal_owned(
+        &state,
+        id,
+        plan.clone(),
+        Owners::Helper { runner: job, job }
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("authorized owner"));
     let path = record_path(&state, id);
     let record = Record {
         filesystem: Some(Filesystem::read(&open_mount(&plan.workspace).unwrap()).unwrap()),
@@ -558,4 +564,19 @@ fn isolated_helper_refuses_root_owned_source_and_runner_forged_record() {
         .to_string()
         .contains("root-owned"));
     assert!(path.exists());
+}
+
+#[test]
+fn owner_policy_distinguishes_direct_root_from_delegated_helper() {
+    let helper = Owners::Helper {
+        runner: 1000,
+        job: 998,
+    };
+    assert!(!helper.permits(0));
+    assert!(helper.permits(1000));
+    assert!(helper.permits(998));
+    assert!(!helper.permits(1001));
+    assert!(Owners::DirectRoot.permits(0));
+    assert!(Owners::DirectRoot.permits(1000));
+    assert!(Owners::DirectRoot.permits(1001));
 }

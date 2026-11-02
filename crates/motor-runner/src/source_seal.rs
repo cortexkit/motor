@@ -22,6 +22,56 @@ mod probe;
 pub(crate) mod refresh;
 pub(crate) use probe::startup;
 
+#[derive(Clone, Copy)]
+enum Owners {
+    // A runner already executing as root may have root-owned checkouts.
+    // Only delegation through the helper needs an owner restriction.
+    DirectRoot,
+    Helper { runner: u32, job: u32 },
+}
+
+impl Owners {
+    fn permits(self, uid: u32) -> bool {
+        match self {
+            Self::DirectRoot => true,
+            Self::Helper { runner, job } => uid != 0 && (uid == runner || uid == job),
+        }
+    }
+
+    fn helper() -> io::Result<Self> {
+        let uid = std::env::var("SUDO_UID")
+            .map_err(io::Error::other)?
+            .parse::<u32>()
+            .map_err(io::Error::other)?;
+        if uid == 0 {
+            return Err(io::Error::other(
+                "source seal helper requires a non-root SUDO_UID",
+            ));
+        }
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found = std::ptr::null_mut();
+        let mut buffer = vec![0u8; 64 * 1024];
+        let result = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut entry,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut found,
+            )
+        };
+        if result != 0 || found.is_null() || entry.pw_uid != uid {
+            return Err(io::Error::other(
+                "source seal helper SUDO_UID is not a real non-root account",
+            ));
+        }
+        Ok(Self::Helper {
+            runner: uid,
+            job: crate::isolation::job_identity()?.uid,
+        })
+    }
+}
+
 /// A real sandbox must receive either a trusted snapshot source or the
 /// explicit compile-cache writer exemption. Resolution happens at its launch
 /// boundary, not in callers that only construct or inspect a launch plan.
@@ -604,6 +654,7 @@ pub(crate) fn helper(action: &str, args: &[String]) -> io::Result<()> {
     let state = Path::new(&args[1]);
     fs::write("/proc/self/oom_score_adj", "900")?;
     let authority = authority::Authority::load()?;
+    let owners = Owners::helper()?;
     authority.roots(state)?;
     match action {
         "seal" => {
@@ -611,9 +662,9 @@ pub(crate) fn helper(action: &str, args: &[String]) -> io::Result<()> {
             io::stdin().take(64 * 1024 * 1024).read_to_end(&mut bytes)?;
             let plan: Plan = serde_json::from_slice(&bytes)?;
             authority.workspace(state, &plan.workspace)?;
-            seal(state, id, plan)
+            seal_owned(state, id, plan, owners)
         }
-        "unseal" => unseal_checked(state, id, Some(&authority)),
+        "unseal" => unseal_checked(state, id, Some(&authority), owners),
         _ => Err(io::Error::other("unknown source seal operation")),
     }
 }
@@ -784,9 +835,9 @@ fn file_flags(file: &File) -> io::Result<libc::c_int> {
 fn immutable(file: &File, enabled: bool) -> io::Result<()> {
     if enabled {
         let metadata = file.metadata()?;
-        if metadata.uid() == 0 || metadata.nlink() != 1 {
+        if metadata.nlink() != 1 {
             return Err(io::Error::other(
-                "refusing immutable flag on root-owned or hard-linked inode",
+                "refusing immutable flag on hard-linked inode",
             ));
         }
     }
@@ -806,6 +857,10 @@ fn immutable(file: &File, enabled: bool) -> io::Result<()> {
 }
 
 fn seal(state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
+    seal_owned(state, id, plan, Owners::DirectRoot)
+}
+
+fn seal_owned(state: &Path, id: Uuid, plan: Plan, owners: Owners) -> io::Result<()> {
     let directory = JobDirectory::open(state, id)?;
     let _operation = directory.lock()?;
     let intent: Plan = serde_json::from_slice(&directory.read(c"seal-intent")?)?;
@@ -824,9 +879,9 @@ fn seal(state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
     for path in &plan.files {
         let pin = step(path, "openat2/fstat", pin_source(&mount, path))?;
         let metadata = pin.metadata()?;
-        if metadata.uid() == 0 || metadata.nlink() != 1 {
+        if !owners.permits(metadata.uid()) || metadata.nlink() != 1 {
             return Err(io::Error::other(format!(
-                "source seal {}: requires non-root owner and exactly one hard link",
+                "source seal {}: requires authorized owner and exactly one hard link",
                 path.display()
             )));
         }
@@ -875,7 +930,7 @@ fn seal(state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
     );
     if let Err(error) = saved {
         if directory.exists(c"seal")? {
-            if let Err(cleanup) = unseal_locked(&directory, id, None) {
+            if let Err(cleanup) = unseal_locked(&directory, id, None, owners) {
                 return Err(io::Error::other(format!("{error}; rollback: {cleanup}")));
             }
         }
@@ -889,9 +944,16 @@ fn seal(state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
             "open_by_handle_at/fstat",
             open_handle(&mount, entry),
         )
-        .and_then(|file| immutable(&file, true));
+        .and_then(|file| {
+            if !owners.permits(file.metadata()?.uid()) {
+                return Err(io::Error::other(
+                    "source inode owner changed before sealing",
+                ));
+            }
+            immutable(&file, true)
+        });
         if let Err(error) = step(&entry.path, "set FS_IMMUTABLE_FL", set) {
-            if let Err(cleanup) = unseal_locked(&directory, id, None) {
+            if let Err(cleanup) = unseal_locked(&directory, id, None, owners) {
                 return Err(io::Error::other(format!("{error}; rollback: {cleanup}")));
             }
             return Err(error);
@@ -902,17 +964,18 @@ fn seal(state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
 }
 
 fn unseal(state: &Path, id: Uuid) -> io::Result<()> {
-    unseal_checked(state, id, None)
+    unseal_checked(state, id, None, Owners::DirectRoot)
 }
 
 fn unseal_checked(
     state: &Path,
     id: Uuid,
     authority: Option<&authority::Authority>,
+    owners: Owners,
 ) -> io::Result<()> {
     let directory = JobDirectory::open(state, id)?;
     let _operation = directory.lock()?;
-    unseal_locked(&directory, id, authority)
+    unseal_locked(&directory, id, authority, owners)
 }
 
 fn remove_intent(directory: &JobDirectory) -> io::Result<()> {
@@ -928,6 +991,7 @@ fn unseal_locked(
     directory: &JobDirectory,
     id: Uuid,
     authority: Option<&authority::Authority>,
+    owners: Owners,
 ) -> io::Result<()> {
     let started = std::time::Instant::now();
     let mut record_file = match directory.file(c"seal", libc::O_RDONLY) {
@@ -964,7 +1028,12 @@ fn unseal_locked(
     }
     clear_handles(&record.handles, |handle| {
         match open_handle(&mount, handle) {
-            Ok(file) => clear_inode(&file, handle, File::sync_all),
+            Ok(file) if owners.permits(file.metadata()?.uid()) => {
+                clear_inode(&file, handle, File::sync_all)
+            }
+            Ok(_) => Err(io::Error::other(
+                "source inode owner is not authorized for helper unseal",
+            )),
             Err(error) => Err(error),
         }
     })?;
