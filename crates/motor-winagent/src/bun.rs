@@ -238,7 +238,7 @@ impl Refusal {
         for field in [
             &self.project,
             &self.package,
-            &self.version,
+            &*self.version,
             &*self.registry_origin,
             &*self.detail,
         ] {
