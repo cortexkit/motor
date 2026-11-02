@@ -1296,6 +1296,54 @@ async fn direct_bind_is_refused_as_before_while_the_switch_is_off() {
 }
 
 #[tokio::test]
+async fn project_free_binds_keep_principal_admission() {
+    let f = Fixture::new(Cut::None, 28).await;
+    for admit_direct_exec in [false, true] {
+        let config = Config {
+            admit_direct_exec,
+            ..f.config.clone()
+        };
+        let daemon = Daemon::start_with_module_id(&f, config, "motor").await;
+        for (channel, principal, refusal) in [
+            (AFT_CHANNEL, aft(), None),
+            (
+                AFT_CHANNEL + 1,
+                json!({"kind":"reserved", "module_id":"prefrontal-core"}),
+                None,
+            ),
+            (
+                DIRECT_CHANNEL,
+                direct(),
+                (!admit_direct_exec).then_some("motor_direct_refused"),
+            ),
+            (
+                OTHER_DIRECT_CHANNEL,
+                json!({"kind":"unverified"}),
+                Some("motor_unverified_refused"),
+            ),
+        ] {
+            let mut reply = daemon
+                .send(
+                    0,
+                    json!({
+                        "op":"route.bind", "route_channel":channel, "epoch":1,
+                        "target":{"kind":"management_surface", "module_id":"ck-motor"},
+                        "identity":{"harness":"aft", "session":"s"},
+                        "principal":principal, "scope":null
+                    }),
+                )
+                .await;
+            let reply = next(&mut reply).await;
+            if let Some(code) = refusal {
+                assert_eq!(error(&reply)["code"], code);
+            } else {
+                assert_eq!(reply.header.ty, FrameType::Response, "{}", body(&reply));
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn hosted_check_is_direct_only_and_mints_through_real_module_with_hosted_off() {
     use crate::hosted::account::tests::{refusal, token, FakeVault};
     let f = Fixture::new(Cut::None, 28).await;

@@ -26,11 +26,12 @@ pub struct AccountTokens {
     cached: Mutex<Option<Token>>,
 }
 impl AccountTokens {
-    pub fn new(connection: PathBuf, workspace: PathBuf, module_id: String) -> Self {
+    pub fn new(connection: PathBuf, _workspace: PathBuf, module_id: String) -> Self {
+        // Keep the workspace argument for existing callers; project-free route
+        // identities no longer use it.
         Self {
             target: Arc::new(Vault {
                 connection,
-                workspace,
                 module_id,
             }),
             cached: Mutex::new(None),
@@ -87,7 +88,6 @@ impl AccountTokens {
 
 struct Vault {
     connection: PathBuf,
-    workspace: PathBuf,
     module_id: String,
 }
 impl Target for Vault {
@@ -127,7 +127,7 @@ impl Vault {
                 RouteTarget::ManagementSurface {
                     module_id: "claustrum".into(),
                 },
-                BindIdentity::new(&self.workspace, &self.module_id, "motor-account-token"),
+                BindIdentity::new(&self.module_id, "motor-account-token"),
                 serde_json::to_vec(&request).expect("serializable account request"),
                 CallOptions {
                     timeout: Duration::from_secs(10),

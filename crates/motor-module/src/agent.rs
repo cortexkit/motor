@@ -1,6 +1,8 @@
 //! A public-only SSH agent bridges authentication requests to the vault signer.
 use base64::Engine;
-use cortexkit_claustrum_client::{CredentialErrorClass, CredentialPublicKey, CredentialResolver};
+use cortexkit_claustrum_client::{
+    CredentialErrorClass, CredentialPublicKey, CredentialResolver, PublicKeyAlgorithm,
+};
 use std::{
     fs, io,
     os::unix::fs::DirBuilderExt,
@@ -185,7 +187,7 @@ impl VaultAgent {
         resolver: Arc<dyn CredentialResolver>,
     ) -> io::Result<Self> {
         let raw = decode_hex(&public.public_key_hex, 32)?;
-        if public.algorithm != "ed25519" {
+        if public.algorithm != PublicKeyAlgorithm::Ed25519 {
             return Err(io::Error::other("runner key must be Ed25519"));
         }
         let mut key_blob = Vec::new();

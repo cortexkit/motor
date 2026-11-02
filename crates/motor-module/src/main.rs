@@ -91,7 +91,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resolver = Arc::new(
         cortexkit_claustrum_client::ClaustrumCredentialResolver::new(
             connection.clone(),
-            std::env::current_dir()?,
             id.clone(),
         ),
     );
