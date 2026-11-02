@@ -510,6 +510,69 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(plistlib.loads(self.plist.read_bytes())['ProgramArguments'][-5:],
                          ['--metrics-push', '--metrics-endpoint', 'https://metrics.example', '--metrics-host-id', 'monitor-1'])
 
+    def install_for_metrics(self, endpoint=None, host_id=None):
+        manifest_path = self.root / "reviewed.json"
+        manifest_path.write_text(json.dumps(self.manifest))
+        bundle = self.root / "bundle"
+        bundle.mkdir(exist_ok=True)
+        runner, helper = self.root / "runner", self.root / "helper"
+        runner.write_bytes(b"runner")
+        helper.write_bytes(b"helper")
+        key = self.root / "identity.pub"
+        key.write_text("ssh-ed25519 AAAA\n")
+        args = SimpleNamespace(state_root=self.state, image=self.image, tool_bundle=bundle, manifest=manifest_path,
+                               runner=runner, vm_helper=helper, runner_key=key, instance="macos",
+                               metrics_endpoint=endpoint, metrics_host_id=host_id)
+        account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
+        with patch.multiple(install, CONFIG=self.config, PLIST=self.plist, SSHD=self.sshd, SSH_ROOT=self.ssh, HOME=self.root / "home"), \
+                patch.object(install, "create_account", return_value=account), patch.object(install.os, "chown"), \
+                patch.object(install.os, "fchown"), patch.object(install, "configure_login", return_value=False), \
+                patch.object(install, "has_gui_session", return_value=False), patch("sys.stdout", io.StringIO()), \
+                patch.object(install.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)):
+            install.install(args, self.manifest)
+
+    def test_reinstall_without_metrics_flags_keeps_installed_pair(self):
+        installed = plistlib.loads(self.plist.read_bytes())
+        installed['ProgramArguments'] += ['--metrics-push', '--metrics-endpoint', 'https://metrics.example:8443',
+                                          '--metrics-host-id', 'monitor-1']
+        self.plist.write_bytes(plistlib.dumps(installed))
+        self.install_for_metrics()
+        self.assertEqual(plistlib.loads(self.plist.read_bytes()), installed)
+
+    def test_reinstall_with_metrics_pair_replaces_installed_pair(self):
+        installed = plistlib.loads(self.plist.read_bytes())
+        old_flags = ['--metrics-push', '--metrics-endpoint', 'https://old.example', '--metrics-host-id', 'old-host']
+        self.plist.write_bytes(plistlib.dumps({**installed, 'ProgramArguments': installed['ProgramArguments'] + old_flags}))
+        self.install_for_metrics('https://new.example:8443', 'new-host')
+        self.assertEqual(plistlib.loads(self.plist.read_bytes())['ProgramArguments'], installed['ProgramArguments'] +
+                         ['--metrics-push', '--metrics-endpoint', 'https://new.example:8443', '--metrics-host-id', 'new-host'])
+
+    def test_first_install_without_metrics_flags_keeps_metrics_off(self):
+        expected = plistlib.loads(self.plist.read_bytes())
+        self.plist.unlink()
+        self.install_for_metrics()
+        installed = plistlib.loads(self.plist.read_bytes())
+        self.assertEqual(installed, expected)
+        self.assertFalse(any(arg.startswith('--metrics-') for arg in installed['ProgramArguments']))
+
+    def test_reinstall_refuses_invalid_or_incomplete_installed_metrics(self):
+        installed = plistlib.loads(self.plist.read_bytes())
+        cases = [(['--metrics-push', '--metrics-endpoint', 'https://metrics.example'],
+                  'metrics endpoint and host id must be supplied together'),
+                 (['--metrics-endpoint', 'https://metrics.example', '--metrics-host-id', 'monitor-1'],
+                  'incomplete LaunchAgent metrics settings'),
+                 (['--metrics-push', '--metrics-endpoint', 'http://metrics.example', '--metrics-host-id', 'monitor-1'],
+                  'metrics endpoint must be an HTTPS origin')]
+        for flags, error in cases:
+            for pair in ((None, None), ('https://new.example', 'new-host')):
+                with self.subTest(flags=flags, pair=pair):
+                    damaged = plistlib.dumps({**installed, 'ProgramArguments': installed['ProgramArguments'] + flags})
+                    self.plist.write_bytes(damaged)
+                    with patch.object(install, 'stop_jobs') as stop, self.assertRaisesRegex(ValueError, error):
+                        self.install_for_metrics(*pair)
+                    stop.assert_not_called()
+                    self.assertEqual(self.plist.read_bytes(), damaged)
+
     def test_runtime_config_cannot_select_an_unchecked_helper_or_tool(self):
         path = self.config / "vm.toml"
         path.write_text(path.read_text().replace("motor-macvm", "unsigned-macvm"))
