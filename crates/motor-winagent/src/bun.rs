@@ -82,6 +82,8 @@ pub enum Check {
     ProcessStart,
     ExitPoll,
     JobTerminate,
+    JobWaitEmpty,
+    InstallCleanup,
     Cancelled,
     InstallDeadline,
     PipeRead,
@@ -104,16 +106,27 @@ fn missing_empty(packages: &[MissingPackage]) -> bool {
     packages.is_empty()
 }
 
+fn detail_empty(detail: &str) -> bool {
+    detail.is_empty()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Refusal {
     pub kind: RefusalKind,
     pub project: String,
     pub package: String,
-    pub version: String,
-    pub registry_origin: String,
+    /// Boxed like `registry_origin` and `detail` so a refusal stays small enough
+    /// to return by value from every preparation step.
+    pub version: Box<str>,
+    /// Boxed like `detail` so a refusal stays small enough to return by value.
+    pub registry_origin: Box<str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<Check>,
+    /// The failed condition and its checkout-relative path, never a host I/O
+    /// error message. Boxing keeps refusals small enough to return by value.
+    #[serde(default, skip_serializing_if = "detail_empty")]
+    pub detail: Box<str>,
     #[serde(default, skip_serializing_if = "missing_empty")]
     pub missing: Box<[MissingPackage]>,
 }
@@ -124,7 +137,13 @@ impl std::fmt::Display for Refusal {
             f,
             "{:?}: project={} package={} version={} registry={} check={:?}",
             self.kind, self.project, self.package, self.version, self.registry_origin, self.check
-        )
+        )?;
+        // A refused job must name the condition and path that refused it, so
+        // the detail is part of the message rather than a separate field.
+        if !self.detail.is_empty() {
+            write!(f, " detail={}", self.detail)?;
+        }
+        Ok(())
     }
 }
 impl std::error::Error for Refusal {}
@@ -153,13 +172,32 @@ impl Refusal {
             .check
             .map(|check| format!("{check:?}"))
             .unwrap_or_else(|| "Unspecified".into());
+        let detail = if self.detail.is_empty() {
+            String::new()
+        } else {
+            format!(" detail={}", self.detail)
+        };
         format!(
-            "bun install skipped for {}: {:?}{} check={}{}\n",
-            self.project, self.kind, identity, check, missing
+            "bun install skipped for {}: {:?}{} check={}{}{}\n",
+            self.project, self.kind, identity, check, missing, detail
         )
+    }
+    /// Say which check failed and what it found, as a path relative to the job
+    /// checkout. Refusals raised outside `check` keep it empty.
+    pub fn detail(mut self, detail: impl Into<Box<str>>) -> Self {
+        self.detail = detail.into();
+        self
     }
     pub fn at(mut self, check: Check) -> Self {
         self.check = Some(check);
+        if self.detail.is_empty()
+            && matches!(
+                self.kind,
+                RefusalKind::BunProjectionInvalid | RefusalKind::BunOfflineInstallFailed
+            )
+        {
+            self.detail = format!("{check:?} failed at . (project working directory)").into();
+        }
         self
     }
     pub fn missing_packages(mut self, packages: impl IntoIterator<Item = MissingPackage>) -> Self {
@@ -175,7 +213,7 @@ impl Refusal {
         {
             if let Ok(url) = url::Url::parse(registry) {
                 if url.scheme() == "https" {
-                    self.registry_origin = url.origin().ascii_serialization();
+                    self.registry_origin = url.origin().ascii_serialization().into();
                 }
             }
         }
@@ -199,8 +237,9 @@ impl Refusal {
         for field in [
             &self.project,
             &self.package,
-            &self.version,
-            &self.registry_origin,
+            &*self.version,
+            &*self.registry_origin,
+            &*self.detail,
         ] {
             if field.len() > 4096 || field.chars().any(char::is_control) {
                 return Err(io::Error::new(
@@ -243,10 +282,10 @@ pub fn refuse(kind: RefusalKind, project: &str, package: &str, version: &str) ->
         {
             version.into()
         } else {
-            String::new()
+            Box::default()
         },
         registry_origin: if package.is_empty() {
-            String::new()
+            Box::default()
         } else {
             "https://registry.npmjs.org".into()
         },
@@ -263,6 +302,7 @@ pub fn refuse(kind: RefusalKind, project: &str, package: &str, version: &str) ->
             RefusalKind::BunProjectionInvalid => Check::Projection,
             RefusalKind::BunOfflineInstallFailed => Check::InstalledTree,
         }),
+        detail: Box::default(),
         missing: Box::default(),
     }
 }
@@ -973,14 +1013,16 @@ fn read_bounded(path: &std::path::Path, limit: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn source_projects(
+/// Directories holding a lockfile, keyed by project path, each with the
+/// enclosing project whose own lockfile lists it as a workspace member.
+pub fn source_projects(
     source: &std::path::Path,
     budget: &ExpansionBudget,
-) -> Result<std::collections::BTreeSet<String>, Refusal> {
+) -> Result<std::collections::BTreeMap<String, Option<String>>, Refusal> {
     fn walk(
         path: &std::path::Path,
         source: &std::path::Path,
-        projects: &mut std::collections::BTreeSet<String>,
+        projects: &mut std::collections::BTreeMap<String, Option<String>>,
         budget: &ExpansionBudget,
     ) -> Result<(), Refusal> {
         let invalid = || refuse(RefusalKind::BunProjectionInvalid, "", "", "");
@@ -1010,14 +1052,102 @@ fn source_projects(
                 if entry.file_name() == "bun.lockb" {
                     return Err(refuse(RefusalKind::BunLockInvalid, &project, "", ""));
                 }
-                projects.insert(project);
+                projects.insert(project, None);
             }
         }
         Ok(())
     }
     let mut projects = Default::default();
     walk(source, source, &mut projects, budget)?;
+    let paths: Vec<String> = projects.keys().cloned().collect();
+    // Bun stops at the nearest ancestor manifest declaring workspaces, even
+    // when it does not include this directory. A nearer standalone lockfile
+    // does not stop that search. Host and guest share this ownership decision.
+    for project in &paths {
+        let member = source.join(project.strip_prefix("m/").unwrap_or(""));
+        let mut ancestor = member.parent();
+        while let Some(directory) = ancestor.filter(|path| path.starts_with(source)) {
+            budget
+                .check()
+                .map_err(|_| refuse(RefusalKind::BunProjectionInvalid, project, "", ""))?;
+            let manifest = directory.join("package.json");
+            let declares_workspaces = if manifest.is_file() {
+                let bytes = read_bounded(&manifest, MAX_LOCK_BYTES as u64)
+                    .map_err(|_| refuse(RefusalKind::BunLockInvalid, project, "", ""))?;
+                let value: Value = serde_json::from_slice(&bytes)
+                    .map_err(|_| refuse(RefusalKind::BunLockInvalid, project, "", ""))?;
+                value.get("workspaces").is_some()
+            } else {
+                false
+            };
+            if declares_workspaces {
+                let relative = directory
+                    .strip_prefix(source)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let owner = if relative.is_empty() {
+                    "m".into()
+                } else {
+                    format!("m/{relative}")
+                };
+                if paths.contains(&owner)
+                    && lists_member(&directory.join("bun.lock"), directory, &member, budget)?
+                {
+                    projects.insert(project.clone(), Some(owner));
+                }
+                break;
+            }
+            ancestor = directory.parent();
+        }
+    }
     Ok(projects)
+}
+
+/// Frozen installs use the resolved workspace table in the enclosing lockfile.
+/// Reading its exact member paths avoids implementing a second, subtly different
+/// version of Bun's workspace glob expansion. Bun checks manifest drift during
+/// the frozen install; an unused member lockfile must not be parsed as a project.
+fn lists_member(
+    lock: &std::path::Path,
+    directory: &std::path::Path,
+    member: &std::path::Path,
+    budget: &ExpansionBudget,
+) -> Result<bool, Refusal> {
+    let invalid = || refuse(RefusalKind::BunProjectionInvalid, "", "", "");
+    budget.check().map_err(|_| invalid())?;
+    let bytes = read_bounded(lock, MAX_LOCK_BYTES as u64).map_err(|_| invalid())?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
+    let lock: Value = text_json(text).map_err(|_| invalid())?;
+    let relative = member
+        .strip_prefix(directory)
+        .map_err(|_| invalid())?
+        .to_str()
+        .ok_or_else(invalid)?
+        .replace('\\', "/");
+    let Some(name) = lock
+        .get("workspaces")
+        .and_then(|workspaces| workspaces.get(&relative))
+        .and_then(|workspace| workspace.get("name"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+    else {
+        return Ok(false);
+    };
+    let bytes =
+        read_bounded(&member.join("package.json"), MAX_LOCK_BYTES as u64).map_err(|_| invalid())?;
+    let manifest: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    Ok(manifest.get("name").and_then(Value::as_str) == Some(name))
+}
+
+/// Report a lockfile that an enclosing workspace project already installs. Bun
+/// reads only the enclosing lockfile there, so the member's own file is unused.
+pub fn workspace_member_warning(project: &str, owner: &str) -> String {
+    format!(
+        "bun.lock unused at {}/bun.lock: inside workspace member of {}; Bun installs it from there\n",
+        project.strip_prefix("m/").unwrap_or(project),
+        owner.strip_prefix("m/").unwrap_or(owner),
+    )
 }
 
 fn clean_install_inputs(directory: &std::path::Path, budget: &ExpansionBudget) -> io::Result<()> {
@@ -1068,7 +1198,13 @@ pub fn prepare_cache_with_budget(
 ) -> Result<Option<Manifest>, Refusal> {
     let invalid = || refuse(RefusalKind::BunProjectionInvalid, "", "", "");
     budget.check().map_err(|_| invalid())?;
-    let input_projects = source_projects(source, budget)?;
+    // Members are prepared by the enclosing project, so the host publishes no
+    // manifest row of their own.
+    let input_projects: std::collections::BTreeSet<String> = source_projects(source, budget)?
+        .into_iter()
+        .filter(|(_, owner)| owner.is_none())
+        .map(|(project, _)| project)
+        .collect();
     let bytes = match read_bounded(&seed.join("manifest.json"), MAX_LOCK_BYTES as u64) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -1300,61 +1436,162 @@ pub fn prepare_cache_with_budget(
     Ok(Some(manifest))
 }
 
+/// The job checkout an installed tree must stay inside. Every path a refusal
+/// names is relative to it, so a live report says where the install left its
+/// tree.
+struct Directory {
+    directory: std::path::PathBuf,
+    root: std::path::PathBuf,
+}
+
+/// An install check that failed: either it left the checkout, or it could not
+/// be read. The caller keeps the distinction in the refusal kind.
+enum Containment {
+    Outside(String),
+    Unreadable(String),
+}
+
+impl Containment {
+    fn into_refusal(self, project: &Project) -> Refusal {
+        match self {
+            Containment::Outside(detail) => {
+                refuse(RefusalKind::BunProjectionInvalid, &project.path, "", "").detail(format!(
+                    "Projection: installed tree leaves the checkout at {detail}"
+                ))
+            }
+            Containment::Unreadable(detail) => {
+                refuse(RefusalKind::BunOfflineInstallFailed, &project.path, "", "").detail(format!(
+                    "InstalledTree: installed tree is unreadable at {detail}"
+                ))
+            }
+        }
+    }
+}
+
+impl Directory {
+    fn new(directory: &std::path::Path, project: &str) -> Result<Self, Refusal> {
+        let root = directory.canonicalize().map_err(|_| {
+            refuse(RefusalKind::BunOfflineInstallFailed, project, "", "")
+                .at(Check::InstalledTree)
+                .detail("InstalledTree: checkout is unreadable at .")
+        })?;
+        Ok(Self {
+            directory: directory.into(),
+            root,
+        })
+    }
+
+    /// Resolve `path`, refusing a link whose target leaves the checkout.
+    fn inside(&self, path: &std::path::Path) -> Result<std::path::PathBuf, Containment> {
+        let relative = self.relative(path);
+        let canonical = path
+            .canonicalize()
+            .map_err(|_| Containment::Unreadable(relative.clone()))?;
+        if !canonical.starts_with(&self.root) {
+            return Err(Containment::Outside(relative));
+        }
+        Ok(canonical)
+    }
+
+    fn failed(&self, path: &std::path::Path, error: io::Error) -> Containment {
+        let _ = error;
+        Containment::Unreadable(self.relative(path))
+    }
+
+    fn relative(&self, path: &std::path::Path) -> String {
+        installed_relative(&self.directory, path)
+    }
+}
+
+/// Install walkers retain lexical entry paths so diagnostics name the link
+/// encountered in the checkout, not its resolved target or a guest disk path.
+fn installed_relative(directory: &std::path::Path, path: &std::path::Path) -> String {
+    let relative = path
+        .strip_prefix(directory)
+        .unwrap_or(std::path::Path::new("."));
+    if relative.as_os_str().is_empty() {
+        return ".".into();
+    }
+    relative.to_string_lossy().replace('\\', "/")
+}
+
 /// A successful offline install may omit optional packages. Check identities and
 /// declared bin targets independently instead of treating exit zero as completeness.
 pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Result<(), Refusal> {
-    fn walk_modules(
+    fn walk_projects(
         path: &std::path::Path,
-        root: &std::path::Path,
+        root: &Directory,
         seen: &mut std::collections::BTreeSet<std::path::PathBuf>,
         installed: &mut Vec<(Value, std::path::PathBuf)>,
-    ) -> io::Result<()> {
-        if !path.exists() {
-            return Ok(());
+    ) -> Result<(), Containment> {
+        for entry in std::fs::read_dir(path).map_err(|error| root.failed(path, error))? {
+            let entry = entry.map_err(|error| root.failed(path, error))?;
+            let target = entry.path();
+            if is_node_modules(&entry.file_name()) {
+                walk_modules(&target, root, seen, installed)?;
+            } else {
+                let metadata = std::fs::symlink_metadata(&target)
+                    .map_err(|error| root.failed(&target, error))?;
+                if metadata.is_dir() && !crate::is_reparse(&metadata) {
+                    walk_projects(&target, root, seen, installed)?;
+                }
+            }
         }
-        let canonical = path.canonicalize()?;
-        if !canonical.starts_with(root) {
-            return Err(io::Error::other(refuse(
-                RefusalKind::BunProjectionInvalid,
-                "",
-                "",
-                "",
-            )));
+        Ok(())
+    }
+    fn walk_modules(
+        path: &std::path::Path,
+        root: &Directory,
+        seen: &mut std::collections::BTreeSet<std::path::PathBuf>,
+        installed: &mut Vec<(Value, std::path::PathBuf)>,
+    ) -> Result<(), Containment> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => (),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(root.failed(path, error)),
         }
+        let canonical = root.inside(path)?;
         if !seen.insert(canonical) {
             return Ok(());
         }
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
+        for entry in std::fs::read_dir(path).map_err(|error| root.failed(path, error))? {
+            let entry = entry.map_err(|error| root.failed(path, error))?;
             let name = entry.file_name().to_string_lossy().into_owned();
+            let target = entry.path();
+            root.inside(&target)?;
             if name == ".bun" {
-                for store in std::fs::read_dir(entry.path())? {
-                    walk_modules(&store?.path().join("node_modules"), root, seen, installed)?;
+                for store in
+                    std::fs::read_dir(&target).map_err(|error| root.failed(&target, error))?
+                {
+                    let store = store.map_err(|error| root.failed(&target, error))?;
+                    root.inside(&store.path())?;
+                    let modules = if store.file_name() == "node_modules" {
+                        store.path()
+                    } else {
+                        store.path().join("node_modules")
+                    };
+                    walk_modules(&modules, root, seen, installed)?;
                 }
             } else if name.starts_with('@') {
-                for package in std::fs::read_dir(entry.path())? {
-                    collect_package(&package?.path(), root, seen, installed)?;
+                for package in
+                    std::fs::read_dir(&target).map_err(|error| root.failed(&target, error))?
+                {
+                    let package = package.map_err(|error| root.failed(&target, error))?;
+                    collect_package(&package.path(), root, seen, installed)?;
                 }
-            } else if !name.starts_with('.') && entry.path().is_dir() {
-                collect_package(&entry.path(), root, seen, installed)?;
+            } else if !name.starts_with('.') && target.is_dir() {
+                collect_package(&target, root, seen, installed)?;
             }
         }
         Ok(())
     }
     fn collect_package(
         path: &std::path::Path,
-        root: &std::path::Path,
+        root: &Directory,
         seen: &mut std::collections::BTreeSet<std::path::PathBuf>,
         installed: &mut Vec<(Value, std::path::PathBuf)>,
-    ) -> io::Result<()> {
-        if !path.canonicalize()?.starts_with(root) {
-            return Err(io::Error::other(refuse(
-                RefusalKind::BunProjectionInvalid,
-                "",
-                "",
-                "",
-            )));
-        }
+    ) -> Result<(), Containment> {
+        root.inside(path)?;
         if let Ok(bytes) = read_bounded(&path.join("package.json"), MAX_LOCK_BYTES as u64) {
             if let Ok(value) = serde_json::from_slice(&bytes) {
                 installed.push((value, path.into()));
@@ -1363,29 +1600,18 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
         walk_modules(&path.join("node_modules"), root, seen, installed)
     }
     let mut installed = Vec::new();
-    let modules = directory.join("node_modules");
-    if modules.exists() {
-        // Isolated linker junctions stay inside the checkout; inspect each real
-        // directory once and never traverse out to an unrelated disk or share.
-        let root = directory.canonicalize().map_err(|_| {
-            refuse(RefusalKind::BunOfflineInstallFailed, &project.path, "", "")
-                .at(Check::InstalledTree)
-        })?;
-        walk_modules(&modules, &root, &mut Default::default(), &mut installed).map_err(
-            |error| {
-                refuse(
-                    if error.get_ref().is_some_and(|error| error.is::<Refusal>()) {
-                        RefusalKind::BunProjectionInvalid
-                    } else {
-                        RefusalKind::BunOfflineInstallFailed
-                    },
-                    &project.path,
-                    "",
-                    "",
-                )
-            },
-        )?;
-    }
+    // Only enclosing workspace projects are installed. Their store and member
+    // links stay inside this tree; the walk checks every entry before following
+    // it, including modules in members that have no root node_modules link.
+    // Visiting each resolved modules directory once breaks link cycles.
+    let boundary = Directory::new(directory, &project.path)?;
+    walk_projects(
+        directory,
+        &boundary,
+        &mut Default::default(),
+        &mut installed,
+    )
+    .map_err(|error| error.into_refusal(project))?;
     for package in project.packages.iter().filter(|p| p.windows) {
         let fail = || {
             refuse(
@@ -1400,7 +1626,12 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
             .find(|(metadata, _)| {
                 metadata["name"] == package.name && metadata["version"] == package.version
             })
-            .ok_or_else(|| fail().at(Check::InstalledPackage))?;
+            .ok_or_else(|| {
+                fail().at(Check::InstalledPackage).detail(format!(
+                    "InstalledPackage: {}@{} is not installed at node_modules",
+                    package.name, package.version
+                ))
+            })?;
         let bins: Vec<&str> = match &metadata["bin"] {
             Value::String(s) => vec![s],
             Value::Object(map) => map.values().filter_map(Value::as_str).collect(),
@@ -1412,20 +1643,36 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
         {
             let bin = bin.strip_prefix("./").unwrap_or(bin);
             for component in bin.split('/') {
-                crate::validate_component(component)
-                    .map_err(|_| projection_error(&project.path, package))?;
+                crate::validate_component(component).map_err(|_| {
+                    projection_error(&project.path, package).detail(format!(
+                        "Projection: invalid bin target at {}",
+                        installed_relative(directory, &root.join(bin))
+                    ))
+                })?;
             }
             if !root.join(bin).is_file() {
-                return Err(fail().at(Check::InstalledBin));
+                return Err(fail().at(Check::InstalledBin).detail(format!(
+                    "InstalledBin: {} is missing at {}",
+                    package.name,
+                    installed_relative(directory, &root.join(bin))
+                )));
             }
         }
         if let Some(bin_dir) = &package.bin_dir {
             for component in bin_dir.strip_prefix("./").unwrap_or(bin_dir).split('/') {
-                crate::validate_component(component)
-                    .map_err(|_| projection_error(&project.path, package))?;
+                crate::validate_component(component).map_err(|_| {
+                    projection_error(&project.path, package).detail(format!(
+                        "Projection: invalid bin directory at {}",
+                        installed_relative(directory, &root.join(bin_dir))
+                    ))
+                })?;
             }
             if !root.join(bin_dir).is_dir() {
-                return Err(fail().at(Check::InstalledBinDirectory));
+                return Err(fail().at(Check::InstalledBinDirectory).detail(format!(
+                    "InstalledBinDirectory: {} is missing at {}",
+                    package.name,
+                    installed_relative(directory, &root.join(bin_dir))
+                )));
             }
         }
     }

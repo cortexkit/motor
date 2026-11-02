@@ -2273,3 +2273,101 @@ fn powershell_brace_scanner_ignores_quoted_literals_and_comments() {
     assert!(powershell_brace_balance("'{' }").is_err());
     assert!(powershell_brace_balance("{ 'unterminated }").is_err());
 }
+
+/// A job from a real checkout must start on a candidate image. Bun preparation
+/// runs before the command, so a checkout whose layout preparation refuses fails
+/// here as a setup error rather than as a command failure.
+///
+/// `MOTOR_QUAL_CHECKOUTS` names the checkouts to try, separated by `:`. Each is
+/// copied to the fixture host so the job is a real repository, not a fixture.
+#[tokio::test]
+#[ignore = "trusted operator: sealed Windows baseline, MOTOR_RUNNER_BINARY, MOTOR_WINDOWS_VM_CONFIG and MOTOR_QUAL_CHECKOUTS required"]
+async fn windows_qualification_real_checkout_bun_preparation_is_not_refused() {
+    let checkouts: Vec<_> = std::env::var_os("MOTOR_QUAL_CHECKOUTS")
+        .map(|value| std::env::split_paths(&value).collect())
+        .expect("set MOTOR_QUAL_CHECKOUTS to the checkouts to prepare, separated by ':'");
+    assert!(
+        !checkouts.is_empty(),
+        "MOTOR_QUAL_CHECKOUTS named no checkout"
+    );
+    let runner = operator();
+    for checkout in checkouts {
+        let f = Fixture::new();
+        // Copy only the committed checkout: untracked caches, credentials and
+        // host-installed node_modules must never become qualification inputs.
+        for entry in fs::read_dir(&f.main).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            if entry.file_type().unwrap().is_dir() {
+                fs::remove_dir_all(entry.path()).unwrap();
+            } else {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        let archive = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["archive", "--format=tar", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(
+            archive.status.success(),
+            "archive {} failed: {}",
+            checkout.display(),
+            String::from_utf8_lossy(&archive.stderr)
+        );
+        tar::Archive::new(std::io::Cursor::new(archive.stdout))
+            .unpack(&f.main)
+            .unwrap();
+        git(&f.main, &["add", "-A", "."]);
+        git(
+            &f.main,
+            &[
+                "-c",
+                "user.name=Motor fixture",
+                "-c",
+                "user.email=motor-fixture@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "real checkout",
+            ],
+        );
+        let (mut request, bytes) = f.run("echo preparation-not-refused; exit 0");
+        request.platform = Some(Platform::Windows);
+        let mirror = runner
+            .core
+            .trees
+            .ensure_mirror(&request.repository_root)
+            .unwrap();
+        git(&mirror, &["fetch", text(&f.main), "HEAD"]);
+        f.submit(&runner, &request, &bytes);
+        let terminal = operator_terminal(&runner, request.job_id).await;
+        let output = replay_output(&runner, request.job_id);
+        assert!(
+            !matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. }),
+            "{} was refused before start ({}):\n{output}",
+            checkout.display(),
+            serde_json::to_string(&terminal).unwrap_or_default()
+        );
+        assert_eq!(
+            terminal.outcome,
+            Outcome::WindowsExit { code: 0 },
+            "{} did not run to completion:\n{output}",
+            checkout.display()
+        );
+        assert!(
+            output.contains("preparation-not-refused"),
+            "{} did not reach its command:\n{output}",
+            checkout.display()
+        );
+        assert!(
+            !output.contains("bun install skipped"),
+            "{} skipped Bun preparation instead of qualifying a complete install:\n{output}",
+            checkout.display()
+        );
+        no_units(&runner);
+    }
+}

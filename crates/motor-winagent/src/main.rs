@@ -1549,7 +1549,12 @@ mod guest {
             );
         }
         drop(identity);
-        let mut warnings = Vec::new();
+        let mut warnings = bun::source_projects(Path::new(SOURCE_ROOT), &budget)?
+            .into_iter()
+            .filter_map(|(member, owner)| {
+                owner.map(|owner| bun::workspace_member_warning(&member, &owner))
+            })
+            .collect::<Vec<_>>();
         for project in &manifest.projects {
             let fail = |_path: &str| {
                 bun::refuse(
@@ -1614,10 +1619,19 @@ mod guest {
                     &mut diagnostics,
                 );
                 // Finish containment before removing any partial dependency tree.
-                let containment =
-                    || bun::refuse(RefusalKind::BunProjectionInvalid, &project.path, "", "");
-                job.terminate(1).map_err(|_| containment())?;
-                job.wait_empty().map_err(|_| containment())?;
+                // The refusal names the step that failed so a live report can tell
+                // it apart from an install tree that left the checkout.
+                let containment = |check: Check| {
+                    bun::refuse(RefusalKind::BunProjectionInvalid, &project.path, "", "")
+                        .at(check)
+                        .detail(format!(
+                            "{check:?} failed at .: Bun install processes did not stop"
+                        ))
+                };
+                job.terminate(1)
+                    .map_err(|_| containment(Check::JobTerminate))?;
+                job.wait_empty()
+                    .map_err(|_| containment(Check::JobWaitEmpty))?;
                 // On timeout/read errors the install loop may leave diagnostics
                 // queued. Drain after containment, with a separate bounded wait.
                 let drain_deadline = Instant::now() + Duration::from_secs(2);

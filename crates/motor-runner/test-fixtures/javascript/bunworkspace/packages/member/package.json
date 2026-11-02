@@ -1,0 +1,9 @@
+{
+  "name": "runner-bun-member-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "memberdep": "file:vendor/memberdep",
+    "rootdep": "workspace:*"
+  }
+}

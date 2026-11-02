@@ -439,12 +439,21 @@ fn parse_lock(project: &str, bytes: &[u8]) -> io::Result<ParsedLock> {
 pub(super) fn write_parsed_locks(staging: &Path) -> io::Result<()> {
     let mut files = Vec::new();
     discover(&staging.join("m"), &mut files)?;
+    let budget = bun::ExpansionBudget::new(
+        4 * 1024 * 1024 * 1024,
+        250_000,
+        Instant::now() + Duration::from_secs(600),
+    );
+    let projects = bun::source_projects(&staging.join("m"), &budget)?;
     let mut parsed = BTreeMap::new();
     let mut input_bytes = 0usize;
     for lock in files
         .iter()
         .filter(|path| path.file_name().is_some_and(|n| n == "bun.lock"))
     {
+        if projects[&lock_project(lock, staging)].is_some() {
+            continue;
+        }
         let bytes = bounded_file(lock, bun::MAX_LOCK_BYTES as u64)?;
         input_bytes = input_bytes.saturating_add(bytes.len());
         if input_bytes > bun::MAX_LOCK_BYTES {
@@ -640,6 +649,18 @@ fn prepare_impl(
             }
         }
     }
+    // The guest refuses an installed tree that leaves the checkout, and Bun
+    // links a workspace member's packages into the enclosing project's store.
+    // Preparing such a member on its own builds a tree Bun never makes for that
+    // lockfile, so its own lockfile is reported and left to the enclosing
+    // install, which is what `bun install` itself does there.
+    let budget = bun::ExpansionBudget::new(
+        4 * 1024 * 1024 * 1024,
+        250_000,
+        Instant::now() + Duration::from_secs(600),
+    );
+    let projects = bun::source_projects(&staging.join("m"), &budget)?;
+    locks.retain(|lock| projects[&lock_project(lock, staging)].is_none());
     let mut projects = Vec::new();
     let mut input_bytes = 0usize;
     for lock in &locks {
@@ -890,6 +911,15 @@ fn prepare_impl(
     }
     fs::write(seed.join("manifest.json"), serde_json::to_vec(&manifest)?)?;
     Ok(lease)
+}
+
+fn lock_project(lock: &Path, staging: &Path) -> String {
+    lock.parent()
+        .unwrap()
+        .strip_prefix(staging)
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
