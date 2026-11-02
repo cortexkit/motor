@@ -439,7 +439,7 @@ fn missing_optional_windows_package_and_bin_are_named_refusals() {
     let refusal = verify_installed(&project, scratch.path()).unwrap_err();
     assert_eq!(refusal.kind, RefusalKind::BunOfflineInstallFailed);
     assert_eq!(refusal.package, "@private/win");
-    assert_eq!(refusal.version, "1.0.0");
+    assert_eq!(&*refusal.version, "1.0.0");
     let installed = scratch.join("node_modules/@private/win");
     std::fs::create_dir_all(&installed).unwrap();
     std::fs::write(
