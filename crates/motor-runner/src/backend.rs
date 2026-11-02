@@ -142,6 +142,7 @@ pub(crate) trait IsolationLauncher: Send + Sync {
         env: &[(String, String)],
         cpus: &[u32],
         requested_vcpus: u32,
+        #[cfg(target_os = "linux")] sources: crate::source_seal::Sources<'_>,
     ) -> io::Result<platform::Launch>;
 }
 
@@ -165,8 +166,9 @@ impl IsolationLauncher for crate::isolation::Sandbox {
         env: &[(String, String)],
         cpus: &[u32],
         requested_vcpus: u32,
+        sources: crate::source_seal::Sources<'_>,
     ) -> io::Result<platform::Launch> {
-        self.launch_durable(command, cwd, env, cpus, requested_vcpus)
+        self.launch_durable(command, cwd, env, cpus, requested_vcpus, sources)
     }
 }
 
@@ -529,6 +531,12 @@ fn verify_boat_storage(users: &Path, state: &Path, workspace: &Path) -> io::Resu
 }
 
 impl Backend for HostBackend {
+    fn initialize(&self, config: &Config) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        crate::source_seal::startup(config)?;
+        let _ = config;
+        Ok(())
+    }
     #[cfg(target_os = "linux")]
     fn live_units(
         &self,
@@ -718,6 +726,13 @@ impl Backend for HostBackend {
                         &caller_commit,
                     ),
                 }),
+            )?;
+        }
+        #[cfg(target_os = "linux")]
+        if config.isolate_jobs && !s.base {
+            setup_step(
+                "rematerialize hard-linked source",
+                crate::source_seal::refresh::linked_sources(config, trees, r),
             )?;
         }
         let computed = setup_step(
@@ -1122,6 +1137,12 @@ impl Backend for HostBackend {
                 &env,
                 &s.cpus,
                 weight,
+                #[cfg(target_os = "linux")]
+                if s.base {
+                    crate::source_seal::Sources::CompileCacheWriter
+                } else {
+                    crate::source_seal::Sources::snapshot(config, trees, r)
+                },
             )
         } else {
             // The non-isolated host backend is development-only and does not pin CPUs.

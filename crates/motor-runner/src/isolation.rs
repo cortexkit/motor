@@ -3632,6 +3632,7 @@ impl Sandbox {
     }
 
     #[cfg(test)]
+    /// Low-level sandbox fixture only: no runner request or durable job path, so source is not sealed.
     pub(crate) fn launch(
         &self,
         command: &str,
@@ -3647,8 +3648,22 @@ impl Sandbox {
         env: &[(String, String)],
         cpus: &[u32],
         requested_vcpus: u32,
+        sources: crate::source_seal::Sources<'_>,
     ) -> io::Result<platform::Launch> {
-        self.launch_inner(command, cwd, env, true, cpus, requested_vcpus)
+        let sealed = sources.seal(self.id, self.writer, &self.prepared_javascript_directories)?;
+        let launched = self.launch_inner(command, cwd, env, true, cpus, requested_vcpus);
+        if launched.is_err() {
+            if let Some(seal) = sealed {
+                discard_unstarted(self.id);
+                if let Err(cleanup) = seal.failed_launch() {
+                    return Err(io::Error::other(format!(
+                        "{}; source unseal: {cleanup}",
+                        launched.err().unwrap()
+                    )));
+                }
+            }
+        }
+        launched
     }
     fn launch_inner(
         &self,

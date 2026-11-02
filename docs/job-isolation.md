@@ -49,6 +49,20 @@ set, so setuid binaries and file capabilities give it nothing. Test:
 
 ## 3. Filesystem
 
+### Read-only source
+
+On Linux, regular files in the source snapshot are immutable while the command
+runs. Writing them in place, removing them, renaming another file over them,
+and changing their times or permissions all fail immediately. Build outputs,
+temporary files, new untracked files, and `node_modules` directories prepared by
+the runner stay writable. A tracked file explicitly named in `return_paths`
+stays writable so it can be regenerated and returned. Tracked symlinks are not
+sealed. Renaming a parent folder is still possible: a command can move it aside
+and create replacement files under the old path; `workspace_changes` reports
+those changes. Windows and macOS do not yet provide this protection.
+Compile-cache fill builds are not sealed: they build trusted default-branch
+commits rather than uploaded job snapshots.
+
 The sandbox has its own empty root directory (`RootDirectory=`) with only the
 paths below bound in. `ProtectSystem=strict`, `ProtectHome=tmpfs`,
 `PrivateTmp=yes`, `PrivateDevices=yes` and `ProtectProc=invisible` apply on top.

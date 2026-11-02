@@ -363,6 +363,8 @@ impl Runner {
         pass: u8,
         repair_incomplete: bool,
     ) -> io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        self.core.config.source_seals.check_host(&candidate.path)?;
         if !self.build_folder_retry_ready(candidate.workspace.as_ref().unwrap(), pass) {
             return Ok(false);
         }
@@ -1007,6 +1009,8 @@ impl Runner {
             self.core.trees.state.clone(),
             self.core.config.build_slot_root.clone(),
         ];
+        #[cfg(target_os = "linux")]
+        protected.extend(self.core.config.source_seals.roots());
         // Source/sibling paths remain protected for task cleanup. A recorded head
         // owns its checkout in both roles, so only active ownership protects it.
         // Every claim is in host form: a mapped caller path names no host

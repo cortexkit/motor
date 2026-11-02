@@ -32,6 +32,8 @@ mod platform;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod privilege;
 mod return_paths;
+#[cfg(target_os = "linux")]
+mod source_seal;
 // Cache records and publication policy are portable; the sandbox transport is
 // Unix-only.
 #[cfg_attr(any(not(test), not(target_os = "linux")), allow(dead_code))]
@@ -96,6 +98,10 @@ pub use storage::{JobState, REPLAY_BYTES, RETENTION_MS};
 #[doc(hidden)]
 pub fn physical_chmod(args: &[String]) -> std::io::Result<()> {
     permissions::run(args)
+}
+#[cfg(target_os = "linux")]
+pub fn source_seal_helper(action: &str, args: &[String]) -> std::io::Result<()> {
+    source_seal::helper(action, args)
 }
 #[cfg(target_os = "linux")]
 #[doc(hidden)]

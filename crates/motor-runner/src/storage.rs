@@ -264,6 +264,9 @@ pub(crate) struct Job {
     /// by the runner, not the job. Persisted so recovered jobs exclude them too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prepared_javascript_directories: Vec<PathBuf>,
+    /// Whether source inode protection was applied before this command started.
+    #[serde(default)]
+    pub source_read_only: bool,
 }
 
 /// A sidecar preserves damaged records and any independently readable ownership.
@@ -369,6 +372,7 @@ impl Job {
             memory_accounting_pending: false,
             sibling_sources: None,
             prepared_javascript_directories: Vec::new(),
+            source_read_only: false,
         }
     }
     pub fn pending(&self) -> bool {
@@ -388,6 +392,11 @@ impl Job {
         let queue_wait_ms = self.queue_wait_ms(now);
         self.queue_entry.store(NO_QUEUE, Ordering::Release);
         let remote = self.started_ms.is_some();
+        let report_source = remote
+            && !matches!(
+                &outcome,
+                Outcome::RefusedBeforeStart { .. } | Outcome::HistoryExpired
+            );
         let bundle_bytes = self
             .request
             .as_ref()
@@ -407,6 +416,9 @@ impl Job {
             bundle_bytes,
         )
         .with_ran(if remote { Ran::Remote } else { Ran::None });
+        if report_source {
+            terminal = terminal.with_source_read_only(self.source_read_only);
+        }
         if let Some((killed, _)) = &self.kill {
             terminal = terminal.with_killed(killed.clone());
         }

@@ -570,6 +570,12 @@ pub fn forget_caller_root(config: &Config, prefix: &str) -> io::Result<Vec<Strin
     check_live_units(config)?;
     #[cfg(target_os = "linux")]
     {
+        // Source seal records are needed to clear immutable flags after a
+        // restart. Keep caller-root data and job records until unsealing succeeds.
+        config.source_seals.load(&state)?;
+        if !config.source_seals.ids().is_empty() {
+            return Err(invalid("forget-caller-root refuses pending source seals; restart the runner to retry unseal"));
+        }
         step_one(config, &plan)?;
         step_two(config, &plan)?;
         step_three(config, &plan)?;

@@ -389,9 +389,11 @@ async fn isolated_legacy_checkout_migration_retires_source_and_first_fill_create
     assert_eq!(error.raw_os_error(), Some(libc::EACCES));
     use std::os::unix::fs::MetadataExt;
     let legacy_inode = fs::symlink_metadata(&legacy.checkout).unwrap().ino();
-    let mut live = sandbox.launch_durable(
-        "trap 'if test -f target/keep; then echo storage-present-at-stop; fi; exit 0' TERM; echo live; while :; do sleep 0.1; done",
-        &legacy.checkout, &[], &[], base.weight).unwrap();
+    // Model a pre-sealing legacy unit through the low-level fixture launcher;
+    // a current job launch would seal source before migration can be tested.
+    let mut live = sandbox.launch(
+        "exec >/motor-output/stdout; trap 'if test -f target/keep; then echo storage-present-at-stop; fi; exit 0' TERM; echo live; while :; do sleep 0.1; done",
+        &legacy.checkout, &[]).unwrap();
     base.process = Some(live.identity);
     base.durable_output = live.durable_output;
     let record = config

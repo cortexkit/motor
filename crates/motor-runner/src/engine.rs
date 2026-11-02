@@ -88,6 +88,8 @@ pub type FreeSpaceProbe = Arc<dyn Fn(&Path) -> io::Result<u64> + Send + Sync>;
 /// Paths are instance-specific except build_slot_root, which is machine-wide.
 #[derive(Clone)]
 pub struct Config {
+    #[cfg(target_os = "linux")]
+    pub(crate) source_seals: Arc<crate::source_seal::Runtime>,
     /// Diagnostic pushes are opt-in and use an identity separate from job state.
     pub metrics: crate::metrics::Settings,
     /// Accept host-authenticated tenant connections over vsock and limit each
@@ -442,6 +444,8 @@ impl Config {
     pub fn new(state_root: impl Into<PathBuf>, instance: impl Into<String>) -> Self {
         let state_root = state_root.into();
         Self {
+            #[cfg(target_os = "linux")]
+            source_seals: Arc::default(),
             metrics: crate::metrics::Settings::default(),
             tenant_vm: false,
             boat_profile: false,
@@ -802,6 +806,10 @@ impl Config {
             || (cfg!(unix) && self.macos_instance())
     }
     fn cleanup_pending(&self, id: Uuid) -> bool {
+        #[cfg(target_os = "linux")]
+        if self.source_seals.unit(id).is_some() {
+            return true;
+        }
         #[cfg(unix)]
         if self.macos_instance() {
             return self.macos_runtime.cleanup_pending(id);
@@ -966,6 +974,8 @@ impl QueueProgress {
 }
 
 struct Inner {
+    #[cfg(target_os = "linux")]
+    source_seals: Arc<crate::source_seal::Runtime>,
     /// Reserve-file allocation claims the idle interval, then releases the state
     /// lock while writing and syncing the file.
     restoring_reserve: bool,
@@ -2235,6 +2245,8 @@ impl Runner {
             compacting: Arc::default(),
         };
         fs::create_dir_all(&trees.mirrors)?;
+        #[cfg(target_os = "linux")]
+        config.source_seals.load(&state)?;
         if config.windows_instance() {
             private_state_directory(&trees.mirrors)?;
         }
@@ -2617,6 +2629,8 @@ impl Runner {
                 }
             }
         }
+        #[cfg(target_os = "linux")]
+        let source_seals = config.source_seals.clone();
         let runner = Self {
             core: Arc::new(Core {
                 reserve_restore: Mutex::new(()),
@@ -2634,6 +2648,8 @@ impl Runner {
                 trees,
                 snapshots: crate::sibling_snapshots::store::SnapshotStore::default(),
                 inner: crate::state_lock::StateLock::new(Inner {
+                    #[cfg(target_os = "linux")]
+                    source_seals,
                     restoring_reserve: false,
                     writer: None,
                     #[cfg(target_os = "linux")]
@@ -3375,6 +3391,8 @@ impl Runner {
     /// (hundreds of thousands of files) takes minutes, and holding the lock
     /// that long stalls every other job, transfer and status request.
     fn discard(&self, path: &Path) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        self.core.config.source_seals.check_host(path)?;
         if let Some(root) = paths::trash::mapped_root(&self.core.config, paths::host(path)) {
             self.long_work("mapped-detach");
             #[cfg(target_os = "linux")]
@@ -3497,6 +3515,10 @@ impl Runner {
     /// running job started with its siblings bound from their host paths
     /// still does (see `legacy_sibling_user`).
     fn occupied(inner: &Inner, key: &str) -> bool {
+        #[cfg(target_os = "linux")]
+        if inner.source_seals.blocks_caller(key) {
+            return true;
+        }
         use crate::sibling_snapshots::SiblingFences;
         let in_place = inner.sibling_fences == SiblingFences::InPlace;
         inner.reserved.contains_key(key)
@@ -3513,6 +3535,15 @@ impl Runner {
                                 .as_ref()
                                 .is_some_and(|r| Self::workspace_uses_sibling(key, &r.siblings))))
             })
+    }
+
+    fn sealed_workspace(_inner: &Inner, _key: &str) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            _inner.source_seals.blocks_caller(_key)
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
     }
 
     /// In snapshot mode, whether `job` still binds its siblings from their
@@ -4565,6 +4596,13 @@ impl Runner {
         // Snapshot siblings never share a checkout with anything.
         if inner.sibling_fences != crate::sibling_snapshots::SiblingFences::InPlace {
             return false;
+        }
+        #[cfg(target_os = "linux")]
+        if siblings
+            .iter()
+            .any(|s| inner.source_seals.blocks_caller(&s.canonical_path))
+        {
+            return true;
         }
         Self::scheduler_jobs(inner)
             .filter(|j| j.state == JobState::Running)
@@ -6005,7 +6043,9 @@ impl Runner {
         Some(
             if inner.dropping.contains(crate::caller_path::job_key(job)) {
                 "workspace drop"
-            } else if index.workspaces.contains(crate::caller_path::job_key(job)) {
+            } else if index.workspaces.contains(crate::caller_path::job_key(job))
+                || Self::sealed_workspace(inner, crate::caller_path::job_key(job))
+            {
                 "workspace owner"
             } else if index.occupied(crate::caller_path::job_key(job)) {
                 SIBLING_USER_WAIT
@@ -6083,7 +6123,7 @@ impl Runner {
                 && !index.occupied(crate::caller_path::job_key(job))
                 && index.held_by_queued_workspace(inner, job, self.core.config.max_weight);
             let pause = job.queued_ms.is_some()
-                && (!holders.is_empty() || held)
+                && (!holders.is_empty() || held || Self::sealed_workspace(inner, crate::caller_path::job_key(job)))
                 && job.request.as_ref().is_some_and(|request| {
                     let holder_weight = holders
                         .values()
@@ -6478,11 +6518,59 @@ impl Runner {
             }
         }
     }
+    #[cfg(target_os = "linux")]
+    fn unseal_stopped_source(&self, id: Uuid) {
+        let Some(unit) = self.core.config.source_seals.unit(id) else {
+            return;
+        };
+        // A daemon can crash between creating the unit and saving its process
+        // identity. The durable unit name still identifies that execution.
+        let process = platform::ProcessIdentity {
+            pid: 0,
+            start: 0,
+            unit: Some(unit),
+        };
+        match self
+            .core
+            .backend
+            .unit_alive(&self.core.config, Some(process))
+        {
+            Ok(Some(false)) => {
+                if let Err(error) = self
+                    .core
+                    .config
+                    .source_seals
+                    .unseal(&self.core.trees.state, id)
+                {
+                    tracing::error!(job_id = %id, %error, "source unseal pending; workspace held for maintenance retry");
+                }
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(job_id = %id, %error, "cannot prove sealed unit stopped"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retry_source_unseals(&self) {
+        for id in self.core.config.source_seals.ids() {
+            let inner = self.core.inner.lock().unwrap();
+            // The seal is published before the launch, so absence of a unit
+            // during that interval is not evidence that sealing has ended.
+            if inner.starting.contains(&id) || inner.launching.contains(&id) {
+                continue;
+            }
+            drop(inner);
+            self.unseal_stopped_source(id);
+        }
+    }
+
     /// Also exposed to fake-clock tests; retention is relative to both terminal
     /// time and mint time, so recent unknown IDs can never rerun an expired job.
     pub fn maintenance(&self) -> io::Result<()> {
         // Outside the state lock, which maintenance later takes.
         self.refresh_slice_budget();
+        #[cfg(target_os = "linux")]
+        self.retry_source_unseals();
         #[cfg(unix)]
         if self.core.config.macos_instance() {
             self.core
@@ -6566,6 +6654,7 @@ impl Runner {
             .values()
             .filter(|j| {
                 j.return_reserved_bytes == 0
+                    && !self.core.config.cleanup_pending(j.id)
                     && !inner.base_finishes.contains_key(&j.id)
                     && j.finished_ms.is_some_and(|t| {
                         self.now().saturating_sub(t.max(mint_ms(j.id))) >= RETENTION_MS
@@ -8060,6 +8149,11 @@ impl Runner {
             }
         }
         job.state = JobState::Running;
+        #[cfg(target_os = "linux")]
+        {
+            job.source_read_only =
+                crate::source_seal::record_path(&self.core.trees.state, id).exists();
+        }
         job.process = launch.process;
         job.durable_output = launch.durable_output;
         job.memory_accounting_pending = self.core.tenant_events.is_some()
@@ -8338,6 +8432,8 @@ impl Runner {
                 delay = (delay * 2).min(Duration::from_secs(5));
             }
         }
+        #[cfg(target_os = "linux")]
+        self.unseal_stopped_source(id);
         let no_start = unreleased && (cfg!(target_os = "linux") || self.core.config.vm_instance());
         if no_start {
             finished.process = None;
@@ -8711,6 +8807,7 @@ impl Runner {
     /// record is withdrawn, as when the launch itself fails before the gate.
     #[cfg(target_os = "linux")]
     fn refuse_unstarted_unit(&self, id: Uuid, detail: String) -> io::Result<()> {
+        self.unseal_stopped_source(id);
         let process = self.core.inner.lock().unwrap().jobs[&id].process;
         // Reading the result also resets the failed unit so systemd unloads
         // it, as the normal finish path does.
@@ -9200,6 +9297,8 @@ impl Runner {
             inner.finalizing.remove(&id);
         });
         self.finish_step(id, &job.kill, "finalization claimed", finish_started);
+        #[cfg(target_os = "linux")]
+        self.unseal_stopped_source(id);
         let ended_ms = self.now();
         job.mem_working_peak_mib.stop();
         let evidence = self.execution_evidence(&job);
@@ -10360,6 +10459,8 @@ const QUEUE_ORDER_WAIT: &str = "queue order";
 /// job's weight, checkout reservations and CPU claims after each start.
 #[derive(Default)]
 struct DispatchIndex {
+    #[cfg(target_os = "linux")]
+    sealed_paths: BTreeSet<String>,
     weight: u32,
     foreground_pending: usize,
     /// For each repository root, the `order` of its most recently accepted
@@ -10395,6 +10496,12 @@ impl DispatchIndex {
     /// finished, their setup reservations included.
     fn build_without(inner: &Inner, excluded: &BTreeSet<Uuid>) -> Self {
         let mut index = Self {
+            #[cfg(target_os = "linux")]
+            sealed_paths: inner
+                .source_seals
+                .caller_paths_excluding(excluded)
+                .into_iter()
+                .collect(),
             in_place: inner.sibling_fences == crate::sibling_snapshots::SiblingFences::InPlace,
             ..Self::default()
         };
@@ -10520,6 +10627,14 @@ impl DispatchIndex {
             .collect()
     }
     fn occupied(&self, key: &str) -> bool {
+        #[cfg(target_os = "linux")]
+        if self
+            .sealed_paths
+            .iter()
+            .any(|path| Self::overlap(key, path))
+        {
+            return true;
+        }
         self.workspaces.contains(key)
             || self
                 .sibling_paths
@@ -10534,6 +10649,14 @@ impl DispatchIndex {
         // Snapshot siblings never share a checkout with anything.
         self.in_place
             && siblings.iter().any(|sibling| {
+                #[cfg(target_os = "linux")]
+                if self
+                    .sealed_paths
+                    .iter()
+                    .any(|path| Self::overlap(&sibling.canonical_path, path))
+                {
+                    return true;
+                }
                 self.running_paths
                     .iter()
                     .chain(&self.reserved_paths)

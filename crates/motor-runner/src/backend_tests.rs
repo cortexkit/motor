@@ -303,6 +303,7 @@ impl IsolationLauncher for ObservedIsolationLauncher {
         env: &[(String, String)],
         cpus: &[u32],
         requested_vcpus: u32,
+        #[cfg(target_os = "linux")] _sources: crate::source_seal::Sources<'_>,
     ) -> io::Result<platform::Launch> {
         *self.0.lock().unwrap() = Some(LaunchCall {
             command: command.into(),
