@@ -163,17 +163,24 @@ impl Connector for RoutingPeer {
             self.ally_behavior.load(Ordering::SeqCst)
         } else if instance == "windows" {
             self.last_behavior.load(Ordering::SeqCst)
+        } else if instance == "macos-signing" {
+            18
         } else {
             0
         };
         let windows = instance == "windows" || instance == "ally-windows";
+        let macos = instance == "macos-signing";
         let offline = windows && self.fail_windows.load(Ordering::SeqCst);
-        let platforms = if windows {
+        let platforms = if macos {
+            vec!["macos".into()]
+        } else if windows {
             self.platforms.clone()
         } else {
             Vec::new()
         };
-        let echo = if windows {
+        let echo = if macos {
+            Some(Platform::Macos)
+        } else if windows {
             self.echo.clone()
         } else {
             Some(Platform::Linux)
@@ -256,7 +263,14 @@ impl Connector for RoutingPeer {
                                 binding["runner_instance"], instance,
                                 "binding must be durable before Run"
                             );
-                            assert_eq!(run.platform, windows.then_some(Platform::Windows));
+                            assert_eq!(
+                                run.platform,
+                                if macos {
+                                    Some(Platform::Macos)
+                                } else {
+                                    windows.then_some(Platform::Windows)
+                                }
+                            );
                             if windows {
                                 dispatches.lock().unwrap().sent(
                                     Uuid::parse_str(caller).unwrap(),
@@ -512,6 +526,214 @@ fn ordered(config: Config) -> Config {
             },
         ],
         ..config
+    }
+}
+
+struct SigningFaultPeer {
+    peer: Arc<RoutingPeer>,
+    code: &'static str,
+    hint: Option<u64>,
+    late: bool,
+    connected: AtomicBool,
+    recovered: AtomicBool,
+    faults: Mutex<Vec<tokio::time::Instant>>,
+    attempts: Mutex<Vec<tokio::time::Instant>>,
+    observed: tokio::sync::Notify,
+}
+
+impl SigningFaultPeer {
+    fn motor(
+        f: &Fixture,
+        platform: Platform,
+        code: &'static str,
+        hint: Option<u64>,
+        late: bool,
+    ) -> (Arc<Self>, Motor) {
+        let peer = RoutingPeer::new(f);
+        peer.ally_behavior.store(18, Ordering::SeqCst);
+        peer.last_behavior.store(18, Ordering::SeqCst);
+        let mut config = ordered(f.config.clone());
+        if platform == Platform::Macos {
+            config.macos_runner = Some(crate::MacosRunner {
+                host: "macos.example.invalid".into(),
+                port: 22,
+                user: "motor".into(),
+                host_key: config.windows_runners[0].host_key.clone(),
+                instance: "macos-signing".into(),
+                state_root: "/Users/motor/state".into(),
+            });
+        }
+        let fault = Arc::new(Self {
+            peer,
+            code,
+            hint,
+            late,
+            connected: AtomicBool::new(false),
+            recovered: AtomicBool::new(false),
+            faults: Mutex::default(),
+            attempts: Mutex::default(),
+            observed: tokio::sync::Notify::new(),
+        });
+        let motor = Motor::with_connector(config, &fault.peer.module_state, fault.clone()).unwrap();
+        (fault, motor)
+    }
+}
+
+impl Connector for SigningFaultPeer {
+    fn refusal(&self) -> Option<&'static str> {
+        (!self.recovered.load(Ordering::SeqCst)
+            && (!self.late || self.connected.load(Ordering::SeqCst)))
+        .then_some(self.code)
+    }
+
+    fn retry_after_ms(&self, code: &str) -> Option<u64> {
+        assert_eq!(code, self.code);
+        self.faults
+            .lock()
+            .unwrap()
+            .push(tokio::time::Instant::now());
+        self.observed.notify_one();
+        self.hint
+    }
+
+    fn connect(
+        &self,
+        _: Uuid,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + '_>> {
+        panic!("signing tests must use an explicit runner endpoint")
+    }
+
+    fn connect_to<'a>(
+        &'a self,
+        id: Uuid,
+        instance: &'a str,
+        root: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + 'a>> {
+        self.attempts
+            .lock()
+            .unwrap()
+            .push(tokio::time::Instant::now());
+        self.connected.store(true, Ordering::SeqCst);
+        if !self.recovered.load(Ordering::SeqCst) {
+            Box::pin(async { Err(io::Error::other("signing transport unavailable")) })
+        } else {
+            self.peer.connect_to(id, instance, root)
+        }
+    }
+}
+
+#[tokio::test]
+async fn windows_and_macos_transient_signing_waits_for_hint_then_recovers() {
+    for platform in [Platform::Windows, Platform::Macos] {
+        for late in [false, true] {
+            for code in ["runner_sign_unavailable", "runner_sign_invalid_response"] {
+                let f = Fixture::new(Cut::None, 28).await;
+                let (fault, motor) =
+                    SigningFaultPeer::motor(&f, platform.clone(), code, Some(2_000), late);
+                let mut request = f.request("true").with_platform(platform.clone());
+                request.queue_wait_limit_s = Some(30);
+                let stream = motor.run(request).unwrap();
+                tokio::time::timeout(Duration::from_secs(10), fault.observed.notified())
+                    .await
+                    .unwrap();
+                fault.recovered.store(true, Ordering::SeqCst);
+                let records = tokio::time::timeout(Duration::from_secs(15), collect(stream))
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(records.last(), Some(StreamRecord::Terminal(t)) if t.outcome == Outcome::Exit { code: 0 })
+                );
+                assert_eq!(
+                    records
+                        .iter()
+                        .filter(|r| matches!(r, StreamRecord::Accepted(_)))
+                        .count(),
+                    1
+                );
+                let frames = fault.peer.frames.lock().unwrap();
+                let runs: Vec<_> = frames
+                    .iter()
+                    .filter_map(|f| {
+                        if let Frame::Run(run) = f {
+                            Some(run)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert_eq!(runs.len(), 1);
+                assert!(
+                    runs[0].queue_wait_limit_s <= 28,
+                    "signing must spend the shared budget"
+                );
+                let first_fault = fault.faults.lock().unwrap()[0];
+                let first_success = fault.peer.visits.lock().unwrap()[0].at;
+                assert!(
+                    first_success.duration_since(first_fault) >= Duration::from_secs(2),
+                    "a different endpoint must not bypass the signing backoff"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn windows_and_macos_transient_signing_exhausts_shared_budget() {
+    for platform in [Platform::Windows, Platform::Macos] {
+        for late in [false, true] {
+            let f = Fixture::new(Cut::None, 28).await;
+            let (fault, motor) = SigningFaultPeer::motor(
+                &f,
+                platform.clone(),
+                "runner_sign_unavailable",
+                Some(2_000),
+                late,
+            );
+            let mut request = f.request("true").with_platform(platform.clone());
+            request.queue_wait_limit_s = Some(3);
+            let records = collect(motor.run(request).unwrap()).await;
+            assert!(
+                matches!(records.last(), Some(StreamRecord::Terminal(t)) if t.outcome == Outcome::RefusedBeforeStart { reason: RefusalReason::QueueWaitExceeded } && t.ran == Some(Ran::None))
+            );
+            assert!(fault.peer.frames.lock().unwrap().is_empty());
+            assert!(!records
+                .iter()
+                .any(|r| matches!(r, StreamRecord::Accepted(_))));
+            let attempts = fault.attempts.lock().unwrap();
+            for pair in attempts.windows(2) {
+                assert!(pair[1].duration_since(pair[0]) >= Duration::from_secs(2));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn windows_and_macos_nontransient_signing_is_an_immediate_typed_refusal() {
+    for platform in [Platform::Windows, Platform::Macos] {
+        for late in [false, true] {
+            for code in [
+                "runner_sign_unavailable",
+                "runner_sign_missing",
+                "runner_sign_grant_refused",
+                "runner_credential_missing",
+                "runner_credential_grant_refused",
+            ] {
+                let f = Fixture::new(Cut::None, 28).await;
+                let (fault, motor) =
+                    SigningFaultPeer::motor(&f, platform.clone(), code, None, late);
+                let records = collect(
+                    motor
+                        .run(f.request("true").with_platform(platform.clone()))
+                        .unwrap(),
+                )
+                .await;
+                assert!(
+                    matches!(records.last(), Some(StreamRecord::Terminal(t)) if t.outcome == Outcome::RefusedBeforeStart { reason: RefusalReason::RunnerAuthenticationFailed } && t.ran == Some(Ran::None) && t.refusal_detail() == Some(code) && t.retry_after_ms().is_none())
+                );
+                assert_eq!(fault.attempts.lock().unwrap().len(), usize::from(late));
+                assert!(fault.peer.frames.lock().unwrap().is_empty());
+            }
+        }
     }
 }
 
