@@ -466,11 +466,33 @@ fn step<T>(path: &Path, operation: &str, result: io::Result<T>) -> io::Result<T>
     })
 }
 
+fn open_mount(path: &Path) -> io::Result<File> {
+    let pinned = crate::permissions::physical_root(path)?;
+    // open_by_handle_at needs a real mount descriptor, not the O_PATH
+    // descriptor used only to pin the physical workspace ancestry.
+    let fd = unsafe {
+        libc::openat(
+            pinned.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY
+                | libc::O_DIRECTORY
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
 fn open_source(root: &File, path: &Path) -> io::Result<File> {
     validate_relative(path)?;
     let name = CString::new(path.as_os_str().as_bytes())?;
     let mut how: libc::open_how = unsafe { std::mem::zeroed() };
-    how.flags = (libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) as u64;
+    how.flags = (libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) as u64;
     how.resolve = 0x08 | 0x04 | 0x01;
     // BENEATH and NO_SYMLINKS prevent replacement paths escaping the pinned
     // tree. NO_XDEV also guarantees every handle is on the workspace mount.
@@ -551,23 +573,38 @@ fn open_handle(mount: &File, handle: &Handle) -> io::Result<File> {
     if fd < 0 {
         Err(io::Error::last_os_error())
     } else {
-        Ok(unsafe { File::from_raw_fd(fd as i32) })
+        let file = unsafe { File::from_raw_fd(fd as i32) };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("inode handle is not a regular file"));
+        }
+        Ok(file)
     }
 }
 
 const IMMUTABLE: libc::c_long = 0x10;
-fn immutable(file: &File, enabled: bool) -> io::Result<()> {
+fn file_flags(file: &File) -> io::Result<libc::c_long> {
     let mut flags: libc::c_long = 0;
     if unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) } != 0 {
-        return Err(io::Error::last_os_error());
+        return Err(io::Error::other(format!(
+            "FS_IOC_GETFLAGS: {}",
+            io::Error::last_os_error()
+        )));
     }
+    Ok(flags)
+}
+
+fn immutable(file: &File, enabled: bool) -> io::Result<()> {
+    let mut flags = file_flags(file)?;
     flags = if enabled {
         flags | IMMUTABLE
     } else {
         flags & !IMMUTABLE
     };
     if unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_SETFLAGS, &flags) } != 0 {
-        return Err(io::Error::last_os_error());
+        return Err(io::Error::other(format!(
+            "FS_IOC_SETFLAGS: {}",
+            io::Error::last_os_error()
+        )));
     }
     Ok(())
 }
@@ -581,11 +618,11 @@ fn seal(state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
         ));
     }
     let started = std::time::Instant::now();
-    let mount = File::from(step(
+    let mount = step(
         &plan.workspace,
         "pin workspace",
-        crate::permissions::physical_root(&plan.workspace),
-    )?);
+        open_mount(&plan.workspace),
+    )?;
     let mut handles = Vec::new();
     for path in &plan.files {
         let file = step(path, "openat2/fstat", open_source(&mount, path))?;
@@ -646,7 +683,12 @@ fn seal(state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
     for entry in &record.handles {
         // Reopen the recorded inode instead of retaining one descriptor per
         // source file, so large snapshots do not exhaust the helper's fd limit.
-        let set = open_handle(&mount, entry).and_then(|file| immutable(&file, true));
+        let set = step(
+            &entry.path,
+            "open_by_handle_at/fstat",
+            open_handle(&mount, entry),
+        )
+        .and_then(|file| immutable(&file, true));
         if let Err(error) = step(&entry.path, "set FS_IMMUTABLE_FL", set) {
             if let Err(cleanup) = unseal_locked(state, id) {
                 return Err(io::Error::other(format!("{error}; rollback: {cleanup}")));
@@ -681,11 +723,11 @@ fn unseal_locked(state: &Path, id: Uuid) -> io::Result<()> {
         Err(error) => return Err(error),
     };
     let record: Record = serde_json::from_slice(&bytes)?;
-    let mount = File::from(step(
+    let mount = step(
         &record.plan.workspace,
         "pin unseal mount",
-        crate::permissions::physical_root(&record.plan.workspace),
-    )?);
+        open_mount(&record.plan.workspace),
+    )?;
     let mut failed = None;
     for handle in &record.handles {
         let clear = match open_handle(&mount, handle) {

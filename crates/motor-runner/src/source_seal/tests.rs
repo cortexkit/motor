@@ -140,6 +140,24 @@ fn pinned_open_refuses_symlinks_directories_and_escapes() {
 }
 
 #[test]
+fn pinned_mount_and_source_descriptors_are_real_ioctl_capable_files() {
+    let scratch = ScratchDir::new("motor-seal-fd-flags");
+    fs::write(scratch.join("source"), b"source").unwrap();
+    let mount = open_mount(scratch.path()).unwrap();
+    let file = open_source(&mount, Path::new("source")).unwrap();
+    for descriptor in [&mount, &file] {
+        let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::O_PATH, 0);
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+        // Reading inode flags needs no capability; this test does not set the
+        // immutable bit.
+        file_flags(descriptor).unwrap();
+    }
+}
+
+#[test]
 fn leftover_record_holds_workspace_and_ancestors_after_reload() {
     let scratch = ScratchDir::new("motor-seal-hold");
     let id = Uuid::now_v7();
