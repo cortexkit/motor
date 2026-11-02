@@ -26,9 +26,7 @@ pub struct AccountTokens {
     cached: Mutex<Option<Token>>,
 }
 impl AccountTokens {
-    pub fn new(connection: PathBuf, _workspace: PathBuf, module_id: String) -> Self {
-        // Keep the workspace argument for existing callers; project-free route
-        // identities no longer use it.
+    pub fn new(connection: PathBuf, module_id: String) -> Self {
         Self {
             target: Arc::new(Vault {
                 connection,

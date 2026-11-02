@@ -99,7 +99,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_credentials(resolver)
         .with_account_tokens(Arc::new(motor_module::AccountTokens::new(
             connection.clone(),
-            std::env::current_dir()?,
             id.clone(),
         )))
         .with_engram_catalog();
