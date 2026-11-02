@@ -26,9 +26,20 @@ if canary_spec is None or canary_spec.loader is None:
     raise ImportError('cannot load deployment canary')
 canary = importlib.util.module_from_spec(canary_spec)
 canary_spec.loader.exec_module(canary)
+seal_spec = importlib.util.spec_from_file_location('source_seal_config', DEPLOY.with_name('source_seal_config.py'))
+seal_config = importlib.util.module_from_spec(seal_spec)
+seal_spec.loader.exec_module(seal_config)
 
 
 class PermissionsPolicyTests(unittest.TestCase):
+    def test_source_seal_authority_requires_explicit_canonical_instances(self):
+        grant = '/srv/build/state/main=/srv/build/workspaces,/srv/build/callers/main'
+        rendered = json.loads(seal_config.render([grant]))
+        self.assertEqual(rendered, {'states': {'/srv/build/state/main': ['/srv/build/callers/main', '/srv/build/workspaces']}})
+        for values in ([], [grant, grant], ['relative=/workspace'], ['/state=/'], ['/state=/workspace/../etc'], ['/state=']):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                seal_config.render(values)
+
     def test_only_fixed_native_operations_are_granted_to_the_trusted_operator(self):
         template = DEPLOY.with_name('permissions-helper.sudoers').read_text()
         accounts = {'ubuntu':1000,'motor-job':997,'motor-cache':996,'alias':997,'root':0}

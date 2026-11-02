@@ -3537,6 +3537,15 @@ impl Runner {
             })
     }
 
+    fn sealed_workspace(_inner: &Inner, _key: &str) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            _inner.source_seals.blocks_caller(_key)
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
     /// In snapshot mode, whether `job` still binds its siblings from their
     /// host paths: it has no `sibling_sources`, so an older runner, or one
     /// with in-place siblings, started it. Warm builds never mount siblings.
@@ -4310,27 +4319,6 @@ impl Runner {
         key: paths::HostPath<'_>,
         siblings: &[SiblingSnapshot],
     ) -> bool {
-        #[cfg(target_os = "linux")]
-        if self
-            .core
-            .config
-            .source_seals
-            .check_host(key.as_path())
-            .is_err()
-            || self
-                .core
-                .config
-                .source_seals
-                .blocks_caller(&key.as_path().to_string_lossy())
-            || siblings.iter().any(|sibling| {
-                self.core
-                    .config
-                    .source_seals
-                    .blocks_caller(&sibling.canonical_path)
-            })
-        {
-            return true;
-        }
         // Without any drop in progress nothing overlaps; return before the
         // canonicalization below, which touches the filesystem with the state
         // lock held, for every queue head on every dispatch pass.
@@ -4608,6 +4596,13 @@ impl Runner {
         // Snapshot siblings never share a checkout with anything.
         if inner.sibling_fences != crate::sibling_snapshots::SiblingFences::InPlace {
             return false;
+        }
+        #[cfg(target_os = "linux")]
+        if siblings
+            .iter()
+            .any(|s| inner.source_seals.blocks_caller(&s.canonical_path))
+        {
+            return true;
         }
         Self::scheduler_jobs(inner)
             .filter(|j| j.state == JobState::Running)
@@ -6048,7 +6043,9 @@ impl Runner {
         Some(
             if inner.dropping.contains(crate::caller_path::job_key(job)) {
                 "workspace drop"
-            } else if index.workspaces.contains(crate::caller_path::job_key(job)) {
+            } else if index.workspaces.contains(crate::caller_path::job_key(job))
+                || Self::sealed_workspace(inner, crate::caller_path::job_key(job))
+            {
                 "workspace owner"
             } else if index.occupied(crate::caller_path::job_key(job)) {
                 SIBLING_USER_WAIT
@@ -6126,7 +6123,7 @@ impl Runner {
                 && !index.occupied(crate::caller_path::job_key(job))
                 && index.held_by_queued_workspace(inner, job, self.core.config.max_weight);
             let pause = job.queued_ms.is_some()
-                && (!holders.is_empty() || held)
+                && (!holders.is_empty() || held || Self::sealed_workspace(inner, crate::caller_path::job_key(job)))
                 && job.request.as_ref().is_some_and(|request| {
                     let holder_weight = holders
                         .values()
@@ -6545,7 +6542,7 @@ impl Runner {
                     .source_seals
                     .unseal(&self.core.trees.state, id)
                 {
-                    tracing::warn!(job_id = %id, %error, "source unseal pending; workspace held for maintenance retry");
+                    tracing::error!(job_id = %id, %error, "source unseal pending; workspace held for maintenance retry");
                 }
             }
             Ok(_) => {}
@@ -10448,6 +10445,8 @@ const QUEUE_ORDER_WAIT: &str = "queue order";
 /// job's weight, checkout reservations and CPU claims after each start.
 #[derive(Default)]
 struct DispatchIndex {
+    #[cfg(target_os = "linux")]
+    sealed_paths: BTreeSet<String>,
     weight: u32,
     foreground_pending: usize,
     /// For each repository root, the `order` of its most recently accepted
@@ -10483,6 +10482,12 @@ impl DispatchIndex {
     /// finished, their setup reservations included.
     fn build_without(inner: &Inner, excluded: &BTreeSet<Uuid>) -> Self {
         let mut index = Self {
+            #[cfg(target_os = "linux")]
+            sealed_paths: inner
+                .source_seals
+                .caller_paths_excluding(excluded)
+                .into_iter()
+                .collect(),
             in_place: inner.sibling_fences == crate::sibling_snapshots::SiblingFences::InPlace,
             ..Self::default()
         };
@@ -10608,6 +10613,14 @@ impl DispatchIndex {
             .collect()
     }
     fn occupied(&self, key: &str) -> bool {
+        #[cfg(target_os = "linux")]
+        if self
+            .sealed_paths
+            .iter()
+            .any(|path| Self::overlap(key, path))
+        {
+            return true;
+        }
         self.workspaces.contains(key)
             || self
                 .sibling_paths
@@ -10622,6 +10635,14 @@ impl DispatchIndex {
         // Snapshot siblings never share a checkout with anything.
         self.in_place
             && siblings.iter().any(|sibling| {
+                #[cfg(target_os = "linux")]
+                if self
+                    .sealed_paths
+                    .iter()
+                    .any(|path| Self::overlap(&sibling.canonical_path, path))
+                {
+                    return true;
+                }
                 self.running_paths
                     .iter()
                     .chain(&self.reserved_paths)

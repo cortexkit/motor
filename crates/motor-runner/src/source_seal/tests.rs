@@ -105,11 +105,13 @@ fn seal_record_roundtrips_non_utf8_snapshot_paths() {
     .unwrap();
     let path = plan.files[0].clone();
     let record = Record {
+        filesystem: None,
         plan,
         handles: vec![Handle {
             path: path.clone(),
             kind: 1,
             bytes: vec![1, 2],
+            prior_flags: 0,
         }],
     };
     let restored: Record = serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
@@ -162,6 +164,7 @@ fn leftover_record_holds_workspace_and_ancestors_after_reload() {
     let scratch = ScratchDir::new("motor-seal-hold");
     let id = Uuid::now_v7();
     let record = Record {
+        filesystem: None,
         plan: plan(&Config::new("/state", "test"), &request(), &[], b"").unwrap(),
         handles: vec![],
     };
@@ -252,6 +255,7 @@ fn helper_refuses_symlinked_intent_and_seal_reads() {
             serde_json::to_vec(&plan).unwrap()
         } else {
             serde_json::to_vec(&Record {
+                filesystem: None,
                 plan: plan.clone(),
                 handles: vec![],
             })
@@ -331,4 +335,227 @@ fn concurrent_runtime_claims_have_one_winner_per_job_without_blocking_other_ids(
     );
     assert_eq!(runtime.ids().len(), 9);
     assert!(runtime.claim(id, plan).is_err());
+}
+
+#[test]
+fn stale_handles_and_failed_durability_are_errors() {
+    let handle = Handle {
+        path: "tracked".into(),
+        kind: 1,
+        bytes: vec![],
+        prior_flags: 0,
+    };
+    for errno in [libc::ESTALE, libc::EIO] {
+        let error = clear_handles(std::slice::from_ref(&handle), |_| {
+            Err(io::Error::from_raw_os_error(errno))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("tracked"));
+    }
+}
+
+#[test]
+fn path_pin_is_not_a_read_open_and_reopen_preserves_identity() {
+    let scratch = ScratchDir::new("seal-path-pin");
+    fs::write(scratch.join("file"), b"source").unwrap();
+    let root = open_mount(scratch.path()).unwrap();
+    let pin = pin_source(&root, Path::new("file")).unwrap();
+    assert_ne!(
+        unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_GETFL) } & libc::O_PATH,
+        0
+    );
+    let file = reopen_regular(&pin).unwrap();
+    assert_eq!(
+        (pin.metadata().unwrap().dev(), pin.metadata().unwrap().ino()),
+        (
+            file.metadata().unwrap().dev(),
+            file.metadata().unwrap().ino()
+        )
+    );
+    let fifo = CString::new(scratch.join("fifo").as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    assert!(pin_source(&root, Path::new("fifo")).is_err());
+}
+
+#[test]
+fn helper_refuses_multiply_linked_source_before_flags_change() {
+    let scratch = ScratchDir::new("seal-hardlink-refusal");
+    let (state, id, mut plan) = helper_fixture(&scratch);
+    fs::write(plan.workspace.join("source"), b"source").unwrap();
+    fs::hard_link(plan.workspace.join("source"), scratch.join("alias")).unwrap();
+    plan.files = vec!["source".into()];
+    fs::write(intent_path(&state, id), serde_json::to_vec(&plan).unwrap()).unwrap();
+    assert!(seal(&state, id, plan)
+        .unwrap_err()
+        .to_string()
+        .contains("exactly one hard link"));
+    assert_eq!(fs::read(scratch.join("alias")).unwrap(), b"source");
+    assert!(!record_path(&state, id).exists());
+}
+
+fn root_source(plan: &mut Plan, count: usize) {
+    assert_eq!(unsafe { libc::geteuid() }, 0, "requires root");
+    let identity = crate::isolation::job_identity().unwrap();
+    for index in 0..count {
+        let name = PathBuf::from(format!("source-{index}"));
+        let file = File::create(plan.workspace.join(&name)).unwrap();
+        assert_eq!(
+            unsafe { libc::fchown(file.as_raw_fd(), identity.uid, identity.gid) },
+            0
+        );
+        plan.files.push(name);
+    }
+}
+
+#[test]
+#[ignore = "requires root, file handles and CAP_LINUX_IMMUTABLE"]
+fn isolated_recovery_retains_stale_handles_and_filesystem_mismatches() {
+    let scratch = ScratchDir::new("seal-recovery-identity");
+    let (state, id, mut plan) = helper_fixture(&scratch);
+    root_source(&mut plan, 1);
+    let runtime = Runtime::default();
+    runtime.seal(&state, id, plan.clone()).unwrap();
+    let path = record_path(&state, id);
+    let original = fs::read(&path).unwrap();
+    let mut record: Record = serde_json::from_slice(&original).unwrap();
+    record.filesystem.as_mut().unwrap().device ^= 1;
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    assert!(runtime
+        .unseal(&state, id)
+        .unwrap_err()
+        .to_string()
+        .contains("filesystem identity mismatch"));
+    assert!(path.exists());
+    assert!(runtime.check_host(&plan.workspace).is_err());
+    record = serde_json::from_slice(&original).unwrap();
+    let dead = plan.workspace.join("dead");
+    let stale = {
+        let file = File::create(&dead).unwrap();
+        handle(&file, "dead".into()).unwrap()
+    };
+    fs::remove_file(dead).unwrap();
+    assert_eq!(
+        open_handle(&open_mount(&plan.workspace).unwrap(), &stale)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::ESTALE)
+    );
+    record.handles.push(stale);
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    assert!(runtime.unseal(&state, id).is_err());
+    assert!(path.exists());
+    assert!(runtime.check_host(&plan.workspace).is_err());
+    fs::write(&path, original).unwrap();
+    runtime.unseal(&state, id).unwrap();
+    assert!(!path.exists());
+}
+
+#[test]
+#[ignore = "requires root, file handles and CAP_LINUX_IMMUTABLE"]
+fn isolated_seal_preserves_preexisting_immutable_flags() {
+    let scratch = ScratchDir::new("seal-prior-flags");
+    let (state, id, mut plan) = helper_fixture(&scratch);
+    root_source(&mut plan, 1);
+    let file = File::open(plan.workspace.join(&plan.files[0])).unwrap();
+    struct Clear(File);
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            let _ = immutable(&self.0, false);
+            let _ = self.0.sync_all();
+        }
+    }
+    immutable(&file, true).unwrap();
+    let _clear = Clear(file.try_clone().unwrap());
+    let runtime = Runtime::default();
+    runtime.seal(&state, id, plan).unwrap();
+    let record: Record =
+        serde_json::from_slice(&fs::read(record_path(&state, id)).unwrap()).unwrap();
+    assert!(record.handles.is_empty());
+    runtime.unseal(&state, id).unwrap();
+    assert_ne!(file_flags(&file).unwrap() & IMMUTABLE, 0);
+}
+
+#[test]
+#[ignore = "requires root, file handles and CAP_LINUX_IMMUTABLE; measures 7111-file seal and fsync unseal"]
+fn isolated_source_seal_7111_file_timing() {
+    let scratch = ScratchDir::new("seal-timing");
+    let (state, id, mut plan) = helper_fixture(&scratch);
+    root_source(&mut plan, 7111);
+    let runtime = Runtime::default();
+    let start = std::time::Instant::now();
+    runtime.seal(&state, id, plan).unwrap();
+    let seal = start.elapsed();
+    let start = std::time::Instant::now();
+    runtime.unseal(&state, id).unwrap();
+    eprintln!(
+        "SOURCE_SEAL_7111_US={} SOURCE_UNSEAL_FSYNC_7111_US={}",
+        seal.as_micros(),
+        start.elapsed().as_micros()
+    );
+}
+
+#[test]
+fn runner_owned_or_writable_records_are_not_trusted() {
+    assert!(trusted_record(0, 0o644));
+    assert!(!trusted_record(1000, 0o644));
+    assert!(!trusted_record(0, 0o664));
+    assert!(!trusted_record(0, 0o646));
+}
+
+#[test]
+fn unseal_requires_successful_sync_and_rejects_prior_immutable_provenance() {
+    let scratch = ScratchDir::new("seal-sync-error");
+    fs::write(scratch.join("source"), b"source").unwrap();
+    let file = File::open(scratch.join("source")).unwrap();
+    let mut entry = Handle {
+        path: "source".into(),
+        kind: 1,
+        bytes: vec![],
+        prior_flags: 0,
+    };
+    let error = clear_inode(&file, &entry, |_| {
+        Err(io::Error::from_raw_os_error(libc::EIO))
+    })
+    .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    entry.prior_flags = IMMUTABLE;
+    assert!(clear_inode(&file, &entry, |_| panic!(
+        "must not sync an inode the seal did not change"
+    ))
+    .unwrap_err()
+    .to_string()
+    .contains("already immutable"));
+}
+
+#[test]
+#[ignore = "requires root and the motor-job account; verifies inode and record ownership refusals"]
+fn isolated_helper_refuses_root_owned_source_and_runner_forged_record() {
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    let scratch = ScratchDir::new("seal-helper-owner");
+    let (state, id, mut plan) = helper_fixture(&scratch);
+    fs::write(plan.workspace.join("source"), b"root source").unwrap();
+    plan.files = vec!["source".into()];
+    fs::write(intent_path(&state, id), serde_json::to_vec(&plan).unwrap()).unwrap();
+    assert!(seal(&state, id, plan.clone())
+        .unwrap_err()
+        .to_string()
+        .contains("non-root owner"));
+    let path = record_path(&state, id);
+    let record = Record {
+        filesystem: Some(Filesystem::read(&open_mount(&plan.workspace).unwrap()).unwrap()),
+        plan,
+        handles: vec![],
+    };
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let file = File::open(&path).unwrap();
+    let user = crate::isolation::job_identity().unwrap();
+    assert_eq!(
+        unsafe { libc::fchown(file.as_raw_fd(), user.uid, user.gid) },
+        0
+    );
+    assert!(unseal(&state, id)
+        .unwrap_err()
+        .to_string()
+        .contains("root-owned"));
+    assert!(path.exists());
 }

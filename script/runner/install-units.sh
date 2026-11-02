@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Before deploying an unprivileged Linux runner, authorize the same roots used
+# by its unit, including caller-root host paths. For the build-server units:
+# sudo bash script/runner/install-permissions-helper.sh /absolute/candidate ubuntu \
+#   --seal-instance /home/ubuntu/.local/share/cortexkit/motor-runner/main=/Users,/srv/build/callers/main/home \
+#   --seal-instance /home/ubuntu/.local/share/cortexkit/motor-runner/e2e=/Users,/srv/build/callers/e2e/home
 # Install the runner's systemd user units from script/runner/units/ on the build
 # server, as the operator (ubuntu). The repository copy is the source of truth:
 # capacity flags such as --max-weight live in units/motor-runner.service.

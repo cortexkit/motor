@@ -531,6 +531,12 @@ fn verify_boat_storage(users: &Path, state: &Path, workspace: &Path) -> io::Resu
 }
 
 impl Backend for HostBackend {
+    fn initialize(&self, config: &Config) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        crate::source_seal::startup(config)?;
+        let _ = config;
+        Ok(())
+    }
     #[cfg(target_os = "linux")]
     fn live_units(
         &self,
@@ -720,6 +726,13 @@ impl Backend for HostBackend {
                         &caller_commit,
                     ),
                 }),
+            )?;
+        }
+        #[cfg(target_os = "linux")]
+        if config.isolate_jobs && !s.base {
+            setup_step(
+                "rematerialize hard-linked source",
+                crate::source_seal::refresh::linked_sources(config, trees, r),
             )?;
         }
         let computed = setup_step(

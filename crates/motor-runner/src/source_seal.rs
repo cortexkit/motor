@@ -17,6 +17,11 @@ use std::{
     sync::Mutex,
 };
 
+pub(crate) mod authority;
+mod probe;
+pub(crate) mod refresh;
+pub(crate) use probe::startup;
+
 /// A real sandbox must receive either a trusted snapshot source or the
 /// explicit compile-cache writer exemption. Resolution happens at its launch
 /// boundary, not in callers that only construct or inspect a launch plan.
@@ -128,6 +133,8 @@ pub(crate) struct Plan {
 struct Record {
     plan: Plan,
     handles: Vec<Handle>,
+    #[serde(default)]
+    filesystem: Option<Filesystem>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -136,6 +143,34 @@ struct Handle {
     path: PathBuf,
     kind: i32,
     bytes: Vec<u8>,
+    #[serde(default)]
+    prior_flags: libc::c_int,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Filesystem {
+    device: u64,
+    fsid: Vec<u8>,
+}
+
+impl Filesystem {
+    fn read(mount: &File) -> io::Result<Self> {
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatfs(mount.as_raw_fd(), &mut stat) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fsid = unsafe {
+            std::slice::from_raw_parts(
+                (&stat.f_fsid as *const libc::fsid_t).cast::<u8>(),
+                std::mem::size_of_val(&stat.f_fsid),
+            )
+        }
+        .to_vec();
+        Ok(Self {
+            device: mount.metadata()?.dev(),
+            fsid,
+        })
+    }
 }
 
 mod path_bytes {
@@ -368,6 +403,19 @@ impl Runtime {
             .any(|plan| overlap(&plan.caller_workspace, Path::new(path)))
     }
 
+    pub(crate) fn caller_paths_excluding(
+        &self,
+        excluded: &std::collections::BTreeSet<Uuid>,
+    ) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| !excluded.contains(id))
+            .map(|(_, plan)| plan.caller_workspace.to_string_lossy().into_owned())
+            .collect()
+    }
+
     pub(crate) fn roots(&self) -> Vec<PathBuf> {
         self.0
             .lock()
@@ -554,13 +602,18 @@ pub(crate) fn helper(action: &str, args: &[String]) -> io::Result<()> {
     }
     let id = args[0].parse::<Uuid>().map_err(io::Error::other)?;
     let state = Path::new(&args[1]);
+    fs::write("/proc/self/oom_score_adj", "900")?;
+    let authority = authority::Authority::load()?;
+    authority.roots(state)?;
     match action {
         "seal" => {
             let mut bytes = Vec::new();
             io::stdin().take(64 * 1024 * 1024).read_to_end(&mut bytes)?;
-            seal(state, id, serde_json::from_slice(&bytes)?)
+            let plan: Plan = serde_json::from_slice(&bytes)?;
+            authority.workspace(state, &plan.workspace)?;
+            seal(state, id, plan)
         }
-        "unseal" => unseal(state, id),
+        "unseal" => unseal_checked(state, id, Some(&authority)),
         _ => Err(io::Error::other("unknown source seal operation")),
     }
 }
@@ -596,11 +649,16 @@ fn open_mount(path: &Path) -> io::Result<File> {
     }
 }
 
+#[cfg(test)]
 fn open_source(root: &File, path: &Path) -> io::Result<File> {
+    reopen_regular(&pin_source(root, path)?)
+}
+
+fn pin_source(root: &File, path: &Path) -> io::Result<File> {
     validate_relative(path)?;
     let name = CString::new(path.as_os_str().as_bytes())?;
     let mut how: libc::open_how = unsafe { std::mem::zeroed() };
-    how.flags = (libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) as u64;
+    how.flags = (libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64;
     how.resolve = 0x08 | 0x04 | 0x01;
     // BENEATH and NO_SYMLINKS prevent replacement paths escaping the pinned
     // tree. NO_XDEV also guarantees every handle is on the workspace mount.
@@ -619,6 +677,27 @@ fn open_source(root: &File, path: &Path) -> io::Result<File> {
     let file = unsafe { File::from_raw_fd(fd as i32) };
     if !file.metadata()?.is_file() {
         return Err(io::Error::other("not a regular file"));
+    }
+    Ok(file)
+}
+
+fn reopen_regular(pin: &File) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let before = pin.metadata()?;
+    if !before.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    // Follow only the kernel's proc fd link, after type checking the pinned
+    // inode. O_NOFOLLOW here would reject that magic link with ELOOP.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(format!("/proc/self/fd/{}", pin.as_raw_fd()))?;
+    let after = file.metadata()?;
+    if (before.dev(), before.ino()) != (after.dev(), after.ino()) || !after.is_file() {
+        return Err(io::Error::other(
+            "source inode changed during descriptor reopen",
+        ));
     }
     Ok(file)
 }
@@ -657,6 +736,7 @@ fn handle(file: &File, path: PathBuf) -> io::Result<Handle> {
         path,
         kind: value.kind,
         bytes: value.bytes[..value.size as usize].to_vec(),
+        prior_flags: 0,
     })
 }
 
@@ -675,7 +755,7 @@ fn open_handle(mount: &File, handle: &Handle) -> io::Result<File> {
             libc::SYS_open_by_handle_at,
             mount.as_raw_fd(),
             &value,
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            libc::O_PATH | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -685,13 +765,13 @@ fn open_handle(mount: &File, handle: &Handle) -> io::Result<File> {
         if !file.metadata()?.is_file() {
             return Err(io::Error::other("inode handle is not a regular file"));
         }
-        Ok(file)
+        reopen_regular(&file)
     }
 }
 
-const IMMUTABLE: libc::c_long = 0x10;
-fn file_flags(file: &File) -> io::Result<libc::c_long> {
-    let mut flags: libc::c_long = 0;
+const IMMUTABLE: libc::c_int = 0x10;
+fn file_flags(file: &File) -> io::Result<libc::c_int> {
+    let mut flags: libc::c_int = 0;
     if unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) } != 0 {
         return Err(io::Error::other(format!(
             "FS_IOC_GETFLAGS: {}",
@@ -702,6 +782,14 @@ fn file_flags(file: &File) -> io::Result<libc::c_long> {
 }
 
 fn immutable(file: &File, enabled: bool) -> io::Result<()> {
+    if enabled {
+        let metadata = file.metadata()?;
+        if metadata.uid() == 0 || metadata.nlink() != 1 {
+            return Err(io::Error::other(
+                "refusing immutable flag on root-owned or hard-linked inode",
+            ));
+        }
+    }
     let mut flags = file_flags(file)?;
     flags = if enabled {
         flags | IMMUTABLE
@@ -734,14 +822,29 @@ fn seal(state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
     )?;
     let mut handles = Vec::new();
     for path in &plan.files {
-        let file = step(path, "openat2/fstat", open_source(&mount, path))?;
-        handles.push(step(
-            path,
-            "name_to_handle_at",
-            handle(&file, path.clone()),
-        )?);
+        let pin = step(path, "openat2/fstat", pin_source(&mount, path))?;
+        let metadata = pin.metadata()?;
+        if metadata.uid() == 0 || metadata.nlink() != 1 {
+            return Err(io::Error::other(format!(
+                "source seal {}: requires non-root owner and exactly one hard link",
+                path.display()
+            )));
+        }
+        let file = step(path, "reopen regular inode", reopen_regular(&pin))?;
+        let flags = file_flags(&file)?;
+        if flags & IMMUTABLE != 0 {
+            tracing::warn!(job_id = %id, path = %path.display(), "source inode already immutable; leaving it untouched");
+            continue;
+        }
+        let mut entry = step(path, "name_to_handle_at", handle(&file, path.clone()))?;
+        entry.prior_flags = flags;
+        handles.push(entry);
     }
-    let record = Record { plan, handles };
+    let record = Record {
+        plan,
+        handles,
+        filesystem: Some(Filesystem::read(&mount)?),
+    };
     let path = directory.path.join("seal");
     if directory.exists(c"seal")? {
         return Err(io::Error::other(format!(
@@ -761,10 +864,7 @@ fn seal(state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
         &path,
         "sync record",
         (|| {
-            // The unprivileged daemon must read recovery records written by
-            // its root helper; job accounts cannot traverse the state root.
-            let owner = directory.directory.metadata()?;
-            if unsafe { libc::fchown(durable.as_raw_fd(), owner.uid(), owner.gid()) } != 0 {
+            if unsafe { libc::fchmod(durable.as_raw_fd(), 0o644) } != 0 {
                 return Err(io::Error::last_os_error());
             }
             durable.write_all(&serde_json::to_vec(&record)?)?;
@@ -775,7 +875,7 @@ fn seal(state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
     );
     if let Err(error) = saved {
         if directory.exists(c"seal")? {
-            if let Err(cleanup) = unseal_locked(&directory, id) {
+            if let Err(cleanup) = unseal_locked(&directory, id, None) {
                 return Err(io::Error::other(format!("{error}; rollback: {cleanup}")));
             }
         }
@@ -791,7 +891,7 @@ fn seal(state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
         )
         .and_then(|file| immutable(&file, true));
         if let Err(error) = step(&entry.path, "set FS_IMMUTABLE_FL", set) {
-            if let Err(cleanup) = unseal_locked(&directory, id) {
+            if let Err(cleanup) = unseal_locked(&directory, id, None) {
                 return Err(io::Error::other(format!("{error}; rollback: {cleanup}")));
             }
             return Err(error);
@@ -802,9 +902,17 @@ fn seal(state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
 }
 
 fn unseal(state: &Path, id: Uuid) -> io::Result<()> {
+    unseal_checked(state, id, None)
+}
+
+fn unseal_checked(
+    state: &Path,
+    id: Uuid,
+    authority: Option<&authority::Authority>,
+) -> io::Result<()> {
     let directory = JobDirectory::open(state, id)?;
     let _operation = directory.lock()?;
-    unseal_locked(&directory, id)
+    unseal_locked(&directory, id, authority)
 }
 
 fn remove_intent(directory: &JobDirectory) -> io::Result<()> {
@@ -816,30 +924,84 @@ fn remove_intent(directory: &JobDirectory) -> io::Result<()> {
     directory.directory.sync_all()
 }
 
-fn unseal_locked(directory: &JobDirectory, id: Uuid) -> io::Result<()> {
+fn unseal_locked(
+    directory: &JobDirectory,
+    id: Uuid,
+    authority: Option<&authority::Authority>,
+) -> io::Result<()> {
     let started = std::time::Instant::now();
-    let bytes = match directory.read(c"seal") {
-        Ok(bytes) => bytes,
+    let mut record_file = match directory.file(c"seal", libc::O_RDONLY) {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return remove_intent(directory),
         Err(error) => return Err(error),
     };
+    let metadata = record_file.metadata()?;
+    if !trusted_record(metadata.uid(), metadata.mode()) {
+        return Err(io::Error::other(
+            "source seal record must be root-owned and not writable by the runner",
+        ));
+    }
+    let mut bytes = Vec::new();
+    record_file.read_to_end(&mut bytes)?;
     let record: Record = serde_json::from_slice(&bytes)?;
+    if let Some(authority) = authority {
+        let state = directory
+            .path
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| io::Error::other("invalid seal state"))?;
+        authority.workspace(state, &record.plan.workspace)?;
+    }
     let mount = step(
         &record.plan.workspace,
         "pin unseal mount",
         open_mount(&record.plan.workspace),
     )?;
-    let mut failed = None;
-    for handle in &record.handles {
-        let clear = match open_handle(&mount, handle) {
-            Ok(file) => immutable(&file, false),
-            Err(error) if error.raw_os_error() == Some(libc::ESTALE) => Ok(()),
+    if record.filesystem.as_ref() != Some(&Filesystem::read(&mount)?) {
+        return Err(io::Error::other(
+            "source seal filesystem identity mismatch; retaining record",
+        ));
+    }
+    clear_handles(&record.handles, |handle| {
+        match open_handle(&mount, handle) {
+            Ok(file) => clear_inode(&file, handle, File::sync_all),
             Err(error) => Err(error),
-        };
+        }
+    })?;
+    directory.unlink(c"seal")?;
+    remove_intent(directory)?;
+    tracing::info!(job_id = %id, files = record.handles.len(), elapsed_us = started.elapsed().as_micros(), "source unsealed");
+    Ok(())
+}
+
+fn trusted_record(uid: u32, mode: u32) -> bool {
+    uid == 0 && mode & 0o022 == 0
+}
+
+fn clear_inode(
+    file: &File,
+    handle: &Handle,
+    sync: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<()> {
+    if handle.prior_flags & IMMUTABLE != 0 {
+        return Err(io::Error::other(
+            "seal record claims an already immutable inode",
+        ));
+    }
+    immutable(file, false)?;
+    sync(file)
+}
+
+fn clear_handles(
+    handles: &[Handle],
+    mut clear: impl FnMut(&Handle) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut failed = None;
+    for handle in handles {
         if let Err(error) = step(
             &handle.path,
             "open_by_handle_at/clear FS_IMMUTABLE_FL",
-            clear,
+            clear(handle),
         ) {
             failed.get_or_insert(error);
         }
@@ -847,9 +1009,6 @@ fn unseal_locked(directory: &JobDirectory, id: Uuid) -> io::Result<()> {
     if let Some(error) = failed {
         return Err(error);
     }
-    directory.unlink(c"seal")?;
-    remove_intent(directory)?;
-    tracing::info!(job_id = %id, files = record.handles.len(), elapsed_us = started.elapsed().as_micros(), "source unsealed");
     Ok(())
 }
 

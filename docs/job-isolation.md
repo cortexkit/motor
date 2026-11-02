@@ -60,6 +60,8 @@ stays writable so it can be regenerated and returned. Tracked symlinks are not
 sealed. Renaming a parent folder is still possible: a command can move it aside
 and create replacement files under the old path; `workspace_changes` reports
 those changes. Windows and macOS do not yet provide this protection.
+Compile-cache fill builds are not sealed: they build trusted default-branch
+commits rather than uploaded job snapshots.
 
 The sandbox has its own empty root directory (`RootDirectory=`) with only the
 paths below bound in. `ProtectSystem=strict`, `ProtectHome=tmpfs`,

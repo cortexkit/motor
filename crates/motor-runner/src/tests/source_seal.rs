@@ -63,7 +63,7 @@ fn pending_seal_fences_reuse_discard_and_record_expiry() {
             .unwrap()
             .terminal(Outcome::Exit { code: 0 }, runner.now());
         assert!(Runner::occupied(&inner, &run.workspace_key));
-        assert!(runner.deleting(&inner, paths::host_str(&run.workspace_key), &[]));
+        assert!(!runner.deleting(&inner, paths::host_str(&run.workspace_key), &[]));
     }
     assert!(runner.discard(Path::new(&run.workspace_key)).is_err());
     assert!(runner
@@ -79,6 +79,43 @@ fn pending_seal_fences_reuse_discard_and_record_expiry() {
         .jobs
         .contains_key(&run.job_id));
     assert!(path.exists());
+    f.clock.fetch_sub(RETENTION_MS + 1, Ordering::SeqCst);
+    let (same, _) = f.run("true");
+    assert!(matches!(
+        runner.accept(same.clone()).unwrap(),
+        Admission::Accepted(_)
+    ));
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let now = runner.now();
+        let job = inner.jobs.get_mut(&same.job_id).unwrap();
+        job.state = JobState::Queued;
+        job.queued_ms = Some(now);
+        let index = DispatchIndex::build(&inner);
+        assert!(index.occupied(&same.workspace_key));
+        runner.update_queue_wait_clocks(&inner, now, &index);
+        assert_eq!(inner.jobs[&same.job_id].queue_wait_ms(now + 5_000), 0);
+        inner.sibling_fences = crate::sibling_snapshots::SiblingFences::Legacy;
+        let siblings = vec![SiblingSnapshot {
+            canonical_path: run.workspace_key.clone(),
+            commit: run.snapshot_commit.clone(),
+            tree_hash: run.tree_hash.clone(),
+            base_commit: None,
+        }];
+        assert!(!Runner::siblings_blocked(&inner, &siblings));
+        assert!(!DispatchIndex::build(&inner)
+            .siblings_blocked(&siblings, &inner.catalog.sibling_commits));
+    }
+    let (mut snapshot_user, _) = f.run("true");
+    snapshot_user.workspace_key = format!("{}-snapshot-user", f.key);
+    snapshot_user.cwd = snapshot_user.workspace_key.clone();
+    snapshot_user.repository_root = Path::new(&f.key)
+        .with_file_name("snapshot-repository")
+        .to_string_lossy()
+        .into_owned();
+    snapshot_user.bundles[0].repository = snapshot_user.repository_root.clone();
+    snapshot_user.siblings[0].canonical_path = run.workspace_key.clone();
+    assert_run_accepted(&runner, &snapshot_user);
 }
 
 fn isolated_config(f: &Fixture) -> Config {
@@ -98,10 +135,10 @@ fn isolated_config(f: &Fixture) -> Config {
     config
 }
 
-fn flags(path: &Path) -> libc::c_long {
+fn flags(path: &Path) -> libc::c_int {
     use std::os::fd::AsRawFd;
     let file = fs::File::open(path).unwrap();
-    let mut flags: libc::c_long = 0;
+    let mut flags: libc::c_int = 0;
     assert_eq!(
         unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) },
         0
@@ -136,7 +173,9 @@ async fn isolated_source_seal_refuses_edits_and_workspace_is_reusable() {
         fs::write(path, "original\n").unwrap();
     }
     commit(&f.main, "first\n");
-    let runner = Runner::open(isolated_config(&f)).unwrap();
+    let mut config = isolated_config(&f);
+    config.manual_tick = true;
+    let runner = Runner::open(config).unwrap();
     let (mut run, bytes) = f.run(
         r#"
         set -e
@@ -161,6 +200,7 @@ async fn isolated_source_seal_refuses_edits_and_workspace_is_reusable() {
         .to_string_lossy()
         .into_owned()];
     f.submit(&runner, &run, &bytes);
+    runner.tick().unwrap();
     until_with_diagnostics(
         || {
             Path::new(&f.key).join("ready").exists()
@@ -193,6 +233,17 @@ async fn isolated_source_seal_refuses_edits_and_workspace_is_reusable() {
     // cannot remove the sealed original, and its new copy has no seal.
     assert_ne!(flags(&Path::new(&f.key).join("cross/source")) & 0x10, 0);
     assert_clear(&Path::new(&f.key).join("target/copied/source"));
+    let (queued, queued_bytes) =
+        f.run("test \"$(cat source)\" = first && echo queued > target/queued");
+    f.submit(&runner, &queued, &queued_bytes);
+    assert_eq!(runner.job_status(queued.job_id).unwrap().state, "queued");
+    f.clock.fetch_add(5_000, Ordering::SeqCst);
+    runner.tick().unwrap();
+    assert_eq!(
+        runner.job_status(queued.job_id).unwrap().queue_wait_ms,
+        Some(0)
+    );
+    assert!(!Path::new(&f.key).join("target/queued").exists());
     fs::write(Path::new(&f.key).join("release"), b"release").unwrap();
     let terminal = terminal(&runner, run.job_id).await;
     assert_eq!(
@@ -228,8 +279,19 @@ async fn isolated_source_seal_refuses_edits_and_workspace_is_reusable() {
         );
     }
     assert!(!crate::source_seal::record_path(&runner.config().state_dir(), run.job_id).exists());
-    let (second, bytes) = f.run("test \"$(cat source)\" = first && echo reused > target/second");
+    runner.tick().unwrap();
+    assert_eq!(
+        super::terminal(&runner, queued.job_id).await.outcome,
+        Outcome::Exit { code: 0 }
+    );
+    fs::hard_link(
+        Path::new(&f.key).join("source"),
+        Path::new(&f.key).join("target/alias"),
+    )
+    .unwrap();
+    let (second, bytes) = f.run("test \"$(cat source)\" = first && echo alias > target/alias && test \"$(cat source)\" = first && echo reused > target/second");
     f.submit(&runner, &second, &bytes);
+    runner.tick().unwrap();
     assert_eq!(
         super::terminal(&runner, second.job_id).await.outcome,
         Outcome::Exit { code: 0 }
@@ -237,6 +299,15 @@ async fn isolated_source_seal_refuses_edits_and_workspace_is_reusable() {
     assert_eq!(
         fs::read_to_string(Path::new(&f.key).join("target/second")).unwrap(),
         "reused\n"
+    );
+    use std::os::unix::fs::MetadataExt;
+    assert_ne!(
+        fs::metadata(Path::new(&f.key).join("source"))
+            .unwrap()
+            .ino(),
+        fs::metadata(Path::new(&f.key).join("target/alias"))
+            .unwrap()
+            .ino()
     );
 }
 
@@ -278,4 +349,20 @@ async fn isolated_startup_unseals_leftover_record_for_dead_unit() {
     assert!(!crate::source_seal::record_path(&reopened.config().state_dir(), run.job_id).exists());
     assert_clear(&Path::new(&f.key).join("source"));
     assert!(reopened.config().source_seals.roots().is_empty());
+}
+
+#[test]
+#[ignore = "requires root and the motor-job account; probes a supported root then an unsupported filesystem"]
+fn isolated_startup_refuses_unsupported_source_filesystem() {
+    let f = Fixture::new();
+    let mut config = isolated_config(&f);
+    config.owned_workspace_roots.push("/proc".into());
+    let error = Runner::open(config)
+        .err()
+        .expect("startup must refuse /proc source sealing");
+    let text = error.to_string();
+    assert!(
+        text.contains("/proc") && text.contains("source read-only startup probe"),
+        "{text}"
+    );
 }

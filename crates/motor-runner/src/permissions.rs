@@ -23,10 +23,14 @@ pub(crate) fn digest() -> String {
     let mut hash = sha2::Sha256::new();
     hash.update(include_bytes!("permissions.rs"));
     hash.update(include_bytes!("source_seal.rs"));
+    hash.update(include_bytes!("source_seal/authority.rs"));
     format!("{hash:x}", hash = hash.finalize())
 }
 
 pub(crate) fn check_install() -> io::Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        crate::source_seal::authority::Authority::load()?;
+    }
     let helper = Path::new(HELPER);
     for path in helper.ancestors() {
         let metadata = fs::symlink_metadata(path).map_err(|error| {
