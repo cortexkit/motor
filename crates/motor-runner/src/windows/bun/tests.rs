@@ -1003,7 +1003,8 @@ fn fake_registry_roundtrip_keeps_credentials_off_the_archive_and_guest_manifest(
 /// as one job checkout.
 #[cfg(unix)]
 fn stage_workspace(staging: &Path) -> PathBuf {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-fixtures/javascript/bunworkspace");
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("test-fixtures/javascript/bunworkspace");
     for relative in [
         "package.json",
         "bun.lock",
@@ -1032,13 +1033,17 @@ fn workspace_member_lockfile_is_left_to_the_enclosing_install() {
     let config = config(scratch.path());
     let staging = scratch.join("staging");
     let checkout = stage_workspace(&staging);
-    prepare_with_fetch(&config, &staging, "/repo", std::slice::from_ref(&checkout), |_| {
-        panic!("file: and workspace: dependencies need no registry")
-    })
+    prepare_with_fetch(
+        &config,
+        &staging,
+        "/repo",
+        std::slice::from_ref(&checkout),
+        |_| panic!("file: and workspace: dependencies need no registry"),
+    )
     .unwrap();
     let seed = staging.join("bun-seed");
-    let manifest: Manifest = serde_json::from_slice(&fs::read(seed.join("manifest.json")).unwrap())
-        .unwrap();
+    let manifest: Manifest =
+        serde_json::from_slice(&fs::read(seed.join("manifest.json")).unwrap()).unwrap();
     // The fixture resolves only `file:` and `workspace:` rows, which stay in the
     // checkout and are not registry packages, so the root project has none.
     assert!(manifest.projects.iter().all(|p| p.packages.is_empty()));
@@ -1077,9 +1082,8 @@ fn workspace_member_lockfile_is_left_to_the_enclosing_install() {
     // beside it inside the checkout, and its own lockfile stays untouched
     // because Bun installed from the root one.
     // The member's own lockfile as tracked, which Bun leaves alone.
-    let member_lock = include_str!(
-        "../../../test-fixtures/javascript/bunworkspace/packages/member/bun.lock"
-    );
+    let member_lock =
+        include_str!("../../../test-fixtures/javascript/bunworkspace/packages/member/bun.lock");
     install(&checkout.join("packages/member"));
     assert_eq!(
         fs::read_to_string(checkout.join("packages/member/bun.lock")).unwrap(),
@@ -1144,10 +1148,14 @@ fn workspace_patterns_follow_the_enclosing_lockfile() {
     assert!(matches(&["packages/*"], "packages/member"));
     assert!(!matches(&["packages/*"], "packages/member/nested"));
     assert!(matches(&["packages/**"], "packages/member/nested"));
-    assert!(matches(&["packages/*", "!packages/legacy"], "packages/member"));
-    assert!(!matches(&["packages/*", "!packages/legacy"], "packages/legacy"));
+    assert!(matches(
+        &["packages/*", "!packages/legacy"],
+        "packages/member"
+    ));
+    assert!(!matches(
+        &["packages/*", "!packages/legacy"],
+        "packages/legacy"
+    ));
     assert!(!matches(&["apps"], "packages/member"));
     assert!(matches(&["apps/*", "benchmarks"], "benchmarks"));
 }
-
-

@@ -1165,9 +1165,7 @@ fn glob_match(pattern: &str, path: &str) -> bool {
     fn walk(pattern: &[&str], path: &[&str]) -> bool {
         match pattern.split_first() {
             None => path.is_empty(),
-            Some((&"**", rest)) => {
-                (0..=path.len()).any(|skip| walk(rest, &path[skip..]))
-            }
+            Some((&"**", rest)) => (0..=path.len()).any(|skip| walk(rest, &path[skip..])),
             Some((segment, rest)) => match path.split_first() {
                 Some((candidate, remaining)) if segment_matches(segment, candidate) => {
                     walk(rest, remaining)
@@ -1518,20 +1516,14 @@ enum Containment {
 impl Containment {
     fn into_refusal(self, project: &Project) -> Refusal {
         match self {
-            Containment::Outside(detail) => refuse(
-                RefusalKind::BunProjectionInvalid,
-                &project.path,
-                "",
-                "",
-            )
-            .detail(format!("installed tree leaves the checkout at {detail}")),
-            Containment::Unreadable(detail) => refuse(
-                RefusalKind::BunOfflineInstallFailed,
-                &project.path,
-                "",
-                "",
-            )
-            .detail(format!("installed tree is unreadable at {detail}")),
+            Containment::Outside(detail) => {
+                refuse(RefusalKind::BunProjectionInvalid, &project.path, "", "")
+                    .detail(format!("installed tree leaves the checkout at {detail}"))
+            }
+            Containment::Unreadable(detail) => {
+                refuse(RefusalKind::BunOfflineInstallFailed, &project.path, "", "")
+                    .detail(format!("installed tree is unreadable at {detail}"))
+            }
         }
     }
 }
@@ -1603,12 +1595,15 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
             let entry = entry.map_err(|error| root.failed(path, error))?;
             let name = entry.file_name().to_string_lossy().into_owned();
             if name == ".bun" {
-                for store in std::fs::read_dir(entry.path()).map_err(|error| root.failed(path, error))? {
+                for store in
+                    std::fs::read_dir(entry.path()).map_err(|error| root.failed(path, error))?
+                {
                     let store = store.map_err(|error| root.failed(path, error))?;
                     walk_modules(&store.path().join("node_modules"), root, seen, installed)?;
                 }
             } else if name.starts_with('@') {
-                for package in std::fs::read_dir(entry.path()).map_err(|error| root.failed(path, error))?
+                for package in
+                    std::fs::read_dir(entry.path()).map_err(|error| root.failed(path, error))?
                 {
                     let package = package.map_err(|error| root.failed(path, error))?;
                     collect_package(&package.path(), root, seen, installed)?;
@@ -1691,9 +1686,11 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
                     .map_err(|_| projection_error(&project.path, package))?;
             }
             if !root.join(bin).is_file() {
-                return Err(fail()
-                    .at(Check::InstalledBin)
-                    .detail(format!("{} is missing {}", package.name, root.join(bin).display())));
+                return Err(fail().at(Check::InstalledBin).detail(format!(
+                    "{} is missing {}",
+                    package.name,
+                    root.join(bin).display()
+                )));
             }
         }
         if let Some(bin_dir) = &package.bin_dir {

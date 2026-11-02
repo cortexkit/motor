@@ -122,7 +122,6 @@ pub fn finish_install(
     }
 }
 
-
 pub fn skip_unprepared(source: &Path, failure: Refusal) -> Result<Vec<String>, Refusal> {
     if failure.kind.is_security() {
         return Err(failure);
@@ -137,9 +136,8 @@ pub fn skip_unprepared(source: &Path, failure: Refusal) -> Result<Vec<String>, R
         let directory = source.join(project.strip_prefix("m/").unwrap_or(""));
         let invalid = || refuse(RefusalKind::BunProjectionInvalid, &project, "", "");
         super::clean_install_inputs(&directory, &budget).map_err(|_| invalid())?;
-        let lock =
-            super::read_bounded(&directory.join("bun.lock"), super::MAX_LOCK_BYTES as u64)
-                .map_err(|_| invalid())?;
+        let lock = super::read_bounded(&directory.join("bun.lock"), super::MAX_LOCK_BYTES as u64)
+            .map_err(|_| invalid())?;
         super::read_lock(&project, std::str::from_utf8(&lock).map_err(|_| invalid())?)?;
         if let Some(owner) = owner {
             // Bun installs this directory as part of the enclosing workspace and

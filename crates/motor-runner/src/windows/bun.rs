@@ -938,11 +938,11 @@ fn covered_members(
         }
         // The lockfile's workspace table records the members Bun resolved; the
         // patterns that select them are in the manifest beside it.
-        let manifest = match bounded_file(&directory.join("package.json"), bun::MAX_LOCK_BYTES as u64)
-        {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
-        };
+        let manifest =
+            match bounded_file(&directory.join("package.json"), bun::MAX_LOCK_BYTES as u64) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
         let manifest: serde_json::Value =
             serde_json::from_slice(&manifest).map_err(|_| invalid())?;
         let patterns: Vec<&str> = manifest
