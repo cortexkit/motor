@@ -139,11 +139,14 @@ def stage_metrics(endpoint, host_id):
 
 
 def agent(runner, state_root, instance, vm_config, metrics_endpoint=None, metrics_host_id=None):
+    # Advertise 128 MiB returns with a shared 512 MiB disk budget for the two VMs.
     return {
         "Label": LABEL, "LimitLoadToSessionType": "Aqua",
         "ProgramArguments": [str(runner), "serve", "--instance", instance,
                              "--state-root", str(state_root), "--backend", "macos-vm",
                              "--vm-config", str(vm_config), "--max-weight", "8",
+                             "--return-chunked-max-bytes", "134217728",
+                             "--return-budget-bytes", "536870912",
                              *metrics_flags(metrics_endpoint, metrics_host_id)],
         "EnvironmentVariables": {"HOME": "/Users/motor", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
         "RunAtLoad": True, "KeepAlive": True, "Umask": 0o077,

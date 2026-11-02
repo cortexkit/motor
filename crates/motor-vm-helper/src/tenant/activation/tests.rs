@@ -4,6 +4,24 @@ use serde_json::json;
 const VECTOR: &[u8] = include_bytes!("../../../tests/vectors/runner-args-staged.json");
 
 #[test]
+fn return_options_accept_positive_byte_counts() {
+    let activation = ResizeActivation::parse(VECTOR).unwrap();
+    let args = format!(
+        "{} --return-chunked-max-bytes 134217728 --return-budget-bytes 2147483648",
+        activation.runner_args
+    );
+    let bytes = serde_json::to_vec(&json!({"runner_args":args,"quota_grew":false})).unwrap();
+    assert_eq!(ResizeActivation::parse(&bytes).unwrap().runner_args, args);
+
+    for option in ["--return-chunked-max-bytes", "--return-budget-bytes"] {
+        for value in ["0", "-1", "128MiB", "18446744073709551616", ""] {
+            let invalid = format!("{} {option} {value}", activation.runner_args);
+            assert!(validate_runner_args(&invalid).is_err(), "{invalid}");
+        }
+    }
+}
+
+#[test]
 fn staged_vector_and_guest_argument_grammar_are_strict_and_bounded() {
     let activation = ResizeActivation::parse(VECTOR).unwrap();
     assert!(activation.quota_grew);

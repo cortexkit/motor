@@ -258,6 +258,7 @@ class RecipeTests(unittest.TestCase):
         self.assertIn('--reserve-daemon-core false', unit)
         self.assertIn('--free-space-floor-bytes 34426847232', unit)
         self.assertIn('--free-space-eviction-bytes 42949672960', unit)
+        self.assertIn('--return-chunked-max-bytes 134217728 --return-budget-bytes 536870912', unit)
         self.assertIn('RuntimeDirectoryMode=0700', unit)
         self.assertNotIn("[Install]", (HERE / "motor-boat-bridge.service").read_text())
         self.assertEqual(self.pins["probe_port"], 19443)
@@ -1094,16 +1095,20 @@ class RecipeTests(unittest.TestCase):
         def popen(argv):
             launched.append(argv)
             raise Stop()
-        with patch.object(sys, 'argv', ['start', 'serve', '--boat-profile']), patch.object(start, 'check_storage'), \
+        with patch.object(sys, 'argv', ['start', 'serve', '--boat-profile',
+                                      '--return-chunked-max-bytes', '134217728',
+                                      '--return-budget-bytes', '536870912']), patch.object(start, 'check_storage'), \
              patch.object(start.Path, 'read_text', return_value=json.dumps({'mem_available_bytes': 8 << 30})), \
              patch.object(start, 'sandbox_cpus', return_value=4), patch.object(start.subprocess, 'Popen', popen), \
              self.assertRaises(Stop):
             start.main()
-        # The cache switch and the measured CPU counts are all that matter; the
-        # order between them is not a contract.
+        # Capacity, cache and returned-file arguments must survive the wrapper;
+        # their relative order is not a contract.
         self.assertEqual(launched[0][:3], ['/usr/local/bin/motor-runner', 'serve', '--boat-profile'])
         self.assertEqual(launched[0][launched[0].index('--max-weight') + 1], '4')
         self.assertEqual(launched[0][launched[0].index('--rustc-slots') + 1], '4')
+        self.assertEqual(launched[0][launched[0].index('--return-chunked-max-bytes') + 1], '134217728')
+        self.assertEqual(launched[0][launched[0].index('--return-budget-bytes') + 1], '536870912')
         self.assertIn('--remote-cache', launched[0])
         self.assertEqual(launched[0][launched[0].index('--remote-cache') + 1], 'true')
 

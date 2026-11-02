@@ -28,6 +28,8 @@ foreach ($file in $files) {
 & {
     $root = 'C:\Runner With Spaces'
     $plain = Get-RunnerServiceDefinition $root
+    $expected = '"C:\Runner With Spaces\bin\motor-runner.exe" service --instance ally --state-root "C:\Runner With Spaces\state" --backend windows-vm --vm-config "C:\Runner With Spaces\vm.toml" --return-chunked-max-bytes 134217728 --return-budget-bytes 268435456'
+    if ($plain.binary -cne $expected) { throw 'FAIL returned-file-cap-and-budget-command' }
     if ($plain.binary -match '--metrics-') { throw 'FAIL metrics-default-off' }
     $flags = ' --metrics-push --metrics-endpoint https://metrics.example:8443 --metrics-host-id monitor-1'
     $enabled = Get-RunnerServiceDefinition $root 'https://metrics.example:8443' 'monitor-1'
