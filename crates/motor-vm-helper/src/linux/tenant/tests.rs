@@ -3,6 +3,75 @@ use std::io::BufRead;
 use std::os::unix::net::UnixListener;
 
 #[test]
+fn clean_stop_requests_stop_and_retries_suspend_only_for_an_unknown_kind() {
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum OldKind {
+        Base,
+        Suspend,
+    }
+    let unknown = json!({"ok":false,"error":serde_json::from_str::<OldKind>(r#""stop""#).unwrap_err().to_string()});
+    let busy = json!({"ok":false,"error":"snapshot_busy: caller_work=1"});
+    for replies in [
+        vec![json!({"ok":true})],
+        vec![unknown.clone(), json!({"ok":true})],
+        vec![busy.clone()],
+        vec![unknown.clone(), busy],
+        vec![unknown.clone(), unknown],
+    ] {
+        let expected_calls = replies.len();
+        let expected_ok = replies.last().unwrap()["ok"] == true;
+        let mut replies = replies.into_iter();
+        let mut calls = 0;
+        let result = prepare_stop_with(|request| {
+            let kind = if calls == 0 { "stop" } else { "suspend" };
+            calls += 1;
+            let reply = replies.next().expect("no more than one fallback");
+            let (client, mut server) = UnixStream::pair()?;
+            let thread = std::thread::spawn(move || {
+                let mut header = [0; 4];
+                server.read_exact(&mut header).unwrap();
+                let mut bytes = vec![0; u32::from_be_bytes(header) as usize];
+                server.read_exact(&mut bytes).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&bytes).unwrap(),
+                    json!({"op":"prepare_snapshot","kind":kind})
+                );
+                let reply = serde_json::to_vec(&reply).unwrap();
+                server
+                    .write_all(&(reply.len() as u32).to_be_bytes())
+                    .unwrap();
+                server.write_all(&reply).unwrap();
+            });
+            let result = exchange_agent(client, request, Duration::from_secs(5));
+            thread.join().unwrap();
+            result
+        });
+        assert_eq!(calls, expected_calls);
+        assert_eq!(result.is_ok(), expected_ok, "{result:?}");
+        assert!(replies.next().is_none());
+    }
+}
+
+#[test]
+fn clean_stop_never_retries_transport_or_local_decode_errors() {
+    for message in [
+        "tenant agent deadline elapsed",
+        "tenant agent closed before reply",
+        "unknown variant `stop`, expected `base` or `suspend`",
+    ] {
+        let mut calls = 0;
+        let result = prepare_stop_with(|request| {
+            calls += 1;
+            assert_eq!(request, &json!({"op":"prepare_snapshot","kind":"stop"}));
+            Err(Error(message.into()))
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(result.unwrap_err().0, message);
+    }
+}
+
+#[test]
 fn network_admission_escalates_when_fence_and_vm_containment_both_fail() {
     let config = serde_json::from_str(include_str!("../../../fixtures/helper.json")).unwrap();
     let mut tenants = LinuxTenants::new(&config, PathBuf::new());

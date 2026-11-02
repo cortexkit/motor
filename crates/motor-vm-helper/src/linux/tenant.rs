@@ -230,6 +230,19 @@ pub(crate) fn exchange_agent(
     }
     Ok(())
 }
+fn prepare_stop_with(mut exchange: impl FnMut(&Value) -> Result<()>) -> Result<()> {
+    let result = exchange(&json!({"op":"prepare_snapshot","kind":"stop"}));
+    // Older images know only base and suspend. Retry only their unknown-kind
+    // refusal, not caller-work refusals, transport errors or timeouts.
+    if result.as_ref().is_err_and(|error| {
+        error.0.starts_with("tenant agent refused: ") && error.0.contains("unknown variant `stop`")
+    }) {
+        exchange(&json!({"op":"prepare_snapshot","kind":"suspend"}))
+    } else {
+        result
+    }
+}
+
 fn read_deadline(
     stream: &mut UnixStream,
     mut bytes: &mut [u8],
@@ -318,12 +331,14 @@ impl Backend for LinuxTenants {
         )
     }
     fn prepare_stop(&mut self, tenant: &str) -> Result<()> {
-        let fd = self.relay(tenant, 54)?;
-        exchange_agent(
-            UnixStream::from(fd),
-            &json!({"op":"prepare_snapshot","kind":"suspend"}),
-            Duration::from_secs(15),
-        )
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        prepare_stop_with(|request| {
+            let fd = self.relay(tenant, 54)?;
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| Error("tenant agent deadline elapsed".into()))?;
+            exchange_agent(UnixStream::from(fd), request, remaining)
+        })
     }
     fn recovery_complete(&mut self, tenant: &str, registry: &Registry) -> Result<()> {
         if !self.unclean(registry)? {

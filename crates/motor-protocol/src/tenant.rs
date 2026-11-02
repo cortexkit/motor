@@ -294,4 +294,5 @@ pub enum TenantAgentRequest {
 pub enum SnapshotKind {
     Base,
     Suspend,
+    Stop,
 }

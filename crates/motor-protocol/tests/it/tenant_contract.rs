@@ -227,6 +227,12 @@ fn tenant_snapshot_control_roundtrips_additively() {
                 kind: SnapshotKind::Suspend,
             },
         ),
+        (
+            r#"{"op":"prepare_snapshot","kind":"stop"}"#,
+            TenantAgentRequest::PrepareSnapshot {
+                kind: SnapshotKind::Stop,
+            },
+        ),
         (r#"{"op":"thaw"}"#, TenantAgentRequest::Thaw),
         (r#"{"op":"status"}"#, TenantAgentRequest::Status),
     ] {

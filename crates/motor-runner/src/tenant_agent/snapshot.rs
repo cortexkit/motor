@@ -54,23 +54,48 @@ pub(super) fn mounted(path: &str) -> io::Result<bool> {
 
 /// None once the runner is idle and admission is drained; otherwise what is
 /// still busy.
-async fn check_and_drain<F, Fut>(mut control: F, drained: &AtomicBool) -> io::Result<Option<String>>
+async fn check_and_drain<F, Fut>(
+    mut control: F,
+    drained: &AtomicBool,
+    kind: SnapshotKind,
+) -> io::Result<Option<String>>
 where
     F: FnMut(Frame) -> Fut,
     Fut: Future<Output = io::Result<Value>>,
 {
-    if let Some(reason) = busy(&control(Frame::Status).await?) {
+    // A stop discards guest memory, so disposable fills may be interrupted.
+    // Suspend preserves memory and must still refuse every running job.
+    let check = if kind == SnapshotKind::Stop {
+        super::resize::busy
+    } else {
+        busy
+    };
+    if let Some(reason) = check(&control(Frame::Status).await?) {
         return Ok(Some(reason));
     }
-    control(Frame::Drain {
-        deadline_s: 0,
-        exit_after: false,
-    })
-    .await?;
+    let frame = if kind == SnapshotKind::Stop {
+        // A lost reply may still have closed admission. Let thaw compensate
+        // even when forwarding the activation drain returns an error.
+        drained.store(true, Ordering::Release);
+        Frame::DrainForActivation
+    } else {
+        Frame::Drain {
+            deadline_s: 0,
+            exit_after: false,
+        }
+    };
+    let reply = control(frame).await?;
     drained.store(true, Ordering::Release);
+    if kind == SnapshotKind::Stop
+        && (reply["ok"] != true
+            || reply["timed_out"] != false
+            || reply["restart_recoverable_jobs"] != 0)
+    {
+        return Ok(Some("runner did not drain all caller work".into()));
+    }
     // Admission and drain share the runner lock. This second read catches a job
     // admitted between the first status and closing admission, without waiting.
-    Ok(busy(&control(Frame::Status).await?))
+    Ok(check(&control(Frame::Status).await?))
 }
 
 async fn command(program: &str, args: &[&str]) -> io::Result<()> {
@@ -105,7 +130,7 @@ pub(super) async fn prepare(kind: SnapshotKind) -> io::Result<Value> {
             command("sync", &[]).await?;
             return Ok(json!({"ok":true}));
         }
-        if let Some(reason) = check_and_drain(super::forward, &DRAINED).await? {
+        if let Some(reason) = check_and_drain(super::forward, &DRAINED, kind).await? {
             return Ok(json!({"ok":false,"error":format!("snapshot_busy: {reason}")}));
         }
         if !mounted("/tenant")? {
@@ -155,6 +180,111 @@ pub(super) async fn thaw() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hosted_stop_ignores_fills_but_refuses_caller_work() {
+        let fill = json!({"job_id":"fill","workspace_key":"base:/repo","weight":4});
+        let caller = json!({"job_id":"caller","workspace_key":"/repo","weight":1});
+        for (queued, running, caller_work) in [
+            (2, vec![], Some(0)),
+            (0, vec![fill.clone()], Some(0)),
+            (2, vec![fill], Some(0)),
+            (1, vec![], Some(1)),
+            (0, vec![caller], Some(1)),
+            (0, vec![], None),
+        ] {
+            let status = json!({"ok":true,"queue_depth":queued,"running_jobs":running,
+                "health":{"caller_work":caller_work}});
+            let mut calls = vec![];
+            let drained = AtomicBool::new(false);
+            let result = check_and_drain(
+                |frame| {
+                    calls.push(frame.clone());
+                    std::future::ready(Ok(match frame {
+                        Frame::Status => status.clone(),
+                        Frame::DrainForActivation => {
+                            json!({"ok":true,"timed_out":false,"restart_recoverable_jobs":0})
+                        }
+                        other => panic!("unexpected frame: {other:?}"),
+                    }))
+                },
+                &drained,
+                SnapshotKind::Stop,
+            )
+            .await
+            .unwrap();
+            if caller_work == Some(0) {
+                assert_eq!(result, None, "{status}");
+                assert_eq!(
+                    calls,
+                    vec![Frame::Status, Frame::DrainForActivation, Frame::Status]
+                );
+                assert!(drained.load(Ordering::Acquire));
+                assert!(busy(&status).is_some(), "suspend must still refuse fills");
+            } else {
+                assert!(result.is_some(), "{status}");
+                assert_eq!(calls, vec![Frame::Status]);
+                assert!(!drained.load(Ordering::Acquire));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_stop_rechecks_caller_work_after_closing_admission() {
+        let mut calls = vec![];
+        let drained = AtomicBool::new(false);
+        let result = check_and_drain(
+            |frame| {
+                calls.push(frame.clone());
+                std::future::ready(Ok(match frame {
+                    Frame::Status => {
+                        json!({"ok":true,"health":{"caller_work":u64::from(calls.len() == 3)}})
+                    }
+                    Frame::DrainForActivation => {
+                        json!({"ok":true,"timed_out":false,"restart_recoverable_jobs":0})
+                    }
+                    other => panic!("unexpected frame: {other:?}"),
+                }))
+            },
+            &drained,
+            SnapshotKind::Stop,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.as_deref(), Some("caller_work=1"));
+        assert!(
+            drained.load(Ordering::Acquire),
+            "thaw must reopen admission after refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_stop_marks_a_lost_or_incomplete_drain_for_thaw() {
+        for reply in [
+            Err(io::Error::other("reply lost")),
+            Ok(json!({"ok":true,"timed_out":true,"restart_recoverable_jobs":0})),
+            Ok(json!({"ok":true,"timed_out":false,"restart_recoverable_jobs":1})),
+            Ok(json!({"ok":true})),
+        ] {
+            let mut reply = Some(reply);
+            let drained = AtomicBool::new(false);
+            let result = check_and_drain(
+                |frame| {
+                    std::future::ready(match frame {
+                        Frame::Status => Ok(json!({"ok":true,"health":{"caller_work":0}})),
+                        Frame::DrainForActivation => reply.take().unwrap(),
+                        other => panic!("unexpected frame: {other:?}"),
+                    })
+                },
+                &drained,
+                SnapshotKind::Stop,
+            )
+            .await;
+            assert!(!matches!(result, Ok(None)));
+            assert!(drained.load(Ordering::Acquire));
+        }
+    }
+
     #[tokio::test]
     async fn hosted_prepare_refuses_started_and_admitted_jobs_without_drain() {
         let job = json!({"job_id":"01a156a8-dae7-77d3-9612-855938acf185","workspace_key":"/Users/q","weight":1});
@@ -169,6 +299,7 @@ mod tests {
                     ))
                 },
                 &AtomicBool::new(false),
+                SnapshotKind::Suspend,
             )
             .await
             .unwrap()
@@ -210,6 +341,7 @@ mod tests {
                 std::future::ready(Ok(status()))
             },
             &AtomicBool::new(false),
+            SnapshotKind::Suspend,
         )
         .await
         .unwrap();
@@ -229,6 +361,7 @@ mod tests {
                 }))
             },
             &AtomicBool::new(false),
+            SnapshotKind::Suspend,
         )
         .await
         .unwrap();

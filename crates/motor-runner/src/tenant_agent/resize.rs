@@ -23,7 +23,7 @@ pub(super) fn parse(value: Value) -> io::Result<String> {
     Ok(runner_args)
 }
 
-fn busy(value: &Value) -> Option<String> {
+pub(super) fn busy(value: &Value) -> Option<String> {
     if value["ok"] != true {
         return Some(format!("runner status unavailable: {value}"));
     }
