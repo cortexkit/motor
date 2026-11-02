@@ -1129,10 +1129,10 @@ fn installed_tree_leaving_the_checkout_is_refused_with_the_offending_path() {
     assert_eq!(refusal.project, "m/repo");
     assert_eq!(refusal.check, Some(bun::Check::Projection));
     assert_eq!(
-        refusal.detail,
+        &*refusal.detail,
         "installed tree leaves the checkout at repo/node_modules/escaped"
     );
-    assert!(refusal.to_string().contains(&refusal.detail));
+    assert!(refusal.to_string().contains(&*refusal.detail));
 }
 
 /// A member is recognised only through the patterns Bun applies to the

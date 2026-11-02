@@ -110,6 +110,10 @@ fn missing_empty(packages: &[MissingPackage]) -> bool {
     packages.is_empty()
 }
 
+fn detail_empty(detail: &str) -> bool {
+    detail.is_empty()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Refusal {
@@ -118,17 +122,15 @@ pub struct Refusal {
     pub package: String,
     pub version: String,
     pub registry_origin: String,
-    /// The enclosing project's lockfile that lists this directory as a member.
-    /// Only `BunWorkspaceMember` carries it.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub owner: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<Check>,
     /// What the failing check found, as a path relative to the job checkout.
     /// Fixed diagnostics cross the trust boundary; this is a path, never a
-    /// host I/O error message.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub detail: String,
+    /// host I/O error message. It is boxed, and the enclosing project a member
+    /// report names is carried here rather than in a field of its own, so a
+    /// refusal stays small enough to return by value from every step.
+    #[serde(default, skip_serializing_if = "detail_empty")]
+    pub detail: Box<str>,
     #[serde(default, skip_serializing_if = "missing_empty")]
     pub missing: Box<[MissingPackage]>,
 }
@@ -186,16 +188,12 @@ impl Refusal {
     }
     /// Say which check failed and what it found, as a path relative to the job
     /// checkout. Refusals raised outside `check` keep it empty.
-    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+    pub fn detail(mut self, detail: impl Into<Box<str>>) -> Self {
         self.detail = detail.into();
         self
     }
     pub fn at(mut self, check: Check) -> Self {
         self.check = Some(check);
-        self
-    }
-    pub fn owned_by(mut self, owner: impl Into<String>) -> Self {
-        self.owner = owner.into();
         self
     }
     pub fn missing_packages(mut self, packages: impl IntoIterator<Item = MissingPackage>) -> Self {
@@ -238,7 +236,7 @@ impl Refusal {
             &self.version,
             &self.registry_origin,
             &self.owner,
-            &self.detail,
+            &*self.detail,
         ] {
             if field.len() > 4096 || field.chars().any(char::is_control) {
                 return Err(io::Error::new(
@@ -302,7 +300,7 @@ pub fn refuse(kind: RefusalKind, project: &str, package: &str, version: &str) ->
             RefusalKind::BunOfflineInstallFailed => Check::InstalledTree,
             RefusalKind::BunWorkspaceMember => Check::WorkspaceMember,
         }),
-        detail: String::new(),
+        detail: Box::default(),
         owner: String::new(),
         missing: Box::default(),
     }
@@ -1201,7 +1199,6 @@ fn glob_match(pattern: &str, path: &str) -> bool {
 /// reads only the enclosing lockfile there, so the member's own file is unused.
 pub fn workspace_member_warning(project: &str, owner: &str) -> String {
     refuse(RefusalKind::BunWorkspaceMember, project, "", "")
-        .owned_by(owner)
         .detail(format!(
             "bun.lock is unused: {owner} installs this directory as a workspace member"
         ))
