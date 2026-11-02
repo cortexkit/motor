@@ -128,6 +128,7 @@ async fn isolated_source_seal_refuses_edits_and_workspace_is_reusable() {
         "rm-file",
         "rename-file",
         "dir/source",
+        "cross/source",
         "pkg/returned",
     ] {
         let path = f.main.join(name);
@@ -138,6 +139,7 @@ async fn isolated_source_seal_refuses_edits_and_workspace_is_reusable() {
     let runner = Runner::open(isolated_config(&f)).unwrap();
     let (mut run, bytes) = f.run(
         r#"
+        set -e
         if sed -i 's/original/edited/' sed-file; then exit 11; fi
         if echo edited > write-file; then exit 12; fi
         if rm rm-file; then exit 13; fi
@@ -146,9 +148,10 @@ async fn isolated_source_seal_refuses_edits_and_workspace_is_reusable() {
         echo new > untracked
         echo output > target/output
         echo returned > pkg/returned
-        mv dir target/moved
+        mv dir dir-moved
         mkdir dir
         echo replacement > dir/source
+        if mv cross target/copied; then exit 15; fi
         echo ready > ready
         while [ ! -f release ]; do sleep 0.01; done
     "#,
@@ -185,10 +188,11 @@ async fn isolated_source_seal_refuses_edits_and_workspace_is_reusable() {
     runner.maintenance().unwrap();
     assert!(crate::source_seal::record_path(&runner.config().state_dir(), run.job_id).exists());
     assert_ne!(flags(&Path::new(&f.key).join("sed-file")) & 0x10, 0);
-    assert_ne!(
-        flags(&Path::new(&f.key).join("target/moved/source")) & 0x10,
-        0
-    );
+    assert_ne!(flags(&Path::new(&f.key).join("dir-moved/source")) & 0x10, 0);
+    // target is a separate bind mount. mv copies across that boundary, but
+    // cannot remove the sealed original, and its new copy has no seal.
+    assert_ne!(flags(&Path::new(&f.key).join("cross/source")) & 0x10, 0);
+    assert_clear(&Path::new(&f.key).join("target/copied/source"));
     fs::write(Path::new(&f.key).join("release"), b"release").unwrap();
     let terminal = terminal(&runner, run.job_id).await;
     assert_eq!(
@@ -204,7 +208,9 @@ async fn isolated_source_seal_refuses_edits_and_workspace_is_reusable() {
         "write-file",
         "rm-file",
         "rename-file",
-        "target/moved/source",
+        "dir-moved/source",
+        "cross/source",
+        "target/copied/source",
     ] {
         let path = Path::new(&f.key).join(name);
         assert_eq!(fs::read_to_string(&path).unwrap(), "original\n");
@@ -214,6 +220,7 @@ async fn isolated_source_seal_refuses_edits_and_workspace_is_reusable() {
         ("untracked", "new\n"),
         ("target/output", "output\n"),
         ("pkg/returned", "returned\n"),
+        ("dir/source", "replacement\n"),
     ] {
         assert_eq!(
             fs::read_to_string(Path::new(&f.key).join(name)).unwrap(),
