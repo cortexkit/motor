@@ -165,6 +165,10 @@ pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest 
         RETURN_CHUNKED_CAPABILITY.into(),
         motor_protocol::SUBMISSION_KEY_CAPABILITY.into(),
         motor_protocol::PROGRESS_CAPABILITY.into(),
+        // Route admission uses the principal; attribution uses the session and
+        // scope. Neither reads the bind identity's project fields, so the daemon
+        // can omit them.
+        subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY.into(),
     ];
     if config.return_large {
         provides.push(motor_protocol::RETURN_LARGE_CAPABILITY.into());

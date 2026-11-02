@@ -1730,7 +1730,6 @@ pub fn exit_code(terminal: &TerminalRecord) -> u8 {
 pub struct SubcClient {
     consumer: SubcConsumer,
     route: Mutex<Option<ClientRoute>>,
-    workspace: PathBuf,
     return_workspace: Option<PathBuf>,
     allow_spill: bool,
     hosted: bool,
@@ -1765,7 +1764,6 @@ impl SubcClient {
         Ok(Self {
             consumer,
             route: Mutex::new(None),
-            workspace: workspace.to_owned(),
             return_workspace: workspace_root(Some(workspace)).ok(),
             allow_spill: false,
             hosted: false,
@@ -1778,11 +1776,8 @@ impl SubcClient {
             .resolve_provider(crate::module::CAPABILITY)
             .await
             .map_err(connection_error)?;
-        let identity = BindIdentity::new(
-            &self.workspace,
-            "ck-motor-run",
-            format!("ck-motor-run-{}", Uuid::now_v7()),
-        );
+        let identity =
+            BindIdentity::new("ck-motor-run", format!("ck-motor-run-{}", Uuid::now_v7()));
         let handle = self
             .consumer
             .open_route(

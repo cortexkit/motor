@@ -32,7 +32,8 @@ async fn account_vault_transport_uses_authenticated_claustrum_route_and_exact_en
         key: subc_transport::generate_key().unwrap(),
         daemon_id: subc_transport::generate_daemon_id().unwrap(),
         pid: std::process::id(),
-        daemon_ver: "test".into(),
+        // Project-free route opens require a daemon that understands them.
+        daemon_ver: "0.39.0".into(),
     };
     let path = root.join("connection.json");
     OpenOptions::new()
@@ -58,6 +59,10 @@ async fn account_vault_transport_uses_authenticated_claustrum_route_and_exact_en
         assert_eq!(route.header.channel, 0);
         let body: Value = serde_json::from_slice(&route.body).unwrap();
         assert_eq!(body["op"], "route.open");
+        assert_eq!(
+            body["identity"],
+            json!({"harness":"ck-motor", "session":"motor-account-token"})
+        );
         assert_eq!(
             body["target"],
             json!({"kind":"management_surface", "module_id":"claustrum"})
@@ -92,7 +97,6 @@ async fn account_vault_transport_uses_authenticated_claustrum_route_and_exact_en
     });
     let vault = Vault {
         connection: path,
-        workspace: root.clone(),
         module_id: "ck-motor".into(),
     };
     let reply = tokio::time::timeout(Duration::from_secs(10), vault.request_with_nonce(json!({
