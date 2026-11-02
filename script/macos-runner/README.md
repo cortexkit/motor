@@ -370,12 +370,13 @@ evict shared live caches to make a lane start.
 
 ## Optional outbound monitor metrics
 
-Metrics are off by default. Add `--metrics-endpoint https://metrics.example
+Metrics are off on first install unless enabled. Add `--metrics-endpoint https://metrics.example
 --metrics-host-id monitor-1` to the normal install command to enable signed,
 outbound-only monitor samples every 60 seconds. Supply both parameters or
 neither: the endpoint must be an HTTPS origin without credentials, a path, query
-or fragment; the id must match `[A-Za-z0-9._-]{1,64}`. A full install renders the
-metrics-disabled default when neither is supplied.
+or fragment; the id must match `[A-Za-z0-9._-]{1,64}`. Reinstalling without either
+parameter preserves the installed metrics settings; supplying both replaces
+them. Use `metrics-config --disable-metrics` to turn metrics off.
 
 Once installed, print (or create once) the stable public key as 64 hex characters
 without loading or starting the LaunchAgent:

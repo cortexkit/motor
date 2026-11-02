@@ -534,6 +534,11 @@ def create_account():
 def install(args, manifest):
     pinlock.require_ready(manifest)
     require_filevault_off()
+    current_metrics = [None, None]
+    if PLIST.exists():
+        current_metrics = metrics_settings(plistlib.loads(PLIST.read_bytes()).get("ProgramArguments", []))
+    if args.metrics_endpoint is not None or args.metrics_host_id is not None:
+        current_metrics = [args.metrics_endpoint, args.metrics_host_id]
     server = json.loads((HERE.parent / "runner/toolchain.json").read_text())
     parity.validate(manifest, server)
     for path in (args.state_root, args.image):
@@ -603,7 +608,7 @@ def install(args, manifest):
     if login_changed:
         print("Restart required: the auto-login user changed to motor. The installer will not restart the host.")
     private_write(PLIST, plistlib.dumps(agent(CONFIG / "motor-runner", args.state_root, args.instance, CONFIG / "vm.toml",
-                                           args.metrics_endpoint, args.metrics_host_id)))
+                                           *current_metrics)))
     os.chown(PLIST, 0, 0)
     PLIST.chmod(0o644)
     installed["auto_login_managed"] = True
@@ -625,7 +630,7 @@ def main():
     parser.add_argument("--instance", default="macos")
     parser.add_argument("--runner", type=Path)
     parser.add_argument("--vm-helper", type=Path)
-    parser.add_argument("--metrics-endpoint", help="HTTPS origin; requires --metrics-host-id (off by default)")
+    parser.add_argument("--metrics-endpoint", help="HTTPS origin; requires --metrics-host-id (install preserves existing settings; first install defaults off)")
     parser.add_argument("--metrics-host-id", help="monitor host id: [A-Za-z0-9._-]{1,64}")
     parser.add_argument("--disable-metrics", action="store_true", help="metrics-config: stage metrics removal")
     parser.add_argument("--tool-bundle", type=Path)
