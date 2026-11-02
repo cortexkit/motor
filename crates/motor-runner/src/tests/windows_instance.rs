@@ -338,6 +338,178 @@ async fn windows_started_unit_backed_job_keeps_drain_waiting() {
     wait_for(|| runner.drain_result() == Some(false)).await;
 }
 
+async fn windows_connection(socket: &Path) -> UnixStream {
+    let mut stream = UnixStream::connect(socket).await.unwrap();
+    write_frame_async(
+        &mut stream,
+        &Frame::Hello {
+            return_paths: false,
+            return_chunked_max_bytes: None,
+            return_chunked: false,
+            sibling_paths: false,
+            protocol_version: PROTOCOL_VERSION,
+            started: true,
+            default_branch_tip: false,
+            gate_jobs: false,
+            platforms: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(read_next(&mut stream).await,
+        Frame::Hello { protocol_version: PROTOCOL_VERSION, platforms, .. }
+            if platforms == ["windows"]));
+    stream
+}
+
+#[tokio::test]
+async fn service_stop_exits_after_hold_drain_with_a_live_heartbeat_client() {
+    let f = Fixture::new();
+    let mut config = config(&f);
+    config.manual_tick = true;
+    let runner = Runner::open_with_backend(config, Box::new(InProcessWindows)).unwrap();
+    runner.begin_drain(Duration::ZERO, false);
+    assert_eq!(runner.drain_result(), Some(true));
+    let (socket, mut server) = listener(&f, &runner);
+    let client = windows_connection(&socket).await;
+    let (mut read, mut write) = client.into_split();
+    let sent = Arc::new(AtomicU64::new(0));
+    let sending = Arc::clone(&sent);
+    let heartbeat = tokio::spawn(async move {
+        loop {
+            if write_frame_async(
+                &mut write,
+                &Frame::Heartbeat {
+                    queue_wait_ms: None,
+                },
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
+            sending.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    let closed =
+        tokio::spawn(
+            async move { while matches!(read_frame_async(&mut read).await, Ok(Some(_))) {} },
+        );
+    wait_for(|| sent.load(Ordering::Relaxed) >= 3).await;
+    let before_stop = sent.load(Ordering::Relaxed);
+
+    // The Windows service-stop handler uses this same state-lock-independent
+    // signal, not another drain request whose exit policy belongs to the
+    // earlier hold-only drain.
+    runner.request_service_stop();
+    assert!(runner.is_draining());
+    let result = tokio::time::timeout(Duration::from_secs(3), &mut server).await;
+    if result.is_err() {
+        server.abort();
+    }
+    heartbeat.abort();
+    result
+        .expect("service stop must finish within the connection grace bound")
+        .unwrap()
+        .unwrap();
+    assert!(sent.load(Ordering::Relaxed) > before_stop + 5);
+    tokio::time::timeout(Duration::from_secs(1), closed)
+        .await
+        .expect("service stop must close the heartbeat connection")
+        .unwrap();
+    assert!(std::os::unix::net::UnixStream::connect(&*socket).is_err());
+}
+
+#[tokio::test]
+async fn service_stop_keeps_a_started_windows_job_and_its_record_until_terminal() {
+    let f = Fixture::new();
+    let mut config = config(&f);
+    config.manual_tick = true;
+    let runner = Runner::open_with_backend(config, Box::new(InProcessWindows)).unwrap();
+    let (mut request, _) = f.run("must not run on host");
+    request.platform = Some(Platform::Windows);
+    let id = request.job_id;
+    let mut job = Job::new(id, Some(request), runner.now(), 1, 4);
+    job.state = JobState::Running;
+    job.started_ms = Some(runner.now());
+    job.started = Some(Started::new(0, 0, runner.now()));
+    job.process = Some(platform::ProcessIdentity {
+        pid: 42,
+        start: 1,
+        unit: Some(id),
+    });
+    job.durable_output = true;
+    runner.save(&job).unwrap();
+    runner.core.inner.lock().unwrap().jobs.insert(id, job);
+    runner.begin_drain(Duration::ZERO, false);
+    assert_eq!(runner.drain_result(), Some(true));
+    let (socket, mut server) = listener(&f, &runner);
+    let _client = windows_connection(&socket).await;
+
+    runner.request_service_stop();
+    assert!(tokio::time::timeout(Duration::from_secs(3), &mut server)
+        .await
+        .is_err());
+    assert!(std::os::unix::net::UnixStream::connect(&*socket).is_err());
+    let persisted: Job = read_json(&runner.record_path(id)).unwrap();
+    assert!(persisted.started.is_some());
+    assert!(persisted.terminal.is_none());
+    assert!(runner
+        .service_stop_blockers()
+        .iter()
+        .any(|wait| wait.contains(&id.to_string())));
+    {
+        let mut inner = runner.core.inner.lock().unwrap();
+        let job = inner.jobs.get_mut(&id).unwrap();
+        job.terminal(Outcome::Exit { code: 0 }, runner.now());
+        runner.save(job).unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(1), &mut server)
+        .await
+        .expect("service stop must finish once accepted work is durable")
+        .unwrap()
+        .unwrap();
+    let persisted: Job = read_json(&runner.record_path(id)).unwrap();
+    assert_eq!(
+        persisted.terminal.unwrap().outcome,
+        Outcome::Exit { code: 0 }
+    );
+}
+
+#[tokio::test]
+async fn service_stop_closes_admission_and_durably_refuses_queued_work_without_a_prior_drain() {
+    let f = Fixture::new();
+    let mut config = config(&f);
+    config.manual_tick = true;
+    let runner = Runner::open_with_backend(config, Box::new(InProcessWindows)).unwrap();
+    let (mut queued, bundles) = f.run("must not run on host");
+    queued.platform = Some(Platform::Windows);
+    f.submit(&runner, &queued, &bundles);
+    assert_eq!(runner.job_status(queued.job_id).unwrap().state, "queued");
+
+    runner.request_service_stop();
+    runner.resume();
+    let (mut new, _) = f.run("must not run either");
+    new.platform = Some(Platform::Windows);
+    assert!(matches!(
+        runner.accept(new).unwrap(),
+        Admission::Refused(RefusalReason::RunnerDraining)
+    ));
+    runner.tick().unwrap();
+    let refused = terminal(&runner, queued.job_id).await;
+    assert_eq!(refused.ran, Some(Ran::None));
+    assert_eq!(
+        refused.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RunnerDraining
+        }
+    );
+    let persisted: Job = read_json(&runner.record_path(queued.job_id)).unwrap();
+    assert_eq!(persisted.terminal, Some(refused));
+    assert!(runner.service_stop_blockers().is_empty());
+}
+
 #[test]
 fn windows_open_requires_vm_config_and_a_sealed_regular_baseline() {
     let f = Fixture::new();

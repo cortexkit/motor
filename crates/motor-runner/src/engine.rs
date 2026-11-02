@@ -1560,6 +1560,7 @@ struct Core {
     #[cfg(test)]
     tenant_fills_off_logs: std::sync::atomic::AtomicUsize,
     draining: std::sync::atomic::AtomicBool,
+    service_stop: tokio::sync::watch::Sender<bool>,
     /// Separate from the fsync/state lock so a slow persistence operation cannot
     /// prevent the server from observing its shutdown deadline.
     drain_control: Mutex<Option<DrainWaiter>>,
@@ -2641,6 +2642,7 @@ impl Runner {
                 #[cfg(test)]
                 tenant_fills_off_logs: std::sync::atomic::AtomicUsize::new(0),
                 draining: std::sync::atomic::AtomicBool::new(false),
+                service_stop: tokio::sync::watch::channel(false).0,
                 drain_control: Mutex::new(None),
                 background_deletes: config.background_deletes.clone(),
                 config,
@@ -2976,6 +2978,47 @@ impl Runner {
     pub fn begin_drain(&self, deadline: Duration, exit_after: bool) {
         self.begin_drain_request(deadline, exit_after);
     }
+    /// Stop the service even if an earlier drain requested that it stay alive.
+    /// This signal takes no state/persistence lock, so the control handler can
+    /// close listeners while a job record is being saved. Accepted work still
+    /// has to settle before the service exits.
+    pub fn request_service_stop(&self) {
+        self.core.service_stop.send_replace(true);
+    }
+    pub(crate) fn service_stop_signal(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.core.service_stop.subscribe()
+    }
+    fn admission_closed(&self, inner: &Inner) -> bool {
+        inner.drain_deadline.is_some() || *self.core.service_stop.borrow()
+    }
+    pub(crate) fn service_stop_blockers(&self) -> Vec<String> {
+        let Ok(inner) = self.core.inner.try_lock() else {
+            return vec!["engine_state_lock".into()];
+        };
+        let mut waits: Vec<_> = inner
+            .jobs
+            .values()
+            .filter(|job| job.terminal.is_none() && !self.restart_recoverable(job))
+            .map(|job| format!("job={} state={:?}", job.id, job.state))
+            .collect();
+        for (name, count) in [
+            ("starting", inner.starting.len()),
+            ("reserved", inner.reserved.len()),
+            ("preparing", inner.preparing.len()),
+            ("admitting", inner.admitting.len()),
+            ("admission_save", inner.admission_saves.len()),
+            ("terminal_save", inner.terminal_saves.len()),
+            ("base_finish", inner.base_finishes.len()),
+            ("base_settle", inner.base_settling.len()),
+            ("finalizing", inner.finalizing.len()),
+            ("writer", usize::from(inner.writer.is_some())),
+        ] {
+            if count != 0 {
+                waits.push(format!("{name}={count}"));
+            }
+        }
+        waits
+    }
     /// Close admission without waiting for or changing any accepted work.
     /// Even transient lifecycle markers block a credential rotation.
     pub(crate) fn drain_if_idle(&self) -> (Option<String>, u64) {
@@ -3083,6 +3126,10 @@ impl Runner {
     /// Reopen admission after a deployment closed it. Running jobs continue;
     /// jobs already refused before start remain safe for callers to retry.
     pub fn resume(&self) {
+        if *self.core.service_stop.borrow() {
+            tracing::warn!("runner service stop cannot be resumed");
+            return;
+        }
         let mut inner = self.core.inner.lock().unwrap();
         inner.drain_deadline = None;
         if let Some(waiter) = self.core.drain_control.lock().unwrap().take() {
@@ -3097,9 +3144,11 @@ impl Runner {
         tracing::info!("runner admission resumed");
     }
     pub fn is_draining(&self) -> bool {
-        self.core
-            .draining
-            .load(std::sync::atomic::Ordering::Acquire)
+        *self.core.service_stop.borrow()
+            || self
+                .core
+                .draining
+                .load(std::sync::atomic::Ordering::Acquire)
     }
     pub fn drain_result(&self) -> Option<bool> {
         let waiter = self.core.drain_control.lock().unwrap().clone()?;
@@ -4006,7 +4055,7 @@ impl Runner {
             Some(refusal)
         } else if let Some(refusal) = self.slice_memory_refusal() {
             Some(refusal)
-        } else if inner.drain_deadline.is_some() {
+        } else if self.admission_closed(inner) {
             Some((RefusalReason::RunnerDraining, "runner is draining".into()))
         } else if (!self.core.config.windows_instance()
             && self.deleting(
@@ -4898,7 +4947,7 @@ impl Runner {
         _siblings: &[SiblingSnapshot],
         _git_dependencies: &[GitDependency],
     ) -> io::Result<()> {
-        if !self.warm_builds_enabled(tip) || inner.drain_deadline.is_some() {
+        if !self.warm_builds_enabled(tip) || self.admission_closed(inner) {
             return Ok(());
         }
         let plan = self.base_plan(root, tip, false);
@@ -5058,7 +5107,7 @@ impl Runner {
         workspace: &str,
         plan: BasePlan,
     ) -> io::Result<bool> {
-        if inner.drain_deadline.is_some() {
+        if self.admission_closed(inner) {
             return Ok(false);
         }
         let checkout = paths::fill_checkout(&self.core.config, workspace, root)?;
@@ -7244,7 +7293,7 @@ impl Runner {
             // Maintenance ran without the state lock; take the time again.
             now = self.now();
         }
-        if inner.drain_deadline.is_some() {
+        if self.admission_closed(&inner) {
             // Do not start queued commands during a deploy. Refuse them durably
             // before acknowledging the drain so callers can retry without the
             // uncertainty of a command interrupted by the binary swap.
@@ -7332,7 +7381,7 @@ impl Runner {
             // Dispatch below changes queue clocks at the current time, not at
             // one taken before the mirror reads.
             now = self.now();
-            if inner.drain_deadline.is_some() {
+            if self.admission_closed(&inner) {
                 // A drain began meanwhile. Start nothing: the next tick
                 // refuses the queued jobs first.
                 return Ok(());
@@ -7506,7 +7555,7 @@ impl Runner {
     }
 
     fn dispatch(&self, inner: &mut Inner, now: u64) -> io::Result<()> {
-        if inner.restoring_reserve {
+        if inner.restoring_reserve || self.admission_closed(inner) {
             return Ok(());
         }
         if self.ensure_admission_ownership().is_err() {
@@ -7515,6 +7564,9 @@ impl Runner {
         let mut index = DispatchIndex::build(inner);
         self.update_queue_wait_clocks(inner, now, &index);
         loop {
+            if self.admission_closed(inner) {
+                return Ok(());
+            }
             // A Boat lease owns the entire sandbox, regardless of CPU weight
             // or checkout. Count setup reservations as well as running jobs.
             if self.core.config.boat_profile && !index.workspace_owners.is_empty() {
@@ -9861,7 +9913,7 @@ impl Runner {
             .desired
             .clone()
             .filter(|desired| {
-                self.warm_builds_enabled(&desired.tip) && inner.drain_deadline.is_none()
+                self.warm_builds_enabled(&desired.tip) && !self.admission_closed(&inner)
             });
             drop(inner);
             self.finish_step(id, &kill, "state lock released", finish_started);
