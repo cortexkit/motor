@@ -108,8 +108,10 @@ struct CancelInFlight {
 
 type CancelDelivery = watch::Receiver<Option<Result<(), (io::ErrorKind, String)>>>;
 
-struct WindowsQueue {
+struct PlacementQueue {
     deadline: tokio::time::Instant,
+    retry_at: Option<tokio::time::Instant>,
+    cycle_windows: bool,
     run_sent: bool,
     accepted: bool,
     retry_delay: Duration,
@@ -899,13 +901,22 @@ impl Motor {
                 )
                 .await;
         }
+        let mut signing_retry = None;
         if let Some(connector) = &connector {
             if let Some(code) = connector.refusal() {
                 let (reason, detail) = request_refusal_fields(RefusalReason::Unknown(code.into()));
                 let retry_after_ms = connector.retry_after_ms(code);
-                return self
-                    .refused_with_retry(id, reason, None, detail, retry_after_ms, tx)
-                    .await;
+                let delay = transient_signing_retry(&reason, detail.as_deref(), retry_after_ms);
+                if let Some(delay) = delay.filter(|_| {
+                    matches!(request.platform, Some(Platform::Windows | Platform::Macos))
+                }) {
+                    let now = tokio::time::Instant::now();
+                    signing_retry = Some((now + Duration::from_secs(wait), now + delay));
+                } else {
+                    return self
+                        .refused_with_retry(id, reason, None, detail, retry_after_ms, tx)
+                        .await;
+                }
             }
         }
         let config = self.config.clone();
@@ -966,18 +977,27 @@ impl Motor {
             }
         };
         let snapshots = Arc::new(snapshots);
-        let mut windows_queue = (request.platform == Some(Platform::Windows)
-            && !self.config.windows_runners.is_empty())
-        .then(|| WindowsQueue {
-            deadline: tokio::time::Instant::now() + Duration::from_secs(wait),
-            run_sent: false,
-            accepted: false,
-            retry_delay: Duration::from_secs(5),
-        });
+        let mut placement_queue =
+            matches!(request.platform, Some(Platform::Windows | Platform::Macos)).then(|| {
+                PlacementQueue {
+                    deadline: signing_retry.map_or_else(
+                        || tokio::time::Instant::now() + Duration::from_secs(wait),
+                        |(deadline, _)| deadline,
+                    ),
+                    retry_at: signing_retry.map(|(_, retry_at)| retry_at),
+                    cycle_windows: request.platform == Some(Platform::Windows)
+                        && !self.config.windows_runners.is_empty(),
+                    run_sent: false,
+                    accepted: false,
+                    retry_delay: Duration::from_secs(5),
+                }
+            });
         // A zero queue budget still permits one immediate admission attempt.
         let mut first_attempt = true;
         loop {
-            let windows_last = windows_queue.is_some()
+            let windows_last = placement_queue
+                .as_ref()
+                .is_some_and(|queue| queue.cycle_windows)
                 && self
                     .storage
                     .job(id)
@@ -985,14 +1005,22 @@ impl Motor {
                     .is_some_and(|runner| {
                         runner.name == self.config.windows_runners.last().unwrap().name
                     });
-            if let Some(queue) = &windows_queue {
+            if let Some(queue) = &mut placement_queue {
+                let delayed = queue.retry_at.is_some();
+                if let Some(retry_at) = queue.retry_at.take() {
+                    progress.phase(ProgressPhase::PlacementWait);
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(queue.deadline.min(retry_at)) => {},
+                        _ = tx.closed() => return Err(io::Error::other("caller detached")),
+                    }
+                }
                 if self.pending(id) {
                     let terminal =
                         TerminalRecord::new(id, Outcome::Cancelled, 0, 0, 0).with_ran(Ran::None);
                     self.storage.local_terminal(terminal.clone())?;
                     return emit(tx, StreamRecord::Terminal(terminal)).await;
                 }
-                if !first_attempt && tokio::time::Instant::now() >= queue.deadline {
+                if (!first_attempt || delayed) && tokio::time::Instant::now() >= queue.deadline {
                     return self
                         .refused(id, RefusalReason::QueueWaitExceeded, None, None, tx)
                         .await;
@@ -1010,7 +1038,7 @@ impl Motor {
                     tx,
                     wake.clone(),
                     &caller,
-                    &mut windows_queue,
+                    &mut placement_queue,
                     progress,
                 )
                 .await
@@ -1018,46 +1046,44 @@ impl Motor {
             {
                 return Ok(());
             }
-            if let Some(queue) = &mut windows_queue {
-                let current = self
-                    .storage
-                    .job(id)
-                    .and_then(|job| job.windows_runner)
-                    .unwrap();
-                let index = self
-                    .config
-                    .windows_runners
-                    .iter()
-                    .position(|runner| runner.name == current.name)
-                    .unwrap();
-                let next =
-                    &self.config.windows_runners[(index + 1) % self.config.windows_runners.len()];
-                // Runners retain refusals by destination ID. A proven
-                // before-start retry needs a new ID, durably mapped with its
-                // endpoint before another Run can be sent.
-                self.storage.bind_windows_retry(
-                    id,
-                    next.clone(),
-                    queue.run_sent.then(Uuid::now_v7),
-                    u64::try_from(
-                        queue
-                            .deadline
-                            .saturating_duration_since(tokio::time::Instant::now())
-                            .as_millis()
-                            .div_ceil(1000),
-                    )
-                    .unwrap_or(u64::MAX),
-                )?;
+            if let Some(queue) = &mut placement_queue {
+                if queue.cycle_windows {
+                    let current = self
+                        .storage
+                        .job(id)
+                        .and_then(|job| job.windows_runner)
+                        .unwrap();
+                    let index = self
+                        .config
+                        .windows_runners
+                        .iter()
+                        .position(|runner| runner.name == current.name)
+                        .unwrap();
+                    let next = &self.config.windows_runners
+                        [(index + 1) % self.config.windows_runners.len()];
+                    // Runners retain refusals by destination ID. A proven
+                    // before-start retry needs a new ID, durably mapped with its
+                    // endpoint before another Run can be sent.
+                    self.storage.bind_windows_retry(
+                        id,
+                        next.clone(),
+                        queue.run_sent.then(Uuid::now_v7),
+                        u64::try_from(
+                            queue
+                                .deadline
+                                .saturating_duration_since(tokio::time::Instant::now())
+                                .as_millis()
+                                .div_ceil(1000),
+                        )
+                        .unwrap_or(u64::MAX),
+                    )?;
+                }
                 queue.run_sent = false;
-                if windows_last {
-                    // All configured Windows runners share one queue-wait
-                    // budget. After trying the last runner, revisit earlier
-                    // busy runners instead of failing while capacity can free up.
-                    progress.phase(ProgressPhase::PlacementWait);
-                    tokio::select! {
-                        _ = tokio::time::sleep_until(queue.deadline.min(tokio::time::Instant::now() + queue.retry_delay)) => {},
-                        _ = tx.closed() => return Err(io::Error::other("caller detached")),
-                    }
+                if windows_last || !queue.cycle_windows {
+                    // Back off between Windows passes, or before retrying a
+                    // single endpoint. A signing hint can extend this delay.
+                    let backoff = tokio::time::Instant::now() + queue.retry_delay;
+                    queue.retry_at = Some(queue.retry_at.map_or(backoff, |hint| hint.max(backoff)));
                     queue.retry_delay = Duration::from_secs(5);
                 }
             }
@@ -1103,7 +1129,7 @@ impl Motor {
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
         wake: watch::Receiver<bool>,
         caller: &str,
-        windows_queue: &mut Option<WindowsQueue>,
+        placement_queue: &mut Option<PlacementQueue>,
         progress: &progress::Reporter,
     ) -> io::Result<bool> {
         let (mut request, mut returns) = submission;
@@ -1131,7 +1157,7 @@ impl Motor {
             .hosted_state(id)
             .is_some_and(|route| route.spill_wait_ms.is_some());
         let spill_after = None;
-        let wait = windows_queue.as_ref().map_or(wait, |queue| {
+        let wait = placement_queue.as_ref().map_or(wait, |queue| {
             u64::try_from(
                 queue
                     .deadline
@@ -1226,7 +1252,7 @@ impl Motor {
                                         tx,
                                         wake,
                                         spill_after,
-                                        windows_queue.as_mut(),
+                                        placement_queue.as_mut(),
                                     )
                                     .await
                             }
@@ -1306,12 +1332,20 @@ impl Motor {
             let mut channel = match opened {
                 Ok(c) => c,
                 Err((reason, detail, retry_after_ms)) => {
+                    if let Some(delay) =
+                        transient_signing_retry(&reason, detail.as_deref(), retry_after_ms)
+                    {
+                        if let Some(queue) = placement_queue.as_mut() {
+                            // No Run was sent. The signer can recover on its own,
+                            // but another endpoint must not bypass its backoff.
+                            queue.retry_at = Some(tokio::time::Instant::now() + delay);
+                            return Ok(true);
+                        }
+                    }
                     if explicit_windows
+                        && reason != RefusalReason::RunnerAuthenticationFailed
                         && (self.has_next_windows_runner(id)
-                            || matches!(
-                                reason,
-                                RefusalReason::Unreachable | RefusalReason::RunnerFull
-                            ))
+                            || windows_retryable_refusal(&reason, detail.as_deref()))
                     {
                         return Ok(true);
                     }
@@ -1579,7 +1613,7 @@ impl Motor {
             .run_sent(id, hosted)
             .inspect_err(|error| self.log_hosted_failure(id, "persist_run", error))?;
         drop(_booking_open);
-        if let Some(queue) = windows_queue {
+        if let Some(queue) = placement_queue {
             queue.run_sent = true;
         }
         if let Err(error) = channel.send(Frame::Run(run)).await {
@@ -1587,7 +1621,7 @@ impl Motor {
             drop(channel);
             drop(snapshots);
             return self
-                .follow_attempt(id, 0, None, tx, wake, spill_after, windows_queue.as_mut())
+                .follow_attempt(id, 0, None, tx, wake, spill_after, placement_queue.as_mut())
                 .await;
         }
         if hosted {
@@ -1647,14 +1681,14 @@ impl Motor {
                 // nor a resubmission is a second job.
                 if !resubmitted
                     && !spilled
-                    && !windows_queue.as_ref().is_some_and(|queue| queue.accepted)
+                    && !placement_queue.as_ref().is_some_and(|queue| queue.accepted)
                 {
                     emit(tx, StreamRecord::Accepted(accepted))
                         .await
                         .inspect_err(|error| {
                             self.log_hosted_failure(id, "accepted_delivery", error)
                         })?;
-                    if let Some(queue) = windows_queue.as_mut() {
+                    if let Some(queue) = placement_queue.as_mut() {
                         queue.accepted = true;
                     }
                 }
@@ -1662,7 +1696,15 @@ impl Motor {
                     drop(channel);
                     drop(snapshots);
                     return self
-                        .follow_attempt(id, 0, None, tx, wake, spill_after, windows_queue.as_mut())
+                        .follow_attempt(
+                            id,
+                            0,
+                            None,
+                            tx,
+                            wake,
+                            spill_after,
+                            placement_queue.as_mut(),
+                        )
                         .await;
                 }
             }
@@ -1673,13 +1715,9 @@ impl Motor {
                 // acknowledgement or an Accepted response alone cannot permit a move.
                 if explicit_windows
                     && !self.pending(id)
-                    && ((reason == RefusalReason::RunnerFull && self.has_next_windows_runner(id))
-                        || (matches!(
-                            reason,
-                            RefusalReason::RunnerFull | RefusalReason::WorkspaceSetupFailed
-                        ) && windows_slot_busy(detail.as_deref())))
+                    && windows_retryable_refusal(&reason, detail.as_deref())
                 {
-                    if let Some(queue) = windows_queue.as_mut() {
+                    if let Some(queue) = placement_queue.as_mut() {
                         queue.retry_delay = queue
                             .retry_delay
                             .max(Duration::from_millis(refusal.retry_after_ms.unwrap_or(0)));
@@ -1726,7 +1764,7 @@ impl Motor {
                 drop(channel);
                 drop(snapshots);
                 return self
-                    .follow_attempt(id, 0, None, tx, wake, spill_after, windows_queue.as_mut())
+                    .follow_attempt(id, 0, None, tx, wake, spill_after, placement_queue.as_mut())
                     .await;
             }
         };
@@ -1754,13 +1792,13 @@ impl Motor {
                         tx,
                         wake,
                         spill_after,
-                        windows_queue.as_mut(),
+                        placement_queue.as_mut(),
                     )
                     .await;
             }
             drop(channel);
             return self
-                .follow_attempt(id, 0, None, tx, wake, spill_after, windows_queue.as_mut())
+                .follow_attempt(id, 0, None, tx, wake, spill_after, placement_queue.as_mut())
                 .await;
         }
         // The first build-server submission can still spill while queued. A
@@ -1775,7 +1813,7 @@ impl Motor {
             tx,
             wake,
             spill_after,
-            windows_queue.as_mut(),
+            placement_queue.as_mut(),
         )
         .await
     }
@@ -2286,7 +2324,7 @@ impl Motor {
         tx: &mpsc::Sender<io::Result<StreamRecord>>,
         mut wake: watch::Receiver<bool>,
         _spill_after: Option<u64>,
-        mut windows_queue: Option<&mut WindowsQueue>,
+        mut placement_queue: Option<&mut PlacementQueue>,
     ) -> io::Result<bool> {
         let hosted = self.hosted_state(id).is_some();
         // Frames to and from the build server carry its ID for the job; records
@@ -2496,7 +2534,7 @@ impl Motor {
                     started_at_ms,
                     path_mapping,
                 })) if job_id == build_server_id => {
-                    windows_queue = None;
+                    placement_queue = None;
                     self.submission_ready(id);
                     if hosted {
                         self.storage.hosted_update(id, |state| {
@@ -2514,7 +2552,7 @@ impl Motor {
                     backoff = 1;
                 }
                 Ok(Incoming::Frame(Frame::Output(output))) => {
-                    windows_queue = None;
+                    placement_queue = None;
                     self.submission_ready(id);
                     if output.seq < cursor {
                         continue;
@@ -2580,13 +2618,12 @@ impl Motor {
                     terminal.job_id = id;
                     if terminal.ran == Some(Ran::None)
                         && matches!(&terminal.outcome, Outcome::RefusedBeforeStart { reason }
-                            if *reason == RefusalReason::Unreachable
-                                || (*reason == RefusalReason::RunnerFull && self.has_next_windows_runner(id))
-                                || (matches!(reason, RefusalReason::RunnerFull | RefusalReason::WorkspaceSetupFailed)
-                                    && windows_slot_busy(terminal.refusal_detail.as_deref())))
+                            if windows_retryable_refusal(reason, terminal.refusal_detail.as_deref()))
                         && !self.pending(id)
                     {
-                        if let Some(queue) = windows_queue.as_mut() {
+                        if let Some(queue) =
+                            placement_queue.as_mut().filter(|queue| queue.cycle_windows)
+                        {
                             queue.retry_delay = queue
                                 .retry_delay
                                 .max(Duration::from_millis(terminal.retry_after_ms.unwrap_or(0)));
@@ -3123,6 +3160,33 @@ impl Motor {
 }
 
 pub(crate) const WINDOWS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+// A before-start refusal releases this destination, not the job's shared wait
+// budget. Treat the last runner like every other runner so a later pass can
+// use capacity that freed up elsewhere.
+fn windows_retryable_refusal(reason: &RefusalReason, detail: Option<&str>) -> bool {
+    matches!(
+        reason,
+        RefusalReason::Unreachable | RefusalReason::RunnerDraining | RefusalReason::RunnerFull
+    ) || (*reason == RefusalReason::WorkspaceSetupFailed && windows_slot_busy(detail))
+}
+
+fn transient_signing_retry(
+    reason: &RefusalReason,
+    detail: Option<&str>,
+    retry_after_ms: Option<u64>,
+) -> Option<Duration> {
+    if *reason == RefusalReason::RunnerAuthenticationFailed
+        && matches!(
+            detail,
+            Some("runner_sign_unavailable" | "runner_sign_invalid_response")
+        )
+    {
+        retry_after_ms.map(Duration::from_millis)
+    } else {
+        None
+    }
+}
 
 fn windows_slot_busy(detail: Option<&str>) -> bool {
     detail.is_some_and(|detail| {

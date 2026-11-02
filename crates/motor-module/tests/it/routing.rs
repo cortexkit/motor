@@ -32,6 +32,31 @@ struct Visit {
     at: tokio::time::Instant,
 }
 
+#[derive(Default)]
+struct DispatchLog {
+    runs: Vec<(Uuid, Uuid, String)>,
+    unresolved: std::collections::HashMap<Uuid, Uuid>,
+}
+
+impl DispatchLog {
+    fn sent(&mut self, caller: Uuid, destination: Uuid, instance: &str) {
+        assert!(
+            !self.unresolved.contains_key(&caller),
+            "a previous destination may still run this job"
+        );
+        assert!(
+            self.runs.iter().all(|(_, id, _)| *id != destination),
+            "a resend must not replay a retained refusal"
+        );
+        self.unresolved.insert(caller, destination);
+        self.runs.push((caller, destination, instance.into()));
+    }
+
+    fn finished(&mut self, destination: Uuid) {
+        self.unresolved.retain(|_, id| *id != destination);
+    }
+}
+
 struct RoutingPeer {
     visits: Mutex<Vec<Visit>>,
     frames: Arc<Mutex<Vec<Frame>>>,
@@ -49,6 +74,7 @@ struct RoutingPeer {
     queue_release: Arc<tokio::sync::Semaphore>,
     endpoints: Mutex<Vec<crate::WindowsRunner>>,
     refused: Arc<Mutex<std::collections::HashMap<Uuid, TerminalRecord>>>,
+    dispatches: Arc<Mutex<DispatchLog>>,
 }
 
 impl RoutingPeer {
@@ -75,6 +101,7 @@ impl RoutingPeer {
             queue_release: Arc::new(tokio::sync::Semaphore::new(0)),
             endpoints: Mutex::new(Vec::new()),
             refused: Arc::default(),
+            dispatches: Arc::default(),
         })
     }
     fn motor(self: &Arc<Self>, config: Config) -> Motor {
@@ -136,17 +163,24 @@ impl Connector for RoutingPeer {
             self.ally_behavior.load(Ordering::SeqCst)
         } else if instance == "windows" {
             self.last_behavior.load(Ordering::SeqCst)
+        } else if instance == "macos-signing" {
+            18
         } else {
             0
         };
         let windows = instance == "windows" || instance == "ally-windows";
+        let macos = instance == "macos-signing";
         let offline = windows && self.fail_windows.load(Ordering::SeqCst);
-        let platforms = if windows {
+        let platforms = if macos {
+            vec!["macos".into()]
+        } else if windows {
             self.platforms.clone()
         } else {
             Vec::new()
         };
-        let echo = if windows {
+        let echo = if macos {
+            Some(Platform::Macos)
+        } else if windows {
             self.echo.clone()
         } else {
             Some(Platform::Linux)
@@ -164,12 +198,16 @@ impl Connector for RoutingPeer {
         let queued = self.queued.clone();
         let queue_release = self.queue_release.clone();
         let refused = self.refused.clone();
+        let dispatches = self.dispatches.clone();
         Box::pin(async move {
             if behavior == 1 {
                 return std::future::pending().await;
             }
             if offline || behavior == 12 {
-                return Err(io::Error::other("windows peer offline"));
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "windows peer offline",
+                ));
             }
             let (client, mut peer) = tokio::io::duplex(65536);
             tokio::spawn(async move {
@@ -212,7 +250,7 @@ impl Connector for RoutingPeer {
                         }
                         Frame::Run(run) => {
                             let stored = crate::storage::durable_value(&module_state).unwrap();
-                            let binding = stored["jobs"]
+                            let (caller, binding) = stored["jobs"]
                                 .as_object()
                                 .unwrap()
                                 .iter()
@@ -220,20 +258,38 @@ impl Connector for RoutingPeer {
                                     *caller == &id.to_string()
                                         || job["build_server_job_id"] == id.to_string()
                                 })
-                                .unwrap()
-                                .1;
+                                .unwrap();
                             assert_eq!(
                                 binding["runner_instance"], instance,
                                 "binding must be durable before Run"
                             );
-                            assert_eq!(run.platform, windows.then_some(Platform::Windows));
-                            if matches!(behavior, 2 | 13 | 17) {
+                            assert_eq!(
+                                run.platform,
+                                if macos {
+                                    Some(Platform::Macos)
+                                } else {
+                                    windows.then_some(Platform::Windows)
+                                }
+                            );
+                            if windows {
+                                dispatches.lock().unwrap().sent(
+                                    Uuid::parse_str(caller).unwrap(),
+                                    id,
+                                    &instance,
+                                );
+                            }
+                            if matches!(behavior, 2 | 13 | 17 | 20) {
+                                dispatches.lock().unwrap().finished(id);
                                 let _ = write_frame_async(
                                     &mut peer,
                                     &Frame::Refusal(Refusal {
                                         job_id: Some(id),
                                         transfer_id: None,
-                                        reason: RefusalReason::RunnerFull,
+                                        reason: if behavior == 20 {
+                                            RefusalReason::RunnerDraining
+                                        } else {
+                                            RefusalReason::RunnerFull
+                                        },
                                         disk_full: None,
                                         retry_after_ms: None,
                                         detail: Some(
@@ -241,6 +297,8 @@ impl Connector for RoutingPeer {
                                                 "windows_slot_busy"
                                             } else if behavior == 17 {
                                                 "runner awaiting qualification"
+                                            } else if behavior == 20 {
+                                                "runner draining"
                                             } else {
                                                 "job exceeds runner capacity"
                                             }
@@ -279,10 +337,11 @@ impl Connector for RoutingPeer {
                                     write_frame_async(&mut peer, &Frame::Terminal(terminal)).await;
                                 return;
                             }
-                            if matches!(behavior, 8..=11 | 14..=16 | 19) {
+                            if matches!(behavior, 8..=11 | 14..=16 | 19 | 21) {
                                 let mut terminal = TerminalRecord::new(id, Outcome::RefusedBeforeStart {
                                     reason: if behavior == 8 { RefusalReason::WorkspaceSetupFailed }
                                         else if behavior == 14 { RefusalReason::Unreachable }
+                                        else if behavior == 21 { RefusalReason::RunnerDraining }
                                         else { RefusalReason::RunnerFull },
                                 }, 0, 0, 0).with_ran(match behavior {
                                     10 => Ran::Unknown("maybe".into()),
@@ -311,6 +370,7 @@ impl Connector for RoutingPeer {
                                     .await;
                                 }
                                 refused.lock().unwrap().insert(id, terminal.clone());
+                                dispatches.lock().unwrap().finished(id);
                                 let _ =
                                     write_frame_async(&mut peer, &Frame::Terminal(terminal)).await;
                                 return;
@@ -325,6 +385,7 @@ impl Connector for RoutingPeer {
                                 .await;
                                 queued.notify_one();
                                 queue_release.acquire().await.unwrap().forget();
+                                dispatches.lock().unwrap().finished(id);
                                 let _ = write_frame_async(
                                     &mut peer,
                                     &Frame::Started {
@@ -369,6 +430,7 @@ impl Connector for RoutingPeer {
                                 )
                                 .await;
                             } else if behavior == 18 {
+                                dispatches.lock().unwrap().finished(id);
                                 let _ = write_frame_async(
                                     &mut peer,
                                     &Frame::Terminal(
@@ -384,6 +446,7 @@ impl Connector for RoutingPeer {
                                 )
                                 .await;
                             } else {
+                                dispatches.lock().unwrap().finished(id);
                                 let _ =
                                     write_frame_async(&mut peer, &terminal(id, request.from_seq))
                                         .await;
@@ -463,6 +526,214 @@ fn ordered(config: Config) -> Config {
             },
         ],
         ..config
+    }
+}
+
+struct SigningFaultPeer {
+    peer: Arc<RoutingPeer>,
+    code: &'static str,
+    hint: Option<u64>,
+    late: bool,
+    connected: AtomicBool,
+    recovered: AtomicBool,
+    faults: Mutex<Vec<tokio::time::Instant>>,
+    attempts: Mutex<Vec<tokio::time::Instant>>,
+    observed: tokio::sync::Notify,
+}
+
+impl SigningFaultPeer {
+    fn motor(
+        f: &Fixture,
+        platform: Platform,
+        code: &'static str,
+        hint: Option<u64>,
+        late: bool,
+    ) -> (Arc<Self>, Motor) {
+        let peer = RoutingPeer::new(f);
+        peer.ally_behavior.store(18, Ordering::SeqCst);
+        peer.last_behavior.store(18, Ordering::SeqCst);
+        let mut config = ordered(f.config.clone());
+        if platform == Platform::Macos {
+            config.macos_runner = Some(crate::MacosRunner {
+                host: "macos.example.invalid".into(),
+                port: 22,
+                user: "motor".into(),
+                host_key: config.windows_runners[0].host_key.clone(),
+                instance: "macos-signing".into(),
+                state_root: "/Users/motor/state".into(),
+            });
+        }
+        let fault = Arc::new(Self {
+            peer,
+            code,
+            hint,
+            late,
+            connected: AtomicBool::new(false),
+            recovered: AtomicBool::new(false),
+            faults: Mutex::default(),
+            attempts: Mutex::default(),
+            observed: tokio::sync::Notify::new(),
+        });
+        let motor = Motor::with_connector(config, &fault.peer.module_state, fault.clone()).unwrap();
+        (fault, motor)
+    }
+}
+
+impl Connector for SigningFaultPeer {
+    fn refusal(&self) -> Option<&'static str> {
+        (!self.recovered.load(Ordering::SeqCst)
+            && (!self.late || self.connected.load(Ordering::SeqCst)))
+        .then_some(self.code)
+    }
+
+    fn retry_after_ms(&self, code: &str) -> Option<u64> {
+        assert_eq!(code, self.code);
+        self.faults
+            .lock()
+            .unwrap()
+            .push(tokio::time::Instant::now());
+        self.observed.notify_one();
+        self.hint
+    }
+
+    fn connect(
+        &self,
+        _: Uuid,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + '_>> {
+        panic!("signing tests must use an explicit runner endpoint")
+    }
+
+    fn connect_to<'a>(
+        &'a self,
+        id: Uuid,
+        instance: &'a str,
+        root: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn Duplex>>> + Send + 'a>> {
+        self.attempts
+            .lock()
+            .unwrap()
+            .push(tokio::time::Instant::now());
+        self.connected.store(true, Ordering::SeqCst);
+        if !self.recovered.load(Ordering::SeqCst) {
+            Box::pin(async { Err(io::Error::other("signing transport unavailable")) })
+        } else {
+            self.peer.connect_to(id, instance, root)
+        }
+    }
+}
+
+#[tokio::test]
+async fn windows_and_macos_transient_signing_waits_for_hint_then_recovers() {
+    for platform in [Platform::Windows, Platform::Macos] {
+        for late in [false, true] {
+            for code in ["runner_sign_unavailable", "runner_sign_invalid_response"] {
+                let f = Fixture::new(Cut::None, 28).await;
+                let (fault, motor) =
+                    SigningFaultPeer::motor(&f, platform.clone(), code, Some(2_000), late);
+                let mut request = f.request("true").with_platform(platform.clone());
+                request.queue_wait_limit_s = Some(30);
+                let stream = motor.run(request).unwrap();
+                tokio::time::timeout(Duration::from_secs(10), fault.observed.notified())
+                    .await
+                    .unwrap();
+                fault.recovered.store(true, Ordering::SeqCst);
+                let records = tokio::time::timeout(Duration::from_secs(15), collect(stream))
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(records.last(), Some(StreamRecord::Terminal(t)) if t.outcome == Outcome::Exit { code: 0 })
+                );
+                assert_eq!(
+                    records
+                        .iter()
+                        .filter(|r| matches!(r, StreamRecord::Accepted(_)))
+                        .count(),
+                    1
+                );
+                let frames = fault.peer.frames.lock().unwrap();
+                let runs: Vec<_> = frames
+                    .iter()
+                    .filter_map(|f| {
+                        if let Frame::Run(run) = f {
+                            Some(run)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert_eq!(runs.len(), 1);
+                assert!(
+                    runs[0].queue_wait_limit_s <= 28,
+                    "signing must spend the shared budget"
+                );
+                let first_fault = fault.faults.lock().unwrap()[0];
+                let first_success = fault.peer.visits.lock().unwrap()[0].at;
+                assert!(
+                    first_success.duration_since(first_fault) >= Duration::from_secs(2),
+                    "a different endpoint must not bypass the signing backoff"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn windows_and_macos_transient_signing_exhausts_shared_budget() {
+    for platform in [Platform::Windows, Platform::Macos] {
+        for late in [false, true] {
+            let f = Fixture::new(Cut::None, 28).await;
+            let (fault, motor) = SigningFaultPeer::motor(
+                &f,
+                platform.clone(),
+                "runner_sign_unavailable",
+                Some(2_000),
+                late,
+            );
+            let mut request = f.request("true").with_platform(platform.clone());
+            request.queue_wait_limit_s = Some(3);
+            let records = collect(motor.run(request).unwrap()).await;
+            assert!(
+                matches!(records.last(), Some(StreamRecord::Terminal(t)) if t.outcome == Outcome::RefusedBeforeStart { reason: RefusalReason::QueueWaitExceeded } && t.ran == Some(Ran::None))
+            );
+            assert!(fault.peer.frames.lock().unwrap().is_empty());
+            assert!(!records
+                .iter()
+                .any(|r| matches!(r, StreamRecord::Accepted(_))));
+            let attempts = fault.attempts.lock().unwrap();
+            for pair in attempts.windows(2) {
+                assert!(pair[1].duration_since(pair[0]) >= Duration::from_secs(2));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn windows_and_macos_nontransient_signing_is_an_immediate_typed_refusal() {
+    for platform in [Platform::Windows, Platform::Macos] {
+        for late in [false, true] {
+            for code in [
+                "runner_sign_unavailable",
+                "runner_sign_missing",
+                "runner_sign_grant_refused",
+                "runner_credential_missing",
+                "runner_credential_grant_refused",
+            ] {
+                let f = Fixture::new(Cut::None, 28).await;
+                let (fault, motor) =
+                    SigningFaultPeer::motor(&f, platform.clone(), code, None, late);
+                let records = collect(
+                    motor
+                        .run(f.request("true").with_platform(platform.clone()))
+                        .unwrap(),
+                )
+                .await;
+                assert!(
+                    matches!(records.last(), Some(StreamRecord::Terminal(t)) if t.outcome == Outcome::RefusedBeforeStart { reason: RefusalReason::RunnerAuthenticationFailed } && t.ran == Some(Ran::None) && t.refusal_detail() == Some(code) && t.retry_after_ms().is_none())
+                );
+                assert_eq!(fault.attempts.lock().unwrap().len(), usize::from(late));
+                assert!(fault.peer.frames.lock().unwrap().is_empty());
+            }
+        }
     }
 }
 
@@ -616,6 +887,10 @@ async fn ordered_windows_both_busy_queue_on_last_runner_with_non_spill_budget() 
     request.queue_wait_limit_s = None;
     let mut stream = motor.run(request).unwrap();
     assert_windows_queued(&peer, &mut stream).await;
+    peer.ally_behavior.store(18, Ordering::SeqCst);
+    // Acceptance keeps the job assigned to its runner unless a later refusal
+    // proves the command never ran, even if another runner becomes available.
+    tokio::time::sleep(Duration::from_secs(6)).await;
     {
         let visits = peer.visits.lock().unwrap();
         assert_eq!(visits[0].instance, "ally-windows");
@@ -634,39 +909,32 @@ async fn ordered_windows_both_busy_queue_on_last_runner_with_non_spill_budget() 
     }
     peer.queue_release.add_permits(1);
     assert_windows_queue_completes(stream).await;
+    assert!(peer.dispatches.lock().unwrap().unresolved.is_empty());
 }
 
 #[tokio::test]
-async fn ordered_windows_last_runner_admission_full_still_refuses() {
+async fn ordered_windows_last_runner_admission_full_spends_shared_budget() {
     let f = Fixture::new(Cut::None, 28).await;
     let peer = RoutingPeer::new(&f);
     peer.ally_behavior.store(5, Ordering::SeqCst);
     peer.last_behavior.store(13, Ordering::SeqCst);
     let motor = peer.motor(ordered(f.config.clone()));
-    let records = collect(
-        motor
-            .run(f.request("true").with_platform(Platform::Windows))
-            .unwrap(),
-    )
-    .await;
+    let mut request = f.request("true").with_platform(Platform::Windows);
+    request.queue_wait_limit_s = Some(12);
+    let records = collect(motor.run(request).unwrap()).await;
     assert!(matches!(
         records.last(),
         Some(StreamRecord::Terminal(TerminalRecord {
             outcome: Outcome::RefusedBeforeStart {
-                reason: RefusalReason::RunnerFull
+                reason: RefusalReason::QueueWaitExceeded
             },
+            ran: Some(Ran::None),
             ..
         }))
     ));
-    assert_eq!(
-        peer.frames
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|frame| matches!(frame, Frame::Run(_)))
-            .count(),
-        1
-    );
+    let dispatches = peer.dispatches.lock().unwrap();
+    assert!(dispatches.runs.len() >= 2);
+    assert!(dispatches.unresolved.is_empty());
 }
 
 #[tokio::test]
@@ -888,58 +1156,137 @@ async fn wait_for_windows_runs(peer: &RoutingPeer, count: usize) {
 }
 
 #[tokio::test]
-async fn ordered_windows_last_unreachable_revisits_busy_earlier_runner() {
-    let f = Fixture::new(Cut::None, 28).await;
-    let peer = RoutingPeer::new(&f);
-    peer.ally_behavior.store(5, Ordering::SeqCst);
-    peer.last_behavior.store(12, Ordering::SeqCst);
-    let motor = peer.motor(ordered(f.config.clone()));
-    let stream = motor
-        .run(f.request("true").with_platform(Platform::Windows))
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if peer
+async fn ordered_windows_last_stopped_or_draining_revisits_first_when_free() {
+    for behavior in [20, 21, 12, 1] {
+        let f = Fixture::new(Cut::None, 28).await;
+        let peer = RoutingPeer::new(&f);
+        peer.ally_behavior.store(5, Ordering::SeqCst);
+        peer.last_behavior.store(behavior, Ordering::SeqCst);
+        let motor = peer.motor(ordered(f.config.clone()));
+        let mut request = f.request("true").with_platform(Platform::Windows);
+        request.queue_wait_limit_s = Some(30);
+        let stream = motor.run(request).unwrap();
+        let id = stream.job_id;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !peer
                 .visits
                 .lock()
                 .unwrap()
                 .iter()
                 .any(|v| v.instance == "windows")
             {
-                break;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    peer.ally_behavior.store(0, Ordering::SeqCst);
-    let records = collect(stream).await;
-    assert!(matches!(records.last(), Some(StreamRecord::Terminal(_))));
-    let visits = peer.visits.lock().unwrap();
-    let offline = visits
-        .iter()
-        .rposition(|v| v.instance == "windows")
+        })
+        .await
         .unwrap();
-    assert!(visits[offline + 1..]
-        .iter()
-        .all(|v| v.instance == "ally-windows"));
-    assert!(visits[offline + 1].at.duration_since(visits[offline].at) >= Duration::from_secs(5));
+        peer.ally_behavior.store(18, Ordering::SeqCst);
+        let records = tokio::time::timeout(Duration::from_secs(15), collect(stream))
+            .await
+            .expect("a free first runner must be used within the shared budget");
+        assert!(
+            matches!(records.last(), Some(StreamRecord::Terminal(t)) if t.outcome == Outcome::Exit { code: 0 } && t.ran == Some(Ran::Remote)),
+            "behavior {behavior}: {records:?}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| matches!(r, StreamRecord::Accepted(_)))
+                .count(),
+            1
+        );
+        let dispatches = peer.dispatches.lock().unwrap();
+        assert_eq!(dispatches.runs.last().unwrap().2, "ally-windows");
+        assert_eq!(dispatches.runs.len(), if behavior <= 12 { 1 } else { 2 });
+        assert!(dispatches.unresolved.is_empty());
+        let stored = crate::storage::durable_value(&peer.module_state).unwrap();
+        let job = &stored["jobs"][id.to_string()];
+        assert_eq!(job["windows_runner"]["name"], "ally");
+        if behavior > 12 {
+            assert_ne!(job["build_server_job_id"], id.to_string());
+            assert_eq!(
+                job["build_server_job_id"],
+                dispatches.runs.last().unwrap().1.to_string()
+            );
+        }
+        let visits = peer.visits.lock().unwrap();
+        let last = visits
+            .iter()
+            .rposition(|v| v.instance == "windows")
+            .unwrap();
+        assert!(visits[last + 1..]
+            .iter()
+            .all(|v| v.instance == "ally-windows"));
+        assert!(visits[last + 1].at.duration_since(visits[last].at) >= Duration::from_secs(5));
+    }
+}
+
+#[tokio::test]
+async fn ordered_windows_all_busy_recover_on_whichever_runner_frees() {
+    for free_first in [true, false] {
+        let f = Fixture::new(Cut::None, 28).await;
+        let peer = RoutingPeer::new(&f);
+        peer.ally_behavior.store(2, Ordering::SeqCst);
+        peer.last_behavior.store(13, Ordering::SeqCst);
+        let motor = peer.motor(ordered(f.config.clone()));
+        let mut request = f.request("true").with_platform(Platform::Windows);
+        request.queue_wait_limit_s = Some(30);
+        let stream = motor.run(request).unwrap();
+        wait_for_windows_runs(&peer, 2).await;
+        if free_first {
+            peer.ally_behavior.store(18, Ordering::SeqCst);
+        } else {
+            peer.last_behavior.store(18, Ordering::SeqCst);
+        }
+        let records = tokio::time::timeout(Duration::from_secs(15), collect(stream))
+            .await
+            .unwrap();
+        assert!(
+            matches!(records.last(), Some(StreamRecord::Terminal(t)) if t.outcome == Outcome::Exit { code: 0 })
+        );
+        let dispatches = peer.dispatches.lock().unwrap();
+        assert_eq!(dispatches.runs.len(), if free_first { 3 } else { 4 });
+        assert_eq!(
+            dispatches.runs.last().unwrap().2,
+            if free_first {
+                "ally-windows"
+            } else {
+                "windows"
+            }
+        );
+        assert!(dispatches.unresolved.is_empty());
+    }
 }
 
 #[tokio::test]
 async fn ordered_windows_retry_exhausts_budget_instead_of_refusing_unreachable() {
     let f = Fixture::new(Cut::None, 28).await;
     let peer = RoutingPeer::new(&f);
-    peer.ally_behavior.store(5, Ordering::SeqCst);
+    peer.ally_behavior.store(12, Ordering::SeqCst);
     peer.last_behavior.store(12, Ordering::SeqCst);
     let motor = peer.motor(ordered(f.config.clone()));
     let mut request = f.request("true").with_platform(Platform::Windows);
-    request.queue_wait_limit_s = Some(1);
+    request.queue_wait_limit_s = Some(18);
     let records = collect(motor.run(request).unwrap()).await;
     assert!(
         matches!(records.last(), Some(StreamRecord::Terminal(t)) if t.outcome == Outcome::RefusedBeforeStart { reason: RefusalReason::QueueWaitExceeded } && t.ran == Some(Ran::None))
     );
+    assert!(!records
+        .iter()
+        .any(|r| matches!(r, StreamRecord::Accepted(_))));
+    assert!(peer.dispatches.lock().unwrap().runs.is_empty());
+    let visits = peer.visits.lock().unwrap();
+    let passes: Vec<_> =
+        visits
+            .iter()
+            .map(|v| v.instance.as_str())
+            .fold(Vec::new(), |mut passes, instance| {
+                if passes.last().copied() != Some(instance) {
+                    passes.push(instance);
+                }
+                passes
+            });
+    assert!(passes.starts_with(&["ally-windows", "windows", "ally-windows"]));
 }
 
 #[tokio::test]
