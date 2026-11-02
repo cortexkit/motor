@@ -1338,7 +1338,11 @@ mod guest {
                 motor_winagent::quote_windows_arg(BASH),
                 motor_winagent::quote_windows_arg(&command.command)
             ));
-            let cwd = wide(&mapped_cwd(&command.cwd)?);
+            let cwd = motor_winagent::bun::windows_path::extended_length(
+                mapped_cwd(&command.cwd)?.encode_utf16(),
+            )?;
+            let application =
+                motor_winagent::bun::windows_path::extended_length(BASH.encode_utf16())?;
             let mut process: PROCESS_INFORMATION = unsafe { zeroed() };
             // Create suspended, assign to the non-breakaway Job Object, and only
             // then resume. PROC_THREAD_ATTRIBUTE_HANDLE_LIST permits only stdin,
@@ -1347,7 +1351,7 @@ mod guest {
             unsafe {
                 win32(CreateProcessAsUserW(
                     user.token.0,
-                    wide(BASH).as_ptr(),
+                    application.as_ptr(),
                     line.as_mut_ptr(),
                     null(),
                     null(),
