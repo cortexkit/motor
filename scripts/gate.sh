@@ -38,7 +38,7 @@ root=$(pwd -P)
 usage() {
   echo 'Usage: scripts/gate.sh [--fast | --lane NAME ...] [--serial]'
   echo 'Default: fast, then all available lanes in parallel.'
-  echo 'Lanes: linux-lint linux-tests windows-clippy musl script-tests macos-clippy'
+  echo 'Lanes: linux-lint linux-tests mixed-version windows-clippy musl script-tests macos-clippy'
   echo '--lane always runs fast first; --fast submits no jobs and builds nothing.'
   echo '--serial runs remote lanes in one job from this checkout (no side clones).'
   echo 'Parallel checkouts: $MOTOR_GATE_ROOT or ~/Work/Projects/CortexKit-scratch/motor-gate/<lane>.'
@@ -56,7 +56,7 @@ while [ "$#" -gt 0 ]; do
     --lane)
       [ "$#" -ge 2 ] || { usage >&2; exit 2; }
       case "$2" in
-        linux-lint|linux-tests|windows-clippy|musl|script-tests|macos-clippy) ;;
+        linux-lint|linux-tests|mixed-version|windows-clippy|musl|script-tests|macos-clippy) ;;
         *) echo "Unknown lane: $2" >&2; exit 2 ;;
       esac
       for lane in "${lanes[@]+${lanes[@]}}"; do
@@ -71,7 +71,7 @@ if $fast_only && [ "${#lanes[@]}" -ne 0 ]; then
   exit 2
 fi
 if [ "${#lanes[@]}" -eq 0 ] && ! $fast_only; then
-  lanes=(linux-lint linux-tests windows-clippy musl script-tests)
+  lanes=(linux-lint linux-tests mixed-version windows-clippy musl script-tests)
   if [ "$(uname -s)" = Darwin ] && command -v cargo >/dev/null; then
     lanes+=(macos-clippy)
   fi
@@ -146,8 +146,19 @@ command_for() {
       trap '\''rm -rf "$scratch"'\'' EXIT
       printf reflink >"$scratch/source"
       cp --reflink=always "$scratch/source" "$scratch/copy"
-      cargo nextest run --workspace --locked --no-tests fail
-      python3 scripts/mixed-version.py' ;;
+      # This test needs a real SSH login shell, which a sandboxed runner job
+      # never has (CI installs sshd on its own VM). Run it directly on a host
+      # with sshd, outside a job; left in here, it fails first and nextest
+      # stops the whole suite.
+      cargo nextest run --workspace --locked --no-tests fail \
+        -E '\''not test(=transport::master_tests::two_ssh_runs_share_one_master_and_one_vault_sign)'\''' ;;
+    mixed-version) printf '%s\n' '
+      # The old-client check builds pinned production revisions, which must be
+      # downloaded, so this is the only lane sent with --net (jobs set
+      # CARGO_NET_OFFLINE=true even then). It stays apart from linux-tests: a
+      # network job mounts a private Cargo overlay that some runner tests find
+      # in the live mount table and cannot read.
+      CARGO_NET_OFFLINE=false python3 scripts/mixed-version.py' ;;
     windows-clippy) printf '%s\n' '
       rustup target add x86_64-pc-windows-gnu
       cargo clippy -p motor-runner --target x86_64-pc-windows-gnu --lib --bins --locked -- -D warnings' ;;
@@ -242,7 +253,10 @@ export CARGO_TERM_COLOR=never'
 
 if $serial && [ "${#remote_lanes[@]}" -gt 0 ]; then
   serial_body='set -uo pipefail; failed=0'
+  online=false
   for lane in "${remote_lanes[@]}"; do
+    # mixed-version needs network; it runs as its own job beside the serial one.
+    if [ "$lane" = mixed-version ]; then online=true; continue; fi
     printf -v quoted '%q' "$(body_for "$lane")"
     serial_body+="
 start=\$SECONDS; code=0
@@ -252,6 +266,7 @@ echo \"gate $lane \$result exit=\$code (\$((SECONDS - start))s)\""
   done
   serial_body+=$'\nexit "$failed"'
   lanes=(remote-serial)
+  $online && lanes+=(mixed-version)
   # Native macOS lint cannot run inside the Linux serial job.
   $native && lanes+=(macos-clippy)
 fi
@@ -266,6 +281,10 @@ for lane in "${lanes[@]}"; do
       bash -c "$body" >"$logs/$lane.log" 2>&1 || code=$?
     elif [ "$lane" = remote-serial ]; then
       ck motor run --vcpus 16 --cwd "$root" -- "$serial_body" >"$logs/$lane.log" 2>&1 || code=$?
+    elif [ "$lane" = mixed-version ]; then
+      cwd="$lane_root/$lane"
+      $serial && cwd=$root
+      ck motor run --vcpus 16 --net --cwd "$cwd" -- "$body" >"$logs/$lane.log" 2>&1 || code=$?
     else
       ck motor run --vcpus 16 --cwd "$lane_root/$lane" -- "$body" >"$logs/$lane.log" 2>&1 || code=$?
     fi
