@@ -152,6 +152,7 @@ fn lifecycle(seq: u64, event: TenantEventKind, job: Uuid) -> TenantEvent {
         setup: None,
         mem_peak_mib: None,
         mem_working_peak_mib: None,
+        remote_cache_totals: None,
     }
 }
 

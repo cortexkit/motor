@@ -9325,6 +9325,16 @@ impl Runner {
         } else {
             Ok(())
         };
+        #[cfg(unix)]
+        let remote_cache_totals = if self.core.config.tenant_vm
+            && self.core.config.remote_cache
+            && self.core.config.remote_cache_runtime.is_some()
+            && job.durable_output
+        {
+            crate::remote_cache::job_totals::read(&self.core.trees.state, id)
+        } else {
+            None
+        };
         // Settling a warm build waits on child processes and the disk (see
         // `clean_base`), seconds on a loaded host, so that part runs here,
         // without the state lock. Until `record_base` runs below, the build
@@ -9507,6 +9517,10 @@ impl Runner {
                 Err(_) => Outcome::OutcomeUnknown,
             };
             let mut finished = inner.jobs[&id].clone();
+            #[cfg(unix)]
+            {
+                finished.remote_cache_totals = remote_cache_totals;
+            }
             #[cfg(unix)]
             if self.core.config.macos_instance()
                 && finished.kill.is_none()

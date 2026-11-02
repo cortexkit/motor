@@ -13,6 +13,8 @@ pub(crate) mod ccache;
 pub(crate) mod environment;
 #[cfg(unix)]
 pub(crate) mod gateway;
+#[cfg(unix)]
+pub(crate) mod job_totals;
 pub(crate) mod provisioning;
 pub(crate) mod publication;
 pub(crate) mod publishing;

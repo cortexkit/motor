@@ -185,6 +185,15 @@ pub enum RefusedCause {
     Expired,
 }
 
+/// Job-private compiler cache counts. Untrusted measurement only, never billing
+/// or admission input and never forwarded to the broker.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteCacheTotals {
+    pub hits: u64,
+    pub misses: u64,
+    pub errors: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TenantEvent {
     pub event_seq: u64,
@@ -203,6 +212,8 @@ pub struct TenantEvent {
     /// or billing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_working_peak_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_cache_totals: Option<RemoteCacheTotals>,
 }
 
 /// Trusted operation names only; never command arguments, paths or peer text.

@@ -121,6 +121,11 @@ fn finished_successful_unit_keeps_final_summary_peak_in_durable_lifecycle() {
         });
         job.memory_accounting_pending = true;
         job.mem_working_peak_mib = serde_json::from_value(serde_json::json!(3)).unwrap();
+        job.remote_cache_totals = Some(motor_protocol::RemoteCacheTotals {
+            hits: 7,
+            misses: 3,
+            errors: 1,
+        });
         job.execution_ended_ms = Some(now + 100);
         job.terminal_ended(Outcome::Exit { code: 0 }, now + 100);
         runner.tenant_events().unwrap().admit(id).unwrap();
@@ -137,6 +142,14 @@ fn finished_successful_unit_keeps_final_summary_peak_in_durable_lifecycle() {
         let disk: Job = read_json(&runner.record_path(id)).unwrap();
         assert_eq!(disk.mem_peak_mib, expected);
         assert_eq!(disk.mem_working_peak_mib.get(), Some(3));
+        assert_eq!(
+            disk.remote_cache_totals,
+            Some(motor_protocol::RemoteCacheTotals {
+                hits: 7,
+                misses: 3,
+                errors: 1,
+            })
+        );
         assert!(!disk.memory_accounting_pending);
         assert_eq!(disk.terminal.unwrap().outcome, Outcome::Exit { code: 0 });
         let events = pending(&runner);
@@ -144,6 +157,7 @@ fn finished_successful_unit_keeps_final_summary_peak_in_durable_lifecycle() {
         assert_eq!(events[0].event, TenantEventKind::Terminal);
         assert_eq!(events[0].mem_peak_mib, expected);
         assert_eq!(events[0].mem_working_peak_mib, Some(3));
+        assert_eq!(events[0].remote_cache_totals, disk.remote_cache_totals);
         let counts = runner.core.health.lock().unwrap().counts(runner.now());
         assert_eq!(
             counts.memory_peak_unavailable,

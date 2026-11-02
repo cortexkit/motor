@@ -56,6 +56,7 @@ fn pinned_tenant_frames_are_inline_and_integer_only() {
         setup: None,
         mem_peak_mib: None,
         mem_working_peak_mib: None,
+        remote_cache_totals: None,
     });
     assert_eq!(
         serde_json::to_value(event).unwrap(),
@@ -69,6 +70,7 @@ fn pinned_tenant_frames_are_inline_and_integer_only() {
         setup: None,
         mem_peak_mib: None,
         mem_working_peak_mib: None,
+        remote_cache_totals: None,
     });
     assert_eq!(
         serde_json::to_value(idle).unwrap(),
@@ -107,6 +109,53 @@ fn working_peak_is_additive_for_old_lifecycle_readers() {
             panic!("event expected")
         };
         assert_eq!(new.mem_working_peak_mib, peak);
+        assert_eq!(serde_json::to_value(Frame::Event(new)).unwrap(), value);
+    }
+}
+
+#[test]
+fn remote_cache_totals_are_additive_for_old_lifecycle_readers() {
+    #[derive(serde::Deserialize)]
+    struct OldEvent {
+        event_seq: u64,
+        event: TenantEventKind,
+        jti: Option<Uuid>,
+        cause: Option<RefusedCause>,
+        setup: Option<TenantSetupPhase>,
+        mem_peak_mib: Option<u64>,
+        mem_working_peak_mib: Option<u64>,
+    }
+    for totals in [
+        None,
+        Some(motor_protocol::RemoteCacheTotals {
+            hits: 7,
+            misses: 3,
+            errors: u64::MAX,
+        }),
+    ] {
+        let mut value = json!({"type":"event","event_seq":3,"event":"terminal","jti":"00000000-0000-4000-8000-000000000001","mem_peak_mib":1600,"mem_working_peak_mib":513});
+        if let Some(totals) = totals {
+            value["remote_cache_totals"] = json!({"hits": 7, "misses": 3, "errors": u64::MAX});
+            assert_eq!(
+                serde_json::to_value(totals).unwrap(),
+                value["remote_cache_totals"]
+            );
+        }
+        // The host decodes the event object directly, ignoring unknown fields.
+        let old: OldEvent = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(old.event_seq, 3);
+        assert_eq!(old.event, TenantEventKind::Terminal);
+        assert!(old.jti.is_some());
+        assert_eq!(old.cause, None);
+        assert_eq!(old.setup, None);
+        assert_eq!(old.mem_peak_mib, Some(1600));
+        assert_eq!(old.mem_working_peak_mib, Some(513));
+        let direct: motor_protocol::TenantEvent = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(direct.remote_cache_totals, totals);
+        let Frame::Event(new) = serde_json::from_value::<Frame>(value.clone()).unwrap() else {
+            panic!("event expected")
+        };
+        assert_eq!(new, direct);
         assert_eq!(serde_json::to_value(Frame::Event(new)).unwrap(), value);
     }
 }

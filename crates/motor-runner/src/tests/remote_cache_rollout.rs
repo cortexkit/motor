@@ -950,3 +950,105 @@ fn remote_cache_totals_are_logged_at_job_end() {
         "disabled cache must stay silent: {log}"
     );
 }
+
+#[test]
+fn tenant_remote_cache_totals_are_job_private_and_durable() {
+    use motor_protocol::{RemoteCacheTotals, TenantEventKind};
+    use std::os::unix::process::ExitStatusExt;
+
+    let provisioned = Fixture::new();
+    let layout = Layout::new(provisioned.scratch.join("provisioning"), HostRole::TenantVm);
+    layout.prepare().unwrap();
+    provision(&layout, true);
+    let gateway_runtime = runtime(&layout);
+    gateway_runtime.watch.reread();
+
+    for (enabled, durable, stats, expected) in [
+        (
+            true,
+            true,
+            Some(
+                r#"{"stats":{"cache_hits":{"counts":{"Rust":7}},"cache_misses":{"counts":{"Rust":3}},"cache_errors":1}}"#,
+            ),
+            Some(RemoteCacheTotals {
+                hits: 7,
+                misses: 3,
+                errors: 1,
+            }),
+        ),
+        (
+            false,
+            true,
+            Some(r#"{"cache_hits":7,"cache_misses":3,"cache_errors":1}"#),
+            None,
+        ),
+        (
+            true,
+            false,
+            Some(r#"{"cache_hits":7,"cache_misses":3,"cache_errors":1}"#),
+            None,
+        ),
+        (true, true, Some("invalid"), None),
+        (true, true, None, None),
+    ] {
+        let f = Fixture::new();
+        let mut config = f.config();
+        config.manual_tick = true;
+        config.disable_warm_builds = true;
+        config.tenant_vm = true;
+        config.remote_cache = enabled;
+        let runner = Runner::open(config).unwrap();
+        let mut core = Arc::try_unwrap(runner.core).ok().unwrap();
+        core.config.remote_cache_runtime = Some(gateway_runtime.clone());
+        let runner = Runner {
+            core: Arc::new(core),
+        };
+        register_runner(&runner);
+        let (request, _) = f.run("true");
+        let id = request.job_id;
+        if let Some(stats) = stats {
+            let output = runner
+                .core
+                .trees
+                .state
+                .join("sandboxes")
+                .join(id.to_string())
+                .join("output");
+            fs::create_dir_all(&output).unwrap();
+            fs::write(output.join("cache-stats"), stats).unwrap();
+        }
+        runner.tenant_events().unwrap().admit(id).unwrap();
+        {
+            let mut inner = runner.core.inner.lock().unwrap();
+            inner
+                .catalog
+                .workspaces
+                .insert(request.workspace_key.clone(), Workspace::default());
+            let mut job = Job::new(id, Some(request), runner.now(), 1, 2);
+            job.state = JobState::Running;
+            job.started_ms = Some(runner.now());
+            job.durable_output = durable;
+            inner.jobs.insert(id, job);
+        }
+        runner
+            .finish(id, Ok(std::process::ExitStatus::from_raw(0)))
+            .unwrap();
+        let disk: Job = crate::storage::read_json(&runner.record_path(id)).unwrap();
+        assert_eq!(disk.remote_cache_totals, expected);
+        assert_eq!(
+            runner.core.inner.lock().unwrap().jobs[&id].remote_cache_totals,
+            expected
+        );
+        let log = crate::tenant::EventLog::open(&runner.core.trees.state).unwrap();
+        loop {
+            let event = log.first().expect("durable terminal event");
+            if event.event == TenantEventKind::Terminal {
+                assert_eq!(event.jti, Some(id));
+                assert_eq!(event.remote_cache_totals, expected);
+                break;
+            }
+            assert_eq!(event.remote_cache_totals, None);
+            log.ack(event.event_seq).unwrap();
+        }
+    }
+}

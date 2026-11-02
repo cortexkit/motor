@@ -832,6 +832,11 @@ impl Host {
                                 mem_working_peak_mib = ?billing.mem_working_peak_mib,
                                 mem_peak_mib = ?billing.mem_peak_mib, "job memory peaks (guest-reported)");
                         }
+                        if let Some(totals) = event.remote_cache_totals {
+                            tracing::info!(job_id = %job,
+                                hits = totals.hits, misses = totals.misses, errors = totals.errors,
+                                "job remote cache totals (guest-reported)");
+                        }
                     }
                     TenantEventKind::Refused
                         if lease.state == LeaseState::Reserved && lease.delivered =>

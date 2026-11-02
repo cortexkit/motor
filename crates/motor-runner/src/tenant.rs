@@ -52,6 +52,7 @@ impl Events {
             setup: None,
             mem_peak_mib: None,
             mem_working_peak_mib: None,
+            remote_cache_totals: None,
         });
     }
 }
@@ -120,6 +121,7 @@ impl EventLog {
             state.push(TenantEventKind::Terminal, Some(job.id), None);
             state.pending.back_mut().unwrap().mem_peak_mib = job.mem_peak_mib;
             state.pending.back_mut().unwrap().mem_working_peak_mib = job.mem_working_peak_mib.get();
+            state.pending.back_mut().unwrap().remote_cache_totals = job.remote_cache_totals;
         }
         atomic_json_private(&self.path, &state)?;
         *guard = state;
@@ -326,6 +328,7 @@ mod tests {
                 setup: None,
                 mem_peak_mib: None,
                 mem_working_peak_mib: None,
+                remote_cache_totals: None,
             }
         );
     }

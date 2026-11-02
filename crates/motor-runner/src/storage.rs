@@ -244,6 +244,10 @@ pub(crate) struct Job {
         skip_serializing_if = "crate::working_memory::WorkingPeak::is_unknown"
     )]
     pub mem_working_peak_mib: crate::working_memory::WorkingPeak,
+    /// Captured from job-private compiler servers before terminal persistence.
+    /// Telemetry only; not a billing or admission input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_cache_totals: Option<motor_protocol::RemoteCacheTotals>,
     /// A live accounting reader will finish the terminal lifecycle event. A
     /// restart loses that reader, so recovered records default to no pending read.
     #[serde(skip)]
@@ -361,6 +365,7 @@ impl Job {
             execution_ended_ms: None,
             mem_peak_mib: None,
             mem_working_peak_mib: Default::default(),
+            remote_cache_totals: None,
             memory_accounting_pending: false,
             sibling_sources: None,
             prepared_javascript_directories: Vec::new(),

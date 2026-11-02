@@ -94,6 +94,7 @@ fn event(
         setup: None,
         mem_peak_mib: None,
         mem_working_peak_mib: None,
+        remote_cache_totals: None,
     }
 }
 fn disk_host(path: &std::path::Path) -> Host {

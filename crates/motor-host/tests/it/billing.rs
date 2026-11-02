@@ -200,6 +200,90 @@ fn guest_working_peak_is_local_display_only_and_never_sent_to_broker() {
 }
 
 #[test]
+fn guest_cache_totals_are_logged_as_integers_and_never_sent_to_broker() {
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buffer = Buffer::default();
+    let capture = tracing::Dispatch::new(motor_protocol::logging::LineSubscriber::new(
+        "[host]",
+        buffer.clone(),
+    ));
+    // Two live subscribers disable tracing's single-subscriber interest shortcut.
+    let _spare = tracing::Dispatch::new(motor_protocol::logging::LineSubscriber::new(
+        "[host]",
+        std::io::sink(),
+    ));
+    for totals in [
+        None,
+        Some(motor_protocol::RemoteCacheTotals {
+            hits: 7,
+            misses: 3,
+            errors: u64::MAX,
+        }),
+    ] {
+        buffer.0.lock().unwrap().clear();
+        let mut h = host();
+        started(&mut h, JOB, 1);
+        let mut ended = event(3, TenantEventKind::Terminal, Some(JOB), None);
+        ended.remote_cache_totals = totals;
+        tracing::dispatcher::with_default(&capture, || {
+            tracing::callsite::rebuild_interest_cache();
+            h.event("tenant", &ended, MS + 3000).unwrap();
+            h.event("tenant", &ended, MS + 3000).unwrap();
+        });
+        let log = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<_> = log
+            .lines()
+            .filter(|line| line.contains("job remote cache totals (guest-reported)"))
+            .collect();
+        assert_eq!(lines.len(), usize::from(totals.is_some()), "{log}");
+        if totals.is_some() {
+            let line = lines[0];
+            for field in [
+                format!("job_id={JOB}"),
+                "hits=7".into(),
+                "misses=3".into(),
+                format!("errors={}", u64::MAX),
+            ] {
+                assert!(line.contains(&field), "{line}");
+            }
+            assert!(!line.contains("Some("), "{line}");
+        }
+        h.receive_terminal(JOB, terminal(JOB, "exit"), MS + 3000)
+            .unwrap();
+        h.terminal_delivered(JOB, MS + 3000).unwrap();
+        let request = h
+            .snapshot
+            .outbox
+            .iter()
+            .find(|r| r.path.ends_with("/usage"))
+            .unwrap();
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "job_id": JOB, "vcpus": 1, "started_at_ms": MS, "ended_at_ms": MS + 3000,
+                "mem_peak_mib": null, "egress_bytes": 0, "outcome": "exit"
+            })
+        );
+        assert!(serde_json::from_slice::<motor_lease::Usage>(&request.body).is_ok());
+        assert!(serde_json::to_value(&h.snapshot.billing[JOB])
+            .unwrap()
+            .get("remote_cache_totals")
+            .is_none());
+    }
+}
+
+#[test]
 fn observed_usage_ignores_guest_clocks_caps_and_maps_all_outcomes() {
     for (outcome, killed, expected) in [
         ("exit", None, UsageOutcome::Exit),
