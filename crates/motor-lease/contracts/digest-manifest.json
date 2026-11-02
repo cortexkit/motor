@@ -3,15 +3,15 @@
     "canonical_repository": "cortexkit-cloud",
     "canonical_contract": "docs/runners-contract.md",
     "canonical_vectors": "test-vectors/runners/",
-    "revision": "e6fa3d5cc062092821220904541936773cbefe98",
+    "revision": "9acdc85cdf06a1fc4ecac219cca6b10c72a4e759",
     "kind": "canonical"
   },
   "files": [
     {
       "path": "cloud/runners-contract.md",
-      "sha256": "6e7ee5c5e3facbaff5adbc0fc1e0ce70db389ff55905fd02002c6fd6622dd347",
+      "sha256": "726b43747f02ee721f371b72de187a00b1fc1339185b43083c0061da655c4c82",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "e6fa3d5cc062092821220904541936773cbefe98",
+      "source_commit": "9acdc85cdf06a1fc4ecac219cca6b10c72a4e759",
       "source_path": "docs/runners-contract.md",
       "canonical": true
     },
@@ -137,9 +137,9 @@
     },
     {
       "path": "cloud/host-metrics.json",
-      "sha256": "77a92ef5cc8ede142b84671697f672078c2c3346f8d758e84fe012582b88c91c",
+      "sha256": "dcee8e9efd564239008a4acb4f7fc71dc7e1e61d3eae3eb550ff4d5072900ee6",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "575270691991956b08c7fd2b0f52e211a976b2bc",
+      "source_commit": "9acdc85cdf06a1fc4ecac219cca6b10c72a4e759",
       "source_path": "test-vectors/runners/host-metrics.json",
       "canonical": true
     },

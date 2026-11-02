@@ -45,15 +45,15 @@ fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
     let now = v["clock_ms"].as_u64().unwrap();
     let mut metrics = HostMetrics {
         at_ms: now,
-        cpu: Cpu {
+        cpu: Some(Cpu {
             threads: 32,
             busy_pct: 41,
             load1: Some(12.4),
-        },
-        mem: Memory {
+        }),
+        mem: Some(Memory {
             total_mib: 128000,
             avail_mib: 22000,
-        },
+        }),
         disks: vec![Disk {
             mount: "/".into(),
             total_gib: 900,
@@ -89,7 +89,7 @@ fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
             .unwrap()
             .as_bytes()
     );
-    metrics.cpu.load1 = None;
+    metrics.cpu.as_mut().unwrap().load1 = None;
     assert_eq!(
         metrics.encode(now).unwrap(),
         v["cases"][5]["request"]["body"]
@@ -118,6 +118,10 @@ fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
         MetricsReply::BadRequest {
             field: Some("tenants[0].disk_free_gib".into()),
         },
+        MetricsReply::Accepted,
+        MetricsReply::BadRequest {
+            field: Some("cpu".into()),
+        },
     ];
     assert_eq!(v["cases"].as_array().unwrap().len(), expected.len());
     for (case, reply) in v["cases"].as_array().unwrap().iter().zip(expected) {
@@ -130,7 +134,7 @@ fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
         let signed = host_message_bytes("POST", path, body.as_bytes(), timestamp, counter);
         assert_eq!(signed, case["signed_string"].as_str().unwrap().as_bytes());
         let signed = HostHeaders::sign(
-            "metrics-vector",
+            headers["CK-Host"].as_str().unwrap(),
             "POST",
             path,
             body.as_bytes(),
@@ -162,11 +166,11 @@ fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
 fn cloud_host_metrics_invalid_samples_are_not_signed() {
     let v = vector("host-metrics.json");
     let now = v["clock_ms"].as_u64().unwrap();
-    for index in [0, 3, 4, 6, 7, 8, 9] {
+    for index in [0, 3, 4, 5, 6, 7, 8, 9, 10, 11] {
         let sample: metrics::HostMetrics =
             serde_json::from_str(v["cases"][index]["request"]["body"].as_str().unwrap()).unwrap();
         let encoded = sample.encode(now);
-        assert_eq!(encoded.is_ok(), matches!(index, 0 | 6 | 7));
+        assert_eq!(encoded.is_ok(), matches!(index, 0 | 5 | 6 | 7 | 10 | 11));
         if let Ok(encoded) = encoded {
             assert_eq!(
                 encoded,
@@ -187,14 +191,32 @@ fn cloud_host_metrics_invalid_samples_are_not_signed() {
     );
     let mut sample: metrics::HostMetrics =
         serde_json::from_str(v["cases"][0]["request"]["body"].as_str().unwrap()).unwrap();
-    sample.cpu.busy_pct = 101;
+    sample.cpu.as_mut().unwrap().busy_pct = 101;
     assert!(sample.encode(now).is_err());
-    sample.cpu.busy_pct = 100;
+    sample.cpu.as_mut().unwrap().busy_pct = 100;
     sample.tenants[0].state = metrics::TenantState::Recovering;
     assert!(sample.encode(now).is_err());
     sample.tenants[0].state = metrics::TenantState::Ready;
     sample.tenants[0].detail = Some("job output\nwith control".into());
     assert!(sample.encode(now).is_err());
+}
+
+#[test]
+fn cloud_monitor_metrics_host_figures_are_nullable_but_keys_are_required() {
+    let v = vector("host-metrics.json");
+    let body = v["cases"][10]["request"]["body"].as_str().unwrap();
+    let value: Value = serde_json::from_str(body).unwrap();
+    let now = v["clock_ms"].as_u64().unwrap();
+    let sample: metrics::HostMetrics = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(sample.encode(now).unwrap(), body.as_bytes());
+    for field in ["cpu", "mem", "disks", "tenants", "runners"] {
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(
+            serde_json::from_value::<metrics::HostMetrics>(missing).is_err(),
+            "missing {field} must be refused"
+        );
+    }
 }
 
 #[test]

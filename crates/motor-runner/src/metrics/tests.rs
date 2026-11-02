@@ -14,15 +14,15 @@ fn scratch() -> PathBuf {
 fn accepted_record() -> HostMetrics {
     HostMetrics {
         at_ms: 1_800_000_000_000,
-        cpu: Cpu {
+        cpu: Some(Cpu {
             threads: 32,
             busy_pct: 41,
             load1: Some(12.4),
-        },
-        mem: Memory {
+        }),
+        mem: Some(Memory {
             total_mib: 128000,
             avail_mib: 22000,
-        },
+        }),
         disks: vec![Disk {
             mount: "/".into(),
             total_gib: 900,
@@ -72,7 +72,7 @@ fn monitor_signing_bytes_match_cloud_vector() {
         (7, Some(12.4), Some((None, None))),
     ] {
         let mut record = accepted_record();
-        record.cpu.load1 = load1;
+        record.cpu.as_mut().unwrap().load1 = load1;
         if let Some((free, total)) = disk {
             record.tenants[0].disk_free_gib = Some(free);
             record.tenants[0].disk_total_gib = Some(total);
@@ -128,7 +128,7 @@ fn monitor_settings_are_opt_in_and_defaults_are_not_serialized() {
 #[test]
 fn monitor_load_absence_is_null_not_a_fake_zero_or_missing_key() {
     let mut record = accepted_record();
-    record.cpu.load1 = None;
+    record.cpu.as_mut().unwrap().load1 = None;
     let body = record.encode(record.at_ms).unwrap();
     assert!(std::str::from_utf8(&body)
         .unwrap()
@@ -224,7 +224,7 @@ fn monitor_linux_counters_exclude_guest_cpu_and_use_available_memory() {
     assert!(sample::cpu_ticks("").is_err());
     assert!(sample::memory("MemFree: 1000 kB").is_err());
     assert!(sample::Sampler::default()
-        .sample(unix_ms())
+        .sample(unix_ms(), crate::BackendKind::Host)
         .unwrap()
         .is_none());
 }

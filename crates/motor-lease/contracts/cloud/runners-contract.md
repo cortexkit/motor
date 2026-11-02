@@ -627,9 +627,15 @@ The strict body has these members (nested objects are strict too); only the tena
 ```
 
 - `at_ms` is within 300000 ms of broker receive time, inclusive in both directions.
+- For a registered `monitor` host, `cpu` and `mem` may each be null when host figures are not
+  reported; `disks` may be empty. The `cpu`, `mem` and `disks` keys remain required, as do
+  `tenants` and `runners`. A runners-only monitor sends `"cpu": null`, `"mem": null`, `"disks": []`
+  and may send `"tenants": []`. Placement hosts must send CPU and memory objects; null returns
+  400 `bad_request` with `field: "cpu"` or `field: "mem"`. The authenticated registry role,
+  not a body member, controls this permission. Non-null CPU and memory objects remain strict.
 - `cpu.busy_pct` is an integer 0..100; `cpu.load1` is a non-negative finite number with at most two
   decimal places, or null when the platform has no load average (for example, Windows). The
-  `load1` key is always required; Linux and macOS send a number. Decimal notation is allowed
+  `load1` key is required whenever `cpu` is non-null; Linux and macOS send a number. Decimal notation is allowed
   here, unlike other routes. All other non-null numeric fields are
   non-negative safe integers. Exponent notation is not accepted.
 - Each array has at most eight entries and may be empty. `mount` is 1..128 UTF-8 bytes with no
@@ -653,12 +659,18 @@ percentage and total memory, minimum available memory and disk free space, last 
 slots, and maximum summed tenant slots used and jobs running. Disk free space is the minimum
 across the body's disks, or NULL with no disks; a bucket retains the minimum non-null sample.
 Load retains the maximum non-null sample, or NULL when every sample in the bucket has null load.
+CPU busy maxima and available-memory minima likewise ignore null samples and are NULL when
+every sample lacks the corresponding figure. Last CPU busy percentage and total memory follow
+the last accepted sample, including NULL. A monitor reporting null CPU/memory and no disks for
+the entire bucket has NULL in every host-figure column, not zero; tenant totals still roll up.
 `last_body` is the last accepted body serialized in the schema's key order without whitespace.
 States, per-disk details and tenant guest disk figures are available in that body, not separate rollup columns.
 
 `test-vectors/runners/host-metrics.json` pins accepted signed pushes with numeric and null load,
 numeric and null tenant guest disks, the 413 boundary, and bad-enum, overlong-detail, stale-clock,
-unpaired guest-disk and free-above-total refusals, produced by the real signer and parser.
+unpaired guest-disk and free-above-total refusals, produced by the real signer and parser. It also
+includes a `metrics-vector` monitor with null CPU/memory and empty disks (204), and a
+`metrics-vector-placement` placement host with null CPU (400 with `field: "cpu"`).
 
 ### POST /v1/hosts/{host_id}/heartbeat
 

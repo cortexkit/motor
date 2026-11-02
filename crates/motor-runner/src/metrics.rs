@@ -139,7 +139,7 @@ pub fn run(config: &Config) -> io::Result<()> {
     let mut deadline = std::time::Instant::now();
     loop {
         let now = unix_ms();
-        match sampler.sample(now) {
+        match sampler.sample(now, config.backend) {
             Ok(Some(mut record)) => {
                 match runtime.block_on(local_runner(config)) {
                     Ok(mut runner) => {
