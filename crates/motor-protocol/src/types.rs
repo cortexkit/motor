@@ -209,6 +209,10 @@ pub struct RunnerHealth {
     /// Null means the state-filesystem probe failed, not zero free space.
     pub free_bytes: Option<u64>,
     pub queue_depth: u32,
+    /// Caller jobs and in-flight caller lifecycle operations, excluding trusted
+    /// cache fills. Absence cannot establish that activation is safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_work: Option<u64>,
     /// Display-only space on the tenant workspace filesystem, not an admission signal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_disk: Option<GuestDisk>,
@@ -542,6 +546,7 @@ define_frames! {
         exit_after: bool,
     },
     DrainIfIdle,
+    DrainForActivation,
     DrainIfIdleReply {
         blocked_by: Option<String>,
         count: u64,

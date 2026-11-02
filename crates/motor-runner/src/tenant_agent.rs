@@ -289,6 +289,7 @@ async fn forward_socket(
             (&frame, &reply),
             (Frame::Cancel(_), Frame::CancelReply(_))
                 | (Frame::Drain { .. }, Frame::DrainReply { .. })
+                | (Frame::DrainForActivation, Frame::DrainReply { .. })
                 | (Frame::DrainIfIdle, Frame::DrainIfIdleReply { .. })
                 | (Frame::Resume, Frame::ResumeReply { .. })
                 | (Frame::Status, Frame::StatusReply(_))

@@ -50,6 +50,19 @@ fn terminal_job_peak_is_an_optional_addition_to_lifecycle_events() {
 }
 
 #[test]
+fn activation_drain_is_an_operator_frame_with_additive_fields() {
+    let value = json!({"type":"drain_for_activation"});
+    assert_eq!(
+        serde_json::to_value(Frame::DrainForActivation).unwrap(),
+        value
+    );
+    assert_eq!(
+        motor_protocol::decode_frame(br#"{"type":"drain_for_activation","future":true}"#).unwrap(),
+        motor_protocol::DecodedFrame::Frame(Frame::DrainForActivation)
+    );
+}
+
+#[test]
 fn pinned_tenant_frames_are_inline_and_integer_only() {
     let id = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
     let value = json!({"type":"verified_lease","jti":id,"purpose":"run","sub":"acct:test","vcpus":2,

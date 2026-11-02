@@ -372,6 +372,23 @@ async fn tenant_mismatch_refuses_without_admission() {
 }
 
 #[tokio::test]
+async fn tenant_activation_drain_is_refused_for_run_and_attach_leases() {
+    for purpose in [LeasePurpose::Run, LeasePurpose::Attach] {
+        let f = Fixture::new();
+        let runner = open(&f);
+        let id = Uuid::now_v7();
+        let (mut client, task) = connect(&runner, lease(id, purpose)).await;
+        motor_protocol::write_frame_async(&mut client, &Frame::DrainForActivation)
+            .await
+            .unwrap();
+        assert!(frame(&mut client).await.is_none());
+        task.await.unwrap().unwrap();
+        assert!(!runner.is_draining());
+        assert!(!runner.has_job_record(id));
+    }
+}
+
+#[tokio::test]
 async fn tenant_operations_fail_closed_without_job_changes() {
     let f = Fixture::new();
     let runner = open(&f);
@@ -381,6 +398,7 @@ async fn tenant_operations_fail_closed_without_job_changes() {
     let forbidden = vec![
         Frame::Status,
         Frame::Resume,
+        Frame::DrainForActivation,
         Frame::Drain {
             deadline_s: 1,
             exit_after: false,

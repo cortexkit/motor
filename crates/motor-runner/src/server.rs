@@ -981,6 +981,19 @@ async fn session(
                 send(tx, Frame::ResumeReply { resumed }).await?;
                 return Ok(());
             }
+            Frame::DrainForActivation => {
+                let caller_work =
+                    locked(&runner, |runner| Ok(runner.drain_for_activation())).await?;
+                send(
+                    tx,
+                    Frame::DrainReply {
+                        timed_out: caller_work != 0,
+                        restart_recoverable_jobs: Some(0),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
             Frame::DrainIfIdle => {
                 let (blocked_by, count) =
                     locked(&runner, |runner| Ok(runner.drain_if_idle())).await?;

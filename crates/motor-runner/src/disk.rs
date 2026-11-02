@@ -843,7 +843,7 @@ impl Runner {
     pub fn runner_status(&self) -> RunnerStatusReply {
         let now = self.now();
         // Keep retained job history out of the state-lock path of each probe.
-        let (status, permits_held, fill_permits, held_workspaces, oldest_wait_s) = {
+        let (status, permits_held, fill_permits, held_workspaces, oldest_wait_s, caller_work) = {
             let inner = self.core.inner.lock().unwrap();
             let usage = self.core.repository_usage.lock().unwrap();
             let active = &usage.active;
@@ -899,6 +899,7 @@ impl Runner {
                 fill_permits,
                 held_workspaces,
                 oldest_wait_s,
+                Self::caller_work(&inner, &usage),
             )
         };
         let (repository_usage, underused_reservations) = {
@@ -954,6 +955,7 @@ impl Runner {
                 window_minutes: health::WINDOW_MINUTES,
                 free_bytes,
                 queue_depth,
+                caller_work: Some(caller_work),
                 guest_disk: {
                     #[cfg(target_os = "linux")]
                     {

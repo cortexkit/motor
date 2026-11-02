@@ -3065,6 +3065,42 @@ impl Runner {
             .store(true, std::sync::atomic::Ordering::Release);
         (None, 0)
     }
+    fn caller_work(inner: &Inner, usage: &health::RepositoryUsage) -> u64 {
+        let caller = |id: &Uuid| !inner.jobs.get(id).is_some_and(|job| job.base);
+        // Unknown lifecycle owners fail closed. A fill is exempt only when its
+        // trusted job record identifies it, never from a caller-supplied key.
+        let active = usage.active.keys().filter(|id| caller(id)).count();
+        let lifecycle = inner
+            .starting
+            .iter()
+            .chain(&inner.finalizing)
+            .filter(|id| caller(id))
+            .count();
+        let reservations = inner
+            .reserved
+            .keys()
+            .filter(|key| !inner.jobs.values().any(|job| job.base && job.key() == *key))
+            .count();
+        (active
+            + lifecycle
+            + reservations
+            + inner.preparing.len()
+            + inner.admitting.len()
+            + inner.admission_saves.len()
+            + usize::from(inner.writer.as_ref().is_some_and(caller))) as u64
+    }
+
+    /// Activation stops this runner, so trusted fills need not finish. Caller
+    /// work must still settle before that stop, including admission in flight.
+    pub(crate) fn drain_for_activation(&self) -> u64 {
+        let mut inner = self.core.inner.lock().unwrap();
+        inner.drain_deadline = Some(std::time::Instant::now());
+        self.core
+            .draining
+            .store(true, std::sync::atomic::Ordering::Release);
+        Self::caller_work(&inner, &self.core.repository_usage.lock().unwrap())
+    }
+
     pub(crate) fn begin_drain_request(&self, deadline: Duration, exit_after: bool) -> DrainWaiter {
         let requested_deadline = std::time::Instant::now() + deadline;
         let mut inner = self.core.inner.lock().unwrap();

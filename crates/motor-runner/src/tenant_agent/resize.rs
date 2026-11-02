@@ -1,5 +1,6 @@
 //! Activation runs after attachment, while the helper still withholds the wake
-//! reply and all Run traffic. The old runner must be idle before it is stopped.
+//! reply and all Run traffic. The old runner must own no caller work before it
+//! is stopped; its disposable compile-cache fills may be interrupted.
 use super::*;
 use serde::Deserialize;
 use std::{future::Future, os::unix::fs::OpenOptionsExt};
@@ -22,6 +23,17 @@ pub(super) fn parse(value: Value) -> io::Result<String> {
     Ok(runner_args)
 }
 
+fn busy(value: &Value) -> Option<String> {
+    if value["ok"] != true {
+        return Some(format!("runner status unavailable: {value}"));
+    }
+    match value["health"]["caller_work"].as_u64() {
+        Some(0) => None,
+        Some(count) => Some(format!("caller_work={count}")),
+        None => Some("runner status has no caller_work count".into()),
+    }
+}
+
 async fn activate<F, Fut, A, AFut>(mut control: F, apply: A) -> io::Result<Value>
 where
     F: FnMut(Frame) -> Fut,
@@ -29,35 +41,38 @@ where
     A: FnOnce() -> AFut,
     AFut: Future<Output = io::Result<()>>,
 {
-    if let Some(reason) = snapshot::busy(&control(Frame::Status).await?) {
+    if let Some(reason) = busy(&control(Frame::Status).await?) {
         return Err(io::Error::other(format!("resize_busy: {reason}")));
     }
-    let drained = control(Frame::Drain {
-        deadline_s: 1,
-        exit_after: false,
-    })
-    .await?;
-    if drained["ok"] != true
-        || drained["timed_out"] != false
-        || drained["restart_recoverable_jobs"] != 0
-    {
+    let result = async {
+        let drained = control(Frame::DrainForActivation).await?;
+        if drained["ok"] != true
+            || drained["timed_out"] != false
+            || drained["restart_recoverable_jobs"] != 0
+        {
+            return Err(io::Error::other(
+                "resize_busy: runner did not drain all accepted work",
+            ));
+        }
+        // Admission closes under the runner lock. Recheck caller work that raced
+        // the first status; fills remain safe to abandon at either check.
+        if let Some(reason) = busy(&control(Frame::Status).await?) {
+            return Err(io::Error::other(format!("resize_busy: {reason}")));
+        }
+        apply().await?;
+        let health = control(Frame::Status).await?;
+        if health["ok"] != true || !health["health"].is_object() {
+            return Err(io::Error::other("resize runner health unavailable"));
+        }
+        Ok(json!({"ok":true}))
+    }
+    .await;
+    if result.is_err() {
+        // A lost reply or a failed apply may leave the original runner alive
+        // with admission closed. Reopen it before reporting the failure.
         control(Frame::Resume).await?;
-        return Err(io::Error::other(
-            "resize_busy: runner did not drain all accepted work",
-        ));
     }
-    // Drain closes admission under the runner lock. Recheck accepted jobs that
-    // raced the first status; never stop a runner that owns work.
-    if let Some(reason) = snapshot::busy(&control(Frame::Status).await?) {
-        control(Frame::Resume).await?;
-        return Err(io::Error::other(format!("resize_busy: {reason}")));
-    }
-    apply().await?;
-    let health = control(Frame::Status).await?;
-    if health["ok"] != true || !health["health"].is_object() {
-        return Err(io::Error::other("resize runner health unavailable"));
-    }
-    Ok(json!({"ok":true}))
+    result
 }
 
 pub(super) async fn apply(text: String) -> io::Result<Value> {
@@ -289,7 +304,7 @@ mod tests {
     }
 
     fn idle() -> Value {
-        json!({"ok":true,"queue_depth":0,"running_jobs":[],"health":{"runner_version":"test"},"timed_out":false,"restart_recoverable_jobs":0})
+        json!({"ok":true,"queue_depth":0,"running_jobs":[],"health":{"runner_version":"test","caller_work":0},"timed_out":false,"restart_recoverable_jobs":0})
     }
 
     #[test]
@@ -386,11 +401,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resize_ignores_queued_and_running_fills() {
+        let fill = json!({"job_id":"fill","workspace_key":"base:/repo","weight":4});
+        for (queued, running) in [(2, vec![]), (0, vec![fill.clone()]), (2, vec![fill])] {
+            let mut status = idle();
+            status["queue_depth"] = json!(queued);
+            status["running_jobs"] = json!(running);
+            let calls = RefCell::new(vec![]);
+            assert_eq!(
+                activate(
+                    |frame| {
+                        calls.borrow_mut().push(frame);
+                        std::future::ready(Ok(status.clone()))
+                    },
+                    || async { Ok(()) }
+                )
+                .await
+                .unwrap(),
+                json!({"ok":true})
+            );
+            assert_eq!(
+                *calls.borrow(),
+                vec![
+                    Frame::Status,
+                    Frame::DrainForActivation,
+                    Frame::Status,
+                    Frame::Status
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn resize_busy_runner_is_never_stopped() {
         for busy in [
-            json!({"ok":true,"queue_depth":1,"running_jobs":[]}),
-            json!({"ok":true,"queue_depth":0,"running_jobs":[{"job_id":"accepted"}]}),
+            json!({"ok":true,"queue_depth":1,"running_jobs":[],"health":{"caller_work":1}}),
+            json!({"ok":true,"queue_depth":0,"running_jobs":[{"job_id":"accepted"}],"health":{"caller_work":1}}),
             json!({"ok":true}),
+            json!({"ok":true,"queue_depth":0,"running_jobs":[],"health":{"runner_version":"older"}}),
+            json!({"ok":true,"health":{"caller_work":null}}),
+            json!({"ok":true,"health":{"caller_work":"0"}}),
         ] {
             let calls = RefCell::new(vec![]);
             let reply = agent_result(
@@ -417,7 +467,7 @@ mod tests {
                 |frame| {
                     calls.borrow_mut().push(frame);
                     std::future::ready(Ok(if calls.borrow().len() == 3 {
-                        json!({"ok":true,"queue_depth":1,"running_jobs":[]})
+                        json!({"ok":true,"queue_depth":1,"running_jobs":[],"health":{"caller_work":1}})
                     } else {
                         idle()
                     }))
@@ -431,14 +481,67 @@ mod tests {
             *calls.borrow(),
             vec![
                 Frame::Status,
-                Frame::Drain {
-                    deadline_s: 1,
-                    exit_after: false
-                },
+                Frame::DrainForActivation,
                 Frame::Status,
                 Frame::Resume
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn resize_failure_after_closing_admission_resumes_the_runner() {
+        for failure in ["drain_reply", "race_status", "apply", "health"] {
+            let scratch = cortexkit_test_support::ScratchDir::new("resize-failed-drain");
+            let mut config = crate::Config::new(scratch.join("state"), "resize-test");
+            config.manual_tick = true;
+            config.free_space_floor_bytes = 0;
+            let runner = crate::Runner::open(config).unwrap();
+            let mut status_reads = 0;
+            let mut resumed = false;
+            let result = activate(
+                |frame| {
+                    let value = match frame {
+                        Frame::Status => {
+                            status_reads += 1;
+                            if (failure == "race_status" && status_reads == 2)
+                                || (failure == "health" && status_reads == 3)
+                            {
+                                Err(io::Error::other("status failed"))
+                            } else {
+                                Ok(idle())
+                            }
+                        }
+                        Frame::DrainForActivation => {
+                            assert_eq!(runner.drain_for_activation(), 0);
+                            if failure == "drain_reply" {
+                                Err(io::Error::other("reply lost"))
+                            } else {
+                                Ok(idle())
+                            }
+                        }
+                        Frame::Resume => {
+                            runner.resume();
+                            resumed = true;
+                            Ok(json!({"ok":true,"resumed":true}))
+                        }
+                        other => panic!("unexpected frame: {other:?}"),
+                    };
+                    std::future::ready(value)
+                },
+                || async {
+                    assert!(runner.is_draining());
+                    if failure == "apply" {
+                        Err(io::Error::other("apply failed"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+            assert!(result.is_err(), "{failure}");
+            assert!(resumed, "{failure}");
+            assert!(!runner.is_draining(), "{failure}");
+        }
     }
 
     #[tokio::test]
@@ -452,7 +555,7 @@ mod tests {
             let reply = agent_result(
                 activate(
                     |frame| {
-                        std::future::ready(Ok(if matches!(frame, Frame::Drain { .. }) {
+                        std::future::ready(Ok(if matches!(frame, Frame::DrainForActivation) {
                             drain.clone()
                         } else {
                             idle()
@@ -515,9 +618,8 @@ mod tests {
         let reply = activate(|frame| {
             let value = match frame {
                 Frame::Status => idle(),
-                Frame::Drain {deadline_s, exit_after} => {
-                    let waiter = runner.begin_drain_request(std::time::Duration::from_secs(deadline_s), exit_after);
-                    let drained = runner.drain_reply_for(&waiter).unwrap();
+                Frame::DrainForActivation => {
+                    let drained = (runner.drain_for_activation() != 0, 0);
                     *result.borrow_mut() = Some(drained);
                     json!({"ok":true,"timed_out":drained.0,"restart_recoverable_jobs":drained.1})
                 }
@@ -555,7 +657,7 @@ mod tests {
             *events.borrow(),
             [
                 "Status",
-                "Drain { deadline_s: 1, exit_after: false }",
+                "DrainForActivation",
                 "Status",
                 "Mount",
                 "Grow",

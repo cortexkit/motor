@@ -1,4 +1,6 @@
 use super::*;
+#[path = "tests/activation.rs"]
+mod activation;
 #[path = "tests/tenant.rs"]
 mod tenant;
 use crate::spool::Upload;
