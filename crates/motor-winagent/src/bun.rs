@@ -235,7 +235,6 @@ impl Refusal {
             &self.package,
             &self.version,
             &self.registry_origin,
-            &self.owner,
             &*self.detail,
         ] {
             if field.len() > 4096 || field.chars().any(char::is_control) {
@@ -301,7 +300,6 @@ pub fn refuse(kind: RefusalKind, project: &str, package: &str, version: &str) ->
             RefusalKind::BunWorkspaceMember => Check::WorkspaceMember,
         }),
         detail: Box::default(),
-        owner: String::new(),
         missing: Box::default(),
     }
 }
