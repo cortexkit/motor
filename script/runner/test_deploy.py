@@ -33,9 +33,9 @@ seal_spec.loader.exec_module(seal_config)
 
 class PermissionsPolicyTests(unittest.TestCase):
     def test_source_seal_authority_requires_explicit_canonical_instances(self):
-        grant = '/srv/build/state/main=/srv/build/workspaces,/srv/build/callers/main'
+        grant = '/srv/build/state/e2e=/srv/build/workspaces,/srv/build/callers/e2e'
         rendered = json.loads(seal_config.render([grant]))
-        self.assertEqual(rendered, {'states': {'/srv/build/state/main': ['/srv/build/callers/main', '/srv/build/workspaces']}})
+        self.assertEqual(rendered, {'states': {'/srv/build/state/e2e': ['/srv/build/callers/e2e', '/srv/build/workspaces']}})
         for values in ([], [grant, grant], ['relative=/workspace'], ['/state=/'], ['/state=/workspace/../etc'], ['/state=']):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 seal_config.render(values)
@@ -60,10 +60,13 @@ class PermissionsPolicyTests(unittest.TestCase):
 
 
 class UnitCommandTests(unittest.TestCase):
+    def test_main_has_no_repository_unit(self):
+        with self.assertRaisesRegex(ValueError, 'main has no repository runner unit'):
+            canary.repository_unit_command(DEPLOY.with_name('units'), 'main')
+
     def test_repository_units_and_boat_wrapper_extract_only_serve_options(self):
         units = DEPLOY.with_name('units')
         for instance, base, dropin, binary in (
-                ('main', 'motor-runner.service', None, 'motor-runner'),
                 ('e2e', 'motor-runner@.service', 'motor-runner@e2e.service.d/binary.conf', 'motor-runner-e2e'),
                 ('windows', 'motor-runner@.service', 'motor-runner@windows.service.d/windows.conf', 'motor-runner-windows')):
             with self.subTest(instance=instance):
@@ -90,7 +93,7 @@ class UnitCommandTests(unittest.TestCase):
             'ExecStart=/binary serve --state-root "/space dir" --instance %i\n', 'e2e'),
             ['/binary', '--state-root', '/space dir', '--instance', 'e2e'])
         with self.assertRaises(ValueError):
-            canary.unit_command('ExecStart=/binary connect\n', 'main')
+            canary.unit_command('ExecStart=/binary connect\n', 'e2e')
 
     def test_repository_dropins_merge_by_name_and_instance_specific_file_wins(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -141,14 +144,15 @@ class SetupCallerRootsTests(unittest.TestCase):
 
             with mock.patch('os.open', side_effect=open_unnamed), mock.patch.object(fcntl, 'ioctl', side_effect=clone):
                 exec(compile(body, str(script), 'exec'), {})
-            self.assertEqual(opened, [users, root / 'callers/main/home', users, root / 'callers/e2e/home'])
-            for instance in ('main', 'e2e'):
+            self.assertEqual(opened, [users, root / 'callers/e2e/home'])
+            self.assertFalse((root / 'callers/main').exists())
+            for instance in ('e2e',):
                 host = root / 'callers' / instance / 'home'
                 self.assertEqual(list(host.iterdir()), [])
                 self.assertEqual(stat.S_IMODE(host.stat().st_mode), 0o751)
                 self.assertEqual((host.stat().st_uid, host.stat().st_gid),
                                  (users.stat().st_uid, users.stat().st_gid))
-            leftover = root / 'callers/main/home/leftover'
+            leftover = root / 'callers/e2e/home/leftover'
             leftover.write_text('preserve')
             with self.assertRaisesRegex(SystemExit, 'requires an empty directory'):
                 exec(compile(body, str(script), 'exec'), {})
@@ -156,8 +160,16 @@ class SetupCallerRootsTests(unittest.TestCase):
 
 
 class DeployTests(unittest.TestCase):
+    def test_deploy_requires_an_explicit_non_main_instance_before_candidate_checks(self):
+        for arguments, error in (([], 'Usage:'), (['main'], 'main instance is not deployable')):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(['bash', str(DEPLOY), '/absent/candidate', *arguments],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(error, result.stderr)
+
     def run_deploy(self, job, *, resume=True, drain="timeout", fail_start=False,
-                    instance="main", default_state_root=False, decoys=False, drain_timeout=None,
+                    instance="e2e", default_state_root=False, decoys=False, drain_timeout=None,
                     helper_valid: 'bool | str' = True, canary='pass', canary_timeout=None, quarantine=None,
                     caller_roots=False, check_options='pass', ever_enabled=False, home_canary='pass',
                     installed_options=None, different_state_override=False):
@@ -187,7 +199,7 @@ class DeployTests(unittest.TestCase):
                     (folder / name).write_text('{}')
             if decoys:
                 for decoy in (root / "state/windows/jobs/wrong-root",
-                              state_root / "main/jobs/wrong-instance"):
+                              state_root / "e2e/jobs/wrong-instance"):
                     decoy.mkdir(parents=True)
                     (decoy / "record.json").write_text(json.dumps(
                         self.job(id=decoy.name, process=None)))
@@ -271,9 +283,7 @@ fi
             env.pop("RUNNER_DRAIN_TIMEOUT_S", None)
             if drain_timeout is not None:
                 env["RUNNER_DRAIN_TIMEOUT_S"] = str(drain_timeout)
-            command = ["bash", str(DEPLOY), str(candidate)]
-            if instance != "main":
-                command.append(instance)
+            command = ["bash", str(DEPLOY), str(candidate), instance]
             result = subprocess.run(command, env=env,
                                     capture_output=True, text=True, timeout=10)
             log = (root / 'log').read_text()
@@ -308,7 +318,7 @@ fi
     def test_legacy_check_options_without_mapping_history_proceeds(self):
         result, log, _ = self.run_deploy(self.job(), drain='complete', check_options='legacy')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('check-options --instance main\n', log)
+        self.assertIn('check-options --instance e2e\n', log)
         self.assertIn('drain --', log)
 
     def test_installed_state_root_controls_sentinel_even_with_an_environment_override(self):
@@ -320,7 +330,7 @@ fi
         self.assertNotIn('drain --', log)
 
     def test_check_options_receives_last_installed_execstart_and_runs_before_drain(self):
-        for instance in ('main', 'e2e', 'windows'):
+        for instance in ('e2e', 'windows'):
             with self.subTest(instance=instance):
                 result, log, _ = self.run_deploy(self.job(), drain='complete', instance=instance)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -352,7 +362,7 @@ fi
 
     def test_swap_and_rollback_warn_with_quarantine_folder_listing(self):
         for canary in ('pass', 'exit-1'):
-            for instance in ('main', 'e2e'):
+            for instance in ('e2e',):
                 with self.subTest(canary=canary, instance=instance):
                     result, _, _ = self.run_deploy(self.job(), drain='complete', canary=canary,
                                                   instance=instance, quarantine=['damaged-job.json'])
@@ -414,7 +424,7 @@ fi
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("survivor-job: UNSAFE", result.stderr)
         self.assertIn("Deploy aborted: unsafe survivors", result.stderr)
-        self.assertIn("resume --instance main", log)
+        self.assertIn("resume --instance e2e", log)
         self.assertNotIn("systemctl", log)
         self.assertEqual(admission, "open")
 
@@ -446,7 +456,7 @@ fi
         result, log, admission = self.run_deploy(self.job(process=dict(unit=None, pid=os.getpid())))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("survivor-job: UNSAFE", result.stderr)
-        self.assertIn("resume --instance main", log)
+        self.assertIn("resume --instance e2e", log)
         self.assertNotIn("systemctl --user stop", log)
         self.assertEqual(admission, "open")
 
@@ -461,23 +471,25 @@ fi
     def test_unacknowledged_drain_reopens_admission(self):
         result, log, admission = self.run_deploy(self.job(process=None), drain="transport")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("resume --instance main", log)
+        self.assertIn("resume --instance e2e", log)
         self.assertEqual(admission, "open")
 
     def test_failed_swap_start_rolls_back_and_reopens(self):
         result, log, admission = self.run_deploy(self.job(process=dict(unit="fake", pid=42)), fail_start=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(log.count("systemctl --user start"), 2)
-        self.assertIn("resume --instance main", log)
+        self.assertIn("resume --instance e2e", log)
         self.assertEqual(admission, "open")
 
-    def test_post_swap_canary_runs_on_main_and_e2e_before_success(self):
-        for instance in ('main', 'e2e'):
+    def test_post_swap_canary_runs_on_e2e_before_success(self):
+        for instance in ('e2e',):
             with self.subTest(instance=instance):
                 result, log, admission = self.run_deploy(
                     self.job(), drain='complete', instance=instance)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(f'--instance {instance} --timeout-s 120', log)
+                self.assertIn('systemctl --user stop motor-runner@e2e.service', log)
+                self.assertIn('systemctl --user start motor-runner@e2e.service', log)
                 self.assertLess(log.index('systemctl --user is-active'), log.index('canary '))
                 self.assertIn('live restored: False', log)
                 self.assertEqual(admission, 'open')
@@ -525,7 +537,7 @@ fi
 
 
 class CanaryTests(unittest.TestCase):
-    def exercise(self, outcome: 'str | list[str]' = 'pass', instance='main', *,
+    def exercise(self, outcome: 'str | list[str]' = 'pass', instance='e2e', *,
                  timeout_s: 'int | None' = None, invocations=1, gate_jobs=True,
                  home_compile_check=False):
         outcomes = outcome if isinstance(outcome, list) else [outcome]
@@ -659,7 +671,7 @@ class CanaryTests(unittest.TestCase):
                     return
                 if home_compile_check and outcome not in ('no-diagnostic', 'exit-0'):
                     path = (request['workspace_key'] if outcome != 'host-diagnostic' else
-                            '/srv/build/callers/main/home/motor-deploy-canary/main/workspace')
+                            '/srv/build/callers/e2e/home/motor-deploy-canary/e2e/workspace')
                     diagnostic = (f'error[E0308]: mismatched types\n --> {path}/canary.rs:1:25\n'
                                   if outcome != 'wrong-error' else
                                   f'error: could not read {path}/canary.rs\n').encode()
@@ -714,7 +726,7 @@ class CanaryTests(unittest.TestCase):
                     self.assertIn('/home compile-check passed', result.stdout)
 
     def test_canary_transfers_a_real_bundle_and_requires_isolated_start_and_zero_exit(self):
-        for instance in ('main', 'e2e'):
+        for instance in ('e2e',):
             with self.subTest(instance=instance):
                 result, requests = self.exercise(instance=instance)
                 self.assertEqual(result.returncode, 0, result.stderr)

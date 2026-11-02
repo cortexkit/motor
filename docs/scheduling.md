@@ -26,12 +26,9 @@ produce.
   without a CPU list) is accepted but waits until it fits; it does not block
   other jobs. Tests: `pinned_job_waits_until_its_exact_claim_fits_max_weight`,
   `without_a_linux_cpu_list_claims_above_max_weight_still_wait`.
-- When ck-motor sent the job to the build server because the hosted broker
-  answered `no_host_fits`, a `runner_full` refusal at admission also names the
-  hosted maximum: the detail ends `; hosted max_vcpus <n>`, or
-  `; hosted max_vcpus unknown` when the broker gave none. Test:
-  `oversized_fleet_jobs_are_refused_before_start_naming_both_routes_limits`
-  (`crates/motor-module/src/motor/fleet_capacity_tests.rs`).
+- Every new Linux job requires a hosted lease. A broker `no_host_fits` response
+  returns a typed refusal; it never sends the job to a direct build-server
+  runner. Test: `linux_exec_refusals_and_followups_never_reach_a_direct_runner`.
 - The background warm build claims up to 4 vCPUs, fewer on a smaller host.
   Test: `internal_warm_build_shrinks_to_a_small_host`.
 
@@ -84,11 +81,6 @@ unchanged. With the option:
 - The option is refused on a VM instance, with an empty list, a CPU that is
   not online, or `--max-weight 0`.
 
-For example, a runner beside a hosted tenant on `0-11,16-27` of a 32-thread
-host runs `--linux-cpus 12-15,28-31 --max-weight 16`: a 12-vCPU job with a
-long timeout is admitted and placed on those 8 threads, and a 17-vCPU job is
-refused before start ([hosted-host.md](hosted-host.md#growing-the-tenant-beside-a-smaller-runner)).
-
 ### Memory and the jobs slice
 
 Every Linux job unit runs in `motor-jobs.slice`. A unit's `MemoryMax` is the
@@ -101,7 +93,7 @@ refused before start with `workspace_setup_failed` and a detail naming the
 repair (raise `jobs_min_bytes` and re-run `provision.py apply-jobs-slice`);
 this is a host setup fault, not a full runner. The declared minimum is
 separate from the combined Linux and Windows slice maximum. Without a
-declaration, Boat, tenant guests and plain build servers admit jobs with
+declaration, Boat, tenant guests and other host-backend instances admit jobs with
 limits clamped to the slice, even below 16 GiB. The runner reads both the
 slice limit and the declaration at startup and at each maintenance pass (at
 least once a minute), not on every admission.

@@ -46,11 +46,12 @@ def unit_command(text, instance):
 
 
 def repository_unit_command(units, instance):
-    base = 'motor-runner.service' if instance == 'main' else 'motor-runner@.service'
+    if instance == 'main':
+        raise ValueError('main has no repository runner unit')
+    base = 'motor-runner@.service'
     dropins = {path.name: path for path in (units / (base + '.d')).glob('*.conf')}
-    if instance != 'main':
-        dropins.update({path.name: path for path in
-                        (units / f'motor-runner@{instance}.service.d').glob('*.conf')})
+    dropins.update({path.name: path for path in
+                    (units / f'motor-runner@{instance}.service.d').glob('*.conf')})
     files = [units / base, *(dropins[name] for name in sorted(dropins))]
     return unit_command('\n'.join(path.read_text() for path in files), instance)
 

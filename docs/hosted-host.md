@@ -3,8 +3,8 @@
 This turns a dedicated Linux server into a hosted-runners host: the
 root `motor-vm-helper`, the unprivileged `motor-host` TLS agent, their
 configs and keys, one tenant VM for our fleet's account, and one public TLS
-port. On the build server the existing SSH runner keeps running beside it; a
-fresh host needs no SSH runner. Broker-side enrollment
+port. Linux jobs run in hosted server VMs; the build server also runs the
+Windows runner. A fresh hosted host needs no SSH runner. Broker-side enrollment
 belongs to the broker operator; this procedure prints the facts the broker
 operator registers.
 
@@ -176,12 +176,10 @@ The host config listens on `0.0.0.0:8443` (IPv4) with resolvers 1.1.1.1 and
 ### Sizes beside the runner
 
 The server has 16 cores / 32 threads (thread *n* and *n*+16 share a core); the
-Windows VM owns 12-15 and 28-31. The Linux runner runs at `--max-weight 80` on
-the rest and is busy, so tenant 1 starts small:
+Windows VM owns 12-15 and 28-31. A small tenant configuration uses:
 
 - `cpuset` `8-11,24-27`: both threads of four cores, none of them Windows's.
-  These threads are shared with the runner; the tenant takes CPU only while it
-  runs a lease, because its CPU quota follows the leased vCPUs (one while idle).
+  The tenant's CPU quota follows its leased vCPUs (one while idle).
 - `vcpu_ceiling` 8, the size of that cpuset.
 - `guest_ram_mib` 28672. A lease for `v` vCPUs lets its job use
   `memory_max(v) = max(16 GiB, 3.5 GiB × v)`, which is 28 GiB at 8 vCPUs; a
@@ -192,10 +190,7 @@ the rest and is busy, so tenant 1 starts small:
   and stopped after `idle_suspend_s` (600 s).
 - `disk_quota_bytes` 107374182400 (100 GiB), so the in-VM runner's compile
   cache is 25 GiB (a quarter of the disk, at most 200 GiB). The tenant disk is
-  on `/srv/build`, which the SSH runner also uses: its disk guard refuses jobs
-  below its free-space floor (128 GiB by default) and evicts idle workspaces
-  and caches below its eviction threshold (twice the floor by default). A
-  tenant disk only grows, offline, with `provision.py resize`
+  on `/srv/build`. A tenant disk only grows, offline, with `provision.py resize`
   ([`script/tenant-provision/README.md`](../script/tenant-provision/README.md#offline-resize)).
   On an image that lists the `sparse-v1` capability a new disk is sparse: only
   the blocks the guest writes occupy the host.
@@ -223,23 +218,17 @@ eviction threshold the runner evicts idle workspaces, least recently used
 first, sooner than it would without the tenant. Pass `--tenant-disk-quota-gib`
 at a first install to change the disk size.
 
-The cutover's rule that `vcpu_ceiling` equals the runner's `--max-weight` is
-deliberately not met: that applies when the hosted route replaces the SSH
-runner, not while it runs beside it. The guest still advertises
+The guest advertises
 `memory_max` of its placeable size: 28,672 − 2,048 = 26,624 MiB places
 leases of up to 7 vCPUs ([hosted-cutover.md](hosted-cutover.md#enable-on-one-machine)).
 
-### Growing the tenant beside a smaller runner
+### Growing the tenant
 
-When the tenant takes over most Linux work, the tenant grows and the runner
-shrinks. As a worked example on this server: switch tenant 1 to an image that
-lists the `resize-v1` capability, then resize it offline (`provision.py
-resize`, both services stopped) to 24 vCPUs on `0-11,16-27`, 78 GiB (79,872
-MiB), a 600 GiB sparse disk, a permit budget (`max_weight`) of 64 and
-`idle_suspend_s` 0; and run the runner with
-`--linux-cpus 12-15,28-31 --max-weight 16`, the 8 threads outside the tenant's
-cpuset, shared with the Windows VM
-([scheduling.md](scheduling.md#confining-linux-jobs-to-a-cpu-list)). The
+As a worked example on this server: switch tenant 1 to an image that lists the
+`resize-v1` capability, then resize it offline (`provision.py resize`, both
+host services stopped) to 24 vCPUs on `0-11,16-27`, 78 GiB (79,872 MiB), a
+600 GiB sparse disk, a permit budget (`max_weight`) of 64 and
+`idle_suspend_s` 0. The tenant's cpuset excludes the Windows VM's CPUs. The
 tenant then advertises at most 77,824 MiB, so the broker's ceilings for the
 host are `max_job_vcpus` 21 and `max_job_mem_mib` 75,264. Headroom defaults to
 and must be at least `max(2048, ceil(guest_ram_mib * 3 / 100))` MiB. The memory fit is

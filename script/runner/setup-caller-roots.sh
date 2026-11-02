@@ -8,7 +8,7 @@ from pathlib import Path
 import stat
 
 source = Path('/srv/build/Users')
-roots = [Path('/srv/build/callers') / instance / 'home' for instance in ('main', 'e2e')]
+roots = [Path('/srv/build/callers/e2e/home')]
 for path in [source, *roots]:
     for component in [*reversed(path.parents), path]:
         if component.is_symlink():

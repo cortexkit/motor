@@ -1,9 +1,9 @@
 # Hosted runner cutover
 
-The hosted path is an opt-in Linux route. `hosted_runners` defaults to false;
-Windows keeps its existing route. Disabling hosted routing sends **new** Linux
-jobs through the existing SSH path. Attach, cancel and recovery of existing jobs
-use their saved route, even after a config change or module restart.
+Linux jobs run on hosted server VMs. Every new Linux job requires a hosted
+lease; a refusal never selects a direct runner or local execution. Windows
+keeps its existing route. Attach, cancel and recovery of existing jobs use
+their saved route, even after a config change or module restart.
 
 This document is a procedure, not a production qualification record. A portable
 test run does not establish a working tenant VM, a deployed broker or a completed
@@ -21,9 +21,9 @@ test run does not establish a working tenant VM, a deployed broker or a complete
   CKCRED must support `credential.account_token` for audience
   `cortexkit-runners`. A person must run `ck account login` if authentication is
   required; ck-motor does not open an interactive login.
-- A rollback binary and saved off-mode configuration, with the ordinary SSH
-  credential and runner still usable. Test that binary against the saved config
-  before enabling the hosted route.
+- A hosted-capable rollback binary and saved broker configuration. Test that
+  binary against the saved config before deployment; rollback must preserve
+  hosted routing for new Linux jobs.
 - A caller that treats a hosted refusal as **no execution**, never permission to
   run locally. The published caller types are pinned at 0.2.8: hosted safety and
   billing fields remain in ck-motor job state rather than new external fields.
@@ -31,9 +31,9 @@ test run does not establish a working tenant VM, a deployed broker or a complete
   and scheduler remain separate caller-side prerequisites, not claims made by
   this cutover procedure.
 
-The default config omits `hosted_runners`, `broker_url` and `broker_token_source`
-so it loads in the pinned older client. Do not leave explicit false/default
-hosted keys in the config used by a binary that rejects unknown fields.
+The legacy `hosted_runners` and spill-routing switches are ignored; they cannot
+select a direct Linux runner. See [module.md](module.md#configuration) for the
+current configuration.
 
 ## Refusal mapping at the 0.2.8 boundary
 
@@ -104,9 +104,8 @@ claiming real service or nonce-issuance qualification.
 ## Smoke-test the hosted path
 
 `ck motor run --hosted -- COMMAND` sends one job straight to a hosted lease, so
-an operator can test the broker, a hosted runner and the account token before
-turning hosted routing on. It does not set `hosted_runners` or spill, and no
-other job changes route.
+an operator can test the broker, a hosted runner and the account token.
+No other job changes route.
 
 - Only a direct caller can ask for it, and only while `admit_direct_exec` is
   on. The agent's and scheduler's routes cannot: their requests ignore the key.
@@ -136,24 +135,17 @@ need a checkout under `/Users` or `/home`, so they are ignored by default),
 `hosted_test_lease_is_not_retried_for_capacity_and_keeps_the_broker_code` and
 `hosted_runs_are_direct_only_and_need_a_configured_broker`.
 
-Ordinary hosted leases also avoid no host. A lease spilled from the build
-server names the build server's broker host id from the ck-motor config key
-`spill_avoid_host` (omitted when unset), so the job is never placed back on the
-machine it left; the value is stored with the job and every re-request repeats
-it (`spilled_lease_avoids_the_build_server_and_every_re_request_repeats_it`).
+Ordinary hosted lease requests do not exclude a host from placement. Linux
+jobs do not begin on a direct build-server runner.
 
 ## Enable on one machine
 
-1. Preserve the current unit, config and rollback binary. Record the **deployed**
-   runner unit's `--max-weight` and `--windows-cpus`; repository defaults are not
+1. Preserve the current host config, tenant registry and hosted-capable rollback
+   binary. Record the deployed Windows CPU set; repository defaults are not
    evidence of the deployed values.
-2. Record the tenant's registry and runner admin response before the flip:
-   - `vcpu_ceiling` equals that deployed `--max-weight`, when the hosted route
-     replaces the build server's runner. A host that keeps a smaller direct
-     runner beside the tenant instead confines that runner's Linux jobs to the
-     CPUs outside the tenant's cpuset with `--linux-cpus` and a lower
-     `--max-weight` ([scheduling.md](scheduling.md#confining-linux-jobs-to-a-cpu-list)),
-     and gives the tenant a permit budget (`max_weight`) of its own;
+2. Record the tenant's registry and runner admin response before deployment:
+   - `vcpu_ceiling` matches the tenant's assigned CPU set, and its runner has an
+     explicit permit budget (`max_weight`);
    - `cpuset` excludes the deployed Windows CPU set;
    - the guest advertises at least `memory_max(N)`, where N is the placeable
      size recorded as the broker's `max_job_vcpus` ceiling for the host: the
@@ -178,11 +170,11 @@ it (`spilled_lease_avoids_the_build_server_and_every_re_request_repeats_it`).
    `memory_max(vcpus)` is `max(16 GiB, 3.5 GiB × vcpus)`, in MiB
    `max(16384, 3584 × vcpus)`. Do not substitute the
    smaller test-tenant values for production provisioning.
-3. Keep the host agent and tenant VM beside the existing SSH runner. Move caches
-   onto the persistent tenant disk; allow for a one-time rebuild. Complete the
+3. Install the host agent and tenant VM. Keep caches on the persistent tenant
+   disk; allow for a one-time rebuild. Complete the
    operator-only isolation and recovery qualification before taking real jobs.
-4. In that machine's existing ck-motor config, set `hosted_runners: true` and
-   `broker_url` to the production HTTPS broker origin. Leave
+4. In that machine's ck-motor config, set `broker_url` to the production HTTPS
+   broker origin. Leave
    `broker_token_source` absent (the default is `ck_account`). Reload/restart the
    module using the normal deployment process. Never put the JWT in the config.
 5. Run a small Linux job. Check the saved hosted route, placement, runtime cap,
@@ -196,8 +188,8 @@ or log the bearer, lease token or challenge signature.
 
 ## Observe for 24 hours
 
-Keep the switch on continuously for at least 24 hours. Record UTC start/end and
-module/host revisions. Reconcile jobs by durable job ID, not the number of
+Keep the hosted deployment running continuously for at least 24 hours. Record
+UTC start/end and module/host revisions. Reconcile jobs by durable job ID, not the number of
 connections or attach attempts. Store the production record outside this public
 repository; do not commit host names, account identifiers, tokens or logs here.
 
@@ -216,25 +208,24 @@ Record at least:
 - Broker authentication/capacity errors, usage outbox backlog/divergence, tenant
   restarts, attach recovery, quota/space pressure and account-token refusals.
 
-The operator owns the production flip, the 24-hour counts and their causes.
+The operator owns the production deployment, the 24-hour counts and their causes.
 The caller execution-tool owner owns support for future typed hosted flags; the
 scheduler owner owns job attribution. Neither is certified by the portable tests
 in this repository.
 
 ## Roll back
 
-1. Set `hosted_runners` off for new jobs while leaving the current hosted-capable
-   binary running. Submit a new Linux job and record that it takes SSH.
-2. Keep at least one in-flight hosted drill job through this flip. Attach/cancel
-   on its saved hosted route; let it finish and record delivery of its terminal.
-   Do not move or resubmit it on SSH.
+1. Preserve the hosted broker configuration. Do not use a rollback binary that
+   routes new Linux jobs to a direct runner.
+2. Keep at least one in-flight hosted drill job through the rollback.
+   Attach/cancel on its saved hosted route; let it finish and record delivery of
+   its terminal. Do not move or resubmit it on another route.
 3. Wait until **no hosted job is non-terminal**. Check saved job state, not just
    the set of live client connections; detached jobs still count. Preserve job
    history and the tenant disk.
-4. Remove **all three** keys from the rollback config: `hosted_runners`,
-   `broker_url`, `broker_token_source`. A false value is not removal. Start the
-   rollback binary against that exact config and record its revision, successful
-   startup and a new SSH job's terminal delivery.
+4. Start the hosted-capable rollback binary against the saved broker config.
+   Record its revision, successful startup and a new hosted Linux job's terminal
+   delivery.
 5. Preserve the observation and drill records, including a zero lost-results
    reconciliation. A failed rollback startup or any missing result is a failed
    drill, not a completed cutover.

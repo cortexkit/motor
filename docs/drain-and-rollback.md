@@ -51,8 +51,8 @@ motor-runner resume --instance <instance>
 
 Pass `--state-root <path>` to `drain` and `resume` when the instance does not
 use the default state root (`$XDG_DATA_HOME/cortexkit/motor-runner`, or
-`~/.local/share/cortexkit/motor-runner`). The instance named `main` runs as
-`motor-runner.service`; other instances run as `motor-runner@<instance>.service`.
+`~/.local/share/cortexkit/motor-runner`). Named instances run as
+`motor-runner@<instance>.service`.
 
 With `--exit-after-drain false` the daemon stays up with admission closed until
 it is stopped or resumed. `deploy.sh` uses this so that systemd's restart policy
@@ -104,10 +104,12 @@ warnings, invalid/over-budget skips and timeout continuation.
 On the build server, as the account that owns the runner's user units:
 
 ```sh
-script/runner/deploy.sh /absolute/path/to/new/motor-runner [instance]
+script/runner/deploy.sh /absolute/path/to/new/motor-runner <instance>
 ```
 
-The instance defaults to `main`. The script:
+The instance is required: use `windows` for the Windows runner or `e2e` for
+the operator test instance. `main` is refused. Linux jobs from `ck-motor` run on
+hosted server VMs, not these user units. The script:
 
 1. Runs the candidate's `--version` and stages it next to the live binary as
    `<live>.new`, without touching the running executable.
@@ -140,8 +142,8 @@ Tests: `python3 -m unittest -v script/runner/test_deploy.py`, including
 ## Verify
 
 ```sh
-systemctl --user is-active motor-runner.service     # or motor-runner@<instance>.service
-journalctl --user -u motor-runner.service -n 50     # look for "motor-runner serving" and its version
+systemctl --user is-active motor-runner@<instance>.service
+journalctl --user -u motor-runner@<instance>.service -n 50     # look for "motor-runner serving" and its version
 <live binary> --version
 ```
 

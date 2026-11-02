@@ -15,7 +15,7 @@ HERE = Path(__file__).resolve().parent
 def strip_caller_roots(units):
     """Remove every --caller-root option from the unit files under units.
 
-    The repository's main and e2e units carry their instance's caller root.
+    The repository's e2e unit carries its instance's caller root.
     Tests of the unflagged install path, and tests that add their own flag,
     start from those units with the repository's flag removed.
     """
@@ -28,6 +28,22 @@ def strip_caller_roots(units):
 
 
 class InstallUnitsTests(unittest.TestCase):
+    def test_installer_leaves_an_installed_direct_unit_untouched_without_prompting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dest = root / 'home/.config/systemd/user'
+            dest.mkdir(parents=True)
+            retired = dest / 'motor-runner.service'
+            retired.write_text('ExecStart=/old-runner serve --max-weight 16\n')
+            env = dict(os.environ, HOME=str(root / 'home'))
+            for instance in ('e2e', 'windows'):
+                env['RUNNER_BINARY_' + instance] = str(root / 'absent-binary')
+            result = subprocess.run(['bash', str(HERE / 'install-units.sh')],
+                                    input='', text=True, capture_output=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn('motor-runner.service', result.stdout + result.stderr)
+            self.assertEqual(retired.read_text(), 'ExecStart=/old-runner serve --max-weight 16\n')
+
     def test_metrics_are_opt_in_rendered_in_diff_and_key_uses_service_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -40,7 +56,7 @@ class InstallUnitsTests(unittest.TestCase):
                 tool.chmod(0o755)
             env = dict(os.environ, HOME=str(root / 'home'), TMPDIR=str(root),
                        PATH=str(tools) + ':' + os.environ['PATH'], UNIT_TEST_LOG=str(log))
-            for name in ('main', 'e2e', 'windows'):
+            for name in ('e2e', 'windows'):
                 binary = tools / ('runner-' + name)
                 binary.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$UNIT_TEST_LOG"\n'
                                   'if [ "$1" = metrics-key ]; then printf "%064d\\n" 0; fi\n')
@@ -64,7 +80,8 @@ class InstallUnitsTests(unittest.TestCase):
             self.assertIn('+ExecStart=', enabled.stdout)
             self.assertIn(flags, enabled.stdout)
             self.assertIn('check-options --instance windows', log.read_text())
-            self.assertNotIn('--metrics-', (dest / 'motor-runner.service').read_text())
+            self.assertNotIn('--metrics-', (dest / 'motor-runner@e2e.service.d/binary.conf').read_text())
+            self.assertFalse((dest / 'motor-runner.service').exists())
             self.assertNotIn('restart', log.read_text())
             log.write_text('')
             key = subprocess.run(script + ['--metrics-key'], text=True, capture_output=True, env=env)
@@ -107,7 +124,7 @@ class InstallUnitsTests(unittest.TestCase):
                        UNIT_TEST_LOG=str(log))
             # The repository units carry --caller-root, so the installer checks
             # them with each instance's binary; plant binaries that accept them.
-            for name in ('main', 'e2e', 'windows'):
+            for name in ('e2e', 'windows'):
                 binary = root / ('binary-' + name)
                 binary.write_text('#!/bin/sh\nexit 0\n')
                 binary.chmod(0o755)
@@ -125,14 +142,14 @@ class InstallUnitsTests(unittest.TestCase):
             self.assertIn('--user daemon-reload', commands)
             self.assertNotIn('restart', commands)
             self.assertIn('Drain all runner instances', result.stdout)
-            for name in ('motor-runner.service', 'motor-runner@.service'):
+            for name in ('motor-runner@.service',):
                 self.assertEqual((home / '.config/systemd/user' / name).read_bytes(),
                                  (HERE / 'units' / name).read_bytes())
             self.assertFalse((home / '.config/systemd/user/system').exists())
 
     def test_unflagged_unit_respects_ever_enabled_history(self):
-        for instance, spelling in (('main', 'default'), ('e2e', 'default'),
-                                   ('main', 'separate'), ('e2e', 'equals'), ('windows', 'separate')):
+        for instance, spelling in (('e2e', 'default'), ('e2e', 'separate'),
+                                   ('e2e', 'equals'), ('windows', 'separate')):
             for capability in ('absent', 'legacy', 'pass'):
                 for ever_enabled in (False, True):
                     with self.subTest(instance=instance, spelling=spelling, capability=capability,
@@ -143,8 +160,7 @@ class InstallUnitsTests(unittest.TestCase):
                         strip_caller_roots(source / 'units')
                         for name in ('install-units.sh', 'deploy_canary.py'):
                             shutil.copyfile(HERE / name, source / name)
-                        relative = {'main': 'motor-runner.service',
-                                    'e2e': 'motor-runner@e2e.service.d/binary.conf',
+                        relative = {'e2e': 'motor-runner@e2e.service.d/binary.conf',
                                     'windows': 'motor-runner@windows.service.d/windows.conf'}[instance]
                         unit = source / 'units' / relative
                         state_root = (root / 'data/cortexkit/motor-runner' if spelling == 'default'
@@ -170,7 +186,7 @@ class InstallUnitsTests(unittest.TestCase):
                         env.pop('RUNNER_STATE_ROOT', None)
                         if spelling != 'default':
                             env['RUNNER_STATE_ROOT'] = str(root / 'wrong-state')
-                        for name in ('main', 'e2e', 'windows'):
+                        for name in ('e2e', 'windows'):
                             binary = root / ('binary-' + name)
                             env['RUNNER_BINARY_' + name] = str(binary)
                             if name == instance and capability == 'absent':
@@ -187,12 +203,12 @@ class InstallUnitsTests(unittest.TestCase):
                         self.assertEqual((dest / relative).exists(), not refused, result.stderr)
                         if refused:
                             self.assertIn('caller roots were enabled for ' + instance, result.stderr)
-                            other = ('motor-runner@e2e.service.d/binary.conf' if instance == 'main'
-                                     else 'motor-runner.service')
+                            other = ('motor-runner@windows.service.d/windows.conf' if instance == 'e2e'
+                                     else 'motor-runner@e2e.service.d/binary.conf')
                             self.assertTrue((dest / other).exists())
 
     def test_flagged_unit_uses_its_own_binary_and_refusals_leave_other_units_installable(self):
-        for instance in ('main', 'e2e'):
+        for instance in ('e2e',):
             for capability in ('absent', 'legacy', 'refuse', 'pass'):
                 with self.subTest(instance=instance, capability=capability), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
@@ -201,8 +217,7 @@ class InstallUnitsTests(unittest.TestCase):
                     strip_caller_roots(source / 'units')
                     for name in ('install-units.sh', 'deploy_canary.py'):
                         shutil.copyfile(HERE / name, source / name)
-                    relative = ('motor-runner.service' if instance == 'main' else
-                                'motor-runner@e2e.service.d/binary.conf')
+                    relative = 'motor-runner@e2e.service.d/binary.conf'
                     flagged = source / 'units' / relative
                     text = flagged.read_text().splitlines()
                     text = [line + ' --caller-root /home=/srv/build/callers/' + instance + '/home'
@@ -218,7 +233,7 @@ class InstallUnitsTests(unittest.TestCase):
                     env = dict(os.environ, HOME=str(root / 'home'),
                                PATH=str(tools) + ':' + os.environ['PATH'])
                     log = root / 'checks'
-                    for name in ('main', 'e2e', 'windows'):
+                    for name in ('e2e', 'windows'):
                         binary = root / ('binary-' + name)
                         env['RUNNER_BINARY_' + name] = str(binary)
                         if name == instance and capability == 'absent':
@@ -238,8 +253,7 @@ fi
                     self.assertEqual(result.returncode, 0, result.stderr)
                     dest = root / 'home/.config/systemd/user'
                     self.assertEqual((dest / relative).exists(), capability == 'pass')
-                    other = ('motor-runner@e2e.service.d/binary.conf' if instance == 'main'
-                             else 'motor-runner.service')
+                    other = 'motor-runner@windows.service.d/windows.conf'
                     self.assertEqual((dest / other).read_bytes(), (source / 'units' / other).read_bytes())
                     self.assertTrue((dest / 'motor-runner@windows.service.d/windows.conf').exists())
                     if capability != 'absent':

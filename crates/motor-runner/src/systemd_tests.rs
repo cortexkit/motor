@@ -37,7 +37,6 @@ fn installed_units_reserve_host_memory_and_protect_user_runners() {
     setting(slice, "[Slice]", "MemoryMax", "85%");
     setting(slice, "[Slice]", "MemorySwapMax", "0");
     for unit in [
-        include_str!("../../../script/runner/units/motor-runner.service"),
         include_str!("../../../script/runner/units/motor-runner@.service"),
         include_str!("../../../script/runner/units/system/runner-user-manager.conf"),
         include_str!("../../../script/boat-image/motor-boat.service"),

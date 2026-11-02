@@ -2,8 +2,8 @@
 
 This contract states what a job can see and do on the runner: its filesystem,
 its network, the account it runs as, and its limits. Linux jobs run in a
-transient systemd service on the build server; Windows jobs run in a fresh
-virtual machine, covered in [windows-jobs.md](windows-jobs.md). The threat model
+transient systemd service inside a hosted server VM or Boat sandbox; Windows
+jobs run in a fresh virtual machine, covered in [windows-jobs.md](windows-jobs.md). The threat model
 built on these rules is in [SECURITY.md](../SECURITY.md).
 
 The code is `crates/motor-runner/src/isolation.rs` (the sandbox and its
@@ -102,7 +102,7 @@ properties. A Rust job also gets `CARGO_TARGET_DIR=/run/motor/target` and
 
 Boat sandboxes and tenant VMs have no shared compile cache: their jobs get
 no `/motor-cache` mount, no `RUSTC_WRAPPER` and no `SCCACHE_*` variables. A Rust
-job there still builds in the same fixed folder as on the build server:
+job there still builds in the host backend's fixed folder:
 `CARGO_TARGET_DIR=/run/motor/target`, bound to the workspace's own `target/`, so
 build paths and `./target` behave identically everywhere. Tests:
 `hosted_jobs_bypass_shared_compile_cache_but_keep_the_fixed_target_folder`,
@@ -165,7 +165,7 @@ store it there: the build server's own `/home` holds the operator account, its
 toolchains and the runner binary, and Boat's provider owns `/home` inside the
 sandbox. A *caller root* therefore pairs one caller prefix with a host
 directory the runner owns, `PREFIX=HOST` for short, for example
-`--caller-root /home=/srv/build/callers/main/home`. The runner stores the
+`--caller-root /home=/srv/build/callers/e2e/home`. The runner stores the
 checkout under the host directory and binds it, read-write, at the caller's
 `/home` path. Every path in the job, its output, `pwd`, `$PWD`, git's
 `safe.directory` entries, `WorkingDirectory` and its compiler diagnostics reads
@@ -194,8 +194,7 @@ Source: `crates/motor-runner/src/caller_path.rs` and
 `crates/motor-runner/src/caller_path/` (`startup.rs`, `owner.rs`, `trash.rs`,
 `forget.rs`).
 
-3.8.1. **One host directory per instance.** Main uses
-`/srv/build/callers/main/home` and the `e2e` instance
+3.8.1. **One host directory per instance.** The `e2e` instance uses
 `/srv/build/callers/e2e/home`; Boat uses
 `/var/lib/motor-boat/state/callers/home`. No two instances share one, so the
 instance's own `daemon.lock` fences every mutation under it. The directory is
@@ -286,8 +285,8 @@ the host directory, is `escape`. Tests:
 the instance's full serve argument list and the prefix:
 
 ```sh
-motor-runner forget-caller-root --prefix /home --instance main --state-root <state-root> \
-  --caller-root /home=/srv/build/callers/main/home # ... the instance's other serve options
+motor-runner forget-caller-root --prefix /home --instance e2e --state-root <state-root> \
+  --caller-root /home=/srv/build/callers/e2e/home # ... the instance's other serve options
 ```
 
 The list is parsed exactly as `serve` and `check-options` parse it, so the
@@ -401,8 +400,8 @@ Tests: `post_credential_drop_rearms_parent_death_signal`,
 `proc_protections_must_equal_the_independent_reference_after_moves`.
 
 4.4.2. How a job can tell it is inside a motor job sandbox. On every Linux
-host that runs jobs (the build server, a Boat sandbox and a hosted tenant VM)
-these hold, and callers may rely on them:
+host backend that runs jobs (the operator test instance, a Boat sandbox and a
+hosted tenant VM) these hold, and callers may rely on them:
 
 - The job's process runs in the cgroup of its own transient system service,
   `/proc/self/cgroup` reads `0::/motor.slice/motor-jobs.slice/motor-job-<uuid>.service`, with a
