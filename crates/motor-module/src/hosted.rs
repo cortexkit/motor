@@ -504,7 +504,7 @@ pub(crate) fn validate(request: &RunRequest) -> Result<(), Error> {
     }
     if request
         .memory_mib
-        .is_some_and(|mib| mib == 0 || mib > 9_007_199_254_740_991 || mib % 1024 != 0)
+        .is_some_and(|mib| mib == 0 || mib > motor_protocol::MEMORY_MAX_MIB || mib % 1024 != 0)
     {
         return Err(Error::RequestInvalid(RequestField::new("memory_mib")));
     }
@@ -537,7 +537,7 @@ pub(crate) fn validation_detail(request: &RunRequest, error: Error) -> String {
             )
         }
         Error::RequestInvalid(Some(field)) if field.as_str() == "memory_mib" => format!(
-            "memory_mib={}: set a positive whole number of GiB (a multiple of 1024 MiB)",
+            "memory_mib={}: set whole GiB (a multiple of 1024 MiB), at most 262144 MiB",
             request.memory_mib.unwrap_or_default()
         ),
         Error::Path => {
@@ -604,9 +604,9 @@ fn spill_wait_budget_ms(job: &crate::storage::Job) -> u64 {
 }
 /// The first leased resource whose token claim differs from what ck-motor
 /// requested, as (field, expected, actual). A first-party host's token states
-/// the broker-raised statement when memory was specified, otherwise one of
-/// the broker's default per-job figures, the ones
-/// [`motor_lease::first_party_mem_mib_accepted`] admits. A Boat token states
+/// the broker-raised statement when memory was specified. Otherwise its memory
+/// must pass [`motor_lease::first_party_mem_mib_accepted`]; the host also checks
+/// its own tenant's ceiling. A Boat token states
 /// the whole sandbox's usable memory, which must lie in
 /// [`motor_lease::boat_memory_range`]. Each check is the one the host or
 /// in-sandbox endpoint also applies.
@@ -631,7 +631,8 @@ fn resource_mismatch(
         (
             motor_lease::first_party_mem_mib_accepted(body.vcpus, claims.mem_mib),
             format!(
-                "{} or {}",
+                "whole GiB >= {} MiB, or retained {} or {} MiB",
+                2048 * u64::from(body.vcpus),
                 motor_lease::job_memory_mib(body.vcpus),
                 motor_lease::memory_max_mib(body.vcpus)
             ),

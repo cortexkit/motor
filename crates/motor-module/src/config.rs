@@ -76,6 +76,9 @@ pub struct Config {
     /// and has sufficient disk reservation budget.
     #[serde(skip_serializing_if = "is_false")]
     pub return_large: bool,
+    /// Allow Linux memory sizes and advertise support for them.
+    #[serde(skip_serializing_if = "is_false")]
+    pub memory_sizes: bool,
     /// The longest timeout, in seconds, a direct `exec.run` may ask for. A
     /// disconnected caller may never return with its secret, so every direct
     /// job must end on its own: ck-motor refuses a direct
@@ -315,6 +318,7 @@ impl Default for Config {
             network_routing: false,
             admit_direct_exec: false,
             return_large: false,
+            memory_sizes: false,
             direct_exec_max_timeout_secs: DEFAULT_DIRECT_EXEC_MAX_TIMEOUT_SECS,
         }
     }
@@ -555,6 +559,30 @@ pub(crate) struct RunnerTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_sizes_defaults_off_omits_false_and_gates_the_capability() {
+        let config = Config::default();
+        assert!(!config.memory_sizes);
+        assert!(serde_json::to_value(&config)
+            .unwrap()
+            .get("memory_sizes")
+            .is_none());
+        assert!(!crate::module::manifest_with_config("motor", &config)
+            .capabilities
+            .unwrap()
+            .provides
+            .contains(&motor_protocol::MEMORY_CAPABILITY.into()));
+        let config: Config =
+            serde_json::from_value(serde_json::json!({"memory_sizes":true})).unwrap();
+        assert!(config.memory_sizes);
+        assert_eq!(serde_json::to_value(&config).unwrap()["memory_sizes"], true);
+        assert!(crate::module::manifest_with_config("motor", &config)
+            .capabilities
+            .unwrap()
+            .provides
+            .contains(&motor_protocol::MEMORY_CAPABILITY.into()));
+    }
 
     #[test]
     fn legacy_shadow_config_loads_but_is_ignored_and_not_serialized() {
