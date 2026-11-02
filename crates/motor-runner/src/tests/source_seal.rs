@@ -90,6 +90,11 @@ fn isolated_config(f: &Fixture) -> Config {
     let mut config = f.config();
     config.isolate_jobs = true;
     config.disable_warm_builds = true;
+    // Preserve the real unit ceiling, but do not read the jobs_min_bytes
+    // declaration in /etc/motor-host/capacity.json for a source-protection test.
+    config.slice_budget_probe = Some(Arc::new(|| {
+        Ok((crate::systemd::read_job_memory_budget()?.max, None))
+    }));
     config
 }
 
@@ -163,11 +168,12 @@ async fn isolated_source_seal_refuses_edits_and_workspace_is_reusable() {
         || runner_diagnostics(&runner),
     )
     .await;
+    let early_terminal = runner.core.inner.lock().unwrap().jobs[&run.job_id]
+        .terminal
+        .clone();
     assert!(
-        runner.core.inner.lock().unwrap().jobs[&run.job_id]
-            .terminal
-            .is_none(),
-        "{}",
+        early_terminal.is_none(),
+        "command ended before edit checks finished (exit 11 means sed changed source): {early_terminal:?}; {}",
         job_output(&runner, run.job_id)
     );
     let unit = runner.core.inner.lock().unwrap().jobs[&run.job_id]
