@@ -102,6 +102,17 @@ impl ExecutionEvidence {
         self.result.as_deref() == Some("oom-kill") || self.oom_kill.is_some_and(|n| n > 0)
     }
 
+    pub(crate) fn job_limit_oom(&self) -> bool {
+        // An ancestor OOM also increments a victim's oom_kill counter. Require
+        // systemd's OOM result and evidence that this unit hit its own cap.
+        self.result.as_deref() == Some("oom-kill")
+            && (self.oom.is_some_and(|count| count > 0)
+                || self
+                    .peak
+                    .zip(self.limit)
+                    .is_some_and(|(peak, limit)| peak >= limit))
+    }
+
     pub(crate) fn disk_full(&self) -> bool {
         self.output_storage_full
             || [&self.workspace, &self.state]
@@ -134,13 +145,7 @@ impl Runner {
             && (self.core.config.isolate_jobs || self.core.config.boat_profile)
         {
             if let Some(unit) = job.process.and_then(|p| p.unit) {
-                #[cfg(test)]
-                let configured = backend::memory_max(job.weight, self.core.config.memory_floor_gib);
-                #[cfg(not(test))]
-                let configured = backend::memory_max(job.weight);
-                evidence.limit = evidence.limit.or(Some(
-                    self.core.config.boat_memory_max_bytes.unwrap_or(configured),
-                ));
+                evidence.limit = evidence.limit.or(Some(self.job_unit_memory_max(job)));
                 let unit = self.core.backend.unit_name(&self.core.config, unit);
                 if let Ok(output) = backend::systemctl(&self.core.config, &[
                     "show", "--property=ControlGroup,MemoryPeak,MemoryMax,Result,ExecMainCode,ExecMainStatus", &unit,
@@ -204,6 +209,26 @@ impl Runner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_systemd_oom_under_the_units_own_limit_is_job_limit() {
+        for (result, peak, oom, expected) in [
+            ("oom-kill", 2048, Some(1), true),
+            ("oom-kill", 4096, None, true),
+            ("oom-kill", 2048, Some(0), false),
+            ("success", 4096, Some(1), false),
+        ] {
+            let evidence = ExecutionEvidence {
+                result: Some(result.into()),
+                peak: Some(peak),
+                limit: Some(4096),
+                oom,
+                oom_kill: Some(1),
+                ..Default::default()
+            };
+            assert_eq!(evidence.job_limit_oom(), expected);
+        }
+    }
 
     #[test]
     fn ancestor_slice_oom_keeps_victim_counters_and_vcpu_advice() {

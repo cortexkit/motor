@@ -249,6 +249,7 @@ fn setup(cwd: &Path) -> Setup {
     let id = Uuid::now_v7();
     Setup {
         id,
+        memory_mib: None,
         cpus: vec![1, 17],
         request: Run {
             return_paths: Vec::new(),
@@ -288,6 +289,7 @@ struct LaunchCall {
     env: BTreeMap<String, String>,
     cpus: Vec<u32>,
     requested_vcpus: u32,
+    memory_mib: Option<u64>,
 }
 
 /// Records dispatch through the same IsolationLauncher boundary as systemd.
@@ -302,7 +304,7 @@ impl IsolationLauncher for ObservedIsolationLauncher {
         cwd: &Path,
         env: &[(String, String)],
         cpus: &[u32],
-        requested_vcpus: u32,
+        resources: JobResources,
         #[cfg(target_os = "linux")] _sources: crate::source_seal::Sources<'_>,
     ) -> io::Result<platform::Launch> {
         *self.0.lock().unwrap() = Some(LaunchCall {
@@ -310,7 +312,8 @@ impl IsolationLauncher for ObservedIsolationLauncher {
             cwd: cwd.into(),
             env: env.iter().cloned().collect(),
             cpus: cpus.to_vec(),
-            requested_vcpus,
+            requested_vcpus: resources.vcpus,
+            memory_mib: resources.memory_mib,
         });
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -358,6 +361,7 @@ fn host_backend_launch_uses_isolation_launcher() {
     assert_eq!(call.command, "exit 0");
     assert_eq!(call.cpus, setup.cpus);
     assert_eq!(call.requested_vcpus, 8);
+    assert_eq!(call.memory_mib, None);
     assert_eq!(call.cwd, scratch.path());
     assert_eq!(
         call.env["CARGO_TARGET_DIR"],
@@ -368,6 +372,33 @@ fn host_backend_launch_uses_isolation_launcher() {
         "/motor-tools/prefrontal-build-slot"
     );
     assert_eq!(call.env["RUSTFLAGS"], "-C debuginfo=1");
+}
+
+#[test]
+fn host_backend_carries_tenant_memory_to_the_isolation_launcher() {
+    let scratch = ScratchDir::new("motor-tenant-memory-dispatch");
+    for tenant in [false, true] {
+        let mut config = Config::new(scratch.join("state"), "main");
+        config.isolate_jobs = true;
+        config.tenant_vm = tenant;
+        let mut setup = setup(scratch.path());
+        setup.memory_mib = Some(6144);
+        let observed = Arc::new(Mutex::new(None));
+        let prepared = Prepared {
+            host_cwd: scratch.path().into(),
+            target: scratch.join("target"),
+            wrapper: None,
+            sandbox: Some(Box::new(ObservedIsolationLauncher(observed.clone()))),
+            vm: None,
+        };
+        let error =
+            launch_error(HostBackend.launch(&config, &trees(&config), &setup, &prepared, 2));
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let captured = observed.lock().unwrap();
+        let captured = captured.as_ref().unwrap();
+        assert_eq!(captured.requested_vcpus, 2);
+        assert_eq!(captured.memory_mib, tenant.then_some(6144));
+    }
 }
 
 #[test]

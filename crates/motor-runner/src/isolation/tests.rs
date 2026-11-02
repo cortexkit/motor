@@ -81,6 +81,56 @@ fn memory_max_scales_per_vcpu_with_a_sixteen_gib_floor() {
 }
 
 #[test]
+fn tenant_unit_uses_host_memory_and_keeps_other_target_limits() {
+    let f = Fixture::new();
+    for (tenant, boat, stated, expected) in [
+        (true, false, Some(6144), 6_u64 << 30),
+        (true, false, None, 16 << 30),
+        (false, false, Some(6144), 16 << 30),
+        (true, true, Some(6144), 14 << 30),
+    ] {
+        let sandbox = f.command_sandbox().in_tenant_vm(tenant).with_boat_profile(
+            boat,
+            true,
+            boat.then_some(14 << 30),
+        );
+        let command = sandbox
+            .command_for_resources(
+                "true",
+                &f.workspace,
+                &[],
+                true,
+                &[1],
+                crate::backend::JobResources {
+                    vcpus: 2,
+                    memory_mib: stated,
+                },
+            )
+            .unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.starts_with("--property=MemoryMax="))
+                .count(),
+            1
+        );
+        assert!(
+            args.contains(&format!("--property=MemoryMax={expected}").as_str()),
+            "{args:?}"
+        );
+        assert!(args.contains(
+            &format!(
+                "--property=TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev,size={expected}"
+            )
+            .as_str()
+        ));
+    }
+}
+
+#[test]
 fn memory_limit_gib_formats_floor_and_scaled_limits() {
     for (vcpus, limit) in [
         (1, "16"),

@@ -99,6 +99,7 @@ pub(crate) fn select(config: &Config) -> io::Result<Box<dyn Backend>> {
 pub(crate) struct Setup {
     pub id: Uuid,
     pub cpus: Vec<u32>,
+    pub memory_mib: Option<u64>,
     pub request: Run,
     pub base: bool,
     /// Sibling checkout paths mapped to their commits when setup was reserved.
@@ -118,6 +119,24 @@ pub(crate) struct Prepared {
     pub wrapper: Option<PathBuf>,
     pub sandbox: Option<Box<dyn IsolationLauncher>>,
     pub vm: Option<std::sync::Mutex<Option<Box<dyn Execution>>>>,
+}
+
+#[derive(Clone, Copy)]
+// Only Linux's systemd sandbox reads these; other backends retain their policy.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+pub(crate) struct JobResources {
+    pub vcpus: u32,
+    pub memory_mib: Option<u64>,
+}
+
+impl JobResources {
+    #[cfg(test)]
+    pub fn unstated(vcpus: u32) -> Self {
+        Self {
+            vcpus,
+            memory_mib: None,
+        }
+    }
 }
 
 /// Owns the prepared service and mount configuration. Tests can substitute a
@@ -141,7 +160,7 @@ pub(crate) trait IsolationLauncher: Send + Sync {
         cwd: &std::path::Path,
         env: &[(String, String)],
         cpus: &[u32],
-        requested_vcpus: u32,
+        resources: JobResources,
         #[cfg(target_os = "linux")] sources: crate::source_seal::Sources<'_>,
     ) -> io::Result<platform::Launch>;
 }
@@ -165,10 +184,10 @@ impl IsolationLauncher for crate::isolation::Sandbox {
         cwd: &std::path::Path,
         env: &[(String, String)],
         cpus: &[u32],
-        requested_vcpus: u32,
+        resources: JobResources,
         sources: crate::source_seal::Sources<'_>,
     ) -> io::Result<platform::Launch> {
-        self.launch_durable(command, cwd, env, cpus, requested_vcpus, sources)
+        self.launch_durable_for_resources(command, cwd, env, cpus, resources, sources)
     }
 }
 
@@ -1136,7 +1155,12 @@ impl Backend for HostBackend {
                 &job_path(&prepared.host_cwd),
                 &env,
                 &s.cpus,
-                weight,
+                JobResources {
+                    vcpus: weight,
+                    memory_mib: (config.tenant_vm && !config.boat_profile && !s.base)
+                        .then_some(s.memory_mib)
+                        .flatten(),
+                },
                 #[cfg(target_os = "linux")]
                 if s.base {
                     crate::source_seal::Sources::CompileCacheWriter

@@ -3378,6 +3378,7 @@ impl Sandbox {
         Ok(self)
     }
 
+    #[cfg(test)]
     fn command(
         &self,
         command: &str,
@@ -3386,6 +3387,25 @@ impl Sandbox {
         durable: bool,
         cpus: &[u32],
         requested_vcpus: u32,
+    ) -> io::Result<Command> {
+        self.command_for_resources(
+            command,
+            cwd,
+            env,
+            durable,
+            cpus,
+            crate::backend::JobResources::unstated(requested_vcpus),
+        )
+    }
+
+    fn command_for_resources(
+        &self,
+        command: &str,
+        cwd: &Path,
+        env: &[(String, String)],
+        durable: bool,
+        cpus: &[u32],
+        resources: crate::backend::JobResources,
     ) -> io::Result<Command> {
         if self.boat_profile && self.writer {
             return Err(io::Error::other(
@@ -3469,7 +3489,7 @@ impl Sandbox {
             cmd.arg("--property=CPUQuotaPeriodSec=100ms");
             cmd.arg(format!(
                 "--property=CPUQuota={}%",
-                u64::from(requested_vcpus) * 100
+                u64::from(resources.vcpus) * 100
             ));
         }
         if self.private_pids {
@@ -3510,11 +3530,11 @@ impl Sandbox {
                 crate::cpu::format_list(cpus)
             ));
         }
-        // The memory limit follows requested_vcpus, even when placement is empty or smaller.
+        // The fallback follows leased vCPUs, even when CPU placement is smaller.
         #[cfg(test)]
-        let memory_max = crate::backend::memory_max(requested_vcpus, self.memory_floor_gib);
+        let memory_max = crate::backend::memory_max(resources.vcpus, self.memory_floor_gib);
         #[cfg(not(test))]
-        let memory_max = crate::backend::memory_max(requested_vcpus);
+        let memory_max = crate::backend::memory_max(resources.vcpus);
         // A job's limit is a ceiling, while the shared slice's is a budget: a
         // request larger than the slice can never be honoured, so the unit asks
         // for the slice's own `MemoryMax` instead. An overrun still ends as an
@@ -3529,6 +3549,16 @@ impl Sandbox {
                 .unwrap()
                 .map_or(crate::systemd::NO_JOB_MEMORY_BUDGET, |budget| budget.max),
         );
+        // Only a tenant job receives a host-verified cap. Build-server, Boat
+        // and dependency-writer units keep their existing limits.
+        let memory_max = if self.tenant_vm && !self.boat_profile && !self.writer {
+            resources
+                .memory_mib
+                .map(|mib| mib.saturating_mul(1 << 20))
+                .unwrap_or(memory_max)
+        } else {
+            memory_max
+        };
         cmd.arg(format!("--property=MemoryMax={memory_max}"));
         // Match the host's executable /dev/shm policy while bounding this
         // job's private tmpfs to the same memory limit as the service.
@@ -3646,19 +3676,26 @@ impl Sandbox {
         cwd: &Path,
         env: &[(String, String)],
     ) -> io::Result<platform::Launch> {
-        self.launch_inner(command, cwd, env, false, &[], 0)
+        self.launch_inner(
+            command,
+            cwd,
+            env,
+            false,
+            &[],
+            crate::backend::JobResources::unstated(0),
+        )
     }
-    pub(crate) fn launch_durable(
+    pub(crate) fn launch_durable_for_resources(
         &self,
         command: &str,
         cwd: &Path,
         env: &[(String, String)],
         cpus: &[u32],
-        requested_vcpus: u32,
+        resources: crate::backend::JobResources,
         sources: crate::source_seal::Sources<'_>,
     ) -> io::Result<platform::Launch> {
         let sealed = sources.seal(self.id, self.writer, &self.prepared_javascript_directories)?;
-        let launched = self.launch_inner(command, cwd, env, true, cpus, requested_vcpus);
+        let launched = self.launch_inner(command, cwd, env, true, cpus, resources);
         if launched.is_err() {
             if let Some(seal) = sealed {
                 discard_unstarted(self.id);
@@ -3679,7 +3716,7 @@ impl Sandbox {
         env: &[(String, String)],
         durable: bool,
         cpus: &[u32],
-        requested_vcpus: u32,
+        resources: crate::backend::JobResources,
     ) -> io::Result<platform::Launch> {
         // Resolved before the unit exists and kept for the command built below.
         self.slice_budget
@@ -3729,7 +3766,7 @@ impl Sandbox {
             None
         };
         let mut child = self
-            .command(command, cwd, env, durable, cpus, requested_vcpus)?
+            .command_for_resources(command, cwd, env, durable, cpus, resources)?
             .env_clear()
             .stdin(if durable {
                 Stdio::null()

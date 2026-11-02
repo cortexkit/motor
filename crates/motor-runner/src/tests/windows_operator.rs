@@ -92,6 +92,7 @@ fn prepare_with_returns(
     }
     let setup = Setup {
         id: request.job_id,
+        memory_mib: None,
         request,
         cpus: vec![12, 13, 14, 15],
         base: false,
@@ -1005,6 +1006,7 @@ fn windows_qualification_one_vm_slot_lock_refuses_without_boot() {
     }
     let setup = Setup {
         id: request.job_id,
+        memory_mib: None,
         request,
         cpus: vec![12, 13, 14, 15],
         base: false,

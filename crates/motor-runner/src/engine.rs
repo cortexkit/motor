@@ -3620,14 +3620,30 @@ impl Runner {
     }
 
     pub(crate) fn accept(&self, request: Run) -> io::Result<Admission> {
-        self.accept_from(request, false)
+        self.accept_from(request, false, None)
     }
 
     pub(crate) fn accept_for_qualification(&self, request: Run) -> io::Result<Admission> {
-        self.accept_from(request, true)
+        self.accept_from(request, true, None)
     }
 
-    fn accept_from(&self, mut request: Run, qualification: bool) -> io::Result<Admission> {
+    pub(crate) fn accept_tenant(
+        &self,
+        request: Run,
+        memory_mib: Option<u64>,
+    ) -> io::Result<Admission> {
+        let memory_mib = memory_mib.filter(|memory| {
+            *memory > 0 && self.core.config.tenant_vm && !self.core.config.boat_profile
+        });
+        self.accept_from(request, false, memory_mib)
+    }
+
+    fn accept_from(
+        &self,
+        mut request: Run,
+        qualification: bool,
+        memory_mib: Option<u64>,
+    ) -> io::Result<Admission> {
         if self.core.quarantined.contains_key(&request.job_id) {
             return Ok(Admission::Duplicate);
         }
@@ -3698,6 +3714,7 @@ impl Runner {
                 request.weight_hint.unwrap_or(2)
             },
         );
+        job.memory_stated_mib = memory_mib;
         // If another pressure pass had already chosen this request's workspace
         // for deletion before admission began, the guard could not stop it, so
         // the files may be partly gone. Keep that setup refusal even when the
@@ -7720,6 +7737,7 @@ impl Runner {
         let setup = Setup {
             id,
             cpus,
+            memory_mib: job.memory_stated_mib,
             base: job.base,
             recorded: if snapshot_mode {
                 BTreeMap::new()
@@ -9099,11 +9117,15 @@ impl Runner {
         self.record_memory_peak(id, mem_peak_mib);
     }
 
-    /// The `MemoryMax` a Linux job unit with `weight` vCPUs is launched with,
-    /// computed as `isolation.rs` does at launch: the per-vCPU limit (or the
-    /// Boat sandbox budget), clamped to the jobs slice. Uses the slice ceiling
-    /// last cached, which changes only when an operator resizes the slice.
-    fn job_unit_memory_max(&self, weight: u32) -> u64 {
+    /// Mirrors the unit's host-verified cap, or its legacy per-vCPU/Boat limit
+    /// clamped to the last observed slice ceiling when no cap was supplied.
+    fn job_unit_memory_max(&self, job: &Job) -> u64 {
+        if self.core.config.tenant_vm && !self.core.config.boat_profile {
+            if let Some(memory) = job.memory_stated_mib {
+                return memory.saturating_mul(1 << 20);
+            }
+        }
+        let weight = job.weight;
         #[cfg(test)]
         let requested = crate::backend::memory_max(weight, self.core.config.memory_floor_gib);
         #[cfg(not(test))]
@@ -9139,7 +9161,7 @@ impl Runner {
         // interval so it never understates. A job held at its limit would then
         // report up to 0.1 GiB above a limit the kernel never let it pass, so
         // the peak is clamped to the limit the unit was launched with.
-        let limit_mib = self.job_unit_memory_max(updated.weight).div_ceil(1 << 20);
+        let limit_mib = self.job_unit_memory_max(&updated).div_ceil(1 << 20);
         updated.mem_peak_mib = Some(mem_peak_mib.min(limit_mib));
         updated.memory_accounting_pending = false;
         for _ in 0..accounting::MEMORY_PEAK_SAVE_ATTEMPTS {
@@ -9311,27 +9333,25 @@ impl Runner {
                 .unwrap_or(false);
         self.finish_step(id, &job.kill, "unit result read", finish_started);
         let memory_limit_detail = oom_stopped.then(|| {
-            oom_memory_limit_detail(
+            if let Some(memory) = job.memory_stated_mib {
+                let size_gib = memory.div_ceil(1024).saturating_mul(3).div_ceil(2);
+                format!("out of memory: the job reached its {memory} MiB limit; ask for {size_gib}gb (linux,{}c,{size_gib}gb)", job.weight)
+            } else {
+                oom_memory_limit_detail(
                 &self.core.config,
                 job.weight,
                 self.core.cpus.claim_limit(),
                 self.core
                     .slice_budget
                     .load(std::sync::atomic::Ordering::Relaxed),
-            )
+                )
+            }
         });
         if let Some(detail) = &memory_limit_detail {
-            #[cfg(test)]
-            let limit =
-                crate::backend::memory_limit_gib(job.weight, self.core.config.memory_floor_gib);
-            #[cfg(not(test))]
-            let limit = crate::backend::memory_limit_gib(job.weight);
-            let limit = self
-                .core
-                .config
-                .boat_memory_max_bytes
-                .map(|bytes| format!("{:.3}", bytes as f64 / (1_u64 << 30) as f64))
-                .unwrap_or(limit);
+            let limit = format!(
+                "{:.3}",
+                self.job_unit_memory_max(&job) as f64 / (1_u64 << 30) as f64
+            );
             tracing::warn!(
                 job_id = %id,
                 memory_limit_gib = %limit,
@@ -9654,6 +9674,11 @@ impl Runner {
                 finished.terminal(outcome, self.now());
             }
             finished.monitoring_error = monitoring_error.clone();
+            if job.memory_stated_mib.is_some() && evidence.job_limit_oom() {
+                finished.terminal = finished.terminal.take().map(|terminal| {
+                    terminal.with_oom_kill(motor_protocol::OomKill::new("job_limit"))
+                });
+            }
             let explanation = if let Some(error) = &monitoring_error {
                 Some(self.explained_terminal(&job, "exit_evidence_unavailable", error, &evidence))
             } else if oom_stopped {
