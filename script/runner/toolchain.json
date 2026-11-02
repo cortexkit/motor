@@ -13,7 +13,8 @@
   "apt_packages": {
     "by_role": {
       "boat": [
-        "coreutils"
+        "coreutils",
+        "musl-tools"
       ],
       "build-server": [
         "binaryen",
@@ -22,7 +23,8 @@
         "musl-tools"
       ],
       "tenant": [
-        "coreutils"
+        "coreutils",
+        "musl-tools"
       ]
     },
     "observed_build_server_versions": {
@@ -804,6 +806,10 @@
         "url": "https://www.kernel.org/pub/software/scm/git/git-2.53.0.tar.xz"
       },
       "version": "git version 2.53.0"
+    },
+    "musl-gcc": {
+      "path": "/usr/bin/musl-gcc",
+      "version_pattern": "(?:x86_64-linux-gnu-)?gcc \\([^)]+\\) [0-9.]+"
     },
     "nats-server": {
       "path": "/usr/local/bin/nats-server",
