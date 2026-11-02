@@ -5,15 +5,12 @@ use motor_protocol::{Run, Uuid};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    ffi::CString,
-    fs::{self, File, OpenOptions},
+    ffi::{CStr, CString},
+    fs::{self, File},
     io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::{
-            ffi::OsStrExt,
-            fs::{MetadataExt, OpenOptionsExt},
-        },
+        unix::{ffi::OsStrExt, fs::MetadataExt},
     },
     path::{Component, Path, PathBuf},
     process::Stdio,
@@ -116,7 +113,7 @@ impl ActiveSeal {
 }
 
 #[derive(Default)]
-pub(crate) struct Runtime(Mutex<BTreeMap<Uuid, Plan>>, Mutex<()>);
+pub(crate) struct Runtime(Mutex<BTreeMap<Uuid, Plan>>);
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Plan {
@@ -197,17 +194,121 @@ fn intent_path(state: &Path, id: Uuid) -> PathBuf {
     record_path(state, id).with_file_name("seal-intent")
 }
 
-fn operation_lock(state: &Path, id: Uuid) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .custom_flags(libc::O_NOFOLLOW)
-        .mode(0o600)
-        .open(record_path(state, id).with_file_name("seal-lock"))?;
-    fs2::FileExt::lock_exclusive(&file)?;
-    Ok(file)
+struct JobDirectory {
+    directory: File,
+    path: PathBuf,
+}
+
+impl JobDirectory {
+    fn open(state: &Path, id: Uuid) -> io::Result<Self> {
+        let root = crate::permissions::physical_root(state)?;
+        let relative = CString::new(format!("jobs/{id}"))?;
+        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+        how.flags = (libc::O_RDONLY
+            | libc::O_DIRECTORY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | libc::O_NONBLOCK) as u64;
+        how.resolve = 0x08 | 0x04; // RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                root.as_raw_fd(),
+                relative.as_ptr(),
+                &how,
+                std::mem::size_of_val(&how),
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            directory: unsafe { File::from_raw_fd(fd as i32) },
+            path: state.join("jobs").join(id.to_string()),
+        })
+    }
+
+    fn file(&self, name: &CStr, flags: i32) -> io::Result<File> {
+        let fd = unsafe {
+            libc::openat(
+                self.directory.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                0o600 as libc::mode_t,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("source seal state is not a regular file"));
+        }
+        Ok(file)
+    }
+
+    fn read(&self, name: &CStr) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.file(name, libc::O_RDONLY)?.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn exists(&self, name: &CStr) -> io::Result<bool> {
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                self.directory.as_raw_fd(),
+                name.as_ptr(),
+                &mut metadata,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0
+        {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(error)
+        }
+    }
+
+    fn unlink(&self, name: &CStr) -> io::Result<()> {
+        if unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
+    fn publish(&self, file: &File) -> io::Result<()> {
+        // Link the created inode, not the runner-owned staging name: replacing
+        // seal.new while the helper writes must not publish a different file.
+        if unsafe {
+            libc::linkat(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                self.directory.as_raw_fd(),
+                c"seal".as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        self.directory.sync_all()
+    }
+
+    fn lock(&self) -> io::Result<File> {
+        let file = self.file(c"seal-lock", libc::O_RDWR | libc::O_CREAT)?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(file)
+    }
 }
 
 fn overlap(a: &Path, b: &Path) -> bool {
@@ -287,12 +388,21 @@ impl Runtime {
         }
     }
 
-    pub(crate) fn seal(&self, state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
-        let _operation = self.1.lock().unwrap();
-        if self.0.lock().unwrap().contains_key(&id) {
-            return Err(io::Error::other("source seal already pending for job"));
+    fn claim(&self, id: Uuid, plan: Plan) -> io::Result<()> {
+        let mut pending = self.0.lock().unwrap();
+        match pending.entry(id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(plan);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {
+                Err(io::Error::other("source seal already pending for job"))
+            }
         }
-        self.0.lock().unwrap().insert(id, plan.clone());
+    }
+
+    pub(crate) fn seal(&self, state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
+        self.claim(id, plan.clone())?;
         // An intent covers the helper's pre-record interval across daemon
         // crashes. A per-job kernel lock serializes a surviving old helper
         // with startup unseal, and a late helper must still find this intent.
@@ -326,7 +436,6 @@ impl Runtime {
     }
 
     pub(crate) fn unseal(&self, state: &Path, id: Uuid) -> io::Result<()> {
-        let _operation = self.1.lock().unwrap();
         privileged("unseal", state, id, None)?;
         self.0.lock().unwrap().remove(&id);
         Ok(())
@@ -445,7 +554,6 @@ pub(crate) fn helper(action: &str, args: &[String]) -> io::Result<()> {
     }
     let id = args[0].parse::<Uuid>().map_err(io::Error::other)?;
     let state = Path::new(&args[1]);
-    crate::permissions::physical_root(state)?;
     match action {
         "seal" => {
             let mut bytes = Vec::new();
@@ -610,8 +718,9 @@ fn immutable(file: &File, enabled: bool) -> io::Result<()> {
 }
 
 fn seal(state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
-    let _operation = operation_lock(state, id)?;
-    let intent: Plan = serde_json::from_slice(&fs::read(intent_path(state, id))?)?;
+    let directory = JobDirectory::open(state, id)?;
+    let _operation = directory.lock()?;
+    let intent: Plan = serde_json::from_slice(&directory.read(c"seal-intent")?)?;
     if intent != plan {
         return Err(io::Error::other(
             "source seal intent differs from helper request",
@@ -633,27 +742,20 @@ fn seal(state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
         )?);
     }
     let record = Record { plan, handles };
-    let path = record_path(state, id);
-    if path.try_exists()? {
+    let path = directory.path.join("seal");
+    if directory.exists(c"seal")? {
         return Err(io::Error::other(format!(
             "source seal record already exists: {}",
             path.display()
         )));
     }
-    let directory = File::open(path.parent().unwrap())?;
     // Publish a complete synced record atomically, without replacing any old
     // recovery obligation. A crash while writing the staging file set no flags.
     let staging = path.with_extension("new");
     let mut durable = step(
         &staging,
         "create record",
-        OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .mode(0o600)
-            .open(&staging),
+        directory.file(c"seal.new", libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL),
     )?;
     let saved = step(
         &path,
@@ -661,20 +763,19 @@ fn seal(state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
         (|| {
             // The unprivileged daemon must read recovery records written by
             // its root helper; job accounts cannot traverse the state root.
-            let owner = directory.metadata()?;
+            let owner = directory.directory.metadata()?;
             if unsafe { libc::fchown(durable.as_raw_fd(), owner.uid(), owner.gid()) } != 0 {
                 return Err(io::Error::last_os_error());
             }
             durable.write_all(&serde_json::to_vec(&record)?)?;
             durable.sync_all()?;
-            fs::hard_link(&staging, &path)?;
-            directory.sync_all()?;
-            fs::remove_file(&staging)
+            directory.publish(&durable)?;
+            directory.unlink(c"seal.new")
         })(),
     );
     if let Err(error) = saved {
-        if path.exists() {
-            if let Err(cleanup) = unseal_locked(state, id) {
+        if directory.exists(c"seal")? {
+            if let Err(cleanup) = unseal_locked(&directory, id) {
                 return Err(io::Error::other(format!("{error}; rollback: {cleanup}")));
             }
         }
@@ -690,7 +791,7 @@ fn seal(state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
         )
         .and_then(|file| immutable(&file, true));
         if let Err(error) = step(&entry.path, "set FS_IMMUTABLE_FL", set) {
-            if let Err(cleanup) = unseal_locked(state, id) {
+            if let Err(cleanup) = unseal_locked(&directory, id) {
                 return Err(io::Error::other(format!("{error}; rollback: {cleanup}")));
             }
             return Err(error);
@@ -701,25 +802,25 @@ fn seal(state: &Path, id: Uuid, plan: Plan) -> io::Result<()> {
 }
 
 fn unseal(state: &Path, id: Uuid) -> io::Result<()> {
-    let _operation = operation_lock(state, id)?;
-    unseal_locked(state, id)
+    let directory = JobDirectory::open(state, id)?;
+    let _operation = directory.lock()?;
+    unseal_locked(&directory, id)
 }
 
-fn remove_intent(state: &Path, id: Uuid) -> io::Result<()> {
-    match fs::remove_file(intent_path(state, id)) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    File::open(record_path(state, id).parent().unwrap())?.sync_all()
+fn remove_intent(directory: &JobDirectory) -> io::Result<()> {
+    // Recovery owns the per-job lock and has cleared the immutable bit on
+    // every inode in the seal record, if a record existed.
+    // Unlink a crash's stale staging name without opening its target.
+    directory.unlink(c"seal.new")?;
+    directory.unlink(c"seal-intent")?;
+    directory.directory.sync_all()
 }
 
-fn unseal_locked(state: &Path, id: Uuid) -> io::Result<()> {
+fn unseal_locked(directory: &JobDirectory, id: Uuid) -> io::Result<()> {
     let started = std::time::Instant::now();
-    let path = record_path(state, id);
-    let bytes = match fs::read(&path) {
+    let bytes = match directory.read(c"seal") {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return remove_intent(state, id),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return remove_intent(directory),
         Err(error) => return Err(error),
     };
     let record: Record = serde_json::from_slice(&bytes)?;
@@ -746,8 +847,8 @@ fn unseal_locked(state: &Path, id: Uuid) -> io::Result<()> {
     if let Some(error) = failed {
         return Err(error);
     }
-    fs::remove_file(&path)?;
-    remove_intent(state, id)?;
+    directory.unlink(c"seal")?;
+    remove_intent(directory)?;
     tracing::info!(job_id = %id, files = record.handles.len(), elapsed_us = started.elapsed().as_micros(), "source unsealed");
     Ok(())
 }

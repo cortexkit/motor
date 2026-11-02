@@ -180,3 +180,155 @@ fn leftover_record_holds_workspace_and_ancestors_after_reload() {
     assert!(!runtime.blocks_caller("/caller/task-other"));
     assert!(runtime.check_host(Path::new("/caller/free")).is_ok());
 }
+
+fn helper_fixture(scratch: &ScratchDir) -> (PathBuf, Uuid, Plan) {
+    let state = scratch.join("state");
+    let id = Uuid::now_v7();
+    fs::create_dir_all(state.join("jobs").join(id.to_string())).unwrap();
+    let workspace = scratch.join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let plan = Plan {
+        unit: Uuid::now_v7(),
+        caller_workspace: workspace.clone(),
+        workspace,
+        files: vec![],
+    };
+    fs::write(intent_path(&state, id), serde_json::to_vec(&plan).unwrap()).unwrap();
+    (state, id, plan)
+}
+
+#[test]
+fn helper_refuses_preexisting_staging_links_without_changing_the_target() {
+    for hardlink in [true, false] {
+        let scratch = ScratchDir::new("motor-seal-staging-link");
+        let (state, id, plan) = helper_fixture(&scratch);
+        let victim = scratch.join("unrelated-file");
+        let original = b"must not truncate or change owner";
+        fs::write(&victim, original).unwrap();
+        let before = fs::metadata(&victim).unwrap();
+        let staging = record_path(&state, id).with_extension("new");
+        if hardlink {
+            fs::hard_link(&victim, &staging).unwrap();
+        } else {
+            std::os::unix::fs::symlink(&victim, &staging).unwrap();
+        }
+        let error = seal(&state, id, plan).unwrap_err();
+        assert_eq!(fs::read(&victim).unwrap(), original);
+        let after = fs::metadata(&victim).unwrap();
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        assert!(error.to_string().contains("create record"), "{error}");
+        assert!(!record_path(&state, id).exists());
+    }
+}
+
+#[test]
+fn recovery_unlinks_stale_staging_without_following_its_target() {
+    let scratch = ScratchDir::new("motor-seal-staging-recovery");
+    let (state, id, _) = helper_fixture(&scratch);
+    let outside = scratch.join("outside");
+    fs::write(&outside, b"outside").unwrap();
+    let staging = record_path(&state, id).with_extension("new");
+    std::os::unix::fs::symlink(&outside, &staging).unwrap();
+    unseal(&state, id).unwrap();
+    assert_eq!(fs::read(&outside).unwrap(), b"outside");
+    assert!(
+        fs::symlink_metadata(staging).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+    );
+    assert!(!intent_path(&state, id).exists());
+}
+
+#[test]
+fn helper_refuses_symlinked_intent_and_seal_reads() {
+    for intent in [true, false] {
+        let scratch = ScratchDir::new("motor-seal-read-link");
+        let (state, id, plan) = helper_fixture(&scratch);
+        let outside = scratch.join("outside-record");
+        let path = if intent {
+            intent_path(&state, id)
+        } else {
+            record_path(&state, id)
+        };
+        let bytes = if intent {
+            serde_json::to_vec(&plan).unwrap()
+        } else {
+            serde_json::to_vec(&Record {
+                plan: plan.clone(),
+                handles: vec![],
+            })
+            .unwrap()
+        };
+        fs::write(&outside, &bytes).unwrap();
+        if intent {
+            fs::remove_file(&path).unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        let result = if intent {
+            seal(&state, id, plan)
+        } else {
+            unseal(&state, id)
+        };
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ELOOP));
+        assert_eq!(fs::read(&outside).unwrap(), bytes);
+        assert!(fs::symlink_metadata(path).unwrap().is_symlink());
+    }
+}
+
+#[test]
+fn helper_state_operations_stay_in_the_pinned_job_after_ancestor_swap() {
+    let scratch = ScratchDir::new("motor-seal-state-swap");
+    let (state, id, _) = helper_fixture(&scratch);
+    let directory = JobDirectory::open(&state, id).unwrap();
+    let original_intent = directory.read(c"seal-intent").unwrap();
+    let outside = scratch.join("outside");
+    fs::create_dir_all(outside.join(id.to_string())).unwrap();
+    let outside_file = outside.join(id.to_string()).join("seal-intent");
+    fs::write(&outside_file, b"outside").unwrap();
+    let retained = state.join("retained-jobs");
+    fs::rename(state.join("jobs"), &retained).unwrap();
+    std::os::unix::fs::symlink(&outside, state.join("jobs")).unwrap();
+    assert!(JobDirectory::open(&state, id).is_err());
+    assert_eq!(directory.read(c"seal-intent").unwrap(), original_intent);
+    let mut created = directory
+        .file(c"seal.new", libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)
+        .unwrap();
+    created.write_all(b"pinned").unwrap();
+    assert_eq!(
+        fs::read(retained.join(id.to_string()).join("seal.new")).unwrap(),
+        b"pinned"
+    );
+    directory.unlink(c"seal-intent").unwrap();
+    assert!(!retained.join(id.to_string()).join("seal-intent").exists());
+    assert_eq!(fs::read(&outside_file).unwrap(), b"outside");
+    assert!(!outside.join(id.to_string()).join("seal.new").exists());
+}
+
+#[test]
+fn concurrent_runtime_claims_have_one_winner_per_job_without_blocking_other_ids() {
+    let runtime = std::sync::Arc::new(Runtime::default());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let id = Uuid::now_v7();
+    let plan = plan(&Config::new("/state", "test"), &request(), &[], b"").unwrap();
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let runtime = runtime.clone();
+            let barrier = barrier.clone();
+            let plan = plan.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let shared = runtime.claim(id, plan.clone());
+                runtime.claim(Uuid::now_v7(), plan).unwrap();
+                shared
+            })
+        })
+        .collect();
+    assert_eq!(
+        threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(Result::is_ok)
+            .count(),
+        1
+    );
+    assert_eq!(runtime.ids().len(), 9);
+    assert!(runtime.claim(id, plan).is_err());
+}
