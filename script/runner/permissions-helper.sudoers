@@ -2,4 +2,7 @@
 # Path arguments are data: the helper rejects non-absolute/root/symlink trees.
 # Seal/unseal accept exactly a job UUID and a state root; the seal plan is stdin.
 # Their state/workspace authority is restricted by /etc/motor-runner/source-seal.json.
-@OPERATOR@ ALL=(root) NOPASSWD: /usr/local/libexec/motor-runner-permissions physical-chmod owner-rwX -- *, /usr/local/libexec/motor-runner-permissions physical-chmod private-rwX -- *, /usr/local/libexec/motor-runner-permissions seal * *, /usr/local/libexec/motor-runner-permissions unseal * *
+# Each form ends in one trailing wildcard: sudo-rs, Ubuntu's default sudo since
+# 25.10, accepts a wildcard only as the last argument. The helper itself refuses
+# any argument count other than its fixed one.
+@OPERATOR@ ALL=(root) NOPASSWD: /usr/local/libexec/motor-runner-permissions physical-chmod owner-rwX -- *, /usr/local/libexec/motor-runner-permissions physical-chmod private-rwX -- *, /usr/local/libexec/motor-runner-permissions seal *, /usr/local/libexec/motor-runner-permissions unseal *
