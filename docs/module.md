@@ -619,10 +619,13 @@ gets `/home/...` back, on delivery, on attach and on replay, from a runner that
 stores the checkout elsewhere
 ([job-isolation.md](job-isolation.md#38-caller-root-mapping)).
 
-**Chunked returned files.** A request that also sets `return_chunked` gets up
+**Chunked returned files.** A request that also sets `return_chunked` defaults
 to 10 MiB of files (64 paths at most) instead of 256 KiB. `return_max_bytes`
-then defaults to, and may be at most, 10,485,760; above 262,144 bytes it is
-allowed only with `return_chunked`. Instead of `return_result`, the stream
+then defaults to 10,485,760. With ck-motor's `return_large` switch on (off by
+default), callers may request up to 128 MiB (134,217,728 bytes) on Linux,
+Windows and macOS when the runner chosen for the job advertises it. Above
+262,144 bytes, `return_max_bytes` is allowed only with `return_chunked`.
+Instead of `return_result`, the stream
 carries `return_chunk` records (at most 512 KiB of one file each, all of one
 file's chunks before the next file's, in request order) and then one
 `return_manifest` immediately before the terminal record. The manifest lists
@@ -642,16 +645,22 @@ the manifest at its original seq, with each returned entry turned into
 before the manifest; callers that set `return_chunked` accept it. The job
 record itself still lives for the usual 24 hours.
 
-The runner's `--return-budget-bytes` budget covers chunked returned files only; legacy `return_result` data keeps its existing 256 KiB cap and job-history retention.
+The runner's `--return-budget-bytes` disk budget covers chunked returned files
+only, including reservation overhead. A job whose returned files need disk
+budget waits in the queue for it and is never cut down to a smaller limit.
+Retained chunks keep their reservation until deleted. Legacy `return_result`
+data keeps its existing 256 KiB cap and job-history retention.
 
 ck-motor lists `exec-remote-return/v2` next to v1, and a caller sets
 `return_chunked` only for a module that lists it. The runner advertises
-support with `return_chunked` in its Hello. A runner without it (an older
-build-server, tenant or Boat image, or a Windows runner, which refuses returned
-files altogether) gets no Run: the job is refused before start as
+support with `return_chunked` in its Hello and its ceiling with
+`return_chunked_max_bytes` (absent means 10 MiB). With `return_large` on,
+ck-motor also lists `exec-remote-return/v3`. If the runner chosen for the job
+advertises a smaller ceiling than requested, the job is refused before Run,
+never reduced to a smaller limit. A runner without chunked support gets no
+Run: the job is refused before start as
 `request_rejected` with `return_chunked_unsupported`. Callers that do not set
-the flag get exactly the `return_result` behaviour above. `ck motor run` does
-not offer chunked return.
+the flag get exactly the `return_result` behaviour above.
 
 Tests: `agent_route::tests` in `crates/motor-module/src/agent_route_tests.rs`
 (hosted usage, settled and pending billing, a hosted return result, the chunked

@@ -109,8 +109,9 @@ function Assert-RunnerServiceCommand([string]$Expected) {
 
 function Get-RunnerServiceDefinition([string]$Root, [string]$MetricsEndpoint = '', [string]$MetricsHostId = '') {
     $metrics = Get-RunnerMetricsArguments $MetricsEndpoint $MetricsHostId
+    # Advertise 128 MiB returns with a 256 MiB disk reservation budget for one job.
     return [pscustomobject]@{
-        binary = ('"{0}\bin\motor-runner.exe" service --instance ally --state-root "{0}\state" --backend windows-vm --vm-config "{0}\vm.toml"' -f $Root) + $metrics
+        binary = ('"{0}\bin\motor-runner.exe" service --instance ally --state-root "{0}\state" --backend windows-vm --vm-config "{0}\vm.toml" --return-chunked-max-bytes 134217728 --return-budget-bytes 268435456' -f $Root) + $metrics
         display_name = 'Motor offline Hyper-V runner'
         start = 'auto'
         dependencies = @('vmms')

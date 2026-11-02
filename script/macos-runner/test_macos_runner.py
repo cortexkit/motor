@@ -222,6 +222,10 @@ class InstallerTests(unittest.TestCase):
     def test_metrics_default_off_and_opt_in_arguments(self):
         args = (Path('/runner'), Path('/state'), 'macos', Path('/vm.toml'))
         plain = install.agent(*args)['ProgramArguments']
+        self.assertEqual(plain, ['/runner', 'serve', '--instance', 'macos', '--state-root', '/state',
+                                 '--backend', 'macos-vm', '--vm-config', '/vm.toml', '--max-weight', '8',
+                                 '--return-chunked-max-bytes', '134217728',
+                                 '--return-budget-bytes', '536870912'])
         self.assertFalse(any(arg.startswith('--metrics-') for arg in plain))
         enabled = install.agent(*args, 'https://metrics.example:8443', 'monitor-1')['ProgramArguments']
         self.assertEqual(enabled, plain + ['--metrics-push', '--metrics-endpoint',

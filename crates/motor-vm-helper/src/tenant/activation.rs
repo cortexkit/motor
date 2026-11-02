@@ -65,6 +65,12 @@ fn validate_runner_args(text: &str) -> Result<()> {
             "--free-space-eviction-bytes" => {
                 value.parse::<u64>().map_err(|e| Error(e.to_string()))?;
             }
+            // The guest checks the maximum's range; the runner checks budget coverage at startup.
+            "--return-chunked-max-bytes" | "--return-budget-bytes" => {
+                if value.parse::<u64>().map_err(|e| Error(e.to_string()))? == 0 {
+                    return Err(Error("return byte count must be positive".into()));
+                }
+            }
             "--workspace-root" => roots.push(std::path::PathBuf::from(value)),
             "--owned-workspace-root" => owned.push(std::path::PathBuf::from(value)),
             "--state-root" if value == "/tenant/state" => {}

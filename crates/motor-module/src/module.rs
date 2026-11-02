@@ -1261,10 +1261,9 @@ impl ModuleHandler for Handler {
     }
 }
 fn return_cap_refusal(config: &Config, request: &RunRequest) -> Option<HandlerOutcome> {
-    // The rollout switch commits all Linux and macOS placements to the same ceiling.
-    // Selected runners still enforce their own advertised maximum before execution.
-    let max = if config.return_large && request.platform != Some(motor_protocol::Platform::Windows)
-    {
+    // The rollout switch applies the same return-size ceiling on every platform.
+    // The runner chosen for a job must still advertise a sufficient maximum before execution.
+    let max = if config.return_large {
         motor_protocol::RETURN_LARGE_MAX_BYTES_CAP
     } else {
         motor_protocol::RETURN_CHUNKED_MAX_BYTES_CAP
@@ -1281,6 +1280,30 @@ fn return_cap_refusal(config: &Config, request: &RunRequest) -> Option<HandlerOu
 #[cfg(test)]
 mod return_large_tests {
     use super::*;
+
+    #[test]
+    fn windows_large_returns_obey_rollout_switch_and_ceiling() {
+        let mut config = Config::default();
+        let mut request = RunRequest::new("task", "/repo", "/repo", "true")
+            .with_return_chunked(true)
+            .with_return_max_bytes(134_217_728);
+        request.platform = Some(motor_protocol::Platform::Windows);
+        assert!(return_cap_refusal(&config, &request).is_some());
+
+        config.return_large = true;
+        assert!(return_cap_refusal(&config, &request).is_none());
+        let request = request.with_return_max_bytes(134_217_729);
+        let Some(HandlerOutcome::ErrorWithDetail { code, detail, .. }) =
+            return_cap_refusal(&config, &request)
+        else {
+            panic!("Windows must enforce the large-return ceiling")
+        };
+        assert_eq!(code, "invalid_params");
+        assert_eq!(
+            detail,
+            serde_json::json!({"field":"return_max_bytes","max_bytes":134217728})
+        );
+    }
 
     #[test]
     fn large_return_submit_refusal_has_exact_detail_and_no_job_id() {

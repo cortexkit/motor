@@ -390,8 +390,10 @@ def runner_args(c):
     # cache switch on. A record without the key renders the same bytes it
     # always did, so resize keeps rendering what install wrote.
     cache = "--remote-cache true " if c.get("remote_cache") else ""
+    # Large returns reserve from a 2 GiB disk budget; jobs wait when it is full.
     return (f"--backend host --tenant-vm --job-network veth --state-root /tenant/state "
             f"--max-weight {weight} --rustc-slots {weight} "
+            "--return-chunked-max-bytes 134217728 --return-budget-bytes 2147483648 "
             f"--sccache-size-gib {min(200, c['disk_quota_bytes'] // (4 * 1024**3))} "
             f"--free-space-floor-bytes {c['disk_quota_bytes'] // 10} "
             f"--free-space-eviction-bytes {c['disk_quota_bytes'] * EVICTION_GOAL_PERCENT // 100} "

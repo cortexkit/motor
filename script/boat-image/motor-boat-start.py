@@ -59,6 +59,7 @@ def sandbox_cpus():
 def boat_runner_args(args):
     """The runner's arguments for this Boat sandbox.
 
+    The unit's returned-file maximum and disk budget pass through unchanged.
     `--remote-cache true` lets the runner read the compile-cache provisioning
     CLOUD's broker installs at /run/motor/cache on every create and resume. The
     runner switches the cache on only while those files parse and `enabled` is

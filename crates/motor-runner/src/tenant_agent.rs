@@ -392,6 +392,21 @@ impl RunnerArgs {
                 "--free-space-eviction-bytes" => {
                     value.parse::<u64>().map_err(io::Error::other)?;
                 }
+                "--return-chunked-max-bytes" => {
+                    let max = value.parse::<u64>().map_err(io::Error::other)?;
+                    if !(motor_protocol::RETURN_CHUNKED_MAX_BYTES_CAP
+                        ..=motor_protocol::RETURN_LARGE_MAX_BYTES_CAP)
+                        .contains(&max)
+                    {
+                        return Err(io::Error::other("return maximum must be 10..128 MiB"));
+                    }
+                }
+                // The runner checks that the budget covers a reservation at startup.
+                "--return-budget-bytes" => {
+                    if value.parse::<u64>().map_err(io::Error::other)? == 0 {
+                        return Err(io::Error::other("return byte count must be positive"));
+                    }
+                }
                 "--workspace-root" => roots.push(PathBuf::from(value)),
                 "--owned-workspace-root" => owned.push(PathBuf::from(value)),
                 "--state-root" if value == "/tenant/state" => {}
@@ -1136,6 +1151,42 @@ mod tests {
     }
 
     const TEST_ARGS: &str = "--backend host --tenant-vm --job-network veth --max-weight 2 --rustc-slots 2 --sccache-size-gib 5 --free-space-floor-bytes 2147483648 --workspace-root /Users --owned-workspace-root /Users --workspace-root /home --owned-workspace-root /home";
+
+    #[test]
+    fn return_options_are_bounded_and_passed_to_the_runner() {
+        let with_returns = format!(
+            "{TEST_ARGS} --return-chunked-max-bytes 134217728 --return-budget-bytes 2147483648"
+        );
+        let args = RunnerArgs::parse(&with_returns).unwrap();
+        let command = runner_command(&args, Path::new("/usr/local/bin/motor-runner"), &[]);
+        let words: Vec<_> = command
+            .get_args()
+            .map(|word| word.to_str().unwrap())
+            .collect();
+        for pair in [
+            ["--return-chunked-max-bytes", "134217728"],
+            ["--return-budget-bytes", "2147483648"],
+        ] {
+            assert!(words.windows(2).any(|words| words == pair));
+        }
+        assert!(RunnerArgs::parse(&with_returns.replace("134217728", "10485760")).is_ok());
+        for value in [
+            "0",
+            "10485759",
+            "134217729",
+            "-1",
+            "128MiB",
+            "18446744073709551616",
+            "",
+        ] {
+            let invalid = format!("{TEST_ARGS} --return-chunked-max-bytes {value}");
+            assert!(RunnerArgs::parse(&invalid).is_err(), "{invalid}");
+        }
+        for value in ["0", "-1", "2GiB", "18446744073709551616", ""] {
+            let invalid = format!("{TEST_ARGS} --return-budget-bytes {value}");
+            assert!(RunnerArgs::parse(&invalid).is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     fn daemon_start_binds_private_dns_and_persistent_cargo_home() {
