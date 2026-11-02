@@ -17,6 +17,7 @@ pub use preparation::{
 };
 #[cfg(windows)]
 pub mod protection;
+pub mod windows_path;
 
 pub const BUN_VERSION: &str = "1.4.4";
 pub const CACHE_DIR: &str = "C:\\motor-job\\bun-cache";

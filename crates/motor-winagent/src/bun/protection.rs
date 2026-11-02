@@ -17,7 +17,7 @@ use windows_sys::Win32::{
 
 /// `other_access` is zero for host secrets and read/execute for the guest seed.
 pub fn check(path: &Path, other_access: u32) -> io::Result<()> {
-    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let path = super::windows_path::extended_length(path.as_os_str().encode_wide())?;
     let (mut owner, mut dacl, mut descriptor) = (null_mut(), null_mut(), null_mut());
     let status = unsafe {
         GetNamedSecurityInfoW(
@@ -87,4 +87,37 @@ pub fn check(path: &Path, other_access: u32) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use cortexkit_test_support::ScratchDir;
+    use std::fs;
+
+    #[test]
+    fn long_blob_path_reaches_security_descriptor() {
+        let scratch = ScratchDir::new("bun-long-path-protection");
+        let directory = scratch
+            .join("a".repeat(64))
+            .join("b".repeat(64))
+            .join("sha512");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("c".repeat(128));
+        let length = path.as_os_str().encode_wide().count();
+        assert!(length > 260, "test path is only {length} UTF-16 units");
+        assert!(!path.to_string_lossy().starts_with(r"\\?\"));
+        fs::write(&path, b"cached package").unwrap();
+
+        // The unprivileged account running this test owns the file, not SYSTEM or
+        // Administrators. An ownership refusal proves the long name reached the
+        // security descriptor lookup.
+        let error = check(&path, 0).unwrap_err();
+        eprintln!(
+            "protection::check ({length} UTF-16 units): {error}; OS error: {:?}",
+            error.raw_os_error()
+        );
+        assert!(error.to_string().contains("untrusted ownership"), "{error}");
+        assert_eq!(error.raw_os_error(), None);
+    }
 }
