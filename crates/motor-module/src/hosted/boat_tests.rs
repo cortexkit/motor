@@ -846,7 +846,8 @@ fn cloud_boat_provisioning_retry_delay_is_clamped() {
 
 /// CLOUD's recorded Boat lease states the sandbox size's measured usable
 /// memory, not the fleet formula, and ck-motor must accept it. A first-party
-/// host's token must still state the formula exactly.
+/// token must state a broker formula or a whole-GiB size of at least 2 GiB per
+/// vCPU, so a usable-memory figure that is neither stays Boat-only.
 #[test]
 fn cloud_boat_vector_token_memory_is_accepted_for_boat_only() {
     let vector: serde_json::Value = serde_json::from_str(include_str!(
@@ -867,10 +868,14 @@ fn cloud_boat_vector_token_memory_is_accepted_for_boat_only() {
     assert_eq!(claims.mem_mib, vector["boat_sizes"][0]["mem_mib"]);
     assert_ne!(claims.mem_mib, motor_lease::memory_max_mib(body.vcpus));
     assert_eq!(resource_mismatch(&claims, &body, true), None);
-    // A first-party token must state one of the broker's per-job figures,
-    // which a Boat sandbox's usable memory is not.
+    // The vector's 14 GiB on 2 vCPUs is also a valid stated first-party size.
+    assert_eq!(resource_mismatch(&claims, &body, false), None);
+    // A usable-memory figure that isn't a whole GiB is accepted from Boat only.
+    let mut uneven = claims.clone();
+    uneven.mem_mib = 12_800;
+    assert_eq!(resource_mismatch(&uneven, &body, true), None);
     assert_eq!(
-        resource_mismatch(&claims, &body, false).map(|(field, ..)| field),
+        resource_mismatch(&uneven, &body, false).map(|(field, ..)| field),
         Some("mem_mib")
     );
     for figure in [

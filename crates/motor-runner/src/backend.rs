@@ -130,7 +130,8 @@ pub(crate) struct JobResources {
 }
 
 impl JobResources {
-    #[cfg(test)]
+    // Only the Linux sandbox's test fixtures build resources without a lease.
+    #[cfg(all(test, target_os = "linux"))]
     pub fn unstated(vcpus: u32) -> Self {
         Self {
             vcpus,
