@@ -469,8 +469,11 @@ class QualificationReadinessTests(unittest.TestCase):
                                  "requested-return-ads-refused", "no-requested-returns-preserves-changed-source"])
         operator = (HERE.parents[1] / "crates/motor-runner/src/tests/windows_operator.rs").read_text()
         checks = re.findall(r"^(?:async )?fn (windows_qualification_\w+)\(", operator, re.MULTILINE)
-        self.assertEqual(len(checks), 18)
+        self.assertEqual(len(checks), 19)
         self.assertIn("windows_qualification_realistic_checkout_bun_failure_is_nonfatal", checks)
+        # Real fleet checkouts (MOTOR_QUAL_CHECKOUTS) must prepare on a candidate
+        # image before it switches; fixtures alone missed three Bun refusals.
+        self.assertIn("windows_qualification_real_checkout_bun_preparation_is_not_refused", checks)
         for name in names:
             self.assertIn("windows_qualification_" + name.replace("-", "_"), checks)
         ads = next(case for case in JOBS.RETURN_QUALIFICATION_CASES if case[0] == "requested-return-ads-refused")
