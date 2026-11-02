@@ -3079,7 +3079,12 @@ impl Runner {
         let reservations = inner
             .reserved
             .keys()
-            .filter(|key| !inner.jobs.values().any(|job| job.base && job.key() == *key))
+            .filter(|key| {
+                !inner
+                    .jobs
+                    .values()
+                    .any(|job| job.base && crate::caller_path::job_key(job) == *key)
+            })
             .count();
         (active
             + lifecycle

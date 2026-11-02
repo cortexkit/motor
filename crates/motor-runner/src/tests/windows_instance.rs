@@ -703,6 +703,8 @@ fn windows_health_and_status_use_the_instance_units_and_baseline_toolchain() {
     );
     // An empty queue reports its oldest wait as zero rather than omitting it.
     assert_eq!(shape["oldest_wait_s"], 0);
+    // An idle runner reports no caller work, the count tenant activation needs.
+    assert_eq!(shape["caller_work"], 0);
     for key in [
         "load_1m",
         "threads",
@@ -711,6 +713,7 @@ fn windows_health_and_status_use_the_instance_units_and_baseline_toolchain() {
         "permits_cap",
         "queue_wait_1h",
         "oldest_wait_s",
+        "caller_work",
     ] {
         shape.as_object_mut().unwrap().remove(key);
     }
