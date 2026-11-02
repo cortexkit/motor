@@ -1308,10 +1308,7 @@ impl Motor {
                 Err((reason, detail, retry_after_ms)) => {
                     if explicit_windows
                         && (self.has_next_windows_runner(id)
-                            || matches!(
-                                reason,
-                                RefusalReason::Unreachable | RefusalReason::RunnerFull
-                            ))
+                            || windows_retryable_refusal(&reason, detail.as_deref()))
                     {
                         return Ok(true);
                     }
@@ -1673,11 +1670,7 @@ impl Motor {
                 // acknowledgement or an Accepted response alone cannot permit a move.
                 if explicit_windows
                     && !self.pending(id)
-                    && ((reason == RefusalReason::RunnerFull && self.has_next_windows_runner(id))
-                        || (matches!(
-                            reason,
-                            RefusalReason::RunnerFull | RefusalReason::WorkspaceSetupFailed
-                        ) && windows_slot_busy(detail.as_deref())))
+                    && windows_retryable_refusal(&reason, detail.as_deref())
                 {
                     if let Some(queue) = windows_queue.as_mut() {
                         queue.retry_delay = queue
@@ -2580,10 +2573,7 @@ impl Motor {
                     terminal.job_id = id;
                     if terminal.ran == Some(Ran::None)
                         && matches!(&terminal.outcome, Outcome::RefusedBeforeStart { reason }
-                            if *reason == RefusalReason::Unreachable
-                                || (*reason == RefusalReason::RunnerFull && self.has_next_windows_runner(id))
-                                || (matches!(reason, RefusalReason::RunnerFull | RefusalReason::WorkspaceSetupFailed)
-                                    && windows_slot_busy(terminal.refusal_detail.as_deref())))
+                            if windows_retryable_refusal(reason, terminal.refusal_detail.as_deref()))
                         && !self.pending(id)
                     {
                         if let Some(queue) = windows_queue.as_mut() {
@@ -3123,6 +3113,16 @@ impl Motor {
 }
 
 pub(crate) const WINDOWS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+// A before-start refusal releases this destination, not the job's shared wait
+// budget. Treat the last runner like every other runner so a later pass can
+// use capacity that freed up elsewhere.
+fn windows_retryable_refusal(reason: &RefusalReason, detail: Option<&str>) -> bool {
+    matches!(
+        reason,
+        RefusalReason::Unreachable | RefusalReason::RunnerDraining | RefusalReason::RunnerFull
+    ) || (*reason == RefusalReason::WorkspaceSetupFailed && windows_slot_busy(detail))
+}
 
 fn windows_slot_busy(detail: Option<&str>) -> bool {
     detail.is_some_and(|detail| {
