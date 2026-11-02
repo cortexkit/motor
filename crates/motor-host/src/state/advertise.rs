@@ -520,6 +520,16 @@ impl Host {
             .max()
             .unwrap_or(0)
     }
+    /// A placed tenant's largest stated job: guest RAM minus the same reserve
+    /// used by heartbeats, not a transient guest-availability sample.
+    pub fn stated_memory_ceiling_mib(&self, tenant: &Tenant) -> Option<u64> {
+        self.capacity.as_ref().map(|capacity| {
+            tenant
+                .guest_ram_mib
+                .saturating_sub(capacity.tenant_memory_reserve_bytes.div_ceil(MIB))
+        })
+    }
+
     fn tenant_free_mem_mib(&mut self, tenant: &Tenant, now_ms: u64) -> u64 {
         let Some(reserve_mib) = self
             .capacity

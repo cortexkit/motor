@@ -96,6 +96,7 @@ pub fn usage_violation(usage: &Usage) -> Option<&'static str> {
     if [usage.started_at_ms, usage.ended_at_ms]
         .into_iter()
         .chain(usage.mem_peak_mib)
+        .chain(usage.mem_working_peak_mib.flatten())
         .chain(usage.egress_bytes)
         .any(|value| value > SAFE_INTEGER)
     {
@@ -206,6 +207,7 @@ mod tests {
             mem_peak_mib: Some(481),
             egress_bytes: None,
             outcome: UsageOutcome::Cancelled,
+            mem_working_peak_mib: None,
         };
         assert_eq!(usage_violation(&usage), None);
         let body = serde_json::to_vec(&usage).unwrap();

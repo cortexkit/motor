@@ -6,6 +6,9 @@ use tokio::io::DuplexStream;
 mod accounting;
 #[path = "tenant_cancellation.rs"]
 mod cancellation;
+#[path = "tenant_memory.rs"]
+#[cfg(target_os = "linux")]
+mod memory;
 
 fn open(f: &Fixture) -> Runner {
     let mut config = f.config();
@@ -19,7 +22,7 @@ fn lease(id: Uuid, purpose: LeasePurpose) -> VerifiedLease {
         purpose,
         sub: "acct:test".into(),
         vcpus: 2,
-        mem_mib: 16384,
+        mem_mib: Some(16384),
         platform: crate::tenant::host_platform()
             .unwrap_or("unsupported")
             .into(),
@@ -94,6 +97,70 @@ fn pending(runner: &Runner) -> Vec<motor_protocol::TenantEvent> {
         events.push(event);
     }
     events
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tenant_memory_comes_from_verified_lease_not_caller_run_fields() {
+    use tokio::io::AsyncWriteExt;
+    let f = Fixture::new();
+    let mut config = f.config();
+    config.tenant_vm = true;
+    config.manual_tick = true;
+    config.slice_budget_probe = Some(Arc::new(|| Ok((64 << 30, None))));
+    let runner = Runner::open(config).unwrap();
+    for stated in [Some(6144), None] {
+        let (mut request, _) = f.run("true");
+        request.weight_hint = Some(2);
+        request.timeout = Some(30);
+        let mut verified = lease(request.job_id, LeasePurpose::Run);
+        verified.mem_mib = stated;
+        let (mut client, task) = connect(&runner, verified).await;
+        let mut caller = serde_json::to_value(Frame::Run(request.clone())).unwrap();
+        caller["memory_mib"] = serde_json::json!(1024);
+        caller["mem_mib"] = serde_json::json!(1024);
+        let bytes = serde_json::to_vec(&caller).unwrap();
+        client
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        client.write_all(&bytes).await.unwrap();
+        assert!(matches!(frame(&mut client).await, Some(Frame::Accepted(_))));
+        let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
+        assert_eq!(job.memory_stated_mib, stated);
+        assert_eq!(
+            runner.job_unit_memory_max(&job),
+            stated.map_or(16 << 30, |mib| mib << 20)
+        );
+        drop(client);
+        task.await.unwrap().unwrap();
+    }
+}
+
+#[test]
+fn memory_results_use_shared_fields_and_omit_unknown_values() {
+    let mut job = Job::new(Uuid::now_v7(), None, 1, 0, 2);
+    job.terminal_ended(Outcome::Exit { code: 0 }, 2);
+    let legacy = serde_json::to_value(&job).unwrap();
+    for field in [
+        "memory_stated_mib",
+        "memory_peak_working_mib",
+        "memory_over_s",
+        "oom_kill",
+    ] {
+        assert!(legacy["terminal"].get(field).is_none(), "{field}");
+    }
+    assert!(legacy.get("memory_stated_mib").is_none());
+    job.started_ms = Some(1);
+    job.memory_stated_mib = Some(6144);
+    job.mem_working_peak_mib = serde_json::from_value(serde_json::json!(123)).unwrap();
+    job.terminal_ended(Outcome::Exit { code: 0 }, 2);
+    let restored: Job = serde_json::from_value(serde_json::to_value(job).unwrap()).unwrap();
+    let terminal = restored.terminal.unwrap();
+    assert_eq!(terminal.memory_stated_mib(), Some(6144));
+    assert_eq!(terminal.memory_peak_working_mib(), Some(123));
+    assert_eq!(terminal.memory_over_s(), None);
+    assert_eq!(terminal.oom_kill(), None);
 }
 
 #[test]

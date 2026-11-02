@@ -727,9 +727,11 @@ async fn hosted_invalid_memory_refuses_before_snapshot_lease_or_ssh() {
     let h = Harness::new(Behavior::Normal).await;
     let scratch = Scratch::new();
     let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+    let mut config = h.config();
+    config.memory_sizes = true;
     let motor =
-        crate::Motor::with_connector(h.config(), &scratch.0.join("state"), ssh.clone()).unwrap();
-    for memory in [0, 1025, 4097, 9_007_199_254_740_992] {
+        crate::Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+    for memory in [0, 1025, 4097, 263168, 9_007_199_254_740_992] {
         let mut request =
             RunRequest::new("/home/missing", "/home/missing", "/home/missing", "true")
                 .with_timeout(30);
@@ -747,6 +749,60 @@ async fn hosted_invalid_memory_refuses_before_snapshot_lease_or_ssh() {
     }
     assert!(h.requests.lock().unwrap().is_empty());
     assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn memory_switch_and_fixed_platforms_refuse_before_any_contact() {
+    let h = Harness::new(Behavior::Normal).await;
+    for (enabled, platform, detail) in [
+        (false, None, "exec-remote-memory/v1"),
+        (false, Some(Platform::Linux), "exec-remote-memory/v1"),
+        (false, Some(Platform::Windows), "memory_mib"),
+        (false, Some(Platform::Macos), "memory_mib"),
+        (true, Some(Platform::Windows), "memory_mib"),
+        (true, Some(Platform::Macos), "memory_mib"),
+    ] {
+        let scratch = Scratch::new();
+        let ssh = Arc::new(NoSsh(AtomicUsize::new(0)));
+        let mut config = h.config();
+        config.memory_sizes = enabled;
+        let motor =
+            crate::Motor::with_connector(config, &scratch.0.join("state"), ssh.clone()).unwrap();
+        let mut request =
+            RunRequest::new("/home/missing", "/home/missing", "/home/missing", "true")
+                .with_timeout(30)
+                .with_memory_mib(4096);
+        request.platform = platform;
+        let result = terminal(motor.run(request).unwrap()).await;
+        assert_eq!(
+            result.outcome,
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::RequestRejected
+            }
+        );
+        assert_eq!(result.ran, Some(Ran::None));
+        assert!(result.refusal_detail().unwrap().contains(detail));
+        assert_eq!(ssh.0.load(Ordering::SeqCst), 0);
+    }
+    assert!(h.requests.lock().unwrap().is_empty());
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn stated_memory_reaches_the_lease_and_its_verified_token() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    let storage = stored(&scratch, id, h.route.clone());
+    let request = Harness::request(&scratch.0).with_memory_mib(6144);
+    let (_connection, _lease) = Client::new(h.route.clone())
+        .run(id, &request, &storage)
+        .await
+        .unwrap();
+    let bodies = h.lease_bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    let sent: LeaseRequest = serde_json::from_slice(&bodies[0]).unwrap();
+    assert_eq!(sent.mem_mib, Some(6144));
 }
 
 #[cfg(unix)]
@@ -1689,8 +1745,8 @@ async fn stored_allow_spill_presence_and_value_survive_lease_re_requests() {
 async fn stored_stated_memory_survives_restart_and_request_changes() {
     for memory in [None, Some(2048), Some(12288)] {
         let h = Harness::new(Behavior::Normal).await;
-        // Refuse at placement: runner-side stated-memory enforcement is not
-        // enabled yet, and this test covers only the persisted lease identity.
+        // Refuse at placement so this test exercises only the persisted lease
+        // identity, without starting a job.
         h.broker.lock().unwrap().knobs.max_vcpus = Some(1);
         let scratch = Scratch::new();
         let id = Uuid::now_v7();

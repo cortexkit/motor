@@ -344,6 +344,15 @@ impl Motor {
         (key, caller): (Option<submission_key::KeyRecord>, String),
     ) -> io::Result<JobStream> {
         let (attribution, secret_hash) = identity;
+        let memory_refusal = request.memory_mib.and({
+            if matches!(request.platform, Some(Platform::Windows | Platform::Macos)) {
+                Some("memory_mib is supported only for Linux jobs")
+            } else if !self.config.memory_sizes {
+                Some("memory_mib requires exec-remote-memory/v1; memory_sizes is disabled")
+            } else {
+                None
+            }
+        });
         let linux = matches!(request.platform, None | Some(Platform::Linux));
         #[cfg(test)]
         let linux = linux && !self.test_fixture_direct_route;
@@ -459,6 +468,21 @@ impl Motor {
         let motor = self.clone();
         tokio::spawn(async move {
             let _submission = submission;
+            if let Some(detail) = memory_refusal {
+                if let Err(error) = motor
+                    .refused(
+                        id,
+                        RefusalReason::RequestRejected,
+                        None,
+                        Some(detail.into()),
+                        &tx,
+                    )
+                    .await
+                {
+                    let _ = tx.send(Err(error)).await;
+                }
+                return;
+            }
             if let Some(message) = wsl_refusal {
                 let result = motor
                     .refused(

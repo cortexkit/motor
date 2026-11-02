@@ -1205,6 +1205,7 @@ async fn windows_backend_launch_transfers_ownership_without_io_and_wait_keeps_al
         }
         let setup = Setup {
             id: r.job_id,
+            memory_mib: None,
             cpus: vec![12, 13, 14, 15],
             request: r,
             base: false,
@@ -1783,6 +1784,7 @@ fn detached_setup(runner: &Runner, f: &Fixture, r: Run) -> Setup {
     runner.core.inner.lock().unwrap().jobs.insert(r.job_id, job);
     Setup {
         id: r.job_id,
+        memory_mib: None,
         cpus: vec![12, 13, 14, 15],
         request: r,
         base: false,
@@ -2756,6 +2758,7 @@ async fn windows_backend_unreleased_prepared_and_execution_drop_each_clean_once(
         }
         let setup = Setup {
             id: r.job_id,
+            memory_mib: None,
             request: r,
             cpus: vec![12, 13, 14, 15],
             base: false,

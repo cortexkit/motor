@@ -395,14 +395,23 @@ impl Runtime {
             return Err(refuse("placement_vm"));
         }
         bind_requester(&claims, jwk).map_err(|_| refuse("requester_key"))?;
-        self.host
-            .lock()
-            .expect("host lock")
-            .binding(&claims)
-            .map_err(|error| AuthRefusal {
-                error,
-                ..refuse("binding")
-            })?;
+        self.probe_storage();
+        let host = self.host.lock().expect("host lock");
+        let tenant = host.binding(&claims).map_err(|error| AuthRefusal {
+            error,
+            ..refuse("binding")
+        })?;
+        // Accept the two retained formulas even before a capacity probe; new
+        // sizes require the placed tenant's ceiling. A known ceiling bounds both.
+        let retained = claims.mem_mib == motor_lease::job_memory_mib(claims.vcpus)
+            || claims.mem_mib == motor_lease::memory_max_mib(claims.vcpus);
+        if identity.is_none()
+            && host
+                .stated_memory_ceiling_mib(tenant)
+                .map_or(!retained, |ceiling| claims.mem_mib > ceiling)
+        {
+            return Err(refuse("mem_mib"));
+        }
         Ok(claims)
     }
     fn ensure(self: &Arc<Self>, tenant: &str) -> Result<()> {

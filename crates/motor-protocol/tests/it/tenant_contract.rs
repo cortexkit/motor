@@ -2,6 +2,18 @@ use motor_protocol::*;
 use serde_json::json;
 
 #[test]
+fn verified_lease_memory_is_optional_for_older_hosts() {
+    let value = json!({
+        "type":"verified_lease", "jti":"019e4567-89ab-7cde-8012-3456789abcde",
+        "purpose":"run", "sub":"acct:test", "vcpus":2,
+        "platform":"linux-x64", "net":false, "max_s":30, "exp":1800000000
+    });
+    let frame: Frame = serde_json::from_value(value.clone()).unwrap();
+    assert!(matches!(&frame, Frame::VerifiedLease(lease) if lease.mem_mib.is_none()));
+    assert_eq!(serde_json::to_value(frame).unwrap(), value);
+}
+
+#[test]
 fn idle_drain_frames_and_bounded_non_debug_cache_request_roundtrip() {
     for value in [
         json!({"type":"drain_if_idle"}),

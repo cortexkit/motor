@@ -297,6 +297,34 @@ fn hosted_usage_needs_a_sent_run_and_reports_only_settled_billing() {
     );
 }
 
+#[test]
+fn memory_result_fields_survive_caller_forwarding_and_hosted_usage() {
+    let scratch = crate::hosted::tests::harness::Scratch::new();
+    let storage = Storage::open(&scratch.0.join("state")).unwrap();
+    let id = Uuid::now_v7();
+    storage
+        .create(id, 30, None, Some("test".into()), false)
+        .unwrap();
+    storage
+        .hosted_route(id, route(true, crate::BillingStatus::Available, Some(6000)))
+        .unwrap();
+    let terminal = TerminalRecord::new(
+        id,
+        motor_protocol::Outcome::Signal { signal: 9 },
+        3000,
+        0,
+        0,
+    )
+    .with_ran(motor_protocol::Ran::Remote)
+    .with_memory_stated_mib(8192)
+    .with_memory_peak_working_mib(8100)
+    .with_memory_over_s(0)
+    .with_oom_kill(motor_protocol::OomKill::new("job_limit"));
+    let records = agent_records(&storage, id, 0, StreamRecord::Terminal(terminal.clone()));
+    let expected = terminal.with_hosted(HostedUsage::new("boat:bx_1").with_billed_vcpu_ms(6000));
+    assert_eq!(records, vec![StreamRecord::Terminal(expected)]);
+}
+
 /// Hosted jobs, against the fake broker and hosted runner of the hosted tests.
 mod hosted {
     use super::*;

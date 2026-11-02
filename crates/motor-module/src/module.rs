@@ -173,6 +173,9 @@ pub fn manifest_with_config(module_id: &str, config: &Config) -> ModuleManifest 
     if config.return_large {
         provides.push(motor_protocol::RETURN_LARGE_CAPABILITY.into());
     }
+    if config.memory_sizes {
+        provides.push(motor_protocol::MEMORY_CAPABILITY.into());
+    }
     if !config.windows_runners.is_empty()
         || (config.windows_runner_instance.is_some() && config.windows_runner_state_root.is_some())
     {

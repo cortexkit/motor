@@ -356,7 +356,7 @@ impl crate::backend::IsolationLauncher for UncachedIsolationLauncher {
         cwd: &Path,
         env: &[(String, String)],
         _cpus: &[u32],
-        _requested_vcpus: u32,
+        _resources: crate::backend::JobResources,
         #[cfg(target_os = "linux")] _sources: crate::source_seal::Sources<'_>,
     ) -> io::Result<crate::platform::Launch> {
         if let Some(state) = &self.boat_disk {
@@ -405,6 +405,7 @@ fn boat_job_environment(f: &Fixture, config: &Config, phase: &str) -> BTreeMap<S
     request.base_commit = Some("f".repeat(40));
     let setup = Setup {
         id: request.job_id,
+        memory_mib: None,
         request,
         cpus: vec![1],
         base: false,
@@ -453,6 +454,7 @@ fn assert_uncached_job_starts(f: &Fixture, config: &Config, phase: &str) {
     request.base_commit = Some("f".repeat(40));
     let setup = Setup {
         id: request.job_id,
+        memory_mib: None,
         request,
         cpus: vec![1],
         base: false,

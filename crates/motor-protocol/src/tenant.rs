@@ -158,7 +158,9 @@ pub struct VerifiedLease {
     pub purpose: LeasePurpose,
     pub sub: String,
     pub vcpus: u32,
-    pub mem_mib: u64,
+    /// Host-verified job cap; absence retains the runner's per-vCPU rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_mib: Option<u64>,
     pub platform: String,
     pub net: bool,
     pub max_s: u64,

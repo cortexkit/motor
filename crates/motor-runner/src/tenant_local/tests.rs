@@ -115,7 +115,7 @@ async fn local_tenant_channels_require_lease_preserve_purpose_and_cancel_via_adm
             purpose: LeasePurpose::Attach,
             sub: "acct:test".into(),
             vcpus: 1,
-            mem_mib: 16384,
+            mem_mib: Some(16384),
             platform: "linux-x64".into(),
             net: false,
             max_s: 30,

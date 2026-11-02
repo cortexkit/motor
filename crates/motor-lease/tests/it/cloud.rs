@@ -38,6 +38,40 @@ fn with_workspace_hash(token: &str, hash: &str, kid: &str, key: &SigningKey) -> 
 }
 
 #[test]
+fn cloud_stated_memory_tokens_accept_the_stated_and_raised_figures() {
+    let v = vector("stated-memory-lease.json");
+    let key = seed(v["test_only_job_seed_hex"].as_str().unwrap());
+    let kid = v["key_id"].as_str().unwrap();
+    let mut keys = KeySet::default();
+    keys.refresh(Ok(Jwks {
+        keys: vec![JwksKey::from_key(kid, &key.verifying_key())],
+    }))
+    .unwrap();
+    for (name, expected) in [("stated", 12288), ("raised", 8192)] {
+        let token = v[name]["reply"]["body"]["job_token"].as_str().unwrap();
+        let now = v["clock_ms"].as_u64().unwrap() / 1000;
+        // The canonical vector predates mandatory workspace hashes; its signed
+        // memory must pass before the missing-hash refusal.
+        assert_eq!(
+            check_token(token, &keys, "host-a", None, Purpose::Run, now)
+                .unwrap_err()
+                .check,
+            "workspace_key_hash_missing"
+        );
+        let token = with_workspace_hash(
+            token,
+            v[name]["request"]["body"]["workspace_key_hash"]
+                .as_str()
+                .unwrap(),
+            kid,
+            &key,
+        );
+        let claims = verify_token(&token, &keys, "host-a", None, Purpose::Run, now).unwrap();
+        assert_eq!(claims.mem_mib, expected);
+    }
+}
+
+#[test]
 fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
     use metrics::*;
     let v = vector("host-metrics.json");
@@ -490,6 +524,10 @@ fn cloud_boat_token_verifies_for_its_sandbox_identity() {
     let mut first_party = claims;
     first_party.aud = "host-a".into();
     first_party.placement.host = "host-a".into();
+    // Whole-GiB Boat memory can also be a valid first-party size. A fractional
+    // GiB within Boat's range must still be refused by a first-party host.
+    first_party.mem_mib -= 1;
+    assert!(boat_memory_range(first_party.vcpus).contains(&first_party.mem_mib));
     let resigned = sign_token(
         &first_party,
         tokens["key_id"].as_str().unwrap(),
@@ -688,6 +726,60 @@ fn cloud_lease_reattach_release_and_nullable_usage_settlement_match_fake() {
     let mut unexpected = v["request"]["body"].clone();
     unexpected["memory_mib"] = json!(16384);
     assert!(serde_json::from_value::<LeaseRequest>(unexpected).is_err());
+}
+
+#[test]
+fn cloud_working_peak_usage_bytes_signatures_and_settlement_match() {
+    let v = vector("usage-settlement.json");
+    for case in v["working_peak_cases"].as_array().unwrap() {
+        let mut broker = FakeBroker::new(
+            "working-peak-vector",
+            FakeConfig {
+                placement: Placement {
+                    host: "host-a".into(),
+                    vm: None,
+                },
+                ..config()
+            },
+        )
+        .unwrap();
+        let key = seed(case["seed_hex"].as_str().unwrap());
+        broker.register_host("host-a".into(), key.verifying_key());
+        let now = case["clock_ms"].as_u64().unwrap();
+        let mut request = lease_request();
+        request.timeout_s = 12;
+        issued(&mut broker, &request, now - 9000);
+        let usage: Usage = serde_json::from_value(case["request"]["body"].clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            case["request"]["body"]
+        );
+        let body = serde_json::to_vec(&usage).unwrap();
+        let path = case["request"]["pathname"].as_str().unwrap();
+        let headers = &case["request"]["headers"];
+        let timestamp = headers["CK-Timestamp"].as_str().unwrap().parse().unwrap();
+        let counter = headers["CK-Counter"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            host_message_bytes("POST", path, &body, timestamp, counter),
+            case["signed_string"].as_str().unwrap().as_bytes()
+        );
+        let signed =
+            HostHeaders::sign("host-a", "POST", path, &body, timestamp, counter, &key).unwrap();
+        assert_eq!(signed.signature, headers["CK-Signature"]);
+        let reply = broker.handle(
+            BrokerRequest {
+                content_type: Some("application/json"),
+                method: "POST",
+                path,
+                bearer: None,
+                host_headers: Some(&signed),
+                body: &body,
+            },
+            now,
+        );
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.body, case["reply"]["body"]);
+    }
 }
 
 /// CLOUD's `settled-reattach.json`: a registered host settles a job by usage

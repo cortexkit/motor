@@ -5572,6 +5572,7 @@ fn setup_refusal_detail_is_bounded_redacted_and_not_part_of_the_reason() {
         .launch_without_dispatch(
             Setup {
                 id: request.job_id,
+                memory_mib: None,
                 cpus: vec![1, 17],
                 request: request.clone(),
                 base: false,

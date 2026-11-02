@@ -229,6 +229,9 @@ pub(crate) struct Job {
     /// existing detail field separately carries bounded resource evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_limit_detail: Option<String>,
+    /// Host-verified memory carried on the tenant channel, never a Run field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_stated_mib: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reservation_use: Option<ReservationUse>,
     /// Fixed execution end, independent of delayed launcher-accounting delivery.
@@ -365,6 +368,7 @@ impl Job {
             monitoring_error: None,
             execution_evidence: None,
             memory_limit_detail: None,
+            memory_stated_mib: None,
             reservation_use: None,
             execution_ended_ms: None,
             mem_peak_mib: None,
@@ -419,6 +423,12 @@ impl Job {
         .with_ran(if remote { Ran::Remote } else { Ran::None });
         if report_source {
             terminal = terminal.with_source_read_only(self.source_read_only);
+            if let Some(memory) = self.memory_stated_mib {
+                terminal = terminal.with_memory_stated_mib(memory);
+            }
+            if let Some(peak) = self.mem_working_peak_mib.get() {
+                terminal = terminal.with_memory_peak_working_mib(peak);
+            }
         }
         if let Some((killed, _)) = &self.kill {
             terminal = terminal.with_killed(killed.clone());

@@ -436,7 +436,7 @@ throttles and reclaims before `MemoryMax=85%` invokes cgroup OOM; percentages
 refer to physical host RAM, so the same policy scales down on Boat and tenant
 VMs. Swap is disabled for this slice. The remaining 15% is headroom for the
 runner and system, not a reservation against unrelated host workloads. The
-per-job limits remain unchanged. A slice cap bounds actual aggregate use,
+per-job limits in section 7.2 also apply. A slice cap bounds actual aggregate use,
 unlike charging admission for each job's declared maximum, which would reject
 low-memory jobs unnecessarily. CPU admission is unchanged.
 
@@ -457,8 +457,8 @@ Launch refuses a missing/unbounded slice rather than silently using systemd's
 implicit unlimited slice. A killed launcher before gate release is setup
 refusal, not an executed/lost job. A victim of an ancestor OOM still increments
 its own `oom_kill` counter even if its own `max` and `oom` counters stay zero;
-the existing OOM counts and per-job vCPU advice remain available. More vCPUs
-raise only the per-job limit, not the shared host budget.
+the OOM evidence remains available for inspection. A larger per-job limit does
+not raise the shared host budget.
 
 Tests: `installed_units_reserve_host_memory_and_protect_user_runners`,
 `missing_or_unbounded_job_slice_refuses_execution`,
@@ -553,12 +553,22 @@ range): `isolated_net_public_https_dns_read_only_resolver`,
 run on more CPUs than it reserved. See [scheduling.md](scheduling.md) for how
 CPUs are chosen. Test: `systemd_job_command_enforces_recorded_cpu_set_and_memory`.
 
-7.2. Memory is capped with `MemoryMax=`: 3.5 GiB per vCPU, with a 16 GiB floor.
-The per-job `/dev/shm` tmpfs has an explicit size cap equal to `MemoryMax`;
-tmpfs pages are charged to that job's memory cgroup. Tests:
+7.2. In a hosted server VM, `MemoryMax=` is the host-verified lease's `mem_mib`,
+not a caller-controlled request field. Without host memory metadata, the runner
+keeps the 3.5 GiB per vCPU rule with a 16 GiB floor. The ordinary Linux runner
+also keeps that rule; Boat, Windows and macOS limits are unchanged.
+
+The cap covers the job's whole memory cgroup, including its private `/dev/shm`
+tmpfs, whose size cap equals `MemoryMax`. Reclaimable file cache is reclaimed
+before a process is killed, so size jobs by the working set: heap, shared memory
+and kernel memory. Results report its peak as `memory_peak_working_mib` and the
+enforced figure as `memory_stated_mib` when known. A job killed at its own limit
+reports `oom_kill` with `cause: job_limit`, so the caller can state a larger size.
+The shared slice's aggregate limit still applies. Tests:
 `systemd_job_command_enforces_recorded_cpu_set_and_memory`,
 `memory_max_scales_per_vcpu_with_a_sixteen_gib_floor`,
-`memory_limit_gib_formats_floor_and_scaled_limits`.
+`tenant_unit_uses_host_memory_and_keeps_other_target_limits`, and operator-only
+`isolated_tenant_stated_memory_kills_above_limit_and_allows_below`.
 
 7.3. The request's `timeout`, in seconds, runs from the moment the job starts,
 not from acceptance. When it expires the runner kills the cgroup and the
