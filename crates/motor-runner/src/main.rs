@@ -768,14 +768,9 @@ mod tests {
     #[tokio::test]
     async fn check_options_accepts_installed_units_with_and_without_caller_roots_without_state() {
         let scratch = cortexkit_test_support::ScratchDir::new("motor-check-options");
-        // Each repository unit carries its instance's caller root. The unflagged
-        // form is the same unit with that flag removed, which is what the
-        // instance ran before caller roots were enabled.
+        // Check both flagged units and flag-off rollback arguments without
+        // creating state or starting a daemon.
         let units = [
-            (
-                include_str!("../../../script/runner/units/motor-runner.service"),
-                "/home=/srv/build/callers/main/home",
-            ),
             (
                 include_str!("../../../script/runner/units/motor-runner@e2e.service.d/binary.conf"),
                 "/home=/srv/build/callers/e2e/home",
@@ -785,7 +780,7 @@ mod tests {
                 "/home=/var/lib/motor-boat/state/callers/home",
             ),
         ];
-        let mut flagged_main = None;
+        let mut flagged_unit = None;
         for (unit, caller_root) in units {
             let exec = unit
                 .lines()
@@ -809,7 +804,7 @@ mod tests {
             assert_eq!(flagged[flags[0] + 1], caller_root, "{exec}");
             let mut unflagged = flagged.clone();
             unflagged.drain(flags[0]..flags[0] + 2);
-            flagged_main.get_or_insert_with(|| flagged.clone());
+            flagged_unit.get_or_insert_with(|| flagged.clone());
             for options in [unflagged, flagged] {
                 let mut args = vec!["check-options".to_string()];
                 args.extend(options);
@@ -824,7 +819,7 @@ mod tests {
         // A second root for a prefix the unit already maps is refused by name
         // rather than silently overriding the installed mapping.
         let mut args = vec!["check-options".to_string()];
-        args.extend(flagged_main.unwrap());
+        args.extend(flagged_unit.unwrap());
         args.extend([
             "--state-root".into(),
             scratch.join("absent-state").to_str().unwrap().into(),

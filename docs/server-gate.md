@@ -10,10 +10,10 @@ relates to hosted CI.
 
 ## Before you start
 
-- A dedicated Linux build server installed as in
-  [runner-install.md](runner-install.md): the `motor-job` and `motor-cache`
+- A dedicated Linux operator test host with the `motor-job` and `motor-cache`
   accounts, systemd with private PID support, ACL tools, and reflink-capable
-  storage under `/srv/build`.
+  storage under `/srv/build`. [runner-install.md](runner-install.md) describes
+  this host setup. Linux jobs from `ck-motor` run on hosted server VMs.
 - The operator account that holds the runner's delegated `sudo` rules. The
   isolation tests start transient system services, so they cannot run as an
   unprivileged user or inside a build job.
@@ -52,13 +52,13 @@ the runner user service, run as the operator on a dedicated host (not through a
 remote build job):
 
 ```sh
-MOTOR_TEST_RUNNER_UNIT=motor-runner.service TMPDIR=/srv/build/tmp \
+MOTOR_TEST_RUNNER_UNIT=motor-runner@windows.service TMPDIR=/srv/build/tmp \
   env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
   cargo nextest run -p motor-runner --lib --locked --run-ignored only \
   -E 'test(=isolation::tests::isolated_job_memory_budget_and_oom_priority_protect_runner)'
 ```
 
-Use `motor-runner@windows.service` to inspect the Windows instance instead.
+Use `motor-runner@e2e.service` to inspect the operator test instance instead.
 The test requires delegated sudo for real job units and the matching installed
 permission helper. It reads the live runner's OOM score, not the test harness's.
 

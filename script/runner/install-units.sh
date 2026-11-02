@@ -2,11 +2,10 @@
 # Before deploying an unprivileged Linux runner, authorize the same roots used
 # by its unit, including caller-root host paths. For the build-server units:
 # sudo bash script/runner/install-permissions-helper.sh /absolute/candidate ubuntu \
-#   --seal-instance /home/ubuntu/.local/share/cortexkit/motor-runner/main=/Users,/srv/build/callers/main/home \
 #   --seal-instance /home/ubuntu/.local/share/cortexkit/motor-runner/e2e=/Users,/srv/build/callers/e2e/home
 # Install the runner's systemd user units from script/runner/units/ on the build
 # server, as the operator (ubuntu). The repository copy is the source of truth:
-# capacity flags such as --max-weight live in units/motor-runner.service.
+# instance flags live in the template and its instance-specific drop-ins.
 #
 # This writes user units and privileged memory-policy units and reloads systemd. It never restarts a
 # runner: a changed ExecStart takes effect at the next deploy.sh swap, which
@@ -144,7 +143,6 @@ while IFS= read -r -d '' -u 3 file; do
   fi
   instances=()
   case "$rel" in
-    motor-runner.service|motor-runner.service.d/*.conf) instances=(main) ;;
     motor-runner@.service|motor-runner@.service.d/*.conf) instances=(e2e windows) ;;
     motor-runner@*.service.d/*.conf)
       name=${rel#motor-runner@}; instances=("${name%%.service.d/*}") ;;

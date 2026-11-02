@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
 # Run as the Linux service owner; deployment must never rerun accepted commands.
 set -euo pipefail
-if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
-  echo "Usage: $0 /absolute/path/to/candidate [instance]" >&2
+if [ "$#" -ne 2 ]; then
+  echo "Usage: $0 /absolute/path/to/candidate instance" >&2
   exit 2
 fi
 candidate=$1
-instance=${2:-main}
+instance=$2
 case "$instance" in *[!a-zA-Z0-9_-]*|'') echo 'Invalid instance' >&2; exit 2;; esac
-unit=motor-runner.service
-live=${RUNNER_LIVE_BINARY:-$HOME/.cargo/bin/motor-runner}
-if [ "$instance" != main ]; then
-  unit="motor-runner@$instance.service"
-  live=${RUNNER_LIVE_BINARY:-$HOME/.cargo/bin/motor-runner-$instance}
-fi
+[ "$instance" != main ] || { echo 'The main instance is not deployable' >&2; exit 2; }
+unit="motor-runner@$instance.service"
+live=${RUNNER_LIVE_BINARY:-$HOME/.cargo/bin/motor-runner-$instance}
 deadline=${RUNNER_DRAIN_TIMEOUT_S:-600}
 state_root=${RUNNER_STATE_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit/motor-runner}
 if [ "$instance" = windows ]; then

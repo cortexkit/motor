@@ -266,8 +266,8 @@ fn isolated_job_memory_budget_and_oom_priority_protect_runner() {
         "{stdout}"
     );
 
-    let runner_unit =
-        std::env::var("MOTOR_TEST_RUNNER_UNIT").unwrap_or_else(|_| "motor-runner.service".into());
+    let runner_unit = std::env::var("MOTOR_TEST_RUNNER_UNIT")
+        .unwrap_or_else(|_| "motor-runner@windows.service".into());
     let runner = Command::new("/usr/bin/systemctl")
         .args([
             "--user",

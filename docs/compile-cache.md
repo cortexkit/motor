@@ -18,7 +18,7 @@ VM queues none unless its provisioning holds a remote cache write key. An
 idle-started fill can outlive the idle period, compete for leased CPU time, or
 hold a setup lock when the next job arrives. Boat avoids that because it only
 reads the cache. A tenant VM given a write key accepts the delay: it fills its
-own cache with its own capacity, as the build server does, one fill at a time
+own cache with its own capacity, one fill at a time
 and only on unallocated permits. Its runner reports the running fill's permits
 as `fill_permits` in health, and motor-host subtracts them from that tenant's
 advertised `free_vcpus` while the report is fresh, so the broker places new
@@ -44,7 +44,7 @@ and `a_job_beside_its_tenants_fill_keeps_its_memory_and_egress`
 ck-motor offers default-branch tips only where the runner may fill. Hosted
 channels to a registered host's tenant runner (a `first_party` placement)
 advertise the fill capability in Hello and send the resolved integration tip.
-Boat spills omit both, as before. Ordinary build-server channels retain fills.
+Boat spills omit both.
 Tests:
 `hosted_hello_advertises_fill_support_only_to_registered_host_tenants`,
 `hello_advertises_default_branch_tip_on_the_wire`,

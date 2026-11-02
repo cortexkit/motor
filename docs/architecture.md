@@ -1,7 +1,7 @@
 # Architecture
 
-Motor runs build and test commands for coding agents on a remote Linux build
-server, or in a fresh Windows virtual machine per job, against a snapshot of
+Motor runs build and test commands for coding agents on hosted Linux server
+VMs, or in a fresh Windows virtual machine per job, against a snapshot of
 the caller's checkout placed at the same path. This document names the parts,
 traces a job through them, and lists the rules that matter most when changing
 them. Each part's details live in the linked documents.
@@ -12,13 +12,13 @@ them. Each part's details live in the linked documents.
 | --- | --- | --- | --- |
 | `ck-motor` | `crates/motor-module` | Caller's machine | CortexKit daemon module: admits callers, captures snapshots, holds the SSH connection, follows job streams. [module.md](module.md) |
 | Protocol | `crates/motor-protocol` | Both | Framed client-runner protocol and codec; re-exports the caller types. [wire-protocol.md](wire-protocol.md) |
-| `motor-runner` | `crates/motor-runner` | Build server | Admission, queueing, Git mirrors, workspaces, execution, retained output. |
-| Linux sandbox | `crates/motor-runner/src/isolation*`, `systemd.rs`, `network*.rs` | Build server | Runs each Linux job as `motor-job` in a transient systemd service. [job-isolation.md](job-isolation.md) |
+| `motor-runner` | `crates/motor-runner` | Hosted Linux server VM, Boat sandbox or Windows runner host | Admission, queueing, Git mirrors, workspaces, execution, retained output. |
+| Linux sandbox | `crates/motor-runner/src/isolation*`, `systemd.rs`, `network*.rs` | Hosted Linux server VM or Boat sandbox | Runs each Linux job as `motor-job` in a transient systemd service. [job-isolation.md](job-isolation.md) |
 | Windows backend | `crates/motor-runner/src/windows/` | Build server | Boots one QEMU VM per job from a sealed baseline. [windows-jobs.md](windows-jobs.md) |
 | Windows guest agent | `crates/motor-winagent` | Inside the Windows VM | Receives the tree, runs the command as the guest's `motor-job`, reports its exit code. |
-| Compile cache | `crates/motor-runner/src/compile_cache.rs`, `writer/` | Build server | Shared read-only sccache for jobs, filled by `motor-cache` from the default branch. [compile-cache.md](compile-cache.md) |
-| vCPU allocator and scheduler | `crates/motor-runner/src/cpu.rs`, `engine.rs` | Build server | Exact vCPU claims, CPU pinning, queue order, disk admission. [scheduling.md](scheduling.md) |
-| Caller-root mapping | `crates/motor-runner/src/caller_path.rs`, `caller_path/` | Build server | Stores a `/home` caller's checkout in a runner-owned directory and presents it at the caller's path. [job-isolation.md](job-isolation.md#38-caller-root-mapping) |
+| Compile cache | `crates/motor-runner/src/compile_cache.rs`, `writer/` | Runner instance | Shared read-only sccache for jobs, filled by `motor-cache` from the default branch. [compile-cache.md](compile-cache.md) |
+| vCPU allocator and scheduler | `crates/motor-runner/src/cpu.rs`, `engine.rs` | Runner instance | Exact vCPU claims, CPU pinning, queue order, disk admission. [scheduling.md](scheduling.md) |
+| Caller-root mapping | `crates/motor-runner/src/caller_path.rs`, `caller_path/` | Host-backend runner | Stores a `/home` caller's checkout in a runner-owned directory and presents it at the caller's path. [job-isolation.md](job-isolation.md#38-caller-root-mapping) |
 | Build-slot supervisor | `crates/prefrontal-build-slot` | Inside Linux jobs | Limits concurrent compiler processes across all jobs on the host. |
 | Linux microVM components | `crates/motor-vm-helper`, `motor-vm-guest`, `motor-vm-loader` | Build server | Firecracker slot pool, UFFD loader and guest supervisor. Not used by any runner backend in this build. [linux-microvm.md](linux-microvm.md) |
 
@@ -35,9 +35,10 @@ them. Each part's details live in the linked documents.
    working-tree changes and untracked non-ignored files, under a 2 GiB cap on
    untracked content. The caller's checkout is not modified.
    [snapshot-contents.md](snapshot-contents.md)
-3. **Connect.** `ck-motor` opens (or reuses) one SSH connection, authenticated
-   by a vault-held key, and runs `motor-runner connect`, which bridges to the
-   runner's Unix socket. Both sides exchange `hello`.
+3. **Connect.** For Linux, `ck-motor` obtains a hosted lease and connects to
+   its runner through the host agent. A lease refusal never falls back to a
+   direct runner. Windows uses its configured runner connection. Both sides
+   exchange `hello`.
 4. **Admit.** `ck-motor` sends `have` to learn which commits the runner holds,
    then `run`. The runner checks platform, capacity, queue depth, drain state and
    disk space, and replies `accepted` or `refusal`.
@@ -90,7 +91,7 @@ sandbox runtime directories, and the compile cache (`sccache/fleet`).
 Workspaces themselves live at the callers' paths under the owned workspace
 roots (default `/Users`), on the same reflink-capable filesystem. A caller root
 is the exception: a `/home` caller's checkout is stored under the instance's own
-host directory (for example `/srv/build/callers/main/home`) and only presented
+host directory (for example `/srv/build/callers/e2e/home`) and only presented
 at the `/home` path inside the job, while the catalogs keep caller spelling. The
 catalogued records that name a mapped path live in `<state-dir>/caller-catalog.json`;
 `catalog.json` keeps identity records and its bytes are unchanged for them.

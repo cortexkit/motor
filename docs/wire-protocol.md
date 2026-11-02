@@ -313,7 +313,7 @@ it:
   (`runner_sign_unavailable`, `runner_sign_invalid_response`): the time left in
   the signing agent's backoff. The other signing details carry no hint, because
   they need an operator. See [module.md](module.md#retry-hints-on-credential-refusals).
-- `queue_wait_exceeded`, on the job's terminal record: the recent build-server
+- `queue_wait_exceeded`, on the job's terminal record: the recent runner
   queue wait, in the rules 5.6 gives.
 
 Disk-full refusals carry no hint, because nothing re-probes on a schedule.
@@ -333,10 +333,7 @@ start backoff, so a caller's deadline is never spent on a hint longer than the
 runner's experience of the queue.
 
 The runner sets this hint, because only it knows the phase a job was waiting
-in; `ck-motor` passes the hint through as the runner set it (it adds a
-`spill_attempted=` note to the refusal detail of a spilled job that went back
-to the build server, see
-[module.md](module.md#retry-hints-on-capacity-refusals)). A deployment that
+in; `ck-motor` passes the hint through as the runner set it. A deployment that
 wants existing jobs to start carrying it therefore ships a new runner, not a
 new `ck-motor`: until the runner is upgraded, capacity refusals keep arriving
 without a hint.

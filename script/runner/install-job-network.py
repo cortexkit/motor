@@ -195,7 +195,6 @@ runpy.run_path('/usr/local/libexec/motor_network_policy.py')['load']()
 Description=Motor outbound IPv4 firewall v2 with exact tenant delegation
 Wants=network-online.target
 After=network-online.target
-Before=motor-runner.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes

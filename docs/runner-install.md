@@ -1,11 +1,12 @@
 # Installing the runner
 
-This guide sets up a dedicated Linux build server to run `motor-runner`, and a
-client machine to reach it with `ck-motor`. It covers the host, the sandbox accounts, the
-tools jobs use, the compile cache, the systemd units, optional job networking,
-and the first start. Later upgrades go through
-[drain-and-rollback.md](drain-and-rollback.md); the Windows instance has its own
-guide, [windows-image.md](windows-image.md).
+This guide prepares the build-server host and its operator test instance,
+`e2e`. The Windows runner uses the same host setup and has its own guide,
+[windows-image.md](windows-image.md). Linux jobs from `ck-motor` run on hosted
+server VMs; provision those with [hosted-host.md](hosted-host.md).
+The host setup covers sandbox accounts, tools, compile-cache support, systemd
+units and optional job networking for operator tests. Later upgrades of the
+named user units go through [drain-and-rollback.md](drain-and-rollback.md).
 
 The scripts under `script/runner/` encode one host layout: shared state under
 `/srv/build`, a single operator account that owns the runner's systemd user
@@ -203,9 +204,8 @@ cargo build --release -p motor-runner --locked
 target/release/motor-runner --version
 ```
 
-The `main` instance's unit runs `~/.cargo/bin/motor-runner`; another instance
-`<name>` runs `~/.cargo/bin/motor-runner-<name>`. For the first install, copy
-the binary there with `install -m 755`. After that, always use
+Each named instance `<name>` runs `~/.cargo/bin/motor-runner-<name>`. For the
+first install, copy the binary there with `install -m 755`. After that, always use
 `script/runner/deploy.sh`, which drains the running daemon first.
 
 ## 5. Install the units
@@ -226,16 +226,15 @@ install. The units are:
 
 | Unit | Runs |
 | --- | --- |
-| `motor-runner.service` | The `main` instance, with its capacity flags (`--max-weight`) and `--job-network veth` |
-| `motor-runner@.service` | Any other instance, `serve --instance %i` |
+| `motor-runner@.service` | Named instances, `serve --instance %i` |
 | `motor-runner@e2e.service.d/binary.conf` | The `e2e` test instance, from its own binary |
 | `motor-runner@windows.service.d/windows.conf` | The Windows instance; see [windows-image.md](windows-image.md) |
 
 Edit capacity flags in the repository copy of the unit, not on the server: the
-repository is the source of truth. Start the main instance the first time with:
+repository is the source of truth. Start the operator test instance when needed with:
 
 ```sh
-systemctl --user enable --now motor-runner.service
+systemctl --user start motor-runner@e2e.service
 ```
 
 The user manager must keep running without a login session for the units to
@@ -274,7 +273,7 @@ that need no state directory and prints the first refusal, and
 `forget-caller-root --prefix PREFIX <serve options>`
 ([section 9.4](#94-forget-caller-root)).
 
-The main runner unit configures Windows CPU avoidance. Each new placement,
+When a host-backend instance configures Windows CPU avoidance, each new placement,
 including background cache fills, stats the slot-lock file and reads `/proc/locks`
 to check for its exclusive flock. This requires the host PID namespace's lock
 table; acquiring or releasing a flock does not generate an inotify event. While
@@ -354,9 +353,9 @@ validated attachment. There is intentionally no extra gate-release probe.
 
 ### Deploy the producer before the consumer
 
-The build-server runner is a **user** unit; `Before=motor-runner.service` in a
-system producer unit does not order it. Correctness comes from per-request
-re-probing, not cross-manager boot ordering. Use this rollout order:
+The `e2e` runner is a **user** unit; ordering a system producer before a
+user unit does not order services across the two managers. Correctness comes
+from per-request re-probing, not cross-manager boot ordering. Use this rollout order:
 
 1. Quiesce new net work while mixing an old table-only consumer with the new
    protocol. Check that `/etc/motor-network.json` agrees with the helper's
@@ -373,7 +372,7 @@ re-probing, not cross-manager boot ordering. Use this rollout order:
    before replacing the runner. Do not count a missing-generation refusal as
    successful network qualification.
 5. Deploy the new runner last, using the user-unit deployment procedure. Run a
-   net canary and a non-net canary through the normal client. If a producer
+   net canary and a non-net canary against the `e2e` instance. If a producer
    reload is unfinished or fails, that net request is refused; rerun the real
    producer after fixing it, then retry the canary in the **same runner**.
 6. Resume net admissions only after the canaries pass. Producer-first minimizes
@@ -465,7 +464,7 @@ Caller roots ship in two steps and never in one:
    units gain `--caller-root`. From then on every rollback target is a binary
    that understands the flag.
 
-The edits that add the flag to `script/runner/units/motor-runner.service`,
+The edits that add the flag to
 `script/runner/units/motor-runner@e2e.service.d/binary.conf` and
 `script/boat-image/motor-boat.service` are one separate change. It merges only
 at step two, after it has been reviewed on its own: it is the change that puts
@@ -488,13 +487,13 @@ On the build server, as the operator:
 bash script/runner/setup-caller-roots.sh
 ```
 
-It creates `/srv/build/callers/main/home` and `/srv/build/callers/e2e/home` with
-the owner, mode and device of `/srv/build/Users`, proves a reflink copy with an
-unnamed temporary file, and leaves both empty. It refuses a symlinked component,
+It creates `/srv/build/callers/e2e/home` with the owner, mode and device of
+`/srv/build/Users`, proves a reflink copy with an unnamed temporary file, and
+leaves the directory empty. It refuses a symlinked component,
 a non-directory, a non-empty directory, and a directory on another device. It
 does nothing else (no packages, no toolchain step), and the host's real `/home`
 is not touched. `setup.sh` calls it, so a freshly provisioned host already has
-the directories.
+the directory.
 
 The serve arguments of a unit are its effective `ExecStart`, meaning the last
 non-empty `ExecStart=` line with `%i` replaced by the instance, minus every word
@@ -502,7 +501,7 @@ up to and including the first `serve`. For the repository units the command is
 ```sh
 python3 script/runner/deploy_canary.py --repository-unit-command script/runner/units <instance>
 ```
-which prints them from `script/runner/units/` for the instance (`main`, `e2e`,
+which prints them from `script/runner/units/` for the instance (`e2e` or
 `windows`); `deploy.sh` and `install-units.sh` use the same extraction on the
 installed unit.
 
@@ -516,7 +515,7 @@ installed unit.
    candidate:
 
    ```sh
-   script/runner/deploy.sh /path/to/installed/motor-runner main
+   script/runner/deploy.sh /path/to/installed/motor-runner-e2e e2e
    ```
 
    `deploy.sh` refuses before draining when the candidate's `check-options`
@@ -539,8 +538,8 @@ instance to be stopped and refuses, changing nothing, while a live job unit
 that belongs to one of that instance's jobs exists:
 
 ```sh
-motor-runner forget-caller-root --prefix /home --instance main \
-  --state-root <state-root> --caller-root /home=/srv/build/callers/main/home
+motor-runner forget-caller-root --prefix /home --instance e2e \
+  --state-root <state-root> --caller-root /home=/srv/build/callers/e2e/home
 ```
 
 Pass the instance's full serve argument list, exactly as the unit has it (the
@@ -581,21 +580,23 @@ on the build server.
 ## Verify
 
 ```sh
-systemctl --user is-active motor-runner.service
-journalctl --user -u motor-runner.service -n 50   # "motor-runner serving" with its version
+systemctl --user is-active motor-runner@e2e.service
+journalctl --user -u motor-runner@e2e.service -n 50   # "motor-runner serving" with its version
 ```
 
-Then run a job from the client machine, for example `ck motor run -- uname -a` (with
-`admit_direct_exec` enabled; save its one-time secret for
-[`ck motor attach JOB_ID`](module.md#reattaching-after-a-disconnect)), and the [server gate](server-gate.md) from a
-checkout on the server.
+Run `script/runner/deploy.sh` with a copy of the installed `e2e` binary and the
+explicit `e2e` instance to exercise its isolated canary. Run the
+[server gate](server-gate.md) from an operator checkout on the server.
+A Linux job submitted with `ck motor run` uses a hosted server VM, not this
+operator test instance.
 
 ## Uninstall
 
-1. Drain: `motor-runner drain --instance main --exit-after-drain false`.
-2. `systemctl --user disable --now motor-runner.service` and remove the unit
-   files from `~/.config/systemd/user/`.
-3. Remove the binaries from `~/.cargo/bin/` and the state root.
+1. Drain: `motor-runner drain --instance e2e --exit-after-drain false`.
+2. `systemctl --user disable --now motor-runner@e2e.service` and remove its
+   instance drop-in from `~/.config/systemd/user/`. Keep the template and shared
+   units while the Windows runner uses them.
+3. Remove `~/.cargo/bin/motor-runner-e2e` and only the `e2e` instance's state.
 4. Remove optional components as described in their sections.
 
 `setup.sh`'s host changes (packages, firewall, SSH policy, `/Users` bind mount,

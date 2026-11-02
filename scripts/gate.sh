@@ -24,8 +24,8 @@
 # ci-success / All jobs succeeded                     -> final exit status
 #
 # GitHub actions (checkout, tool installs/cache, sudo SSH/XFS setup) are not
-# replayed: direct jobs have no host-admin privileges and use the build server's
-# provisioned tools, sshd and reflink scratch instead. The lanes check their
+# replayed: Linux jobs have no host-admin privileges and use the hosted server
+# VM's provisioned tools, sshd and reflink scratch instead. The lanes check their
 # prerequisites and fail rather than silently omit checks. No hosted-only test
 # step is omitted. Operator-only isolation/VM tests are not CI push jobs.
 # Extra pre-push checks: fast lockfile/unmerged checks; native macOS clippy.
