@@ -125,6 +125,8 @@ fn install_failures_name_exit_pipe_and_deadline_checks() {
         )
         .unwrap_err();
         assert_eq!(refusal.check, Some(check));
+        assert!(refusal.detail.contains(&format!("{check:?}")));
+        assert!(refusal.detail.contains("at ."));
         assert!(!refusal.warning().contains("windows-bun-probe@"));
     }
     let mut tail = DiagnosticTail::default();
@@ -143,6 +145,7 @@ fn install_failures_name_exit_pipe_and_deadline_checks() {
     )
     .unwrap_err();
     assert_eq!(refusal.check, Some(Check::NonzeroExit));
+    assert!(refusal.warning().contains("NonzeroExit failed at ."));
     assert!(tail.line().contains("gopd"));
     let refusal = wait_install(
         &project,
@@ -153,11 +156,13 @@ fn install_failures_name_exit_pipe_and_deadline_checks() {
     )
     .unwrap_err();
     assert_eq!(refusal.check, Some(Check::PipesDisconnected));
+    assert!(refusal.detail.contains("PipesDisconnected failed at ."));
 }
 
 #[test]
 fn refusal_diagnostics_are_bounded_and_validated() {
     let mut refusal = refuse(RefusalKind::BunCacheMissing, "m/probe", "gopd", "1.2.0")
+        .detail("CacheRead failed at node_modules/gopd")
         .missing_packages((0..8).map(|i| MissingPackage {
             name: format!("p{i}"),
             version: "1.0.0".into(),
@@ -172,10 +177,16 @@ fn refusal_diagnostics_are_bounded_and_validated() {
     refusal.missing[0].name = "bad\nname".into();
     assert!(refusal.validate().is_err());
     refusal.missing = Box::default();
+    refusal.detail = "unsafe\npath".into();
+    assert!(refusal.validate().is_err());
+    refusal.detail = Box::default();
     refusal.check = None;
     let encoded = serde_json::to_value(&refusal).unwrap();
     assert!(encoded.get("missing").is_none());
     assert!(encoded.get("check").is_none());
+    assert!(encoded.get("detail").is_none());
+    assert!(encoded.get("version").is_some());
+    assert!(encoded.get("registry_origin").is_some());
     assert!(serde_json::from_value::<Refusal>(encoded).is_ok());
 }
 use motor_winagent::bun::*;
@@ -440,6 +451,8 @@ fn missing_optional_windows_package_and_bin_are_named_refusals() {
     assert_eq!(refusal.kind, RefusalKind::BunOfflineInstallFailed);
     assert_eq!(refusal.package, "@private/win");
     assert_eq!(&*refusal.version, "1.0.0");
+    assert_eq!(refusal.check, Some(Check::InstalledPackage));
+    assert!(refusal.detail.contains("at node_modules"));
     let installed = scratch.join("node_modules/@private/win");
     std::fs::create_dir_all(&installed).unwrap();
     std::fs::write(
@@ -447,14 +460,29 @@ fn missing_optional_windows_package_and_bin_are_named_refusals() {
         r#"{"name":"@private/win","version":"1.0.0","bin":{"tool":"tool.exe"}}"#,
     )
     .unwrap();
-    assert_eq!(
-        verify_installed(&project, scratch.path())
-            .unwrap_err()
-            .package,
-        "@private/win"
-    );
+    let refusal = verify_installed(&project, scratch.path()).unwrap_err();
+    assert_eq!(refusal.package, "@private/win");
+    assert_eq!(refusal.check, Some(Check::InstalledBin));
+    assert!(refusal
+        .detail
+        .contains("at node_modules/@private/win/tool.exe"));
+    assert!(!refusal.detail.contains(&*scratch.path().to_string_lossy()));
     std::fs::write(installed.join("tool.exe"), b"binary").unwrap();
     verify_installed(&project, scratch.path()).unwrap();
+    let mut project = project;
+    project.packages[0].bin_dir = Some("tools".into());
+    let refusal = verify_installed(&project, scratch.path()).unwrap_err();
+    assert_eq!(refusal.check, Some(Check::InstalledBinDirectory));
+    assert!(refusal
+        .detail
+        .contains("at node_modules/@private/win/tools"));
+    project.packages[0].bins.push("../escape".into());
+    let refusal = verify_installed(&project, scratch.path()).unwrap_err();
+    assert_eq!(refusal.kind, RefusalKind::BunProjectionInvalid);
+    assert_eq!(refusal.check, Some(Check::Projection));
+    assert!(refusal
+        .detail
+        .contains("at node_modules/@private/win/../escape"));
 }
 
 #[test]
@@ -696,4 +724,48 @@ fn missing_seed_is_refused_even_when_a_host_omits_the_bun_namespace() {
             .kind,
         RefusalKind::BunCacheMissing
     );
+}
+
+/// Missing link targets and failed cleanup need distinct checks and lexical
+/// checkout paths, not opaque guest filesystem errors.
+#[cfg(unix)]
+#[test]
+fn post_install_unreadable_tree_and_cleanup_failures_name_their_paths() {
+    let scratch = ScratchDir::new("bun-post-install-paths");
+    let directory = scratch.join("project");
+    let modules = directory.join("node_modules");
+    std::fs::create_dir_all(&modules).unwrap();
+    std::os::unix::fs::symlink(scratch.join("missing"), modules.join("broken")).unwrap();
+    let project = Project {
+        path: "m/project".into(),
+        name: String::new(),
+        version: String::new(),
+        lock_sha256: String::new(),
+        manifest_sha256: String::new(),
+        packages: Vec::new(),
+        skipped: None,
+    };
+    let refusal = verify_installed(&project, &directory).unwrap_err();
+    assert_eq!(refusal.kind, RefusalKind::BunOfflineInstallFailed);
+    assert_eq!(refusal.check, Some(Check::InstalledTree));
+    assert_eq!(
+        &*refusal.detail,
+        "InstalledTree: installed tree is unreadable at node_modules/broken"
+    );
+    let file = scratch.join("not-a-directory");
+    std::fs::write(&file, "file").unwrap();
+    let refusal = finish_install(
+        &project,
+        &file,
+        Err(refuse(
+            RefusalKind::BunOfflineInstallFailed,
+            &project.path,
+            "",
+            "",
+        )),
+    )
+    .unwrap_err();
+    assert_eq!(refusal.kind, RefusalKind::BunProjectionInvalid);
+    assert_eq!(refusal.check, Some(Check::InstallCleanup));
+    assert_eq!(&*refusal.detail, "InstallCleanup failed at .");
 }

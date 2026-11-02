@@ -1022,10 +1022,10 @@ fn stage_workspace(staging: &Path) -> PathBuf {
     staging.join("m/repo")
 }
 
-/// Bun run inside a workspace member installs the enclosing workspace from the
-/// root lockfile and links the member's packages into the root project's store.
-/// Preparing the member as its own project therefore checked a tree Bun never
-/// builds and refused the job, so it is left to the enclosing install.
+/// Bun invoked in a workspace member reads the root lockfile, not the member's
+/// stale standalone lockfile. The isolated linker can link member dependencies
+/// into the enclosing store, so the whole workspace must be verified
+/// against that enclosing directory, not against the member alone.
 #[cfg(unix)]
 #[test]
 fn workspace_member_lockfile_is_left_to_the_enclosing_install() {
@@ -1041,22 +1041,12 @@ fn workspace_member_lockfile_is_left_to_the_enclosing_install() {
         |_| panic!("file: and workspace: dependencies need no registry"),
     )
     .unwrap();
-    let seed = staging.join("bun-seed");
-    let manifest: Manifest =
-        serde_json::from_slice(&fs::read(seed.join("manifest.json")).unwrap()).unwrap();
-    // The fixture resolves only `file:` and `workspace:` rows, which stay in the
-    // checkout and are not registry packages, so the root project has none.
-    assert!(manifest.projects.iter().all(|p| p.packages.is_empty()));
-    assert_eq!(manifest.members, ["m/repo/packages/member"]);
     let cache = scratch.join("cache");
-    let prepared = bun::prepare_cache(&seed, &staging.join("m"), &cache)
+    let prepared = bun::prepare_cache(&staging.join("bun-seed"), &staging.join("m"), &cache)
         .unwrap()
         .unwrap();
-    let paths: Vec<_> = prepared.projects.iter().map(|p| p.path.as_str()).collect();
-    assert_eq!(paths, ["m/repo"]);
-    let root = &prepared.projects[0];
-    assert!(root.skipped.is_none(), "{:?}", root.skipped);
-
+    let member = checkout.join("packages/member");
+    let member_lock = fs::read(member.join("bun.lock")).unwrap();
     let install = |directory: &Path| {
         let output = std::process::Command::new("bun")
             .args([
@@ -1077,85 +1067,196 @@ fn workspace_member_lockfile_is_left_to_the_enclosing_install() {
             String::from_utf8_lossy(&output.stderr)
         );
     };
-    install(&checkout);
-    // The member's entries point into the root project's store, which sits
-    // beside it inside the checkout, and its own lockfile stays untouched
-    // because Bun installed from the root one.
-    // The member's own lockfile as tracked, which Bun leaves alone.
-    let member_lock =
-        include_str!("../../../test-fixtures/javascript/bunworkspace/packages/member/bun.lock");
-    install(&checkout.join("packages/member"));
-    assert_eq!(
-        fs::read_to_string(checkout.join("packages/member/bun.lock")).unwrap(),
-        member_lock
+    // Start in the member with no installed tree. Its standalone lock lacks
+    // rootdep, yet Bun installs rootdep and writes the enclosing .bun store.
+    install(&member);
+    assert_eq!(fs::read(member.join("bun.lock")).unwrap(), member_lock);
+    assert!(member.join("node_modules/rootdep/package.json").is_file());
+    let stored = checkout.join(
+        "node_modules/.bun/memberdep@file+packages+member+vendor+memberdep/node_modules/memberdep",
     );
-    let rooted = checkout.canonicalize().unwrap();
-    let linked = checkout.join("packages/member/node_modules/memberdep");
-    assert!(
-        linked.canonicalize().unwrap().starts_with(&rooted),
-        "member entry resolves outside the checkout"
-    );
-    // Verifying the enclosing project covers the member too.
-    assert!(bun::verify_installed(root, &checkout).is_ok());
+    assert!(stored.join("package.json").is_file());
+    for project in &prepared.projects {
+        assert!(project.skipped.is_none(), "{:?}", project.skipped);
+        let directory = staging.join(&project.path);
+        install(&directory);
+        // Bun may copy these local fixture dependencies. Represent its
+        // Windows directory-link topology with a Unix symlink so Linux exercises
+        // the guest's canonical containment check on the same link shape.
+        let linked = member.join("node_modules/memberdep");
+        if fs::symlink_metadata(&linked)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+        {
+            fs::remove_file(&linked).unwrap();
+        } else {
+            fs::remove_dir_all(&linked).unwrap();
+        }
+        std::os::unix::fs::symlink(&stored, &linked).unwrap();
+        assert!(fs::symlink_metadata(&linked)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(linked
+            .canonicalize()
+            .unwrap()
+            .starts_with(checkout.canonicalize().unwrap()));
+        assert!(!linked
+            .canonicalize()
+            .unwrap()
+            .starts_with(member.canonicalize().unwrap()));
+        bun::verify_installed(project, &directory).unwrap();
+    }
+    let paths: Vec<_> = prepared.projects.iter().map(|p| p.path.as_str()).collect();
+    assert_eq!(paths, ["m/repo"]);
 }
 
-/// An installed entry that resolves outside the job checkout is still refused,
-/// and the refusal names the entry so a live report shows what left the tree.
+/// Both root and member modules must stay in the checkout. Checking containers
+/// before enumerating them also catches empty scope and isolated-store escapes.
 #[cfg(unix)]
 #[test]
 fn installed_tree_leaving_the_checkout_is_refused_with_the_offending_path() {
     let scratch = ScratchDir::new("bun-workspace-escape");
-    let staging = scratch.join("staging");
-    let checkout = stage_workspace(&staging);
     let outside = scratch.join("outside");
     fs::create_dir_all(&outside).unwrap();
-    fs::write(
-        outside.join("package.json"),
-        r#"{"name":"escaped","version":"1.0.0"}"#,
-    )
-    .unwrap();
-    // A checkout whose own node_modules links a directory that lives beside
-    // it, the shape an install escaping the checkout would leave behind.
-    let modules = checkout.join("node_modules");
-    fs::create_dir_all(&modules).unwrap();
-    std::os::unix::fs::symlink(&outside, modules.join("escaped")).unwrap();
-    let project = Project {
-        path: "m/repo".into(),
-        name: String::new(),
-        version: String::new(),
-        lock_sha256: String::new(),
-        manifest_sha256: String::new(),
-        packages: Vec::new(),
-        skipped: None,
-    };
-    let refusal = bun::verify_installed(&project, &checkout).unwrap_err();
-    assert_eq!(refusal.kind, RefusalKind::BunProjectionInvalid);
-    assert_eq!(refusal.project, "m/repo");
-    assert_eq!(refusal.check, Some(bun::Check::Projection));
-    assert_eq!(
-        &*refusal.detail,
-        "installed tree leaves the checkout at repo/node_modules/escaped"
-    );
-    assert!(refusal.to_string().contains(&*refusal.detail));
+    for (index, relative) in [
+        "node_modules/escaped",
+        "packages/member/node_modules/escaped",
+        "node_modules/@empty",
+        "node_modules/.bun/escaped",
+        "node_modules/.bun/node_modules/escaped",
+        "node_modules",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let checkout = stage_workspace(&scratch.join(format!("staging-{index}")));
+        let link = checkout.join(relative);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let project = Project {
+            path: "m/repo".into(),
+            name: String::new(),
+            version: String::new(),
+            lock_sha256: String::new(),
+            manifest_sha256: String::new(),
+            packages: Vec::new(),
+            skipped: None,
+        };
+        let refusal = bun::verify_installed(&project, &checkout).unwrap_err();
+        assert_eq!(refusal.kind, RefusalKind::BunProjectionInvalid);
+        assert_eq!(refusal.project, "m/repo");
+        assert_eq!(refusal.check, Some(bun::Check::Projection));
+        assert_eq!(
+            &*refusal.detail,
+            format!("Projection: installed tree leaves the checkout at {relative}")
+        );
+        assert!(refusal.to_string().contains(&*refusal.detail));
+        assert!(!refusal.detail.contains(&*scratch.path().to_string_lossy()));
+    }
 }
 
-/// A member is recognised only through the patterns Bun applies to the
-/// workspace root, so members of nested workspaces and excluded directories
-/// keep their own project.
+/// Resolved lockfile keys support Bun's full glob grammar without a second
+/// matcher. Root discovery stops at an intervening workspace declaration, not
+/// at a standalone lockfile, and only named members are covered.
+#[cfg(unix)]
 #[test]
-fn workspace_patterns_follow_the_enclosing_lockfile() {
-    let matches = bun::workspace_glob_matches;
-    assert!(matches(&["packages/*"], "packages/member"));
-    assert!(!matches(&["packages/*"], "packages/member/nested"));
-    assert!(matches(&["packages/**"], "packages/member/nested"));
-    assert!(matches(
-        &["packages/*", "!packages/legacy"],
-        "packages/member"
-    ));
-    assert!(!matches(
-        &["packages/*", "!packages/legacy"],
-        "packages/legacy"
-    ));
-    assert!(!matches(&["apps"], "packages/member"));
-    assert!(matches(&["apps/*", "benchmarks"], "benchmarks"));
+fn workspace_ownership_uses_resolved_keys_and_the_nearest_workspace_manifest() {
+    let scratch = ScratchDir::new("bun-workspace-ownership");
+    let staging = scratch.join("staging");
+    let checkout = stage_workspace(&staging);
+    let root_lock = checkout.join("bun.lock");
+    let mut lock = bun::text_json(&fs::read_to_string(&root_lock).unwrap()).unwrap();
+    for (path, name) in [
+        ("packages/member/nested", "nested"),
+        ("apps/blocked", "blocked"),
+        ("packages/unnamed", "unnamed"),
+    ] {
+        lock["workspaces"][path] = serde_json::json!({"name": name});
+    }
+    fs::write(&root_lock, serde_json::to_vec(&lock).unwrap()).unwrap();
+    fs::write(
+        checkout.join("package.json"),
+        r#"{"name":"root","workspaces":{"packages":["./packages/{member,unnamed}/**","apps/*"]}}"#,
+    )
+    .unwrap();
+    for (path, manifest) in [
+        ("packages/member/nested", r#"{"name":"nested"}"#),
+        ("apps/blocked", r#"{"name":"blocked"}"#),
+        ("packages/unnamed", "{}"),
+        ("packages/unlisted", r#"{"name":"unlisted"}"#),
+    ] {
+        let directory = checkout.join(path);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("package.json"), manifest).unwrap();
+        fs::write(
+            directory.join("bun.lock"),
+            r#"{"lockfileVersion":1,"workspaces":{"":{}},"packages":{}}"#,
+        )
+        .unwrap();
+    }
+    fs::write(
+        checkout.join("apps/package.json"),
+        r#"{"name":"apps","workspaces":[]}"#,
+    )
+    .unwrap();
+    let budget =
+        bun::ExpansionBudget::new(1_000_000, 1000, Instant::now() + Duration::from_secs(60));
+    let projects = bun::source_projects(&staging.join("m"), &budget).unwrap();
+    assert_eq!(
+        projects["m/repo/packages/member"].as_deref(),
+        Some("m/repo")
+    );
+    assert_eq!(
+        projects["m/repo/packages/member/nested"].as_deref(),
+        Some("m/repo")
+    );
+    for independent in [
+        "m/repo",
+        "m/repo/apps/blocked",
+        "m/repo/packages/unnamed",
+        "m/repo/packages/unlisted",
+    ] {
+        assert_eq!(projects[independent], None, "{independent}");
+    }
+}
+
+/// A member's unused standalone lockfile must not be parsed while staging
+/// dependencies, validating the guest cache, or reporting a skipped install.
+#[cfg(unix)]
+#[test]
+fn unused_workspace_member_lockfile_is_not_parsed_in_any_preparation_path() {
+    let scratch = ScratchDir::new("bun-unused-member-lock");
+    let config = config(scratch.path());
+    let staging = scratch.join("staging");
+    let checkout = stage_workspace(&staging);
+    fs::write(checkout.join("packages/member/bun.lock"), "not a lockfile").unwrap();
+    write_parsed_locks(&staging).unwrap();
+    let parsed =
+        serde_json::from_slice(&fs::read(staging.join("bun-parsed.json")).unwrap()).unwrap();
+    prepare_impl(
+        &config,
+        &staging,
+        "/repo",
+        &[checkout],
+        |_| panic!(),
+        Some(&parsed),
+    )
+    .unwrap();
+    let manifest = bun::prepare_cache(
+        &staging.join("bun-seed"),
+        &staging.join("m"),
+        &scratch.join("cache"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(manifest.projects.len(), 1);
+    let warnings = bun::skip_unprepared(
+        &staging.join("m"),
+        bun::refuse(RefusalKind::BunCacheMissing, "", "", ""),
+    )
+    .unwrap();
+    assert_eq!(warnings.len(), 2);
+    assert!(warnings.iter().any(|warning| warning == "bun.lock unused at repo/packages/member/bun.lock: inside workspace member of repo; Bun installs it from there\n"));
 }

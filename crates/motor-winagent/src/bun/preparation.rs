@@ -1,6 +1,6 @@
 //! Operational preparation failures must not leave a partial dependency tree.
 use super::{Check, Project, Refusal, RefusalKind, is_node_modules, refuse};
-use std::{io, path::Path};
+use std::path::Path;
 
 pub enum InstallEvent {
     Stderr(Vec<u8>),
@@ -25,6 +25,9 @@ pub fn wait_install(
             &project.version,
         )
         .at(check)
+        .detail(format!(
+            "{check:?} failed at . (Bun install working directory)"
+        ))
     };
     let (mut code, mut closed) = (None, 0);
     loop {
@@ -89,25 +92,32 @@ pub fn skip_project(directory: &Path, refusal: Refusal) -> Result<Refusal, Refus
     if refusal.kind.is_security() {
         return Err(refusal);
     }
-    fn clean(directory: &Path) -> io::Result<()> {
-        for entry in std::fs::read_dir(directory)? {
-            let entry = entry?;
-            let metadata = std::fs::symlink_metadata(entry.path())?;
+    fn clean(directory: &Path) -> Result<(), std::path::PathBuf> {
+        for entry in std::fs::read_dir(directory).map_err(|_| directory.to_path_buf())? {
+            let entry = entry.map_err(|_| directory.to_path_buf())?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|_| path.clone())?;
             if is_node_modules(&entry.file_name()) {
                 if metadata.is_dir() {
-                    std::fs::remove_dir_all(entry.path())?;
+                    std::fs::remove_dir_all(&path).map_err(|_| path.clone())?;
                 } else {
-                    std::fs::remove_file(entry.path())?;
+                    std::fs::remove_file(&path).map_err(|_| path.clone())?;
                 }
             } else if metadata.is_dir() && !crate::is_reparse(&metadata) {
-                clean(&entry.path())?;
+                clean(&path)?;
             }
         }
         Ok(())
     }
     // A failed cleanup cannot safely hand an incomplete tree to the command.
-    clean(directory)
-        .map_err(|_| refuse(RefusalKind::BunProjectionInvalid, &refusal.project, "", ""))?;
+    clean(directory).map_err(|path| {
+        refuse(RefusalKind::BunProjectionInvalid, &refusal.project, "", "")
+            .at(super::Check::InstallCleanup)
+            .detail(format!(
+                "InstallCleanup failed at {}",
+                super::installed_relative(directory, &path)
+            ))
+    })?;
     Ok(refusal)
 }
 
@@ -133,19 +143,16 @@ pub fn skip_unprepared(source: &Path, failure: Refusal) -> Result<Vec<String>, R
     );
     let mut warnings = Vec::new();
     for (project, owner) in super::source_projects(source, &budget)? {
+        if let Some(owner) = owner {
+            warnings.push(super::workspace_member_warning(&project, &owner));
+            continue;
+        }
         let directory = source.join(project.strip_prefix("m/").unwrap_or(""));
         let invalid = || refuse(RefusalKind::BunProjectionInvalid, &project, "", "");
         super::clean_install_inputs(&directory, &budget).map_err(|_| invalid())?;
         let lock = super::read_bounded(&directory.join("bun.lock"), super::MAX_LOCK_BYTES as u64)
             .map_err(|_| invalid())?;
         super::read_lock(&project, std::str::from_utf8(&lock).map_err(|_| invalid())?)?;
-        if let Some(owner) = owner {
-            // Bun installs this directory as part of the enclosing workspace and
-            // never reads its own lockfile. Say so instead of preparing a tree
-            // Bun will not build.
-            warnings.push(super::workspace_member_warning(&project, &owner));
-            continue;
-        }
         let mut refusal = failure.clone();
         refusal.project = project;
         warnings.push(skip_project(&directory, refusal)?.warning());

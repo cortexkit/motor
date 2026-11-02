@@ -40,10 +40,6 @@ pub enum RefusalKind {
     BunCacheMissing,
     BunProjectionInvalid,
     BunOfflineInstallFailed,
-    /// A lockfile inside a project that an enclosing lockfile already installs.
-    /// Report-only: the enclosing install supplies that tree, so the file's own
-    /// lockfile is never read by Bun.
-    BunWorkspaceMember,
 }
 
 impl RefusalKind {
@@ -87,6 +83,7 @@ pub enum Check {
     ExitPoll,
     JobTerminate,
     JobWaitEmpty,
+    InstallCleanup,
     Cancelled,
     InstallDeadline,
     PipeRead,
@@ -96,7 +93,6 @@ pub enum Check {
     InstalledPackage,
     InstalledBin,
     InstalledBinDirectory,
-    WorkspaceMember,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,18 +118,13 @@ pub struct Refusal {
     pub package: String,
     /// Boxed like `registry_origin` and `detail` so a refusal stays small enough
     /// to return by value from every preparation step.
-    #[serde(default, skip_serializing_if = "detail_empty")]
     pub version: Box<str>,
     /// Boxed like `detail` so a refusal stays small enough to return by value.
-    #[serde(default, skip_serializing_if = "detail_empty")]
     pub registry_origin: Box<str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<Check>,
-    /// What the failing check found, as a path relative to the job checkout.
-    /// Fixed diagnostics cross the trust boundary; this is a path, never a
-    /// host I/O error message. It is boxed, and the enclosing project a member
-    /// report names is carried here rather than in a field of its own, so a
-    /// refusal stays small enough to return by value from every step.
+    /// The failed condition and its checkout-relative path, never a host I/O
+    /// error message. Boxing keeps refusals small enough to return by value.
     #[serde(default, skip_serializing_if = "detail_empty")]
     pub detail: Box<str>,
     #[serde(default, skip_serializing_if = "missing_empty")]
@@ -199,6 +190,14 @@ impl Refusal {
     }
     pub fn at(mut self, check: Check) -> Self {
         self.check = Some(check);
+        if self.detail.is_empty()
+            && matches!(
+                self.kind,
+                RefusalKind::BunProjectionInvalid | RefusalKind::BunOfflineInstallFailed
+            )
+        {
+            self.detail = format!("{check:?} failed at . (project working directory)").into();
+        }
         self
     }
     pub fn missing_packages(mut self, packages: impl IntoIterator<Item = MissingPackage>) -> Self {
@@ -302,7 +301,6 @@ pub fn refuse(kind: RefusalKind, project: &str, package: &str, version: &str) ->
             RefusalKind::BunCacheMissing => Check::SeedBlobs,
             RefusalKind::BunProjectionInvalid => Check::Projection,
             RefusalKind::BunOfflineInstallFailed => Check::InstalledTree,
-            RefusalKind::BunWorkspaceMember => Check::WorkspaceMember,
         }),
         detail: Box::default(),
         missing: Box::default(),
@@ -655,10 +653,6 @@ pub struct Manifest {
     pub bun_version: String,
     pub projects: Vec<Project>,
     pub registries: BTreeMap<String, String>,
-    /// Lockfiles inside a project that the enclosing install already covers.
-    /// The guest reports each one so its owner learns the file is unused.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub members: Vec<String>,
 }
 
 pub const SEED_DIR: &str = "C:\\motor-bun-seed";
@@ -1066,33 +1060,54 @@ pub fn source_projects(
     let mut projects = Default::default();
     walk(source, source, &mut projects, budget)?;
     let paths: Vec<String> = projects.keys().cloned().collect();
-    // A directory a lockfile above it lists as a workspace member is installed
-    // by that enclosing project. Bun never reads the member's own lockfile
-    // there, so preparing it separately would verify a tree Bun did not make.
+    // Bun stops at the nearest ancestor manifest declaring workspaces, even
+    // when it does not include this directory. A nearer standalone lockfile
+    // does not stop that search. Host and guest share this ownership decision.
     for project in &paths {
-        let Some(owner) = paths
-            .iter()
-            .filter(|owner| project.starts_with(&format!("{owner}/")))
-            .max_by_key(|owner| owner.len())
-        else {
-            continue;
-        };
-        let owner_directory = source.join(owner.strip_prefix("m/").unwrap_or(""));
-        if lists_member(
-            &owner_directory.join("bun.lock"),
-            &owner_directory,
-            &source.join(project.strip_prefix("m/").unwrap_or("")),
-            budget,
-        )? {
-            projects.insert(project.clone(), Some(owner.clone()));
+        let member = source.join(project.strip_prefix("m/").unwrap_or(""));
+        let mut ancestor = member.parent();
+        while let Some(directory) = ancestor.filter(|path| path.starts_with(source)) {
+            budget
+                .check()
+                .map_err(|_| refuse(RefusalKind::BunProjectionInvalid, project, "", ""))?;
+            let manifest = directory.join("package.json");
+            let declares_workspaces = if manifest.is_file() {
+                let bytes = read_bounded(&manifest, MAX_LOCK_BYTES as u64)
+                    .map_err(|_| refuse(RefusalKind::BunLockInvalid, project, "", ""))?;
+                let value: Value = serde_json::from_slice(&bytes)
+                    .map_err(|_| refuse(RefusalKind::BunLockInvalid, project, "", ""))?;
+                value.get("workspaces").is_some()
+            } else {
+                false
+            };
+            if declares_workspaces {
+                let relative = directory
+                    .strip_prefix(source)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let owner = if relative.is_empty() {
+                    "m".into()
+                } else {
+                    format!("m/{relative}")
+                };
+                if paths.contains(&owner)
+                    && lists_member(&directory.join("bun.lock"), directory, &member, budget)?
+                {
+                    projects.insert(project.clone(), Some(owner));
+                }
+                break;
+            }
+            ancestor = directory.parent();
         }
     }
     Ok(projects)
 }
 
-/// Whether `lock` names `member` among its workspaces, as `bun install` reads
-/// them: patterns relative to the lockfile's directory, `*` and `**` wildcards,
-/// `!` exclusions, and the nesting a workspace member's own `workspaces` adds.
+/// Frozen installs use the resolved workspace table in the enclosing lockfile.
+/// Reading its exact member paths avoids implementing a second, subtly different
+/// version of Bun's workspace glob expansion. Bun checks manifest drift during
+/// the frozen install; an unused member lockfile must not be parsed as a project.
 fn lists_member(
     lock: &std::path::Path,
     directory: &std::path::Path,
@@ -1101,109 +1116,38 @@ fn lists_member(
 ) -> Result<bool, Refusal> {
     let invalid = || refuse(RefusalKind::BunProjectionInvalid, "", "", "");
     budget.check().map_err(|_| invalid())?;
-    // A lockfile without a workspace table belongs to one project, which has no
-    // members to cover.
-    let bytes = match read_bounded(lock, MAX_LOCK_BYTES as u64) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(_) => return Err(invalid()),
-    };
-    // Bun writes trailing commas, so its lockfiles parse only through the text
-    // form the rest of preparation uses.
+    let bytes = read_bounded(lock, MAX_LOCK_BYTES as u64).map_err(|_| invalid())?;
     let text = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
     let lock: Value = text_json(text).map_err(|_| invalid())?;
-    if !lock.get("workspaces").is_some_and(Value::is_object) {
-        return Ok(false);
-    }
-    // The table the lockfile writes records the members Bun resolved; the
-    // patterns that select them live in the manifest beside it.
-    let manifest = match read_bounded(&directory.join("package.json"), MAX_LOCK_BYTES as u64) {
-        Ok(bytes) => bytes,
-        Err(_) => return Ok(false),
-    };
-    let manifest: Value = serde_json::from_slice(&manifest).map_err(|_| invalid())?;
-    let patterns: Vec<&str> = manifest
+    let relative = member
+        .strip_prefix(directory)
+        .map_err(|_| invalid())?
+        .to_str()
+        .ok_or_else(invalid)?
+        .replace('\\', "/");
+    let Some(name) = lock
         .get("workspaces")
-        .and_then(Value::as_array)
-        .map(|list| list.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    let Ok(relative) = member.strip_prefix(directory) else {
+        .and_then(|workspaces| workspaces.get(&relative))
+        .and_then(|workspace| workspace.get("name"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+    else {
         return Ok(false);
     };
-    let Some(relative) = relative.to_str() else {
-        return Err(invalid());
-    };
-    Ok(workspace_glob_matches(
-        &patterns,
-        &relative.replace('\\', "/"),
-    ))
-}
-
-/// Match workspace patterns in order, later ones overriding earlier ones.
-pub fn workspace_glob_matches(patterns: &[&str], member: &str) -> bool {
-    let mut matched = false;
-    for pattern in patterns {
-        match pattern.strip_prefix('!') {
-            Some(negated) => {
-                if glob_match(negated, member) {
-                    matched = false;
-                }
-            }
-            None => {
-                if glob_match(pattern, member) {
-                    matched = true;
-                }
-            }
-        }
-    }
-    matched
-}
-
-/// `*` matches within one path segment and `**` across them; `?` is not a Bun
-/// workspace wildcard, so it stays literal.
-fn glob_match(pattern: &str, path: &str) -> bool {
-    fn walk(pattern: &[&str], path: &[&str]) -> bool {
-        match pattern.split_first() {
-            None => path.is_empty(),
-            Some((&"**", rest)) => (0..=path.len()).any(|skip| walk(rest, &path[skip..])),
-            Some((segment, rest)) => match path.split_first() {
-                Some((candidate, remaining)) if segment_matches(segment, candidate) => {
-                    walk(rest, remaining)
-                }
-                _ => false,
-            },
-        }
-    }
-    fn segment_matches(pattern: &str, segment: &str) -> bool {
-        match pattern.split_once('*') {
-            None => pattern == segment,
-            // A `*` swallows any run of characters inside the segment, so the
-            // rest must match some suffix of it.
-            Some((head, tail)) => {
-                segment.len() >= head.len()
-                    && segment.starts_with(head)
-                    && match tail {
-                        "" => true,
-                        tail => (head.len()..=segment.len()).any(|at| {
-                            segment.is_char_boundary(at) && segment_matches(tail, &segment[at..])
-                        }),
-                    }
-            }
-        }
-    }
-    let pattern: Vec<&str> = pattern.split('/').collect();
-    let path: Vec<&str> = path.split('/').collect();
-    walk(&pattern, &path)
+    let bytes =
+        read_bounded(&member.join("package.json"), MAX_LOCK_BYTES as u64).map_err(|_| invalid())?;
+    let manifest: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    Ok(manifest.get("name").and_then(Value::as_str) == Some(name))
 }
 
 /// Report a lockfile that an enclosing workspace project already installs. Bun
 /// reads only the enclosing lockfile there, so the member's own file is unused.
 pub fn workspace_member_warning(project: &str, owner: &str) -> String {
-    refuse(RefusalKind::BunWorkspaceMember, project, "", "")
-        .detail(format!(
-            "bun.lock is unused: {owner} installs this directory as a workspace member"
-        ))
-        .warning()
+    format!(
+        "bun.lock unused at {}/bun.lock: inside workspace member of {}; Bun installs it from there\n",
+        project.strip_prefix("m/").unwrap_or(project),
+        owner.strip_prefix("m/").unwrap_or(owner),
+    )
 }
 
 fn clean_install_inputs(directory: &std::path::Path, budget: &ExpansionBudget) -> io::Result<()> {
@@ -1290,11 +1234,6 @@ pub fn prepare_cache_with_budget(
         .collect::<std::collections::BTreeSet<_>>()
         != input_projects
     {
-        return Err(invalid());
-    }
-    if !manifest.members.iter().all(|member| {
-        member.starts_with("m/") && !input_projects.contains(member) && member.len() <= 4096
-    }) {
         return Err(invalid());
     }
     let expected_blobs: std::collections::BTreeSet<_> = manifest
@@ -1501,8 +1440,7 @@ pub fn prepare_cache_with_budget(
 /// names is relative to it, so a live report says where the install left its
 /// tree.
 struct Directory {
-    /// The checkout as the job sees it: the project path without its `m/` mount.
-    checkout: String,
+    directory: std::path::PathBuf,
     root: std::path::PathBuf,
 }
 
@@ -1517,12 +1455,14 @@ impl Containment {
     fn into_refusal(self, project: &Project) -> Refusal {
         match self {
             Containment::Outside(detail) => {
-                refuse(RefusalKind::BunProjectionInvalid, &project.path, "", "")
-                    .detail(format!("installed tree leaves the checkout at {detail}"))
+                refuse(RefusalKind::BunProjectionInvalid, &project.path, "", "").detail(format!(
+                    "Projection: installed tree leaves the checkout at {detail}"
+                ))
             }
             Containment::Unreadable(detail) => {
-                refuse(RefusalKind::BunOfflineInstallFailed, &project.path, "", "")
-                    .detail(format!("installed tree is unreadable at {detail}"))
+                refuse(RefusalKind::BunOfflineInstallFailed, &project.path, "", "").detail(format!(
+                    "InstalledTree: installed tree is unreadable at {detail}"
+                ))
             }
         }
     }
@@ -1533,13 +1473,12 @@ impl Directory {
         let root = directory.canonicalize().map_err(|_| {
             refuse(RefusalKind::BunOfflineInstallFailed, project, "", "")
                 .at(Check::InstalledTree)
-                .detail("checkout is unreadable")
+                .detail("InstalledTree: checkout is unreadable at .")
         })?;
-        // Project paths carry the `m/` mount the transferred tree sits under,
-        // which is not part of the checkout: `m/repo/packages/x` is
-        // `repo/packages/x` for the job.
-        let checkout = project.strip_prefix("m/").unwrap_or(project).to_owned();
-        Ok(Self { checkout, root })
+        Ok(Self {
+            directory: directory.into(),
+            root,
+        })
     }
 
     /// Resolve `path`, refusing a link whose target leaves the checkout.
@@ -1560,32 +1499,56 @@ impl Directory {
     }
 
     fn relative(&self, path: &std::path::Path) -> String {
-        let relative = path
-            .strip_prefix(&self.root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if self.checkout.is_empty() {
-            return relative;
-        }
-        if relative.is_empty() {
-            return self.checkout.clone();
-        }
-        format!("{}/{relative}", self.checkout)
+        installed_relative(&self.directory, path)
     }
+}
+
+/// Install walkers retain lexical entry paths so diagnostics name the link
+/// encountered in the checkout, not its resolved target or a guest disk path.
+fn installed_relative(directory: &std::path::Path, path: &std::path::Path) -> String {
+    let relative = path
+        .strip_prefix(directory)
+        .unwrap_or(std::path::Path::new("."));
+    if relative.as_os_str().is_empty() {
+        return ".".into();
+    }
+    relative.to_string_lossy().replace('\\', "/")
 }
 
 /// A successful offline install may omit optional packages. Check identities and
 /// declared bin targets independently instead of treating exit zero as completeness.
 pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Result<(), Refusal> {
+    fn walk_projects(
+        path: &std::path::Path,
+        root: &Directory,
+        seen: &mut std::collections::BTreeSet<std::path::PathBuf>,
+        installed: &mut Vec<(Value, std::path::PathBuf)>,
+    ) -> Result<(), Containment> {
+        for entry in std::fs::read_dir(path).map_err(|error| root.failed(path, error))? {
+            let entry = entry.map_err(|error| root.failed(path, error))?;
+            let target = entry.path();
+            if is_node_modules(&entry.file_name()) {
+                walk_modules(&target, root, seen, installed)?;
+            } else {
+                let metadata = std::fs::symlink_metadata(&target)
+                    .map_err(|error| root.failed(&target, error))?;
+                if metadata.is_dir() && !crate::is_reparse(&metadata) {
+                    walk_projects(&target, root, seen, installed)?;
+                }
+            }
+        }
+        Ok(())
+    }
     fn walk_modules(
         path: &std::path::Path,
         root: &Directory,
         seen: &mut std::collections::BTreeSet<std::path::PathBuf>,
         installed: &mut Vec<(Value, std::path::PathBuf)>,
     ) -> Result<(), Containment> {
-        if !path.exists() {
-            return Ok(());
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => (),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(root.failed(path, error)),
         }
         let canonical = root.inside(path)?;
         if !seen.insert(canonical) {
@@ -1594,33 +1557,30 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
         for entry in std::fs::read_dir(path).map_err(|error| root.failed(path, error))? {
             let entry = entry.map_err(|error| root.failed(path, error))?;
             let name = entry.file_name().to_string_lossy().into_owned();
+            let target = entry.path();
+            root.inside(&target)?;
             if name == ".bun" {
                 for store in
-                    std::fs::read_dir(entry.path()).map_err(|error| root.failed(path, error))?
+                    std::fs::read_dir(&target).map_err(|error| root.failed(&target, error))?
                 {
-                    let store = store.map_err(|error| root.failed(path, error))?;
-                    walk_modules(&store.path().join("node_modules"), root, seen, installed)?;
+                    let store = store.map_err(|error| root.failed(&target, error))?;
+                    root.inside(&store.path())?;
+                    let modules = if store.file_name() == "node_modules" {
+                        store.path()
+                    } else {
+                        store.path().join("node_modules")
+                    };
+                    walk_modules(&modules, root, seen, installed)?;
                 }
             } else if name.starts_with('@') {
                 for package in
-                    std::fs::read_dir(entry.path()).map_err(|error| root.failed(path, error))?
+                    std::fs::read_dir(&target).map_err(|error| root.failed(&target, error))?
                 {
-                    let package = package.map_err(|error| root.failed(path, error))?;
+                    let package = package.map_err(|error| root.failed(&target, error))?;
                     collect_package(&package.path(), root, seen, installed)?;
                 }
-            } else if !name.starts_with('.') {
-                // A link is checked as an entry: `is_dir` follows it, so the
-                // canonical check could run on the target instead.
-                let target = entry.path();
-                let linked = std::fs::symlink_metadata(&target)
-                    .map_err(|error| root.failed(path, error))?
-                    .file_type()
-                    .is_symlink();
-                if target.is_dir() && !linked {
-                    collect_package(&target, root, seen, installed)?;
-                } else {
-                    root.inside(&target)?;
-                }
+            } else if !name.starts_with('.') && target.is_dir() {
+                collect_package(&target, root, seen, installed)?;
             }
         }
         Ok(())
@@ -1640,18 +1600,18 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
         walk_modules(&path.join("node_modules"), root, seen, installed)
     }
     let mut installed = Vec::new();
-    let modules = directory.join("node_modules");
-    // `exists` follows the final component, which would hide a node_modules
-    // link: test for the entry itself.
-    if std::fs::symlink_metadata(&modules).is_ok() {
-        // The checkout is the containment boundary, not this project: a
-        // workspace member's entries link into the root project's store, which
-        // stays inside the job's tree. Inspect each real directory once and
-        // never traverse out to an unrelated disk or share.
-        let root = Directory::new(directory, &project.path)?;
-        walk_modules(&modules, &root, &mut Default::default(), &mut installed)
-            .map_err(|error| error.into_refusal(project))?;
-    }
+    // Only enclosing workspace projects are installed. Their store and member
+    // links stay inside this tree; the walk checks every entry before following
+    // it, including modules in members that have no root node_modules link.
+    // Visiting each resolved modules directory once breaks link cycles.
+    let boundary = Directory::new(directory, &project.path)?;
+    walk_projects(
+        directory,
+        &boundary,
+        &mut Default::default(),
+        &mut installed,
+    )
+    .map_err(|error| error.into_refusal(project))?;
     for package in project.packages.iter().filter(|p| p.windows) {
         let fail = || {
             refuse(
@@ -1667,9 +1627,10 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
                 metadata["name"] == package.name && metadata["version"] == package.version
             })
             .ok_or_else(|| {
-                fail()
-                    .at(Check::InstalledPackage)
-                    .detail(format!("{} is not installed in the checkout", package.name))
+                fail().at(Check::InstalledPackage).detail(format!(
+                    "InstalledPackage: {}@{} is not installed at node_modules",
+                    package.name, package.version
+                ))
             })?;
         let bins: Vec<&str> = match &metadata["bin"] {
             Value::String(s) => vec![s],
@@ -1682,27 +1643,35 @@ pub fn verify_installed(project: &Project, directory: &std::path::Path) -> Resul
         {
             let bin = bin.strip_prefix("./").unwrap_or(bin);
             for component in bin.split('/') {
-                crate::validate_component(component)
-                    .map_err(|_| projection_error(&project.path, package))?;
+                crate::validate_component(component).map_err(|_| {
+                    projection_error(&project.path, package).detail(format!(
+                        "Projection: invalid bin target at {}",
+                        installed_relative(directory, &root.join(bin))
+                    ))
+                })?;
             }
             if !root.join(bin).is_file() {
                 return Err(fail().at(Check::InstalledBin).detail(format!(
-                    "{} is missing {}",
+                    "InstalledBin: {} is missing at {}",
                     package.name,
-                    root.join(bin).display()
+                    installed_relative(directory, &root.join(bin))
                 )));
             }
         }
         if let Some(bin_dir) = &package.bin_dir {
             for component in bin_dir.strip_prefix("./").unwrap_or(bin_dir).split('/') {
-                crate::validate_component(component)
-                    .map_err(|_| projection_error(&project.path, package))?;
+                crate::validate_component(component).map_err(|_| {
+                    projection_error(&project.path, package).detail(format!(
+                        "Projection: invalid bin directory at {}",
+                        installed_relative(directory, &root.join(bin_dir))
+                    ))
+                })?;
             }
             if !root.join(bin_dir).is_dir() {
                 return Err(fail().at(Check::InstalledBinDirectory).detail(format!(
-                    "{} is missing {}",
+                    "InstalledBinDirectory: {} is missing at {}",
                     package.name,
-                    root.join(bin_dir).display()
+                    installed_relative(directory, &root.join(bin_dir))
                 )));
             }
         }

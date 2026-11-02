@@ -2293,24 +2293,34 @@ async fn windows_qualification_real_checkout_bun_preparation_is_not_refused() {
     let runner = operator();
     for checkout in checkouts {
         let f = Fixture::new();
-        // Replace the fixture repository's tracked contents with the checkout's,
-        // so preparation sees the real layout rather than a minimal fixture.
-        for entry in fs::read_dir(&checkout).unwrap() {
+        // Copy only the committed checkout: untracked caches, credentials and
+        // host-installed node_modules must never become qualification inputs.
+        for entry in fs::read_dir(&f.main).unwrap() {
             let entry = entry.unwrap();
             if entry.file_name() == ".git" {
                 continue;
             }
-            let _ = fs::remove_dir_all(f.main.join(entry.file_name()));
-            let _ = fs::remove_file(f.main.join(entry.file_name()));
-            let status = Command::new("cp")
-                .arg("-R")
-                .arg("--preserve=mode")
-                .arg(entry.path())
-                .arg(&f.main)
-                .status()
-                .unwrap();
-            assert!(status.success(), "copy {} failed", entry.path().display());
+            if entry.file_type().unwrap().is_dir() {
+                fs::remove_dir_all(entry.path()).unwrap();
+            } else {
+                fs::remove_file(entry.path()).unwrap();
+            }
         }
+        let archive = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["archive", "--format=tar", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(
+            archive.status.success(),
+            "archive {} failed: {}",
+            checkout.display(),
+            String::from_utf8_lossy(&archive.stderr)
+        );
+        tar::Archive::new(std::io::Cursor::new(archive.stdout))
+            .unpack(&f.main)
+            .unwrap();
         git(&f.main, &["add", "-A", "."]);
         git(
             &f.main,
@@ -2351,6 +2361,11 @@ async fn windows_qualification_real_checkout_bun_preparation_is_not_refused() {
         assert!(
             output.contains("preparation-not-refused"),
             "{} did not reach its command:\n{output}",
+            checkout.display()
+        );
+        assert!(
+            !output.contains("bun install skipped"),
+            "{} skipped Bun preparation instead of qualifying a complete install:\n{output}",
             checkout.display()
         );
         no_units(&runner);

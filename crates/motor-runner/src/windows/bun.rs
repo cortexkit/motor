@@ -439,12 +439,21 @@ fn parse_lock(project: &str, bytes: &[u8]) -> io::Result<ParsedLock> {
 pub(super) fn write_parsed_locks(staging: &Path) -> io::Result<()> {
     let mut files = Vec::new();
     discover(&staging.join("m"), &mut files)?;
+    let budget = bun::ExpansionBudget::new(
+        4 * 1024 * 1024 * 1024,
+        250_000,
+        Instant::now() + Duration::from_secs(600),
+    );
+    let projects = bun::source_projects(&staging.join("m"), &budget)?;
     let mut parsed = BTreeMap::new();
     let mut input_bytes = 0usize;
     for lock in files
         .iter()
         .filter(|path| path.file_name().is_some_and(|n| n == "bun.lock"))
     {
+        if projects[&lock_project(lock, staging)].is_some() {
+            continue;
+        }
         let bytes = bounded_file(lock, bun::MAX_LOCK_BYTES as u64)?;
         input_bytes = input_bytes.saturating_add(bytes.len());
         if input_bytes > bun::MAX_LOCK_BYTES {
@@ -645,8 +654,13 @@ fn prepare_impl(
     // Preparing such a member on its own builds a tree Bun never makes for that
     // lockfile, so its own lockfile is reported and left to the enclosing
     // install, which is what `bun install` itself does there.
-    let members = covered_members(&locks, staging, &files)?;
-    locks.retain(|lock| !members.contains(&lock_project(lock, staging)));
+    let budget = bun::ExpansionBudget::new(
+        4 * 1024 * 1024 * 1024,
+        250_000,
+        Instant::now() + Duration::from_secs(600),
+    );
+    let projects = bun::source_projects(&staging.join("m"), &budget)?;
+    locks.retain(|lock| projects[&lock_project(lock, staging)].is_none());
     let mut projects = Vec::new();
     let mut input_bytes = 0usize;
     for lock in &locks {
@@ -734,7 +748,6 @@ fn prepare_impl(
         bun_version: bun::BUN_VERSION.into(),
         projects: Vec::new(),
         registries: BTreeMap::new(),
-        members: members.into_iter().collect(),
     };
     let deadline = Instant::now() + Duration::from_secs(600);
     let mut seed_bytes = 0u64;
@@ -907,67 +920,6 @@ fn lock_project(lock: &Path, staging: &Path) -> String {
         .unwrap()
         .to_string_lossy()
         .replace('\\', "/")
-}
-
-/// Lockfiles whose directory a lockfile above it installs as a workspace
-/// member, in the terms `bun install` uses: the enclosing lockfile's
-/// `workspaces` patterns. Those directories cannot be prepared on their own.
-fn covered_members(
-    locks: &std::collections::BTreeSet<PathBuf>,
-    source: &Path,
-    files: &[PathBuf],
-) -> io::Result<std::collections::BTreeSet<String>> {
-    let mut members = std::collections::BTreeSet::new();
-    for lock in locks {
-        let directory = lock.parent().unwrap();
-        let invalid = || {
-            io::Error::other(bun::refuse(
-                RefusalKind::BunLockInvalid,
-                &lock_project(lock, source),
-                "",
-                "",
-            ))
-        };
-        let bytes = bounded_file(lock, bun::MAX_LOCK_BYTES as u64)?;
-        // Bun writes trailing commas, so its lockfiles parse only through the
-        // text form the rest of preparation uses.
-        let text = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
-        let value = bun::text_json(text).map_err(|_| invalid())?;
-        if !value.get("workspaces").is_some_and(|w| w.is_object()) {
-            continue;
-        }
-        // The lockfile's workspace table records the members Bun resolved; the
-        // patterns that select them are in the manifest beside it.
-        let manifest =
-            match bounded_file(&directory.join("package.json"), bun::MAX_LOCK_BYTES as u64) {
-                Ok(bytes) => bytes,
-                Err(_) => continue,
-            };
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&manifest).map_err(|_| invalid())?;
-        let patterns: Vec<&str> = manifest
-            .get("workspaces")
-            .and_then(|list| list.as_array())
-            .map(|list| list.iter().filter_map(|p| p.as_str()).collect())
-            .unwrap_or_default();
-        for candidate in locks {
-            let member = candidate.parent().unwrap();
-            if !member.starts_with(directory) || member == directory {
-                continue;
-            }
-            let relative = member
-                .strip_prefix(directory)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            if files.contains(&member.join("package.json"))
-                && bun::workspace_glob_matches(&patterns, &relative)
-            {
-                members.insert(lock_project(candidate, source));
-            }
-        }
-    }
-    Ok(members)
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {

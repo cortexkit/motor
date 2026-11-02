@@ -1542,7 +1542,6 @@ mod guest {
         let Some(manifest) = manifest else {
             return Ok(Vec::new());
         };
-        let members = manifest.members.clone();
         if bun::write_registry_config(&user.profile, &manifest.registries).is_err() {
             return bun::skip_unprepared(
                 Path::new(SOURCE_ROOT),
@@ -1550,7 +1549,12 @@ mod guest {
             );
         }
         drop(identity);
-        let mut warnings = Vec::new();
+        let mut warnings = bun::source_projects(Path::new(SOURCE_ROOT), &budget)?
+            .into_iter()
+            .filter_map(|(member, owner)| {
+                owner.map(|owner| bun::workspace_member_warning(&member, &owner))
+            })
+            .collect::<Vec<_>>();
         for project in &manifest.projects {
             let fail = |_path: &str| {
                 bun::refuse(
@@ -1620,7 +1624,9 @@ mod guest {
                 let containment = |check: Check| {
                     bun::refuse(RefusalKind::BunProjectionInvalid, &project.path, "", "")
                         .at(check)
-                        .detail("the job's processes did not stop")
+                        .detail(format!(
+                            "{check:?} failed at .: Bun install processes did not stop"
+                        ))
                 };
                 job.terminate(1)
                     .map_err(|_| containment(Check::JobTerminate))?;
@@ -1652,15 +1658,6 @@ mod guest {
                         if tail.is_empty() { "<empty>" } else { &tail }
                     ));
                 }
-            } else {
-                // Installed here, so this is where its members' unused lockfiles
-                // are reported.
-                warnings.extend(
-                    members
-                        .iter()
-                        .filter(|member| member.starts_with(&format!("{}/", project.path)))
-                        .map(|member| bun::workspace_member_warning(member, &project.path)),
-                );
             }
         }
         Ok(warnings)
