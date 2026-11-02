@@ -173,6 +173,7 @@ The config file is JSONC. Unknown keys are refused. All keys are optional.
 | `hosted_repositories` | `[]` (omitted) | Absolute main-checkout repository roots whose Linux leases use repository-specific placement policy. See [repository routing](#hosted-repository-routing). |
 | `hosted_repositories_placement_hint` | absent (omitted) | Optional `{ "host": "control-host", "vm": "t1" }` placement hint for repository-routed leases only. Both names must follow the broker grammar; `vm` cannot be null. Hinted jobs never fall back to the build server. |
 | `network_routing` | `false` | Forward a caller's request for outbound network. When off, such requests are refused with `network_unsupported`. |
+| `memory_sizes` | `false` (omitted) | Accept Linux `memory_mib` requests and list `exec-remote-memory/v1`. |
 | `admit_direct_exec` | `false` | Admit direct local callers (`ck motor run`) for their own jobs. |
 | `direct_exec_max_timeout_secs` | `7200` | Longest timeout a direct run may ask for. |
 | `ssh_config_override` | absent | Test control: an SSH config file used instead of the vault-backed identity. |
@@ -594,6 +595,25 @@ terminal record. If billing is still pending after that, `billed_vcpu_ms` is
 absent. A
 later `exec.attach` re-sends the terminal record and `exec.status` returns it,
 both with the figure as it stands at that moment.
+
+**Job memory.** With `memory_sizes` on, ck-motor lists `exec-remote-memory/v1`
+and forwards Linux `memory_mib` requests to the broker. The size is in MiB,
+in whole GiB (multiples of 1024), up to 262,144 MiB. The broker raises a smaller
+size to 2 GiB per vCPU and refuses a size no eligible host can fit. Without a
+size, the broker's default applies. Windows and macOS refuse `memory_mib` as
+`request_rejected` before start. On Linux with the switch off, a request
+carrying the field is refused before start, naming `exec-remote-memory/v1`.
+Nothing runs in either case (`ran: none`).
+
+The hosted server VM caps the job's whole memory cgroup at the broker-signed
+figure. Reclaimable file cache is reclaimed before a process is killed, so size
+the job by its working set: heap, shared memory and kernel memory. Job results
+report this peak as `memory_peak_working_mib` and the enforced figure as
+`memory_stated_mib`, when available. A job killed at its own limit reports
+`oom_kill` with `cause: job_limit`, so the caller knows to state a larger size.
+Memory fields are preserved on delivery, status and attach; unknown values are
+omitted. See [job-isolation.md](job-isolation.md#7-limits) for the limits on other
+runners and the fallback when host memory metadata is absent.
 
 **Returned files.** `return_paths` names files relative to the request's `cwd`;
 `return_max_bytes` caps their total size, 262,144 bytes when absent. A larger
