@@ -12,6 +12,17 @@ fn writer_job_reports_source_protection_was_not_applied() {
 }
 
 #[test]
+fn acknowledged_protection_survives_into_terminal_result() {
+    let f = Fixture::new();
+    let (run, _) = f.run("true");
+    let mut job = Job::new(run.job_id, Some(run), 0, 0, 1);
+    job.source_read_only = true;
+    job.started_ms = Some(1);
+    job.terminal(Outcome::Exit { code: 0 }, 2);
+    assert_eq!(job.terminal.unwrap().source_read_only(), Some(true));
+}
+
+#[test]
 fn refused_before_start_omits_source_protection_even_after_sealing() {
     let f = Fixture::new();
     let (run, _) = f.run("true");

@@ -8261,9 +8261,10 @@ impl Runner {
             }
         }
         job.state = JobState::Running;
+        job.source_read_only = launch.execution.source_read_only();
         #[cfg(target_os = "linux")]
         {
-            job.source_read_only =
+            job.source_read_only |=
                 crate::source_seal::record_path(&self.core.trees.state, id).exists();
         }
         job.process = launch.process;

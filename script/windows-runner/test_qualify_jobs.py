@@ -469,7 +469,8 @@ class QualificationReadinessTests(unittest.TestCase):
                                  "requested-return-ads-refused", "no-requested-returns-preserves-changed-source"])
         operator = (HERE.parents[1] / "crates/motor-runner/src/tests/windows_operator.rs").read_text()
         checks = re.findall(r"^(?:async )?fn (windows_qualification_\w+)\(", operator, re.MULTILINE)
-        self.assertEqual(len(checks), 19)
+        self.assertEqual(len(checks), 20)
+        self.assertIn("windows_qualification_tracked_source_is_read_only_and_new_files_are_writable", checks)
         self.assertIn("windows_qualification_realistic_checkout_bun_failure_is_nonfatal", checks)
         # Real fleet checkouts (MOTOR_QUAL_CHECKOUTS) must prepare on a candidate
         # image before it switches; fixtures alone missed three Bun refusals.
@@ -655,6 +656,24 @@ class QualificationReadinessTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "gate failed"):
                 JOBS.run_preparation_case(self.root, self.runner, self.root, "failed", self.root, "commit", "tree", "sh run.sh")
         channel.close.assert_called_once()
+
+    def test_source_seal_qualification_requires_positive_acknowledgement(self):
+        for protection in (None, False, True):
+            with self.subTest(protection=protection):
+                channel = Mock()
+                channel.until.return_value = dict(outcome=dict(type="windows_exit", code=0), source_read_only=protection)
+                with patch.object(JOBS, "no_lockfile_fixture", return_value=("commit", "tree")), \
+                        patch.object(JOBS, "fixture_bundle", side_effect=lambda repo, bundle, commit: bundle.write_bytes(b"bundle")), \
+                        patch.object(JOBS, "Channel", return_value=channel):
+                    if protection is True:
+                        JOBS.qualify_source_seal(self.root, self.runner, self.root)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "positive protection acknowledgement"):
+                            JOBS.qualify_source_seal(self.root, self.runner, self.root)
+                command = channel.send.call_args_list[0].args[0]["command"]
+                self.assertIn("if printf changed > run.sh", command)
+                self.assertIn("printf allowed > source-seal-new", command)
+                channel.close.assert_called_once()
 
     def test_preparation_only_cli_submits_only_the_two_preparation_cases(self):
         evidence = self.root / "preparation-evidence"

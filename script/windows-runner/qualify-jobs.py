@@ -358,7 +358,7 @@ def dependency_bundle(repo, bundle, commit):
         git(repo, "update-ref", "-d", ref)
 
 
-def run_preparation_case(root, runner, evidence, name, repo, commit, tree, command, dependency=None):
+def run_preparation_case(root, runner, evidence, name, repo, commit, tree, command, dependency=None, source_read_only=False):
     bundle = evidence / f"{name}.bundle"
     fixture_bundle(repo, bundle, commit)
     payloads = [bundle.read_bytes()]
@@ -387,6 +387,8 @@ def run_preparation_case(root, runner, evidence, name, repo, commit, tree, comma
         (evidence / f"terminal-{name}.json").write_text(json.dumps(terminal, indent=2))
         (evidence / f"output-{name}.bin").write_bytes(output)
         require_gate_success(terminal)
+        if source_read_only and terminal.get("source_read_only") is not True:
+            raise RuntimeError("source seal qualification lacked positive protection acknowledgement")
         print(f"PASS {name} job={job}", flush=True)
     finally:
         channel.close()
@@ -401,6 +403,15 @@ def qualify_preparation_cases(root, runner, evidence):
     repo = evidence / "no-lockfile-fixture"
     commit, tree = no_lockfile_fixture(repo)
     run_preparation_case(root, runner, evidence, "no-lockfile", repo, commit, tree, "sh run.sh")
+
+
+def qualify_source_seal(root, runner, evidence):
+    repo = evidence / "source-read-only-fixture"
+    commit, tree = no_lockfile_fixture(repo)
+    run_preparation_case(root, runner, evidence, "source-read-only", repo, commit, tree,
+                         "if printf changed > run.sh; then echo 'tracked write unexpectedly allowed'; exit 1; fi; "
+                         "printf allowed > source-seal-new && test \"$(cat source-seal-new)\" = allowed && sh run.sh",
+                         source_read_only=True)
 
 
 RETURN_QUALIFICATION_BYTES = b"motor requested return qualification"
@@ -516,6 +527,7 @@ def qualify_return_cases(root, runner, evidence):
 def run(root, runner, evidence, gate):
     require_runner_service()
     qualify_preparation_cases(root, runner, evidence)
+    qualify_source_seal(root, runner, evidence)
     qualify_return_cases(root, runner, evidence)
     repo = evidence / "fixture"
     commit, tree = fixture(repo)

@@ -210,6 +210,9 @@ pub(crate) struct Output {
 }
 
 pub(crate) trait Execution: Send {
+    fn source_read_only(&self) -> bool {
+        false
+    }
     fn release(&mut self) -> io::Result<()>;
     fn output(&self) -> io::Result<Output>;
     /// Stop resources owned by this execution that backend cancellation cannot

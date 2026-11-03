@@ -11,6 +11,38 @@ use std::{
 // These tests skip startup account and ACL checks, which windows_instance.rs
 // covers separately. Preparation, VM ownership and socket I/O still use the
 // production backend with fake systemd commands and a fake guest agent.
+#[test]
+fn source_plan_uses_accepted_regular_files_and_exact_cwd_returns() {
+    let f = Fixture::new();
+    let (mut request, _) = f.run("true");
+    request.cwd = format!("{}/nested", request.workspace_key);
+    request.return_paths = vec![
+        format!("{}/RETURN.rs", request.cwd),
+        format!("{}/directory", request.cwd),
+    ];
+    let prefix = format!("m{}", request.workspace_key);
+    // Symlinks and generated files are absent from the accepted regular set.
+    let regular = [
+        "root.rs",
+        "nested/return.rs",
+        "nested/directory/child.rs",
+        "node_modules/tracked.js",
+        "nested/source.rs",
+    ]
+    .map(|name| format!("{prefix}/{name}"))
+    .into_iter()
+    .chain(["m/sibling/keep.rs".into()])
+    .collect();
+    let plan = prep::source_plan(&regular, &request).unwrap();
+    assert_eq!(
+        plan.files,
+        ["nested/directory/child.rs", "nested/source.rs", "root.rs"]
+            .map(|path| format!("{}/{path}", request.workspace_key.trim_start_matches('/')))
+    );
+    let collision = [format!("{prefix}/A"), format!("{prefix}/a")].into();
+    assert!(prep::source_plan(&collision, &request).is_err());
+}
+
 struct FakeHost;
 impl Backend for FakeHost {
     fn materialize(&self, c: &Config, t: &Trees, s: &Setup) -> io::Result<Prepared> {
@@ -72,6 +104,7 @@ enum Fault {
     Malformed,
     Nonce,
     Version,
+    SealAck,
     Order,
     CollectOversized,
     DirtyDismount,
@@ -97,6 +130,7 @@ struct Agent {
     tree: Mutex<Vec<u8>>,
     env: Mutex<BTreeMap<String, String>>,
     returns: Mutex<Option<motor_winagent::returned::Request>>,
+    sealed: Mutex<Vec<String>>,
     units: Mutex<Vec<Vec<String>>>,
     exit_reply: Mutex<Option<ExitReply>>,
 }
@@ -403,6 +437,29 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                 } else {
                     None
                 };
+                loop {
+                    match gate {
+                        AgentFrame::SealSource { files } => a.sealed.lock().unwrap().extend(files),
+                        AgentFrame::SealSourceEnd { identity, count } => {
+                            if fault == Fault::SealAck {
+                                motor_winagent::write_frame(
+                                    &mut port,
+                                    &AgentFrame::SourceSealed {
+                                        identity,
+                                        count: count + 1,
+                                    },
+                                )?;
+                                return Ok(());
+                            }
+                            session
+                                .send(&mut port, &AgentFrame::SourceSealed { identity, count })?;
+                            break;
+                        }
+                        _ => panic!("expected source seal plan"),
+                    }
+                    gate = session.receive(&mut port)?.unwrap();
+                }
+                gate = session.receive(&mut port)?.unwrap();
                 assert_eq!(gate, AgentFrame::Start {});
                 if fault == Fault::Start {
                     stall(&a, &s, 4);
@@ -2739,6 +2796,24 @@ async fn windows_backend_stages_a_tracked_symlink_as_a_file_holding_its_target()
         }
     }
     assert!(found, "link.txt missing from the transferred tree");
+    let selected = a.sealed.lock().unwrap();
+    assert!(!selected.iter().any(|path| path.ends_with("/link.txt")));
+    assert!(selected.iter().any(|path| path.ends_with("/Cargo.toml")));
+    assert_eq!(t.source_read_only(), Some(true));
+}
+
+#[tokio::test]
+async fn windows_backend_bad_source_ack_refuses_without_start_or_protection_claim() {
+    let f = Fixture::new();
+    source(&f);
+    let (config, agent) = configure(&f, Fault::SealAck, 0);
+    let runner = Runner::open_with_backend(config, Box::new(FakeHost)).unwrap();
+    let (request, bytes) = request(&f);
+    f.submit(&runner, &request, &bytes);
+    let result = terminal(&runner, request.job_id).await;
+    assert!(matches!(result.outcome, Outcome::RefusedBeforeStart { .. }));
+    assert_eq!(result.source_read_only(), None);
+    assert_eq!(agent.starts.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

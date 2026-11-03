@@ -19,10 +19,11 @@ pub mod cache_format;
 pub mod cache_steps;
 pub mod environment;
 pub mod returned;
+pub mod source_seal;
 pub mod transport;
 
 /// Version of the Windows profile; the Windows agent sends it in its Hello.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 /// Version of the macOS profile, versioned independently of the Windows one.
 pub const MACOS_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -105,6 +106,17 @@ pub enum Frame {
     Start {},
     RequestReturns {
         request: returned::Request,
+    },
+    SealSource {
+        files: Vec<String>,
+    },
+    SealSourceEnd {
+        identity: String,
+        count: u64,
+    },
+    SourceSealed {
+        identity: String,
+        count: u64,
     },
     Started {},
     Output {
@@ -235,6 +247,9 @@ pub enum State {
     AwaitCommand,
     AwaitTreeReceived,
     Ready,
+    SealingSource,
+    AwaitSourceSealed,
+    SourceProtected,
     AwaitStarted,
     Running,
     Exited,
@@ -261,6 +276,8 @@ pub struct Protocol {
     return_committed: u64,
     return_discarded: u64,
     return_current: u64,
+    seal_files: Vec<String>,
+    seal_plan: Option<source_seal::Plan>,
 }
 
 impl Protocol {
@@ -286,6 +303,8 @@ impl Protocol {
             return_committed: 0,
             return_discarded: 0,
             return_current: 0,
+            seal_files: Vec::new(),
+            seal_plan: None,
         })
     }
 
@@ -408,11 +427,30 @@ impl Protocol {
                 refusal.validate()?;
                 Failed
             }
-            (Ready, Host, Start {}) => AwaitStarted,
+            (SourceProtected, Host, Start {}) => AwaitStarted,
             (Ready, Host, RequestReturns { request }) if self.returns.is_none() => {
                 request.validate()?;
                 self.returns = Some(request.clone());
                 Ready
+            }
+            (Ready | SealingSource, Host, SealSource { files }) => {
+                source_seal::Plan::new(files.clone())?;
+                self.seal_files.extend(files.iter().cloned());
+                SealingSource
+            }
+            (Ready | SealingSource, Host, SealSourceEnd { identity, count }) => {
+                let plan = source_seal::Plan::new(std::mem::take(&mut self.seal_files))?;
+                if !plan.matches(identity, *count) {
+                    return Err(invalid("source seal plan identity/count mismatch"));
+                }
+                self.seal_plan = Some(plan);
+                AwaitSourceSealed
+            }
+            (AwaitSourceSealed, Agent, SourceSealed { identity, count }) => {
+                if !self.seal_plan.as_ref().unwrap().matches(identity, *count) {
+                    return Err(invalid("source seal acknowledgement mismatch"));
+                }
+                SourceProtected
             }
             (AwaitStarted, Agent, Started {}) => Running,
             (AwaitStarted | Running, Host, Cancel {}) => self.state,
@@ -1494,17 +1532,17 @@ mod tests {
     fn native_cache_timings_have_a_distinct_field_and_protocol_generation() {
         let value = serde_json::to_value(CacheTimings::default()).unwrap();
         assert!(value["native_attributes_ms"].is_u64());
-        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
     }
 
     #[test]
-    fn windows_v7_agent_is_rejected_before_preparation() {
+    fn windows_v8_agent_is_rejected_before_preparation() {
         let mut protocol = Protocol::new("boot-nonce").unwrap();
         let error = protocol
             .accept(
                 Peer::Agent,
                 &Frame::Hello {
-                    version: 7,
+                    version: 8,
                     nonce: "boot-nonce".into(),
                 },
             )
@@ -1512,7 +1550,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("unsupported agent protocol version 7")
+                .contains("unsupported agent protocol version 8")
         );
     }
 
@@ -1603,6 +1641,24 @@ mod tests {
             nonce: "boot-a".into(),
         }
     }
+    fn seal_frames() -> [(Peer, Frame); 2] {
+        let identity = source_seal::Plan::default().identity();
+        [
+            (
+                Peer::Host,
+                Frame::SealSourceEnd {
+                    identity: identity.clone(),
+                    count: 0,
+                },
+            ),
+            (Peer::Agent, Frame::SourceSealed { identity, count: 0 }),
+        ]
+    }
+    fn seal(protocol: &mut Protocol) {
+        for (peer, frame) in seal_frames() {
+            protocol.accept(peer, &frame).unwrap();
+        }
+    }
     #[test]
     fn requested_returns_are_negotiated_before_start_and_bound_the_stream() {
         fn ready() -> Protocol {
@@ -1620,6 +1676,7 @@ mod tests {
         };
         let mut protocol = ready();
         protocol.accept(Peer::Host, &request).unwrap();
+        seal(&mut protocol);
         for (peer, frame) in [
             (Peer::Host, Frame::Start {}),
             (Peer::Agent, Frame::Started {}),
@@ -1635,6 +1692,7 @@ mod tests {
                 .is_err()
         );
         let mut protocol = ready();
+        seal(&mut protocol);
         protocol.accept(Peer::Host, &Frame::Start {}).unwrap();
         assert!(
             protocol.accept(Peer::Host, &request).is_err(),
@@ -1647,6 +1705,7 @@ mod tests {
             "request cannot be replaced"
         );
         let mut protocol = ready();
+        seal(&mut protocol);
         protocol.accept(Peer::Host, &Frame::Start {}).unwrap();
         protocol.accept(Peer::Agent, &Frame::Started {}).unwrap();
         protocol
@@ -1676,6 +1735,8 @@ mod tests {
                     },
                 },
             ),
+            seal_frames()[0].clone(),
+            seal_frames()[1].clone(),
             (Peer::Host, Frame::Start {}),
             (Peer::Agent, Frame::Started {}),
             (Peer::Agent, Frame::Exit { code: 0 }),
@@ -1712,6 +1773,8 @@ mod tests {
             ),
             (Peer::Host, Frame::TreeEnd { command: command() }),
             (Peer::Agent, Frame::TreeReceived {}),
+            seal_frames()[0].clone(),
+            seal_frames()[1].clone(),
             (Peer::Host, Frame::Start {}),
             (Peer::Agent, Frame::Started {}),
             (
@@ -1899,7 +1962,7 @@ mod tests {
         assert_eq!(host.state(), State::Complete);
         assert!(host.receive(&mut &[][..]).unwrap().is_none());
         let mut protocol = Protocol::new("boot-a").unwrap();
-        advance(&mut protocol, 5);
+        advance(&mut protocol, 7);
         protocol.accept(Peer::Host, &Frame::Cancel {}).unwrap();
         protocol.accept(Peer::Agent, &Frame::Started {}).unwrap();
         protocol.accept(Peer::Host, &Frame::Cancel {}).unwrap();
@@ -1945,24 +2008,24 @@ mod tests {
             let mut protocol = Protocol::new("boot-a").unwrap();
             advance(&mut protocol, step);
             assert!(
-                protocol.accept(Peer::Host, &Frame::Dismount {}).is_err() || step == 12,
+                protocol.accept(Peer::Host, &Frame::Dismount {}).is_err() || step == 14,
                 "early dismount at step {step}"
             );
         }
         for (count, sender, frame) in [
             (0, Peer::Host, Frame::Start {}),
             (2, Peer::Host, Frame::Start {}),
-            (5, Peer::Agent, Frame::Exit { code: 0 }),
+            (7, Peer::Agent, Frame::Exit { code: 0 }),
             (
-                9,
+                11,
                 Peer::Agent,
                 Frame::Output {
                     stream: Stream::Stdout,
                     bytes: vec![],
                 },
             ),
-            (12, Peer::Host, Frame::Start {}),
-            (14, Peer::Agent, hello()),
+            (14, Peer::Host, Frame::Start {}),
+            (16, Peer::Agent, hello()),
         ] {
             let mut protocol = Protocol::new("boot-a").unwrap();
             advance(&mut protocol, count);
@@ -1973,7 +2036,7 @@ mod tests {
     #[test]
     fn collection_bound_and_unclean_dismount_fail_closed() {
         let mut protocol = Protocol::new("boot-a").unwrap();
-        advance(&mut protocol, 10);
+        advance(&mut protocol, 12);
         let chunk = Frame::Collected {
             bytes: vec![0; CHUNK_BYTES],
         };
@@ -1987,7 +2050,7 @@ mod tests {
                 .is_err()
         );
         let mut protocol = Protocol::new("boot-a").unwrap();
-        advance(&mut protocol, 13);
+        advance(&mut protocol, 15);
         assert!(
             protocol
                 .accept(Peer::Agent, &Frame::Dismounted { clean: false })

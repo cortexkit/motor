@@ -58,6 +58,7 @@ fn snapshot_error(
 pub(super) struct PreparedTree {
     pub path: PathBuf,
     pub lease: super::bun::Lease,
+    pub source_plan: motor_winagent::source_seal::Plan,
 }
 
 pub(super) fn prepare(
@@ -268,7 +269,45 @@ pub(super) fn prepare(
         .map_err(|error| super::vm::path_error("open trusted preparation tree", &tar, error))?;
     motor_winagent::validate_tree(&mut file)
         .map_err(|error| super::vm::path_error("validate trusted preparation tree", &tar, error))?;
-    Ok(PreparedTree { path: tar, lease })
+    let regular_files: BTreeSet<String> = read_json(&staging.join("source-regular.json"))?;
+    let source_plan = source_plan(&regular_files, request)?;
+    Ok(PreparedTree {
+        path: tar,
+        lease,
+        source_plan,
+    })
+}
+
+pub(crate) fn source_plan(
+    regular_files: &BTreeSet<String>,
+    request: &motor_protocol::Run,
+) -> io::Result<motor_winagent::source_seal::Plan> {
+    let workspace = crate::caller_path::request(request)
+        .caller_workspace_key
+        .text();
+    let prefix = format!(
+        "{}/",
+        mapped(workspace)?.to_string_lossy().replace('\\', "/")
+    );
+    let returned = super::agent::return_request(request);
+    let exemptions: BTreeSet<_> = returned
+        .paths
+        .iter()
+        .filter(|path| motor_winagent::returned::validate_relative(path).is_ok())
+        .map(|path| format!("{prefix}{path}").to_lowercase())
+        .collect();
+    let files = regular_files
+        .iter()
+        .filter(|path| path.starts_with(&prefix))
+        .filter(|path| !exemptions.contains(&path.to_lowercase()))
+        .filter(|path| {
+            !path
+                .split('/')
+                .any(|name| motor_winagent::bun::is_node_modules(name.as_ref()))
+        })
+        .map(|path| path.strip_prefix("m/").unwrap().to_owned())
+        .collect();
+    motor_winagent::source_seal::Plan::new(files)
 }
 
 #[cfg(unix)]
@@ -663,6 +702,9 @@ fn stage_snapshots(plan: &Plan) -> io::Result<(Vec<PathBuf>, BTreeSet<String>, B
         }
         roots.push(root);
     }
+    // Preserve the accepted regular-file set before dependency preparation can
+    // add generated files or turn symlink-text entries into ordinary files.
+    atomic_json(&plan.staging.join("source-regular.json"), &regular_files)?;
     Ok((roots, members, regular_files))
 }
 
