@@ -18,6 +18,7 @@ use std::{
 };
 use url::Url;
 mod store;
+pub(super) use store::log_pin_usage;
 pub(super) use store::Lease;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -573,6 +574,7 @@ fn validate_registry_inputs(
 /// It reads bounded lock inputs without starting repository executables or scripts.
 pub(super) fn prepare(
     config: &crate::engine::Config,
+    job_id: uuid::Uuid,
     staging: &Path,
     repository: &str,
     checkouts: &[PathBuf],
@@ -592,6 +594,7 @@ pub(super) fn prepare(
     let parsed = None;
     prepare_impl(
         config,
+        Some(job_id),
         staging,
         repository,
         checkouts,
@@ -608,18 +611,19 @@ fn prepare_with_fetch(
     checkouts: &[PathBuf],
     download: impl FnMut(&FetchTarget<'_>) -> Result<Vec<u8>, RefusalKind>,
 ) -> io::Result<Lease> {
-    prepare_impl(config, staging, repository, checkouts, download, None)
+    prepare_impl(config, None, staging, repository, checkouts, download, None)
 }
 
 fn prepare_impl(
     config: &crate::engine::Config,
+    job_id: Option<uuid::Uuid>,
     staging: &Path,
     repository: &str,
     checkouts: &[PathBuf],
     mut download: impl FnMut(&FetchTarget<'_>) -> Result<Vec<u8>, RefusalKind>,
     parsed: Option<&BTreeMap<String, ParsedLock>>,
 ) -> io::Result<Lease> {
-    let mut lease = Lease::default();
+    let mut lease = job_id.map_or_else(Lease::default, Lease::for_job);
     let registries = &config.windows.as_ref().unwrap().bun;
     let cache = config.state_dir().join("bun-cas");
     let mut files = Vec::new();

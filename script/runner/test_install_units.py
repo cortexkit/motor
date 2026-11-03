@@ -68,6 +68,7 @@ class InstallUnitsTests(unittest.TestCase):
             dest = root / 'home/.config/systemd/user'
             unit = dest / 'motor-runner@windows.service.d/windows.conf'
             self.assertNotIn('--metrics-', unit.read_text())
+            self.assertIn('LimitNOFILE=131072:524288\n', unit.read_text())
             returns = '--return-chunked-max-bytes 134217728 --return-budget-bytes 268435456'
             self.assertIn(returns, unit.read_text())
             enabled = subprocess.run(script + ['--metrics-endpoint', 'https://metrics.example:8443',
@@ -76,6 +77,7 @@ class InstallUnitsTests(unittest.TestCase):
             self.assertEqual(enabled.returncode, 0, enabled.stderr)
             flags = '--metrics-push --metrics-endpoint https://metrics.example:8443 --metrics-host-id monitor-1'
             self.assertIn(flags, unit.read_text())
+            self.assertIn('LimitNOFILE=131072:524288\n', unit.read_text())
             self.assertIn(returns, unit.read_text())
             self.assertIn('+ExecStart=', enabled.stdout)
             self.assertIn(flags, enabled.stdout)

@@ -220,6 +220,91 @@ fn quota_refuses_before_write_while_all_objects_are_leased() {
 }
 
 #[test]
+fn repeated_workspace_packages_share_one_pin_per_blob() {
+    let scratch = ScratchDir::new("bun-deduplicated-pins");
+    let source = public_source();
+    let hash = integrity(b"shared");
+    let mut lease = Lease::default();
+    for _ in 0..12 {
+        store::get(scratch.path(), &source, &hash, 6, &mut lease, || {
+            Ok(b"shared".to_vec())
+        })
+        .unwrap();
+        assert_eq!(lease.pin_count(), 1);
+    }
+    let probe = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(blob(scratch.path(), &source, &hash).with_extension("pin"))
+        .unwrap();
+    assert!(fs2::FileExt::try_lock_exclusive(&probe).is_err());
+    drop(lease);
+    fs2::FileExt::try_lock_exclusive(&probe).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn pin_diagnostics_follow_job_acquisition_and_error_unwind() {
+    #[derive(Clone, Default)]
+    struct LogBytes(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBytes {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let scratch = ScratchDir::new("bun-pin-diagnostics");
+    let source = public_source();
+    let job_id = uuid::Uuid::now_v7();
+    let logs = LogBytes::default();
+    let result: Result<(), RefusalKind> = tracing::subscriber::with_default(
+        motor_protocol::logging::LineSubscriber::new("[runner]", logs.clone()),
+        || {
+            let mut lease = Lease::for_job(job_id);
+            store::get(
+                scratch.path(),
+                &source,
+                &integrity(b"first"),
+                64,
+                &mut lease,
+                || Ok(b"first".to_vec()),
+            )?;
+            log_pin_usage();
+            store::get(
+                scratch.path(),
+                &source,
+                &integrity(b"second"),
+                64,
+                &mut lease,
+                || Ok(b"wrong digest".to_vec()),
+            )?;
+            Ok(())
+        },
+    );
+    assert_eq!(result.unwrap_err(), RefusalKind::BunIntegrityMismatch);
+    let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(text.contains(&job_id.to_string()), "{text}");
+    for expected in [
+        "Bun package pin acquired",
+        "lease_pins=1",
+        "Bun package pin usage",
+        "Bun package lease dropped",
+        "released_pins=1",
+    ] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+    let probe = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(blob(scratch.path(), &source, &integrity(b"first")).with_extension("pin"))
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&probe).unwrap();
+}
+
+#[test]
 fn quota_evicts_lru_not_recent_verified_hit() {
     let scratch = ScratchDir::new("bun-quota-lru");
     let source = public_source();
@@ -348,14 +433,25 @@ fn host_requires_the_memory_limited_units_parsed_plan() {
         r#"{"lockfileVersion":1,"workspaces":{"":{}},"packages":{}}"#,
     )
     .unwrap();
-    assert!(
-        prepare(&config, &staging, "/repo", std::slice::from_ref(&checkout))
-            .unwrap_err()
-            .to_string()
-            .contains("BunLockInvalid")
-    );
+    assert!(prepare(
+        &config,
+        uuid::Uuid::now_v7(),
+        &staging,
+        "/repo",
+        std::slice::from_ref(&checkout)
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("BunLockInvalid"));
     write_parsed_locks(&staging).unwrap();
-    prepare(&config, &staging, "/repo", &[checkout]).unwrap();
+    prepare(
+        &config,
+        uuid::Uuid::now_v7(),
+        &staging,
+        "/repo",
+        &[checkout],
+    )
+    .unwrap();
 }
 
 #[cfg(unix)]
@@ -1237,6 +1333,7 @@ fn unused_workspace_member_lockfile_is_not_parsed_in_any_preparation_path() {
         serde_json::from_slice(&fs::read(staging.join("bun-parsed.json")).unwrap()).unwrap();
     prepare_impl(
         &config,
+        None,
         &staging,
         "/repo",
         &[checkout],

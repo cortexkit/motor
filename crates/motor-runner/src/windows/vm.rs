@@ -349,11 +349,15 @@ impl Resources {
                 // verified exit, but do not treat a live child as stopped.
                 if exited || self.child.try_wait().ok().flatten().is_some() {
                     self.booted = false;
+                    self.bun_lease = None;
                 }
                 return Err(error);
             }
             self.booted = false;
         }
+        // The VM is gone (or was never booted). Later cache and filesystem
+        // cleanup can be retried without retaining package descriptors.
+        self.bun_lease = None;
         if self.attached {
             self.config
                 .windows
@@ -459,6 +463,91 @@ impl Drop for Resources {
 mod lease_tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
+
+    #[cfg(target_os = "linux")]
+    fn open_pins(root: &Path) -> usize {
+        fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| fs::read_link(entry.ok()?.path()).ok())
+            .filter(|path| {
+                path.starts_with(root) && path.extension().is_some_and(|ext| ext == "pin")
+            })
+            .count()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finished_jobs_release_pins_while_cleanup_records_remain() {
+        struct ExitProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl UnitChild for ExitProbe {
+            fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+                use std::os::unix::process::ExitStatusExt;
+                if self.0.load(std::sync::atomic::Ordering::Acquire) {
+                    Ok(Some(ExitStatus::from_raw(0)))
+                } else {
+                    Err(io::Error::other("VM exit not yet proven"))
+                }
+            }
+            fn stop(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let scratch = ScratchDir::new("qemu-finished-bun-leases");
+        let store = scratch.join("store");
+        let config = Config::new(scratch.join("state"), "lease");
+        let runtime = config.windows_runtime.clone();
+        let mut finished = Vec::new();
+        for job in 0..6 {
+            let lease = super::super::bun::Lease::prepare_for_test(&store);
+            assert_eq!(lease.pin_count(), 3);
+            assert_eq!(open_pins(&store), 3, "only the current job owns pins");
+            let overlay = scratch.join(format!("overlay-{job}"));
+            let mut resources = Resources {
+                config: config.clone(),
+                id: Uuid::now_v7(),
+                workspace: String::new(),
+                staging: scratch.join(format!("staging-{job}")),
+                overlay: overlay.clone(),
+                cache: PathBuf::new(),
+                socket_dir: scratch.join(format!("socket-{job}")),
+                booted: false,
+                attached: false,
+                cleaned: false,
+                cleanup_attempted: false,
+                cleanup_on_drop: true,
+                child: Box::new(NotBooted),
+                _slot: None,
+                bun_lease: Some(lease),
+            };
+            if job == 5 {
+                // Pins stay while the VM may run, but filesystem cleanup after
+                // verified exit must retry without holding package descriptors.
+                let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                resources.child = Box::new(ExitProbe(exited.clone()));
+                resources.booted = true;
+                fs::create_dir(&overlay).unwrap();
+                assert!(resources.finalize().is_err());
+                let id = resources.id;
+                drop(resources);
+                runtime.retry_cleanups();
+                assert!(runtime.cleanup_pending(id));
+                assert_eq!(open_pins(&store), 3);
+                exited.store(true, std::sync::atomic::Ordering::Release);
+                runtime.retry_cleanups();
+                assert!(runtime.cleanup_pending(id), "overlay removal still pending");
+                assert_eq!(open_pins(&store), 0, "stopped VM must release pins");
+                fs::remove_dir(&overlay).unwrap();
+                runtime.retry_cleanups();
+                assert!(!runtime.cleanup_pending(id));
+            } else {
+                resources.finalize().unwrap();
+                finished.push(resources);
+            }
+            assert_eq!(open_pins(&store), 0, "finished job {job} retained pins");
+        }
+        drop(finished);
+    }
+
     #[test]
     fn deferred_cleanup_keeps_package_leases() {
         let scratch = ScratchDir::new("qemu-deferred-bun-lease");

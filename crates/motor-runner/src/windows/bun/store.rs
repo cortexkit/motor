@@ -4,13 +4,17 @@ use motor_winagent::bun::{Check, Integrity, RefusalKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
 pub(super) const DEFAULT_QUOTA: u64 = 16 * 1024 * 1024 * 1024;
+const MAX_OBJECTS: usize = 65_536;
+static ACTIVE_PINS: AtomicUsize = AtomicUsize::new(0);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Provenance {
     pub registry: String,
@@ -34,14 +38,82 @@ impl Provenance {
 
 #[derive(Default, Debug)]
 pub(crate) struct Lease {
-    pins: Vec<File>,
+    job_id: Option<uuid::Uuid>,
+    // Workspaces can request the same blob repeatedly. Keep one shared lock
+    // per store path, bounded by the store's object limit, not by lockfile rows.
+    pins: BTreeMap<PathBuf, File>,
+}
+impl Lease {
+    pub(super) fn for_job(job_id: uuid::Uuid) -> Self {
+        Self {
+            job_id: Some(job_id),
+            pins: BTreeMap::new(),
+        }
+    }
+}
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let pins = std::mem::take(&mut self.pins);
+        let released = pins.len();
+        drop(pins);
+        let total = ACTIVE_PINS.fetch_sub(released, Ordering::Relaxed) - released;
+        tracing::info!(job_id = ?self.job_id, released_pins = released, runner_pins = total,
+            "Bun package lease dropped");
+    }
+}
+pub(crate) fn log_pin_usage() {
+    // Compare tracked leases with the kernel on Linux so an untracked open
+    // descriptor is visible too. Never emit registry paths or credentials.
+    #[cfg(target_os = "linux")]
+    let open_pin_fds = fs::read_dir("/proc/self/fd").ok().map(|entries| {
+        entries
+            .filter_map(|entry| fs::read_link(entry.ok()?.path()).ok())
+            .filter(|path| {
+                let path = path.to_string_lossy();
+                path.contains("/bun-cas/")
+                    && (path.ends_with(".pin") || path.ends_with(".pin (deleted)"))
+            })
+            .count()
+    });
+    #[cfg(not(target_os = "linux"))]
+    let open_pin_fds: Option<usize> = None;
+    tracing::info!(
+        runner_pins = ACTIVE_PINS.load(Ordering::Relaxed),
+        ?open_pin_fds,
+        "Bun package pin usage"
+    );
 }
 #[cfg(test)]
 impl Lease {
     pub(crate) fn for_test(reference: File) -> Self {
+        ACTIVE_PINS.fetch_add(1, Ordering::Relaxed);
         Self {
-            pins: vec![reference],
+            pins: BTreeMap::from([(PathBuf::new(), reference)]),
+            job_id: None,
         }
+    }
+    pub(crate) fn pin_count(&self) -> usize {
+        self.pins.len()
+    }
+    pub(crate) fn prepare_for_test(root: &Path) -> Self {
+        let source = Provenance {
+            registry: "https://registry.npmjs.org/".into(),
+            origin: "https://registry.npmjs.org".into(),
+            scope: None,
+            credentialed: false,
+        };
+        let mut lease = Self::default();
+        for body in [b"first".as_slice(), b"second", b"third"] {
+            let integrity = Integrity {
+                algorithm: "sha256".into(),
+                hex: format!("{:x}", Sha256::digest(body)),
+            };
+            get(root, &source, &integrity, 1024, &mut lease, || {
+                Ok(body.to_vec())
+            })
+            .unwrap();
+        }
+        lease
     }
 }
 
@@ -164,7 +236,7 @@ fn make_room(root: &Path, quota: u64, additional: u64, new_object: bool) -> io::
     let mut count = entries.len() + usize::from(new_object);
     entries.sort();
     for (_, path, bytes) in entries {
-        if size <= quota && count <= 65_536 {
+        if size <= quota && count <= MAX_OBJECTS {
             return Ok(());
         }
         let reference = pin(&path)?;
@@ -182,7 +254,7 @@ fn make_room(root: &Path, quota: u64, additional: u64, new_object: bool) -> io::
             Err(error) => return Err(error),
         }
     }
-    if size <= quota && count <= 65_536 {
+    if size <= quota && count <= MAX_OBJECTS {
         Ok(())
     } else {
         Err(io::Error::other(
@@ -266,8 +338,13 @@ pub(super) fn get_checked(
         return Err((RefusalKind::BunIntegrityMismatch, Check::Integrity));
     }
     let reference = if path.exists() {
-        let reference = pin(&path).map_err(cache_error)?;
-        fs2::FileExt::lock_shared(&reference).map_err(cache_error)?;
+        let reference = if lease.pins.contains_key(&path) {
+            None
+        } else {
+            let reference = pin(&path).map_err(cache_error)?;
+            fs2::FileExt::lock_shared(&reference).map_err(cache_error)?;
+            Some(reference)
+        };
         make_room(root, quota, 0, false)
             .map_err(|_| (RefusalKind::BunCacheMissing, Check::CacheQuota))?;
         reference
@@ -279,7 +356,7 @@ pub(super) fn get_checked(
         protected_directory(&directory).map_err(cache_error)?;
         let reference = pin(&path).map_err(cache_error)?;
         fs2::FileExt::lock_shared(&reference).map_err(cache_error)?;
-        reference
+        Some(reference)
     };
     if !path.exists() {
         let temporary = directory.join(format!(".{}", uuid::Uuid::now_v7()));
@@ -295,6 +372,13 @@ pub(super) fn get_checked(
         fs::remove_file(temporary).map_err(cache_error)?;
     }
     touch(root, &path).map_err(cache_error)?;
-    lease.pins.push(reference);
+    if let Some(reference) = reference {
+        let previous = lease.pins.insert(path, reference);
+        if previous.is_none() {
+            let total = ACTIVE_PINS.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::info!(job_id = ?lease.job_id, lease_pins = lease.pins.len(), runner_pins = total,
+                "Bun package pin acquired");
+        }
+    }
     Ok(bytes)
 }

@@ -256,6 +256,7 @@ pub(super) fn prepare(
         .collect::<io::Result<Vec<_>>>()?;
     let lease = super::bun::prepare(
         config,
+        setup.id,
         staging,
         crate::caller_path::request(request)
             .caller_repository_root

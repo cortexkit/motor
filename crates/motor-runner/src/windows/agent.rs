@@ -101,6 +101,7 @@ impl Runtime {
         ))
     }
     pub(super) fn defer_cleanup(&self, resources: super::vm::Resources) {
+        tracing::info!(job_id = %resources.id, "Windows VM cleanup queued for maintenance");
         self.cleanup_ids.lock().unwrap().insert(resources.id);
         self.cleanups.lock().unwrap().push_back(resources);
     }
@@ -118,6 +119,7 @@ impl Runtime {
         }
     }
     pub(crate) fn retry_cleanups(&self) {
+        super::bun::log_pin_usage();
         // Give each queued job at most one attempt per pass, and cap the work
         // so a broken unit cannot monopolize maintenance or starve later jobs.
         let attempts = self.cleanups.lock().unwrap().len().min(8);
@@ -125,6 +127,7 @@ impl Runtime {
             let Some(mut resources) = self.cleanups.lock().unwrap().pop_front() else {
                 break;
             };
+            tracing::info!(job_id = %resources.id, "retrying Windows VM cleanup");
             match resources.finalize() {
                 Ok(()) => {
                     self.cleanup_ids.lock().unwrap().remove(&resources.id);

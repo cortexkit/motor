@@ -395,6 +395,9 @@ impl Resources {
             Vec::new()
         };
         checked(control(&self.config, "Remove", Some(self.id), &extra)?)?;
+        // Remove has proven the VM is gone. Retain the slot for any remaining
+        // cache/staging retry, but no package handles are needed for that work.
+        self.bun_lease = None;
         if self.attached {
             self.config.windows.as_ref().unwrap().caches().complete(
                 &self.workspace,
