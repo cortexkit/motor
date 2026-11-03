@@ -421,8 +421,18 @@ impl FakeBroker {
             iat,
             exp,
             vcpus: job.request.vcpus,
+            // A lease that states no memory, placed on our own hosts (any host
+            // not named `boat:<sandbox>`), carries the limit those hosts enforce
+            // as the job's MemoryMax: max(16 GiB, 3.5 GiB per vCPU). Placement
+            // still counts the capped figure, and Boat tokens keep it too.
             mem_mib: job.request.mem_mib.map_or_else(
-                || job_memory_mib(job.request.vcpus),
+                || {
+                    if self.config.placement.host.starts_with("boat:") {
+                        job_memory_mib(job.request.vcpus)
+                    } else {
+                        crate::memory_max_mib(job.request.vcpus)
+                    }
+                },
                 |stated| stated.max(2048 * u64::from(job.request.vcpus)),
             ),
             platform: job.request.platform.clone(),

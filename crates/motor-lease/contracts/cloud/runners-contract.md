@@ -220,11 +220,13 @@ rules still reject fractional/exponent spellings and unsafe numbers as `field: "
 schema validation. When stated, effective memory is `max(mem_mib, 2048 × vcpus)` MiB: smaller
 figures are raised to 2 GiB per vCPU, not refused. When absent, the unchanged default is
 `min(16384, max(4096, 3584 × vcpus))` MiB (3584 MiB per vCPU, at least 4 GiB and at most 16 GiB).
-Registered-host placement, the in-flight ledger, the persisted job and the token's `mem_mib`
-(the host runner's per-job cap) all use the effective figure. Re-signs, attaches and moves retain
-the job's stored memory rather than rebuilding it from vCPUs. Hosts must also accept tokens using
-the previous figure, `max(16384, 3584 × vcpus)`, until the operator ends support for those older
-tokens.
+Registered-host placement, the in-flight ledger and the persisted job use the effective figure.
+For a stated-memory lease, the token's `mem_mib` also uses that effective figure. For an unstated
+host lease, the token instead carries `max(16384, 3584 × vcpus)` MiB: hosts enforce the token's
+figure as the per-job cap, so unstated jobs keep their pre-enforcement limit until the default
+changes. Re-signs, attaches and moves retain this distinction without changing stored memory.
+Jobs stored before the broker recorded whether memory was stated get the greater of their stored
+memory and that legacy token figure, so an older stated-memory job never gets less than it asked for.
 `placement_hint` is JSON `null` or exactly `{host, vm}`, both strings following the common name
 grammar, except that `host` may also carry the `boat:` prefix of a Boat placement, so a client can
 send back the placement it was last given. A matching selectable warm placement is preferred; an
