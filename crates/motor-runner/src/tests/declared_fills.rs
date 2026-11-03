@@ -26,6 +26,7 @@ fn commit_declaration(f: &Fixture, text: &str) -> String {
     git(&f.main, &["rev-parse", "HEAD"])
 }
 
+use super::cargo_warm::{with_clippy, CLIPPY_STEP};
 use crate::workspace::warm_steps;
 use crate::writer::declaration::{self, Compilers};
 use crate::writer::fill::{dependency_free, descriptor};
@@ -172,7 +173,7 @@ fn a_tree_without_cargo_warms_from_its_declaration() {
     assert_eq!(
         workspace::warm_plan(&f.main, &cargo),
         (
-            "cargo build && make clean && make -j2 && make check".to_string(),
+            with_clippy("cargo build && make clean && make -j2 && make check"),
             true
         )
     );
@@ -334,10 +335,10 @@ async fn a_no_cargo_repository_runs_its_declared_fill() {
     );
 }
 
-/// Without a declaration a Cargo tree must get exactly the fill it gets today:
-/// Cargo's own warm command, and the same shortcut rules.
+/// Without a cache declaration a Cargo tree gets Cargo's own warm command and
+/// the best-effort clippy pass, with the same dependency-free shortcut rules.
 #[test]
-fn a_cargo_tree_without_a_declaration_keeps_todays_fill() {
+fn a_cargo_tree_without_a_declaration_keeps_its_shortcut() {
     let f = Fixture::new();
     fs::create_dir_all(f.main.join("src")).unwrap();
     fs::write(f.main.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
@@ -345,10 +346,13 @@ fn a_cargo_tree_without_a_declaration_keeps_todays_fill() {
     assert_eq!(
         warm_steps(&f.main, &plain),
         (
-            vec!["cargo build --workspace --all-targets".to_string()],
+            vec![
+                "cargo build --workspace --all-targets".to_string(),
+                CLIPPY_STEP.to_string()
+            ],
             false
         ),
-        "an undeclared Cargo tree warms with Cargo's default alone"
+        "an undeclared Cargo tree warms with Cargo's default and clippy"
     );
     // No declaration is read for this tip, so the descriptor has exactly the
     // inputs it always had.
@@ -361,8 +365,8 @@ fn a_cargo_tree_without_a_declaration_keeps_todays_fill() {
     let command = steps.join(" && ");
     assert_eq!(
         command,
-        workspace::manifest_warm_command("[workspace]\nmembers = []\n", "tip"),
-        "the command changed for an undeclared Cargo tree"
+        with_clippy("cargo build --workspace --all-targets"),
+        "an undeclared Cargo tree did not get the default plan"
     );
     let with_none = descriptor(
         &f.main,
@@ -389,7 +393,10 @@ fn a_cargo_tree_without_a_declaration_keeps_todays_fill() {
     assert_eq!(
         warm_steps(&f.main, &package),
         (
-            vec!["cargo build --workspace --all-targets".to_string()],
+            vec![
+                "cargo build --workspace --all-targets".to_string(),
+                CLIPPY_STEP.to_string()
+            ],
             false
         )
     );
@@ -397,7 +404,7 @@ fn a_cargo_tree_without_a_declaration_keeps_todays_fill() {
 }
 
 /// A Cargo tree that also declares ccache steps runs Cargo's warm command and
-/// then each declared step, in order.
+/// then each declared step, in order, before the best-effort clippy pass.
 #[test]
 fn a_cargo_tree_runs_its_declared_steps_after_the_cargo_warm_command() {
     let f = Fixture::new();
@@ -420,6 +427,7 @@ fn a_cargo_tree_runs_its_declared_steps_after_the_cargo_warm_command() {
             "cargo build --workspace".to_string(),
             "make deps".to_string(),
             "make && make check".to_string(),
+            CLIPPY_STEP.to_string(),
         ],
         "the Cargo command and the declared steps did not run in order"
     );
@@ -506,7 +514,7 @@ async fn a_cargo_fill_runs_its_declared_ccache_step_after_cargo() {
     let request = writers[0].request.as_ref().unwrap();
     assert_eq!(
         request.command,
-        "printf cargo >> order && printf ccache >> order && printf done >> order"
+        with_clippy("printf cargo >> order && printf ccache >> order && printf done >> order")
     );
     assert_eq!(
         fs::read_to_string(Path::new(&request.cwd).join("order")).unwrap(),

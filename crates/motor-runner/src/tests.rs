@@ -31,6 +31,8 @@ mod caller_persistence;
 mod caller_trash;
 #[path = "tests/cancellation.rs"]
 mod cancellation;
+#[path = "tests/cargo_warm.rs"]
+mod cargo_warm;
 #[path = "tests/compatibility.rs"]
 mod compatibility;
 #[path = "tests/declared_fills.rs"]
@@ -3787,63 +3789,6 @@ fn declare(f: &Fixture, body: &str) -> String {
     commit(&f.main, body).0
 }
 
-#[test]
-fn warm_command_is_derived_from_the_repository_tree() {
-    let f = Fixture::new();
-    let bare = git(&f.main, &["rev-parse", "HEAD"]);
-    assert_eq!(workspace::warm_command(&f.main, &bare), "true");
-    let plain = declare(&f, "[workspace]\nmembers = [\"a\"]\n");
-    assert_eq!(
-        workspace::warm_command(&f.main, &plain),
-        "cargo build --workspace --all-targets"
-    );
-    let declared = declare(
-        &f,
-        "[workspace]\nmembers = [\"a\"]\n[workspace.metadata.motor]\nwarm-commands = [\"cargo nextest run --workspace --no-run\", \"cargo nextest run -p a --no-run\"]\n",
-    );
-    assert_eq!(
-        workspace::warm_command(&f.main, &declared),
-        "cargo nextest run --workspace --no-run && cargo nextest run -p a --no-run"
-    );
-    let package = declare(
-        &f,
-        "[package]\nname = \"a\"\n[package.metadata.motor]\nwarm-commands = [\"cargo build\"]\n",
-    );
-    assert_eq!(workspace::warm_command(&f.main, &package), "cargo build");
-    let malformed = declare(
-        &f,
-        "[workspace]\n[workspace.metadata.motor]\nwarm-commands = \"cargo build\"\n",
-    );
-    assert_eq!(
-        workspace::warm_command(&f.main, &malformed),
-        "cargo build --workspace --all-targets"
-    );
-    // The original commits keep their own commands: derivation reads the
-    // commit being warmed, not whatever the repository holds now.
-    assert_eq!(workspace::warm_command(&f.main, &bare), "true");
-    assert_eq!(
-        workspace::warm_command(&f.main, &plain),
-        "cargo build --workspace --all-targets"
-    );
-}
-
-/// Motor declares the workspace and package-scoped commands that precompile
-/// its test binaries; the runner reads them instead of hardcoding package names.
-#[test]
-fn this_repository_declares_its_warm_build() {
-    let manifest =
-        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml")).unwrap();
-    let command = workspace::manifest_warm_command(&manifest, "HEAD");
-    assert_eq!(
-        command,
-        concat!(
-            "cargo nextest run --workspace --no-run && ",
-            "cargo nextest run -p motor-module --lib --bins --no-run && ",
-            "cargo nextest run -p motor-runner --lib --bins --no-run"
-        )
-    );
-}
-
 #[tokio::test]
 async fn disabled_warm_builds_still_dispatch_accepted_jobs() {
     let f = Fixture::new();
@@ -3893,7 +3838,9 @@ async fn warm_build_runs_the_repositorys_own_command() {
     warm(&f, &runner).await;
     assert_eq!(
         base_commands(&runner),
-        vec!["printf declared > \"$CARGO_TARGET_DIR/artifact\"".to_string()]
+        vec![cargo_warm::with_clippy(
+            "printf declared > \"$CARGO_TARGET_DIR/artifact\""
+        )]
     );
     let status = runner.status();
     assert_eq!(

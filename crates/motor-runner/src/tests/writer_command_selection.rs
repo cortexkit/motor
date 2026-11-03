@@ -100,7 +100,12 @@ async fn explicit_default_command_does_not_reuse_a_record_with_no_writer() {
     warm(&f, &runner).await;
     assert!(writers(&runner).is_empty());
     drop(runner);
-    config.base_commands = vec!["cargo build --workspace --all-targets".into()];
+    // Keep the override identical to the derived default, including its clippy
+    // pass, so only the explicit request distinguishes it from the no-op record.
+    config.base_commands = vec![workspace::warm_command(
+        &f.main,
+        &git(&f.main, &["rev-parse", "HEAD"]),
+    )];
     let runner = reopen(config);
     until(|| !writers(&runner).is_empty()).await;
     base_done(&runner).await;

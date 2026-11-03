@@ -993,7 +993,8 @@ pub(crate) fn warm_plan(mirror: &Path, commit: &str) -> (String, bool) {
 /// A Cargo tree warms with Cargo's own command, then with whatever
 /// `.motor/cache.toml` declares. A tree with no root `Cargo.toml` has no Cargo
 /// command and warms from its declaration alone. Steps run in this order in one
-/// shell, so a failing step fails the fill.
+/// shell, so a failing declared step fails the fill. Cargo trees finish with a
+/// best-effort clippy pass that does not change the warm build's result.
 pub(crate) fn warm_steps(mirror: &Path, commit: &str) -> (Vec<String>, bool) {
     let declared: Vec<String> = crate::writer::declaration::read(mirror, commit)
         .ok()
@@ -1008,9 +1009,10 @@ pub(crate) fn warm_steps(mirror: &Path, commit: &str) -> (Vec<String>, bool) {
         .unwrap_or_default();
     let mut steps = Vec::new();
     let mut explicit = false;
-    if let Ok(manifest) = git(mirror, &["show", &format!("{commit}:Cargo.toml")]) {
-        let (cargo, requested) = manifest_warm_plan(&manifest, commit);
-        steps.push(cargo);
+    let manifest = git(mirror, &["show", &format!("{commit}:Cargo.toml")]).ok();
+    if let Some(manifest) = &manifest {
+        let (command, requested) = manifest_warm_plan(manifest, commit);
+        steps.push(command);
         explicit = requested;
     }
     // Declared steps follow the Cargo warm command in the same fill, so a Cargo
@@ -1018,17 +1020,23 @@ pub(crate) fn warm_steps(mirror: &Path, commit: &str) -> (Vec<String>, bool) {
     // warms with `true`, as it did before declarations existed.
     steps.extend(declared.iter().cloned());
     explicit |= !declared.is_empty();
+    if manifest.is_some() {
+        // Clippy checks dependencies with --emit=metadata, so its jobs read
+        // check-mode dependency cache keys, not the compiled-artifact keys a
+        // normal build writes. Warm both in the same fill, but keep lint/compile
+        // failures from failing a successful warm build or changing its refill
+        // schedule. An operator's base_commands override replaces this derived
+        // plan, including the clippy pass.
+        let clippy = concat!(
+            "(clippy_status=0; cargo clippy --workspace --all-targets || clippy_status=$?; ",
+            "printf 'cargo clippy warm-up exited with status %s\\n' \"$clippy_status\"; exit 0)"
+        );
+        steps.push(clippy.to_string());
+    }
     if steps.is_empty() {
         steps.push("true".to_string());
     }
     (steps, explicit)
-}
-
-/// The warm command a root `Cargo.toml` declares, or the whole-workspace
-/// default; `commit` only labels warnings.
-#[cfg(test)]
-pub(crate) fn manifest_warm_command(manifest: &str, commit: &str) -> String {
-    manifest_warm_plan(manifest, commit).0
 }
 
 fn manifest_warm_plan(manifest: &str, commit: &str) -> (String, bool) {
