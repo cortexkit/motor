@@ -1805,12 +1805,12 @@ mod guest {
         } else {
             None
         };
-        let mut files = Vec::new();
+        let mut files = motor_winagent::source_seal::PlanBuilder::default();
         loop {
             match gate {
-                Frame::SealSource { files: chunk } => files.extend(chunk),
+                Frame::SealSource { files: chunk } => files.extend(chunk)?,
                 Frame::SealSourceEnd { identity, count } => {
-                    let plan = motor_winagent::source_seal::Plan::new(files)?;
+                    let plan = files.finish()?;
                     if !plan.matches(&identity, count) {
                         return Err(invalid("source seal plan mismatch"));
                     }

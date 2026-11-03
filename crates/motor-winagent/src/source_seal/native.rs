@@ -296,8 +296,8 @@ mod tests {
     fn cleanup_handle(path: &Path) -> File {
         OpenOptions::new()
             .access_mode(FILE_READ_ATTRIBUTES | WRITE_DAC)
-            // Cleanup handles must not themselves prevent delete/rename: the
-            // matrix measures DACL enforcement, not sharing violations.
+            // Allow the directory itself to be renamed while retained for
+            // teardown. Open descendant files would still block its rename.
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)
@@ -368,9 +368,11 @@ mod tests {
             std::fs::write(root.join(path), b"original").unwrap();
         }
         std::fs::write(root.join("src/return"), b"original").unwrap();
-        // Retain pre-seal WRITE_DAC handles solely for fixture cleanup. No job
-        // process in production can obtain these handles before the Start gate.
-        let mut cleanup = Cleanup {
+        // Retain only directory WRITE_DAC handles for teardown. Open child-file
+        // handles prevent directory renames even with delete sharing. Restoring
+        // parent full control after assertions lets teardown delete sealed files
+        // without reopening their denied WRITE_DAC handles.
+        let _cleanup = Cleanup {
             root: root.clone(),
             handles: plan
                 .directories()
@@ -379,9 +381,6 @@ mod tests {
                 .collect(),
             sid: sid.clone(),
         };
-        for path in &plan.files {
-            cleanup.handles.push(cleanup_handle(&root.join(path)));
-        }
         // An explicit full-parent control makes removal of the parent policy
         // observable even on images whose inherited scratch ACL is only Modify.
         for parent in plan.directories() {
@@ -502,6 +501,23 @@ mod tests {
         })
         .unwrap();
         assert_eq!(std::fs::read(root.join("src/return")).unwrap(), b"changed");
+        let moved = root.join("renamed-source");
+        std::fs::rename(root.join("src"), &moved).unwrap();
+        assert_eq!(std::fs::read(moved.join("write")).unwrap(), b"original");
+        denied(
+            std::fs::write(moved.join("write"), b"changed"),
+            "write after folder rename",
+        );
+        denied(
+            std::fs::remove_file(moved.join("delete")),
+            "delete after folder rename",
+        );
+        std::fs::write(moved.join("new-after-rename"), b"allowed").unwrap();
+        drop(_cleanup);
+        assert!(
+            !root.exists(),
+            "directory-only teardown must remove the sealed fixture"
+        );
     }
 
     #[test]

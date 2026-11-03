@@ -33,14 +33,57 @@ fn source_plan_uses_accepted_regular_files_and_exact_cwd_returns() {
     .into_iter()
     .chain(["m/sibling/keep.rs".into()])
     .collect();
-    let plan = prep::source_plan(&regular, &request).unwrap();
+    let selection = prep::source_plan(&regular, &request).unwrap();
+    let mut expected: Vec<_> = ["nested/directory/child.rs", "nested/source.rs", "root.rs"]
+        .map(|path| format!("{}/{path}", request.workspace_key.trim_start_matches('/')))
+        .into();
+    expected.push("sibling/keep.rs".into());
+    expected.sort();
+    assert_eq!(selection.plan.files, expected);
+    assert_eq!(selection.unprotected_count, 1);
     assert_eq!(
-        plan.files,
-        ["nested/directory/child.rs", "nested/source.rs", "root.rs"]
-            .map(|path| format!("{}/{path}", request.workspace_key.trim_start_matches('/')))
+        selection.unprotected_examples,
+        [format!("{prefix}/node_modules/tracked.js")]
     );
     let collision = [format!("{prefix}/A"), format!("{prefix}/a")].into();
     assert!(prep::source_plan(&collision, &request).is_err());
+}
+
+#[test]
+fn source_plan_accounts_for_skipped_siblings_and_exact_return_exemptions() {
+    let f = Fixture::new();
+    let (mut request, _) = f.run("true");
+    request.return_paths = vec![format!("{}/node_modules/returned", request.workspace_key)];
+    let returned = format!("m{}/node_modules/returned", request.workspace_key);
+    let complete = prep::source_plan(
+        &[returned.clone(), "m/sibling/source.rs".into()].into(),
+        &request,
+    )
+    .unwrap();
+    assert_eq!(complete.unprotected_count, 0);
+    assert_eq!(complete.plan.files, ["sibling/source.rs"]);
+    let regular = std::iter::once(returned)
+        .chain((0..7).map(|i| format!("m/sibling/node_modules/tracked-{i}")))
+        .collect();
+    let partial = prep::source_plan(&regular, &request).unwrap();
+    assert_eq!(partial.unprotected_count, 7);
+    assert_eq!(partial.unprotected_examples.len(), 5);
+    assert!(partial.plan.files.is_empty());
+}
+
+#[test]
+fn source_plan_refuses_aggregate_limit_with_named_reason() {
+    let f = Fixture::new();
+    let (request, _) = f.run("true");
+    let regular = (0..=motor_winagent::source_seal::MAX_SOURCE_FILES)
+        .map(|i| format!("m/sibling/file-{i}"))
+        .collect();
+    let error = prep::source_plan(&regular, &request)
+        .err()
+        .expect("oversized source plan must be refused");
+    assert!(error
+        .to_string()
+        .contains(motor_winagent::source_seal::PLAN_LIMIT_REASON));
 }
 
 struct FakeHost;
@@ -2799,7 +2842,46 @@ async fn windows_backend_stages_a_tracked_symlink_as_a_file_holding_its_target()
     let selected = a.sealed.lock().unwrap();
     assert!(!selected.iter().any(|path| path.ends_with("/link.txt")));
     assert!(selected.iter().any(|path| path.ends_with("/Cargo.toml")));
+    let sibling_prefix = format!("{}/", r.siblings[0].canonical_path.trim_start_matches('/'));
+    assert!(selected
+        .iter()
+        .any(|path| path.starts_with(&sibling_prefix)));
     assert_eq!(t.source_read_only(), Some(true));
+}
+
+#[tokio::test]
+async fn windows_backend_skipped_primary_or_sibling_files_report_false_without_refusal() {
+    for sibling in [false, true] {
+        let f = Fixture::new();
+        source(&f);
+        let repository = if sibling { &f.sibling } else { &f.main };
+        fs::create_dir(repository.join("node_modules")).unwrap();
+        fs::write(
+            repository.join("node_modules/tracked"),
+            b"tracked dependency input",
+        )
+        .unwrap();
+        git(repository, &["add", "."]);
+        git(repository, &["commit", "-m", "tracked dependency input"]);
+        let (config, agent) = configure(&f, Fault::None, 0);
+        let runner = Runner::open_with_backend(config, Box::new(FakeHost)).unwrap();
+        let (request, bytes) = request(&f);
+        f.submit(&runner, &request, &bytes);
+        let result = terminal(&runner, request.job_id).await;
+        assert_eq!(
+            result.outcome,
+            Outcome::WindowsExit { code: 0 },
+            "{result:?}"
+        );
+        assert_eq!(result.source_read_only(), Some(false));
+        assert_eq!(agent.starts.load(Ordering::SeqCst), 1);
+        assert!(!agent
+            .sealed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path.ends_with("/node_modules/tracked")));
+    }
 }
 
 #[tokio::test]

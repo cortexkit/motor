@@ -276,7 +276,7 @@ pub struct Protocol {
     return_committed: u64,
     return_discarded: u64,
     return_current: u64,
-    seal_files: Vec<String>,
+    seal_files: source_seal::PlanBuilder,
     seal_plan: Option<source_seal::Plan>,
 }
 
@@ -303,7 +303,7 @@ impl Protocol {
             return_committed: 0,
             return_discarded: 0,
             return_current: 0,
-            seal_files: Vec::new(),
+            seal_files: source_seal::PlanBuilder::default(),
             seal_plan: None,
         })
     }
@@ -434,12 +434,12 @@ impl Protocol {
                 Ready
             }
             (Ready | SealingSource, Host, SealSource { files }) => {
+                self.seal_files.extend(files.clone())?;
                 source_seal::Plan::new(files.clone())?;
-                self.seal_files.extend(files.iter().cloned());
                 SealingSource
             }
             (Ready | SealingSource, Host, SealSourceEnd { identity, count }) => {
-                let plan = source_seal::Plan::new(std::mem::take(&mut self.seal_files))?;
+                let plan = std::mem::take(&mut self.seal_files).finish()?;
                 if !plan.matches(identity, *count) {
                     return Err(invalid("source seal plan identity/count mismatch"));
                 }

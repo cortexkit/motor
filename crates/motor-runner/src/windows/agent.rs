@@ -352,6 +352,7 @@ pub(crate) struct PreparedVm {
     output: Mutex<Option<backend::Output>>,
     completion: mpsc::Receiver<io::Result<ExecutionOutcome>>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    source_read_only: bool,
 }
 impl Drop for PreparedVm {
     fn drop(&mut self) {
@@ -361,7 +362,7 @@ impl Drop for PreparedVm {
 impl Execution for PreparedVm {
     fn source_read_only(&self) -> bool {
         // materialize_attempt returns only after a matching SourceSealed frame.
-        true
+        self.source_read_only
     }
     fn release(&mut self) -> io::Result<()> {
         self.control.release.store(true, Ordering::Release);
@@ -763,6 +764,7 @@ fn materialize_attempt(
     })?;
     let tar = prepared_tree.path;
     let source_plan = prepared_tree.source_plan;
+    let source_read_only = prepared_tree.source_read_only;
     resources.bun_lease = Some(prepared_tree.lease);
     if control.cancel.load(Ordering::Acquire) > 0 {
         return Err(invalid("Windows setup cancelled"));
@@ -1054,7 +1056,7 @@ fn materialize_attempt(
         thread_control.done.store(true, Ordering::Release);
         let _ = result_tx.send(result);
     });
-    let handle = PreparedVm {
+    let mut handle = PreparedVm {
         _registration: None,
         control,
         output: Mutex::new(Some(backend::Output {
@@ -1069,6 +1071,7 @@ fn materialize_attempt(
         })),
         completion: result_rx,
         thread: Mutex::new(Some(thread)),
+        source_read_only: false,
     };
     let ready = ready_rx
         .recv()
@@ -1082,6 +1085,7 @@ fn materialize_attempt(
             .and_then(Result::err)
             .unwrap_or(error));
     }
+    handle.source_read_only = source_read_only;
     Ok(handle)
 }
 
