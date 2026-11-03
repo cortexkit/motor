@@ -97,7 +97,8 @@ and stderr here as they arrive.
                       7200; ck-motor may be configured with a lower cap)
   --cwd PATH          directory to run in; its git checkout is the workspace
   --return-path PATH  return this absolute workspace file (repeatable, at most 64)
-  --return-max-bytes N  cap total returned raw bytes (default/maximum 10485760;
+  --return-max-bytes N  cap total returned raw bytes (default 10485760, at most
+                       134217728 when ck-motor offers large returns;
                        legacy runners are capped at 262144)
   --secret-file PATH  save the reattach secret in this new 0600 file (optional)
   --record-file PATH  save Accepted/Started/Output/Terminal JSONL to a new 0600
