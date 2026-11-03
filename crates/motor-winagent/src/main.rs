@@ -1668,7 +1668,7 @@ mod guest {
         rx: &mpsc::Receiver<Event>,
         port: &mut Port,
         user: &User,
-    ) -> io::Result<(Command, Inventory, Vec<String>)> {
+    ) -> io::Result<(Command, Inventory, Vec<String>, File)> {
         let _identity = user.impersonate()?;
         let home = user.profile.join(".cargo");
         let temp = user.profile.join("AppData/Local/Temp");
@@ -1783,11 +1783,9 @@ mod guest {
             return Err(invalid("workspace is not in the transferred tree"));
         }
         junction(&workspace.join("target"))?;
-        drop(archive);
-        std::fs::remove_file(temp.join("motor-tree.tar"))?;
         send(protocol, port, &Frame::TreeReceived {})?;
         diagnostic!("staging TreeReceived sent");
-        Ok((command, before, warnings))
+        Ok((command, before, warnings, archive))
     }
 
     fn execute(
@@ -1797,8 +1795,9 @@ mod guest {
         port: &mut Port,
         user: &User,
         command: &Command,
-        warnings: Vec<String>,
+        preparation: (Vec<String>, File),
     ) -> io::Result<Option<motor_winagent::returned::Request>> {
+        let (warnings, mut archive) = preparation;
         let mut gate = receive(protocol, rx, &port.stop)?;
         let returns = if let Frame::RequestReturns { request } = gate {
             gate = receive(protocol, rx, &port.stop)?;
@@ -1806,6 +1805,45 @@ mod guest {
         } else {
             None
         };
+        let mut files = motor_winagent::source_seal::PlanBuilder::default();
+        loop {
+            match gate {
+                Frame::SealSource { files: chunk } => files.extend(chunk)?,
+                Frame::SealSourceEnd { identity, count } => {
+                    let plan = files.finish()?;
+                    if !plan.matches(&identity, count) {
+                        return Err(invalid("source seal plan mismatch"));
+                    }
+                    let started = Instant::now();
+                    {
+                        let _identity = user.impersonate()?;
+                        motor_winagent::source_seal::refresh(
+                            Path::new(SOURCE_ROOT),
+                            &mut archive,
+                            &plan,
+                        )?;
+                    }
+                    // The job token is used only to obtain its exact SID. ACL
+                    // writes run as SYSTEM, after dependency processes exited.
+                    motor_winagent::source_seal::apply(
+                        Path::new(SOURCE_ROOT),
+                        &plan,
+                        user.token.0,
+                    )?;
+                    diagnostic!(
+                        "source sealed count={} elapsed_ms={}",
+                        count,
+                        started.elapsed().as_millis()
+                    );
+                    send(protocol, port, &Frame::SourceSealed { identity, count })?;
+                    break;
+                }
+                _ => return Err(invalid("expected source seal plan")),
+            }
+            gate = receive(protocol, rx, &port.stop)?;
+        }
+        drop(archive);
+        gate = receive(protocol, rx, &port.stop)?;
         if gate != (Frame::Start {}) {
             return Err(invalid("expected the execution gate"));
         }
@@ -1986,8 +2024,16 @@ mod guest {
                 timings: cache.timings.clone(),
             },
         )?;
-        let (command, before, warnings) = stage(&mut protocol, &rx, &mut port, &user)?;
-        let returns = execute(&mut protocol, &rx, tx, &mut port, &user, &command, warnings)?;
+        let (command, before, warnings, archive) = stage(&mut protocol, &rx, &mut port, &user)?;
+        let returns = execute(
+            &mut protocol,
+            &rx,
+            tx,
+            &mut port,
+            &user,
+            &command,
+            (warnings, archive),
+        )?;
         let collect = receive(&mut protocol, &rx, &port.stop)?;
         if let Some(request) = returns {
             if collect != (Frame::CollectReturns {}) {

@@ -355,6 +355,7 @@ pub(crate) struct PreparedVm {
     output: Mutex<Option<backend::Output>>,
     completion: mpsc::Receiver<io::Result<ExecutionOutcome>>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    source_read_only: bool,
 }
 impl Drop for PreparedVm {
     fn drop(&mut self) {
@@ -362,6 +363,10 @@ impl Drop for PreparedVm {
     }
 }
 impl Execution for PreparedVm {
+    fn source_read_only(&self) -> bool {
+        // materialize_attempt returns only after a matching SourceSealed frame.
+        self.source_read_only
+    }
     fn release(&mut self) -> io::Result<()> {
         self.control.release.store(true, Ordering::Release);
         Ok(())
@@ -761,6 +766,8 @@ fn materialize_attempt(
         }
     })?;
     let tar = prepared_tree.path;
+    let source_plan = prepared_tree.source_plan;
+    let source_read_only = prepared_tree.source_read_only;
     resources.bun_lease = Some(prepared_tree.lease);
     if control.cancel.load(Ordering::Acquire) > 0 {
         return Err(invalid("Windows setup cancelled"));
@@ -903,27 +910,39 @@ fn materialize_attempt(
                 .caller_return_paths
                 .is_empty();
             if returning {
-                let workspace = crate::caller_path::request(&return_request)
-                    .caller_workspace_key
-                    .text();
-                let paths = crate::caller_path::run(&return_request)
-                    .caller_return_paths
-                    .iter()
-                    .map(|path| {
-                        // An invalid relative name is deliberately sent as invalid,
-                        // so the guest reports a per-file Escape without opening it.
-                        path.strip_prefix(workspace)
-                            .and_then(|p| p.strip_prefix('/'))
-                            .unwrap_or(":")
-                            .to_owned()
-                    })
-                    .collect();
                 io.send(&Frame::RequestReturns {
-                    request: motor_winagent::returned::Request {
-                        paths,
-                        max_bytes: return_request.return_max_bytes,
-                    },
+                    request: self::return_request(&return_request),
                 })?;
+            }
+            // Bound each JSON frame independently; large snapshots span frames.
+            let mut chunk = Vec::new();
+            let mut bytes = 0;
+            for file in &source_plan.files {
+                let encoded = serde_json::to_vec(file)?.len() + 1;
+                if bytes + encoded > motor_winagent::MAX_FRAME_BYTES / 2 && !chunk.is_empty() {
+                    io.send(&Frame::SealSource {
+                        files: std::mem::take(&mut chunk),
+                    })?;
+                    bytes = 0;
+                }
+                chunk.push(file.clone());
+                bytes += encoded;
+            }
+            if !chunk.is_empty() {
+                io.send(&Frame::SealSource { files: chunk })?;
+            }
+            let identity = source_plan.identity();
+            let count = source_plan.count();
+            io.send(&Frame::SealSourceEnd {
+                identity: identity.clone(),
+                count,
+            })?;
+            match io.reply(&mut resources)? {
+                Frame::SourceSealed {
+                    identity: acknowledged,
+                    count: sealed,
+                } if source_plan.matches(&acknowledged, sealed) => (),
+                _ => return Err(invalid("missing or mismatched source seal acknowledgement")),
             }
             ready_tx
                 .send(Ok(()))
@@ -1040,7 +1059,7 @@ fn materialize_attempt(
         thread_control.done.store(true, Ordering::Release);
         let _ = result_tx.send(result);
     });
-    let handle = PreparedVm {
+    let mut handle = PreparedVm {
         _registration: None,
         control,
         output: Mutex::new(Some(backend::Output {
@@ -1055,6 +1074,7 @@ fn materialize_attempt(
         })),
         completion: result_rx,
         thread: Mutex::new(Some(thread)),
+        source_read_only: false,
     };
     let ready = ready_rx
         .recv()
@@ -1068,7 +1088,30 @@ fn materialize_attempt(
             .and_then(Result::err)
             .unwrap_or(error));
     }
+    handle.source_read_only = source_read_only;
     Ok(handle)
+}
+
+pub(super) fn return_request(request: &motor_protocol::Run) -> motor_winagent::returned::Request {
+    let workspace = crate::caller_path::request(request)
+        .caller_workspace_key
+        .text();
+    let paths = crate::caller_path::run(request)
+        .caller_return_paths
+        .iter()
+        .map(|path| {
+            // Invalid mappings stay invalid for collection, so they are not
+            // opened and cannot exempt any selected source file either.
+            path.strip_prefix(workspace)
+                .and_then(|p| p.strip_prefix('/'))
+                .unwrap_or(":")
+                .to_owned()
+        })
+        .collect();
+    motor_winagent::returned::Request {
+        paths,
+        max_bytes: request.return_max_bytes,
+    }
 }
 
 #[cfg(test)]
@@ -1228,6 +1271,20 @@ mod tests {
                 },
             ),
             (Peer::Agent, Frame::TreeReceived {}),
+            (
+                Peer::Host,
+                Frame::SealSourceEnd {
+                    identity: motor_winagent::source_seal::Plan::default().identity(),
+                    count: 0,
+                },
+            ),
+            (
+                Peer::Agent,
+                Frame::SourceSealed {
+                    identity: motor_winagent::source_seal::Plan::default().identity(),
+                    count: 0,
+                },
+            ),
             (Peer::Host, Frame::Start {}),
             (Peer::Agent, Frame::Started {}),
         ] {
@@ -1561,6 +1618,19 @@ mod tests {
                 .unwrap();
             protocol
                 .accept(Peer::Agent, &Frame::TreeReceived {})
+                .unwrap();
+            let identity = motor_winagent::source_seal::Plan::default().identity();
+            protocol
+                .accept(
+                    Peer::Host,
+                    &Frame::SealSourceEnd {
+                        identity: identity.clone(),
+                        count: 0,
+                    },
+                )
+                .unwrap();
+            protocol
+                .accept(Peer::Agent, &Frame::SourceSealed { identity, count: 0 })
                 .unwrap();
             let blocked = Arc::new(AtomicBool::new(false));
             let mut transport = Transport {

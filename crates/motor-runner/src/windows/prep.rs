@@ -58,6 +58,8 @@ fn snapshot_error(
 pub(super) struct PreparedTree {
     pub path: PathBuf,
     pub lease: super::bun::Lease,
+    pub source_plan: motor_winagent::source_seal::Plan,
+    pub source_read_only: bool,
 }
 
 pub(super) fn prepare(
@@ -269,7 +271,78 @@ pub(super) fn prepare(
         .map_err(|error| super::vm::path_error("open trusted preparation tree", &tar, error))?;
     motor_winagent::validate_tree(&mut file)
         .map_err(|error| super::vm::path_error("validate trusted preparation tree", &tar, error))?;
-    Ok(PreparedTree { path: tar, lease })
+    let regular_files: BTreeSet<String> = read_json(&staging.join("source-regular.json"))?;
+    let selection = source_plan(&regular_files, request)?;
+    if selection.unprotected_count > 0 {
+        tracing::warn!(job_id = %setup.id, unprotected_count = selection.unprotected_count,
+            unprotected_paths = ?selection.unprotected_examples, selected_count = selection.plan.count(),
+            "Windows tracked source protection is incomplete");
+    }
+    Ok(PreparedTree {
+        path: tar,
+        lease,
+        source_read_only: selection.unprotected_count == 0,
+        source_plan: selection.plan,
+    })
+}
+
+pub(crate) struct SourceSelection {
+    pub plan: motor_winagent::source_seal::Plan,
+    pub unprotected_count: usize,
+    pub unprotected_examples: Vec<String>,
+}
+
+pub(crate) fn source_plan(
+    regular_files: &BTreeSet<String>,
+    request: &motor_protocol::Run,
+) -> io::Result<SourceSelection> {
+    let workspace = crate::caller_path::request(request)
+        .caller_workspace_key
+        .text();
+    let prefix = format!(
+        "{}/",
+        mapped(workspace)?.to_string_lossy().replace('\\', "/")
+    );
+    let returned = super::agent::return_request(request);
+    let exemptions: BTreeSet<_> = returned
+        .paths
+        .iter()
+        .filter(|path| motor_winagent::returned::validate_relative(path).is_ok())
+        .map(|path| format!("{prefix}{path}").to_lowercase())
+        .collect();
+    let mut files = motor_winagent::source_seal::PlanBuilder::default();
+    let mut unprotected_count = 0;
+    let mut unprotected_examples = Vec::new();
+    for path in regular_files {
+        if exemptions.contains(&path.to_lowercase()) {
+            continue;
+        }
+        // Dependency installation can link node_modules to writable storage.
+        // Leave those paths usable, but count tracked entries as unprotected.
+        if path
+            .split('/')
+            .any(|name| motor_winagent::bun::is_node_modules(name.as_ref()))
+        {
+            unprotected_count += 1;
+            if unprotected_examples.len() < 5 {
+                unprotected_examples.push(path.clone());
+            }
+            continue;
+        }
+        // Include transferred repositories outside the primary workspace too:
+        // their edits would otherwise be lost, and primary return exemptions
+        // do not apply to them. The guest source root replaces the archive's m/.
+        files.push(
+            path.strip_prefix("m/")
+                .ok_or_else(|| invalid("non-source path in accepted regular manifest"))?
+                .to_owned(),
+        )?;
+    }
+    Ok(SourceSelection {
+        plan: files.finish()?,
+        unprotected_count,
+        unprotected_examples,
+    })
 }
 
 #[cfg(unix)]
@@ -664,6 +737,9 @@ fn stage_snapshots(plan: &Plan) -> io::Result<(Vec<PathBuf>, BTreeSet<String>, B
         }
         roots.push(root);
     }
+    // Preserve the accepted regular-file set before dependency preparation can
+    // add generated files or turn symlink-text entries into ordinary files.
+    atomic_json(&plan.staging.join("source-regular.json"), &regular_files)?;
     Ok((roots, members, regular_files))
 }
 

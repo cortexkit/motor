@@ -1730,6 +1730,28 @@ async fn operator_terminal(runner: &Runner, id: Uuid) -> TerminalRecord {
     .expect("Windows qualification job did not finish within ten minutes")
 }
 
+#[tokio::test]
+#[ignore = "trusted operator: sealed Windows baseline, dedicated accounts, KVM and systemd required"]
+async fn windows_qualification_tracked_source_is_read_only_and_new_files_are_writable() {
+    let runner = operator();
+    let f = Fixture::new();
+    source(&f);
+    let (mut request, bytes) = f.run(
+        "if printf changed > Cargo.toml; then echo 'tracked write unexpectedly allowed'; exit 1; fi; printf allowed > source-seal-new && test \"$(cat source-seal-new)\" = allowed",
+    );
+    request.platform = Some(Platform::Windows);
+    request.timeout = Some(120);
+    f.submit(&runner, &request, &bytes);
+    let terminal = operator_terminal(&runner, request.job_id).await;
+    assert_eq!(
+        terminal.outcome,
+        Outcome::WindowsExit { code: 0 },
+        "{terminal:?}"
+    );
+    assert_eq!(terminal.source_read_only(), Some(true));
+    no_units(&runner);
+}
+
 /// Break check: remove private git routing to the verified mirror, discard a
 /// clean target cache, or let preparation accept a missing lock or outside path.
 #[tokio::test]

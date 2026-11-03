@@ -8261,6 +8261,9 @@ impl Runner {
             }
         }
         job.state = JobState::Running;
+        // Windows reports its guest acknowledgement through the execution;
+        // macOS and Linux record their own durable seal facts.
+        job.source_read_only = launch.execution.source_read_only();
         #[cfg(unix)]
         if self.core.config.macos_instance() {
             job.source_read_only = self.core.config.macos_runtime.source_read_only(id);
@@ -8268,7 +8271,7 @@ impl Runner {
         #[cfg(target_os = "linux")]
         {
             if !self.core.config.macos_instance() {
-                job.source_read_only =
+                job.source_read_only |=
                     crate::source_seal::record_path(&self.core.trees.state, id).exists();
             }
         }
