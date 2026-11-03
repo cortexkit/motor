@@ -6,6 +6,16 @@ fn main() {
 
 #[cfg(windows)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().skip(1).eq(["--bun-paths"]) {
+        println!(
+            "{}",
+            serde_json::json!({
+                "cache": motor_winagent::bun::CACHE_DIR,
+                "seed": motor_winagent::bun::SEED_DIR,
+            })
+        );
+        return Ok(());
+    }
     #[cfg(feature = "hyperv-spike")]
     if std::env::args().skip(1).eq(["--build-info"]) {
         if cfg!(feature = "hyperv-runner") {
@@ -1523,33 +1533,56 @@ mod guest {
         stop: &Handle,
     ) -> Result<Vec<String>, motor_winagent::bun::Refusal> {
         use motor_winagent::bun::{self, Check, InstallEvent, RefusalKind};
-        let deadline = Instant::now() + Duration::from_secs(300);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(300);
+        // Open as SYSTEM, before impersonation; this handle is never inherited by Bun.
+        // Both virtio and Hyper-V guests retain the same private phase log.
+        let mut log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(r"C:\ProgramData\Motor\bun-preparation.jsonl")
+            .ok();
+        let mut timings = bun::PreparationTimings::new(
+            |line: &str| {
+                diagnostic!("{line}");
+                if let Some(log) = &mut log {
+                    let _ = writeln!(log, "{line}");
+                }
+            },
+            started,
+            deadline,
+        );
         let budget = bun::ExpansionBudget::new(4 * 1024 * 1024 * 1024, 250_000, deadline);
         let fail =
             |project: &str| bun::refuse(RefusalKind::BunOfflineInstallFailed, project, "", "");
         let identity = user
             .impersonate()
             .map_err(|_| fail("").at(Check::Identity))?;
-        let manifest = match bun::prepare_cache_with_budget(
-            Path::new(bun::SEED_DIR),
-            Path::new(SOURCE_ROOT),
-            Path::new(bun::CACHE_DIR),
-            &budget,
-        ) {
+        let manifest = match timings.measure("cache_expansion", "", || {
+            bun::prepare_cache_with_budget(
+                Path::new(bun::SEED_DIR),
+                Path::new(SOURCE_ROOT),
+                Path::new(bun::CACHE_DIR),
+                &budget,
+            )
+        }) {
             Ok(manifest) => manifest,
             Err(refusal) => return bun::skip_unprepared(Path::new(SOURCE_ROOT), refusal),
         };
         let Some(manifest) = manifest else {
             return Ok(Vec::new());
         };
-        if bun::write_registry_config(&user.profile, &manifest.registries).is_err() {
-            return bun::skip_unprepared(
-                Path::new(SOURCE_ROOT),
-                fail("").at(Check::RegistryConfig),
-            );
+        if let Err(refusal) = timings.measure("registry_config", "", || {
+            bun::write_registry_config(&user.profile, &manifest.registries)
+                .map_err(|_| fail("").at(Check::RegistryConfig))
+        }) {
+            return bun::skip_unprepared(Path::new(SOURCE_ROOT), refusal);
         }
         drop(identity);
-        let mut warnings = bun::source_projects(Path::new(SOURCE_ROOT), &budget)?
+        let mut warnings = timings
+            .measure("source_projects", "", || {
+                bun::source_projects(Path::new(SOURCE_ROOT), &budget)
+            })?
             .into_iter()
             .filter_map(|(member, owner)| {
                 owner.map(|owner| bun::workspace_member_warning(&member, &owner))
@@ -1576,6 +1609,7 @@ mod guest {
                     .map_err(|_| fail(&project.path).at(Check::WorkingDirectory))?,
             );
             if let Some(refusal) = &project.skipped {
+                timings.skipped("project_install", &project.path, refusal);
                 let _identity = user
                     .impersonate()
                     .map_err(|_| fail(&project.path).at(Check::Identity))?;
@@ -1586,7 +1620,7 @@ mod guest {
             prep.command = "test \"$('C:/Program Files/Bun/bun.exe' --version)\" = 1.4.4 && 'C:/Program Files/Bun/bun.exe' install --offline --frozen-lockfile --ignore-scripts --backend=copyfile".into();
             let mut diagnostics = bun::DiagnosticTail::default();
             let mut started = false;
-            let result = (|| {
+            let result = timings.measure("project_install", &project.path, || {
                 let (tx, rx) = mpsc::sync_channel(16);
                 let prep_stop = Arc::new(
                     Handle::event().map_err(|_| fail(&project.path).at(Check::ProcessStart))?,
@@ -1645,11 +1679,15 @@ mod guest {
                 drop(rx);
                 drop(job);
                 result
-            })();
+            });
             let _identity = user
                 .impersonate()
                 .map_err(|_| fail(&project.path).at(Check::Identity))?;
-            if let Some(refusal) = bun::finish_install(project, &directory, result)? {
+            if let Some(refusal) =
+                timings.measure("project_verify_cleanup", &project.path, || {
+                    bun::finish_install(project, &directory, result)
+                })?
+            {
                 warnings.push(refusal.registry(&manifest.registries).warning());
                 let tail = diagnostics.line();
                 if started {

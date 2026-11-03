@@ -11,10 +11,12 @@ mod expansion;
 mod graph;
 mod hash;
 mod preparation;
+mod timing;
 pub use expansion::ExpansionBudget;
 pub use preparation::{
     DiagnosticTail, InstallEvent, finish_install, skip_project, skip_unprepared, wait_install,
 };
+pub use timing::PreparationTimings;
 #[cfg(windows)]
 pub mod protection;
 pub mod windows_path;
@@ -958,6 +960,14 @@ pub fn expand_tarball_with_budget(
         return Err(io::Error::other("npm package.json missing"));
     }
     std::fs::create_dir_all(destination)?;
+    // The validated index includes implicit parents and repeated directory headers.
+    // Create each directory once, not once per file (costly CreateFile probes on NTFS).
+    for (path, file) in names.values() {
+        if !file {
+            budget.check()?;
+            std::fs::create_dir_all(destination.join(path))?;
+        }
+    }
     for entry in
         tar::Archive::new(budget.reader(flate2::read::GzDecoder::new(bytes), false)).entries()?
     {
@@ -972,10 +982,7 @@ pub fn expand_tarball_with_budget(
             continue;
         };
         let dest = destination.join(relative);
-        if entry.header().entry_type().is_dir() {
-            std::fs::create_dir_all(dest)?;
-        } else {
-            std::fs::create_dir_all(dest.parent().unwrap())?;
+        if entry.header().entry_type().is_file() {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)

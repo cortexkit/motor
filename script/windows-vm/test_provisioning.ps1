@@ -470,6 +470,32 @@ foreach ($state in @('key-absent','value-absent','zero','one')) {
 }
 $checks++
 Write-Host 'PASS developer_mode_absent_key_absent_value_zero_and_one'
+$bunExclusions = [regex]::Match($baseline, '(?s)\$bunPathsJson = .*?(?=\$agentHash =)').Value
+Assert ($bunExclusions.Contains('& "$motor\motor-winagent.exe" --bun-paths')) 'Bun exclusions must query the installed agent'
+$bunExclusions = $bunExclusions.Replace('& "$motor\motor-winagent.exe" --bun-paths', '& $readBunPaths')
+$appliedBunExclusions = [Collections.Generic.List[string]]::new()
+function Add-MpPreference([string]$ExclusionPath) { $appliedBunExclusions.Add($ExclusionPath) }
+$readBunPaths = { $global:LASTEXITCODE = 0; '{"cache":"C:\\motor-job\\bun-cache","seed":"C:\\motor-bun-seed"}' }
+& ([scriptblock]::Create($bunExclusions))
+Assert ($appliedBunExclusions.Count -eq 2) 'exactly two Bun folders must be excluded'
+Assert ($appliedBunExclusions[0] -ceq 'C:\motor-job\bun-cache') 'wrong Bun cache exclusion'
+Assert ($appliedBunExclusions[1] -ceq 'C:\motor-bun-seed') 'wrong Bun seed exclusion'
+foreach ($readBunPaths in @(
+    { $global:LASTEXITCODE = 1; '{}' },
+    { $global:LASTEXITCODE = 0; '{"cache":"","seed":"C:\\motor-bun-seed"}' },
+    { $global:LASTEXITCODE = 0; '{"cache":"relative","seed":"C:\\motor-bun-seed"}' },
+    { $global:LASTEXITCODE = 0; '{"cache":"C:\\motor-job\\bun-cache","seed":""}' },
+    { $global:LASTEXITCODE = 0; '{"cache":"C:\\motor-job\\bun-cache","seed":"relative"}' }
+)) {
+    $appliedBunExclusions.Clear()
+    $threw = $false
+    try { & ([scriptblock]::Create($bunExclusions)) } catch { $threw = $true }
+    Assert $threw 'invalid agent paths must fail provisioning'
+    Assert ($appliedBunExclusions.Count -eq 0) 'invalid agent paths changed Defender policy'
+}
+Remove-Item Function:\Add-MpPreference
+$checks++
+Write-Host 'PASS bun_cache_and_seed_exclusions_follow_installed_agent'
 $items = [ordered]@{
     machine_llvm = @("`$llvmVersion = '21.1.8'", 'llvmorg-21.1.8/LLVM-21.1.8-win64.exe', 'https://api.github.com/repos/llvm/llvm-project/releases/assets/329799346', '7a5386c26497db1691f320121e5b113364dd0274b98e55f15f4dbc00c0450113', "`$llvmInstall = 'C:\Program Files\LLVM'", 'Start-Process -FilePath $llvmInstaller -ArgumentList "/S /D=$llvmInstall" -Wait -PassThru', '& icacls "$llvmInstall\*" /reset /T /C /L /Q', '& icacls $llvmInstall /setowner', 'SetEnvironmentVariable(''Path'', "$llvmBin;$machinePath", ''Machine'')', 'SetEnvironmentVariable(''LIBCLANG_PATH'', $llvmBin, ''Machine'')', 'Test-Path -LiteralPath "$llvmBin\libclang.dll" -PathType Leaf', '& "$llvmBin\clang.exe" --version')
     machine_toolchain = @("`$toolchain = '1.99.0'", "`$hostTriple = 'x86_64-pc-windows-msvc'", "`$env:RUSTUP_HOME = 'C:\rust\rustup'", "`$env:CARGO_HOME = 'C:\rust\cargo'", '--default-toolchain $toolchain --default-host $hostTriple --no-modify-path', "SetEnvironmentVariable('RUSTUP_HOME'", "SetEnvironmentVariable('Path'", "'C:\rust' /inheritance:r", ':(OI)(CI)RX')

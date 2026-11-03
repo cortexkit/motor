@@ -194,6 +194,33 @@ fn dot_components_and_identical_repeats_expand_but_divergent_ones_do_not() {
     assert!(!scratch.join("escape.js").exists());
 }
 
+#[test]
+fn expansion_creates_shared_implicit_directories_before_writing_files() {
+    let scratch = ScratchDir::new("bun-shared-directories");
+    let bytes = tar_of(&[
+        (
+            "package/package.json",
+            br#"{"name":"dirs","version":"1.0.0"}"#,
+        ),
+        ("package/dist/nested/first.js", b"first"),
+        ("package/dist/second.js", b"second"),
+        ("package/dist/nested/third.js", b"third"),
+        ("package/dist/nested/first.js", b"first"),
+    ]);
+    let destination = scratch.join("cache");
+    bun::expand_tarball(&bytes, &destination).unwrap();
+    for (path, contents) in [
+        ("dist/nested/first.js", "first"),
+        ("dist/second.js", "second"),
+        ("dist/nested/third.js", "third"),
+    ] {
+        assert_eq!(
+            fs::read_to_string(destination.join(path)).unwrap(),
+            contents
+        );
+    }
+}
+
 /// Operator check against real registry tarballs: expands every `*.tgz` in
 /// `MOTOR_BUN_TARBALL_DIR` under one job budget and lists the ones refused.
 #[test]
