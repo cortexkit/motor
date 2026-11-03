@@ -95,6 +95,8 @@ impl Lease {
     pub(crate) fn pin_count(&self) -> usize {
         self.pins.len()
     }
+    // Only the Linux descriptor-count test uses it (it reads /proc/self/fd).
+    #[cfg(target_os = "linux")]
     pub(crate) fn prepare_for_test(root: &Path) -> Self {
         let source = Provenance {
             registry: "https://registry.npmjs.org/".into(),
