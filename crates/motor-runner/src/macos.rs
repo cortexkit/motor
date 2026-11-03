@@ -23,6 +23,7 @@ mod fs;
 mod lifecycle;
 mod preflight;
 mod process;
+mod source_seal;
 pub(crate) use execution::MacosBackend;
 pub(crate) use lifecycle::evict;
 pub(crate) use lifecycle::{Runtime, VmConfig};
@@ -239,6 +240,9 @@ pub struct Prepared {
     pub siblings: Vec<(String, PathBuf)>,
     pub cargo_home: PathBuf,
     pub prepared_javascript_directories: Vec<PathBuf>,
+    /// Regular files enumerated from the requested workspace commit in the
+    /// trusted mirror, before preparation. Siblings use read-only VM shares.
+    pub source_files: Vec<PathBuf>,
 }
 impl Staging {
     /// `state` holds staging's own prep folders. `tree_state` must be the
@@ -301,9 +305,10 @@ impl Staging {
     }
     /// Call only after the VM is proven stopped, or after failed pre-admission prep.
     pub fn remove_job_trees(&self, id: uuid::Uuid) -> io::Result<()> {
+        source_seal::require_cleared(&source_seal::path(&self.state, id))?;
         for tree in ["jobs", "prep"] {
             match Dir::open(&self.state.join(tree), false) {
-                Ok(dir) => dir.remove(id.to_string().as_ref())?,
+                Ok(dir) => dir.remove_job(id.to_string().as_ref())?,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
@@ -354,6 +359,7 @@ impl Staging {
                 s.tree_hash.clone(),
             ));
         }
+        let mut source_files = Vec::new();
         for (logical, repository, commit, caller, tree_hash) in &roots {
             control.check()?;
             let _lock = control.lock(&self.path_lock(logical))?;
@@ -362,6 +368,12 @@ impl Staging {
             parent.remove(canonical.file_name().unwrap())?;
             parent.child(canonical.file_name().unwrap(), true)?;
             self.checkout(repository, &canonical, commit, caller, tree_hash, &control)?;
+            if logical == &request.workspace_key {
+                source_files = source_seal::regular_files(&crate::workspace::snapshot_tree(
+                    &self.trees.mirror(repository),
+                    commit,
+                )?)?;
+            }
             let destination = job.join(mapped(logical)?);
             Dir::open(&canonical, false)?.clone_into(&Dir::open(&destination, true)?, &control)?;
         }
@@ -498,6 +510,7 @@ impl Staging {
                 .collect::<io::Result<_>>()?,
             cargo_home: job_cargo,
             prepared_javascript_directories,
+            source_files,
             tree: job,
         })
     }

@@ -306,6 +306,16 @@ fn collect_after_measure(request: &Run, seq: u64, before_read: impl FnOnce()) ->
     collect_with_root(request, seq, collection_root(None, request), before_read)
 }
 
+pub(crate) fn relative<'a>(request: &Run, path: &'a str) -> Result<&'a Path, Cause> {
+    Path::new(path)
+        .strip_prefix(
+            crate::caller_path::request(request)
+                .caller_workspace_key
+                .text(),
+        )
+        .map_err(|_| Cause::Escape)
+}
+
 fn collect_with_root(
     request: &Run,
     seq: u64,
@@ -323,13 +333,7 @@ fn collect_with_root(
         let (directory, root) = root?;
         let mut files = Vec::new();
         for path in crate::caller_path::run(request).caller_return_paths {
-            let relative = Path::new(path)
-                .strip_prefix(
-                    crate::caller_path::request(request)
-                        .caller_workspace_key
-                        .text(),
-                )
-                .map_err(|_| Cause::Escape)?;
+            let relative = relative(request, path)?;
             let file = open_file(&root, &directory, relative)?;
             measured = measured.saturating_add(file.metadata().map_err(|_| Cause::Missing)?.len());
             files.push(file);
@@ -513,18 +517,11 @@ fn collect_chunked_with_root(
                 .iter()
                 .enumerate()
             {
-                let opened = Path::new(path)
-                    .strip_prefix(
-                        crate::caller_path::request(request)
-                            .caller_workspace_key
-                            .text(),
-                    )
-                    .map_err(|_| Cause::Escape)
-                    .and_then(|relative| {
-                        let file = open_file(&root, &root_directory, relative)?;
-                        let size = file.metadata().map_err(|_| Cause::Missing)?.len();
-                        Ok((relative.to_owned(), file, size))
-                    });
+                let opened = relative(request, path).and_then(|relative| {
+                    let file = open_file(&root, &root_directory, relative)?;
+                    let size = file.metadata().map_err(|_| Cause::Missing)?.len();
+                    Ok((relative.to_owned(), file, size))
+                });
                 match opened {
                     Err(cause) => outcomes[index] = Some(fail(shared_cause(cause), None)),
                     // Decided before any byte of any file is read.

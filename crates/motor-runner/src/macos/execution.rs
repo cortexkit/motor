@@ -138,6 +138,16 @@ fn prepare(
     }
     target_in(config, &entry, &staged)?;
     entry.check()?;
+    let selected = super::source_seal::plan(
+        staged.source_files.clone(),
+        &super::source_seal::returns(&setup.request)?,
+    )?;
+    super::source_seal::seal(
+        &super::source_seal::path(&config.state_root, setup.id),
+        &staged.workspace,
+        &selected.files,
+    )?;
+    runtime.record_sealed(&config.state_root, &entry, &selected)?;
     let vm = config
         .macos
         .as_ref()
@@ -280,7 +290,7 @@ pub(super) fn capture_completion(
 pub(super) fn target_in(config: &Config, entry: &Entry, staged: &Staged) -> io::Result<()> {
     let record = entry.owned.lock().unwrap().record.clone();
     let workspace = Dir::open(&staged.workspace, false)?;
-    workspace.remove("target".as_ref())?;
+    workspace.remove_job("target".as_ref())?;
     let target = config
         .state_root
         .join("targets")
@@ -295,6 +305,9 @@ pub(super) fn target_in(config: &Config, entry: &Entry, staged: &Staged) -> io::
     }
 }
 pub(super) fn target_out(config: &Config, entry: &Entry, workspace: &Path) -> io::Result<()> {
+    // APFS clones may carry inode flags into the persistent cache. Never clone
+    // until every source inode (including ones moved into target) is unsealed.
+    config.macos_runtime.unseal(&config.state_root, entry)?;
     let record = entry.owned.lock().unwrap().record.clone();
     let source = match Dir::open(workspace, false)?.child("target".as_ref(), false) {
         Ok(source) => source,
@@ -305,6 +318,7 @@ pub(super) fn target_out(config: &Config, entry: &Entry, workspace: &Path) -> io
     let temporary = record.paths.target_tmp.file_name().unwrap();
     let dest = parent.child(temporary, true)?;
     source.clone_into(&dest, &lifecycle::control(entry.cancel.clone()))?;
+    super::fs::clear_job_target(&record.paths.target_tmp)?;
     dest.sync_all()?;
     #[cfg(test)]
     if let Some(hook) = &config.long_work {

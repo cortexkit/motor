@@ -139,6 +139,9 @@ fn cv(value: libc::c_int) -> io::Result<libc::c_int> {
     }
 }
 impl Dir {
+    pub(super) fn sync_directory(&self) -> io::Result<()> {
+        self.0.sync_all()
+    }
     pub(super) fn sync_all(&self) -> io::Result<()> {
         let mut stack = vec![ReadFrame::new(self.child(".".as_ref(), false)?)?];
         while !stack.is_empty() {
@@ -306,6 +309,9 @@ impl Dir {
         Ok(names)
     }
     pub(super) fn kind(&self, name: &std::ffi::OsStr) -> io::Result<libc::mode_t> {
+        Ok(self.stat(name)?.st_mode & libc::S_IFMT)
+    }
+    pub(super) fn stat(&self, name: &std::ffi::OsStr) -> io::Result<libc::stat> {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         cv(unsafe {
             libc::fstatat(
@@ -315,7 +321,47 @@ impl Dir {
                 libc::AT_SYMLINK_NOFOLLOW,
             )
         })?;
-        Ok(unsafe { stat.assume_init() }.st_mode & libc::S_IFMT)
+        Ok(unsafe { stat.assume_init() })
+    }
+
+    /// Stopped-tree recovery restores directory traversal without following
+    /// guest links. Stream entries so wide/deep output trees cannot exhaust fds.
+    pub(super) fn visit_owned_files(
+        path: &Path,
+        mut visit: impl FnMut(&Dir, &std::ffi::OsStr, &libc::stat) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let parent = match Self::open(path.parent().ok_or_else(|| invalid("walk parent"))?, false) {
+            Ok(parent) => parent,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let stream =
+            match DirectoryStream::owned_child(parent.0.as_raw_fd(), path.file_name().unwrap()) {
+                Ok(stream) => stream,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e),
+            };
+        let mut stack = vec![stream];
+        while let Some(stream) = stack.last_mut() {
+            let Some(name) = stream.next()? else {
+                stack.pop();
+                continue;
+            };
+            let fd = cv(unsafe { libc::fcntl(stream.fd(), libc::F_DUPFD_CLOEXEC, 0) })?;
+            let dir = Self(unsafe { File::from_raw_fd(fd) });
+            let stat = dir.stat(&name)?;
+            match stat.st_mode & libc::S_IFMT {
+                libc::S_IFDIR => {
+                    if stack.len() >= MAX_TREE_DEPTH {
+                        return Err(invalid("guest tree depth limit exceeded"));
+                    }
+                    stack.push(DirectoryStream::owned_child(dir.0.as_raw_fd(), &name)?);
+                }
+                libc::S_IFREG => visit(&dir, &name, &stat)?,
+                _ => {}
+            }
+        }
+        Ok(())
     }
     pub(super) fn contains(&self, name: &std::ffi::OsStr) -> io::Result<bool> {
         match self.kind(name) {
@@ -344,13 +390,24 @@ impl Dir {
         Ok(OsString::from_vec(buffer))
     }
     pub(super) fn remove(&self, name: &std::ffi::OsStr) -> io::Result<()> {
+        self.remove_with(name, false)
+    }
+    /// Only for a stopped VM's disposable job trees, never canonical or shared
+    /// caches. A crash can persist the immutable flag but lose its earlier clear.
+    pub(super) fn remove_job(&self, name: &std::ffi::OsStr) -> io::Result<()> {
+        self.remove_with(name, true)?;
+        // Persist removal of the owned root before lifecycle forgets its journal.
+        // Child flags need not be individually durable once that root is gone.
+        self.sync_directory()
+    }
+    fn remove_with(&self, name: &std::ffi::OsStr, job: bool) -> io::Result<()> {
         let kind = match self.kind(name) {
             Ok(k) => k,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
         };
         if kind != libc::S_IFDIR {
-            cv(unsafe { libc::unlinkat(self.0.as_raw_fd(), c(name)?.as_ptr(), 0) })?;
+            unlink_file(self.0.as_raw_fd(), name, job)?;
             return Ok(());
         }
         let mut stack = vec![(
@@ -375,7 +432,7 @@ impl Dir {
                     let parent = stack.last().unwrap().1.fd();
                     stack.push((name.clone(), DirectoryStream::owned_child(parent, &name)?));
                 } else {
-                    cv(unsafe { libc::unlinkat(stream.fd(), c(&name)?.as_ptr(), 0) })?;
+                    unlink_file(stream.fd(), &name, job)?;
                 }
             } else {
                 let (name, stream) = stack.pop().unwrap();
@@ -566,6 +623,70 @@ impl Dir {
     }
 }
 
+fn unlink_file(parent: libc::c_int, name: &std::ffi::OsStr, job: bool) -> io::Result<()> {
+    let result = unsafe { libc::unlinkat(parent, c(name)?.as_ptr(), 0) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if job && error.raw_os_error() == Some(libc::EPERM) && clear_job_file(parent, name)? {
+        cv(unsafe { libc::unlinkat(parent, c(name)?.as_ptr(), 0) })?;
+        return Ok(());
+    }
+    Err(error)
+}
+
+fn clear_job_file(parent: libc::c_int, name: &std::ffi::OsStr) -> io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let fd = cv(unsafe {
+            libc::openat(
+                parent,
+                c(name)?.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        })?;
+        let file = unsafe { File::from_raw_fd(fd) };
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        cv(unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) })?;
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+            || stat.st_uid != unsafe { libc::geteuid() }
+            || stat.st_flags & libc::UF_IMMUTABLE == 0
+        {
+            return Ok(false);
+        }
+        cv(unsafe { libc::fchflags(file.as_raw_fd(), stat.st_flags & !libc::UF_IMMUTABLE) })?;
+        Ok(true)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (parent, name);
+        Ok(false)
+    }
+}
+
+/// Only for the stopped job's disposable target temporary, before publication.
+/// A clone must not publish an immutable bit resurrected across a crash, even
+/// if a durable source journal already says cleared.
+pub(super) fn clear_job_target(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        Dir::visit_owned_files(path, |dir, name, stat| {
+            if stat.st_flags & libc::UF_IMMUTABLE != 0 && !clear_job_file(dir.0.as_raw_fd(), name)?
+            {
+                return Err(invalid("immutable job target file is not runner-owned"));
+            }
+            Ok(())
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 pub(super) fn read(path: &Path) -> io::Result<String> {
     Dir::open(path.parent().ok_or_else(|| invalid("file parent"))?, false)?
         .text(path.file_name().ok_or_else(|| invalid("file name"))?)
@@ -576,4 +697,17 @@ pub(super) fn remove(path: &Path) -> io::Result<()> {
         false,
     )?
     .remove(path.file_name().ok_or_else(|| invalid("remove name"))?)
+}
+
+pub(super) fn remove_job(path: &Path) -> io::Result<()> {
+    match Dir::open(
+        path.parent().ok_or_else(|| invalid("remove job parent"))?,
+        false,
+    ) {
+        Ok(parent) => {
+            parent.remove_job(path.file_name().ok_or_else(|| invalid("remove job name"))?)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }

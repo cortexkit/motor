@@ -59,7 +59,7 @@ impl Host for Fake {
         if self.delete_failure.load(Ordering::Acquire) {
             return Err(invalid("injected delete failure"));
         }
-        let result = remove(path);
+        let result = super::super::fs::remove_job(path);
         if let Err(error) = &result {
             self.delete_errors
                 .lock()
@@ -121,6 +121,130 @@ fn assert_gone(entry: &Entry) {
     }
 }
 
+fn empty_seal_journal(root: &Path, id: Uuid, complete: bool) -> PathBuf {
+    let path = super::super::source_seal::path(root, id);
+    crate::storage::atomic_json_private(
+        &path,
+        &serde_json::json!({
+            "version": 1, "entries": [], "complete": complete, "cleared": false,
+        }),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn source_read_only_requires_durable_completion_before_exposure_and_survives_cleanup_errors() {
+    let scratch = ScratchDir::new("macos-seal-fact");
+    let root = scratch.join("state");
+    let host = Arc::new(Fake::default());
+    let runtime = new_runtime(host.clone());
+    let entry = begin(&runtime, &root, 0);
+    let id = entry.owned.lock().unwrap().record.id;
+    make_paths(&entry);
+    let plan = super::super::source_seal::plan(Vec::new(), &Default::default()).unwrap();
+    assert!(!runtime.source_read_only(id));
+    assert!(runtime.record_sealed(&root, &entry, &plan).is_err());
+    empty_seal_journal(&root, id, false);
+    assert!(runtime.record_sealed(&root, &entry, &plan).is_err());
+    assert!(!runtime.source_read_only(id));
+    let journal = empty_seal_journal(&root, id, true);
+    runtime.record_sealed(&root, &entry, &plan).unwrap();
+    let saved: Record = crate::storage::read_json(&Runtime::record_path(&root, id)).unwrap();
+    assert!(saved.source_read_only);
+    assert!(runtime.source_read_only(id));
+    boot(&runtime, &host, &root, &entry, 100);
+    assert!(runtime.record_sealed(&root, &entry, &plan).is_err());
+    host.disk_held.store(true, Ordering::Release);
+    runtime.finish(&root, &entry);
+    let saved: serde_json::Value = crate::storage::read_json(&journal).unwrap();
+    assert_eq!(saved["cleared"], false, "unproven stop cannot unseal");
+    assert!(entry.owned.lock().unwrap().record.paths.tree.exists());
+    host.disk_held.store(false, Ordering::Release);
+    host.delete_failure.store(true, Ordering::Release);
+    runtime.finish(&root, &entry);
+    let saved: serde_json::Value = crate::storage::read_json(&journal).unwrap();
+    assert_eq!(saved["cleared"], true);
+    let record: Record = crate::storage::read_json(&Runtime::record_path(&root, id)).unwrap();
+    assert!(record.quarantined);
+    assert!(
+        record.source_read_only,
+        "cleanup cannot erase the execution fact"
+    );
+    assert!(record.slot.is_none());
+    assert!(record.paths.quarantine.exists());
+    // A fresh runtime must retain the clear marker until retry deletes all trees.
+    host.delete_failure.store(false, Ordering::Release);
+    let recovered = new_runtime(host);
+    recovered.recover(&root).unwrap();
+    assert!(recovered.entry(id).is_none());
+    assert!(!journal.exists());
+    assert_gone(&entry);
+}
+
+#[test]
+fn invalid_seal_journal_quarantines_before_any_tree_deletion_and_retries() {
+    for content in [
+        "broken",
+        r#"{"version":2,"entries":[],"complete":true,"cleared":true}"#,
+    ] {
+        let scratch = ScratchDir::new("macos-seal-quarantine");
+        let root = scratch.join("state");
+        let host = Arc::new(Fake::default());
+        let runtime = new_runtime(host.clone());
+        let entry = begin(&runtime, &root, 0);
+        let id = entry.owned.lock().unwrap().record.id;
+        make_paths(&entry);
+        let journal = empty_seal_journal(&root, id, false);
+        std::fs::write(&journal, content).unwrap();
+        runtime.finish(&root, &entry);
+        let record = entry.owned.lock().unwrap().record.clone();
+        assert!(record.quarantined);
+        assert!(
+            record.paths.quarantine.join("0/resource").exists(),
+            "VM clone must not be deleted before unseal"
+        );
+        assert!(record.paths.quarantine.join("3/resource").exists());
+        assert_eq!(std::fs::read_to_string(&journal).unwrap(), content);
+        assert!(runtime.entry(id).is_some());
+        assert!(
+            !runtime.source_read_only(id),
+            "partial intent is not a complete execution seal"
+        );
+        empty_seal_journal(&root, id, false);
+        runtime.finish(&root, &entry);
+        assert_gone(&entry);
+        assert!(!journal.exists());
+    }
+}
+
+#[test]
+fn recovery_finishes_cleared_journal_after_ownership_removal_but_keeps_unresolved_orphans() {
+    let scratch = ScratchDir::new("macos-seal-orphan");
+    let root = scratch.join("state");
+    let id = Uuid::now_v7();
+    let journal = empty_seal_journal(&root, id, true);
+    crate::storage::atomic_json_private(
+        &journal,
+        &serde_json::json!({
+            "version": 1, "entries": [], "complete": true, "cleared": true,
+        }),
+    )
+    .unwrap();
+    let runtime = new_runtime(Arc::new(Fake::default()));
+    runtime.recover(&root).unwrap();
+    assert!(
+        !journal.exists(),
+        "clear marker survives until the last cleanup step"
+    );
+    empty_seal_journal(&root, id, false);
+    assert!(runtime.recover(&root).is_err());
+    assert!(
+        journal.exists(),
+        "an unresolved orphan must never be forgotten"
+    );
+}
+
 #[test]
 fn returned_files_wait_for_stop_and_saved_proof_then_survive_cleanup() {
     for failure in ["none", "stop", "disk", "proof-save"] {
@@ -150,6 +274,7 @@ fn returned_files_wait_for_stop_and_saved_proof_then_survive_cleanup() {
                 workspace,
                 siblings: vec![],
                 prepared_javascript_directories: vec![],
+                source_files: vec![],
             };
             let motor_protocol::Frame::Run(mut request) = serde_json::from_str(include_str!(
                 "../../../../test-vectors/exec-remote-v1/frames/run.json"

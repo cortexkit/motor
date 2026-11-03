@@ -168,6 +168,7 @@ pub(crate) fn capture_finished_workspace_after_stop(
         workspace,
         siblings: vec![],
         prepared_javascript_directories: vec![],
+        source_files: vec![],
     };
     execution::capture_changes(runtime, trees, &entry, request, &staged);
     execution::capture_returns(runtime, trees, &entry, request, &staged);
@@ -1490,6 +1491,7 @@ fn cross_job_poisoning_never_runs_guest_git_hooks_or_follows_guest_links() {
     host::create_dir(first.workspace.join("node_modules")).unwrap();
     symlink(&config.state_root, first.workspace.join("node_modules/x")).unwrap();
     symlink(&sentinel, first.workspace.join("target")).unwrap();
+    runtime.stop(&config.state_root, &entry).unwrap();
     assert!(execution::target_out(&config, &entry, &first.workspace).is_err());
     entry.owned.lock().unwrap().record.stop_proven = true;
     runtime.finish(&config.state_root, &entry);
@@ -1504,6 +1506,7 @@ fn cross_job_poisoning_never_runs_guest_git_hooks_or_follows_guest_links() {
     execution::target_in(&config, &entry, &second).unwrap();
     host::create_dir(second.workspace.join("target")).unwrap();
     host::write(second.workspace.join("target/whole"), "new job").unwrap();
+    runtime.stop(&config.state_root, &entry).unwrap();
     execution::target_out(&config, &entry, &second.workspace).unwrap();
     entry.owned.lock().unwrap().record.stop_proven = true;
     runtime.finish(&config.state_root, &entry);
