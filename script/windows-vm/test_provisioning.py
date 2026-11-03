@@ -245,6 +245,23 @@ class BaselineInputsTests(unittest.TestCase):
         self.assertIn("& icacls 'C:\\motor-bun-seed' /setowner '*S-1-5-32-544'", source)
         self.assertIn("throw 'Bun disposable cache ACL setup failed'", source)
 
+    def test_bun_cache_and_seed_exclusions_follow_the_installed_agent(self):
+        source = (HERE / "setup-job-baseline.ps1").read_text()
+        agent = (HERE.parent.parent / "crates/motor-winagent/src/main.rs").read_text()
+        for expected in ('& "$motor\\motor-winagent.exe" --bun-paths',
+                         "$bunPathsJson | ConvertFrom-Json",
+                         "@($bunPaths.cache, $bunPaths.seed)",
+                         "Add-MpPreference -ExclusionPath $path -ErrorAction Stop",
+                         "throw 'Cannot read Bun paths from the installed agent'",
+                         "throw 'Invalid agent Bun exclusion path'"):
+            self.assertIn(expected, source)
+        self.assertIn('eq(["--bun-paths"])', agent)
+        self.assertIn('"cache": motor_winagent::bun::CACHE_DIR', agent)
+        self.assertIn('"seed": motor_winagent::bun::SEED_DIR', agent)
+        self.assertLess(source.index('Copy-Item "$AgentSource\\target\\$hostTriple\\release\\motor-winagent.exe"'),
+                        source.index('--bun-paths'))
+        self.assertLess(source.index('--bun-paths'), source.index('New-Service -Name motor-winagent'))
+
     def test_job_baseline_owns_bun_for_both_guest_install_paths(self):
         guest = (HERE / "setup-guest.ps1").read_text()
         self.assertIn("if ($JobBaseline) {\n    Write-Host 'Job baseline: machine-wide pinned Bun is installed by setup-job-baseline.ps1.'\n} elseif ($null -eq (Get-Command bun", guest)

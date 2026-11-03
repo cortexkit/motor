@@ -606,6 +606,20 @@ if ($HyperVSpike) { $agentOptions = @('--features', 'hyperv-spike') }
 if ($LASTEXITCODE -ne 0) { throw "Agent release build failed: $LASTEXITCODE" }
 Copy-Item "$AgentSource\target\$hostTriple\release\motor-winagent.exe" "$motor\motor-winagent.exe" -Force
 }
+# Match the existing checkout/Cargo exclusions: disposable offline job VMs use
+# lockfile-integrity-verified packages, so real-time scanning adds no protection
+# here but scans thousands of files during cache expansion. Ask the installed
+# agent for its constants so the image policy cannot drift from the cache paths.
+$bunPathsJson = & "$motor\motor-winagent.exe" --bun-paths
+if ($LASTEXITCODE -ne 0) { throw 'Cannot read Bun paths from the installed agent' }
+$bunPaths = $bunPathsJson | ConvertFrom-Json
+$bunExclusionPaths = @($bunPaths.cache, $bunPaths.seed)
+foreach ($path in $bunExclusionPaths) {
+    if ([string]::IsNullOrWhiteSpace($path) -or $path -notmatch '\A[A-Za-z]:\\') { throw 'Invalid agent Bun exclusion path' }
+}
+foreach ($path in $bunExclusionPaths) {
+    Add-MpPreference -ExclusionPath $path -ErrorAction Stop
+}
 $agentHash = (Get-FileHash "$motor\motor-winagent.exe" -Algorithm SHA256).Hash
 Set-Content "$PSScriptRoot\winagent.sha256" "$agentHash  motor-winagent.exe" -Encoding ascii
 Write-Host "Installed motor-winagent SHA-256: $agentHash"
