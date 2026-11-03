@@ -145,9 +145,9 @@ fn prepare(
     super::source_seal::seal(
         &super::source_seal::path(&config.state_root, setup.id),
         &staged.workspace,
-        &selected,
+        &selected.files,
     )?;
-    runtime.record_sealed(&config.state_root, &entry)?;
+    runtime.record_sealed(&config.state_root, &entry, &selected)?;
     let vm = config
         .macos
         .as_ref()

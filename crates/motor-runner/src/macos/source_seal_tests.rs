@@ -65,9 +65,8 @@ impl Flags for TestFlags {
     }
 }
 
-#[test]
-fn snapshot_plan_selects_regular_modes_and_exact_collector_returns() {
-    let mut request: motor_protocol::Run = serde_json::from_value(serde_json::json!({
+fn request() -> motor_protocol::Run {
+    serde_json::from_value(serde_json::json!({
         "job_id": Uuid::now_v7(), "workspace_key": "/workspace",
         "repository_root": "/repository", "cwd": "/workspace/sub", "command": "true",
         "env": {}, "queue_wait_limit_s": 60,
@@ -75,7 +74,12 @@ fn snapshot_plan_selects_regular_modes_and_exact_collector_returns() {
         "tree_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "integration_tip": "", "siblings": [], "bundles": []
     }))
-    .unwrap();
+    .unwrap()
+}
+
+#[test]
+fn snapshot_plan_selects_regular_modes_and_exact_collector_returns() {
+    let mut request = request();
     request.workspace_key = "/workspace".into();
     request.cwd = "/workspace/sub".into();
     request.return_paths = vec![
@@ -91,16 +95,101 @@ fn snapshot_plan_selects_regular_modes_and_exact_collector_returns() {
                  100644 blob ff\tsub/node_modules/a\0\
                  100644 blob ff\ttarget/a\0\
                  100644 blob ff\tsub/target/a\0";
+    let selected = plan(regular_files(tree).unwrap(), &returns(&request).unwrap()).unwrap();
     assert_eq!(
-        plan(regular_files(tree).unwrap(), &returns(&request).unwrap()).unwrap(),
+        selected.files,
         vec![PathBuf::from("directory/child"), PathBuf::from("sub/run")]
     );
+    assert_eq!(
+        selected.unprotected(),
+        [
+            "node_modules/a",
+            "sub/node_modules/a",
+            "sub/target/a",
+            "target/a"
+        ]
+        .map(PathBuf::from)
+    );
+    assert!(!selected.source_read_only());
     request.return_paths = vec!["/workspace-escape/sub/run".into()];
     assert!(returns(&request).is_err());
     for invalid in ["../escape", "/absolute", ""] {
         assert!(plan([PathBuf::from(invalid)], &BTreeSet::new()).is_err());
     }
     assert!(regular_files(b"broken\0").is_err());
+}
+
+#[test]
+fn tracked_cache_paths_make_the_persisted_source_fact_false() {
+    for (tracked, returned, expected) in [
+        ("target/tracked", None, false),
+        ("src/target/tracked", None, false),
+        ("node_modules/tracked", None, false),
+        ("src/node_modules/tracked", None, false),
+        ("src/source", None, true),
+        ("target/tracked", Some("target/tracked"), true),
+        (
+            "src/node_modules/tracked",
+            Some("src/node_modules/tracked"),
+            true,
+        ),
+        ("target/tracked", Some("target"), false),
+    ] {
+        let tree = Tree::new();
+        let root = tree.0.join("state");
+        let config = crate::engine::Config::new(&root, "macos");
+        let runtime = &config.macos_runtime;
+        let entry = runtime.begin(&root, Uuid::now_v7(), "/workspace").unwrap();
+        let record = entry.owned.lock().unwrap().record.clone();
+        let workspace = record.paths.tree.join("workspace");
+        std::fs::create_dir_all(workspace.join(tracked).parent().unwrap()).unwrap();
+        std::fs::write(workspace.join(tracked), b"tracked").unwrap();
+        std::fs::write(workspace.join("protected"), b"still protected").unwrap();
+        let staged = super::super::Prepared {
+            tree: record.paths.tree.clone(),
+            workspace: workspace.clone(),
+            cargo_home: record.paths.cargo.clone(),
+            siblings: Vec::new(),
+            prepared_javascript_directories: Vec::new(),
+            source_files: vec![tracked.into(), "protected".into()],
+        };
+        // The trusted manifest must still account for a tracked root target
+        // after cache publication replaces that directory in the staged tree.
+        super::super::execution::target_in(&config, &entry, &staged).unwrap();
+        if tracked.starts_with("target/") {
+            assert!(!workspace.join(tracked).exists());
+        }
+        let returns = returned.map(PathBuf::from).into_iter().collect();
+        let planned = plan(staged.source_files, &returns).unwrap();
+        let flags = TestFlags::default();
+        seal_with(&path(&root, record.id), &workspace, &planned.files, &flags).unwrap();
+        assert_ne!(
+            flags
+                .inspect(&File::open(workspace.join("protected")).unwrap())
+                .unwrap()
+                .1
+                & IMMUTABLE,
+            0
+        );
+        runtime.record_sealed(&root, &entry, &planned).unwrap();
+        assert_eq!(
+            runtime.source_read_only(record.id),
+            expected,
+            "tracked={tracked}, returned={returned:?}"
+        );
+        let saved: super::super::lifecycle::Record = crate::storage::read_json(
+            &root
+                .join("macvm-records")
+                .join(format!("{}.json", record.id)),
+        )
+        .unwrap();
+        assert_eq!(saved.source_read_only, expected);
+        assert_eq!(planned.unprotected().len(), usize::from(!expected));
+        assert!(
+            entry.active.load(std::sync::atomic::Ordering::Acquire),
+            "incomplete coverage must not refuse the job"
+        );
+    }
 }
 
 #[test]
@@ -474,5 +563,65 @@ fn native_timing_seal_and_unseal_7000_small_files() {
             0
         );
     }
+    forget(&journal).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_return_alias_spooling_does_not_clone_sealed_flags() {
+    use crate::return_paths::Collection;
+    let tree = Tree::new();
+    tree.file("job/source");
+    let workspace = tree.0.join("job");
+    std::os::unix::fs::symlink("source", workspace.join("out")).unwrap();
+    let mut request = request();
+    request.cwd = request.workspace_key.clone();
+    request.return_paths = vec![format!("{}/out", request.workspace_key)];
+    let planned = plan(
+        regular_files(
+            b"100644 blob aa\tsource\0\
+        120000 blob bb\tout\0",
+        )
+        .unwrap(),
+        &returns(&request).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(planned.files, vec![PathBuf::from("source")]);
+    let source = File::open(workspace.join("source")).unwrap();
+    let _cleanup = NativeCleanup(vec![source.try_clone().unwrap()]);
+    let journal = tree.0.join("seals/job.json");
+    seal(&journal, &workspace, &planned.files).unwrap();
+    for chunked in [false, true] {
+        request.return_chunked = chunked;
+        let spool = tree
+            .0
+            .join("returns")
+            .join(if chunked { "chunked" } else { "legacy" });
+        // The alias is not the selected source pathname. Collection may read a
+        // sealed inode, so output must be byte-written rather than APFS-cloned.
+        match crate::return_paths::collect_staged(&request, &workspace, &spool) {
+            Collection::Legacy(result) => {
+                assert!(!chunked);
+                assert!(result.return_paths_failed.is_none());
+                let files = result.returned_files.unwrap();
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].data, "b3JpZ2luYWw=");
+            }
+            Collection::Chunked(result) => {
+                assert!(chunked);
+                assert_eq!(result.chunks.len(), 1);
+                let chunk = spool.join(result.directory).join("chunk-0");
+                assert_eq!(std::fs::read(&chunk).unwrap(), b"original");
+                let (chunk_id, chunk_flags) = Native.inspect(&File::open(&chunk).unwrap()).unwrap();
+                assert_ne!(chunk_id, Native.inspect(&source).unwrap().0);
+                assert_eq!(chunk_flags & IMMUTABLE, 0);
+                std::fs::write(&chunk, b"writable before source unseal").unwrap();
+                std::fs::remove_file(&chunk).unwrap();
+            }
+        }
+        assert_ne!(Native.inspect(&source).unwrap().1 & IMMUTABLE, 0);
+        assert!(!Journal::load(&journal).unwrap().unwrap().cleared);
+    }
+    unseal(&journal, &[&workspace]).unwrap();
     forget(&journal).unwrap();
 }

@@ -139,13 +139,28 @@ impl Journal {
     }
 }
 
+pub(super) struct Plan {
+    pub(super) files: Vec<PathBuf>,
+    unprotected: Vec<PathBuf>,
+}
+impl Plan {
+    pub(super) fn source_read_only(&self) -> bool {
+        self.unprotected.is_empty()
+    }
+
+    pub(super) fn unprotected(&self) -> &[PathBuf] {
+        &self.unprotected
+    }
+}
+
 /// Paths in `returns` are relative to the workspace, as in `return_paths::relative`.
 /// Excluding a directory never exempts its children.
 pub(super) fn plan(
     files: impl IntoIterator<Item = PathBuf>,
     returns: &BTreeSet<PathBuf>,
-) -> io::Result<Vec<PathBuf>> {
+) -> io::Result<Plan> {
     let mut selected = BTreeSet::new();
+    let mut unprotected = BTreeSet::new();
     for path in files {
         if path.as_os_str().is_empty()
             || path
@@ -154,17 +169,22 @@ pub(super) fn plan(
         {
             return Err(invalid("non-normal source seal path"));
         }
+        if returns.contains(&path) {
+            continue;
+        }
         if path.components().any(|c| {
             c == Component::Normal("node_modules".as_ref())
                 || c == Component::Normal("target".as_ref())
         }) {
+            unprotected.insert(path);
             continue;
         }
-        if !returns.contains(&path) {
-            selected.insert(path);
-        }
+        selected.insert(path);
     }
-    Ok(selected.into_iter().collect())
+    Ok(Plan {
+        files: selected.into_iter().collect(),
+        unprotected: unprotected.into_iter().collect(),
+    })
 }
 
 fn open(root: &Path, relative: &Path) -> io::Result<File> {

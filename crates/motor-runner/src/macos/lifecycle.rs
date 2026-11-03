@@ -606,7 +606,12 @@ impl Runtime {
             .is_some_and(|entry| entry.owned.lock().unwrap().record.source_read_only)
     }
 
-    pub(super) fn record_sealed(&self, root: &Path, entry: &Entry) -> io::Result<()> {
+    pub(super) fn record_sealed(
+        &self,
+        root: &Path,
+        entry: &Entry,
+        plan: &super::source_seal::Plan,
+    ) -> io::Result<()> {
         let mut owned = entry.owned.lock().unwrap();
         if owned.record.gate_open
             || owned.helper.is_some()
@@ -616,7 +621,13 @@ impl Runtime {
         }
         super::source_seal::before_exposure(&super::source_seal::path(root, owned.record.id))?;
         let mut sealed = owned.record.clone();
-        sealed.source_read_only = true;
+        sealed.source_read_only = plan.source_read_only();
+        let unprotected = plan.unprotected();
+        if !unprotected.is_empty() {
+            tracing::warn!(job_id = %sealed.id, unprotected_count = unprotected.len(),
+                first_paths = ?&unprotected[..unprotected.len().min(5)],
+                "macOS tracked source files left unprotected; source_read_only is false");
+        }
         Self::save(root, &sealed)?;
         owned.record = sealed;
         Ok(())
