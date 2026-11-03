@@ -21,3 +21,10 @@ slow-timeout = { period = "3600s", terminate-after = 6, grace-period = "60s" }
 [[profile.default.overrides]]
 filter = 'test(=isolation::tests::cargo_cache::isolated_tenant_net_overlay_setup_on_large_cache)'
 slow-timeout = { period = "600s", terminate-after = 2, grace-period = "60s" }
+
+# Windows qualification boots a fresh Windows VM for every job it submits, and
+# the real-checkout test submits one job per named checkout in sequence (2 to 4
+# minutes each), so the default 240 s ceiling cut it off on 2 Nov.
+[[profile.default.overrides]]
+filter = 'package(=motor-runner) and test(/windows_qualification_/)'
+slow-timeout = { period = "300s", terminate-after = 4, grace-period = "60s" }
