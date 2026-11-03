@@ -378,8 +378,12 @@ pub(super) fn get_checked(
         let previous = lease.pins.insert(path, reference);
         if previous.is_none() {
             let total = ACTIVE_PINS.fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::info!(job_id = ?lease.job_id, lease_pins = lease.pins.len(), runner_pins = total,
-                "Bun package pin acquired");
+            // A large lockfile takes over a thousand pins. Log only a lease's
+            // first one; the drop line reports how many the job held in total.
+            if lease.pins.len() == 1 {
+                tracing::info!(job_id = ?lease.job_id, lease_pins = 1, runner_pins = total,
+                    "Bun package pin acquired");
+            }
         }
     }
     Ok(bytes)
