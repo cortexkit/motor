@@ -8,6 +8,10 @@ impl Tree {
         let root = cortexkit_test_support::scratch_root()
             .join(format!("mac-source-seal-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&root).unwrap();
+        // macOS TMPDIR can start with /var, a symlink to /private/var. Keep the
+        // production no-follow walk strict and resolve only this fixture's root.
+        #[cfg(target_os = "macos")]
+        let root = std::fs::canonicalize(root).unwrap();
         Self(root)
     }
     fn file(&self, relative: &str) -> PathBuf {
@@ -19,7 +23,7 @@ impl Tree {
 }
 impl Drop for Tree {
     fn drop(&mut self) {
-        let _ = super::super::fs::remove(&self.0);
+        let _ = super::super::fs::remove_job(&self.0);
     }
 }
 
@@ -30,6 +34,7 @@ struct TestFlags {
     values: RefCell<BTreeMap<Identity, u32>>,
     calls: Cell<usize>,
     fail_at: Cell<Option<usize>>,
+    fail_barrier: Cell<bool>,
 }
 impl Flags for TestFlags {
     fn inspect(&self, file: &File) -> io::Result<(Identity, u32)> {
@@ -51,6 +56,12 @@ impl Flags for TestFlags {
         let key = self.inspect(file)?.0;
         self.values.borrow_mut().insert(key, flags);
         Ok(())
+    }
+    fn clear_barrier(&self, roots: &[&Path]) -> io::Result<()> {
+        if self.fail_barrier.get() {
+            return Err(io::Error::other("injected bulk flush failure"));
+        }
+        Native.clear_barrier(roots)
     }
 }
 
@@ -135,6 +146,26 @@ fn recovery_at_every_flag_crash_boundary_keeps_the_full_intent() {
         forget(&journal).unwrap();
         assert!(!journal.exists());
     }
+}
+
+#[test]
+fn cleared_marker_waits_for_bulk_flush_and_retries_after_failure() {
+    let tree = Tree::new();
+    tree.file("job/source");
+    let journal = tree.0.join("seals/job.json");
+    let flags = TestFlags::default();
+    seal_with(&journal, &tree.0.join("job"), &["source".into()], &flags).unwrap();
+    flags.fail_barrier.set(true);
+    assert!(unseal_with(&journal, &[&tree.0.join("job")], &flags).is_err());
+    assert!(!Journal::load(&journal).unwrap().unwrap().cleared);
+    assert!(forget(&journal).is_err());
+    // Simulate a flag that survived a crash while its earlier clear did not.
+    let file = File::open(tree.0.join("job/source")).unwrap();
+    flags.set(&file, IMMUTABLE).unwrap();
+    flags.fail_barrier.set(false);
+    unseal_with(&journal, &[&tree.0.join("job")], &flags).unwrap();
+    assert_eq!(flags.inspect(&file).unwrap().1, 0);
+    assert!(Journal::load(&journal).unwrap().unwrap().cleared);
 }
 
 #[test]
@@ -288,7 +319,7 @@ fn native_uchg_survives_parent_rename_and_unseals_in_detached_target() {
     tree.file("job/src/source");
     tree.file("job/returned");
     let source = File::open(tree.0.join("job/src/source")).unwrap();
-    let _cleanup = NativeCleanup(vec![source.try_clone().unwrap()]);
+    let mut cleanup = NativeCleanup(vec![source.try_clone().unwrap()]);
     let before = Native.inspect(&source).unwrap();
     assert!(
         before.0.birth_seconds > 0,
@@ -303,6 +334,7 @@ fn native_uchg_survives_parent_rename_and_unseals_in_detached_target() {
         )
         .unwrap();
     let canonical = File::open(tree.0.join("canonical/source")).unwrap();
+    cleanup.0.push(canonical.try_clone().unwrap());
     assert_ne!(Native.inspect(&canonical).unwrap().0, before.0);
     let journal = tree.0.join("seals/job.json");
     seal(&journal, &tree.0.join("job"), &["src/source".into()]).unwrap();
@@ -337,6 +369,30 @@ fn native_uchg_survives_parent_rename_and_unseals_in_detached_target() {
         b"writable again",
     )
     .unwrap();
+    // Model a crash where cleared persisted but the inode's clear did not.
+    assert!(Journal::load(&journal).unwrap().unwrap().cleared);
+    Native.set(&source, before.1 | IMMUTABLE).unwrap();
+    let canonical_flags = Native.inspect(&canonical).unwrap().1;
+    Native.set(&canonical, canonical_flags | IMMUTABLE).unwrap();
+    std::os::unix::fs::symlink(
+        tree.0.join("canonical"),
+        tree.0.join("detached-target/alias"),
+    )
+    .unwrap();
+    assert_eq!(
+        super::super::fs::remove(&tree.0.join("detached-target"))
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EPERM)
+    );
+    super::super::fs::remove_job(&tree.0.join("detached-target")).unwrap();
+    assert_eq!(Native.inspect(&source).unwrap().1, before.1);
+    assert_eq!(
+        Native.inspect(&canonical).unwrap().1,
+        canonical_flags | IMMUTABLE,
+        "job cleanup must not follow links into another tree"
+    );
+    assert!(!tree.0.join("detached-target").exists());
     forget(&journal).unwrap();
 }
 
@@ -374,6 +430,49 @@ fn native_apfs_clone_of_sealed_file_records_flag_propagation() {
         clone_flags,
         "unseal must not clear a different cloned inode"
     );
-    Native.set(&cloned, clone_flags & !IMMUTABLE).unwrap();
+    // A target clone must be clean before publication even if the journal's
+    // cleared marker survived a crash while an earlier flag clear did not.
+    Native.set(&cloned, clone_flags | IMMUTABLE).unwrap();
+    super::super::fs::clear_job_target(&tree.0.join("cloned")).unwrap();
+    assert_eq!(Native.inspect(&cloned).unwrap().1, clone_flags & !IMMUTABLE);
+    forget(&journal).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "operator: measure 7,000 real host APFS flag operations, never inside virtiofs"]
+fn native_timing_seal_and_unseal_7000_small_files() {
+    let tree = Tree::new();
+    let job = tree.0.join("job");
+    std::fs::create_dir(&job).unwrap();
+    let mut selected = Vec::with_capacity(7000);
+    for index in 0..7000 {
+        let relative = PathBuf::from(format!("source-{index}"));
+        std::fs::write(job.join(&relative), [b'x'; 200]).unwrap();
+        selected.push(relative);
+    }
+    let journal = tree.0.join("seals/job.json");
+    let started = std::time::Instant::now();
+    seal(&journal, &job, &selected).unwrap();
+    let seal_elapsed = started.elapsed();
+    let started = std::time::Instant::now();
+    unseal(&journal, &[&job]).unwrap();
+    let unseal_elapsed = started.elapsed();
+    eprintln!(
+        "APFS source seal timing: files=7000 bytes_per_file=200 seal_ms={:.3} unseal_ms={:.3}",
+        seal_elapsed.as_secs_f64() * 1000.0,
+        unseal_elapsed.as_secs_f64() * 1000.0
+    );
+    assert!(Journal::load(&journal).unwrap().unwrap().cleared);
+    for relative in [selected.first().unwrap(), selected.last().unwrap()] {
+        assert_eq!(
+            Native
+                .inspect(&File::open(job.join(relative)).unwrap())
+                .unwrap()
+                .1
+                & IMMUTABLE,
+            0
+        );
+    }
     forget(&journal).unwrap();
 }

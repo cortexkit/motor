@@ -153,7 +153,7 @@ pub(super) trait Host: Send + Sync {
         Ok(())
     }
     fn delete(&self, path: &Path) -> io::Result<()> {
-        remove(path)
+        super::fs::remove_job(path)
     }
 }
 struct Native;

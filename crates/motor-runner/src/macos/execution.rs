@@ -290,7 +290,7 @@ pub(super) fn capture_completion(
 pub(super) fn target_in(config: &Config, entry: &Entry, staged: &Staged) -> io::Result<()> {
     let record = entry.owned.lock().unwrap().record.clone();
     let workspace = Dir::open(&staged.workspace, false)?;
-    workspace.remove("target".as_ref())?;
+    workspace.remove_job("target".as_ref())?;
     let target = config
         .state_root
         .join("targets")
@@ -318,6 +318,7 @@ pub(super) fn target_out(config: &Config, entry: &Entry, workspace: &Path) -> io
     let temporary = record.paths.target_tmp.file_name().unwrap();
     let dest = parent.child(temporary, true)?;
     source.clone_into(&dest, &lifecycle::control(entry.cancel.clone()))?;
+    super::fs::clear_job_target(&record.paths.target_tmp)?;
     dest.sync_all()?;
     #[cfg(test)]
     if let Some(hook) = &config.long_work {

@@ -59,7 +59,7 @@ impl Host for Fake {
         if self.delete_failure.load(Ordering::Acquire) {
             return Err(invalid("injected delete failure"));
         }
-        let result = remove(path);
+        let result = super::super::fs::remove_job(path);
         if let Err(error) = &result {
             self.delete_errors
                 .lock()

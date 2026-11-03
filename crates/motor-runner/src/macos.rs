@@ -308,7 +308,7 @@ impl Staging {
         source_seal::require_cleared(&source_seal::path(&self.state, id))?;
         for tree in ["jobs", "prep"] {
             match Dir::open(&self.state.join(tree), false) {
-                Ok(dir) => dir.remove(id.to_string().as_ref())?,
+                Ok(dir) => dir.remove_job(id.to_string().as_ref())?,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }

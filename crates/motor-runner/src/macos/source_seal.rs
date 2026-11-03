@@ -185,6 +185,16 @@ fn open(root: &Path, relative: &Path) -> io::Result<File> {
 trait Flags {
     fn inspect(&self, file: &File) -> io::Result<(Identity, u32)>;
     fn set(&self, file: &File, flags: u32) -> io::Result<()>;
+    fn clear_barrier(&self, roots: &[&Path]) -> io::Result<()> {
+        for root in roots {
+            match Dir::open(root, false) {
+                Ok(dir) => return dir.sync_directory(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
 }
 
 struct Native;
@@ -214,8 +224,7 @@ impl Flags for Native {
             if unsafe { libc::fchflags(file.as_raw_fd(), flags) } != 0 {
                 return Err(io::Error::last_os_error());
             }
-            // Persist inode metadata before publishing complete/cleared markers.
-            file.sync_all()
+            Ok(())
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -278,6 +287,9 @@ fn seal_with(
             return Err(invalid("source seal flag not applied"));
         }
     }
+    // Flag durability is unnecessary for completion: a host crash loses the VM
+    // and command anyway. The identity journal was durable before the first flag,
+    // so daemon/host recovery can still reconcile every inode we may have sealed.
     intent.complete = true;
     intent.save(journal)?;
     tracing::info!(
@@ -339,6 +351,11 @@ fn unseal_with(journal: &Path, roots: &[&Path], flags: &impl Flags) -> io::Resul
             pending.len()
         )));
     }
+    // Use one bulk directory flush, not F_FULLFSYNC for every file. A crash may
+    // still leave an old flag beside a cleared marker: stopped-job deletion must
+    // retry EPERM after clearing the immutable flag; target clones are scrubbed
+    // before publication as well.
+    flags.clear_barrier(roots)?;
     intent.cleared = true;
     intent.save(journal)?;
     tracing::info!(
