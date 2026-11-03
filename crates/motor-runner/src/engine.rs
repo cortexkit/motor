@@ -8261,10 +8261,16 @@ impl Runner {
             }
         }
         job.state = JobState::Running;
+        #[cfg(unix)]
+        if self.core.config.macos_instance() {
+            job.source_read_only = self.core.config.macos_runtime.source_read_only(id);
+        }
         #[cfg(target_os = "linux")]
         {
-            job.source_read_only =
-                crate::source_seal::record_path(&self.core.trees.state, id).exists();
+            if !self.core.config.macos_instance() {
+                job.source_read_only =
+                    crate::source_seal::record_path(&self.core.trees.state, id).exists();
+            }
         }
         job.process = launch.process;
         job.durable_output = launch.durable_output;

@@ -166,7 +166,48 @@ fn staged(root: &Path, id: Uuid) -> Staged {
         cargo_home: tree.join("cargo-home"),
         siblings: vec![],
         prepared_javascript_directories: vec![],
+        source_files: vec![],
     }
+}
+
+#[test]
+fn source_unseal_barrier_prevents_target_cache_publication() {
+    let scratch = ScratchDir::new("macos-target-seal-barrier");
+    let root = scratch.join("state");
+    let config = Config::new(&root, "macos");
+    let runtime = Runtime::default();
+    let entry = runtime
+        .begin(&root, Uuid::now_v7(), "/Users/test/repo")
+        .unwrap();
+    let id = entry.owned.lock().unwrap().record.id;
+    let staged = staged(&root, id);
+    let store = root
+        .join("targets")
+        .join(lifecycle::key("/Users/test/repo"));
+    std::fs::create_dir(&store).unwrap();
+    std::fs::write(store.join("whole"), "old").unwrap();
+    std::fs::create_dir(staged.workspace.join("target")).unwrap();
+    std::fs::write(staged.workspace.join("target/new"), "must not publish").unwrap();
+    assert!(
+        target_out(&config, &entry, &staged.workspace).is_err(),
+        "stop proof is required even without an intent"
+    );
+    runtime.stop(&root, &entry).unwrap();
+    let journal = super::super::source_seal::path(&root, id);
+    crate::storage::atomic_json_private(&journal, &serde_json::json!({
+        "version": 1, "entries": [{"identity": {"device": 0, "inode": 0, "birth_seconds": 0, "birth_nanos": 0}, "original_flags": 0}],
+        "complete": true, "cleared": false,
+    })).unwrap();
+    assert!(target_out(&config, &entry, &staged.workspace).is_err());
+    assert_eq!(std::fs::read_to_string(store.join("whole")).unwrap(), "old");
+    assert!(!store.join("new").exists());
+    assert!(!entry.owned.lock().unwrap().record.paths.target_tmp.exists());
+    let saved: serde_json::Value = crate::storage::read_json(&journal).unwrap();
+    assert_eq!(saved["cleared"], false);
+    // The unresolved identity remains an obligation for lifecycle maintenance.
+    runtime.finish(&root, &entry);
+    assert!(runtime.entry(id).is_some());
+    assert!(journal.exists());
 }
 #[test]
 fn target_store_is_cloned_and_atomically_replaced_with_recorded_old_store() {
@@ -190,6 +231,7 @@ fn target_store_is_cloned_and_atomically_replaced_with_recorded_old_store() {
         "old"
     );
     std::fs::write(staged.workspace.join("target/whole"), "new").unwrap();
+    runtime.stop(&root, &entry).unwrap();
     target_out(&config, &entry, &staged.workspace).unwrap();
     assert_eq!(std::fs::read_to_string(store.join("whole")).unwrap(), "new");
     let temporary = entry.owned.lock().unwrap().record.paths.target_tmp.clone();
@@ -218,6 +260,7 @@ fn top_level_target_symlink_never_reaches_outside_sentinel() {
     std::fs::create_dir(&sentinel).unwrap();
     std::fs::write(sentinel.join("whole"), "unchanged").unwrap();
     symlink(&sentinel, staged.workspace.join("target")).unwrap();
+    runtime.stop(&root, &entry).unwrap();
     assert!(target_out(&config, &entry, &staged.workspace).is_err());
     target_in(&config, &entry, &staged).unwrap();
     assert!(!staged.workspace.join("target").exists());

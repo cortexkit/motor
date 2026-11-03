@@ -109,6 +109,8 @@ pub(super) struct Record {
     pub proof_version: u8,
     #[serde(default)]
     pub quarantined: bool,
+    #[serde(default)]
+    pub source_read_only: bool,
 }
 pub(super) struct Owned {
     pub record: Record,
@@ -366,6 +368,7 @@ impl Runtime {
             stop_proven: false,
             proof_version: RELEASE_PROOF_VERSION,
             quarantined: false,
+            source_read_only: false,
         };
         // This durable inventory precedes staging, including the first job directory.
         Self::save(root, &record)?;
@@ -598,6 +601,49 @@ impl Runtime {
         owned.record = proven;
         Ok(())
     }
+    pub(crate) fn source_read_only(&self, id: Uuid) -> bool {
+        self.entry(id)
+            .is_some_and(|entry| entry.owned.lock().unwrap().record.source_read_only)
+    }
+
+    pub(super) fn record_sealed(&self, root: &Path, entry: &Entry) -> io::Result<()> {
+        let mut owned = entry.owned.lock().unwrap();
+        if owned.record.gate_open
+            || owned.helper.is_some()
+            || owned.record.paths != Paths::new(root, owned.record.id)
+        {
+            return Err(invalid("source seal must precede helper exposure"));
+        }
+        super::source_seal::before_exposure(&super::source_seal::path(root, owned.record.id))?;
+        let mut sealed = owned.record.clone();
+        sealed.source_read_only = true;
+        Self::save(root, &sealed)?;
+        owned.record = sealed;
+        Ok(())
+    }
+
+    pub(super) fn unseal(&self, root: &Path, entry: &Entry) -> io::Result<()> {
+        let record = entry.owned.lock().unwrap().record.clone();
+        if record.paths != Paths::new(root, record.id)
+            || !record.stop_proven
+            || record.proof_version != RELEASE_PROOF_VERSION
+        {
+            return Err(invalid("source unseal requires a durable VM stop proof"));
+        }
+        let journal = super::source_seal::path(root, record.id);
+        if record.source_read_only {
+            super::source_seal::require_complete(&journal)?;
+        }
+        super::source_seal::unseal(
+            &journal,
+            &[
+                &record.paths.tree,
+                &record.paths.target_tmp,
+                &record.paths.quarantine,
+            ],
+        )
+    }
+
     pub(super) fn cleanup(&self, root: &Path, entry: &Entry) -> io::Result<()> {
         let record = entry.owned.lock().unwrap().record.clone();
         if record.paths != Paths::new(root, record.id) {
@@ -610,11 +656,15 @@ impl Runtime {
             Self::save(root, &owned.record)?;
             release_slot(&mut owned)?;
         }
+        self.unseal(root, entry)?;
         for path in record.paths.all() {
             self.host.delete(path)?;
         }
         remove(&Self::record_path(root, record.id))?;
         File::open(root.join("macvm-records"))?.sync_all()?;
+        // Keep the cleared seal journal until ownership removal is durable. A
+        // restart can then finish forgetting an orphaned clear marker safely.
+        super::source_seal::forget(&super::source_seal::path(root, record.id))?;
         {
             let mut owned = entry.owned.lock().unwrap();
             owned.workspace_lock.take();
@@ -760,6 +810,38 @@ impl Runtime {
         let entries: Vec<_> = self.jobs.lock().unwrap().values().cloned().collect();
         for entry in entries {
             self.finish(root, &entry);
+        }
+        self.recover_cleared_seals(root)?;
+        Ok(())
+    }
+
+    fn recover_cleared_seals(&self, root: &Path) -> io::Result<()> {
+        let seals = match Dir::open(&root.join("seals"), false) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        for name in seals.names()? {
+            let Some(id) = name
+                .to_str()
+                .and_then(|n| n.strip_suffix(".json"))
+                .and_then(|n| Uuid::parse_str(n).ok())
+            else {
+                continue;
+            };
+            if self.entry(id).is_some() {
+                continue;
+            }
+            // Only the crash window after durable ownership removal can leave
+            // an orphan: every resource must be absent and the clear marker valid.
+            for path in Paths::new(root, id).all() {
+                match std::fs::symlink_metadata(path) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                    Ok(_) => return Err(invalid("orphaned source seal still owns resources")),
+                }
+            }
+            super::source_seal::forget(&root.join("seals").join(name))?;
         }
         Ok(())
     }

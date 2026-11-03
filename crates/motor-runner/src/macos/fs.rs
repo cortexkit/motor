@@ -139,6 +139,9 @@ fn cv(value: libc::c_int) -> io::Result<libc::c_int> {
     }
 }
 impl Dir {
+    pub(super) fn sync_directory(&self) -> io::Result<()> {
+        self.0.sync_all()
+    }
     pub(super) fn sync_all(&self) -> io::Result<()> {
         let mut stack = vec![ReadFrame::new(self.child(".".as_ref(), false)?)?];
         while !stack.is_empty() {
@@ -306,6 +309,9 @@ impl Dir {
         Ok(names)
     }
     pub(super) fn kind(&self, name: &std::ffi::OsStr) -> io::Result<libc::mode_t> {
+        Ok(self.stat(name)?.st_mode & libc::S_IFMT)
+    }
+    pub(super) fn stat(&self, name: &std::ffi::OsStr) -> io::Result<libc::stat> {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         cv(unsafe {
             libc::fstatat(
@@ -315,7 +321,47 @@ impl Dir {
                 libc::AT_SYMLINK_NOFOLLOW,
             )
         })?;
-        Ok(unsafe { stat.assume_init() }.st_mode & libc::S_IFMT)
+        Ok(unsafe { stat.assume_init() })
+    }
+
+    /// Stopped-tree recovery restores directory traversal without following
+    /// guest links. Stream entries so wide/deep output trees cannot exhaust fds.
+    pub(super) fn visit_owned_files(
+        path: &Path,
+        mut visit: impl FnMut(&Dir, &std::ffi::OsStr, &libc::stat) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let parent = match Self::open(path.parent().ok_or_else(|| invalid("walk parent"))?, false) {
+            Ok(parent) => parent,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let stream =
+            match DirectoryStream::owned_child(parent.0.as_raw_fd(), path.file_name().unwrap()) {
+                Ok(stream) => stream,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e),
+            };
+        let mut stack = vec![stream];
+        while let Some(stream) = stack.last_mut() {
+            let Some(name) = stream.next()? else {
+                stack.pop();
+                continue;
+            };
+            let fd = cv(unsafe { libc::fcntl(stream.fd(), libc::F_DUPFD_CLOEXEC, 0) })?;
+            let dir = Self(unsafe { File::from_raw_fd(fd) });
+            let stat = dir.stat(&name)?;
+            match stat.st_mode & libc::S_IFMT {
+                libc::S_IFDIR => {
+                    if stack.len() >= MAX_TREE_DEPTH {
+                        return Err(invalid("guest tree depth limit exceeded"));
+                    }
+                    stack.push(DirectoryStream::owned_child(dir.0.as_raw_fd(), &name)?);
+                }
+                libc::S_IFREG => visit(&dir, &name, &stat)?,
+                _ => {}
+            }
+        }
+        Ok(())
     }
     pub(super) fn contains(&self, name: &std::ffi::OsStr) -> io::Result<bool> {
         match self.kind(name) {

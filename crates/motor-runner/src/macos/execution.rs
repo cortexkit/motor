@@ -138,6 +138,16 @@ fn prepare(
     }
     target_in(config, &entry, &staged)?;
     entry.check()?;
+    let selected = super::source_seal::plan(
+        staged.source_files.clone(),
+        &super::source_seal::returns(&setup.request)?,
+    )?;
+    super::source_seal::seal(
+        &super::source_seal::path(&config.state_root, setup.id),
+        &staged.workspace,
+        &selected,
+    )?;
+    runtime.record_sealed(&config.state_root, &entry)?;
     let vm = config
         .macos
         .as_ref()
@@ -295,6 +305,9 @@ pub(super) fn target_in(config: &Config, entry: &Entry, staged: &Staged) -> io::
     }
 }
 pub(super) fn target_out(config: &Config, entry: &Entry, workspace: &Path) -> io::Result<()> {
+    // APFS clones may carry inode flags into the persistent cache. Never clone
+    // until every source inode (including ones moved into target) is unsealed.
+    config.macos_runtime.unseal(&config.state_root, entry)?;
     let record = entry.owned.lock().unwrap().record.clone();
     let source = match Dir::open(workspace, false)?.child("target".as_ref(), false) {
         Ok(source) => source,
