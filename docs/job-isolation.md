@@ -109,6 +109,15 @@ build paths and `./target` behave identically everywhere. Tests:
 `tenant_rust_launch_builds_in_fixed_target_without_compile_cache`
 (`crates/motor-runner/src/backend_tests.rs`).
 
+That folder is the workspace's warm build output, so a job must not build a
+different copy of the source into it. Cargo names a path package's build output
+independently of where the workspace sits, and it treats that output as fresh
+when it is newer than the source files' modification times. A copy edited and
+built under `$TMPDIR` with the inherited `CARGO_TARGET_DIR` therefore leaves
+build output that later jobs in the real checkout reuse as current. Give such a
+copy its own `CARGO_TARGET_DIR`, for example `$TMPDIR/copy-target`. If it has
+already happened, `cargo clean -p <crate>` for the affected crates repairs it.
+
 3.1. A job cannot read the runner's state, mirrors, other workspaces or other
 jobs' sandboxes. Tests: `isolated_job_cannot_access_runner_or_other_jobs` and
 `isolated_jobs_receive_private_shm_that_disappears_after_they_end` (operator-only).
