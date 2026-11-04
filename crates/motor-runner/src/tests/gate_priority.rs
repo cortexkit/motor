@@ -373,12 +373,14 @@ fn return_budget_probe_failure_waits_without_stalling_plain_dispatch() {
 }
 
 #[test]
-fn return_budget_free_space_subtracts_committed_chunk_bytes_only() {
+fn return_budget_free_space_counts_only_writes_still_to_come() {
     let f = Fixture::new();
     let charge = Config::return_charge(RETURN_LARGE_MAX_BYTES_CAP);
     let written = 2 * RETURN_CHUNK_MAX_BYTES as u64;
     let floor = 4096;
-    let boundary = floor + 2 * charge - written;
+    // A finished job writes nothing more: its committed chunks already reduced
+    // the probed free space, so only the next job's own charge must fit.
+    let boundary = floor + charge;
     let free = Arc::new(AtomicU64::new(boundary));
     let probe = free.clone();
     let mut config = returned_budget_config(&f);
@@ -421,12 +423,18 @@ fn return_budget_free_space_subtracts_committed_chunk_bytes_only() {
     assert!(runner.return_budget_available(&inner, &next));
     free.store(boundary - 1, Ordering::SeqCst);
     assert!(!runner.return_budget_available(&inner, &next));
+    // A job still collecting can write its whole charge, so free space must
+    // also cover it until its sizes are committed with its terminal record.
     free.store(boundary, Ordering::SeqCst);
-    inner.jobs.get_mut(&retained_id).unwrap().returned = None;
+    let collecting = inner.jobs.get_mut(&retained_id).unwrap();
+    collecting.terminal = None;
+    collecting.returned = None;
     assert!(
         !runner.return_budget_available(&inner, &next),
         "unpublished writes must remain reserved until their sizes are committed"
     );
+    free.store(floor + 2 * charge, Ordering::SeqCst);
+    assert!(runner.return_budget_available(&inner, &next));
 }
 
 #[test]
