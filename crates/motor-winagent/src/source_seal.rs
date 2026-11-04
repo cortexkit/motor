@@ -180,6 +180,13 @@ mod tests {
             ),
             (
                 Peer::Host,
+                Frame::SyncClock {
+                    unix_ms: 1_800_000_000_000,
+                },
+            ),
+            (Peer::Agent, Frame::ClockSynchronized { correction_ms: 0 }),
+            (
+                Peer::Host,
                 Frame::TreeEnd {
                     command: Command {
                         command: "true".into(),

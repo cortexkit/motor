@@ -783,10 +783,13 @@ fn materialize_attempt(
     let unit_started_ms = clock.now();
     resources.boot(config, &nonce)?;
     let caches = vm_config.caches();
+    let workspace = crate::caller_path::request(&setup.request)
+        .caller_workspace_key
+        .text();
     super::source_mtimes::commit(
         &resources.staging,
-        &caches.disk(&setup.request.workspace_key),
-        &caches.source_mtimes(&setup.request.workspace_key),
+        &caches.disk(workspace),
+        &caches.source_mtimes(workspace),
     )?;
     let thread_config = config.clone();
     let id = setup.id;
