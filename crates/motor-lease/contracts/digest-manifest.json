@@ -3,15 +3,15 @@
     "canonical_repository": "cortexkit-cloud",
     "canonical_contract": "docs/runners-contract.md",
     "canonical_vectors": "test-vectors/runners/",
-    "revision": "9acdc85cdf06a1fc4ecac219cca6b10c72a4e759",
+    "revision": "2c7c66b9c8f45c5f05e782a28e16d6d0e349a5da",
     "kind": "canonical"
   },
   "files": [
     {
       "path": "cloud/runners-contract.md",
-      "sha256": "d2abf1ec7cec4dc61107894bac51d9d3098e87925a8047c74ebc3eeb91941ba2",
+      "sha256": "97e5292c4ad84433d30d6f01bbd1e8b1c7783f150d88a819d4a678a8a7b6ddc7",
       "source_repository": "cortexkit-cloud",
-      "source_commit": "9acdc85cdf06a1fc4ecac219cca6b10c72a4e759",
+      "source_commit": "2c7c66b9c8f45c5f05e782a28e16d6d0e349a5da",
       "source_path": "docs/runners-contract.md",
       "canonical": true
     },

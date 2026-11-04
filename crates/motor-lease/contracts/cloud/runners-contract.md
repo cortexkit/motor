@@ -366,8 +366,9 @@ SPKI hash, run limit and reservation. The new token has a fresh issue time and 3
 The broker remembers the requester key of the job's latest run token; a
 [replace](#post-v1leasesjob_idreplace) signs for that key. If a token is expired before
 connecting, re-request before admission or use reattach; never
-connect with a token whose `token_expires_at_ms` is not after the client's current time. Neither
-refresh path, nor a replace, extends the original host-lost deadline or starts another execution.
+connect with a token whose `token_expires_at_ms` is not after the client's current time. A run-token
+re-request or replace extends the host-lost deadline to cover the new admission window, full run
+limit and reporting grace; reattach does not. None of these operations starts another execution.
 
 Placement is not a capacity lock. On a full host, retrying the same lease keeps the same
 placement; a job no host has admitted yet can be moved to another registered host with
@@ -475,9 +476,9 @@ Success is **201** with exactly the lease reply fields, for the new host:
 `lease_id`, `max_s` and `reserved_vcpu_ms` are unchanged. `placement`, `endpoint` and
 `endpoint_spki_sha256` are the new host's. `job_token` is a fresh `run` token for the new host,
 bound to the requester key of the job's latest run token (the original lease's key, or the key of
-the latest re-request). The reservation and totals don't change, and the host-lost deadline stays
-the original lease's. Release afterwards still waits for the latest run token the broker issued,
-for either host, to expire.
+the latest re-request). The reservation and totals don't change. The host-lost deadline is extended
+to cover the new run token as described below. Release afterwards still waits for the latest run
+token the broker issued, for either host, to expire.
 
 From then on the job belongs to the new host only, and the host it left must not run it:
 
@@ -862,12 +863,16 @@ these effective figures. An entry is removed on any of these events (the 1024-en
 - when the job's latest run token expires without such a heartbeat: a host refuses an expired
   token, so the job can no longer be admitted. When a re-signed run token's refresh reaches the
   placement object, it moves the entry's expiry to the new token's, and brings the entry back if
-  it had expired, unless the host's latest heartbeat already shows the job admitted or started.
+  it had expired, unless the host's latest heartbeat already shows the job admitted or started,
+  or a committed entry for another host still exists.
 
 Consistency: placement decisions and ledger writes are serialized in the one placement object and
 survive its eviction. Releases on settlement, release, replace and re-sign are sent by the job's
 tenant object after its own state change commits; a failed message is logged and not retried. A
-lost release leaves an entry until its stored expiry, so its host looks fuller than it is for up to
+confirmation whose placement entry is already absent is ignored, so a delayed confirmation cannot
+remove the newer placement's hold. A delayed refresh for an old host is ignored while a committed
+hold for another host remains. A lost release leaves an entry until its stored expiry, so its
+host looks fuller than it is for up to
 300 seconds. A lost refresh can leave an entry expiring before the newest token does, so that host
 can look freer than it is. The ledger holds at most 1024 entries: before inserting into a full
 ledger, the broker drops the existing entry with the earliest expiry. Effective figures are
@@ -875,9 +880,13 @@ estimates, not a lock: the host's own admission remains the real limit.
 
 Capacity snapshots do not lock hosts or VMs.
 
-The original lease fixes the host-lost deadline at
-`original_lease_iat × 1000 + max_s × 1000 + 600000`. Neither reattach nor lease re-request moves
-it. When due, the alarm settles `min(vcpus × last_elapsed_ms, reserved_vcpu_ms)`, zero without
+Every issued registered-host run token, including a lease re-request or replacement, keeps the
+host-lost deadline at least `token_expires_at_ms + max_s × 1000 + 600000`. The deadline is stored
+with the token's expiry before the reply is returned, and the alarm is re-armed: a host can admit
+until token expiry, run for the full limit, then report within the ten-minute grace. The deadline
+never moves backward. Reattach issues only an attach token and does not move it. Neither the run
+limit nor the reservation increases. When due, the alarm settles
+`min(vcpus × last_elapsed_ms, reserved_vcpu_ms)`, zero without
 proved elapsed time, and releases the rest. Usage and alarm settlement serialize; the first
 transition wins. Usage after host-lost settlement is 409 `job_settled` and changes no totals.
 An unadmitted release can instead settle for zero at its release deadline, as described above.
