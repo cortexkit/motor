@@ -2,6 +2,7 @@
 //! connector. Hosted jobs keep their route even after hosted routing is disabled.
 pub(crate) mod account;
 pub(crate) mod check;
+pub(crate) mod fence_probe;
 mod finish;
 pub(crate) mod placement;
 mod ssh;
@@ -798,6 +799,7 @@ pub(crate) struct Client {
     /// was not a success, so a lease refusal can be logged with its body.
     broker_status: std::sync::Mutex<Option<u16>>,
     broker_failure: std::sync::Mutex<Option<String>>,
+    probe_replies: Option<std::sync::Mutex<fence_probe::Replies>>,
     booking_open: Option<Arc<std::sync::Mutex<bool>>>,
     progress: crate::motor::progress::Reporter,
     #[cfg(test)]
@@ -816,6 +818,7 @@ impl Client {
             broker_code: std::sync::Mutex::new(None),
             broker_status: std::sync::Mutex::new(None),
             broker_failure: std::sync::Mutex::new(None),
+            probe_replies: None,
             booking_open: None,
             progress: crate::motor::progress::Reporter::new(false, 2),
             #[cfg(test)]
@@ -915,6 +918,7 @@ impl Client {
             http_status = reply.status().as_u16(),
             "hosted broker replied"
         );
+        self.observe_probe_reply(path, reply.status().as_u16());
         Ok(reply)
     }
     async fn post_with_refresh<T: Serialize>(
@@ -929,10 +933,11 @@ impl Client {
         {
             let tokens = self.account_tokens.as_ref().ok_or(Error::AccountNotFound)?;
             tokens.invalidate(&bearer).await;
-            drop(reply);
+            self.discard_probe_reply(path, reply).await;
             bearer = tokens.bearer().await?;
             reply = self.post_once(path, body, &bearer).await?;
             if reply.status() == reqwest::StatusCode::UNAUTHORIZED {
+                self.discard_probe_reply(path, reply).await;
                 tokens.invalidate(&bearer).await;
                 *self.broker_status.lock().unwrap() = Some(401);
                 *self.broker_failure.lock().unwrap() =
@@ -967,6 +972,7 @@ impl Client {
                 .map(|seconds| seconds.saturating_mul(1000))
                 .unwrap_or(MIN_PROVISIONING_RETRY_MS);
             let code = reply.json::<serde_json::Value>().await.ok();
+            self.observe_probe_error(path, code.as_ref());
             let broker_code = code
                 .as_ref()
                 .and_then(|v| v.get("error"))
