@@ -17,7 +17,17 @@ here=$(cd -- "$(dirname -- "$0")" && pwd)
 failed=0
 
 ssh -o BatchMode=yes "$host" "rm -rf $remote && mkdir -p $remote"
-trap 'ssh -o BatchMode=yes "$host" "rm -rf $remote"' EXIT
+finished=false
+# macOS /bin/bash 3.2 exits 0 when an unbound variable stops a `set -euo
+# pipefail` script that has an EXIT trap, so count an exit 0 only when the
+# script reached its end.
+cleanup() {
+  local status=$?
+  ssh -o BatchMode=yes "$host" "rm -rf $remote" || true
+  if [ "$status" -ne 0 ]; then exit "$status"; fi
+  $finished || { echo "FAIL: stopped before its end (unexpected error)" >&2; exit 1; }
+}
+trap cleanup EXIT
 scp -q "$here/check_nested_js_remote.sh" "$host:$remote/run.sh"
 
 for repo in "$projects"/*/; do
@@ -47,4 +57,5 @@ for repo in "$projects"/*/; do
     failed=1
   fi
 done
+finished=true
 exit "$failed"

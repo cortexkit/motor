@@ -180,14 +180,21 @@ mkdir -p .cortexkit/internal-docs/gate
 logs=$(mktemp -d "$root/.cortexkit/internal-docs/gate/run.XXXXXX")
 pids=()
 locked=false
+finished=false
 cleanup() {
-  local pid
+  local status=$? pid
   for pid in "${pids[@]+${pids[@]}}"; do kill "$pid" 2>/dev/null || true; done
   for pid in "${pids[@]+${pids[@]}}"; do wait "$pid" 2>/dev/null || true; done
   if $locked; then
     rm -f "$lane_root/.lock/pid"
     rmdir "$lane_root/.lock"
   fi
+  # macOS /bin/bash 3.2 exits 0, with $? reading 0 here too, when an unbound
+  # variable stops a `set -euo pipefail` script that has an EXIT trap. A gate
+  # that ran nothing would then pass, so an exit 0 counts only when the script
+  # reached its intended end.
+  if [ "$status" -ne 0 ]; then exit "$status"; fi
+  $finished || { echo "gate FAIL: stopped before its end (unexpected error)" >&2; exit 1; }
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -313,4 +320,5 @@ for index in "${!lanes[@]}"; do
   fi
 done
 pids=()
+finished=true
 exit "$failed"
