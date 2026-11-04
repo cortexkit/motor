@@ -931,11 +931,14 @@ async fn windows_return_reservation_uses_shared_spool_and_releases_only_after_de
     let negotiated = agent.returns.lock().unwrap().clone().unwrap();
     assert_eq!(negotiated.paths, ["artifact"]);
     assert_eq!(negotiated.max_bytes, RETURN_LARGE_MAX_BYTES_CAP);
-    let charge = Config::return_charge(RETURN_LARGE_MAX_BYTES_CAP);
+    // A finished job keeps only what it wrote: 12 bytes in one chunk, plus the
+    // per-chunk and fixed filesystem overhead. The budget here is exactly one
+    // full charge, so the second job still waits until those bytes are deleted.
+    let retained = 12 + 8192 + 64 * 8192;
     let spool = {
         let inner = runner.core.inner.lock().unwrap();
         let job = &inner.jobs[&first.job_id];
-        assert_eq!(job.return_reserved_bytes, charge);
+        assert_eq!(job.return_reserved_bytes, retained);
         let returned = job.returned.as_ref().unwrap();
         assert_eq!(returned.chunks.len(), 1);
         assert_eq!(
@@ -957,7 +960,7 @@ async fn windows_return_reservation_uses_shared_spool_and_releases_only_after_de
     let runner = reopen_with(|| Runner::open_with_backend(config.clone(), Box::new(FakeHost)));
     assert_eq!(
         runner.core.inner.lock().unwrap().jobs[&first.job_id].return_reserved_bytes,
-        charge
+        retained
     );
     let (mut second, bytes) = request(&f);
     second.return_paths = first.return_paths.clone();
@@ -979,7 +982,7 @@ async fn windows_return_reservation_uses_shared_spool_and_releases_only_after_de
     runner.maintenance().unwrap();
     assert_eq!(
         runner.core.inner.lock().unwrap().jobs[&first.job_id].return_reserved_bytes,
-        charge
+        retained
     );
     assert!(spool.exists());
     drop(lease);
