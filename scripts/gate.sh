@@ -151,7 +151,10 @@ command_for() {
       # with sshd, outside a job; left in here, it fails first and nextest
       # stops the whole suite.
       cargo nextest run --workspace --locked --no-tests fail \
-        -E '\''not test(=transport::master_tests::two_ssh_runs_share_one_master_and_one_vault_sign)'\''' ;;
+        -E '\''not test(=transport::master_tests::two_ssh_runs_share_one_master_and_one_vault_sign)'\''
+      # The Windows guest agent is its own Cargo project, outside the workspace,
+      # so the workspace run above never tests it.
+      cargo nextest run --manifest-path crates/motor-winagent/Cargo.toml --locked --no-tests fail' ;;
     mixed-version) printf '%s\n' '
       # The old-client check builds pinned production revisions, which must be
       # downloaded, so this is the only lane sent with --net (jobs set
