@@ -250,7 +250,9 @@ fn real_gate_standard_account_cache_boundary_and_large_collection() {
 }
 ''')
     (path / "multi-frame.bin").write_bytes(os.urandom(2 * 1024 * 1024))
-    (path / "large-output.bin").write_bytes(b'x' * (2 * 1024 * 1024))
+    # The gate job creates large-output.bin; the fixture must not commit it.
+    # Tracked files are read-only in jobs, so a committed copy would make the
+    # job's write fail with access denied.
     git(path, "init", "-b", "main")
     git(path, "-c", "user.name=Qualification", "-c", "user.email=qualification@invalid", "add", ".")
     git(path, "-c", "user.name=Qualification", "-c", "user.email=qualification@invalid", "commit", "-m", "qualification fixture")
