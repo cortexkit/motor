@@ -703,10 +703,13 @@ swapped for a symlink), and in
 
 ## Direct runs
 
-`ck motor run [--vcpus N] [--sibling PATH]... [--env NAME=VALUE]... [--timeout SECONDS] [--cwd PATH] [--secret-file PATH] -- COMMAND...`
+`ck motor run [--vcpus N] [--memory N] [--sibling PATH]... [--env NAME=VALUE]... [--timeout SECONDS] [--cwd PATH] [--secret-file PATH] -- COMMAND...`
 runs one command on the runner from a script with no agent behind it, streams
 its output, and exits with its status. It works only when `admit_direct_exec`
 is `true` in the configuration file ([Configuration](#configuration)).
+
+`--memory N`: The job's memory limit in GiB (Linux only). Without --memory,
+the server's default applies; a job that exceeds its limit is stopped.
 
 The words after `--` follow two rules:
 

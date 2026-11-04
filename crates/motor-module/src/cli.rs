@@ -76,7 +76,7 @@ shell-quoted so bash preserves each word:
 See `ck motor run --help` for the options and exit statuses.";
 
 pub const HELP: &str = "\
-usage: ck motor run [--vcpus N] [--sibling PATH]... [--env NAME=VALUE]...
+usage: ck motor run [--vcpus N] [--memory N] [--sibling PATH]... [--env NAME=VALUE]...
                     [--timeout SECONDS] [--cwd PATH] [--secret-file PATH]
                     [--platform linux|windows|macos] [--net]
                     [--allow-spill | --hosted] -- COMMAND...
@@ -86,6 +86,9 @@ that contains --cwd (default: the current directory), and streams its stdout
 and stderr here as they arrive.
 
   --vcpus N           vCPUs to reserve (the runner's default when omitted)
+  --memory N          The job's memory limit in GiB (Linux only).
+                      Without --memory, the server's default applies; a job that
+                      exceeds its limit is stopped.
   --platform NAME     linux (default), windows or macos; macos is direct-only
   --net               allow outbound IPv4 internet (package and tool fetches);
                       jobs are offline without it
@@ -198,6 +201,7 @@ pub fn parse_cancel_args(args: &[String]) -> Result<Option<CancelArgs>, String> 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RunArgs {
     pub vcpus: Option<u32>,
+    pub memory_mib: Option<u64>,
     pub net: bool,
     pub platform: Option<motor_protocol::Platform>,
     pub siblings: Vec<PathBuf>,
@@ -271,6 +275,7 @@ fn parse_args_checked(args: &[String], wsl: &crate::wsl::Checks) -> Result<Invoc
         if !matches!(
             name,
             "--vcpus"
+                | "--memory"
                 | "--platform"
                 | "--sibling"
                 | "--env"
@@ -326,6 +331,18 @@ fn parse_args_checked(args: &[String], wsl: &crate::wsl::Checks) -> Result<Invoc
                     .ok_or_else(|| {
                         format!("--timeout needs a positive number of seconds, got {value:?}")
                     })?
+            }
+            "--memory" => {
+                parsed.memory_mib = Some(
+                    value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|gib| *gib > 0)
+                        .and_then(|gib| gib.checked_mul(1024))
+                        .ok_or_else(|| {
+                            format!("--memory needs a positive integer in GiB, got {value:?}")
+                        })?,
+                )
             }
             "--sibling" => parsed.siblings.push(PathBuf::from(value)),
             "--cwd" => parsed.cwd = Some(PathBuf::from(value)),
@@ -689,6 +706,11 @@ fn build_request_checked(args: &RunArgs, wsl: &crate::wsl::Checks) -> Result<Run
     if let Some(message) = supplied_wsl_refusal(args, wsl) {
         return Err(message);
     }
+    if let Some(message) =
+        crate::motor::memory_platform_refusal(args.memory_mib, args.platform.as_ref())
+    {
+        return Err(message.into());
+    }
     validate_return_args(args)?;
     let cwd = match &args.cwd {
         Some(cwd) => cwd.clone(),
@@ -733,6 +755,9 @@ fn build_request_checked(args: &RunArgs, wsl: &crate::wsl::Checks) -> Result<Run
     );
     if let Some(vcpus) = args.vcpus {
         request = request.with_weight_hint(vcpus);
+    }
+    if let Some(memory_mib) = args.memory_mib {
+        request = request.with_memory_mib(memory_mib);
     }
     if args.net {
         request = request.with_network(motor_protocol::Network::Outbound);
@@ -2633,7 +2658,7 @@ mod tests {
     #[test]
     fn arguments_map_onto_the_run_request_fields() {
         let Ok(Invocation::Run(args)) = parse_args(&words(
-            "--vcpus 4 --sibling /a --sibling=/b --env CI=1 --env RUSTFLAGS=-D=warnings --timeout=90 --cwd /w --record-file=/evidence.jsonl -- cargo test -p x",
+            "--vcpus 4 --memory 16 --sibling /a --sibling=/b --env CI=1 --env RUSTFLAGS=-D=warnings --timeout=90 --cwd /w --record-file=/evidence.jsonl -- cargo test -p x",
         )) else {
             panic!("expected a run")
         };
@@ -2641,6 +2666,7 @@ mod tests {
             args,
             RunArgs {
                 vcpus: Some(4),
+                memory_mib: Some(16384),
                 net: false,
                 platform: None,
                 siblings: vec!["/a".into(), "/b".into()],
@@ -2669,6 +2695,7 @@ mod tests {
         };
         assert_eq!(args.timeout, DEFAULT_TIMEOUT_SECS);
         assert_eq!(args.vcpus, None);
+        assert_eq!(args.memory_mib, None);
         assert!(!args.net);
         assert!(!args.allow_spill);
         let Ok(Invocation::Run(args)) = parse_args(&words("--allow-spill -- true")) else {
@@ -2716,6 +2743,130 @@ mod tests {
                 assert!(params.get("network").is_none(), "{params}");
             }
         }
+    }
+
+    #[test]
+    fn memory_accepts_whole_gib_in_spaced_and_inline_options() {
+        for (option, memory_mib) in [
+            ("--memory 1", 1024),
+            ("--memory=16", 16384),
+            ("--memory 256", 262144),
+        ] {
+            let Ok(Invocation::Run(args)) = parse_args(&words(&format!("{option} -- true"))) else {
+                panic!("expected a run for {option}")
+            };
+            assert_eq!(args.memory_mib, Some(memory_mib));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_memory_values_are_usage_errors() {
+        for value in [
+            "0",
+            "-1",
+            "1.5",
+            "many",
+            "18014398509481984",
+            "18446744073709551616",
+        ] {
+            let input = words(&format!("--memory {value} -- true"));
+            assert_eq!(
+                parse_args(&input),
+                Err(format!(
+                    "--memory needs a positive integer in GiB, got {value:?}"
+                ))
+            );
+            assert_eq!(
+                main_checked(&input, &crate::wsl::Checks::default()).await,
+                EXIT_USAGE
+            );
+        }
+        assert_eq!(
+            parse_args(&words("--memory")),
+            Err("--memory needs a value".into())
+        );
+    }
+
+    #[test]
+    fn memory_flag_sets_mib_on_the_run_request() {
+        let scratch = cortexkit_test_support::ScratchDir::new("cli-memory");
+        crate::snapshot::git(scratch.path(), &["init", "--quiet"]).unwrap();
+        for options in [
+            "--memory 16 -- true",
+            "--memory 16 --platform linux -- true",
+        ] {
+            let mut input = vec!["--cwd".into(), scratch.path().display().to_string()];
+            input.extend(words(options));
+            let Ok(Invocation::Run(args)) = parse_args(&input) else {
+                panic!("expected a run")
+            };
+            let request = build_request(&args).unwrap();
+            assert_eq!(request.memory_mib, Some(16384));
+            let params = serde_json::to_value(&request).unwrap();
+            assert_eq!(params["memory_mib"], 16384);
+        }
+    }
+
+    #[test]
+    fn omitted_memory_keeps_legacy_request_bytes() {
+        let scratch = cortexkit_test_support::ScratchDir::new("cli-memory-omitted");
+        let root = fs::canonicalize(scratch.path()).unwrap();
+        crate::snapshot::git(&root, &["init", "--quiet"]).unwrap();
+        let Ok(Invocation::Run(args)) = parse_args(&[
+            "--cwd".into(),
+            root.display().to_string(),
+            "--".into(),
+            "true".into(),
+        ]) else {
+            panic!("expected a run")
+        };
+        let request = build_request(&args).unwrap();
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let params: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(params.get("memory_mib").is_none(), "{params}");
+        let key = root.to_str().unwrap();
+        let legacy = RunRequest::new(key, key, key, "true")
+            .with_timeout(DEFAULT_TIMEOUT_SECS)
+            .with_return_max_bytes(motor_protocol::RETURN_MAX_BYTES);
+        assert_eq!(bytes, serde_json::to_vec(&legacy).unwrap());
+    }
+
+    #[tokio::test]
+    async fn memory_on_fixed_platforms_is_refused_before_submission() {
+        let scratch = cortexkit_test_support::ScratchDir::new("cli-memory-platform");
+        for platform in ["windows", "macos"] {
+            let secret_file = scratch.path().join(format!("{platform}.secret"));
+            let input = vec![
+                "--memory=16".into(),
+                "--platform".into(),
+                platform.into(),
+                "--cwd".into(),
+                scratch.path().join("missing").display().to_string(),
+                "--secret-file".into(),
+                secret_file.display().to_string(),
+                "--".into(),
+                "true".into(),
+            ];
+            let Ok(Invocation::Run(args)) = parse_args(&input) else {
+                panic!("expected a run")
+            };
+            assert_eq!(
+                build_request(&args).unwrap_err(),
+                "memory_mib is supported only for Linux jobs"
+            );
+            assert_eq!(
+                main_checked(&input, &crate::wsl::Checks::default()).await,
+                EXIT_REFUSED
+            );
+            assert!(!secret_file.exists());
+        }
+    }
+
+    #[test]
+    fn help_describes_the_memory_limit() {
+        assert!(HELP.contains("[--memory N]"));
+        let help = HELP.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(help.contains("--memory N The job's memory limit in GiB (Linux only). Without --memory, the server's default applies; a job that exceeds its limit is stopped."));
     }
 
     #[test]

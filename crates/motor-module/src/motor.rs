@@ -344,15 +344,9 @@ impl Motor {
         (key, caller): (Option<submission_key::KeyRecord>, String),
     ) -> io::Result<JobStream> {
         let (attribution, secret_hash) = identity;
-        let memory_refusal = request.memory_mib.and({
-            if matches!(request.platform, Some(Platform::Windows | Platform::Macos)) {
-                Some("memory_mib is supported only for Linux jobs")
-            } else if !self.config.memory_sizes {
-                Some("memory_mib requires exec-remote-memory/v1; memory_sizes is disabled")
-            } else {
-                None
-            }
-        });
+        let memory_refusal = memory_platform_refusal(request.memory_mib, request.platform.as_ref())
+            .or((request.memory_mib.is_some() && !self.config.memory_sizes)
+                .then_some("memory_mib requires exec-remote-memory/v1; memory_sizes is disabled"));
         let linux = matches!(request.platform, None | Some(Platform::Linux));
         #[cfg(test)]
         let linux = linux && !self.test_fixture_direct_route;
@@ -3181,6 +3175,14 @@ impl Motor {
             .and_then(|index| self.config.windows_runners.get(index + 1));
         next.is_some()
     }
+}
+
+pub(crate) fn memory_platform_refusal(
+    memory_mib: Option<u64>,
+    platform: Option<&Platform>,
+) -> Option<&'static str> {
+    (memory_mib.is_some() && matches!(platform, Some(Platform::Windows | Platform::Macos)))
+        .then_some("memory_mib is supported only for Linux jobs")
 }
 
 pub(crate) const WINDOWS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
