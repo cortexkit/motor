@@ -732,7 +732,7 @@ impl Handler {
     /// Requests on a route the daemon attested as `Principal::Direct`. Enabling
     /// `admit_direct_exec` permits these local non-agent callers to start jobs and
     /// attach to, cancel or check jobs their route started or whose secret they
-    /// hold, plus the credential-only hosted operator check.
+    /// hold, plus the store-free hosted operator checks.
     async fn handle_direct(
         &self,
         ctx: RequestCtx,
@@ -742,15 +742,20 @@ impl Handler {
         let op = envelope.op.as_str();
         if !matches!(
             op,
-            "exec.run" | "exec.attach" | "exec.cancel" | "exec.status" | "hosted.check"
+            "exec.run"
+                | "exec.attach"
+                | "exec.cancel"
+                | "exec.status"
+                | "hosted.check"
+                | "hosted.fence_probe"
         ) {
             return Ok(HandlerOutcome::Error {
                 code: "motor_op_not_permitted_for_principal".into(),
                 message: format!("{} refuses {op} for direct", self.module_id),
             });
         }
-        if op != "hosted.check" {
-            // Every other direct op reads the store; wait for startup to open
+        if !matches!(op, "hosted.check" | "hosted.fence_probe") {
+            // Job operations read the store; wait for startup to open
             // it so the `initialized` calls below find it.
             self.ready().await?;
         }
@@ -761,6 +766,14 @@ impl Handler {
         match op {
             "hosted.check" => response(
                 crate::hosted::check::check(self.account_tokens.as_ref(), &self.config).await,
+            ),
+            "hosted.fence_probe" => response(
+                crate::hosted::fence_probe::run(
+                    self.config.clone(),
+                    self.account_tokens.clone(),
+                    parse(envelope.params)?,
+                )
+                .await?,
             ),
             "exec.run" => {
                 #[derive(Deserialize, Default)]

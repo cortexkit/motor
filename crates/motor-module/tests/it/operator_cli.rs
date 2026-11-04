@@ -32,6 +32,59 @@ const OTHER_DIRECT_CHANNEL: u16 = 8;
 const AFT_CHANNEL: u16 = 9;
 
 #[tokio::test]
+async fn hosted_fence_probe_is_direct_only_and_uses_the_account_bearer() {
+    use crate::hosted::{
+        account::tests::{token, FakeVault},
+        tests::harness::{Behavior, Harness},
+    };
+    let f = Fixture::new(Cut::None, 28).await;
+    let broker = Harness::new(Behavior::ConnectFailure).await;
+    let vault = FakeVault::new(vec![Ok(token("hosted-test-bearer"))]);
+    let config = Config {
+        broker_url: broker.config().broker_url,
+        broker_token_source: crate::config::BrokerTokenSource::CkAccount,
+        hosted_repositories_placement_hint: Some(motor_lease::Placement {
+            host: "configured-canary-host".into(),
+            vm: Some("test-vm".into()),
+        }),
+        ..direct_config(&f)
+    };
+    let daemon = Daemon::start_with_tokens(&f, config, "motor", Some(vault.client())).await;
+    daemon.bind(DIRECT_CHANNEL, direct()).await;
+    daemon.bind(AFT_CHANNEL, aft()).await;
+    for mode in ["release", "replace"] {
+        let denied = error(
+            &daemon
+                .request(
+                    AFT_CHANNEL,
+                    "hosted.fence_probe",
+                    json!({"mode":mode, "host":"test-host"}),
+                )
+                .await,
+        );
+        assert_eq!(denied["code"], "motor_op_not_permitted_for_principal");
+    }
+    assert!(vault.requests.lock().unwrap().is_empty());
+    assert!(broker.requests.lock().unwrap().is_empty());
+    let reply = daemon
+        .request(
+            DIRECT_CHANNEL,
+            "hosted.fence_probe",
+            json!({"mode":"release", "host":"test-host"}),
+        )
+        .await;
+    assert_eq!(reply.header.ty, FrameType::Response);
+    let report: Value = serde_json::from_str(&body(&reply)).unwrap();
+    assert_eq!(report["status"], "ok");
+    assert_eq!(report["placement"]["host"], "test-host");
+    assert_eq!(
+        report["replies"]["release"],
+        json!([{"status":202,"error":null}])
+    );
+    assert_eq!(vault.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn direct_submission_key_requires_an_attested_caller() {
     let f = Fixture::new(Cut::None, 28).await;
     let daemon = Daemon::start(&f, direct_config(&f)).await;

@@ -32,6 +32,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
                 .into(),
         ),
+        Some("hosted-fence-probe") => std::process::exit(
+            motor_module::cli::hosted_fence_probe_main(&args[1..])
+                .await
+                .into(),
+        ),
         Some("attach") => {
             std::process::exit(motor_module::cli::attach_main(&args[1..]).await.into())
         }
