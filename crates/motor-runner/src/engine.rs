@@ -626,12 +626,14 @@ impl Config {
     }
 
     fn return_charge(cap: u64) -> u64 {
+        Self::return_chunk_charge(cap, cap.div_ceil(RETURN_CHUNK_MAX_BYTES as u64))
+    }
+
+    fn return_chunk_charge(bytes: u64, chunks: u64) -> u64 {
         // Each chunk needs an inode and block rounding in addition to its raw bytes.
-        cap.saturating_add(
-            cap.div_ceil(RETURN_CHUNK_MAX_BYTES as u64)
-                .saturating_mul(8192),
-        )
-        .saturating_add(64 * 8192)
+        bytes
+            .saturating_add(chunks.saturating_mul(8192))
+            .saturating_add(64 * 8192)
     }
     pub fn sccache_dir(&self) -> PathBuf {
         self.state_dir().join("sccache/fleet")
@@ -5727,7 +5729,7 @@ impl Runner {
                 .then(|| {
                     let heads = index.heads(&inner, now);
                     let (label, _) = self.queue_wait_label(&inner, &heads, &index, id, now);
-                    label.to_owned()
+                    label
                 }),
             terminal: job.and_then(|j| j.terminal.clone()),
             unit: process
@@ -5995,12 +5997,22 @@ impl Runner {
         index: &DispatchIndex,
         id: Uuid,
         now: u64,
-    ) -> (&'static str, Option<(Uuid, bool)>) {
+    ) -> (String, Option<(Uuid, bool)>) {
         let phase = self
             .queue_wait_phase(inner, index, id)
             .unwrap_or(QUEUE_ORDER_WAIT);
         if phase != QUEUE_ORDER_WAIT {
-            return (phase, None);
+            let reason = if phase == "returned bytes budget" {
+                let needs = self.return_budget_charge(&inner.jobs[&id]).unwrap_or(0);
+                let reserved = inner.jobs.values().fold(0u64, |sum, job| {
+                    sum.saturating_add(job.return_reserved_bytes)
+                });
+                let budget = self.core.config.return_budget_bytes.unwrap_or(0);
+                format!("{phase} (needs {needs} bytes; {reserved} of {budget} bytes reserved)")
+            } else {
+                phase.to_owned()
+            };
+            return (reason, None);
         }
         let blocking = self.blocking_head(inner, heads, id, index.weight, now);
         let label = match blocking {
@@ -6011,7 +6023,7 @@ impl Runner {
             Some((_, false)) => "older job ahead needs more free permits",
             None => QUEUE_ORDER_WAIT,
         };
-        (label, blocking)
+        (label.to_owned(), blocking)
     }
 
     /// Whether `waiting_on` names a wait for capacity that could clear on its
@@ -7567,7 +7579,11 @@ impl Runner {
                 });
                 (
                     used.saturating_add(j.return_reserved_bytes),
-                    unwritten.saturating_add(j.return_reserved_bytes.saturating_sub(written)),
+                    unwritten.saturating_add(if j.terminal.is_some() {
+                        0
+                    } else {
+                        j.return_reserved_bytes.saturating_sub(written)
+                    }),
                 )
             });
         if used.saturating_add(charge) > budget {
@@ -7585,8 +7601,8 @@ impl Runner {
                 return false;
             }
         };
-        // Committed chunks already reduced free space. In-flight writes remain
-        // fully reserved until publication; filesystem overhead stays reserved until deletion.
+        // Finished collections, including their filesystem overhead, already
+        // reduced free space. In-flight writes stay fully reserved until publication.
         free >= self
             .core
             .config
@@ -9686,6 +9702,7 @@ impl Runner {
                     && !self.core.config.windows_instance()
             })
             .map(|request| {
+                self.long_work("returned_files_collect");
                 crate::return_paths::collect_chunked_authorized(
                     &self.core.config,
                     request,
@@ -9765,6 +9782,18 @@ impl Runner {
                 // Chunk bytes are already synced; this save commits their
                 // seqs, the manifest and the terminal together.
                 finished.returned = Some(returned.commit(id, &mut finished.next_seq));
+                if finished.return_reserved_bytes != 0 && !returned.chunks.is_empty() {
+                    // Collection has stopped writing. Publish the smaller charge
+                    // only with the durable manifest and terminal, before dispatch
+                    // can reuse the freed budget. Empty collections keep their
+                    // charge until orphan-directory cleanup confirms deletion.
+                    let bytes = returned
+                        .chunks
+                        .iter()
+                        .fold(0u64, |sum, chunk| sum.saturating_add(chunk.length));
+                    finished.return_reserved_bytes =
+                        Config::return_chunk_charge(bytes, returned.chunks.len() as u64);
+                }
             }
             finished.execution_ended_ms = Some(ended_ms);
             if let Some(cpu_time_ns) = inner.cpu_times.get(&id) {

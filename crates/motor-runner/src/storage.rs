@@ -187,7 +187,8 @@ pub(crate) struct Job {
     pub return_result: Option<ReturnResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub returned: Option<ReturnedFiles>,
-    /// Charged at dispatch and retained until all returned directories are deleted.
+    /// Charged at dispatch, reduced to committed bytes and filesystem overhead
+    /// when collection finishes, and released after returned directories are deleted.
     #[serde(default, skip_serializing_if = "return_reservation_is_zero")]
     pub return_reserved_bytes: u64,
     pub chunks: Chunks,
