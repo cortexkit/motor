@@ -58,6 +58,9 @@ pub struct Vm {
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Snapshot {
+    /// Independent of finished-job retention: old tokens stay fenced until expiry.
+    #[serde(default)]
+    pub revocations: BTreeMap<String, Revocation>,
     pub leases: BTreeMap<String, Lease>,
     pub nonces: BTreeMap<String, u64>,
     pub vms: BTreeMap<String, Vm>,
@@ -85,6 +88,13 @@ pub struct Snapshot {
     /// Keep fleet placement paused across host and helper restarts during an update.
     #[serde(default)]
     pub draining: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct Revocation {
+    pub until_ms: u64,
+    /// Repeat safe acknowledgements while the broker still lists the job.
+    pub listed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -490,6 +500,9 @@ impl Host {
     }
     pub fn claim(&mut self, claims: Claims, now_ms: u64) -> Result<(u64, Admission), Error> {
         self.observed_at_ms = now_ms;
+        if self.snapshot.revocations.contains_key(&claims.jti) {
+            return refuse(Refusal::Auth);
+        }
         let tenant = self.binding(&claims)?.clone();
         if now_ms / 1000 >= claims.exp {
             return refuse(Refusal::Expired);

@@ -50,6 +50,15 @@ fn job_id(value: &str) -> bool {
 
 /// The first rule this heartbeat breaks, or None when the broker accepts it.
 pub fn heartbeat_violation(heartbeat: &Heartbeat) -> Option<&'static str> {
+    let mut acked = std::collections::BTreeSet::new();
+    if heartbeat.revoked_ack.len() > motor_lease::REVOKED_LIMIT
+        || heartbeat
+            .revoked_ack
+            .iter()
+            .any(|job| !job_id(job) || !acked.insert(job))
+    {
+        return Some("revoked_ack must contain at most 256 distinct lowercase UUIDv7 job ids");
+    }
     if [
         heartbeat.free_vcpus,
         heartbeat.free_mem_mib,
@@ -149,6 +158,7 @@ mod tests {
             }],
             healthy: true,
             draining: false,
+            revoked_ack: Vec::new(),
         }
     }
 

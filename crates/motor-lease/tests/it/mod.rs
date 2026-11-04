@@ -3,3 +3,4 @@ mod broker;
 mod cloud;
 mod common;
 mod mirror;
+mod revoke_fence;

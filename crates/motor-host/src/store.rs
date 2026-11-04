@@ -40,6 +40,7 @@ const PENDING_CANCEL: &str = "pending_cancel";
 const NONCE: &str = "nonce";
 const VM: &str = "vm";
 const CLOSED: &str = "closed";
+const REVOCATION: &str = "revocation";
 const JOB_KINDS: [&str; 4] = [LEASE, BILLING, ZERO_USAGE, PENDING_CANCEL];
 
 /// Set once `journal.json` has been imported (or there was none), so a later
@@ -283,6 +284,7 @@ fn diff_value<T: Serialize + PartialEq>(
 /// adding it here and in [`load`]; the round-trip test fails otherwise.
 fn write_diff(tx: &Transaction<'_>, old: &Snapshot, new: &Snapshot) -> rusqlite::Result<()> {
     let Snapshot {
+        revocations,
         leases,
         nonces,
         vms,
@@ -297,6 +299,7 @@ fn write_diff(tx: &Transaction<'_>, old: &Snapshot, new: &Snapshot) -> rusqlite:
         closed,
         draining,
     } = new;
+    diff_entries(tx, REVOCATION, &old.revocations, revocations)?;
     diff_entries(tx, LEASE, &old.leases, leases)?;
     diff_entries(tx, NONCE, &old.nonces, nonces)?;
     diff_entries(tx, VM, &old.vms, vms)?;
@@ -322,6 +325,7 @@ fn load(conn: &Connection) -> rusqlite::Result<Snapshot> {
     while let Some(row) = rows.next()? {
         let (kind, key, value): (String, String, String) = (row.get(0)?, row.get(1)?, row.get(2)?);
         match kind.as_str() {
+            REVOCATION => drop(snapshot.revocations.insert(key, from_json(&value)?)),
             LEASE => drop(snapshot.leases.insert(key, from_json(&value)?)),
             NONCE => drop(snapshot.nonces.insert(key, from_json(&value)?)),
             VM => drop(snapshot.vms.insert(key, from_json(&value)?)),

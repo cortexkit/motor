@@ -91,7 +91,7 @@ pub struct HostedJobState {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) fleet_no_spill: bool,
     /// Hosts refused before Run for which no further replacement is attempted.
-    /// Persist before the request so queue retries cannot churn placements.
+    /// Pending revocation fences do not count as refusals.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub(crate) replacement_hosts: std::collections::BTreeSet<String>,
     /// Set durably just before ck-motor sends the Run frame to a hosted
@@ -255,6 +255,7 @@ pub(crate) enum Error {
     Spki,
     SshKey,
     Provisioning(u64),
+    ReplacePending(u64),
     SandboxLost,
     BrokerRefused,
     HostFull,
@@ -355,6 +356,7 @@ impl Error {
             Self::Spki => "hosted_spki_mismatch",
             Self::SshKey => "hosted_ssh_host_key_mismatch",
             Self::Provisioning(_) => "hosted_provisioning",
+            Self::ReplacePending(_) => "hosted_replace_pending",
             Self::SandboxLost => "hosted_sandbox_lost",
             Self::BrokerRefused => "hosted_broker_refused",
             Self::HostFull | Self::BoatHostFull => "hosted_host_full",
@@ -403,6 +405,7 @@ impl Error {
             | Self::Broker
             | Self::ReattachUnknown
             | Self::AccountTransient(_)
+            | Self::ReplacePending(_)
             | Self::Provisioning(_) => RefusalReason::Unreachable,
             Self::Platform => RefusalReason::PlatformUnsupported,
             // RequestRejected tells the caller to avoid the request rather
@@ -441,7 +444,9 @@ impl Error {
     pub(crate) fn retry_after_ms(self) -> Option<u64> {
         match self {
             Self::AccountTransient(delay) => delay,
-            Self::Provisioning(delay) | Self::NoCapacity(delay) => Some(delay),
+            Self::Provisioning(delay) | Self::NoCapacity(delay) | Self::ReplacePending(delay) => {
+                Some(delay)
+            }
             _ => None,
         }
     }
@@ -1001,6 +1006,12 @@ impl Client {
                 {
                     Some("job_admitted") => Error::Admitted,
                     Some("job_finished") if status == 409 => Error::Finished,
+                    Some("replace_pending")
+                        if status == 503
+                            && (path == "/v1/leases" || path.ends_with("/replace")) =>
+                    {
+                        Error::ReplacePending(retry_after_ms)
+                    }
                     Some("no_capacity")
                         if status == 503
                             && path == "/v1/leases"
@@ -1019,6 +1030,9 @@ impl Client {
                             .and_then(serde_json::Value::as_u64),
                     ),
                     Some("host_full") => Error::HostFull,
+                    Some("job_unknown") if status == 404 && path.ends_with("/replace") => {
+                        Error::NotGranted
+                    }
                     Some("job_released") => Error::Released,
                     // A refused lease has no granted lease for release to cancel.
                     Some("job_unknown") if status == 404 && path.ends_with("/release") => {
@@ -1418,21 +1432,23 @@ impl Client {
                         // A refusal proves this connection never reached Run. Keep
                         // the reservation and requester key while the broker tries
                         // another host; any refusal leaves the old placement intact.
-                        storage
-                            .hosted_update(id, |state| {
-                                state.replacement_hosts.insert(lease.placement.host.clone());
-                            })
-                            .map_err(|_| Error::Broker)?;
-                        let replacement = tokio::time::timeout_at(
-                            provisioning_deadline,
-                            self.post::<_, Lease>(
+                        let replacement = async {
+                            let bearer =
+                                tokio::time::timeout_at(provisioning_deadline, self.bearer())
+                                    .await
+                                    .map_err(|_| Error::HostFull)??;
+                            self.post_ready_authorized::<_, Lease>(
                                 &format!("/v1/leases/{runner_id}/replace"),
                                 &serde_json::json!({}),
-                            ),
-                        )
+                                bearer,
+                                provisioning_deadline,
+                                Error::HostFull,
+                            )
+                            .await
+                        }
                         .await;
                         match replacement {
-                            Ok(Ok(next)) => {
+                            Ok(next) => {
                                 if next.lease_id != lease.lease_id
                                     || next.job_id != lease.job_id
                                     || next.max_s != lease.max_s
@@ -1443,12 +1459,39 @@ impl Client {
                                 {
                                     return Err(Error::Auth);
                                 }
+                                storage
+                                    .hosted_update(id, |state| {
+                                        state
+                                            .replacement_hosts
+                                            .insert(lease.placement.host.clone());
+                                    })
+                                    .map_err(|_| Error::Broker)?;
                                 lease = next;
                                 continue;
                             }
-                            Ok(Err(error)) => tracing::info!(job_id = %id, code = error.code(),
-                            "hosted replace refused; waiting on current placement"),
-                            Err(_) => tracing::info!(job_id = %id, "hosted replace wait expired"),
+                            Err(error @ Error::ReplacePending(_)) => return Err(error),
+                            Err(error) => {
+                                if matches!(
+                                    error,
+                                    Error::Admitted
+                                        | Error::Finished
+                                        | Error::Released
+                                        | Error::Rejected
+                                        | Error::NotGranted
+                                        | Error::Capacity
+                                        | Error::BrokerRefused
+                                ) {
+                                    storage
+                                        .hosted_update(id, |state| {
+                                            state
+                                                .replacement_hosts
+                                                .insert(lease.placement.host.clone());
+                                        })
+                                        .map_err(|_| Error::Broker)?;
+                                }
+                                tracing::info!(job_id = %id, code = error.code(),
+                                    "hosted replace refused; waiting on current placement");
+                            }
                         }
                     }
                 }
@@ -1513,7 +1556,7 @@ impl Client {
         self.post(path, body).await
     }
     /// Posts until the broker grants or refuses, waiting out `202
-    /// provisioning` and routed `503 no_capacity` answers until `deadline`.
+    /// provisioning`, routed `503 no_capacity` and `replace_pending` answers until `deadline`.
     /// When the deadline passes first, the request in flight is dropped and
     /// the refusal for the wait the deadline ended is returned: the broker's
     /// latest provisioning or capacity answer or, before the broker has sent
@@ -1538,15 +1581,24 @@ impl Client {
             };
             match reply {
                 Err(_) => return Err(pending),
-                Ok(Err(error @ (Error::Provisioning(_) | Error::NoCapacity(_)))) => {
-                    let retry_after_ms =
-                        bounded_provisioning_retry_ms(error.retry_after_ms().unwrap());
+                Ok(Err(
+                    error @ (Error::Provisioning(_)
+                    | Error::NoCapacity(_)
+                    | Error::ReplacePending(_)),
+                )) => {
+                    let retry_after_ms = if let Error::ReplacePending(delay) = error {
+                        delay.max(MIN_PROVISIONING_RETRY_MS)
+                    } else {
+                        bounded_provisioning_retry_ms(error.retry_after_ms().unwrap())
+                    };
                     pending = match error {
                         Error::NoCapacity(_) => Error::NoCapacity(retry_after_ms),
+                        Error::ReplacePending(_) => Error::ReplacePending(retry_after_ms),
                         _ => Error::Provisioning(retry_after_ms),
                     };
-                    let retry_at =
-                        tokio::time::Instant::now() + Duration::from_millis(retry_after_ms);
+                    let retry_at = tokio::time::Instant::now()
+                        .checked_add(Duration::from_millis(retry_after_ms))
+                        .unwrap_or(deadline);
                     // Held-clock tests must observe a parsed reply and a fixed
                     // wake time before advancing time; a server-side send is too early.
                     #[cfg(test)]

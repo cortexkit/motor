@@ -342,6 +342,89 @@ pub struct Heartbeat {
     pub healthy: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub draining: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_ack: Vec<String>,
+}
+
+pub const REVOKED_LIMIT: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Revocation {
+    pub job_id: String,
+    #[serde(with = "revocation_expiry")]
+    pub until_ms: u64,
+}
+
+mod revocation_expiry {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let number = value.parse::<u64>().map_err(serde::de::Error::custom)?;
+        if number.to_string() != value || number > 9_007_199_254_740_991 {
+            return Err(serde::de::Error::custom("noncanonical revocation expiry"));
+        }
+        Ok(number)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeartbeatReply {
+    pub ignored: Vec<String>,
+    pub closed_subjects: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_bool"
+    )]
+    pub draining: Option<bool>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "revocations"
+    )]
+    pub revoked: Option<Vec<Revocation>>,
+}
+
+/// Reads the fence independently of legacy heartbeat reply fields. A malformed
+/// list must be discarded in full, without discarding an accepted heartbeat.
+pub fn heartbeat_revocations(bytes: &[u8]) -> Result<Option<Vec<Revocation>>, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct Fence {
+        #[serde(default, deserialize_with = "revocations")]
+        revoked: Option<Vec<Revocation>>,
+    }
+    serde_json::from_slice::<Fence>(bytes).map(|reply| reply.revoked)
+}
+
+fn present_bool<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error> {
+    bool::deserialize(deserializer).map(Some)
+}
+
+fn revocations<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<Revocation>>, D::Error> {
+    let entries = Vec::<Revocation>::deserialize(deserializer)?;
+    let mut jobs = std::collections::BTreeSet::new();
+    if entries.len() > REVOKED_LIMIT
+        || entries
+            .iter()
+            .any(|entry| !crate::valid_job_id(&entry.job_id) || !jobs.insert(&entry.job_id))
+        || entries
+            .windows(2)
+            .any(|pair| (pair[0].until_ms, &pair[0].job_id) > (pair[1].until_ms, &pair[1].job_id))
+    {
+        return Err(serde::de::Error::custom("invalid revocation list"));
+    }
+    Ok(Some(entries))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -195,7 +195,20 @@ impl Sender {
             }
         };
         let status = response.status().as_u16();
-        let body: Value = response.json().unwrap_or(Value::Null);
+        let bytes = response.bytes().unwrap_or_default();
+        let mut body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        if (200..300).contains(&status)
+            && request.path.ends_with("/heartbeat")
+            && body.get("revoked").is_some()
+        {
+            if let Err(error) = motor_lease::heartbeat_revocations(&bytes) {
+                // Validate raw JSON before Value can discard duplicate object members.
+                tracing::warn!(reason = %error, "host_heartbeat_revocations_invalid");
+                body.as_object_mut()
+                    .expect("revoked member belongs to an object")
+                    .remove("revoked");
+            }
+        }
         // CLOUD's error bodies are exactly {"error":"<code>"}; the code is the
         // only part of a reply worth logging.
         let code = body["error"].as_str().unwrap_or("");

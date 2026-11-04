@@ -80,6 +80,8 @@ fn cloud_final_files_match_their_manifest_digests() {
         "cloud/account-closure.json",
         "cloud/long-lease.json",
         "cloud/replace-lease.json",
+        "cloud/host-revoke-fence-off.json",
+        "cloud/host-revoke-fence-on.json",
     ] {
         let entry = manifest
             .files
@@ -102,7 +104,15 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "97e5292c4ad84433d30d6f01bbd1e8b1c7783f150d88a819d4a678a8a7b6ddc7",
+            "487b79f0f0acb8a3ff6c3e7c9416ba4794a614a16ce8b4656bc5b8f128950fda",
+        ),
+        (
+            "host-revoke-fence-off.json",
+            "f5c5f289799db666099e521f53d5ee368f5aae94d7b65d425cac578165fe5cab",
+        ),
+        (
+            "host-revoke-fence-on.json",
+            "9182b525a1cdaa90ba5f9da89695ef88ee26ad22f2fe976bb0fde88c88b5942e",
         ),
         (
             "host-draining.json",

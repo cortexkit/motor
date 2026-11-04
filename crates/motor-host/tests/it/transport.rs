@@ -719,6 +719,38 @@ async fn invalid_signature_never_wakes_or_attaches_and_refuses_before_lease_ok()
     task.await.unwrap().unwrap();
     assert!(fake.calls.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn tombstoned_job_connect_is_auth_refused_before_admission_or_wake() {
+    let (runtime, fake, broker, requester, c) = fixture();
+    {
+        let mut host = runtime.host.lock().unwrap();
+        let ms = c.iat * 1000;
+        let heartbeat = host.heartbeat(ms, 100_000, true);
+        host.queue_heartbeat("host", &heartbeat, ms).unwrap();
+        let request = host.snapshot.outbox.last().unwrap().clone();
+        assert!(host
+            .finish_request(
+                &request,
+                200,
+                &json!({
+                    "ignored":[], "closed_subjects":[],
+                    "revoked":[{"job_id":c.jti,"until_ms":(c.exp * 1000).to_string()}]
+                })
+            )
+            .unwrap());
+    }
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut client, &broker, &requester, &c).await;
+    let result = respond(&mut client, &requester, &c, challenge).await;
+    assert_eq!(result, json!({"type":"lease_refused","reason":"auth"}));
+    task.await.unwrap().unwrap();
+    assert!(fake.calls.lock().unwrap().is_empty());
+    let host = runtime.host.lock().unwrap();
+    assert!(host.snapshot.leases.is_empty());
+    assert!(host.snapshot.zero_usage.is_empty());
+}
 #[tokio::test]
 async fn unknown_vm_wrong_sub_and_wrong_requester_are_auth_before_challenge_with_no_usage() {
     // A cold placement (`vm: null`) is not refused here: the contract allows

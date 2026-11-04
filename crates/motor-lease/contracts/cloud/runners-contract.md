@@ -165,7 +165,7 @@ request and reply bytes.
 | 409 | `job_conflict`, `job_admitted`, `job_released`, `job_finished`, `job_settled`, `usage_conflict`, `sandbox_lost` |
 | 422 | `no_host_fits` (lease only; never carries `Retry-After`) |
 | 500 | `internal` |
-| 503 | `no_capacity`, `unavailable`; both include `Retry-After`, 5 seconds unless a Boat refusal or the tenant's Boat start limit names a longer wait |
+| 503 | `no_capacity`, `unavailable`, `replace_pending`; all include `Retry-After`, 15 seconds for `replace_pending`, otherwise 5 seconds unless a Boat refusal or the tenant's Boat start limit names a longer wait |
 
 Clients treat `usage_conflict`, `job_settled` and `job_unknown` as final for that report, not
 retryable transport failures; so are a usage report's `job_conflict` (the job was replaced away
@@ -429,13 +429,29 @@ return the same time and change no totals. Release is delayed cancellation, not 
 settlement: outstanding run tokens must expire first. A release marker blocks lease re-request
 and reattach with 409 `job_released`.
 
-An `admitted` or `started` heartbeat that wins before settlement clears the marker and keeps
+With `HOST_REVOKE_FENCE` off, an `admitted` or `started` heartbeat that wins before settlement clears the marker and keeps
 the reservation; a `reserved` heartbeat preserves it. The alarm settles an unadmitted job for
 zero charge once release is due, releasing its entire reservation. The marker remains, so
 lease re-request and reattach continue returning `job_released`; another release returns
 `job_finished`. Usage after release settlement returns `job_settled`.
 
-**Known gap: a released job can run unbilled.** Every executed job should be billed, but this
+With `HOST_REVOKE_FENCE=true`, a recorded release also revokes the job on its placed host,
+even if that host never reported the job. The alarm settles it at zero only **after the host's
+durable-and-stopped acknowledgement or the post-expiry absence proof below, and no earlier than
+`release_at_ms`**. An `admitted` or `started` report received before settlement cancels the
+release as above: the reservation remains and normal usage bills the run, including elapsed
+time up to the host's cancel. This still applies to an admission reported after token expiry.
+A `reserved` report does not cancel release, but cannot prove the job absent either. A fresh
+host that never acks no longer holds release pending once the token has expired and its latest
+fresh, current-generation heartbeat, received by the broker strictly after `until_ms`, omits the
+job. Without either proof, release remains pending even past the ordinary job deadline; the
+broker checks again at 15-second intervals once release is due. If the host is retired or its
+latest heartbeat is older than the 60-second placement freshness window (including no
+current-generation snapshot), the broker instead keeps today's
+zero-charge settlement at `release_at_ms` without an ack. See the heartbeat fence below.
+
+**Remaining host-lost gap: a released job can run unbilled.** With the switch off, or under the
+stale/retired fallback with it on, every executed job should be billed, but this
 contract doesn't guarantee it for a released job that a host admits anyway. Billing depends on
 that host reporting `admitted` or `started` before `release_at_ms`. If those heartbeats don't
 arrive in time, for example because the host can't reach the broker, the alarm settles the job at
@@ -480,6 +496,24 @@ the latest re-request). The reservation and totals don't change. The host-lost d
 to cover the new run token as described below. Release afterwards still waits for the latest run
 token the broker issued, for either host, to expire.
 
+With `HOST_REVOKE_FENCE=true`, before placing or minting any replacement token the broker
+records a revocation on the current host and waits for that host's durable-and-stopped ack or
+the post-expiry absence proof below. Until the fence is satisfied, replace returns **503**
+`{"error":"replace_pending"}` with **`Retry-After: 15`**.
+A pending retry changes no placement, reservation, lease identity or totals and does not conflict
+with a later retry. An unknown or another host's ack cannot satisfy the fence. After either proof,
+the retry may place and mint as above; it still returns `no_capacity` if no alternative fits.
+Once revocation begins, **`POST /v1/leases` re-requests also return `replace_pending` with
+`Retry-After: 15` for that placement, even after the ack, until the move succeeds**: no new run
+token may be issued for the host being revoked. After the move, a re-request re-signs for the
+new host as usual. A released job keeps its existing `job_released` refusal instead.
+
+Exception: if the old host is retired or has no current-generation heartbeat within the
+60-second placement freshness window, replace proceeds without an ack. Its revocation remains
+available to that host until the old run token expires. This is the **remaining host-lost gap**:
+the broker cannot enforce a fence on an unreachable host. With the switch off, replace and
+lease re-requests behave exactly as before, with no fence or `replace_pending` refusal.
+
 From then on the job belongs to the new host only, and the host it left must not run it:
 
 - The old host's heartbeats that name the job list it in `ignored` and change nothing, whatever
@@ -489,7 +523,8 @@ From then on the job belongs to the new host only, and the host it left must not
 - Only the new host's heartbeats advance `last_elapsed_ms` or mark the job admitted, so a
   host-lost settlement uses only the new host's proved elapsed time.
 
-**If the old host admitted the job anyway**, typically because ck-motor connected with a run
+**With the switch off, or under the host-lost fallback, if the old host admitted the job anyway**,
+typically because ck-motor connected with a run
 token issued before the replace and the host admitted it before its next heartbeat, that run is
 not billed: its usage report is refused, and the tenant pays only what the new host reports, or
 what the host-lost alarm settles from the new host's elapsed time. The broker detects it when the
@@ -681,7 +716,7 @@ The exact body is:
 
 ```text
 {free_vcpus, free_mem_mib, queued, warm:[{tenant, workspace_key_hash, vm, busy?}],
- running:[{job_id, state, elapsed_ms}], healthy, draining?}
+ running:[{job_id, state, elapsed_ms}], healthy, draining?, revoked_ack?:[job_id,…]}
 ```
 
 Integers are non-negative safe integers. `healthy` is boolean. `warm` and `running` each have at
@@ -689,7 +724,8 @@ most 64 entries. `state` is exactly `reserved`, `admitted` or `started`. The hea
 the host capacity snapshot, timestamped at broker receive time. `queued` is stored but does not
 affect placement.
 
-The optional final member `draining` is boolean; absent and `false` mean the same. Every other
+The optional member `draining` is boolean; absent and `false` mean the same. Apart from
+`revoked_ack` described below, every other
 unknown body member is still refused. Only the latest accepted snapshot stored by PlacementDO
 controls draining: a delayed older heartbeat cannot set or clear it. The next accepted heartbeat
 that omits `draining` or sends `false` clears the drain.
@@ -764,7 +800,7 @@ host has no effect. A reserved job on this host updates
 `started` permanently mark it admitted; later `reserved` does not clear that flag. This prevents
 lease re-request and replace, but not reattach.
 
-Success is **200**. When the host's stored latest snapshot after this heartbeat is draining, the
+Success is **200**. With `HOST_REVOKE_FENCE` off, when the host's stored latest snapshot after this heartbeat is draining, the
 reply is exactly `{"ignored":[<job_id>…],"closed_subjects":[<subject>…],"draining":true}`, in that
 member order. Otherwise it is exactly `{"ignored":[<job_id>…],"closed_subjects":[<subject>…]}`,
 unchanged for hosts that never send the field. The echo describes the stored snapshot even when
@@ -781,6 +817,55 @@ VM disks, warm state and cached workspaces) once that tenant's last lease on the
 it keeps running the tenant's current jobs to their end. Closure is permanent, so a listed
 subject never needs to be undone. A valid heartbeat from a retired host still updates elapsed
 time and snapshots.
+
+#### Host revocation fence
+
+`revoked_ack` is optional, with **at most 256 distinct job-id strings** in the usual lowercase
+UUIDv7 grammar. A non-array, excess length or duplicate is 400 `bad_request` with
+`field: "revoked_ack"`; an invalid member is 400 `bad_request` with
+`field: "revoked_ack.job_id"`. It is authenticated and signed as part of the exact body bytes,
+and accepted and ignored with the switch off. With the switch off every heartbeat reply is
+byte-identical to the reply without this field, including omission of `revoked`.
+
+With `HOST_REVOKE_FENCE=true`, every successful heartbeat reply appends **`revoked`** as its
+last member, including an empty array when none is pending:
+
+```text
+{"ignored":[],"closed_subjects":[],"revoked":[{"job_id":"…","until_ms":"1800000300000"}]}
+```
+
+Each entry names a job released on this host, or being replaced away from it, **whether or not
+the host ever reported it**. `until_ms` is the old run token's expiry as a **canonical decimal
+string of Unix milliseconds**. The list contains at most **256** entries, oldest expiry first,
+then bytewise job id for ties. An entry remains eligible on every reply until this host acks it
+or broker time reaches `until_ms`; the cap pages a backlog as earlier entries leave.
+The broker uses an indexed, bounded pending queue, not a scan of job history.
+
+A revocation fence is also satisfied without an ack when **broker time is strictly greater than
+`until_ms` and the host's latest stored heartbeat is fresh, is for its current registry
+generation, was received by the broker strictly after `until_ms`, and does not list the job in
+`running`**. Fresh means within the 60-second placement window. Both time comparisons use
+broker time, not the host's signed timestamp; a heartbeat received exactly at expiry is not
+enough. After expiry the host cannot admit a new run, and any earlier admission must still be
+reported until stopped. Expiry alone is not proof that a live run stopped. This alternative
+proof bounds waiting for a fresh host that never acks; it does not change reply lifetime:
+`revoked` entries still leave the reply at `until_ms`.
+
+For each listed job the host **must durably record a tombstone that prevents admission through
+`until_ms`, and must cancel any admitted/live run before acknowledging**. An ack means
+**durable and stopped**, not merely received. The host keeps at least 256 tombstones and must
+not evict an unexpired tombstone after acking it. It sends the job id in `revoked_ack` only when
+no run of that job is live on it. Acks are durable per job and host and idempotent; unknown acks
+are ignored, never remembered in advance of a revocation. Running reports in the same heartbeat
+are applied before its acks, so an admission reported before cancellation still cancels a pending
+release and is billed. Stopping a run does not replace the normal usage report.
+
+Rollout order is mandatory: **(1) deploy broker acceptance of `revoked_ack` with
+`HOST_REVOKE_FENCE=false`; (2) deploy hosts that durably stop and ack, and ck-motor that retries
+`replace_pending` on replace and lease re-request; (3) enable the broker switch**. Disabling it
+restores the old behavior and the old host-lost/unbilled gaps; accepting acks remains enabled.
+`test-vectors/runners/host-revoke-fence-off.json` and `host-revoke-fence-on.json` pin both switch
+states, signed ack bodies, pending retries, release revocation and the 256-entry reply cap.
 
 ### POST /v1/hosts/{host_id}/usage
 

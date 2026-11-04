@@ -36,6 +36,8 @@ pub struct Knobs {
     /// jobs it already holds keep their normal answers; heartbeat replies list
     /// the closed subjects among the tenants the host reports.
     pub closed_subjects: BTreeSet<String>,
+    /// None preserves fence-off replies; Some enables per-host pending revocations.
+    pub revocations: Option<BTreeMap<String, Vec<Revocation>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -206,7 +208,7 @@ impl FakeBroker {
             self.settle_due(now_ms);
             return match route {
                 "heartbeat" => match serde_json::from_slice(request.body) {
-                    Ok(body) => self.heartbeat(host_id, body),
+                    Ok(body) => self.heartbeat(host_id, body, now_ms),
                     Err(_) => BrokerReply::error(400, "bad_request"),
                 },
                 "usage" => match serde_json::from_slice(request.body) {
@@ -465,7 +467,16 @@ impl FakeBroker {
         )
     }
 
-    fn heartbeat(&mut self, host: &str, heartbeat: Heartbeat) -> BrokerReply {
+    fn heartbeat(&mut self, host: &str, heartbeat: Heartbeat, now_ms: u64) -> BrokerReply {
+        let mut acked = BTreeSet::new();
+        if heartbeat.revoked_ack.len() > REVOKED_LIMIT
+            || heartbeat
+                .revoked_ack
+                .iter()
+                .any(|job| !valid_job_id(job) || !acked.insert(job))
+        {
+            return BrokerReply::error(400, "bad_request");
+        }
         if heartbeat.free_vcpus > MAX_SAFE_INTEGER
             || heartbeat.free_mem_mib > MAX_SAFE_INTEGER
             || heartbeat.queued > MAX_SAFE_INTEGER
@@ -523,10 +534,16 @@ impl FakeBroker {
                 None => ignored.push(running.job_id),
             }
         }
-        BrokerReply::json(
-            200,
-            json!({"ignored": ignored, "closed_subjects": closed_subjects}),
-        )
+        let mut reply = json!({"ignored": ignored, "closed_subjects": closed_subjects});
+        if let Some(revocations) = &mut self.knobs.revocations {
+            let pending = revocations.entry(host.to_owned()).or_default();
+            pending.retain(|entry| entry.until_ms > now_ms && !acked.contains(&entry.job_id));
+            pending.sort_by(|a, b| (a.until_ms, &a.job_id).cmp(&(b.until_ms, &b.job_id)));
+            reply["revoked"] =
+                serde_json::to_value(pending.iter().take(REVOKED_LIMIT).collect::<Vec<_>>())
+                    .expect("revocations are serializable");
+        }
+        BrokerReply::json(200, reply)
     }
 
     fn usage(&mut self, host: &str, usage: Usage, now_ms: u64) -> BrokerReply {

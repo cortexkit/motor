@@ -23,6 +23,8 @@ pub const RECORD_RETENTION_MS: u64 = 60 * 60 * 1000;
 pub const RETENTION_BATCH: usize = 256;
 /// How often the host tick runs a retention pass while nothing is left over.
 pub const RETENTION_INTERVAL_MS: u64 = 10 * 60 * 1000;
+/// Bound storage without ever evicting an unexpired, acknowledged fence.
+pub const REVOCATION_CAP: usize = 4096;
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
@@ -404,6 +406,21 @@ impl Host {
                 .collect(),
             healthy,
             draining: self.snapshot.draining,
+            revoked_ack: self
+                .snapshot
+                .revocations
+                .iter()
+                .filter(|(job, fence)| {
+                    fence.listed
+                        && self
+                            .snapshot
+                            .leases
+                            .get(*job)
+                            .is_none_or(|lease| lease.state == LeaseState::Ended)
+                })
+                .take(motor_lease::REVOKED_LIMIT)
+                .map(|(job, _)| job.clone())
+                .collect(),
         }
     }
     pub fn queue_heartbeat(
@@ -447,6 +464,23 @@ impl Host {
         status: u16,
         reply: &Value,
     ) -> Result<bool, Error> {
+        let revocations = if (200..300).contains(&status) && request.path.ends_with("/heartbeat") {
+            if reply.get("revoked").is_some() {
+                match motor_lease::heartbeat_revocations(
+                    &serde_json::to_vec(reply).map_err(std::io::Error::other)?,
+                ) {
+                    Ok(revoked) => revoked,
+                    Err(error) => {
+                        tracing::warn!(reason = %error, "host_heartbeat_revocations_invalid");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if (200..300).contains(&status) && request.job.is_some() {
             let parsed = serde_json::from_value::<motor_lease::UsageReply>(reply.clone());
             if parsed.as_ref().is_err()
@@ -495,6 +529,36 @@ impl Host {
             }
         }
         let mut next = self.snapshot.clone();
+        if let Some(revocations) = revocations {
+            for fence in next.revocations.values_mut() {
+                fence.listed = false;
+            }
+            for revoked in revocations {
+                if let Some(fence) = next.revocations.get_mut(&revoked.job_id) {
+                    fence.until_ms = fence.until_ms.max(revoked.until_ms);
+                    fence.listed = true;
+                } else if next.revocations.len() < REVOCATION_CAP {
+                    next.revocations.insert(
+                        revoked.job_id.clone(),
+                        crate::state::Revocation {
+                            until_ms: revoked.until_ms,
+                            listed: true,
+                        },
+                    );
+                } else {
+                    // No durable fence means no ack: the broker must keep waiting.
+                    tracing::error!(job_id = %revoked.job_id, until_ms = revoked.until_ms,
+                        cap = REVOCATION_CAP, "host_revocation_capacity_exhausted_not_acked");
+                }
+                if let Some(lease) = next.leases.get_mut(&revoked.job_id) {
+                    lease.refusal = Some(Refusal::Auth);
+                    if lease.state != LeaseState::Ended {
+                        next.pending_cancels
+                            .insert(revoked.job_id, lease.tenant.clone());
+                    }
+                }
+            }
+        }
         if (200..300).contains(&status) && request.path.ends_with("/heartbeat") {
             for job in reply["ignored"]
                 .as_array()
@@ -527,6 +591,16 @@ impl Host {
     /// or again on the next tick while a full batch was deleted, so a backlog
     /// drains in bounded steps.
     pub fn retention_tick(&mut self, now_ms: u64) -> Result<usize, Error> {
+        if self
+            .snapshot
+            .revocations
+            .values()
+            .any(|fence| fence.until_ms < now_ms)
+        {
+            let mut next = self.snapshot.clone();
+            next.revocations.retain(|_, fence| fence.until_ms >= now_ms);
+            self.save(next)?;
+        }
         if now_ms < self.retention_due_ms {
             return Ok(0);
         }
@@ -621,6 +695,12 @@ impl Host {
         };
         let now_s = now_ms / 1000;
         let mut next = Snapshot {
+            revocations: snapshot
+                .revocations
+                .iter()
+                .filter(|(_, fence)| fence.until_ms >= now_ms)
+                .map(|(job, fence)| (job.clone(), fence.clone()))
+                .collect(),
             leases: snapshot.leases.clone(),
             nonces: snapshot.nonces.clone(),
             vms: snapshot.vms.clone(),

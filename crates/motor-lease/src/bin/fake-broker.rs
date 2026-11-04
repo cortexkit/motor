@@ -229,7 +229,9 @@ fn positive_header(text: &str) -> Option<u64> {
 
 fn send_reply(stream: &mut TcpStream, reply: BrokerReply) -> io::Result<()> {
     let body = serde_json::to_vec(&reply.body)?;
-    let extra = if reply.status == 503 {
+    let extra = if reply.status == 503 && reply.body["error"] == "replace_pending" {
+        "Retry-After: 15\r\n"
+    } else if reply.status == 503 {
         "Retry-After: 5\r\n"
     } else if reply.body.get("keys").is_some() {
         "Cache-Control: public, max-age=300\r\n"

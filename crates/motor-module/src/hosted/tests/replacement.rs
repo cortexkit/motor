@@ -14,6 +14,134 @@ fn replace_count(h: &Harness) -> usize {
 }
 
 #[tokio::test]
+async fn replace_pending_retries_same_route_after_retry_after_without_blacklisting_host() {
+    let first = Harness::with_host(Behavior::Refuse("host_full"), "first-host").await;
+    let second = Harness::with_host(Behavior::CompleteRun, "second-host").await;
+    first.replace_replies.lock().unwrap().extend([
+        (503, serde_json::json!({"error":"replace_pending"}), "1"),
+        (503, serde_json::json!({"error":"replace_pending"}), "1"),
+    ]);
+    first
+        .replacement_hosts
+        .lock()
+        .unwrap()
+        .push_back(second.broker.clone());
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    let route = HostedJobState {
+        fleet_routed: true,
+        ..first.route.clone()
+    };
+    let storage = stored(&scratch, id, route.clone());
+    let client = Client::new(route);
+    let request = Harness::request(&scratch.0);
+    let start = tokio::time::Instant::now();
+    let run = client.run(id, &request, &storage);
+    tokio::pin!(run);
+    tokio::select! {
+        result = &mut run => panic!("run finished before the fence wait: {:?}", result.err()),
+        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+    }
+    assert_eq!(replace_count(&first), 1);
+    assert!(storage
+        .job(id)
+        .unwrap()
+        .hosted
+        .unwrap()
+        .replacement_hosts
+        .is_empty());
+    let (_, lease) = run.await.unwrap();
+    assert_eq!(lease.placement.host, "second-host");
+    assert_eq!(replace_count(&first), 3);
+    assert!(start.elapsed() >= Duration::from_secs(2));
+    assert_eq!(first.lease_bodies.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn pending_replace_deadline_keeps_host_eligible_and_carries_retry_after() {
+    let h = Harness::with_host(Behavior::Refuse("host_full"), "first-host").await;
+    h.replace_replies.lock().unwrap().push_back((
+        503,
+        serde_json::json!({"error":"replace_pending"}),
+        "15",
+    ));
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    let route = HostedJobState {
+        fleet_routed: true,
+        spill_wait_ms: Some(29_000),
+        ..h.route.clone()
+    };
+    let storage = stored(&scratch, id, route.clone());
+    let error = Client::new(route)
+        .run(id, &Harness::request(&scratch.0), &storage)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error, Error::ReplacePending(15_000));
+    assert_eq!(error.retry_after_ms(), Some(15_000));
+    assert_eq!(replace_count(&h), 1);
+    assert!(storage
+        .job(id)
+        .unwrap()
+        .hosted
+        .unwrap()
+        .replacement_hosts
+        .is_empty());
+}
+
+#[tokio::test]
+async fn lease_rerequest_pending_retries_identical_bytes_and_preserves_stored_body_on_restart() {
+    let h = Harness::new(Behavior::Normal).await;
+    let scratch = Scratch::new();
+    let id = Uuid::now_v7();
+    let request = Harness::request(&scratch.0);
+    let route = HostedJobState {
+        fleet_routed: true,
+        ..h.route.clone()
+    };
+    let storage = stored(&scratch, id, route);
+    let mut stored_body = None;
+    for _ in 0..2 {
+        h.lease_replies.lock().unwrap().push_back((
+            503,
+            serde_json::json!({"error":"replace_pending"}),
+            "1",
+        ));
+        let route = storage.job(id).unwrap().hosted.unwrap();
+        let start = tokio::time::Instant::now();
+        drop(
+            Client::new(route)
+                .run(id, &request, &storage)
+                .await
+                .unwrap(),
+        );
+        assert!(start.elapsed() >= Duration::from_secs(1));
+        let body = storage
+            .job(id)
+            .unwrap()
+            .hosted
+            .unwrap()
+            .lease_request
+            .unwrap();
+        if let Some(original) = &stored_body {
+            assert_eq!(&body, original);
+        } else {
+            stored_body = Some(body);
+        }
+    }
+    let bodies = h.lease_bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 4);
+    assert_eq!(bodies[0], bodies[1]);
+    assert_eq!(bodies[2], bodies[3]);
+    let original = canonical_lease_bytes(stored_body.as_ref().unwrap());
+    for body in bodies.iter() {
+        let sent: LeaseRequest = serde_json::from_slice(body).unwrap();
+        assert_eq!(canonical_lease_bytes(&sent), original);
+    }
+}
+
+#[tokio::test]
 async fn host_full_replaces_onto_second_or_third_host_with_one_job_and_reservation() {
     for third_host in [false, true] {
         let first = Harness::with_host(Behavior::Refuse("host_full"), "first-host").await;

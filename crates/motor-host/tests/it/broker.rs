@@ -809,3 +809,50 @@ fn heartbeat_reply_with_cloud_closure_bytes_closes_the_bound_tenant() {
         closed
     );
 }
+
+#[test]
+fn malformed_revoked_confirms_without_ack_and_next_valid_reply_records_the_fence() {
+    let ms = NOW * 1000;
+    let runtime = Runtime::new("host".into(), host(), Arc::new(NoVm));
+    runtime.host.lock().unwrap().start_billing(ms).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let replies = [
+        json!({"ignored":[],"closed_subjects":[],"revoked":null}).to_string(),
+        json!({"ignored":[],"closed_subjects":[],"revoked":[{"job_id":JOB,"until_ms":((NOW + 300) * 1000).to_string()}]}).to_string(),
+        format!(r#"{{"ignored":[],"closed_subjects":[],"revoked":[{{"job_id":"{JOB2}","job_id":"{JOB2}","until_ms":"{}"}}]}}"#, (NOW + 300) * 1000),
+        "not json".into(),
+        json!({"ignored":[],"closed_subjects":[]}).to_string(),
+    ];
+    let broker = std::thread::spawn(move || {
+        for (n, reply) in replies.into_iter().enumerate() {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (path, bytes, _) = signed_request(&stream);
+            assert!(path.ends_with("/heartbeat"));
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            if n < 2 {
+                assert!(body.get("revoked_ack").is_none());
+            } else {
+                assert_eq!(body["revoked_ack"], json!([JOB]));
+            }
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+        }
+    });
+    let mut sender = Sender::new(
+        runtime.clone(),
+        ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
+    )
+    .unwrap();
+    sender.test_endpoint(endpoint);
+    for n in 0..5 {
+        sender.step(ms + n * 15_000).unwrap();
+        let h = runtime.host.lock().unwrap();
+        assert!(h.snapshot.outbox.is_empty());
+        assert_eq!(h.snapshot.revocations.len(), usize::from(n > 0));
+        assert_eq!(
+            h.heartbeat(ms, 100_000, true).revoked_ack.len(),
+            usize::from(n > 0)
+        );
+    }
+    broker.join().unwrap();
+}
