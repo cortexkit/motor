@@ -547,21 +547,108 @@ async fn large_returns_ninety_mb_and_exact_ceiling_replay_across_pages_and_resta
 }
 
 #[tokio::test]
-async fn return_reservation_waits_for_deletion_and_survives_restart_and_replay_lease() {
+async fn finished_return_reservation_shrinks_before_next_dispatch() {
     let f = Fixture::new();
-    let config = large_config(&f);
-    let runner = Runner::open(config.clone()).unwrap();
-    let (mut first, bytes) = chunked_request(&f, "printf x > one", &["one"]);
+    let mut config = large_config(&f);
+    let requested = Config::return_charge(RETURN_LARGE_MAX_BYTES_CAP);
+    config.return_budget_bytes = Some(requested + requested / 2);
+    config.free_space_floor_bytes = 4096;
+    // Only the next collection needs free space: retained bytes and their
+    // filesystem overhead are already reflected in the disk's free-space probe.
+    config.free_space_probe = Arc::new(move |_| Ok(4096 + requested));
+    let runner = Runner::open(config).unwrap();
+    let (mut first, bytes) = chunked_request(&f, "head -c 1048576 /dev/zero > one", &["one"]);
     first.return_max_bytes = RETURN_LARGE_MAX_BYTES_CAP;
     f.submit(&runner, &first, &bytes);
     runner.tick().unwrap();
     terminal(&runner, first.job_id).await;
+
+    let (mut second, bytes) = chunked_request(&f, "printf y > two", &["two"]);
+    second.return_max_bytes = RETURN_LARGE_MAX_BYTES_CAP;
+    f.submit(&runner, &second, &bytes);
+    runner.tick().unwrap();
+    assert!(
+        runner.core.inner.lock().unwrap().jobs[&second.job_id]
+            .setup_ms
+            .is_some(),
+        "a finished 1 MiB return must not hold its requested 128 MiB charge"
+    );
+    let stored: Job = read_json(&runner.record_path(first.job_id)).unwrap();
+    // One MiB occupies two 512 KiB chunks, plus the per-chunk and fixed overhead.
     assert_eq!(
-        runner.core.inner.lock().unwrap().jobs[&first.job_id].return_reserved_bytes,
+        stored.return_reserved_bytes,
+        1_048_576 + 2 * 8192 + 64 * 8192
+    );
+    verify_large_pages(&runner, &first, 1_048_576);
+    terminal(&runner, second.job_id).await;
+}
+
+#[tokio::test]
+async fn return_reservation_stays_full_while_collecting() {
+    let f = Fixture::new();
+    let hold = Hold::new("returned_files_collect");
+    let _release = Release(hold.clone());
+    let mut config = large_config(&f);
+    config.long_work = Some(hold.hook());
+    let runner = Runner::open(config).unwrap();
+    let (mut request, bytes) = chunked_request(&f, "head -c 1048576 /dev/zero > one", &["one"]);
+    request.return_max_bytes = RETURN_LARGE_MAX_BYTES_CAP;
+    hold.arm();
+    f.submit(&runner, &request, &bytes);
+    runner.tick().unwrap();
+    assert!(poll(Duration::from_secs(5), || hold.held()));
+    runner.maintenance().unwrap();
+    {
+        let inner = runner.core.inner.lock().unwrap();
+        let job = &inner.jobs[&request.job_id];
+        assert!(inner.finalizing.contains(&request.job_id));
+        assert!(job.terminal.is_none());
+        assert_eq!(
+            job.return_reserved_bytes,
+            Config::return_charge(RETURN_LARGE_MAX_BYTES_CAP)
+        );
+    }
+    let stored: Job = read_json(&runner.record_path(request.job_id)).unwrap();
+    assert_eq!(
+        stored.return_reserved_bytes,
         Config::return_charge(RETURN_LARGE_MAX_BYTES_CAP)
     );
+    hold.release();
+    terminal(&runner, request.job_id).await;
+    assert_eq!(
+        runner.core.inner.lock().unwrap().jobs[&request.job_id].return_reserved_bytes,
+        1_048_576 + 2 * 8192 + 64 * 8192
+    );
+}
+
+#[tokio::test]
+async fn return_reservation_waits_for_deletion_and_survives_restart_and_replay_lease() {
+    let f = Fixture::new();
+    let config = large_config(&f);
+    let runner = Runner::open(config.clone()).unwrap();
+    let (mut first, bytes) =
+        chunked_request(&f, "printf x > one; printf z > tiny", &["one", "tiny"]);
+    first.return_max_bytes = RETURN_LARGE_MAX_BYTES_CAP;
+    f.submit(&runner, &first, &bytes);
+    runner.tick().unwrap();
+    terminal(&runner, first.job_id).await;
+    // Two tiny files still occupy two chunks; rounding their combined bytes
+    // up to one chunk would undercharge the retained filesystem overhead.
+    let retained = 2 + 2 * 8192 + 64 * 8192;
+    assert_eq!(
+        runner.core.inner.lock().unwrap().jobs[&first.job_id].return_reserved_bytes,
+        retained
+    );
+    let stored: Job = read_json(&runner.record_path(first.job_id)).unwrap();
+    assert_eq!(stored.return_reserved_bytes, retained);
+    let frames = runner.replay(first.job_id, 0).unwrap();
     drop(runner);
     let runner = reopen(config);
+    assert_eq!(
+        runner.core.inner.lock().unwrap().jobs[&first.job_id].return_reserved_bytes,
+        retained
+    );
+    assert_eq!(runner.replay(first.job_id, 0).unwrap(), frames);
     let (mut second, bytes) = chunked_request(&f, "printf y > two", &["two"]);
     second.return_max_bytes = RETURN_LARGE_MAX_BYTES_CAP;
     second.queue_wait_limit_s = 7200;
@@ -570,6 +657,18 @@ async fn return_reservation_waits_for_deletion_and_survives_restart_and_replay_l
     assert!(runner.core.inner.lock().unwrap().jobs[&second.job_id]
         .setup_ms
         .is_none());
+    let reason = format!(
+        "returned bytes budget (needs {} bytes; {retained} of {} bytes reserved)",
+        Config::return_charge(RETURN_LARGE_MAX_BYTES_CAP),
+        Config::return_charge(RETURN_LARGE_MAX_BYTES_CAP)
+    );
+    assert_eq!(
+        runner.job_status(second.job_id).unwrap().waiting_on,
+        Some(reason.clone())
+    );
+    assert!(runner
+        .queue_wait_detail(&runner.core.inner.lock().unwrap(), second.job_id)
+        .starts_with(&format!("waiting_on={reason};")));
     let log = runner.job_log(first.job_id);
     let lease = log.lease(Vec::new());
     let finished = runner.core.inner.lock().unwrap().jobs[&first.job_id]
@@ -578,9 +677,9 @@ async fn return_reservation_waits_for_deletion_and_survives_restart_and_replay_l
     f.clock
         .store(finished + RETURN_RETENTION_MS, Ordering::SeqCst);
     runner.maintenance().unwrap();
-    assert_ne!(
+    assert_eq!(
         runner.core.inner.lock().unwrap().jobs[&first.job_id].return_reserved_bytes,
-        0
+        retained
     );
     drop(lease);
     runner.maintenance().unwrap();
@@ -588,6 +687,15 @@ async fn return_reservation_waits_for_deletion_and_survives_restart_and_replay_l
         runner.core.inner.lock().unwrap().jobs[&first.job_id].return_reserved_bytes,
         0
     );
+    let stored: Job = read_json(&runner.record_path(first.job_id)).unwrap();
+    assert_eq!(stored.return_reserved_bytes, 0);
+    assert!(stored.returned.as_ref().unwrap().expired);
+    assert!(!runner
+        .record_path(first.job_id)
+        .parent()
+        .unwrap()
+        .join(&stored.returned.as_ref().unwrap().directory)
+        .exists());
     runner.tick().unwrap();
     terminal(&runner, second.job_id).await;
 }

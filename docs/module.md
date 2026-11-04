@@ -668,8 +668,11 @@ record itself still lives for the usual 24 hours.
 The runner's `--return-budget-bytes` disk budget covers chunked returned files
 only, including reservation overhead. A job whose returned files need disk
 budget waits in the queue for it and is never cut down to a smaller limit.
-Retained chunks keep their reservation until deleted. Legacy `return_result`
-data keeps its existing 256 KiB cap and job-history retention.
+While collection is in progress, the job keeps its requested reservation. When
+collection finishes, the reservation shrinks to the committed chunk bytes plus
+filesystem overhead for those chunks, and stays reserved until the chunks are
+deleted, an hour after the job ends. Legacy `return_result` data keeps its
+existing 256 KiB cap and job-history retention.
 
 ck-motor lists `exec-remote-return/v2` next to v1, and a caller sets
 `return_chunked` only for a module that lists it. The runner advertises
