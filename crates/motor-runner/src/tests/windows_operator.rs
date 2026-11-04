@@ -222,6 +222,47 @@ fn direct_collection_can_be_read_after_finish_before_owner_cleanup() {
 
 const RETURN_QUALIFICATION_BYTES: &[u8] = b"motor requested return qualification";
 
+#[test]
+#[ignore = "trusted operator: sealed Windows baseline, dedicated accounts, KVM and systemd required"]
+fn windows_qualification_guest_clock_matches_host_utc() {
+    use std::io::BufRead;
+    let runner = operator();
+    let f = Fixture::new();
+    source(&f);
+    let (_, mut launch) = launch(&runner, &f, "date -u +%s");
+    let output = launch.execution.output().unwrap();
+    let stderr = std::thread::spawn(move || {
+        let mut text = String::new();
+        let mut stream = output.stderr;
+        stream.read_to_string(&mut text).unwrap();
+        text
+    });
+    let mut stdout = std::io::BufReader::new(output.stdout);
+    let mut sample = String::new();
+    stdout.read_line(&mut sample).unwrap();
+    let host = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let guest: u64 = sample.trim().parse().expect("guest UTC epoch seconds");
+    let mut rest = String::new();
+    stdout.read_to_string(&mut rest).unwrap();
+    let status = launch.execution.wait();
+    launch.execution.reap();
+    let stderr = stderr.join().unwrap();
+    assert!(
+        matches!(
+            status,
+            Ok(backend::ExecutionOutcome::WindowsExit { code: 0 })
+        ),
+        "{status:?}\n{rest}\n{stderr}"
+    );
+    assert!(
+        guest.abs_diff(host) <= 5,
+        "guest UTC={guest} host UTC={host}"
+    );
+}
+
 fn returned_file_script(path: &str) -> String {
     use base64::Engine;
     format!(

@@ -125,6 +125,7 @@ impl Backend for FakeHost {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Fault {
+    ClockSetFailed,
     None,
     Hello,
     Transfer,
@@ -413,6 +414,24 @@ fn configure(f: &Fixture, fault: Fault, code: u32) -> (Config, Arc<Agent>) {
                         version: motor_winagent::PROTOCOL_VERSION,
                         nonce,
                     },
+                )?;
+                assert!(matches!(
+                    session.receive(&mut port)?,
+                    Some(AgentFrame::SyncClock { .. })
+                ));
+                if fault == Fault::ClockSetFailed {
+                    session.send(
+                        &mut port,
+                        &AgentFrame::ClockFailed {
+                            reason: motor_winagent::clock::Refusal::SetSystemTimeFailed,
+                        },
+                    )?;
+                    stall(&a, &s, 2);
+                    return Ok(());
+                }
+                session.send(
+                    &mut port,
+                    &AgentFrame::ClockSynchronized { correction_ms: 0 },
                 )?;
                 if fault == Fault::CacheGrantMissingAlways {
                     session.send(
@@ -1668,6 +1687,28 @@ async fn windows_backend_missing_cache_grant_on_retry_refuses_without_third_boot
         .caches()
         .disk(&request.workspace_key)
         .exists());
+}
+
+#[tokio::test]
+async fn windows_backend_clock_failure_refuses_before_command_without_retry() {
+    let f = Fixture::new();
+    source(&f);
+    let (c, a) = configure(&f, Fault::ClockSetFailed, 0);
+    let runner = Runner::open_with_backend(c, Box::new(FakeHost)).unwrap();
+    let (request, bytes) = request(&f);
+    f.submit(&runner, &request, &bytes);
+    let result = terminal(&runner, request.job_id).await;
+    assert!(
+        matches!(result.outcome, Outcome::RefusedBeforeStart { .. }),
+        "{result:?}"
+    );
+    let detail = result.refusal_detail().unwrap();
+    assert!(
+        detail.contains("windows_clock_set_system_time_failed"),
+        "{detail}"
+    );
+    assert_eq!(a.units.lock().unwrap().len(), 1);
+    assert_eq!(a.starts.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

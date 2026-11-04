@@ -28,7 +28,7 @@ pub(super) struct Plan {
     #[cfg(any(unix, test))]
     pub(super) toolchain_source: PathBuf,
 }
-fn mapped(path: &str) -> io::Result<PathBuf> {
+pub(super) fn mapped(path: &str) -> io::Result<PathBuf> {
     motor_winagent::mapped_cwd(path)?;
     Ok(PathBuf::from("m").join(path.trim_start_matches('/')))
 }
@@ -264,6 +264,14 @@ pub(super) fn prepare(
             .caller_repository_root
             .text(),
         &checkouts,
+    )?;
+    let caches = config.windows.as_ref().unwrap().caches();
+    super::source_mtimes::prepare(
+        &plan.snapshots,
+        staging,
+        &caches.disk(&plan.workspace),
+        &caches.source_mtimes(&plan.workspace),
+        std::time::SystemTime::now(),
     )?;
     build_tar(staging)?;
     let tar = staging.join("tree.tar");
@@ -519,7 +527,7 @@ fn validate_lock(lock: &str, routes: &BTreeMap<String, PathBuf>) -> io::Result<(
     Ok(())
 }
 
-fn git(snapshot: &Snapshot, args: &[&str]) -> io::Result<std::process::Output> {
+pub(super) fn git(snapshot: &Snapshot, args: &[&str]) -> io::Result<std::process::Output> {
     let mut command = Command::new(if cfg!(windows) {
         r"C:\Program Files\Git\cmd\git.exe"
     } else {
@@ -1275,6 +1283,12 @@ fn append(
     } else if metadata.is_file() {
         let mut file = File::open(path)
             .map_err(|error| error_at_path("open staged file for transfer", path, error))?;
+        let modified = metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(invalid)?;
+        let mtime = format!("{}.{:09}", modified.as_secs(), modified.subsec_nanos());
+        builder.append_pax_extensions([("mtime", mtime.as_bytes())])?;
         builder
             .append_file(relative, &mut file)
             .map_err(|error| error_at_path("append file to transfer archive from", path, error))?;

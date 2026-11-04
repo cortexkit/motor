@@ -167,10 +167,8 @@ pub fn refresh(root: &Path, archive: &mut File, plan: &Plan) -> io::Result<()> {
             .write(true)
             .create_new(true)
             .open(&path)?;
+        let modified = crate::archive_time::modified(&mut entry)?;
         io::copy(&mut entry, &mut fresh)?;
-        let modified = std::time::UNIX_EPOCH
-            .checked_add(std::time::Duration::from_secs(entry.header().mtime()?))
-            .ok_or_else(|| invalid("source timestamp out of range"))?;
         fresh.set_times(std::fs::FileTimes::new().set_modified(modified))?;
     }
     if !remaining.is_empty() {
@@ -534,6 +532,9 @@ mod tests {
         std::fs::hard_link(root.join("repo/source"), root.join("writable-alias")).unwrap();
         let archive_path = root.join("upload.tar");
         let mut archive = tar::Builder::new(File::create(&archive_path).unwrap());
+        archive
+            .append_pax_extensions([("mtime", b"1800000000.123456700".as_slice())])
+            .unwrap();
         let mut header = tar::Header::new_gnu();
         header.set_mode(0o644);
         header.set_size(8);
@@ -546,6 +547,13 @@ mod tests {
         drop(archive);
         let plan = Plan::new(vec!["repo/source".into()]).unwrap();
         refresh(&root, &mut File::open(&archive_path).unwrap(), &plan).unwrap();
+        assert_eq!(
+            std::fs::metadata(root.join("repo/source"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            std::time::UNIX_EPOCH + std::time::Duration::new(1_800_000_000, 123_456_700)
+        );
         assert_eq!(
             std::fs::read(root.join("repo/source")).unwrap(),
             b"original"

@@ -37,6 +37,7 @@ pub(crate) mod prep_error;
 pub(crate) mod returned_tests;
 #[cfg(any(windows, test))]
 mod slot;
+mod source_mtimes;
 #[cfg(test)]
 mod staging;
 #[cfg(windows)]

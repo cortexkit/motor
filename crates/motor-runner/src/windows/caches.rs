@@ -61,6 +61,9 @@ impl CacheDisks {
     fn usage(&self, disk: &Path) -> PathBuf {
         disk.with_extension("json")
     }
+    pub(super) fn source_mtimes(&self, workspace: &str) -> PathBuf {
+        self.disk(workspace).with_extension("source-mtimes.json")
+    }
     fn valid_disk(&self, path: &Path) -> bool {
         path.parent() == Some(self.root.as_path())
             && path.extension().is_some_and(|s| s == extension())
@@ -201,7 +204,12 @@ impl CacheDisks {
         }
         // Delete the disk before its marker: a crash must never make a dirty
         // disk appear reusable. Unlinking a sidecar never follows a symlink.
-        for path in [disk.to_path_buf(), self.usage(disk), self.marker(disk)] {
+        for path in [
+            disk.to_path_buf(),
+            self.usage(disk),
+            self.marker(disk),
+            disk.with_extension("source-mtimes.json"),
+        ] {
             match fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}

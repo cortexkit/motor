@@ -39,6 +39,26 @@ def hello(version=1, platform="windows", agent_ready=True, agent_detail=None):
 
 
 
+class ClockProbeTests(unittest.TestCase):
+    def test_clock_sample_is_compared_live_and_can_span_output_frames(self):
+        probe = JOBS.ClockProbe()
+        probe.observe(b"MOTOR_CLOCK_", 1_800_000_000)
+        probe.observe(b"UTC=1800000000\r\n", 1_800_000_001)
+        self.assertEqual(probe.samples, [dict(guest_seconds=1_800_000_000, host_seconds=1_800_000_001)])
+
+    def test_clock_offset_in_either_direction_fails_qualification(self):
+        for offset in [-3600, -6, 6, 3600]:
+            probe = JOBS.ClockProbe()
+            with self.assertRaisesRegex(RuntimeError, "guest clock differs from host UTC"):
+                probe.observe(f"MOTOR_CLOCK_UTC={1_800_000_000 + offset}\n".encode(), 1_800_000_000)
+
+    def test_clock_setter_precedes_all_guest_job_preparation(self):
+        agent = (HERE.parents[1] / "crates/motor-winagent/src/main.rs").read_text()
+        serve = agent[agent.index("    fn serve(stop:"):]
+        self.assertLess(serve.index("clock::synchronize"), serve.index("mount_cache(&mut protocol"))
+        self.assertLess(serve.index("return Err(reason.into())"), serve.index("mount_cache(&mut protocol"))
+
+
 class Bridge:
     def __init__(self, wire=b"", diagnostic=b"", running=False, hung=False):
         self.stdin = io.BytesIO()
@@ -108,7 +128,7 @@ class QualificationReadinessTests(unittest.TestCase):
 
     def test_real_jobs_check_bun_even_with_a_custom_gate(self):
         source = (HERE / "qualify-jobs.py").read_text()
-        self.assertIn('command = BUN_VERSION_CHECK + " || exit $?; " + ', source)
+        self.assertIn('date -u +%s; " + BUN_VERSION_CHECK + " || exit $?; " + ', source)
 
     @unittest.skipUnless(shutil.which("bash"), "requires Bash for the Git Bash version guard")
     def test_bun_version_check_rejects_wrong_missing_and_failed_bun(self):
@@ -469,7 +489,8 @@ class QualificationReadinessTests(unittest.TestCase):
                                  "requested-return-ads-refused", "no-requested-returns-preserves-changed-source"])
         operator = (HERE.parents[1] / "crates/motor-runner/src/tests/windows_operator.rs").read_text()
         checks = re.findall(r"^(?:async )?fn (windows_qualification_\w+)\(", operator, re.MULTILINE)
-        self.assertEqual(len(checks), 20)
+        self.assertEqual(len(checks), 21)
+        self.assertIn("windows_qualification_guest_clock_matches_host_utc", checks)
         self.assertIn("windows_qualification_tracked_source_is_read_only_and_new_files_are_writable", checks)
         self.assertIn("windows_qualification_realistic_checkout_bun_failure_is_nonfatal", checks)
         # Real fleet checkouts (MOTOR_QUAL_CHECKOUTS) must prepare on a candidate

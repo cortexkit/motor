@@ -798,9 +798,12 @@ fn windows_cache_reuse_requires_clean_dismount_normal_exit_and_known_outcome() {
     ] {
         let key = format!("{known}-{clean}-{normal}");
         let disk = seed_disk(&vm, &key, 1, true);
+        let mtimes = disk.with_extension("source-mtimes.json");
+        fs::write(&mtimes, "source timestamp history").unwrap();
         assert!(vm.caches().marker(&disk).exists());
         vm.caches().complete(&key, 9, known, clean, normal).unwrap();
         assert_eq!(disk.exists(), known && clean && normal);
+        assert_eq!(mtimes.exists(), known && clean && normal);
         assert!(!vm.caches().marker(&disk).exists());
         if disk.exists() {
             assert_eq!(vm.caches().last_used(&disk).unwrap(), 9);
