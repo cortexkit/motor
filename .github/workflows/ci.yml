@@ -101,6 +101,9 @@ jobs:
       # overriding NEXTEST_NO_TESTS even if it is set to allow an empty run.
       - name: Workspace tests (nonzero passed count)
         run: env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo nextest run --workspace --locked --no-tests fail
+      # The Windows guest agent is its own Cargo project, outside the workspace.
+      - name: Windows guest agent tests
+        run: env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo nextest run --manifest-path crates/motor-winagent/Cargo.toml --locked --no-tests fail
       - name: Pinned production client compatibility
         run: python3 scripts/mixed-version.py
       - name: Protocol vectors

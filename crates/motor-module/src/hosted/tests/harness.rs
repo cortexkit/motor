@@ -750,9 +750,15 @@ impl Harness {
                             motor_lease::fake::BrokerReply::error(503, "no_capacity")
                         }
                     } else {
-                        let job = serde_json::from_slice::<serde_json::Value>(&body)
-                            .ok()
-                            .and_then(|v| v["job_id"].as_str().map(str::to_owned));
+                        let job = path
+                            .strip_prefix("/v1/leases/")
+                            .and_then(|path| path.strip_suffix("/release"))
+                            .map(str::to_owned)
+                            .or_else(|| {
+                                serde_json::from_slice::<serde_json::Value>(&body)
+                                    .ok()
+                                    .and_then(|v| v["job_id"].as_str().map(str::to_owned))
+                            });
                         let selected = job
                             .as_ref()
                             .and_then(|j| placements.get(j))

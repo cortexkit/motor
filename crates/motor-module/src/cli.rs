@@ -66,6 +66,7 @@ usage: ck motor run [OPTIONS] -- COMMAND...
        ck motor attach JOB_ID [--secret-file PATH] [--status]
        ck motor cancel JOB_ID [--secret-file PATH]
         ck motor hosted-check
+        ck motor hosted-fence-probe release|replace HOST
         ck-motor store-checkpoint --root STORE_DIR
 
 Runs COMMAND on the remote build server and streams its output here.
@@ -2094,6 +2095,101 @@ pub async fn hosted_check_main(args: &[String]) -> u8 {
         }
     }
 }
+/// Exercise releasing or replacing an unconnected hosted booking through the local module.
+pub async fn hosted_fence_probe_main(args: &[String]) -> u8 {
+    use crate::hosted::fence_probe::{Mode, Report, Request, CALL_TIMEOUT};
+    let request = match args {
+        [mode, host]
+            if matches!(mode.as_str(), "release" | "replace") && motor_lease::valid_name(host) =>
+        {
+            Request {
+                mode: if mode == "release" {
+                    Mode::Release
+                } else {
+                    Mode::Replace
+                },
+                host: host.clone(),
+            }
+        }
+        _ => {
+            eprintln!("usage: ck motor hosted-fence-probe release|replace HOST");
+            return EXIT_USAGE;
+        }
+    };
+    let workspace = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(_) => return EXIT_REFUSED,
+    };
+    let client = match SubcClient::connect(&workspace).await {
+        Ok(client) => client,
+        Err(_) => {
+            eprintln!("hosted-fence-probe: module unavailable");
+            return EXIT_REFUSED;
+        }
+    };
+    let result = client
+        .consumer
+        .request(
+            &client
+                .route
+                .lock()
+                .await
+                .as_ref()
+                .expect("connected route")
+                .handle,
+            direct_envelope(
+                "hosted.fence_probe",
+                serde_json::to_value(request).expect("serializable fence probe request"),
+                None,
+            ),
+            CallOptions {
+                timeout: CALL_TIMEOUT,
+                ..CallOptions::default()
+            },
+        )
+        .await;
+    match result
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Report>(&bytes).ok())
+    {
+        Some(report) => {
+            println!(
+                "{}",
+                serde_json::to_string(&report).expect("serializable fence probe report")
+            );
+            if report.status == "ok" {
+                0
+            } else {
+                EXIT_REFUSED
+            }
+        }
+        None => {
+            eprintln!("hosted-fence-probe: module refused or unavailable");
+            EXIT_REFUSED
+        }
+    }
+}
+
+#[cfg(test)]
+mod fence_probe_tests {
+    #[tokio::test]
+    async fn malformed_arguments_are_refused_before_connecting() {
+        for args in [
+            vec![],
+            vec!["release"],
+            vec!["unknown", "host"],
+            vec!["release", "boat:vm-1"],
+            vec!["replace", "host", "extra"],
+        ] {
+            let args: Vec<_> = args.into_iter().map(String::from).collect();
+            assert_eq!(
+                super::hosted_fence_probe_main(&args).await,
+                super::EXIT_USAGE
+            );
+        }
+    }
+}
+
 pub async fn attach_main(args: &[String]) -> u8 {
     let args = match parse_attach_args(args) {
         Ok(Some(args)) => args,
