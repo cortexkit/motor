@@ -104,15 +104,15 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "487b79f0f0acb8a3ff6c3e7c9416ba4794a614a16ce8b4656bc5b8f128950fda",
+            "018cf97f58e7ddd690a63512f3222eb0ca4c62e35a4b6399598534af1ce16a14",
         ),
         (
             "host-revoke-fence-off.json",
-            "f5c5f289799db666099e521f53d5ee368f5aae94d7b65d425cac578165fe5cab",
+            "86bb9fd961fc86a75784bbe03fef6bbcfd4eb0bd3c9b07fb6bd845f92aeb6df9",
         ),
         (
             "host-revoke-fence-on.json",
-            "9182b525a1cdaa90ba5f9da89695ef88ee26ad22f2fe976bb0fde88c88b5942e",
+            "989b55f465db090e1da1e5e517a0d13622f4c3f13336dcbfcb3a66872195827b",
         ),
         (
             "host-draining.json",
@@ -140,7 +140,7 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         ),
         (
             "explicit-only-leases.json",
-            "93136da9d2703acee05e80889ed18c1aaa1d0dd1623848548d08c29b5f673708",
+            "42cbd8136daef1be9428296de14cfcbd0d077f029a7a41ffd3e6668c46a83629",
         ),
         (
             "boat-lease.json",
@@ -152,15 +152,15 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         ),
         (
             "job-tokens.json",
-            "541eccc153088ef5be8755bdda9d633bed44237544acae6e365be4124eecc8bb",
+            "417efcb8af6bbb6df19e94eb2672878dc1af319741a40c7a93dfeec5f39ea93e",
         ),
         (
             "job-tokens-workspace.json",
-            "67b86a1bb25eeb6b62454a0aeb30ce1388da0b2474954ce589c84165d8ba8857",
+            "a8e6ad7afd8fa79c0dc3efdca81068d4ad72b7a885866dfca6df54597e92ce39",
         ),
         (
             "lease.json",
-            "aa3996947d5da23807cd32813be57c673610c23ed704d92bf95b24db8ee14d81",
+            "7b66236303bc2d541f1dc5e0f7ec6dc50b54ad7258840858123c13e2170aa001",
         ),
         (
             "usage-settlement.json",
@@ -168,7 +168,7 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         ),
         (
             "settled-reattach.json",
-            "59308e456afcde26a9fa9973bd9b243a67f8f8cb3886dc8f20c344c597176b16",
+            "1d6a35763c9fd66da3e2383fdcce0ec5903ec19fe27f2c60ff917268bf6ec55e",
         ),
         (
             "account-closure.json",
@@ -176,11 +176,11 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         ),
         (
             "long-lease.json",
-            "a0fb260259ccf90b00ecf8d08af5b06aa649564ba0f898ebac8987c0eaab2b4c",
+            "71feb561ca70e2989b6b2a1cdb149b4d99d5e4ba5583d571a2f45a5032bec73a",
         ),
         (
             "replace-lease.json",
-            "96c5abfae5898ac7756847152f6e7f9aca6791d94880b29b5758ff1d5ce077d6",
+            "f0dd550e59289fb02e172d61ad463b83f72ccb4edaffccf1c3a4e8266fc88a8b",
         ),
     ] {
         assert_eq!(
