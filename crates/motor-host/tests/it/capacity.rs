@@ -831,6 +831,7 @@ fn isolated_sparse_disk_on_loop_filesystem_trips_the_latch_before_the_direct_run
         capacity: capacity_path,
         guest_init: BTreeMap::new(),
         vcpu_ceiling: BTreeMap::new(),
+        pressure_cgroups: BTreeMap::new(),
     });
     let runtime = Runtime::new("host".into(), host, helper.clone());
     let now = NOW * 1000;

@@ -104,7 +104,7 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "018cf97f58e7ddd690a63512f3222eb0ca4c62e35a4b6399598534af1ce16a14",
+            "8c62d0d83abad72eedb5c50ab7d9f988ab78488e019388e0ca8077a3a1d20602",
         ),
         (
             "host-revoke-fence-off.json",
@@ -120,7 +120,7 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         ),
         (
             "host-metrics.json",
-            "dcee8e9efd564239008a4acb4f7fc71dc7e1e61d3eae3eb550ff4d5072900ee6",
+            "51c927ce42be0b8d79907ecacf999d28430988f836ce6474c40a0a24f0729fc3",
         ),
         (
             "bad-request.json",

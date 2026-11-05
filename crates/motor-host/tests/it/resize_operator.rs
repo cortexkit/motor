@@ -133,6 +133,7 @@ fn isolated_staged_resize_cold_start() {
         storage: storage.into(),
         capacity: "/etc/motor-host/capacity.json".into(),
         vcpu_ceiling: BTreeMap::from([(tenant.clone(), r.vcpu_ceiling)]),
+        pressure_cgroups: BTreeMap::new(),
         guest_init: BTreeMap::from([(
             tenant.clone(),
             json!({

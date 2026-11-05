@@ -311,6 +311,7 @@ impl Harness {
             storage: directory.path().into(),
             capacity: directory.path().join("capacity.json"),
             vcpu_ceiling: BTreeMap::from([("tenant".into(), 4)]),
+            pressure_cgroups: BTreeMap::new(),
             guest_init: BTreeMap::from([("tenant".into(), json!({}))]),
         });
         Self {
@@ -412,6 +413,7 @@ fn resize_crash_after_attach_cold_boots_and_redelivers_before_ready() {
         capacity: h.helper.capacity.clone(),
         guest_init: h.helper.guest_init.clone(),
         vcpu_ceiling: h.helper.vcpu_ceiling.clone(),
+        pressure_cgroups: h.helper.pressure_cgroups.clone(),
     };
     let mut stream = UnixStream::connect(&old_host.socket).unwrap();
     writeln!(

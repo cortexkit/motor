@@ -643,7 +643,8 @@ failures are 401 `host_auth_failed`. Size is checked before authentication, sche
 The route never updates heartbeat, placement capacity, availability or admission state. Missing
 metrics never prevents a placement host from receiving jobs.
 
-The strict body has these members (nested objects are strict too); only the tenant disk pair is optional:
+The strict body has these members (nested objects are strict too); the tenant disk pair and
+host/tenant `pressure` objects are optional, additive members:
 
 ```json
 {
@@ -653,9 +654,11 @@ The strict body has these members (nested objects are strict too); only the tena
   "disks": [{ "mount": "/", "total_gib": 900, "free_gib": 310 }],
   "tenants": [{ "vm": "vm-1", "state": "ready", "vcpus": 30, "mem_mib": 106496,
     "slots_total": 90, "slots_used": 41, "jobs_running": 12, "recovery": null, "detail": null,
-    "disk_free_gib": 80, "disk_total_gib": 600 }],
+    "disk_free_gib": 80, "disk_total_gib": 600,
+    "pressure": { "cpu_some": 2.34, "mem_some": 3.45, "mem_full": 0.12, "io_some": 5.67, "io_full": 0.89 } }],
   "runners": [{ "name": "direct", "state": "ready", "slots_total": 16, "slots_used": 3,
-    "queued": 0, "oldest_wait_s": 0, "detail": null }]
+    "queued": 0, "oldest_wait_s": 0, "detail": null }],
+  "pressure": { "cpu_some": 0.12, "mem_some": 1.23, "mem_full": 0, "io_some": 4.56, "io_full": 0.78 }
 }
 ```
 
@@ -669,8 +672,20 @@ The strict body has these members (nested objects are strict too); only the tena
 - `cpu.busy_pct` is an integer 0..100; `cpu.load1` is a non-negative finite number with at most two
   decimal places, or null when the platform has no load average (for example, Windows). The
   `load1` key is required whenever `cpu` is non-null; Linux and macOS send a number. Decimal notation is allowed
-  here, unlike other routes. All other non-null numeric fields are
+  here and in `pressure`, unlike other routes. All other non-null numeric fields are
   non-negative safe integers. Exponent notation is not accepted.
+- Optional `pressure` at the top level reports host-wide Linux pressure stall information (PSI)
+  from `/proc/pressure/{cpu,memory,io}`. Optional `tenants[i].pressure` reports PSI from that tenant
+  VM cgroup's `cpu.pressure`, `memory.pressure` and `io.pressure` files. Each object has exactly
+  five required members: `cpu_some`, `mem_some`, `mem_full`, `io_some`, `io_full`, taken from the
+  corresponding `some` or `full` line's kernel `avg10` percent. Each value is a finite number in
+  0..100 inclusive, with at most two decimal places, using the same number grammar as `cpu.load1`
+  (no exponent notation). Neither the object nor any member may be null; no extra members are
+  allowed. Omit the key when PSI is unreadable or unsupported, for example on macOS or Windows.
+  Host and tenant objects may be omitted independently, for both monitor and placement hosts;
+  pushes omitting them keep the existing wire behavior. Invalid or missing members name their
+  path in 400 `bad_request`, for example `pressure.mem_full` or `tenants[0].pressure.io_full`;
+  extra members use the existing strict-object `field: "body"` refusal.
 - Each array has at most eight entries and may be empty. `mount` is 1..128 UTF-8 bytes with no
   Unicode control characters. `vm` matches `^[A-Za-z0-9._-]{1,64}$`.
 - Tenant `state` is `ready`, `starting`, `recovering` or `stopped`. `recovery` must be null except
@@ -695,15 +710,24 @@ Load retains the maximum non-null sample, or NULL when every sample in the bucke
 CPU busy maxima and available-memory minima likewise ignore null samples and are NULL when
 every sample lacks the corresponding figure. Last CPU busy percentage and total memory follow
 the last accepted sample, including NULL. A monitor reporting null CPU/memory and no disks for
-the entire bucket has NULL in every host-figure column, not zero; tenant totals still roll up.
+the entire bucket has NULL in every CPU/load, memory and disk column, not zero; tenant totals
+and any reported PSI figures still roll up.
 `last_body` is the last accepted body serialized in the schema's key order without whitespace.
-States, per-disk details and tenant guest disk figures are available in that body, not separate rollup columns.
+The five `psi_{cpu_some,mem_some,mem_full,io_some,io_full}_max` columns retain the maximum
+host PSI figure in the bucket; the five corresponding `tenant_psi_*_max` columns retain the
+maximum across all tenants and samples in the bucket. These nullable columns ignore omitted
+figures: a value wins over NULL and NULL never erases a value; all-omitted buckets and pre-existing
+rows stay NULL. Individual tenant PSI figures, states, per-disk details and tenant guest disk
+figures are available in `last_body`, not separate per-tenant rollup rows.
 
 `test-vectors/runners/host-metrics.json` pins accepted signed pushes with numeric and null load,
 numeric and null tenant guest disks, the 413 boundary, and bad-enum, overlong-detail, stale-clock,
 unpaired guest-disk and free-above-total refusals, produced by the real signer and parser. It also
 includes a `metrics-vector` monitor with null CPU/memory and empty disks (204), and a
 `metrics-vector-placement` placement host with null CPU (400 with `field: "cpu"`).
+The original pushes without PSI remain byte-identical; additive cases cover host and tenant
+`pressure` together (204), malformed tenant `io_full` (400 with
+`field: "tenants[0].pressure.io_full"`) and an extra PSI member (400 with `field: "body"`).
 
 ### POST /v1/hosts/{host_id}/heartbeat
 

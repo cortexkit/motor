@@ -14,6 +14,10 @@ pub trait Control: Send + Sync {
     fn metrics(&self, _tenant: &str) -> Result<crate::billing::Metrics> {
         anyhow::bail!("tenant metrics unavailable")
     }
+    /// Read-only cgroup location for display-only pressure sampling.
+    fn pressure_cgroup(&self, _tenant: &str) -> Option<&Path> {
+        None
+    }
     /// Trusted registry quota, used only to bound display-only guest disk reports.
     fn disk_quota_bytes(&self, _tenant: &str) -> Result<u64> {
         anyhow::bail!("tenant disk quota unavailable")
@@ -116,6 +120,7 @@ pub struct Helper {
     pub capacity: PathBuf,
     pub guest_init: BTreeMap<String, Value>,
     pub vcpu_ceiling: BTreeMap<String, u32>,
+    pub pressure_cgroups: BTreeMap<String, PathBuf>,
 }
 impl Helper {
     fn request(&self, request: Value) -> Result<(Value, Vec<OwnedFd>)> {
@@ -206,6 +211,9 @@ fn exchange_helper_with_deadline(
 }
 
 impl Control for Helper {
+    fn pressure_cgroup(&self, tenant: &str) -> Option<&Path> {
+        self.pressure_cgroups.get(tenant).map(PathBuf::as_path)
+    }
     fn disk_quota_bytes(&self, tenant: &str) -> Result<u64> {
         let (reply, _) = self.request(json!({"op":"tenant_metrics", "tenant":tenant}))?;
         reply["disk_quota_bytes"]

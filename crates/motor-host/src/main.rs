@@ -92,6 +92,7 @@ async fn main() -> Result<()> {
         serde_json::from_reader(File::open(&config.bindings)?)?;
     let mut tenants = BTreeMap::new();
     let mut guest_init = BTreeMap::new();
+    let mut pressure_cgroups = BTreeMap::new();
     for (vm, binding) in bindings {
         ensure!(
             !vm.is_empty() && !guest_init.contains_key(&binding.tenant),
@@ -102,6 +103,10 @@ async fn main() -> Result<()> {
             config.registry_dir.join(format!("{}.json", binding.tenant)),
         )?)?;
         registry.validate(&binding.tenant)?;
+        pressure_cgroups.insert(
+            binding.tenant.clone(),
+            motor_host::metrics::tenant_pressure_cgroup(registry.tap_index),
+        );
         let identity = motor_lease::sha256_hex(
             format!("{}\n{}\n{}", config.host_id, binding.sub, vm).as_bytes(),
         );
@@ -147,6 +152,7 @@ async fn main() -> Result<()> {
             capacity: motor_host::capacity::CONFIG.into(),
             vcpu_ceiling,
             guest_init,
+            pressure_cgroups,
         }),
         broker_endpoint,
         jwks_url,

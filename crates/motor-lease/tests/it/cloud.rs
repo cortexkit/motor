@@ -105,6 +105,7 @@ fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
             detail: None,
             disk_free_gib: None,
             disk_total_gib: None,
+            pressure: None,
         }],
         runners: vec![Runner {
             name: "direct".into(),
@@ -115,6 +116,7 @@ fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
             oldest_wait_s: 0,
             detail: None,
         }],
+        pressure: None,
     };
     assert_eq!(
         metrics.encode(now).unwrap(),
@@ -155,6 +157,13 @@ fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
         MetricsReply::Accepted,
         MetricsReply::BadRequest {
             field: Some("cpu".into()),
+        },
+        MetricsReply::Accepted,
+        MetricsReply::BadRequest {
+            field: Some("tenants[0].pressure.io_full".into()),
+        },
+        MetricsReply::BadRequest {
+            field: Some("body".into()),
         },
     ];
     assert_eq!(v["cases"].as_array().unwrap().len(), expected.len());
@@ -200,11 +209,14 @@ fn cloud_host_metrics_serializer_signer_and_refusals_match_pinned_bytes() {
 fn cloud_host_metrics_invalid_samples_are_not_signed() {
     let v = vector("host-metrics.json");
     let now = v["clock_ms"].as_u64().unwrap();
-    for index in [0, 3, 4, 5, 6, 7, 8, 9, 10, 11] {
+    for index in [0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13] {
         let sample: metrics::HostMetrics =
             serde_json::from_str(v["cases"][index]["request"]["body"].as_str().unwrap()).unwrap();
         let encoded = sample.encode(now);
-        assert_eq!(encoded.is_ok(), matches!(index, 0 | 5 | 6 | 7 | 10 | 11));
+        assert_eq!(
+            encoded.is_ok(),
+            matches!(index, 0 | 5 | 6 | 7 | 10 | 11 | 12)
+        );
         if let Ok(encoded) = encoded {
             assert_eq!(
                 encoded,
@@ -217,6 +229,10 @@ fn cloud_host_metrics_invalid_samples_are_not_signed() {
     }
     assert!(serde_json::from_str::<metrics::HostMetrics>(
         v["cases"][2]["request"]["body"].as_str().unwrap()
+    )
+    .is_err());
+    assert!(serde_json::from_str::<metrics::HostMetrics>(
+        v["cases"][14]["request"]["body"].as_str().unwrap()
     )
     .is_err());
     assert_eq!(

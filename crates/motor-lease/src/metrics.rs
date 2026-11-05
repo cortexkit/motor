@@ -14,6 +14,12 @@ pub struct HostMetrics {
     pub disks: Vec<Disk>,
     pub tenants: Vec<Tenant>,
     pub runners: Vec<Runner>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_pressure"
+    )]
+    pub pressure: Option<Pressure>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -23,6 +29,54 @@ pub struct Cpu {
     pub busy_pct: u64,
     #[serde(deserialize_with = "required_nullable")]
     pub load1: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pressure {
+    #[serde(serialize_with = "pressure_number")]
+    pub cpu_some: f64,
+    #[serde(serialize_with = "pressure_number")]
+    pub mem_some: f64,
+    #[serde(serialize_with = "pressure_number")]
+    pub mem_full: f64,
+    #[serde(serialize_with = "pressure_number")]
+    pub io_some: f64,
+    #[serde(serialize_with = "pressure_number")]
+    pub io_full: f64,
+}
+
+impl Pressure {
+    pub fn is_valid(&self) -> bool {
+        [
+            self.cpu_some,
+            self.mem_some,
+            self.mem_full,
+            self.io_some,
+            self.io_full,
+        ]
+        .into_iter()
+        .all(|value| (0.0..=100.0).contains(&value) && two_decimal_places(value))
+    }
+}
+
+fn pressure_number<S: serde::Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+    // The broker's canonical PSI numbers omit the decimal suffix for whole percentages.
+    if value.is_finite() && (0.0..=100.0).contains(value) && value.fract() == 0.0 {
+        serializer.serialize_u64(*value as u64)
+    } else {
+        serializer.serialize_f64(*value)
+    }
+}
+
+fn optional_pressure<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Pressure>, D::Error> {
+    Pressure::deserialize(deserializer).map(Some)
+}
+
+fn two_decimal_places(value: f64) -> bool {
+    value.is_finite() && (value * 100.0 - (value * 100.0).round()).abs() <= 0.000001
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -67,6 +121,12 @@ pub struct Tenant {
         deserialize_with = "optional_nullable"
     )]
     pub disk_total_gib: Option<Option<u64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_pressure"
+    )]
+    pub pressure: Option<Pressure>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,13 +193,14 @@ impl HostMetrics {
         }
         if self.cpu.as_ref().is_some_and(|cpu| {
             cpu.busy_pct > 100
-                || cpu.load1.is_some_and(|load| {
-                    !load.is_finite()
-                        || load < 0.0
-                        || (load * 100.0 - (load * 100.0).round()).abs() > 0.000001
-                })
+                || cpu
+                    .load1
+                    .is_some_and(|load| load < 0.0 || !two_decimal_places(load))
         }) {
             return Err("cpu");
+        }
+        if self.pressure.as_ref().is_some_and(|p| !p.is_valid()) {
+            return Err("pressure");
         }
         if self.disks.len() > 8 || self.tenants.len() > 8 || self.runners.len() > 8 {
             return Err("body");
@@ -148,6 +209,9 @@ impl HostMetrics {
             return Err("disks.mount");
         }
         for t in &self.tenants {
+            if t.pressure.as_ref().is_some_and(|p| !p.is_valid()) {
+                return Err("tenants.pressure");
+            }
             if t.disk_free_gib.is_some() != t.disk_total_gib.is_some()
                 || t.disk_free_gib
                     .flatten()
@@ -227,5 +291,101 @@ pub fn parse_reply(status: u16, body: &[u8]) -> MetricsReply {
         },
         (401, Some("host_auth_failed")) => MetricsReply::AuthFailed,
         _ => MetricsReply::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn sample() -> HostMetrics {
+        let vector: Value =
+            serde_json::from_str(include_str!("../contracts/cloud/host-metrics.json")).unwrap();
+        serde_json::from_str(vector["cases"][12]["request"]["body"].as_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn pressure_validation_checks_every_host_and_tenant_value() {
+        let base = sample();
+        for tenant in [false, true] {
+            for field in ["cpu_some", "mem_some", "mem_full", "io_some", "io_full"] {
+                for (number, valid) in [
+                    (0.0, true),
+                    (100.0, true),
+                    (1.23, true),
+                    (-0.01, false),
+                    (100.01, false),
+                    (1.234, false),
+                ] {
+                    let mut body = serde_json::to_value(&base).unwrap();
+                    let pressure = if tenant {
+                        &mut body["tenants"][0]["pressure"]
+                    } else {
+                        &mut body["pressure"]
+                    };
+                    pressure[field] = json!(number);
+                    let parsed: HostMetrics = serde_json::from_value(body).unwrap();
+                    assert_eq!(
+                        parsed.encode(base.at_ms).is_ok(),
+                        valid,
+                        "{tenant} {field} {number}"
+                    );
+                }
+            }
+        }
+        for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut body = base.clone();
+            body.pressure.as_mut().unwrap().cpu_some = number;
+            assert_eq!(body.encode(base.at_ms).unwrap_err(), "pressure");
+            body.pressure = None;
+            body.tenants[0].pressure.as_mut().unwrap().io_full = number;
+            assert_eq!(body.encode(base.at_ms).unwrap_err(), "tenants.pressure");
+        }
+    }
+
+    #[test]
+    fn pressure_may_be_omitted_independently_but_never_null_or_partial() {
+        let base = sample();
+        for tenant in [false, true] {
+            let mut body = serde_json::to_value(&base).unwrap();
+            let object = if tenant {
+                &mut body["tenants"][0]
+            } else {
+                &mut body
+            };
+            let pressure = object.as_object_mut().unwrap().remove("pressure").unwrap();
+            let parsed: HostMetrics = serde_json::from_value(body.clone()).unwrap();
+            let encoded: Value =
+                serde_json::from_slice(&parsed.encode(base.at_ms).unwrap()).unwrap();
+            assert_eq!(encoded, body);
+            for invalid in [Value::Null, json!({}), json!({"cpu_some":0})] {
+                let mut invalid_body = body.clone();
+                let object = if tenant {
+                    &mut invalid_body["tenants"][0]
+                } else {
+                    &mut invalid_body
+                };
+                object["pressure"] = invalid;
+                assert!(serde_json::from_value::<HostMetrics>(invalid_body).is_err());
+            }
+            for field in ["cpu_some", "mem_some", "mem_full", "io_some", "io_full"] {
+                for missing in [false, true] {
+                    let mut invalid_body = body.clone();
+                    let object = if tenant {
+                        &mut invalid_body["tenants"][0]
+                    } else {
+                        &mut invalid_body
+                    };
+                    object["pressure"] = pressure.clone();
+                    if missing {
+                        object["pressure"].as_object_mut().unwrap().remove(field);
+                    } else {
+                        object["pressure"][field] = Value::Null;
+                    }
+                    assert!(serde_json::from_value::<HostMetrics>(invalid_body).is_err());
+                }
+            }
+        }
     }
 }

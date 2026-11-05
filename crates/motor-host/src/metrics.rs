@@ -8,9 +8,19 @@ use anyhow::Result;
 use motor_lease::metrics::*;
 use std::{path::Path, sync::Arc};
 
+// Mirrors the VM helper's delegated service cgroup. If the helper's location
+// diverges, pressure is omitted rather than affecting host or tenant operation.
+const HELPER_TENANT_CGROUPS: &str = "/sys/fs/cgroup/system.slice/motor-vm-helper.service/tenants";
+
+pub fn tenant_pressure_cgroup(tap_index: u8) -> std::path::PathBuf {
+    Path::new(HELPER_TENANT_CGROUPS).join(format!("tenant-{tap_index}"))
+}
+
 #[derive(Default)]
 pub struct Sampler {
     previous_cpu: Option<(u64, u64)>,
+    #[cfg(target_os = "linux")]
+    pressure_warned: std::collections::HashSet<String>,
 }
 
 impl Sampler {
@@ -55,6 +65,7 @@ impl Sampler {
             disks: vec![disk(Path::new("/"))?],
             tenants: vec![],
             runners: vec![],
+            pressure: pressure(Path::new("/proc/pressure"), ["cpu", "memory", "io"]),
         };
         // Mount names are the only paths allowed by the wire contract. Never
         // publish the configured storage path, which can contain tenant data.
@@ -80,7 +91,7 @@ impl Sampler {
     }
 
     #[cfg(target_os = "linux")]
-    fn tenants(&self, runtime: &Arc<Runtime>, sample: &mut HostMetrics) {
+    fn tenants(&mut self, runtime: &Arc<Runtime>, sample: &mut HostMetrics) {
         let bindings: Vec<_> = {
             let host = runtime.host.lock().expect("host lock");
             host.tenants
@@ -137,10 +148,14 @@ impl Sampler {
                         detail: detail.map(str::to_owned),
                         disk_free_gib: None,
                         disk_total_gib: None,
+                        pressure: None,
                     },
                     ready,
                 )
             };
+            if let Some(cgroup) = runtime.control.pressure_cgroup(&binding.tenant) {
+                tenant.pressure = self.tenant_pressure(&binding.tenant, cgroup);
+            }
             let idle = ready
                 && runtime
                     .tenant_operations(&binding.tenant)
@@ -171,6 +186,46 @@ impl Sampler {
             sample.tenants.push(tenant);
         }
     }
+
+    #[cfg(target_os = "linux")]
+    fn tenant_pressure(&mut self, tenant: &str, directory: &Path) -> Option<Pressure> {
+        let pressure = pressure(
+            directory,
+            ["cpu.pressure", "memory.pressure", "io.pressure"],
+        );
+        if pressure.is_none() && self.pressure_warned.insert(tenant.to_owned()) {
+            tracing::warn!(tenant, cgroup = %directory.display(), "tenant pressure unavailable; omitting PSI metrics");
+        }
+        pressure
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pressure(directory: &Path, files: [&str; 3]) -> Option<Pressure> {
+    let [cpu, memory, io] = files.map(|file| std::fs::read_to_string(directory.join(file)).ok());
+    let (cpu, memory, io) = (cpu?, memory?, io?);
+    let pressure = Pressure {
+        cpu_some: psi_avg10(&cpu, "some")?,
+        mem_some: psi_avg10(&memory, "some")?,
+        mem_full: psi_avg10(&memory, "full")?,
+        io_some: psi_avg10(&io, "some")?,
+        io_full: psi_avg10(&io, "full")?,
+    };
+    pressure.is_valid().then_some(pressure)
+}
+
+#[cfg(target_os = "linux")]
+fn psi_avg10(text: &str, kind: &str) -> Option<f64> {
+    text.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != kind {
+            return None;
+        }
+        fields
+            .find_map(|field| field.strip_prefix("avg10="))?
+            .parse()
+            .ok()
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -287,6 +342,103 @@ fn disk(mount: &Path) -> Result<Disk> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    const CPU_PSI: &str = "some avg10=0.00 avg60=0.01 avg300=0.05 total=2435237\n";
+    const MEMORY_PSI: &str = "some avg10=1.23 avg60=2.34 avg300=3.45 total=1234567\nfull avg10=0.12 avg60=0.23 avg300=0.34 total=12345\n";
+    const IO_PSI: &str = "some avg10=45.67 avg60=34.56 avg300=23.45 total=9876543\nfull avg10=8.90 avg60=7.89 avg300=6.78 total=123456\n";
+    const HOST_PSI_FILES: [&str; 3] = ["cpu", "memory", "io"];
+    const TENANT_PSI_FILES: [&str; 3] = ["cpu.pressure", "memory.pressure", "io.pressure"];
+
+    fn write_psi(directory: &Path, files: [&str; 3]) {
+        std::fs::create_dir_all(directory).unwrap();
+        for (file, text) in files.into_iter().zip([CPU_PSI, MEMORY_PSI, IO_PSI]) {
+            std::fs::write(directory.join(file), text).unwrap();
+        }
+    }
+
+    #[test]
+    fn pressure_reads_kernel_avg10_with_or_without_cpu_full() {
+        let scratch = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+        write_psi(scratch.path(), HOST_PSI_FILES);
+        let expected = Pressure {
+            cpu_some: 0.0,
+            mem_some: 1.23,
+            mem_full: 0.12,
+            io_some: 45.67,
+            io_full: 8.9,
+        };
+        assert_eq!(
+            pressure(scratch.path(), HOST_PSI_FILES),
+            Some(expected.clone())
+        );
+        std::fs::write(
+            scratch.path().join("cpu"),
+            format!("{CPU_PSI}full avg10=0.09 avg60=0.08 avg300=0.07 total=123\n"),
+        )
+        .unwrap();
+        assert_eq!(pressure(scratch.path(), HOST_PSI_FILES), Some(expected));
+    }
+
+    #[test]
+    fn tenant_pressure_uses_vmm_cgroup_files_and_warns_once_per_tenant() {
+        assert_eq!(
+            tenant_pressure_cgroup(7),
+            Path::new("/sys/fs/cgroup/system.slice/motor-vm-helper.service/tenants/tenant-7")
+        );
+        let scratch = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+        let mut sampler = Sampler::default();
+        assert!(sampler
+            .tenant_pressure("tenant-a", scratch.path())
+            .is_none());
+        assert!(sampler
+            .tenant_pressure("tenant-a", scratch.path())
+            .is_none());
+        assert_eq!(sampler.pressure_warned.len(), 1);
+        assert!(sampler
+            .tenant_pressure("tenant-b", scratch.path())
+            .is_none());
+        assert_eq!(sampler.pressure_warned.len(), 2);
+        write_psi(scratch.path(), TENANT_PSI_FILES);
+        let sampled = sampler.tenant_pressure("tenant-a", scratch.path()).unwrap();
+        assert_eq!(sampled.mem_some, 1.23);
+        assert_eq!(sampled.io_full, 8.9);
+        assert_eq!(sampler.pressure_warned.len(), 2);
+    }
+
+    #[test]
+    fn pressure_files_omit_only_the_missing_or_malformed_object() {
+        let scratch = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+        let host = scratch.path().join("host");
+        let tenant = scratch.path().join("tenant");
+        for (broken, files, healthy, healthy_files) in [
+            (&host, HOST_PSI_FILES, &tenant, TENANT_PSI_FILES),
+            (&tenant, TENANT_PSI_FILES, &host, HOST_PSI_FILES),
+        ] {
+            write_psi(healthy, healthy_files);
+            for file in files {
+                write_psi(broken, files);
+                std::fs::remove_file(broken.join(file)).unwrap();
+                assert!(pressure(broken, files).is_none());
+                assert!(pressure(healthy, healthy_files).is_some());
+                for malformed in [
+                    "some avg60=0.00 total=1\nfull avg10=0.00\n",
+                    "some avg10=bad\nfull avg10=0.00\n",
+                    "some avg10=NaN\nfull avg10=0.00\n",
+                    "some avg10=100.01\nfull avg10=0.00\n",
+                    "some avg10=1.234\nfull avg10=0.00\n",
+                    "full avg10=0.00\n",
+                ] {
+                    std::fs::write(broken.join(file), malformed).unwrap();
+                    assert!(pressure(broken, files).is_none(), "{file}: {malformed}");
+                    assert!(pressure(healthy, healthy_files).is_some());
+                }
+                if file != files[0] {
+                    std::fs::write(broken.join(file), CPU_PSI).unwrap();
+                    assert!(pressure(broken, files).is_none(), "full line is required");
+                }
+            }
+        }
+    }
 
     #[test]
     fn guest_disk_ignores_old_guests_stale_reports_and_malformed_values() {

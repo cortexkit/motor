@@ -43,6 +43,7 @@ fn remote_cache_credentials_cross_only_the_helper_relay_and_fail_without_logging
         capacity: directory.path().join("capacity.json"),
         guest_init: BTreeMap::new(),
         vcpu_ceiling: BTreeMap::new(),
+        pressure_cgroups: BTreeMap::new(),
     };
     let logs = super::billing::Logs::default();
     let captured = logs.0.clone();
@@ -232,6 +233,7 @@ fn helper_initialization_holds_one_vcpu_until_attach_or_post_restore_reply() {
             storage: directory.path().to_path_buf(),
             capacity: directory.path().join("capacity.json"),
             vcpu_ceiling: BTreeMap::from([("tenant".into(), 24)]),
+            pressure_cgroups: BTreeMap::new(),
             guest_init: BTreeMap::from([(
                 "tenant".into(),
                 json!({"address":"10.200.1.2/30","gateway":"10.200.1.1","resolvers":["1.1.1.1"],"hostname":"motor-1","machine_id":"12345678901234567890123456789012"}),
@@ -322,6 +324,7 @@ fn recovery_guest_pass_clears_flag_but_failure_or_unreachable_guest_keeps_tenant
             storage: directory.path().into(),
             capacity: directory.path().join("capacity.json"),
             vcpu_ceiling: BTreeMap::from([("tenant".into(), 24)]),
+            pressure_cgroups: BTreeMap::new(),
             guest_init: BTreeMap::from([("tenant".into(), json!({}))]),
         };
         let response = helper.wake("tenant", None);
@@ -384,6 +387,7 @@ fn helper_start_refused_reply_is_a_typed_start_refusal_and_stops_the_wake() {
         storage: directory.path().into(),
         capacity: directory.path().join("capacity.json"),
         vcpu_ceiling: BTreeMap::from([("tenant".into(), 24)]),
+        pressure_cgroups: BTreeMap::new(),
         guest_init: BTreeMap::from([("tenant".into(), json!({}))]),
     };
     let error = helper.wake("tenant", None).unwrap_err();
@@ -426,6 +430,7 @@ fn adopted_vm_must_still_be_running_after_idempotent_activation() {
         storage: directory.path().into(),
         capacity: directory.path().join("capacity.json"),
         vcpu_ceiling: BTreeMap::from([("tenant".into(), 24)]),
+        pressure_cgroups: BTreeMap::new(),
         guest_init: BTreeMap::new(),
     };
     let error = helper.wake("tenant", Some(2)).unwrap_err();
