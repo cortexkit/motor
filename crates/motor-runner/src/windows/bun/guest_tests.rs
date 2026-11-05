@@ -635,6 +635,17 @@ fn bun_failure_is_only_legal_before_tree_received_and_version_four_is_named() {
     protocol
         .accept(
             Peer::Host,
+            &Frame::SyncClock {
+                unix_ms: 1_800_000_000_000,
+            },
+        )
+        .unwrap();
+    protocol
+        .accept(Peer::Agent, &Frame::ClockSynchronized { correction_ms: 0 })
+        .unwrap();
+    protocol
+        .accept(
+            Peer::Host,
             &Frame::TreeEnd {
                 command: Command {
                     command: "echo should-not-run".into(),

@@ -56,6 +56,7 @@ fn snapshot_error(
 }
 
 pub(super) struct PreparedTree {
+    pub(super) mtimes: super::source_mtimes::Record,
     pub path: PathBuf,
     pub lease: super::bun::Lease,
     pub source_plan: motor_winagent::source_seal::Plan,
@@ -266,11 +267,23 @@ pub(super) fn prepare(
         &checkouts,
     )?;
     let caches = config.windows.as_ref().unwrap().caches();
-    super::source_mtimes::prepare(
+    let regular_files: BTreeSet<String> = read_json(&staging.join("source-regular.json"))?;
+    let members: BTreeSet<String> = read_json(&staging.join("source-members.json"))?;
+    let selection = source_plan(&regular_files, request)?;
+    #[cfg(windows)]
+    let concurrent_jobs = config.windows.as_ref().unwrap().concurrent_jobs;
+    #[cfg(not(windows))]
+    let concurrent_jobs = 1;
+    let mtimes = super::source_mtimes::prepare(
         &plan.snapshots,
         staging,
         &caches.disk(&plan.workspace),
         &caches.source_mtimes(&plan.workspace),
+        super::source_mtimes::Policy {
+            exported: &members,
+            sealed: &selection.plan,
+            concurrent_jobs,
+        },
         std::time::SystemTime::now(),
     )?;
     build_tar(staging)?;
@@ -279,14 +292,13 @@ pub(super) fn prepare(
         .map_err(|error| super::vm::path_error("open trusted preparation tree", &tar, error))?;
     motor_winagent::validate_tree(&mut file)
         .map_err(|error| super::vm::path_error("validate trusted preparation tree", &tar, error))?;
-    let regular_files: BTreeSet<String> = read_json(&staging.join("source-regular.json"))?;
-    let selection = source_plan(&regular_files, request)?;
     if selection.unprotected_count > 0 {
         tracing::warn!(job_id = %setup.id, unprotected_count = selection.unprotected_count,
             unprotected_paths = ?selection.unprotected_examples, selected_count = selection.plan.count(),
             "Windows tracked source protection is incomplete");
     }
     Ok(PreparedTree {
+        mtimes,
         path: tar,
         lease,
         source_read_only: selection.unprotected_count == 0,
@@ -748,6 +760,7 @@ fn stage_snapshots(plan: &Plan) -> io::Result<(Vec<PathBuf>, BTreeSet<String>, B
     // Preserve the accepted regular-file set before dependency preparation can
     // add generated files or turn symlink-text entries into ordinary files.
     atomic_json(&plan.staging.join("source-regular.json"), &regular_files)?;
+    atomic_json(&plan.staging.join("source-members.json"), &members)?;
     Ok((roots, members, regular_files))
 }
 

@@ -189,6 +189,8 @@ impl CacheDisks {
             atomic_json(&self.usage(&disk), &Usage { last_used_ms: now }).map_err(|error| {
                 super::vm::path_error("write cache usage", &self.usage(&disk), error)
             })?;
+            // Both VM backends call completion only after proving the VM stopped.
+            super::source_mtimes::ended(&disk, &self.source_mtimes(workspace), now)?;
             let marker = self.marker(&disk);
             fs::remove_file(&marker).map_err(|error| {
                 super::vm::path_error("remove cache attachment", &marker, error)

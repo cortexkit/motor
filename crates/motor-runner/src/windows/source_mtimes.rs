@@ -1,12 +1,15 @@
 //! Source timestamps belong to the persistent workspace disk, not to a job VM.
 use super::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{collections::BTreeMap, io::Read};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::{Read, Write},
+};
 
 const MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_FILES: usize = 100_000;
-const CANDIDATE: &str = "source-mtimes.json";
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct DiskIdentity {
@@ -32,12 +35,23 @@ fn identity(disk: &Path) -> Option<DiskIdentity> {
 struct Entry {
     blob: String,
     modified_ms: u64,
+    #[serde(default)]
+    sealed: bool,
 }
 
 #[derive(Serialize, Deserialize)]
-struct Record {
+pub(super) struct Record {
     disk: Option<DiskIdentity>,
     files: BTreeMap<String, Entry>,
+    #[serde(default)]
+    attributes: String,
+    ended_ms: Option<u64>,
+}
+
+pub(super) struct Policy<'a> {
+    pub(super) exported: &'a BTreeSet<String>,
+    pub(super) sealed: &'a motor_winagent::source_seal::Plan,
+    pub(super) concurrent_jobs: u32,
 }
 
 fn load(path: &Path) -> Option<Record> {
@@ -54,53 +68,86 @@ pub(super) fn prepare(
     staging: &Path,
     disk: &Path,
     record_path: &Path,
+    policy: Policy<'_>,
     now: SystemTime,
-) -> io::Result<()> {
+) -> io::Result<Record> {
     let disk = identity(disk);
-    let previous = load(record_path).filter(|r| disk.is_some() && r.disk == disk);
+    let previous = load(record_path).filter(|r| {
+        disk.is_some()
+            && r.disk == disk
+            && r.ended_ms
+                .is_some_and(|end| end.checked_add(1000).is_some())
+    });
     let now_ms = u64::try_from(now.duration_since(UNIX_EPOCH).map_err(invalid)?.as_millis())
         .map_err(invalid)?;
+    let fresh_ms = previous
+        .as_ref()
+        .and_then(|r| r.ended_ms)
+        .map_or(now_ms, |end| now_ms.max(end + 1000));
+    let trees = snapshots
+        .iter()
+        .map(|snapshot| {
+            super::prep::git(
+                snapshot,
+                &["ls-tree", "-r", "-z", "--full-tree", &snapshot.commit],
+            )
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut attributes = Sha256::new();
+    for (snapshot, tree) in snapshots.iter().zip(&trees) {
+        for (name, blob) in blobs(&tree.stdout)? {
+            if name.rsplit('/').next() == Some(".gitattributes") {
+                attributes.update(
+                    serde_json::to_vec(&(&snapshot.destination, name, blob)).map_err(invalid)?,
+                );
+            }
+        }
+    }
+    let attributes = format!("{:x}", attributes.finalize());
+    let previous = previous.filter(|r| r.attributes == attributes);
+    let sealed: BTreeSet<_> = policy
+        .sealed
+        .files
+        .iter()
+        .map(|path| format!("m/{path}"))
+        .collect();
+    // Multiple slots let preparation overlap another VM's writes. Old source
+    // times are reusable only when the slot serializes staging after teardown.
+    let reuse = policy.concurrent_jobs == 1;
     let mut record = Record {
         disk,
         files: BTreeMap::new(),
+        attributes,
+        ended_ms: None,
     };
     let mut bytes = 1024;
     let mut bounded = true;
-    for snapshot in snapshots {
-        let output = super::prep::git(
-            snapshot,
-            &["ls-tree", "-r", "-z", "--full-tree", &snapshot.commit],
-        )?;
-        for line in output
-            .stdout
-            .split(|b| *b == 0)
-            .filter(|line| !line.is_empty())
-        {
-            let line = std::str::from_utf8(line).map_err(invalid)?;
-            let (header, name) = line
-                .split_once('\t')
-                .ok_or_else(|| invalid("invalid git tree entry"))?;
-            let mut fields = header.split_whitespace();
-            let _mode = fields.next();
-            if fields.next() != Some("blob") {
-                continue;
-            }
-            let blob = fields
-                .next()
-                .ok_or_else(|| invalid("missing git blob id"))?;
+    for (snapshot, tree) in snapshots.iter().zip(&trees) {
+        for (name, blob) in blobs(&tree.stdout)? {
             let path = super::prep::mapped(&snapshot.destination)?.join(name);
             let key = path.to_string_lossy().replace('\\', "/");
             motor_winagent::validate_archive_path(&key)?;
             let path = staging.join(path);
-            // export-ignore paths are absent from git archive. Do not create them.
-            if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+            // Filesystem existence is not membership: on NTFS an ignored name
+            // can resolve to a differently cased exported file.
+            if !policy.exported.contains(&key) {
                 continue;
             }
+            if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+                continue;
+            }
+            let sealed = sealed.contains(&key);
             let modified_ms = previous
                 .as_ref()
                 .and_then(|r| r.files.get(&key))
-                .filter(|entry| entry.blob == blob && entry.modified_ms <= now_ms)
-                .map_or(now_ms, |entry| entry.modified_ms);
+                .filter(|entry| {
+                    reuse
+                        && sealed
+                        && entry.sealed
+                        && entry.blob == blob
+                        && entry.modified_ms <= fresh_ms
+                })
+                .map_or(fresh_ms, |entry| entry.modified_ms);
             let modified = UNIX_EPOCH + Duration::from_millis(modified_ms);
             fs::OpenOptions::new()
                 .write(true)
@@ -110,6 +157,7 @@ pub(super) fn prepare(
                 let entry = Entry {
                     blob: blob.into(),
                     modified_ms,
+                    sealed,
                 };
                 bytes += serde_json::to_vec(&(&key, &entry)).map_err(invalid)?.len() + 2;
                 if bytes as u64 > MAX_BYTES || record.files.len() == MAX_FILES {
@@ -121,22 +169,89 @@ pub(super) fn prepare(
             }
         }
     }
-    // An empty candidate also replaces any oversized previous record at commit.
-    atomic_json(&staging.join(CANDIDATE), &record)
+    // Keep candidates in memory: staging is writable by the preparation account.
+    Ok(record)
+}
+
+fn blobs(bytes: &[u8]) -> io::Result<Vec<(&str, &str)>> {
+    bytes
+        .split(|b| *b == 0)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let parse = || {
+                let line = std::str::from_utf8(line).map_err(invalid)?;
+                let (header, name) = line
+                    .split_once('\t')
+                    .ok_or_else(|| invalid("invalid git tree entry"))?;
+                let mut fields = header.split_whitespace();
+                let _mode = fields.next();
+                if fields.next() != Some("blob") {
+                    return Ok(None);
+                }
+                let blob = fields
+                    .next()
+                    .ok_or_else(|| invalid("missing git blob id"))?;
+                Ok(Some((name, blob)))
+            };
+            parse().transpose()
+        })
+        .collect()
 }
 
 /// Boot creates a missing cache disk after preparation. Only bind the successful
 /// staging to that disk once it exists; failed preparation never replaces history.
-pub(super) fn commit(staging: &Path, disk: &Path, record_path: &Path) -> io::Result<()> {
-    let Some(mut record) = load(&staging.join(CANDIDATE)) else {
-        return forget(record_path);
-    };
+pub(super) fn commit(mut record: Record, disk: &Path, record_path: &Path) -> io::Result<()> {
     let current = identity(disk);
     if current.is_none() || (record.disk.is_some() && record.disk != current) {
         return forget(record_path);
     }
     record.disk = current;
-    atomic_json(record_path, &record)
+    record.ended_ms = None;
+    write_record(record_path, &record)
+}
+
+/// Record the host-observed end only after the guest confirmed the job cannot
+/// write or delete the selected source files and the host proved the VM stopped.
+/// Missing end times, including records written before a crash, never authorize reuse.
+pub(super) fn ended(disk: &Path, record_path: &Path, now_ms: u64) -> io::Result<()> {
+    let Some(mut record) = load(record_path) else {
+        return Ok(());
+    };
+    if record.disk.is_none() || record.disk != identity(disk) {
+        return forget(record_path);
+    }
+    record.ended_ms = Some(now_ms);
+    write_record(record_path, &record)
+}
+
+fn write_record(path: &Path, record: &Record) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("source timestamp record has no parent"))?;
+    let temporary = parent.join(format!(".source-mtimes-{}.tmp", Uuid::now_v7()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&temporary)?;
+    let result = (|| {
+        let bytes = serde_json::to_vec(record).map_err(invalid)?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(invalid("source timestamp record exceeds size bound"));
+        }
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        crate::filesystem::rename(&temporary, path)?;
+        crate::filesystem::sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn forget(path: &Path) -> io::Result<()> {
@@ -191,9 +306,10 @@ mod tests {
                 record,
             }
         }
-        fn stage(&self, label: &str, seconds: u64) -> PathBuf {
+        fn extract(&self, label: &str) -> (PathBuf, BTreeSet<String>) {
             let staging = self.root.join(label);
             fs::create_dir_all(&staging).unwrap();
+            let mut exported = BTreeSet::new();
             for snapshot in &self.snapshots {
                 let output = super::super::prep::git(
                     snapshot,
@@ -206,19 +322,55 @@ mod tests {
                 .unwrap();
                 let root = staging.join(super::super::prep::mapped(&snapshot.destination).unwrap());
                 fs::create_dir_all(&root).unwrap();
+                for entry in tar::Archive::new(io::Cursor::new(&output.stdout))
+                    .entries()
+                    .unwrap()
+                {
+                    let entry = entry.unwrap();
+                    if entry.header().entry_type().is_file() {
+                        let name = entry.path().unwrap().to_string_lossy().into_owned();
+                        exported.insert(format!("m{}/{name}", snapshot.destination));
+                    }
+                }
                 tar::Archive::new(io::Cursor::new(output.stdout))
                     .unpack(root)
                     .unwrap();
             }
+            (staging, exported)
+        }
+        fn apply(
+            &self,
+            staging: &Path,
+            exported: &BTreeSet<String>,
+            sealed: &motor_winagent::source_seal::Plan,
+            concurrent_jobs: u32,
+            now: SystemTime,
+        ) -> Record {
             prepare(
                 &self.snapshots,
-                &staging,
+                staging,
                 &self.disk,
                 &self.record,
-                UNIX_EPOCH + Duration::from_secs(seconds),
+                Policy {
+                    exported,
+                    sealed,
+                    concurrent_jobs,
+                },
+                now,
             )
-            .unwrap();
-            commit(&staging, &self.disk, &self.record).unwrap();
+            .unwrap()
+        }
+        fn stage(&self, label: &str, seconds: u64) -> PathBuf {
+            let (staging, exported) = self.extract(label);
+            let candidate = self.apply(
+                &staging,
+                &exported,
+                &seal(&exported),
+                1,
+                UNIX_EPOCH + Duration::from_secs(seconds),
+            );
+            commit(candidate, &self.disk, &self.record).unwrap();
+            ended(&self.disk, &self.record, seconds * 1000).unwrap();
             staging
         }
         fn change(&mut self, contents: &str) {
@@ -251,6 +403,15 @@ mod tests {
         );
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
+    fn seal(exported: &BTreeSet<String>) -> motor_winagent::source_seal::Plan {
+        motor_winagent::source_seal::Plan::new(
+            exported
+                .iter()
+                .map(|path| path.strip_prefix("m/").unwrap().to_owned())
+                .collect(),
+        )
+        .unwrap()
+    }
     fn mtime(staging: &Path, repository: &str, file: &str) -> u64 {
         fs::metadata(staging.join(format!("m/work/{repository}/{file}")))
             .unwrap()
@@ -259,6 +420,176 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    #[test]
+    fn reuse_requires_previous_and_current_byte_protection() {
+        for (previously_sealed, currently_sealed) in [(false, true), (true, false), (false, false)]
+        {
+            let f = Fixture::new();
+            let (first, exported) = f.extract("first");
+            let plan = if previously_sealed {
+                seal(&exported)
+            } else {
+                Default::default()
+            };
+            let candidate = f.apply(
+                &first,
+                &exported,
+                &plan,
+                1,
+                UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+            );
+            commit(candidate, &f.disk, &f.record).unwrap();
+            ended(&f.disk, &f.record, 1_800_000_000_000).unwrap();
+            assert_eq!(
+                load(&f.record).unwrap().files["m/work/main/unchanged.rs"].sealed,
+                previously_sealed
+            );
+            let (second, exported) = f.extract("second");
+            let plan = if currently_sealed {
+                seal(&exported)
+            } else {
+                Default::default()
+            };
+            f.apply(
+                &second,
+                &exported,
+                &plan,
+                1,
+                UNIX_EPOCH + Duration::from_secs(1_800_000_010),
+            );
+            for repo in ["main", "sibling"] {
+                assert_eq!(mtime(&second, repo, "unchanged.rs"), 1_800_000_010);
+            }
+        }
+    }
+
+    #[test]
+    fn attributes_in_any_snapshot_invalidate_all_recorded_times() {
+        let mut f = Fixture::new();
+        f.stage("first", 1_800_000_000);
+        for (index, repository) in [0, 1].into_iter().enumerate() {
+            let snapshot = &mut f.snapshots[repository];
+            let repo = snapshot.mirror.parent().unwrap();
+            fs::write(repo.join(".gitattributes"), "*.rs text eol=crlf\n").unwrap();
+            git(repo, &["add", ".gitattributes"]);
+            git(repo, &["commit", "-qm", "attributes only"]);
+            snapshot.commit = git(repo, &["rev-parse", "HEAD"]);
+            let now = 1_800_000_010 + index as u64 * 10;
+            let staged = f.stage(&format!("attributes-{index}"), now);
+            for repo in ["main", "sibling"] {
+                assert_eq!(mtime(&staged, repo, "unchanged.rs"), now);
+            }
+        }
+    }
+
+    #[test]
+    fn ignored_case_alias_is_not_an_exported_record_entry() {
+        let mut f = Fixture::new();
+        let snapshot = &mut f.snapshots[0];
+        let repo = snapshot.mirror.parent().unwrap();
+        git(repo, &["config", "core.ignorecase", "false"]);
+        fs::write(repo.join("A.rs"), "exported").unwrap();
+        fs::write(repo.join(".gitattributes"), "a.rs export-ignore\n").unwrap();
+        git(repo, &["add", "."]);
+        // Populate the case-distinct tree directly so the fixture also works
+        // when its own checkout cannot hold both spellings as separate files.
+        let ignored = git(repo, &["rev-parse", "HEAD:changed.rs"]);
+        git(
+            repo,
+            &[
+                "-c",
+                "core.ignorecase=false",
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{ignored},a.rs"),
+            ],
+        );
+        git(repo, &["commit", "-qm", "case alias fixture"]);
+        snapshot.commit = git(repo, &["rev-parse", "HEAD"]);
+        let (staging, exported) = f.extract("alias");
+        assert!(exported.contains("m/work/main/A.rs"));
+        assert!(!exported.contains("m/work/main/a.rs"));
+        // A hard link models NTFS resolving the ignored spelling to the same
+        // object while keeping the regression portable on case-sensitive hosts.
+        if !staging.join("m/work/main/a.rs").exists() {
+            fs::hard_link(
+                staging.join("m/work/main/A.rs"),
+                staging.join("m/work/main/a.rs"),
+            )
+            .unwrap();
+        }
+        let candidate = f.apply(
+            &staging,
+            &exported,
+            &seal(&exported),
+            1,
+            UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        );
+        assert!(candidate.files.contains_key("m/work/main/A.rs"));
+        assert!(!candidate.files.contains_key("m/work/main/a.rs"));
+    }
+
+    #[test]
+    fn multiple_slots_disable_old_time_reuse() {
+        let f = Fixture::new();
+        f.stage("first", 1_800_000_000);
+        let (second, exported) = f.extract("second");
+        f.apply(
+            &second,
+            &exported,
+            &seal(&exported),
+            2,
+            UNIX_EPOCH + Duration::from_secs(1_800_000_010),
+        );
+        for repo in ["main", "sibling"] {
+            assert_eq!(mtime(&second, repo, "unchanged.rs"), 1_800_000_010);
+        }
+    }
+
+    #[test]
+    fn changed_times_follow_completed_vm_end_even_if_host_clock_moves_back() {
+        let mut f = Fixture::new();
+        f.stage("first", 1_800_000_000);
+        ended(&f.disk, &f.record, 1_800_000_010_000).unwrap();
+        f.change("new bytes");
+        let second = f.stage("backward", 1_799_999_000);
+        assert_eq!(mtime(&second, "main", "changed.rs"), 1_800_000_011);
+        let mut record = load(&f.record).unwrap();
+        record.ended_ms = None;
+        write_record(&f.record, &record).unwrap();
+        let third = f.stage("no-end", 1_800_000_100);
+        assert_eq!(mtime(&third, "main", "unchanged.rs"), 1_800_000_100);
+        // Older records have no end field either, and must also rebuild.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&f.record).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("ended_ms");
+        fs::write(&f.record, serde_json::to_vec(&value).unwrap()).unwrap();
+        let fourth = f.stage("old-record", 1_800_000_200);
+        assert_eq!(mtime(&fourth, "main", "unchanged.rs"), 1_800_000_200);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn record_never_writes_through_a_prep_owned_temporary_path() {
+        let f = Fixture::new();
+        let (staging, exported) = f.extract("prep-owned");
+        let victim = f.root.join("runner-owned-canary");
+        fs::write(&victim, "must survive").unwrap();
+        std::os::unix::fs::symlink(&victim, staging.join("source-mtimes.tmp")).unwrap();
+        let candidate = f.apply(
+            &staging,
+            &exported,
+            &seal(&exported),
+            1,
+            UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        );
+        commit(candidate, &f.disk, &f.record).unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "must survive");
+        assert!(!staging.join("source-mtimes.json").exists());
+        assert!(staging.join("source-mtimes.tmp").is_symlink());
     }
 
     #[test]
@@ -310,33 +641,15 @@ mod tests {
                     fs::write(&f.disk, "replacement disk").unwrap();
                 }
             }
-            let staging = f.root.join(format!("fallback-{index}"));
-            // Restore the path after observing the unreadable-record fallback,
-            // so committing the successful staging can replace its history.
-            let mut snapshots = Vec::new();
-            for snapshot in &f.snapshots {
-                snapshots.push(super::super::prep::Snapshot {
-                    mirror: snapshot.mirror.clone(),
-                    commit: snapshot.commit.clone(),
-                    destination: snapshot.destination.clone(),
-                });
-            }
-            fs::create_dir_all(&staging).unwrap();
-            for snapshot in &snapshots {
-                let root = staging.join(super::super::prep::mapped(&snapshot.destination).unwrap());
-                fs::create_dir_all(&root).unwrap();
-                fs::write(root.join("unchanged.rs"), "unchanged").unwrap();
-                fs::write(root.join("changed.rs"), "version one").unwrap();
-            }
+            let (staging, exported) = f.extract(&format!("fallback-{index}"));
             let now = 1_800_000_100 + index as u64;
-            prepare(
-                &snapshots,
+            let candidate = f.apply(
                 &staging,
-                &f.disk,
-                &f.record,
+                &exported,
+                &seal(&exported),
+                1,
                 UNIX_EPOCH + Duration::from_secs(now),
-            )
-            .unwrap();
+            );
             for repo in ["main", "sibling"] {
                 for file in ["unchanged.rs", "changed.rs"] {
                     assert_eq!(mtime(&staging, repo, file), now, "{case}");
@@ -345,17 +658,17 @@ mod tests {
             if *case == "unreadable" {
                 fs::remove_dir(&f.record).unwrap();
             }
-            commit(&staging, &f.disk, &f.record).unwrap();
+            commit(candidate, &f.disk, &f.record).unwrap();
+            ended(&f.disk, &f.record, now * 1000).unwrap();
         }
     }
 
     #[test]
     fn fractional_staging_times_survive_transfer_and_guest_unpack() {
         let f = Fixture::new();
-        let staging = f.stage("fractional", 1_800_000_000);
-        fs::remove_file(&f.record).unwrap();
+        let (staging, exported) = f.extract("fractional");
         let now = UNIX_EPOCH + Duration::from_millis(1_800_000_010_123);
-        prepare(&f.snapshots, &staging, &f.disk, &f.record, now).unwrap();
+        f.apply(&staging, &exported, &seal(&exported), 1, now);
         super::super::prep::build_tar(&staging).unwrap();
         let guest = f.root.join("guest");
         let cargo = f.root.join("cargo-home");
@@ -381,16 +694,12 @@ mod tests {
     }
 
     #[test]
-    fn unidentifiable_disk_or_missing_candidate_discards_older_history() {
+    fn unidentifiable_disk_discards_older_history() {
         let f = Fixture::new();
-        let staging = f.stage("first", 1_800_000_000);
+        f.stage("first", 1_800_000_000);
+        let candidate = load(&f.record).unwrap();
         fs::rename(&f.disk, f.root.join("old-disk")).unwrap();
-        commit(&staging, &f.disk, &f.record).unwrap();
-        assert!(!f.record.exists());
-        fs::write(&f.disk, "new disk").unwrap();
-        let staging = f.stage("second", 1_800_000_010);
-        fs::remove_file(staging.join(CANDIDATE)).unwrap();
-        commit(&staging, &f.disk, &f.record).unwrap();
+        commit(candidate, &f.disk, &f.record).unwrap();
         assert!(!f.record.exists());
     }
 
@@ -407,10 +716,15 @@ mod tests {
             &staging,
             &f.disk,
             &f.record,
+            Policy {
+                exported: &BTreeSet::new(),
+                sealed: &motor_winagent::source_seal::Plan::default(),
+                concurrent_jobs: 1
+            },
             UNIX_EPOCH + Duration::from_secs(1_800_000_010)
         )
         .is_err());
         assert_eq!(fs::read(&f.record).unwrap(), original);
-        assert!(!staging.join(CANDIDATE).exists());
+        assert!(!staging.join("source-mtimes.json").exists());
     }
 }

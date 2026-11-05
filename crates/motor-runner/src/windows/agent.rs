@@ -787,7 +787,7 @@ fn materialize_attempt(
         .caller_workspace_key
         .text();
     super::source_mtimes::commit(
-        &resources.staging,
+        prepared_tree.mtimes,
         &caches.disk(workspace),
         &caches.source_mtimes(workspace),
     )?;
