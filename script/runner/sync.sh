@@ -23,7 +23,12 @@ export GIT_CONFIG_NOSYSTEM=1
 unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
 scratch=$(mktemp -d)
 locked=0
+finished=false
+# macOS /bin/bash 3.2 exits 0 when an unbound variable stops a `set -euo
+# pipefail` script that has an EXIT trap, so count an exit 0 only when the
+# script reached its end.
 cleanup() {
+  local status=$?
   if [ "$locked" -eq 1 ]; then
     if ! ssh -o BatchMode=yes -o ForwardAgent=no "$host" \
       "flock -x /srv/build/runner.lock.guard bash -s -- release $lock_owner_arg" <<'REMOTE'
@@ -40,6 +45,8 @@ REMOTE
     fi
   fi
   rm -rf "$scratch"
+  if [ "$status" -ne 0 ]; then exit "$status"; fi
+  $finished || { echo "FAIL: stopped before its end (unexpected error)" >&2; exit 1; }
 }
 trap cleanup EXIT
 
@@ -225,3 +232,4 @@ REMOTE
   rsync -az --delete --exclude=/.git/ -e 'ssh -o BatchMode=yes -o ForwardAgent=no' \
     "$scratch/$name/" "$host:/srv/build/src/$name/"
 done < "$scratch/repos"
+finished=true
