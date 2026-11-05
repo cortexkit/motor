@@ -274,7 +274,7 @@ pub(super) fn prepare(
     let concurrent_jobs = config.windows.as_ref().unwrap().concurrent_jobs;
     #[cfg(not(windows))]
     let concurrent_jobs = 1;
-    let mtimes = super::source_mtimes::prepare(
+    let (mtimes, times) = super::source_mtimes::prepare(
         &plan.snapshots,
         staging,
         &caches.disk(&plan.workspace),
@@ -286,7 +286,7 @@ pub(super) fn prepare(
         },
         std::time::SystemTime::now(),
     )?;
-    build_tar(staging)?;
+    build_tar_with_times(staging, &times)?;
     let tar = staging.join("tree.tar");
     let mut file = File::open(&tar)
         .map_err(|error| super::vm::path_error("open trusted preparation tree", &tar, error))?;
@@ -1210,6 +1210,15 @@ fn replace_links(directory: &Path) -> io::Result<()> {
 }
 
 pub(super) fn build_tar(staging: &Path) -> io::Result<()> {
+    build_tar_with_times(staging, &BTreeMap::new())
+}
+
+/// Build the transfer archive. A file named in `times` (archive name to Unix
+/// milliseconds) carries that time; every other file carries its staged time.
+pub(super) fn build_tar_with_times(
+    staging: &Path,
+    times: &BTreeMap<String, u64>,
+) -> io::Result<()> {
     let archive = staging.join("tree.tar");
     let temporary = staging.join(format!(".tree-{}.tar", Uuid::now_v7()));
     let mut options = OpenOptions::new();
@@ -1225,9 +1234,15 @@ pub(super) fn build_tar(staging: &Path) -> io::Result<()> {
     let mut verification = file.try_clone()?;
     let mut builder = tar::Builder::new(file);
     let mut seen = BTreeSet::new();
-    append(&mut builder, staging, &staging.join("m"), &mut seen)?;
+    append(&mut builder, staging, &staging.join("m"), &mut seen, times)?;
     if staging.join("bun-seed").exists() {
-        append(&mut builder, staging, &staging.join("bun-seed"), &mut seen)?;
+        append(
+            &mut builder,
+            staging,
+            &staging.join("bun-seed"),
+            &mut seen,
+            times,
+        )?;
     }
     for name in [
         "config.toml",
@@ -1242,7 +1257,7 @@ pub(super) fn build_tar(staging: &Path) -> io::Result<()> {
     ] {
         let path = staging.join("cargo-home").join(name);
         if path.exists() {
-            append(&mut builder, staging, &path, &mut seen)?;
+            append(&mut builder, staging, &path, &mut seen, times)?;
         }
     }
     builder
@@ -1258,6 +1273,7 @@ fn append(
     staging: &Path,
     path: &Path,
     seen: &mut BTreeSet<String>,
+    times: &BTreeMap<String, u64>,
 ) -> io::Result<()> {
     let relative = path.strip_prefix(staging).map_err(invalid)?;
     let name = relative
@@ -1291,19 +1307,27 @@ fn append(
             .map_err(|error| error_at_path("read staged directory entry", path, error))?;
         entries.sort();
         for entry in entries {
-            append(builder, staging, &entry, seen)?;
+            append(builder, staging, &entry, seen, times)?;
         }
     } else if metadata.is_file() {
         let mut file = File::open(path)
             .map_err(|error| error_at_path("open staged file for transfer", path, error))?;
-        let modified = metadata
-            .modified()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(invalid)?;
+        let modified = match times.get(name) {
+            Some(ms) => std::time::Duration::from_millis(*ms),
+            None => metadata
+                .modified()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(invalid)?,
+        };
         let mtime = format!("{}.{:09}", modified.as_secs(), modified.subsec_nanos());
         builder.append_pax_extensions([("mtime", mtime.as_bytes())])?;
+        // The header's whole-second time matches the PAX time, for readers
+        // that ignore PAX records.
+        let mut header = tar::Header::new_gnu();
+        header.set_metadata(&metadata);
+        header.set_mtime(modified.as_secs());
         builder
-            .append_file(relative, &mut file)
+            .append_data(&mut header, relative, &mut file)
             .map_err(|error| error_at_path("append file to transfer archive from", path, error))?;
     } else {
         return Err(invalid(format!("special file: {name}")));

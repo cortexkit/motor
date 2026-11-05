@@ -2,7 +2,7 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{Read, Write},
@@ -48,6 +48,13 @@ pub(super) struct Record {
     ended_ms: Option<u64>,
 }
 
+/// Planned modification time, in Unix milliseconds, for each staged source file,
+/// keyed by its archive name (`m/...`). The times travel in the transfer
+/// archive's PAX headers; staged files on disk are never retimed, because on
+/// Linux they belong to the preparation account and only a file's owner may set
+/// an explicit time.
+pub(super) type Times = BTreeMap<String, u64>;
+
 pub(super) struct Policy<'a> {
     pub(super) exported: &'a BTreeSet<String>,
     pub(super) sealed: &'a motor_winagent::source_seal::Plan,
@@ -70,7 +77,7 @@ pub(super) fn prepare(
     record_path: &Path,
     policy: Policy<'_>,
     now: SystemTime,
-) -> io::Result<Record> {
+) -> io::Result<(Record, Times)> {
     let disk = identity(disk);
     let previous = load(record_path).filter(|r| {
         disk.is_some()
@@ -120,6 +127,7 @@ pub(super) fn prepare(
         attributes,
         ended_ms: None,
     };
+    let mut times = Times::new();
     let mut bytes = 1024;
     let mut bounded = true;
     for (snapshot, tree) in snapshots.iter().zip(&trees) {
@@ -148,19 +156,7 @@ pub(super) fn prepare(
                         && entry.modified_ms <= fresh_ms
                 })
                 .map_or(fresh_ms, |entry| entry.modified_ms);
-            let modified = UNIX_EPOCH + Duration::from_millis(modified_ms);
-            let mut options = fs::OpenOptions::new();
-            options.write(true);
-            // The preparation account can write staging, so a file checked above
-            // could be swapped for a symlink before this open.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(libc::O_NOFOLLOW);
-            }
-            options
-                .open(&path)?
-                .set_times(fs::FileTimes::new().set_modified(modified))?;
+            times.insert(key.clone(), modified_ms);
             if bounded {
                 let entry = Entry {
                     blob: blob.into(),
@@ -178,7 +174,7 @@ pub(super) fn prepare(
         }
     }
     // Keep candidates in memory: staging is writable by the preparation account.
-    Ok(record)
+    Ok((record, times))
 }
 
 fn blobs(bytes: &[u8]) -> io::Result<Vec<(&str, &str)>> {
@@ -275,6 +271,7 @@ fn forget(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     struct Fixture {
         root: PathBuf,
@@ -353,7 +350,7 @@ mod tests {
             sealed: &motor_winagent::source_seal::Plan,
             concurrent_jobs: u32,
             now: SystemTime,
-        ) -> Record {
+        ) -> (Record, Times) {
             prepare(
                 &self.snapshots,
                 staging,
@@ -368,9 +365,9 @@ mod tests {
             )
             .unwrap()
         }
-        fn stage(&self, label: &str, seconds: u64) -> PathBuf {
+        fn stage(&self, label: &str, seconds: u64) -> Times {
             let (staging, exported) = self.extract(label);
-            let candidate = self.apply(
+            let (candidate, times) = self.apply(
                 &staging,
                 &exported,
                 &seal(&exported),
@@ -379,7 +376,7 @@ mod tests {
             );
             commit(candidate, &self.disk, &self.record).unwrap();
             ended(&self.disk, &self.record, seconds * 1000).unwrap();
-            staging
+            times
         }
         fn change(&mut self, contents: &str) {
             for snapshot in &mut self.snapshots {
@@ -420,14 +417,9 @@ mod tests {
         )
         .unwrap()
     }
-    fn mtime(staging: &Path, repository: &str, file: &str) -> u64 {
-        fs::metadata(staging.join(format!("m/work/{repository}/{file}")))
-            .unwrap()
-            .modified()
-            .unwrap()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
+    /// Planned time of one staged file, in whole seconds.
+    fn mtime(times: &Times, repository: &str, file: &str) -> u64 {
+        times[&format!("m/work/{repository}/{file}")] / 1000
     }
 
     #[test]
@@ -441,7 +433,7 @@ mod tests {
             } else {
                 Default::default()
             };
-            let candidate = f.apply(
+            let (candidate, _) = f.apply(
                 &first,
                 &exported,
                 &plan,
@@ -460,7 +452,7 @@ mod tests {
             } else {
                 Default::default()
             };
-            f.apply(
+            let (_, times) = f.apply(
                 &second,
                 &exported,
                 &plan,
@@ -468,7 +460,7 @@ mod tests {
                 UNIX_EPOCH + Duration::from_secs(1_800_000_010),
             );
             for repo in ["main", "sibling"] {
-                assert_eq!(mtime(&second, repo, "unchanged.rs"), 1_800_000_010);
+                assert_eq!(mtime(&times, repo, "unchanged.rs"), 1_800_000_010);
             }
         }
     }
@@ -529,7 +521,7 @@ mod tests {
             )
             .unwrap();
         }
-        let candidate = f.apply(
+        let (candidate, times) = f.apply(
             &staging,
             &exported,
             &seal(&exported),
@@ -538,6 +530,7 @@ mod tests {
         );
         assert!(candidate.files.contains_key("m/work/main/A.rs"));
         assert!(!candidate.files.contains_key("m/work/main/a.rs"));
+        assert!(!times.contains_key("m/work/main/a.rs"));
     }
 
     #[test]
@@ -545,7 +538,7 @@ mod tests {
         let f = Fixture::new();
         f.stage("first", 1_800_000_000);
         let (second, exported) = f.extract("second");
-        f.apply(
+        let (_, times) = f.apply(
             &second,
             &exported,
             &seal(&exported),
@@ -553,7 +546,7 @@ mod tests {
             UNIX_EPOCH + Duration::from_secs(1_800_000_010),
         );
         for repo in ["main", "sibling"] {
-            assert_eq!(mtime(&second, repo, "unchanged.rs"), 1_800_000_010);
+            assert_eq!(mtime(&times, repo, "unchanged.rs"), 1_800_000_010);
         }
     }
 
@@ -587,7 +580,7 @@ mod tests {
         let victim = f.root.join("runner-owned-canary");
         fs::write(&victim, "must survive").unwrap();
         std::os::unix::fs::symlink(&victim, staging.join("source-mtimes.tmp")).unwrap();
-        let candidate = f.apply(
+        let (candidate, _) = f.apply(
             &staging,
             &exported,
             &seal(&exported),
@@ -651,7 +644,7 @@ mod tests {
             }
             let (staging, exported) = f.extract(&format!("fallback-{index}"));
             let now = 1_800_000_100 + index as u64;
-            let candidate = f.apply(
+            let (candidate, times) = f.apply(
                 &staging,
                 &exported,
                 &seal(&exported),
@@ -660,7 +653,7 @@ mod tests {
             );
             for repo in ["main", "sibling"] {
                 for file in ["unchanged.rs", "changed.rs"] {
-                    assert_eq!(mtime(&staging, repo, file), now, "{case}");
+                    assert_eq!(mtime(&times, repo, file), now, "{case}");
                 }
             }
             if *case == "unreadable" {
@@ -676,8 +669,8 @@ mod tests {
         let f = Fixture::new();
         let (staging, exported) = f.extract("fractional");
         let now = UNIX_EPOCH + Duration::from_millis(1_800_000_010_123);
-        f.apply(&staging, &exported, &seal(&exported), 1, now);
-        super::super::prep::build_tar(&staging).unwrap();
+        let (_, times) = f.apply(&staging, &exported, &seal(&exported), 1, now);
+        super::super::prep::build_tar_with_times(&staging, &times).unwrap();
         let guest = f.root.join("guest");
         let cargo = f.root.join("cargo-home");
         fs::create_dir_all(&guest).unwrap();
@@ -699,6 +692,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn planning_never_retimes_staged_files() {
+        // On Linux, staged files belong to the preparation account, and only a
+        // file's owner may set an explicit time, so retiming them on disk failed
+        // every Windows job's preparation on the build server.
+        let f = Fixture::new();
+        let (staging, exported) = f.extract("untouched");
+        let path = staging.join("m/work/main/unchanged.rs");
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        let planned = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert_ne!(before, planned);
+        let (_, times) = f.apply(&staging, &exported, &seal(&exported), 1, planned);
+        assert_eq!(mtime(&times, "main", "unchanged.rs"), 1_800_000_000);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
     }
 
     #[test]
