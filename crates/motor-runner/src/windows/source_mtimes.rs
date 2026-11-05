@@ -149,8 +149,16 @@ pub(super) fn prepare(
                 })
                 .map_or(fresh_ms, |entry| entry.modified_ms);
             let modified = UNIX_EPOCH + Duration::from_millis(modified_ms);
-            fs::OpenOptions::new()
-                .write(true)
+            let mut options = fs::OpenOptions::new();
+            options.write(true);
+            // The preparation account can write staging, so a file checked above
+            // could be swapped for a symlink before this open.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW);
+            }
+            options
                 .open(&path)?
                 .set_times(fs::FileTimes::new().set_modified(modified))?;
             if bounded {
