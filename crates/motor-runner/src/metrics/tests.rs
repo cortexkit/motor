@@ -40,6 +40,7 @@ fn accepted_record() -> HostMetrics {
             detail: None,
             disk_free_gib: None,
             disk_total_gib: None,
+            pressure: None,
         }],
         runners: vec![Runner {
             name: "direct".into(),
@@ -50,6 +51,7 @@ fn accepted_record() -> HostMetrics {
             oldest_wait_s: 0,
             detail: None,
         }],
+        pressure: None,
     }
 }
 

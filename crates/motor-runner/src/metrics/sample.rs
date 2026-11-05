@@ -23,6 +23,7 @@ impl Sampler {
                 disks: vec![],
                 tenants: vec![],
                 runners: vec![],
+                pressure: None,
             }));
         }
         let (mut cpu, mem, disks, total, idle) = platform()?;
@@ -46,6 +47,8 @@ impl Sampler {
             disks,
             tenants: vec![],
             runners: vec![],
+            // Monitor runners report no pressure; only motor-host samples it.
+            pressure: None,
         }))
     }
 }
