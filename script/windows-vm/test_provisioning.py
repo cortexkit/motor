@@ -643,6 +643,16 @@ class BaselineInputsTests(unittest.TestCase):
                          "Set-Content C:\\build\\provision\\FAILED.txt"):
             self.assertIn(expected, finalize)
 
+    def test_definition_updates_never_keep_the_image_unsettled(self):
+        # On 5 Nov 2026 five finalize passes each found a newer Defender
+        # definition (KB2267602) and the build failed. Definitions still install,
+        # but only OS updates, a reboot, or a pending reboot repeat the pass.
+        finalize = (HERE / "finalize-job-baseline.ps1").read_text()
+        self.assertIn("$definitionUpdates = 'e0789628-ce08-4437-be74-2495b842f43b'", finalize)
+        self.assertIn("if ($reboot -or $pending -or $osUpdates -gt 0) {", finalize)
+        self.assertNotIn("$pending -or $result.Updates.Count -gt 0", finalize)
+        self.assertIn("$updates = New-Object -ComObject Microsoft.Update.UpdateColl", finalize)
+
     def test_baseline_inputs_include_driver_identity_service_and_hardening(self):
         source = (HERE / "setup-job-baseline.ps1").read_text()
         for expected in ('vioserial\\2k22\\amd64\\vioser.inf', '& pnputil /add-driver',

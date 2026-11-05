@@ -49,7 +49,15 @@ try {
     }
     $pending = (New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
     "pending=$pending"
-    if ($reboot -or $pending -or $result.Updates.Count -gt 0) {
+    # Microsoft publishes Defender definition updates several times a day, so a
+    # pass can always find a newer one. They install without a reboot and don't
+    # change the OS, so they never keep the image from counting as settled.
+    $definitionUpdates = 'e0789628-ce08-4437-be74-2495b842f43b'
+    $osUpdates = @($result.Updates | Where-Object {
+        -not @($_.Categories | Where-Object { $_.CategoryID -eq $definitionUpdates }).Count
+    }).Count
+    "os_updates=$osUpdates definition_updates=$($result.Updates.Count - $osUpdates)"
+    if ($reboot -or $pending -or $osUpdates -gt 0) {
         if ($runs -ge 5) { throw "Updates did not settle within five $phase passes" }
         Stop-Transcript | Out-Null
         $transcriptOpen = $false
