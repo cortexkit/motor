@@ -85,7 +85,7 @@ class ImageTests(unittest.TestCase):
         self.assertIn('Acquire::AllowInsecureRepositories "false";', written['/etc/apt/apt.conf.d/99snapshot'])
         self.assertIn('APT::Get::AllowUnauthenticated "false";', written['/etc/apt/apt.conf.d/99snapshot'])
 
-    def test_mirror_override_is_used_for_all_guest_apt_sources(self):
+    def test_mirror_override_is_used_for_installs_but_never_shipped(self):
         pins = {'debian_snapshot': '20261016T000000Z', 'debian_suite': 'trixie'}
         manifest = json.loads((image.REPO / 'script/runner/toolchain.json').read_text())
         mirror = 'http://127.0.0.1:3142/debian-snapshot/20261016T000000Z'
@@ -95,11 +95,11 @@ class ImageTests(unittest.TestCase):
                 mock.patch.dict(os.environ, MOTOR_DEBIAN_MIRROR=mirror):
             guest.install_job_packages(pins, manifest)
             self.assertEqual(written['/etc/apt/sources.list'], f'deb {mirror}/ trixie main\n')
-            written.clear()
-            guest.configure_apt(pins)
-            self.assertEqual(written['/etc/apt/sources.list'], f'deb {mirror}/ trixie main\n')
+        # The image's final apt source is the public snapshot, whatever cache
+        # the build used, so images don't vary with the build host.
         configure = (HERE / 'install-guest.py').read_text().split('def configure(pins):', 1)[1].split('def verify_git', 1)[0]
-        self.assertIn('configure_apt(pins)', configure)
+        self.assertIn('configure_apt(pins, f"https://snapshot.debian.org/archive/debian/{pins[\'debian_snapshot\']}/")', configure)
+        self.assertNotIn('mirror_url', configure)
 
     def test_mirror_setting_rejects_apt_source_injection(self):
         from debian_mirror import mirror_url
