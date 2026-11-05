@@ -61,7 +61,8 @@ impl Pressure {
 }
 
 fn pressure_number<S: serde::Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
-    // The broker's canonical PSI numbers omit the decimal suffix for whole percentages.
+    // The broker's canonical bodies write a whole pressure-stall (PSI) percentage
+    // as an integer (`0`, not `0.0`), so ours must too for the bytes to match.
     if value.is_finite() && (0.0..=100.0).contains(value) && value.fract() == 0.0 {
         serializer.serialize_u64(*value as u64)
     } else {

@@ -14,7 +14,8 @@ pub trait Control: Send + Sync {
     fn metrics(&self, _tenant: &str) -> Result<crate::billing::Metrics> {
         anyhow::bail!("tenant metrics unavailable")
     }
-    /// Read-only cgroup location for display-only pressure sampling.
+    /// The tenant VM's Linux control group (cgroup) directory, read only to
+    /// sample its pressure figures for display.
     fn pressure_cgroup(&self, _tenant: &str) -> Option<&Path> {
         None
     }

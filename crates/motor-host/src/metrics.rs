@@ -8,8 +8,9 @@ use anyhow::Result;
 use motor_lease::metrics::*;
 use std::{path::Path, sync::Arc};
 
-// Mirrors the VM helper's delegated service cgroup. If the helper's location
-// diverges, pressure is omitted rather than affecting host or tenant operation.
+// Where the VM helper's delegated control group (cgroup) puts each tenant VM.
+// motor-host doesn't learn this from the helper, so it mirrors the layout; if
+// the two ever diverge, tenant pressure is omitted and nothing else changes.
 const HELPER_TENANT_CGROUPS: &str = "/sys/fs/cgroup/system.slice/motor-vm-helper.service/tenants";
 
 pub fn tenant_pressure_cgroup(tap_index: u8) -> std::path::PathBuf {
