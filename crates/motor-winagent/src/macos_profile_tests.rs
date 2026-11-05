@@ -89,7 +89,7 @@ fn sessions() -> (Session, Session) {
 
 #[test]
 fn profiles_are_versioned_independently() {
-    assert_eq!(Profile::Windows.version(), 8);
+    assert_eq!(Profile::Windows.version(), 10);
     assert_eq!(Profile::Macos.version(), 1);
     assert_eq!(Protocol::new("n").unwrap().profile(), Profile::Windows);
     assert_eq!(
@@ -370,6 +370,17 @@ fn macos_rejects_collect_end() {
 }
 
 #[test]
+fn macos_rejects_windows_clock_frames() {
+    assert_rejected_everywhere(Frame::SyncClock {
+        unix_ms: 1_800_000_000_000,
+    });
+    assert_rejected_everywhere(Frame::ClockSynchronized { correction_ms: 0 });
+    assert_rejected_everywhere(Frame::ClockFailed {
+        reason: clock::Refusal::SetSystemTimeFailed,
+    });
+}
+
+#[test]
 fn macos_rejects_dismount() {
     assert_rejected_everywhere(Frame::Dismount {});
 }
@@ -391,9 +402,30 @@ fn windows_rejects_signal_in_every_phase() {
                 nonce: NONCE.into(),
             },
         ),
+        (
+            Peer::Host,
+            Frame::SyncClock {
+                unix_ms: 1_800_000_000_000,
+            },
+        ),
+        (Peer::Agent, Frame::ClockSynchronized { correction_ms: 0 }),
         (Peer::Host, Frame::ReceiveTree { bytes: vec![1] }),
         (Peer::Host, Frame::TreeEnd { command: command() }),
         (Peer::Agent, Frame::TreeReceived {}),
+        (
+            Peer::Host,
+            Frame::SealSourceEnd {
+                identity: source_seal::Plan::default().identity(),
+                count: 0,
+            },
+        ),
+        (
+            Peer::Agent,
+            Frame::SourceSealed {
+                identity: source_seal::Plan::default().identity(),
+                count: 0,
+            },
+        ),
         (Peer::Host, Frame::Start {}),
         (Peer::Agent, Frame::Started {}),
         (Peer::Agent, output(Stream::Stdout)),
@@ -435,6 +467,13 @@ fn windows_session_rejects_a_received_signal() {
         ),
         (
             Peer::Host,
+            Frame::SyncClock {
+                unix_ms: 1_800_000_000_000,
+            },
+        ),
+        (Peer::Agent, Frame::ClockSynchronized { correction_ms: 0 }),
+        (
+            Peer::Host,
             Frame::TreeEnd {
                 command: Command {
                     cwd: "/work/project".into(),
@@ -444,6 +483,20 @@ fn windows_session_rejects_a_received_signal() {
             },
         ),
         (Peer::Agent, Frame::TreeReceived {}),
+        (
+            Peer::Host,
+            Frame::SealSourceEnd {
+                identity: source_seal::Plan::default().identity(),
+                count: 0,
+            },
+        ),
+        (
+            Peer::Agent,
+            Frame::SourceSealed {
+                identity: source_seal::Plan::default().identity(),
+                count: 0,
+            },
+        ),
         (Peer::Host, Frame::Start {}),
         (Peer::Agent, Frame::Started {}),
     ];

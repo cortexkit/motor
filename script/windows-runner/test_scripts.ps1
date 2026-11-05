@@ -1,5 +1,5 @@
 # Windows PowerShell parser, policy, and temporary-VHD fixtures. Never boots a VM.
-param([switch]$UpdateOnly, [string]$UpdateCase = '', [string]$ScratchRoot = $env:TMPDIR, [switch]$MetricsKeyOnly)
+param([switch]$UpdateOnly, [string]$UpdateCase = '', [string]$ScratchRoot = $env:TMPDIR, [switch]$MetricsKeyOnly, [switch]$PeerHelloOnly)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 # Any failure that escapes a check reports its script line and stack, so even
@@ -22,6 +22,31 @@ foreach ($file in $files) {
     if ($errors.Count) { throw "Parse failure $($file.Name): $($errors | Out-String)" }
     Write-Host "PASS powershell-parse-$($file.Name)"
     $count++
+}
+function New-PeerHelloFixture([string]$Nonce, [int]$Version = 10) {
+    $frameText = ConvertTo-Json -InputObject ([ordered]@{kind='hello'; nonce=$Nonce; version=$Version}) -Compress
+    $framePayload = [Text.UTF8Encoding]::new($false, $true).GetBytes($frameText)
+    $frameLength = $framePayload.Length
+    $frame = [byte[]]::new($frameLength + 4)
+    $frame[0] = [byte](($frameLength -shr 24) -band 0xff)
+    $frame[1] = [byte](($frameLength -shr 16) -band 0xff)
+    $frame[2] = [byte](($frameLength -shr 8) -band 0xff)
+    $frame[3] = [byte]($frameLength -band 0xff)
+    [Array]::Copy($framePayload, 0, $frame, 4, $frameLength)
+    return ,$frame
+}
+if ($PeerHelloOnly) {
+    . "$PSScriptRoot\qualify-peer.ps1"
+    $nonce = '0123456789abcdef0123456789abcdef'
+    $frame = New-PeerHelloFixture $nonce
+    $null = Convert-RunnerPeerHello $frame $nonce
+    Write-Host 'PASS peer-current-protocol-hello'
+    $rejected = $false
+    try { $null = Convert-RunnerPeerHello (New-PeerHelloFixture $nonce 9) $nonce } catch { $rejected = $true }
+    if (-not $rejected) { throw 'FAIL peer-previous-protocol-hello-rejected' }
+    Write-Host 'PASS peer-previous-protocol-hello-rejected'
+    Write-Host "PASS $($count + 2) PowerShell parser/peer Hello checks"
+    return
 }
 . "$PSScriptRoot\accounts.ps1"
 . "$PSScriptRoot\service-definition.ps1"
@@ -1017,15 +1042,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         $nonce = $peerNonce
         $victimVm = [Guid]'11111111-2222-3333-4444-555555555555'
         $attackerVm = [Guid]'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
-        $frameText = ConvertTo-Json -InputObject ([ordered]@{kind='hello'; nonce=$nonce; version=9}) -Compress
-        $framePayload = [Text.UTF8Encoding]::new($false, $true).GetBytes($frameText)
-        $frameLength = $framePayload.Length
-        $frame = [byte[]]::new($frameLength + 4)
-        $frame[0] = [byte](($frameLength -shr 24) -band 0xff)
-        $frame[1] = [byte](($frameLength -shr 16) -band 0xff)
-        $frame[2] = [byte](($frameLength -shr 8) -band 0xff)
-        $frame[3] = [byte]($frameLength -band 0xff)
-        [Array]::Copy($framePayload, 0, $frame, 4, $frameLength)
+        $frame = New-PeerHelloFixture $nonce
         $null = Convert-RunnerPeerHello $frame $nonce
         $peerStart = [DateTimeOffset]::Parse('2026-10-22T10:00:00Z')
         $peerTimeline = [ordered]@{

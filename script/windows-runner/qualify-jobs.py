@@ -56,6 +56,28 @@ def require_windows_guest_agent_ready(status):
     return agent
 
 
+class ClockProbe:
+    """Compare a live guest sample with host UTC when its output arrives."""
+    prefix = b"MOTOR_CLOCK_UTC="
+
+    def __init__(self):
+        self.pending = bytearray()
+        self.samples = []
+
+    def observe(self, data, host_seconds):
+        self.pending.extend(data)
+        while b"\n" in self.pending:
+            line, _, rest = self.pending.partition(b"\n")
+            self.pending = bytearray(rest)
+            if line.startswith(self.prefix):
+                guest_seconds = int(line[len(self.prefix):].strip())
+                if abs(guest_seconds - host_seconds) > 5:
+                    raise RuntimeError(f"guest clock differs from host UTC: guest={guest_seconds} host={host_seconds}")
+                self.samples.append(dict(guest_seconds=guest_seconds, host_seconds=host_seconds))
+        if len(self.pending) > 4096:
+            self.pending.clear()
+
+
 class Channel:
     def __init__(self, runner, root, log, hello_timeout: float = 30, check_agent_readiness: bool = False):
         require_runner_service()
@@ -148,7 +170,7 @@ class Channel:
             except (OSError, ValueError):
                 return
 
-    def until(self, kind, output=None, timeout: float = 900, frames=None):
+    def until(self, kind, output=None, timeout: float = 900, frames=None, clock=None):
         deadline = time.monotonic() + timeout
         while True:
             if time.monotonic() >= deadline:
@@ -166,7 +188,10 @@ class Channel:
             if value["type"] == "refusal":
                 raise RuntimeError(f"runner refused qualification: {value}")
             if value["type"] == "output" and output is not None:
-                output.extend(base64.b64decode(value["bytes"], validate=True))
+                data = base64.b64decode(value["bytes"], validate=True)
+                output.extend(data)
+                if clock is not None:
+                    clock.observe(data, time.time())
             if value["type"] == kind:
                 return value
 
@@ -546,14 +571,18 @@ def run(root, runner, evidence, gate):
         job = str(uuid.uuid4())
         channel = Channel(runner, root, evidence / f"bridge-{iteration}.log")
         try:
-            command = BUN_VERSION_CHECK + " || exit $?; " + JQ_VERSION_CHECK + " || exit $?; " + CACHE_DRIVE_CHECK + " || exit $?; " + NEXTEST_VERSION_CHECK + " || exit $?; " + PYTHON_CHECK + " || exit $?; " + NATS_VERSION_CHECK + " || exit $?; " + LLVM_CHECK + " || exit $?; " + STABLE_VERSION_CHECK + " || exit $?; " + ("test -f /c/t/qualification-cache-marker && " if iteration else "") + gate + " && printf cached > /c/t/qualification-cache-marker"
+            command = "printf 'MOTOR_CLOCK_UTC='; date -u +%s; " + BUN_VERSION_CHECK + " || exit $?; " + JQ_VERSION_CHECK + " || exit $?; " + CACHE_DRIVE_CHECK + " || exit $?; " + NEXTEST_VERSION_CHECK + " || exit $?; " + PYTHON_CHECK + " || exit $?; " + NATS_VERSION_CHECK + " || exit $?; " + LLVM_CHECK + " || exit $?; " + STABLE_VERSION_CHECK + " || exit $?; " + ("test -f /c/t/qualification-cache-marker && " if iteration else "") + gate + " && printf cached > /c/t/qualification-cache-marker"
             request = dict(type="run", job_id=job, gate_job=True, platform="windows", workspace_key="/qualification/workspace", repository_root="/qualification/workspace", cwd="/qualification/workspace", command=command, env={}, weight_hint=4, timeout=600, queue_wait_limit_s=60, snapshot_commit=commit, tree_hash=tree, integration_tip=commit, siblings=[], git_dependencies=[], bundles=[dict(index=0, repository="/qualification/workspace", length=len(data), sha256=hashlib.sha256(data).hexdigest())])
             channel.send(request)
             channel.until("accepted")
             for offset in range(0, len(data), 65536):
                 channel.send(dict(type="bundle_chunk", index=0, offset=offset, data=base64.b64encode(data[offset:offset+65536]).decode()))
             output = bytearray()
-            terminal = channel.until("terminal", output)
+            clock = ClockProbe()
+            terminal = channel.until("terminal", output, clock=clock)
+            if len(clock.samples) != 1:
+                raise RuntimeError("missing or duplicate guest UTC sample")
+            (evidence / f"clock-{iteration}.json").write_text(json.dumps(clock.samples, indent=2))
             (evidence / f"terminal-{iteration}.json").write_text(json.dumps(terminal, indent=2))
             (evidence / f"output-{iteration}.bin").write_bytes(output)
             require_gate_success(terminal)

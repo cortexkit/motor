@@ -13,17 +13,19 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
+pub mod archive_time;
 pub mod bun;
 pub mod cache;
 pub mod cache_format;
 pub mod cache_steps;
+pub mod clock;
 pub mod environment;
 pub mod returned;
 pub mod source_seal;
 pub mod transport;
 
 /// Version of the Windows profile; the Windows agent sends it in its Hello.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 /// Version of the macOS profile, versioned independently of the Windows one.
 pub const MACOS_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -82,6 +84,15 @@ pub enum Frame {
     Hello {
         version: u32,
         nonce: String,
+    },
+    SyncClock {
+        unix_ms: u64,
+    },
+    ClockSynchronized {
+        correction_ms: i64,
+    },
+    ClockFailed {
+        reason: clock::Refusal,
     },
     CacheMounted {
         timings: CacheTimings,
@@ -241,6 +252,8 @@ impl Profile {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     AwaitHello,
+    AwaitClock,
+    AwaitClockResult,
     ReceivingTree,
     /// macOS only: Hello accepted, waiting for the host's TreeEnd, which carries
     /// the command and no tree chunks.
@@ -397,8 +410,11 @@ impl Protocol {
         let next = match (self.state, sender, frame) {
             (AwaitHello, Agent, Hello { version, nonce }) => {
                 self.check_hello(*version, nonce)?;
-                ReceivingTree
+                AwaitClock
             }
+            (AwaitClock, Host, SyncClock { .. }) => AwaitClockResult,
+            (AwaitClockResult, Agent, ClockSynchronized { .. }) => ReceivingTree,
+            (AwaitClockResult, Agent, ClockFailed { .. }) => Failed,
             (ReceivingTree, Host, ReceiveTree { .. }) => ReceivingTree,
             (ReceivingTree | AwaitTreeReceived, Agent, CacheMounted { .. })
                 if !self.cache_reported =>
@@ -1039,7 +1055,8 @@ fn validate_archive(reader: &mut (impl Read + io::Seek), collection: bool) -> io
     let mut bun_seed = false;
     let mut bun_manifest = false;
     for entry in archive.entries()? {
-        let entry = entry?;
+        let mut entry = entry?;
+        archive_time::modified(&mut entry)?;
         let bytes = entry.path_bytes();
         let path = std::str::from_utf8(&bytes).map_err(|_| invalid("tar path is not UTF-8"))?;
         let kind = entry.header().entry_type();
@@ -1179,6 +1196,7 @@ pub fn unpack_tree(
     safe_directory(cargo_home)?;
     for entry in tar::Archive::new(reader).entries()? {
         let mut entry = entry?;
+        let modified = archive_time::modified(&mut entry)?;
         let bytes = entry.path_bytes();
         let path = std::str::from_utf8(&bytes).map_err(|_| invalid("tar path is not UTF-8"))?;
         let mut components = path.trim_end_matches('/').split('/');
@@ -1201,6 +1219,7 @@ pub fn unpack_tree(
                 .create_new(true)
                 .open(&dest)?;
             io::copy(&mut entry, &mut file)?;
+            file.set_times(std::fs::FileTimes::new().set_modified(modified))?;
         }
     }
     Ok(())
@@ -1514,7 +1533,7 @@ mod tests {
         assert!(bytes.len() < 1024);
         assert_eq!(read_frame(&mut &bytes[..]).unwrap(), Some(frame.clone()));
         let mut protocol = Protocol::new("boot-a").unwrap();
-        protocol.accept(Peer::Agent, &hello()).unwrap();
+        handshake(&mut protocol);
         protocol.accept(Peer::Agent, &frame).unwrap();
         assert_eq!(protocol.state(), State::ReceivingTree);
         assert!(
@@ -1524,7 +1543,7 @@ mod tests {
         let mut protocol = Protocol::new("boot-a").unwrap();
         assert!(protocol.accept(Peer::Agent, &frame).is_err());
         let mut protocol = Protocol::new("boot-a").unwrap();
-        protocol.accept(Peer::Agent, &hello()).unwrap();
+        handshake(&mut protocol);
         assert!(protocol.accept(Peer::Host, &frame).is_err());
     }
 
@@ -1532,7 +1551,7 @@ mod tests {
     fn native_cache_timings_have_a_distinct_field_and_protocol_generation() {
         let value = serde_json::to_value(CacheTimings::default()).unwrap();
         assert!(value["native_attributes_ms"].is_u64());
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
     }
 
     #[test]
@@ -1567,7 +1586,7 @@ mod tests {
         };
         for tree_end in [false, true] {
             let mut protocol = Protocol::new("boot-a").unwrap();
-            protocol.accept(Peer::Agent, &hello()).unwrap();
+            handshake(&mut protocol);
             if tree_end {
                 protocol
                     .accept(Peer::Host, &Frame::TreeEnd { command: command() })
@@ -1595,7 +1614,7 @@ mod tests {
                 }
             }
             let mut protocol = Protocol::new("boot-a").unwrap();
-            protocol.accept(Peer::Agent, &hello()).unwrap();
+            handshake(&mut protocol);
             assert!(protocol.accept(Peer::Agent, &invalid_frame).is_err());
         }
     }
@@ -1608,13 +1627,13 @@ mod tests {
             elapsed_ms: 1_000,
         };
         let mut protocol = Protocol::new("boot-a").unwrap();
-        protocol.accept(Peer::Agent, &hello()).unwrap();
+        handshake(&mut protocol);
         for _ in 0..64 {
             protocol.accept(Peer::Agent, &frame).unwrap();
         }
         assert!(protocol.accept(Peer::Agent, &frame).is_err());
         let mut protocol = Protocol::new("boot-a").unwrap();
-        protocol.accept(Peer::Agent, &hello()).unwrap();
+        handshake(&mut protocol);
         protocol
             .accept(
                 Peer::Agent,
@@ -1641,6 +1660,40 @@ mod tests {
             nonce: "boot-a".into(),
         }
     }
+    fn handshake(protocol: &mut Protocol) {
+        for (peer, frame) in transcript().into_iter().take(3) {
+            protocol.accept(peer, &frame).unwrap();
+        }
+    }
+
+    #[test]
+    fn clock_synchronization_is_required_before_preparation_or_command() {
+        for forbidden in [Frame::Start {}, Frame::TreeEnd { command: command() }] {
+            let mut protocol = Protocol::new("boot-a").unwrap();
+            protocol.accept(Peer::Agent, &hello()).unwrap();
+            assert!(protocol.accept(Peer::Host, &forbidden).is_err());
+        }
+        for reason in [
+            clock::Refusal::ImplausibleTime,
+            clock::Refusal::SetSystemTimeFailed,
+        ] {
+            let mut protocol = Protocol::new("boot-a").unwrap();
+            protocol.accept(Peer::Agent, &hello()).unwrap();
+            protocol
+                .accept(Peer::Host, &Frame::SyncClock { unix_ms: 0 })
+                .unwrap();
+            protocol
+                .accept(Peer::Agent, &Frame::ClockFailed { reason })
+                .unwrap();
+            assert_eq!(protocol.state(), State::Failed);
+            assert!(
+                protocol
+                    .accept(Peer::Host, &Frame::TreeEnd { command: command() })
+                    .is_err()
+            );
+            assert!(protocol.accept(Peer::Host, &Frame::Start {}).is_err());
+        }
+    }
     fn seal_frames() -> [(Peer, Frame); 2] {
         let identity = source_seal::Plan::default().identity();
         [
@@ -1663,7 +1716,7 @@ mod tests {
     fn requested_returns_are_negotiated_before_start_and_bound_the_stream() {
         fn ready() -> Protocol {
             let mut protocol = Protocol::new("boot-a").unwrap();
-            for (peer, frame) in transcript().into_iter().take(4) {
+            for (peer, frame) in transcript().into_iter().take(6) {
                 protocol.accept(peer, &frame).unwrap();
             }
             protocol
@@ -1722,7 +1775,7 @@ mod tests {
     #[test]
     fn requested_returns_discarded_chunks_still_spend_the_wire_allowance() {
         let mut protocol = Protocol::new("boot-a").unwrap();
-        for (peer, frame) in transcript().into_iter().take(4) {
+        for (peer, frame) in transcript().into_iter().take(6) {
             protocol.accept(peer, &frame).unwrap();
         }
         for (peer, frame) in [
@@ -1765,6 +1818,13 @@ mod tests {
     fn transcript() -> Vec<(Peer, Frame)> {
         vec![
             (Peer::Agent, hello()),
+            (
+                Peer::Host,
+                Frame::SyncClock {
+                    unix_ms: 1_800_000_000_000,
+                },
+            ),
+            (Peer::Agent, Frame::ClockSynchronized { correction_ms: 0 }),
             (
                 Peer::Host,
                 Frame::ReceiveTree {
@@ -1962,7 +2022,7 @@ mod tests {
         assert_eq!(host.state(), State::Complete);
         assert!(host.receive(&mut &[][..]).unwrap().is_none());
         let mut protocol = Protocol::new("boot-a").unwrap();
-        advance(&mut protocol, 7);
+        advance(&mut protocol, 9);
         protocol.accept(Peer::Host, &Frame::Cancel {}).unwrap();
         protocol.accept(Peer::Agent, &Frame::Started {}).unwrap();
         protocol.accept(Peer::Host, &Frame::Cancel {}).unwrap();
@@ -1974,7 +2034,7 @@ mod tests {
     #[test]
     fn output_cannot_open_the_execution_gate() {
         let mut protocol = Protocol::new("boot-a").unwrap();
-        advance(&mut protocol, 4);
+        advance(&mut protocol, 6);
         assert_eq!(protocol.state(), State::Ready);
         assert!(
             protocol
@@ -2008,24 +2068,24 @@ mod tests {
             let mut protocol = Protocol::new("boot-a").unwrap();
             advance(&mut protocol, step);
             assert!(
-                protocol.accept(Peer::Host, &Frame::Dismount {}).is_err() || step == 14,
+                protocol.accept(Peer::Host, &Frame::Dismount {}).is_err() || step == 16,
                 "early dismount at step {step}"
             );
         }
         for (count, sender, frame) in [
             (0, Peer::Host, Frame::Start {}),
             (2, Peer::Host, Frame::Start {}),
-            (7, Peer::Agent, Frame::Exit { code: 0 }),
+            (9, Peer::Agent, Frame::Exit { code: 0 }),
             (
-                11,
+                13,
                 Peer::Agent,
                 Frame::Output {
                     stream: Stream::Stdout,
                     bytes: vec![],
                 },
             ),
-            (14, Peer::Host, Frame::Start {}),
-            (16, Peer::Agent, hello()),
+            (16, Peer::Host, Frame::Start {}),
+            (18, Peer::Agent, hello()),
         ] {
             let mut protocol = Protocol::new("boot-a").unwrap();
             advance(&mut protocol, count);
@@ -2036,7 +2096,7 @@ mod tests {
     #[test]
     fn collection_bound_and_unclean_dismount_fail_closed() {
         let mut protocol = Protocol::new("boot-a").unwrap();
-        advance(&mut protocol, 12);
+        advance(&mut protocol, 14);
         let chunk = Frame::Collected {
             bytes: vec![0; CHUNK_BYTES],
         };
@@ -2050,7 +2110,7 @@ mod tests {
                 .is_err()
         );
         let mut protocol = Protocol::new("boot-a").unwrap();
-        advance(&mut protocol, 15);
+        advance(&mut protocol, 17);
         assert!(
             protocol
                 .accept(Peer::Agent, &Frame::Dismounted { clean: false })

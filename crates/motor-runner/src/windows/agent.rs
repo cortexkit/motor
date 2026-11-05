@@ -782,6 +782,15 @@ fn materialize_attempt(
     let agent_path = resources.agent_path();
     let unit_started_ms = clock.now();
     resources.boot(config, &nonce)?;
+    let caches = vm_config.caches();
+    let workspace = crate::caller_path::request(&setup.request)
+        .caller_workspace_key
+        .text();
+    super::source_mtimes::commit(
+        prepared_tree.mtimes,
+        &caches.disk(workspace),
+        &caches.source_mtimes(workspace),
+    )?;
     let thread_config = config.clone();
     let id = setup.id;
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -879,6 +888,25 @@ fn materialize_attempt(
                 blocked_write: None,
             };
             let _hello = io.reply(&mut resources)?;
+            let unix_ms = u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(invalid)?
+                    .as_millis(),
+            )
+            .map_err(invalid)?;
+            io.send(&Frame::SyncClock { unix_ms })?;
+            match io.reply(&mut resources)? {
+                Frame::ClockSynchronized { correction_ms } => {
+                    tracing::info!(
+                        correction_ms,
+                        unix_ms,
+                        "Windows guest clock synchronized to host UTC"
+                    );
+                }
+                Frame::ClockFailed { reason } => return Err(reason.into()),
+                _ => return Err(invalid("expected guest clock synchronization")),
+            }
             io.enter(Phase::Transfer)?;
             let mut tree = fs::File::open(&tar)
                 .map_err(|error| super::vm::path_error("open transfer tree", &tar, error))?;
@@ -1260,6 +1288,13 @@ mod tests {
             ),
             (
                 Peer::Host,
+                Frame::SyncClock {
+                    unix_ms: 1_800_000_000_000,
+                },
+            ),
+            (Peer::Agent, Frame::ClockSynchronized { correction_ms: 0 }),
+            (
+                Peer::Host,
                 Frame::TreeEnd {
                     command: motor_winagent::Command {
                         command: "true".into(),
@@ -1416,6 +1451,17 @@ mod tests {
                 },
             )
             .unwrap();
+        protocol
+            .accept(
+                Peer::Host,
+                &Frame::SyncClock {
+                    unix_ms: 1_800_000_000_000,
+                },
+            )
+            .unwrap();
+        protocol
+            .accept(Peer::Agent, &Frame::ClockSynchronized { correction_ms: 0 })
+            .unwrap();
         let mut transport = Transport {
             stream,
             agent_path: PathBuf::from("<cache diagnostic stream>"),
@@ -1469,6 +1515,17 @@ mod tests {
                     nonce: "nonce".into(),
                 },
             )
+            .unwrap();
+        protocol
+            .accept(
+                Peer::Host,
+                &Frame::SyncClock {
+                    unix_ms: 1_800_000_000_000,
+                },
+            )
+            .unwrap();
+        protocol
+            .accept(Peer::Agent, &Frame::ClockSynchronized { correction_ms: 0 })
             .unwrap();
         let mut transport = Transport {
             stream,
@@ -1525,6 +1582,17 @@ mod tests {
                     nonce: "nonce".into(),
                 },
             )
+            .unwrap();
+        protocol
+            .accept(
+                Peer::Host,
+                &Frame::SyncClock {
+                    unix_ms: 1_800_000_000_000,
+                },
+            )
+            .unwrap();
+        protocol
+            .accept(Peer::Agent, &Frame::ClockSynchronized { correction_ms: 0 })
             .unwrap();
         let mut transport = Transport {
             stream,
@@ -1601,6 +1669,17 @@ mod tests {
                         nonce: "nonce".into(),
                     },
                 )
+                .unwrap();
+            protocol
+                .accept(
+                    Peer::Host,
+                    &Frame::SyncClock {
+                        unix_ms: 1_800_000_000_000,
+                    },
+                )
+                .unwrap();
+            protocol
+                .accept(Peer::Agent, &Frame::ClockSynchronized { correction_ms: 0 })
                 .unwrap();
             protocol
                 .accept(

@@ -2054,6 +2054,26 @@ mod guest {
                 nonce,
             },
         )?;
+        let Frame::SyncClock { unix_ms } = receive(&mut protocol, &rx, &port.stop)? else {
+            return Err(invalid("expected authenticated host UTC"));
+        };
+        match motor_winagent::clock::synchronize(unix_ms, motor_winagent::clock::set_system_time) {
+            Ok(correction_ms) => {
+                diagnostic!(
+                    "host UTC synchronized requested_unix_ms={unix_ms} correction_ms={correction_ms}"
+                );
+                send(
+                    &mut protocol,
+                    &mut port,
+                    &Frame::ClockSynchronized { correction_ms },
+                )?;
+            }
+            Err(reason) => {
+                diagnostic!("host UTC synchronization refused reason={reason}");
+                send(&mut protocol, &mut port, &Frame::ClockFailed { reason })?;
+                return Err(reason.into());
+            }
+        }
         let (user, mut cache) = mount_cache(&mut protocol, &mut port)?;
         send(
             &mut protocol,
