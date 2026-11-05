@@ -538,7 +538,36 @@ async fn large_returns_ninety_mb_and_exact_ceiling_replay_across_pages_and_resta
         request.return_max_bytes = RETURN_LARGE_MAX_BYTES_CAP;
         f.submit(&runner, &request, &bytes);
         runner.tick().unwrap();
-        terminal(&runner, request.job_id).await;
+        // Measured collection took 6.3 s for 90 MB and 9.1 s for 128 MiB with
+        // 15 competing fsync writers, versus 2.2/3.7 s alone. Each byte is
+        // hashed once and each spool chunk file must be flushed before commit.
+        // terminal()'s default 15 s wait leaves too little headroom when many
+        // tests contend for CPU/disk; give only these large cases a 60 s budget.
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if runner.core.inner.lock().unwrap().jobs[&request.job_id]
+                    .terminal
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "waiting for large-return terminal of {}; {}",
+                request.job_id,
+                runner_diagnostics(&runner)
+            )
+        });
+        eprintln!(
+            "large-return terminal: bytes={} elapsed={:?}",
+            sizes.iter().sum::<u64>(),
+            started.elapsed()
+        );
         assert!(verify_large_pages(&runner, &request, sizes.iter().sum()) > 64);
         drop(runner);
         let runner = reopen(config);
