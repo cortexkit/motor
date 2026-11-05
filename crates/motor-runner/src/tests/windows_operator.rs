@@ -1952,17 +1952,18 @@ fn main() {{ assert_eq!(commons::helper(), 42); assert_eq!(private::helper(), 42
             "{stdout}\n--- combined:\n{output}"
         );
         if !with_bundle {
-            for fresh in ["Fresh itoa v1.0.18", "Fresh private v0.1.0"] {
-                assert!(output.contains(fresh), "missing {fresh}: {output}");
-            }
-            for compiled in ["Compiling itoa", "Compiling private"] {
+            // The same commit again on the reused cache disk: unchanged source
+            // files keep their times between jobs, so local path crates stay
+            // fresh along with registry and git dependencies.
+            for name in ["itoa", "private", "commons", "motor-qualification"] {
                 assert!(
-                    !output.contains(compiled),
-                    "unexpected {compiled}: {output}"
+                    output.contains(&format!("Fresh {name} v")),
+                    "missing Fresh {name}: {output}"
                 );
-            }
-            for compiled in ["Compiling commons", "Compiling motor-qualification"] {
-                assert!(output.contains(compiled), "missing {compiled}: {output}");
+                assert!(
+                    !output.contains(&format!("Compiling {name}")),
+                    "unexpected Compiling {name}: {output}"
+                );
             }
         }
         no_units(&runner);
