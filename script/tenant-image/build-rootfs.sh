@@ -9,7 +9,7 @@ for command in debootstrap mkfs.ext4 mount umount chroot truncate; do
     command -v "$command" >/dev/null
 done
 suite=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["debian_suite"])' "$out/versions.json")
-snapshot=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["debian_snapshot"])' "$out/versions.json")
+mirror=$(python3 "$here/debian_mirror.py" "$out/versions.json")
 size=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["rootfs_gib"])' "$out/versions.json")
 # debootstrap installs the base system only; install-guest.py installs the job
 # package contract (toolchain.json's apt_packages) with apt, which resolves the
@@ -29,8 +29,20 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-debootstrap --arch=amd64 --variant=minbase --include="$packages" \
-    "$suite" "$root" "https://snapshot.debian.org/archive/debian/$snapshot/"
+# debootstrap uses wget, not apt. Bound retries and timeouts per URL, including
+# the archive's transient HTTP failures, without rerunning a partial bootstrap.
+cat > "$out/debootstrap.wgetrc" <<'WGETRC'
+tries = 4
+timeout = 30
+wait_retry = 2
+retry_connrefused = on
+retry_on_http_error = 429,500,502,503,504
+WGETRC
+# The mirror may be a localhost cache, but Release signatures and the package
+# hashes they authenticate remain mandatory; transport is not the trust anchor.
+WGETRC="$out/debootstrap.wgetrc" debootstrap --arch=amd64 --variant=minbase --include="$packages" \
+    --force-check-gpg --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
+    "$suite" "$root" "$mirror"
 mkdir -p "$root/srv/build" "$root/proc" "$root/sys" "$root/dev"
 mount --bind "$out/scratch" "$root/srv/build"
 mount -t proc proc "$root/proc"
@@ -38,10 +50,10 @@ mount -t sysfs -o ro sysfs "$root/sys"
 mount --rbind /dev "$root/dev"
 mount --make-rprivate "$root/dev"
 cp -a "$out/script" "$out/guest" "$out/versions.json" "$out/motor-runner" "$root/srv/build/"
-cp "$here/install-guest.py" "$root/srv/build/install-guest.py"
+cp "$here/install-guest.py" "$here/debian_mirror.py" "$root/srv/build/"
 chroot "$root" /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin:/usr/sbin:/sbin LANG=C.UTF-8 \
     RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= \
-    CARGO_BUILD_JOBS="${JOBS:?}" /usr/bin/python3 /srv/build/install-guest.py
+    CARGO_BUILD_JOBS="${JOBS:?}" MOTOR_DEBIAN_MIRROR="$mirror" /usr/bin/python3 /srv/build/install-guest.py
 cp "$root/srv/build/packages.txt" "$out/packages.txt"
 cp "$root/srv/build/tools.json" "$out/tools.json"
 cleanup

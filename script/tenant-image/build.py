@@ -135,7 +135,7 @@ def build_artifacts(stage, pins, runner, jobs, run=subprocess.run):
 
 
 def recipe_digest(pins, runner, jobs):
-    files = [HERE / name for name in ("build.py", "build_storage.py", "build-kernel.sh", "build-rootfs.sh", "install-guest.py", "kernel-options.txt")]
+    files = [HERE / name for name in ("build.py", "build_storage.py", "build-kernel.sh", "build-rootfs.sh", "install-guest.py", "debian_mirror.py", "kernel-options.txt")]
     files.extend(path for path in (HERE / "guest").iterdir() if path.is_file())
     recipe = dict(pins=pins, runner_sha256=digest(runner), jobs=jobs,
                   sources={str(path.relative_to(HERE)): digest(path) for path in sorted(files)})
@@ -150,10 +150,11 @@ def build(version, output, versions, runner, jobs=4, builder=build_artifacts,
     target = output / version
     # mkdir is the reservation: simultaneous builders cannot replace each other.
     target.mkdir()
+    reservation = target.stat()
     stage = target / ".work"
-    stage.mkdir()
     meter = None
     try:
+        stage.mkdir()
         shutil.copy2(versions, stage / "versions.txt")
         pins = load_versions(stage / "versions.txt")
         recipe = recipe_digest(pins, runner, jobs)
@@ -201,13 +202,21 @@ def build(version, output, versions, runner, jobs=4, builder=build_artifacts,
             os.close(fd)
         meter.finish("success")
     except BaseException:
-        (target / "manifest.json").unlink(missing_ok=True)
         if meter is not None:
             try:
                 meter.finish("failed")
             except Exception as error:
                 print(f"storage measurement failure: {type(error).__name__}: {error}", flush=True)
-        print(f"incomplete version retained at {target}; inspect mounts before removing it", flush=True)
+        # Only the successful exclusive mkdir above grants deletion ownership.
+        # Check the whole reservation, not just .work, before traversing it.
+        try:
+            current = target.lstat()
+            if (current.st_dev, current.st_ino) != (reservation.st_dev, reservation.st_ino):
+                raise RuntimeError("build reservation was replaced")
+            assert_unmounted(target, mountinfo_reader)
+            shutil.rmtree(target)
+        except Exception as error:
+            print(f"incomplete version retained at {target}; cleanup refused: {error}", flush=True)
         raise
     print(f"image build: {target} (kernel, rootfs, manifest, configuration and tool inventories)")
     return target

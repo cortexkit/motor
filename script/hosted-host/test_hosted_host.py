@@ -8,6 +8,7 @@ import re
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -20,6 +21,11 @@ if spec is None or spec.loader is None:
     raise ImportError("cannot load hosted_host.py")
 hosted = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hosted)
+cache_spec = importlib.util.spec_from_file_location('apt_cache', HERE / 'install-apt-cache.py')
+if cache_spec is None or cache_spec.loader is None:
+    raise ImportError('cannot load install-apt-cache.py')
+apt_cache = importlib.util.module_from_spec(cache_spec)
+cache_spec.loader.exec_module(apt_cache)
 
 
 def struct_fields(path, name):
@@ -859,6 +865,106 @@ class InstallScriptTests(CapacityConfigTests):
         self.assertIn("ufw allow in proto tcp from any to 0.0.0.0/0 port \"$port\" comment motor-host-agent", start)
         self.assertIn("inbound_policy.py\" --host-agent-port \"$port\"", start)
         self.assertIn("# motor-host-agent", self.function("stop_units"))
+
+
+class AptCacheInstallTests(unittest.TestCase):
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
+        self.root = Path(self.scratch.name)
+        for name, value in (('BUILD', self.root / 'build'),
+                            ('CACHE', self.root / 'build/apt-cacher-ng'),
+                            ('UNIT', self.root / 'etc/systemd/system/apt-cacher-ng.service.d/motor-cache.conf'),
+                            ('CONFIG', self.root / 'etc/apt-cacher-ng/zz-motor-snapshot.conf')):
+            patch = mock.patch.object(apt_cache, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.installed = set()
+        self.calls = []
+
+    def run_command(self, args, **kwargs):
+        self.calls.append((args, kwargs))
+        if args[0] == 'dpkg-query':
+            present = args[-1] in self.installed
+            return subprocess.CompletedProcess(args, 0 if present else 1, 'installed' if present else '')
+        if args[0] == 'apt-get' and 'install' in args:
+            self.installed.update(apt_cache.PACKAGES)
+        if args[:3] == ['systemctl', 'enable', '--now']:
+            self.assertTrue(apt_cache.CONFIG.exists(), 'never start the unconfigured listener')
+            self.assertTrue(apt_cache.UNIT.exists())
+        return subprocess.CompletedProcess(args, 0)
+
+    def test_installer_is_idempotent_and_preserves_cached_packages(self):
+        apt_cache.install(self.run_command)
+        config = apt_cache.CONFIG.read_bytes()
+        modified = apt_cache.CONFIG.stat().st_mtime_ns
+        unit = apt_cache.UNIT.read_bytes()
+        unit_modified = apt_cache.UNIT.stat().st_mtime_ns
+        apt_cache.CACHE.mkdir(parents=True)
+        cached = apt_cache.CACHE / 'cached.deb'
+        cached.write_bytes(b'keep cached package')
+        first_calls = list(self.calls)
+        self.calls.clear()
+        apt_cache.install(self.run_command)
+        self.assertEqual(apt_cache.CONFIG.read_bytes(), config)
+        self.assertEqual(apt_cache.CONFIG.stat().st_mtime_ns, modified)
+        self.assertEqual(apt_cache.UNIT.read_bytes(), unit)
+        self.assertEqual(apt_cache.UNIT.stat().st_mtime_ns, unit_modified)
+        self.assertEqual(cached.read_bytes(), b'keep cached package')
+        self.assertFalse(any(args[0] == 'apt-get' or 'mask' in args for args, _ in self.calls))
+        commands = [args for args, _ in first_calls]
+        self.assertLess(commands.index(['systemctl', 'mask', '--now', 'apt-cacher-ng.service']),
+                        next(i for i, args in enumerate(commands) if args[0] == 'apt-get'))
+        for args, options in first_calls:
+            if args[0] == 'apt-get':
+                self.assertEqual(options['env']['NEEDRESTART_MODE'], 'l')
+                self.assertIn('Acquire::Retries=3', args)
+        self.assertIn(f'CacheDir: {apt_cache.CACHE}\n'.encode(), config)
+        self.assertIn(['install', '-d', '-o', 'apt-cacher-ng', '-g', 'apt-cacher-ng', '-m', '0750', str(apt_cache.CACHE)], commands)
+        self.assertLess(commands.index(['systemctl', 'daemon-reload']),
+                        commands.index(['systemctl', 'enable', '--now', 'apt-cacher-ng.service']))
+        self.assertIn(f'RequiresMountsFor={apt_cache.CACHE}\n'.encode(), unit)
+        self.assertIn(f'ConditionPathIsMountPoint={apt_cache.BUILD}\n'.encode(), unit)
+        self.assertIn(f'ReadWritePaths={apt_cache.CACHE}\n'.encode(), unit)
+
+    def test_proxy_is_loopback_only_and_caches_https_instead_of_tunnelling(self):
+        config = apt_cache.configuration()
+        self.assertIn('BindAddress: 127.0.0.1\n', config)
+        self.assertIn('Port: 3142\n', config)
+        self.assertIn('Remap-debian-snapshot: /debian-snapshot ; https://snapshot.debian.org/archive/debian\n', config)
+        self.assertIn('NoSSLChecks: 0\n', config)
+        self.assertNotIn('PassThroughPattern:', config)
+
+    def test_snapshot_indexes_are_solid_and_all_cached_snapshot_files_are_retained(self):
+        settings = dict(line.split(': ', 1) for line in apt_cache.configuration().splitlines()
+                        if ': ' in line and not line.startswith('#'))
+        solid = settings['SPfilePatternEx']
+        retained = settings['WfilePatternEx']
+        for path in ('/20261016T000000Z/dists/trixie/InRelease',
+                     '/debian-snapshot/20261016T000000Z/dists/trixie/Release',
+                     'debian-snapshot/20261016T000000Z/dists/trixie/main/binary-amd64/Packages.xz',
+                     '/archive/debian/20261016T000000Z/dists/trixie/Release.gpg'):
+            with self.subTest(path=path):
+                self.assertIsNotNone(re.search(solid, path))
+        self.assertIsNone(re.search(solid, '/debian-snapshot/dists/trixie/InRelease'))
+        self.assertIsNone(re.search(solid, '/debian-snapshot/20261016T000000Z/pool/main/x/pkg.deb'))
+        for path in ('debian-snapshot/20261016T000000Z/dists/trixie/InRelease',
+                     'debian-snapshot/20261016T000000Z/pool/main/x/pkg.deb'):
+            self.assertIsNotNone(re.search(retained, path))
+        self.assertIsNone(re.search(retained, 'other-repository/pool/main/x/pkg.deb'))
+
+    def test_missing_build_volume_refuses_before_installation(self):
+        run = mock.Mock(side_effect=subprocess.CalledProcessError(1, ['mountpoint']))
+        with self.assertRaises(subprocess.CalledProcessError):
+            apt_cache.install(run)
+        run.assert_called_once_with(['mountpoint', '-q', str(apt_cache.BUILD)], check=True)
+        self.assertFalse(apt_cache.CONFIG.exists())
+
+    def test_help_documents_the_mirror_without_installing(self):
+        result = subprocess.run([sys.executable, str(HERE / 'install-apt-cache.py'), '--help'],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('MOTOR_DEBIAN_MIRROR=http://127.0.0.1:3142/debian-snapshot/<snapshot>/', result.stdout)
 
 
 if __name__ == "__main__":

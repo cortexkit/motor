@@ -13,6 +13,8 @@ import stat
 import subprocess
 import urllib.request
 
+from debian_mirror import mirror_url
+
 BUILD = Path("/srv/build")
 PREFIX = Path("/usr/local/lib/motor")
 GUEST_SERVICES = ("motor-tenant-agent.service", "motor-net-rules.service", "motor-image-check.service")
@@ -85,6 +87,17 @@ def published_hash(url, filename):
     raise ValueError(f"no checksum for {filename} at {url}")
 
 
+def configure_apt(pins):
+    # The cache only supplies bytes: apt still verifies signed Release metadata
+    # and its Packages/package hashes. Only snapshot expiry checks are disabled.
+    Path("/etc/apt/sources.list").write_text(
+        f"deb {mirror_url(pins)} {pins['debian_suite']} main\n")
+    Path("/etc/apt/apt.conf.d/99snapshot").write_text(
+        'Acquire::Check-Valid-Until "false";\nAcquire::Retries "3";\n'
+        'APT::Update::Error-Mode "any";\nAcquire::AllowInsecureRepositories "false";\n'
+        'APT::Get::AllowUnauthenticated "false";\n')
+
+
 def install_job_packages(pins, manifest):
     """Installs the shared job package contract with apt inside the guest.
 
@@ -94,9 +107,7 @@ def install_job_packages(pins, manifest):
     read the same pinned Debian snapshot, so a package gets the version
     debootstrap would have picked; recommends stay out, as with debootstrap.
     """
-    Path("/etc/apt/sources.list").write_text(
-        f"deb https://snapshot.debian.org/archive/debian/{pins['debian_snapshot']}/ {pins['debian_suite']} main\n")
-    Path("/etc/apt/apt.conf.d/99snapshot").write_text('Acquire::Check-Valid-Until "false";\n')
+    configure_apt(pins)
     # Tenant jobs build the static runner too; their role includes musl-tools
     # so apt supplies musl-gcc and its matching libc development files.
     packages = sorted(set(manifest["apt_packages"]["required"] + manifest["apt_packages"]["by_role"]["tenant"]))
@@ -338,9 +349,7 @@ def configure(pins):
     Path("/etc/default/locale").write_text("LANG=C.UTF-8\n")
     Path("/etc/profile.d/motor-tools.sh").write_text(
         f"export RUSTUP_HOME={PREFIX}/rustup\nexport PATH={PREFIX}/cargo/bin:$PATH\n")
-    Path("/etc/apt/sources.list").write_text(
-        f"deb https://snapshot.debian.org/archive/debian/{pins['debian_snapshot']}/ {pins['debian_suite']} main\n")
-    Path("/etc/apt/apt.conf.d/99snapshot").write_text('Acquire::Check-Valid-Until "false";\n')
+    configure_apt(pins)
     run("systemctl", "enable", "motor-tenant-agent.service")
     run("systemctl", "mask", "systemd-networkd.service", "systemd-resolved.service",
         "systemd-remount-fs.service",

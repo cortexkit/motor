@@ -2,6 +2,7 @@
 """Portable build-plumbing tests; these do not claim to boot a VM or compile a kernel."""
 
 import hashlib
+import http.server
 import importlib.util
 import json
 import os
@@ -10,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -69,7 +71,7 @@ class ImageTests(unittest.TestCase):
         written = {}
         with mock.patch.object(guest, 'run') as run, \
                 mock.patch.object(guest.Path, 'write_text', lambda path, text: written.__setitem__(str(path), text)), \
-                mock.patch.dict(guest.os.environ):
+                mock.patch.dict(guest.os.environ, {}, clear=True):
             guest.install_job_packages(pins, manifest)
         self.assertIn('snapshot.debian.org/archive/debian/20261016T000000Z/ trixie main', written['/etc/apt/sources.list'])
         install = run.call_args_list[-1].args
@@ -78,6 +80,34 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(set(install[4:]), expected)
         self.assertIn('libwebkit2gtk-4.1-dev', install[4:])
         self.assertIn('musl-tools', install[4:])
+        self.assertIn('Acquire::Retries "3";', written['/etc/apt/apt.conf.d/99snapshot'])
+        self.assertIn('APT::Update::Error-Mode "any";', written['/etc/apt/apt.conf.d/99snapshot'])
+        self.assertIn('Acquire::AllowInsecureRepositories "false";', written['/etc/apt/apt.conf.d/99snapshot'])
+        self.assertIn('APT::Get::AllowUnauthenticated "false";', written['/etc/apt/apt.conf.d/99snapshot'])
+
+    def test_mirror_override_is_used_for_all_guest_apt_sources(self):
+        pins = {'debian_snapshot': '20261016T000000Z', 'debian_suite': 'trixie'}
+        manifest = json.loads((image.REPO / 'script/runner/toolchain.json').read_text())
+        mirror = 'http://127.0.0.1:3142/debian-snapshot/20261016T000000Z'
+        written = {}
+        with mock.patch.object(guest, 'run'), \
+                mock.patch.object(guest.Path, 'write_text', lambda path, text: written.__setitem__(str(path), text)), \
+                mock.patch.dict(os.environ, MOTOR_DEBIAN_MIRROR=mirror):
+            guest.install_job_packages(pins, manifest)
+            self.assertEqual(written['/etc/apt/sources.list'], f'deb {mirror}/ trixie main\n')
+            written.clear()
+            guest.configure_apt(pins)
+            self.assertEqual(written['/etc/apt/sources.list'], f'deb {mirror}/ trixie main\n')
+        configure = (HERE / 'install-guest.py').read_text().split('def configure(pins):', 1)[1].split('def verify_git', 1)[0]
+        self.assertIn('configure_apt(pins)', configure)
+
+    def test_mirror_setting_rejects_apt_source_injection(self):
+        from debian_mirror import mirror_url
+        for value in ('', 'file:///srv/cache', 'http://localhost/ trixie main\n',
+                      'http://user:secret@localhost/cache', 'https://localhost/cache?override=1'):
+            with self.subTest(value=value), mock.patch.dict(os.environ, MOTOR_DEBIAN_MIRROR=value):
+                with self.assertRaises(ValueError):
+                    mirror_url({'debian_snapshot': '20261016T000000Z'})
 
     def test_default_build_output_uses_root_trusted_vm_bind_view(self):
         with mock.patch.object(sys, "argv", ["build.py", "build", "test-version", "--runner", "/runner", "--build-budget-gib", "1"]), mock.patch.object(image, "build") as build:
@@ -283,18 +313,68 @@ class ImageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "differs from its manifest"):
             image.verify(target)
 
-    def test_failed_build_remains_reserved_and_cannot_pass_inventory(self):
+    def test_failed_build_removes_its_reservation_and_allows_retry(self):
         def fail(*_args):
             raise RuntimeError("stopped before unmount")
 
-        with self.assertRaises(RuntimeError):
+        with self.assertRaisesRegex(RuntimeError, "stopped before unmount"):
             image.build("failed", self.root / "images", self.versions, self.runner, builder=fail,
                         build_budget=1024**3, free_floor=0, mountinfo_reader=lambda: ROOT_MOUNTINFO)
         target = self.root / "images/failed"
-        with self.assertRaisesRegex(ValueError, "incomplete"):
+        self.assertFalse(target.exists())
+        with self.assertRaises(FileNotFoundError):
             image.inventory(target, self.versions)
-        with self.assertRaises(FileExistsError):
-            self.build("failed")
+        self.assertEqual(self.build("failed"), target)
+
+    def test_preflight_failure_removes_only_the_new_reservation(self):
+        other = self.build('existing')
+        before = {path.name: path.read_bytes() for path in other.iterdir()}
+        with self.assertRaisesRegex(ValueError, 'floor'):
+            image.build('preflight', other.parent, self.versions, self.runner,
+                        builder=self.builder, build_budget=1024**3, free_floor=2**100)
+        self.assertFalse((other.parent / 'preflight').exists())
+        self.assertEqual({path.name: path.read_bytes() for path in other.iterdir()}, before)
+
+    def test_failed_build_never_deletes_a_replacement_directory(self):
+        target = self.root / 'images/replaced'
+        def fail(stage, *_args):
+            target.rename(target.with_name('original'))
+            target.mkdir()
+            (target / 'not-ours').write_text('keep')
+            raise RuntimeError('replacement')
+        with self.assertRaisesRegex(RuntimeError, 'replacement'):
+            image.build('replaced', target.parent, self.versions, self.runner, builder=fail,
+                        build_budget=1024**3, free_floor=0, mountinfo_reader=lambda: ROOT_MOUNTINFO)
+        self.assertEqual((target / 'not-ours').read_text(), 'keep')
+
+    def test_stage_creation_failure_still_releases_the_reservation(self):
+        mkdir = Path.mkdir
+        def create(path, *args, **kwargs):
+            if path.name == '.work':
+                raise OSError('stage mkdir failed')
+            return mkdir(path, *args, **kwargs)
+        with mock.patch.object(Path, 'mkdir', create), self.assertRaisesRegex(OSError, 'stage mkdir failed'):
+            image.build('no-stage', self.root / 'images', self.versions, self.runner,
+                        build_budget=1024**3, free_floor=0, mountinfo_reader=lambda: ROOT_MOUNTINFO)
+        self.assertFalse((self.root / 'images/no-stage').exists())
+
+    def test_failed_build_refuses_mounts_outside_stage_and_unknown_mount_state(self):
+        for name in ('mounted', 'unknown'):
+            target = self.root / 'images' / name
+            def fail(*_args):
+                (target / 'other').mkdir()
+                raise RuntimeError('builder failed')
+            def mountinfo():
+                if not (target / 'other').exists():
+                    return ROOT_MOUNTINFO
+                return (ROOT_MOUNTINFO + f'2 1 0:2 / {target / "other"} rw - tmpfs tmpfs rw\n'
+                        if name == 'mounted' else '')
+            with self.subTest(name=name), mock.patch.object(image.shutil, 'rmtree') as remove:
+                with self.assertRaisesRegex(RuntimeError, 'builder failed'):
+                    image.build(name, target.parent, self.versions, self.runner, builder=fail,
+                                build_budget=1024**3, free_floor=0, mountinfo_reader=mountinfo)
+                remove.assert_not_called()
+            self.assertTrue((target / 'other').is_dir())
 
     def test_mounted_stage_is_retained_without_recursive_delete_or_manifest(self):
         ready = False
@@ -659,7 +739,7 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(table["/"][0], "overlay")
         self.assertIn("ro", table["/.lower"][1])
 
-    def rootfs_shell(self, fail_chroot=False):
+    def rootfs_shell(self, fail_chroot=False, mirror=None):
         stage, bins = self.root / ".work", self.root / "bin"
         stage.mkdir()
         bins.mkdir()
@@ -689,6 +769,9 @@ elif name == "umount":
     paths = json.loads(mounts.read_text())
     paths.remove(args[-1])
     mounts.write_text(json.dumps(paths))
+elif name == "debootstrap":
+    with log.open("a") as stream:
+        stream.write(json.dumps(["debootstrap-wgetrc", pathlib.Path(os.environ["WGETRC"]).read_text()]) + "\\n")
 elif name == "python3":
     if len(args) >= 3 and args[1] == "cleanup-mounts":
         import importlib.util
@@ -713,6 +796,9 @@ elif name in ("truncate", "mkfs.ext4"):
             path.write_text(f"#!{sys.executable}\n" + stub)
             path.chmod(0o755)
         env = dict(os.environ, PATH=f"{bins}:/usr/bin:/bin", STUB_LOG=str(log), STUB_MOUNTS=str(mounts), JOBS="2")
+        env.pop('MOTOR_DEBIAN_MIRROR', None)
+        if mirror is not None:
+            env['MOTOR_DEBIAN_MIRROR'] = mirror
         if fail_chroot:
             env["FAIL_CHROOT"] = "1"
         result = subprocess.run(["bash", str(HERE / "build-rootfs.sh"), str(stage)],
@@ -723,6 +809,13 @@ elif name in ("truncate", "mkfs.ext4"):
         result, calls, stage = self.rootfs_shell()
         self.assertEqual(result.returncode, 0, result.stderr)
         debootstrap = next(call for call in calls if call[0] == 'debootstrap')
+        self.assertEqual(debootstrap[-1], 'https://snapshot.debian.org/archive/debian/20261016T000000Z/')
+        self.assertIn('--force-check-gpg', debootstrap)
+        self.assertIn('--keyring=/usr/share/keyrings/debian-archive-keyring.gpg', debootstrap)
+        wgetrc = next(call[1] for call in calls if call[0] == 'debootstrap-wgetrc')
+        self.assertIn('tries = 4\n', wgetrc)
+        self.assertIn('timeout = 30\n', wgetrc)
+        self.assertIn('retry_on_http_error = 429,500,502,503,504\n', wgetrc)
         included = next(arg.removeprefix('--include=') for arg in debootstrap if arg.startswith('--include=')).split(',')
         manifest = json.loads((image.REPO / 'script/runner/toolchain.json').read_text())
         pins = json.loads((HERE / 'versions.txt').read_text())
@@ -743,6 +836,41 @@ elif name in ("truncate", "mkfs.ext4"):
         self.assertLess(paths.index(str(stage / "root/dev/shm")), paths.index(str(stage / "root/dev")))
         self.assertLess(max(unmounts), packing)
         self.assertEqual((stage / "rootfs").read_bytes(), b"test rootfs")
+
+    def test_rootfs_shell_routes_bootstrap_and_chroot_through_the_mirror(self):
+        mirror = 'http://127.0.0.1:3142/debian-snapshot/20261016T000000Z/'
+        result, calls, stage = self.rootfs_shell(mirror=mirror)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(next(call for call in calls if call[0] == 'debootstrap')[-1], mirror)
+        self.assertIn('MOTOR_DEBIAN_MIRROR=' + mirror, next(call for call in calls if call[0] == 'chroot'))
+        self.assertEqual((stage / 'root/srv/build/debian_mirror.py').read_bytes(), (HERE / 'debian_mirror.py').read_bytes())
+
+    def test_debootstrap_wget_policy_retries_503_and_stops(self):
+        result, _calls, stage = self.rootfs_shell()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        requests = []
+        class Unavailable(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append(self.path)
+                self.send_response(503)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                pass
+        with http.server.HTTPServer(('127.0.0.1', 0), Unavailable) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                fetch = subprocess.run(['wget', '--no-proxy', '-q', '-O', str(stage / 'download'),
+                                        f'http://127.0.0.1:{server.server_port}/package.deb'],
+                                       env=dict(os.environ, WGETRC=str(stage / 'debootstrap.wgetrc')),
+                                       capture_output=True, text=True, timeout=30)
+            finally:
+                server.shutdown()
+                thread.join()
+        self.assertNotEqual(fetch.returncode, 0, fetch.stdout + fetch.stderr)
+        self.assertEqual(requests, ['/package.deb'] * 4)
 
     def test_rootfs_shell_failure_unmounts_but_does_not_publish_image(self):
         result, calls, stage = self.rootfs_shell(fail_chroot=True)
