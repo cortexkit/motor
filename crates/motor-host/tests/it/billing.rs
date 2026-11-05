@@ -820,6 +820,75 @@ fn warm_workspaces_join_admitted_hashes_order_cap_and_forget_evictions() {
 }
 
 #[test]
+fn a_busy_workspace_stays_in_the_warm_list_whatever_its_age() {
+    // On 5 Nov 2026 a checkout whose job had run for over half an hour kept
+    // getting more jobs placed on the same host to queue behind it: by start
+    // time it ranked below 64 newer workspaces, so it left the warm list and
+    // its busy flag with it.
+    use motor_protocol::HeldWorkspace;
+    let mut h = host();
+    h.guest_ready("tenant", 1).unwrap();
+    let mut held = Vec::new();
+    for i in 0..70_u64 {
+        let job = format!("00000000-0000-7000-8000-{:012x}", i + 100);
+        let mut c = claims(&job);
+        c.workspace_key_hash = Some(motor_lease::base64url(&[i as u8; 32]));
+        let (connection, _) = h.claim(c, MS).unwrap();
+        h.delivered(connection).unwrap();
+        h.event(
+            "tenant",
+            &event(i * 2 + 1, TenantEventKind::Admitted, Some(&job), None),
+            MS,
+        )
+        .unwrap();
+        h.event(
+            "tenant",
+            &event(i * 2 + 2, TenantEventKind::Terminal, Some(&job), None),
+            MS,
+        )
+        .unwrap();
+        held.push(HeldWorkspace {
+            job_id: job.parse().unwrap(),
+            used_ms: MS - 100 + i,
+        });
+    }
+    let long = "00000000-0000-7000-8000-000000000fff";
+    let mut c = claims(long);
+    c.workspace_key_hash = Some(motor_lease::base64url(&[200; 32]));
+    let (connection, _) = h.claim(c, MS).unwrap();
+    h.delivered(connection).unwrap();
+    h.event(
+        "tenant",
+        &event(201, TenantEventKind::Admitted, Some(long), None),
+        MS,
+    )
+    .unwrap();
+    h.event(
+        "tenant",
+        &event(202, TenantEventKind::Started, Some(long), None),
+        MS,
+    )
+    .unwrap();
+    held.push(HeldWorkspace {
+        job_id: long.parse().unwrap(),
+        used_ms: MS - 10_000,
+    });
+    h.record_warm("tenant", MS, held);
+    let warm = h.heartbeat(MS, 0, true).warm;
+    assert_eq!(warm.len(), 64);
+    assert_eq!(
+        warm[0].workspace_key_hash,
+        motor_lease::base64url(&[200; 32])
+    );
+    assert!(warm[0].busy);
+    assert_eq!(
+        warm[1].workspace_key_hash,
+        motor_lease::base64url(&[69; 32])
+    );
+    assert!(warm[1..].iter().all(|entry| !entry.busy));
+}
+
+#[test]
 fn usage_outbox_finals_advance_retry_bodies_are_unchanged_and_counter_is_durable() {
     let dir = scratch();
     let mut h = disk_host(dir.path());

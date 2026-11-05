@@ -415,20 +415,23 @@ impl Host {
                 else {
                     continue;
                 };
+                let busy = self.snapshot.leases.values().any(|active| {
+                    active.tenant == *tenant
+                        && active.claims.workspace_key_hash.as_ref() == Some(hash)
+                        && matches!(active.state, LeaseState::Admitted | LeaseState::Started)
+                });
+                // A workspace in use is being used now, whatever time its job
+                // started. Ranking it by that start would let a long job's
+                // workspace fall out of the 64 reported, and the broker would
+                // then place the checkout's next job here without knowing it
+                // must queue behind that job.
                 entries.push((
-                    held.used_ms,
+                    if busy { u64::MAX } else { held.used_ms },
                     motor_lease::WarmVm {
                         tenant: lease.claims.sub.clone(),
                         workspace_key_hash: hash.clone(),
                         vm: vm.clone(),
-                        busy: self.snapshot.leases.values().any(|active| {
-                            active.tenant == *tenant
-                                && active.claims.workspace_key_hash.as_ref() == Some(hash)
-                                && matches!(
-                                    active.state,
-                                    LeaseState::Admitted | LeaseState::Started
-                                )
-                        }),
+                        busy,
                     },
                 ));
             }
