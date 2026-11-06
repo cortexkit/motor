@@ -405,7 +405,15 @@ pub fn run(runtime: Arc<Runtime>, key: SigningKey, storage: std::path::PathBuf) 
                 });
             match result {
                 Ok(request) => {
-                    let _ = metrics_tx.try_send(request);
+                    // The sender takes a sample only after pending heartbeats
+                    // and usage reports, so a busy host can still hold the
+                    // previous minute's sample. Say so: otherwise the gap
+                    // shows only as missing rows on the broker's side.
+                    if let Err(std::sync::mpsc::TrySendError::Full(_)) =
+                        metrics_tx.try_send(request)
+                    {
+                        tracing::info!("host_metrics_sample_skipped");
+                    }
                 }
                 Err(_) => tracing::warn!("host_metrics_sample_failed"),
             }
