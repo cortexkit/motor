@@ -415,7 +415,9 @@ class Harness:
 
     def helper(self, op):
         with socket.socket(socket.AF_UNIX) as conn:
-            conn.settimeout(180)
+            # Match the host's stop reply budget: the guest flush can take
+            # 300 s inside the helper's 400 s prepare, before final cleanup.
+            conn.settimeout(600 if op == "stop_tenant" else 180)
             try:
                 os.setegid(self.gid)
                 os.seteuid(self.uid)

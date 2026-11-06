@@ -277,15 +277,15 @@ fn service_uses_delegation_leaf_and_sends_sigterm_only_to_the_helper() {
     }
     assert!(!unit.lines().any(|l| l.starts_with("SendSIGKILL=")));
     assert!(!unit.lines().any(|l| l.starts_with("ExecStop=")));
-    // One in-flight suspend (50 s prepare, 300 s snapshot, 10 s VMM exit)
-    // plus one tenant's clean stop (45 s); the unit file explains each part.
+    // One in-flight stop/suspend reply (600 s), one tenant's prepare (400 s),
+    // and Firecracker exit/helper cleanup (20 s); the unit explains each part.
     let timeout: u64 = unit
         .lines()
         .find_map(|l| l.strip_prefix("TimeoutStopSec="))
         .unwrap()
         .parse()
         .unwrap();
-    assert!(timeout >= 405, "{timeout}");
+    assert!(timeout >= 1020, "{timeout}");
 }
 
 #[test]

@@ -37,6 +37,7 @@ struct Running {
     attached: bool,
     restored: bool,
     snapshot_uncertain: bool,
+    snapshot_prepare_started: Option<std::time::Instant>,
 }
 pub struct LinuxTenants {
     config: Config,
@@ -203,7 +204,26 @@ impl LinuxTenants {
         let fd = self.relay(tenant, 54)?;
         exchange_agent(UnixStream::from(fd), &body, Duration::from_secs(30))
     }
+
+    fn agent_until(
+        &mut self,
+        tenant: &str,
+        body: &Value,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        let fd = self.relay(tenant, 54)?;
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .ok_or_else(|| Error("tenant agent deadline elapsed".into()))?;
+        exchange_agent(UnixStream::from(fd), body, remaining)
+    }
 }
+
+// Guest sync may spend 300 s writing Dirty + Writeback pages. Give prepare
+// 400 s including relay, runner drain and the short freeze, below the host's
+// 600 s stop/suspend reply budget. Ordinary agent requests keep their 30 s bound.
+const SNAPSHOT_PREPARE_TIMEOUT: Duration = Duration::from_secs(400);
+const SNAPSHOT_IO_BUDGET: Duration = Duration::from_secs(540);
 
 pub(crate) fn exchange_agent(
     mut stream: UnixStream,
@@ -331,14 +351,8 @@ impl Backend for LinuxTenants {
         )
     }
     fn prepare_stop(&mut self, tenant: &str) -> Result<()> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        prepare_stop_with(|request| {
-            let fd = self.relay(tenant, 54)?;
-            let remaining = deadline
-                .checked_duration_since(std::time::Instant::now())
-                .ok_or_else(|| Error("tenant agent deadline elapsed".into()))?;
-            exchange_agent(UnixStream::from(fd), request, remaining)
-        })
+        let deadline = std::time::Instant::now() + SNAPSHOT_PREPARE_TIMEOUT;
+        prepare_stop_with(|request| self.agent_until(tenant, request, deadline))
     }
     fn recovery_complete(&mut self, tenant: &str, registry: &Registry) -> Result<()> {
         if !self.unclean(registry)? {
@@ -604,6 +618,7 @@ impl Backend for LinuxTenants {
                 attached: false,
                 restored: saved,
                 snapshot_uncertain: false,
+                snapshot_prepare_started: None,
             },
         );
         // A successful connection is required, not merely a leftover socket inode.
@@ -688,9 +703,16 @@ impl Backend for LinuxTenants {
         activation::complete(&r.disk.with_file_name("runner-args.staged"), activation)
     }
     fn prepare(&mut self, tenant: &str) -> Result<()> {
-        self.agent(tenant, json!({"op":"prepare_snapshot","kind":"suspend"}))
+        let started = std::time::Instant::now();
+        self.vm(tenant)?.snapshot_prepare_started = Some(started);
+        self.agent_until(
+            tenant,
+            &json!({"op":"prepare_snapshot","kind":"suspend"}),
+            started + SNAPSHOT_PREPARE_TIMEOUT,
+        )
     }
     fn thaw(&mut self, tenant: &str) -> Result<()> {
+        self.vm(tenant)?.snapshot_prepare_started = None;
         if self.vm(tenant)?.paused {
             self.resume(tenant)?;
         }
@@ -698,6 +720,10 @@ impl Backend for LinuxTenants {
     }
     fn snapshot(&mut self, tenant: &str, r: &Registry, key: &SnapshotKey) -> Result<()> {
         let vm = self.vm(tenant)?;
+        let started = vm
+            .snapshot_prepare_started
+            .take()
+            .ok_or_else(|| Error("snapshot has no guest preparation deadline".into()))?;
         // A lost pause reply may still have paused the VM. Compensation must
         // issue Resume even when the API call itself fails.
         vm.paused = true;
@@ -716,7 +742,10 @@ impl Backend for LinuxTenants {
             (r.snapshot_memory_high_mib.min(r.guest_ram_mib) * 1048576).to_string(),
         )?;
         let result = (|| {
-            let timeout = snapshot_create_timeout(r.guest_ram_mib);
+            let timeout = snapshot_create_timeout(r.guest_ram_mib, started.elapsed());
+            if timeout.is_zero() {
+                return Err(Error("snapshot preparation exhausted I/O budget".into()));
+            }
             eprintln!(
                 "tenant {tenant}: suspend_snapshot_create ram_mib={} timeout_ms={}",
                 r.guest_ram_mib,
@@ -926,10 +955,15 @@ fn relay_handshake(stream: &mut (impl Read + Write), port: u32) -> Result<()> {
     Ok(())
 }
 
-/// Budget for 64 MiB/s plus 30 s of overhead. Reserve two minutes of the host's
-/// 600 s helper deadline for guest preparation, pause and failure compensation.
-fn snapshot_create_timeout(ram_mib: u64) -> Duration {
+/// Budget for 64 MiB/s plus 30 s of overhead, capped at 480 s. Guest preparation
+/// and pause consume the same 540 s I/O budget, leaving 60 s of the host's 600 s
+/// reply deadline for durable snapshot metadata, Firecracker exit and failure
+/// cleanup.
+/// A quick flush retains the old create limit; a slow flush cannot overrun the
+/// host deadline by starting a fresh, independent snapshot-write timeout.
+fn snapshot_create_timeout(ram_mib: u64, prepare_elapsed: Duration) -> Duration {
     Duration::from_secs(ram_mib.div_ceil(64).saturating_add(30).clamp(60, 480))
+        .min(SNAPSHOT_IO_BUDGET.saturating_sub(prepare_elapsed))
 }
 
 pub(crate) fn create_snapshot(root: &Path, timeout: Duration, uncertain: &mut bool) -> Result<()> {

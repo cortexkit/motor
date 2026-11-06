@@ -575,10 +575,10 @@ impl<B: Backend> Controller<B> {
     }
     /// The service stop path: stops every running tenant the way
     /// `Operation::Stop` does (guest drain, `sync -f /tenant` and freeze,
-    /// bounded at 15 s, then the VMM is killed). A tenant that cannot be
-    /// stopped cleanly is recorded as unclean before this returns, so the
-    /// caller may exit and let systemd kill whatever is left. Returns the
-    /// tenants that did not stop cleanly, with the reason.
+    /// bounded at 400 s including guest preparation, then the VMM is killed).
+    /// A tenant that cannot be stopped cleanly is recorded as unclean before
+    /// this returns, so the caller may exit and let systemd kill whatever is
+    /// left. Returns the tenants that did not stop cleanly, with the reason.
     pub fn stop_all(&mut self) -> Vec<(String, Error)> {
         let mut failures = Vec::new();
         for tenant in self.0.running_tenants() {

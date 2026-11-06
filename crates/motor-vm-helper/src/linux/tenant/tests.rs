@@ -308,10 +308,33 @@ fn isolated_tenant_load_paths_verify_firecracker_oom_score() {
 
 #[test]
 fn snapshot_deadline_scales_with_memory_and_reserves_helper_cleanup_budget() {
-    assert_eq!(snapshot_create_timeout(1024), Duration::from_secs(60));
-    assert_eq!(snapshot_create_timeout(28 * 1024), Duration::from_secs(478));
-    assert_eq!(snapshot_create_timeout(30 * 1024), Duration::from_secs(480));
-    assert_eq!(snapshot_create_timeout(u64::MAX), Duration::from_secs(480));
+    assert_eq!(
+        snapshot_create_timeout(1024, Duration::ZERO),
+        Duration::from_secs(60)
+    );
+    assert_eq!(
+        snapshot_create_timeout(28 * 1024, Duration::ZERO),
+        Duration::from_secs(478)
+    );
+    assert_eq!(
+        snapshot_create_timeout(30 * 1024, Duration::ZERO),
+        Duration::from_secs(480)
+    );
+    assert_eq!(
+        snapshot_create_timeout(u64::MAX, Duration::ZERO),
+        Duration::from_secs(480)
+    );
+    for (elapsed, expected) in [(60, 480), (300, 240), (400, 140), (540, 0), (600, 0)] {
+        let timeout = snapshot_create_timeout(100 * 1024, Duration::from_secs(elapsed));
+        assert_eq!(timeout, Duration::from_secs(expected));
+        if elapsed <= 540 {
+            assert!(
+                Duration::from_secs(elapsed) + timeout + Duration::from_secs(60)
+                    <= Duration::from_secs(600)
+            );
+        }
+    }
+    assert_eq!(SNAPSHOT_PREPARE_TIMEOUT, Duration::from_secs(400));
 }
 
 #[test]

@@ -50,8 +50,9 @@ guest `prepare_snapshot` (bounded drain, sync and freeze), snapshots to a key
 containing image hashes and generation, then stops the VMM. Insufficient byte
 space returns `suspend_skipped_space`. Failed preparation or snapshot creation
 leaves the VM running and thaws the guest. `stop_tenant` tries disk preparation
-for at most 15 seconds, then stops without a snapshot even if the guest refuses
-or is unreachable. Before an unclean stop it fsyncs an `unclean-stop.json` record
+for at most 400 seconds including relay and drain, then stops without a snapshot
+even if the guest refuses or is unreachable. Before an unclean stop it fsyncs an
+`unclean-stop.json` record
 beside the disk's generation file, including time and reason. Restore consumes/fsyncs the snapshot and advances
 generation **before** resume; it then thaws. The host still calls `post_restore`
 on a restored VM and `attach_tenant` on a fresh one. Mismatched keys or failed
@@ -81,8 +82,10 @@ progress finishes, runs `stop_tenant` for every running tenant, refuses all
 later requests and exits. A tenant whose preparation fails is recorded as
 unclean before its VMM is killed. Each tenant's outcome and stop time go to
 the journal. systemd then SIGKILLs what is left (job VMs). `TimeoutStopSec`
-covers one in-flight suspend and one tenant's stop; the unit file shows the
-arithmetic. Tests: `service_stop_signal_runs_the_clean_tenant_stop_before_the_helper_exits`,
+covers one in-flight stop or suspend (600 s), then one tenant's preparation
+(400 s) and helper cleanup (20 s), for 1020 s total. Add 420 s for each further
+running tenant; the unit file shows the arithmetic.
+Tests: `service_stop_signal_runs_the_clean_tenant_stop_before_the_helper_exits`,
 `service_stop_signal_records_a_tenant_whose_guest_flush_fails_as_unclean`,
 `killed_helper_leaves_the_running_marker_so_the_next_start_runs_recovery`.
 

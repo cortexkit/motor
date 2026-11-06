@@ -153,14 +153,16 @@ impl Helper {
 }
 
 const ORDINARY_HELPER_TIMEOUT: Duration = Duration::from_secs(60);
-/// Suspend writes a complete guest-memory image and its durable snapshot record.
-/// Give that storage-heavy operation a separate ten-minute reply budget without
-/// weakening short control writes or waiting indefinitely for a stuck helper.
-const SUSPEND_HELPER_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
+/// Both stop and suspend flush the guest's dirty pages before freezing. The
+/// guest's 300 s sync limit fits inside the helper's 400 s prepare budget, which
+/// must in turn fit inside this 600 s reply deadline. Stop now matches suspend
+/// so a large dirty cache does not make the host abandon a still-cleaning guest.
+/// Suspend also writes memory within that budget; control writes stay short.
+const SNAPSHOT_HELPER_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn helper_reply_deadline(request: &Value) -> Duration {
-    if request["op"] == "suspend" {
-        SUSPEND_HELPER_REPLY_TIMEOUT
+    if request["op"] == "suspend" || request["op"] == "stop_tenant" {
+        SNAPSHOT_HELPER_REPLY_TIMEOUT
     } else {
         ORDINARY_HELPER_TIMEOUT
     }
@@ -673,9 +675,10 @@ mod helper_deadline_tests {
     }
 
     #[test]
-    fn suspend_reply_budget_is_applied_to_the_actual_helper_socket_only() {
+    fn snapshot_reply_budget_is_applied_to_the_actual_helper_socket_only() {
         for (op, expected) in [
             ("suspend", 600),
+            ("stop_tenant", 600),
             ("adopt", 60),
             ("tenant_metrics", 60),
             ("ensure", 60),

@@ -103,6 +103,40 @@ where
 async fn command(program: &str, args: &[&str]) -> io::Result<()> {
     command_with_timeout(program, args, Duration::from_secs(10)).await
 }
+
+fn sync_timeout(meminfo: &str) -> io::Result<Duration> {
+    let kib = |name: &str| -> io::Result<u64> {
+        let mut fields = meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .ok_or_else(|| io::Error::other(format!("missing {name} in /proc/meminfo")))?
+            .split_whitespace();
+        let value = fields
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| io::Error::other(format!("invalid {name} in /proc/meminfo")))?;
+        if fields.next() != Some("kB") || fields.next().is_some() {
+            return Err(io::Error::other(format!(
+                "invalid {name} unit in /proc/meminfo"
+            )));
+        }
+        Ok(value)
+    };
+    // Dirty pages and writeback both still need disk I/O. Allow a conservative
+    // 64 MiB/s plus 10 s of overhead, rather than timing out large guest caches
+    // after 10 s. The 300 s ceiling leaves room inside the helper's 400 s
+    // prepare budget and the host's 600 s stop/suspend reply deadline.
+    let pending_kib = kib("Dirty:")?.saturating_add(kib("Writeback:")?);
+    Ok(Duration::from_secs(
+        pending_kib.div_ceil(64 * 1024).saturating_add(10).min(300),
+    ))
+}
+
+async fn sync(args: &[&str]) -> io::Result<()> {
+    let timeout = sync_timeout(&fs::read_to_string("/proc/meminfo")?)?;
+    command_with_timeout("sync", args, timeout).await
+}
+
 async fn command_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Result<()> {
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args).kill_on_drop(true);
@@ -129,7 +163,7 @@ pub(super) async fn prepare(kind: SnapshotKind) -> io::Result<Value> {
             if runner_socket::main_pid()?.is_some() || mounted("/tenant")? {
                 return Ok(json!({"ok":false,"error":"snapshot_busy"}));
             }
-            command("sync", &[]).await?;
+            sync(&[]).await?;
             return Ok(json!({"ok":true}));
         }
         if let Some(reason) = check_and_drain(super::forward, &DRAINED, kind).await? {
@@ -138,7 +172,9 @@ pub(super) async fn prepare(kind: SnapshotKind) -> io::Result<Value> {
         if !mounted("/tenant")? {
             return Err(io::Error::other("tenant filesystem is not mounted"));
         }
-        command("sync", &["-f", "/tenant"]).await?;
+        sync(&["-f", "/tenant"]).await?;
+        // Sync has already flushed the bulk data; freeze only needs a short
+        // bound for the final filesystem consistency boundary.
         // Mark before the command: a timed-out freeze may have reached the
         // kernel. The compensating thaw must run even if its reply was lost.
         FROZEN.store(true, Ordering::Release);
@@ -182,6 +218,43 @@ pub(super) async fn thaw() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_limit_covers_dirty_and_writeback_with_a_floor_and_ceiling() {
+        for (dirty, writeback, seconds) in [
+            (0, 0, 10),
+            (1, 0, 11),
+            (64 * 1024, 0, 11),
+            (64 * 1024 + 1, 0, 12),
+            (1024 * 1024, 1024 * 1024, 42),
+            (0, 10 * 1024 * 1024, 170),
+            (100 * 1024 * 1024, 0, 300),
+            (u64::MAX, u64::MAX, 300),
+        ] {
+            let meminfo = format!(
+                "MemTotal: 104857600 kB\nDirty: {dirty} kB\nWriteback: {writeback} kB\nWritebackTmp: 99 kB\n"
+            );
+            assert_eq!(
+                sync_timeout(&meminfo).unwrap(),
+                Duration::from_secs(seconds),
+                "dirty={dirty}, writeback={writeback}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_limit_refuses_missing_or_malformed_memory_counters() {
+        for meminfo in [
+            "Dirty: 0 kB\n",
+            "Writeback: 0 kB\n",
+            "Dirty: -1 kB\nWriteback: 0 kB\n",
+            "Dirty: 1 MB\nWriteback: 0 kB\n",
+            "Dirty: 0 kB\nWriteback: invalid kB\n",
+            "Dirty: 0 kB\nWriteback: 0 kB extra\n",
+        ] {
+            assert!(sync_timeout(meminfo).is_err(), "{meminfo}");
+        }
+    }
 
     #[tokio::test]
     async fn hosted_stop_ignores_fills_but_refuses_caller_work() {

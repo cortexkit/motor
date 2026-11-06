@@ -30,6 +30,22 @@ def frames():
 
 
 class QualificationTests(unittest.TestCase):
+    def test_stop_helper_timeout_matches_host_without_widening_other_calls(self):
+        harness = q.Harness.__new__(q.Harness)
+        harness.name = "qualify-host"
+        harness.uid, harness.gid = 1234, 1234
+        harness.record = mock.Mock()
+        reply = {"result": "tenant", "running": False}
+        for op, timeout in [("stop_tenant", 600), ("adopt", 180), ("suspend", 180), ("restore", 180)]:
+            with self.subTest(op=op), mock.patch.object(q.socket, "socket") as factory, \
+                    mock.patch.object(q.os, "seteuid"), mock.patch.object(q.os, "setegid"):
+                conn = factory.return_value.__enter__.return_value
+                conn.recv.return_value = json.dumps(reply).encode() + b"\n"
+                self.assertEqual(harness.helper(op), reply)
+                conn.settimeout.assert_called_once_with(timeout)
+                conn.sendall.assert_called_once_with(
+                    json.dumps(dict(op=op, tenant=harness.name)).encode() + b"\n")
+
     def test_sandbox_probe_is_a_real_leased_job_and_refuses_missing_psi(self):
         captured = (q.SANDBOX_PROBE.parent / "test-fixtures/job-sandbox-passing.json").read_bytes()
         terminal = dict(type="terminal", outcome=dict(type="exit", code=0))

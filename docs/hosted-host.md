@@ -365,14 +365,21 @@ extra rule.
    ```
 
    Stopping the helper is the clean stop: it has each running tenant's guest
-   drain, `sync -f /tenant` and freeze (bounded at 15 s) before it stops the
-   VM, and only then exits. The guest refuses that while its runner has a job
+   drain, `sync -f /tenant` and freeze before it stops the VM, and only then
+   exits. The guest refuses that while its runner has a job
    queued or running, so stop when the tenant is idle; a tenant that cannot be
    stopped cleanly is recorded as unclean and its next start runs the in-guest
    recovery check. `journalctl -u motor-vm-helper` shows `tenant tenant-1: clean
    stop took N ms` or the reason it was not clean. The stop can take up to
-   `TimeoutStopSec` (420 s) when a suspend is in progress. If the tenant's
-   last stop was not clean, `switch-image` prints a warning saying so.
+   `TimeoutStopSec` (1020 s for one tenant) when a stop or suspend is already in
+   progress. The guest flush allows 10–300 s, scaled from `/proc/meminfo`'s
+   `Dirty` plus `Writeback` at 64 MiB/s with 10 s overhead; freeze stays bounded
+   at 10 s. The helper's 400 s prepare budget includes the relay and drain,
+   inside the host's 600 s stop/suspend reply deadline. Suspend shares a
+   540 s budget between prepare, pause and memory-image creation, reserving
+   60 s for durable metadata and cleanup. Add 420 s to the service stop bound
+   for each further running tenant. If the tenant's last stop was not clean,
+   `switch-image` prints a warning saying so.
    It verifies the image with the hosted
    image inventory command, builds the tenant's size-specific base if needed,
    and updates the helper registry and `/etc/motor-host/provision/tenant-1.json`

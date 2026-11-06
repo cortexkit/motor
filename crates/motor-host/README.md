@@ -212,9 +212,14 @@ idleness and preserves new activity; a successful snapshot clears VM readiness,
 so a later connection restores it. Async connection cleanup runs in the blocking
 pool rather than issuing helper calls from a destructor on a runtime thread.
 
-The helper's suspend reply has a separate **600-second** bound because writing
-guest memory and its durable snapshot record can take minutes. Ordinary helper
-replies and control writes retain their 60-second bounds. The reply budget also
+The helper's stop and suspend replies have a separate **600-second** bound
+because flushing dirty guest pages, and writing guest memory and its durable
+snapshot record on suspend, can take minutes. The guest flush limit is 10–300 s,
+scaled from `Dirty` plus `Writeback` at 64 MiB/s with 10 s overhead; the helper's
+prepare budget is 400 s, below the host's 600 s reply deadline. Suspend shares
+a 540 s budget between prepare, pause and memory-image creation, leaving 60 s
+for durable metadata and cleanup. Ordinary helper replies and control writes
+retain their 60-second bounds. The reply budget also
 limits continuation reads, so a partial response cannot restart the full wait.
 Helper failures log operation, tenant, budget and elapsed time; `host_tick_failed`
 includes the error chain. Heartbeat publication skips busy/suspending tenant
