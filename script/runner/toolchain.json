@@ -779,6 +779,19 @@
       "realpath_suffix": "/lib/bun/1.3.14/bin/bun",
       "version": "1.3.14"
     },
+    "bun-1.4.2": {
+      "archive": {
+        "archive_path": "bun-linux-x64/bun",
+        "format": "zip",
+        "install_dir": "/usr/local/lib/bun/1.4.2",
+        "install_path": "bin/bun",
+        "sha256": "36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913",
+        "url": "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip"
+      },
+      "path": "/usr/local/bin/bun-1.4.2",
+      "realpath_suffix": "/lib/bun/1.4.2/bin/bun",
+      "version": "1.4.2"
+    },
     "corepack": {
       "path": "/usr/local/bin/corepack",
       "realpath_suffix": "/lib/node_modules/corepack/dist/corepack.js",

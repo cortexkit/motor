@@ -396,18 +396,22 @@ def validate(manifest, role="build-server"):
     for name, pattern in {"node": r"v\d+\.\d+\.\d+", "node22": r"v\d+\.\d+\.\d+",
                           "npm": r"\d+\.\d+\.\d+", "npx": r"\d+\.\d+\.\d+",
                           "corepack": r"\d+\.\d+\.\d+", "bun": r"\d+\.\d+\.\d+",
-                          "bun-1.3.14": r"\d+\.\d+\.\d+", "pnpm": r"\d+\.\d+\.\d+",
+                          "bun-1.3.14": r"\d+\.\d+\.\d+", "bun-1.4.2": r"\d+\.\d+\.\d+",
+                          "pnpm": r"\d+\.\d+\.\d+",
                           "pnpx": r"\d+\.\d+\.\d+", "pnx": r"\d+\.\d+\.\d+",
                           "nats-server": r"nats-server: v\d+\.\d+\.\d+"}.items():
         if name in manifest["tools"] and not re.fullmatch(pattern, manifest["tools"][name]["version"]):
             raise ValueError("unpinned version: " + name)
     archive_urls = {
         "bun-1.3.14": "https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-x64.zip",
+        "bun-1.4.2": "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip",
         "node22": "https://nodejs.org/dist/v22.22.1/node-v22.22.1-linux-x64.tar.xz",
     }
     archive_layouts = {
         "bun-1.3.14": ("1.3.14", "zip", "/usr/local/lib/bun/1.3.14", "bin/bun",
                         "/usr/local/bin/bun-1.3.14"),
+        "bun-1.4.2": ("1.4.2", "zip", "/usr/local/lib/bun/1.4.2", "bin/bun",
+                       "/usr/local/bin/bun-1.4.2"),
         "node22": ("v22.22.1", "tar.xz", "/usr/local/lib/nodejs/22.22.1", "bin/node",
                    "/usr/local/bin/node22"),
     }
@@ -423,7 +427,7 @@ def validate(manifest, role="build-server"):
                 or archive.get("install_dir") != install_dir or archive.get("install_path") != install_path
                 or spec["path"] != link):
             raise ValueError("invalid archive install layout: " + name)
-        if name == "bun-1.3.14" and archive.get("archive_path") != "bun-linux-x64/bun":
+        if name in ("bun-1.3.14", "bun-1.4.2") and archive.get("archive_path") != "bun-linux-x64/bun":
             raise ValueError("invalid Bun archive binary: " + name)
         if name == "node22" and archive.get("strip_components") != 1:
             raise ValueError("invalid Node archive root: " + name)
@@ -875,8 +879,8 @@ def main():
         parser.error('--remote-cache on describes a job environment; it needs --job')
     if args.capture:
         # The manifest names tools beyond the built-in list (pinned variants such
-        # as bun-1.3.14) and the GNU coreutils locations; without it the capture
-        # omits them and --from-capture refuses it as unmeasured.
+        # as bun-1.3.14 and bun-1.4.2) and GNU coreutils locations. Without the
+        # manifest, capture omits them and --from-capture refuses it as unmeasured.
         manifest = json.loads(args.manifest.read_text())
         if args.role == "macos":
             result = capture(manifest, job=args.job, role=args.role)

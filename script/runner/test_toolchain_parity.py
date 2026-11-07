@@ -876,6 +876,21 @@ class ParityTests(unittest.TestCase):
                     self.assertIn("bun version: expected '1.4.4', observed '1.4.2'",
                                   parity.differences(self.manifest, actual, role=role, job=job))
 
+    def test_linux_roles_require_versioned_bun_1_4_2(self):
+        for role in ('build-server', 'boat', 'tenant'):
+            for job in (False, True):
+                with self.subTest(role=role, job=job):
+                    manifest = parity.role_manifest(self.manifest, role, job=job)
+                    self.assertIn('bun-1.4.2', manifest['tools'])
+                    self.assertEqual('1.4.2', manifest['tools']['bun-1.4.2']['version'])
+                    self.assertEqual('/usr/local/bin/bun-1.4.2', manifest['tools']['bun-1.4.2']['path'])
+                    actual = self.observed(role, job=job)
+                    errors = parity.differences(self.manifest, actual, role=role, job=job)
+                    self.assertEqual([], [error for error in errors if error.startswith('bun-1.4.2')])
+                    del actual['tools']['bun-1.4.2']
+                    self.assertIn("bun-1.4.2 path: expected '/usr/local/bin/bun-1.4.2', observed None",
+                                  parity.differences(self.manifest, actual, role=role, job=job))
+
     def test_tools_and_packages_are_checked(self):
         for name in ('bun', 'wasm-opt', 'x86_64-w64-mingw32-gcc', 'gnucp'):
             with self.subTest(name=name):
@@ -1047,7 +1062,7 @@ class ParityTests(unittest.TestCase):
     def test_build_server_job_visible_tools_are_in_the_catalogue(self):
         actual = self.observed()
         actual['local_bin_entries'].extend(
-            ('bun-1.3.14', 'node22', 'corepack', 'npx', 'pn', 'pnpx', 'pnx'))
+            ('bun-1.3.14', 'bun-1.4.2', 'node22', 'corepack', 'npx', 'pn', 'pnpx', 'pnx'))
         errors = self.report(actual)['errors']
         self.assertFalse(errors, errors)
 
@@ -1219,6 +1234,27 @@ class ParityTests(unittest.TestCase):
             self.assertEqual(parity.main(), 0)
         self.assertEqual(1, len(seen))
         self.assertIn('bun-1.3.14', seen[0]['tools'])
+        self.assertIn('bun-1.4.2', seen[0]['tools'])
+
+    def test_versioned_bun_archives_require_pinned_versions_and_layouts(self):
+        parity.validate(self.manifest)
+        for name in ('bun-1.3.14', 'bun-1.4.2'):
+            for field, value, error in (
+                    ('version', 'latest', 'unpinned version'),
+                    ('version', '1.0.0', 'invalid archive install layout'),
+                    ('path', '/usr/local/bin/bun', 'invalid archive install layout'),
+                    ('sha256', 'latest', 'invalid pinned archive'),
+                    ('url', 'https://example.com/bun.zip', 'invalid pinned archive'),
+                    ('format', 'tar.xz', 'invalid archive install layout'),
+                    ('install_dir', '/usr/local/lib/bun', 'invalid archive install layout'),
+                    ('install_path', 'bun', 'invalid archive install layout'),
+                    ('archive_path', 'bun', 'invalid Bun archive binary')):
+                with self.subTest(name=name, field=field, value=value):
+                    manifest = copy.deepcopy(self.manifest)
+                    spec = manifest['tools'][name]
+                    (spec if field in ('version', 'path') else spec['archive'])[field] = value
+                    with self.assertRaisesRegex(ValueError, error + ': ' + name):
+                        parity.validate(manifest)
 
     def test_capture_cli_honors_tenant_and_job_without_rewriting_path(self):
         with patch.object(parity.sys, 'argv', ['toolchain-parity.py', '--capture', '--job', '--role', 'tenant']), \
@@ -1394,6 +1430,10 @@ class InstallerTests(unittest.TestCase):
             bun_archive = archive_dir / 'bun.zip'
             with zipfile.ZipFile(bun_archive, 'w') as archive:
                 archive.writestr('bun-linux-x64/bun', bun_payload)
+            bun_1_4_2_payload = b'#!/bin/sh\necho 1.4.2\n'
+            bun_1_4_2_archive = archive_dir / 'bun-1.4.2.zip'
+            with zipfile.ZipFile(bun_1_4_2_archive, 'w') as archive:
+                archive.writestr('bun-linux-x64/bun', bun_1_4_2_payload)
             node_payload = b'#!/bin/sh\necho v22.22.1\n'
             node_archive = archive_dir / 'node.tar.xz'
             with tarfile.open(node_archive, 'w:xz') as archive:
@@ -1401,7 +1441,8 @@ class InstallerTests(unittest.TestCase):
                 entry.size = len(node_payload)
                 entry.mode = 0o755
                 archive.addfile(entry, io.BytesIO(node_payload))
-            for name, archive_path in (('bun-1.3.14', bun_archive), ('node22', node_archive)):
+            for name, archive_path in (('bun-1.3.14', bun_archive), ('bun-1.4.2', bun_1_4_2_archive),
+                                       ('node22', node_archive)):
                 manifest['tools'][name]['archive']['sha256'] = hashlib.sha256(archive_path.read_bytes()).hexdigest()
             (root / 'toolchain.json').write_text(json.dumps(manifest))
             script = root / 'install-tools.sh'
@@ -1424,6 +1465,7 @@ class InstallerTests(unittest.TestCase):
                             'url = next(arg for arg in args if arg.startswith("https://"))\n'
                             'target = pathlib.Path(args[args.index("-o") + 1])\n'
                             'source = pathlib.Path(os.environ["TEST_ARCHIVE_DIR"]) / ("bun.zip" if "bun-linux-x64.zip" in url else "node.tar.xz")\n'
+                            'if "/bun-v1.4.2/" in url: source = source.with_name("bun-1.4.2.zip")\n'
                             'shutil.copyfile(source, target)\n')
             curl.chmod(0o755)
             rustup = fake_bin / 'rustup'
@@ -1445,6 +1487,9 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(str(sysroot / 'usr/local/lib/bun/1.3.14/bin/bun'),
                              os.readlink(sysroot / 'usr/local/bin/bun-1.3.14'))
             self.assertEqual(bun_payload, (sysroot / 'usr/local/lib/bun/1.3.14/bin/bun').read_bytes())
+            self.assertEqual(str(sysroot / 'usr/local/lib/bun/1.4.2/bin/bun'),
+                             os.readlink(sysroot / 'usr/local/bin/bun-1.4.2'))
+            self.assertEqual(bun_1_4_2_payload, (sysroot / 'usr/local/lib/bun/1.4.2/bin/bun').read_bytes())
             self.assertEqual(str(sysroot / 'usr/local/lib/nodejs/22.22.1/bin/node'),
                              os.readlink(sysroot / 'usr/local/bin/node22'))
             self.assertEqual(node_payload,
