@@ -40,18 +40,29 @@ pub(crate) const TARGET: &str = "/run/motor/target";
 pub(crate) const CACHE: &str = "/motor-cache";
 pub(crate) const CARGO_HOME: &str = "/motor-home/cargo";
 
-/// sccache hashes CARGO_HOME, CARGO_TARGET_DIR and CARGO_NET_OFFLINE even for non-incremental dependencies.
+#[cfg(target_os = "linux")]
+pub(crate) fn build_directory() -> String {
+    format!("{TARGET}/bd/{{workspace-path-hash}}")
+}
+
+/// Set the output layout shared by isolated Linux jobs and cache fills.
+pub(crate) fn target_environment(env: &mut BTreeMap<String, String>) {
+    env.insert("CARGO_TARGET_DIR".into(), TARGET.into());
+    // macOS and Windows keep Cargo's existing intermediate-output layout.
+    #[cfg(target_os = "linux")]
+    env.insert("CARGO_BUILD_BUILD_DIR".into(), build_directory());
+}
+
+/// sccache hashes CARGO_HOME, CARGO_TARGET_DIR, CARGO_BUILD_BUILD_DIR and
+/// CARGO_NET_OFFLINE even for non-incremental dependencies.
 /// Changing their presence or value between a fill and a reader loses every hit.
 /// Readers use Cargo's profile defaults. Writers enable incremental in Cargo,
 /// and the trusted compile shim strips incremental environment variables before
 /// sccache sees them, preserving Cargo's per-crate flags.
 pub(crate) fn cargo_environment(env: &mut BTreeMap<String, String>) {
     env.remove("CARGO_INCREMENTAL");
-    for (key, value) in [
-        ("CARGO_HOME", CARGO_HOME),
-        ("CARGO_TARGET_DIR", TARGET),
-        ("CARGO_NET_OFFLINE", "true"),
-    ] {
+    target_environment(env);
+    for (key, value) in [("CARGO_HOME", CARGO_HOME), ("CARGO_NET_OFFLINE", "true")] {
         env.insert(key.into(), value.into());
     }
 }
@@ -131,6 +142,8 @@ mod tests {
         let mut reader = BTreeMap::from([
             ("CARGO_HOME".into(), "/operator/cargo".into()),
             ("CARGO_TARGET_DIR".into(), "/workspace/target".into()),
+            #[cfg(target_os = "linux")]
+            ("CARGO_BUILD_BUILD_DIR".into(), "/workspace/build".into()),
             ("CARGO_NET_OFFLINE".into(), "false".into()),
             ("CARGO_INCREMENTAL".into(), "1".into()),
         ]);
@@ -138,6 +151,11 @@ mod tests {
         reader.retain(|key, _| key.starts_with("CARGO_"));
         assert_eq!(reader, writer);
         assert_eq!(reader["CARGO_TARGET_DIR"], "/run/motor/target");
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            reader["CARGO_BUILD_BUILD_DIR"],
+            "/run/motor/target/bd/{workspace-path-hash}"
+        );
         assert_eq!(reader["CARGO_HOME"], "/motor-home/cargo");
         assert_eq!(reader["CARGO_NET_OFFLINE"], "true");
         assert!(!reader.contains_key("CARGO_INCREMENTAL"));

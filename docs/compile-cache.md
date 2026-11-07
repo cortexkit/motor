@@ -111,6 +111,10 @@ sccache keys a Rust compile on, among other things, the compiler arguments, the
 working directory, and Cargo's environment. Registry and Git dependencies
 compile from their directory under the shared `CARGO_HOME`, so the writer and
 every reader must see the same `CARGO_HOME` path and the same Cargo variables.
+These include `CARGO_TARGET_DIR=/run/motor/target` and
+`CARGO_BUILD_BUILD_DIR=/run/motor/target/bd/{workspace-path-hash}`. Cargo expands
+the build-folder template; the variable's literal value is the same in fills
+and jobs.
 Otherwise identical sources produce unrelated entries and every lookup misses.
 Test: `reader_and_writer_have_identical_hashed_cargo_inputs`.
 

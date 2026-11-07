@@ -522,6 +522,10 @@ fn tenant_rust_launch_builds_in_fixed_target_without_compile_cache() {
     let observed = observed.lock().unwrap();
     let env = &observed.as_ref().unwrap().env;
     assert_eq!(env["CARGO_TARGET_DIR"], "/run/motor/target");
+    assert_eq!(
+        env["CARGO_BUILD_BUILD_DIR"],
+        "/run/motor/target/bd/{workspace-path-hash}"
+    );
     assert!(!env.contains_key("RUSTC_WRAPPER"), "{env:?}");
     assert!(
         !env.keys().any(|key| key.starts_with("SCCACHE_")),
@@ -577,6 +581,16 @@ fn hosted_cache_case(
     let fixed_target = format!("{}:/run/motor/target", prepared.target.display());
     if rust || writer {
         assert_eq!(env["CARGO_TARGET_DIR"], "/run/motor/target", "{case}");
+        let mut fill_environment = BTreeMap::new();
+        crate::compile_cache::cargo_environment(&mut fill_environment);
+        assert_eq!(
+            env["CARGO_BUILD_BUILD_DIR"], "/run/motor/target/bd/{workspace-path-hash}",
+            "{case}"
+        );
+        assert_eq!(
+            env["CARGO_BUILD_BUILD_DIR"], fill_environment["CARGO_BUILD_BUILD_DIR"],
+            "{case}"
+        );
         assert!(read_write.contains(&fixed_target), "{case}: {read_write:?}");
         assert!(
             destinations.contains(&PathBuf::from("/run/motor/target")),
@@ -718,10 +732,10 @@ fn isolated_launch_cache_environment_preserves_wrapper_precedence() {
     }
 }
 
-/// The pinned switch-off environments: what base fd9ac13f's
-/// `compile_cache_environment` produced for each role and unit kind. The sets
-/// below are written from that version's rules, not read back from the code
-/// under test, so a change to either side shows up as a difference here.
+/// With the remote cache disabled, these expected environments follow the
+/// local-cache rules for each role and unit kind, with the per-workspace
+/// intermediate-folder setting added. These values are written independently
+/// of the code under test, so a change to either side shows up as a difference.
 ///
 /// The fixture is a Cargo workspace at `<scratch>/workspace`, an inherited
 /// `RUSTFLAGS=-C debuginfo=1`, and `SCCACHE_LOCAL_RW_MODE`, `SCCACHE_DIR` and
@@ -733,6 +747,10 @@ fn switched_off_environments_match_the_base_runner_for_every_role_and_kind() {
     // shared compile cache, and replaces them on the build server with its own
     // read-only local level 1.
     const BUILD_SERVER_JOB: &[(&str, &str)] = &[
+        (
+            "CARGO_BUILD_BUILD_DIR",
+            "/run/motor/target/bd/{workspace-path-hash}",
+        ),
         ("CARGO_HOME", "/motor-home/cargo"),
         ("CARGO_NET_OFFLINE", "true"),
         ("CARGO_TARGET_DIR", "/run/motor/target"),
@@ -749,6 +767,10 @@ fn switched_off_environments_match_the_base_runner_for_every_role_and_kind() {
     // The runner strips every SCCACHE_* value it inherited before adding its
     // own, so base's fill keeps only the runner's names.
     const BUILD_SERVER_FILL: &[(&str, &str)] = &[
+        (
+            "CARGO_BUILD_BUILD_DIR",
+            "/run/motor/target/bd/{workspace-path-hash}",
+        ),
         ("CARGO_INCREMENTAL", "1"),
         ("CARGO_HOME", "/motor-home/cargo"),
         ("CARGO_NET_OFFLINE", "true"),
@@ -762,8 +784,12 @@ fn switched_off_environments_match_the_base_runner_for_every_role_and_kind() {
     ];
     // Boat and tenant VMs have no shared compile cache, so base strips both
     // the wrapper and every cache setting, and the Cargo environment that goes
-    // with them; a Rust job there keeps only the fixed target folder.
+    // with them; a Rust job there keeps only the fixed output layout.
     const HOSTED_JOB: &[(&str, &str)] = &[
+        (
+            "CARGO_BUILD_BUILD_DIR",
+            "/run/motor/target/bd/{workspace-path-hash}",
+        ),
         ("CARGO_TARGET_DIR", "/run/motor/target"),
         ("RUSTFLAGS", "-C debuginfo=1"),
     ];

@@ -1,4 +1,4 @@
-//! Project quotas for Boat's sparse XFS state disk. Never used by other profiles.
+//! Project quotas for Boat's sparse XFS state disk, plus shared physical-tree walking.
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -11,7 +11,7 @@ use std::{
 use uuid::Uuid;
 
 #[path = "boat_quota_walk.rs"]
-mod walk;
+pub(crate) mod walk;
 #[cfg(test)]
 pub(crate) use regression_tests::DeepTree;
 

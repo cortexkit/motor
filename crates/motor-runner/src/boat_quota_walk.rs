@@ -273,7 +273,7 @@ pub(super) fn remove_private(path: &Path, container: &Path) -> io::Result<()> {
     remove_private_at(&parent, name)
 }
 
-pub(super) fn remove_private_at(parent: &File, name: &std::ffi::OsStr) -> io::Result<()> {
+pub(crate) fn remove_private_at(parent: &File, name: &std::ffi::OsStr) -> io::Result<()> {
     let mut budget = Budget::default();
     let root = match open_at(parent.as_raw_fd(), name, false) {
         Ok(root) => root,

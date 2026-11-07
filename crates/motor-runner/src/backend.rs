@@ -785,6 +785,12 @@ impl Backend for HostBackend {
         } else {
             path.join("target")
         };
+        #[cfg(target_os = "linux")]
+        if config.isolate_jobs && rust_job(config, s) {
+            // Materialization holds the workspace reservation, not the global
+            // state lock. Finish target maintenance before granting the sandbox.
+            crate::cargo_build_dir::prepare(config, r, &target);
+        }
         let wrapper = trees.state.join("prefrontal-build-slot");
         #[cfg(target_os = "linux")]
         let wrapper = if config.isolate_jobs {
@@ -1342,10 +1348,7 @@ fn compile_cache_environment(
         // target folder (`compile_cache_mounts`).
         #[cfg(target_os = "linux")]
         if config.isolate_jobs && rust_job(config, setup) {
-            env.insert(
-                "CARGO_TARGET_DIR".into(),
-                crate::compile_cache::TARGET.into(),
-            );
+            crate::compile_cache::target_environment(env);
         }
         #[cfg(unix)]
         return remote_cache_environment(config, setup, prepared, env);

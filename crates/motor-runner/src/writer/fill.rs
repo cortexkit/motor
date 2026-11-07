@@ -26,6 +26,13 @@ pub(crate) fn descriptor(
         &["ls-tree", "-r", "-z", &format!("{tip}^{{commit}}")],
     )?;
     let mut hash = Sha256::new();
+    // A different intermediate layout changes readers' sccache keys, so every
+    // repository needs a fill made with the same layout as its Linux jobs.
+    #[cfg(target_os = "linux")]
+    {
+        hash.update(crate::compile_cache::build_directory().as_bytes());
+        hash.update([0]);
+    }
     for input in [toolchain, command] {
         hash.update(input.as_bytes());
         hash.update([0]);
@@ -64,6 +71,46 @@ pub(crate) fn descriptor(
         }
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use cortexkit_test_support::ScratchDir;
+
+    #[test]
+    fn build_directory_layout_invalidates_legacy_fill_identity() {
+        let scratch = ScratchDir::new("motor-fill-layout-identity");
+        workspace::git(scratch.path(), &["init"]).unwrap();
+        std::fs::write(scratch.join("README"), "no Cargo inputs\n").unwrap();
+        workspace::git(scratch.path(), &["add", "README"]).unwrap();
+        workspace::git(
+            scratch.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        // With no Cargo files or declaration, the old descriptor hashes only
+        // the toolchain and command, each followed by a NUL separator.
+        let legacy = format!("{:x}", Sha256::digest(b"rustc A\0cargo build\0"));
+        let current = descriptor(
+            scratch.path(),
+            "HEAD",
+            "rustc A",
+            "cargo build",
+            None,
+            &Compilers::default(),
+        )
+        .unwrap();
+        assert_ne!(current, legacy, "the new layout must trigger a refill");
+    }
 }
 
 /// Every pattern any declared fill lists, in declaration order.
