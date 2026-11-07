@@ -26,6 +26,9 @@ pub const RETENTION_INTERVAL_MS: u64 = 10 * 60 * 1000;
 /// Bound storage without ever evicting an unexpired, acknowledged fence.
 pub const REVOCATION_CAP: usize = 4096;
 
+// Let the runner report its own deadline terminal before the host backstop cancels.
+const BACKSTOP_CANCEL_GRACE_MS: u64 = 30_000;
+
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct JobBilling {
@@ -244,7 +247,10 @@ impl Host {
             for (job, lease) in &next.leases {
                 if lease.state == LeaseState::Started
                     && lease.started_at_ms.is_some_and(|started| {
-                        now_ms >= started.saturating_add(lease.claims.max_s.saturating_mul(1000))
+                        now_ms
+                            >= started
+                                .saturating_add(lease.claims.max_s.saturating_mul(1000))
+                                .saturating_add(BACKSTOP_CANCEL_GRACE_MS)
                     })
                 {
                     next.pending_cancels
@@ -271,7 +277,8 @@ impl Host {
                         b.ended_observed_ms = Some(receipt);
                     }
                 } else if now_ms >= cap {
-                    if !b.cancelled_at_cap {
+                    if !b.cancelled_at_cap && now_ms >= cap.saturating_add(BACKSTOP_CANCEL_GRACE_MS)
+                    {
                         b.cancelled_at_cap = true;
                         next.pending_cancels
                             .insert(job.clone(), lease.tenant.clone());

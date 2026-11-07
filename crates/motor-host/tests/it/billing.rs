@@ -395,6 +395,37 @@ fn replay_boundary_distinguishes_outage_events_from_new_live_observations_and_ol
 }
 
 #[test]
+fn backstop_cancel_waits_thirty_seconds_after_runner_cap() {
+    for provider_managed in [false, true] {
+        let mut h = host();
+        started(&mut h, JOB, 1);
+        h.provider_managed = provider_managed;
+        let cap = MS + 30_000;
+        for now in [cap, cap + 29_999] {
+            h.billing_tick(now).unwrap();
+            assert!(
+                !h.snapshot.pending_cancels.contains_key(JOB),
+                "cancel queued at {now}"
+            );
+            assert!(!h.snapshot.billing[JOB].cancelled_at_cap);
+            assert!(!h.snapshot.billing[JOB].host_settled);
+        }
+        h.billing_tick(cap + 30_000).unwrap();
+        assert_eq!(
+            h.snapshot.pending_cancels.get(JOB).map(String::as_str),
+            Some("tenant")
+        );
+        assert!(!h.snapshot.billing[JOB].host_settled);
+        if !provider_managed {
+            h.billing_tick(cap + 59_999).unwrap();
+            assert!(!h.snapshot.billing[JOB].host_settled);
+            h.billing_tick(cap + 60_000).unwrap();
+            assert!(h.snapshot.billing[JOB].host_settled);
+        }
+    }
+}
+
+#[test]
 fn watchdog_cancels_drops_share_across_restart_settles_once_and_defers_stop_for_healthy_job() {
     let dir = scratch();
     let mut h = disk_host(dir.path());
@@ -405,6 +436,8 @@ fn watchdog_cancels_drops_share_across_restart_settles_once_and_defers_stop_for_
     h.snapshot.leases.get_mut(JOB2).unwrap().claims.max_s = 120;
     h.billing_tick(MS + 30_000).unwrap();
     assert_eq!(h.share("tenant", MS + 30_000), 1);
+    assert!(!h.snapshot.pending_cancels.contains_key(JOB));
+    h.billing_tick(MS + 60_000).unwrap();
     assert!(h.snapshot.pending_cancels.contains_key(JOB));
     h.cancel_delivered(JOB).unwrap();
     drop(h);
@@ -461,10 +494,10 @@ fn watchdog_cancels_drops_share_across_restart_settles_once_and_defers_stop_for_
 
 #[test]
 fn port52_terminal_disarms_watchdog_and_preserves_real_result_with_port53_down() {
-    for receipt in [59_000, 89_000] {
+    for receipt in [61_000, 89_000] {
         let mut h = host();
         started(&mut h, JOB, 1);
-        h.billing_tick(MS + 30_000).unwrap();
+        h.billing_tick(MS + 60_000).unwrap();
         h.receive_terminal(JOB, terminal(JOB, "exit"), MS + receipt)
             .unwrap();
         h.billing_tick(MS + 90_000).unwrap();
