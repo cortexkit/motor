@@ -698,7 +698,14 @@ temporary="node_modules/.bin/.fixture-tool.$$.tmp"
 printf '#!/bin/sh\nprintf fixture' > "$temporary"
 /bin/chmod +x "$temporary"
 /bin/mv -f "$temporary" node_modules/.bin/fixture-tool
-if [ -f "$JS_MEMBERS" ]; then for m in $(/bin/cat "$JS_MEMBERS"); do /bin/mkdir -p "$m/node_modules/member-dep"; done; fi
+if [ -f "$JS_MEMBERS" ]; then
+    for m in $(/bin/cat "$JS_MEMBERS"); do
+        if [ ! -d "$m/node_modules/member-dep" ]; then
+            /bin/mkdir -p "$m/node_modules/member-dep"
+            printf '{"name":"member-dep","version":"1.0.0"}' > "$m/node_modules/member-dep/package.json"
+        fi
+    done
+fi
 "#;
         // The same fake answers for every manager, so each lockfile kind
         // finds its manager at the fake tool location.
@@ -1122,10 +1129,7 @@ fn javascript_workspace_install_with_member_modules_is_never_cached() {
         0,
         "an entry would restore the root without the member's node_modules"
     );
-    // The next job starts from a cleaned checkout.
-    for dir in ["nested/node_modules", "nested/member/node_modules"] {
-        fs::remove_dir_all(f.workspace.join(dir)).unwrap();
-    }
+    // A same-tree job reuses the checkout; preparation must clear dependencies.
     manager.prepare(&f, &tree).unwrap();
     assert_eq!(
         manager.count(),
@@ -1136,6 +1140,187 @@ fn javascript_workspace_install_with_member_modules_is_never_cached() {
         .workspace
         .join("nested/member/node_modules/member-dep")
         .is_dir());
+}
+
+#[test]
+fn javascript_workspace_install_replaces_leftover_member_modules() {
+    let f = Fixture::new();
+    write_js_pair(&f.workspace, "", "bun.lock");
+    fs::write(
+        f.workspace.join("package.json"),
+        r#"{"private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(f.workspace.join("packages/plugin")).unwrap();
+    fs::write(f.workspace.join("packages/plugin/package.json"), "{}").unwrap();
+    let tree = tracked_tree(&f.workspace);
+    let manager = FakeJavascriptManager::new(&f);
+    fs::write(&manager.members, "packages/plugin\n").unwrap();
+    let modules = f.workspace.join("packages/plugin/node_modules");
+    fs::create_dir_all(modules.join("member-dep")).unwrap();
+    fs::write(
+        modules.join("member-dep/package.json"),
+        r#"{"name":"member-dep","version":"9.9.9"}"#,
+    )
+    .unwrap();
+    fs::write(modules.join("stray"), "left by an earlier job").unwrap();
+    fs::create_dir_all(f.workspace.join("node_modules")).unwrap();
+    fs::write(f.workspace.join("node_modules/stray"), "root leftover").unwrap();
+
+    manager.prepare(&f, &tree).unwrap();
+
+    assert_eq!(manager.count(), 1);
+    assert_eq!(
+        fs::read_to_string(modules.join("member-dep/package.json")).unwrap(),
+        r#"{"name":"member-dep","version":"1.0.0"}"#,
+        "the locked install must not reuse an earlier job's dependency"
+    );
+    assert!(!modules.join("stray").exists());
+    assert!(!f.workspace.join("node_modules/stray").exists());
+    assert_eq!(fs::read_dir(&modules).unwrap().count(), 1);
+    assert_eq!(
+        fs::read_dir(f.state.join("js-installs")).unwrap().count(),
+        0
+    );
+}
+
+#[test]
+fn javascript_cache_hit_removes_leftover_member_modules() {
+    let f = Fixture::new();
+    write_js_pair(&f.workspace, "", "bun.lock");
+    fs::write(
+        f.workspace.join("package.json"),
+        r#"{"private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(f.workspace.join("packages/plugin/src")).unwrap();
+    fs::write(f.workspace.join("packages/plugin/package.json"), "{}").unwrap();
+    fs::write(f.workspace.join("packages/plugin/src/index.js"), "").unwrap();
+    let tree = tracked_tree(&f.workspace);
+    let manager = FakeJavascriptManager::new(&f);
+    manager.prepare(&f, &tree).unwrap();
+    assert_eq!(
+        fs::read_dir(f.state.join("js-installs")).unwrap().count(),
+        1
+    );
+    for directory in ["packages", "packages/plugin", "packages/plugin/src"] {
+        let modules = f.workspace.join(directory).join("node_modules");
+        fs::create_dir_all(&modules).unwrap();
+        fs::write(modules.join("stray"), "left by an earlier job").unwrap();
+    }
+    fs::write(f.workspace.join("node_modules/stray"), "root leftover").unwrap();
+
+    manager.prepare(&f, &tree).unwrap();
+
+    assert_eq!(manager.count(), 1, "the root install must come from cache");
+    assert!(f.workspace.join("node_modules/.bin/fixture-tool").is_file());
+    assert!(!f.workspace.join("node_modules/stray").exists());
+    for directory in ["packages", "packages/plugin", "packages/plugin/src"] {
+        assert!(!f.workspace.join(directory).join("node_modules").exists());
+    }
+}
+
+#[test]
+fn javascript_module_cleanup_preserves_tracked_content() {
+    let f = Fixture::new();
+    write_js_pair(&f.workspace, "", "bun.lock");
+    fs::create_dir_all(f.workspace.join("packages/plugin")).unwrap();
+    fs::write(f.workspace.join("packages/plugin/package.json"), "{}").unwrap();
+    let manager = FakeJavascriptManager::new(&f);
+    let tree = tracked_tree(&f.workspace);
+    manager.prepare(&f, &tree).unwrap();
+    assert_eq!(
+        fs::read_dir(f.state.join("js-installs")).unwrap().count(),
+        1
+    );
+    fs::create_dir_all(f.workspace.join("packages/plugin/node_modules/tracked-dep")).unwrap();
+    fs::create_dir_all(f.workspace.join("node_modules/tracked-dep")).unwrap();
+    for directory in ["", "packages/plugin"] {
+        fs::write(
+            f.workspace
+                .join(directory)
+                .join("node_modules/tracked-dep/package.json"),
+            "tracked content",
+        )
+        .unwrap();
+    }
+    let tree = tracked_tree(&f.workspace);
+
+    manager.prepare(&f, &tree).unwrap();
+
+    assert_eq!(
+        manager.count(),
+        2,
+        "tracked root content prevents cache restore"
+    );
+    for directory in ["", "packages/plugin"] {
+        assert_eq!(
+            fs::read_to_string(
+                f.workspace
+                    .join(directory)
+                    .join("node_modules/tracked-dep/package.json")
+            )
+            .unwrap(),
+            "tracked content"
+        );
+    }
+}
+
+#[test]
+fn javascript_module_cleanup_refuses_non_directory_members_without_following_links() {
+    let f = Fixture::new();
+    write_js_pair(&f.workspace, "", "bun.lock");
+    fs::create_dir_all(f.workspace.join("packages/plugin")).unwrap();
+    fs::write(f.workspace.join("packages/plugin/package.json"), "{}").unwrap();
+    let tree = tracked_tree(&f.workspace);
+    let manager = FakeJavascriptManager::new(&f);
+    let modules = f.workspace.join("packages/plugin/node_modules");
+    let outside = f.scratch.join("outside-modules");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("keep"), "outside content").unwrap();
+    std::os::unix::fs::symlink(&outside, &modules).unwrap();
+
+    for symlink in [true, false] {
+        if !symlink {
+            fs::remove_file(&modules).unwrap();
+            fs::write(&modules, "not a directory").unwrap();
+        }
+        let error = manager.prepare(&f, &tree).unwrap_err().to_string();
+        assert!(error.contains(&format!(
+            "workspace {} has a non-directory node_modules entry",
+            f.workspace.join("packages/plugin").display()
+        )));
+        assert_eq!(manager.count(), 0);
+        assert_eq!(
+            fs::read_to_string(outside.join("keep")).unwrap(),
+            "outside content"
+        );
+    }
+}
+
+#[test]
+fn javascript_module_cleanup_refuses_member_directory_symlinks() {
+    let f = Fixture::new();
+    write_js_pair(&f.workspace, "", "bun.lock");
+    fs::create_dir_all(f.workspace.join("packages/plugin")).unwrap();
+    fs::write(f.workspace.join("packages/plugin/package.json"), "{}").unwrap();
+    let tree = tracked_tree(&f.workspace);
+    let manager = FakeJavascriptManager::new(&f);
+    let outside = f.scratch.join("outside-member");
+    fs::create_dir_all(outside.join("node_modules")).unwrap();
+    fs::write(outside.join("package.json"), "{}").unwrap();
+    fs::write(outside.join("node_modules/keep"), "outside content").unwrap();
+    fs::remove_dir_all(f.workspace.join("packages/plugin")).unwrap();
+    std::os::unix::fs::symlink(&outside, f.workspace.join("packages/plugin")).unwrap();
+
+    let error = manager.prepare(&f, &tree).unwrap_err().to_string();
+    assert!(error.contains("refusing JavaScript dependency directory symlink:"));
+    assert_eq!(manager.count(), 0);
+
+    assert_eq!(
+        fs::read_to_string(outside.join("node_modules/keep")).unwrap(),
+        "outside content"
+    );
 }
 
 #[test]
@@ -1544,6 +1729,9 @@ fn javascript_transitive_local_dependency_changes_miss_without_keying_unrelated_
         "changed unrelated sibling",
     )
     .unwrap();
+    // tracked_tree force-adds files; keep prepared dependencies out of snapshots
+    // that are meant to differ only in their source inputs.
+    fs::remove_dir_all(f.workspace.join("install/node_modules")).unwrap();
     let tree = tracked_tree(&f.workspace);
     let unrelated = javascript_tracked_tree(&f.workspace, &tree).unwrap();
     assert_eq!(
@@ -1565,6 +1753,7 @@ fn javascript_transitive_local_dependency_changes_miss_without_keying_unrelated_
         "module.exports = 'changed B';\n",
     )
     .unwrap();
+    fs::remove_dir_all(f.workspace.join("install/node_modules")).unwrap();
     let tree = tracked_tree(&f.workspace);
     let changed = javascript_tracked_tree(&f.workspace, &tree).unwrap();
     assert_eq!(

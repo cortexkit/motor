@@ -445,6 +445,9 @@ struct JavascriptObject {
 
 struct JavascriptTree {
     paths: Vec<PathBuf>,
+    /// Outermost tracked node_modules roots: excluded from discovery, but
+    /// retained here so dependency cleanup cannot delete tracked content.
+    tracked_node_modules: std::collections::BTreeSet<PathBuf>,
     objects: BTreeMap<PathBuf, JavascriptObject>,
     manifests: BTreeMap<PathBuf, io::Result<serde_json::Value>>,
     /// The path at which the install sees this checkout, when that is not
@@ -492,7 +495,8 @@ fn javascript_tracked_tree(workspace: &Path, tree: &str) -> io::Result<Javascrip
     );
     let mut paths = Vec::new();
     let mut manifests = BTreeMap::new();
-    for entry in entries.split(|b| *b == 0).filter(|entry| !entry.is_empty()) {
+    let mut tracked_node_modules = std::collections::BTreeSet::new();
+    'entries: for entry in entries.split(|b| *b == 0).filter(|entry| !entry.is_empty()) {
         let tab = entry
             .iter()
             .position(|b| *b == b'\t')
@@ -503,11 +507,13 @@ fn javascript_tracked_tree(workspace: &Path, tree: &str) -> io::Result<Javascrip
             return Err(io::Error::other("malformed JavaScript Git tree object"));
         }
         let path = PathBuf::from(std::ffi::OsString::from_vec(entry[tab + 1..].to_vec()));
-        if path
-            .components()
-            .any(|part| part.as_os_str() == "node_modules")
-        {
-            continue;
+        let mut prefix = PathBuf::new();
+        for part in path.components() {
+            prefix.push(part);
+            if part.as_os_str() == "node_modules" {
+                tracked_node_modules.insert(prefix);
+                continue 'entries;
+            }
         }
         let object = JavascriptObject {
             mode: fields[0].into(),
@@ -532,6 +538,7 @@ fn javascript_tracked_tree(workspace: &Path, tree: &str) -> io::Result<Javascrip
     }
     Ok(JavascriptTree {
         paths,
+        tracked_node_modules,
         objects,
         manifests,
         logical_root: None,
@@ -1308,16 +1315,22 @@ fn cache_javascript_install_via(
         &manager_version,
         &node_version,
     )?;
+    // Jobs with the same tracked tree reuse their checkout, including anything
+    // they installed themselves. Clear root and member dependencies before a
+    // cache restore or locked install so neither can reuse those leftover bytes.
+    remove_javascript_node_modules(workspace, tracked, install)?;
     let lock = platform::javascript_cache_lock(state, &key)?;
     lock.lock_exclusive()?;
     let cache = state.join("js-installs");
     fs::create_dir_all(&cache)?;
     let entry = cache.join(&key);
     let modules = workspace.join(&install.directory).join("node_modules");
-    if entry.is_dir() {
-        if modules.exists() {
-            fs::remove_dir_all(&modules)?;
-        }
+    // Restoring a cached root replaces its whole tree. A repository that tracks
+    // files there must keep its existing tree and run the manager instead.
+    let root_has_tracked_modules = tracked
+        .tracked_node_modules
+        .contains(&install.directory.join("node_modules"));
+    if entry.is_dir() && !root_has_tracked_modules {
         platform::clone_target(&entry.join("node_modules"), &modules)?;
         File::open(&entry)?
             .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now()))?;
@@ -1349,7 +1362,9 @@ fn cache_javascript_install_via(
     // stores only <dir>/node_modules. Caching such an install would give later
     // jobs members without their dependencies, so it is not cached and runs
     // fresh in every job.
-    if javascript_install_wrote_member_modules(workspace, tracked, install) {
+    if root_has_tracked_modules
+        || javascript_install_wrote_member_modules(workspace, tracked, install)
+    {
         return Ok(());
     }
     // Managers may omit node_modules entirely for a dependency-free package.
@@ -1380,14 +1395,10 @@ fn record_javascript_cache_owner(entry: &Path, repository: &str) -> io::Result<(
     Ok(())
 }
 
-/// Whether the install left a node_modules in any tracked directory below the
-/// install directory. Installs run shallowest first in a cleaned checkout, so
-/// any such tree was written by this install.
-fn javascript_install_wrote_member_modules(
-    workspace: &Path,
+fn javascript_member_directories(
     tracked: &JavascriptTree,
     install: &JavascriptInstall,
-) -> bool {
+) -> std::collections::BTreeSet<PathBuf> {
     let mut directories = std::collections::BTreeSet::new();
     for path in &tracked.paths {
         let Ok(relative) = path.strip_prefix(&install.directory) else {
@@ -1399,9 +1410,74 @@ fn javascript_install_wrote_member_modules(
             current = directory.parent();
         }
     }
-    directories.iter().any(|directory| {
-        fs::symlink_metadata(workspace.join(directory).join("node_modules")).is_ok()
-    })
+    directories
+}
+
+fn remove_javascript_node_modules(
+    workspace: &Path,
+    tracked: &JavascriptTree,
+    install: &JavascriptInstall,
+) -> io::Result<()> {
+    let directories = std::iter::once(install.directory.clone())
+        .chain(javascript_member_directories(tracked, install));
+    'directories: for directory in directories {
+        let mut absolute = workspace.to_path_buf();
+        // A job may also have replaced a tracked directory with a symlink.
+        // Check ancestors in order so cleanup never reaches through that link.
+        for part in directory.components() {
+            absolute.push(part);
+            match fs::symlink_metadata(&absolute) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(io::Error::other(format!(
+                        "refusing JavaScript dependency directory symlink: {}",
+                        absolute.display()
+                    )))
+                }
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => continue 'directories,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue 'directories,
+                Err(error) => return Err(error),
+            }
+        }
+        let modules = absolute.join("node_modules");
+        match fs::symlink_metadata(&modules) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(io::Error::other(format!(
+                    "workspace {} has a non-directory node_modules entry",
+                    absolute.display()
+                )))
+            }
+            Ok(_) => {
+                // Some repositories track files inside node_modules. Leave
+                // those directories alone rather than deleting tracked content.
+                if !tracked
+                    .tracked_node_modules
+                    .contains(&directory.join("node_modules"))
+                {
+                    fs::remove_dir_all(&modules)?;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Whether the install left a node_modules in any tracked directory below the
+/// install directory. All untracked node_modules in those directories were
+/// removed before the install, so any such tree was written by this install
+/// (or contains tracked content that cleanup deliberately preserved).
+fn javascript_install_wrote_member_modules(
+    workspace: &Path,
+    tracked: &JavascriptTree,
+    install: &JavascriptInstall,
+) -> bool {
+    javascript_member_directories(tracked, install)
+        .iter()
+        .any(|directory| {
+            fs::symlink_metadata(workspace.join(directory).join("node_modules")).is_ok()
+        })
 }
 
 #[cfg(test)]
