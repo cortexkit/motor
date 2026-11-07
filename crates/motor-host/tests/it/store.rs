@@ -60,6 +60,8 @@ fn full() -> Snapshot {
             egress_bytes: Some(1),
             outcome: UsageOutcome::Lost,
             mem_working_peak_mib: None,
+            mem_over_mib_ms: None,
+            oom_kill: None,
         },
     );
     s.pending_cancels.insert(JOB.into(), "tenant".into());

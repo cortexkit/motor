@@ -93,6 +93,7 @@ pub(super) fn claims(
                 || lease.token_expires_at_ms <= now.saturating_mul(1000),
         ),
         ("cnf", motor_lease::bind_requester(&claims, &jwk).is_err()),
+        ("mem_burst_mib", !claims.mem_burst_mib_accepted()),
         (
             "workspace_key_hash",
             claims.workspace_key_hash.as_deref().is_some_and(|hash| {
@@ -320,4 +321,74 @@ pub(super) async fn read<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Pre
     let mut bytes = vec![0; len];
     reader.read_exact(&mut bytes).await?;
     serde_json::from_slice(&bytes).map_err(io::Error::other)
+}
+
+#[cfg(test)]
+mod mem_burst_claim_tests {
+    use super::*;
+
+    #[test]
+    fn hosted_claims_accept_burst_vectors_and_validate_optional_allowance() {
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../motor-lease/contracts/cloud/mem-burst.json"
+        ))
+        .unwrap();
+        let requester = SigningKey::from_bytes(&std::array::from_fn(|i| 32 + i as u8));
+        assert_eq!(
+            serde_json::to_value(motor_lease::RequesterJwk::from_key(
+                &requester.verifying_key()
+            ))
+            .unwrap(),
+            vector["registered"][0]["request"]["body"]["requester_jwk"]
+        );
+        for case in vector["registered"].as_array().unwrap() {
+            for pointer in [
+                "/run/body",
+                "/rerequest/body",
+                "/resigned/body",
+                "/reattach/reply/body",
+                "/replace/reply/body",
+            ] {
+                let mut lease: LeaseResponse =
+                    serde_json::from_value(case.pointer(pointer).unwrap().clone()).unwrap();
+                let payload = lease.job_token.split('.').nth(1).unwrap();
+                let mut c: Claims =
+                    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+                // Refresh only the fixture clock; the client checks expiration
+                // against the live clock rather than the vector's broker clock.
+                c.iat = now_s();
+                c.exp = c.iat + 300;
+                lease.token_expires_at_ms = c.exp * 1000;
+                let id = Uuid::parse_str(&c.jti).unwrap();
+                let allowance = c.mem_burst_mib.unwrap();
+                for (burst, accepted) in [
+                    (None, true),
+                    (Some(allowance), true),
+                    (Some(0), false),
+                    (Some(allowance - 1), false),
+                    (Some(allowance + 1), false),
+                ] {
+                    c.mem_burst_mib = burst;
+                    lease.job_token = motor_lease::sign_token(&c, "test", &requester).unwrap();
+                    assert_eq!(claims(id, &lease, &requester, c.purpose).is_ok(), accepted);
+                }
+                let mut value = serde_json::to_value(&c).unwrap();
+                for invalid in [
+                    serde_json::json!(null),
+                    serde_json::json!(1.5),
+                    serde_json::json!("2048"),
+                ] {
+                    value["mem_burst_mib"] = invalid;
+                    lease.job_token = format!(
+                        "unused.{}.unused",
+                        motor_lease::base64url(&serde_json::to_vec(&value).unwrap())
+                    );
+                    assert!(matches!(
+                        claims(id, &lease, &requester, c.purpose),
+                        Err(Error::Auth)
+                    ));
+                }
+            }
+        }
+    }
 }

@@ -413,6 +413,7 @@ impl FakeBroker {
             return BrokerReply::error(400, "bad_request");
         };
         let claims = Claims {
+            mem_burst_mib: None,
             workspace_key_hash: (!self.config.placement.host.starts_with("boat:"))
                 .then(|| job.request.workspace_key_hash.clone()),
             iss: ISSUER.into(),
@@ -558,6 +559,10 @@ impl FakeBroker {
                 .flatten()
                 .is_some_and(|v| v > MAX_SAFE_INTEGER)
             || usage.egress_bytes.is_some_and(|v| v > MAX_SAFE_INTEGER)
+            || usage
+                .mem_over_mib_ms
+                .flatten()
+                .is_some_and(|v| v > MAX_SAFE_INTEGER)
         {
             return BrokerReply::error(400, "bad_request");
         }

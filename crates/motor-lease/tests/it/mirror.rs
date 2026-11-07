@@ -71,6 +71,7 @@ fn cloud_final_files_match_their_manifest_digests() {
         "cloud/boat-lease.json",
         "cloud/job-tokens.json",
         "cloud/job-tokens-workspace.json",
+        "cloud/mem-burst.json",
         "cloud/host-signature.json",
         "cloud/host-metrics.json",
         "cloud/host-draining.json",
@@ -105,7 +106,11 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "bfd73b288d53d73be24c704d7fad8f38157860457a95c8b3eb6a3c3880dfcd07",
+            "08b52282ebd0bb6ff19be060abe225ac5cd573e4261e0ce032275452a40039aa",
+        ),
+        (
+            "mem-burst.json",
+            "ef702927a7d7515086dee4bdfe7eb1f1fe91c97cb329cd244814724269b0933b",
         ),
         (
             "host-revoke-fence-off.json",

@@ -1,0 +1,720 @@
+{
+  "note": "TEST-ONLY bytes generated through broker routes with memory burst enabled; seeds reproduce signing keys.",
+  "key_id": "runner_2026_10",
+  "test_only_job_seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+  "test_only_host_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "clock_ms": 1792195200123,
+  "usage_clock_ms": 1792195209000,
+  "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "host": {
+    "host_id": "host-a",
+    "public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+    "endpoint": "runner.example:7443",
+    "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "platform": "linux-x64"
+  },
+  "switches": {
+    "JOB_TOKEN_MEM_BURST": "true",
+    "JOB_TOKEN_WORKSPACE_HASH": "true"
+  },
+  "registered": [
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "body": {
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "vcpus": 2,
+          "platform": "linux-x64",
+          "net": true,
+          "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4",
+          "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+          "placement_hint": {
+            "host": "host-a",
+            "vm": "warm-vm-1"
+          },
+          "avoid_host": null,
+          "timeout_s": 100,
+          "requester_jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+          },
+          "allow_spill": false,
+          "mem_mib": 4096
+        }
+      },
+      "run": {
+        "status": 201,
+        "retry_after": null,
+        "body": {
+          "lease_id": "12345678-1234-4321-8765-123456789abc",
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "placement": {
+            "host": "host-a",
+            "vm": "warm-vm-1"
+          },
+          "endpoint": "runner.example:7443",
+          "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6MiwibWVtX21pYiI6NDA5NiwicGxhdGZvcm0iOiJsaW51eC14NjQiLCJuZXQiOnRydWUsInBsYWNlbWVudCI6eyJob3N0IjoiaG9zdC1hIiwidm0iOiJ3YXJtLXZtLTEifSwibWF4X3MiOjEwMCwiY25mIjp7ImprdCI6IkFrWElaRnpvbmI1OVptR3d5S2dpM0gzQndNaTZhbWV2cWRLUWlMWmhkdGMifSwicHVycG9zZSI6InJ1biIsIndvcmtzcGFjZV9rZXlfaGFzaCI6IkltaThJSUdxQ2lzMm1wOHh5cXpzZEtVTXNMRGI2M25EY1JfM0ZjMjZxUTQiLCJtZW1fYnVyc3RfbWliIjoyMDQ4fQ.QXwQVDxfB2-P-ih7a7T_ZIU0ZLmZd8kW3cJf0w8xLesNZ-lHZzuolFs0tBxF_FsGLeuDH9JvY67UuMamiNRIBg",
+          "token_expires_at_ms": 1792195500000,
+          "max_s": 100,
+          "reserved_vcpu_ms": 200000
+        }
+      },
+      "rerequest": {
+        "status": 201,
+        "retry_after": null,
+        "body": {
+          "lease_id": "12345678-1234-4321-8765-123456789abc",
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "placement": {
+            "host": "host-a",
+            "vm": "warm-vm-1"
+          },
+          "endpoint": "runner.example:7443",
+          "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6MiwibWVtX21pYiI6NDA5NiwicGxhdGZvcm0iOiJsaW51eC14NjQiLCJuZXQiOnRydWUsInBsYWNlbWVudCI6eyJob3N0IjoiaG9zdC1hIiwidm0iOiJ3YXJtLXZtLTEifSwibWF4X3MiOjEwMCwiY25mIjp7ImprdCI6IkFrWElaRnpvbmI1OVptR3d5S2dpM0gzQndNaTZhbWV2cWRLUWlMWmhkdGMifSwicHVycG9zZSI6InJ1biIsIndvcmtzcGFjZV9rZXlfaGFzaCI6IkltaThJSUdxQ2lzMm1wOHh5cXpzZEtVTXNMRGI2M25EY1JfM0ZjMjZxUTQiLCJtZW1fYnVyc3RfbWliIjoyMDQ4fQ.QXwQVDxfB2-P-ih7a7T_ZIU0ZLmZd8kW3cJf0w8xLesNZ-lHZzuolFs0tBxF_FsGLeuDH9JvY67UuMamiNRIBg",
+          "token_expires_at_ms": 1792195500000,
+          "max_s": 100,
+          "reserved_vcpu_ms": 200000
+        }
+      },
+      "resigned_at_ms": 1792195501123,
+      "resigned": {
+        "status": 201,
+        "retry_after": null,
+        "body": {
+          "lease_id": "12345678-1234-4321-8765-123456789abc",
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "placement": {
+            "host": "host-a",
+            "vm": "warm-vm-1"
+          },
+          "endpoint": "runner.example:7443",
+          "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTUwMSwiZXhwIjoxNzkyMTk1ODAxLCJ2Y3B1cyI6MiwibWVtX21pYiI6NDA5NiwicGxhdGZvcm0iOiJsaW51eC14NjQiLCJuZXQiOnRydWUsInBsYWNlbWVudCI6eyJob3N0IjoiaG9zdC1hIiwidm0iOiJ3YXJtLXZtLTEifSwibWF4X3MiOjEwMCwiY25mIjp7ImprdCI6IkFrWElaRnpvbmI1OVptR3d5S2dpM0gzQndNaTZhbWV2cWRLUWlMWmhkdGMifSwicHVycG9zZSI6InJ1biIsIndvcmtzcGFjZV9rZXlfaGFzaCI6IkltaThJSUdxQ2lzMm1wOHh5cXpzZEtVTXNMRGI2M25EY1JfM0ZjMjZxUTQiLCJtZW1fYnVyc3RfbWliIjoyMDQ4fQ._vLz4tJlIZmX69AbIeyMiQgX69Ou69laFQDy1u-SGaseFguJ-TN39vzLeoTEeFimR-j_eZNk_cHisT1a3WOHDA",
+          "token_expires_at_ms": 1792195801000,
+          "max_s": 100,
+          "reserved_vcpu_ms": 200000
+        }
+      },
+      "reattach": {
+        "request": {
+          "method": "POST",
+          "pathname": "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
+          "body": {
+            "requester_jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+            }
+          }
+        },
+        "reply": {
+          "status": 200,
+          "retry_after": null,
+          "body": {
+            "lease_id": "12345678-1234-4321-8765-123456789abc",
+            "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+            "placement": {
+              "host": "host-a",
+              "vm": "warm-vm-1"
+            },
+            "endpoint": "runner.example:7443",
+            "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTUwMSwiZXhwIjoxNzkyMTk1ODAxLCJ2Y3B1cyI6MiwibWVtX21pYiI6NDA5NiwicGxhdGZvcm0iOiJsaW51eC14NjQiLCJuZXQiOnRydWUsInBsYWNlbWVudCI6eyJob3N0IjoiaG9zdC1hIiwidm0iOiJ3YXJtLXZtLTEifSwibWF4X3MiOjEwMCwiY25mIjp7ImprdCI6IkFrWElaRnpvbmI1OVptR3d5S2dpM0gzQndNaTZhbWV2cWRLUWlMWmhkdGMifSwicHVycG9zZSI6ImF0dGFjaCIsIndvcmtzcGFjZV9rZXlfaGFzaCI6IkltaThJSUdxQ2lzMm1wOHh5cXpzZEtVTXNMRGI2M25EY1JfM0ZjMjZxUTQiLCJtZW1fYnVyc3RfbWliIjoyMDQ4fQ.uQFgXkfNhaoLCaZ6i_c6DqaLnLn9g_d8MP-qggqyBnLV2kHqLFJPw-7UuvwrkWK8eNsAD2n0Ini9qu6rp6fcDQ",
+            "token_expires_at_ms": 1792195801000,
+            "max_s": 100,
+            "reserved_vcpu_ms": 200000
+          }
+        }
+      },
+      "replace": {
+        "request": {
+          "method": "POST",
+          "pathname": "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/replace",
+          "body": {}
+        },
+        "reply": {
+          "status": 201,
+          "retry_after": null,
+          "body": {
+            "lease_id": "12345678-1234-4321-8765-123456789abc",
+            "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+            "placement": {
+              "host": "host-b",
+              "vm": null
+            },
+            "endpoint": "runner-b.example:7443",
+            "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1iIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTUwMSwiZXhwIjoxNzkyMTk1ODAxLCJ2Y3B1cyI6MiwibWVtX21pYiI6NDA5NiwicGxhdGZvcm0iOiJsaW51eC14NjQiLCJuZXQiOnRydWUsInBsYWNlbWVudCI6eyJob3N0IjoiaG9zdC1iIiwidm0iOm51bGx9LCJtYXhfcyI6MTAwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIiwid29ya3NwYWNlX2tleV9oYXNoIjoiSW1pOElJR3FDaXMybXA4eHlxenNkS1VNc0xEYjYzbkRjUl8zRmMyNnFRNCIsIm1lbV9idXJzdF9taWIiOjIwNDh9.ZkZXz6qln-8MP2c7wCqS1JYhSTbF-gCThMMAjtbBbiLnu6lsVb6JubAjdidw31jKAC8kpcghdu5CbiXwbdUtDg",
+            "token_expires_at_ms": 1792195801000,
+            "max_s": 100,
+            "reserved_vcpu_ms": 200000
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "body": {
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "vcpus": 8,
+          "platform": "linux-x64",
+          "net": true,
+          "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4",
+          "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+          "placement_hint": {
+            "host": "host-a",
+            "vm": "warm-vm-1"
+          },
+          "avoid_host": null,
+          "timeout_s": 100,
+          "requester_jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+          },
+          "allow_spill": false,
+          "mem_mib": 16384
+        }
+      },
+      "run": {
+        "status": 201,
+        "retry_after": null,
+        "body": {
+          "lease_id": "12345678-1234-4321-8765-123456789abc",
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "placement": {
+            "host": "host-a",
+            "vm": "warm-vm-1"
+          },
+          "endpoint": "runner.example:7443",
+          "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6OCwibWVtX21pYiI6MTYzODQsInBsYXRmb3JtIjoibGludXgteDY0IiwibmV0Ijp0cnVlLCJwbGFjZW1lbnQiOnsiaG9zdCI6Imhvc3QtYSIsInZtIjoid2FybS12bS0xIn0sIm1heF9zIjoxMDAsImNuZiI6eyJqa3QiOiJBa1hJWkZ6b25iNTlabUd3eUtnaTNIM0J3TWk2YW1ldnFkS1FpTFpoZHRjIn0sInB1cnBvc2UiOiJydW4iLCJ3b3Jrc3BhY2Vfa2V5X2hhc2giOiJJbWk4SUlHcUNpczJtcDh4eXF6c2RLVU1zTERiNjNuRGNSXzNGYzI2cVE0IiwibWVtX2J1cnN0X21pYiI6ODE5Mn0.O-rs8eiZLSlfOBJPzw_LX5krcrscS_Dkplxyk0kAU12_WIUwoUTKpYf9YwdWFPGlGP-4t4Swxvi2SeAsx1PQBg",
+          "token_expires_at_ms": 1792195500000,
+          "max_s": 100,
+          "reserved_vcpu_ms": 800000
+        }
+      },
+      "rerequest": {
+        "status": 201,
+        "retry_after": null,
+        "body": {
+          "lease_id": "12345678-1234-4321-8765-123456789abc",
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "placement": {
+            "host": "host-a",
+            "vm": "warm-vm-1"
+          },
+          "endpoint": "runner.example:7443",
+          "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6OCwibWVtX21pYiI6MTYzODQsInBsYXRmb3JtIjoibGludXgteDY0IiwibmV0Ijp0cnVlLCJwbGFjZW1lbnQiOnsiaG9zdCI6Imhvc3QtYSIsInZtIjoid2FybS12bS0xIn0sIm1heF9zIjoxMDAsImNuZiI6eyJqa3QiOiJBa1hJWkZ6b25iNTlabUd3eUtnaTNIM0J3TWk2YW1ldnFkS1FpTFpoZHRjIn0sInB1cnBvc2UiOiJydW4iLCJ3b3Jrc3BhY2Vfa2V5X2hhc2giOiJJbWk4SUlHcUNpczJtcDh4eXF6c2RLVU1zTERiNjNuRGNSXzNGYzI2cVE0IiwibWVtX2J1cnN0X21pYiI6ODE5Mn0.O-rs8eiZLSlfOBJPzw_LX5krcrscS_Dkplxyk0kAU12_WIUwoUTKpYf9YwdWFPGlGP-4t4Swxvi2SeAsx1PQBg",
+          "token_expires_at_ms": 1792195500000,
+          "max_s": 100,
+          "reserved_vcpu_ms": 800000
+        }
+      },
+      "resigned_at_ms": 1792195501123,
+      "resigned": {
+        "status": 201,
+        "retry_after": null,
+        "body": {
+          "lease_id": "12345678-1234-4321-8765-123456789abc",
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "placement": {
+            "host": "host-a",
+            "vm": "warm-vm-1"
+          },
+          "endpoint": "runner.example:7443",
+          "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTUwMSwiZXhwIjoxNzkyMTk1ODAxLCJ2Y3B1cyI6OCwibWVtX21pYiI6MTYzODQsInBsYXRmb3JtIjoibGludXgteDY0IiwibmV0Ijp0cnVlLCJwbGFjZW1lbnQiOnsiaG9zdCI6Imhvc3QtYSIsInZtIjoid2FybS12bS0xIn0sIm1heF9zIjoxMDAsImNuZiI6eyJqa3QiOiJBa1hJWkZ6b25iNTlabUd3eUtnaTNIM0J3TWk2YW1ldnFkS1FpTFpoZHRjIn0sInB1cnBvc2UiOiJydW4iLCJ3b3Jrc3BhY2Vfa2V5X2hhc2giOiJJbWk4SUlHcUNpczJtcDh4eXF6c2RLVU1zTERiNjNuRGNSXzNGYzI2cVE0IiwibWVtX2J1cnN0X21pYiI6ODE5Mn0.HotQ6hLE2XXWln68iditpruL0iv1F-UlqLbcUgfRhqIGL6wugkQQ_PsjXux0uGbdmXoF0sPlCYShqu0PHjX3BA",
+          "token_expires_at_ms": 1792195801000,
+          "max_s": 100,
+          "reserved_vcpu_ms": 800000
+        }
+      },
+      "reattach": {
+        "request": {
+          "method": "POST",
+          "pathname": "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
+          "body": {
+            "requester_jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+            }
+          }
+        },
+        "reply": {
+          "status": 200,
+          "retry_after": null,
+          "body": {
+            "lease_id": "12345678-1234-4321-8765-123456789abc",
+            "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+            "placement": {
+              "host": "host-a",
+              "vm": "warm-vm-1"
+            },
+            "endpoint": "runner.example:7443",
+            "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTUwMSwiZXhwIjoxNzkyMTk1ODAxLCJ2Y3B1cyI6OCwibWVtX21pYiI6MTYzODQsInBsYXRmb3JtIjoibGludXgteDY0IiwibmV0Ijp0cnVlLCJwbGFjZW1lbnQiOnsiaG9zdCI6Imhvc3QtYSIsInZtIjoid2FybS12bS0xIn0sIm1heF9zIjoxMDAsImNuZiI6eyJqa3QiOiJBa1hJWkZ6b25iNTlabUd3eUtnaTNIM0J3TWk2YW1ldnFkS1FpTFpoZHRjIn0sInB1cnBvc2UiOiJhdHRhY2giLCJ3b3Jrc3BhY2Vfa2V5X2hhc2giOiJJbWk4SUlHcUNpczJtcDh4eXF6c2RLVU1zTERiNjNuRGNSXzNGYzI2cVE0IiwibWVtX2J1cnN0X21pYiI6ODE5Mn0.h3Tmwttaukkb9aMIp00daA-cARS0bxInI_1B-NYlPTF1dN99ewMxASQ3dGD4XYh-nNyEiCC7y41UFp3_m8tZAA",
+            "token_expires_at_ms": 1792195801000,
+            "max_s": 100,
+            "reserved_vcpu_ms": 800000
+          }
+        }
+      },
+      "replace": {
+        "request": {
+          "method": "POST",
+          "pathname": "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/replace",
+          "body": {}
+        },
+        "reply": {
+          "status": 201,
+          "retry_after": null,
+          "body": {
+            "lease_id": "12345678-1234-4321-8765-123456789abc",
+            "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+            "placement": {
+              "host": "host-b",
+              "vm": null
+            },
+            "endpoint": "runner-b.example:7443",
+            "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1iIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTUwMSwiZXhwIjoxNzkyMTk1ODAxLCJ2Y3B1cyI6OCwibWVtX21pYiI6MTYzODQsInBsYXRmb3JtIjoibGludXgteDY0IiwibmV0Ijp0cnVlLCJwbGFjZW1lbnQiOnsiaG9zdCI6Imhvc3QtYiIsInZtIjpudWxsfSwibWF4X3MiOjEwMCwiY25mIjp7ImprdCI6IkFrWElaRnpvbmI1OVptR3d5S2dpM0gzQndNaTZhbWV2cWRLUWlMWmhkdGMifSwicHVycG9zZSI6InJ1biIsIndvcmtzcGFjZV9rZXlfaGFzaCI6IkltaThJSUdxQ2lzMm1wOHh5cXpzZEtVTXNMRGI2M25EY1JfM0ZjMjZxUTQiLCJtZW1fYnVyc3RfbWliIjo4MTkyfQ.jzq97hoF-ya__TQq1pkgMBD3GNUwC3orYsYU5ErYrqx2ULqAJ3O7HPMFgoXnG1nYH4KJy4tyq-yeOekH_0EnAw",
+            "token_expires_at_ms": 1792195801000,
+            "max_s": 100,
+            "reserved_vcpu_ms": 800000
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "body": {
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "vcpus": 32,
+          "platform": "linux-x64",
+          "net": true,
+          "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4",
+          "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+          "placement_hint": {
+            "host": "host-a",
+            "vm": "warm-vm-1"
+          },
+          "avoid_host": null,
+          "timeout_s": 100,
+          "requester_jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+          },
+          "allow_spill": false,
+          "mem_mib": 65536
+        }
+      },
+      "run": {
+        "status": 201,
+        "retry_after": null,
+        "body": {
+          "lease_id": "12345678-1234-4321-8765-123456789abc",
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "placement": {
+            "host": "host-a",
+            "vm": "warm-vm-1"
+          },
+          "endpoint": "runner.example:7443",
+          "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6MzIsIm1lbV9taWIiOjY1NTM2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWEiLCJ2bSI6Indhcm0tdm0tMSJ9LCJtYXhfcyI6MTAwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIiwid29ya3NwYWNlX2tleV9oYXNoIjoiSW1pOElJR3FDaXMybXA4eHlxenNkS1VNc0xEYjYzbkRjUl8zRmMyNnFRNCIsIm1lbV9idXJzdF9taWIiOjgxOTJ9.7NUAd4ZxTYzyQ7183sA7otdhoidMxINBAnSYRUd0IarM2sjaxuhX74Pm0Vmaa_XJG2TvpZFS1NhST0TcQmbNBA",
+          "token_expires_at_ms": 1792195500000,
+          "max_s": 100,
+          "reserved_vcpu_ms": 3200000
+        }
+      },
+      "rerequest": {
+        "status": 201,
+        "retry_after": null,
+        "body": {
+          "lease_id": "12345678-1234-4321-8765-123456789abc",
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "placement": {
+            "host": "host-a",
+            "vm": "warm-vm-1"
+          },
+          "endpoint": "runner.example:7443",
+          "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6MzIsIm1lbV9taWIiOjY1NTM2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWEiLCJ2bSI6Indhcm0tdm0tMSJ9LCJtYXhfcyI6MTAwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIiwid29ya3NwYWNlX2tleV9oYXNoIjoiSW1pOElJR3FDaXMybXA4eHlxenNkS1VNc0xEYjYzbkRjUl8zRmMyNnFRNCIsIm1lbV9idXJzdF9taWIiOjgxOTJ9.7NUAd4ZxTYzyQ7183sA7otdhoidMxINBAnSYRUd0IarM2sjaxuhX74Pm0Vmaa_XJG2TvpZFS1NhST0TcQmbNBA",
+          "token_expires_at_ms": 1792195500000,
+          "max_s": 100,
+          "reserved_vcpu_ms": 3200000
+        }
+      },
+      "resigned_at_ms": 1792195501123,
+      "resigned": {
+        "status": 201,
+        "retry_after": null,
+        "body": {
+          "lease_id": "12345678-1234-4321-8765-123456789abc",
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "placement": {
+            "host": "host-a",
+            "vm": "warm-vm-1"
+          },
+          "endpoint": "runner.example:7443",
+          "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTUwMSwiZXhwIjoxNzkyMTk1ODAxLCJ2Y3B1cyI6MzIsIm1lbV9taWIiOjY1NTM2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWEiLCJ2bSI6Indhcm0tdm0tMSJ9LCJtYXhfcyI6MTAwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIiwid29ya3NwYWNlX2tleV9oYXNoIjoiSW1pOElJR3FDaXMybXA4eHlxenNkS1VNc0xEYjYzbkRjUl8zRmMyNnFRNCIsIm1lbV9idXJzdF9taWIiOjgxOTJ9.qMXrsmfsINQe9ZNcStwfQWj-gf-S9roFuEwJMAb1Itu-YTui_nxZxvvZBAvTZCHLe8SUXF4OO8p6AjEpcDCQAA",
+          "token_expires_at_ms": 1792195801000,
+          "max_s": 100,
+          "reserved_vcpu_ms": 3200000
+        }
+      },
+      "reattach": {
+        "request": {
+          "method": "POST",
+          "pathname": "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/reattach",
+          "body": {
+            "requester_jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+            }
+          }
+        },
+        "reply": {
+          "status": 200,
+          "retry_after": null,
+          "body": {
+            "lease_id": "12345678-1234-4321-8765-123456789abc",
+            "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+            "placement": {
+              "host": "host-a",
+              "vm": "warm-vm-1"
+            },
+            "endpoint": "runner.example:7443",
+            "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTUwMSwiZXhwIjoxNzkyMTk1ODAxLCJ2Y3B1cyI6MzIsIm1lbV9taWIiOjY1NTM2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWEiLCJ2bSI6Indhcm0tdm0tMSJ9LCJtYXhfcyI6MTAwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoiYXR0YWNoIiwid29ya3NwYWNlX2tleV9oYXNoIjoiSW1pOElJR3FDaXMybXA4eHlxenNkS1VNc0xEYjYzbkRjUl8zRmMyNnFRNCIsIm1lbV9idXJzdF9taWIiOjgxOTJ9.Xx05wPCBV7jgR1nwDhtQqkwu6ZZMslBrPPSOf1bQ8KSZ1M3lIe541XTy5JV4OgsBPvBnNM426d7SiEveWfqeAw",
+            "token_expires_at_ms": 1792195801000,
+            "max_s": 100,
+            "reserved_vcpu_ms": 3200000
+          }
+        }
+      },
+      "replace": {
+        "request": {
+          "method": "POST",
+          "pathname": "/v1/leases/019e4567-89ab-7cde-8012-3456789abcde/replace",
+          "body": {}
+        },
+        "reply": {
+          "status": 201,
+          "retry_after": null,
+          "body": {
+            "lease_id": "12345678-1234-4321-8765-123456789abc",
+            "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+            "placement": {
+              "host": "host-b",
+              "vm": null
+            },
+            "endpoint": "runner-b.example:7443",
+            "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1iIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOWU0NTY3LTg5YWItN2NkZS04MDEyLTM0NTY3ODlhYmNkZSIsImlhdCI6MTc5MjE5NTUwMSwiZXhwIjoxNzkyMTk1ODAxLCJ2Y3B1cyI6MzIsIm1lbV9taWIiOjY1NTM2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWIiLCJ2bSI6bnVsbH0sIm1heF9zIjoxMDAsImNuZiI6eyJqa3QiOiJBa1hJWkZ6b25iNTlabUd3eUtnaTNIM0J3TWk2YW1ldnFkS1FpTFpoZHRjIn0sInB1cnBvc2UiOiJydW4iLCJ3b3Jrc3BhY2Vfa2V5X2hhc2giOiJJbWk4SUlHcUNpczJtcDh4eXF6c2RLVU1zTERiNjNuRGNSXzNGYzI2cVE0IiwibWVtX2J1cnN0X21pYiI6ODE5Mn0.SRqO7jsQudpXouw8yEhNzKQlaAhpU-M25Sderb36s1_5yM5k1jEqNuY6mrnNU1UNzAdKBEK69bMNJBAoovnRBg",
+            "token_expires_at_ms": 1792195801000,
+            "max_s": 100,
+            "reserved_vcpu_ms": 3200000
+          }
+        }
+      }
+    }
+  ],
+  "reports": [
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/hosts/host-a/usage",
+        "body": {
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "vcpus": 2,
+          "started_at_ms": 1792195200123,
+          "ended_at_ms": 1792195207623,
+          "mem_peak_mib": null,
+          "egress_bytes": null,
+          "outcome": "exit",
+          "mem_over_mib_ms": 123456,
+          "oom_kill": "job_limit"
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "CK-Host": "host-a",
+          "CK-Timestamp": "1792195209000",
+          "CK-Counter": "1792195209000001",
+          "CK-Signature": "48097cd51a1990ea182f5560434d71c0e39620747591194881e5b26d2b260d880882db557a4fdf9c2d020f8871845c5279514f419c2793a4cd602759e283a20f"
+        }
+      },
+      "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-a/usage\n9c244973f51b20eac750bee3c8a0e2ce27e66680e27f39e25ea358282092adbe\n1792195209000\n1792195209000001",
+      "usage_hash": "9c244973f51b20eac750bee3c8a0e2ce27e66680e27f39e25ea358282092adbe",
+      "reply": {
+        "status": 200,
+        "retry_after": null,
+        "body": {
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "settled_vcpu_ms": 15000,
+          "released_vcpu_ms": 9000
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/hosts/host-a/usage",
+        "body": {
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "vcpus": 2,
+          "started_at_ms": 1792195200123,
+          "ended_at_ms": 1792195207623,
+          "mem_peak_mib": null,
+          "egress_bytes": null,
+          "outcome": "exit",
+          "mem_over_mib_ms": 654321,
+          "oom_kill": "host_pressure"
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "CK-Host": "host-a",
+          "CK-Timestamp": "1792195209000",
+          "CK-Counter": "1792195209000001",
+          "CK-Signature": "6c38864b1882b46ca4cd532e4e59fa7f43d0189730f87c237683084aef5f86529eec6d96795c5413c41e9512afa9b8abae597181fd770f584f94c54cfb9ba600"
+        }
+      },
+      "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-a/usage\nff8fcd92357447109110a7ccfb31d02f9d3e20587ace041f72733eb00458cd5b\n1792195209000\n1792195209000001",
+      "usage_hash": "ff8fcd92357447109110a7ccfb31d02f9d3e20587ace041f72733eb00458cd5b",
+      "reply": {
+        "status": 200,
+        "retry_after": null,
+        "body": {
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "settled_vcpu_ms": 15000,
+          "released_vcpu_ms": 9000
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/hosts/host-a/usage",
+        "body": {
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "vcpus": 2,
+          "started_at_ms": 1792195200123,
+          "ended_at_ms": 1792195207623,
+          "mem_peak_mib": null,
+          "egress_bytes": null,
+          "outcome": "exit",
+          "mem_over_mib_ms": 1024,
+          "oom_kill": "host_oom"
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "CK-Host": "host-a",
+          "CK-Timestamp": "1792195209000",
+          "CK-Counter": "1792195209000001",
+          "CK-Signature": "9f1a26a49ed0fab8a34a22db24edc1cfa00b425f3a0fcfe82ceed1698ef19c02b1107c6d30421d5bdef68052ea9621348f9d999988bf7b15bf6c0f549036070b"
+        }
+      },
+      "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-a/usage\n1c7b6177f02fb420eca5253c170e3a4cc3e5421eef22e8d3311fc4025ef3e25e\n1792195209000\n1792195209000001",
+      "usage_hash": "1c7b6177f02fb420eca5253c170e3a4cc3e5421eef22e8d3311fc4025ef3e25e",
+      "reply": {
+        "status": 200,
+        "retry_after": null,
+        "body": {
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "settled_vcpu_ms": 15000,
+          "released_vcpu_ms": 9000
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/hosts/host-a/usage",
+        "body": {
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "vcpus": 2,
+          "started_at_ms": 1792195200123,
+          "ended_at_ms": 1792195207623,
+          "mem_peak_mib": null,
+          "egress_bytes": null,
+          "outcome": "exit",
+          "mem_over_mib_ms": null
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "CK-Host": "host-a",
+          "CK-Timestamp": "1792195209000",
+          "CK-Counter": "1792195209000001",
+          "CK-Signature": "7f104d33777ebbdfa763457505220f4c57c9967db0cc46d6d2fb3d99473d7cd5f171f0b8fe26f2d65546137fac15380e0fe451bcfc162b5000407c0f95fb7a0a"
+        }
+      },
+      "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-a/usage\nd762f506f394dc4fe711e3ce34bea349c8c9a76c6568c3fc402b0fb044605e9a\n1792195209000\n1792195209000001",
+      "usage_hash": "d762f506f394dc4fe711e3ce34bea349c8c9a76c6568c3fc402b0fb044605e9a",
+      "reply": {
+        "status": 200,
+        "retry_after": null,
+        "body": {
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "settled_vcpu_ms": 15000,
+          "released_vcpu_ms": 9000
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/hosts/host-a/usage",
+        "body": {
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "vcpus": 2,
+          "started_at_ms": 1792195200123,
+          "ended_at_ms": 1792195207623,
+          "mem_peak_mib": null,
+          "egress_bytes": null,
+          "outcome": "exit"
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "CK-Host": "host-a",
+          "CK-Timestamp": "1792195209000",
+          "CK-Counter": "1792195209000001",
+          "CK-Signature": "c2a27bd1e3271dcfa625e88e6d813c763ae61a45e97bb6f716e7dd29232057797cf3b76c828eeac3c0e7d69c209b3618bae88e7c740921db02deda9499398902"
+        }
+      },
+      "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-a/usage\na9ca655915d5988a86e7b236cceedc0de98bc2fc1f2f8a672d414896483db859\n1792195209000\n1792195209000001",
+      "usage_hash": "a9ca655915d5988a86e7b236cceedc0de98bc2fc1f2f8a672d414896483db859",
+      "reply": {
+        "status": 200,
+        "retry_after": null,
+        "body": {
+          "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+          "settled_vcpu_ms": 15000,
+          "released_vcpu_ms": 9000
+        }
+      }
+    }
+  ],
+  "invalid_oom_kill": {
+    "request": {
+      "method": "POST",
+      "pathname": "/v1/hosts/host-a/usage",
+      "body": {
+        "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+        "vcpus": 2,
+        "started_at_ms": 1792195200123,
+        "ended_at_ms": 1792195207623,
+        "mem_peak_mib": null,
+        "egress_bytes": null,
+        "outcome": "exit",
+        "oom_kill": "other"
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "CK-Host": "host-a",
+        "CK-Timestamp": "1792195209000",
+        "CK-Counter": "1792195209000001",
+        "CK-Signature": "a23e42500da0f2c4a84fd8918db992ed6da8e6bc3f19c9beaa56adbc358f80dd427884f8154596b0e1b2be58ae1f44597def495fd604d51c659e3351cfcfff04"
+      }
+    },
+    "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-a/usage\nba766cd9d9f4723855d1d06e9d3802f3f28ccda4788eda45da84240f775057b9\n1792195209000\n1792195209000001",
+    "reply": {
+      "status": 400,
+      "retry_after": null,
+      "body": {
+        "error": "bad_request",
+        "field": "oom_kill"
+      }
+    }
+  },
+  "boat": {
+    "clock_ms": 1900000000123,
+    "request": {
+      "method": "POST",
+      "pathname": "/v1/leases",
+      "body": {
+        "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+        "vcpus": 2,
+        "platform": "linux-x64",
+        "net": true,
+        "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4",
+        "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+        "placement_hint": null,
+        "avoid_host": null,
+        "timeout_s": 100,
+        "requester_jwk": {
+          "kty": "OKP",
+          "crv": "Ed25519",
+          "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+        },
+        "allow_spill": true
+      }
+    },
+    "provisioning": {
+      "status": 202,
+      "retry_after": null,
+      "body": {
+        "status": "provisioning",
+        "retry_after_ms": 5000
+      }
+    },
+    "run": {
+      "status": 201,
+      "retry_after": null,
+      "body": {
+        "provider": "boat",
+        "lease_id": "12345678-1234-4321-8765-123456789abc",
+        "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+        "placement": {
+          "host": "boat:bx_22222222",
+          "vm": "bx_22222222"
+        },
+        "ssh": {
+          "endpoint": "198.51.100.1:22000",
+          "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA0UGyIpMDc+RUxTWmFob3Z9hIuSmaCnrrW8w8rR2N/m",
+          "user": "user"
+        },
+        "runner_port": 9443,
+        "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiYm9hdDpieF8yMjIyMjIyMiIsInN1YiI6ImFjY3Q6MDFBUlozTkRFS1RTVjRSUkZGUTY5RzVGQVYiLCJqdGkiOiIwMTllNDU2Ny04OWFiLTdjZGUtODAxMi0zNDU2Nzg5YWJjZGUiLCJpYXQiOjE5MDAwMDAwMTAsImV4cCI6MTkwMDAwMDMxMCwidmNwdXMiOjIsIm1lbV9taWIiOjE0MzM2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJib2F0OmJ4XzIyMjIyMjIyIiwidm0iOiJieF8yMjIyMjIyMiJ9LCJtYXhfcyI6MTAwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIn0.rLnJrNLb7t_lCeOlo9jOBgfvUOuhAQGt_VNV2JgC4ipDoO4KxKcrEl_3KFyHTM-XSHpDkEGbTwV5F2DGQoliDg",
+        "token_expires_at_ms": 1900000310000,
+        "max_s": 100,
+        "reserved_vcpu_ms": 200000
+      }
+    },
+    "attach": {
+      "status": 200,
+      "retry_after": null,
+      "body": {
+        "provider": "boat",
+        "lease_id": "12345678-1234-4321-8765-123456789abc",
+        "job_id": "019e4567-89ab-7cde-8012-3456789abcde",
+        "placement": {
+          "host": "boat:bx_22222222",
+          "vm": "bx_22222222"
+        },
+        "ssh": {
+          "endpoint": "198.51.100.1:22000",
+          "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA0UGyIpMDc+RUxTWmFob3Z9hIuSmaCnrrW8w8rR2N/m",
+          "user": "user"
+        },
+        "runner_port": 9443,
+        "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiYm9hdDpieF8yMjIyMjIyMiIsInN1YiI6ImFjY3Q6MDFBUlozTkRFS1RTVjRSUkZGUTY5RzVGQVYiLCJqdGkiOiIwMTllNDU2Ny04OWFiLTdjZGUtODAxMi0zNDU2Nzg5YWJjZGUiLCJpYXQiOjE5MDAwMDAwMTAsImV4cCI6MTkwMDAwMDMxMCwidmNwdXMiOjIsIm1lbV9taWIiOjE0MzM2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJib2F0OmJ4XzIyMjIyMjIyIiwidm0iOiJieF8yMjIyMjIyMiJ9LCJtYXhfcyI6MTAwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoiYXR0YWNoIn0.phnQbP8z5u_Sy8TXeAO89uUcQoea_CyfR-oTaY7Z-i9QvHsdSxQ78GSNs3nXsP6aXXsKfU1KAudeAdTfLfEqCw",
+        "token_expires_at_ms": 1900000310000,
+        "max_s": 100,
+        "reserved_vcpu_ms": 200000
+      }
+    }
+  }
+}

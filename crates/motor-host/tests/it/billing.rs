@@ -1822,3 +1822,85 @@ fn retention_never_deletes_a_running_lease_and_drains_a_backlog_in_bounded_passe
     );
     assert_eq!(h.snapshot.leases.keys().collect::<Vec<_>>(), vec![JOB2]);
 }
+
+#[test]
+fn absent_burst_telemetry_preserves_heartbeat_and_usage_bytes() {
+    let mut h = host();
+    assert_eq!(
+        serde_json::to_string(&h.heartbeat(MS, 245760, true)).unwrap(),
+        r#"{"free_vcpus":2,"free_mem_mib":245760,"queued":0,"warm":[],"running":[],"healthy":true}"#
+    );
+    started(&mut h, JOB, 1);
+    end(&mut h, JOB, 3, MS + 3000, terminal(JOB, "exit"));
+    h.terminal_delivered(JOB, MS + 3000).unwrap();
+    let request = h
+        .snapshot
+        .outbox
+        .iter()
+        .find(|r| r.path.ends_with("/usage"))
+        .unwrap();
+    assert_eq!(
+        std::str::from_utf8(&request.body).unwrap(),
+        r#"{"job_id":"00000000-0000-7000-8000-000000000001","vcpus":1,"started_at_ms":1800000000000,"ended_at_ms":1800000003000,"mem_peak_mib":null,"egress_bytes":45,"outcome":"exit"}"#
+    );
+}
+
+#[test]
+fn usage_reports_only_observed_memory_kill_causes_and_never_invents_overage() {
+    for burst in [None, Some(8192)] {
+        for cause in [
+            None,
+            Some("job_limit"),
+            Some("host_pressure"),
+            Some("host_oom"),
+            Some("unknown"),
+        ] {
+            let mut h = host();
+            let mut c = claims(JOB);
+            c.mem_burst_mib = burst;
+            let (connection, _) = h.claim(c, MS).unwrap();
+            h.delivered(connection).unwrap();
+            for (seq, kind) in [
+                (1, TenantEventKind::Admitted),
+                (2, TenantEventKind::Started),
+            ] {
+                h.event("tenant", &event(seq, kind, Some(JOB), None), MS)
+                    .unwrap();
+            }
+            let mut frame = serde_json::to_value(
+                motor_protocol::TerminalRecord::new(
+                    JOB.parse().unwrap(),
+                    motor_protocol::Outcome::Signal { signal: 9 },
+                    3000,
+                    0,
+                    0,
+                )
+                .with_ran(motor_protocol::Ran::Remote),
+            )
+            .unwrap();
+            if let Some(cause) = cause {
+                frame["oom_kill"] =
+                    serde_json::to_value(motor_protocol::OomKill::new(cause)).unwrap();
+            }
+            end(&mut h, JOB, 3, MS + 3000, frame);
+            h.terminal_delivered(JOB, MS + 3000).unwrap();
+            let request = h
+                .snapshot
+                .outbox
+                .iter()
+                .find(|r| r.path.ends_with("/usage"))
+                .unwrap();
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let expected = cause.filter(|cause| *cause != "unknown");
+            assert_eq!(
+                body.get("oom_kill"),
+                expected.map(|cause| json!(cause)).as_ref()
+            );
+            assert!(body.get("mem_over_mib_ms").is_none());
+            assert_eq!(
+                h.snapshot.billing[JOB].hosted_terminal.as_ref().unwrap()["billed_vcpu_ms"],
+                3000
+            );
+        }
+    }
+}

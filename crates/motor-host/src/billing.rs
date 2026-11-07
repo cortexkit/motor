@@ -1,6 +1,6 @@
 //! Host observations, durable settlement records and the serialized broker outbox.
 use crate::state::{Error, Host, LeaseState, Refusal, Snapshot};
-use motor_lease::{Heartbeat, HostHeaders, JobState, RunningJob, Usage, UsageOutcome};
+use motor_lease::{Heartbeat, HostHeaders, JobState, OomKill, RunningJob, Usage, UsageOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -143,6 +143,16 @@ pub(crate) fn finalize_ready(next: &mut Snapshot, now_ms: u64) {
             ),
             outcome,
             mem_working_peak_mib: lease.started_at_ms.and(b.mem_working_peak_mib).map(Some),
+            // The runner does not yet report a working-set overage integral.
+            mem_over_mib_ms: None,
+            oom_kill: b.terminal.as_ref().and_then(|terminal| {
+                match terminal["oom_kill"]["cause"].as_str() {
+                    Some("job_limit") => Some(OomKill::JobLimit),
+                    Some("host_pressure") => Some(OomKill::HostPressure),
+                    Some("host_oom") => Some(OomKill::HostOom),
+                    _ => None,
+                }
+            }),
         };
         let billed = u64::from(usage.vcpus)
             .saturating_mul(end.saturating_sub(start))

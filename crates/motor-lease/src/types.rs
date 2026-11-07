@@ -115,6 +115,23 @@ pub struct Claims {
         deserialize_with = "present_workspace_hash"
     )]
     pub workspace_key_hash: Option<String>,
+    /// When enabled by the broker, on registered-host placements only:
+    /// `min(floor(mem_mib / 2), 8192)` whole MiB, derived from this token's
+    /// `mem_mib`; always the last payload key.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_memory"
+    )]
+    pub mem_burst_mib: Option<u64>,
+}
+
+impl Claims {
+    pub fn mem_burst_mib_accepted(&self) -> bool {
+        self.mem_burst_mib.is_none_or(|burst| {
+            !self.aud.starts_with("boat:") && burst == (self.mem_mib / 2).min(8192)
+        })
+    }
 }
 
 // Boat sandbox job tokens omit the hash; registered hosts require it during verification.
@@ -449,6 +466,14 @@ pub enum UsageOutcome {
     Lost,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OomKill {
+    JobLimit,
+    HostPressure,
+    HostOom,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Usage {
@@ -469,6 +494,27 @@ pub struct Usage {
         deserialize_with = "present_nullable"
     )]
     pub mem_working_peak_mib: Option<Option<u64>>,
+    /// Working-set integral above stated `mem_mib`, excluding file cache, in
+    /// MiB·ms. Send only when the token carried `mem_burst_mib` and measured;
+    /// absence is not a zero measurement.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_nullable"
+    )]
+    pub mem_over_mib_ms: Option<Option<u64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_oom_kill"
+    )]
+    pub oom_kill: Option<OomKill>,
+}
+
+fn present_oom_kill<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<OomKill>, D::Error> {
+    OomKill::deserialize(deserializer).map(Some)
 }
 
 fn present_nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(

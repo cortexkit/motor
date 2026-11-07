@@ -123,6 +123,8 @@ pub fn usage() -> Usage {
         egress_bytes: Some(0),
         outcome: UsageOutcome::Exit,
         mem_working_peak_mib: None,
+        mem_over_mib_ms: None,
+        oom_kill: None,
     }
 }
 pub fn issued(b: &mut FakeBroker, request: &LeaseRequest, now: u64) -> LeaseResponse {

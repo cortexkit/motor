@@ -121,6 +121,7 @@ pub fn usage_violation(usage: &Usage) -> Option<&'static str> {
         .into_iter()
         .chain(usage.mem_peak_mib)
         .chain(usage.mem_working_peak_mib.flatten())
+        .chain(usage.mem_over_mib_ms.flatten())
         .chain(usage.egress_bytes)
         .any(|value| value > SAFE_INTEGER)
     {
@@ -277,11 +278,21 @@ mod tests {
             egress_bytes: None,
             outcome: UsageOutcome::Cancelled,
             mem_working_peak_mib: None,
+            mem_over_mib_ms: None,
+            oom_kill: None,
         };
         assert_eq!(usage_violation(&usage), None);
         let body = serde_json::to_vec(&usage).unwrap();
         assert_eq!(request_violation("/v1/hosts/ovh-1/usage", &body), None);
         assert!(request_violation("/v1/hosts/ovh-1/heartbeat", &body).is_some());
+        for overage in [None, Some(None), Some(Some(0)), Some(Some(SAFE_INTEGER))] {
+            let measured = Usage {
+                mem_over_mib_ms: overage,
+                oom_kill: Some(motor_lease::OomKill::HostOom),
+                ..usage.clone()
+            };
+            assert_eq!(usage_violation(&measured), None);
+        }
         for broken in [
             Usage {
                 vcpus: 0,
@@ -293,6 +304,10 @@ mod tests {
             },
             Usage {
                 job_id: "not-a-job".into(),
+                ..usage.clone()
+            },
+            Usage {
+                mem_over_mib_ms: Some(Some(SAFE_INTEGER + 1)),
                 ..usage.clone()
             },
         ] {
