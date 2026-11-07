@@ -385,7 +385,7 @@ def dependency_bundle(repo, bundle, commit):
         git(repo, "update-ref", "-d", ref)
 
 
-def run_preparation_case(root, runner, evidence, name, repo, commit, tree, command, dependency=None, source_read_only=False):
+def run_preparation_case(root, runner, evidence, name, repo, commit, tree, command, dependency=None, source_read_only=False, required_output=None):
     bundle = evidence / f"{name}.bundle"
     fixture_bundle(repo, bundle, commit)
     payloads = [bundle.read_bytes()]
@@ -414,6 +414,8 @@ def run_preparation_case(root, runner, evidence, name, repo, commit, tree, comma
         (evidence / f"terminal-{name}.json").write_text(json.dumps(terminal, indent=2))
         (evidence / f"output-{name}.bin").write_bytes(output)
         require_gate_success(terminal)
+        if required_output is not None and required_output not in output:
+            raise RuntimeError(f"{name} did not report its required success marker")
         if source_read_only and terminal.get("source_read_only") is not True:
             raise RuntimeError("source seal qualification lacked positive protection acknowledgement")
         print(f"PASS {name} job={job}", flush=True)
@@ -439,6 +441,19 @@ def qualify_source_seal(root, runner, evidence):
                          "if printf changed > run.sh; then echo 'tracked write unexpectedly allowed'; exit 1; fi; "
                          "printf allowed > source-seal-new && test \"$(cat source-seal-new)\" = allowed && sh run.sh",
                          source_read_only=True)
+
+
+def crash_dump_command():
+    script = Path(__file__).with_name("qualify-crash-dumps.ps1").read_text()
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return "powershell.exe -NoProfile -EncodedCommand " + encoded
+
+
+def qualify_crash_dumps(root, runner, evidence):
+    repo = evidence / "crash-dump-fixture"
+    commit, tree = no_lockfile_fixture(repo)
+    run_preparation_case(root, runner, evidence, "job-crash-dump", repo, commit, tree,
+                         crash_dump_command(), required_output=b"PASS job-crash-dump readable non-empty minidump:")
 
 
 RETURN_QUALIFICATION_BYTES = b"motor requested return qualification"
@@ -555,6 +570,7 @@ def run(root, runner, evidence, gate):
     require_runner_service()
     qualify_preparation_cases(root, runner, evidence)
     qualify_source_seal(root, runner, evidence)
+    qualify_crash_dumps(root, runner, evidence)
     qualify_return_cases(root, runner, evidence)
     repo = evidence / "fixture"
     commit, tree = fixture(repo)

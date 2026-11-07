@@ -146,6 +146,11 @@ lifetime write/delete guard, a same-size rewrite with restored LastWriteTime,
 ChangeTime-only qualification reuse, and identity/record changes; the full
 Hyper-V qualification is operator-only.
 
+Windows Error Reporting writes minidumps for crashing job processes to
+`C:\CrashDumps`. The job account can read the dumps; the VM keeps at most 10,
+and they are deleted with the job VM. To retrieve a dump, copy it into the job's
+checkout and name that path in `return_paths`.
+
 3.2. The VM has no network device. The command can use loopback inside the
 guest and nothing else. A request for outbound network is refused with
 `network_unsupported`. Tests: `windows_qualification_no_network_but_loopback_works`

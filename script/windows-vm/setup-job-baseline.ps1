@@ -583,6 +583,27 @@ if ($LASTEXITCODE -ne 0) { throw 'Git long-path configuration failed' }
 New-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -PropertyType DWord -Value 1 -Force | Out-Null
 foreach ($path in @('C:\m', 'C:\rust', $jobCargo)) { Add-MpPreference -ExclusionPath $path }
 
+# Crash dumps for job processes stay VM-local and are deleted with the job VM.
+try {
+    $dumpFolder = 'C:\CrashDumps'
+    New-Item $dumpFolder -ItemType Directory -Force | Out-Null
+    $dumpAcl = [Security.AccessControl.DirectorySecurity]::new()
+    $dumpAcl.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @('S-1-5-18', 'S-1-5-32-544', $jobSid)) {
+        $rights = if ($sid -eq $jobSid) { 'Modify' } else { 'FullControl' }
+        $trustee = [Security.Principal.SecurityIdentifier]::new($sid)
+        $dumpAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($trustee, $rights, 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+    }
+    Set-Acl -LiteralPath $dumpFolder -AclObject $dumpAcl
+    $localDumps = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+    New-Item $localDumps -Force | Out-Null
+    New-ItemProperty $localDumps -Name DumpFolder -PropertyType ExpandString -Value $dumpFolder -Force | Out-Null
+    New-ItemProperty $localDumps -Name DumpType -PropertyType DWord -Value 1 -Force | Out-Null
+    New-ItemProperty $localDumps -Name DumpCount -PropertyType DWord -Value 10 -Force | Out-Null
+} catch {
+    throw "Job crash dump setup failed: $_"
+}
+
 $prebuiltHvsock = Test-Path "$PSScriptRoot\hyperv-runner"
 if ($prebuiltHvsock) {
     if (-not $HyperVSpike) { throw 'Prebuilt hvsock agent requires Hyper-V provisioning mode' }

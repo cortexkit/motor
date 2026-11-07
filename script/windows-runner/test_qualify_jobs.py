@@ -489,7 +489,8 @@ class QualificationReadinessTests(unittest.TestCase):
                                  "requested-return-ads-refused", "no-requested-returns-preserves-changed-source"])
         operator = (HERE.parents[1] / "crates/motor-runner/src/tests/windows_operator.rs").read_text()
         checks = re.findall(r"^(?:async )?fn (windows_qualification_\w+)\(", operator, re.MULTILINE)
-        self.assertEqual(len(checks), 21)
+        self.assertEqual(len(checks), 22)
+        self.assertIn("windows_qualification_job_crash_dump_is_readable", checks)
         self.assertIn("windows_qualification_guest_clock_matches_host_utc", checks)
         self.assertIn("windows_qualification_tracked_source_is_read_only_and_new_files_are_writable", checks)
         self.assertIn("windows_qualification_realistic_checkout_bun_failure_is_nonfatal", checks)
@@ -677,6 +678,59 @@ class QualificationReadinessTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "gate failed"):
                 JOBS.run_preparation_case(self.root, self.runner, self.root, "failed", self.root, "commit", "tree", "sh run.sh")
         channel.close.assert_called_once()
+
+    def test_crash_dump_probe_is_shared_and_fits_its_own_job_command(self):
+        command = JOBS.crash_dump_command()
+        self.assertLess(len(JOBS.BUN_VERSION_CHECK + " || exit $?; " + command), 8000)
+        probe = base64.b64decode(command.split()[-1]).decode("utf-16-le")
+        self.assertEqual(probe, (HERE / "qualify-crash-dumps.ps1").read_text())
+        for witness in ("core::arch::asm!", "in(reg) 0usize", "& rustc", "Start-Process",
+                        "$process.ExitCode -ne -1073741819", "Expected 0xC0000005",
+                        "UtcNow.AddSeconds(30)", "C:\\CrashDumps", "$name.exe.$($process.Id).dmp",
+                        "[IO.File]::Open", "'Open', 'Read', 'ReadWrite'", "$stream.Length -gt 0",
+                        "$stream.ReadByte() -ge 0", "$stream.Dispose()"):
+            self.assertIn(witness, probe)
+        operator = (HERE.parents[1] / "crates/motor-runner/src/tests/windows_operator.rs").read_text()
+        self.assertIn('include_str!("../../../../script/windows-runner/qualify-crash-dumps.ps1")', operator)
+        run_source = (HERE / "qualify-jobs.py").read_text().split("def run(root, runner, evidence, gate):", 1)[1]
+        self.assertLess(run_source.index("qualify_crash_dumps(root, runner, evidence)"), run_source.index("for iteration in range(5)"))
+
+    def test_crash_dump_probe_ships_with_full_hyperv_qualification(self):
+        for filename in ("install.ps1", "update-functions.ps1", "test_scripts.ps1"):
+            with self.subTest(filename=filename):
+                source = (HERE / filename).read_text()
+                payloads = re.findall(r"@\([^\n]*'qualify-jobs.py'[^\n]*\)", source)
+                self.assertTrue(payloads)
+                for payload in payloads:
+                    self.assertIn("'qualify-crash-dumps.ps1'", payload)
+        qualification = (HERE / "qualify.ps1").read_text()
+        self.assertLess(
+            qualification.index('& $Python "$Root\\bin\\qualify-jobs.py" --root $Root --evidence "$Evidence\\real-jobs"'),
+            qualification.index("Open-RunnerQualificationGate $Root"))
+
+    def test_crash_dump_qualification_requires_successful_job_and_dump_marker(self):
+        for code, marker in ((0, True), (0, False), (1, True)):
+            with self.subTest(code=code, marker=marker):
+                channel = Mock()
+                def until(kind, output=None):
+                    if kind == "terminal":
+                        assert output is not None
+                        if marker:
+                            output.extend(b"PASS job-crash-dump readable non-empty minidump: C:\\CrashDumps\\probe.dmp")
+                        return dict(outcome=dict(type="windows_exit", code=code))
+                channel.until.side_effect = until
+                with patch.object(JOBS, "no_lockfile_fixture", return_value=("commit", "tree")), \
+                        patch.object(JOBS, "fixture_bundle", side_effect=lambda repo, bundle, commit: bundle.write_bytes(b"bundle")), \
+                        patch.object(JOBS, "Channel", return_value=channel):
+                    if code == 0 and marker:
+                        JOBS.qualify_crash_dumps(self.root, self.runner, self.root)
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            JOBS.qualify_crash_dumps(self.root, self.runner, self.root)
+                request = channel.send.call_args_list[0].args[0]
+                self.assertEqual(request["platform"], "windows")
+                self.assertTrue(request["command"].endswith(JOBS.crash_dump_command()))
+                channel.close.assert_called_once()
 
     def test_source_seal_qualification_requires_positive_acknowledgement(self):
         for protection in (None, False, True):

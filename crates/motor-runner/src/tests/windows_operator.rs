@@ -547,6 +547,24 @@ fn baseline_qualification_commands() -> [String; 3] {
     ]
 }
 
+const CRASH_DUMP_SCRIPT: &str =
+    include_str!("../../../../script/windows-runner/qualify-crash-dumps.ps1");
+
+/// A real access violation must leave a non-empty dump readable by the job user.
+#[test]
+#[ignore = "trusted operator: sealed Windows baseline, dedicated accounts, KVM and systemd required"]
+fn windows_qualification_job_crash_dump_is_readable() {
+    let runner = operator();
+    let f = Fixture::new();
+    source(&f);
+    let output = run(&runner, &f, &powershell(CRASH_DUMP_SCRIPT));
+    assert!(
+        output.contains("PASS job-crash-dump readable non-empty minidump:"),
+        "{output}"
+    );
+    no_units(&runner);
+}
+
 fn realistic_bun_checkout_command() -> String {
     // Retrying in the command exposes Bun's full diagnostics only to the caller,
     // while preparation retains a bounded stderr tail for ordinary jobs.
@@ -2287,10 +2305,10 @@ fn offline_canary_generated_powershell_has_balanced_braces() {
 #[test]
 fn baseline_qualification_commands_fit_the_guest_command_limit() {
     // The guest's job launcher truncates a command past 8,191 characters.
-    for command in baseline_qualification_commands()
-        .into_iter()
-        .chain([realistic_bun_checkout_command()])
-    {
+    for command in baseline_qualification_commands().into_iter().chain([
+        realistic_bun_checkout_command(),
+        powershell(CRASH_DUMP_SCRIPT),
+    ]) {
         assert!(
             command.len() < 8000,
             "job command has {} characters",
@@ -2304,6 +2322,11 @@ fn baseline_environment_generated_powershell_has_balanced_braces() {
     let script = baseline_environment_script();
     assert_eq!(powershell_brace_balance(&script), Ok(()), "{script}");
     assert!(powershell(&script).len() < 8000);
+}
+
+#[test]
+fn crash_dump_generated_powershell_has_balanced_braces() {
+    powershell_brace_balance(CRASH_DUMP_SCRIPT).unwrap();
 }
 
 #[test]

@@ -270,7 +270,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
                 $hash = (Get-FileHash -LiteralPath "$bundle\bin\motor-winagent.exe" -Algorithm SHA256).Hash
                 if ($case -eq 'agent-mismatch') { $hash = 'B' * 64 }
                 [IO.File]::WriteAllText("$installed\vm.toml", "guest_agent_sha256 = '$hash'`r`n")
-                foreach ($name in @('hyperv.ps1','parent-identity.ps1','guest-agent-identity.ps1','guest-evidence.ps1','accounts.ps1','qualify.ps1','qualify-peer.ps1','uninstall.ps1','run-system.ps1','verify-sshd-system.ps1','qualify-jobs.py','update.ps1','update-functions.ps1','service-definition.ps1')) {
+                foreach ($name in @('hyperv.ps1','parent-identity.ps1','guest-agent-identity.ps1','guest-evidence.ps1','accounts.ps1','qualify.ps1','qualify-peer.ps1','uninstall.ps1','run-system.ps1','verify-sshd-system.ps1','qualify-jobs.py','qualify-crash-dumps.ps1','update.ps1','update-functions.ps1','service-definition.ps1')) {
                     [IO.File]::WriteAllText("$bundle\script\windows-runner\$name", 'new-script')
                 }
                 Copy-Item -LiteralPath "$PSScriptRoot\service-definition.ps1" -Destination "$bundle\script\windows-runner\service-definition.ps1" -Force

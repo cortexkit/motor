@@ -184,7 +184,7 @@ function Invoke-RunnerHostUpdate {
         $files = Test-RunnerUpdateManifest $source
         $payload = @{}
         foreach ($path in $files.Keys) { if ($path -match '^bin/[^/]+$') { $payload[$path] = $path } }
-        foreach ($name in @('hyperv.ps1','parent-identity.ps1','guest-agent-identity.ps1','guest-evidence.ps1','accounts.ps1','qualify.ps1','qualify-peer.ps1','uninstall.ps1','run-system.ps1','verify-sshd-system.ps1','qualify-jobs.py','update.ps1','update-functions.ps1','service-definition.ps1')) {
+        foreach ($name in @('hyperv.ps1','parent-identity.ps1','guest-agent-identity.ps1','guest-evidence.ps1','accounts.ps1','qualify.ps1','qualify-peer.ps1','uninstall.ps1','run-system.ps1','verify-sshd-system.ps1','qualify-jobs.py','qualify-crash-dumps.ps1','update.ps1','update-functions.ps1','service-definition.ps1')) {
             $payload["bin/$name"] = "script/windows-runner/$name"
         }
         foreach ($name in @('common.ps1','process.ps1')) { $payload["bin/$name"] = "script/hyperv-spike/$name" }

@@ -67,7 +67,7 @@ Close-RunnerQualificationGate $Root
 Protect-RunnerPath "$Root\staging" $nativeLogPath
 Copy-Item "$Bundle\bin\*" "$Root\bin" -Recurse
 Copy-Item "$Bundle\prep-toolchain" $Root -Recurse
-foreach ($name in @('hyperv.ps1','parent-identity.ps1','guest-agent-identity.ps1','guest-evidence.ps1','accounts.ps1','qualify.ps1','qualify-peer.ps1','uninstall.ps1','run-system.ps1','verify-sshd-system.ps1','qualify-jobs.py','update.ps1','update-functions.ps1','service-definition.ps1')) { Copy-Item "$PSScriptRoot\$name" "$Root\bin" }
+foreach ($name in @('hyperv.ps1','parent-identity.ps1','guest-agent-identity.ps1','guest-evidence.ps1','accounts.ps1','qualify.ps1','qualify-peer.ps1','uninstall.ps1','run-system.ps1','verify-sshd-system.ps1','qualify-jobs.py','qualify-crash-dumps.ps1','update.ps1','update-functions.ps1','service-definition.ps1')) { Copy-Item "$PSScriptRoot\$name" "$Root\bin" }
 foreach ($name in @('common.ps1','process.ps1')) { Copy-Item "$PSScriptRoot\..\hyperv-spike\$name" "$Root\bin" }
 $parent = "$Root\baselines\ally-hvsock.vhdx"
 Copy-Item -LiteralPath $ParentPath -Destination $parent
