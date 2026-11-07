@@ -121,6 +121,7 @@ rustup target add x86_64-unknown-linux-musl
 command -v musl-gcc >/dev/null || { echo 'musl-gcc is required; install musl-tools' >&2; exit 1; }
 env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
   CC_x86_64_unknown_linux_musl=musl-gcc \
+  MOTOR_BUILD_COMMIT="$(git rev-parse HEAD)" \
   cargo build --release --locked --target x86_64-unknown-linux-musl -p motor-runner
 ```
 

@@ -789,7 +789,8 @@ def main():
             and args.acknowledge_tenant_one_private_cache):
         parser.error('fleet image installation requires an operator-supplied Cargo seed, its manifest SHA-256, and --acknowledge-tenant-one-private-cache')
     seed_manifest = parity.seed.verified_manifest(args.cargo_seed_manifest, args.cargo_seed_sha256)
-    if run("git", "-C", str(ROOT), "rev-parse", "HEAD", capture=True) != args.revision:
+    revision = run("git", "-C", str(ROOT), "rev-parse", "HEAD", capture=True)
+    if revision != args.revision:
         raise ValueError("source revision differs")
     if run("git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no", capture=True):
         raise ValueError("source has modified tracked files")
@@ -840,6 +841,7 @@ def main():
     if not parity_result["passed"]:
         raise ValueError("toolchain parity failed: " + json.dumps(parity_result["errors"]))
     os.chdir(ROOT)
+    os.environ["MOTOR_BUILD_COMMIT"] = revision
     run("cargo", "build", "--release", "--locked", "-p", "motor-runner", "-p", "motor-host")
     for binary in ('motor-runner', 'motor-host'):
         run("install", "-m", "0755", '/srv/build/target/release/' + binary, '/usr/local/bin/' + binary)

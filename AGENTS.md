@@ -50,10 +50,10 @@ revision pinned in `scripts/compat-client-revision`; run it on Linux.
 
 ```sh
 # Client module
-env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo build --release -p motor-module --bin ck-motor --locked
-target/release/ck-motor --version
+env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 scripts/build-ck-motor-card.sh
+# Run --version on the binary path printed by the helper.
 # Linux runner
-env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 cargo build --release -p motor-runner --locked
+env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 MOTOR_BUILD_COMMIT="$(git rev-parse HEAD)" cargo build --release -p motor-runner --locked
 target/release/motor-runner --version
 ```
 

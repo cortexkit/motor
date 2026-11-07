@@ -200,7 +200,7 @@ binary it replaces as `sccache-0.18.0-stock`, and prints both hashes. See
 Build on the server, or on another x86_64 Linux host with the same Rust version:
 
 ```sh
-cargo build --release -p motor-runner --locked
+MOTOR_BUILD_COMMIT="$(git rev-parse HEAD)" cargo build --release -p motor-runner --locked
 target/release/motor-runner --version
 ```
 
@@ -265,7 +265,11 @@ stay up (`loginctl enable-linger <operator>`).
 | `--boat-profile` | absent | Explicit single-tenant Boat compatibility for systemd 255: omit unsupported PrivatePIDs, retain other isolation and add CPU/PID ceilings. Do not enable it to bypass missing PID isolation on an ordinary build server; the default profile refuses unsupported systemd. See `script/boat-image/README.md`. |
 | `--drain-timeout-s N` | 1800 | Deadline for a SIGUSR1-initiated drain. |
 
-`motor-runner --version` prints the version. Other subcommands are `connect`
+`motor-runner --version` prints `<version> (<commit>)`. Release builders set the
+optional compile-time `MOTOR_BUILD_COMMIT` to the full SHA of the checkout being
+built; without it the suffix is `(unknown commit)`. Cargo does not query Git at
+build time, and unrelated CI variables do not supply the commit.
+Other subcommands are `connect`
 (the SSH bridge `ck-motor` runs), `drain` and `resume`
 ([drain-and-rollback.md](drain-and-rollback.md)), and two that open no state:
 `check-options <serve options>`, which runs the option parsing and the checks

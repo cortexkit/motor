@@ -1313,9 +1313,12 @@ class AptInstallTests(unittest.TestCase):
             stack.enter_context(patch.object(install.parity.seed, 'install', return_value={}))
             stack.enter_context(patch.object(install.parity, 'check', return_value={'passed': True}))
             stack.enter_context(patch.object(install.root_paths, 'require', return_value={}))
+            build_commits = []
             def execute(*command, **kwargs):
                 if command[:3] == ('git', '-C', str(install.ROOT)):
                     return 'abc' if command[3] == 'rev-parse' else ''
+                if command[:2] == ('cargo', 'build'):
+                    build_commits.append(install.os.environ.get('MOTOR_BUILD_COMMIT'))
                 if command[:2] == ('systemctl', 'show'):
                     return '255.4'
                 if command == ('systemd-analyze', 'cat-config', 'systemd/journald.conf'):
@@ -1330,6 +1333,7 @@ class AptInstallTests(unittest.TestCase):
                 install.main()
             inventory = json.loads((root / 'var/lib/motor-boat/inventory.json').read_text())
         self.assertEqual(inventory['apt_held_packages'], {'openssh-server': '1:9.6p1-3ubuntu13.8'})
+        self.assertEqual(build_commits, ['abc'])
         command = next(call.args for call in run.call_args_list if call.args[:2] == ('apt-get', 'install'))
         self.assertNotIn('openssh-server', command)
         self.assertIn('musl-tools', command)

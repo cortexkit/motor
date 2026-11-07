@@ -63,6 +63,7 @@ mkdir -p script/tenant-vm-spike/.work script/tenant-vm-spike/.results
 export CARGO_TARGET_DIR="$PWD/script/tenant-vm-spike/.work/cargo-target"
 env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
   RUSTC_WRAPPER= CARGO_BUILD_RUSTC_WRAPPER= \
+  MOTOR_BUILD_COMMIT="$(git rev-parse HEAD)" \
   cargo build --release --locked -p motor-runner -j4
 CC=gcc-13 JOBS=4 bash script/tenant-vm-spike/build-kernel.sh \
   "$PWD/script/tenant-vm-spike/.work/kernel"

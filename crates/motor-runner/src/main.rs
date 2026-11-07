@@ -716,7 +716,14 @@ fn version_requested(args: &[String]) -> bool {
 }
 
 fn binary_version() -> &'static str {
-    concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")")
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        format!(
+            "{} ({})",
+            env!("CARGO_PKG_VERSION"),
+            option_env!("MOTOR_BUILD_COMMIT").unwrap_or("unknown commit")
+        )
+    })
 }
 
 #[cfg(test)]
@@ -966,8 +973,11 @@ mod tests {
         assert!(version_requested(&["--version".into()]));
         assert!(!version_requested(&[]));
         assert!(!version_requested(&["--version".into(), "extra".into()]));
-        assert!(binary_version().starts_with(concat!(env!("CARGO_PKG_VERSION"), " (")));
-        assert!(binary_version().ends_with(')'));
+        let commit = option_env!("MOTOR_BUILD_COMMIT").unwrap_or("unknown commit");
+        assert_eq!(
+            binary_version(),
+            format!("{} ({commit})", env!("CARGO_PKG_VERSION"))
+        );
     }
 }
 

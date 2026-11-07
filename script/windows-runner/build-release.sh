@@ -19,6 +19,8 @@ cargo xwin --version
 python3 script/windows-runner/cache-manifest.py "$XWIN_CACHE_DIR" .cortexkit/internal-docs/investigations/ally-windows-sdk-sha256.json script/runner/toolchain.json
 rustc --version
 cargo --version
+MOTOR_BUILD_COMMIT=$(git rev-parse HEAD)
+export MOTOR_BUILD_COMMIT
 cargo xwin build --release --locked --offline --target x86_64-pc-windows-msvc -p motor-runner
 cargo xwin build --release --locked --offline --target x86_64-pc-windows-msvc --manifest-path crates/motor-winagent/Cargo.toml --features hyperv-runner
 python3 - <<'PY'

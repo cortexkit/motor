@@ -111,7 +111,7 @@ fast() {
   "$python" script/boat-image/test_boat_image.py RecipeTests.test_pins_match_real_runner_inputs || return
   "$python" script/tenant-image/test_tenant_image.py ImageTests.test_pins_cover_real_runner_inputs || return
   local check
-  for check in test-binary-fold unreachable-modules test-dev-binaries test-scratch subc-daemon-env; do
+  for check in no-build-scripts test-binary-fold unreachable-modules test-dev-binaries test-scratch subc-daemon-env; do
     "$python" "scripts/$check.py" || return
   done
 }

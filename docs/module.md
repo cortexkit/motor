@@ -16,7 +16,7 @@ components. They do not ship in this repository.
 - Module ID `ck-motor`, installed as a reserved module, not a shell-accessible
   provider.
 - Program: the absolute installed path of the `ck-motor` binary, built with
-  `cargo build --release -p motor-module --bin ck-motor --locked`. Do not point
+  `scripts/build-ck-motor-card.sh`. Do not point
   the placement at a binary inside a development checkout.
 - Arguments: `--subc <daemon-connection-file>`, and optionally
   `--config <JSONC file>`. `CK_MOTOR_CONFIG` names the config file when
@@ -33,6 +33,16 @@ components. They do not ship in this repository.
   0.32.4 with subc-protocol 0.33.0, subc-transport 0.14.0 and subc-os 0.1.19.
   Install through the ck-motor card placed by SubC; replacing the binary does
   not upgrade an older daemon's protocol support.
+
+The card build helper fetches `origin`, requires a clean checkout whose HEAD is
+reachable from `origin/main` (older mainline commits are allowed for rollbacks),
+and builds for the host. It prints the commit, whether it is the mainline tip,
+the binary path and its SHA-256. Signing and staging the card remain manual.
+It sets `MOTOR_BUILD_COMMIT` to the full Git SHA for `--version`, and supplies
+`CK_BUILD_GIT_SHA`, `CK_BUILD_GIT_STATUS` (`clean`) and `CK_BUILD_LOCK_DIGEST`
+(the SHA-256 of the workspace `Cargo.lock`) for manifest provenance. No Cargo
+build script derives these facts. Direct development builds without these
+variables report `unknown commit` and the existing unknown manifest provenance.
 
 `ck-motor --ck-domain` prints one line for the `ck` launcher, and
 `ck motor run` (`ck-motor run`) submits one job from a script,

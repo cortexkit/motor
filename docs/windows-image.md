@@ -215,7 +215,7 @@ the standing build VM (`windows-build-vm.service`, a long-lived VM for manual
 Windows work that shares the VM slot) stopped:
 
 ```sh
-cargo build -p motor-runner --bin motor-runner --release --locked
+MOTOR_BUILD_COMMIT="$(git rev-parse HEAD)" cargo build -p motor-runner --bin motor-runner --release --locked
 MOTOR_WINDOWS_VM_CONFIG=/srv/build/motor-windows/windows/vm.toml \
 MOTOR_RUNNER_BINARY="$PWD/target/release/motor-runner" \
   cargo nextest run -p motor-runner --lib --locked --run-ignored only \

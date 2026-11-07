@@ -46,7 +46,7 @@ NEEDRESTART
   trap - EXIT
 fi
 sudo -n apt-get update
-# Workspace build.rs files invoke rustc and hash Cargo.lock, with no generators.
+# Workspace crates have no build scripts; release builders supply Git provenance.
 # Bundled SQLite/crypto dependencies need the C toolchain. unzip is required by
 # Bun's installer; xz and CA certificates are required by toolchain downloads.
 # musl-tools supplies musl-gcc to compile the ring crate's C code for the static tenant runner.

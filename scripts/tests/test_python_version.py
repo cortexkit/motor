@@ -7,6 +7,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = (
+    "scripts/no-build-scripts.py",
     "scripts/unreachable-modules.py",
     "scripts/test-scratch.py",
     "scripts/subc-daemon-env.py",

@@ -35,7 +35,7 @@ class GateTests(unittest.TestCase):
         self.put(".gitignore", (ROOT / ".gitignore").read_text())
         self.put("scripts/gate.sh", (ROOT / "scripts/gate.sh").read_text())
         self.put("scripts/check-cortexkit-layout.sh", (ROOT / "scripts/check-cortexkit-layout.sh").read_text())
-        for name in ("test-binary-fold", "unreachable-modules", "test-dev-binaries", "test-scratch", "subc-daemon-env"):
+        for name in ("no-build-scripts", "test-binary-fold", "unreachable-modules", "test-dev-binaries", "test-scratch", "subc-daemon-env"):
             self.put(f"scripts/{name}.py", "print('safety check')\n")
         self.put("crates/motor-protocol/tests/generate_vectors.py", "print('vectors checked')\n")
         for name in ("script/runner/test_toolchain_parity.py", "script/boat-image/test_boat_image.py",
@@ -119,6 +119,15 @@ if os.environ.get('EXECUTE_REMOTE'):
         self.assertIn("gate fast FAIL", result.stdout)
         self.assertEqual(self.commands("ck"), [])
         self.assertFalse(self.lanes.exists())
+
+    def test_fast_refuses_build_scripts_before_submission(self):
+        self.put("scripts/no-build-scripts.py", (ROOT / "scripts/no-build-scripts.py").read_text())
+        self.put("crates/example/build.rs", "fn main() {}\n")
+        result = self.run_gate("--fast")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("per checkout path and per commit", result.stderr)
+        self.assertIn("gate fast FAIL", result.stdout)
+        self.assertEqual(self.commands("ck"), [])
 
     def test_all_remote_lanes_start_in_parallel_and_report_failure(self):
         result = self.run_gate(EXPECT_PARALLEL="6", FAIL_LANE="windows-clippy")

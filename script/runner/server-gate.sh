@@ -27,6 +27,8 @@ export PATH=/srv/build/cargo-home/bin:/home/ubuntu/.bun/bin:/usr/local/bin:/usr/
 export MOTOR_READER_SCCACHE_SIZE_GIB=200
 # The operator's Git config injection would change test behavior (AGENTS.md).
 unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+MOTOR_BUILD_COMMIT=$(git rev-parse HEAD) || exit 1
+export MOTOR_BUILD_COMMIT
 
 status=0
 step() {
@@ -74,7 +76,7 @@ done
 step operator-it cargo nextest run -p motor-runner --test it --locked --run-ignored only \
   -E 'test(serve_writes_its_tracing_events_to_stderr) | test(/::isolated_/)' --no-fail-fast
 step mixed-version python3 scripts/mixed-version.py
-for gate in subc-daemon-env test-binary-fold test-dev-binaries test-scratch unreachable-modules; do
+for gate in no-build-scripts subc-daemon-env test-binary-fold test-dev-binaries test-scratch unreachable-modules; do
   step "$gate" python3 "scripts/$gate.py"
 done
 step script-tests python3 scripts/run-script-tests.py
