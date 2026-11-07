@@ -27,6 +27,20 @@ struct Candidate {
     snapshot: bool,
 }
 
+#[derive(Default)]
+struct PressurePass {
+    periodic: bool,
+    evictions: u64,
+    bytes_freed: u64,
+}
+
+impl PressurePass {
+    fn record(&mut self, bytes: u64) {
+        self.evictions += 1;
+        self.bytes_freed = self.bytes_freed.saturating_add(bytes);
+    }
+}
+
 /// Approximate allocated sizes for ranking, refreshed when a workspace becomes
 /// idle. They are not evidence of how many bytes a deletion will actually free.
 #[derive(Clone, Copy, Default)]
@@ -362,6 +376,7 @@ impl Runner {
         candidate: &Candidate,
         pass: u8,
         repair_incomplete: bool,
+        report: Option<&mut PressurePass>,
     ) -> io::Result<bool> {
         #[cfg(target_os = "linux")]
         self.core.config.source_seals.check_host(&candidate.path)?;
@@ -449,8 +464,17 @@ impl Runner {
         }
         let after = allocated_bytes(&target, device)?;
         self.measure_build_candidate(&claimed);
-        tracing::info!(path = %target.display(), bytes_before = before, bytes_after = after,
-            bytes_freed = before.saturating_sub(after), pass, "runner build folder reclaim");
+        let bytes_freed = before.saturating_sub(after);
+        let periodic = report.as_ref().is_some_and(|report| report.periodic);
+        if let Some(report) = report {
+            if bytes_freed > 0 {
+                report.record(bytes_freed);
+            }
+        }
+        if !periodic {
+            tracing::info!(path = %target.display(), bytes_before = before, bytes_after = after,
+                bytes_freed, pass, "runner build folder reclaim");
+        }
         Ok(true)
     }
 
@@ -463,7 +487,7 @@ impl Runner {
                 return Ok(());
             };
             self.measure_build_candidate(&candidate);
-            if !self.trim_build_folder(&candidate, 0, true)? {
+            if !self.trim_build_folder(&candidate, 0, true, None)? {
                 return Ok(());
             }
             self.core
@@ -570,7 +594,7 @@ impl Runner {
                         return Ok(());
                     }
                     drop(inner);
-                    if self.trim_build_folder(&candidate, 1, true)? {
+                    if self.trim_build_folder(&candidate, 1, true, None)? {
                         self.core
                             .inner
                             .lock()
@@ -627,6 +651,7 @@ impl Runner {
         soft: u64,
         floor: u64,
         free: &mut u64,
+        report: &mut PressurePass,
     ) -> io::Result<()> {
         let candidates = self.disk_candidates(&self.core.inner.lock().unwrap())?;
         let mut candidates: Vec<_> = candidates
@@ -673,7 +698,7 @@ impl Runner {
             {
                 continue;
             }
-            if let Err(error) = self.trim_build_folder(&candidate, pass, pass == 2) {
+            if let Err(error) = self.trim_build_folder(&candidate, pass, pass == 2, Some(report)) {
                 self.back_off_build_folder(candidate.workspace.as_ref().unwrap(), pass);
                 tracing::warn!(path = %candidate.path.display(), pass, %error, "runner build folder reclaim failed");
             }
@@ -1373,6 +1398,7 @@ impl Runner {
         candidate: &Candidate,
         deleted: io::Result<u64>,
         cache_cleared: bool,
+        report: &mut PressurePass,
     ) {
         let disappeared = deleted.is_err()
             && matches!(
@@ -1408,8 +1434,11 @@ impl Runner {
                     last_used_ms: candidate.last_used_ms,
                     evicted_ms: self.now(),
                 };
-                tracing::info!(path = %eviction.path, bytes, bytes_freed = bytes, pass = 3,
-                    last_used_ms = eviction.last_used_ms, evicted_ms = eviction.evicted_ms, "runner disk eviction");
+                report.record(bytes);
+                if !report.periodic {
+                    tracing::info!(path = %eviction.path, bytes, bytes_freed = bytes, pass = 3,
+                        last_used_ms = eviction.last_used_ms, evicted_ms = eviction.evicted_ms, "runner disk eviction");
+                }
                 self.core
                     .health
                     .lock()
@@ -1748,7 +1777,7 @@ impl Runner {
             .as_ref()
             .map(|_| ())
             .map_err(|error| io::Error::new(error.kind(), error.to_string()));
-        self.record_disk_removal(&candidate, deleted, false);
+        self.record_disk_removal(&candidate, deleted, false, &mut PressurePass::default());
         result?;
         (self.core.config.boat_storage_trim)()
     }
@@ -1761,6 +1790,16 @@ impl Runner {
         sweep_idle_workspaces: bool,
     ) -> io::Result<Option<RunnerDiskFull>> {
         let _pressure = self.core.disk.lock().unwrap();
+        self.reclaim_disk_space_in_pass(sweep_idle_workspaces, &mut PressurePass::default())
+    }
+
+    /// The caller owns the disk claim, not the state lock. Admission waits for
+    /// that claim; the timer skips a turn when another pressure pass owns it.
+    fn reclaim_disk_space_in_pass(
+        &self,
+        sweep_idle_workspaces: bool,
+        report: &mut PressurePass,
+    ) -> io::Result<Option<RunnerDiskFull>> {
         #[cfg(unix)]
         if self.core.config.macos_instance() {
             return crate::macos::evict(&self.core.config, self.core.trees.mirrors.clone());
@@ -1812,7 +1851,7 @@ impl Runner {
         let device = crate::filesystem::device(&self.core.trees.state)?;
         if !sweep_idle_workspaces && !self.core.config.vm_instance() {
             for pass in [1, 2] {
-                self.reclaim_build_pass(pass, soft, floor, &mut free)?;
+                self.reclaim_build_pass(pass, soft, floor, &mut free, report)?;
                 if free >= soft {
                     return Ok(None);
                 }
@@ -1943,7 +1982,7 @@ impl Runner {
                     Ok(Some(bytes)) => Ok(bytes),
                     Err(error) => Err(error),
                 };
-                self.record_disk_removal(&candidate, deleted, false);
+                self.record_disk_removal(&candidate, deleted, false, report);
                 free = probe()?;
                 if free >= soft && !sweep_idle_workspaces && !self.core.config.boat_profile {
                     self.core.health.lock().unwrap().record(self.now(), |c| {
@@ -2101,7 +2140,7 @@ impl Runner {
                 }
                 Ok(bytes)
             });
-            self.record_disk_removal(&candidate, deleted, cache_cleared);
+            self.record_disk_removal(&candidate, deleted, cache_cleared, report);
             free = probe()?;
             if free >= soft && !sweep_idle_workspaces && !self.core.config.boat_profile {
                 self.core.health.lock().unwrap().record(self.now(), |c| {
@@ -2128,20 +2167,24 @@ impl Runner {
                 c.soft_goal_unmet_passes += 1;
                 c.skipped_recent += skipped_recent.len() as u64;
             });
-            tracing::info!(
-                free_bytes = free,
-                floor_bytes = floor,
-                soft_bytes = soft,
-                skipped_recent_candidates = skipped_recent.len(),
-                "runner disk soft goal unmet; admitting above hard floor"
-            );
+            if !report.periodic {
+                tracing::info!(
+                    free_bytes = free,
+                    floor_bytes = floor,
+                    soft_bytes = soft,
+                    skipped_recent_candidates = skipped_recent.len(),
+                    "runner disk soft goal unmet; admitting above hard floor"
+                );
+            }
             return Ok(None);
         }
-        tracing::warn!(
-            free_bytes = free,
-            floor_bytes = floor,
-            "runner_disk_full; refusing before start"
-        );
+        if !report.periodic {
+            tracing::warn!(
+                free_bytes = free,
+                floor_bytes = floor,
+                "runner_disk_full; refusing before start"
+            );
+        }
         Ok(Some(RunnerDiskFull {
             free_bytes: free,
             floor_bytes: floor,
@@ -2153,24 +2196,73 @@ impl Runner {
 /// dropped under the admission floor.
 pub(super) const DISK_UPKEEP_INTERVAL: Duration = Duration::from_secs(10);
 
+pub(super) const DISK_PRESSURE_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Whether a failed write ran out of space (ENOSPC).
 pub(super) fn storage_full(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::StorageFull
 }
 
 impl Runner {
+    /// Reclaim ordinary pressure independently of admissions, including while
+    /// drained or running jobs. Workspaces and siblings in use or being
+    /// prepared or admitted stay protected, as do referenced sibling snapshots.
+    /// Unresolved quarantined ownership blocks cleanup just as at admission.
+    pub(super) fn periodic_disk_pressure(&self) -> io::Result<()> {
+        if !self.periodic_disk_pressure_enabled() {
+            return Ok(());
+        }
+        let Ok(_pressure) = self.core.disk.try_lock() else {
+            return Ok(());
+        };
+        let probe = || (self.core.config.free_space_probe)(&self.core.trees.state);
+        let before = probe()?;
+        let goal = self
+            .core
+            .config
+            .free_space_eviction_bytes
+            .unwrap_or_else(|| self.core.config.free_space_floor_bytes.saturating_mul(2));
+        if before >= goal {
+            return Ok(());
+        }
+        let mut report = PressurePass {
+            periodic: true,
+            ..PressurePass::default()
+        };
+        let result = self.reclaim_disk_space_in_pass(false, &mut report);
+        if report.evictions > 0 {
+            let after = probe()?;
+            tracing::info!(
+                bytes_freed = report.bytes_freed,
+                evictions = report.evictions,
+                free_bytes_before = before,
+                free_bytes_after = after,
+                "runner periodic disk reclaim"
+            );
+        }
+        result.map(|_| ())
+    }
+
+    pub(super) fn periodic_disk_pressure_enabled(&self) -> bool {
+        // Boat retains reserve upkeep; macOS VMs have their own fixed
+        // thresholds and admission-time cleanup in macos::evict.
+        !self.core.config.boat_profile
+            && !self.core.config.macos_instance()
+            && (self.core.config.tenant_vm || self.core.config.free_space_eviction_bytes.is_some())
+    }
+
     fn disk_reserve_path(&self) -> PathBuf {
         self.core.trees.state.join("disk-reserve")
     }
 
     /// Keeps a runner that reserves disk (the Boat profile) able to admit a job
-    /// without waiting for one to arrive. Admission is the only other place
-    /// that evicts, and in a Boat sandbox nothing reaches admission while the
-    /// disk is full: the endpoint's journal shares this disk and the endpoint
-    /// withdraws its readiness below the floor. So when no job is live and free
-    /// space is under the floor, this runs the ordinary pressure pass, which
-    /// below the floor may evict any idle workspace, including the one the last
-    /// job used. Once free space is back above the floor, it recreates the disk
+    /// without waiting for one to arrive. In a Boat sandbox nothing reaches
+    /// admission while the disk is full: the endpoint's journal shares this
+    /// disk and the endpoint withdraws its readiness below the floor. So when
+    /// no job is live and free space is under the floor, this runs the ordinary
+    /// pressure pass, which may evict any idle workspace below the floor,
+    /// including the one the last job used. Once free space is back above the
+    /// floor, it recreates the disk
     /// reserve if a full disk used it up.
     pub(crate) fn disk_upkeep(&self) -> io::Result<()> {
         let floor = self.core.config.free_space_floor_bytes;

@@ -219,6 +219,23 @@ is permanently reserved. Tests: `capped_head_allows_backfill_only_until_its_grac
 The runner checks free space on the filesystem holding its state before it
 accepts an upload, and again before setup.
 
+Tenant runners and other runners with `--free-space-eviction-bytes` set also
+run the ordinary pressure pass every 30 seconds when below their eviction
+goal, including while jobs run and during a drain. Running, queued, reserved,
+admitting and preparing workspaces and the sibling repositories they check out
+stay protected, as do sibling snapshots referenced by those jobs, reservations,
+admissions or preparations, with the same quarantine ownership checks as at
+admission.
+An overlapping pressure pass skips the timer turn. Passes that evict nothing
+stay quiet; otherwise one summary records bytes freed, eviction count and free
+space before and after. Boat retains its separate reserve-file upkeep; macOS
+VM runners retain their fixed thresholds and admission-time cleanup instead
+of the timer.
+Tests: `periodic_disk_pressure_evicts_idle_workspaces_while_a_job_runs_without_admission`,
+`periodic_disk_pressure_keeps_reclaiming_during_drain`,
+`periodic_disk_pressure_does_nothing_at_or_above_goal`,
+`periodic_disk_pressure_skips_a_busy_pass`.
+
 A workspace served through a caller root is checked and evicted on the
 filesystem its host directory lives on, not on the caller's `/home`, which the
 runner never writes. Admission and eviction decisions are otherwise identical,

@@ -215,7 +215,13 @@ must stay at or above that runner's refusal floor, where the runner starts
 refusing jobs. Otherwise provisioning refuses with "would leave X GiB free ...
 below motor-runner pid N's refusal floor Y GiB". Between the floor and the
 eviction threshold the runner evicts idle workspaces, least recently used
-first, sooner than it would without the tenant. Pass `--tenant-disk-quota-gib`
+first, sooner than it would without the tenant. Besides admission-time cleanup,
+tenant runners and other runners with `--free-space-eviction-bytes` set check
+every 30 seconds and reclaim below their eviction goal, even while jobs are
+running or the runner is drained. Running and queued workspaces and other live
+claims retain the same protections as at admission. Boat keeps its separate
+reserve-file upkeep, and macOS VM runners keep their fixed thresholds and
+admission-time cleanup instead of the timer. Pass `--tenant-disk-quota-gib`
 at a first install to change the disk size.
 
 The guest advertises

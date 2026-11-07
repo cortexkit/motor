@@ -21,6 +21,163 @@ fn config(f: &Fixture, probe: impl Fn(&Path) -> io::Result<u64> + Send + Sync + 
     c
 }
 
+#[derive(Clone, Default)]
+struct PressureLogs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for PressureLogs {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn pressure_logs(f: impl FnOnce()) -> String {
+    let bytes = PressureLogs::default();
+    tracing::subscriber::with_default(
+        motor_protocol::logging::LineSubscriber::new("[runner]", bytes.clone()),
+        f,
+    );
+    let captured = bytes.0.lock().unwrap().clone();
+    String::from_utf8(captured).unwrap()
+}
+
+#[test]
+fn periodic_disk_pressure_evicts_idle_workspaces_while_a_job_runs_without_admission() {
+    let f = Fixture::new();
+    let root = f.scratch.join("remote/worktrees");
+    let running = root.join("running");
+    let idle = [root.join("old-idle"), root.join("new-idle")];
+    let reclaim = idle.clone();
+    let mut c = config(&f, move |_| {
+        Ok(if reclaim.iter().any(|path| path.exists()) {
+            250
+        } else {
+            350
+        })
+    });
+    c.tenant_vm = true;
+    c.free_space_eviction_bytes = Some(350);
+    c.manual_tick = true;
+    let runner = Runner::open(c).unwrap();
+    let now = runner.now();
+    workspace(&runner, &running, now - 3 * 60 * 60 * 1000);
+    for (path, age) in idle.iter().zip([2, 1]) {
+        workspace(&runner, path, now - age * 60 * 60 * 1000);
+    }
+    let (mut request, _) = f.run("true");
+    request.workspace_key = text(&running).into();
+    request.cwd = text(&running).into();
+    let mut job = Job::new(request.job_id, Some(request), now, 1, 1);
+    job.state = JobState::Running;
+    runner.core.inner.lock().unwrap().jobs.insert(job.id, job);
+
+    let output = pressure_logs(|| runner.periodic_disk_pressure().unwrap());
+
+    assert!(
+        idle.iter().all(|path| !path.exists()),
+        "the timer must evict idle workspaces without a new admission"
+    );
+    assert!(running.join("target/artifact").exists());
+    let status = runner.runner_status();
+    assert_eq!(status.disk.unwrap().free_bytes, Some(350));
+    let counts = status.health.unwrap().counts;
+    assert_eq!(counts.accepted, 0);
+    assert_eq!(counts.evictions, 2);
+    assert!(counts.eviction_bytes >= 2 * 8192);
+    assert_eq!(output.lines().count(), 1, "{output}");
+    for field in [
+        "runner periodic disk reclaim",
+        "bytes_freed=",
+        "evictions=2",
+        "free_bytes_before=250",
+        "free_bytes_after=350",
+    ] {
+        assert!(output.contains(field), "{output}");
+    }
+}
+
+#[test]
+fn periodic_disk_pressure_keeps_reclaiming_during_drain() {
+    let f = Fixture::new();
+    let idle = f.scratch.join("remote/worktrees/idle");
+    let reclaim = idle.clone();
+    let mut c = config(&f, move |_| Ok(if reclaim.exists() { 150 } else { 350 }));
+    c.free_space_eviction_bytes = Some(350);
+    c.manual_tick = true;
+    let runner = Runner::open(c).unwrap();
+    workspace(&runner, &idle, runner.now() - 60 * 60 * 1000);
+    runner.begin_drain(Duration::from_secs(60), false);
+    assert!(runner.is_draining());
+
+    runner.periodic_disk_pressure().unwrap();
+
+    assert!(!idle.exists());
+    assert!(runner.is_draining());
+    assert_eq!(runner.runner_status().health.unwrap().counts.evictions, 1);
+}
+
+#[test]
+fn periodic_disk_pressure_does_nothing_at_or_above_goal() {
+    let f = Fixture::new();
+    let free = Arc::new(AtomicU64::new(400));
+    let probe = free.clone();
+    let mut c = config(&f, move |_| Ok(probe.load(Ordering::SeqCst)));
+    c.tenant_vm = true;
+    c.free_space_eviction_bytes = Some(350);
+    c.manual_tick = true;
+    let runner = Runner::open(c).unwrap();
+    let idle = f.scratch.join("remote/worktrees/idle");
+    workspace(&runner, &idle, runner.now() - 60 * 60 * 1000);
+
+    for available in [400, 350] {
+        free.store(available, Ordering::SeqCst);
+        let output = pressure_logs(|| runner.periodic_disk_pressure().unwrap());
+        assert!(output.is_empty(), "{output}");
+        assert!(idle.join("target/artifact").exists());
+        assert_eq!(runner.runner_status().health.unwrap().counts.evictions, 0);
+    }
+}
+
+#[test]
+fn periodic_disk_pressure_stays_quiet_when_only_recent_workspaces_remain() {
+    let f = Fixture::new();
+    let mut c = config(&f, |_| Ok(150));
+    c.free_space_eviction_bytes = Some(350);
+    c.manual_tick = true;
+    let runner = Runner::open(c).unwrap();
+    let recent = f.scratch.join("remote/worktrees/recent");
+    workspace(&runner, &recent, runner.now());
+
+    let output = pressure_logs(|| runner.periodic_disk_pressure().unwrap());
+
+    assert!(recent.join("target/artifact").exists());
+    assert!(output.is_empty(), "{output}");
+    assert_eq!(runner.runner_status().health.unwrap().counts.evictions, 0);
+}
+
+#[test]
+fn periodic_disk_pressure_skips_a_busy_pass() {
+    let f = Fixture::new();
+    let idle = f.scratch.join("remote/worktrees/idle");
+    let reclaim = idle.clone();
+    let mut c = config(&f, move |_| Ok(if reclaim.exists() { 150 } else { 200 }));
+    c.tenant_vm = true;
+    c.manual_tick = true;
+    let runner = Runner::open(c).unwrap();
+    workspace(&runner, &idle, runner.now() - 60 * 60 * 1000);
+
+    let pressure = runner.core.disk.lock().unwrap();
+    runner.periodic_disk_pressure().unwrap();
+    assert!(idle.exists());
+    drop(pressure);
+    runner.periodic_disk_pressure().unwrap();
+    assert!(!idle.exists());
+}
+
 #[test]
 fn disk_eviction_skips_reserved_and_running_workspaces() {
     let f = Fixture::new();

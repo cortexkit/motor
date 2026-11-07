@@ -2824,6 +2824,29 @@ impl Runner {
                 }
             });
         }
+        if runner.periodic_disk_pressure_enabled() {
+            let interval = disk::DISK_PRESSURE_INTERVAL;
+            let weak = Arc::downgrade(&runner.core);
+            std::thread::spawn(move || {
+                let mut next = std::time::Instant::now() + interval;
+                loop {
+                    std::thread::sleep(next.saturating_duration_since(std::time::Instant::now()));
+                    let Some(core) = weak.upgrade() else {
+                        break;
+                    };
+                    let runner = Runner { core };
+                    if let Err(error) = runner.periodic_disk_pressure() {
+                        tracing::warn!(%error, "runner periodic disk reclaim failed");
+                    }
+                    drop(runner);
+                    // A slow pass skips elapsed turns rather than queueing
+                    // another cleanup behind itself.
+                    while next <= std::time::Instant::now() {
+                        next += interval;
+                    }
+                }
+            });
+        }
         let weak = Arc::downgrade(&runner.core);
         std::thread::spawn(move || loop {
             let Some(core) = weak.upgrade() else {
