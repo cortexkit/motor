@@ -1247,3 +1247,59 @@ fn javascript_snapshot_failed_rebuild_is_rate_limited_and_keeps_warning() {
         ["warning: failed locked install\n"]
     );
 }
+
+#[test]
+fn javascript_snapshot_retry_build_failure_reuses_marked_generation() {
+    let f = Fixture::new("snapshot-js-retry-build-failed");
+    let (commit, tree) = f.commit(&[("source", "verified sources")]);
+    let key = f.key(&commit, &commit);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let calls = attempts.clone();
+    let warning = "warning: failed locked install\n".to_string();
+    let expected = warning.clone();
+    let store = SnapshotStore {
+        javascript_override: Some(Arc::new(move |temporary| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(vec![warning.clone()])
+            } else {
+                fs::write(temporary.join("partial-retry"), "incomplete").unwrap();
+                Err(io::Error::other("injected retry storage failure"))
+            }
+        })),
+        ..Default::default()
+    };
+    let original = f.resolve(&store, &key, &tree).unwrap();
+    let mut metadata = read_metadata(&original).unwrap();
+    metadata.javascript_retry.as_mut().unwrap().attempted =
+        SystemTime::now() - JAVASCRIPT_RETRY_INTERVAL - Duration::from_secs(1);
+    atomic_json(&metadata_path(&original), &metadata).unwrap();
+
+    let retry_started = SystemTime::now();
+    let reused = f.resolve(&store, &key, &tree).unwrap();
+    assert_eq!(reused, original);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let retry = read_metadata(&original).unwrap().javascript_retry.unwrap();
+    assert!(
+        retry.attempted >= retry_started,
+        "a failed rebuild must retain its new attempt time"
+    );
+    assert_eq!(retry.warnings, std::slice::from_ref(&expected));
+    #[cfg(target_os = "linux")]
+    assert_eq!(javascript_warnings(&reused).unwrap(), [expected]);
+    assert_eq!(
+        entries(&f.snapshots()),
+        published(&original),
+        "no retry generation or temporary may survive"
+    );
+    assert_eq!(
+        fs::read_to_string(original.join("source")).unwrap(),
+        "verified sources"
+    );
+    assert!(!original.join("partial-retry").exists());
+    assert_eq!(f.resolve(&store, &key, &tree).unwrap(), original);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "a failed rebuild must wait another ten minutes"
+    );
+}

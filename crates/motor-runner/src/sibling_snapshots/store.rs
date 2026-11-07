@@ -322,10 +322,16 @@ impl SnapshotStore {
                             atomic_json(&metadata_path(&directory), &metadata)?;
                             // Never write dependencies into a published tree: a
                             // running job may still have that directory mounted.
-                            directory = key_directory.with_file_name(format!(
+                            let replacement = key_directory.with_file_name(format!(
                                 "{}-retry-{}", key.directory_name(), Uuid::now_v7()
                             ));
-                            self.create(config, trees, key, tree_hash, &directory, boot.as_deref())?;
+                            match self.create(config, trees, key, tree_hash, &replacement, boot.as_deref()) {
+                                Ok(()) => directory = replacement,
+                                // Rebuilding dependencies is optional while a
+                                // verified source generation is still usable.
+                                // Keep its recorded attempt time for backoff.
+                                Err(error) => tracing::warn!(key = %key_directory.display(), %error, "cannot rebuild sibling snapshot; reusing existing generation"),
+                            }
                         }
                     }
                     // The directory's mtime is its last-use time.
