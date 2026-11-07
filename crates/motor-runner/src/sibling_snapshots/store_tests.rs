@@ -1136,3 +1136,170 @@ fn snapshot_from_an_earlier_boot_is_checked_once_and_rebuilt_when_damaged() {
         .collect();
     assert_eq!(sources, std::slice::from_ref(broken_git));
 }
+
+#[test]
+fn javascript_failed_snapshot_reuses_warning_then_rebuilds_after_backoff() {
+    let f = Fixture::new("snapshot-js-retry");
+    let (commit, tree) = f.commit(&[("source", "verified sources")]);
+    let key = f.key(&commit, &commit);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let calls = attempts.clone();
+    let warning = format!("warning: JavaScript install failed for {} using bun.lock; running without installed dependencies: patch failed\n", f.repository);
+    let expected = warning.clone();
+    let store = SnapshotStore {
+        javascript_override: Some(Arc::new(move |temporary| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(vec![warning.clone()])
+            } else {
+                fs::create_dir_all(temporary.join("node_modules")).unwrap();
+                fs::write(temporary.join("node_modules/complete"), "installed").unwrap();
+                Ok(Vec::new())
+            }
+        })),
+        ..Default::default()
+    };
+    let first_job = f.resolve(&store, &key, &tree).unwrap();
+    assert_eq!(
+        read_metadata(&first_job)
+            .unwrap()
+            .javascript_retry
+            .as_ref()
+            .unwrap()
+            .warnings,
+        std::slice::from_ref(&expected)
+    );
+    assert!(!first_job.join("node_modules").exists());
+    let second_job = f.resolve(&store, &key, &tree).unwrap();
+    assert_eq!(second_job, first_job);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "reuse inside ten minutes must not rebuild"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(javascript_warnings(&second_job).unwrap(), [expected]);
+
+    let mut metadata = read_metadata(&first_job).unwrap();
+    metadata.javascript_retry.as_mut().unwrap().attempted =
+        SystemTime::now() - JAVASCRIPT_RETRY_INTERVAL - Duration::from_secs(1);
+    atomic_json(&metadata_path(&first_job), &metadata).unwrap();
+    let third_job = f.resolve(&store, &key, &tree).unwrap();
+    assert_ne!(
+        third_job, first_job,
+        "retry must publish an immutable replacement"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert!(read_metadata(&third_job)
+        .unwrap()
+        .javascript_retry
+        .is_none());
+    assert_eq!(
+        fs::read_to_string(third_job.join("node_modules/complete")).unwrap(),
+        "installed"
+    );
+    assert!(
+        !first_job.join("node_modules").exists(),
+        "an already running job keeps its original tree"
+    );
+    assert_eq!(
+        fs::read_to_string(first_job.join("source")).unwrap(),
+        "verified sources"
+    );
+    assert_eq!(f.resolve(&store, &key, &tree).unwrap(), third_job);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let restarted = SnapshotStore::default();
+    assert_eq!(
+        f.resolve(&restarted, &key, &tree).unwrap(),
+        third_job,
+        "generation selection survives runner restart"
+    );
+}
+
+#[test]
+fn javascript_snapshot_failed_rebuild_is_rate_limited_and_keeps_warning() {
+    let f = Fixture::new("snapshot-js-still-failed");
+    let (commit, tree) = f.commit(&[("source", "unchanged")]);
+    let key = f.key(&commit, &commit);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let calls = attempts.clone();
+    let store = SnapshotStore {
+        javascript_override: Some(Arc::new(move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec!["warning: failed locked install\n".into()])
+        })),
+        ..Default::default()
+    };
+    let first = f.resolve(&store, &key, &tree).unwrap();
+    let mut metadata = read_metadata(&first).unwrap();
+    metadata.javascript_retry.as_mut().unwrap().attempted =
+        SystemTime::now() - JAVASCRIPT_RETRY_INTERVAL - Duration::from_secs(1);
+    atomic_json(&metadata_path(&first), &metadata).unwrap();
+    let retried = f.resolve(&store, &key, &tree).unwrap();
+    assert_ne!(retried, first);
+    assert_eq!(f.resolve(&store, &key, &tree).unwrap(), retried);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        read_metadata(&retried)
+            .unwrap()
+            .javascript_retry
+            .unwrap()
+            .warnings,
+        ["warning: failed locked install\n"]
+    );
+}
+
+#[test]
+fn javascript_snapshot_retry_build_failure_reuses_marked_generation() {
+    let f = Fixture::new("snapshot-js-retry-build-failed");
+    let (commit, tree) = f.commit(&[("source", "verified sources")]);
+    let key = f.key(&commit, &commit);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let calls = attempts.clone();
+    let warning = "warning: failed locked install\n".to_string();
+    let expected = warning.clone();
+    let store = SnapshotStore {
+        javascript_override: Some(Arc::new(move |temporary| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(vec![warning.clone()])
+            } else {
+                fs::write(temporary.join("partial-retry"), "incomplete").unwrap();
+                Err(io::Error::other("injected retry storage failure"))
+            }
+        })),
+        ..Default::default()
+    };
+    let original = f.resolve(&store, &key, &tree).unwrap();
+    let mut metadata = read_metadata(&original).unwrap();
+    metadata.javascript_retry.as_mut().unwrap().attempted =
+        SystemTime::now() - JAVASCRIPT_RETRY_INTERVAL - Duration::from_secs(1);
+    atomic_json(&metadata_path(&original), &metadata).unwrap();
+
+    let retry_started = SystemTime::now();
+    let reused = f.resolve(&store, &key, &tree).unwrap();
+    assert_eq!(reused, original);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let retry = read_metadata(&original).unwrap().javascript_retry.unwrap();
+    assert!(
+        retry.attempted >= retry_started,
+        "a failed rebuild must retain its new attempt time"
+    );
+    assert_eq!(retry.warnings, std::slice::from_ref(&expected));
+    #[cfg(target_os = "linux")]
+    assert_eq!(javascript_warnings(&reused).unwrap(), [expected]);
+    assert_eq!(
+        entries(&f.snapshots()),
+        published(&original),
+        "no retry generation or temporary may survive"
+    );
+    assert_eq!(
+        fs::read_to_string(original.join("source")).unwrap(),
+        "verified sources"
+    );
+    assert!(!original.join("partial-retry").exists());
+    assert_eq!(f.resolve(&store, &key, &tree).unwrap(), original);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "a failed rebuild must wait another ten minutes"
+    );
+}

@@ -1,6 +1,6 @@
 //! Creation and publication of sibling snapshot directories.
 //!
-//! A snapshot of one key is built at most once: setups that need it take the
+//! A snapshot of one key is normally built once: setups that need it take the
 //! key's mutex, and the first one builds it while the others wait and then
 //! find it ready. Setups that need different keys, including two snapshots of
 //! one repository, build in parallel.
@@ -58,6 +58,18 @@ const METADATA_VERSION: u32 = 1;
 /// `<name>.tmp-<uuid>`. Final names contain no `.`.
 const TEMPORARY_MARKER: &str = ".tmp-";
 
+/// A source-only snapshot retains each install warning for every job that
+/// reuses it. Retrying can be expensive, so attempts are at least ten minutes
+/// apart. A retry publishes a new immutable generation: jobs already using
+/// the old directory keep it, and normal lease-aware eviction reclaims it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct JavascriptRetry {
+    attempted: SystemTime,
+    warnings: Vec<String>,
+}
+
+const JAVASCRIPT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// What the runner knows about a published snapshot. It lives in
 /// `<name>.json` beside the snapshot directory, never inside the tree that
 /// jobs see at the sibling's path.
@@ -78,6 +90,8 @@ pub(crate) struct Metadata {
     /// before this field existed, which counts as an earlier boot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    javascript_retry: Option<JavascriptRetry>,
 }
 
 impl Metadata {
@@ -90,6 +104,7 @@ impl Metadata {
             javascript_environment: key.javascript_environment.as_str().to_string(),
             tree_hash: tree_hash.to_string(),
             boot_id: None,
+            javascript_retry: None,
         }
     }
 
@@ -125,6 +140,21 @@ pub(crate) fn read_metadata(directory: &Path) -> io::Result<Metadata> {
     read_json(&metadata_path(directory))
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn javascript_warnings(directory: &Path) -> io::Result<Vec<String>> {
+    let metadata = match read_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    Ok(metadata
+        .javascript_retry
+        .map_or_else(Vec::new, |retry| retry.warnings))
+}
+
+#[cfg(test)]
+pub(crate) type JavascriptHook = Arc<dyn Fn(&Path) -> io::Result<Vec<String>> + Send + Sync>;
+
 /// The snapshots that snapshot creations are reading, and the snapshots that
 /// deletions have claimed. One mutex guards both, so a deletion can never
 /// claim a snapshot that a creation has started to copy, and a creation never
@@ -155,6 +185,8 @@ pub(crate) struct SnapshotStore {
     /// the directory away, with the key mutex held.
     #[cfg(test)]
     pub(crate) deletion_claimed: Option<TouchHook>,
+    #[cfg(test)]
+    pub(crate) javascript_override: Option<JavascriptHook>,
 }
 
 /// How one `SnapshotStore::delete` ended.
@@ -251,11 +283,12 @@ impl SnapshotStore {
                 ),
             ));
         }
-        let directory = key.directory(config);
+        let key_directory = key.directory(config);
         let boot = current_boot(config);
-        self.with_key_lock(&directory, || {
+        self.with_key_lock(&key_directory, || {
+            let mut directory = latest_generation(key, &key_directory)?;
             match existing(key, &directory)? {
-                Existing::Ready(metadata) if metadata.tree_hash == tree_hash => {
+                Existing::Ready(mut metadata) if metadata.tree_hash == tree_hash => {
                     if metadata.predates_boot(boot.as_deref()) {
                         // The first use since the host restarted: the files
                         // may not have reached the disk before it went down.
@@ -264,20 +297,40 @@ impl SnapshotStore {
                                 &metadata_path(&directory),
                                 &Metadata {
                                     boot_id: boot.clone(),
-                                    ..metadata
+                                    ..metadata.clone()
                                 },
                             )?,
                             Err(error) => {
                                 tracing::warn!(snapshot = %directory.display(), %error, "sibling snapshot from before the host restarted is damaged; recreating it");
                                 discard(&directory)?;
-                                return self.create(
+                                self.create(
                                     config,
                                     trees,
                                     key,
                                     tree_hash,
                                     &directory,
                                     boot.as_deref(),
-                                );
+                                )?;
+                                return Ok(directory);
+                            }
+                        }
+                    }
+                    if let Some(retry) = &mut metadata.javascript_retry {
+                        let now = SystemTime::now();
+                        if now.duration_since(retry.attempted).unwrap_or_default() >= JAVASCRIPT_RETRY_INTERVAL {
+                            retry.attempted = now;
+                            atomic_json(&metadata_path(&directory), &metadata)?;
+                            // Never write dependencies into a published tree: a
+                            // running job may still have that directory mounted.
+                            let replacement = key_directory.with_file_name(format!(
+                                "{}-retry-{}", key.directory_name(), Uuid::now_v7()
+                            ));
+                            match self.create(config, trees, key, tree_hash, &replacement, boot.as_deref()) {
+                                Ok(()) => directory = replacement,
+                                // Rebuilding dependencies is optional while a
+                                // verified source generation is still usable.
+                                // Keep its recorded attempt time for backoff.
+                                Err(error) => tracing::warn!(key = %key_directory.display(), %error, "cannot rebuild sibling snapshot; reusing existing generation"),
                             }
                         }
                     }
@@ -285,7 +338,7 @@ impl SnapshotStore {
                     if let Err(error) = stamp(&directory) {
                         tracing::warn!(snapshot = %directory.display(), %error, "cannot stamp sibling snapshot use");
                     }
-                    return Ok(());
+                    return Ok(directory);
                 }
                 Existing::Ready(metadata) => {
                     return Err(invalid(format!(
@@ -302,9 +355,9 @@ impl SnapshotStore {
                 }
                 Existing::Absent => {}
             }
-            self.create(config, trees, key, tree_hash, &directory, boot.as_deref())
-        })?;
-        Ok(directory)
+            self.create(config, trees, key, tree_hash, &directory, boot.as_deref())?;
+            Ok(directory)
+        })
     }
 
     /// Whether a creation in progress is copying `directory` as its
@@ -389,8 +442,18 @@ impl SnapshotStore {
 
     /// Runs `work` while holding the mutex of the snapshot at `directory`.
     pub(crate) fn with_key_lock<T>(&self, directory: &Path, work: impl FnOnce() -> T) -> T {
+        // Generations share their key's lock with resolve and deletion.
+        let key = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.rsplit_once("-retry-"))
+            .filter(|(_, generation)| Uuid::parse_str(generation).is_ok())
+            .map_or_else(
+                || directory.to_path_buf(),
+                |(base, _)| directory.with_file_name(base),
+            );
         let mutex = lock(&self.key_locks)
-            .entry(directory.to_path_buf())
+            .entry(key.clone())
             .or_default()
             .clone();
         let result = {
@@ -401,7 +464,7 @@ impl SnapshotStore {
         // Only the map and this call hold the mutex: nobody else holds or
         // waits for it, and nobody can obtain it without the map's lock.
         if Arc::strong_count(&mutex) == 2 {
-            locks.remove(directory);
+            locks.remove(&key);
         }
         result
     }
@@ -430,8 +493,8 @@ impl SnapshotStore {
         let source = predecessor.as_ref().map(|p| p.directory.clone());
         let result = self
             .build(config, trees, key, tree_hash, source.as_deref(), &temporary)
-            .and_then(|cloned| {
-                publish(key, tree_hash, boot, &temporary, directory).map(|()| cloned)
+            .and_then(|(cloned, warnings)| {
+                publish(key, tree_hash, boot, &temporary, directory, warnings).map(|()| cloned)
             });
         drop(predecessor);
         match result {
@@ -463,7 +526,7 @@ impl SnapshotStore {
         tree_hash: &str,
         predecessor: Option<&Path>,
         temporary: &Path,
-    ) -> io::Result<bool> {
+    ) -> io::Result<(bool, Vec<String>)> {
         let mut cloned = false;
         if let Some(source) = predecessor {
             match self.clone_tree(source, temporary) {
@@ -491,10 +554,17 @@ impl SnapshotStore {
             return Err(invalid(format!("sibling {}: {mismatch}", key.repository)));
         }
         dissociate(temporary, tree_hash)?;
-        install_javascript(config, key, tree_hash, temporary)?;
+        #[cfg(test)]
+        let warnings = if let Some(install) = &self.javascript_override {
+            install(temporary)?
+        } else {
+            install_javascript(config, key, tree_hash, temporary)?
+        };
+        #[cfg(not(test))]
+        let warnings = install_javascript(config, key, tree_hash, temporary)?;
         remove_group_and_other_write(temporary)?;
         restrict_job_access(config, temporary)?;
-        Ok(cloned)
+        Ok((cloned, warnings))
     }
 
     /// Picks the most recently used ready snapshot of the repository that no
@@ -537,6 +607,34 @@ impl SnapshotStore {
             ))
         }
     }
+}
+
+fn latest_generation(key: &SnapshotKey, base: &Path) -> io::Result<PathBuf> {
+    let parent = base
+        .parent()
+        .ok_or_else(|| invalid("snapshot has no parent"))?;
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(base.to_path_buf()),
+        Err(error) => return Err(error),
+    };
+    let prefix = format!("{}-retry-", key.directory_name());
+    let mut latest = base.to_path_buf();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(generation) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {
+            continue;
+        };
+        if Uuid::parse_str(generation).is_ok()
+            && entry.file_type()?.is_dir()
+            && read_metadata(&entry.path()).is_ok_and(|metadata| metadata.describes(key))
+            && entry.path() > latest
+        {
+            latest = entry.path();
+        }
+    }
+    Ok(latest)
 }
 
 fn existing(key: &SnapshotKey, directory: &Path) -> io::Result<Existing> {
@@ -592,12 +690,17 @@ fn publish(
     boot: Option<&str>,
     temporary: &Path,
     directory: &Path,
+    warnings: Vec<String>,
 ) -> io::Result<()> {
     let parent = directory
         .parent()
         .ok_or_else(|| invalid("sibling snapshot has no parent directory"))?;
     let metadata = Metadata {
         boot_id: boot.map(str::to_string),
+        javascript_retry: (!warnings.is_empty()).then(|| JavascriptRetry {
+            attempted: SystemTime::now(),
+            warnings,
+        }),
         ..Metadata::new(key, tree_hash)
     };
     atomic_json(&metadata_path(directory), &metadata)?;
@@ -934,7 +1037,7 @@ fn install_javascript(
     key: &SnapshotKey,
     tree_hash: &str,
     temporary: &Path,
-) -> io::Result<()> {
+) -> io::Result<Vec<String>> {
     #[cfg(target_os = "linux")]
     {
         crate::setup_log::phase("prepare sibling snapshot javascript dependencies", || {
@@ -960,7 +1063,7 @@ fn install_javascript(
         // Snapshot mode is never on outside isolated Linux runners, and
         // portable fixtures on other systems use no JavaScript.
         let _ = (config, key, tree_hash, temporary);
-        Ok(())
+        Ok(Vec::new())
     }
 }
 

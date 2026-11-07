@@ -556,13 +556,19 @@ fn prepare_javascript_dependencies(
     workspace: &Path,
     tree: &str,
     tools: &JavascriptTools,
-) -> io::Result<Vec<PathBuf>> {
+) -> io::Result<JavascriptPreparation> {
     let tracked = javascript_tracked_tree(workspace, tree)?;
-    prepare_javascript_with(workspace, &tracked.paths, tools, |install, command| {
-        cache_javascript_install(
-            state, repository, workspace, &tracked, install, command, tools,
-        )
-    })
+    prepare_javascript_advisory(
+        workspace,
+        repository,
+        &tracked,
+        tools,
+        |install, command| {
+            cache_javascript_install(
+                state, repository, workspace, &tracked, install, command, tools,
+            )
+        },
+    )
 }
 
 /// Expands to one embedded file of a committed JavaScript fixture:
@@ -699,7 +705,7 @@ pub(crate) fn prepare_snapshot_javascript(
     path: &Path,
     snapshot: &Path,
     tree: &str,
-) -> io::Result<()> {
+) -> io::Result<Vec<String>> {
     use crate::sibling_snapshots::helper::{self, Helper, View};
     let state = config.state_dir();
     let repository = path
@@ -709,27 +715,128 @@ pub(crate) fn prepare_snapshot_javascript(
     tracked.logical_root = Some(path.to_path_buf());
     let view = View::javascript(snapshot, path);
     let tools = JavascriptTools::for_config(config);
-    prepare_javascript_with(snapshot, &tracked.paths, &tools, |install, command| {
-        cache_javascript_install_via(
-            &state,
-            repository,
-            snapshot,
-            &tracked,
-            install,
-            command,
-            &tools,
-            |command| {
-                helper::run(
-                    config,
-                    Helper::JavascriptInstall,
-                    Helper::JavascriptInstall.limit(config),
-                    command,
-                    &view,
-                )
-            },
-        )
-    })
-    .map(|_| ())
+    prepare_javascript_advisory(
+        snapshot,
+        repository,
+        &tracked,
+        &tools,
+        |install, command| {
+            cache_javascript_install_via(
+                &state,
+                repository,
+                snapshot,
+                &tracked,
+                install,
+                command,
+                &tools,
+                |command| {
+                    helper::run(
+                        config,
+                        Helper::JavascriptInstall,
+                        Helper::JavascriptInstall.limit(config),
+                        command,
+                        &view,
+                    )
+                },
+            )
+        },
+    )
+    .map(|prepared| prepared.warnings)
+}
+
+#[derive(Default, Debug)]
+struct JavascriptPreparation {
+    directories: Vec<PathBuf>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug)]
+struct JavascriptInstallFailure(String);
+
+impl std::fmt::Display for JavascriptInstallFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for JavascriptInstallFailure {}
+
+pub(crate) fn javascript_install_failure(error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), JavascriptInstallFailure(error.to_string()))
+}
+
+fn javascript_failure_tail(detail: &str, max_bytes: usize) -> String {
+    // Reserve room for replacing up to nineteen newlines with " | ".
+    let mut start = detail.len().saturating_sub(max_bytes.saturating_sub(38));
+    while !detail.is_char_boundary(start) {
+        start += 1;
+    }
+    let lines = detail[start..].lines().rev().take(20).collect::<Vec<_>>();
+    lines
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join(" | ")
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+fn prepare_javascript_advisory(
+    workspace: &Path,
+    repository: &str,
+    tracked: &JavascriptTree,
+    tools: &JavascriptTools,
+    mut install: impl FnMut(&JavascriptInstall, &mut Command) -> io::Result<()>,
+) -> io::Result<JavascriptPreparation> {
+    let installs = discover_javascript_installs(&tracked.paths)?;
+    let mut prepared = JavascriptPreparation::default();
+    for entry in installs {
+        // Only manager availability and execution failures are advisory: jobs
+        // can read sources without dependencies. Validate tracked inputs and
+        // containment even when the manager is missing; unsafe layouts and a
+        // cleanup that cannot remove partial dependencies must still refuse.
+        validate_javascript_install(workspace, &entry)?;
+        javascript_cache_inputs(workspace, tracked, &entry)?;
+        remove_javascript_node_modules(workspace, tracked, &entry)?;
+        let result = javascript_install_command(workspace, &entry, tools)
+            .and_then(|mut command| install(&entry, &mut command));
+        match result {
+            Ok(()) => {}
+            Err(error)
+                if error
+                    .get_ref()
+                    .is_some_and(|e| e.is::<JavascriptInstallFailure>()) =>
+            {
+                // Cleanup preserves tracked node_modules content. Without a
+                // pristine copy to restore it from, keep refusing a failed
+                // install that could have modified that tracked content.
+                if std::iter::once(entry.directory.clone())
+                    .chain(javascript_member_directories(tracked, &entry))
+                    .any(|directory| {
+                        tracked
+                            .tracked_node_modules
+                            .contains(&directory.join("node_modules"))
+                    })
+                {
+                    return Err(error);
+                }
+                remove_javascript_node_modules(workspace, tracked, &entry)?;
+                let prefix = format!(
+                    "warning: JavaScript install failed for {repository:?} using {:?}; running without installed dependencies: ",
+                    entry.directory.join(entry.lockfile),
+                );
+                let tail = javascript_failure_tail(
+                    &error.to_string(),
+                    4096usize.saturating_sub(prefix.len() + 1),
+                );
+                prepared.warnings.push(format!("{prefix}{tail}\n"));
+            }
+            Err(error) => return Err(error),
+        }
+        prepared.directories.push(entry.directory);
+    }
+    Ok(prepared)
 }
 
 fn prepare_javascript_checkouts(
@@ -737,15 +844,16 @@ fn prepare_javascript_checkouts(
     repository: &str,
     tree: &str,
     siblings: &[SiblingSnapshot],
-    mut prepare: impl FnMut(&Path, &str, &str) -> io::Result<Vec<PathBuf>>,
-) -> io::Result<Vec<PathBuf>> {
-    let workspace_prepared = prepare(workspace, repository, tree)?;
+    mut prepare: impl FnMut(&Path, &str, &str) -> io::Result<JavascriptPreparation>,
+) -> io::Result<JavascriptPreparation> {
+    let mut workspace_prepared = prepare(workspace, repository, tree)?;
     for sibling in siblings {
-        prepare(
+        let prepared = prepare(
             crate::caller_path::sibling(sibling).host.as_path(),
             crate::caller_path::sibling(sibling).caller.text(),
             &sibling.tree_hash,
         )?;
+        workspace_prepared.warnings.extend(prepared.warnings);
     }
     // Sibling installs are outside the workspace's change scan.
     Ok(workspace_prepared)
@@ -791,6 +899,27 @@ fn javascript_install_command(
     install: &JavascriptInstall,
     tools: &JavascriptTools,
 ) -> io::Result<Command> {
+    validate_javascript_install(workspace, install)?;
+    let directory = workspace.join(&install.directory);
+    let manager = javascript_manager(install.lockfile);
+    let mut command = Command::new(tools.require(manager).map_err(javascript_install_failure)?);
+    // npm and pnpm run on Node; name the configured path rather than letting
+    // `env node` fail inside the manager.
+    if manager != "bun" {
+        tools.require("node").map_err(javascript_install_failure)?;
+    }
+    if manager == "npm" {
+        command.args(["ci", "--ignore-scripts"]);
+    } else {
+        command.args(["install", "--frozen-lockfile", "--ignore-scripts"]);
+    }
+    command
+        .current_dir(directory)
+        .env("PATH", tools.search_path());
+    Ok(command)
+}
+
+fn validate_javascript_install(workspace: &Path, install: &JavascriptInstall) -> io::Result<()> {
     let directory = workspace.join(&install.directory);
     for name in ["package.json", install.lockfile] {
         if !optional_regular_file(&directory.join(name))? {
@@ -812,22 +941,7 @@ fn javascript_install_command(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let manager = javascript_manager(install.lockfile);
-    let mut command = Command::new(tools.require(manager)?);
-    // npm and pnpm run on Node: refuse here, naming Node's configured path,
-    // rather than let `env node` fail inside the manager.
-    if manager != "bun" {
-        tools.require("node")?;
-    }
-    if manager == "npm" {
-        command.args(["ci", "--ignore-scripts"]);
-    } else {
-        command.args(["install", "--frozen-lockfile", "--ignore-scripts"]);
-    }
-    command
-        .current_dir(directory)
-        .env("PATH", tools.search_path());
-    Ok(command)
+    Ok(())
 }
 
 /// For the sibling snapshot key: the `--version` output of each JavaScript
@@ -1272,7 +1386,14 @@ fn cache_javascript_install(
     tools: &JavascriptTools,
 ) -> io::Result<()> {
     cache_javascript_install_via(
-        state, repository, workspace, tracked, install, command, tools, checked,
+        state,
+        repository,
+        workspace,
+        tracked,
+        install,
+        command,
+        tools,
+        run_javascript_manager,
     )
 }
 
@@ -1283,11 +1404,19 @@ fn javascript_install_versions(
     install: &JavascriptInstall,
     tools: &JavascriptTools,
 ) -> io::Result<(Vec<u8>, Vec<u8>)> {
-    let manager_version = javascript_version(command, command.get_program())?;
+    let manager_version =
+        javascript_version(command, command.get_program()).map_err(javascript_install_failure)?;
     let node_version = if javascript_manager(install.lockfile) == "bun" {
         Vec::new()
     } else {
-        javascript_version(command, tools.require("node")?.as_os_str())?
+        javascript_version(
+            command,
+            tools
+                .require("node")
+                .map_err(javascript_install_failure)?
+                .as_os_str(),
+        )
+        .map_err(javascript_install_failure)?
     };
     Ok((manager_version, node_version))
 }
@@ -1504,11 +1633,32 @@ fn run_javascript_install_via(
         } else {
             error.to_string()
         };
-        io::Error::other(format!(
+        let message = format!(
             "locked {manager} install using {lockfile} failed in {}: {detail}",
             workspace.display()
-        ))
+        );
+        if error
+            .get_ref()
+            .is_some_and(|e| e.is::<JavascriptInstallFailure>())
+        {
+            javascript_install_failure(io::Error::other(message))
+        } else {
+            io::Error::other(message)
+        }
     })
+}
+
+fn run_javascript_manager(command: &mut Command) -> io::Result<()> {
+    let output = crate::systemd::output(command).map_err(javascript_install_failure)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(javascript_install_failure(io::Error::other(format!(
+        "{}: {}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))))
 }
 
 /// Let the job bind any port, including 443, on its own loopback.
@@ -2954,7 +3104,7 @@ impl Sandbox {
         // Offline jobs have no route to package registries. Resolve only from
         // a checked-in lockfile while still trusted, and never run package
         // lifecycle scripts as the daemon.
-        let prepared_javascript_directories = if !writer {
+        let mut prepared_javascript = if !writer {
             crate::setup_log::phase("prepare javascript dependencies", || {
                 prepare_javascript_checkouts(
                     workspace,
@@ -2973,8 +3123,15 @@ impl Sandbox {
                 )
             })?
         } else {
-            Vec::new()
+            JavascriptPreparation::default()
         };
+        if let Some(snapshots) = snapshots {
+            for (directory, _) in &snapshots.siblings {
+                prepared_javascript.warnings.extend(
+                    crate::sibling_snapshots::store::javascript_warnings(directory)?,
+                );
+            }
+        }
         // Seed the private Cargo cache from every requested checkout, just as
         // prefetch does; a sibling can lock Git commits the workspace never uses.
         // Read before dissociating: an uncommitted snapshot tree may be reachable
@@ -3035,6 +3192,10 @@ impl Sandbox {
             }
             grant_paths.push(file);
         }
+        // Use the existing stderr stream, not shell interpolation of untrusted
+        // manager output. Commands with file-backed output append to this
+        // prefix; commands with piped output copy it to stderr before starting.
+        fs::write(output.join("stderr"), prepared_javascript.warnings.concat())?;
         // Supply only the default names and validated repository loopback
         // aliases: the job root has no resolver or host /etc/hosts to inherit.
         let hosts = runtime.0.join("hosts");
@@ -3315,7 +3476,7 @@ impl Sandbox {
             read_only,
             read_write,
             wrapper,
-            prepared_javascript_directories,
+            prepared_javascript_directories: prepared_javascript.directories,
             runtime,
             retain_failed: false,
             #[cfg(test)]
@@ -3522,8 +3683,23 @@ impl Sandbox {
         } else {
             "IFS= read -r -n 1 || exit 125; umask 022; exec /bin/bash -c \"$1\" </dev/null"
         };
+        let shell = if fs::metadata(self.runtime.0.join("output/stderr"))
+            .is_ok_and(|file| file.len() > 0)
+        {
+            if durable {
+                shell.replace("2>/motor-output/stderr", "2>>/motor-output/stderr")
+            } else {
+                shell.replacen(
+                    "umask 022; ",
+                    "umask 022; /bin/cat -- /motor-output/stderr >&2; ",
+                    1,
+                )
+            }
+        } else {
+            shell.to_string()
+        };
         let shell = with_ccache_statistics(
-            shell,
+            &shell,
             durable
                 && self
                     .cache_forwarders

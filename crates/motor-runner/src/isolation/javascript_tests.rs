@@ -619,7 +619,7 @@ fn copy_committed_js_fixture(workspace: &Path, manager: &str) {
 }
 
 #[test]
-fn javascript_real_managers_install_nested_and_refuse_stale_lock() {
+fn javascript_real_managers_install_nested_and_warn_for_stale_lock() {
     let f = Fixture::new();
     for manager in ["npm", "bun", "pnpm"] {
         copy_committed_js_fixture(&f.workspace, manager);
@@ -657,6 +657,9 @@ fn javascript_real_managers_install_nested_and_refuse_stale_lock() {
     .unwrap();
     value["dependencies"]["missing"] = "file:vendor/missing".into();
     fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+    for manager in ["npm", "bun", "pnpm"] {
+        fs::remove_dir_all(f.workspace.join(manager).join("node_modules")).unwrap();
+    }
     let tree = tracked_tree(&f.workspace);
     let error = prepare_javascript_dependencies(
         &f.state,
@@ -665,12 +668,16 @@ fn javascript_real_managers_install_nested_and_refuse_stale_lock() {
         &tree,
         &installed_tools(),
     )
-    .unwrap_err()
-    .to_string();
+    .unwrap()
+    .warnings
+    .concat();
+    assert!(error.contains("JavaScript install failed"), "{error}");
+    assert!(error.contains("npm/package-lock.json"), "{error}");
     assert!(
-        error.contains("locked npm install using npm/package-lock.json failed"),
+        error.contains("npm error A complete log of this run can be found in:"),
         "{error}"
     );
+    assert!(error.len() <= 4096, "{}", error.len());
 }
 
 struct FakeJavascriptManager {
@@ -691,7 +698,6 @@ impl FakeJavascriptManager {
         let script = r#"#!/bin/sh
 if [ "$1" = --version ]; then /bin/cat "$JS_VERSION"; exit; fi
 printf 'install\n' >> "$JS_CALLS"
-if [ -f "$JS_INTERRUPTED" ]; then kill -TERM $$; fi
 /bin/mkdir -p node_modules/.bin
 # Publish the executable only after its contents and mode are complete.
 temporary="node_modules/.bin/.fixture-tool.$$.tmp"
@@ -705,6 +711,10 @@ if [ -f "$JS_MEMBERS" ]; then
             printf '{"name":"member-dep","version":"1.0.0"}' > "$m/node_modules/member-dep/package.json"
         fi
     done
+fi
+if [ -f "$JS_INTERRUPTED" ]; then
+    printf 'failed applying patch: photon_rs.js\n' >&2
+    kill -TERM $$
 fi
 "#;
         // The same fake answers for every manager, so each lockfile kind
@@ -740,7 +750,7 @@ fi
         f: &Fixture,
         checkout: &Path,
         tree: &str,
-    ) -> io::Result<Vec<PathBuf>> {
+    ) -> io::Result<JavascriptPreparation> {
         let tracked = javascript_tracked_tree(checkout, tree)?;
         self.prepare_tracked_checkout(f, checkout, &tracked)
     }
@@ -753,27 +763,33 @@ fi
         f: &Fixture,
         checkout: &Path,
         tracked: &JavascriptTree,
-    ) -> io::Result<Vec<PathBuf>> {
+    ) -> io::Result<JavascriptPreparation> {
         let tools = self.tools();
-        prepare_javascript_with(checkout, &tracked.paths, &tools, |install, command| {
-            let mut fake = Command::new(&self.executable);
-            fake.args(command.get_args())
-                .current_dir(command.get_current_dir().unwrap())
-                .env("PATH", &self.bin)
-                .env("JS_VERSION", &self.version)
-                .env("JS_CALLS", &self.calls)
-                .env("JS_INTERRUPTED", &self.interrupted)
-                .env("JS_MEMBERS", &self.members);
-            cache_javascript_install(
-                &f.state,
-                &checkout.to_string_lossy(),
-                checkout,
-                tracked,
-                install,
-                &mut fake,
-                &tools,
-            )
-        })
+        prepare_javascript_advisory(
+            checkout,
+            &checkout.to_string_lossy(),
+            tracked,
+            &tools,
+            |install, command| {
+                let mut fake = Command::new(&self.executable);
+                fake.args(command.get_args())
+                    .current_dir(command.get_current_dir().unwrap())
+                    .env("PATH", &self.bin)
+                    .env("JS_VERSION", &self.version)
+                    .env("JS_CALLS", &self.calls)
+                    .env("JS_INTERRUPTED", &self.interrupted)
+                    .env("JS_MEMBERS", &self.members);
+                cache_javascript_install(
+                    &f.state,
+                    &checkout.to_string_lossy(),
+                    checkout,
+                    tracked,
+                    install,
+                    &mut fake,
+                    &tools,
+                )
+            },
+        )
     }
     fn count(&self) -> usize {
         fs::read_to_string(&self.calls)
@@ -788,7 +804,7 @@ fn prepare_checkouts_with_fake_manager(
     manager: &FakeJavascriptManager,
     workspace_tree: &str,
     siblings: &[SiblingSnapshot],
-) -> io::Result<Vec<PathBuf>> {
+) -> io::Result<JavascriptPreparation> {
     prepare_javascript_checkouts(
         &f.workspace,
         &f.workspace.to_string_lossy(),
@@ -812,7 +828,7 @@ fn javascript_sibling_with_lockfile_gets_node_modules() {
     let prepared =
         prepare_checkouts_with_fake_manager(&f, &manager, &workspace_tree, &siblings).unwrap();
 
-    assert!(prepared.is_empty());
+    assert!(prepared.directories.is_empty());
     assert!(sibling.join("node_modules/.bin/fixture-tool").is_file());
     assert!(!f.workspace.join("node_modules").exists());
     assert_eq!(manager.count(), 1);
@@ -841,7 +857,9 @@ fn prepared_workspace_changes_fixture(
     )
     .unwrap();
     let manager = FakeJavascriptManager::new(&f);
-    let prepared = prepare_checkouts_with_fake_manager(&f, &manager, &tree, &[]).unwrap();
+    let prepared = prepare_checkouts_with_fake_manager(&f, &manager, &tree, &[])
+        .unwrap()
+        .directories;
     assert_eq!(prepared.len(), directories.len());
     for directory in directories {
         assert!(prepared.contains(&PathBuf::from(directory)));
@@ -1331,9 +1349,10 @@ fn javascript_interrupted_install_never_publishes_a_cache_entry() {
     let manager = FakeJavascriptManager::new(&f);
     fs::write(&manager.interrupted, "interrupt").unwrap();
     assert!(manager
-        .prepare(&f, &tree)
-        .unwrap_err()
-        .to_string()
+        .prepare_checkout(&f, &f.workspace, &tree)
+        .unwrap()
+        .warnings
+        .concat()
         .contains("nested/package-lock.json"));
     assert_eq!(manager.count(), 1);
     assert_eq!(
@@ -1866,7 +1885,7 @@ fn javascript_transitive_local_dependency_refusals_name_manifest_and_spec() {
 }
 
 #[test]
-fn javascript_tracked_local_probe_reaches_bun_and_npm_frozen_lock_refusal() {
+fn javascript_tracked_local_probe_reaches_bun_and_npm_frozen_lock_warning() {
     for (manager, lockfile) in [("bun", "bun.lock"), ("npm", "package-lock.json")] {
         let f = Fixture::new();
         copy_committed_js_fixture(&f.workspace, manager);
@@ -1886,6 +1905,7 @@ fn javascript_tracked_local_probe_reaches_bun_and_npm_frozen_lock_refusal() {
             serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
         value["dependencies"]["lock-mismatch-probe"] = "file:vendor/lock-mismatch-probe".into();
         fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+        fs::remove_dir_all(directory.join("node_modules")).unwrap();
         let tree = tracked_tree(&f.workspace);
         let error = prepare_javascript_dependencies(
             &f.state,
@@ -1894,14 +1914,18 @@ fn javascript_tracked_local_probe_reaches_bun_and_npm_frozen_lock_refusal() {
             &tree,
             &installed_tools(),
         )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            error.contains(&format!(
-                "locked {manager} install using {manager}/{lockfile} failed"
-            )),
-            "{error}"
-        );
+        .unwrap()
+        .warnings
+        .concat();
+        assert!(error.contains("JavaScript install failed"), "{error}");
+        assert!(error.contains(&format!("{manager}/{lockfile}")), "{error}");
+        let manager_error = if manager == "bun" {
+            "lockfile is frozen"
+        } else {
+            "npm error A complete log of this run can be found in:"
+        };
+        assert!(error.contains(manager_error), "{error}");
+        assert!(error.len() <= 4096, "{}", error.len());
         assert!(!directory.join("lifecycle-ran").exists());
     }
 }
@@ -2334,4 +2358,169 @@ fn javascript_setup_check_installs_every_lockfile_kind_with_the_configured_tools
         )),
         "{error}"
     );
+}
+
+fn run_warning_job(f: &Fixture, warnings: &[String], durable: bool) -> String {
+    use std::io::Write;
+    let runtime = f.scratch.join("warning-runtime");
+    let output = runtime.join("output");
+    fs::create_dir_all(&output).unwrap();
+    fs::write(output.join("stderr"), warnings.concat()).unwrap();
+    let raw = "printf 'job ran\\n'; printf 'job stderr\\n' >&2";
+    let mut sandbox = f.command_sandbox();
+    sandbox.runtime = std::sync::Arc::new(RuntimeDir(
+        runtime,
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+    ));
+    let command = sandbox
+        .command(raw, &f.workspace, &[], durable, &[], 0)
+        .unwrap();
+    let args: Vec<_> = command.get_args().collect();
+    let shell = args[args.len() - 3]
+        .to_str()
+        .unwrap()
+        .replace("/motor-output", output.to_str().unwrap());
+    let mut child = Command::new("/bin/bash")
+        .args(["-c", &shell, USER, raw])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(result.status.success(), "{result:?}");
+    let (stdout, stderr) = if durable {
+        (
+            fs::read(output.join("stdout")).unwrap(),
+            fs::read(output.join("stderr")).unwrap(),
+        )
+    } else {
+        (result.stdout, result.stderr)
+    };
+    assert_eq!(stdout, b"job ran\n");
+    String::from_utf8(stderr).unwrap()
+}
+
+#[test]
+fn javascript_workspace_install_failure_runs_job_with_warning_and_no_modules() {
+    let f = Fixture::new();
+    write_js_pair(&f.workspace, "", "package-lock.json");
+    fs::create_dir_all(f.workspace.join("member")).unwrap();
+    fs::write(f.workspace.join("member/package.json"), "{}").unwrap();
+    let tree = tracked_tree(&f.workspace);
+    let manager = FakeJavascriptManager::new(&f);
+    fs::write(&manager.interrupted, "interrupt").unwrap();
+    fs::write(&manager.members, "member\n").unwrap();
+    let prepared = prepare_checkouts_with_fake_manager(&f, &manager, &tree, &[]).unwrap();
+    assert_eq!(prepared.warnings.len(), 1);
+    let warning = &prepared.warnings[0];
+    assert!(warning.contains(f.workspace.to_str().unwrap()), "{warning}");
+    assert!(warning.contains("package-lock.json"), "{warning}");
+    assert!(
+        warning.contains("failed applying patch: photon_rs.js"),
+        "{warning}"
+    );
+    assert!(!f.workspace.join("node_modules").exists());
+    assert!(!f.workspace.join("member/node_modules").exists());
+    assert_eq!(
+        fs::read_dir(f.state.join("js-installs")).unwrap().count(),
+        0
+    );
+    for durable in [false, true] {
+        assert_eq!(
+            run_warning_job(&f, &prepared.warnings, durable),
+            format!("{warning}job stderr\n")
+        );
+    }
+    fs::remove_file(&manager.interrupted).unwrap();
+    assert!(
+        prepare_checkouts_with_fake_manager(&f, &manager, &tree, &[])
+            .unwrap()
+            .warnings
+            .is_empty()
+    );
+    assert_eq!(manager.count(), 2, "a failed install must be retried");
+}
+
+#[test]
+fn javascript_sibling_install_failure_runs_job_with_warning_and_no_modules() {
+    let f = Fixture::new();
+    let workspace_tree = tracked_tree(&f.workspace);
+    let sibling = f.scratch.join("sibling");
+    fs::create_dir_all(&sibling).unwrap();
+    write_js_pair(&sibling, "", "package-lock.json");
+    let sibling_tree = tracked_tree(&sibling);
+    let manager = FakeJavascriptManager::new(&f);
+    fs::write(&manager.interrupted, "interrupt").unwrap();
+    let prepared = prepare_checkouts_with_fake_manager(
+        &f,
+        &manager,
+        &workspace_tree,
+        &[sibling_snapshot(&sibling, &sibling_tree)],
+    )
+    .unwrap();
+    assert!(prepared.directories.is_empty());
+    assert_eq!(prepared.warnings.len(), 1);
+    let warning = &prepared.warnings[0];
+    assert!(warning.contains(sibling.to_str().unwrap()), "{warning}");
+    assert!(warning.contains("package-lock.json"), "{warning}");
+    assert!(!sibling.join("node_modules").exists());
+    assert_eq!(
+        fs::read_dir(f.state.join("js-installs")).unwrap().count(),
+        0
+    );
+    assert_eq!(
+        run_warning_job(&f, &prepared.warnings, true),
+        format!("{warning}job stderr\n")
+    );
+}
+
+#[test]
+fn javascript_advisory_preparation_still_refuses_non_directory_modules() {
+    let f = Fixture::new();
+    write_js_pair(&f.workspace, "", "package-lock.json");
+    let tree = tracked_tree(&f.workspace);
+    fs::write(f.workspace.join("node_modules"), "not a directory").unwrap();
+    let manager = FakeJavascriptManager::new(&f);
+    let error = manager.prepare(&f, &tree).unwrap_err().to_string();
+    assert!(error.contains("non-directory node_modules"), "{error}");
+    assert_eq!(manager.count(), 0);
+}
+
+#[test]
+fn javascript_missing_manager_warns_but_does_not_bypass_input_checks() {
+    let f = Fixture::new();
+    write_js_pair(&f.workspace, "", "bun.lock");
+    let empty = f.scratch.join("no-manager");
+    fs::create_dir(&empty).unwrap();
+    let tools = JavascriptTools::at(ToolchainRole::Tenant, &empty, &empty);
+    let tree = tracked_tree(&f.workspace);
+    let prepared =
+        prepare_javascript_dependencies(&f.state, "workspace", &f.workspace, &tree, &tools)
+            .unwrap();
+    assert_eq!(prepared.warnings.len(), 1);
+    assert!(prepared.warnings[0].contains("bun not installed"));
+    fs::remove_file(f.workspace.join("package.json")).unwrap();
+    let error = prepare_javascript_dependencies(&f.state, "workspace", &f.workspace, &tree, &tools)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("tracked JavaScript input is missing"),
+        "{error}"
+    );
+}
+
+#[test]
+fn javascript_warning_tail_is_one_bounded_line_with_recent_output() {
+    let detail = (0..40)
+        .map(|n| format!("line {n}: {}\n", "é".repeat(100)))
+        .collect::<String>();
+    let tail = javascript_failure_tail(&detail, 4096);
+    assert!(tail.len() <= 4096, "{}", tail.len());
+    assert!(!tail.contains('\n'));
+    assert!(!tail.contains("line 0:"));
+    assert!(tail.contains("line 39:"));
 }
