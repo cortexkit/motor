@@ -3,7 +3,7 @@
 This document describes how the runner decides which job runs next, which CPUs
 it gets, when a job is refused for capacity or disk, and how long it keeps job
 history and workspaces. The code is in `crates/motor-runner/src/engine.rs`,
-`cpu.rs` and `disk.rs`. [architecture.md](architecture.md) shows where these
+`cpu.rs` and `disk.rs`. [ARCHITECTURE.md](../ARCHITECTURE.md) shows where these
 parts sit; [wire-protocol.md](wire-protocol.md) defines the refusals they
 produce.
 

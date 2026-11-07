@@ -5,7 +5,7 @@ of the CortexKit daemon (SubC). It receives `exec-remote/v1` requests, captures 
 snapshot of the caller's checkout, and sends it with the command to
 `motor-runner` over SSH. This document covers how it is placed, who may call it,
 how it authenticates to the runner, and what it stores.
-[architecture.md](architecture.md) shows where it sits in the whole system;
+[ARCHITECTURE.md](../ARCHITECTURE.md) shows where it sits in the whole system;
 [snapshot-contents.md](snapshot-contents.md) defines what it captures.
 
 The daemon, its callers and the credential vault are separate CortexKit

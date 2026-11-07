@@ -4,8 +4,9 @@ Motor is a standalone Rust workspace. Dependencies come from crates.io and this
 repository; the ordinary build and test suite needs no adjacent CortexKit
 checkout and no running daemon. [CONTRIBUTING.md](CONTRIBUTING.md) is the
 reference for prerequisites, the CI gate, the server gate, the operator-only
-tests, and where code goes. [docs/architecture.md](docs/architecture.md) maps
-the system. This guide adds what an agent working here must do.
+tests. [ARCHITECTURE.md](ARCHITECTURE.md) maps the system and
+[STRUCTURE.md](STRUCTURE.md) maps the code and where it goes. This guide adds
+what an agent working here must do.
 
 ## Running gates
 
@@ -70,6 +71,6 @@ and [docs/server-gate.md](docs/server-gate.md) runs the runner's lanes.
 ## Documentation
 
 Docs live in `docs/`, one topic per file. Follow the conventions in
-[docs/architecture.md](docs/architecture.md#documentation-conventions): describe
+[ARCHITECTURE.md](ARCHITECTURE.md#documentation-conventions): describe
 the code as it is, name the test behind each contract rule, and keep
 production numbers, host names and private paths out.
