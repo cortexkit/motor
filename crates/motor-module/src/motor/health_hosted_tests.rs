@@ -479,7 +479,7 @@ async fn hosted_unknown_past_deadline_retires_once_across_restart_without_reatta
 }
 
 #[tokio::test]
-async fn hosted_unknown_before_deadline_backs_off_without_retiring_even_while_provisioning() {
+async fn hosted_unknown_before_deadline_shares_recovery_and_never_probes_provisioning() {
     let h = Harness::new(Behavior::Normal).await;
     for run_sent in [false, true] {
         let scratch =
@@ -495,9 +495,25 @@ async fn hosted_unknown_before_deadline_backs_off_without_retiring_even_while_pr
             motor.storage.hosted_route(id, h.route.clone()).unwrap();
             (motor, id)
         };
-        let http =
-            crate::hosted::test_http::Http::new(|_, _| (404, json!({"error": "job_unknown"})))
-                .await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let http = crate::hosted::test_http::Http::with_async_reply({
+            let entered = entered.clone();
+            let release = release.clone();
+            move |_, _| {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    (
+                        404,
+                        serde_json::to_vec(&json!({"error": "job_unknown"})).unwrap(),
+                    )
+                }
+            }
+        })
+        .await;
         motor
             .storage
             .hosted_update(id, |s| s.broker_url = http.url.clone())
@@ -505,27 +521,22 @@ async fn hosted_unknown_before_deadline_backs_off_without_retiring_even_while_pr
         let _submission = (!run_sent).then(|| motor.submission(id));
         let state = motor.hosted_state(id).unwrap();
         let now = crate::hosted::now_s() * 1000;
-        let deadline = state.reattach_deadline_s().map_or_else(
+        let limit = state.reattach_deadline_s().map_or_else(
             || deadline(id, &motor.storage.job(id).unwrap()),
             |d| d * 1000,
         );
-        assert!(now + 210_000 < deadline);
-        for (elapsed, attempts) in [
-            (0, 1),
-            (15_000, 1),
-            (29_999, 1),
-            (30_000, 2),
-            (89_999, 2),
-            (90_000, 3),
-            (209_999, 3),
-            (210_000, 4),
-        ] {
+        assert!(now + 210_000 < limit);
+        let first = if run_sent {
+            let motor = motor.clone();
+            let first = tokio::spawn(async move { motor.machine_jobs_health_at(now).await });
+            entered.notified().await;
+            Some(first)
+        } else {
+            None
+        };
+        for elapsed in [0, 15_000, 29_999, 30_000, 89_999, 90_000, 209_999, 210_000] {
             motor.machine_jobs_health_at(now + elapsed).await;
-            assert_eq!(
-                http.requests.lock().unwrap().len(),
-                if run_sent { attempts } else { 0 },
-                "at {elapsed}ms, run_sent={run_sent}"
-            );
+            assert_eq!(http.requests.lock().unwrap().len(), usize::from(run_sent));
             let job = motor.storage.job(id).unwrap();
             assert!(job.local_terminal.is_none());
             let current = job.hosted.unwrap();
@@ -534,8 +545,14 @@ async fn hosted_unknown_before_deadline_backs_off_without_retiring_even_while_pr
             assert_eq!(current.retry_iat, state.retry_iat);
             assert_eq!(current.run_sent, run_sent);
         }
+        if let Some(first) = first {
+            release.notify_one();
+            first.await.unwrap();
+        }
         assert!(h.requests.lock().unwrap().is_empty());
         assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+        drop(_submission);
+        motor.close().await;
     }
 }
 
@@ -559,6 +576,13 @@ async fn legacy_hosted_unknown_uses_the_conservative_health_deadline() {
     motor
         .machine_jobs_health_at(now + LEGACY_JOB_HORIZON_MS + 1000)
         .await;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while motor.storage.job(id).unwrap().local_terminal.is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("legacy unknown recovery must retire at its conservative deadline");
     assert_eq!(
         motor
             .storage
@@ -570,12 +594,18 @@ async fn legacy_hosted_unknown_uses_the_conservative_health_deadline() {
         Outcome::OutcomeUnknown
     );
     assert!(motor.hosted_state(id).unwrap().finish_done);
-    assert_eq!(http.requests.lock().unwrap().len(), 2);
+    let attempts = http.requests.lock().unwrap().len();
+    motor
+        .machine_jobs_health_at(now + LEGACY_JOB_HORIZON_MS + 2000)
+        .await;
+    assert_eq!(http.requests.lock().unwrap().len(), attempts);
+    motor.close().await;
 }
 
 #[tokio::test]
-async fn hosted_auth_health_probes_back_off_until_original_deadline_then_retire() {
+async fn hosted_auth_health_and_status_share_one_recovery_until_original_deadline() {
     let h = Harness::new(Behavior::RefuseAttach("auth")).await;
+    h.run_gate.send_replace(false);
     let scratch = cortexkit_test_support::ScratchDir::new("health-hosted-auth");
     let (motor, id) = detached_job(&h, &scratch).await;
     let state = motor.hosted_state(id).unwrap();
@@ -583,42 +613,54 @@ async fn hosted_auth_health_probes_back_off_until_original_deadline_then_retire(
     let now = issued * 1000;
     let deadline = (issued + 30 + HOST_LOST_GRACE_S) * 1000;
     assert_eq!(state.reattach_deadline_s().unwrap() * 1000, deadline);
-    // A legacy generic health deadline must not replace the original Run limit.
     motor.storage.health_deadline(id, None).unwrap();
-    for (elapsed, attempts) in [
-        (0, 1),
-        (15_000, 1),
-        (29_999, 1),
-        (30_000, 2),
-        (45_000, 2),
-        (89_999, 2),
-        (90_000, 3),
-        (120_000, 3),
-        (209_999, 3),
-        (210_000, 4),
-        (450_000, 5),
-    ] {
+    let first = tokio::spawn({
+        let motor = motor.clone();
+        async move { motor.machine_jobs_health_at(now).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while h.requests.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    for elapsed in [15_000, 30_000, 90_000] {
         motor.machine_jobs_health_at(now + elapsed).await;
-        assert_eq!(h.requests.lock().unwrap().len(), attempts, "at {elapsed}ms");
+        motor.job_status(id).await.unwrap();
+        assert_eq!(
+            h.requests.lock().unwrap().len(),
+            1,
+            "health/status must add no request to the owner's held attempt"
+        );
         assert!(motor.storage.job(id).unwrap().local_terminal.is_none());
-        assert_eq!(motor.hosted_state(id).unwrap().retry_iat, Some(issued));
     }
-    motor.machine_jobs_health_at(deadline - 1).await;
-    assert_eq!(h.requests.lock().unwrap().len(), 5);
+    h.run_gate.send_replace(true);
+    first.await.unwrap();
     motor.machine_jobs_health_at(deadline).await;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while motor.storage.job(id).unwrap().local_terminal.is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("idle auth recovery must retire at the original deadline");
     let terminal = motor.storage.job(id).unwrap().local_terminal.unwrap();
     assert_eq!(terminal.outcome, Outcome::OutcomeUnknown);
     assert_eq!(terminal.ran, Some(Ran::Unknown("maybe".into())));
-    assert!(terminal.refusal_detail.unwrap().contains(
-        "host refused reattach with auth past the job's deadline; no result reached ck-motor"
-    ));
-    assert_eq!(h.requests.lock().unwrap().len(), 6);
+    assert!(terminal
+        .refusal_detail
+        .unwrap()
+        .contains("auth past the job's deadline"));
+    assert_eq!(motor.hosted_state(id).unwrap().retry_iat, Some(issued));
+    let count = h.requests.lock().unwrap().len();
     motor
         .machine_jobs_health_at(deadline + STALE_PROBE_INTERVAL_MS)
         .await;
-    assert_eq!(h.requests.lock().unwrap().len(), 6);
+    assert_eq!(h.requests.lock().unwrap().len(), count);
     assert!(h.frames.lock().unwrap().is_empty());
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    motor.close().await;
 }
 
 #[tokio::test]
@@ -636,6 +678,13 @@ async fn legacy_hosted_auth_uses_the_conservative_health_deadline() {
     motor
         .machine_jobs_health_at(now + LEGACY_JOB_HORIZON_MS + 1000)
         .await;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while motor.storage.job(id).unwrap().local_terminal.is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("legacy idle auth recovery must observe its conservative deadline");
     assert_eq!(
         motor
             .storage
@@ -646,15 +695,35 @@ async fn legacy_hosted_auth_uses_the_conservative_health_deadline() {
             .outcome,
         Outcome::OutcomeUnknown
     );
-    assert_eq!(h.requests.lock().unwrap().len(), 2);
+    let attempts = h.requests.lock().unwrap().len();
+    motor
+        .machine_jobs_health_at(now + LEGACY_JOB_HORIZON_MS + 2000)
+        .await;
+    assert_eq!(h.requests.lock().unwrap().len(), attempts);
+    motor.close().await;
 }
 
 #[tokio::test]
-async fn broker_auth_failures_back_off_to_fifteen_minutes_without_retiring_the_job() {
+async fn broker_auth_failure_is_shared_by_health_and_status_without_false_retirement() {
     let h = Harness::new(Behavior::Normal).await;
     let scratch = cortexkit_test_support::ScratchDir::new("health-hosted-broker-auth");
     let (motor, id) = detached_job(&h, &scratch).await;
-    let http = crate::hosted::test_http::Http::new(|_, _| (401, json!({"error": "auth"}))).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let http = crate::hosted::test_http::Http::with_async_reply({
+        let entered = entered.clone();
+        let release = release.clone();
+        move |_, _| {
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                (401, serde_json::to_vec(&json!({"error": "auth"})).unwrap())
+            }
+        }
+    })
+    .await;
     motor
         .storage
         .hosted_update(id, |s| {
@@ -663,26 +732,35 @@ async fn broker_auth_failures_back_off_to_fifteen_minutes_without_retiring_the_j
         })
         .unwrap();
     let now = crate::hosted::now_s() * 1000;
+    let first = tokio::spawn({
+        let motor = motor.clone();
+        async move { motor.machine_jobs_health_at(now).await }
+    });
+    entered.notified().await;
     for elapsed in [0, 30_000, 90_000, 210_000, 450_000, 930_000, 1_830_000] {
         motor.machine_jobs_health_at(now + elapsed).await;
+        motor.job_status(id).await.unwrap();
+        assert_eq!(
+            http.requests.lock().unwrap().len(),
+            1,
+            "only the elected owner's attempt may open"
+        );
         assert!(motor.storage.job(id).unwrap().local_terminal.is_none());
     }
-    assert_eq!(http.requests.lock().unwrap().len(), 7);
-    motor
-        .machine_jobs_health_at(now + 1_830_000 + STALE_PROBE_INTERVAL_MS - 1)
-        .await;
-    assert_eq!(http.requests.lock().unwrap().len(), 7);
-    motor
-        .machine_jobs_health_at(now + 1_830_000 + STALE_PROBE_INTERVAL_MS)
-        .await;
-    assert_eq!(http.requests.lock().unwrap().len(), 8);
+    release.notify_one();
+    first.await.unwrap();
+    entered.notified().await;
+    assert_eq!(http.requests.lock().unwrap().len(), 2);
+    assert!(motor.storage.job(id).unwrap().local_terminal.is_none());
     assert!(h.requests.lock().unwrap().is_empty());
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    motor.close().await;
 }
 
 #[tokio::test]
-async fn hosted_running_health_probe_keeps_the_job_even_past_deadline() {
-    let h = Harness::new(Behavior::Normal).await;
+async fn hosted_running_owner_keeps_the_job_even_past_deadline_without_rival_probes() {
+    let h = Harness::new(Behavior::QuietAttach).await;
+    h.run_gate.send_replace(false);
     let scratch = cortexkit_test_support::ScratchDir::new("health-hosted-running");
     let (motor, id) = detached_job(&h, &scratch).await;
     motor
@@ -690,14 +768,14 @@ async fn hosted_running_health_probe_keeps_the_job_even_past_deadline() {
         .hosted_update(id, |s| s.retry_iat = Some(0))
         .unwrap();
     let now = crate::hosted::now_s() * 1000;
-    for elapsed in [0, 15_000] {
-        let health = motor.machine_jobs_health_at(now + elapsed).await;
-        assert_eq!(health["linux"]["running"], 1);
-        assert!(motor.storage.job(id).unwrap().local_terminal.is_none());
-        let state = motor.hosted_state(id).unwrap();
-        assert!(state.terminal.is_none());
-        assert!(!state.finish_done);
-    }
+    let health = motor.machine_jobs_health_at(now).await;
+    assert_eq!(health["linux"]["running"], 1);
+    owner_attach_count(&h, 1).await;
+    let health = motor.machine_jobs_health_at(now + 15_000).await;
+    assert_eq!(health["linux"]["running"], 1);
+    assert!(motor.storage.job(id).unwrap().local_terminal.is_none());
+    assert!(motor.hosted_state(id).unwrap().terminal.is_none());
+    assert!(!motor.hosted_state(id).unwrap().finish_done);
     assert_eq!(h.requests.lock().unwrap().len(), 2);
     assert_eq!(
         h.frames
@@ -706,7 +784,284 @@ async fn hosted_running_health_probe_keeps_the_job_even_past_deadline() {
             .iter()
             .filter(|f| matches!(f, Frame::JobStatus { .. }))
             .count(),
-        2
+        1
     );
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    h.run_gate.send_replace(true);
+    owner_settled(&motor, id).await;
+    assert_eq!(
+        motor.hosted_state(id).unwrap().terminal.unwrap().outcome,
+        Outcome::Exit { code: 23 }
+    );
+    motor.close().await;
+}
+
+async fn result_record(stream: &mut crate::JobStream) -> StreamRecord {
+    tokio::time::timeout(Duration::from_secs(15), stream.records.recv())
+        .await
+        .expect("owner must deliver a record")
+        .expect("stream closed")
+        .unwrap()
+}
+
+async fn owner_settled(motor: &Motor, id: Uuid) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while motor.hosted_state(id).unwrap().billing == BillingStatus::Pending {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owner must retain settlement without a caller");
+}
+
+async fn owner_attach_count(h: &Harness, count: usize) {
+    let mut lifecycle = h.attach_lifecycle.subscribe();
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        lifecycle.wait_for(|s| s.2 >= count),
+    )
+    .await
+    .expect("owner must reach gated host replay")
+    .unwrap();
+}
+
+#[tokio::test]
+async fn health_ended_hosted_reply_retains_terminal_and_recovers_settlement() {
+    let h = Harness::new(Behavior::StatusTerminal).await;
+    h.run_gate.send_replace(false);
+    let scratch = cortexkit_test_support::ScratchDir::new("health-ended-hosted-owner");
+    let (motor, id) = detached_job(&h, &scratch).await;
+    motor
+        .machine_jobs_health_at(crate::hosted::now_s() * 1000)
+        .await;
+    let terminal = motor
+        .hosted_state(id)
+        .unwrap()
+        .terminal
+        .expect("a hosted terminal in a successful health reply must be durable");
+    assert_eq!(terminal.job_id, id);
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 41 });
+    assert_eq!(terminal.ran, Some(Ran::Remote));
+    assert_eq!(
+        motor.hosted_state(id).unwrap().billing,
+        BillingStatus::Pending
+    );
+    owner_attach_count(&h, 1).await;
+    h.run_gate.send_replace(true);
+    owner_settled(&motor, id).await;
+    let requests = h.requests.lock().unwrap().len();
+    for elapsed in [15_000, 30_000, 3_600_000] {
+        motor
+            .machine_jobs_health_at(crate::hosted::now_s() * 1000 + elapsed)
+            .await;
+    }
+    assert_eq!(h.requests.lock().unwrap().len(), requests);
+    assert_eq!(h.attach_lifecycle.borrow().2, 1);
+    assert_eq!(motor.hosted_state(id).unwrap().terminal, Some(terminal));
+    assert_eq!(motor.hosted_state(id).unwrap().billed_vcpu_ms, Some(6001));
+    assert!(!h
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame, Frame::Cancel(_))));
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn caller_joins_internal_hosted_follower_while_health_and_status_probe() {
+    let h = Harness::new(Behavior::OwnerReplay).await;
+    h.run_gate.send_replace(false);
+    let scratch = cortexkit_test_support::ScratchDir::new("hosted-owner-local-join");
+    let (motor, id) = detached_job(&h, &scratch).await;
+    motor.resume_finishes().await;
+    owner_attach_count(&h, 1).await;
+    assert_eq!(owner_replay_cursors(&h), vec![u64::MAX]);
+    let mut caller = motor.attach(AttachRequest::new(id, 7)).unwrap();
+    let (health, status) = tokio::join!(
+        motor.machine_jobs_health_at(crate::hosted::now_s() * 1000),
+        motor.job_status(id),
+    );
+    assert!(status.unwrap().terminal.is_none());
+    assert!(health["linux"]["unknown"].as_u64().is_some());
+    owner_outputs(&mut caller, 7).await;
+    assert_eq!(owner_replay_cursors(&h), vec![u64::MAX, 7]);
+    h.run_gate.send_replace(true);
+    let StreamRecord::Terminal(terminal) = result_record(&mut caller).await else {
+        panic!("terminal missing")
+    };
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 41 });
+    assert_eq!(motor.hosted_state(id).unwrap().billed_vcpu_ms, Some(6001));
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    assert!(!h
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame, Frame::JobStatus { .. } | Frame::Cancel(_))));
+    drop(caller);
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn health_auth_past_deadline_cannot_retire_live_hosted_result_owner() {
+    let h = Harness::new(Behavior::QuietAttach).await;
+    h.run_gate.send_replace(false);
+    let scratch = cortexkit_test_support::ScratchDir::new("hosted-owner-auth-fence");
+    let (motor, id) = detached_job(&h, &scratch).await;
+    let mut caller = motor.attach(AttachRequest::new(id, 0)).unwrap();
+    owner_attach_count(&h, 1).await;
+    let expired = motor
+        .hosted_state(id)
+        .unwrap()
+        .reattach_deadline_s()
+        .unwrap()
+        * 1000
+        + 1;
+    motor.machine_jobs_health_at(expired).await;
+    assert!(
+        motor.storage.job(id).unwrap().local_terminal.is_none(),
+        "a live owner must fence auth retirement"
+    );
+    assert!(motor.hosted_state(id).unwrap().terminal.is_none());
+    h.run_gate.send_replace(true);
+    assert!(matches!(
+        result_record(&mut caller).await,
+        StreamRecord::Output(_)
+    ));
+    let StreamRecord::Terminal(terminal) = result_record(&mut caller).await else {
+        panic!("terminal missing")
+    };
+    assert_eq!(terminal.outcome, Outcome::Exit { code: 23 });
+    let mut later = motor.attach(AttachRequest::new(id, 0)).unwrap();
+    assert_eq!(
+        result_record(&mut later).await,
+        StreamRecord::Terminal(terminal)
+    );
+    assert_eq!(h.attach_lifecycle.borrow().2, 1);
+    assert!(!h
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame, Frame::Cancel(_))));
+    drop((caller, later));
+    motor.close().await;
+}
+
+fn owner_replay_cursors(h: &Harness) -> Vec<u64> {
+    h.frames
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Attach(request) => Some(request.from_seq),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn owner_outputs(stream: &mut crate::JobStream, from: u64) {
+    use crate::hosted::tests::harness::{OWNER_REPLAY_BYTES, OWNER_REPLAY_RECORDS};
+    for expected in from..OWNER_REPLAY_RECORDS {
+        let StreamRecord::Output(output) = result_record(stream).await else {
+            panic!("output {expected} missing")
+        };
+        assert_eq!(output.seq, expected);
+        assert_eq!(output.bytes.0, vec![expected as u8; OWNER_REPLAY_BYTES]);
+        assert_eq!(output.truncated_before_seq, None);
+    }
+}
+
+#[tokio::test]
+async fn hosted_late_subscriber_rewinds_single_host_connection() {
+    let h = Harness::new(Behavior::OwnerReplay).await;
+    h.run_gate.send_replace(false);
+    let scratch = cortexkit_test_support::ScratchDir::new("hosted-owner-late-rewind");
+    let (motor, id) = detached_job(&h, &scratch).await;
+    let mut first = motor.attach(AttachRequest::new(id, 0)).unwrap();
+    owner_outputs(&mut first, 0).await;
+    let mut late = motor.attach(AttachRequest::new(id, 11)).unwrap();
+    owner_outputs(&mut late, 11).await;
+    assert_eq!(owner_replay_cursors(&h), vec![0, 11]);
+    assert_eq!(
+        h.attach_lifecycle.borrow().0 - h.attach_lifecycle.borrow().1,
+        1
+    );
+    h.run_gate.send_replace(true);
+    assert!(matches!(
+        result_record(&mut first).await,
+        StreamRecord::Terminal(_)
+    ));
+    assert!(matches!(
+        result_record(&mut late).await,
+        StreamRecord::Terminal(_)
+    ));
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    drop((first, late));
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn hosted_concurrent_rewinds_fold_to_oldest_waiting_cursor() {
+    let h = Harness::new(Behavior::OwnerReplay).await;
+    h.run_gate.send_replace(false);
+    let scratch = cortexkit_test_support::ScratchDir::new("hosted-owner-fold-rewind");
+    let (motor, id) = detached_job(&h, &scratch).await;
+    let mut first = motor.attach(AttachRequest::new(id, 0)).unwrap();
+    owner_outputs(&mut first, 0).await;
+    let mut newer = motor.attach(AttachRequest::new(id, 17)).unwrap();
+    let mut older = motor.attach(AttachRequest::new(id, 3)).unwrap();
+    tokio::join!(owner_outputs(&mut newer, 17), owner_outputs(&mut older, 3));
+    assert_eq!(owner_replay_cursors(&h), vec![0, 3]);
+    h.run_gate.send_replace(true);
+    for stream in [&mut first, &mut newer, &mut older] {
+        assert!(matches!(
+            result_record(stream).await,
+            StreamRecord::Terminal(_)
+        ));
+    }
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    drop((first, newer, older));
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn hosted_restart_collects_terminal_without_replaying_until_subscriber_arrives() {
+    let h = Harness::new(Behavior::OwnerReplay).await;
+    h.run_gate.send_replace(false);
+    let scratch = cortexkit_test_support::ScratchDir::new("hosted-owner-restart-no-replay");
+    let (motor, id) = detached_job(&h, &scratch).await;
+    motor.resume_finishes().await;
+    owner_attach_count(&h, 1).await;
+    assert_eq!(owner_replay_cursors(&h), vec![u64::MAX]);
+    motor.close().await;
+    let mut lifecycle = h.attach_lifecycle.subscribe();
+    tokio::time::timeout(Duration::from_secs(15), lifecycle.wait_for(|s| s.1 == 1))
+        .await
+        .unwrap()
+        .unwrap();
+    let motor =
+        Motor::with_connector(h.config(), &scratch, Arc::new(NoSsh(AtomicUsize::new(0)))).unwrap();
+    motor.resume_finishes().await;
+    owner_attach_count(&h, 2).await;
+    assert_eq!(owner_replay_cursors(&h), vec![u64::MAX, u64::MAX]);
+    let mut caller = motor.attach(AttachRequest::new(id, 9)).unwrap();
+    owner_outputs(&mut caller, 9).await;
+    assert_eq!(owner_replay_cursors(&h), vec![u64::MAX, u64::MAX, 9]);
+    h.run_gate.send_replace(true);
+    assert!(matches!(
+        result_record(&mut caller).await,
+        StreamRecord::Terminal(_)
+    ));
+    drop(caller);
+    motor.close().await;
+}
+
+impl Motor {
+    pub(crate) fn expire_hosted_result_for_test(&self, id: Uuid) {
+        self.storage
+            .hosted_update(id, |state| state.retry_iat = Some(0))
+            .unwrap();
+    }
 }

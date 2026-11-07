@@ -74,6 +74,11 @@ pub enum Behavior {
     UnknownTerminal,
     /// Attach stays quiet until `run_gate` opens, then sends output and terminal.
     QuietAttach,
+    /// Retains a multi-megabyte stream for inclusive cursor rewind tests.
+    OwnerReplay,
+    /// Status carries the real terminal; run_gate delays Attach's terminal and
+    /// HostedTerminal billing record so the test can inspect pending settlement.
+    StatusTerminal,
 }
 
 /// Wall time of the `UnknownTerminal` job's terminal.
@@ -120,6 +125,8 @@ pub struct Harness {
     /// QuietAttach counts: admitted connections, closed connections (including
     /// idle closes), and protocol Attach frames received, in that order.
     pub attach_lifecycle: Arc<tokio::sync::watch::Sender<(usize, usize, usize)>>,
+    /// Changing the generation closes QuietAttach's current relay once.
+    pub drop_follow: Arc<tokio::sync::watch::Sender<usize>>,
     /// The 1-based number of the `/v1/leases` request the broker reads and
     /// records but never answers, holding its connection open as a broker
     /// that stopped responding would; 0 answers every request.
@@ -207,12 +214,14 @@ impl Harness {
         let capacity = Arc::new(Mutex::new(None::<TenantCapacity>));
         let run_gate = Arc::new(tokio::sync::watch::Sender::new(true));
         let attach_lifecycle = Arc::new(tokio::sync::watch::Sender::new((0, 0, 0)));
+        let drop_follow = Arc::new(tokio::sync::watch::Sender::new(0));
         let host_task = tokio::spawn({
             let broker = broker.clone();
             let host_refusals = host_refusals.clone();
             let capacity = capacity.clone();
             let run_gate = run_gate.clone();
             let attach_lifecycle = attach_lifecycle.clone();
+            let drop_follow = drop_follow.clone();
             let tokens = tokens.clone();
             let iats = iats.clone();
             let runs = runs.clone();
@@ -231,6 +240,7 @@ impl Harness {
                     let capacity = capacity.clone();
                     let run_gate = run_gate.clone();
                     let attach_lifecycle = attach_lifecycle.clone();
+                    let drop_follow = drop_follow.clone();
                     let broker = broker.clone();
                     tokio::spawn(async move {
                         let Ok(mut tls) = acceptor.accept(socket).await else {
@@ -284,8 +294,13 @@ impl Harness {
                         Nonces::default()
                             .verify(&challenge, &claims, &requester_jwk, &sig, now_s())
                             .unwrap();
-                        let _attach = if matches!(behavior, Behavior::QuietAttach)
-                            && purpose == Purpose::Attach
+                        let _attach = if matches!(
+                            behavior,
+                            Behavior::QuietAttach
+                                | Behavior::OwnerReplay
+                                | Behavior::StatusTerminal
+                                | Behavior::DropTerminal
+                        ) && purpose == Purpose::Attach
                         {
                             let (opened, closed, _) = *attach_lifecycle.borrow();
                             if opened != closed {
@@ -400,10 +415,17 @@ impl Harness {
                                         &mut tls,
                                         &Frame::JobStatusReply(motor_protocol::JobStatusReply {
                                             job_id,
-                                            state: "running".into(),
+                                            state:
+                                                if matches!(behavior, Behavior::StatusTerminal) {
+                                                    "ended"
+                                                } else {
+                                                    "running"
+                                                }
+                                                .into(),
                                             waiting_on: None,
                                             queue_wait_ms: None,
-                                            terminal: None,
+                                            terminal: matches!(behavior, Behavior::StatusTerminal)
+                                                .then(|| owner_terminal(job_id)),
                                             unit: None,
                                             unit_alive: Some(true),
                                         }),
@@ -518,12 +540,38 @@ impl Harness {
                                     return;
                                 }
                                 Frame::Attach(attach) => {
+                                    if matches!(behavior, Behavior::DropTerminal) {
+                                        attach_lifecycle
+                                            .send_modify(|(_, _, following)| *following += 1);
+                                    }
+                                    if matches!(behavior, Behavior::OwnerReplay) {
+                                        attach_lifecycle
+                                            .send_modify(|(_, _, following)| *following += 1);
+                                        replay_owner(
+                                            &mut tls,
+                                            id,
+                                            attach.from_seq,
+                                            &run_gate,
+                                            host_id,
+                                            claims.max_s,
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                    if matches!(behavior, Behavior::StatusTerminal) {
+                                        attach_lifecycle
+                                            .send_modify(|(_, _, following)| *following += 1);
+                                        let mut gate = run_gate.subscribe();
+                                        let _ = gate.wait_for(|open| *open).await;
+                                    }
                                     if matches!(behavior, Behavior::QuietAttach) {
                                         attach_lifecycle
                                             .send_modify(|(_, _, following)| *following += 1);
                                         let mut gate = run_gate.subscribe();
+                                        let mut drop_follow = drop_follow.subscribe();
                                         loop {
                                             tokio::select! {
+                                                _ = drop_follow.changed() => return,
                                                 _ = gate.wait_for(|open| *open) => break,
                                                 frame = motor_protocol::read_frame_async(&mut tls) => {
                                                     if !matches!(frame, Ok(Some(Frame::Heartbeat { .. }))) {
@@ -564,13 +612,18 @@ impl Harness {
                                         .await
                                         .unwrap();
                                     }
-                                    let mut terminal = TerminalRecord::new(
-                                        id,
-                                        Outcome::Exit { code: 23 },
-                                        0,
-                                        0,
-                                        0,
-                                    );
+                                    let mut terminal =
+                                        if matches!(behavior, Behavior::StatusTerminal) {
+                                            owner_terminal(id)
+                                        } else {
+                                            TerminalRecord::new(
+                                                id,
+                                                Outcome::Exit { code: 23 },
+                                                0,
+                                                0,
+                                                0,
+                                            )
+                                        };
                                     if matches!(behavior, Behavior::ReturnCapFailure) {
                                         terminal.ran = Some(Ran::Remote);
                                     }
@@ -628,6 +681,7 @@ impl Harness {
             let drop_lease = drop_lease.clone();
             let release_admitted = release_admitted.clone();
             let unanswered_lease = unanswered_lease.clone();
+            let run_gate = run_gate.clone();
             async move {
                 // Connections of unanswered requests, kept open until the
                 // harness is dropped and aborts this task.
@@ -681,6 +735,11 @@ impl Harness {
                     let mut body = vec![0; length];
                     socket.read_exact(&mut body).await.unwrap();
                     requests.lock().unwrap().push(path.clone());
+                    if path.ends_with("/reattach") && matches!(behavior, Behavior::RefuseAttach(_))
+                    {
+                        let mut gate = run_gate.subscribe();
+                        let _ = gate.wait_for(|open| *open).await;
+                    }
                     let stub = if path == "/v1/leases" {
                         let number = {
                             let mut bodies = lease_bodies.lock().unwrap();
@@ -820,6 +879,7 @@ impl Harness {
             capacity,
             run_gate,
             attach_lifecycle,
+            drop_follow,
             unanswered_lease,
             tasks: vec![host_task, http_task],
         }
@@ -998,4 +1058,68 @@ async fn replay_settled<W: tokio::io::AsyncWrite + Unpin>(
             .await
             .unwrap();
     }
+}
+
+pub const OWNER_REPLAY_RECORDS: u64 = 64;
+pub const OWNER_REPLAY_BYTES: usize = 32 * 1024;
+
+fn owner_terminal(id: Uuid) -> TerminalRecord {
+    let mut terminal =
+        TerminalRecord::new(id, Outcome::Exit { code: 41 }, 125, 0, 0).with_ran(Ran::Remote);
+    terminal.wall_ms = 125;
+    terminal
+}
+
+async fn replay_owner(
+    tls: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
+    id: Uuid,
+    cursor: u64,
+    gate: &tokio::sync::watch::Sender<bool>,
+    host: &str,
+    max_runtime_s: u64,
+) {
+    for seq in cursor..OWNER_REPLAY_RECORDS {
+        if motor_protocol::write_frame_async(
+            tls,
+            &Frame::Output(Output::new(
+                seq,
+                OutputStream::Stdout,
+                BytePayload(vec![seq as u8; OWNER_REPLAY_BYTES]),
+            )),
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+    }
+    let mut gate = gate.subscribe();
+    while !*gate.borrow_and_update() {
+        tokio::select! {
+            _ = gate.changed() => {},
+            frame = motor_protocol::read_frame_async(tls) => {
+                if !matches!(frame, Ok(Some(Frame::Heartbeat { .. }))) { return; }
+            },
+        }
+    }
+    for frame in [
+        Frame::Terminal(owner_terminal(id)),
+        Frame::HostedTerminal(HostedTerminal {
+            job_id: id,
+            placement: format!("first_party/{host}"),
+            billed_vcpu_ms: 6001,
+            max_runtime_s,
+        }),
+    ] {
+        if motor_protocol::write_frame_async(tls, &frame)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    while motor_protocol::read_frame_async(tls)
+        .await
+        .is_ok_and(|frame| frame.is_some())
+    {}
 }

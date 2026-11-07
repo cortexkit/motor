@@ -19,6 +19,7 @@ enum Branch {
     Refused,
     Lost,
     Running,
+    Completed,
 }
 
 #[derive(Default)]
@@ -179,6 +180,35 @@ impl Connector for Runner {
                                 .unwrap();
                             }
                             gates.cancel_ready.notified().await;
+                            if branch == Branch::Completed {
+                                write_frame_async(
+                                    &mut server,
+                                    &Frame::Terminal(
+                                        TerminalRecord::new(
+                                            id,
+                                            Outcome::Exit { code: 47 },
+                                            125,
+                                            0,
+                                            0,
+                                        )
+                                        .with_ran(Ran::Remote),
+                                    ),
+                                )
+                                .await
+                                .unwrap();
+                                write_frame_async(
+                                    &mut server,
+                                    &Frame::HostedTerminal(motor_protocol::HostedTerminal {
+                                        job_id: id,
+                                        placement: "first_party/host:test".into(),
+                                        billed_vcpu_ms: 250,
+                                        max_runtime_s: 7200,
+                                    }),
+                                )
+                                .await
+                                .unwrap();
+                                return;
+                            }
                             if branch == Branch::UploadCancelled {
                                 let terminal = tombstone
                                     .lock()
@@ -1206,4 +1236,63 @@ async fn rollback_222d833_preserves_recovery_and_uncancelled_detach() {
         }
         assert_eq!(h.runner.runs.load(Ordering::SeqCst), 0);
     }
+}
+
+#[tokio::test]
+async fn caller_detached_before_late_grant_retains_real_terminal_without_new_caller() {
+    let h = Harness::with_host(Branch::Completed, "host:test").await;
+    let scratch = ScratchDir::new("late-grant-result-owner");
+    let (_repo_scratch, repo) = crate::hosted::boat_tests::committed_repo();
+    let config = Config {
+        runner_instance: "test".into(),
+        broker_token_source: crate::BrokerTokenSource::Fake,
+        broker_url: Some(h.broker.url.clone()),
+        ..Config::default()
+    };
+    let mut motor =
+        Motor::with_connector(config.clone(), &scratch, Arc::new(ResubmitPeer::new())).unwrap();
+    motor.hosted_connector = Some(h.runner.clone());
+    let path = repo.to_str().unwrap();
+    let caller = motor
+        .run_direct_hosted(
+            RunRequest::new(path, path, path, "exit 47").with_timeout(7200),
+            None,
+            crate::ReturnOptions::default(),
+        )
+        .unwrap();
+    let id = caller.job_id;
+    h.gates.lease_requested.notified().await;
+    drop(caller);
+    h.gates.grant.notify_one();
+    h.gates.admission.notify_one();
+    h.gates.cancel_ready.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while motor.hosted_state(id).unwrap().billing != crate::BillingStatus::Available {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detaching before the late grant must not abandon result ownership");
+    let result = motor.hosted_state(id).unwrap().terminal.unwrap();
+    assert_eq!(result.outcome, Outcome::Exit { code: 47 });
+    assert_eq!(result.ran, Some(Ran::Remote));
+    assert_eq!(motor.hosted_state(id).unwrap().billed_vcpu_ms, Some(250));
+    assert_eq!(h.runner.runs.load(Ordering::SeqCst), 1);
+    assert_eq!(h.runner.cancels.load(Ordering::SeqCst), 0);
+    motor.close().await;
+    let motor = Motor::with_connector(config, &scratch, Arc::new(ResubmitPeer::new())).unwrap();
+    assert_eq!(
+        motor.job_status(id).await.unwrap().terminal,
+        Some(result.clone())
+    );
+    let mut replay = motor.attach(AttachRequest::new(id, 0)).unwrap();
+    assert_eq!(
+        replay.records.recv().await.unwrap().unwrap(),
+        StreamRecord::Terminal(result)
+    );
+    assert!(replay.records.recv().await.is_none());
+    assert_eq!(h.runner.runs.load(Ordering::SeqCst), 1);
+    assert_eq!(h.runner.attaches.load(Ordering::SeqCst), 0);
+    drop(replay);
+    motor.close().await;
 }
