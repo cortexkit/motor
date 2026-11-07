@@ -94,6 +94,19 @@ class ParityTests(unittest.TestCase):
             self.assertEqual(chain["targets"], ["aarch64-apple-darwin"])
         self.assertEqual(self.manifest["sources"]["bash"]["version"], "5.2.37")
 
+    def test_real_manifest_validates_against_real_server_manifest(self):
+        manifest = json.loads((HERE / "toolchain.json").read_text())
+        parity.validate(manifest, SERVER)
+
+    def test_bun_version_outside_server_and_pending_versions_is_rejected(self):
+        self.manifest["tools"]["bun"]["version"] = "1.4.3"
+        with self.assertRaisesRegex(ValueError, "macOS tool version differs from build-server: bun"):
+            parity.validate(self.manifest, SERVER)
+
+    def test_server_bun_1_4_4_is_accepted(self):
+        self.manifest["tools"]["bun"]["version"] = "1.4.4"
+        parity.validate(self.manifest, SERVER)
+
     def test_build_server_rustc_drift_is_rejected_before_capture(self):
         server = copy.deepcopy(SERVER)
         server["rust_toolchains"]["1.99.0-x86_64-unknown-linux-gnu"]["rustc"] = "rustc 1.99.0 (deadbeef 2026-09-28)"
