@@ -28,12 +28,18 @@ pub(crate) enum Store<'a> {
     Directory(&'a Path),
 }
 
+impl<'a> Store<'a> {
+    fn path(self) -> &'a Path {
+        match self {
+            Store::File(path) => path,
+            #[cfg(unix)]
+            Store::Directory(path) => path,
+        }
+    }
+}
+
 fn identity(store: Store<'_>) -> Option<DiskIdentity> {
-    let disk = match store {
-        Store::File(path) => path,
-        #[cfg(unix)]
-        Store::Directory(path) => path,
-    };
+    let disk = store.path();
     let metadata = fs::symlink_metadata(disk).ok()?;
     let valid = match store {
         Store::File(_) => metadata.is_file(),
