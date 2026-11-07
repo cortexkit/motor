@@ -263,6 +263,7 @@ impl Host {
             return Ok(());
         }
         let mut next = self.snapshot.clone();
+        let mut lost = Vec::new();
         for (job, lease) in &mut next.leases {
             let b = next.billing.entry(job.clone()).or_default();
             if lease.state == LeaseState::Started {
@@ -284,6 +285,13 @@ impl Host {
                             .insert(job.clone(), lease.tenant.clone());
                     }
                     if now_ms >= cap.saturating_add(60_000) {
+                        lost.push((
+                            job.clone(),
+                            lease.tenant.clone(),
+                            lease.started_at_ms,
+                            lease.claims.max_s,
+                            cap,
+                        ));
                         settle_lost(lease, b, cap, now_ms);
                         next.vms
                             .entry(lease.tenant.clone())
@@ -297,6 +305,16 @@ impl Host {
         enqueue_usage(&mut next, now_ms);
         if serde_json::to_vec(&next).ok() != serde_json::to_vec(&self.snapshot).ok() {
             self.save(next)?;
+        }
+        for (job_id, tenant, started_at_ms, max_s, cap_ms) in lost {
+            tracing::warn!(
+                job_id,
+                tenant,
+                started_at_ms,
+                max_s,
+                cap_ms,
+                "lease_settled_lost_stop_pending"
+            );
         }
         Ok(())
     }
@@ -338,12 +356,20 @@ impl Host {
             .collect()
     }
     pub fn stopped(&mut self, tenant: &str) -> Result<(), Error> {
+        let pending = self
+            .snapshot
+            .vms
+            .get(tenant)
+            .is_some_and(|vm| vm.stop_pending);
         let mut next = self.snapshot.clone();
         let vm = next.vms.entry(tenant.to_owned()).or_default();
         vm.stop_pending = false;
         vm.initialized_generation = None;
         next.pending_cancels.retain(|_, t| t != tenant);
         self.save(next)?;
+        if pending {
+            tracing::info!(tenant, "tenant_stop_pending_cleared");
+        }
         self.guest_unready(tenant);
         Ok(())
     }

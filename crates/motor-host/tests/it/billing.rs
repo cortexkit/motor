@@ -703,6 +703,41 @@ fn heartbeat_uses_pinned_interim_values_and_released_is_reserved() {
 }
 
 #[test]
+fn stop_pending_tenant_advertises_no_capacity_warm_workspace_or_disk() {
+    let mut h = host();
+    h.guest_ready("tenant", 1).unwrap();
+    admitted(&mut h, JOB, 1);
+    h.event(
+        "tenant",
+        &event(2, TenantEventKind::Terminal, Some(JOB), None),
+        MS,
+    )
+    .unwrap();
+    h.record_warm(
+        "tenant",
+        MS,
+        vec![motor_protocol::HeldWorkspace {
+            job_id: JOB.parse().unwrap(),
+            used_ms: MS,
+        }],
+    );
+    h.record_disk("tenant", MS, 0, 10, 50);
+    let before = h.heartbeat(MS, 0, true);
+    assert!(before.free_vcpus > 0);
+    assert_eq!(before.warm.len(), 1);
+    assert!(!before.warm[0].busy);
+    assert_eq!(before.tenant_disk.len(), 1);
+    h.set_stop_pending("tenant", true).unwrap();
+    let blocked = h.heartbeat(MS, 0, true);
+    assert_eq!(blocked.free_vcpus, 0);
+    assert!(blocked.warm.is_empty());
+    assert!(blocked.tenant_disk.is_empty());
+    assert!(!h.memory_probe_due("tenant", MS, true));
+    h.stopped("tenant").unwrap();
+    assert!(h.heartbeat(MS, 0, true).free_vcpus > 0);
+}
+
+#[test]
 fn warm_workspace_busy_tracks_active_leases_on_its_tenant_and_hash() {
     use motor_host::state::LeaseState;
     let hash = claims(JOB).workspace_key_hash;
@@ -980,16 +1015,265 @@ impl tracing::Subscriber for Logs {
     fn event(&self, event: &tracing::Event<'_>) {
         struct Visitor(String);
         impl tracing::field::Visit for Visitor {
-            fn record_debug(&mut self, _: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0.push_str(&format!("{value:?}"));
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={value:?} ", field.name()));
             }
         }
-        let mut visitor = Visitor(String::new());
+        let mut visitor = Visitor(format!("{} ", event.metadata().level()));
         event.record(&mut visitor);
         self.0.lock().unwrap().push(visitor.0);
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
+}
+
+struct DiagnosticsControl {
+    requests: Mutex<Vec<Value>>,
+    arrived: std::sync::mpsc::Sender<String>,
+    release: (Mutex<bool>, std::sync::Condvar),
+    reply: Option<Value>,
+    stops: std::sync::atomic::AtomicUsize,
+}
+impl DiagnosticsControl {
+    fn new(reply: Option<Value>, blocked: bool) -> (Arc<Self>, std::sync::mpsc::Receiver<String>) {
+        let (arrived, receive) = std::sync::mpsc::channel();
+        (
+            Arc::new(Self {
+                requests: Mutex::new(Vec::new()),
+                arrived,
+                release: (Mutex::new(!blocked), std::sync::Condvar::new()),
+                reply,
+                stops: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            receive,
+        )
+    }
+    fn release(&self) {
+        *self.release.0.lock().unwrap() = true;
+        self.release.1.notify_all();
+    }
+}
+impl motor_host::helper::Control for DiagnosticsControl {
+    fn adopt(&self, _: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    fn wake(&self, _: &str, _: Option<u64>) -> anyhow::Result<u64> {
+        anyhow::bail!("unexpected wake")
+    }
+    fn quota(&self, _: &str, _: u32) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn relay(&self, _: &str, _: u32) -> anyhow::Result<std::os::unix::net::UnixStream> {
+        anyhow::bail!("unexpected relay")
+    }
+    fn admin(&self, _: &str, request: &Value) -> anyhow::Result<Value> {
+        if request["op"] != "diagnostics" {
+            return Ok(json!({"ok":true}));
+        }
+        self.requests.lock().unwrap().push(request.clone());
+        let _ = self
+            .arrived
+            .send(request["jti"].as_str().unwrap().to_owned());
+        let _released = self
+            .release
+            .1
+            .wait_while(self.release.0.lock().unwrap(), |released| !*released)
+            .unwrap();
+        self.reply
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("diagnostic transport failed"))
+    }
+    fn suspend(&self, _: &str) -> anyhow::Result<()> {
+        anyhow::bail!("unexpected suspend")
+    }
+    fn available_bytes(&self) -> anyhow::Result<u64> {
+        Ok(u64::MAX)
+    }
+    fn stop(&self, _: &str) -> anyhow::Result<()> {
+        self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[test]
+fn lost_settlement_fetches_each_job_once_caps_jobs_and_never_blocks_stop() {
+    let logs = Logs::default();
+    let captured = logs.0.clone();
+    tracing::subscriber::with_default(logs, || {
+        let mut h = host();
+        h.tenants.get_mut("vm").unwrap().max_weight = Some(8);
+        let lost: Vec<_> = (0..4)
+            .map(|i| format!("00000000-0000-7000-8000-{:012x}", i + 100))
+            .collect();
+        for (index, job) in lost.iter().enumerate() {
+            started(&mut h, job, index as u64 * 2 + 1);
+        }
+        started(&mut h, JOB, 9);
+        h.snapshot.leases.get_mut(JOB).unwrap().claims.max_s = 120;
+        h.guest_ready("tenant", 1).unwrap();
+        let (control, arrived) =
+            DiagnosticsControl::new(Some(json!({"ok":true,"journal":{"entries":[]}})), true);
+        let runtime = motor_host::server::Runtime::new("host".into(), h, control.clone());
+        runtime.tick(MS + 90_000).unwrap();
+        let jobs: std::collections::BTreeSet<_> = (0..3)
+            .map(|_| {
+                arrived
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(jobs, lost[..3].iter().cloned().collect());
+        assert_eq!(control.stops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(runtime.host.lock().unwrap().snapshot.vms["tenant"].stop_pending);
+        runtime.tick(MS + 90_001).unwrap();
+        assert_eq!(control.requests.lock().unwrap().len(), 3);
+        for request in control.requests.lock().unwrap().iter() {
+            assert_eq!(request["op"], "diagnostics");
+            assert_eq!(request["since_unix_s"], MS / 1000);
+        }
+        end(
+            &mut runtime.host.lock().unwrap(),
+            JOB,
+            11,
+            MS + 91_000,
+            terminal(JOB, "exit"),
+        );
+        let (done, completed) = std::sync::mpsc::channel();
+        let tick_runtime = runtime.clone();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let tick = std::thread::spawn(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                let _ = done.send(tick_runtime.tick(MS + 91_000));
+            })
+        });
+        let result = completed.recv_timeout(std::time::Duration::from_secs(5));
+        // Always release the blocked read-only queries, including on a failed assertion.
+        control.release();
+        result.expect("stop waited on a diagnostics query").unwrap();
+        tick.join().unwrap();
+        assert_eq!(control.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!runtime.host.lock().unwrap().snapshot.vms["tenant"].stop_pending);
+    });
+    let captured = captured.lock().unwrap();
+    let lost: Vec<_> = captured
+        .iter()
+        .filter(|s| s.contains("lease_settled_lost_stop_pending"))
+        .collect();
+    assert_eq!(lost.len(), 4);
+    for event in lost {
+        assert!(event.starts_with("WARN "));
+        for field in [
+            "job_id=",
+            "tenant=",
+            "started_at_ms=",
+            "max_s=30",
+            "cap_ms=",
+        ] {
+            assert!(event.contains(field), "{event}");
+        }
+    }
+    for name in [
+        "tenant_pending_stop_released",
+        "tenant_stop_pending_cleared",
+    ] {
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|s| s.starts_with("INFO ") && s.contains(name))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn lost_diagnostics_bound_journal_entries_and_unicode_lines() {
+    let entries: Vec<_> = (0..55).map(|index| json!({"unix_us":MS * 1000,
+        "message":if index == 0 { "first\nsecond".into() } else { format!("{}SHOULD_NOT_APPEAR", "é".repeat(300)) }
+    })).collect();
+    let (control, _) = DiagnosticsControl::new(
+        Some(json!({"ok":true,"journal":{"entries":entries}})),
+        false,
+    );
+    let logs = Logs::default();
+    let captured = logs.0.clone();
+    tracing::subscriber::with_default(logs, || {
+        crate::lost_diagnostics::collect(
+            control,
+            "tenant",
+            vec![(JOB.into(), MS / 1000)],
+            std::time::Duration::from_secs(5),
+        )
+    });
+    let captured = captured.lock().unwrap();
+    let lines: Vec<_> = captured
+        .iter()
+        .filter(|s| s.contains("lost_job_runner_log"))
+        .collect();
+    assert_eq!(lines.len(), 50);
+    assert!(lines[0].contains("line=first second"), "{}", lines[0]);
+    for line in &lines[1..] {
+        assert_eq!(line.chars().filter(|c| *c == 'é').count(), 300);
+        assert!(!line.contains("SHOULD_NOT_APPEAR"));
+        assert!(line.contains(JOB));
+    }
+    assert!(captured
+        .iter()
+        .any(|s| s.contains("lost_job_diagnostics_finished") && s.contains("truncated=true")));
+}
+
+#[test]
+fn lost_diagnostics_failures_and_shared_timeout_are_logged_without_late_entries() {
+    for reply in [
+        None,
+        Some(json!({"ok":false})),
+        Some(json!({"ok":true,"journal":{"unavailable":true}})),
+    ] {
+        let (control, _) = DiagnosticsControl::new(reply, false);
+        let logs = Logs::default();
+        let captured = logs.0.clone();
+        tracing::subscriber::with_default(logs, || {
+            crate::lost_diagnostics::collect(
+                control,
+                "tenant",
+                vec![(JOB.into(), MS / 1000)],
+                std::time::Duration::from_secs(5),
+            )
+        });
+        let captured = captured.lock().unwrap();
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|s| s.starts_with("WARN ") && s.contains("lost_job_diagnostics_failed"))
+                .count(),
+            1
+        );
+        assert!(!captured.iter().any(|s| s.contains("lost_job_runner_log")));
+    }
+    let (control, _) = DiagnosticsControl::new(
+        Some(json!({"ok":true,"journal":{"entries":[{"message":"LATE_ENTRY"}]}})),
+        true,
+    );
+    let logs = Logs::default();
+    let captured = logs.0.clone();
+    tracing::subscriber::with_default(logs, || {
+        crate::lost_diagnostics::collect(
+            control.clone(),
+            "tenant",
+            vec![(JOB.into(), MS / 1000), (JOB2.into(), MS / 1000)],
+            std::time::Duration::from_millis(10),
+        )
+    });
+    control.release();
+    let captured = captured.lock().unwrap();
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|s| s.starts_with("WARN ") && s.contains("lost_job_diagnostics_timed_out"))
+            .count(),
+        2
+    );
+    assert!(!captured.iter().any(|s| s.contains("LATE_ENTRY")));
 }
 
 #[test]

@@ -190,6 +190,7 @@ pub struct Runtime {
     last_key_refresh: Mutex<u64>,
     event_workers: Mutex<BTreeSet<String>>,
     terminal_workers: Mutex<BTreeSet<String>>,
+    lost_diagnostic_jobs: Mutex<BTreeMap<String, BTreeSet<String>>>,
     tenant_operations: BTreeMap<String, Arc<Mutex<()>>>,
     /// Closed tenants whose removal is running on its own thread.
     removal_workers: Mutex<BTreeSet<String>>,
@@ -258,6 +259,7 @@ impl Runtime {
             control,
             event_workers: Mutex::new(BTreeSet::new()),
             terminal_workers: Mutex::new(BTreeSet::new()),
+            lost_diagnostic_jobs: Mutex::new(BTreeMap::new()),
             tenant_operations,
             removal_workers: Mutex::new(BTreeSet::new()),
             start_retry_workers: Mutex::new(BTreeSet::new()),
@@ -745,9 +747,31 @@ impl Runtime {
         if self.sandbox_identity.is_none() {
             self.fetch_detached_terminals();
         }
-        let (cancels, quotas, candidates) = {
+        let (cancels, quotas, candidates, diagnostics) = {
             let mut host = self.host.lock().expect("host lock");
+            let unsettled: Vec<_> = host
+                .snapshot
+                .leases
+                .iter()
+                .filter(|(_, lease)| lease.state == LeaseState::Started)
+                .map(|(job, _)| job.clone())
+                .collect();
             host.billing_tick(now_ms)?;
+            let mut diagnostics: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
+            for job in unsettled {
+                if host
+                    .snapshot
+                    .billing
+                    .get(&job)
+                    .is_some_and(|billing| billing.host_settled)
+                {
+                    let lease = &host.snapshot.leases[&job];
+                    diagnostics
+                        .entry(lease.tenant.clone())
+                        .or_default()
+                        .push((job, lease.started_at_ms.unwrap_or(now_ms) / 1000));
+                }
+            }
             let cancels = host.expire(now_ms)?;
             host.retention_tick(now_ms)?;
             let mut quotas = Vec::new();
@@ -763,8 +787,26 @@ impl Runtime {
                     candidates.push(tenant.clone());
                 }
             }
-            (cancels, quotas, candidates)
+            (cancels, quotas, candidates, diagnostics)
         };
+        for (tenant, jobs) in diagnostics {
+            let jobs = {
+                let mut selected = self
+                    .lost_diagnostic_jobs
+                    .lock()
+                    .expect("lost diagnostic jobs");
+                let selected = selected.entry(tenant.clone()).or_default();
+                jobs.into_iter()
+                    .filter(|(job, _)| {
+                        selected.len() < crate::lost_diagnostics::MAX_JOBS
+                            && selected.insert(job.clone())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if !jobs.is_empty() {
+                crate::lost_diagnostics::spawn(self.control.clone(), tenant, jobs);
+            }
+        }
         let mut failure = None;
         for (tenant, job) in cancels {
             let result = (|| -> Result<()> {
@@ -796,8 +838,13 @@ impl Runtime {
                 .stops_due()
                 .contains(&tenant)
             {
+                tracing::info!(tenant, "tenant_pending_stop_released");
                 self.control.stop(&tenant)?;
                 self.host.lock().expect("host lock").stopped(&tenant)?;
+                self.lost_diagnostic_jobs
+                    .lock()
+                    .expect("lost diagnostic jobs")
+                    .remove(&tenant);
             }
         }
         // A start can take minutes, so each due retry of a start-refused
