@@ -1,0 +1,931 @@
+{
+  "note": "TEST-ONLY signed heartbeat and lease bytes generated through real routes for tenant disk validation, opportunistic cold placement and unrestricted warm reuse; each host has a separate reproducible key.",
+  "test_only_host_seeds_hex": {
+    "host-disk-a": "2121212121212121212121212121212121212121212121212121212121212121",
+    "host-disk-b": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "clock_ms": 1792195200123,
+  "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "host": {
+    "host_id": "host-disk-a",
+    "public_key_hex": "884b8857f4eaa1613c61504db34d4beaf346517a0e31de3cddd4d9b4201d9d0b",
+    "endpoint": "disk-a.example:7443",
+    "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "platform": "linux-x64"
+  },
+  "alternate_host": {
+    "host_id": "host-disk-b",
+    "public_key_hex": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+    "endpoint": "disk-b.example:7443",
+    "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "platform": "linux-x64"
+  },
+  "lease_allowance": "unlimited",
+  "malformed": {
+    "request": {
+      "method": "POST",
+      "pathname": "/v1/hosts/host-disk-a/heartbeat",
+      "body": {
+        "free_vcpus": 60,
+        "free_mem_mib": 245760,
+        "queued": 0,
+        "warm": [],
+        "running": [],
+        "healthy": true,
+        "tenant_disk": [
+          {
+            "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "disk_free_gib": 101,
+            "disk_total_gib": 100
+          }
+        ]
+      },
+      "headers": {
+        "Content-Type": "application/json",
+        "CK-Host": "host-disk-a",
+        "CK-Timestamp": "1792195200123",
+        "CK-Counter": "1",
+        "CK-Signature": "11defcaf73c8bf5bf26a9f810546ab77b1f7b0cc9ed63ea7bf6525d494d00aefdccce603f861cda9e90d2eaf561cf623458683fecc7f71a98ff8ece2f8a01b02"
+      },
+      "body_bytes": "{\"free_vcpus\":60,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"tenant_disk\":[{\"tenant\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"disk_free_gib\":101,\"disk_total_gib\":100}]}"
+    },
+    "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-disk-a/heartbeat\n579008afb1dffed1095238df39fba8c955408fdbd655be1463bbdf52a74c7a60\n1792195200123\n1",
+    "reply": {
+      "status": 400,
+      "body": {
+        "error": "bad_request",
+        "field": "tenant_disk.disk_free_gib"
+      },
+      "body_bytes": "{\"error\":\"bad_request\",\"field\":\"tenant_disk.disk_free_gib\"}"
+    }
+  },
+  "disk_cases": [
+    {
+      "name": "cold-19-skips-for-25",
+      "heartbeats": [
+        {
+          "request": {
+            "method": "POST",
+            "pathname": "/v1/hosts/host-disk-a/heartbeat",
+            "body": {
+              "free_vcpus": 60,
+              "free_mem_mib": 245760,
+              "queued": 0,
+              "warm": [],
+              "running": [],
+              "healthy": true,
+              "tenant_disk": [
+                {
+                  "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  "disk_free_gib": 19,
+                  "disk_total_gib": 100
+                }
+              ]
+            },
+            "headers": {
+              "Content-Type": "application/json",
+              "CK-Host": "host-disk-a",
+              "CK-Timestamp": "1792195200123",
+              "CK-Counter": "2",
+              "CK-Signature": "2576e61ebcd5f8697899e4eb5c1ceabb08dc157a70c172b3f696be1e28ffa2daa45a6733ede3328eef6151e5470add5aa8c569558268e58750ad4675ebab9807"
+            },
+            "body_bytes": "{\"free_vcpus\":60,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"tenant_disk\":[{\"tenant\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"disk_free_gib\":19,\"disk_total_gib\":100}]}"
+          },
+          "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-disk-a/heartbeat\nb3c7a57fcb1e69930e73da018ad1ea591778b39116268ce2ec0e104e38d684b9\n1792195200123\n2",
+          "reply": {
+            "status": 200,
+            "body": {
+              "ignored": [],
+              "closed_subjects": []
+            },
+            "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+          }
+        },
+        {
+          "request": {
+            "method": "POST",
+            "pathname": "/v1/hosts/host-disk-b/heartbeat",
+            "body": {
+              "free_vcpus": 32,
+              "free_mem_mib": 245760,
+              "queued": 0,
+              "warm": [],
+              "running": [],
+              "healthy": true,
+              "tenant_disk": [
+                {
+                  "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  "disk_free_gib": 25,
+                  "disk_total_gib": 100
+                }
+              ]
+            },
+            "headers": {
+              "Content-Type": "application/json",
+              "CK-Host": "host-disk-b",
+              "CK-Timestamp": "1792195200123",
+              "CK-Counter": "1",
+              "CK-Signature": "4418bb09e1a717bbb74a761772e6951ed8a42a6c0403780fceb6e5c3c61698311afa1bb714131bc566548de160ea573a856b31903ebec1dcd7d8540c62240404"
+            },
+            "body_bytes": "{\"free_vcpus\":32,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"tenant_disk\":[{\"tenant\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"disk_free_gib\":25,\"disk_total_gib\":100}]}"
+          },
+          "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-disk-b/heartbeat\n92172cca7d0a2afe2c5093b7aebfb34a4b6e95583c4349db57c13a656de539ba\n1792195200123\n1",
+          "reply": {
+            "status": 200,
+            "body": {
+              "ignored": [],
+              "closed_subjects": []
+            },
+            "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+          }
+        }
+      ],
+      "lease": {
+        "request": {
+          "method": "POST",
+          "pathname": "/v1/leases",
+          "body": {
+            "job_id": "01900000-0000-7000-8000-000000000200",
+            "vcpus": 2,
+            "platform": "linux-x64",
+            "net": true,
+            "workspace_key_hash": "0000000000000000000000000000000000000000000",
+            "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+            "placement_hint": null,
+            "avoid_host": null,
+            "timeout_s": 10,
+            "requester_jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+            },
+            "allow_spill": false
+          },
+          "body_bytes": "{\"job_id\":\"01900000-0000-7000-8000-000000000200\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"0000000000000000000000000000000000000000000\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":null,\"avoid_host\":null,\"timeout_s\":10,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":false}"
+        },
+        "reply": {
+          "status": 201,
+          "body": {
+            "lease_id": "12345678-1234-4321-8765-123456789abc",
+            "job_id": "01900000-0000-7000-8000-000000000200",
+            "placement": {
+              "host": "host-disk-b",
+              "vm": null
+            },
+            "endpoint": "disk-b.example:7443",
+            "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1kaXNrLWIiLCJzdWIiOiJhY2N0OjAxQVJaM05ERUtUU1Y0UlJGRlE2OUc1RkFWIiwianRpIjoiMDE5MDAwMDAtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMjAwIiwiaWF0IjoxNzkyMTk1MjAwLCJleHAiOjE3OTIxOTU1MDAsInZjcHVzIjoyLCJtZW1fbWliIjo0MDk2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWRpc2stYiIsInZtIjpudWxsfSwibWF4X3MiOjEwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIn0.OTA_OASzpst2XcZ45ddGnRy7gh9oeXKEsZiAMqxPefk8uhjH_dhHYJ9HC5-lSVZkb9qyVbZ0zY-40psIggPhBg",
+            "token_expires_at_ms": 1792195500000,
+            "max_s": 10,
+            "reserved_vcpu_ms": 20000
+          },
+          "body_bytes": "{\"lease_id\":\"12345678-1234-4321-8765-123456789abc\",\"job_id\":\"01900000-0000-7000-8000-000000000200\",\"placement\":{\"host\":\"host-disk-b\",\"vm\":null},\"endpoint\":\"disk-b.example:7443\",\"endpoint_spki_sha256\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"job_token\":\"eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1kaXNrLWIiLCJzdWIiOiJhY2N0OjAxQVJaM05ERUtUU1Y0UlJGRlE2OUc1RkFWIiwianRpIjoiMDE5MDAwMDAtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMjAwIiwiaWF0IjoxNzkyMTk1MjAwLCJleHAiOjE3OTIxOTU1MDAsInZjcHVzIjoyLCJtZW1fbWliIjo0MDk2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWRpc2stYiIsInZtIjpudWxsfSwibWF4X3MiOjEwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIn0.OTA_OASzpst2XcZ45ddGnRy7gh9oeXKEsZiAMqxPefk8uhjH_dhHYJ9HC5-lSVZkb9qyVbZ0zY-40psIggPhBg\",\"token_expires_at_ms\":1792195500000,\"max_s\":10,\"reserved_vcpu_ms\":20000}"
+        }
+      }
+    },
+    {
+      "name": "cold-both-19-stays",
+      "heartbeats": [
+        {
+          "request": {
+            "method": "POST",
+            "pathname": "/v1/hosts/host-disk-a/heartbeat",
+            "body": {
+              "free_vcpus": 60,
+              "free_mem_mib": 245760,
+              "queued": 0,
+              "warm": [],
+              "running": [],
+              "healthy": true,
+              "tenant_disk": [
+                {
+                  "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  "disk_free_gib": 19,
+                  "disk_total_gib": 100
+                }
+              ]
+            },
+            "headers": {
+              "Content-Type": "application/json",
+              "CK-Host": "host-disk-a",
+              "CK-Timestamp": "1792195200123",
+              "CK-Counter": "3",
+              "CK-Signature": "c2f459be738e30f68fad155e3e7e988c39b84a1c04915bb36216e019d6bf9bb25e43453acb3c59fbcda3728b4b5659230ba3eef0971bc443484d25dc9798620a"
+            },
+            "body_bytes": "{\"free_vcpus\":60,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"tenant_disk\":[{\"tenant\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"disk_free_gib\":19,\"disk_total_gib\":100}]}"
+          },
+          "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-disk-a/heartbeat\nb3c7a57fcb1e69930e73da018ad1ea591778b39116268ce2ec0e104e38d684b9\n1792195200123\n3",
+          "reply": {
+            "status": 200,
+            "body": {
+              "ignored": [],
+              "closed_subjects": []
+            },
+            "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+          }
+        },
+        {
+          "request": {
+            "method": "POST",
+            "pathname": "/v1/hosts/host-disk-b/heartbeat",
+            "body": {
+              "free_vcpus": 32,
+              "free_mem_mib": 245760,
+              "queued": 0,
+              "warm": [],
+              "running": [],
+              "healthy": true,
+              "tenant_disk": [
+                {
+                  "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  "disk_free_gib": 19,
+                  "disk_total_gib": 100
+                }
+              ]
+            },
+            "headers": {
+              "Content-Type": "application/json",
+              "CK-Host": "host-disk-b",
+              "CK-Timestamp": "1792195200123",
+              "CK-Counter": "2",
+              "CK-Signature": "8f9dd5f568466aafa5947ec3326a01b1cc419d1e280f4d41d1240ee9d237d39b53603802b52088ae678f95537e668c695d755116da01ed5809aeb2d54ee4160c"
+            },
+            "body_bytes": "{\"free_vcpus\":32,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"tenant_disk\":[{\"tenant\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"disk_free_gib\":19,\"disk_total_gib\":100}]}"
+          },
+          "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-disk-b/heartbeat\ne42a5314d2e8b5d9fe156f39c9c5afddd6c04291ee07af110cc9ed3dfa024480\n1792195200123\n2",
+          "reply": {
+            "status": 200,
+            "body": {
+              "ignored": [],
+              "closed_subjects": []
+            },
+            "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+          }
+        }
+      ],
+      "lease": {
+        "request": {
+          "method": "POST",
+          "pathname": "/v1/leases",
+          "body": {
+            "job_id": "01900000-0000-7000-8000-000000000201",
+            "vcpus": 2,
+            "platform": "linux-x64",
+            "net": true,
+            "workspace_key_hash": "1111111111111111111111111111111111111111111",
+            "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+            "placement_hint": null,
+            "avoid_host": null,
+            "timeout_s": 10,
+            "requester_jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+            },
+            "allow_spill": false
+          },
+          "body_bytes": "{\"job_id\":\"01900000-0000-7000-8000-000000000201\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"1111111111111111111111111111111111111111111\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":null,\"avoid_host\":null,\"timeout_s\":10,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":false}"
+        },
+        "reply": {
+          "status": 201,
+          "body": {
+            "lease_id": "12345678-1234-4321-8765-123456789abc",
+            "job_id": "01900000-0000-7000-8000-000000000201",
+            "placement": {
+              "host": "host-disk-a",
+              "vm": null
+            },
+            "endpoint": "disk-a.example:7443",
+            "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1kaXNrLWEiLCJzdWIiOiJhY2N0OjAxQVJaM05ERUtUU1Y0UlJGRlE2OUc1RkFWIiwianRpIjoiMDE5MDAwMDAtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMjAxIiwiaWF0IjoxNzkyMTk1MjAwLCJleHAiOjE3OTIxOTU1MDAsInZjcHVzIjoyLCJtZW1fbWliIjo0MDk2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWRpc2stYSIsInZtIjpudWxsfSwibWF4X3MiOjEwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIn0.fXUPRQQFYfEUQ-FMJWT6V8QsTr_xwGYGRY9kab6D0KXWtkZv7f22_1qiggeCqj3Z8UA6QkCqgnORbmaVLmq7Aw",
+            "token_expires_at_ms": 1792195500000,
+            "max_s": 10,
+            "reserved_vcpu_ms": 20000
+          },
+          "body_bytes": "{\"lease_id\":\"12345678-1234-4321-8765-123456789abc\",\"job_id\":\"01900000-0000-7000-8000-000000000201\",\"placement\":{\"host\":\"host-disk-a\",\"vm\":null},\"endpoint\":\"disk-a.example:7443\",\"endpoint_spki_sha256\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"job_token\":\"eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1kaXNrLWEiLCJzdWIiOiJhY2N0OjAxQVJaM05ERUtUU1Y0UlJGRlE2OUc1RkFWIiwianRpIjoiMDE5MDAwMDAtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMjAxIiwiaWF0IjoxNzkyMTk1MjAwLCJleHAiOjE3OTIxOTU1MDAsInZjcHVzIjoyLCJtZW1fbWliIjo0MDk2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWRpc2stYSIsInZtIjpudWxsfSwibWF4X3MiOjEwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIn0.fXUPRQQFYfEUQ-FMJWT6V8QsTr_xwGYGRY9kab6D0KXWtkZv7f22_1qiggeCqj3Z8UA6QkCqgnORbmaVLmq7Aw\",\"token_expires_at_ms\":1792195500000,\"max_s\":10,\"reserved_vcpu_ms\":20000}"
+        }
+      }
+    },
+    {
+      "name": "cold-other-does-not-fit-stays",
+      "heartbeats": [
+        {
+          "request": {
+            "method": "POST",
+            "pathname": "/v1/hosts/host-disk-a/heartbeat",
+            "body": {
+              "free_vcpus": 60,
+              "free_mem_mib": 245760,
+              "queued": 0,
+              "warm": [],
+              "running": [],
+              "healthy": true,
+              "tenant_disk": [
+                {
+                  "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  "disk_free_gib": 19,
+                  "disk_total_gib": 100
+                }
+              ]
+            },
+            "headers": {
+              "Content-Type": "application/json",
+              "CK-Host": "host-disk-a",
+              "CK-Timestamp": "1792195200123",
+              "CK-Counter": "4",
+              "CK-Signature": "cb6ff827a84f341d63b7c831b56fb9ab28ef88f4c94f29140297bcaf96508887fea52ab535106f7e1f8cd4f14ddc5ce3f466459fd71279ce02fdc35bb90da709"
+            },
+            "body_bytes": "{\"free_vcpus\":60,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"tenant_disk\":[{\"tenant\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"disk_free_gib\":19,\"disk_total_gib\":100}]}"
+          },
+          "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-disk-a/heartbeat\nb3c7a57fcb1e69930e73da018ad1ea591778b39116268ce2ec0e104e38d684b9\n1792195200123\n4",
+          "reply": {
+            "status": 200,
+            "body": {
+              "ignored": [],
+              "closed_subjects": []
+            },
+            "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+          }
+        },
+        {
+          "request": {
+            "method": "POST",
+            "pathname": "/v1/hosts/host-disk-b/heartbeat",
+            "body": {
+              "free_vcpus": 1,
+              "free_mem_mib": 245760,
+              "queued": 0,
+              "warm": [],
+              "running": [],
+              "healthy": true,
+              "tenant_disk": [
+                {
+                  "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  "disk_free_gib": 25,
+                  "disk_total_gib": 100
+                }
+              ]
+            },
+            "headers": {
+              "Content-Type": "application/json",
+              "CK-Host": "host-disk-b",
+              "CK-Timestamp": "1792195200123",
+              "CK-Counter": "3",
+              "CK-Signature": "e901f32c3226b9f82417914b080df2bb1a0d666d17fac5e7e9c515fa22ee9ccd46f4130668e006bba9442b9acf1e4dabcac86ace762e8fb6a4db0efe17049009"
+            },
+            "body_bytes": "{\"free_vcpus\":1,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"tenant_disk\":[{\"tenant\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"disk_free_gib\":25,\"disk_total_gib\":100}]}"
+          },
+          "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-disk-b/heartbeat\nc6df4749987116a739352ea8519a9be8cafc102c88ac55df1d6102b9d06ad3e0\n1792195200123\n3",
+          "reply": {
+            "status": 200,
+            "body": {
+              "ignored": [],
+              "closed_subjects": []
+            },
+            "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+          }
+        }
+      ],
+      "lease": {
+        "request": {
+          "method": "POST",
+          "pathname": "/v1/leases",
+          "body": {
+            "job_id": "01900000-0000-7000-8000-000000000202",
+            "vcpus": 2,
+            "platform": "linux-x64",
+            "net": true,
+            "workspace_key_hash": "2222222222222222222222222222222222222222222",
+            "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+            "placement_hint": null,
+            "avoid_host": null,
+            "timeout_s": 10,
+            "requester_jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+            },
+            "allow_spill": false
+          },
+          "body_bytes": "{\"job_id\":\"01900000-0000-7000-8000-000000000202\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"2222222222222222222222222222222222222222222\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":null,\"avoid_host\":null,\"timeout_s\":10,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":false}"
+        },
+        "reply": {
+          "status": 201,
+          "body": {
+            "lease_id": "12345678-1234-4321-8765-123456789abc",
+            "job_id": "01900000-0000-7000-8000-000000000202",
+            "placement": {
+              "host": "host-disk-a",
+              "vm": null
+            },
+            "endpoint": "disk-a.example:7443",
+            "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1kaXNrLWEiLCJzdWIiOiJhY2N0OjAxQVJaM05ERUtUU1Y0UlJGRlE2OUc1RkFWIiwianRpIjoiMDE5MDAwMDAtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMjAyIiwiaWF0IjoxNzkyMTk1MjAwLCJleHAiOjE3OTIxOTU1MDAsInZjcHVzIjoyLCJtZW1fbWliIjo0MDk2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWRpc2stYSIsInZtIjpudWxsfSwibWF4X3MiOjEwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIn0.xW3DdzMxDtmbCeU5wcyDDC4IC1lwC5RUfYv7HycsUIRwvziWnBXzl0RSL-ynt9IGGi7oXkClfA9OuGVyzvK3Ag",
+            "token_expires_at_ms": 1792195500000,
+            "max_s": 10,
+            "reserved_vcpu_ms": 20000
+          },
+          "body_bytes": "{\"lease_id\":\"12345678-1234-4321-8765-123456789abc\",\"job_id\":\"01900000-0000-7000-8000-000000000202\",\"placement\":{\"host\":\"host-disk-a\",\"vm\":null},\"endpoint\":\"disk-a.example:7443\",\"endpoint_spki_sha256\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"job_token\":\"eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1kaXNrLWEiLCJzdWIiOiJhY2N0OjAxQVJaM05ERUtUU1Y0UlJGRlE2OUc1RkFWIiwianRpIjoiMDE5MDAwMDAtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMjAyIiwiaWF0IjoxNzkyMTk1MjAwLCJleHAiOjE3OTIxOTU1MDAsInZjcHVzIjoyLCJtZW1fbWliIjo0MDk2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWRpc2stYSIsInZtIjpudWxsfSwibWF4X3MiOjEwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIn0.xW3DdzMxDtmbCeU5wcyDDC4IC1lwC5RUfYv7HycsUIRwvziWnBXzl0RSL-ynt9IGGi7oXkClfA9OuGVyzvK3Ag\",\"token_expires_at_ms\":1792195500000,\"max_s\":10,\"reserved_vcpu_ms\":20000}"
+        }
+      }
+    },
+    {
+      "name": "warm-5-stays",
+      "heartbeats": [
+        {
+          "request": {
+            "method": "POST",
+            "pathname": "/v1/hosts/host-disk-a/heartbeat",
+            "body": {
+              "free_vcpus": 60,
+              "free_mem_mib": 245760,
+              "queued": 0,
+              "warm": [
+                {
+                  "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  "workspace_key_hash": "3333333333333333333333333333333333333333333",
+                  "vm": "disk-warm"
+                }
+              ],
+              "running": [],
+              "healthy": true,
+              "tenant_disk": [
+                {
+                  "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  "disk_free_gib": 5,
+                  "disk_total_gib": 100
+                }
+              ]
+            },
+            "headers": {
+              "Content-Type": "application/json",
+              "CK-Host": "host-disk-a",
+              "CK-Timestamp": "1792195200123",
+              "CK-Counter": "5",
+              "CK-Signature": "8e9119be48d170af34d4df4f7b3b1469dbe1e087862a2490e30be65614f357125ebd704d8935ccd1769915b5a22a6b37e3520278c8505555e3c4300cd79ee70c"
+            },
+            "body_bytes": "{\"free_vcpus\":60,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[{\"tenant\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"workspace_key_hash\":\"3333333333333333333333333333333333333333333\",\"vm\":\"disk-warm\"}],\"running\":[],\"healthy\":true,\"tenant_disk\":[{\"tenant\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"disk_free_gib\":5,\"disk_total_gib\":100}]}"
+          },
+          "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-disk-a/heartbeat\na8a81ea7875407691f2ccb5489725ba478ee402f9eb0ef141bb6bdc5b0a19d8c\n1792195200123\n5",
+          "reply": {
+            "status": 200,
+            "body": {
+              "ignored": [],
+              "closed_subjects": []
+            },
+            "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+          }
+        },
+        {
+          "request": {
+            "method": "POST",
+            "pathname": "/v1/hosts/host-disk-b/heartbeat",
+            "body": {
+              "free_vcpus": 32,
+              "free_mem_mib": 245760,
+              "queued": 0,
+              "warm": [],
+              "running": [],
+              "healthy": true,
+              "tenant_disk": [
+                {
+                  "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  "disk_free_gib": 25,
+                  "disk_total_gib": 100
+                }
+              ]
+            },
+            "headers": {
+              "Content-Type": "application/json",
+              "CK-Host": "host-disk-b",
+              "CK-Timestamp": "1792195200123",
+              "CK-Counter": "4",
+              "CK-Signature": "28b7a97da01a07c966092ae595a9f1eeaebb453791b6d82c624f17274bd996f1852c3be696be068a1ce440b6c0915cb48ffbff128ddd43ca96a0d3d5d247bc0b"
+            },
+            "body_bytes": "{\"free_vcpus\":32,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"tenant_disk\":[{\"tenant\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"disk_free_gib\":25,\"disk_total_gib\":100}]}"
+          },
+          "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-disk-b/heartbeat\n92172cca7d0a2afe2c5093b7aebfb34a4b6e95583c4349db57c13a656de539ba\n1792195200123\n4",
+          "reply": {
+            "status": 200,
+            "body": {
+              "ignored": [],
+              "closed_subjects": []
+            },
+            "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+          }
+        }
+      ],
+      "lease": {
+        "request": {
+          "method": "POST",
+          "pathname": "/v1/leases",
+          "body": {
+            "job_id": "01900000-0000-7000-8000-000000000203",
+            "vcpus": 2,
+            "platform": "linux-x64",
+            "net": true,
+            "workspace_key_hash": "3333333333333333333333333333333333333333333",
+            "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+            "placement_hint": null,
+            "avoid_host": null,
+            "timeout_s": 10,
+            "requester_jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+            },
+            "allow_spill": false
+          },
+          "body_bytes": "{\"job_id\":\"01900000-0000-7000-8000-000000000203\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"3333333333333333333333333333333333333333333\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":null,\"avoid_host\":null,\"timeout_s\":10,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":false}"
+        },
+        "reply": {
+          "status": 201,
+          "body": {
+            "lease_id": "12345678-1234-4321-8765-123456789abc",
+            "job_id": "01900000-0000-7000-8000-000000000203",
+            "placement": {
+              "host": "host-disk-a",
+              "vm": "disk-warm"
+            },
+            "endpoint": "disk-a.example:7443",
+            "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1kaXNrLWEiLCJzdWIiOiJhY2N0OjAxQVJaM05ERUtUU1Y0UlJGRlE2OUc1RkFWIiwianRpIjoiMDE5MDAwMDAtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMjAzIiwiaWF0IjoxNzkyMTk1MjAwLCJleHAiOjE3OTIxOTU1MDAsInZjcHVzIjoyLCJtZW1fbWliIjo0MDk2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWRpc2stYSIsInZtIjoiZGlzay13YXJtIn0sIm1heF9zIjoxMCwiY25mIjp7ImprdCI6IkFrWElaRnpvbmI1OVptR3d5S2dpM0gzQndNaTZhbWV2cWRLUWlMWmhkdGMifSwicHVycG9zZSI6InJ1biJ9.1hWn0i_9-BKRJXgpRyJfCQTNxQq48M7ylUrdPsNOLw41ZfAb5jmyoOYsj9TvfcREfksedYA4wpSgbNK35VzwCw",
+            "token_expires_at_ms": 1792195500000,
+            "max_s": 10,
+            "reserved_vcpu_ms": 20000
+          },
+          "body_bytes": "{\"lease_id\":\"12345678-1234-4321-8765-123456789abc\",\"job_id\":\"01900000-0000-7000-8000-000000000203\",\"placement\":{\"host\":\"host-disk-a\",\"vm\":\"disk-warm\"},\"endpoint\":\"disk-a.example:7443\",\"endpoint_spki_sha256\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"job_token\":\"eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1kaXNrLWEiLCJzdWIiOiJhY2N0OjAxQVJaM05ERUtUU1Y0UlJGRlE2OUc1RkFWIiwianRpIjoiMDE5MDAwMDAtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMjAzIiwiaWF0IjoxNzkyMTk1MjAwLCJleHAiOjE3OTIxOTU1MDAsInZjcHVzIjoyLCJtZW1fbWliIjo0MDk2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWRpc2stYSIsInZtIjoiZGlzay13YXJtIn0sIm1heF9zIjoxMCwiY25mIjp7ImprdCI6IkFrWElaRnpvbmI1OVptR3d5S2dpM0gzQndNaTZhbWV2cWRLUWlMWmhkdGMifSwicHVycG9zZSI6InJ1biJ9.1hWn0i_9-BKRJXgpRyJfCQTNxQq48M7ylUrdPsNOLw41ZfAb5jmyoOYsj9TvfcREfksedYA4wpSgbNK35VzwCw\",\"token_expires_at_ms\":1792195500000,\"max_s\":10,\"reserved_vcpu_ms\":20000}"
+        }
+      }
+    },
+    {
+      "name": "cold-no-tenant-entry",
+      "heartbeats": [
+        {
+          "request": {
+            "method": "POST",
+            "pathname": "/v1/hosts/host-disk-a/heartbeat",
+            "body": {
+              "free_vcpus": 60,
+              "free_mem_mib": 245760,
+              "queued": 0,
+              "warm": [],
+              "running": [],
+              "healthy": true,
+              "tenant_disk": [
+                {
+                  "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAW",
+                  "disk_free_gib": 0,
+                  "disk_total_gib": 100
+                }
+              ]
+            },
+            "headers": {
+              "Content-Type": "application/json",
+              "CK-Host": "host-disk-a",
+              "CK-Timestamp": "1792195200123",
+              "CK-Counter": "6",
+              "CK-Signature": "12c89edfdcfe8511e0819e97ddf164760cba306c90bcac81b824cb2f055215bd8e39b8a0ab0d228b3fa476906667dcc50a419ad08f364c5f59db651b39ba9c07"
+            },
+            "body_bytes": "{\"free_vcpus\":60,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"tenant_disk\":[{\"tenant\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"disk_free_gib\":0,\"disk_total_gib\":100}]}"
+          },
+          "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-disk-a/heartbeat\n074b447eede13e4ae901ff979f107c0a321d42db3cc201398978d028623a4f9e\n1792195200123\n6",
+          "reply": {
+            "status": 200,
+            "body": {
+              "ignored": [],
+              "closed_subjects": []
+            },
+            "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+          }
+        },
+        {
+          "request": {
+            "method": "POST",
+            "pathname": "/v1/hosts/host-disk-b/heartbeat",
+            "body": {
+              "free_vcpus": 32,
+              "free_mem_mib": 245760,
+              "queued": 0,
+              "warm": [],
+              "running": [],
+              "healthy": true,
+              "tenant_disk": [
+                {
+                  "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  "disk_free_gib": 25,
+                  "disk_total_gib": 100
+                }
+              ]
+            },
+            "headers": {
+              "Content-Type": "application/json",
+              "CK-Host": "host-disk-b",
+              "CK-Timestamp": "1792195200123",
+              "CK-Counter": "5",
+              "CK-Signature": "83e4ab2c9979c17f00f9c93b5c1a9662f0b39da25e49af77e84adb212ff268aeb88b9417f78a2d893c918429626713aaefae0d45cbbfbc158d7aec2fa8c67700"
+            },
+            "body_bytes": "{\"free_vcpus\":32,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"tenant_disk\":[{\"tenant\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"disk_free_gib\":25,\"disk_total_gib\":100}]}"
+          },
+          "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-disk-b/heartbeat\n92172cca7d0a2afe2c5093b7aebfb34a4b6e95583c4349db57c13a656de539ba\n1792195200123\n5",
+          "reply": {
+            "status": 200,
+            "body": {
+              "ignored": [],
+              "closed_subjects": []
+            },
+            "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+          }
+        }
+      ],
+      "lease": {
+        "request": {
+          "method": "POST",
+          "pathname": "/v1/leases",
+          "body": {
+            "job_id": "01900000-0000-7000-8000-000000000204",
+            "vcpus": 2,
+            "platform": "linux-x64",
+            "net": true,
+            "workspace_key_hash": "4444444444444444444444444444444444444444444",
+            "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+            "placement_hint": null,
+            "avoid_host": null,
+            "timeout_s": 10,
+            "requester_jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+            },
+            "allow_spill": false
+          },
+          "body_bytes": "{\"job_id\":\"01900000-0000-7000-8000-000000000204\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"4444444444444444444444444444444444444444444\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":null,\"avoid_host\":null,\"timeout_s\":10,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":false}"
+        },
+        "reply": {
+          "status": 201,
+          "body": {
+            "lease_id": "12345678-1234-4321-8765-123456789abc",
+            "job_id": "01900000-0000-7000-8000-000000000204",
+            "placement": {
+              "host": "host-disk-a",
+              "vm": null
+            },
+            "endpoint": "disk-a.example:7443",
+            "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1kaXNrLWEiLCJzdWIiOiJhY2N0OjAxQVJaM05ERUtUU1Y0UlJGRlE2OUc1RkFWIiwianRpIjoiMDE5MDAwMDAtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMjA0IiwiaWF0IjoxNzkyMTk1MjAwLCJleHAiOjE3OTIxOTU1MDAsInZjcHVzIjoyLCJtZW1fbWliIjo0MDk2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWRpc2stYSIsInZtIjpudWxsfSwibWF4X3MiOjEwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIn0.V1XZZ2CouA2jto28JrOnbkrpMDjrEhBzAgEZlkUKgzRArB0y_fxmlB2IbBJWr-RyOofGEgjasDGb3hGauhtEBg",
+            "token_expires_at_ms": 1792195500000,
+            "max_s": 10,
+            "reserved_vcpu_ms": 20000
+          },
+          "body_bytes": "{\"lease_id\":\"12345678-1234-4321-8765-123456789abc\",\"job_id\":\"01900000-0000-7000-8000-000000000204\",\"placement\":{\"host\":\"host-disk-a\",\"vm\":null},\"endpoint\":\"disk-a.example:7443\",\"endpoint_spki_sha256\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"job_token\":\"eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1kaXNrLWEiLCJzdWIiOiJhY2N0OjAxQVJaM05ERUtUU1Y0UlJGRlE2OUc1RkFWIiwianRpIjoiMDE5MDAwMDAtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMjA0IiwiaWF0IjoxNzkyMTk1MjAwLCJleHAiOjE3OTIxOTU1MDAsInZjcHVzIjoyLCJtZW1fbWliIjo0MDk2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWRpc2stYSIsInZtIjpudWxsfSwibWF4X3MiOjEwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIn0.V1XZZ2CouA2jto28JrOnbkrpMDjrEhBzAgEZlkUKgzRArB0y_fxmlB2IbBJWr-RyOofGEgjasDGb3hGauhtEBg\",\"token_expires_at_ms\":1792195500000,\"max_s\":10,\"reserved_vcpu_ms\":20000}"
+        }
+      }
+    },
+    {
+      "name": "cold-exact-20-stays",
+      "heartbeats": [
+        {
+          "request": {
+            "method": "POST",
+            "pathname": "/v1/hosts/host-disk-a/heartbeat",
+            "body": {
+              "free_vcpus": 60,
+              "free_mem_mib": 245760,
+              "queued": 0,
+              "warm": [],
+              "running": [],
+              "healthy": true,
+              "tenant_disk": [
+                {
+                  "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  "disk_free_gib": 200,
+                  "disk_total_gib": 1000
+                }
+              ]
+            },
+            "headers": {
+              "Content-Type": "application/json",
+              "CK-Host": "host-disk-a",
+              "CK-Timestamp": "1792195200123",
+              "CK-Counter": "7",
+              "CK-Signature": "a28d031d0e363ba0a3d04f7b01c8c87bcc6fc99899080596b881c444224010dfdda5d56894a765b0cd154e828397ee7c5e3a9765da2117121ff8a6e9add7a00f"
+            },
+            "body_bytes": "{\"free_vcpus\":60,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"tenant_disk\":[{\"tenant\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"disk_free_gib\":200,\"disk_total_gib\":1000}]}"
+          },
+          "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-disk-a/heartbeat\na3253fd27151d388e980b4aef2f0f128e742098974e92581fe6314390aa3f57f\n1792195200123\n7",
+          "reply": {
+            "status": 200,
+            "body": {
+              "ignored": [],
+              "closed_subjects": []
+            },
+            "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+          }
+        },
+        {
+          "request": {
+            "method": "POST",
+            "pathname": "/v1/hosts/host-disk-b/heartbeat",
+            "body": {
+              "free_vcpus": 32,
+              "free_mem_mib": 245760,
+              "queued": 0,
+              "warm": [],
+              "running": [],
+              "healthy": true,
+              "tenant_disk": [
+                {
+                  "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  "disk_free_gib": 25,
+                  "disk_total_gib": 100
+                }
+              ]
+            },
+            "headers": {
+              "Content-Type": "application/json",
+              "CK-Host": "host-disk-b",
+              "CK-Timestamp": "1792195200123",
+              "CK-Counter": "6",
+              "CK-Signature": "f829f9a77445128c8a8d2c00d9f9f9a0517749eace0aeb7fd81e3eb191b4224a4b63c7cee8b6ef42c1a52e04e007a8f9a8f5f3def787514a693a0b5bd835a805"
+            },
+            "body_bytes": "{\"free_vcpus\":32,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"tenant_disk\":[{\"tenant\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"disk_free_gib\":25,\"disk_total_gib\":100}]}"
+          },
+          "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-disk-b/heartbeat\n92172cca7d0a2afe2c5093b7aebfb34a4b6e95583c4349db57c13a656de539ba\n1792195200123\n6",
+          "reply": {
+            "status": 200,
+            "body": {
+              "ignored": [],
+              "closed_subjects": []
+            },
+            "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+          }
+        }
+      ],
+      "lease": {
+        "request": {
+          "method": "POST",
+          "pathname": "/v1/leases",
+          "body": {
+            "job_id": "01900000-0000-7000-8000-000000000205",
+            "vcpus": 2,
+            "platform": "linux-x64",
+            "net": true,
+            "workspace_key_hash": "5555555555555555555555555555555555555555555",
+            "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+            "placement_hint": null,
+            "avoid_host": null,
+            "timeout_s": 10,
+            "requester_jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+            },
+            "allow_spill": false
+          },
+          "body_bytes": "{\"job_id\":\"01900000-0000-7000-8000-000000000205\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"5555555555555555555555555555555555555555555\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":null,\"avoid_host\":null,\"timeout_s\":10,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":false}"
+        },
+        "reply": {
+          "status": 201,
+          "body": {
+            "lease_id": "12345678-1234-4321-8765-123456789abc",
+            "job_id": "01900000-0000-7000-8000-000000000205",
+            "placement": {
+              "host": "host-disk-a",
+              "vm": null
+            },
+            "endpoint": "disk-a.example:7443",
+            "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1kaXNrLWEiLCJzdWIiOiJhY2N0OjAxQVJaM05ERUtUU1Y0UlJGRlE2OUc1RkFWIiwianRpIjoiMDE5MDAwMDAtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMjA1IiwiaWF0IjoxNzkyMTk1MjAwLCJleHAiOjE3OTIxOTU1MDAsInZjcHVzIjoyLCJtZW1fbWliIjo0MDk2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWRpc2stYSIsInZtIjpudWxsfSwibWF4X3MiOjEwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIn0.QQ9aLAS9hqH7bbCQwSnxTolmx1l6BRbw08dv6DULcd9aAmYlk2PQHoKEGSkyQtDA8yN3FyTIXvixK2gPlFQGBw",
+            "token_expires_at_ms": 1792195500000,
+            "max_s": 10,
+            "reserved_vcpu_ms": 20000
+          },
+          "body_bytes": "{\"lease_id\":\"12345678-1234-4321-8765-123456789abc\",\"job_id\":\"01900000-0000-7000-8000-000000000205\",\"placement\":{\"host\":\"host-disk-a\",\"vm\":null},\"endpoint\":\"disk-a.example:7443\",\"endpoint_spki_sha256\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"job_token\":\"eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1kaXNrLWEiLCJzdWIiOiJhY2N0OjAxQVJaM05ERUtUU1Y0UlJGRlE2OUc1RkFWIiwianRpIjoiMDE5MDAwMDAtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMjA1IiwiaWF0IjoxNzkyMTk1MjAwLCJleHAiOjE3OTIxOTU1MDAsInZjcHVzIjoyLCJtZW1fbWliIjo0MDk2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWRpc2stYSIsInZtIjpudWxsfSwibWF4X3MiOjEwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIn0.QQ9aLAS9hqH7bbCQwSnxTolmx1l6BRbw08dv6DULcd9aAmYlk2PQHoKEGSkyQtDA8yN3FyTIXvixK2gPlFQGBw\",\"token_expires_at_ms\":1792195500000,\"max_s\":10,\"reserved_vcpu_ms\":20000}"
+        }
+      }
+    },
+    {
+      "name": "cold-one-gib-below-20-skips",
+      "heartbeats": [
+        {
+          "request": {
+            "method": "POST",
+            "pathname": "/v1/hosts/host-disk-a/heartbeat",
+            "body": {
+              "free_vcpus": 60,
+              "free_mem_mib": 245760,
+              "queued": 0,
+              "warm": [],
+              "running": [],
+              "healthy": true,
+              "tenant_disk": [
+                {
+                  "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  "disk_free_gib": 199,
+                  "disk_total_gib": 1000
+                }
+              ]
+            },
+            "headers": {
+              "Content-Type": "application/json",
+              "CK-Host": "host-disk-a",
+              "CK-Timestamp": "1792195200123",
+              "CK-Counter": "8",
+              "CK-Signature": "3efe5f9520fd3c49f7d06ec757e529c8a637cb6725e0bce548d29646e88b171da03a14bf514096efaaac87cb53c64a667dda50508af5793324d4c6e4a1aebc06"
+            },
+            "body_bytes": "{\"free_vcpus\":60,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"tenant_disk\":[{\"tenant\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"disk_free_gib\":199,\"disk_total_gib\":1000}]}"
+          },
+          "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-disk-a/heartbeat\nbd0286e9352b8068f57d443662d391d398e9ab870f7608ed85982a75d495c229\n1792195200123\n8",
+          "reply": {
+            "status": 200,
+            "body": {
+              "ignored": [],
+              "closed_subjects": []
+            },
+            "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+          }
+        },
+        {
+          "request": {
+            "method": "POST",
+            "pathname": "/v1/hosts/host-disk-b/heartbeat",
+            "body": {
+              "free_vcpus": 32,
+              "free_mem_mib": 245760,
+              "queued": 0,
+              "warm": [],
+              "running": [],
+              "healthy": true,
+              "tenant_disk": [
+                {
+                  "tenant": "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  "disk_free_gib": 25,
+                  "disk_total_gib": 100
+                }
+              ]
+            },
+            "headers": {
+              "Content-Type": "application/json",
+              "CK-Host": "host-disk-b",
+              "CK-Timestamp": "1792195200123",
+              "CK-Counter": "7",
+              "CK-Signature": "8a8de606170c2608f23d9a381a9f9b7f3cb922a652e5353f8e261f74456b1154b1eeb65df2768c95fc108432d1311fd5c213f092c3408c180389b10d1f32000e"
+            },
+            "body_bytes": "{\"free_vcpus\":32,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"tenant_disk\":[{\"tenant\":\"acct:01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"disk_free_gib\":25,\"disk_total_gib\":100}]}"
+          },
+          "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-disk-b/heartbeat\n92172cca7d0a2afe2c5093b7aebfb34a4b6e95583c4349db57c13a656de539ba\n1792195200123\n7",
+          "reply": {
+            "status": 200,
+            "body": {
+              "ignored": [],
+              "closed_subjects": []
+            },
+            "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+          }
+        }
+      ],
+      "lease": {
+        "request": {
+          "method": "POST",
+          "pathname": "/v1/leases",
+          "body": {
+            "job_id": "01900000-0000-7000-8000-000000000206",
+            "vcpus": 2,
+            "platform": "linux-x64",
+            "net": true,
+            "workspace_key_hash": "6666666666666666666666666666666666666666666",
+            "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+            "placement_hint": null,
+            "avoid_host": null,
+            "timeout_s": 10,
+            "requester_jwk": {
+              "kty": "OKP",
+              "crv": "Ed25519",
+              "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+            },
+            "allow_spill": false
+          },
+          "body_bytes": "{\"job_id\":\"01900000-0000-7000-8000-000000000206\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"6666666666666666666666666666666666666666666\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":null,\"avoid_host\":null,\"timeout_s\":10,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":false}"
+        },
+        "reply": {
+          "status": 201,
+          "body": {
+            "lease_id": "12345678-1234-4321-8765-123456789abc",
+            "job_id": "01900000-0000-7000-8000-000000000206",
+            "placement": {
+              "host": "host-disk-b",
+              "vm": null
+            },
+            "endpoint": "disk-b.example:7443",
+            "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1kaXNrLWIiLCJzdWIiOiJhY2N0OjAxQVJaM05ERUtUU1Y0UlJGRlE2OUc1RkFWIiwianRpIjoiMDE5MDAwMDAtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMjA2IiwiaWF0IjoxNzkyMTk1MjAwLCJleHAiOjE3OTIxOTU1MDAsInZjcHVzIjoyLCJtZW1fbWliIjo0MDk2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWRpc2stYiIsInZtIjpudWxsfSwibWF4X3MiOjEwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIn0.j2yjuPul05C30BcxV3aUbJqFpdGBAP80ER5cNoHjLfLfmzphl_rZKfqAK-cyxP4Cr7odG59swj6Erb0dBJnhCQ",
+            "token_expires_at_ms": 1792195500000,
+            "max_s": 10,
+            "reserved_vcpu_ms": 20000
+          },
+          "body_bytes": "{\"lease_id\":\"12345678-1234-4321-8765-123456789abc\",\"job_id\":\"01900000-0000-7000-8000-000000000206\",\"placement\":{\"host\":\"host-disk-b\",\"vm\":null},\"endpoint\":\"disk-b.example:7443\",\"endpoint_spki_sha256\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"job_token\":\"eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1kaXNrLWIiLCJzdWIiOiJhY2N0OjAxQVJaM05ERUtUU1Y0UlJGRlE2OUc1RkFWIiwianRpIjoiMDE5MDAwMDAtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMjA2IiwiaWF0IjoxNzkyMTk1MjAwLCJleHAiOjE3OTIxOTU1MDAsInZjcHVzIjoyLCJtZW1fbWliIjo0MDk2LCJwbGF0Zm9ybSI6ImxpbnV4LXg2NCIsIm5ldCI6dHJ1ZSwicGxhY2VtZW50Ijp7Imhvc3QiOiJob3N0LWRpc2stYiIsInZtIjpudWxsfSwibWF4X3MiOjEwLCJjbmYiOnsiamt0IjoiQWtYSVpGem9uYjU5Wm1Hd3lLZ2kzSDNCd01pNmFtZXZxZEtRaUxaaGR0YyJ9LCJwdXJwb3NlIjoicnVuIn0.j2yjuPul05C30BcxV3aUbJqFpdGBAP80ER5cNoHjLfLfmzphl_rZKfqAK-cyxP4Cr7odG59swj6Erb0dBJnhCQ\",\"token_expires_at_ms\":1792195500000,\"max_s\":10,\"reserved_vcpu_ms\":20000}"
+        }
+      }
+    }
+  ]
+}

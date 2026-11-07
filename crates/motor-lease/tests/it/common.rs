@@ -103,6 +103,8 @@ pub fn heartbeat(state: JobState, elapsed_ms: u64) -> Heartbeat {
         warm: vec![],
         healthy: true,
         draining: false,
+        accept_until_ms: None,
+        tenant_disk: Vec::new(),
         revoked_ack: Vec::new(),
         running: vec![RunningJob {
             job_id: "019e4567-89ab-7cde-8012-3456789abcde".into(),

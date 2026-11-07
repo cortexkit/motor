@@ -735,7 +735,8 @@ The exact body is:
 
 ```text
 {free_vcpus, free_mem_mib, queued, warm:[{tenant, workspace_key_hash, vm, busy?}],
- running:[{job_id, state, elapsed_ms}], healthy, draining?, revoked_ack?:[job_id,…]}
+ running:[{job_id, state, elapsed_ms}], healthy, draining?, revoked_ack?:[job_id,…], accept_until_ms?,
+ tenant_disk?:[{tenant, disk_free_gib, disk_total_gib}]}
 ```
 
 Integers are non-negative safe integers. `healthy` is boolean. `warm` and `running` each have at
@@ -744,8 +745,8 @@ the host capacity snapshot, timestamped at broker receive time. `queued` is stor
 affect placement.
 
 The optional member `draining` is boolean; absent and `false` mean the same. Apart from
-`revoked_ack` described below, every other
-unknown body member is still refused. Only the latest accepted snapshot stored by PlacementDO
+`revoked_ack`, `accept_until_ms` and `tenant_disk` described below, every other unknown body member is still refused.
+Only the latest accepted snapshot stored by PlacementDO
 controls draining: a delayed older heartbeat cannot set or clear it. The next accepted heartbeat
 that omits `draining` or sends `false` clears the drain.
 
@@ -757,6 +758,58 @@ never falls back to another host or Boat. Draining hosts still count for the reg
 `no_host_fits` ceiling check (both maxima) because draining is temporary. A job only a draining
 host can fit receives retryable `no_capacity` with `Retry-After`, not `no_host_fits` (and may
 spill when allowed). The independent operator `explicit_only` override is unchanged.
+
+The optional member `accept_until_ms` is a non-negative safe integer on the broker's clock
+(Unix milliseconds). Member-level validation reports 400 `bad_request` with
+`field: "accept_until_ms"`. As for other heartbeat members, numeric spellings refused by the
+strict JSON reader (including fractional or unsafe literals) report `field: "body"` instead.
+Only the latest accepted snapshot controls the bound; omitting the member removes it. Absent means
+no bound, and `draining: true` takes precedence when both members are present.
+
+A bounded host accepts ordinary placement only when
+`now_ms + timeout_s × 1000 + 300000 ≤ accept_until_ms`. Placement uses the lease's requested
+`timeout_s`, not its later budget-capped `max_s`; replacements use the stored job's already-fixed
+`max_s` instead. The 300 s slack is the run token's full life, because admission may occur any
+time before expiry. For a lease that fits, capacity, warm and
+busy-checkout tiers are unchanged. A lease that does not fit treats the host exactly as draining:
+no selection or warm affinity, ordinary spill where allowed, and retryable 503 `no_capacity`
+(with `Retry-After`) when no other host is available. A `placement_hint.host` naming that host
+is still a binding canary exception, even for a cold VM, with no fallback to another host or Boat.
+The bound never affects the registry's `no_host_fits` ceiling check: a temporary bound cannot
+make a job never fit. The host must also refuse at admission a token whose job could run past
+its own bound, even if broker placement allowed it.
+
+The optional final member `tenant_disk` reports tenant-VM disk samples. It is an array of at most
+64 entries, each exactly `{tenant, disk_free_gib, disk_total_gib}`, with no duplicate tenant.
+`tenant` uses the same `acct:<account ULID>` subject and validation as a `warm` entry.
+Both disk values are non-negative safe integers in GiB, `disk_total_gib > 0`, and
+`disk_free_gib ≤ disk_total_gib`. A host computes each by rounding its byte count down to whole
+GiB (bytes / 2^30, floored), which keeps free at or below total. Malformed arrays and duplicate tenants report 400 `bad_request`
+with `field: "tenant_disk"`; malformed members name `tenant_disk.tenant`,
+`tenant_disk.disk_free_gib` or `tenant_disk.disk_total_gib`. A free value above total names
+`tenant_disk.disk_free_gib`. Unknown keys and numeric spellings refused by the strict JSON reader
+still name `body`, as for other heartbeat members.
+
+Only the latest accepted snapshot supplies disk samples; omitting the array or a tenant's entry
+removes that tenant's disk constraint. A host **must omit** a tenant's entry when its latest guest
+sample is older than 60 seconds, so stale readings never steer placement. Missing entries cover
+hosts without that tenant VM yet, older host builds and stale samples, and impose no disk rule.
+
+For a cold placement for tenant T, the broker skips a host with T's sample below 20% free only
+when another host passes every other eligibility and capacity check for the lease and has either
+at least 20% free for T or no entry for T. The comparison is exact integer arithmetic:
+`disk_free_gib × 100 < 20 × disk_total_gib`; exactly 20% passes. With no such fitting alternative,
+the broker ignores disk and places as before. Warm or affinity matches for this tenant and
+workspace have **no disk rule**, even below 20%. Binding explicit-only, draining or bounded-host
+placement hints also ignore disk. Disk is an extra predicate after the other checks, not a sort
+key; the existing placement tiers and free-capacity ordering remain unchanged. A busy host can sit
+just above its runner's 10% floor: that floor and admission-time eviction are the real guard.
+Disk is not accounted in the in-flight ledger.
+
+Disk alone never causes `no_capacity` or `no_host_fits`, never changes the registry ceiling, and
+does not cause spill. The `disk` host-placement refusal counter counts only hosts actually skipped
+for disk on leases that were then placed elsewhere. Unlike the other refusal reasons, these
+disk-only observations are recorded on successful placements; non-disk counter behavior is unchanged.
 
 `warm` lists the tenant workspaces the host holds **now**, after eviction, most-recent first. A
 host holding more than 64 reports only the 64 most recent workspaces.

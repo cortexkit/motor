@@ -26,6 +26,10 @@ pub const RETENTION_INTERVAL_MS: u64 = 10 * 60 * 1000;
 /// Bound storage without ever evicting an unexpired, acknowledged fence.
 pub const REVOCATION_CAP: usize = 4096;
 
+// Let the runner report its own deadline terminal before the host backstop cancels.
+const BACKSTOP_CANCEL_GRACE_MS: u64 = 30_000;
+const LOST_SETTLEMENT_GRACE_MS: u64 = 300_000;
+
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct JobBilling {
@@ -36,6 +40,10 @@ pub struct JobBilling {
     pub terminal: Option<Value>,
     pub cancelled_at_cap: bool,
     pub host_settled: bool,
+    /// A lost result requires a restart until the runner proves the job ended.
+    /// For older records without this field, keep the restart requirement while a stop is pending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_pending: Option<bool>,
     pub synthesized_output: Option<Value>,
     pub hosted_terminal: Option<Value>,
     pub usage: Option<Usage>,
@@ -226,8 +234,16 @@ impl Host {
             return Ok(());
         }
         let mut next = self.snapshot.clone();
+        if next.billing.get(job).is_some_and(|b| b.host_settled) {
+            let stopping = next
+                .leases
+                .get(job)
+                .is_some_and(|lease| self.stopping.contains(&lease.tenant));
+            observe_settled_terminal(&mut next, job, now_ms, stopping);
+            return self.save(next);
+        }
         let b = next.billing.entry(job.to_owned()).or_default();
-        if b.host_settled || b.terminal.is_some() {
+        if b.terminal.is_some() {
             return Ok(());
         }
         b.terminal_received_ms = Some(now_ms);
@@ -244,7 +260,10 @@ impl Host {
             for (job, lease) in &next.leases {
                 if lease.state == LeaseState::Started
                     && lease.started_at_ms.is_some_and(|started| {
-                        now_ms >= started.saturating_add(lease.claims.max_s.saturating_mul(1000))
+                        now_ms
+                            >= started
+                                .saturating_add(lease.claims.max_s.saturating_mul(1000))
+                                .saturating_add(BACKSTOP_CANCEL_GRACE_MS)
                     })
                 {
                     next.pending_cancels
@@ -257,6 +276,7 @@ impl Host {
             return Ok(());
         }
         let mut next = self.snapshot.clone();
+        let mut lost = Vec::new();
         for (job, lease) in &mut next.leases {
             let b = next.billing.entry(job.clone()).or_default();
             if lease.state == LeaseState::Started {
@@ -271,12 +291,20 @@ impl Host {
                         b.ended_observed_ms = Some(receipt);
                     }
                 } else if now_ms >= cap {
-                    if !b.cancelled_at_cap {
+                    if !b.cancelled_at_cap && now_ms >= cap.saturating_add(BACKSTOP_CANCEL_GRACE_MS)
+                    {
                         b.cancelled_at_cap = true;
                         next.pending_cancels
                             .insert(job.clone(), lease.tenant.clone());
                     }
-                    if now_ms >= cap.saturating_add(60_000) {
+                    if now_ms >= cap.saturating_add(LOST_SETTLEMENT_GRACE_MS) {
+                        lost.push((
+                            job.clone(),
+                            lease.tenant.clone(),
+                            lease.started_at_ms,
+                            lease.claims.max_s,
+                            cap,
+                        ));
                         settle_lost(lease, b, cap, now_ms);
                         next.vms
                             .entry(lease.tenant.clone())
@@ -291,18 +319,26 @@ impl Host {
         if serde_json::to_vec(&next).ok() != serde_json::to_vec(&self.snapshot).ok() {
             self.save(next)?;
         }
+        for (job_id, tenant, started_at_ms, max_s, cap_ms) in lost {
+            tracing::warn!(
+                job_id,
+                tenant,
+                started_at_ms,
+                max_s,
+                cap_ms,
+                "lease_settled_lost_stop_pending"
+            );
+        }
         Ok(())
     }
     pub fn lose_tenant(&mut self, tenant: &str, now_ms: u64) -> Result<(), Error> {
         let mut next = self.snapshot.clone();
         for (job, lease) in &mut next.leases {
             if lease.tenant == tenant && lease.state != LeaseState::Ended {
-                settle_lost(
-                    lease,
-                    next.billing.entry(job.clone()).or_default(),
-                    now_ms,
-                    now_ms,
-                );
+                let billing = next.billing.entry(job.clone()).or_default();
+                settle_lost(lease, billing, now_ms, now_ms);
+                // The VM is already gone, so this loss cannot require another stop.
+                billing.restart_pending = Some(false);
             }
         }
         finalize_ready(&mut next, now_ms);
@@ -331,14 +367,49 @@ impl Host {
             .collect()
     }
     pub fn stopped(&mut self, tenant: &str) -> Result<(), Error> {
+        let pending = self
+            .snapshot
+            .vms
+            .get(tenant)
+            .is_some_and(|vm| vm.stop_pending);
         let mut next = self.snapshot.clone();
         let vm = next.vms.entry(tenant.to_owned()).or_default();
         vm.stop_pending = false;
         vm.initialized_generation = None;
         next.pending_cancels.retain(|_, t| t != tenant);
+        for (job, billing) in &mut next.billing {
+            if billing.host_settled
+                && next
+                    .leases
+                    .get(job)
+                    .is_some_and(|lease| lease.tenant == tenant)
+            {
+                billing.restart_pending = Some(false);
+            }
+        }
         self.save(next)?;
+        self.stopping.remove(tenant);
+        if pending {
+            tracing::info!(tenant, "tenant_stop_pending_cleared");
+        }
         self.guest_unready(tenant);
         Ok(())
+    }
+
+    /// Order the start of a stop with incoming terminal proof under the Host mutex.
+    pub(crate) fn begin_pending_stop(&mut self, tenant: &str) -> bool {
+        if self.stopping.contains(tenant) || !self.stops_due().iter().any(|due| due == tenant) {
+            return false;
+        }
+        self.stopping.insert(tenant.to_owned());
+        true
+    }
+
+    pub(crate) fn stop_attempt_failed(&mut self, tenant: &str) -> Result<(), Error> {
+        self.stopping.remove(tenant);
+        let mut next = self.snapshot.clone();
+        clear_proven_restart(&mut next, tenant);
+        self.save(next)
     }
     pub fn terminal_delivered(&mut self, job: &str, now_ms: u64) -> Result<(), Error> {
         if self.provider_managed {
@@ -352,12 +423,15 @@ impl Host {
     pub fn host_settled_frames(&self, job: &str, from_seq: u64) -> Option<Vec<Value>> {
         let l = self.snapshot.leases.get(job)?;
         let b = self.snapshot.billing.get(job)?;
-        if !b.host_settled {
+        let withdrawn = l.started_at_ms.is_none()
+            && l.refusal == Some(crate::state::Refusal::Capacity)
+            && self.snapshot.zero_usage.contains_key(job);
+        if !b.host_settled && !withdrawn {
             return None;
         }
         let mut frames = Vec::new();
         let seq = l.highest_seq.saturating_add(1);
-        if from_seq <= seq {
+        if b.host_settled && from_seq <= seq {
             frames.push(b.synthesized_output.clone()?);
         }
         frames.push(b.terminal.clone()?);
@@ -406,6 +480,8 @@ impl Host {
                 .collect(),
             healthy,
             draining: self.snapshot.draining,
+            accept_until_ms: None,
+            tenant_disk: self.tenant_disk(now_ms),
             revoked_ack: self
                 .snapshot
                 .revocations
@@ -769,12 +845,64 @@ impl Host {
     }
 }
 
+fn clear_proven_restart(next: &mut Snapshot, tenant: &str) {
+    let unproven = next.billing.iter().any(|(job, billing)| {
+        billing.host_settled
+            && billing.restart_pending != Some(false)
+            && next
+                .leases
+                .get(job)
+                .is_some_and(|lease| lease.tenant == tenant)
+    });
+    if !unproven {
+        if let Some(vm) = next.vms.get_mut(tenant) {
+            vm.stop_pending = false;
+        }
+    }
+}
+
+pub(crate) fn observe_settled_terminal(
+    next: &mut Snapshot,
+    job: &str,
+    now_ms: u64,
+    stopping: bool,
+) {
+    let Some(lease) = next.leases.get(job) else {
+        return;
+    };
+    let tenant = lease.tenant.clone();
+    let cap = lease
+        .started_at_ms
+        .unwrap_or(now_ms)
+        .saturating_add(lease.claims.max_s.saturating_mul(1000));
+    let Some(billing) = next
+        .billing
+        .get_mut(job)
+        .filter(|billing| billing.host_settled)
+    else {
+        return;
+    };
+    let had_restart_claim = billing.restart_pending != Some(false);
+    billing.restart_pending = Some(false);
+    tracing::warn!(
+        job_id = job,
+        tenant,
+        delay_since_cap_ms = now_ms.saturating_sub(cap),
+        stopping,
+        "host_settled_runner_terminal_observed"
+    );
+    if had_restart_claim && !stopping {
+        clear_proven_restart(next, &tenant);
+    }
+}
+
 fn settle_lost(lease: &mut crate::state::Lease, b: &mut JobBilling, end: u64, observed: u64) {
     lease.state = LeaseState::Ended;
     lease.ended_at_ms = Some(end);
     b.ended_observed_ms = Some(observed);
     b.terminal_live = true;
     b.host_settled = true;
+    b.restart_pending = Some(true);
     let seq = lease.highest_seq.saturating_add(1);
     b.synthesized_output = Some(
         json!({"type":"output", "seq":seq, "stream":"stdout", "bytes":"", "truncated_before_seq":seq}),

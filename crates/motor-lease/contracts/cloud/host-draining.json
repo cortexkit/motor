@@ -1,5 +1,5 @@
 {
-  "note": "TEST-ONLY signed heartbeat bytes produced by the broker: draining true echoes the stored drain, omission and false clear it; the seed reproduces the host key.",
+  "note": "TEST-ONLY signed heartbeat and lease bytes produced by the broker: full drain and clear, bounded acceptance and malformed refusal, exact-bound fit, non-fit fallback and binding canary; the seed reproduces the host key.",
   "test_only_host_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
   "clock_ms": 1792195200123,
   "host": {
@@ -9,6 +9,14 @@
     "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     "platform": "linux-x64"
   },
+  "alternate_host": {
+    "host_id": "host-b",
+    "public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+    "endpoint": "other.example:7443",
+    "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "platform": "linux-x64"
+  },
+  "bounded_lease_allowance": "unlimited",
   "exchanges": [
     {
       "request": {
@@ -213,6 +221,232 @@
           "closed_subjects": []
         },
         "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/hosts/host-a/heartbeat",
+        "body": {
+          "free_vcpus": 60,
+          "free_mem_mib": 245760,
+          "queued": 0,
+          "warm": [],
+          "running": [],
+          "healthy": true,
+          "accept_until_ms": 1792195510123
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "CK-Host": "host-a",
+          "CK-Timestamp": "1792195200123",
+          "CK-Counter": "8",
+          "CK-Signature": "681e106de7832868065e9cac384505bcb1d5140c94fd855b449ca0008d85e38b60cd9a3ed3df06a49dc50236e07c914192c82db9ed4442dd8ad58b174476890a"
+        },
+        "body_bytes": "{\"free_vcpus\":60,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"accept_until_ms\":1792195510123}"
+      },
+      "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-a/heartbeat\n60d5683ba369c47864e595a97ec5c4f7e92bbb46be857bb5d51637279fc7f1cc\n1792195200123\n8",
+      "reply": {
+        "status": 200,
+        "body": {
+          "ignored": [],
+          "closed_subjects": []
+        },
+        "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/hosts/host-a/heartbeat",
+        "body": {
+          "free_vcpus": 60,
+          "free_mem_mib": 245760,
+          "queued": 0,
+          "warm": [],
+          "running": [],
+          "healthy": true,
+          "accept_until_ms": -1
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "CK-Host": "host-a",
+          "CK-Timestamp": "1792195200123",
+          "CK-Counter": "9",
+          "CK-Signature": "be80407c107abef6b7401f4b4c306e7fea8ef3a501e1892a4b610ea474fe8f7de385f538ac33b8581228e3e8a172857d328a4855d464518230d1f62eaae49906"
+        },
+        "body_bytes": "{\"free_vcpus\":60,\"free_mem_mib\":245760,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true,\"accept_until_ms\":-1}"
+      },
+      "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-a/heartbeat\nbaa58f6e625d6d77fd2bd06c0acdd1d357f3e4d2b80cee858422561d62770a24\n1792195200123\n9",
+      "reply": {
+        "status": 400,
+        "body": {
+          "error": "bad_request",
+          "field": "accept_until_ms"
+        },
+        "body_bytes": "{\"error\":\"bad_request\",\"field\":\"accept_until_ms\"}"
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/hosts/host-b/heartbeat",
+        "body": {
+          "free_vcpus": 10,
+          "free_mem_mib": 65536,
+          "queued": 0,
+          "warm": [],
+          "running": [],
+          "healthy": true
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "CK-Host": "host-b",
+          "CK-Timestamp": "1792195200123",
+          "CK-Counter": "1",
+          "CK-Signature": "9598dd09e9ab945e5722a35b898ccf392d71019db5e9703d56a38778df594fac792555b7cb81dc5bf8d60258cff94175df26762dd2bb9df1590c927ee384c303"
+        },
+        "body_bytes": "{\"free_vcpus\":10,\"free_mem_mib\":65536,\"queued\":0,\"warm\":[],\"running\":[],\"healthy\":true}"
+      },
+      "signed_string": "ck-host-v1\nPOST\n/v1/hosts/host-b/heartbeat\n5791596e27fcb632393a47b0b3bd30551011424528afb6ab7593cc6cc3f1337a\n1792195200123\n1",
+      "reply": {
+        "status": 200,
+        "body": {
+          "ignored": [],
+          "closed_subjects": []
+        },
+        "body_bytes": "{\"ignored\":[],\"closed_subjects\":[]}"
+      }
+    }
+  ],
+  "lease_exchanges": [
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "body": {
+          "job_id": "01900000-0000-7000-8000-000000000101",
+          "vcpus": 2,
+          "platform": "linux-x64",
+          "net": true,
+          "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4",
+          "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+          "placement_hint": null,
+          "avoid_host": null,
+          "timeout_s": 10,
+          "requester_jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+          },
+          "allow_spill": false
+        },
+        "body_bytes": "{\"job_id\":\"01900000-0000-7000-8000-000000000101\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":null,\"avoid_host\":null,\"timeout_s\":10,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":false}"
+      },
+      "reply": {
+        "status": 201,
+        "body": {
+          "lease_id": "12345678-1234-4321-8765-123456789abc",
+          "job_id": "01900000-0000-7000-8000-000000000101",
+          "placement": {
+            "host": "host-a",
+            "vm": null
+          },
+          "endpoint": "runner.example:7443",
+          "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOTAwMDAwLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDEwMSIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6MiwibWVtX21pYiI6NDA5NiwicGxhdGZvcm0iOiJsaW51eC14NjQiLCJuZXQiOnRydWUsInBsYWNlbWVudCI6eyJob3N0IjoiaG9zdC1hIiwidm0iOm51bGx9LCJtYXhfcyI6MTAsImNuZiI6eyJqa3QiOiJBa1hJWkZ6b25iNTlabUd3eUtnaTNIM0J3TWk2YW1ldnFkS1FpTFpoZHRjIn0sInB1cnBvc2UiOiJydW4ifQ.w7Ykza89TOzlZ2KHqBuri1pRsNBazvsoXB6MBcGWCXpB1F91lq7i52d9ZfWvBt9dsFwU4F_6hvwyeVff_ftbDQ",
+          "token_expires_at_ms": 1792195500000,
+          "max_s": 10,
+          "reserved_vcpu_ms": 20000
+        },
+        "body_bytes": "{\"lease_id\":\"12345678-1234-4321-8765-123456789abc\",\"job_id\":\"01900000-0000-7000-8000-000000000101\",\"placement\":{\"host\":\"host-a\",\"vm\":null},\"endpoint\":\"runner.example:7443\",\"endpoint_spki_sha256\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"job_token\":\"eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOTAwMDAwLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDEwMSIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6MiwibWVtX21pYiI6NDA5NiwicGxhdGZvcm0iOiJsaW51eC14NjQiLCJuZXQiOnRydWUsInBsYWNlbWVudCI6eyJob3N0IjoiaG9zdC1hIiwidm0iOm51bGx9LCJtYXhfcyI6MTAsImNuZiI6eyJqa3QiOiJBa1hJWkZ6b25iNTlabUd3eUtnaTNIM0J3TWk2YW1ldnFkS1FpTFpoZHRjIn0sInB1cnBvc2UiOiJydW4ifQ.w7Ykza89TOzlZ2KHqBuri1pRsNBazvsoXB6MBcGWCXpB1F91lq7i52d9ZfWvBt9dsFwU4F_6hvwyeVff_ftbDQ\",\"token_expires_at_ms\":1792195500000,\"max_s\":10,\"reserved_vcpu_ms\":20000}"
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "body": {
+          "job_id": "01900000-0000-7000-8000-000000000102",
+          "vcpus": 2,
+          "platform": "linux-x64",
+          "net": true,
+          "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4",
+          "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+          "placement_hint": null,
+          "avoid_host": null,
+          "timeout_s": 11,
+          "requester_jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+          },
+          "allow_spill": false
+        },
+        "body_bytes": "{\"job_id\":\"01900000-0000-7000-8000-000000000102\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":null,\"avoid_host\":null,\"timeout_s\":11,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":false}"
+      },
+      "reply": {
+        "status": 201,
+        "body": {
+          "lease_id": "12345678-1234-4321-8765-123456789abc",
+          "job_id": "01900000-0000-7000-8000-000000000102",
+          "placement": {
+            "host": "host-b",
+            "vm": null
+          },
+          "endpoint": "other.example:7443",
+          "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1iIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOTAwMDAwLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDEwMiIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6MiwibWVtX21pYiI6NDA5NiwicGxhdGZvcm0iOiJsaW51eC14NjQiLCJuZXQiOnRydWUsInBsYWNlbWVudCI6eyJob3N0IjoiaG9zdC1iIiwidm0iOm51bGx9LCJtYXhfcyI6MTEsImNuZiI6eyJqa3QiOiJBa1hJWkZ6b25iNTlabUd3eUtnaTNIM0J3TWk2YW1ldnFkS1FpTFpoZHRjIn0sInB1cnBvc2UiOiJydW4ifQ.hufUwqPzqCOBupjx0msmJlwPn5y7GDQQ6U5MxJ-whtQ0aREyZMTkDYzA2tCwgowwjHZ1uVOyIVe9kf_Qbx3bCA",
+          "token_expires_at_ms": 1792195500000,
+          "max_s": 11,
+          "reserved_vcpu_ms": 22000
+        },
+        "body_bytes": "{\"lease_id\":\"12345678-1234-4321-8765-123456789abc\",\"job_id\":\"01900000-0000-7000-8000-000000000102\",\"placement\":{\"host\":\"host-b\",\"vm\":null},\"endpoint\":\"other.example:7443\",\"endpoint_spki_sha256\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"job_token\":\"eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1iIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOTAwMDAwLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDEwMiIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6MiwibWVtX21pYiI6NDA5NiwicGxhdGZvcm0iOiJsaW51eC14NjQiLCJuZXQiOnRydWUsInBsYWNlbWVudCI6eyJob3N0IjoiaG9zdC1iIiwidm0iOm51bGx9LCJtYXhfcyI6MTEsImNuZiI6eyJqa3QiOiJBa1hJWkZ6b25iNTlabUd3eUtnaTNIM0J3TWk2YW1ldnFkS1FpTFpoZHRjIn0sInB1cnBvc2UiOiJydW4ifQ.hufUwqPzqCOBupjx0msmJlwPn5y7GDQQ6U5MxJ-whtQ0aREyZMTkDYzA2tCwgowwjHZ1uVOyIVe9kf_Qbx3bCA\",\"token_expires_at_ms\":1792195500000,\"max_s\":11,\"reserved_vcpu_ms\":22000}"
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "pathname": "/v1/leases",
+        "body": {
+          "job_id": "01900000-0000-7000-8000-000000000103",
+          "vcpus": 2,
+          "platform": "linux-x64",
+          "net": true,
+          "workspace_key_hash": "Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4",
+          "repo_hash": "NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s",
+          "placement_hint": {
+            "host": "host-a",
+            "vm": "cold-canary"
+          },
+          "avoid_host": null,
+          "timeout_s": 11,
+          "requester_jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+          },
+          "allow_spill": false
+        },
+        "body_bytes": "{\"job_id\":\"01900000-0000-7000-8000-000000000103\",\"vcpus\":2,\"platform\":\"linux-x64\",\"net\":true,\"workspace_key_hash\":\"Imi8IIGqCis2mp8xyqzsdKUMsLDb63nDcR_3Fc26qQ4\",\"repo_hash\":\"NeiECQvtr9GVEbh9Kx60zG7xhyEX_DXqg54lhT55W6s\",\"placement_hint\":{\"host\":\"host-a\",\"vm\":\"cold-canary\"},\"avoid_host\":null,\"timeout_s\":11,\"requester_jwk\":{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc\"},\"allow_spill\":false}"
+      },
+      "reply": {
+        "status": 201,
+        "body": {
+          "lease_id": "12345678-1234-4321-8765-123456789abc",
+          "job_id": "01900000-0000-7000-8000-000000000103",
+          "placement": {
+            "host": "host-a",
+            "vm": null
+          },
+          "endpoint": "runner.example:7443",
+          "endpoint_spki_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "job_token": "eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOTAwMDAwLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDEwMyIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6MiwibWVtX21pYiI6NDA5NiwicGxhdGZvcm0iOiJsaW51eC14NjQiLCJuZXQiOnRydWUsInBsYWNlbWVudCI6eyJob3N0IjoiaG9zdC1hIiwidm0iOm51bGx9LCJtYXhfcyI6MTEsImNuZiI6eyJqa3QiOiJBa1hJWkZ6b25iNTlabUd3eUtnaTNIM0J3TWk2YW1ldnFkS1FpTFpoZHRjIn0sInB1cnBvc2UiOiJydW4ifQ.jhkRi4Q8lBoQ7kWfC9iZ3YHsDTi97VUYVBx1LXYrDWDEP-scKH5F0FEcUHJS_qN0Eb-7i7NA9dKzAl1lJOKKAQ",
+          "token_expires_at_ms": 1792195500000,
+          "max_s": 11,
+          "reserved_vcpu_ms": 22000
+        },
+        "body_bytes": "{\"lease_id\":\"12345678-1234-4321-8765-123456789abc\",\"job_id\":\"01900000-0000-7000-8000-000000000103\",\"placement\":{\"host\":\"host-a\",\"vm\":null},\"endpoint\":\"runner.example:7443\",\"endpoint_spki_sha256\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"job_token\":\"eyJhbGciOiJFZERTQSIsImtpZCI6InJ1bm5lcl8yMDI2XzEwIiwidHlwIjoiY2stam9iK2p3dCJ9.eyJpc3MiOiJodHRwczovL3J1bm5lcnMuY29ydGV4a2l0LmlvIiwiYXVkIjoiaG9zdC1hIiwic3ViIjoiYWNjdDowMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsImp0aSI6IjAxOTAwMDAwLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDEwMyIsImlhdCI6MTc5MjE5NTIwMCwiZXhwIjoxNzkyMTk1NTAwLCJ2Y3B1cyI6MiwibWVtX21pYiI6NDA5NiwicGxhdGZvcm0iOiJsaW51eC14NjQiLCJuZXQiOnRydWUsInBsYWNlbWVudCI6eyJob3N0IjoiaG9zdC1hIiwidm0iOm51bGx9LCJtYXhfcyI6MTEsImNuZiI6eyJqa3QiOiJBa1hJWkZ6b25iNTlabUd3eUtnaTNIM0J3TWk2YW1ldnFkS1FpTFpoZHRjIn0sInB1cnBvc2UiOiJydW4ifQ.jhkRi4Q8lBoQ7kWfC9iZ3YHsDTi97VUYVBx1LXYrDWDEP-scKH5F0FEcUHJS_qN0Eb-7i7NA9dKzAl1lJOKKAQ\",\"token_expires_at_ms\":1792195500000,\"max_s\":11,\"reserved_vcpu_ms\":22000}"
       }
     }
   ]

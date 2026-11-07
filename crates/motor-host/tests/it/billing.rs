@@ -1,10 +1,132 @@
 use super::*;
 use motor_host::billing::{sign_request, Metrics, OUTBOX_MAX_AGE_MS};
 use motor_host::server::LifecycleStream;
+use motor_host::state::LeaseState;
 use motor_lease::{JobState, UsageOutcome};
 use serde_json::{json, Value};
 
 const MS: u64 = NOW * 1000;
+
+#[test]
+fn late_runner_terminal_clears_only_its_restart_claim_without_rebilling() {
+    for lifecycle in [true, false] {
+        let dir = scratch();
+        let mut h = disk_host(dir.path());
+        started(&mut h, JOB, 1);
+        started(&mut h, JOB2, 3);
+        h.billing_tick(MS + 330_000).unwrap();
+        assert!(h.snapshot.vms["tenant"].stop_pending);
+        h.billing_tick(MS + 390_000).unwrap();
+        let usage = serde_json::to_vec(&h.snapshot.billing[JOB].usage).unwrap();
+        let terminal_before = h.snapshot.billing[JOB].terminal.clone();
+        let outbox = serde_json::to_vec(&h.snapshot.outbox).unwrap();
+        let logs = Logs::default();
+        let captured = logs.0.clone();
+        tracing::subscriber::with_default(logs, || {
+            if lifecycle {
+                h.event(
+                    "tenant",
+                    &event(5, TenantEventKind::Terminal, Some(JOB), None),
+                    MS + 401_000,
+                )
+                .unwrap();
+            } else {
+                h.receive_terminal(JOB, terminal(JOB, "exit"), MS + 401_000)
+                    .unwrap();
+            }
+            assert!(
+                h.snapshot.vms["tenant"].stop_pending,
+                "another lost job still needs a restart"
+            );
+            h.receive_terminal(JOB2, terminal(JOB2, "exit"), MS + 402_000)
+                .unwrap();
+            assert!(
+                !h.snapshot.vms["tenant"].stop_pending,
+                "all lost jobs supplied proof of ending"
+            );
+        });
+        h.billing_tick(MS + 403_000).unwrap();
+        assert!(h.stops_due().is_empty());
+        assert_eq!(
+            serde_json::to_vec(&h.snapshot.billing[JOB].usage).unwrap(),
+            usage
+        );
+        assert_eq!(h.snapshot.billing[JOB].terminal, terminal_before);
+        assert_eq!(serde_json::to_vec(&h.snapshot.outbox).unwrap(), outbox);
+        let captured = captured.lock().unwrap();
+        assert!(
+            captured.iter().any(|line| line.starts_with("WARN ")
+                && line.contains(JOB)
+                && line.contains("delay_since_cap_ms=371000")),
+            "{captured:?}"
+        );
+        drop(h);
+        assert!(!disk_host(dir.path()).snapshot.vms["tenant"].stop_pending);
+    }
+}
+
+#[test]
+fn runtime_cap_waits_five_minutes_for_runner_terminal_before_settling_lost() {
+    let mut h = host();
+    started(&mut h, JOB, 1);
+    let cap = MS + 30_000;
+    h.billing_tick(cap + 30_000).unwrap();
+    assert!(h.snapshot.pending_cancels.contains_key(JOB));
+    for delay in [60_000, 101_000, 299_999] {
+        h.billing_tick(cap + delay).unwrap();
+        assert!(
+            !h.snapshot.billing[JOB].host_settled,
+            "settled after only {delay}ms"
+        );
+        assert!(!h.snapshot.vms["tenant"].stop_pending);
+    }
+    h.billing_tick(cap + 300_000).unwrap();
+    assert!(h.snapshot.billing[JOB].host_settled);
+    let mut normal = host();
+    started(&mut normal, JOB, 1);
+    normal.billing_tick(cap + 30_000).unwrap();
+    end(&mut normal, JOB, 3, cap + 101_000, terminal(JOB, "exit"));
+    normal.billing_tick(cap + 300_000).unwrap();
+    assert!(!normal.snapshot.billing[JOB].host_settled);
+    assert_eq!(
+        normal.snapshot.billing[JOB].usage.as_ref().unwrap().outcome,
+        UsageOutcome::Timeout
+    );
+    assert!(!normal.snapshot.vms["tenant"].stop_pending);
+}
+
+#[test]
+fn pending_restart_cancels_admitted_without_start_but_keeps_started_lease() {
+    let mut h = host();
+    h.tenants.get_mut("vm").unwrap().max_weight = Some(4);
+    started(&mut h, JOB, 1);
+    admitted(&mut h, JOB2, 3);
+    started(&mut h, JOB3, 4);
+    h.snapshot.leases.get_mut(JOB3).unwrap().claims.max_s = 600;
+    h.billing_tick(MS + 330_000).unwrap();
+    let cancels = h.expire(MS + 330_000).unwrap();
+    assert!(
+        cancels.contains(&("tenant".into(), JOB2.into())),
+        "queued lease was not cancelled: {cancels:?}"
+    );
+    assert!(h.stops_due().is_empty(), "Started work must retain its VM");
+    end(&mut h, JOB3, 6, MS + 331_000, terminal(JOB3, "exit"));
+    assert!(
+        h.stops_due().is_empty(),
+        "withdrawal still needs a no-start proof"
+    );
+    h.restart_withdrawn(JOB2, MS + 331_001).unwrap();
+    assert_eq!(h.stops_due(), vec!["tenant"]);
+    let frames = h.host_settled_frames(JOB2, 0).unwrap();
+    assert_eq!(frames[0]["ran"], "none");
+    assert_eq!(frames[0]["outcome"]["type"], "refused_before_start");
+    assert_eq!(frames[0]["outcome"]["reason"], "queue_wait_exceeded");
+    assert_eq!(
+        h.snapshot.zero_usage[JOB2].started_at_ms,
+        h.snapshot.zero_usage[JOB2].ended_at_ms
+    );
+    assert!(!h.snapshot.pending_cancels.contains_key(JOB2));
+}
 
 #[test]
 fn fresh_counter_baselines_and_unexpected_resets_never_bill_negative_or_wrapped_usage() {
@@ -395,6 +517,37 @@ fn replay_boundary_distinguishes_outage_events_from_new_live_observations_and_ol
 }
 
 #[test]
+fn backstop_cancel_waits_thirty_seconds_after_runner_cap() {
+    for provider_managed in [false, true] {
+        let mut h = host();
+        started(&mut h, JOB, 1);
+        h.provider_managed = provider_managed;
+        let cap = MS + 30_000;
+        for now in [cap, cap + 29_999] {
+            h.billing_tick(now).unwrap();
+            assert!(
+                !h.snapshot.pending_cancels.contains_key(JOB),
+                "cancel queued at {now}"
+            );
+            assert!(!h.snapshot.billing[JOB].cancelled_at_cap);
+            assert!(!h.snapshot.billing[JOB].host_settled);
+        }
+        h.billing_tick(cap + 30_000).unwrap();
+        assert_eq!(
+            h.snapshot.pending_cancels.get(JOB).map(String::as_str),
+            Some("tenant")
+        );
+        assert!(!h.snapshot.billing[JOB].host_settled);
+        if !provider_managed {
+            h.billing_tick(cap + 299_999).unwrap();
+            assert!(!h.snapshot.billing[JOB].host_settled);
+            h.billing_tick(cap + 300_000).unwrap();
+            assert!(h.snapshot.billing[JOB].host_settled);
+        }
+    }
+}
+
+#[test]
 fn watchdog_cancels_drops_share_across_restart_settles_once_and_defers_stop_for_healthy_job() {
     let dir = scratch();
     let mut h = disk_host(dir.path());
@@ -402,27 +555,32 @@ fn watchdog_cancels_drops_share_across_restart_settles_once_and_defers_stop_for_
     started(&mut h, JOB2, 3);
     // The second command starts later and remains inside its own runtime cap.
     h.snapshot.leases.get_mut(JOB2).unwrap().started_at_ms = Some(MS + 20_000);
-    h.snapshot.leases.get_mut(JOB2).unwrap().claims.max_s = 120;
+    h.snapshot.leases.get_mut(JOB2).unwrap().claims.max_s = 600;
     h.billing_tick(MS + 30_000).unwrap();
     assert_eq!(h.share("tenant", MS + 30_000), 1);
+    assert!(!h.snapshot.pending_cancels.contains_key(JOB));
+    h.billing_tick(MS + 60_000).unwrap();
     assert!(h.snapshot.pending_cancels.contains_key(JOB));
     h.cancel_delivered(JOB).unwrap();
     drop(h);
     let mut h = disk_host(dir.path());
     assert_eq!(h.share("tenant", MS + 31_000), 1);
-    h.billing_tick(MS + 89_999).unwrap();
+    h.billing_tick(MS + 329_999).unwrap();
     assert!(!h.snapshot.billing[JOB].host_settled);
-    h.billing_tick(MS + 90_000).unwrap();
+    h.billing_tick(MS + 330_000).unwrap();
     assert!(h.snapshot.billing[JOB].host_settled);
     assert!(h.snapshot.vms["tenant"].stop_pending);
     assert!(h.stops_due().is_empty());
+    let mut new_claim = claims(JOB3);
+    new_claim.iat += 300;
+    new_claim.exp += 300;
     assert!(matches!(
-        h.claim(claims(JOB3), MS + 90_000),
+        h.claim(new_claim, MS + 330_000),
         Err(motor_host::state::Error::Refused(
             motor_host::state::Refusal::Capacity
         ))
     ));
-    end(&mut h, JOB2, 5, MS + 91_000, terminal(JOB2, "exit"));
+    end(&mut h, JOB2, 5, MS + 331_000, terminal(JOB2, "exit"));
     assert_eq!(
         h.snapshot.billing[JOB2].usage.as_ref().unwrap().outcome,
         UsageOutcome::Exit
@@ -430,15 +588,15 @@ fn watchdog_cancels_drops_share_across_restart_settles_once_and_defers_stop_for_
     assert_eq!(h.stops_due(), vec!["tenant"]);
     h.stopped("tenant").unwrap();
     assert!(h.stops_due().is_empty());
-    h.billing_tick(MS + 150_000).unwrap();
+    h.billing_tick(MS + 390_000).unwrap();
     let original = serde_json::to_vec(&h.snapshot.billing[JOB].usage).unwrap();
     h.event(
         "tenant",
         &event(6, TenantEventKind::Terminal, Some(JOB), None),
-        MS + 160_000,
+        MS + 400_000,
     )
     .unwrap();
-    h.receive_terminal(JOB, terminal(JOB, "exit"), MS + 160_000)
+    h.receive_terminal(JOB, terminal(JOB, "exit"), MS + 400_000)
         .unwrap();
     assert_eq!(
         serde_json::to_vec(&h.snapshot.billing[JOB].usage).unwrap(),
@@ -461,10 +619,10 @@ fn watchdog_cancels_drops_share_across_restart_settles_once_and_defers_stop_for_
 
 #[test]
 fn port52_terminal_disarms_watchdog_and_preserves_real_result_with_port53_down() {
-    for receipt in [59_000, 89_000] {
+    for receipt in [61_000, 89_000] {
         let mut h = host();
         started(&mut h, JOB, 1);
-        h.billing_tick(MS + 30_000).unwrap();
+        h.billing_tick(MS + 60_000).unwrap();
         h.receive_terminal(JOB, terminal(JOB, "exit"), MS + receipt)
             .unwrap();
         h.billing_tick(MS + 90_000).unwrap();
@@ -667,6 +825,41 @@ fn heartbeat_uses_pinned_interim_values_and_released_is_reserved() {
         (hb.running[0].state, hb.free_vcpus),
         (JobState::Reserved, 2)
     );
+}
+
+#[test]
+fn stop_pending_tenant_advertises_no_capacity_warm_workspace_or_disk() {
+    let mut h = host();
+    h.guest_ready("tenant", 1).unwrap();
+    admitted(&mut h, JOB, 1);
+    h.event(
+        "tenant",
+        &event(2, TenantEventKind::Terminal, Some(JOB), None),
+        MS,
+    )
+    .unwrap();
+    h.record_warm(
+        "tenant",
+        MS,
+        vec![motor_protocol::HeldWorkspace {
+            job_id: JOB.parse().unwrap(),
+            used_ms: MS,
+        }],
+    );
+    h.record_disk("tenant", MS, 0, 10, 50);
+    let before = h.heartbeat(MS, 0, true);
+    assert!(before.free_vcpus > 0);
+    assert_eq!(before.warm.len(), 1);
+    assert!(!before.warm[0].busy);
+    assert_eq!(before.tenant_disk.len(), 1);
+    h.set_stop_pending("tenant", true).unwrap();
+    let blocked = h.heartbeat(MS, 0, true);
+    assert_eq!(blocked.free_vcpus, 0);
+    assert!(blocked.warm.is_empty());
+    assert!(blocked.tenant_disk.is_empty());
+    assert!(!h.memory_probe_due("tenant", MS, true));
+    h.stopped("tenant").unwrap();
+    assert!(h.heartbeat(MS, 0, true).free_vcpus > 0);
 }
 
 #[test]
@@ -947,16 +1140,460 @@ impl tracing::Subscriber for Logs {
     fn event(&self, event: &tracing::Event<'_>) {
         struct Visitor(String);
         impl tracing::field::Visit for Visitor {
-            fn record_debug(&mut self, _: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0.push_str(&format!("{value:?}"));
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={value:?} ", field.name()));
             }
         }
-        let mut visitor = Visitor(String::new());
+        let mut visitor = Visitor(format!("{} ", event.metadata().level()));
         event.record(&mut visitor);
         self.0.lock().unwrap().push(visitor.0);
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
+}
+
+struct DiagnosticsControl {
+    requests: Mutex<Vec<Value>>,
+    arrived: std::sync::mpsc::Sender<String>,
+    release: (Mutex<bool>, std::sync::Condvar),
+    reply: Option<Value>,
+    stops: std::sync::atomic::AtomicUsize,
+    stop_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    relays: Mutex<Vec<std::os::unix::net::UnixStream>>,
+    cancels: Mutex<Vec<String>>,
+}
+impl DiagnosticsControl {
+    fn new(reply: Option<Value>, blocked: bool) -> (Arc<Self>, std::sync::mpsc::Receiver<String>) {
+        let (arrived, receive) = std::sync::mpsc::channel();
+        (
+            Arc::new(Self {
+                requests: Mutex::new(Vec::new()),
+                arrived,
+                release: (Mutex::new(!blocked), std::sync::Condvar::new()),
+                reply,
+                stops: std::sync::atomic::AtomicUsize::new(0),
+                stop_hook: Mutex::new(None),
+                relays: Mutex::new(Vec::new()),
+                cancels: Mutex::new(Vec::new()),
+            }),
+            receive,
+        )
+    }
+    fn release(&self) {
+        *self.release.0.lock().unwrap() = true;
+        self.release.1.notify_all();
+    }
+}
+impl motor_host::helper::Control for DiagnosticsControl {
+    fn adopt(&self, _: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    fn wake(&self, _: &str, _: Option<u64>) -> anyhow::Result<u64> {
+        anyhow::bail!("unexpected wake")
+    }
+    fn quota(&self, _: &str, _: u32) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn relay(&self, _: &str, _: u32) -> anyhow::Result<std::os::unix::net::UnixStream> {
+        self.relays
+            .lock()
+            .unwrap()
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("unexpected relay"))
+    }
+    fn admin(&self, _: &str, request: &Value) -> anyhow::Result<Value> {
+        if request["op"] != "diagnostics" {
+            if request["op"] == "cancel" {
+                self.cancels
+                    .lock()
+                    .unwrap()
+                    .push(request["job_id"].as_str().unwrap().to_owned());
+            }
+            return Ok(json!({"ok":true}));
+        }
+        self.requests.lock().unwrap().push(request.clone());
+        let _ = self
+            .arrived
+            .send(request["jti"].as_str().unwrap().to_owned());
+        let _released = self
+            .release
+            .1
+            .wait_while(self.release.0.lock().unwrap(), |released| !*released)
+            .unwrap();
+        self.reply
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("diagnostic transport failed"))
+    }
+    fn suspend(&self, _: &str) -> anyhow::Result<()> {
+        anyhow::bail!("unexpected suspend")
+    }
+    fn available_bytes(&self) -> anyhow::Result<u64> {
+        Ok(u64::MAX)
+    }
+    fn stop(&self, _: &str) -> anyhow::Result<()> {
+        self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(hook) = self.stop_hook.lock().unwrap().take() {
+            hook();
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn late_terminal_after_stop_starts_does_not_cancel_the_stop() {
+    let mut h = host();
+    started(&mut h, JOB, 1);
+    h.billing_tick(MS + 330_000).unwrap();
+    let (control, _) = DiagnosticsControl::new(None, false);
+    let runtime = motor_host::server::Runtime::new("host".into(), h, control.clone());
+    let weak = Arc::downgrade(&runtime);
+    *control.stop_hook.lock().unwrap() = Some(Box::new(move || {
+        let runtime = weak.upgrade().unwrap();
+        let mut host = runtime.host.lock().unwrap();
+        host.event(
+            "tenant",
+            &event(3, TenantEventKind::Terminal, Some(JOB), None),
+            MS + 331_000,
+        )
+        .unwrap();
+        assert!(
+            host.snapshot.vms["tenant"].stop_pending,
+            "stop was already committed to start"
+        );
+        assert_eq!(host.snapshot.billing[JOB].restart_pending, Some(false));
+    }));
+    runtime.tick(MS + 331_000).unwrap();
+    assert_eq!(control.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(!runtime.host.lock().unwrap().snapshot.vms["tenant"].stop_pending);
+}
+
+#[tokio::test]
+async fn pending_restart_withdrawal_requires_authoritative_proof_and_late_started_holds_vm() {
+    use motor_host::helper::{read_json, write_json};
+    for started_race in [false, true] {
+        let mut h = host();
+        started(&mut h, JOB, 1);
+        admitted(&mut h, JOB2, 3);
+        let mut updates = h.watch_connection(2).unwrap();
+        updates.borrow_and_update();
+        h.billing_tick(MS + 330_000).unwrap();
+        let (control, _) = DiagnosticsControl::new(None, false);
+        let (relay, mut guest) = std::os::unix::net::UnixStream::pair().unwrap();
+        guest
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        control.relays.lock().unwrap().push(relay);
+        let runtime = motor_host::server::Runtime::new("host".into(), h, control.clone());
+        let worker_runtime = runtime.clone();
+        let guest = std::thread::spawn(move || {
+            let verified = read_json(&mut guest).unwrap();
+            assert_eq!(verified["type"], "verified_lease");
+            assert_eq!(verified["purpose"], "attach");
+            assert_eq!(verified["jti"], JOB2);
+            assert_eq!(read_json(&mut guest).unwrap()["type"], "hello");
+            write_json(&mut guest, &json!({"type":"hello","protocol_version":1})).unwrap();
+            assert_eq!(
+                read_json(&mut guest).unwrap(),
+                json!({"type":"withdraw", "job_id":JOB2})
+            );
+            if started_race {
+                worker_runtime
+                    .host
+                    .lock()
+                    .unwrap()
+                    .event(
+                        "tenant",
+                        &event(4, TenantEventKind::Started, Some(JOB2), None),
+                        MS + 330_001,
+                    )
+                    .unwrap();
+            }
+            write_json(&mut guest, &json!({"type":"withdraw_reply", "outcome":if started_race {"started"} else {"withdrawn"}})).unwrap();
+        });
+        runtime.tick(MS + 330_000).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), updates.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        guest.join().unwrap();
+        {
+            let host = runtime.host.lock().unwrap();
+            assert_eq!(
+                host.snapshot.leases[JOB2].state,
+                if started_race {
+                    LeaseState::Started
+                } else {
+                    LeaseState::Ended
+                }
+            );
+            if started_race {
+                assert!(host.stops_due().is_empty());
+                assert!(!host.snapshot.zero_usage.contains_key(JOB2));
+                assert!(host.host_settled_frames(JOB2, 0).is_none());
+            } else {
+                let frames = host.host_settled_frames(JOB2, 0).unwrap();
+                for frame in &frames {
+                    motor_protocol::decode_frame(&serde_json::to_vec(frame).unwrap()).unwrap();
+                }
+                assert_eq!(frames[0]["outcome"]["type"], "refused_before_start");
+                assert_eq!(frames[0]["ran"], "none");
+                assert_eq!(host.stops_due(), vec!["tenant"]);
+            }
+        }
+        runtime.tick(MS + 330_002).unwrap();
+        assert!(
+            !control
+                .cancels
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|job| job == JOB2),
+            "withdrawal must not turn into a cancel after Started"
+        );
+        assert_eq!(
+            control.stops.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(!started_race)
+        );
+    }
+}
+
+#[test]
+fn legacy_lost_records_keep_claims_and_completed_restarts_do_not_claim_again() {
+    let mut h = host();
+    started(&mut h, JOB, 1);
+    started(&mut h, JOB2, 3);
+    h.billing_tick(MS + 330_000).unwrap();
+    let mut legacy = serde_json::to_value(&h.snapshot).unwrap();
+    for job in [JOB, JOB2] {
+        legacy["billing"][job]
+            .as_object_mut()
+            .unwrap()
+            .remove("restart_pending");
+    }
+    h.snapshot = serde_json::from_value(legacy).unwrap();
+    h.receive_terminal(JOB, terminal(JOB, "exit"), MS + 331_000)
+        .unwrap();
+    assert!(h.snapshot.vms["tenant"].stop_pending);
+    h.receive_terminal(JOB2, terminal(JOB2, "exit"), MS + 331_001)
+        .unwrap();
+    assert!(!h.snapshot.vms["tenant"].stop_pending);
+    // A previous VM generation's lost jobs no longer own the next restart.
+    h.stopped("tenant").unwrap();
+    started(&mut h, JOB3, 5);
+    h.billing_tick(MS + 330_000).unwrap();
+    h.receive_terminal(JOB3, terminal(JOB3, "exit"), MS + 332_000)
+        .unwrap();
+    assert!(!h.snapshot.vms["tenant"].stop_pending);
+    assert!(
+        serde_json::to_value(motor_host::billing::JobBilling::default())
+            .unwrap()
+            .get("restart_pending")
+            .is_none()
+    );
+}
+
+#[test]
+fn a_missing_vm_loss_does_not_claim_the_next_generations_restart() {
+    let mut h = host();
+    started(&mut h, JOB, 1);
+    h.lose_tenant("tenant", MS + 1000).unwrap();
+    started(&mut h, JOB2, 3);
+    h.billing_tick(MS + 330_000).unwrap();
+    h.receive_terminal(JOB2, terminal(JOB2, "exit"), MS + 331_000)
+        .unwrap();
+    assert!(!h.snapshot.vms["tenant"].stop_pending);
+}
+
+#[test]
+fn lost_settlement_fetches_each_job_once_caps_jobs_and_never_blocks_stop() {
+    let logs = Logs::default();
+    let captured = logs.0.clone();
+    tracing::subscriber::with_default(logs, || {
+        let mut h = host();
+        h.tenants.get_mut("vm").unwrap().max_weight = Some(8);
+        let lost: Vec<_> = (0..4)
+            .map(|i| format!("00000000-0000-7000-8000-{:012x}", i + 100))
+            .collect();
+        for (index, job) in lost.iter().enumerate() {
+            started(&mut h, job, index as u64 * 2 + 1);
+        }
+        started(&mut h, JOB, 9);
+        h.snapshot.leases.get_mut(JOB).unwrap().claims.max_s = 600;
+        h.guest_ready("tenant", 1).unwrap();
+        let (control, arrived) =
+            DiagnosticsControl::new(Some(json!({"ok":true,"journal":{"entries":[]}})), true);
+        let runtime = motor_host::server::Runtime::new("host".into(), h, control.clone());
+        runtime.tick(MS + 330_000).unwrap();
+        let jobs: std::collections::BTreeSet<_> = (0..3)
+            .map(|_| {
+                arrived
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(jobs, lost[..3].iter().cloned().collect());
+        assert_eq!(control.stops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(runtime.host.lock().unwrap().snapshot.vms["tenant"].stop_pending);
+        runtime.tick(MS + 330_001).unwrap();
+        assert_eq!(control.requests.lock().unwrap().len(), 3);
+        for request in control.requests.lock().unwrap().iter() {
+            assert_eq!(request["op"], "diagnostics");
+            assert_eq!(request["since_unix_s"], MS / 1000);
+        }
+        end(
+            &mut runtime.host.lock().unwrap(),
+            JOB,
+            11,
+            MS + 331_000,
+            terminal(JOB, "exit"),
+        );
+        let (done, completed) = std::sync::mpsc::channel();
+        let tick_runtime = runtime.clone();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let tick = std::thread::spawn(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                let _ = done.send(tick_runtime.tick(MS + 331_000));
+            })
+        });
+        let result = completed.recv_timeout(std::time::Duration::from_secs(5));
+        // Always release the blocked read-only queries, including on a failed assertion.
+        control.release();
+        result.expect("stop waited on a diagnostics query").unwrap();
+        tick.join().unwrap();
+        assert_eq!(control.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!runtime.host.lock().unwrap().snapshot.vms["tenant"].stop_pending);
+    });
+    let captured = captured.lock().unwrap();
+    let lost: Vec<_> = captured
+        .iter()
+        .filter(|s| s.contains("lease_settled_lost_stop_pending"))
+        .collect();
+    assert_eq!(lost.len(), 4);
+    for event in lost {
+        assert!(event.starts_with("WARN "));
+        for field in [
+            "job_id=",
+            "tenant=",
+            "started_at_ms=",
+            "max_s=30",
+            "cap_ms=",
+        ] {
+            assert!(event.contains(field), "{event}");
+        }
+    }
+    for name in [
+        "tenant_pending_stop_released",
+        "tenant_stop_pending_cleared",
+    ] {
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|s| s.starts_with("INFO ") && s.contains(name))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn lost_diagnostics_bound_journal_entries_and_unicode_lines() {
+    let entries: Vec<_> = (0..55).map(|index| json!({"unix_us":MS * 1000,
+        "message":if index == 0 { "first\nsecond".into() } else { format!("{}SHOULD_NOT_APPEAR", "é".repeat(300)) }
+    })).collect();
+    let (control, _) = DiagnosticsControl::new(
+        Some(json!({"ok":true,"journal":{"entries":entries}})),
+        false,
+    );
+    let logs = Logs::default();
+    let captured = logs.0.clone();
+    tracing::subscriber::with_default(logs, || {
+        crate::lost_diagnostics::collect(
+            control,
+            "tenant",
+            vec![(JOB.into(), MS / 1000)],
+            std::time::Duration::from_secs(5),
+        )
+    });
+    let captured = captured.lock().unwrap();
+    let lines: Vec<_> = captured
+        .iter()
+        .filter(|s| s.contains("lost_job_runner_log"))
+        .collect();
+    assert_eq!(lines.len(), 50);
+    assert!(lines[0].contains("line=first second"), "{}", lines[0]);
+    for line in &lines[1..] {
+        assert_eq!(line.chars().filter(|c| *c == 'é').count(), 300);
+        assert!(!line.contains("SHOULD_NOT_APPEAR"));
+        assert!(line.contains(JOB));
+    }
+    assert!(captured
+        .iter()
+        .any(|s| s.contains("lost_job_diagnostics_finished") && s.contains("truncated=true")));
+}
+
+#[test]
+fn lost_diagnostics_failures_and_shared_timeout_are_logged_without_late_entries() {
+    for reply in [
+        None,
+        Some(json!({"ok":false})),
+        Some(json!({"ok":true,"journal":{"unavailable":true}})),
+        Some(json!({"ok":true,"journal":{"unavailable":true,"error":{
+            "type":"journal_command_failed", "exit_status":7, "stderr_tail":"Permission denied"
+        }}})),
+    ] {
+        let command_failure = reply
+            .as_ref()
+            .is_some_and(|reply| reply["journal"]["error"]["type"] == "journal_command_failed");
+        let (control, _) = DiagnosticsControl::new(reply, false);
+        let logs = Logs::default();
+        let captured = logs.0.clone();
+        tracing::subscriber::with_default(logs, || {
+            crate::lost_diagnostics::collect(
+                control,
+                "tenant",
+                vec![(JOB.into(), MS / 1000)],
+                std::time::Duration::from_secs(5),
+            )
+        });
+        let captured = captured.lock().unwrap();
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|s| s.starts_with("WARN ") && s.contains("lost_job_diagnostics_failed"))
+                .count(),
+            1
+        );
+        assert!(!captured.iter().any(|s| s.contains("lost_job_runner_log")));
+        if command_failure {
+            assert!(captured
+                .iter()
+                .any(|s| s.contains("exit_status") && s.contains("Permission denied")));
+        }
+    }
+    let (control, _) = DiagnosticsControl::new(
+        Some(json!({"ok":true,"journal":{"entries":[{"message":"LATE_ENTRY"}]}})),
+        true,
+    );
+    let logs = Logs::default();
+    let captured = logs.0.clone();
+    tracing::subscriber::with_default(logs, || {
+        crate::lost_diagnostics::collect(
+            control.clone(),
+            "tenant",
+            vec![(JOB.into(), MS / 1000), (JOB2.into(), MS / 1000)],
+            std::time::Duration::from_millis(10),
+        )
+    });
+    control.release();
+    let captured = captured.lock().unwrap();
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|s| s.starts_with("WARN ") && s.contains("lost_job_diagnostics_timed_out"))
+            .count(),
+        2
+    );
+    assert!(!captured.iter().any(|s| s.contains("LATE_ENTRY")));
 }
 
 #[test]
@@ -1070,8 +1707,8 @@ fn watchdog_runtime_stops_the_only_lease_once_and_clears_durable_stop_pending() 
     let runtime = Runtime::new("host".into(), h, control.clone());
     runtime.tick(MS + 30_000).unwrap();
     assert_eq!(runtime.host.lock().unwrap().share("tenant", MS + 30_000), 0);
-    runtime.tick(MS + 90_000).unwrap();
-    runtime.tick(MS + 91_000).unwrap();
+    runtime.tick(MS + 330_000).unwrap();
+    runtime.tick(MS + 331_000).unwrap();
     assert_eq!(control.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     let h = runtime.host.lock().unwrap();
     assert!(!h.snapshot.vms["tenant"].stop_pending);

@@ -344,6 +344,18 @@ pub struct Heartbeat {
     pub draining: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub revoked_ack: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept_until_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tenant_disk: Vec<TenantDisk>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantDisk {
+    pub tenant: String,
+    pub disk_free_gib: u64,
+    pub disk_total_gib: u64,
 }
 
 pub const REVOKED_LIMIT: usize = 256;

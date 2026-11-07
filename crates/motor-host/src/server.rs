@@ -190,6 +190,8 @@ pub struct Runtime {
     last_key_refresh: Mutex<u64>,
     event_workers: Mutex<BTreeSet<String>>,
     terminal_workers: Mutex<BTreeSet<String>>,
+    withdrawal_workers: Mutex<BTreeSet<String>>,
+    lost_diagnostic_jobs: Mutex<BTreeMap<String, BTreeSet<String>>>,
     tenant_operations: BTreeMap<String, Arc<Mutex<()>>>,
     /// Closed tenants whose removal is running on its own thread.
     removal_workers: Mutex<BTreeSet<String>>,
@@ -258,6 +260,8 @@ impl Runtime {
             control,
             event_workers: Mutex::new(BTreeSet::new()),
             terminal_workers: Mutex::new(BTreeSet::new()),
+            withdrawal_workers: Mutex::new(BTreeSet::new()),
+            lost_diagnostic_jobs: Mutex::new(BTreeMap::new()),
             tenant_operations,
             removal_workers: Mutex::new(BTreeSet::new()),
             start_retry_workers: Mutex::new(BTreeSet::new()),
@@ -745,9 +749,53 @@ impl Runtime {
         if self.sandbox_identity.is_none() {
             self.fetch_detached_terminals();
         }
-        let (cancels, quotas, candidates) = {
+        let (cancels, quotas, candidates, diagnostics) = {
             let mut host = self.host.lock().expect("host lock");
+            let unsettled: Vec<_> = host
+                .snapshot
+                .leases
+                .iter()
+                .filter(|(_, lease)| lease.state == LeaseState::Started)
+                .map(|(job, _)| job.clone())
+                .collect();
             host.billing_tick(now_ms)?;
+            self.withdrawal_workers
+                .lock()
+                .expect("withdrawal workers")
+                .retain(|job| {
+                    host.snapshot.leases.get(job).is_some_and(|lease| {
+                        lease.state == LeaseState::Admitted
+                            && host
+                                .snapshot
+                                .vms
+                                .get(&lease.tenant)
+                                .is_some_and(|vm| vm.stop_pending)
+                    })
+                });
+            self.lost_diagnostic_jobs
+                .lock()
+                .expect("lost diagnostic jobs")
+                .retain(|tenant, _| {
+                    host.snapshot
+                        .vms
+                        .get(tenant)
+                        .is_some_and(|vm| vm.stop_pending)
+                });
+            let mut diagnostics: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
+            for job in unsettled {
+                if host
+                    .snapshot
+                    .billing
+                    .get(&job)
+                    .is_some_and(|billing| billing.host_settled)
+                {
+                    let lease = &host.snapshot.leases[&job];
+                    diagnostics
+                        .entry(lease.tenant.clone())
+                        .or_default()
+                        .push((job, lease.started_at_ms.unwrap_or(now_ms) / 1000));
+                }
+            }
             let cancels = host.expire(now_ms)?;
             host.retention_tick(now_ms)?;
             let mut quotas = Vec::new();
@@ -763,10 +811,47 @@ impl Runtime {
                     candidates.push(tenant.clone());
                 }
             }
-            (cancels, quotas, candidates)
+            (cancels, quotas, candidates, diagnostics)
         };
+        for (tenant, jobs) in diagnostics {
+            let jobs = {
+                let mut selected = self
+                    .lost_diagnostic_jobs
+                    .lock()
+                    .expect("lost diagnostic jobs");
+                let selected = selected.entry(tenant.clone()).or_default();
+                jobs.into_iter()
+                    .filter(|(job, _)| {
+                        selected.len() < crate::lost_diagnostics::MAX_JOBS
+                            && selected.insert(job.clone())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if !jobs.is_empty() {
+                crate::lost_diagnostics::spawn(self.control.clone(), tenant, jobs);
+            }
+        }
         let mut failure = None;
         for (tenant, job) in cancels {
+            let withdrawal = {
+                let host = self.host.lock().expect("host lock");
+                host.snapshot
+                    .leases
+                    .get(&job)
+                    .filter(|lease| {
+                        lease.state == LeaseState::Admitted
+                            && host
+                                .snapshot
+                                .vms
+                                .get(&lease.tenant)
+                                .is_some_and(|vm| vm.stop_pending)
+                    })
+                    .cloned()
+            };
+            if let Some(lease) = withdrawal {
+                self.withdraw_for_restart(job, lease);
+                continue;
+            }
             let result = (|| -> Result<()> {
                 let reply = self.admin(&tenant, &json!({"op":"cancel", "job_id":job}))?;
                 ensure!(reply["ok"] == true, "guest cancel refused");
@@ -793,11 +878,27 @@ impl Runtime {
                 .host
                 .lock()
                 .expect("host lock")
-                .stops_due()
-                .contains(&tenant)
+                .begin_pending_stop(&tenant)
             {
-                self.control.stop(&tenant)?;
-                self.host.lock().expect("host lock").stopped(&tenant)?;
+                tracing::info!(tenant, "tenant_pending_stop_released");
+                let result = self.control.stop(&tenant).and_then(|()| {
+                    self.host
+                        .lock()
+                        .expect("host lock")
+                        .stopped(&tenant)
+                        .map_err(Into::into)
+                });
+                if let Err(error) = result {
+                    self.host
+                        .lock()
+                        .expect("host lock")
+                        .stop_attempt_failed(&tenant)?;
+                    return Err(error);
+                }
+                self.lost_diagnostic_jobs
+                    .lock()
+                    .expect("lost diagnostic jobs")
+                    .remove(&tenant);
             }
         }
         // A start can take minutes, so each due retry of a start-refused
@@ -900,6 +1001,75 @@ impl Runtime {
             tracing::error!(tenant, %error, "tenant_removal_record_failed");
         }
     }
+    fn withdraw_for_restart(self: &Arc<Self>, job: String, lease: crate::state::Lease) {
+        // One attempt per admitted lease; unanswered/ineligible withdrawals keep
+        // the original admission deadline rather than treating the job as never started.
+        if !self
+            .withdrawal_workers
+            .lock()
+            .expect("withdrawal workers")
+            .insert(job.clone())
+        {
+            return;
+        }
+        let runtime = self.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                let mut stream = runtime.control.relay(&lease.tenant, 52)?;
+                stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+                let claims = &lease.claims;
+                write_json(
+                    &mut stream,
+                    &json!({"type":"verified_lease", "jti":job,
+                    "purpose":"attach", "sub":claims.sub, "vcpus":claims.vcpus,
+                    "mem_mib":claims.mem_mib, "platform":claims.platform, "net":claims.net,
+                    "max_s":claims.max_s, "exp":unix_ms() / 1000 + 30}),
+                )?;
+                write_json(
+                    &mut stream,
+                    &json!({"type":"hello", "protocol_version":1, "started":true}),
+                )?;
+                loop {
+                    let reply = read_json(&mut stream)?;
+                    if reply["type"] == "heartbeat" {
+                        continue;
+                    }
+                    ensure!(reply["type"] == "hello", "withdrawal hello refused");
+                    break;
+                }
+                write_json(&mut stream, &json!({"type":"withdraw", "job_id":job}))?;
+                loop {
+                    let reply = read_json(&mut stream)?;
+                    if reply["type"] == "heartbeat" {
+                        continue;
+                    }
+                    ensure!(
+                        reply["type"] == "withdraw_reply",
+                        "unexpected withdrawal reply"
+                    );
+                    match reply["outcome"].as_str() {
+                        Some("withdrawn") => {
+                            runtime
+                                .host
+                                .lock()
+                                .expect("host lock")
+                                .restart_withdrawn(&job, unix_ms())?;
+                        }
+                        Some("started") => {
+                            tracing::info!(job_id = job, "restart_withdrawal_ineligible");
+                        }
+                        _ => anyhow::bail!("unknown withdrawal outcome"),
+                    }
+                    return Ok(());
+                }
+            })();
+            if let Err(error) = result {
+                tracing::warn!(job_id = job, error = %error, "restart_withdrawal_failed");
+            }
+        });
+    }
+
     fn fetch_detached_terminals(self: &Arc<Self>) {
         let jobs: Vec<_> = {
             let host = self.host.lock().expect("host lock");
@@ -1679,6 +1849,9 @@ where
                 let settled = relay_state(&runtime, &claims.jti, move |host, jti| host.host_settled_frames(jti, cursor.saturating_add(1))).await?;
                 if let Some(frames) = settled {
                     draining_terminal.store(true, Ordering::Release);
+                    if let Some(terminal) = batch.iter().find(|frame| frame["type"] == "terminal").cloned() {
+                        relay_state(&runtime, &claims.jti, move |host, jti| host.receive_terminal(jti, terminal, unix_ms())).await??;
+                    }
                     tracing::warn!(jti=claims.jti, "host_settled_runner_frame_ignored");
                     for frame in frames { relay_trace.client_frame(&mut *cw.lock().await,&frame).await.at(Side::Client, "relay")?; }
                     terminal_written.store(true, Ordering::Release);
