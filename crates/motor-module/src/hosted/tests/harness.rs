@@ -125,6 +125,9 @@ pub struct Harness {
     /// QuietAttach counts: admitted connections, closed connections (including
     /// idle closes), and protocol Attach frames received, in that order.
     pub attach_lifecycle: Arc<tokio::sync::watch::Sender<(usize, usize, usize)>>,
+    /// Reject this many valid Attach handshakes with an `auth` authentication
+    /// refusal before claiming a slot, to model delayed observation of a close.
+    pub attach_auth_refusals: Arc<AtomicUsize>,
     /// Changing the generation closes QuietAttach's current relay once.
     pub drop_follow: Arc<tokio::sync::watch::Sender<usize>>,
     /// The 1-based number of the `/v1/leases` request the broker reads and
@@ -214,6 +217,7 @@ impl Harness {
         let capacity = Arc::new(Mutex::new(None::<TenantCapacity>));
         let run_gate = Arc::new(tokio::sync::watch::Sender::new(true));
         let attach_lifecycle = Arc::new(tokio::sync::watch::Sender::new((0, 0, 0)));
+        let attach_auth_refusals = Arc::new(AtomicUsize::new(0));
         let drop_follow = Arc::new(tokio::sync::watch::Sender::new(0));
         let host_task = tokio::spawn({
             let broker = broker.clone();
@@ -221,6 +225,7 @@ impl Harness {
             let capacity = capacity.clone();
             let run_gate = run_gate.clone();
             let attach_lifecycle = attach_lifecycle.clone();
+            let attach_auth_refusals = attach_auth_refusals.clone();
             let drop_follow = drop_follow.clone();
             let tokens = tokens.clone();
             let iats = iats.clone();
@@ -240,6 +245,7 @@ impl Harness {
                     let capacity = capacity.clone();
                     let run_gate = run_gate.clone();
                     let attach_lifecycle = attach_lifecycle.clone();
+                    let attach_auth_refusals = attach_auth_refusals.clone();
                     let drop_follow = drop_follow.clone();
                     let broker = broker.clone();
                     tokio::spawn(async move {
@@ -294,6 +300,23 @@ impl Harness {
                         Nonces::default()
                             .verify(&challenge, &claims, &requester_jwk, &sig, now_s())
                             .unwrap();
+                        if purpose == Purpose::Attach
+                            && attach_auth_refusals
+                                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                                    remaining.checked_sub(1)
+                                })
+                                .is_ok()
+                        {
+                            super::super::tls::write(
+                                &mut tls,
+                                &Prelude::LeaseRefused {
+                                    reason: "auth".into(),
+                                },
+                            )
+                            .await
+                            .unwrap();
+                            return;
+                        }
                         let _attach = if matches!(
                             behavior,
                             Behavior::QuietAttach
@@ -879,6 +902,7 @@ impl Harness {
             capacity,
             run_gate,
             attach_lifecycle,
+            attach_auth_refusals,
             drop_follow,
             unanswered_lease,
             tasks: vec![host_task, http_task],

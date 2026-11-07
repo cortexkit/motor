@@ -288,7 +288,12 @@ impl Motor {
                         }
                     }
                     if let Some(cause) = retire_cause {
-                        match self.storage.retire_health_job(id, cause, now) {
+                        let retired = if self.hosted_state(id).is_some() {
+                            self.retire_idle_hosted_result(id, now, cause, false)
+                        } else {
+                            self.storage.retire_health_job(id, cause, now)
+                        };
+                        match retired {
                             Ok(true) => {
                                 self.health_probes.lock().unwrap().remove(&id);
                                 tracing::info!(job_id = %id, cause, "retired abandoned job from health polling");

@@ -304,7 +304,11 @@ impl Motor {
     /// reopens the same store right away must wait for that, not retry.
     #[cfg(test)]
     pub(crate) async fn close(self) {
-        self.shutdown_hosted().await;
+        self.stop_hosted_cleanup_for_test().await;
+        // Model process loss without settling bookings or acknowledging cancels.
+        // Graceful shutdown is exercised separately through shutdown_hosted.
+        self.hosted_cleanup.shutdown.send_replace(true);
+        self.stop_hosted_results().await;
         let storage = Arc::downgrade(&self.storage);
         drop(self);
         tokio::time::timeout(Duration::from_secs(30), async {
@@ -2435,6 +2439,7 @@ impl Motor {
         let mut wake_open = true;
         let mut reattaches = 0;
         let mut reconnect_delay = 1;
+        let mut rewind_auth_attempts = None;
         let mut hosted_terminal_deadline = self
             .hosted_state(id)
             .filter(|state| state.awaiting_cancel_terminal())
@@ -2450,7 +2455,11 @@ impl Motor {
         loop {
             if let Some(owner) = &owner {
                 if let Some(from) = owner.take_rewind() {
-                    drop(channel.take());
+                    if channel.take().is_some() {
+                        // A self-initiated rewind can reach the host before EOF
+                        // frees our old slot. First attaches get no such allowance.
+                        rewind_auth_attempts = Some(0u8);
+                    }
                     cursor = from;
                     hosted_terminal_deadline = None;
                 }
@@ -2523,7 +2532,18 @@ impl Motor {
                     }
                 }
                 if let Some(owner) = &owner {
-                    owner.live(true);
+                    if !self.claim_hosted_result_transport(id, owner) {
+                        if let Some(terminal) =
+                            self.storage.job(id).and_then(|job| job.local_terminal)
+                        {
+                            return emit(tx, StreamRecord::Terminal(terminal))
+                                .await
+                                .map(|_| false);
+                        }
+                        return Err(io::Error::other(
+                            "hosted result owner no longer owns the transport",
+                        ));
+                    }
                 }
                 let now = owner.as_ref().map_or_else(
                     || crate::hosted::now_s().saturating_mul(1000),
@@ -2542,7 +2562,27 @@ impl Motor {
                         cursor = from;
                     }
                     if let Err(error) = &opened {
-                        self.retire_failed_hosted_result(id, *error, now)?;
+                        let fenced = if matches!(error, crate::hosted::Error::AttachAuth) {
+                            if let Some(attempt) = rewind_auth_attempts.as_mut() {
+                                *attempt += 1;
+                                let fenced = *attempt < 3;
+                                tracing::info!(job_id = %id, step = "rewind_auth", attempt = *attempt, fenced,
+                                    "host refused owner-initiated rewind");
+                                if !fenced {
+                                    rewind_auth_attempts = None;
+                                }
+                                fenced
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if !fenced {
+                            self.retire_failed_hosted_result(id, *error, now)?;
+                        }
+                    } else {
+                        rewind_auth_attempts = None;
                     }
                 }
                 if let Err(error) = &opened {

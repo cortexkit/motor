@@ -46,6 +46,21 @@ impl Motor {
     }
 
     #[cfg(test)]
+    pub(super) async fn stop_hosted_cleanup_for_test(&self) {
+        let tasks = self
+            .hosted_cleanup
+            .tasks
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_default();
+        for (_, task) in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    #[cfg(test)]
     pub(super) async fn wait_hosted_cleanup(&self, id: Uuid) {
         let task = self
             .hosted_cleanup

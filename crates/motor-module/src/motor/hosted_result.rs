@@ -359,6 +359,14 @@ impl Motor {
                 owner.state.lock().unwrap().reply = Some(reply.unwrap_or_else(|| empty_status(id)));
                 owner.changed.send_replace(());
             }
+            match motor.recover_recorded_unknown(id, &owner, &tx).await {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(error) => {
+                    let _ = tx.send(Err(error)).await;
+                    return;
+                }
+            }
             if let Err(error) = motor
                 .follow(id, cursor, None, &tx, owner.wake.subscribe())
                 .await
@@ -366,6 +374,49 @@ impl Motor {
                 let _ = tx.send(Err(error)).await;
             }
         })
+    }
+
+    async fn recover_recorded_unknown(
+        &self,
+        id: Uuid,
+        owner: &Arc<Owner>,
+        tx: &mpsc::Sender<io::Result<StreamRecord>>,
+    ) -> io::Result<bool> {
+        let recorded = self.hosted_state(id).is_some_and(|state| {
+            !state.cancel_settlement_ready()
+                && state.terminal.is_some_and(|terminal| {
+                    matches!(terminal.outcome, motor_protocol::Outcome::OutcomeUnknown)
+                        && terminal.refusal_detail.is_some()
+                })
+        });
+        if !recorded {
+            return Ok(false);
+        }
+        // Older clients can have published an unknown outcome while cancellation
+        // remains unconfirmed. Preserve that result and retry durable cancellation;
+        // this is not permission to synthesize a new unknown for a live job.
+        let mut backoff = 1;
+        loop {
+            if !self.claim_hosted_result_transport(id, owner) {
+                if let Some(terminal) = self.storage.job(id).and_then(|job| job.local_terminal) {
+                    emit(tx, StreamRecord::Terminal(terminal)).await?;
+                }
+                return Ok(true);
+            }
+            let result = self.finish_hosted(id, false, tx).await;
+            owner.live(false);
+            result?;
+            let Some(state) = self.hosted_state(id) else {
+                return Ok(true);
+            };
+            if !self.pending(id) || state.finish_done {
+                return Ok(!state.booked_or_attempted()
+                    || state.finish_done
+                    || state.billing != crate::BillingStatus::Pending);
+            }
+            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            backoff = (backoff * 2).min(30);
+        }
     }
 
     pub(super) fn ensure_hosted_result(&self, id: Uuid, probe_at: Option<u64>) -> Arc<Owner> {
@@ -390,7 +441,9 @@ impl Motor {
         now: u64,
         owner: &Owner,
     ) -> Option<JobStatusReply> {
-        owner.live(true);
+        if !self.claim_hosted_result_transport(id, owner) {
+            return None;
+        }
         let mut failure = None;
         let probe = async {
             let mut channel = match self.open_job_channel_at(id, now).await {
@@ -480,6 +533,13 @@ impl Motor {
                 }
             };
             if let Some(reply) = reply {
+                let retired_without_subscribers =
+                    self.storage.job(id).is_some_and(|job| job.health_retired())
+                        && owner.state.lock().unwrap().subscribers.is_empty();
+                if retired_without_subscribers {
+                    let mut stopped = owner.stopped.subscribe();
+                    let _ = stopped.wait_for(|done| *done).await;
+                }
                 return reply;
             }
             if changed.changed().await.is_err() {
@@ -605,9 +665,10 @@ impl Motor {
         broker_finished: bool,
     ) -> io::Result<bool> {
         let owners = self.hosted_results.lock().unwrap();
-        if owners
-            .get(&id)
-            .is_some_and(|owner| owner.state.lock().unwrap().live)
+        // Hold the owner's transport gate through the store write, not just the
+        // liveness check: reconnects can use an Arc obtained before retirement.
+        let state = owners.get(&id).map(|owner| owner.state.lock().unwrap());
+        if state.as_ref().is_some_and(|state| state.live)
             || self
                 .hosted_state(id)
                 .is_some_and(|state| state.terminal.is_some())
@@ -616,6 +677,22 @@ impl Motor {
         }
         self.storage
             .retire_hosted_job(id, cause, now, broker_finished)
+    }
+
+    pub(super) fn claim_hosted_result_transport(&self, id: Uuid, owner: &Owner) -> bool {
+        let owners = self.hosted_results.lock().unwrap();
+        if !owners
+            .get(&id)
+            .is_some_and(|current| std::ptr::eq(current.as_ref(), owner))
+        {
+            return false;
+        }
+        let mut state = owner.state.lock().unwrap();
+        if self.storage.job(id).is_none_or(|job| job.health_retired()) {
+            return false;
+        }
+        state.live = true;
+        true
     }
 }
 
@@ -648,6 +725,38 @@ impl Motor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn retirement_and_new_transport_claim_are_mutually_exclusive() {
+        let scratch = cortexkit_test_support::ScratchDir::new("hosted-owner-retirement-claim");
+        let motor = Motor::with_connector(
+            crate::Config::default(),
+            &scratch,
+            Arc::new(crate::hosted::tests::harness::NoSsh(
+                std::sync::atomic::AtomicUsize::new(0),
+            )),
+        )
+        .unwrap();
+        let id = Uuid::now_v7();
+        motor.storage.create(id, 60, None, None, false).unwrap();
+        let mut route = crate::HostedJobState::new(&motor.config);
+        route.run_sent = true;
+        motor.storage.hosted_route(id, route).unwrap();
+        let owner = motor.reserve_hosted_result(id, u64::MAX);
+        owner.live(false);
+        assert!(motor.claim_hosted_result_transport(id, &owner));
+        assert!(!motor
+            .retire_idle_hosted_result(id, u64::MAX, "expired", false)
+            .unwrap());
+        assert!(motor.storage.job(id).unwrap().local_terminal.is_none());
+        owner.live(false);
+        assert!(motor
+            .retire_idle_hosted_result(id, u64::MAX, "expired", false)
+            .unwrap());
+        assert!(!motor.claim_hosted_result_transport(id, &owner));
+        motor.hosted_results.lock().unwrap().remove(&id);
+        motor.close().await;
+    }
 
     #[tokio::test(start_paused = true)]
     async fn boat_finish_waits_only_for_terminal_time_subscribers_and_detach_unblocks_it() {
@@ -696,4 +805,3 @@ mod tests {
         assert_eq!(tokio::time::Instant::now(), start);
     }
 }
-

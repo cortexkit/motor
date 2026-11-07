@@ -1026,6 +1026,77 @@ async fn hosted_concurrent_rewinds_fold_to_oldest_waiting_cursor() {
     motor.close().await;
 }
 
+async fn assert_rewind_auth_outcome(refusals: usize, expected: Outcome) {
+    let h = Harness::new(Behavior::OwnerReplay).await;
+    h.run_gate.send_replace(false);
+    let scratch = cortexkit_test_support::ScratchDir::new("hosted-owner-expired-rewind-auth");
+    let (motor, id) = detached_job(&h, &scratch).await;
+    let mut first = motor.attach(AttachRequest::new(id, 0)).unwrap();
+    owner_outputs(&mut first, 0).await;
+    let tokens = h.tokens.load(Ordering::SeqCst);
+    motor
+        .storage
+        .hosted_update(id, |state| state.retry_iat = Some(0))
+        .unwrap();
+    h.attach_auth_refusals.store(refusals, Ordering::SeqCst);
+    let mut late = motor.attach(AttachRequest::new(id, 11)).unwrap();
+    let recovered = matches!(expected, Outcome::Exit { code: 41 });
+    if recovered {
+        owner_outputs(&mut late, 11).await;
+        assert!(motor.storage.job(id).unwrap().local_terminal.is_none());
+        h.run_gate.send_replace(true);
+    }
+    let StreamRecord::Terminal(terminal) = result_record(&mut late).await else {
+        panic!("terminal missing")
+    };
+    assert_eq!(terminal.outcome, expected);
+    assert_eq!(
+        result_record(&mut first).await,
+        StreamRecord::Terminal(terminal.clone())
+    );
+    assert_eq!(h.tokens.load(Ordering::SeqCst) - tokens, 3);
+    assert_eq!(h.attach_auth_refusals.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        owner_replay_cursors(&h),
+        if recovered { vec![0, 11] } else { vec![0] }
+    );
+    if recovered {
+        assert_eq!(motor.hosted_state(id).unwrap().billed_vcpu_ms, Some(6001));
+    } else {
+        assert!(terminal
+            .refusal_detail
+            .as_deref()
+            .unwrap()
+            .contains("auth past the job's deadline"));
+        assert_eq!(
+            motor.storage.job(id).unwrap().local_terminal,
+            Some(terminal)
+        );
+        assert_eq!(
+            motor.hosted_state(id).unwrap().billing,
+            BillingStatus::Unavailable
+        );
+    }
+    assert!(!h
+        .frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| matches!(frame, Frame::Cancel(_) | Frame::Run(_))));
+    drop((first, late));
+    motor.close().await;
+}
+
+#[tokio::test]
+async fn hosted_rewind_past_deadline_retries_two_auth_refusals_and_delivers_result() {
+    assert_rewind_auth_outcome(2, Outcome::Exit { code: 41 }).await;
+}
+
+#[tokio::test]
+async fn hosted_rewind_past_deadline_retires_after_third_auth_refusal() {
+    assert_rewind_auth_outcome(3, Outcome::OutcomeUnknown).await;
+}
+
 #[tokio::test]
 async fn hosted_restart_collects_terminal_without_replaying_until_subscriber_arrives() {
     let h = Harness::new(Behavior::OwnerReplay).await;
