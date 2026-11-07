@@ -61,7 +61,8 @@ const TEMPORARY_MARKER: &str = ".tmp-";
 /// A source-only snapshot retains each install warning for every job that
 /// reuses it. Retrying can be expensive, so attempts are at least ten minutes
 /// apart. A retry publishes a new immutable generation: jobs already using
-/// the old directory keep it, and normal lease-aware eviction reclaims it.
+/// the old directory keep it, and normal snapshot eviction reclaims it once
+/// no job uses it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct JavascriptRetry {
     attempted: SystemTime,

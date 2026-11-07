@@ -163,8 +163,9 @@ sources. Tests: `isolated_nested_javascript_jobs_resolve_offline_and_reuse_trust
 
 On Linux, a failed locked JavaScript install in the workspace or a sibling
 checkout warns on the job's stderr and the job still runs without the failed
-install's dependencies. Partial dependency trees are removed, and failed
-installs are not cached. Unsafe layouts, missing tracked inputs and dependency
+install's dependencies. A failed install's partial dependency tree is removed,
+so no later job reuses it, and a later job retries the install. Unsafe layouts,
+missing tracked inputs and dependency
 paths that escape the checkout still refuse the job before it starts.
 
 3.7. A caller root never changes what a job sees at `/Users`. Caller paths under
