@@ -1,4 +1,6 @@
 //! Linux-only maintenance for Cargo's per-workspace intermediate folders.
+//! Each folder also holds registry and Git dependency outputs. Keep it if any
+//! dep-info file names a source under the job's workspace or a declared sibling.
 use crate::{caller_path as paths, Config};
 use motor_protocol::Run;
 use std::{
@@ -191,9 +193,10 @@ fn cleanup(
             let Some(folder) = directory(&parent, &hash)? else {
                 continue;
             };
-            let keep = match dependency(&folder)? {
-                Some(path) => roots.iter().any(|root| path.starts_with(root)),
-                None => now
+            let keep = match dependency(&folder, roots)? {
+                Dependency::Checkout => true,
+                Dependency::Foreign => false,
+                Dependency::Unidentified => now
                     .duration_since(folder.metadata()?.modified()?)
                     .map_or(true, |age| age <= UNIDENTIFIED_AGE),
             };
@@ -211,7 +214,18 @@ fn cleanup(
     Ok(())
 }
 
-fn dependency(folder: &File) -> io::Result<Option<PathBuf>> {
+enum Dependency {
+    Checkout,
+    Foreign,
+    Unidentified,
+}
+
+/// Scan dep-info files until any source matches the workspace or a sibling.
+/// Registry and Git dependencies can sort before local crates, so an earlier
+/// foreign source does not identify the whole folder as foreign. Without any
+/// readable source path, leave retention to the folder's age.
+fn dependency(folder: &File, roots: &[&Path]) -> io::Result<Dependency> {
+    let mut dependency = Dependency::Unidentified;
     for (_, profile) in profiles(folder)? {
         let Some(deps) = directory(&profile, OsStr::new("deps"))? else {
             continue;
@@ -228,11 +242,14 @@ fn dependency(folder: &File) -> io::Result<Option<PathBuf>> {
                 continue;
             }
             if let Some(path) = dependency_path(&bytes) {
-                return Ok(Some(path));
+                if roots.iter().any(|root| path.starts_with(root)) {
+                    return Ok(Dependency::Checkout);
+                }
+                dependency = Dependency::Foreign;
             }
         }
     }
-    Ok(None)
+    Ok(dependency)
 }
 
 fn dependency_path(bytes: &[u8]) -> Option<PathBuf> {

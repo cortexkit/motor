@@ -145,6 +145,29 @@ fn cleanup_keeps_workspace_and_sibling_but_removes_foreign_and_old_unidentified(
 }
 
 #[test]
+fn cleanup_keeps_checkout_when_registry_dep_info_sorts_first() {
+    let scratch = ScratchDir::new("motor-cargo-mixed-dep-info");
+    let target = scratch.join("target");
+    let own = folder(&target, "00000000000001", "debug", None);
+    let deps = own.join("debug/deps");
+    fs::write(
+        deps.join("addr2line-000.d"),
+        "out: /motor-home/cargo/registry/src/addr2line/src/lib.rs\n",
+    )
+    .unwrap();
+    fs::write(
+        deps.join("workspace-000.d"),
+        "out: /caller/work/src/lib.rs\n",
+    )
+    .unwrap();
+    run(&target, &[Path::new("/caller/work")], SystemTime::now());
+    assert!(
+        deps.join("workspace-000.d").is_file(),
+        "registry dep-info must not hide a later checkout dependency"
+    );
+}
+
+#[test]
 fn cleanup_does_not_follow_symlinked_folders_or_dep_info() {
     let scratch = ScratchDir::new("motor-cargo-build-symlinks");
     let target = scratch.join("target");
