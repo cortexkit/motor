@@ -5,7 +5,7 @@
 # CI job / step                                      -> gate lane
 # linux-ordinary / checkout (full history)             -> source snapshots
 #   Rust 1.99.0 + rustfmt/clippy, nextest 0.9.138       -> provisioned runner tools
-#   Node 24.21.0, Bun 1.4.2, pnpm 11.1.2, JS layout   -> linux-tests (runner tools)
+#   Node 24.21.0, Bun 1.4.4, pnpm 11.1.2, JS layout   -> linux-tests (runner tools)
 #   Tool versions                                    -> linux-lint, linux-tests
 #   Nothing tracked outside .cortexkit allowlist      -> fast
 #   Formatting                                       -> fast

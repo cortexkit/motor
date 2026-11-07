@@ -68,6 +68,11 @@ PENDING_MACOS_COMPONENTS = {"llvm-tools", "rust-analyzer"}
 # 30 Oct 2026 for a Linux minimum-supported-Rust-version check.
 PENDING_MACOS_TOOLCHAINS = {"1.92.0"}
 
+# The sealed macOS image still carries Bun 1.4.2 while Linux uses 1.4.4 for
+# workspace lockfile handling. Remove this entry with the next macOS image
+# build, which takes the build server's tool version.
+PENDING_MACOS_TOOL_VERSIONS = {("bun", "1.4.2")}
+
 
 def macos_components(server_components):
     """The macOS image's components for one build-server toolchain: the host's
@@ -140,7 +145,8 @@ def validate(manifest, server):
         spec = manifest["tools"][name]
         if not sha256(spec.get("sha256")) or not spec.get("version"):
             raise ValueError("missing macOS tool pin: " + name)
-        if name in ("bun", "git") and spec["version"] != server["tools"][name]["version"]:
+        if (name in ("bun", "git") and spec["version"] != server["tools"][name]["version"]
+                and (name, spec["version"]) not in PENDING_MACOS_TOOL_VERSIONS):
             raise ValueError("macOS tool version differs from build-server: " + name)
         if not spec["path"].startswith(PREFIX + "/"):
             raise ValueError("invalid macOS tool path: " + name)
