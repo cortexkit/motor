@@ -863,6 +863,19 @@ class ParityTests(unittest.TestCase):
                 actual['cargo_binaries'][name][key] = value
                 self.assertFalse(self.report(actual)['passed'])
 
+    def test_linux_roles_require_bun_1_4_4(self):
+        # Bun 1.4.2 ignores the root workspace lockfile when installation starts
+        # inside a workspace member; every Linux role needs the fixed release.
+        for role in ('build-server', 'boat', 'tenant'):
+            for job in (False, True):
+                with self.subTest(role=role, job=job):
+                    manifest = parity.role_manifest(self.manifest, role, job=job)
+                    self.assertEqual('1.4.4', manifest['tools']['bun']['version'])
+                    actual = self.observed(role, job=job)
+                    actual['tools']['bun']['version'] = '1.4.2'
+                    self.assertIn("bun version: expected '1.4.4', observed '1.4.2'",
+                                  parity.differences(self.manifest, actual, role=role, job=job))
+
     def test_tools_and_packages_are_checked(self):
         for name in ('bun', 'wasm-opt', 'x86_64-w64-mingw32-gcc', 'gnucp'):
             with self.subTest(name=name):

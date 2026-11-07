@@ -666,7 +666,7 @@ class ImageTests(unittest.TestCase):
         def run(*args, capture=False):
             calls.append(args)
             scratch.mkdir()
-            return "bun/bun.lock: /usr/local/lib/motor/bun/bin/bun 1.4.2\n" + guest.JAVASCRIPT_SETUP_PASS
+            return "bun/bun.lock: /usr/local/lib/motor/bun/bin/bun 1.4.4\n" + guest.JAVASCRIPT_SETUP_PASS
         with mock.patch.object(guest, "run", side_effect=run):
             lines = guest.verify_javascript_setup(scratch)
         # --tenant-vm selects the same tool locations the serving tenant runner uses.
@@ -716,7 +716,7 @@ class ImageTests(unittest.TestCase):
                 return "rustc 1.99.0 (test 2026-09-28)"
             if args[:2] == ("rustup", "target"):
                 return "x86_64-unknown-linux-gnu\nwasm32-wasip1"
-            return {"node": "v24.21.0", "npm": "11.19.0", "bun": "1.4.2", "pnpm": "11.1.2"}[args[0]]
+            return {"node": "v24.21.0", "npm": "11.19.0", "bun": "1.4.4", "pnpm": "11.1.2"}[args[0]]
 
         with mock.patch.object(capture, "output", side_effect=output):
             pins = capture.capture()

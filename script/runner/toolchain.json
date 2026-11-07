@@ -764,7 +764,7 @@
       "path_by_role": {
         "tenant": "/usr/local/lib/motor/bun/bin/bun"
       },
-      "version": "1.4.2"
+      "version": "1.4.4"
     },
     "bun-1.3.14": {
       "archive": {
