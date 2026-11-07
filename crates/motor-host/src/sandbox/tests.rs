@@ -454,7 +454,10 @@ async fn sandbox_max_s_cancels_through_runner_after_requester_disconnects() {
             .unwrap();
         }
     }
-    f.runtime.tick(now + c.max_s * 1000 - 1).unwrap();
+    // The runner gets a grace period after max_s to report its own deadline
+    // terminal; the host's backstop cancel comes only after that.
+    let backstop = now + c.max_s * 1000 + crate::billing::BACKSTOP_CANCEL_GRACE_MS;
+    f.runtime.tick(backstop - 1).unwrap();
     assert!(f
         .runtime
         .host
@@ -464,7 +467,7 @@ async fn sandbox_max_s_cancels_through_runner_after_requester_disconnects() {
         .pending_cancels
         .is_empty());
     let runtime = f.runtime.clone();
-    let tick = tokio::task::spawn_blocking(move || runtime.tick(now + c.max_s * 1000));
+    let tick = tokio::task::spawn_blocking(move || runtime.tick(backstop));
     let (mut socket, _) = admin.accept().await.unwrap();
     assert_eq!(
         read_frame(&mut socket).await.unwrap(),

@@ -27,7 +27,7 @@ pub const RETENTION_INTERVAL_MS: u64 = 10 * 60 * 1000;
 pub const REVOCATION_CAP: usize = 4096;
 
 // Let the runner report its own deadline terminal before the host backstop cancels.
-const BACKSTOP_CANCEL_GRACE_MS: u64 = 30_000;
+pub(crate) const BACKSTOP_CANCEL_GRACE_MS: u64 = 30_000;
 const LOST_SETTLEMENT_GRACE_MS: u64 = 300_000;
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
