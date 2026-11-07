@@ -533,21 +533,36 @@ fn run_via(
             }
             Ok(())
         }
-        Verdict::TimedOut => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
+        Verdict::TimedOut => Err(javascript_failure(
+            helper,
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
                 "{} helper unit {unit} exceeded its time limit of {} s ({}); systemd stopped it \
                  and every process it started{output}",
                 helper.label(),
                 limit.as_secs_f64(),
                 helper.setting()
             ),
+            ),
         )),
-        Verdict::Failed(reason) => Err(io::Error::other(format!(
-            "{} helper unit {unit} failed: {reason}{output}",
-            helper.label()
-        ))),
+        Verdict::Failed(reason) => Err(javascript_failure(
+            helper,
+            io::Error::other(format!(
+                "{} helper unit {unit} failed: {reason}{output}",
+                helper.label()
+            )),
+        )),
     }
+}
+
+fn javascript_failure(helper: Helper, error: io::Error) -> io::Error {
+    #[cfg(target_os = "linux")]
+    if matches!(helper, Helper::JavascriptInstall) {
+        return crate::isolation::javascript_install_failure(error);
+    }
+    let _ = helper;
+    error
 }
 
 /// Stops every helper unit this runner left behind, for example when it was
