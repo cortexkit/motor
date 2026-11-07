@@ -58,6 +58,14 @@ pub(crate) struct TenantAdvert {
     /// The permits the tenant runner's own cache fill held at the last probe.
     fill: Option<FillSample>,
     warm: Option<WarmSample>,
+    disk: Option<DiskSample>,
+}
+
+struct DiskSample {
+    received_ms: u64,
+    age_ms: u64,
+    free_gib: u64,
+    total_gib: u64,
 }
 
 struct WarmSample {
@@ -322,7 +330,62 @@ impl Host {
             // guest reports its own fill, if any, at its first probe.
             advert.fill = None;
             advert.warm = None;
+            advert.disk = None;
         }
+    }
+
+    /// Reuses the metrics path's quota-clamped job-disk figures. Keep the
+    /// guest's sample age so receiving an old report does not make it fresh.
+    pub(crate) fn record_disk(
+        &mut self,
+        tenant: &str,
+        received_ms: u64,
+        age_ms: u64,
+        free_gib: u64,
+        total_gib: u64,
+    ) {
+        self.advert.entry(tenant.to_owned()).or_default().disk = Some(DiskSample {
+            received_ms,
+            age_ms,
+            free_gib,
+            total_gib,
+        });
+    }
+
+    pub(crate) fn tenant_disk(&self, now_ms: u64) -> Vec<motor_lease::TenantDisk> {
+        let mut entries = std::collections::BTreeMap::new();
+        for binding in self.tenants.values() {
+            if !self.is_ready(&binding.tenant) || self.is_suspending(&binding.tenant) {
+                continue;
+            }
+            let Some(disk) = self
+                .advert
+                .get(&binding.tenant)
+                .and_then(|a| a.disk.as_ref())
+            else {
+                continue;
+            };
+            if disk.total_gib == 0
+                || now_ms
+                    .saturating_sub(disk.received_ms)
+                    .saturating_add(disk.age_ms)
+                    > 60_000
+            {
+                continue;
+            }
+            entries.insert(
+                binding.sub.clone(),
+                motor_lease::TenantDisk {
+                    tenant: binding.sub.clone(),
+                    disk_free_gib: disk.free_gib,
+                    disk_total_gib: disk.total_gib,
+                },
+            );
+        }
+        entries
+            .into_values()
+            .take(crate::wire::MAX_ENTRIES)
+            .collect()
     }
     /// Records the permits a running tenant's own cache fill holds, from the
     /// same runner probe as its memory. The guest is root-controlled, so this

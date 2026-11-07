@@ -19,7 +19,7 @@ pub trait Control: Send + Sync {
     fn pressure_cgroup(&self, _tenant: &str) -> Option<&Path> {
         None
     }
-    /// Trusted registry quota, used only to bound display-only guest disk reports.
+    /// Host-recorded VM disk size bounding guest disk reports for metrics and placement.
     fn disk_quota_bytes(&self, _tenant: &str) -> Result<u64> {
         anyhow::bail!("tenant disk quota unavailable")
     }
@@ -43,8 +43,8 @@ pub trait Control: Send + Sync {
     fn capacity(&self) -> Result<crate::capacity::Capacity> {
         anyhow::bail!("host capacity file unavailable")
     }
-    /// The running guest's `mem_available_bytes` and the permits its cache
-    /// fill holds, both from the tenant runner's `status` health. A runner
+    /// The running guest's memory, workspace disk sample, and the permits its cache
+    /// fill holds, all from the tenant runner's `status` health. A runner
     /// whose health lacks `mem_available_bytes` gives `None` there; one
     /// without `fill_permits` (an older runner, or one not filling) gives 0.
     fn runner_sample(&self, tenant: &str) -> Result<RunnerSample> {
@@ -58,6 +58,9 @@ impl RunnerSample {
     fn from_health(health: &Value) -> Self {
         Self {
             mem_available_bytes: health["mem_available_bytes"].as_u64(),
+            guest_disk: health
+                .get("guest_disk")
+                .and_then(|value| serde_json::from_value(value.clone()).ok()),
             fill_permits: health["fill_permits"]
                 .as_u64()
                 .map_or(0, |permits| u32::try_from(permits).unwrap_or(u32::MAX)),
@@ -73,6 +76,7 @@ impl RunnerSample {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RunnerSample {
     pub mem_available_bytes: Option<u64>,
+    pub guest_disk: Option<motor_protocol::GuestDisk>,
     /// Permits held by the tenant's own cache fill. Guest-reported, so they
     /// only lower that tenant's advertised capacity.
     pub fill_permits: u32,

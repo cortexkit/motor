@@ -406,6 +406,8 @@ impl Host {
                 .collect(),
             healthy,
             draining: self.snapshot.draining,
+            accept_until_ms: None,
+            tenant_disk: self.tenant_disk(now_ms),
             revoked_ack: self
                 .snapshot
                 .revocations

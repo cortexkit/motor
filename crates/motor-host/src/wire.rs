@@ -72,6 +72,21 @@ pub fn heartbeat_violation(heartbeat: &Heartbeat) -> Option<&'static str> {
     if heartbeat.warm.len() > MAX_ENTRIES || heartbeat.running.len() > MAX_ENTRIES {
         return Some("more than 64 warm or running entries");
     }
+    if heartbeat.tenant_disk.len() > MAX_ENTRIES {
+        return Some("more than 64 tenant disk entries");
+    }
+    let mut disk_tenants = std::collections::BTreeSet::new();
+    for disk in &heartbeat.tenant_disk {
+        if !account(&disk.tenant) || !disk_tenants.insert(&disk.tenant) {
+            return Some("tenant disk requires distinct acct:<ULID> tenants");
+        }
+        if disk.disk_total_gib == 0
+            || disk.disk_total_gib > SAFE_INTEGER
+            || disk.disk_free_gib > disk.disk_total_gib
+        {
+            return Some("tenant disk requires free <= total and positive safe-integer total");
+        }
+    }
     for warm in &heartbeat.warm {
         if !account(&warm.tenant) {
             return Some("warm tenant is not acct:<ULID>");
@@ -159,7 +174,51 @@ mod tests {
             healthy: true,
             draining: false,
             revoked_ack: Vec::new(),
+            accept_until_ms: None,
+            tenant_disk: Vec::new(),
         }
+    }
+
+    #[test]
+    fn tenant_disk_heartbeat_grammar_matches_cloud_vectors_and_bounds() {
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../motor-lease/contracts/cloud/tenant-disk.json"
+        ))
+        .unwrap();
+        let mut accepted = 0;
+        for case in vector["disk_cases"].as_array().unwrap() {
+            for exchange in case["heartbeats"].as_array().unwrap() {
+                let body: Heartbeat =
+                    serde_json::from_str(exchange["request"]["body_bytes"].as_str().unwrap())
+                        .unwrap();
+                assert_eq!(heartbeat_violation(&body), None);
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, 14);
+        let malformed: Heartbeat =
+            serde_json::from_value(vector["malformed"]["request"]["body"].clone()).unwrap();
+        assert!(heartbeat_violation(&malformed).is_some());
+        let mut body = heartbeat();
+        let disk = motor_lease::TenantDisk {
+            tenant: body.warm[0].tenant.clone(),
+            disk_free_gib: 0,
+            disk_total_gib: 50,
+        };
+        body.tenant_disk = vec![disk.clone()];
+        assert_eq!(heartbeat_violation(&body), None);
+        for (free, total) in [(1, 0), (51, 50), (0, SAFE_INTEGER + 1)] {
+            body.tenant_disk[0].disk_free_gib = free;
+            body.tenant_disk[0].disk_total_gib = total;
+            assert!(heartbeat_violation(&body).is_some());
+        }
+        body.tenant_disk = vec![disk.clone(), disk.clone()];
+        assert!(heartbeat_violation(&body).is_some());
+        body.tenant_disk = vec![disk.clone(); 65];
+        assert!(heartbeat_violation(&body).is_some());
+        body.tenant_disk = vec![disk];
+        body.tenant_disk[0].tenant = "tenant-local".into();
+        assert!(heartbeat_violation(&body).is_some());
     }
 
     #[test]

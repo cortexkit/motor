@@ -74,6 +74,7 @@ fn cloud_final_files_match_their_manifest_digests() {
         "cloud/host-signature.json",
         "cloud/host-metrics.json",
         "cloud/host-draining.json",
+        "cloud/tenant-disk.json",
         "cloud/lease.json",
         "cloud/usage-settlement.json",
         "cloud/settled-reattach.json",
@@ -104,7 +105,7 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
     for (path, digest) in [
         (
             "runners-contract.md",
-            "8c62d0d83abad72eedb5c50ab7d9f988ab78488e019388e0ca8077a3a1d20602",
+            "bfd73b288d53d73be24c704d7fad8f38157860457a95c8b3eb6a3c3880dfcd07",
         ),
         (
             "host-revoke-fence-off.json",
@@ -116,7 +117,11 @@ fn cloud_policy_pins_and_historical_vectors_are_byte_identical() {
         ),
         (
             "host-draining.json",
-            "f61120e8c08e880ffbac8dc2cf3b474a87228131d89adc8ee9c830dc675adbe5",
+            "849a17ec763c5b686cd3c99d48d55a577d677cb6c0a3a024184d5024b4902c25",
+        ),
+        (
+            "tenant-disk.json",
+            "5843daf2cb7a70cd4be2d34c70c09347f8b08eb922df6a2f2ee390599cfc4c07",
         ),
         (
             "host-metrics.json",
