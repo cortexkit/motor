@@ -65,6 +65,7 @@ pub(crate) const JOB_MEMORY_PROPERTIES: [&str; 3] = [
     "--property=OOMScoreAdjust=900",
     "--property=OOMPolicy=kill",
 ];
+mod source_mtimes;
 mod tenant;
 #[cfg(target_os = "linux")]
 mod tenant_agent;

@@ -202,6 +202,78 @@ fn open(root: &Path, relative: &Path) -> io::Result<File> {
     Err(invalid("empty source seal path"))
 }
 
+/// Plan against the trusted snapshots, not Git configuration in the staged tree.
+pub(super) fn prepare_times(
+    trees: &[crate::source_mtimes::Tree],
+    staging: &Path,
+    store: &Path,
+    record: &Path,
+    workspace: &str,
+    selected: &Plan,
+    now: std::time::SystemTime,
+) -> io::Result<(crate::source_mtimes::Record, crate::source_mtimes::Times)> {
+    let mut exported = BTreeSet::new();
+    let mut sealed = BTreeSet::new();
+    for tree in trees {
+        for path in regular_files(&tree.entries)? {
+            let key = tree.prefix.join(&path).to_string_lossy().into_owned();
+            exported.insert(key.clone());
+            // Sibling shares are read-only; workspace files need the inode seal.
+            if tree.destination != workspace || selected.files.binary_search(&path).is_ok() {
+                sealed.insert(key);
+            }
+        }
+    }
+    crate::source_mtimes::prepare(
+        trees,
+        staging,
+        crate::source_mtimes::Store::Directory(store),
+        record,
+        crate::source_mtimes::Policy {
+            exported: &exported,
+            sealed: &sealed,
+            // The workspace lock is held from staging through VM stop and
+            // copy-back. Serializing jobs of a checkout makes time reuse safe.
+            concurrent_jobs: 1,
+            validate_path: |path| {
+                if path.is_empty() || path.split('/').any(|part| matches!(part, "" | "." | "..")) {
+                    return Err(invalid("non-normal source timestamp path"));
+                }
+                Ok(())
+            },
+        },
+        now,
+    )
+}
+
+/// Apply before setting uchg: immutable inodes cannot be retimed. Every path
+/// component is opened relative to a directory descriptor without following links.
+pub(super) fn apply_times(root: &Path, times: &crate::source_mtimes::Times) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    for (path, modified_ms) in times {
+        let file = open(root, Path::new(path))?;
+        if file.metadata()?.nlink() != 1 {
+            return Err(invalid("source timestamp file has aliases"));
+        }
+        let times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: (modified_ms / 1000).try_into().map_err(invalid)?,
+                tv_nsec: ((modified_ms % 1000) * 1_000_000)
+                    .try_into()
+                    .map_err(invalid)?,
+            },
+        ];
+        if unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 trait Flags {
     fn inspect(&self, file: &File) -> io::Result<(Identity, u32)>;
     fn set(&self, file: &File, flags: u32) -> io::Result<()>;

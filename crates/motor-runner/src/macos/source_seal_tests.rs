@@ -120,6 +120,111 @@ fn snapshot_plan_selects_regular_modes_and_exact_collector_returns() {
 }
 
 #[test]
+fn unchanged_file_keeps_time_across_staged_jobs_and_changed_file_advances() {
+    use std::time::{Duration, UNIX_EPOCH};
+    let f = Tree::new();
+    let destination = "/Users/motor/repo";
+    let store = f.0.join("targets/checkout");
+    std::fs::create_dir_all(&store).unwrap();
+    let history = store.with_extension("source-mtimes.json");
+    let start = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let end = start + Duration::from_secs(60);
+    let trees = |changed: &str| {
+        vec![crate::source_mtimes::Tree {
+            destination: destination.into(),
+            prefix: "repo".into(),
+            entries: format!(
+                "100644 blob aa\tunchanged.rs\0\
+                          100644 blob {changed}\tchanged.rs\0\
+                          100644 blob cc\treturned.rs\0"
+            )
+            .into_bytes(),
+        }]
+    };
+    let selected = plan(
+        ["unchanged.rs", "changed.rs", "returned.rs"].map(PathBuf::from),
+        &[PathBuf::from("returned.rs")].into(),
+    )
+    .unwrap();
+    let mut previous = None;
+    for (job, blob, now) in [
+        ("first", "bb", start),
+        ("second", "dd", start + Duration::from_secs(20)),
+    ] {
+        let staging = f.0.join(job);
+        for name in ["unchanged.rs", "changed.rs", "returned.rs"] {
+            let path = f.file(&format!("{job}/repo/{name}"));
+            // Make staging times distinct even on a fast or coarse-clock host.
+            File::open(path)
+                .unwrap()
+                .set_modified(now + Duration::from_secs(120))
+                .unwrap();
+        }
+        let (candidate, times) = prepare_times(
+            &trees(blob),
+            &staging,
+            &store,
+            &history,
+            destination,
+            &selected,
+            now,
+        )
+        .unwrap();
+        apply_times(&staging, &times).unwrap();
+        let modified = |name| {
+            std::fs::metadata(staging.join("repo").join(name))
+                .unwrap()
+                .modified()
+                .unwrap()
+        };
+        let unchanged = modified("unchanged.rs");
+        if let Some(previous) = previous {
+            assert_eq!(
+                unchanged, previous,
+                "unchanged source time must survive staging"
+            );
+            assert_eq!(modified("changed.rs"), end + Duration::from_secs(1));
+            assert_eq!(modified("returned.rs"), end + Duration::from_secs(1));
+        }
+        previous = Some(unchanged);
+        // Copy-back replaces the build directory inode before saving history.
+        let old = f.0.join(format!("old-{job}"));
+        std::fs::rename(&store, old).unwrap();
+        std::fs::create_dir(&store).unwrap();
+        crate::source_mtimes::replaced(candidate, &store, &history, end).unwrap();
+    }
+}
+
+#[test]
+fn source_times_never_follow_leaf_or_parent_symlinks() {
+    let f = Tree::new();
+    let outside = f.file("outside/file");
+    let before = std::fs::metadata(&outside).unwrap().modified().unwrap();
+    std::fs::create_dir(f.0.join("staged")).unwrap();
+    for (name, target, path) in [
+        ("link", outside.clone(), "link"),
+        ("directory", f.0.join("outside"), "directory/file"),
+    ] {
+        let link = f.0.join("staged").join(name);
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        let link_before = std::fs::symlink_metadata(&link)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let times = [(path.to_owned(), 1_800_000_000_123)].into();
+        assert!(apply_times(&f.0.join("staged"), &times).is_err());
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().modified().unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(link).unwrap().modified().unwrap(),
+            link_before
+        );
+    }
+}
+
+#[test]
 fn tracked_cache_paths_make_the_persisted_source_fact_false() {
     for (tracked, returned, expected) in [
         ("target/tracked", None, false),

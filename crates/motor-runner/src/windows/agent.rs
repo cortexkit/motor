@@ -788,7 +788,7 @@ fn materialize_attempt(
         .text();
     super::source_mtimes::commit(
         prepared_tree.mtimes,
-        &caches.disk(workspace),
+        super::source_mtimes::Store::File(&caches.disk(workspace)),
         &caches.source_mtimes(workspace),
     )?;
     let thread_config = config.clone();

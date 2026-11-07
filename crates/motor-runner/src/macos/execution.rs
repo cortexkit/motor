@@ -142,6 +142,37 @@ fn prepare(
         staged.source_files.clone(),
         &super::source_seal::returns(&setup.request)?,
     )?;
+    let mut source_trees = Vec::new();
+    for (destination, repository, commit) in std::iter::once((
+        &setup.request.workspace_key,
+        &setup.request.repository_root,
+        &setup.request.snapshot_commit,
+    ))
+    .chain(
+        setup
+            .request
+            .siblings
+            .iter()
+            .map(|s| (&s.canonical_path, &s.canonical_path, &s.commit)),
+    ) {
+        source_trees.push(crate::source_mtimes::Tree {
+            destination: destination.clone(),
+            prefix: super::mapped(destination)?.to_path_buf(),
+            entries: crate::workspace::snapshot_tree(&trees.mirror(repository), commit)?,
+        });
+    }
+    let (store, history) = timestamp_paths(config, &entry);
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    let (mtimes, times) = super::source_seal::prepare_times(
+        &source_trees,
+        &staged.tree,
+        &store,
+        &history,
+        &setup.request.workspace_key,
+        &selected,
+        std::time::SystemTime::now(),
+    )?;
+    super::source_seal::apply_times(&staged.tree, &times)?;
     super::source_seal::seal(
         &super::source_seal::path(&config.state_root, setup.id),
         &staged.workspace,
@@ -211,7 +242,7 @@ fn prepare(
         }
     }
     #[allow(unreachable_code)]
-    start_io(config, setup, entry, nonce, staged, staging)
+    start_io(config, setup, entry, nonce, staged, staging, mtimes)
 }
 
 pub(super) fn capture_changes(
@@ -304,14 +335,23 @@ pub(super) fn target_in(config: &Config, entry: &Entry, staged: &Staged) -> io::
         Err(e) => Err(e),
     }
 }
-pub(super) fn target_out(config: &Config, entry: &Entry, workspace: &Path) -> io::Result<()> {
+fn timestamp_paths(config: &Config, entry: &Entry) -> (std::path::PathBuf, std::path::PathBuf) {
+    let key = lifecycle::key(&entry.owned.lock().unwrap().record.workspace);
+    let parent = config.state_root.join("targets");
+    (
+        parent.join(&key),
+        parent.join(format!("{key}.source-mtimes.json")),
+    )
+}
+
+pub(super) fn target_out(config: &Config, entry: &Entry, workspace: &Path) -> io::Result<bool> {
     // APFS clones may carry inode flags into the persistent cache. Never clone
     // until every source inode (including ones moved into target) is unsealed.
     config.macos_runtime.unseal(&config.state_root, entry)?;
     let record = entry.owned.lock().unwrap().record.clone();
     let source = match Dir::open(workspace, false)?.child("target".as_ref(), false) {
         Ok(source) => source,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
     let parent = Dir::open(&config.state_root.join("targets"), false)?;
@@ -325,7 +365,8 @@ pub(super) fn target_out(config: &Config, entry: &Entry, workspace: &Path) -> io
         hook("macos-target-before-publish");
     }
     entry.check()?;
-    parent.publish(temporary, lifecycle::key(&record.workspace).as_ref())
+    parent.publish(temporary, lifecycle::key(&record.workspace).as_ref())?;
+    Ok(true)
 }
 
 struct VmExecution {
@@ -422,6 +463,7 @@ fn start_io(
     nonce: String,
     staged: Staged,
     staging: super::Staging,
+    mtimes: crate::source_mtimes::Record,
 ) -> io::Result<Prepared> {
     let config = config.clone();
     let request = setup.request.clone();
@@ -517,8 +559,21 @@ fn start_io(
             if !thread_entry.cancel.0.load(Ordering::Acquire)
                 && thread_entry.owned.lock().unwrap().record.stop_proven
             {
-                if let Err(error) = target_out(&config, &thread_entry, &staged.workspace) {
-                    tracing::warn!(%error, "macOS target copy-back not published");
+                let published =
+                    target_out(&config, &thread_entry, &staged.workspace).and_then(|published| {
+                        if published {
+                            let (store, history) = timestamp_paths(&config, &thread_entry);
+                            crate::source_mtimes::replaced(
+                                mtimes,
+                                &store,
+                                &history,
+                                std::time::SystemTime::now(),
+                            )?;
+                        }
+                        Ok(())
+                    });
+                if let Err(error) = published {
+                    tracing::warn!(%error, "macOS target copy-back or source timestamp history failed");
                 }
             }
             drop(stdout_tx);

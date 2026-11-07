@@ -7,10 +7,10 @@ use std::{
 };
 
 #[derive(Serialize, Deserialize)]
-pub(super) struct Snapshot {
-    pub(super) mirror: PathBuf,
-    pub(super) commit: String,
-    pub(super) destination: String,
+pub(crate) struct Snapshot {
+    pub(crate) mirror: PathBuf,
+    pub(crate) commit: String,
+    pub(crate) destination: String,
 }
 #[derive(Serialize, Deserialize)]
 pub(super) struct Plan {
@@ -28,7 +28,7 @@ pub(super) struct Plan {
     #[cfg(any(unix, test))]
     pub(super) toolchain_source: PathBuf,
 }
-pub(super) fn mapped(path: &str) -> io::Result<PathBuf> {
+pub(crate) fn mapped(path: &str) -> io::Result<PathBuf> {
     motor_winagent::mapped_cwd(path)?;
     Ok(PathBuf::from("m").join(path.trim_start_matches('/')))
 }
@@ -274,15 +274,22 @@ pub(super) fn prepare(
     let concurrent_jobs = config.windows.as_ref().unwrap().concurrent_jobs;
     #[cfg(not(windows))]
     let concurrent_jobs = 1;
+    let sealed = selection
+        .plan
+        .files
+        .iter()
+        .map(|path| format!("m/{path}"))
+        .collect();
     let (mtimes, times) = super::source_mtimes::prepare(
-        &plan.snapshots,
+        &mtime_trees(&plan.snapshots)?,
         staging,
-        &caches.disk(&plan.workspace),
+        super::source_mtimes::Store::File(&caches.disk(&plan.workspace)),
         &caches.source_mtimes(&plan.workspace),
         super::source_mtimes::Policy {
             exported: &members,
-            sealed: &selection.plan,
+            sealed: &sealed,
             concurrent_jobs,
+            validate_path: motor_winagent::validate_archive_path,
         },
         std::time::SystemTime::now(),
     )?;
@@ -539,7 +546,24 @@ fn validate_lock(lock: &str, routes: &BTreeMap<String, PathBuf>) -> io::Result<(
     Ok(())
 }
 
-pub(super) fn git(snapshot: &Snapshot, args: &[&str]) -> io::Result<std::process::Output> {
+pub(crate) fn mtime_trees(snapshots: &[Snapshot]) -> io::Result<Vec<crate::source_mtimes::Tree>> {
+    snapshots
+        .iter()
+        .map(|snapshot| {
+            Ok(crate::source_mtimes::Tree {
+                destination: snapshot.destination.clone(),
+                prefix: mapped(&snapshot.destination)?,
+                entries: git(
+                    snapshot,
+                    &["ls-tree", "-r", "-z", "--full-tree", &snapshot.commit],
+                )?
+                .stdout,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn git(snapshot: &Snapshot, args: &[&str]) -> io::Result<std::process::Output> {
     let mut command = Command::new(if cfg!(windows) {
         r"C:\Program Files\Git\cmd\git.exe"
     } else {
@@ -1215,7 +1239,7 @@ pub(super) fn build_tar(staging: &Path) -> io::Result<()> {
 
 /// Build the transfer archive. A file named in `times` (archive name to Unix
 /// milliseconds) carries that time; every other file carries its staged time.
-pub(super) fn build_tar_with_times(
+pub(crate) fn build_tar_with_times(
     staging: &Path,
     times: &BTreeMap<String, u64>,
 ) -> io::Result<()> {

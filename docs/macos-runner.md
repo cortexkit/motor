@@ -6,6 +6,10 @@ the job command has not run.
 
 ## Host preparation
 
+Unchanged source files keep their modification times between jobs of the same
+checkout, so Cargo can reuse the checkout's saved build folder. Reuse applies
+only to files sealed read-only in both jobs; changed files receive newer times.
+
 ### Bun lockfiles
 
 Host preparation supports the text `bun.lock` format. Binary `bun.lockb` files
