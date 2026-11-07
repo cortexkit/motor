@@ -1333,6 +1333,7 @@ class AptInstallTests(unittest.TestCase):
         command = next(call.args for call in run.call_args_list if call.args[:2] == ('apt-get', 'install'))
         self.assertNotIn('openssh-server', command)
         self.assertIn('musl-tools', command)
+        self.assertIn('python3-venv', command)
         for package in manifest['apt_packages']['required'] + manifest['apt_packages']['by_role']['boat']:
             if package != 'openssh-server':
                 self.assertIn(package, command)

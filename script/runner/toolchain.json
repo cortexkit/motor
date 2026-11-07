@@ -14,7 +14,8 @@
     "by_role": {
       "boat": [
         "coreutils",
-        "musl-tools"
+        "musl-tools",
+        "python3-venv"
       ],
       "build-server": [
         "binaryen",
@@ -24,7 +25,8 @@
       ],
       "tenant": [
         "coreutils",
-        "musl-tools"
+        "musl-tools",
+        "python3-venv"
       ]
     },
     "observed_build_server_versions": {

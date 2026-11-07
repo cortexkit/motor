@@ -985,6 +985,19 @@ class ParityTests(unittest.TestCase):
                 self.assertIn('missing apt package: musl-tools',
                               parity.differences(manifest, actual, role=role))
 
+    def test_python3_venv_is_required_only_on_boat_and_tenant_roles(self):
+        manifest = self.manifest
+        self.assertNotIn('python3-venv', manifest['apt_packages']['required'])
+        self.assertNotIn('python3-venv', manifest['apt_packages']['by_role']['build-server'])
+        for role in ('boat', 'tenant'):
+            with self.subTest(role=role):
+                self.assertIn('python3-venv', manifest['apt_packages']['by_role'][role])
+                actual = self.observed_host(role)
+                self.assertEqual([], parity.differences(manifest, actual, role=role))
+                del actual['apt_packages']['python3-venv']
+                self.assertIn('missing apt package: python3-venv',
+                              parity.differences(manifest, actual, role=role))
+
     def test_musl_gcc_is_required_on_every_linux_host_and_job_path(self):
         self.assertIn('musl-gcc', self.manifest['tools'])
         self.assertEqual('/usr/bin/musl-gcc', self.manifest['tools']['musl-gcc']['path'])
