@@ -326,6 +326,7 @@ pub fn check_token(
             claims.iat > MAX_SAFE_INTEGER || claims.exp > MAX_SAFE_INTEGER,
         ),
         ("mem_mib", !memory_ok),
+        ("mem_burst_mib", !claims.mem_burst_mib_accepted()),
         (
             "max_s",
             claims.max_s == 0 || claims.max_s > if boat { 7200 } else { 21600 },

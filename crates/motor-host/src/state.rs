@@ -1198,6 +1198,8 @@ fn end_zero(
             egress_bytes: None,
             outcome: UsageOutcome::Cancelled,
             mem_working_peak_mib: None,
+            mem_over_mib_ms: None,
+            oom_kill: None,
         });
     Ok(())
 }
