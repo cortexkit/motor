@@ -84,7 +84,8 @@ fn log_reply(tenant: &str, job_id: &str, reply: &Value) -> anyhow::Result<()> {
     anyhow::ensure!(reply["ok"] == true, "guest diagnostics refused");
     anyhow::ensure!(
         reply["journal"]["unavailable"] != true,
-        "guest journal unavailable"
+        "guest journal unavailable: {}",
+        reply["journal"]["error"]
     );
     let entries = reply["journal"]["entries"]
         .as_array()

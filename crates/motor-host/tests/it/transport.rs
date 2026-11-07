@@ -1931,6 +1931,54 @@ async fn terminal_delivery_with_optional_guest_input_close(close_input: bool) {
 }
 
 #[tokio::test]
+async fn restart_withdrawal_delivers_typed_no_start_terminal_even_after_guest_closes() {
+    let (runtime, fake, broker, requester, c) = fixture();
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut client, &broker, &requester, &c).await;
+    assert_eq!(
+        respond(&mut client, &requester, &c, challenge).await["type"],
+        "lease_ok"
+    );
+    write_frame(&mut client, &json!({"type":"hello","protocol_version":1}))
+        .await
+        .unwrap();
+    let mut guest = peer(&fake).await;
+    guest = tokio::task::spawn_blocking(move || {
+        read_json(&mut guest).unwrap();
+        read_json(&mut guest).unwrap();
+        write_json(&mut guest, &json!({"type":"hello","protocol_version":1})).unwrap();
+        guest
+    })
+    .await
+    .unwrap();
+    assert_eq!(read_frame(&mut client).await.unwrap()["type"], "hello");
+    {
+        let mut host = runtime.host.lock().unwrap();
+        host.event(
+            "tenant",
+            &event(1, TenantEventKind::Admitted, Some(JOB), None),
+            unix_ms(),
+        )
+        .unwrap();
+        host.set_stop_pending("tenant", true).unwrap();
+        host.restart_withdrawn(JOB, unix_ms()).unwrap();
+    }
+    drop(guest);
+    let terminal = read_frame(&mut client).await.unwrap();
+    assert_eq!(
+        terminal["outcome"],
+        json!({"type":"refused_before_start","reason":"queue_wait_exceeded"})
+    );
+    assert_eq!(terminal["ran"], "none");
+    let hosted = read_frame(&mut client).await.unwrap();
+    assert_eq!(hosted["type"], "hosted_terminal");
+    assert_eq!(hosted["billed_vcpu_ms"], 0);
+    drop(client);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn host_loss_sends_stored_frames_even_when_guest_eof_wins_the_relay_race() {
     let (runtime, fake, broker, requester, c) = fixture();
     let (mut client, server) = tokio::io::duplex(8192);

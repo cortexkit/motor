@@ -214,6 +214,7 @@ pub struct Host {
     pub(crate) restart_ms: u64,
     pub(crate) prior_alive_ms: u64,
     pub(crate) provider_managed: bool,
+    pub(crate) stopping: std::collections::BTreeSet<String>,
     /// When the next billing-record retention pass is due; see `retention_tick`.
     pub(crate) retention_due_ms: u64,
     storage: advertise::StorageLatch,
@@ -240,6 +241,7 @@ impl Host {
             restart_ms: 0,
             prior_alive_ms: 0,
             provider_managed: false,
+            stopping: Default::default(),
             retention_due_ms: 0,
             storage: Default::default(),
             capacity: None,
@@ -798,6 +800,24 @@ impl Host {
                 return refuse(Refusal::Auth);
             }
         } else if let Some(job) = event.jti.map(|j| j.to_string()) {
+            if event.event == TenantEventKind::Terminal
+                && next
+                    .leases
+                    .get(&job)
+                    .is_some_and(|lease| lease.tenant == tenant)
+                && next
+                    .billing
+                    .get(&job)
+                    .is_some_and(|billing| billing.host_settled)
+            {
+                crate::billing::observe_settled_terminal(
+                    &mut next,
+                    &job,
+                    now_ms,
+                    self.stopping.contains(tenant),
+                );
+                return self.save(next);
+            }
             if let Some(lease) = next.leases.get_mut(&job).filter(|l| l.tenant == tenant) {
                 if next.billing.get(&job).is_some_and(|b| b.host_settled) {
                     tracing::warn!(jti = job, "host_settled_runner_event_ignored");
@@ -811,6 +831,9 @@ impl Host {
                     }
                     TenantEventKind::Started if lease.state == LeaseState::Admitted => {
                         lease.state = LeaseState::Started;
+                        // A queued withdrawal must not become a running-job cancel
+                        // if the runner won the start race. Its own cap still applies.
+                        next.pending_cancels.remove(&job);
                         lease.started_at_ms =
                             Some(if live_event { now_ms } else { self.restart_ms });
                         if !self.provider_managed {
@@ -911,6 +934,19 @@ impl Host {
             if matches!(lease.state, LeaseState::Started | LeaseState::Ended) {
                 continue;
             }
+            if lease.state == LeaseState::Admitted
+                && self
+                    .snapshot
+                    .vms
+                    .get(&lease.tenant)
+                    .is_some_and(|vm| vm.stop_pending)
+            {
+                // The runner must confirm withdrawal before this becomes a no-start
+                // result: a Started lifecycle event can still be in transit.
+                next.pending_cancels
+                    .insert(job.clone(), lease.tenant.clone());
+                cancel.push((lease.tenant.clone(), job.clone()));
+            }
             let exp_ms = lease.claims.exp.saturating_mul(1000);
             // Accepted jobs can queue behind other work in the guest. Keep them
             // until the reservation's overall deadline, not the delivery deadline.
@@ -973,6 +1009,26 @@ impl Host {
     pub fn cancel_delivered(&mut self, job: &str) -> Result<(), Error> {
         let mut next = self.snapshot.clone();
         next.pending_cancels.remove(job);
+        self.save(next)
+    }
+
+    pub fn restart_withdrawn(&mut self, job: &str, now_ms: u64) -> Result<(), Error> {
+        let mut next = self.snapshot.clone();
+        let lease = next.leases.get(job).ok_or(Error::Refused(Refusal::Auth))?;
+        if lease.state != LeaseState::Admitted || lease.started_at_ms.is_some() {
+            return Ok(());
+        }
+        end_zero(&mut next, job, now_ms, Some(Refusal::Capacity))?;
+        next.pending_cancels.remove(job);
+        let billing = next.billing.entry(job.to_owned()).or_default();
+        billing.terminal_received_ms = Some(now_ms);
+        billing.terminal_live = true;
+        billing.ended_observed_ms = Some(now_ms);
+        billing.terminal = Some(serde_json::json!({"type":"terminal", "job_id":job,
+            "outcome":{"type":"refused_before_start", "reason":"queue_wait_exceeded"},
+            "wall_ms":0, "queue_wait_ms":0, "bundle_bytes":0, "ran":"none",
+            "tree_hash":null, "workspace_changes":null, "execution_ended":true}));
+        crate::billing::finalize_ready(&mut next, now_ms);
         self.save(next)
     }
     pub fn prelude(&mut self, tenant: &str, begin: bool) {
