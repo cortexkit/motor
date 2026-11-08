@@ -237,6 +237,8 @@ pub(crate) struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_stated_mib: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_burst_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reservation_use: Option<ReservationUse>,
     /// Fixed execution end, independent of delayed launcher-accounting delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -251,6 +253,8 @@ pub(crate) struct Job {
         skip_serializing_if = "crate::working_memory::WorkingPeak::is_unknown"
     )]
     pub mem_working_peak_mib: crate::working_memory::WorkingPeak,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_over_mib_ms: Option<crate::working_memory::OverIntegral>,
     /// Captured from job-private compiler servers before terminal persistence.
     /// Telemetry only; not a billing or admission input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -374,10 +378,12 @@ impl Job {
             execution_evidence: None,
             memory_limit_detail: None,
             memory_stated_mib: None,
+            memory_burst_mib: None,
             reservation_use: None,
             execution_ended_ms: None,
             mem_peak_mib: None,
             mem_working_peak_mib: Default::default(),
+            mem_over_mib_ms: None,
             remote_cache_totals: None,
             memory_accounting_pending: false,
             sibling_sources: None,

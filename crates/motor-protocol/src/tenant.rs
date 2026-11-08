@@ -161,6 +161,9 @@ pub struct VerifiedLease {
     /// Host-verified job cap; absence retains the runner's per-vCPU rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_mib: Option<u64>,
+    /// Extra job-unit headroom; never changes the stated memory reservation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_burst_mib: Option<u64>,
     pub platform: String,
     pub net: bool,
     pub max_s: u64,
@@ -214,8 +217,27 @@ pub struct TenantEvent {
     /// or billing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_working_peak_mib: Option<u64>,
+    /// Final working-set overage integral for burst leases. An explicit null
+    /// means the cgroup samples could not be attributed; absence means unmeasured.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "nullable_u64")]
+    pub mem_over_mib_ms: Option<Option<u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_cache_totals: Option<RemoteCacheTotals>,
+}
+
+/// Best-effort cumulative guest telemetry, not an admission or placement input.
+/// Receivers retain maxima so delayed samples cannot lower an observed value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemorySample {
+    pub jti: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_working_peak_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "nullable_u64")]
+    pub mem_over_mib_ms: Option<Option<u64>>,
+}
+
+fn nullable_u64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Option<u64>>, D::Error> {
+    Option::<u64>::deserialize(deserializer).map(Some)
 }
 
 /// Trusted operation names only; never command arguments, paths or peer text.

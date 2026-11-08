@@ -26,6 +26,7 @@ fn lease(id: Uuid, purpose: LeasePurpose) -> VerifiedLease {
         sub: "acct:test".into(),
         vcpus: 2,
         mem_mib: Some(16384),
+        mem_burst_mib: None,
         platform: crate::tenant::host_platform()
             .unwrap_or("unsupported")
             .into(),

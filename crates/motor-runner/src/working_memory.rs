@@ -5,12 +5,77 @@ use std::path::Path;
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     thread,
 };
 
 const UNKNOWN: u64 = u64::MAX;
+const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
+#[derive(Default)]
+struct IntegralState {
+    byte_ms: Option<u128>,
+    previous: Option<(u64, u64)>,
+    incomplete: bool,
+}
+
+/// Present only for burst leases. Null is distinct from a measured zero.
+#[derive(Clone, Default)]
+pub(crate) struct OverIntegral(Arc<Mutex<IntegralState>>);
+
+impl OverIntegral {
+    pub(crate) fn get(&self) -> Option<u64> {
+        self.0.lock().unwrap().byte_ms.map(|value| {
+            value.div_ceil(1 << 20).min(u128::from(MAX_SAFE_INTEGER)) as u64
+        })
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn sample(&self, bytes: Option<u64>, stated_mib: u64, elapsed_ms: u64) {
+        let mut state = self.0.lock().unwrap();
+        let Some(bytes) = bytes else {
+            // A missing cgroup before the first read is normal during launch.
+            // A later gap cannot be integrated without inventing usage.
+            if state.previous.is_some() {
+                state.incomplete = true;
+                state.byte_ms = None;
+            }
+            return;
+        };
+        if state.incomplete {
+            return;
+        }
+        let over = bytes.saturating_sub(stated_mib.saturating_mul(1 << 20));
+        let mut total = state.byte_ms.unwrap_or(0);
+        if let Some((previous_ms, previous_over)) = state.previous {
+            // Hold each observed working set until the next observation. Keep
+            // sub-MiB contributions until reporting, rather than rounding every
+            // interval up and charging file cache or fractional MiB repeatedly.
+            total = total.saturating_add(
+                u128::from(previous_over) * u128::from(elapsed_ms.saturating_sub(previous_ms)),
+            );
+        }
+        state.byte_ms = Some(total);
+        state.previous = Some((elapsed_ms, over));
+    }
+}
+
+impl Serialize for OverIntegral {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.get().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for OverIntegral {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Option::<u64>::deserialize(deserializer)?;
+        Ok(Self(Arc::new(Mutex::new(IntegralState {
+            byte_ms: value.map(|value| u128::from(value) << 20),
+            ..Default::default()
+        }))))
+    }
+}
 
 #[derive(Default)]
 struct State {
@@ -64,24 +129,28 @@ impl WorkingPeak {
     }
 
     #[cfg(any(target_os = "linux", test))]
-    fn sample(&self, path: &Path) {
-        let Some(mib) = std::fs::read_to_string(path)
+    fn sample(&self, path: &Path) -> Option<u64> {
+        let bytes = std::fs::read_to_string(path)
             .ok()
-            .and_then(|text| working_bytes(&text))
-            .map(|bytes| bytes.div_ceil(1 << 20))
-        else {
-            return;
-        };
+            .and_then(|text| working_bytes(&text))?;
+        let mib = bytes.div_ceil(1 << 20);
         let _ = self
             .0
             .peak_mib
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 Some(if old == UNKNOWN { mib } else { old.max(mib) })
             });
+        Some(bytes)
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn start(&self, unit: &str) {
+    pub(crate) fn start(
+        &self,
+        unit: &str,
+        stated_mib: Option<u64>,
+        over: Option<OverIntegral>,
+        publish: impl Fn(Option<u64>, Option<Option<u64>>) + Send + 'static,
+    ) {
         if self.0.started.swap(true, Ordering::Relaxed) {
             return;
         }
@@ -91,6 +160,7 @@ impl WorkingPeak {
             .join(unit)
             .join("memory.stat");
         let weak = Arc::downgrade(&self.0);
+        let started = std::time::Instant::now();
         let _ = thread::Builder::new()
             .name("job-working-memory".into())
             .spawn(move || loop {
@@ -101,8 +171,17 @@ impl WorkingPeak {
                 let peak = WorkingPeak(state);
                 // The stop wakeup makes one final cheap read best-effort. Never
                 // join this thread: terminal publication must not wait for it.
-                peak.sample(&path);
-                if peak.0.stopped.load(Ordering::Relaxed) {
+                let bytes = peak.sample(&path);
+                let stopped = peak.0.stopped.load(Ordering::Relaxed);
+                if let Some(over) = over.as_ref().filter(|_| bytes.is_some() || !stopped) {
+                    over.sample(
+                        bytes,
+                        stated_mib.unwrap_or(0),
+                        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    );
+                }
+                publish(peak.get(), over.as_ref().map(OverIntegral::get));
+                if stopped {
                     return;
                 }
                 drop(peak);
