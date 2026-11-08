@@ -469,7 +469,6 @@ async fn settle_base_store(f: &Fixture, runner: &Runner) -> Job {
 #[tokio::test]
 #[ignore = "requires root, host system manager, and motor-cache/motor-job accounts"]
 async fn isolated_base_fill_publishes_nested_uplift_links_and_replaces_current() {
-    crate::build_base::DIAGNOSTICS.store(true, Ordering::SeqCst);
     assert_eq!(unsafe { libc::geteuid() }, 0);
     let f = Fixture::new();
     let command = "mkdir -p \"$CARGO_TARGET_DIR/bd/nested/deeper\"; printf first > \"$CARGO_TARGET_DIR/bd/nested/deeper/artifact\"; ln \"$CARGO_TARGET_DIR/bd/nested/deeper/artifact\" \"$CARGO_TARGET_DIR/uplift\"";
