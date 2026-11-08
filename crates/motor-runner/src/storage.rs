@@ -220,6 +220,9 @@ pub(crate) struct Job {
     pub stderr_offset: u64,
     #[serde(default)]
     pub durable_output: bool,
+    /// Launch-time fixed-to-caller paths, retained independently of runner options.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_rewrites: Vec<crate::output_rewrite::Rewrite>,
     /// Retained in the record even when replay storage cannot accept a diagnostic.
     #[serde(default)]
     pub monitoring_error: Option<String>,
@@ -366,6 +369,7 @@ impl Job {
             stdout_offset: 0,
             stderr_offset: 0,
             durable_output: false,
+            output_rewrites: Vec::new(),
             monitoring_error: None,
             execution_evidence: None,
             memory_limit_detail: None,
@@ -898,6 +902,22 @@ pub(crate) fn mint_ms(id: Uuid) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn output_rewrite_map_is_optional_and_survives_record_roundtrip() {
+        let mut job = super::Job::new(uuid::Uuid::now_v7(), None, 0, 0, 1);
+        let legacy = serde_json::to_value(&job).unwrap();
+        assert!(legacy.get("output_rewrites").is_none());
+        let loaded: super::Job = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(loaded.output_rewrites.is_empty());
+        assert_eq!(serde_json::to_value(loaded).unwrap(), legacy);
+        job.output_rewrites = vec![crate::output_rewrite::Rewrite {
+            fixed: "/w/repo".into(),
+            caller: "/caller/workspace".into(),
+        }];
+        let loaded: super::Job =
+            serde_json::from_slice(&serde_json::to_vec(&job).unwrap()).unwrap();
+        assert_eq!(loaded.output_rewrites, job.output_rewrites);
+    }
     use super::*;
     use cortexkit_test_support::ScratchDir;
 

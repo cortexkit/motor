@@ -27,6 +27,7 @@ pub mod metrics;
 #[cfg(windows)]
 mod native_process;
 pub mod network;
+mod output_rewrite;
 #[cfg(target_os = "linux")]
 mod permissions;
 mod platform;
