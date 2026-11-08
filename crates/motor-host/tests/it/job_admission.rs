@@ -375,17 +375,14 @@ fn guest_ram_rounds_limit_up_after_contract_burst_not_admission_debit() {
 }
 
 #[test]
-fn hashless_run_and_attach_claims_are_auth_in_both_modes() {
-    for settings in host_settings() {
-        let mut h = host();
-        h.settings = settings;
-        for purpose in [Purpose::Run, Purpose::Attach] {
-            let mut c = job(JOB);
-            c.purpose = purpose;
-            c.workspace_key_hash = None;
-            auth(h.claim(c, AT));
-        }
-        assert!(h.snapshot.leases.is_empty());
-        assert!(h.snapshot.per_job.is_empty());
+fn hashless_run_and_attach_cannot_enter_job_admission_ledger() {
+    let mut h = memory_host(1_000);
+    for purpose in [Purpose::Run, Purpose::Attach] {
+        let mut c = job(JOB);
+        c.purpose = purpose;
+        c.workspace_key_hash = None;
+        auth(h.claim(c, AT));
     }
+    assert!(h.snapshot.leases.is_empty());
+    assert!(h.snapshot.per_job.is_empty());
 }

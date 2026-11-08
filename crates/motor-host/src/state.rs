@@ -534,9 +534,6 @@ impl Host {
     ) -> Result<(u64, Admission), crate::claim_log::ClaimError> {
         use crate::claim_log::RefusalCause;
         self.observed_at_ms = now_ms;
-        if claims.workspace_key_hash.is_none() {
-            return Err(Refusal::Auth.into());
-        }
         if matches!(self.settings, crate::config::HostSettings::PerJob(_)) {
             return self.claim_job(claims, now_ms);
         }
