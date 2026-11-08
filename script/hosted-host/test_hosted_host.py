@@ -107,7 +107,11 @@ class HostedHostConfigTests(CapacityConfigTests):
     def test_host_config_has_every_required_motor_host_field_and_no_fake_broker(self):
         config = hosted.host_config(HOST_ID)
         fields = struct_fields("crates/motor-host/src/main.rs", "Config")
-        self.assertEqual(set(config), fields - {"fake_broker_url"})
+        # The installer writes tenant-mode hosts; `mode` defaults to tenant and
+        # `per_job` is only read when per-job mode is selected.
+        self.assertEqual(set(config), fields - {"fake_broker_url", "mode", "per_job"})
+        self.assertNotIn("mode", config)
+        self.assertNotIn("per_job", config)
         self.assertEqual(config["host_id"], HOST_ID)
         self.assertEqual(config["listen"], "0.0.0.0:8443")
         self.assertEqual(config["resolvers"], ["1.1.1.1", "9.9.9.9"])
