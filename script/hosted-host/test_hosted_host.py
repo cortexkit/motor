@@ -126,7 +126,10 @@ class HostedHostConfigTests(CapacityConfigTests):
 
     def test_helper_config_matches_the_helper_struct_and_admits_only_the_host_account(self):
         config = hosted.helper_config(998, 998, "enp6s0", "8.8.8.8")
-        self.assertEqual(set(config), struct_fields("crates/motor-vm-helper/src/config.rs", "Config") - {"proxy_for_jobs"})
+        # The installer configures tenant hosts; `job_vms` is optional and only
+        # set on a host that runs one VM per job.
+        self.assertEqual(set(config), struct_fields("crates/motor-vm-helper/src/config.rs", "Config") - {"proxy_for_jobs", "job_vms"})
+        self.assertNotIn("job_vms", config)
         self.assertEqual(set(config["slots"][0]), struct_fields("crates/motor-vm-helper/src/config.rs", "SlotConfig"))
         self.assertEqual(config["allowed_uids"], [998])
         self.assertEqual(config["socket_gid"], 998)

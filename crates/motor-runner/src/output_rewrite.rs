@@ -30,7 +30,7 @@ pub(crate) fn for_job(config: &crate::Config, request: &motor_protocol::Run) -> 
                     .zip(&request.siblings)
                     .map(|(fixed, sibling)| Rewrite {
                         fixed: fixed.to_string_lossy().into_owned(),
-                        caller: sibling.canonical_path.clone(),
+                        caller: crate::caller_path::sibling(sibling).caller.text().clone(),
                     }),
             )
             .collect()
