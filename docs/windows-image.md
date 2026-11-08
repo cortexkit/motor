@@ -119,6 +119,8 @@ administrator, randomizes local passwords and runs, in order:
    `C:\ProgramData\Motor\motor-winagent.exe`. The agent's SHA-256 is written to
    `C:\build\provision\winagent.sha256`.
 
+Windows Error Reporting keeps up to 10 VM-local minidumps in `C:\CrashDumps`, readable by the job account.
+
 The baseline downloads the official x86_64 Windows cargo-nextest 0.9.138
 `tar.gz` release while the image has network access, verifies its pinned SHA-256
 before extraction, and installs `cargo-nextest.exe` beside Cargo at

@@ -14,13 +14,17 @@ fn host_drain_heartbeat_body_matches_pinned_cloud_bytes() {
         Snapshot::default(),
         Box::<MemoryJournal>::default(),
     );
-    // The drain exchanges carry no warm workspaces; the busy exchanges are
-    // checked by the test below.
+    // Full-drain exchanges carry no warm workspaces and no accept_until_ms;
+    // this host does not yet send a bounded-acceptance deadline.
     for exchange in vector["exchanges"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|exchange| exchange["request"]["body"]["warm"] == serde_json::json!([]))
+        .filter(|exchange| {
+            exchange["request"]["body"]["warm"] == serde_json::json!([])
+                && exchange["request"]["body"].get("accept_until_ms").is_none()
+                && exchange["request"]["pathname"] == "/v1/hosts/host-a/heartbeat"
+        })
     {
         let expected = &exchange["request"];
         let draining = expected["body"]["draining"].as_bool().unwrap_or(false);

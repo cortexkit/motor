@@ -8,6 +8,7 @@ pub mod enroll;
 pub mod helper;
 pub mod ingress;
 pub mod journal;
+mod lost_diagnostics;
 pub mod metrics;
 mod relay;
 pub mod sandbox;

@@ -58,6 +58,14 @@ pub(crate) struct TenantAdvert {
     /// The permits the tenant runner's own cache fill held at the last probe.
     fill: Option<FillSample>,
     warm: Option<WarmSample>,
+    disk: Option<DiskSample>,
+}
+
+struct DiskSample {
+    received_ms: u64,
+    age_ms: u64,
+    free_gib: u64,
+    total_gib: u64,
 }
 
 struct WarmSample {
@@ -304,7 +312,7 @@ impl Host {
                 .values()
                 .any(|lease| lease.tenant == tenant && lease.delivered);
         self.is_ready(tenant)
-            && !self.is_suspending(tenant)
+            && !self.placement_stopping(tenant)
             && self.start_refusal(tenant).is_none()
             && (force
                 || self
@@ -322,7 +330,62 @@ impl Host {
             // guest reports its own fill, if any, at its first probe.
             advert.fill = None;
             advert.warm = None;
+            advert.disk = None;
         }
+    }
+
+    /// Reuses the metrics path's quota-clamped job-disk figures. Keep the
+    /// guest's sample age so receiving an old report does not make it fresh.
+    pub(crate) fn record_disk(
+        &mut self,
+        tenant: &str,
+        received_ms: u64,
+        age_ms: u64,
+        free_gib: u64,
+        total_gib: u64,
+    ) {
+        self.advert.entry(tenant.to_owned()).or_default().disk = Some(DiskSample {
+            received_ms,
+            age_ms,
+            free_gib,
+            total_gib,
+        });
+    }
+
+    pub(crate) fn tenant_disk(&self, now_ms: u64) -> Vec<motor_lease::TenantDisk> {
+        let mut entries = std::collections::BTreeMap::new();
+        for binding in self.tenants.values() {
+            if !self.is_ready(&binding.tenant) || self.placement_stopping(&binding.tenant) {
+                continue;
+            }
+            let Some(disk) = self
+                .advert
+                .get(&binding.tenant)
+                .and_then(|a| a.disk.as_ref())
+            else {
+                continue;
+            };
+            if disk.total_gib == 0
+                || now_ms
+                    .saturating_sub(disk.received_ms)
+                    .saturating_add(disk.age_ms)
+                    > 60_000
+            {
+                continue;
+            }
+            entries.insert(
+                binding.sub.clone(),
+                motor_lease::TenantDisk {
+                    tenant: binding.sub.clone(),
+                    disk_free_gib: disk.free_gib,
+                    disk_total_gib: disk.total_gib,
+                },
+            );
+        }
+        entries
+            .into_values()
+            .take(crate::wire::MAX_ENTRIES)
+            .collect()
     }
     /// Records the permits a running tenant's own cache fill holds, from the
     /// same runner probe as its memory. The guest is root-controlled, so this
@@ -372,7 +435,7 @@ impl Host {
     pub(crate) fn warm_workspaces(&self, now_ms: u64) -> Vec<motor_lease::WarmVm> {
         let mut entries = Vec::new();
         for (tenant, advert) in &self.advert {
-            if !self.is_ready(tenant) || self.is_suspending(tenant) {
+            if !self.is_ready(tenant) || self.placement_stopping(tenant) {
                 continue;
             }
             let Some(sample) = advert
@@ -485,6 +548,17 @@ impl Host {
         self.advert.get(tenant).is_some_and(|a| a.wake_pending)
     }
 
+    // Admission refuses a tenant while suspension or a durable stop is pending.
+    // Placement hints must obey the same fence until the operation completes.
+    fn placement_stopping(&self, tenant: &str) -> bool {
+        self.is_suspending(tenant)
+            || self
+                .snapshot
+                .vms
+                .get(tenant)
+                .is_some_and(|vm| vm.stop_pending)
+    }
+
     fn start_fenced(&self, tenant: &str) -> bool {
         self.advert
             .get(tenant)
@@ -494,10 +568,10 @@ impl Host {
     /// The heartbeat's `free_vcpus` term for one tenant: its permit budget
     /// minus the counted claims and the permits of its own running cache
     /// fill, whether the VM is running, stopped, or suspended; 0 while a wake
-    /// is pending or start-refused. Saturating at 0, a fill report of any size
-    /// can take away only this tenant's own budget.
+    /// is pending, start-refused, suspending or stop-pending. Saturating at 0,
+    /// a fill report of any size can take away only this tenant's own budget.
     pub(crate) fn tenant_free_vcpus(&self, tenant: &Tenant, now_ms: u64) -> u64 {
-        if self.start_fenced(&tenant.tenant) {
+        if self.start_fenced(&tenant.tenant) || self.placement_stopping(&tenant.tenant) {
             return 0;
         }
         u64::from(
@@ -512,7 +586,7 @@ impl Host {
     /// place the lease that wakes it; a running tenant advertises its guest's
     /// measured available memory. Both are floored to MiB and reduced by
     /// `tenant_memory_reserve_bytes` rounded up to whole MiB, saturating at
-    /// 0. A running tenant without a usable sample, a pending/refused start,
+    /// 0. A running tenant without a usable sample, a pending/refused start or stop,
     /// and any tenant while no valid capacity file has been read advertise 0.
     /// Logs each running tenant's unusable-sample case once when it starts.
     pub fn free_mem_mib(&mut self, now_ms: u64) -> u64 {
@@ -541,10 +615,10 @@ impl Host {
         else {
             return 0;
         };
-        if self.start_fenced(&tenant.tenant) {
+        if self.start_fenced(&tenant.tenant) || self.placement_stopping(&tenant.tenant) {
             return 0;
         }
-        if !self.is_ready(&tenant.tenant) || self.is_suspending(&tenant.tenant) {
+        if !self.is_ready(&tenant.tenant) {
             return tenant.guest_ram_mib.saturating_sub(reserve_mib);
         }
         let advert = self.advert.entry(tenant.tenant.clone()).or_default();

@@ -536,7 +536,7 @@ impl Heartbeats {
     }
 }
 impl Heartbeats {
-    /// Asks each running tenant's runner for its guest's available memory
+    /// Asks each running tenant's runner for its guest's memory and disk report
     /// when its last sample is due for renewal. A tenant busy with a wake,
     /// suspend or other operation is skipped; its sample ages, and a sample
     /// older than the freshness bound advertises no free memory.
@@ -573,7 +573,18 @@ impl Heartbeats {
                 .control
                 .runner_sample(tenant)
                 .map_err(|error| format!("{error:#}"));
+            // Reuse the status probe's disk report and the metrics clamp;
+            // heartbeat placement must not trust a guest's disk size.
+            let disk = sample.as_ref().ok().and_then(|sample| {
+                let disk = sample.guest_disk.as_ref()?;
+                let quota = self.runtime.control.disk_quota_bytes(tenant).ok()?;
+                let (free, total) = crate::metrics::clamp_guest_disk(disk, quota)?;
+                Some((disk.age_ms, free, total))
+            });
             let mut host = self.runtime.host.lock().expect("host lock");
+            if let Some((age_ms, free, total)) = disk {
+                host.record_disk(tenant, now_ms, age_ms, free, total);
+            }
             host.record_memory(
                 tenant,
                 now_ms,

@@ -469,6 +469,29 @@ extra rule.
    enables the units, because an enabled unit would start on the next reboot
    and make the host placeable.
 
+## Lost jobs and tenant VM restarts
+
+If a started job exceeds its runtime cap without a terminal result, the host
+requests a hard cancel after 30 seconds. At five minutes past the cap, it sends
+another hard cancel and asks the guest runner for that job's status over the
+existing tenant control channel. The confirmation window is 30 seconds from
+the lost point, covering cancel delivery and status checks. While the job is
+still stopping, the host re-asks about every two seconds rather than treating
+the first running reply as a reason to restart.
+
+A terminal record marked `execution_ended`, or a named systemd unit confirmed
+gone, proves execution ended even if the result never reached the host. The host
+settles the lease as lost without restarting the VM, so other jobs continue and
+the server can accept new work within its normal allocation. The caller still
+receives an unknown outcome and the lost job is still billed to its runtime cap;
+guest status cannot change billing or raise the VM's host-side capacity limit.
+
+If the guest reports the job still running after the hard cancel, or cannot
+prove execution ended within the window, the host settles it as lost and stops
+taking new jobs for that tenant. It restarts the VM once its other jobs end.
+An absent job record alone is not proof. Older guest images that do not support
+the status request follow this same restart fallback.
+
 ## Drain the host for an update
 
 From the checkout on the host, pause fleet placement before stopping or switching

@@ -5,7 +5,7 @@ recompile dependencies that another job, or a background build, already
 compiled. Jobs only read the cache. A separate trusted account fills it from the
 repository's default-branch tip, never from a submitted branch. This document
 covers who reads and writes the cache, what goes into a fill, and the rules that
-keep a job from poisoning it. [architecture.md](architecture.md) shows where the
+keep a job from poisoning it. [ARCHITECTURE.md](../ARCHITECTURE.md) shows where the
 cache sits; [job-isolation.md](job-isolation.md) describes the reader's sandbox.
 
 The Windows backend has its own per-workspace cache disks, described in

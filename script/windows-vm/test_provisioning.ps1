@@ -505,6 +505,7 @@ $items = [ordered]@{
     standard_job_user = @("`$jobUser = 'motor-job'", 'New-LocalUser $jobUser', 'Remove-LocalGroupMember $admins', 'SeBatchLogonRight', 'SeCreateSymbolicLinkPrivilege', 'Job SID missing from $right', 'Job baseline must not enable Developer Mode', 'CreateProfile($jobSid', 'job-password.txt', '$credential /inheritance:r')
     service = @('build --release --locked', 'New-Service -Name motor-winagent', '-StartupType Automatic', "StartName -ne 'LocalSystem'", 'Get-FileHash', 'SHA256')
     long_paths = @('config --system core.longpaths true', 'LongPathsEnabled -PropertyType DWord -Value 1')
+    crash_dumps = @('HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps', "`$dumpFolder = 'C:\CrashDumps'", '[Security.AccessControl.DirectorySecurity]::new()', '$dumpAcl.SetAccessRuleProtection($true, $false)', "@('S-1-5-18', 'S-1-5-32-544', `$jobSid)", "`$rights = if (`$sid -eq `$jobSid) { 'Modify' } else { 'FullControl' }", "'ContainerInherit,ObjectInherit', 'None', 'Allow'", 'Set-Acl -LiteralPath $dumpFolder -AclObject $dumpAcl', '-Name DumpFolder -PropertyType ExpandString -Value $dumpFolder -Force', '-Name DumpType -PropertyType DWord -Value 1 -Force', '-Name DumpCount -PropertyType DWord -Value 10 -Force', 'throw "Job crash dump setup failed: $_"')
     defender = @("@('C:\m', 'C:\rust', `$jobCargo)", 'Add-MpPreference -ExclusionPath $path')
     no_ssh = @('Stop-Service sshd', 'Remove-WindowsCapability -Online -Name OpenSSH.Server', "'C:\ProgramData\ssh'", 'authorized_keys', "Join-Path `$_.FullName '.ssh'")
 }

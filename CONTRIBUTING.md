@@ -1,9 +1,9 @@
 # Contributing to motor
 
 This guide covers the checks a change must pass, how to commit it, and where
-code belongs. [docs/architecture.md](docs/architecture.md) explains how the
-parts fit together; [AGENTS.md](AGENTS.md) adds the rules for coding agents
-working in this repository.
+code belongs. [ARCHITECTURE.md](ARCHITECTURE.md) explains how the parts fit
+together; [AGENTS.md](AGENTS.md) adds the rules for coding agents working in
+this repository.
 
 ## Prerequisites
 
@@ -120,34 +120,11 @@ is added to the list in that script.
 
 ## Where code goes
 
-| Change | Place |
-| --- | --- |
-| Wire frames and codec shared by client and runner | `crates/motor-protocol` |
-| Caller-facing request and outcome types | The published `cortexkit-exec-remote-types` crate; `motor-protocol` re-exports them |
-| Snapshot capture, transport, credentials, caller admission | `crates/motor-module` |
-| Admission, queueing, transfers, workspaces, retention | `crates/motor-runner/src/engine.rs`, `server.rs`, `workspace/` |
-| Linux job sandbox | `crates/motor-runner/src/isolation*`, `systemd.rs`, `network*.rs` |
-| Windows VM backend, host side | `crates/motor-runner/src/windows/` |
-| Windows guest agent | `crates/motor-winagent`, a separate crate with its own `Cargo.lock`, excluded from the workspace |
-| Compile cache and warm builds | `crates/motor-runner/src/compile_cache.rs`, `writer/` |
-| Linux microVM components | `crates/motor-vm-helper`, `motor-vm-guest`, `motor-vm-loader` |
-| Build server scripts and units | `script/runner/` |
-| Windows image and VM scripts | `script/windows-vm/` |
-| Repository gates and fences | `scripts/` |
-| Documentation | `docs/`, one topic per file |
+[STRUCTURE.md](STRUCTURE.md) maps the directories, says where each kind of
+change belongs, and lists the test conventions the checks in `scripts/`
+enforce.
 
-Tests follow these rules, which the checks in `scripts/` enforce:
-
-- Integration tests live as modules under the crate's `tests/it/`, not as new
-  top-level test files.
-- Test scratch directories come from `cortexkit_test_support::scratch_root()`.
-- A test that needs a CortexKit daemon gets it from
-  `cortexkit_test_support::SubcDaemonBinary`.
-- A test that needs a privileged host is `#[ignore]` (runner) or behind a
-  Cargo feature (VM crates), and fails rather than skips when a prerequisite is
-  missing.
-
-Documentation follows the conventions in [docs/architecture.md](docs/architecture.md#documentation-conventions).
+Documentation follows the conventions in [ARCHITECTURE.md](ARCHITECTURE.md#documentation-conventions).
 
 ## Reporting security issues
 

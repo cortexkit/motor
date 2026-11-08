@@ -77,12 +77,17 @@ fn host_drain_echo_parses_pinned_replies_and_records_receipt_time() {
         "../../../motor-lease/contracts/cloud/host-draining.json"
     ))
     .unwrap();
-    // Only the drain exchanges (no warm workspaces) drive the echo sequence.
+    // Only host-a's full-drain exchanges, without warm workspaces or an
+    // accept_until_ms deadline, drive the echo sequence.
     let replies: Vec<String> = vector["exchanges"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|exchange| exchange["request"]["body"]["warm"] == json!([]))
+        .filter(|exchange| {
+            exchange["request"]["body"]["warm"] == json!([])
+                && exchange["request"]["body"].get("accept_until_ms").is_none()
+                && exchange["request"]["pathname"] == "/v1/hosts/host-a/heartbeat"
+        })
         .map(|exchange| exchange["reply"]["body_bytes"].as_str().unwrap().to_owned())
         .chain([
             r#"{"ignored":[],"closed_subjects":[],"draining":false}"#.into(),
@@ -90,6 +95,11 @@ fn host_drain_echo_parses_pinned_replies_and_records_receipt_time() {
             r#"{"error":"unavailable"}"#.into(),
         ])
         .collect();
+    assert_eq!(
+        replies.len(),
+        7,
+        "full-drain replies and the three local cases"
+    );
     let dir = scratch();
     let runtime = Runtime::new("host".into(), disk_host(dir.path()), Arc::new(NoVm));
     runtime.host_admin(&json!({"op":"drain_host"})).unwrap();
@@ -342,7 +352,12 @@ fn metrics_sample_reports_real_host_counters_and_safe_recovery_latch() {
     );
 }
 
-struct DiskGuest(Mutex<Value>);
+struct DiskGuest(Mutex<Value>, std::sync::atomic::AtomicUsize);
+impl DiskGuest {
+    fn new(health: Value) -> Self {
+        Self(Mutex::new(health), std::sync::atomic::AtomicUsize::new(0))
+    }
+}
 impl Control for DiskGuest {
     fn adopt(&self, tenant: &str) -> Result<bool> {
         NoVm.adopt(tenant)
@@ -357,6 +372,7 @@ impl Control for DiskGuest {
         NoVm.relay(tenant, port)
     }
     fn admin(&self, _: &str, _: &Value) -> Result<Value> {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(self.0.lock().unwrap().clone())
     }
     fn suspend(&self, tenant: &str) -> Result<()> {
@@ -373,7 +389,7 @@ impl Control for DiskGuest {
 #[test]
 fn hostile_guest_disk_is_clamped_in_push_and_cannot_change_admission() {
     let ms = NOW * 1000;
-    let control = Arc::new(DiskGuest(Mutex::new(json!({"ok":true,"health":{}}))));
+    let control = Arc::new(DiskGuest::new(json!({"ok":true,"health":{}})));
     let mut h = host();
     h.guest_ready("tenant", 1).unwrap();
     let before = serde_json::to_value(&h.snapshot).unwrap();
@@ -413,6 +429,136 @@ fn hostile_guest_disk_is_clamped_in_push_and_cannot_change_admission() {
         .unwrap();
     assert!(sample.tenants[0].disk_free_gib.is_none());
     assert!(sample.tenants[0].disk_total_gib.is_none());
+}
+
+#[test]
+fn tenant_disk_heartbeat_reuses_status_probe_and_clamps_guest_figures() {
+    let ms = NOW * 1000;
+    for (free, total, expected) in [
+        (u64::MAX, u64::MAX, Some((50, 50))),
+        (u64::MAX, 1 << 30, Some((1, 1))),
+        (10 * (1 << 30) + 17, 52 * (1 << 30) + 900, Some((10, 50))),
+        (0, 0, None),
+    ] {
+        let control = Arc::new(DiskGuest::new(json!({"ok":true,"health":{"guest_disk":{
+            "free_bytes":free,"total_bytes":total,"age_ms":0
+        }}})));
+        let mut h = host();
+        h.guest_ready("tenant", 1).unwrap();
+        let runtime = Runtime::new("host".into(), h, control.clone());
+        let mut heartbeats = motor_host::broker::Heartbeats::new(runtime.clone());
+        heartbeats.step(ms).unwrap();
+        assert_eq!(control.1.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let heartbeat = runtime.host.lock().unwrap().heartbeat(ms, 0, true);
+        let expected = expected
+            .map(|(free, total)| motor_lease::TenantDisk {
+                tenant: claims(JOB).sub,
+                disk_free_gib: free,
+                disk_total_gib: total,
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(heartbeat.tenant_disk, expected);
+        assert!(heartbeat.accept_until_ms.is_none());
+        heartbeats.step(ms + 1).unwrap();
+        assert_eq!(control.1.load(std::sync::atomic::Ordering::Relaxed), 1);
+        runtime.host.lock().unwrap().guest_unready("tenant");
+        assert!(runtime
+            .host
+            .lock()
+            .unwrap()
+            .heartbeat(ms, 0, true)
+            .tenant_disk
+            .is_empty());
+    }
+}
+
+#[test]
+fn tenant_disk_heartbeat_omits_samples_after_sixty_seconds() {
+    let ms = NOW * 1000;
+    for age_ms in [0, 45_000] {
+        let control = Arc::new(DiskGuest::new(json!({"ok":true,"health":{"guest_disk":{
+            "free_bytes": 10 * (1u64 << 30), "total_bytes": 50 * (1u64 << 30), "age_ms":age_ms
+        }}})));
+        let mut h = host();
+        h.guest_ready("tenant", 1).unwrap();
+        let runtime = Runtime::new("host".into(), h, control);
+        motor_host::broker::Heartbeats::new(runtime.clone())
+            .step(ms)
+            .unwrap();
+        let h = runtime.host.lock().unwrap();
+        assert_eq!(
+            h.heartbeat(ms + 60_000 - age_ms, 0, true).tenant_disk.len(),
+            1
+        );
+        let stale = serde_json::to_value(h.heartbeat(ms + 61_000 - age_ms, 0, true)).unwrap();
+        assert!(
+            stale.get("tenant_disk").is_none(),
+            "61-second-old sample: {stale}"
+        );
+    }
+}
+
+#[test]
+fn tenant_disk_heartbeat_covers_more_than_eight_vms_and_caps_at_sixty_four_subjects() {
+    let ms = NOW * 1000;
+    let mut bindings = BTreeMap::new();
+    for index in 0..65 {
+        let mut binding = tenants().remove("vm").unwrap();
+        binding.tenant = format!("tenant-{index}");
+        binding.sub = format!("acct:{index:026}");
+        bindings.insert(format!("vm-{index:02}"), binding);
+    }
+    let mut h = Host::new(
+        bindings,
+        Snapshot::default(),
+        Box::<MemoryJournal>::default(),
+    );
+    for index in 0..65 {
+        h.guest_ready(&format!("tenant-{index}"), 1).unwrap();
+    }
+    let control = Arc::new(DiskGuest::new(json!({"ok":true,"health":{"guest_disk":{
+        "free_bytes":10 * (1u64 << 30),"total_bytes":50 * (1u64 << 30),"age_ms":0
+    }}})));
+    let runtime = Runtime::new("host".into(), h, control.clone());
+    motor_host::broker::Heartbeats::new(runtime.clone())
+        .step(ms)
+        .unwrap();
+    let heartbeat = runtime.host.lock().unwrap().heartbeat(ms, 0, true);
+    assert_eq!(heartbeat.tenant_disk.len(), 64);
+    let subjects = heartbeat
+        .tenant_disk
+        .iter()
+        .map(|disk| disk.tenant.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(subjects.len(), 64);
+    assert_eq!(subjects.first().unwrap(), "acct:00000000000000000000000000");
+    assert_eq!(subjects.last().unwrap(), "acct:00000000000000000000000063");
+    assert_eq!(control.1.load(std::sync::atomic::Ordering::Relaxed), 65);
+}
+
+#[test]
+fn tenant_disk_absent_or_stale_guest_report_preserves_original_heartbeat_bytes() {
+    let ms = NOW * 1000;
+    for health in [
+        json!({}),
+        json!({"guest_disk":{
+            "free_bytes": 1u64 << 30, "total_bytes": 50 * (1u64 << 30), "age_ms":61_000
+        }}),
+    ] {
+        let control = Arc::new(DiskGuest::new(json!({"ok":true,"health":health})));
+        let mut h = host();
+        h.guest_ready("tenant", 1).unwrap();
+        let runtime = Runtime::new("host".into(), h, control);
+        motor_host::broker::Heartbeats::new(runtime.clone())
+            .step(ms)
+            .unwrap();
+        let h = runtime.host.lock().unwrap();
+        assert_eq!(
+            serde_json::to_string(&h.heartbeat(ms, 245760, true)).unwrap(),
+            r#"{"free_vcpus":2,"free_mem_mib":245760,"queued":0,"warm":[],"running":[],"healthy":true}"#
+        );
+    }
 }
 
 #[test]

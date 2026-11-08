@@ -362,6 +362,58 @@ fn fixture() -> (Arc<Runtime>, Arc<Fake>, SigningKey, SigningKey, Claims) {
 }
 
 #[test]
+fn optional_burst_tokens_are_checked_without_changing_stated_memory() {
+    let (runtime, _, signer, requester, mut c) = fixture();
+    let jwk = RequesterJwk::from_key(&requester.verifying_key());
+    c.mem_mib = 4096;
+    for (burst, accepted) in [
+        (None, true),
+        (Some(2048), true),
+        (Some(0), false),
+        (Some(2047), false),
+        (Some(2049), false),
+        (Some(8193), false),
+    ] {
+        c.mem_burst_mib = burst;
+        let token = motor_lease::sign_token(&c, "key", &signer).unwrap();
+        let result = runtime.authenticate(&token, &jwk, c.iat);
+        if accepted {
+            assert_eq!(result.unwrap(), c);
+        } else {
+            assert_eq!(result.unwrap_err().check, "mem_burst_mib");
+        }
+    }
+}
+
+#[tokio::test]
+async fn burst_token_keeps_verified_job_memory_limit_at_mem_mib() {
+    let (runtime, fake, broker, requester, mut c) = fixture();
+    c.mem_mib = 4096;
+    c.mem_burst_mib = Some(2048);
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut client, &broker, &requester, &c).await;
+    respond(&mut client, &requester, &c, challenge).await;
+    write_frame(&mut client, &json!({"type":"hello"}))
+        .await
+        .unwrap();
+    let guest = peer(&fake).await;
+    guest.set_nonblocking(true).unwrap();
+    let mut guest = tokio::net::UnixStream::from_std(guest).unwrap();
+    let verified = read_frame(&mut guest).await.unwrap();
+    assert_eq!(verified["type"], "verified_lease");
+    // The runner uses this stated value for the job unit's MemoryMax. The
+    // runner must not receive the burst allowance for enforcement.
+    assert_eq!(verified["mem_mib"], 4096);
+    assert!(verified.get("mem_burst_mib").is_none());
+    assert_eq!(read_frame(&mut guest).await.unwrap()["type"], "hello");
+    drop(guest);
+    drop(client);
+    let _ = task.await.unwrap();
+    runtime.host.lock().unwrap().guest_unready("tenant");
+}
+
+#[test]
 fn stated_token_memory_uses_the_placed_tenants_ram_minus_heartbeat_reserve() {
     let (runtime, _, signer, requester, mut c) = fixture();
     let jwk = RequesterJwk::from_key(&requester.verifying_key());
@@ -1928,6 +1980,54 @@ async fn terminal_delivery_with_optional_guest_input_close(close_input: bool) {
     drop(client);
     task.await.unwrap().unwrap();
     assert_eq!(runtime.host.lock().unwrap().snapshot.outbox.len(), 1);
+}
+
+#[tokio::test]
+async fn restart_withdrawal_delivers_typed_no_start_terminal_even_after_guest_closes() {
+    let (runtime, fake, broker, requester, c) = fixture();
+    let (mut client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve(runtime.clone(), server));
+    let challenge = hello(&mut client, &broker, &requester, &c).await;
+    assert_eq!(
+        respond(&mut client, &requester, &c, challenge).await["type"],
+        "lease_ok"
+    );
+    write_frame(&mut client, &json!({"type":"hello","protocol_version":1}))
+        .await
+        .unwrap();
+    let mut guest = peer(&fake).await;
+    guest = tokio::task::spawn_blocking(move || {
+        read_json(&mut guest).unwrap();
+        read_json(&mut guest).unwrap();
+        write_json(&mut guest, &json!({"type":"hello","protocol_version":1})).unwrap();
+        guest
+    })
+    .await
+    .unwrap();
+    assert_eq!(read_frame(&mut client).await.unwrap()["type"], "hello");
+    {
+        let mut host = runtime.host.lock().unwrap();
+        host.event(
+            "tenant",
+            &event(1, TenantEventKind::Admitted, Some(JOB), None),
+            unix_ms(),
+        )
+        .unwrap();
+        host.set_stop_pending("tenant", true).unwrap();
+        host.restart_withdrawn(JOB, unix_ms()).unwrap();
+    }
+    drop(guest);
+    let terminal = read_frame(&mut client).await.unwrap();
+    assert_eq!(
+        terminal["outcome"],
+        json!({"type":"refused_before_start","reason":"queue_wait_exceeded"})
+    );
+    assert_eq!(terminal["ran"], "none");
+    let hosted = read_frame(&mut client).await.unwrap();
+    assert_eq!(hosted["type"], "hosted_terminal");
+    assert_eq!(hosted["billed_vcpu_ms"], 0);
+    drop(client);
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test]

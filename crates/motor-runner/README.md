@@ -6,7 +6,7 @@ them in the Linux sandbox or a per-job Windows VM, and retains their output for
 replay. `Config::new` without job isolation uses an in-process backend for
 tests; it is not an isolation boundary.
 
-- [docs/architecture.md](../../docs/architecture.md): how the runner fits in.
+- [ARCHITECTURE.md](../../ARCHITECTURE.md): how the runner fits in.
 - [docs/job-isolation.md](../../docs/job-isolation.md): what a Linux job sees.
 - [docs/windows-jobs.md](../../docs/windows-jobs.md): the Windows VM backend.
 - [docs/scheduling.md](../../docs/scheduling.md): capacity, queueing, disk

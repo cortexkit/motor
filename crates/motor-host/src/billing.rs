@@ -1,6 +1,6 @@
 //! Host observations, durable settlement records and the serialized broker outbox.
 use crate::state::{Error, Host, LeaseState, Refusal, Snapshot};
-use motor_lease::{Heartbeat, HostHeaders, JobState, RunningJob, Usage, UsageOutcome};
+use motor_lease::{Heartbeat, HostHeaders, JobState, OomKill, RunningJob, Usage, UsageOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -26,6 +26,53 @@ pub const RETENTION_INTERVAL_MS: u64 = 10 * 60 * 1000;
 /// Bound storage without ever evicting an unexpired, acknowledged fence.
 pub const REVOCATION_CAP: usize = 4096;
 
+// Let the runner report its own deadline terminal before the host backstop cancels.
+pub(crate) const BACKSTOP_CANCEL_GRACE_MS: u64 = 30_000;
+const LOST_SETTLEMENT_GRACE_MS: u64 = 300_000;
+pub(crate) const LOST_GUEST_CHECK_MS: u64 = 30_000;
+pub(crate) const LOST_GUEST_POLL_MS: u64 = 2_000;
+
+pub(crate) struct LostCheck {
+    // Use the host observation clock for the deadline, polling and reply acceptance.
+    deadline_ms: u64,
+    next_poll_ms: u64,
+    in_flight: bool,
+    report: Option<LostReport>,
+}
+
+#[derive(Debug)]
+enum LostReport {
+    Ended(&'static str),
+    Running,
+    Unknown,
+}
+
+fn lost_report(job: &str, reply: Value) -> LostReport {
+    if reply["ok"] != true {
+        return LostReport::Unknown;
+    }
+    let Ok(status) = serde_json::from_value::<motor_protocol::JobStatusReply>(reply) else {
+        return LostReport::Unknown;
+    };
+    if status.job_id.to_string() != job {
+        return LostReport::Unknown;
+    }
+    if status
+        .terminal
+        .is_some_and(|terminal| terminal.job_id.to_string() == job && terminal.execution_ended())
+    {
+        LostReport::Ended("terminal_record")
+    } else if status.unit.as_ref().is_some_and(|unit| !unit.is_empty())
+        && status.unit_alive == Some(false)
+    {
+        LostReport::Ended("unit_confirmed_gone")
+    } else if status.unit_alive == Some(true) || status.state == "running" {
+        LostReport::Running
+    } else {
+        LostReport::Unknown
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct JobBilling {
@@ -36,6 +83,10 @@ pub struct JobBilling {
     pub terminal: Option<Value>,
     pub cancelled_at_cap: bool,
     pub host_settled: bool,
+    /// A lost result requires a restart until the runner proves the job ended.
+    /// For older records without this field, keep the restart requirement while a stop is pending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_pending: Option<bool>,
     pub synthesized_output: Option<Value>,
     pub hosted_terminal: Option<Value>,
     pub usage: Option<Usage>,
@@ -135,6 +186,16 @@ pub(crate) fn finalize_ready(next: &mut Snapshot, now_ms: u64) {
             ),
             outcome,
             mem_working_peak_mib: lease.started_at_ms.and(b.mem_working_peak_mib).map(Some),
+            // The runner does not yet report a working-set overage integral.
+            mem_over_mib_ms: None,
+            oom_kill: b.terminal.as_ref().and_then(|terminal| {
+                match terminal["oom_kill"]["cause"].as_str() {
+                    Some("job_limit") => Some(OomKill::JobLimit),
+                    Some("host_pressure") => Some(OomKill::HostPressure),
+                    Some("host_oom") => Some(OomKill::HostOom),
+                    _ => None,
+                }
+            }),
         };
         let billed = u64::from(usage.vcpus)
             .saturating_mul(end.saturating_sub(start))
@@ -226,8 +287,16 @@ impl Host {
             return Ok(());
         }
         let mut next = self.snapshot.clone();
+        if next.billing.get(job).is_some_and(|b| b.host_settled) {
+            let stopping = next
+                .leases
+                .get(job)
+                .is_some_and(|lease| self.stopping.contains(&lease.tenant));
+            observe_settled_terminal(&mut next, job, now_ms, stopping);
+            return self.save(next);
+        }
         let b = next.billing.entry(job.to_owned()).or_default();
-        if b.host_settled || b.terminal.is_some() {
+        if b.terminal.is_some() {
             return Ok(());
         }
         b.terminal_received_ms = Some(now_ms);
@@ -244,7 +313,10 @@ impl Host {
             for (job, lease) in &next.leases {
                 if lease.state == LeaseState::Started
                     && lease.started_at_ms.is_some_and(|started| {
-                        now_ms >= started.saturating_add(lease.claims.max_s.saturating_mul(1000))
+                        now_ms
+                            >= started
+                                .saturating_add(lease.claims.max_s.saturating_mul(1000))
+                                .saturating_add(BACKSTOP_CANCEL_GRACE_MS)
                     })
                 {
                     next.pending_cancels
@@ -257,6 +329,8 @@ impl Host {
             return Ok(());
         }
         let mut next = self.snapshot.clone();
+        let mut lost = Vec::new();
+        let mut new_checks = Vec::new();
         for (job, lease) in &mut next.leases {
             let b = next.billing.entry(job.clone()).or_default();
             if lease.state == LeaseState::Started {
@@ -271,17 +345,67 @@ impl Host {
                         b.ended_observed_ms = Some(receipt);
                     }
                 } else if now_ms >= cap {
-                    if !b.cancelled_at_cap {
+                    if !b.cancelled_at_cap && now_ms >= cap.saturating_add(BACKSTOP_CANCEL_GRACE_MS)
+                    {
                         b.cancelled_at_cap = true;
                         next.pending_cancels
                             .insert(job.clone(), lease.tenant.clone());
                     }
-                    if now_ms >= cap.saturating_add(60_000) {
+                    if now_ms >= cap.saturating_add(LOST_SETTLEMENT_GRACE_MS) {
+                        let check = self.lost_checks.entry(job.clone()).or_insert_with(|| {
+                            // Send a fresh hard cancel before inspecting this job, even
+                            // if the earlier cap backstop was already acknowledged.
+                            next.pending_cancels
+                                .insert(job.clone(), lease.tenant.clone());
+                            new_checks.push(job.clone());
+                            LostCheck {
+                                deadline_ms: cap
+                                    .saturating_add(LOST_SETTLEMENT_GRACE_MS)
+                                    .saturating_add(LOST_GUEST_CHECK_MS),
+                                next_poll_ms: now_ms,
+                                in_flight: false,
+                                report: None,
+                            }
+                        });
+                        let ended = match check.report {
+                            Some(LostReport::Ended(proof)) => Some(proof),
+                            _ => None,
+                        };
+                        // An accepted cancel starts TERM/KILL escalation; it does not
+                        // prove the unit is already gone. Keep polling until the end
+                        // of the shared window before acting on a running reply.
+                        let reason = if ended.is_some() {
+                            "guest_confirmed_ended"
+                        } else if now_ms >= check.deadline_ms {
+                            if matches!(check.report, Some(LostReport::Running)) {
+                                "guest_still_running_after_cancel"
+                            } else {
+                                "guest_unknown_or_timeout"
+                            }
+                        } else {
+                            continue;
+                        };
+                        lost.push((
+                            job.clone(),
+                            lease.tenant.clone(),
+                            lease.started_at_ms,
+                            lease.claims.max_s,
+                            cap,
+                            ended,
+                            reason,
+                        ));
                         settle_lost(lease, b, cap, now_ms);
-                        next.vms
-                            .entry(lease.tenant.clone())
-                            .or_default()
-                            .stop_pending = true;
+                        if ended.is_some() {
+                            // Guest input frees only this lease inside its tenant VM's
+                            // fixed host-side allocation, just like a terminal result.
+                            // It cannot raise that allocation or alter lost billing.
+                            b.restart_pending = Some(false);
+                        } else {
+                            next.vms
+                                .entry(lease.tenant.clone())
+                                .or_default()
+                                .stop_pending = true;
+                        }
                     }
                 }
             }
@@ -289,20 +413,80 @@ impl Host {
         finalize_ready(&mut next, now_ms);
         enqueue_usage(&mut next, now_ms);
         if serde_json::to_vec(&next).ok() != serde_json::to_vec(&self.snapshot).ok() {
-            self.save(next)?;
+            if let Err(error) = self.save(next) {
+                for job in new_checks {
+                    self.lost_checks.remove(&job);
+                }
+                return Err(error);
+            }
+        }
+        self.lost_checks.retain(|job, _| {
+            self.snapshot
+                .leases
+                .get(job)
+                .is_some_and(|lease| lease.state == LeaseState::Started)
+        });
+        for (job_id, tenant, started_at_ms, max_s, cap_ms, ended, reason) in lost {
+            if let Some(guest_report) = ended {
+                tracing::warn!(
+                    job_id,
+                    tenant,
+                    guest_report,
+                    "lease_settled_lost_guest_confirmed_ended"
+                );
+            } else {
+                tracing::warn!(
+                    job_id,
+                    tenant,
+                    started_at_ms,
+                    max_s,
+                    cap_ms,
+                    reason,
+                    "lease_settled_lost_stop_pending"
+                );
+            }
         }
         Ok(())
+    }
+
+    pub(crate) fn lost_checks_due(&mut self, now_ms: u64) -> Vec<(String, String)> {
+        let mut due = Vec::new();
+        for (job, check) in &mut self.lost_checks {
+            if !check.in_flight
+                && !matches!(check.report, Some(LostReport::Ended(_)))
+                && now_ms >= check.next_poll_ms
+                && now_ms < check.deadline_ms
+                && !self.snapshot.pending_cancels.contains_key(job)
+            {
+                if let Some(lease) = self.snapshot.leases.get(job) {
+                    check.in_flight = true;
+                    check.next_poll_ms = now_ms.saturating_add(LOST_GUEST_POLL_MS);
+                    due.push((lease.tenant.clone(), job.clone()));
+                }
+            }
+        }
+        due
+    }
+
+    pub(crate) fn lost_check_reply(&mut self, job: &str, reply: Value, now_ms: u64) {
+        if let Some(check) = self
+            .lost_checks
+            .get_mut(job)
+            .filter(|check| check.in_flight && now_ms < check.deadline_ms)
+        {
+            check.report = Some(lost_report(job, reply));
+            check.in_flight = false;
+            check.next_poll_ms = now_ms.saturating_add(LOST_GUEST_POLL_MS);
+        }
     }
     pub fn lose_tenant(&mut self, tenant: &str, now_ms: u64) -> Result<(), Error> {
         let mut next = self.snapshot.clone();
         for (job, lease) in &mut next.leases {
             if lease.tenant == tenant && lease.state != LeaseState::Ended {
-                settle_lost(
-                    lease,
-                    next.billing.entry(job.clone()).or_default(),
-                    now_ms,
-                    now_ms,
-                );
+                let billing = next.billing.entry(job.clone()).or_default();
+                settle_lost(lease, billing, now_ms, now_ms);
+                // The VM is already gone, so this loss cannot require another stop.
+                billing.restart_pending = Some(false);
             }
         }
         finalize_ready(&mut next, now_ms);
@@ -331,14 +515,49 @@ impl Host {
             .collect()
     }
     pub fn stopped(&mut self, tenant: &str) -> Result<(), Error> {
+        let pending = self
+            .snapshot
+            .vms
+            .get(tenant)
+            .is_some_and(|vm| vm.stop_pending);
         let mut next = self.snapshot.clone();
         let vm = next.vms.entry(tenant.to_owned()).or_default();
         vm.stop_pending = false;
         vm.initialized_generation = None;
         next.pending_cancels.retain(|_, t| t != tenant);
+        for (job, billing) in &mut next.billing {
+            if billing.host_settled
+                && next
+                    .leases
+                    .get(job)
+                    .is_some_and(|lease| lease.tenant == tenant)
+            {
+                billing.restart_pending = Some(false);
+            }
+        }
         self.save(next)?;
+        self.stopping.remove(tenant);
+        if pending {
+            tracing::info!(tenant, "tenant_stop_pending_cleared");
+        }
         self.guest_unready(tenant);
         Ok(())
+    }
+
+    /// Order the start of a stop with incoming terminal proof under the Host mutex.
+    pub(crate) fn begin_pending_stop(&mut self, tenant: &str) -> bool {
+        if self.stopping.contains(tenant) || !self.stops_due().iter().any(|due| due == tenant) {
+            return false;
+        }
+        self.stopping.insert(tenant.to_owned());
+        true
+    }
+
+    pub(crate) fn stop_attempt_failed(&mut self, tenant: &str) -> Result<(), Error> {
+        self.stopping.remove(tenant);
+        let mut next = self.snapshot.clone();
+        clear_proven_restart(&mut next, tenant);
+        self.save(next)
     }
     pub fn terminal_delivered(&mut self, job: &str, now_ms: u64) -> Result<(), Error> {
         if self.provider_managed {
@@ -352,12 +571,15 @@ impl Host {
     pub fn host_settled_frames(&self, job: &str, from_seq: u64) -> Option<Vec<Value>> {
         let l = self.snapshot.leases.get(job)?;
         let b = self.snapshot.billing.get(job)?;
-        if !b.host_settled {
+        let withdrawn = l.started_at_ms.is_none()
+            && l.refusal == Some(crate::state::Refusal::Capacity)
+            && self.snapshot.zero_usage.contains_key(job);
+        if !b.host_settled && !withdrawn {
             return None;
         }
         let mut frames = Vec::new();
         let seq = l.highest_seq.saturating_add(1);
-        if from_seq <= seq {
+        if b.host_settled && from_seq <= seq {
             frames.push(b.synthesized_output.clone()?);
         }
         frames.push(b.terminal.clone()?);
@@ -406,6 +628,8 @@ impl Host {
                 .collect(),
             healthy,
             draining: self.snapshot.draining,
+            accept_until_ms: None,
+            tenant_disk: self.tenant_disk(now_ms),
             revoked_ack: self
                 .snapshot
                 .revocations
@@ -769,12 +993,64 @@ impl Host {
     }
 }
 
+fn clear_proven_restart(next: &mut Snapshot, tenant: &str) {
+    let unproven = next.billing.iter().any(|(job, billing)| {
+        billing.host_settled
+            && billing.restart_pending != Some(false)
+            && next
+                .leases
+                .get(job)
+                .is_some_and(|lease| lease.tenant == tenant)
+    });
+    if !unproven {
+        if let Some(vm) = next.vms.get_mut(tenant) {
+            vm.stop_pending = false;
+        }
+    }
+}
+
+pub(crate) fn observe_settled_terminal(
+    next: &mut Snapshot,
+    job: &str,
+    now_ms: u64,
+    stopping: bool,
+) {
+    let Some(lease) = next.leases.get(job) else {
+        return;
+    };
+    let tenant = lease.tenant.clone();
+    let cap = lease
+        .started_at_ms
+        .unwrap_or(now_ms)
+        .saturating_add(lease.claims.max_s.saturating_mul(1000));
+    let Some(billing) = next
+        .billing
+        .get_mut(job)
+        .filter(|billing| billing.host_settled)
+    else {
+        return;
+    };
+    let had_restart_claim = billing.restart_pending != Some(false);
+    billing.restart_pending = Some(false);
+    tracing::warn!(
+        job_id = job,
+        tenant,
+        delay_since_cap_ms = now_ms.saturating_sub(cap),
+        stopping,
+        "host_settled_runner_terminal_observed"
+    );
+    if had_restart_claim && !stopping {
+        clear_proven_restart(next, &tenant);
+    }
+}
+
 fn settle_lost(lease: &mut crate::state::Lease, b: &mut JobBilling, end: u64, observed: u64) {
     lease.state = LeaseState::Ended;
     lease.ended_at_ms = Some(end);
     b.ended_observed_ms = Some(observed);
     b.terminal_live = true;
     b.host_settled = true;
+    b.restart_pending = Some(true);
     let seq = lease.highest_seq.saturating_add(1);
     b.synthesized_output = Some(
         json!({"type":"output", "seq":seq, "stream":"stdout", "bytes":"", "truncated_before_seq":seq}),

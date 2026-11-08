@@ -231,17 +231,28 @@ fn psi_avg10(text: &str, kind: &str) -> Option<f64> {
 
 #[cfg(target_os = "linux")]
 fn guest_disk(reply: &serde_json::Value, quota: u64) -> Option<(u64, u64)> {
-    if reply["ok"] != true || quota == 0 {
+    if reply["ok"] != true {
         return None;
     }
     let disk = &reply["health"]["guest_disk"];
-    if disk["age_ms"].as_u64()? > 60_000 {
+    clamp_guest_disk(
+        &motor_protocol::GuestDisk {
+            free_bytes: disk["free_bytes"].as_u64()?,
+            total_bytes: disk["total_bytes"].as_u64()?,
+            age_ms: disk["age_ms"].as_u64()?,
+        },
+        quota,
+    )
+}
+
+pub(crate) fn clamp_guest_disk(disk: &motor_protocol::GuestDisk, quota: u64) -> Option<(u64, u64)> {
+    if quota == 0 || disk.age_ms > 60_000 {
         return None;
     }
-    // Guest input is display-only. The helper's registry, not the guest,
-    // bounds the figures; none of these values enter Host admission state.
-    let total = disk["total_bytes"].as_u64()?.min(quota);
-    let free = disk["free_bytes"].as_u64()?.min(total);
+    // The host-recorded disk quota, not the guest, bounds metrics and placement
+    // reports. These figures do not change the host's local admission gates.
+    let total = disk.total_bytes.min(quota);
+    let free = disk.free_bytes.min(total);
     Some((free / (1 << 30), total / (1 << 30)))
 }
 

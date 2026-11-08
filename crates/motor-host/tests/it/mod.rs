@@ -29,6 +29,7 @@ const JOB3: &str = "00000000-0000-7000-8000-000000000003";
 
 fn claims(job: &str) -> Claims {
     Claims {
+        mem_burst_mib: None,
         workspace_key_hash: Some(motor_lease::base64url(&[5; 32])),
         iss: motor_lease::ISSUER.into(),
         aud: "host".into(),

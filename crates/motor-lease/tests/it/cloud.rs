@@ -13,6 +13,54 @@ fn vector(name: &str) -> Value {
         .join(name);
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
+
+#[test]
+fn tenant_disk_heartbeats_match_accepted_cloud_vector_bytes() {
+    let vector = vector("tenant-disk.json");
+    let cases = vector["disk_cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 7);
+    let mut checked = 0;
+    for case in cases {
+        for exchange in case["heartbeats"].as_array().unwrap() {
+            assert_eq!(exchange["reply"]["status"], 200);
+            let bytes = exchange["request"]["body_bytes"].as_str().unwrap();
+            let heartbeat: Heartbeat = serde_json::from_str(bytes).unwrap();
+            assert_eq!(
+                serde_json::to_string(&heartbeat).unwrap(),
+                bytes,
+                "{}",
+                case["name"]
+            );
+            assert_eq!(
+                serde_json::to_value(&heartbeat).unwrap(),
+                exchange["request"]["body"]
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 14);
+}
+
+#[test]
+fn bounded_drain_heartbeats_decode_without_enabling_host_output() {
+    let vector = vector("host-draining.json");
+    let mut checked = 0;
+    for exchange in vector["exchanges"].as_array().unwrap() {
+        if exchange["request"]["body"].get("accept_until_ms").is_none() {
+            continue;
+        }
+        let bytes = exchange["request"]["body_bytes"].as_str().unwrap();
+        if exchange["reply"]["status"] == 200 {
+            let heartbeat: Heartbeat = serde_json::from_str(bytes).unwrap();
+            assert_eq!(heartbeat.accept_until_ms, Some(1_792_195_510_123));
+            assert_eq!(serde_json::to_string(&heartbeat).unwrap(), bytes);
+        } else {
+            assert!(serde_json::from_str::<Heartbeat>(bytes).is_err());
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 2);
+}
 fn seed(text: &str) -> SigningKey {
     let bytes: Vec<_> = text
         .as_bytes()

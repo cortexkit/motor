@@ -188,6 +188,29 @@ class HolderTests(unittest.TestCase):
 
 
 class BaselineInputsTests(unittest.TestCase):
+    def test_baseline_enables_vm_local_minidumps_with_only_job_and_system_acl(self):
+        script = (HERE / "setup-job-baseline.ps1").read_text()
+        self.assertIn("# Crash dumps for job processes", script)
+        block = script.split("# Crash dumps for job processes", 1)[1].split("$prebuiltHvsock", 1)[0]
+        for required in (
+            "$dumpFolder = 'C:\\CrashDumps'",
+            "New-Item $dumpFolder -ItemType Directory -Force",
+            "[Security.AccessControl.DirectorySecurity]::new()",
+            "$dumpAcl.SetAccessRuleProtection($true, $false)",
+            "@('S-1-5-18', 'S-1-5-32-544', $jobSid)",
+            "$rights = if ($sid -eq $jobSid) { 'Modify' } else { 'FullControl' }",
+            "'ContainerInherit,ObjectInherit', 'None', 'Allow'",
+            "Set-Acl -LiteralPath $dumpFolder -AclObject $dumpAcl",
+            "HKLM:\\SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps",
+            "-Name DumpFolder -PropertyType ExpandString -Value $dumpFolder -Force",
+            "-Name DumpType -PropertyType DWord -Value 1 -Force",
+            "-Name DumpCount -PropertyType DWord -Value 10 -Force",
+            'throw "Job crash dump setup failed: $_"',
+        ):
+            self.assertIn(required, block)
+        self.assertNotIn("SilentlyContinue", block)
+        self.assertIn("$ErrorActionPreference = 'Stop'", script)
+
     def test_job_symlink_right_is_sid_scoped_and_verified_without_developer_mode(self):
         source = (HERE / "setup-job-baseline.ps1").read_text()
         self.assertIn("@('SeBatchLogonRight', 'SeCreateSymbolicLinkPrivilege')", source)

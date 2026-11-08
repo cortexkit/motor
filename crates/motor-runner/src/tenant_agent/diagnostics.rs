@@ -6,6 +6,7 @@ use std::{
     fs,
     io::{self, Read},
     os::unix::fs::MetadataExt,
+    os::unix::process::ExitStatusExt,
     path::Path,
     process::Stdio,
 };
@@ -15,6 +16,7 @@ const MAX_PROCESSES: usize = 128;
 const MAX_PROC_ENTRIES: usize = 8192;
 const MAX_STATE_ENTRIES: usize = 4096;
 const MAX_JOURNAL_BYTES: u64 = 32 * 1024;
+const MAX_JOURNAL_STDERR_BYTES: usize = 2048;
 /// Raw journalctl output read for a time-window query. Entries are filtered
 /// and redacted afterwards, so this bounds the guest's work, not the reply.
 const MAX_WINDOW_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
@@ -68,7 +70,9 @@ pub(super) async fn collect(https: bool, query: JournalQuery) -> io::Result<Valu
     .map_err(io::Error::other)??;
     result["journal"] = journal(query)
         .await
-        .unwrap_or_else(|_| json!({"unavailable":true}));
+        .unwrap_or_else(|error| json!({"unavailable":true,"error":{
+            "type":"journal_read_failed", "detail":error.to_string().chars().take(300).collect::<String>()
+        }}));
     result["network"] = super::network::collect(pid, https)
         .await
         .unwrap_or_else(|_| json!({"unavailable":true}));
@@ -378,31 +382,66 @@ fn journal_message(message: &str) -> String {
 }
 
 async fn journal(query: JournalQuery) -> io::Result<Value> {
+    let mut command = tokio::process::Command::new("journalctl");
+    command.args(query.args());
+    journal_command(command, query).await
+}
+
+async fn journal_command(
+    mut command: tokio::process::Command,
+    query: JournalQuery,
+) -> io::Result<Value> {
     let limit = query.byte_limit();
-    let mut child = tokio::process::Command::new("journalctl")
-        .args(query.args())
+    let mut child = command
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .stdout(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
     let mut bytes = Vec::new();
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        child
-            .stdout
-            .take()
-            .unwrap()
-            .take(limit)
-            .read_to_end(&mut bytes)
-            .await?;
-        // A full buffer may have stopped in the middle of a journal entry.
-        if bytes.len() == limit as usize {
-            child.kill().await?;
-        }
-        child.wait().await
+    let mut stdout = child.stdout.take().unwrap().take(limit);
+    let mut stderr = child.stderr.take().unwrap();
+    let (status, tail) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        // Drain both pipes together: a warning must not deadlock the stdout read.
+        let (_, tail) = tokio::try_join!(
+            async {
+                stdout.read_to_end(&mut bytes).await?;
+                // Stop at the raw byte cap without waiting for stderr's EOF.
+                if bytes.len() == limit as usize {
+                    child.start_kill()?;
+                }
+                Ok::<_, io::Error>(())
+            },
+            async {
+                let mut tail = Vec::new();
+                let mut chunk = [0; 1024];
+                loop {
+                    let size = stderr.read(&mut chunk).await?;
+                    if size == 0 {
+                        break;
+                    }
+                    tail.extend_from_slice(&chunk[..size]);
+                    if tail.len() > MAX_JOURNAL_STDERR_BYTES {
+                        tail.drain(..tail.len() - MAX_JOURNAL_STDERR_BYTES);
+                    }
+                }
+                Ok::<_, io::Error>(tail)
+            }
+        )?;
+        Ok::<_, io::Error>((child.wait().await?, tail))
     })
     .await
     .map_err(io::Error::other)??;
+    // A warning can mean the caller sees only part of the journal even when
+    // journalctl exits successfully. Never report that as a clean empty query.
+    // Reaching our own byte cap deliberately kills the process, not a read failure.
+    let killed_at_limit = bytes.len() == limit as usize && status.signal() == Some(libc::SIGKILL);
+    if !tail.is_empty() || (!status.success() && !killed_at_limit) {
+        return Ok(json!({"unavailable":true,"error":{
+            "type":"journal_command_failed", "exit_status":status.code(),
+            "stderr_tail":String::from_utf8_lossy(&tail)
+        }}));
+    }
     Ok(journal_entries(&bytes, limit, &query))
 }
 
@@ -440,6 +479,100 @@ fn journal_entries(bytes: &[u8], limit: u64, query: &JournalQuery) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn journal_command_failure_reports_status_and_bounded_stderr_not_empty_entries() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "printf 'Permission denied reading journal\\n' >&2; exit 7",
+        ]);
+        let reply = journal_command(command, JournalQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(reply["unavailable"], true, "{reply}");
+        assert_eq!(reply["error"]["type"], "journal_command_failed");
+        assert_eq!(reply["error"]["exit_status"], 7);
+        assert!(reply["error"]["stderr_tail"]
+            .as_str()
+            .unwrap()
+            .contains("Permission denied"));
+        assert!(reply.get("entries").is_none());
+    }
+
+    #[tokio::test]
+    async fn journal_success_with_unreadable_warning_is_not_a_clean_empty_journal() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "printf 'No journal files were opened due to insufficient permissions.\\n' >&2",
+        ]);
+        let reply = journal_command(command, JournalQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(reply["unavailable"], true, "{reply}");
+        assert_eq!(reply["error"]["exit_status"], 0);
+        assert!(reply.get("entries").is_none());
+    }
+
+    #[tokio::test]
+    async fn journal_stderr_tail_is_bounded_and_retains_the_end() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%5000s' x >&2; printf 'journal access denied' >&2; exit 9",
+        ]);
+        let reply = journal_command(command, JournalQuery::default())
+            .await
+            .unwrap();
+        let tail = reply["error"]["stderr_tail"].as_str().unwrap();
+        assert_eq!(reply["error"]["exit_status"], 9);
+        assert_eq!(tail.len(), MAX_JOURNAL_STDERR_BYTES);
+        assert!(tail.ends_with("journal access denied"));
+    }
+
+    #[tokio::test]
+    async fn journal_raw_byte_cap_remains_truncation_not_command_failure() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "printf '%40000s' x"]);
+        let reply = journal_command(command, JournalQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(reply["truncated"], true, "{reply}");
+        assert!(reply.get("unavailable").is_none());
+    }
+
+    #[tokio::test]
+    async fn journal_command_keeps_recognised_job_lines_and_still_omits_unrecognised_text() {
+        let job = uuid::Uuid::parse_str("018d0d3b-a338-7181-8fcc-88e901ef438c").unwrap();
+        let known = json!({"__REALTIME_TIMESTAMP":"1800000000000000", "MESSAGE":format!(
+            "[motor-runner] INFO motor_runner::server: tenant_job_stream_ended jti={job} reason=error error=TOP_SECRET")});
+        let unknown = json!({"__REALTIME_TIMESTAMP":"1800000000000001", "MESSAGE":format!(
+            "[motor-runner] INFO motor_runner::server: unapproved message jti={job} TOP_SECRET")});
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s\\n' \"$1\" \"$2\"",
+            "journal-fixture",
+            &known.to_string(),
+            &unknown.to_string(),
+        ]);
+        let reply = journal_command(
+            command,
+            JournalQuery {
+                jti: Some(job),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reply["entries"][0]["message"],
+            format!("tenant_job_stream_ended jti={job} reason=error")
+        );
+        assert_eq!(reply["entries"][1]["message"], "[message omitted]");
+        assert!(!reply.to_string().contains("TOP_SECRET"));
+    }
 
     #[test]
     fn diagnostics_redact_command_arguments_and_untrusted_journal_text() {

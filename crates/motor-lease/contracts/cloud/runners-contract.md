@@ -37,7 +37,8 @@ Payload keys occur in this order, without whitespace:
 | `max_s` | Run limit enforced by the host from job start, not token issue |
 | `cnf` | `{"jkt":"<thumbprint>"}` |
 | `purpose` | `"run"` from lease; `"attach"` from reattach |
-| `workspace_key_hash` | When enabled by the broker, on registered-host placements only: the lease request's `workspace_key_hash` verbatim (`^[A-Za-z0-9_-]{43}$`); always the last payload key, after `purpose` |
+| `workspace_key_hash` | When enabled by the broker, on registered-host placements only: the lease request's `workspace_key_hash` verbatim (`^[A-Za-z0-9_-]{43}$`); after `purpose`, before `mem_burst_mib` when that claim is present |
+| `mem_burst_mib` | When enabled by the broker, on registered-host placements only: `min(floor(mem_mib / 2), 8192)` whole MiB, derived from this token's `mem_mib`; always the last payload key |
 
 The temporary broker rollout switch `JOB_TOKEN_WORKSPACE_HASH` emits `workspace_key_hash` only
 when its value is exactly the string `"true"`. Otherwise the payload and signed token bytes are
@@ -48,12 +49,25 @@ it: the broker chooses Boat sandboxes by workspace itself, so the sandbox has no
 and Boat token readers keep rejecting it as an unknown claim. While the claim is optional, a token for a job recorded before the broker stored its
 hash may omit it, even with the switch on. The broker stores a hash for every newly recorded job.
 
+The separate rollout switch `JOB_TOKEN_MEM_BURST` emits `mem_burst_mib` only when its value is
+exactly the string `"true"`; it ships as `"false"`. Hosts must accept the optional claim before
+the broker emits it: leave the switch off until MOTOR (the host owner) confirms every live host
+verifier accepts it. With the switch off, existing payload and signed token bytes are unchanged. With it on,
+registered-host run and attach tokens append the claim after `workspace_key_hash` when present,
+or after `purpose` otherwise. Boat placements never carry it. The value stays the same across
+re-request, re-sign, reattach and replace because it is derived from the job's stored `mem_mib`.
+The host may let the working set exceed `mem_mib` by this bounded amount, but may stop a burst
+job first under host memory pressure. File cache never counts towards the working set. Placement,
+host fit and the in-flight ledger reserve only `mem_mib`, never the burst allowance.
+
 `cnf.jkt` is the unpadded base64url SHA-256 RFC 7638 thumbprint of the UTF-8 JSON
 `{"crv":"Ed25519","kty":"OKP","x":"<requester x>"}`. The token is bound to the requester key.
 
 Hosts check expiration at connect only. They reject any other `alg` or `typ`, unknown `kid`, any
 `crit` header, wrong `iss` or `aud`, any purpose other than `run` or `attach`, and extra or missing
-claims, except that hosts must accept `workspace_key_hash` as optional during rollout and validate
+claims, except that hosts must accept `mem_burst_mib` as optional before its rollout and validate
+its whole-MiB value against the formula above when present. Hosts must also accept
+`workspace_key_hash` as optional during rollout and validate
 it against `^[A-Za-z0-9_-]{43}$` when present. Hosts may require it only after the operator announces
 the switch is on everywhere and confirms no hashless legacy job is still unsettled or inside its
 reattach window. Such jobs cannot be created anymore and age out within the 6-hour run limit plus
@@ -735,7 +749,8 @@ The exact body is:
 
 ```text
 {free_vcpus, free_mem_mib, queued, warm:[{tenant, workspace_key_hash, vm, busy?}],
- running:[{job_id, state, elapsed_ms}], healthy, draining?, revoked_ack?:[job_id,…]}
+ running:[{job_id, state, elapsed_ms}], healthy, draining?, revoked_ack?:[job_id,…], accept_until_ms?,
+ tenant_disk?:[{tenant, disk_free_gib, disk_total_gib}]}
 ```
 
 Integers are non-negative safe integers. `healthy` is boolean. `warm` and `running` each have at
@@ -744,8 +759,8 @@ the host capacity snapshot, timestamped at broker receive time. `queued` is stor
 affect placement.
 
 The optional member `draining` is boolean; absent and `false` mean the same. Apart from
-`revoked_ack` described below, every other
-unknown body member is still refused. Only the latest accepted snapshot stored by PlacementDO
+`revoked_ack`, `accept_until_ms` and `tenant_disk` described below, every other unknown body member is still refused.
+Only the latest accepted snapshot stored by PlacementDO
 controls draining: a delayed older heartbeat cannot set or clear it. The next accepted heartbeat
 that omits `draining` or sends `false` clears the drain.
 
@@ -757,6 +772,58 @@ never falls back to another host or Boat. Draining hosts still count for the reg
 `no_host_fits` ceiling check (both maxima) because draining is temporary. A job only a draining
 host can fit receives retryable `no_capacity` with `Retry-After`, not `no_host_fits` (and may
 spill when allowed). The independent operator `explicit_only` override is unchanged.
+
+The optional member `accept_until_ms` is a non-negative safe integer on the broker's clock
+(Unix milliseconds). Member-level validation reports 400 `bad_request` with
+`field: "accept_until_ms"`. As for other heartbeat members, numeric spellings refused by the
+strict JSON reader (including fractional or unsafe literals) report `field: "body"` instead.
+Only the latest accepted snapshot controls the bound; omitting the member removes it. Absent means
+no bound, and `draining: true` takes precedence when both members are present.
+
+A bounded host accepts ordinary placement only when
+`now_ms + timeout_s × 1000 + 300000 ≤ accept_until_ms`. Placement uses the lease's requested
+`timeout_s`, not its later budget-capped `max_s`; replacements use the stored job's already-fixed
+`max_s` instead. The 300 s slack is the run token's full life, because admission may occur any
+time before expiry. For a lease that fits, capacity, warm and
+busy-checkout tiers are unchanged. A lease that does not fit treats the host exactly as draining:
+no selection or warm affinity, ordinary spill where allowed, and retryable 503 `no_capacity`
+(with `Retry-After`) when no other host is available. A `placement_hint.host` naming that host
+is still a binding canary exception, even for a cold VM, with no fallback to another host or Boat.
+The bound never affects the registry's `no_host_fits` ceiling check: a temporary bound cannot
+make a job never fit. The host must also refuse at admission a token whose job could run past
+its own bound, even if broker placement allowed it.
+
+The optional final member `tenant_disk` reports tenant-VM disk samples. It is an array of at most
+64 entries, each exactly `{tenant, disk_free_gib, disk_total_gib}`, with no duplicate tenant.
+`tenant` uses the same `acct:<account ULID>` subject and validation as a `warm` entry.
+Both disk values are non-negative safe integers in GiB, `disk_total_gib > 0`, and
+`disk_free_gib ≤ disk_total_gib`. A host computes each by rounding its byte count down to whole
+GiB (bytes / 2^30, floored), which keeps free at or below total. Malformed arrays and duplicate tenants report 400 `bad_request`
+with `field: "tenant_disk"`; malformed members name `tenant_disk.tenant`,
+`tenant_disk.disk_free_gib` or `tenant_disk.disk_total_gib`. A free value above total names
+`tenant_disk.disk_free_gib`. Unknown keys and numeric spellings refused by the strict JSON reader
+still name `body`, as for other heartbeat members.
+
+Only the latest accepted snapshot supplies disk samples; omitting the array or a tenant's entry
+removes that tenant's disk constraint. A host **must omit** a tenant's entry when its latest guest
+sample is older than 60 seconds, so stale readings never steer placement. Missing entries cover
+hosts without that tenant VM yet, older host builds and stale samples, and impose no disk rule.
+
+For a cold placement for tenant T, the broker skips a host with T's sample below 20% free only
+when another host passes every other eligibility and capacity check for the lease and has either
+at least 20% free for T or no entry for T. The comparison is exact integer arithmetic:
+`disk_free_gib × 100 < 20 × disk_total_gib`; exactly 20% passes. With no such fitting alternative,
+the broker ignores disk and places as before. Warm or affinity matches for this tenant and
+workspace have **no disk rule**, even below 20%. Binding explicit-only, draining or bounded-host
+placement hints also ignore disk. Disk is an extra predicate after the other checks, not a sort
+key; the existing placement tiers and free-capacity ordering remain unchanged. A busy host can sit
+just above its runner's 10% floor: that floor and admission-time eviction are the real guard.
+Disk is not accounted in the in-flight ledger.
+
+Disk alone never causes `no_capacity` or `no_host_fits`, never changes the registry ceiling, and
+does not cause spill. The `disk` host-placement refusal counter counts only hosts actually skipped
+for disk on leases that were then placed elsewhere. Unlike the other refusal reasons, these
+disk-only observations are recorded on successful placements; non-disk counter behavior is unchanged.
 
 `warm` lists the tenant workspaces the host holds **now**, after eviction, most-recent first. A
 host holding more than 64 reports only the 64 most recent workspaces.
@@ -891,7 +958,7 @@ states, signed ack bodies, pending retries, release revocation and the 256-entry
 The exact body, also its canonical hash order, is:
 
 ```text
-{job_id, vcpus, started_at_ms, ended_at_ms, mem_peak_mib, egress_bytes, outcome[, mem_working_peak_mib]}
+{job_id, vcpus, started_at_ms, ended_at_ms, mem_peak_mib, egress_bytes, outcome[, mem_working_peak_mib][, mem_over_mib_ms][, oom_kill]}
 ```
 
 `vcpus` is 1–64. Times are non-negative safe integers; `ended_at_ms ≥ started_at_ms`.
@@ -902,8 +969,33 @@ memory, sampled from the job cgroup's `memory.stat`, excluding file cache. It is
 safe integer or null when not attributable, and older hosts may omit it. When present it is
 appended after `outcome` in the canonical hash order, including an explicit null; omission keeps
 the original hash bytes. Changing, adding or removing the member on a replay is a
-409 `usage_conflict`. `outcome` is exactly `exit`, `signal`, `timeout`, `cancelled` or
-`lost`. Outcome and memory/egress measurements are audit-only. The host must cap its own report
+409 `usage_conflict`.
+
+The optional `mem_over_mib_ms` is the integral over time of the job's working set above its
+stated `mem_mib` (not above `mem_mib + mem_burst_mib`), in MiB·ms, sampled like
+`mem_working_peak_mib`. It is a non-negative safe integer, or null when not attributable, with the
+same omission/null grammar as `mem_working_peak_mib`. A host sends it only for a job whose token
+carried `mem_burst_mib` and omits it otherwise, rather than sending 0. File cache never counts
+towards the working set or this integral.
+
+When the token carries `mem_burst_mib`, the host enforces `mem_mib + mem_burst_mib` as the job's
+memory limit; otherwise the limit is `mem_mib`. The optional `oom_kill` names why a job was
+killed for memory, and is exactly one of:
+
+- `"job_limit"`: the job exceeded its own enforced limit (with burst, it hit the burst cap);
+- `"host_pressure"`: the host's watcher stopped it because the VM was short of memory;
+- `"host_oom"`: the host or VM kernel killed it outside the job's own limit.
+
+Null and every other value are refused with 400 `bad_request`, `field: "oom_kill"`. Both new members enter the canonical usage hash only
+when present, after the optional working peak and in the order shown above; an explicit null
+overage enters the hash. Omission of both preserves every existing report's hash and reply bytes.
+Changing, adding or removing either member for the same job is 409 `usage_conflict`; an identical
+resend returns the stored reply. Both are stored in the tenant job record and nullable D1
+`settlements` columns of the same names.
+
+`outcome` is exactly `exit`, `signal`, `timeout`, `cancelled` or
+`lost`. Outcome, OOM cause and memory/egress measurements are audit-only: billing remains vCPU-ms
+only. The host must cap its own report
 at `max_s` (`ended_at_ms − started_at_ms ≤ max_s × 1000`); independently the broker caps
 settlement at the reservation even if the host over-reports.
 
@@ -960,23 +1052,37 @@ these effective figures. An entry is removed on any of these events (the 1024-en
 
 - on the first heartbeat from H whose `running` list shows the job `admitted` or `started`, the
   point from which the host's own figures count both resources. A heartbeat that shows the job
-  `reserved`, or doesn't list it, keeps the entry for memory or both resources respectively;
+  `reserved` keeps the entry for memory and clears its absence evidence;
+- after two consecutive counted absences from H's accepted, strictly newer snapshots at the same
+  host generation. Each entry durably records the broker-time origin of its unobserved episode,
+  absence count and host generation. New placements start the episode at creation; an absence
+  counts only when the snapshot's `received_at_ms` is at least 10,000 ms after that origin.
+  Presence in any state clears the count and the origin, so the next absence starts a new grace
+  period. A host-generation change resets the evidence; legacy entries without it initialize at
+  their first accepted snapshot, never at time zero. Stale, older, duplicate and other-generation
+  snapshots cannot add to the streak. Reconciliation and snapshot acceptance are one transaction;
 - when the job settles (usage report or alarm), is released, or is replaced away from H, and
   when the lease that asked for the placement doesn't commit it (the job already existed, or the
   budget ran out while the token was signed);
 - when the job's latest run token expires without such a heartbeat: a host refuses an expired
   token, so the job can no longer be admitted. When a re-signed run token's refresh reaches the
-  placement object, it moves the entry's expiry to the new token's, and brings the entry back if
-  it had expired, unless the host's latest heartbeat already shows the job admitted or started,
-  or a committed entry for another host still exists.
+  placement object, it extends an existing entry's expiry without changing its absence origin or
+  count. It recreates a missing entry only when the latest accepted heartbeat lists the job
+  `reserved`, since that job still needs a memory hold; no fit check is needed for this host-held
+  reservation. A job absent from that snapshot gets no new hold. Admission or a committed entry
+  for another host still suppresses refresh as before.
+
+Absence release does not revoke a run token or change re-request replies: the tenant object still
+issues tokens for the stored placement. The host's own admission checks are the safety boundary.
+A token without a ledger hold may incur a host-side refusal, but cannot bypass host admission.
 
 Consistency: placement decisions and ledger writes are serialized in the one placement object and
 survive its eviction. Releases on settlement, release, replace and re-sign are sent by the job's
 tenant object after its own state change commits; a failed message is logged and not retried. A
 confirmation whose placement entry is already absent is ignored, so a delayed confirmation cannot
 remove the newer placement's hold. A delayed refresh for an old host is ignored while a committed
-hold for another host remains. A lost release leaves an entry until its stored expiry, so its
-host looks fuller than it is for up to
+hold for another host remains. A lost release leaves an entry until admission, absence reconciliation
+or its stored expiry, so its host can look fuller than it is for up to
 300 seconds. A lost refresh can leave an entry expiring before the newest token does, so that host
 can look freer than it is. The ledger holds at most 1024 entries: before inserting into a full
 ledger, the broker drops the existing entry with the earliest expiry. Effective figures are
