@@ -39,6 +39,9 @@ struct Events {
 pub(crate) struct EventLog {
     path: PathBuf,
     state: Mutex<Events>,
+    // Samples are coalesced and ephemeral; only lifecycle events need replay.
+    #[cfg(any(target_os = "linux", test))]
+    samples: Mutex<BTreeMap<Uuid, MemorySample>>,
 }
 
 impl Events {
@@ -52,6 +55,7 @@ impl Events {
             setup: None,
             mem_peak_mib: None,
             mem_working_peak_mib: None,
+            mem_over_mib_ms: None,
             remote_cache_totals: None,
         });
     }
@@ -77,6 +81,8 @@ impl EventLog {
         Ok(Self {
             path,
             state: Mutex::new(state),
+            #[cfg(any(target_os = "linux", test))]
+            samples: Mutex::new(BTreeMap::new()),
         })
     }
     fn update(&self, change: impl FnOnce(&mut Events)) -> io::Result<()> {
@@ -98,6 +104,27 @@ impl EventLog {
     }
     pub(crate) fn refused(&self, id: Uuid, cause: RefusedCause) -> io::Result<()> {
         self.update(|s| s.push(TenantEventKind::Refused, Some(id), Some(cause)))
+    }
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn sample(&self, sample: MemorySample, accepted_burst_mib: Option<u64>) {
+        // Older hosts reject non-lifecycle frames on this channel. Accepting
+        // burst is the host's opt-in to receiving memory-sample frames; legacy
+        // leases must keep their original lifecycle-only stream.
+        if accepted_burst_mib.is_none() {
+            return;
+        }
+        self.samples.lock().unwrap().insert(sample.jti, sample);
+    }
+    #[cfg(any(target_os = "linux", test))]
+    async fn send_samples<W: tokio::io::AsyncWrite + Unpin>(
+        &self,
+        writer: &mut W,
+    ) -> io::Result<()> {
+        let samples = std::mem::take(&mut *self.samples.lock().unwrap());
+        for sample in samples.into_values() {
+            write_frame_async(writer, &Frame::MemorySample(sample)).await?;
+        }
+        Ok(())
     }
     pub(crate) fn observe(&self, job: &Job) -> io::Result<()> {
         let mut guard = self.state.lock().unwrap();
@@ -121,6 +148,8 @@ impl EventLog {
             state.push(TenantEventKind::Terminal, Some(job.id), None);
             state.pending.back_mut().unwrap().mem_peak_mib = job.mem_peak_mib;
             state.pending.back_mut().unwrap().mem_working_peak_mib = job.mem_working_peak_mib.get();
+            state.pending.back_mut().unwrap().mem_over_mib_ms =
+                job.mem_over_mib_ms.as_ref().map(|over| over.get());
             state.pending.back_mut().unwrap().remote_cache_totals = job.remote_cache_totals;
         }
         atomic_json_private(&self.path, &state)?;
@@ -236,32 +265,41 @@ pub async fn serve_tenant(runner: crate::Runner) -> io::Result<()> {
 #[cfg(any(target_os = "linux", test))]
 pub(crate) async fn event_session<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     runner: &crate::Runner,
-    mut socket: S,
+    socket: S,
 ) -> io::Result<()> {
     let log = runner
         .tenant_events()
         .ok_or_else(|| io::Error::other("not a tenant runner"))?;
+    let (mut reader, mut writer) = tokio::io::split(socket);
     // Capture the watermark before any await; newly allocated events are live.
     // This additive control frame leaves the retained event and ack bytes alone.
     let mut boundary = serde_json::to_value(log.replay_boundary()).map_err(io::Error::other)?;
     boundary["type"] = serde_json::json!("event_replay");
     let bytes = serde_json::to_vec(&boundary).map_err(io::Error::other)?;
     use tokio::io::AsyncWriteExt;
-    socket.write_u32(bytes.len() as u32).await?;
-    socket.write_all(&bytes).await?;
-    socket.flush().await?;
+    writer.write_u32(bytes.len() as u32).await?;
+    writer.write_all(&bytes).await?;
+    writer.flush().await?;
     loop {
+        log.send_samples(&mut writer).await?;
         log.idle(runner.tenant_idle())?;
         if let Some(event) = log.first() {
             let seq = event.event_seq;
-            write_frame_async(&mut socket, &Frame::Event(event)).await?;
-            match tokio::time::timeout(
+            write_frame_async(&mut writer, &Frame::Event(event)).await?;
+            let ack = tokio::time::timeout(
                 std::time::Duration::from_secs(60),
-                read_record_async(&mut socket),
-            )
-            .await
-            .map_err(io::Error::other)??
-            {
+                read_record_async(&mut reader),
+            );
+            tokio::pin!(ack);
+            let record = loop {
+                tokio::select! {
+                    result = &mut ack => break result.map_err(io::Error::other)??,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {
+                        log.send_samples(&mut writer).await?;
+                    }
+                }
+            };
+            match record {
                 Some(DecodedFrame::Frame(Frame::Ack { event_seq })) if event_seq == seq => {
                     log.ack(seq)?
                 }
@@ -270,7 +308,7 @@ pub(crate) async fn event_session<S: tokio::io::AsyncRead + tokio::io::AsyncWrit
         } else {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {},
-                _ = read_record_async(&mut socket) => return Err(io::Error::other("unexpected event channel input")),
+                _ = read_record_async(&mut reader) => return Err(io::Error::other("unexpected event channel input")),
             }
         }
     }
@@ -328,6 +366,7 @@ mod tests {
                 setup: None,
                 mem_peak_mib: None,
                 mem_working_peak_mib: None,
+                mem_over_mib_ms: None,
                 remote_cache_totals: None,
             }
         );

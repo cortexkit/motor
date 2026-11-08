@@ -116,6 +116,7 @@ fn event(
         setup: None,
         mem_peak_mib: None,
         mem_working_peak_mib: None,
+        mem_over_mib_ms: None,
         remote_cache_totals: None,
     }
 }

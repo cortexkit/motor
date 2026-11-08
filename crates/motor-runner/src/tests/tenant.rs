@@ -26,6 +26,7 @@ fn lease(id: Uuid, purpose: LeasePurpose) -> VerifiedLease {
         sub: "acct:test".into(),
         vcpus: 2,
         mem_mib: Some(16384),
+        mem_burst_mib: None,
         platform: crate::tenant::host_platform()
             .unwrap_or("unsupported")
             .into(),
@@ -112,16 +113,23 @@ async fn tenant_memory_comes_from_verified_lease_not_caller_run_fields() {
     config.manual_tick = true;
     config.slice_budget_probe = Some(Arc::new(|| Ok((64 << 30, None))));
     let runner = Runner::open(config).unwrap();
-    for stated in [Some(6144), None] {
+    for (stated, burst, expected_limit) in [
+        (Some(6144), None, 6144 << 20),
+        (Some(6144), Some(3072), 9216 << 20),
+        (None, None, 16 << 30),
+        (None, Some(3072), 16 << 30),
+    ] {
         let (mut request, _) = f.run("true");
         request.weight_hint = Some(2);
         request.timeout = Some(30);
         let mut verified = lease(request.job_id, LeasePurpose::Run);
         verified.mem_mib = stated;
+        verified.mem_burst_mib = burst;
         let (mut client, task) = connect(&runner, verified).await;
         let mut caller = serde_json::to_value(Frame::Run(request.clone())).unwrap();
         caller["memory_mib"] = serde_json::json!(1024);
         caller["mem_mib"] = serde_json::json!(1024);
+        caller["mem_burst_mib"] = serde_json::json!(8192);
         let bytes = serde_json::to_vec(&caller).unwrap();
         client
             .write_all(&(bytes.len() as u32).to_be_bytes())
@@ -131,13 +139,48 @@ async fn tenant_memory_comes_from_verified_lease_not_caller_run_fields() {
         assert!(matches!(frame(&mut client).await, Some(Frame::Accepted(_))));
         let job: Job = read_json(&runner.record_path(request.job_id)).unwrap();
         assert_eq!(job.memory_stated_mib, stated);
-        assert_eq!(
-            runner.job_unit_memory_max(&job),
-            stated.map_or(16 << 30, |mib| mib << 20)
-        );
+        assert_eq!(job.memory_burst_mib, burst.filter(|_| stated.is_some()));
+        assert_eq!(runner.job_unit_memory_max(&job), expected_limit);
         drop(client);
         task.await.unwrap().unwrap();
     }
+}
+
+#[test]
+fn burst_job_record_preserves_attribution_and_job_local_limits_on_reopen() {
+    let f = Fixture::new();
+    let runner = open(&f);
+    let (burst_run, _) = f.run("true");
+    let (legacy_run, _) = f.run("true");
+    let burst_id = burst_run.job_id;
+    let legacy_id = legacy_run.job_id;
+    runner
+        .accept_tenant(burst_run, Some(6144), Some(3072))
+        .unwrap();
+    runner.accept_tenant(legacy_run, Some(4096), None).unwrap();
+    let legacy_bytes = fs::read(runner.record_path(legacy_id)).unwrap();
+    let legacy: serde_json::Value = serde_json::from_slice(&legacy_bytes).unwrap();
+    assert!(legacy.get("memory_burst_mib").is_none());
+    assert!(legacy.get("mem_over_mib_ms").is_none());
+    let loaded: Job = serde_json::from_slice(&legacy_bytes).unwrap();
+    assert_eq!(serde_json::to_vec(&loaded).unwrap(), legacy_bytes);
+    let burst: Job = read_json(&runner.record_path(burst_id)).unwrap();
+    assert_eq!(burst.mem_over_mib_ms.as_ref().unwrap().get(), None);
+    assert_eq!(
+        serde_json::to_value(&burst).unwrap()["mem_over_mib_ms"],
+        serde_json::Value::Null
+    );
+    drop(runner);
+
+    let runner = open(&f);
+    let inner = runner.core.inner.lock().unwrap();
+    let burst = inner.jobs.get(&burst_id).unwrap();
+    let legacy = inner.jobs.get(&legacy_id).unwrap();
+    assert_eq!(burst.memory_stated_mib, Some(6144));
+    assert_eq!(burst.memory_burst_mib, Some(3072));
+    assert_eq!(runner.job_unit_memory_max(burst), 9216 << 20);
+    assert_eq!(runner.job_unit_memory_max(legacy), 4096 << 20);
+    assert!(legacy.mem_over_mib_ms.is_none());
 }
 
 #[test]
@@ -813,6 +856,124 @@ async fn tenant_event_replay_boundary_precedes_backlog_and_excludes_later_events
     ));
     drop(client);
     assert!(task.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn tenant_no_burst_job_keeps_event_channel_lifecycle_only() {
+    let f = Fixture::new();
+    let runner = open(&f);
+    let (mut request, _) = f.run("true");
+    request.weight_hint = Some(2);
+    request.timeout = Some(30);
+    let id = request.job_id;
+    let (mut caller, caller_task) = connect(&runner, lease(id, LeasePurpose::Run)).await;
+    motor_protocol::write_frame_async(&mut caller, &Frame::Run(request))
+        .await
+        .unwrap();
+    assert!(matches!(frame(&mut caller).await, Some(Frame::Accepted(_))));
+    let job: Job = read_json(&runner.record_path(id)).unwrap();
+    assert_eq!(job.memory_burst_mib, None);
+    pending(&runner);
+
+    let log = runner.tenant_events().unwrap();
+    log.refused(Uuid::now_v7(), RefusedCause::Disconnect)
+        .unwrap();
+    let first = log.first().unwrap();
+    log.sample(
+        motor_protocol::MemorySample {
+            jti: id,
+            mem_working_peak_mib: Some(123),
+            mem_over_mib_ms: None,
+        },
+        job.memory_burst_mib,
+    );
+    log.refused(Uuid::now_v7(), RefusedCause::Mismatch).unwrap();
+    let (mut client, server) = tokio::io::duplex(4096);
+    let r = runner.clone();
+    let task = tokio::spawn(async move { crate::tenant::event_session(&r, server).await });
+    assert_eq!(frame(&mut client).await, Some(Frame::Event(first.clone())));
+    motor_protocol::write_frame_async(
+        &mut client,
+        &Frame::Ack {
+            event_seq: first.event_seq,
+        },
+    )
+    .await
+    .unwrap();
+    let Some(Frame::Event(second)) = frame(&mut client).await else {
+        panic!("expected the next lifecycle event, not a memory sample")
+    };
+    assert_eq!(second.event_seq, first.event_seq + 1);
+    assert_eq!(second.cause, Some(RefusedCause::Mismatch));
+    motor_protocol::write_frame_async(
+        &mut client,
+        &Frame::Ack {
+            event_seq: second.event_seq,
+        },
+    )
+    .await
+    .unwrap();
+    drop(client);
+    assert!(task.await.unwrap().is_err());
+    drop(caller);
+    caller_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn tenant_memory_samples_flow_during_unacked_lifecycle_and_final_values_survive_reopen() {
+    use motor_protocol::MemorySample;
+    let f = Fixture::new();
+    let runner = open(&f);
+    let log = runner.tenant_events().unwrap();
+    let id = Uuid::now_v7();
+    log.admit(id).unwrap();
+    let (mut client, server) = tokio::io::duplex(4096);
+    let r = runner.clone();
+    let task = tokio::spawn(async move { crate::tenant::event_session(&r, server).await });
+    assert!(matches!(frame(&mut client).await, Some(Frame::Event(_))));
+    for over in [None, Some(Some(0)), Some(Some(500)), Some(None)] {
+        let sample = MemorySample {
+            jti: id,
+            mem_working_peak_mib: Some(3),
+            mem_over_mib_ms: over,
+        };
+        log.sample(sample.clone(), Some(1));
+        assert_eq!(frame(&mut client).await, Some(Frame::MemorySample(sample)));
+    }
+    assert_eq!(
+        log.first().unwrap().event_seq,
+        1,
+        "samples do not advance lifecycle acks"
+    );
+    drop(client);
+    assert!(task.await.unwrap().is_err());
+    let events = pending(&runner);
+    assert_eq!(events[0].event, TenantEventKind::Admitted);
+    assert!(events[1..]
+        .iter()
+        .all(|event| event.event == TenantEventKind::Idle));
+
+    for over in [None, Some(None), Some(Some(0)), Some(Some(500))] {
+        let id = Uuid::now_v7();
+        log.admit(id).unwrap();
+        let admitted = log.first().unwrap();
+        log.ack(admitted.event_seq).unwrap();
+        let mut job = Job::new(id, None, 1, 0, 1);
+        job.mem_working_peak_mib = serde_json::from_value(serde_json::json!(3)).unwrap();
+        if let Some(value) = over {
+            job.memory_burst_mib = Some(1);
+            job.mem_over_mib_ms = Some(serde_json::from_value(serde_json::json!(value)).unwrap());
+        }
+        job.terminal_ended(Outcome::Exit { code: 0 }, 2);
+        let job: Job = serde_json::from_slice(&serde_json::to_vec(&job).unwrap()).unwrap();
+        runner.save(&job).unwrap();
+        let reopened = crate::tenant::EventLog::open(&runner.config().state_dir()).unwrap();
+        let terminal = reopened.first().unwrap();
+        assert_eq!(terminal.event, TenantEventKind::Terminal);
+        assert_eq!(terminal.mem_working_peak_mib, Some(3));
+        assert_eq!(terminal.mem_over_mib_ms, over);
+        log.ack(terminal.event_seq).unwrap();
+    }
 }
 
 #[tokio::test]

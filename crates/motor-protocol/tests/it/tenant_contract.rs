@@ -9,8 +9,75 @@ fn verified_lease_memory_is_optional_for_older_hosts() {
         "platform":"linux-x64", "net":false, "max_s":30, "exp":1800000000
     });
     let frame: Frame = serde_json::from_value(value.clone()).unwrap();
-    assert!(matches!(&frame, Frame::VerifiedLease(lease) if lease.mem_mib.is_none()));
+    assert!(
+        matches!(&frame, Frame::VerifiedLease(lease) if lease.mem_mib.is_none() && lease.mem_burst_mib.is_none())
+    );
     assert_eq!(serde_json::to_value(frame).unwrap(), value);
+}
+
+#[test]
+fn burst_lease_is_additive_for_old_guest_readers() {
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct OldLease {
+        jti: Uuid,
+        purpose: LeasePurpose,
+        sub: String,
+        vcpus: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mem_mib: Option<u64>,
+        platform: String,
+        net: bool,
+        max_s: u64,
+        exp: u64,
+    }
+    let legacy = json!({
+        "type":"verified_lease", "jti":"019e4567-89ab-7cde-8012-3456789abcde",
+        "purpose":"run", "sub":"acct:test", "vcpus":2, "mem_mib":6144,
+        "platform":"linux-x64", "net":false, "max_s":30, "exp":1800000000
+    });
+    for burst in [None, Some(3072)] {
+        let mut value = legacy.clone();
+        if let Some(burst) = burst {
+            value["mem_burst_mib"] = json!(burst);
+        }
+        let Frame::VerifiedLease(lease) = serde_json::from_value::<Frame>(value.clone()).unwrap()
+        else {
+            panic!("expected verified lease")
+        };
+        assert_eq!(lease.mem_mib, Some(6144));
+        assert_eq!(lease.mem_burst_mib, burst);
+        assert_eq!(
+            serde_json::to_value(Frame::VerifiedLease(lease)).unwrap(),
+            value
+        );
+        let old: OldLease = serde_json::from_value(value).unwrap();
+        let mut old_value = serde_json::to_value(old).unwrap();
+        old_value["type"] = json!("verified_lease");
+        assert_eq!(old_value, legacy);
+    }
+}
+
+#[test]
+fn memory_samples_and_terminal_overage_preserve_absent_null_and_zero() {
+    for over in [None, Some(None), Some(Some(0)), Some(Some(1_234_567))] {
+        for kind in ["memory_sample", "event"] {
+            let mut value = json!({"type":kind,"jti":"019e4567-89ab-7cde-8012-3456789abcde","mem_working_peak_mib":7000});
+            if kind == "event" {
+                value["event_seq"] = json!(3);
+                value["event"] = json!("terminal");
+            }
+            if let Some(over) = over {
+                value["mem_over_mib_ms"] = json!(over);
+            }
+            let frame = serde_json::from_value::<Frame>(value.clone()).unwrap();
+            match &frame {
+                Frame::MemorySample(sample) => assert_eq!(sample.mem_over_mib_ms, over),
+                Frame::Event(event) => assert_eq!(event.mem_over_mib_ms, over),
+                _ => panic!("expected sample or terminal event"),
+            }
+            assert_eq!(serde_json::to_value(frame).unwrap(), value);
+        }
+    }
 }
 
 #[test]
@@ -81,6 +148,7 @@ fn pinned_tenant_frames_are_inline_and_integer_only() {
         setup: None,
         mem_peak_mib: None,
         mem_working_peak_mib: None,
+        mem_over_mib_ms: None,
         remote_cache_totals: None,
     });
     assert_eq!(
@@ -95,6 +163,7 @@ fn pinned_tenant_frames_are_inline_and_integer_only() {
         setup: None,
         mem_peak_mib: None,
         mem_working_peak_mib: None,
+        mem_over_mib_ms: None,
         remote_cache_totals: None,
     });
     assert_eq!(

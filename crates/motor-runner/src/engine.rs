@@ -3935,22 +3935,24 @@ impl Runner {
     }
 
     pub(crate) fn accept(&self, request: Run) -> io::Result<Admission> {
-        self.accept_from(request, false, None)
+        self.accept_from(request, false, None, None)
     }
 
     pub(crate) fn accept_for_qualification(&self, request: Run) -> io::Result<Admission> {
-        self.accept_from(request, true, None)
+        self.accept_from(request, true, None, None)
     }
 
     pub(crate) fn accept_tenant(
         &self,
         request: Run,
         memory_mib: Option<u64>,
+        burst_mib: Option<u64>,
     ) -> io::Result<Admission> {
         let memory_mib = memory_mib.filter(|memory| {
             *memory > 0 && self.core.config.tenant_vm && !self.core.config.boat_profile
         });
-        self.accept_from(request, false, memory_mib)
+        let burst_mib = burst_mib.filter(|_| memory_mib.is_some());
+        self.accept_from(request, false, memory_mib, burst_mib)
     }
 
     fn accept_from(
@@ -3958,6 +3960,7 @@ impl Runner {
         mut request: Run,
         qualification: bool,
         memory_mib: Option<u64>,
+        burst_mib: Option<u64>,
     ) -> io::Result<Admission> {
         if self.core.quarantined.contains_key(&request.job_id) {
             return Ok(Admission::Duplicate);
@@ -4036,6 +4039,8 @@ impl Runner {
             },
         );
         job.memory_stated_mib = memory_mib;
+        job.memory_burst_mib = burst_mib;
+        job.mem_over_mib_ms = burst_mib.map(|_| Default::default());
         // If another pressure pass had already chosen this request's workspace
         // for deletion before admission began, the guard could not stop it, so
         // the files may be partly gone. Keep that setup refusal even when the
@@ -8108,7 +8113,7 @@ impl Runner {
         let setup = Setup {
             id,
             cpus,
-            memory_mib: job.memory_stated_mib,
+            memory_mib: job.memory_limit_mib(),
             base: job.base,
             recorded: if snapshot_mode {
                 BTreeMap::new()
@@ -9531,8 +9536,25 @@ impl Runner {
             let inner = self.core.inner.lock().unwrap();
             if let Some(job) = inner.jobs.get(&id) {
                 if let Some(unit) = job.process.and_then(|process| process.unit) {
-                    job.mem_working_peak_mib
-                        .start(&self.core.backend.unit_name(&self.core.config, unit));
+                    let events = self.core.tenant_events.as_ref().map(Arc::downgrade);
+                    let accepted_burst_mib = job.memory_burst_mib;
+                    job.mem_working_peak_mib.start(
+                        &self.core.backend.unit_name(&self.core.config, unit),
+                        job.memory_stated_mib,
+                        job.mem_over_mib_ms.clone(),
+                        move |peak, over| {
+                            if let Some(log) = events.as_ref().and_then(|events| events.upgrade()) {
+                                log.sample(
+                                    motor_protocol::MemorySample {
+                                        jti: id,
+                                        mem_working_peak_mib: peak,
+                                        mem_over_mib_ms: over,
+                                    },
+                                    accepted_burst_mib,
+                                );
+                            }
+                        },
+                    );
                 }
             }
         }
@@ -9591,7 +9613,7 @@ impl Runner {
     /// clamped to the last observed slice ceiling when no cap was supplied.
     fn job_unit_memory_max(&self, job: &Job) -> u64 {
         if self.core.config.tenant_vm && !self.core.config.boat_profile {
-            if let Some(memory) = job.memory_stated_mib {
+            if let Some(memory) = job.memory_limit_mib() {
                 return memory.saturating_mul(1 << 20);
             }
         }
