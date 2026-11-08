@@ -106,7 +106,7 @@ fn which_published(snapshots: &[PathBuf]) -> Vec<bool> {
 /// the cap, a snapshot whose name starts with a referenced commit counts as
 /// referenced whatever its caller commit, and of the unreferenced ones the
 /// cap keeps the most recently used. When all those references end at once,
-/// with no creation after, the next maintenance tick enforces the cap.
+/// with no creation after, the next maintenance pass enforces the cap.
 #[test]
 fn cap_keeps_every_referenced_snapshot_and_the_most_recently_used_others() {
     let f = Fixture::new();
@@ -156,11 +156,13 @@ fn cap_keeps_every_referenced_snapshot_and_the_most_recently_used_others() {
         inner.preparing.clear();
     }
     f.clock.fetch_add(60_000, Ordering::SeqCst);
-    runner.tick().unwrap();
+    // Snapshot eviction runs on the maintenance worker, not the dispatch
+    // tick. Drive its due pass explicitly with this manual-clock runner.
+    runner.maintenance_tick().unwrap();
     assert_eq!(
         which_published(&snapshots),
         [false, false, false, false, false, true, true, true, true, false],
-        "the maintenance tick after the references ended keeps the four most recently used"
+        "the maintenance pass after the references ended keeps the four most recently used"
     );
 }
 

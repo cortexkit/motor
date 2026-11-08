@@ -345,6 +345,9 @@ fn cancel_proceeds_while_maintenance_deletes_an_expired_job() {
 fn deadline_kill_proceeds_while_scheduled_maintenance_is_blocked() {
     let f = LockFixture::with("expired_job_remove", |config| {
         config.manual_tick = true;
+        // This test deliberately starts both production workers after setting
+        // up the fake clock, unlike fixtures that drive maintenance by hand.
+        config.manual_maintenance = false;
         config.disable_warm_builds = true;
     });
     let expired = f.finished(false);
@@ -396,13 +399,14 @@ fn deadline_kill_proceeds_while_scheduled_maintenance_is_blocked() {
 }
 
 #[test]
-fn concurrent_maintenance_passes_skip_instead_of_overlapping() {
+fn concurrent_maintenance_timer_skips_instead_of_overlapping() {
     let f = LockFixture::with("maintenance", |config| config.manual_tick = true);
     f.maintenance_passes.store(0, Ordering::SeqCst);
     f.hold.arm();
     let _release = f.hold_in(|runner| runner.maintenance().unwrap());
+    f.fixture.clock.fetch_add(60_000, Ordering::SeqCst);
     let runner = f.runner.clone();
-    let second = std::thread::spawn(move || runner.maintenance());
+    let second = std::thread::spawn(move || runner.maintenance_tick());
     assert!(
         poll(Duration::from_secs(2), || second.is_finished()),
         "a concurrent maintenance pass queued behind the active pass"
@@ -413,7 +417,37 @@ fn concurrent_maintenance_passes_skip_instead_of_overlapping() {
 }
 
 #[test]
-fn maintenance_and_pressure_cleanup_share_a_nonblocking_claim() {
+fn explicit_maintenance_waits_for_a_busy_claim_and_completes_its_own_pass() {
+    let f = LockFixture::with("maintenance", |config| config.manual_tick = true);
+    f.maintenance_passes.store(0, Ordering::SeqCst);
+    f.hold.arm();
+    let release = f.hold_in(|runner| runner.maintenance().unwrap());
+    let runner = f.runner.clone();
+    let (started, started_rx) = std::sync::mpsc::channel();
+    let (finished, finished_rx) = std::sync::mpsc::channel();
+    let second = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        let result = runner.maintenance();
+        finished.send(()).unwrap();
+        result
+    });
+    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    // A completion signal, not a sleep, distinguishes waiting from silently
+    // skipping the pass while the first caller still owns the cleanup claim.
+    let waiting = matches!(
+        finished_rx.recv_timeout(Duration::from_secs(2)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    );
+    let passes_while_held = f.maintenance_passes.load(Ordering::SeqCst);
+    drop(release);
+    second.join().unwrap().unwrap();
+    assert!(waiting, "explicit maintenance skipped a busy cleanup claim");
+    assert_eq!(passes_while_held, 1, "maintenance passes overlapped");
+    assert_eq!(f.maintenance_passes.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn maintenance_and_pressure_timers_share_a_nonblocking_claim() {
     let probes = Arc::new(AtomicU64::new(0));
     let f = LockFixture::with("maintenance", |config| {
         config.manual_tick = true;
@@ -432,7 +466,8 @@ fn maintenance_and_pressure_cleanup_share_a_nonblocking_claim() {
     drop(held);
     let passes = f.maintenance_passes.load(Ordering::SeqCst);
     let pressure = f.runner.core.maintenance.lock().unwrap();
-    f.runner.maintenance().unwrap();
+    f.fixture.clock.fetch_add(60_000, Ordering::SeqCst);
+    f.runner.maintenance_tick().unwrap();
     assert_eq!(f.maintenance_passes.load(Ordering::SeqCst), passes);
     drop(pressure);
     f.runner.periodic_disk_pressure().unwrap();

@@ -257,6 +257,10 @@ pub struct Config {
     /// be consumed by a concurrent background tick.
     #[cfg(test)]
     pub(crate) manual_tick: bool,
+    /// Let fake-clock fixtures finish maintenance explicitly without racing
+    /// the real-time worker, while still dispatching foreground jobs.
+    #[cfg(test)]
+    pub(crate) manual_maintenance: bool,
     #[cfg(test)]
     pub(crate) writer_unavailable: bool,
     /// Stands in for whether a tenant VM's provisioning holds a write key.
@@ -550,6 +554,8 @@ impl Config {
             disable_warm_builds: false,
             #[cfg(test)]
             manual_tick: false,
+            #[cfg(test)]
+            manual_maintenance: false,
             #[cfg(test)]
             writer_unavailable: false,
             #[cfg(test)]
@@ -2904,7 +2910,11 @@ impl Runner {
         Ok(runner)
     }
 
-    fn start_background_scheduler(&self) {
+    fn start_background_maintenance(&self) {
+        #[cfg(test)]
+        if self.core.config.manual_maintenance {
+            return;
+        }
         let weak = Arc::downgrade(&self.core);
         std::thread::spawn(move || {
             let interval = Duration::from_secs(1);
@@ -2926,6 +2936,10 @@ impl Runner {
                 }
             }
         });
+    }
+
+    fn start_background_scheduler(&self) {
+        self.start_background_maintenance();
         let weak = Arc::downgrade(&self.core);
         std::thread::spawn(move || loop {
             let Some(core) = weak.upgrade() else {
@@ -2962,7 +2976,12 @@ impl Runner {
                 "longest state lock hold since the previous report"
             );
         }
-        let result = self.maintenance();
+        // Only timers may skip a busy cleanup claim. Explicit callers, such
+        // as startup, require a completed pass before proceeding.
+        let result = match self.core.maintenance.try_lock() {
+            Ok(_cleanup) => self.maintenance_pass(),
+            Err(_) => Ok(()),
+        };
         self.core.inner.lock().unwrap().maintained_ms = self.now();
         result
     }
@@ -6814,12 +6833,15 @@ impl Runner {
 
     /// Also exposed to fake-clock tests; retention is relative to both terminal
     /// time and mint time, so recent unknown IDs can never rerun an expired job.
+    /// Waits for active cleanup, then completes a pass before returning.
     pub fn maintenance(&self) -> io::Result<()> {
-        // The pressure timer uses the same claim. Never wait or queue a second
-        // cleanup pass behind one already working on a slow disk.
-        let Ok(_cleanup) = self.core.maintenance.try_lock() else {
-            return Ok(());
-        };
+        let _cleanup = self.core.maintenance.lock().unwrap();
+        self.maintenance_pass()
+    }
+
+    /// Run with the shared cleanup claim held, whether acquired by an explicit
+    /// caller or by a timer that skips when cleanup is already in progress.
+    fn maintenance_pass(&self) -> io::Result<()> {
         let mut timings = MaintenanceTimings::new();
         self.long_work("maintenance");
         // Outside the state lock, which maintenance later takes.

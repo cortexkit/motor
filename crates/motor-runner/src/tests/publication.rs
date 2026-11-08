@@ -473,6 +473,9 @@ async fn reuse_requires_a_young_publication_without_a_later_marker() {
     settle(&f, &runner, &job).await;
     f.clock.fetch_add(14 * DAY, Ordering::SeqCst);
     submit_reader(&f, &runner).await;
+    // History expiry runs off dispatch; finish that pass before counting
+    // only the newly queued fill rather than retained terminal fills too.
+    runner.maintenance().unwrap();
     assert_eq!(
         count_fills(&runner),
         1,
@@ -524,6 +527,9 @@ async fn the_timer_republishes_without_jobs_across_periods_restart_and_empty_pre
         f.clock.fetch_add(14 * DAY, Ordering::SeqCst);
         if attempt < 3 {
             runner.tick().unwrap();
+            // The timer queues the refresh independently of history cleanup.
+            // Complete cleanup before asserting the number of retained jobs.
+            runner.maintenance().unwrap();
             assert_eq!(
                 count_fills(&runner),
                 1,
@@ -609,6 +615,9 @@ async fn three_failed_build_retries_hold_a_published_descriptor_until_restart() 
     for _ in 0..4 {
         runner.tick().unwrap();
     }
+    // The maintenance worker, not dispatch, expires the original success.
+    // Complete its pass so the count below contains only failed retries.
+    runner.maintenance().unwrap();
     // The original success expired from the 24-hour job log, but the three
     // failed retries remain: no fourth failed build was started.
     assert_eq!(count_fills(&runner), 3);
@@ -731,6 +740,9 @@ async fn an_initial_build_failure_keeps_the_legacy_hold() {
     settle(&f, &runner, &job).await;
     f.clock.fetch_add(20 * DAY, Ordering::SeqCst);
     submit_reader(&f, &runner).await;
+    // Expire the old failed job explicitly: dispatch no longer performs
+    // history cleanup before checking the persistent failed-descriptor hold.
+    runner.maintenance().unwrap();
     assert_eq!(count_fills(&runner), 0);
     assert_eq!(
         repository(&f, &runner).failed_descriptor,
@@ -1014,6 +1026,9 @@ async fn the_gate_waits_for_the_write_breaker_window_but_allows_its_probe_fill()
     assert!(runner.publishing_policy().write_breaker_open);
     f.clock.fetch_add(14 * DAY, Ordering::SeqCst);
     runner.tick().unwrap();
+    // Complete off-thread history expiry so an old terminal fill cannot be
+    // mistaken for a newly queued breaker probe by the job count below.
+    runner.maintenance().unwrap();
     assert_eq!(count_fills(&runner), 0, "open breaker queued a fill");
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(61)).await;

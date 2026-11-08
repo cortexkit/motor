@@ -321,6 +321,9 @@ impl Fixture {
         c.base_commands = vec!["printf warm > \"$CARGO_TARGET_DIR/artifact\"".into()];
         let clock = self.clock.clone();
         c.clock = Arc::new(move || clock.load(Ordering::SeqCst));
+        // Drive maintenance explicitly at fake-time boundaries; the real-time
+        // worker must not consume observations while a test advances its clock.
+        c.manual_maintenance = true;
         c
     }
     fn bundle(&self, source: &Path, repository: &str, index: u32) -> (BundleManifest, Vec<u8>) {
