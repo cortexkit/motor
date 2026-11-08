@@ -822,7 +822,15 @@ pub(crate) fn bundle_prerequisites(path: &Path) -> io::Result<Vec<String>> {
     // A header lists every ref and prerequisite; a megabyte is far more than
     // any real bundle needs, and the bound keeps a corrupt file from being
     // read whole.
-    let mut reader = io::BufReader::new(fs::File::open(path)?).take(1 << 20);
+    // Name the file: this runs before git sees the bundle, so a missing or
+    // unreadable upload would otherwise be refused with a bare OS error.
+    let file = fs::File::open(path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("could not open bundle {}: {e}", path.display()),
+        )
+    })?;
+    let mut reader = io::BufReader::new(file).take(1 << 20);
     let mut prerequisites = Vec::new();
     let mut line = Vec::new();
     loop {
