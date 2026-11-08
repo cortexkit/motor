@@ -50,14 +50,15 @@ fn validations() -> &'static Mutex<BTreeMap<PathBuf, Validation>> {
 /// The daemon and its snapshot helpers create cache entries as the daemon UID.
 /// Validate old entries once, without blocking readiness or holding runner state.
 /// Later job setup only checks the identity of the append-only archive root.
-pub(in crate::isolation) fn start(home: &Path) {
+pub(in crate::isolation) fn start(roots: Vec<PathBuf>) {
     let mut pending = Vec::new();
     {
         let mut validated = validations().lock().unwrap();
-        let path = home.join("registry/cache");
-        if !validated.contains_key(&path) {
-            validated.insert(path.clone(), Validation::Pending);
-            pending.push(path);
+        for path in roots {
+            if !validated.contains_key(&path) {
+                validated.insert(path.clone(), Validation::Pending);
+                pending.push(path);
+            }
         }
     }
     if pending.is_empty() {

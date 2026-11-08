@@ -167,6 +167,32 @@ pub(super) struct DiskLayout {
 }
 
 impl DiskLayout {
+    pub(super) fn initialize_job_history(&self, boot_marker: &Path) -> io::Result<()> {
+        match fs::symlink_metadata(boot_marker) {
+            Ok(metadata) => {
+                if !metadata.is_file()
+                    || metadata.uid() != self.runner.owner
+                    || metadata.mode() & 0o022 != 0
+                {
+                    return Err(unsafe_path(boot_marker, "expected an owned boot marker"));
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.clear_execution_history()?;
+        // The marker lives on /run, not the workspace disk. It is created before
+        // starting a runner, so a restart in this boot cannot erase a live job.
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(boot_marker)?
+            .sync_all()
+    }
+
     // Execution pages and returned-file collections are both below jobs/.
     // Keep the catalog, mirror refs and retirement records beside them intact.
     fn execution_history(&self) -> [PathBuf; 2] {
@@ -440,5 +466,29 @@ mod job_layout_tests {
         .unwrap();
         layout.clear_execution_history().unwrap();
         assert_eq!(fs::read(kept.join("page")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn second_initialization_in_one_boot_keeps_job_records() {
+        let (scratch, root) = tenant_root("motor-job-boot-history");
+        let layout = prepare_disk_layout(&root, uid()).unwrap();
+        let marker = scratch.join("boot-marker");
+        let jobs = layout.runner.path().join("jobs");
+        fs::create_dir(&jobs).unwrap();
+        fs::write(jobs.join("old-record"), b"previous boot").unwrap();
+        layout.initialize_job_history(&marker).unwrap();
+        assert!(!jobs.exists());
+        fs::create_dir(&jobs).unwrap();
+        let record = jobs.join("record.json");
+        fs::write(&record, b"this boot's execution").unwrap();
+        drop(layout);
+        let restarted = prepare_disk_layout(&root, uid()).unwrap();
+        restarted.initialize_job_history(&marker).unwrap();
+        assert_eq!(fs::read(&record).unwrap(), b"this boot's execution");
+        fs::remove_file(marker).unwrap();
+        restarted
+            .initialize_job_history(&scratch.join("boot-marker"))
+            .unwrap();
+        assert!(!jobs.exists());
     }
 }

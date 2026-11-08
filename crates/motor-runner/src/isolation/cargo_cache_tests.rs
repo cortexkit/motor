@@ -293,22 +293,87 @@ fn overlay_backing_path_is_reserved_for_tenant_network_jobs() {
 #[test]
 #[ignore = "operator only: non-root account with sudo -n, provisioned motor_net and trusted host isolation"]
 fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
+    net_fetches_missing_crate_without_writing_shared_cache(false);
+}
+
+#[test]
+#[ignore = "operator only: non-root account with sudo -n, provisioned motor_net and trusted host isolation"]
+fn isolated_job_vm_net_uses_physical_source_layers_without_copying_image() {
+    net_fetches_missing_crate_without_writing_shared_cache(true);
+}
+
+struct SourceMounts(Vec<PathBuf>);
+impl Drop for SourceMounts {
+    fn drop(&mut self) {
+        for target in self.0.iter().rev() {
+            let status = crate::privilege::command("/usr/bin/umount")
+                .arg(target)
+                .status();
+            assert!(
+                status.is_ok_and(|status| status.success()),
+                "unmount Cargo source fixture: {}",
+                target.display()
+            );
+        }
+    }
+}
+
+fn net_fetches_missing_crate_without_writing_shared_cache(per_job: bool) {
     print_kernel();
     let _guard = net_operator_lock();
     let f = Fixture::new();
     let shared = f.scratch.join("shared-cargo");
+    let image = per_job.then(|| f.scratch.join("image-cargo"));
+    let source = image.as_deref().unwrap_or(&shared);
     for name in ["registry/index/seed", "registry/cache/seed", "git/db/seed"] {
-        let directory = shared.join(name);
+        let directory = source.join(name);
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("canary"), "shared\n").unwrap();
         fs::set_permissions(directory.join("canary"), fs::Permissions::from_mode(0o444)).unwrap();
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(
+            &directory,
+            fs::Permissions::from_mode(if per_job { 0o755 } else { 0o555 }),
+        )
+        .unwrap();
     }
     for name in ["registry", "git"] {
         // Production defaults name both reader accounts. Exercise ACL copy-up
         // as well as file data, and leave the shared ACLs untouched.
-        grant_read_only_tree_as(&shared.join(name), true, USER).unwrap();
-        grant_read_only_tree_as(&shared.join(name), true, WRITER_USER).unwrap();
+        grant_read_only_tree_as(&source.join(name), true, USER).unwrap();
+        grant_read_only_tree_as(&source.join(name), true, WRITER_USER).unwrap();
+    }
+    let image_before = image.as_ref().map(|image| CacheSnapshot::capture(image));
+    let mut mounts = SourceMounts(Vec::new());
+    if let Some(image) = &image {
+        for layer in cargo_sources::layers(&shared, image) {
+            for path in [&layer.upper, &layer.work, &layer.target] {
+                fs::create_dir_all(path).unwrap();
+            }
+            fs::create_dir(layer.upper.join("cache")).unwrap();
+            grant_read_only_tree_as(&layer.upper, true, USER).unwrap();
+            checked(
+                crate::privilege::command("/usr/bin/mount")
+                    .args(["-t", "overlay", "-o", &layer.options(), "overlay"])
+                    .arg(&layer.target),
+            )
+            .unwrap();
+            mounts.0.push(layer.target);
+        }
+        fs::write(
+            shared.join("registry/cache/seed/workspace-only"),
+            b"workspace",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(
+                shared
+                    .with_file_name("cargo-source-layers")
+                    .join("registry/upper/cache/seed/workspace-only")
+            )
+            .unwrap(),
+            b"workspace"
+        );
+        assert!(!image.join("registry/cache/seed/workspace-only").exists());
     }
     fs::write(
         f.workspace.join("cargo-network-probe.py"),
@@ -316,8 +381,10 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
     )
     .unwrap();
     let offline_before = CacheSnapshot::capture(&shared);
-    cargo_overlay::ownership::validate(&shared.join("registry/cache"));
-    cargo_overlay::ownership::validated_owner(&shared.join("registry/cache")).unwrap();
+    for lower in cargo_sources::archive_lowers(&shared, image.as_deref()) {
+        cargo_overlay::ownership::validate(&lower);
+        cargo_overlay::ownership::validated_owner(&lower).unwrap();
+    }
 
     // An offline job still reads the shared trees and cannot write to them.
     let mut offline = f.sandbox().in_tenant_vm(true);
@@ -331,7 +398,10 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
     drop(offline);
     offline_before.assert_unchanged(&shared);
 
-    let mut sandbox = f.sandbox().in_tenant_vm(true);
+    let mut sandbox = f
+        .sandbox()
+        .in_tenant_vm(true)
+        .with_cargo_image(image.clone());
     shared_cache(&mut sandbox, &shared);
     let mut sandbox = host_inputs::fixture::with(
         host_inputs::fixture::Inputs {
@@ -348,9 +418,12 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
     let runtime = sandbox.runtime.0.clone();
     no_seeded_files(&sandbox);
     let overlays = sandbox.cargo_overlays.take();
-    let mut launch = sandbox
-        .launch("python3 cargo-network-probe.py", &f.workspace, &[])
-        .unwrap();
+    let command = if per_job {
+        "test \"$(cat \"$CARGO_HOME/registry/cache/seed/workspace-only\")\" = workspace && python3 cargo-network-probe.py"
+    } else {
+        "python3 cargo-network-probe.py"
+    };
+    let mut launch = sandbox.launch(command, &f.workspace, &[]).unwrap();
     if let Some(overlays) = overlays {
         let decoy_fixture = Fixture::new();
         let decoy = decoy_fixture.sandbox().in_tenant_vm(true);
@@ -396,6 +469,10 @@ fn isolated_tenant_net_fetches_missing_crate_without_writing_shared_cache() {
         "private Cargo cache survived job cleanup"
     );
     before.assert_unchanged(&shared);
+    if let Some(image) = &image {
+        image_before.as_ref().unwrap().assert_unchanged(image);
+    }
+    drop(mounts);
 }
 
 #[test]

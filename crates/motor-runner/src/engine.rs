@@ -1987,14 +1987,21 @@ fn prepare_job_shared_roots(config: &Config) -> io::Result<()> {
             bun_bin.as_deref(),
         );
     }
-    crate::isolation::prepare_shared_read_access(&crate::isolation::JavascriptTools::for_config(
-        config,
-    ))?;
+    let javascript = crate::isolation::JavascriptTools::for_config(config);
+    if config.per_job {
+        crate::isolation::prepare_job_vm_read_access(&javascript)?;
+    } else {
+        crate::isolation::prepare_shared_read_access(&javascript)?;
+    }
     if config.tenant_vm && !config.boat_profile && config.job_network.is_some() {
         // The scan runs independently of readiness and never takes runner state.
         // Offline jobs need no ownership invariant; pending or unsafe cache
         // ownership refuses only jobs that request writable Cargo overlays.
-        crate::isolation::cargo_overlay::start_validation();
+        crate::isolation::cargo_overlay::start_validation(
+            config
+                .per_job
+                .then(|| Path::new(crate::isolation::cargo_sources::IMAGE_CARGO)),
+        );
     }
     Ok(())
 }

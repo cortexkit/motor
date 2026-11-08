@@ -49,7 +49,7 @@ pub(super) fn enabled() -> io::Result<bool> {
 }
 
 fn dax_mount(mountinfo: &str) -> io::Result<String> {
-    for line in mountinfo.lines() {
+    for line in mountinfo.lines().rev() {
         let Some((mount, filesystem)) = line.split_once(" - ") else {
             continue;
         };
@@ -153,21 +153,39 @@ pub(super) fn mount_workspace() -> io::Result<()> {
     workspace_steps(kind.as_deref().map(str::trim), command)
 }
 
-pub(super) fn seed_sources(image_cargo: &Path) -> io::Result<()> {
-    // Shared sources stay writable on the workspace disk, just as in a tenant
-    // VM. Never bind a writable cache over the immutable toolchain image.
-    for name in ["registry", "git"] {
-        let source = image_cargo.join(name);
-        if source.exists() {
-            let status = Command::new("cp")
-                .args(["-a", "--no-clobber"])
-                .arg(source.join("."))
-                .arg(Path::new("/tenant/cargo-home").join(name))
-                .status()?;
-            if !status.success() {
-                return Err(io::Error::other("copy toolchain Cargo sources failed"));
-            }
+pub(super) fn mount_sources(image_cargo: &Path) -> io::Result<()> {
+    use crate::isolation::cargo_sources;
+    if image_cargo != Path::new(cargo_sources::IMAGE_CARGO) {
+        return Err(io::Error::other(
+            "job image CARGO_HOME does not match the immutable source layout",
+        ));
+    }
+    let home = paths::Directory::absolute(Path::new("/tenant/cargo-home"), 0)?;
+    let backing = paths::Directory::absolute(Path::new("/tenant"), 0)?
+        .create("cargo-source-layers", 0o700)?;
+    for layer in cargo_sources::layers(home.path(), image_cargo) {
+        if super::snapshot::mounted(layer.target.to_str().unwrap())? {
+            continue;
         }
+        paths::Directory::absolute(&layer.lower, 0)?;
+        let name = layer.target.file_name().unwrap().to_str().unwrap();
+        let root = backing.create(name, 0o700)?;
+        let upper = root.create("upper", 0o755)?;
+        root.create("work", 0o700)?;
+        if name == "registry" {
+            upper.create("cache", 0o755)?;
+        }
+        command(
+            "mount",
+            &[
+                "-t",
+                "overlay",
+                "-o",
+                &layer.options(),
+                "overlay",
+                layer.target.to_str().unwrap(),
+            ],
+        )?;
     }
     Ok(())
 }
@@ -177,6 +195,13 @@ mod tests {
     use super::*;
 
     const DAX: &str = "44 25 259:0 / /toolchain ro,relatime - ext4 /dev/pmem0 ro,dax=always";
+
+    #[test]
+    fn dax_validation_uses_the_visible_stacked_mount() {
+        let hidden = DAX.replace(",dax=always", "");
+        assert!(dax_mount(&format!("{DAX}\n{hidden}\n")).is_err());
+        assert_eq!(dax_mount(&format!("{hidden}\n{DAX}\n")).unwrap(), "259:0");
+    }
 
     #[test]
     fn daxless_boot_refuses_before_workspace_mount_or_account_input() {

@@ -745,7 +745,7 @@ fn initialize_tenant(request: TenantAgentRequest, started: Instant) -> io::Resul
     }
     let layout = paths::prepare_disk_layout(Path::new("/tenant"), 0)?;
     if per_job {
-        layout.clear_execution_history()?;
+        layout.initialize_job_history(Path::new("/run/motor-job-state-initialized"))?;
     }
     layout.runner.remove_stale_socket("runner.sock")?;
     let args = match job_args {
@@ -763,7 +763,7 @@ fn initialize_tenant(request: TenantAgentRequest, started: Instant) -> io::Resul
     }
     let tool_bin = image_cargo.join("bin");
     if per_job {
-        per_job::seed_sources(&image_cargo)?;
+        per_job::mount_sources(&image_cargo)?;
     }
     paths::Directory::absolute(&tool_bin, 0)?.bind(&layout.cargo_bin, true)?;
     let mut bound_roots = Vec::new();

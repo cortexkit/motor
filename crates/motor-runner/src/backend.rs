@@ -988,6 +988,9 @@ impl Backend for HostBackend {
                         sandbox
                             .retaining_failed_units()
                             .in_tenant_vm(config.tenant_vm)
+                            .with_cargo_image(config.per_job.then(|| {
+                                PathBuf::from(crate::isolation::cargo_sources::IMAGE_CARGO)
+                            }))
                             .with_boat_profile(
                                 config.boat_profile,
                                 config.private_pids,
