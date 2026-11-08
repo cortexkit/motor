@@ -466,25 +466,39 @@ fn directory_entries(fd: &OwnedFd) -> io::Result<fs::ReadDir> {
 const MAX_STAGING_DEPTH: usize = 128;
 
 fn mount_id(fd: &OwnedFd) -> io::Result<u64> {
-    let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+    // The libc crate has no statx binding for musl, and the static runner is a
+    // musl build, so call the syscall directly. The buffer and offsets follow
+    // the kernel ABI in include/uapi/linux/stat.h: a 256-byte `struct statx`
+    // with `stx_mask` at offset 0 and `stx_mnt_id` at offset 144.
+    const STATX_MNT_ID: u32 = 0x1000;
+    const MASK_OFFSET: usize = 0;
+    const MNT_ID_OFFSET: usize = 144;
+    #[repr(C, align(8))]
+    struct Statx([u8; 256]);
+    let mut stat = Statx([0; 256]);
     if unsafe {
-        libc::statx(
+        libc::syscall(
+            libc::SYS_statx,
             fd.as_raw_fd(),
             c"".as_ptr(),
             libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-            libc::STATX_MNT_ID,
-            &mut stat,
+            STATX_MNT_ID,
+            stat.0.as_mut_ptr(),
         )
     } != 0
     {
         return Err(io::Error::last_os_error());
     }
-    if stat.stx_mask & libc::STATX_MNT_ID == 0 {
+    let field = |offset: usize, len: usize| &stat.0[offset..offset + len];
+    let mask = u32::from_ne_bytes(field(MASK_OFFSET, 4).try_into().expect("4 bytes"));
+    if mask & STATX_MNT_ID == 0 {
         return Err(io::Error::other(
             "staging walk requires statx mount identity",
         ));
     }
-    Ok(stat.stx_mnt_id)
+    Ok(u64::from_ne_bytes(
+        field(MNT_ID_OFFSET, 8).try_into().expect("8 bytes"),
+    ))
 }
 
 struct StagingWalk {

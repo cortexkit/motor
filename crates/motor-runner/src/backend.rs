@@ -127,6 +127,7 @@ pub(crate) struct EnvironmentInputs<'a> {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub host_cwd: &'a Path,
     pub target: &'a Path,
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub wrapper: Option<&'a Path>,
     #[cfg(unix)]
     pub remote: Option<(

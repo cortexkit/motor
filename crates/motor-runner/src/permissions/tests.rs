@@ -930,3 +930,22 @@ fn operator_staging_security_rejects_malformed_fixed_helper_forms() {
         }
     }
 }
+
+#[test]
+fn mount_id_matches_the_kernels_fdinfo_mount_id() {
+    // mount_id reads raw statx bytes at fixed offsets; /proc's fdinfo reports
+    // the same mount id, so a wrong offset or mask shows up here on any libc.
+    let scratch = ScratchDir::new("mount-id");
+    for path in [Path::new("/"), scratch.path(), Path::new("/proc")] {
+        let fd: OwnedFd = fs::File::open(path).unwrap().into();
+        let fdinfo = fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).unwrap();
+        let expected: u64 = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("mnt_id:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(mount_id(&fd).unwrap(), expected, "{}", path.display());
+    }
+}

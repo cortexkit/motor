@@ -194,7 +194,8 @@ pub(super) fn install() -> io::Result<()> {
     let directory = std::ffi::CString::new("/run/motor").unwrap();
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(directory.as_ptr(), &mut stat) } != 0
-        || stat.f_type != libc::TMPFS_MAGIC
+        // f_type is signed on glibc and unsigned on musl; compare as u64.
+        || stat.f_type as u64 != libc::TMPFS_MAGIC as u64
     {
         return Err(io::Error::other("remote_cache_requires_tmpfs"));
     }
