@@ -2,7 +2,7 @@
 use super::{cgroup, fs, process, tenant};
 use crate::{
     config::{Config, JobVms},
-    job::{self, Operation, Start, Workspace},
+    job::{self, ExitReport, Operation, Start, Workspace},
     Error, Peer, Reply, Response, Result,
 };
 use serde::{Deserialize, Serialize};
@@ -19,13 +19,15 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 const JOB_OOM_SCORE: i32 = 1000;
+const TOMBSTONE_RETENTION: Duration = Duration::from_secs(48 * 60 * 60);
+const TOMBSTONE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+// Rollbacks must be able to read records written by a newer helper.
 struct Record {
     start: Start,
     uid: u32,
@@ -33,6 +35,31 @@ struct Record {
     disk_inode: u64,
     released: bool,
     oom_kill: Option<u64>,
+    #[serde(default)]
+    exit_acknowledged: bool,
+}
+
+impl Record {
+    fn is_tombstone(&self) -> bool {
+        self.released && self.exit_acknowledged
+    }
+
+    fn pending_exit(&self) -> Option<ExitReport> {
+        self.oom_kill
+            .filter(|_| !self.exit_acknowledged)
+            .map(|oom_kill| ExitReport {
+                job_id: self.start.job_id.clone(),
+                oom_kill,
+            })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitStep {
+    Captured,
+    Recorded,
+    Removed,
+    Delivery,
 }
 
 pub struct LinuxJobs {
@@ -42,6 +69,11 @@ pub struct LinuxJobs {
     jail: PathBuf,
     records: BTreeMap<String, Record>,
     children: BTreeMap<String, Child>,
+    next_prune: Option<SystemTime>,
+    #[cfg(test)]
+    exit_fault: Option<ExitStep>,
+    #[cfg(test)]
+    remove_test_group: Option<fn(&Path) -> std::io::Result<()>>,
 }
 
 impl LinuxJobs {
@@ -53,6 +85,11 @@ impl LinuxJobs {
             jail: Path::new(super::BUILD_ROOT).join("jail/jobs"),
             records: BTreeMap::new(),
             children: BTreeMap::new(),
+            next_prune: None,
+            #[cfg(test)]
+            exit_fault: None,
+            #[cfg(test)]
+            remove_test_group: None,
         }
     }
 
@@ -102,15 +139,18 @@ impl LinuxJobs {
             }
             self.adopt_record(record)?;
         }
-        Ok(())
+        self.maintain()
     }
 
     fn adopt_record(&mut self, record: Record) -> Result<()> {
         // A trusted, fresh cgroup identifies the process even if the helper
         // died between spawning jailer and recording its pid. Never signal a
         // stale saved pid or move an unrelated process into this group.
-        if !record.released {
-            self.pid(&record)?;
+        if !record.released && self.pid(&record)?.is_some() && record.oom_kill.is_some() {
+            return Err(Error("exited job record has a running VMM".into()));
+        }
+        if record.exit_acknowledged && record.oom_kill.is_none() {
+            return Err(Error("job acknowledgement has no exit evidence".into()));
         }
         self.records.insert(record.start.job_id.clone(), record);
         Ok(())
@@ -149,15 +189,148 @@ impl LinuxJobs {
     }
 
     fn reap(&mut self) -> Result<()> {
-        for child in self.children.values_mut() {
-            child.try_wait()?;
+        let mut ended = Vec::new();
+        for (id, child) in &mut self.children {
+            if child.try_wait()?.is_some() {
+                ended.push(id.clone());
+            }
+        }
+        for id in ended {
+            self.children.remove(&id);
         }
         Ok(())
     }
 
+    pub fn collect_exits(&mut self) -> Result<()> {
+        self.reap()?;
+        let ids: Vec<_> = self
+            .records
+            .values()
+            .filter(|record| !record.is_tombstone())
+            .map(|record| record.start.job_id.clone())
+            .collect();
+        let mut result = Ok(());
+        for id in ids {
+            if let Err(error) = self.collect_exit(&id) {
+                eprintln!("job {id} exit evidence: {error}");
+                result = Err(error);
+            }
+        }
+        result
+    }
+
+    pub fn maintain(&mut self) -> Result<()> {
+        self.maintain_at(SystemTime::now())
+    }
+
+    fn maintain_at(&mut self, now: SystemTime) -> Result<()> {
+        let collection = self.collect_exits();
+        // Maintenance runs every 100 ms. Retention needs only a minute's
+        // cadence, not a metadata lookup per tombstone on every tick.
+        let pruning = if self.next_prune.is_none_or(|deadline| now >= deadline) {
+            self.prune_records(now).map(|()| {
+                self.next_prune = now.checked_add(TOMBSTONE_PRUNE_INTERVAL);
+            })
+        } else {
+            Ok(())
+        };
+        collection.and(pruning)
+    }
+
+    fn prune_records(&mut self, now: SystemTime) -> Result<()> {
+        let ids: Vec<_> = self
+            .records
+            .values()
+            .filter(|record| record.is_tombstone())
+            .map(|record| record.start.job_id.clone())
+            .collect();
+        for id in ids {
+            let path = self.records_path.join(format!("{id}.json"));
+            // Atomic rewrites refresh mtime, so the full replay window begins
+            // only after both release and acknowledgement have been recorded.
+            let modified = std::fs::metadata(&path)?.modified()?;
+            if now
+                .duration_since(modified)
+                .is_ok_and(|age| age >= TOMBSTONE_RETENTION)
+            {
+                std::fs::remove_file(&path)?;
+                File::open(&self.records_path)?.sync_all()?;
+                self.records.remove(&id);
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_exit(&mut self, id: &str) -> Result<()> {
+        let group = self.group(id);
+        if !group.try_exists()? {
+            // A reboot can erase cgroups. No count is better than an invented 0.
+            return Ok(());
+        }
+        if !std::fs::read_to_string(group.join("cgroup.procs"))?
+            .trim()
+            .is_empty()
+        {
+            return Ok(());
+        }
+        let mut record = self.records.get(id).unwrap().clone();
+        if record.oom_kill.is_none() {
+            record.oom_kill = Some(read_oom_kill(&group)?);
+            self.exit_checkpoint(ExitStep::Captured)?;
+            self.save(&record)?;
+            self.records.insert(id.into(), record);
+            self.exit_checkpoint(ExitStep::Recorded)?;
+        }
+        self.remove_empty_group(&group)?;
+        self.exit_checkpoint(ExitStep::Removed)
+    }
+
+    fn remove_empty_group(&self, group: &Path) -> Result<()> {
+        // Unit fixtures model cgroup control files with ordinary files. Only
+        // deletion is replaced; emptiness and evidence checks run unchanged.
+        #[cfg(test)]
+        if let Some(remove) = self.remove_test_group {
+            return Ok(remove(group)?);
+        }
+        Ok(std::fs::remove_dir(group)?)
+    }
+
+    fn exit_checkpoint(&mut self, step: ExitStep) -> Result<()> {
+        #[cfg(test)]
+        if self.exit_fault == Some(step) {
+            self.exit_fault = None;
+            return Err(Error(format!("injected exit fault at {step:?}")));
+        }
+        let _ = step;
+        Ok(())
+    }
+
+    fn acknowledge_exit(&mut self, report: ExitReport) -> Result<Response> {
+        let mut record = self
+            .records
+            .get(&report.job_id)
+            .cloned()
+            .ok_or_else(|| Error("unknown job VM".into()))?;
+        if record.oom_kill != Some(report.oom_kill) {
+            return Err(Error(
+                "job exit count does not match durable evidence".into(),
+            ));
+        }
+        if !record.exit_acknowledged {
+            record.exit_acknowledged = true;
+            self.save(&record)?;
+            self.records.insert(report.job_id, record);
+        }
+        Ok(Response::new(Reply::Ok))
+    }
+
     pub fn handle(&mut self, op: Operation, peer: Peer) -> Result<Response> {
         op.validate()?;
-        self.reap()?;
+        // Invalid acknowledgements must not change any evidence or cgroups.
+        if let Operation::AckExit(report) = op {
+            return self.acknowledge_exit(report);
+        }
+        self.collect_exits()?;
         match op {
             Operation::Start(start) => self.start(start, peer),
             Operation::Adopt(id) => self.status(&id),
@@ -178,6 +351,16 @@ impl LinuxJobs {
                     fds: vec![tenant::connect_relay(&self.root(&id), port)?],
                 })
             }
+            Operation::Exits => {
+                let exits = self
+                    .records
+                    .values()
+                    .filter_map(Record::pending_exit)
+                    .collect();
+                self.exit_checkpoint(ExitStep::Delivery)?;
+                Ok(Response::new(Reply::JobExits { exits }))
+            }
+            Operation::AckExit(_) => unreachable!(),
         }
     }
 
@@ -190,6 +373,7 @@ impl LinuxJobs {
         Ok(Response::new(Reply::Job {
             running: pid.is_some(),
             vmm_pid: pid,
+            exit_report: record.pending_exit(),
         }))
     }
 
@@ -318,6 +502,7 @@ impl LinuxJobs {
             disk_inode: meta.ino(),
             released: false,
             oom_kill: None,
+            exit_acknowledged: false,
         };
         // The intent is durable before any jail or VMM can open the disk. A
         // crash in setup keeps it reserved until explicit stop has cleaned up.
@@ -387,7 +572,7 @@ impl LinuxJobs {
     }
 
     fn stop(&mut self, id: &str) -> Result<()> {
-        let mut record = self
+        let record = self
             .records
             .get(id)
             .cloned()
@@ -402,11 +587,9 @@ impl LinuxJobs {
                 child.wait()?;
             }
             tenant::wait_empty(&group)?;
-            // Keep final OOM evidence durable before removing its cgroup.
-            record.oom_kill = Some(read_oom_kill(&group)?);
-            self.save(&record)?;
-            self.records.insert(id.into(), record.clone());
         }
+        self.collect_exit(id)?;
+        let mut record = self.records.get(id).unwrap().clone();
         tenant::cleanup_boundary(&self.boundary(id))?;
         let disk_path = Path::new(job::WORKSPACES)
             .join(&record.start.workspace_disk_id)
@@ -414,9 +597,6 @@ impl LinuxJobs {
         let disk = open_owned_disk(&disk_path, &record)?;
         disk.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         fs::chown(&disk, 0)?;
-        if group.try_exists()? {
-            std::fs::remove_dir(&group)?;
-        }
         record.released = true;
         self.save(&record)?;
         self.records.insert(id.into(), record);

@@ -469,6 +469,9 @@ impl Machine for LinuxMachine {
     fn job(&mut self, op: crate::job::Operation, peer: crate::Peer) -> Result<crate::Response> {
         self.jobs.handle(op, peer)
     }
+    fn maintain_jobs(&mut self) -> Result<()> {
+        self.jobs.maintain()
+    }
     fn shutdown(&mut self) -> Result<()> {
         // stop_all logs each tenant's outcome; this only summarises.
         let failures = self.tenants.stop_all();
