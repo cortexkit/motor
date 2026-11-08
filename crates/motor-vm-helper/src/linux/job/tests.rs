@@ -66,6 +66,19 @@ impl Vmm {
             .arg("300")
             .spawn()
             .unwrap();
+        // spawn can return while the child is still inside execve: the kernel
+        // wakes a vfork-style parent before it renames the child, so `comm`
+        // briefly still shows the test's name. The helper itself checks the
+        // name only after the VMM's API socket is up.
+        let comm = format!("/proc/{}/comm", child.id());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::read_to_string(&comm).unwrap().trim() != "firecracker" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture never became firecracker"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         Self { child, base }
     }
 }
