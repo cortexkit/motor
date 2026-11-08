@@ -1,6 +1,16 @@
 use super::*;
 use motor_host::claim_log::{record, RefusalCause};
+use motor_host::state::jobs::HostResources;
 use motor_host::state::{Admission, Error, Refusal};
+
+fn resources(h: &mut Host) {
+    h.record_host_resources(HostResources {
+        at_ms: NOW * 1000,
+        available_mem_mib: 100_000,
+        vcpu_ceiling: 2,
+        permit_budget: 2,
+    });
+}
 
 fn capture(f: impl FnOnce()) -> Vec<String> {
     let logs = super::billing::Logs::default();
@@ -38,6 +48,7 @@ fn every_run_claim_logs_result_and_refusal_cause_in_both_modes() {
         let mode = settings.mode().as_str();
         let mut h = host();
         h.settings = settings;
+        resources(&mut h);
         h.guest_ready("tenant", 1).unwrap();
         let lines = capture(|| {
             h.claim(claims(JOB), NOW * 1000).unwrap();
@@ -75,33 +86,29 @@ fn every_run_claim_logs_result_and_refusal_cause_in_both_modes() {
 }
 
 #[test]
-fn replacement_waiting_and_storage_refusal_are_logged_in_both_modes() {
-    for settings in host_settings() {
-        let mode = settings.mode().as_str();
-        let mut h = host();
-        h.settings = settings;
-        h.guest_ready("tenant", 1).unwrap();
-        let (id, _) = h.claim(claims(JOB), NOW * 1000).unwrap();
-        h.delivered(id).unwrap();
-        h.close(id).unwrap();
-        let lines = capture(|| {
-            let mut replacement = claims(JOB);
-            replacement.iat += 1;
-            replacement.exp += 1;
-            assert_eq!(
-                h.claim(replacement, NOW * 1000).unwrap().1,
-                Admission::Waiting
-            );
-            h.enforce_storage();
-            assert!(matches!(
-                h.claim(claims(JOB2), NOW * 1000),
-                Err(Error::Refused(Refusal::HostFull))
-            ));
-        });
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert_record(&lines[0], JOB, mode, "waiting", None);
-        assert_record(&lines[1], JOB2, mode, "refused", Some("storage"));
-    }
+fn tenant_replacement_waiting_and_storage_refusal_are_logged() {
+    let mut h = host();
+    h.guest_ready("tenant", 1).unwrap();
+    let (id, _) = h.claim(claims(JOB), NOW * 1000).unwrap();
+    h.delivered(id).unwrap();
+    h.close(id).unwrap();
+    let lines = capture(|| {
+        let mut replacement = claims(JOB);
+        replacement.iat += 1;
+        replacement.exp += 1;
+        assert_eq!(
+            h.claim(replacement, NOW * 1000).unwrap().1,
+            Admission::Waiting
+        );
+        h.enforce_storage();
+        assert!(matches!(
+            h.claim(claims(JOB2), NOW * 1000),
+            Err(Error::Refused(Refusal::HostFull))
+        ));
+    });
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_record(&lines[0], JOB, "tenant", "waiting", None);
+    assert_record(&lines[1], JOB2, "tenant", "refused", Some("storage"));
 }
 
 #[test]
@@ -116,6 +123,7 @@ fn journal_failure_is_a_refused_run_claim_not_an_admission() {
         let mode = settings.mode().as_str();
         let mut h = Host::new(tenants(), Snapshot::default(), Box::new(FailedJournal));
         h.settings = settings;
+        resources(&mut h);
         let lines = capture(|| {
             assert!(matches!(
                 h.claim(claims(JOB), NOW * 1000),
@@ -125,7 +133,33 @@ fn journal_failure_is_a_refused_run_claim_not_an_admission() {
         assert_eq!(lines.len(), 1);
         assert_record(&lines[0], JOB, mode, "refused", Some("storage_full"));
         assert!(h.snapshot.leases.is_empty());
+        assert!(h.snapshot.per_job.is_empty());
     }
+}
+
+#[test]
+fn job_reconnect_and_storage_refusal_are_logged_without_replacement_launch() {
+    let mut h = host();
+    h.settings = host_settings()[1].clone();
+    resources(&mut h);
+    let (id, _) = h.claim(claims(JOB), NOW * 1000).unwrap();
+    h.begin_job_boot(JOB).unwrap().unwrap();
+    h.close(id).unwrap();
+    let lines = capture(|| {
+        let mut reconnect = claims(JOB);
+        reconnect.iat += 1;
+        reconnect.exp += 1;
+        assert_eq!(h.claim(reconnect, NOW * 1000).unwrap().1, Admission::Ready);
+        assert!(h.begin_job_boot(JOB).unwrap().is_none());
+        h.enforce_storage();
+        assert!(matches!(
+            h.claim(claims(JOB2), NOW * 1000),
+            Err(Error::Refused(Refusal::HostFull))
+        ));
+    });
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_record(&lines[0], JOB, "per_job", "admitted", None);
+    assert_record(&lines[1], JOB2, "per_job", "refused", Some("storage"));
 }
 
 #[test]

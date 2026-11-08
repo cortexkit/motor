@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::io;
 
 mod advertise;
+pub mod jobs;
 pub use advertise::{MemoryCase, MEMORY_FRESH_MS, MEMORY_PROBE_MS, START_RETRY_MS};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -58,6 +59,8 @@ pub struct Vm {
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 pub struct Snapshot {
+    #[serde(default, skip_serializing_if = "jobs::Ledger::is_empty")]
+    pub per_job: jobs::Ledger,
     /// Independent of finished-job retention: old tokens stay fenced until expiry.
     #[serde(default)]
     pub revocations: BTreeMap<String, Revocation>,
@@ -225,6 +228,7 @@ pub struct Host {
     pub(crate) broker_draining: bool,
     pub(crate) broker_heartbeat_at_ms: Option<u64>,
     pub(crate) lost_checks: BTreeMap<String, crate::billing::LostCheck>,
+    host_resources: Option<jobs::HostResources>,
 }
 impl Host {
     pub fn new(
@@ -252,6 +256,7 @@ impl Host {
             broker_draining: false,
             broker_heartbeat_at_ms: None,
             lost_checks: BTreeMap::new(),
+            host_resources: None,
         }
     }
     /// Replaces the journal, so tests can make writes fail the way a full
@@ -295,6 +300,11 @@ impl Host {
         self.save(next)
     }
     fn publish_connections(&self) {
+        // Job-VM relays are driven by their own durable execution records, not
+        // by the tenant lease state machine. Their lifecycle is wired separately.
+        if matches!(self.settings, crate::config::HostSettings::PerJob(_)) {
+            return;
+        }
         for connection in &self.connections {
             let current = *connection.updates.borrow();
             if self
@@ -524,6 +534,9 @@ impl Host {
     ) -> Result<(u64, Admission), crate::claim_log::ClaimError> {
         use crate::claim_log::RefusalCause;
         self.observed_at_ms = now_ms;
+        if matches!(self.settings, crate::config::HostSettings::PerJob(_)) {
+            return self.claim_job(claims, now_ms);
+        }
         if self.snapshot.revocations.contains_key(&claims.jti) {
             return Err(Refusal::Auth.into());
         }

@@ -919,6 +919,7 @@ impl Host {
         };
         let now_s = now_ms / 1000;
         let mut next = Snapshot {
+            per_job: snapshot.per_job.clone(),
             revocations: snapshot
                 .revocations
                 .iter()

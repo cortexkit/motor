@@ -136,7 +136,7 @@ impl SqliteJournal {
             .map_err(other)?
             .is_some();
         let snapshot = if imported {
-            store.with_conn(load).map_err(other)?
+            store.with_conn(load_snapshot).map_err(other)?
         } else {
             let snapshot = match fs::read(&legacy) {
                 Ok(bytes) => serde_json::from_slice(&bytes).map_err(other)?,
@@ -298,6 +298,7 @@ fn write_diff(tx: &Transaction<'_>, old: &Snapshot, new: &Snapshot) -> rusqlite:
         last_alive,
         closed,
         draining,
+        per_job,
     } = new;
     diff_entries(tx, REVOCATION, &old.revocations, revocations)?;
     diff_entries(tx, LEASE, &old.leases, leases)?;
@@ -312,7 +313,75 @@ fn write_diff(tx: &Transaction<'_>, old: &Snapshot, new: &Snapshot) -> rusqlite:
     diff_value(tx, "rejected_outbox", &old.rejected_outbox, rejected_outbox)?;
     diff_value(tx, "counter", &old.counter, counter)?;
     diff_value(tx, "last_alive", &old.last_alive, last_alive)?;
-    diff_value(tx, "draining", &old.draining, draining)
+    diff_value(tx, "draining", &old.draining, draining)?;
+    write_job_ledger(tx, &old.per_job, per_job)
+}
+
+// Keep job-VM state out of host_entries: older binaries reject unknown kinds.
+// This additive table deliberately does not advance the schema version, so a
+// tenant-mode rollback can still open and update its own unchanged records.
+fn write_job_ledger(
+    tx: &Transaction<'_>,
+    old: &crate::state::jobs::Ledger,
+    new: &crate::state::jobs::Ledger,
+) -> rusqlite::Result<()> {
+    if old == new {
+        return Ok(());
+    }
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS job_vm_entries (
+        kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+        PRIMARY KEY (kind, key)
+    ) WITHOUT ROWID;",
+    )?;
+    diff_job_entries(tx, "disk", &old.disks, &new.disks)?;
+    diff_job_entries(tx, "execution", &old.executions, &new.executions)
+}
+
+fn diff_job_entries<V: Serialize + PartialEq>(
+    tx: &Transaction<'_>,
+    kind: &str,
+    old: &BTreeMap<String, V>,
+    new: &BTreeMap<String, V>,
+) -> rusqlite::Result<()> {
+    for (key, value) in new {
+        if old.get(key) != Some(value) {
+            tx.execute(
+                "INSERT INTO job_vm_entries (kind, key, value) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (kind, key) DO UPDATE SET value = excluded.value",
+                params![kind, key, to_json(value)?],
+            )?;
+        }
+    }
+    for key in old.keys().filter(|key| !new.contains_key(*key)) {
+        tx.execute(
+            "DELETE FROM job_vm_entries WHERE kind = ?1 AND key = ?2",
+            params![kind, key],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_snapshot(conn: &Connection) -> rusqlite::Result<Snapshot> {
+    let mut snapshot = load(conn)?;
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'job_vm_entries')",
+        [], |row| row.get(0),
+    )?;
+    if exists {
+        let mut entries = conn.prepare("SELECT kind, key, value FROM job_vm_entries")?;
+        let mut rows = entries.query([])?;
+        while let Some(row) = rows.next()? {
+            let (kind, key, value): (String, String, String) =
+                (row.get(0)?, row.get(1)?, row.get(2)?);
+            match kind.as_str() {
+                "disk" => drop(snapshot.per_job.disks.insert(key, from_json(&value)?)),
+                "execution" => drop(snapshot.per_job.executions.insert(key, from_json(&value)?)),
+                _ => return Err(unknown("job VM entry kind", &kind)),
+            }
+        }
+    }
+    Ok(snapshot)
 }
 
 /// Reads the whole state. An entry kind or value name this binary doesn't
@@ -360,4 +429,80 @@ fn unknown(what: &str, name: &str) -> rusqlite::Error {
         rusqlite::types::Type::Text,
         format!("unknown {what} {name:?}: the database was written by a newer motor-host").into(),
     )
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::*;
+
+    #[test]
+    fn unchanged_legacy_snapshot_loader_ignores_additive_job_vm_table() {
+        let dir = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+        let (mut journal, mut snapshot) = SqliteJournal::open(dir.path()).unwrap();
+        snapshot.counter = 17;
+        journal.store(&snapshot).unwrap();
+        let legacy = snapshot.clone();
+        snapshot.per_job.disks.insert(
+            "ws-rollback".into(),
+            crate::state::jobs::WorkspaceDisk {
+                sub: "account".into(),
+                workspace_key_hash: "hash".into(),
+                queue: vec![],
+                attached_job: None,
+                quarantined: false,
+            },
+        );
+        journal.store(&snapshot).unwrap();
+        drop(journal);
+        let conn = Connection::open(dir.path().join("store.db")).unwrap();
+        // load is the unchanged tenant loader from before job-VM state existed.
+        // It still rejects unknown legacy kinds, but never visits the new table.
+        assert_eq!(load(&conn).unwrap(), legacy);
+        assert_eq!(load_snapshot(&conn).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn tenant_journal_updates_never_create_or_write_job_vm_rows() {
+        let dir = tempfile::tempdir_in(cortexkit_test_support::scratch_root()).unwrap();
+        let (mut journal, mut snapshot) = SqliteJournal::open(dir.path()).unwrap();
+        snapshot.counter = 18;
+        journal.store(&snapshot).unwrap();
+        drop(journal);
+        let conn = Connection::open(dir.path().join("store.db")).unwrap();
+        let tables: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'job_vm_entries'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
+        drop(conn);
+        // A tenant-mode rollback preserves the ledger without updating it.
+        let (mut journal, mut snapshot) = SqliteJournal::open(dir.path()).unwrap();
+        snapshot.per_job.disks.insert(
+            "ws-rollback".into(),
+            crate::state::jobs::WorkspaceDisk {
+                sub: "account".into(),
+                workspace_key_hash: "hash".into(),
+                queue: vec![],
+                attached_job: None,
+                quarantined: false,
+            },
+        );
+        journal.store(&snapshot).unwrap();
+        drop(journal);
+        let conn = Connection::open(dir.path().join("store.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER forbid_job_vm_update BEFORE UPDATE ON job_vm_entries
+            BEGIN SELECT RAISE(ABORT, 'tenant wrote job VM state'); END;",
+        )
+        .unwrap();
+        drop(conn);
+        let (mut journal, mut snapshot) = SqliteJournal::open(dir.path()).unwrap();
+        snapshot.counter += 1;
+        journal.store(&snapshot).unwrap();
+        drop(journal);
+        assert_eq!(SqliteJournal::open(dir.path()).unwrap().1, snapshot);
+    }
 }
