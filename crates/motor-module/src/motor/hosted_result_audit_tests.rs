@@ -687,19 +687,37 @@ async fn audit_14a_pending_settlement_attach_preserves_requested_output_cursor()
     let h = Harness::new(Behavior::OwnerReplay).await;
     h.run_gate.send_replace(false);
     let root = cortexkit_test_support::ScratchDir::new("audit-pending-attach-cursor");
+    h.timeline.mark("detached starting");
     let (motor, id) = detached(&h, &root).await;
+    h.timeline.mark("detached ready");
     motor
         .storage
         .hosted_update(id, |state| state.terminal = Some(real_terminal(id)))
         .unwrap();
+    h.timeline.mark("attach starting");
     let mut caller = motor
         .attach(motor_protocol::AttachRequest::new(id, 9))
         .unwrap();
+    h.timeline.mark(format!(
+        "attach subscribed {}",
+        motor.hosted_result_snapshot_for_test(id)
+    ));
     let record = tokio::time::timeout(Duration::from_secs(2), caller.records.recv())
         .await
-        .expect("pending-settlement attach discarded its replay cursor")
+        .unwrap_or_else(|_| {
+            panic!(
+                "pending-settlement attach discarded its replay cursor; {}; timeline={}",
+                motor.hosted_result_snapshot_for_test(id),
+                h.timeline.snapshot()
+            )
+        })
         .unwrap()
         .unwrap();
+    h.timeline.mark(format!(
+        "caller output received {}",
+        motor.hosted_result_snapshot_for_test(id)
+    ));
+    eprintln!("pending attach timeline={}", h.timeline.snapshot());
     assert!(matches!(record, StreamRecord::Output(o) if o.seq == 9));
     drop(caller);
     h.run_gate.send_replace(true);

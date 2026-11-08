@@ -106,7 +106,41 @@ pub const SETTLED_OUTPUT: [&[u8]; 2] = [b"before the drop\n", b"after the drop\n
 type LeaseReplies = Arc<Mutex<VecDeque<(u16, serde_json::Value, &'static str)>>>;
 type ReplacementHosts = Arc<Mutex<VecDeque<Arc<Mutex<FakeBroker>>>>>;
 
+pub struct Timeline {
+    start: std::time::Instant,
+    events: Mutex<Vec<(std::time::Duration, String)>>,
+}
+
+impl Timeline {
+    fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            events: Mutex::new(vec![(
+                std::time::Duration::ZERO,
+                format!(
+                    "wall start {:?}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                ),
+            )]),
+        }
+    }
+
+    pub fn mark(&self, event: impl Into<String>) {
+        self.events
+            .lock()
+            .unwrap()
+            .push((self.start.elapsed(), event.into()));
+    }
+
+    pub fn snapshot(&self) -> String {
+        format!("{:?}", self.events.lock().unwrap())
+    }
+}
+
 pub struct Harness {
+    pub timeline: Arc<Timeline>,
     pub route: HostedJobState,
     pub broker: Arc<Mutex<FakeBroker>>,
     pub requests: Arc<Mutex<Vec<String>>>,
@@ -160,6 +194,7 @@ impl Harness {
         Self::with_host(behavior, "test-host").await
     }
     pub async fn with_host(behavior: Behavior, host_id: &'static str) -> Self {
+        let timeline = Arc::new(Timeline::new());
         // A deliberately self-signed certificate for an unrelated DNS name.
         let rcgen::CertifiedKey { cert, key_pair } =
             rcgen::generate_simple_self_signed(vec!["not-the-host.invalid".into()]).unwrap();
@@ -232,6 +267,7 @@ impl Harness {
         let attach_auth_refusals = Arc::new(AtomicUsize::new(0));
         let drop_follow = Arc::new(tokio::sync::watch::Sender::new(0));
         let host_task = tokio::spawn({
+            let timeline = timeline.clone();
             let broker = broker.clone();
             let host_refusals = host_refusals.clone();
             let capacity = capacity.clone();
@@ -246,6 +282,8 @@ impl Harness {
             let client_hellos = client_hellos.clone();
             async move {
                 while let Ok((socket, _)) = host.accept().await {
+                    timeline.mark("host TCP accepted");
+                    let timeline = timeline.clone();
                     let acceptor = acceptor.clone();
                     let keys = keys.clone();
                     let tokens = tokens.clone();
@@ -264,6 +302,7 @@ impl Harness {
                         let Ok(mut tls) = acceptor.accept(socket).await else {
                             return;
                         };
+                        timeline.mark("host TLS accepted");
                         let Ok(Prelude::LeaseHello {
                             token,
                             requester_jwk,
@@ -273,6 +312,7 @@ impl Harness {
                             return;
                         };
                         tokens.fetch_add(1, Ordering::SeqCst);
+                        timeline.mark("host LeaseHello received");
                         let purpose = if serde_json::from_slice::<Claims>(
                             &base64::Engine::decode(
                                 &base64::engine::general_purpose::URL_SAFE_NO_PAD,
@@ -312,6 +352,7 @@ impl Harness {
                         Nonces::default()
                             .verify(&challenge, &claims, &requester_jwk, &sig, now_s())
                             .unwrap();
+                        timeline.mark("host challenge verified");
                         if purpose == Purpose::Attach
                             && attach_auth_refusals
                                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -408,6 +449,7 @@ impl Harness {
                             return;
                         };
                         client_hellos.lock().unwrap().push(hello);
+                        timeline.mark("host Hello received");
                         if let Behavior::RefuseHello(reason) = behavior {
                             super::super::tls::write(
                                 &mut tls,
@@ -589,6 +631,8 @@ impl Harness {
                                     return;
                                 }
                                 Frame::Attach(attach) => {
+                                    timeline
+                                        .mark(format!("host Attach from_seq={}", attach.from_seq));
                                     if matches!(behavior, Behavior::DropTerminal) {
                                         attach_lifecycle
                                             .send_modify(|(_, _, following)| *following += 1);
@@ -603,6 +647,7 @@ impl Harness {
                                             &run_gate,
                                             host_id,
                                             claims.max_s,
+                                            &timeline,
                                         )
                                         .await;
                                         return;
@@ -714,6 +759,7 @@ impl Harness {
         let release_admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let unanswered_lease = Arc::new(AtomicUsize::new(0));
         let http_task = tokio::spawn({
+            let timeline = timeline.clone();
             let broker = broker.clone();
             let capacity = capacity.clone();
             let requests = requests.clone();
@@ -735,6 +781,7 @@ impl Harness {
                     std::collections::BTreeMap::<String, serde_json::Value>::new();
                 let mut lease_requests = std::collections::BTreeMap::<String, Vec<u8>>::new();
                 while let Ok((mut socket, _)) = http.accept().await {
+                    timeline.mark("broker TCP accepted");
                     let mut bytes = Vec::new();
                     loop {
                         let mut byte = [0];
@@ -778,6 +825,7 @@ impl Harness {
                         .map(str::to_string);
                     let mut body = vec![0; length];
                     socket.read_exact(&mut body).await.unwrap();
+                    timeline.mark(format!("broker request {path}"));
                     requests.lock().unwrap().push(path.clone());
                     if path.ends_with("/reattach") && matches!(behavior, Behavior::RefuseAttach(_))
                     {
@@ -897,13 +945,17 @@ impl Harness {
                         continue;
                     }
                     let body = serde_json::to_vec(&reply.body).unwrap();
+                    timeline.mark(format!("broker reply {path} status={}", reply.status));
                     let head = format!("HTTP/1.1 {} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: {retry_after}\r\nConnection: close\r\n\r\n", reply.status, body.len());
-                    socket.write_all(head.as_bytes()).await.unwrap();
-                    socket.write_all(&body).await.unwrap();
+                    let sent = write_broker_reply(&mut socket, head.as_bytes(), &body)
+                        .await
+                        .unwrap();
+                    timeline.mark(format!("broker reply {path} sent={sent}"));
                 }
             }
         });
         Self {
+            timeline,
             route: HostedJobState {
                 broker_url,
                 token_source: BrokerTokenSource::Fake,
@@ -951,6 +1003,56 @@ impl Harness {
         .with_timeout(30)
         .with_weight_hint(2)
     }
+}
+
+async fn write_broker_reply(
+    socket: &mut (impl tokio::io::AsyncWrite + Unpin),
+    head: &[u8],
+    body: &[u8],
+) -> io::Result<bool> {
+    let written = async {
+        socket.write_all(head).await?;
+        socket.write_all(body).await
+    }
+    .await;
+    match written {
+        Ok(()) => Ok(true),
+        // A rewind or shutdown can cancel the client's HTTP request after the
+        // broker read it. Keep serving other requests on the same fake broker.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[tokio::test]
+async fn broker_reply_tolerates_disconnect_before_headers() {
+    let head = b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n";
+    let body = [b'x'; 64];
+    let (mut server, client) = tokio::io::duplex(head.len());
+    drop(client);
+    assert!(!write_broker_reply(&mut server, head, &body).await.unwrap());
+}
+
+#[tokio::test]
+async fn broker_reply_tolerates_disconnect_during_body() {
+    let head = b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n";
+    let body = [b'x'; 64];
+    let (mut server, mut client) = tokio::io::duplex(head.len());
+    let reply = tokio::spawn(async move { write_broker_reply(&mut server, head, &body).await });
+    let mut received = vec![0; head.len()];
+    client.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, head);
+    drop(client);
+    assert!(!reply.await.unwrap().unwrap());
 }
 
 /// Milliseconds of runtime the `SettleThenDrop` host reports per vCPU; the
@@ -1138,6 +1240,7 @@ async fn owner_replay_flushes_output_and_terminal_before_waiting_for_peer() {
             &server_gate,
             "test-host",
             60,
+            &Timeline::new(),
         )
         .await;
     });
@@ -1182,8 +1285,10 @@ async fn replay_owner(
     gate: &tokio::sync::watch::Sender<bool>,
     host: &str,
     max_runtime_s: u64,
+    timeline: &Timeline,
 ) {
     for seq in cursor..OWNER_REPLAY_RECORDS {
+        timeline.mark(format!("host output seq={seq} writing"));
         if motor_protocol::write_frame_async(
             tls,
             &Frame::Output(Output::new(
@@ -1197,12 +1302,14 @@ async fn replay_owner(
         {
             return;
         }
+        timeline.mark(format!("host output seq={seq} written"));
     }
     // The caller drains output before opening the terminal gate. Flush any TLS
     // ciphertext still buffered by the last write before waiting for the gate.
     if tls.flush().await.is_err() {
         return;
     }
+    timeline.mark("host replay output flushed");
     let mut gate = gate.subscribe();
     while !*gate.borrow_and_update() {
         tokio::select! {

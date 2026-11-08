@@ -2681,6 +2681,10 @@ impl Motor {
                     || crate::hosted::now_s().saturating_mul(1000),
                     |owner| owner.now_ms(),
                 );
+                #[cfg(test)]
+                if let Some(owner) = &owner {
+                    owner.trace_transport_for_test("channel open starting");
+                }
                 let opened = tokio::select! {
                     result = self.open_job_channel_at(id, now) => result,
                     _ = async { match cancel_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {
@@ -2688,6 +2692,10 @@ impl Motor {
                         return self.finish_hosted(id, false, tx).await.map(|_| false);
                     },
                     changed = wake.changed(), if wake_open => {
+                        #[cfg(test)]
+                        if let Some(owner) = &owner {
+                            owner.trace_transport_for_test("wake cancelled channel open");
+                        }
                         if changed.is_err() { wake_open = false; }
                         continue;
                     },
@@ -2696,6 +2704,10 @@ impl Motor {
                         return Err(io::Error::other("caller detached"));
                     },
                 };
+                #[cfg(test)]
+                if let Some(owner) = &owner {
+                    owner.trace_transport_for_test("channel open completed");
+                }
                 if let Some(owner) = &owner {
                     owner.live(opened.is_ok());
                     if let Some(from) = owner.take_rewind() {
