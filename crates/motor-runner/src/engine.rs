@@ -8113,9 +8113,7 @@ impl Runner {
         let setup = Setup {
             id,
             cpus,
-            memory_mib: job
-                .memory_stated_mib
-                .map(|stated| stated.saturating_add(job.memory_burst_mib.unwrap_or(0))),
+            memory_mib: job.memory_limit_mib(),
             base: job.base,
             recorded: if snapshot_mode {
                 BTreeMap::new()
@@ -9611,10 +9609,8 @@ impl Runner {
     /// clamped to the last observed slice ceiling when no cap was supplied.
     fn job_unit_memory_max(&self, job: &Job) -> u64 {
         if self.core.config.tenant_vm && !self.core.config.boat_profile {
-            if let Some(memory) = job.memory_stated_mib {
-                return memory
-                    .saturating_add(job.memory_burst_mib.unwrap_or(0))
-                    .saturating_mul(1 << 20);
+            if let Some(memory) = job.memory_limit_mib() {
+                return memory.saturating_mul(1 << 20);
             }
         }
         let weight = job.weight;

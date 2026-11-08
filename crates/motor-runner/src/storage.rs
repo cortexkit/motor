@@ -236,6 +236,9 @@ pub(crate) struct Job {
     /// Host-verified memory carried on the tenant channel, never a Run field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_stated_mib: Option<u64>,
+    /// Accepted memory headroom above stated memory for this job only. Absent
+    /// (or legacy null) means no burst was accepted; numeric values never change
+    /// stated memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_burst_mib: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -253,7 +256,14 @@ pub(crate) struct Job {
         skip_serializing_if = "crate::working_memory::WorkingPeak::is_unknown"
     )]
     pub mem_working_peak_mib: crate::working_memory::WorkingPeak,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Working-set integral above `memory_stated_mib`, in MiB-milliseconds.
+    /// Absent means not measured or no burst. Null means measured but not
+    /// attributable to this job.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::working_memory::OverIntegral::present"
+    )]
     pub mem_over_mib_ms: Option<crate::working_memory::OverIntegral>,
     /// Captured from job-private compiler servers before terminal persistence.
     /// Telemetry only; not a billing or admission input.
@@ -403,6 +413,10 @@ impl Job {
     }
     pub fn key(&self) -> &str {
         crate::caller_path::job_key(self)
+    }
+    pub fn memory_limit_mib(&self) -> Option<u64> {
+        self.memory_stated_mib
+            .map(|stated| stated.saturating_add(self.memory_burst_mib.unwrap_or(0)))
     }
     pub fn terminal(&mut self, outcome: Outcome, now: u64) {
         let queue_wait_ms = self.queue_wait_ms(now);

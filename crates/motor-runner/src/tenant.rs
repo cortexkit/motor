@@ -40,6 +40,7 @@ pub(crate) struct EventLog {
     path: PathBuf,
     state: Mutex<Events>,
     // Samples are coalesced and ephemeral; only lifecycle events need replay.
+    #[cfg(any(target_os = "linux", test))]
     samples: Mutex<BTreeMap<Uuid, MemorySample>>,
 }
 
@@ -80,6 +81,7 @@ impl EventLog {
         Ok(Self {
             path,
             state: Mutex::new(state),
+            #[cfg(any(target_os = "linux", test))]
             samples: Mutex::new(BTreeMap::new()),
         })
     }
@@ -108,7 +110,10 @@ impl EventLog {
         self.samples.lock().unwrap().insert(sample.jti, sample);
     }
     #[cfg(any(target_os = "linux", test))]
-    async fn send_samples<W: tokio::io::AsyncWrite + Unpin>(&self, writer: &mut W) -> io::Result<()> {
+    async fn send_samples<W: tokio::io::AsyncWrite + Unpin>(
+        &self,
+        writer: &mut W,
+    ) -> io::Result<()> {
         let samples = std::mem::take(&mut *self.samples.lock().unwrap());
         for sample in samples.into_values() {
             write_frame_async(writer, &Frame::MemorySample(sample)).await?;
@@ -137,7 +142,8 @@ impl EventLog {
             state.push(TenantEventKind::Terminal, Some(job.id), None);
             state.pending.back_mut().unwrap().mem_peak_mib = job.mem_peak_mib;
             state.pending.back_mut().unwrap().mem_working_peak_mib = job.mem_working_peak_mib.get();
-            state.pending.back_mut().unwrap().mem_over_mib_ms = job.mem_over_mib_ms.as_ref().map(|over| over.get());
+            state.pending.back_mut().unwrap().mem_over_mib_ms =
+                job.mem_over_mib_ms.as_ref().map(|over| over.get());
             state.pending.back_mut().unwrap().remote_cache_totals = job.remote_cache_totals;
         }
         atomic_json_private(&self.path, &state)?;

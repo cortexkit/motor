@@ -14,6 +14,7 @@ const UNKNOWN: u64 = u64::MAX;
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
 #[derive(Default)]
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 struct IntegralState {
     byte_ms: Option<u128>,
     previous: Option<(u64, u64)>,
@@ -25,14 +26,22 @@ struct IntegralState {
 pub(crate) struct OverIntegral(Arc<Mutex<IntegralState>>);
 
 impl OverIntegral {
+    pub(crate) fn present<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Self>, D::Error> {
+        Self::deserialize(deserializer).map(Some)
+    }
+
     pub(crate) fn get(&self) -> Option<u64> {
-        self.0.lock().unwrap().byte_ms.map(|value| {
-            value.div_ceil(1 << 20).min(u128::from(MAX_SAFE_INTEGER)) as u64
-        })
+        self.0
+            .lock()
+            .unwrap()
+            .byte_ms
+            .map(|value| value.div_ceil(1 << 20).min(u128::from(MAX_SAFE_INTEGER)) as u64)
     }
 
     #[cfg(any(target_os = "linux", test))]
-    fn sample(&self, bytes: Option<u64>, stated_mib: u64, elapsed_ms: u64) {
+    pub(crate) fn sample(&self, bytes: Option<u64>, stated_mib: u64, elapsed_ms: u64) {
         let mut state = self.0.lock().unwrap();
         let Some(bytes) = bytes else {
             // A missing cgroup before the first read is normal during launch.
@@ -231,6 +240,54 @@ fn working_bytes(text: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overage_integrates_only_working_bytes_above_stated_without_interval_rounding() {
+        let peak = WorkingPeak::default();
+        let over = OverIntegral::default();
+        let root = cortexkit_test_support::scratch_root()
+            .join(format!("overage-memory-{}", motor_protocol::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("memory.stat");
+        for (elapsed, anon, shmem, kernel, expected) in [
+            (0, 1 << 20, 0, 0, 0),
+            (100, 1 << 20, 1 << 18, 1 << 18, 0),
+            (101, 1 << 20, 1 << 18, 1 << 18, 1),
+            (102, 0, 0, 0, 1),
+            (1102, 0, 0, 0, 1),
+        ] {
+            std::fs::write(&path, format!("anon {anon}\nshmem {shmem}\nkernel {kernel}\nfile 9999999999\nslab_reclaimable 9999999999\n")).unwrap();
+            over.sample(peak.sample(&path), 1, elapsed);
+            assert_eq!(over.get(), Some(expected));
+        }
+        assert_eq!(peak.get(), Some(2));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn overage_distinguishes_unmeasured_zero_gaps_and_saturates_safe_integers() {
+        let over = OverIntegral::default();
+        assert_eq!(over.get(), None);
+        over.sample(None, 1, 0);
+        over.sample(Some(1 << 20), 1, 100);
+        assert_eq!(over.get(), Some(0));
+        over.sample(Some(3 << 20), 1, 200);
+        over.sample(Some(1 << 20), 1, 450);
+        assert_eq!(over.get(), Some(500));
+        over.sample(None, 1, 500);
+        assert_eq!(over.get(), None);
+        over.sample(Some(3 << 20), 1, 1000);
+        assert_eq!(
+            over.get(),
+            None,
+            "a later read cannot repair an attribution gap"
+        );
+        let over = OverIntegral::default();
+        over.sample(Some(u64::MAX), 0, 0);
+        over.sample(Some(u64::MAX), 0, u64::MAX);
+        assert_eq!(over.get(), Some(MAX_SAFE_INTEGER));
+        assert_eq!(serde_json::to_value(&over).unwrap(), MAX_SAFE_INTEGER);
+    }
 
     #[test]
     fn memory_stat_kernel_variants_exclude_file_cache_and_do_not_double_count() {
