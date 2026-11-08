@@ -3,7 +3,12 @@ fn main() {
     use motor_vm_helper::linux::server;
     let result = (|| {
         let mut args = std::env::args_os().skip(1);
-        if args.next().as_deref() != Some(std::ffi::OsStr::new("--config")) {
+        let command = args.next();
+        motor_vm_helper::linux::cache::disable_core_dumps()?;
+        if command.as_deref() == Some(std::ffi::OsStr::new("set-remote-cache")) {
+            return motor_vm_helper::linux::cache::install_command(args.collect());
+        }
+        if command.as_deref() != Some(std::ffi::OsStr::new("--config")) {
             return Err(motor_vm_helper::Error(
                 "usage: motor-vm-helper --config /etc/motor-vm-helper.json".into(),
             ));

@@ -4,8 +4,122 @@ use std::sync::atomic::{AtomicU64, Ordering};
 mod exit_tests;
 mod network_tests;
 
+#[test]
+fn credential_boot_is_read_only_nonce_bound_and_absent_for_unprovisioned_vms() {
+    let nonce = "0123456789abcdef0123456789abcdef";
+    let requests = boot_requests(&start(), Some(17), Some(nonce));
+    let drive = requests
+        .iter()
+        .find(|request| request.0 == "/drives/remote-cache")
+        .unwrap();
+    assert_eq!(
+        drive.1,
+        json!({"drive_id":"remote-cache","path_on_host":"/remote-cache.img","is_root_device":false,"is_read_only":true})
+    );
+    assert_eq!(
+        requests[1].1["boot_args"],
+        format!("{JOB_BOOT_ARGS} motor.cache_nonce={nonce}")
+    );
+    let plain = boot_requests(&start(), Some(17), None);
+    assert!(!plain
+        .iter()
+        .any(|request| request.0 == "/drives/remote-cache"));
+    assert!(!plain[1].1["boot_args"]
+        .as_str()
+        .unwrap()
+        .contains("motor.cache_nonce"));
+    let recovery = boot_requests(&start(), None, None);
+    assert!(!recovery
+        .iter()
+        .any(|request| request.0.starts_with("/network-interfaces/")));
+    assert!(!requests.iter().any(|request| request.0.contains("mmds")));
+}
+
+#[test]
+#[cfg(feature = "linux-root-tests")]
+fn isolated_credential_image_is_removed_on_restart_and_release_before_uid_reuse() {
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    let base = scratch();
+    let mut jobs = machine(&base);
+    jobs.settings = Some(JobVms {
+        uid_base: 600001,
+        uid_count: 1,
+        memory_max_bytes: 1048576,
+    });
+    std::fs::create_dir_all(&jobs.records_path).unwrap();
+    let mut record = record();
+    record.uid = 600001;
+    let disk_dir = jobs.workspaces.join(&record.start.workspace_disk_id);
+    std::fs::create_dir_all(&disk_dir).unwrap();
+    let disk = disk_dir.join("workspace.img");
+    std::fs::write(&disk, "workspace-data-not-credentials").unwrap();
+    let metadata = std::fs::metadata(&disk).unwrap();
+    record.disk_device = metadata.dev();
+    record.disk_inode = metadata.ino();
+    fs::chown(&File::open(&disk).unwrap(), record.uid).unwrap();
+    let id = record.start.job_id.clone();
+    // The production jail parent is created once at helper startup.
+    std::fs::create_dir_all(&jobs.jail).unwrap();
+    super::super::create_boundary(&jobs.boundary(&id)).unwrap();
+    cache::tests::install_fixture(&jobs.cache_store, &record.start.account);
+    let nonce = cache::stage(
+        &jobs.cache_store,
+        &record.start.account,
+        job::VmKind::Job,
+        &File::open(jobs.boundary(&id)).unwrap(),
+        record.uid,
+    )
+    .unwrap()
+    .unwrap();
+    let bytes = std::fs::read(jobs.boundary(&id).join(cache::IMAGE)).unwrap();
+    let offset = motor_protocol::REMOTE_CACHE_DRIVE_MAGIC.len();
+    let header: String = bytes[offset..offset + 16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(header, nonce);
+    assert!(
+        boot_requests(&record.start, Some(17), Some(&nonce))[1].1["boot_args"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("motor.cache_nonce={header}"))
+    );
+    jobs.adopt_record(record.clone()).unwrap();
+    assert!(jobs.allocate_uid(jobs.settings.as_ref().unwrap()).is_err());
+    jobs.save(&record).unwrap();
+    let mut restarted = machine(&base);
+    restarted.settings = jobs.settings.clone();
+    restarted.reconcile_records(vec![record.clone()]).unwrap();
+    assert!(!restarted.boundary(&id).join(cache::IMAGE).exists());
+    assert!(restarted
+        .allocate_uid(restarted.settings.as_ref().unwrap())
+        .is_err());
+    // Release retries cleanup even after startup already removed the image.
+    restarted.stop(&id).unwrap();
+    assert!(!restarted.boundary(&id).exists());
+    assert_eq!(
+        restarted
+            .allocate_uid(restarted.settings.as_ref().unwrap())
+            .unwrap(),
+        record.uid
+    );
+    assert_eq!(
+        std::fs::read_to_string(&disk).unwrap(),
+        "workspace-data-not-credentials"
+    );
+    let saved = std::fs::read_to_string(restarted.records_path.join(format!("{id}.json"))).unwrap();
+    let reply = serde_json::to_string(&restarted.status(&id).unwrap().reply).unwrap();
+    for text in [saved, reply] {
+        assert!(!text.contains("SECRET"));
+        assert!(!text.contains("remote-cache"));
+        assert!(!text.contains(&nonce));
+    }
+    std::fs::remove_dir_all(base).unwrap();
+}
+
 fn start() -> Start {
     Start {
+        kind: job::VmKind::Job,
         job_id: "00000000-0000-4000-8000-000000000001".into(),
         account: "account-1".into(),
         workspace_disk_id: "disk-1".into(),
@@ -47,6 +161,8 @@ fn machine(base: &Path) -> LinuxJobs {
         groups: base.join("groups"),
         records_path: base.join("records"),
         jail: base.join("jail"),
+        cache_store: base.join("remote-cache"),
+        workspaces: base.join("workspaces"),
         records: BTreeMap::new(),
         children: BTreeMap::new(),
         next_prune: None,
@@ -110,7 +226,7 @@ fn job_boot_command_line_tracks_the_tenant_image_and_selects_per_job_mode() {
         .filter_map(|(index, text)| (index % 2 == 1).then_some(text))
         .collect();
     assert!(!tenant_args.is_empty());
-    let requests = boot_requests(&start(), 17);
+    let requests = boot_requests(&start(), Some(17), None);
     assert_eq!(
         requests[1].1["boot_args"],
         format!("{tenant_args} motor.per_job=1")
@@ -119,7 +235,7 @@ fn job_boot_command_line_tracks_the_tenant_image_and_selects_per_job_mode() {
 
 #[test]
 fn cold_boot_uses_request_size_and_exactly_the_three_job_images() {
-    let requests = boot_requests(&start(), 17);
+    let requests = boot_requests(&start(), Some(17), None);
     let paths: Vec<_> = requests.iter().map(|r| r.0).collect();
     assert_eq!(
         paths,
@@ -168,7 +284,7 @@ fn cold_boot_uses_request_size_and_exactly_the_three_job_images() {
     different.vcpus = 2;
     different.memory_mib = 8192;
     assert_eq!(
-        boot_requests(&different, 18)[0].1,
+        boot_requests(&different, Some(18), None)[0].1,
         json!({"vcpu_count":2,"mem_size_mib":8192,"smt":false})
     );
 }

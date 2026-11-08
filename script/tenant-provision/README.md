@@ -132,6 +132,46 @@ If argument activation fails, the command attempts to restore the
 previous arguments and reports whether the runner recovered; newly delivered
 key files remain installed. Retry the command before undraining.
 
+#### Per-job VM credential store
+
+Per-job VMs use the helper's credential store rather than the tenant command
+above. As root, install or replace one account's complete set:
+
+```sh
+sudo motor-vm-helper set-remote-cache --account ACCOUNT \
+  --config /absolute/root-only-dir/config.json \
+  --read-key /absolute/root-only-dir/read-key \
+  --write-key /absolute/root-only-dir/write-key
+```
+
+Omit `--write-key` to install a read-only set. Arguments name files, never key
+contents. Each source must be a root-owned regular file; keys must have no
+group or other permissions. Paths must be absolute, with no symlinks at any
+level and no group- or other-writable ancestors. Files are limited to 64 KiB
+each. The command checks the same JSON fields, account subject, tenant prefix
+and matching generations as the tenant installer. `ACCOUNT` is the account
+identity used in job starts, not a tenant VM name.
+
+The root-owned store is `/var/lib/motor-vm/remote-cache`, with mode-0700
+directories and mode-0600 files. The helper replaces an account directory
+atomically and syncs it before returning; motor-host never reads it or receives
+its contents. No drain or service restart is needed: the next VM start reads
+the replacement, while an already started VM retains its original set.
+
+An ordinary job gets only config and the read key. Trusted fill and base-build
+VMs also get the write key; recovery VMs get neither credentials nor a network
+interface. An account without a set gets no credential drive. The helper makes
+a fresh read-only drive for each start, binds it to that boot with a random
+nonce on the kernel command line, and deletes it on VM exit or release (also
+after adopting an exited VM on helper restart). The mode-0600 image is owned
+by that VM's exclusive jail UID, beneath a root-only jail boundary, and is
+never written to a workspace disk or a published image. The guest consumes
+the drive into its tmpfs provisioning directory before accepting jobs.
+
+The helper checks are `linux::cache::tests` and `linux::job::tests`; the
+`linux-root-tests` feature enables the root-only store permissions, rotation,
+per-kind drive contents, nonce and release-cleanup tests.
+
 Choose a cpuset excluding the host runner's reserved Windows CPUs. Each tap
 index must be unique and reserves a dedicated no-login uid `400000 + index`;
 the helper refuses overlaps with job accounts, slot accounts and allowed peers.

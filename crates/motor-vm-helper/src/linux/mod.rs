@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod cgroup;
 pub mod fs;
 pub mod job;

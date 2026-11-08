@@ -41,6 +41,8 @@ pub enum Kind {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     StartJob {
+        #[serde(default)]
+        kind: job::VmKind,
         job_id: String,
         account: String,
         workspace_disk_id: String,
@@ -349,6 +351,7 @@ impl<M: Machine> Helper<M> {
         }
         match request {
             Request::StartJob {
+                kind,
                 job_id,
                 account,
                 workspace_disk_id,
@@ -358,6 +361,7 @@ impl<M: Machine> Helper<M> {
                 burst_mib,
             } => self.job(
                 job::Operation::Start(job::Start {
+                    kind,
                     job_id,
                     account,
                     workspace_disk_id,

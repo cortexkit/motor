@@ -1,10 +1,11 @@
 //! Cold boots use ordinary guest RAM, not the legacy userfaultfd snapshot pool.
-use super::{cgroup, fs, process, tenant};
+use super::{cache, cgroup, fs, process, tenant};
 use crate::{
     config::{Config, JobVms},
     job::{self, ExitReport, Operation, Start, Workspace},
     Error, Peer, Reply, Response, Result,
 };
+use motor_protocol::REMOTE_CACHE_NONCE_CMDLINE_KEY;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -92,6 +93,8 @@ pub struct LinuxJobs {
     groups: PathBuf,
     records_path: PathBuf,
     jail: PathBuf,
+    cache_store: PathBuf,
+    workspaces: PathBuf,
     records: BTreeMap<String, Record>,
     children: BTreeMap<String, Child>,
     next_prune: Option<SystemTime>,
@@ -109,6 +112,8 @@ impl LinuxJobs {
             groups: cgroup::JOB_SLICE.into(),
             records_path: job::RECORDS.into(),
             jail: Path::new(super::BUILD_ROOT).join("jail/jobs"),
+            cache_store: cache::STORE.into(),
+            workspaces: job::WORKSPACES.into(),
             records: BTreeMap::new(),
             children: BTreeMap::new(),
             next_prune: None,
@@ -292,6 +297,7 @@ impl LinuxJobs {
         let group = self.group(id);
         if !group.try_exists()? {
             // A reboot can erase cgroups. No count is better than an invented 0.
+            self.remove_credentials(id)?;
             return self.remove_network(id);
         }
         if !std::fs::read_to_string(group.join("cgroup.procs"))?
@@ -300,6 +306,7 @@ impl LinuxJobs {
         {
             return Ok(());
         }
+        self.remove_credentials(id)?;
         let mut record = self.records.get(id).unwrap().clone();
         if record.oom_kill.is_none() {
             record.oom_kill = Some(read_oom_kill(&group)?);
@@ -329,6 +336,28 @@ impl LinuxJobs {
             self.save(&record)?;
             self.records.insert(id.into(), record);
         }
+        Ok(())
+    }
+
+    fn remove_credentials(&self, id: &str) -> Result<()> {
+        let source = self.boundary(id).join(cache::IMAGE);
+        if !source.try_exists()? {
+            return Ok(());
+        }
+        let target = self.root(id).join(cache::IMAGE);
+        let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+        if mounts
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(4))
+            .any(|path| super::unescape_mount(path) == target)
+        {
+            fs::unmount(&target)?;
+        }
+        if target.try_exists()? {
+            std::fs::remove_file(target)?;
+        }
+        std::fs::remove_file(source)?;
+        File::open(self.boundary(id))?.sync_all()?;
         Ok(())
     }
 
@@ -482,7 +511,7 @@ impl LinuxJobs {
                 "stale job cgroup or jail requires reconciliation".into(),
             ));
         }
-        let workspace = Path::new(job::WORKSPACES).join(&start.workspace_disk_id);
+        let workspace = self.workspaces.join(&start.workspace_disk_id);
         let registry: Workspace =
             serde_json::from_reader(fs::trusted_file(&workspace.join("registry.json"))?)
                 .map_err(|e| Error(format!("invalid workspace registry: {e}")))?;
@@ -538,7 +567,11 @@ impl LinuxJobs {
         let uid = self.allocate_uid(&settings)?;
         let tenants = self.network.tenants()?;
         network::check_capacity(settings.uid_count, tenants.len())?;
-        let tap_index = network::allocate(&tenants, &self.records)?;
+        let tap_index = if start.kind == job::VmKind::Recovery {
+            None
+        } else {
+            Some(network::allocate(&tenants, &self.records)?)
+        };
         let host_score = host_oom_score(peer.uid)?;
         let helper_score = read_oom_score(std::process::id())?;
         check_oom_order(host_score, helper_score)?;
@@ -554,7 +587,7 @@ impl LinuxJobs {
             released: false,
             oom_kill: None,
             exit_acknowledged: false,
-            tap_index: Some(tap_index),
+            tap_index,
             egress_bytes: None,
         };
         // The intent is durable before any jail or VMM can open the disk. A
@@ -566,9 +599,22 @@ impl LinuxJobs {
         let root = self.root(id);
         let group = self.group(id);
         let launch = (|| -> Result<()> {
-            self.prepare_network(tenants, Tap { tap_index, uid })?;
+            if let Some(tap_index) = tap_index {
+                self.prepare_network(tenants, Tap { tap_index, uid })?;
+            }
             cgroup::create_job(&group, start.vcpus)?;
             super::create_boundary(&boundary)?;
+            let boundary_fd = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(&boundary)?;
+            let nonce = cache::stage(
+                &self.cache_store,
+                &start.account,
+                start.kind,
+                &boundary_fd,
+                uid,
+            )?;
             std::fs::create_dir_all(&root)?;
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
             fs::chown(&File::open(&root)?, uid)?;
@@ -577,6 +623,13 @@ impl LinuxJobs {
             }
             fs::chown(&disk, uid)?;
             tenant::bind(&disk, &root.join("workspace.img"), false)?;
+            if nonce.is_some() {
+                let image = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(boundary.join(cache::IMAGE))?;
+                tenant::bind(&image, &root.join(cache::IMAGE), true)?;
+            }
             let procs = OpenOptions::new()
                 .write(true)
                 .open(group.join("cgroup.procs"))?;
@@ -611,7 +664,7 @@ impl LinuxJobs {
                 Duration::from_secs(10),
             )?);
             set_job_oom_score(pid, host_score, helper_score)?;
-            for (path, body) in boot_requests(&start, tap_index) {
+            for (path, body) in boot_requests(&start, tap_index, nonce.as_deref()) {
                 tenant::api(&short_root, "PUT", path, &body)?;
             }
             Ok(())
@@ -651,7 +704,8 @@ impl LinuxJobs {
         self.collect_exit(id)?;
         let mut record = self.records.get(id).unwrap().clone();
         tenant::cleanup_boundary(&self.boundary(id))?;
-        let disk_path = Path::new(job::WORKSPACES)
+        let disk_path = self
+            .workspaces
             .join(&record.start.workspace_disk_id)
             .join("workspace.img");
         let disk = open_owned_disk(&disk_path, &record)?;
@@ -769,18 +823,26 @@ fn set_job_oom_score(pid: u32, host_score: i32, helper_score: i32) -> Result<()>
     Ok(())
 }
 
-/// Cold-boot API with no snapshot load, userfaultfd, or hugepages. Only the root,
-/// toolchain and workspace images are attached; caller source bundles travel
-/// over the existing runner channel rather than on a fourth drive.
-fn boot_requests(start: &Start, tap_index: u8) -> Vec<(&'static str, Value)> {
-    vec![
+/// Git source bundles uploaded by the client use the runner channel, not a
+/// drive. Credentials use a read-only drive,
+/// bound to this boot by a nonce rather than a device letter or virtio serial.
+fn boot_requests(
+    start: &Start,
+    tap_index: Option<u8>,
+    nonce: Option<&str>,
+) -> Vec<(&'static str, Value)> {
+    let boot_args = match nonce {
+        Some(nonce) => format!("{JOB_BOOT_ARGS} {REMOTE_CACHE_NONCE_CMDLINE_KEY}={nonce}"),
+        None => JOB_BOOT_ARGS.to_owned(),
+    };
+    let mut requests = vec![
         (
             "/machine-config",
             json!({"vcpu_count":start.vcpus,"mem_size_mib":start.memory_mib,"smt":false}),
         ),
         (
             "/boot-source",
-            json!({"kernel_image_path":"/kernel","boot_args":JOB_BOOT_ARGS}),
+            json!({"kernel_image_path":"/kernel","boot_args":boot_args}),
         ),
         (
             "/drives/root",
@@ -799,12 +861,18 @@ fn boot_requests(start: &Start, tap_index: u8) -> Vec<(&'static str, Value)> {
             "/balloon",
             json!({"amount_mib":0,"deflate_on_oom":true,"free_page_reporting":true,"stats_polling_interval_s":0}),
         ),
-        (
+    ];
+    if let Some(tap_index) = tap_index {
+        requests.push((
             "/network-interfaces/eth0",
             json!({"iface_id":"eth0","host_dev_name":format!("mtap{tap_index}"),"guest_mac":format!("02:fc:00:00:{tap_index:02x}:02")}),
-        ),
-        ("/actions", json!({"action_type":"InstanceStart"})),
-    ]
+        ));
+    }
+    if nonce.is_some() {
+        requests.push(("/drives/remote-cache", json!({"drive_id":"remote-cache","path_on_host":"/remote-cache.img","is_root_device":false,"is_read_only":true})));
+    }
+    requests.push(("/actions", json!({"action_type":"InstanceStart"})));
+    requests
 }
 
 #[cfg(test)]
