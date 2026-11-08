@@ -16,12 +16,42 @@ struct Target {
     unit: String,
 }
 
-struct Cache {
-    name: &'static str,
+struct Lower {
     source: PathBuf,
     owner: ownership::Owner,
-    validation_root: PathBuf,
+}
+struct Cache {
+    name: &'static str,
+    lowers: Vec<Lower>,
     target: PathBuf,
+}
+
+impl Cache {
+    fn mounts(&self, job_uid: u32, job_gid: u32) -> Vec<Vec<String>> {
+        let base = format!("{LAYERS}/{}", self.name);
+        let mut mounts = Vec::new();
+        let mut mapped = Vec::new();
+        // A job VM's merged Cargo cache is itself overlayfs, which cannot be
+        // idmapped. Map each physical archive layer, newest first, instead.
+        for (index, lower) in self.lowers.iter().enumerate() {
+            let target = format!("{base}/mapped-lower-{index}");
+            mounts.push(vec![
+                "--internal-only".into(),
+                "--no-mtab".into(),
+                "--bind".into(),
+                "--read-only".into(),
+                "-o".into(),
+                lower_mapping(lower.owner.uid, lower.owner.gid, job_uid, job_gid),
+                format!("{base}/lower-{index}"),
+                target.clone(),
+            ]);
+            mapped.push(target);
+        }
+        mounts.push(vec!["--internal-only".into(), "--no-mtab".into(), "-t".into(), "overlay".into(), "-o".into(),
+            format!("lowerdir={},upperdir={base}/upper,workdir={base}/work,index=off,nosuid,nodev,metacopy=off,redirect_dir=nofollow", mapped.join(":")),
+            "overlay".into(), self.target.to_string_lossy().into_owned()]);
+        mounts
+    }
 }
 
 pub(super) struct Plan {
@@ -49,20 +79,23 @@ impl Plan {
         read_only: &mut Vec<String>,
         read_write: &mut Vec<String>,
         commits: &[String],
+        image: Option<&Path>,
     ) -> io::Result<Self> {
         let mut caches = Vec::new();
-        let registry = shared.join("registry");
-        let source = registry.join("cache");
-        match ownership::validated_owner(&source) {
-            Ok(owner) => caches.push(Cache {
+        let mut lowers = Vec::new();
+        for source in super::cargo_sources::archive_lowers(shared, image) {
+            match ownership::validated_owner(&source) {
+                Ok(owner) => lowers.push(Lower { source, owner }),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if !lowers.is_empty() {
+            caches.push(Cache {
                 name: "archives",
-                owner,
-                validation_root: source.clone(),
-                source,
+                lowers,
                 target: cargo.join("registry/cache"),
-            }),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            });
         }
         let job_uid = account_uid(USER)?
             .ok_or_else(|| io::Error::other("cargo_overlay_account_missing: motor-job"))?;
@@ -94,7 +127,7 @@ impl Plan {
         }
         read_write.push(bind(&private.join("cache"), &cargo.join("registry/cache"))?);
         for cache in &caches {
-            for name in ["lower", "mapped-lower", "upper", "work"] {
+            for name in ["upper", "work"] {
                 fs::create_dir_all(layers.join(cache.name).join(name))?;
             }
             // Only the lower bind is idmapped. The plain upper/work directories
@@ -107,10 +140,17 @@ impl Plan {
                         layers.join(cache.name).join("work"),
                     ]),
             )?;
-            read_only.push(bind(
-                &cache.source,
-                &Path::new(LAYERS).join(cache.name).join("lower"),
-            )?);
+            for (index, lower) in cache.lowers.iter().enumerate() {
+                for name in [format!("lower-{index}"), format!("mapped-lower-{index}")] {
+                    fs::create_dir_all(layers.join(cache.name).join(name))?;
+                }
+                read_only.push(bind(
+                    &lower.source,
+                    &Path::new(LAYERS)
+                        .join(cache.name)
+                        .join(format!("lower-{index}")),
+                )?);
+            }
         }
         // The backing directories are outside /motor-home. This root-only bind
         // lets the trusted namespace helper reach them, never job code.
@@ -175,28 +215,15 @@ impl Plan {
         let started = Instant::now();
         let mut mounts = vec![vec!["--make-rprivate".to_owned(), "/".to_owned()]];
         for cache in &self.caches {
-            ownership::validated_owner(&cache.validation_root)?;
-            if ownership::Owner::observed(&cache.source)? != cache.owner {
-                return Err(io::Error::other(
-                    "cargo_overlay_lower_changed: archive root changed before mount",
-                ));
+            for lower in &cache.lowers {
+                ownership::validated_owner(&lower.source)?;
+                if ownership::Owner::observed(&lower.source)? != lower.owner {
+                    return Err(io::Error::other(
+                        "cargo_overlay_lower_changed: archive root changed before mount",
+                    ));
+                }
             }
-            let base = format!("{LAYERS}/{}", cache.name);
-            mounts.push(vec![
-                "--internal-only".into(),
-                "--no-mtab".into(),
-                "--bind".into(),
-                "--read-only".into(),
-                "-o".into(),
-                lower_mapping(cache.owner.uid, cache.owner.gid, self.job_uid, self.job_gid),
-                format!("{base}/lower"),
-                format!("{base}/mapped-lower"),
-            ]);
-            mounts.push(vec![
-                "--internal-only".into(), "--no-mtab".into(), "-t".into(), "overlay".into(), "-o".into(),
-                format!("lowerdir={base}/mapped-lower,upperdir={base}/upper,workdir={base}/work,index=off,nosuid,nodev,metacopy=off,redirect_dir=nofollow"),
-                "overlay".into(), cache.target.to_string_lossy().into_owned(),
-            ]);
+            mounts.extend(cache.mounts(self.job_uid, self.job_gid));
         }
         let plan = serde_json::json!({ "pid": target.pid, "unit": target.unit, "cgroup": target.cgroup, "guard": self.guard, "mounts": mounts });
         // Bootstrap in the trusted daemon namespace. The helper opens pidfd,
@@ -259,7 +286,7 @@ fn id_swap(kind: char, source: u32, job: u32) -> Vec<String> {
     mappings
 }
 
-pub(crate) fn start_validation() {
+pub(crate) fn start_validation(image: Option<&Path>) {
     if let Some(home) = host_inputs::environment("CARGO_HOME") {
         let created = tree_fs::Directory::open(Path::new(&home))
             .and_then(|home| home.ensure_child(std::ffi::OsStr::new("registry")))
@@ -267,13 +294,49 @@ pub(crate) fn start_validation() {
         if let Err(error) = created {
             tracing::warn!(%error, "cannot initialize archive lower root");
         }
-        ownership::start(Path::new(&home));
+        let roots = super::cargo_sources::archive_lowers(Path::new(&home), image)
+            .into_iter()
+            .filter(|path| fs::symlink_metadata(path).is_ok())
+            .collect();
+        ownership::start(roots);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn net_overlay_idmaps_both_physical_layers_without_stacking_overlays() {
+        let scratch = cortexkit_test_support::ScratchDir::new("cargo-physical-layers");
+        let mut lowers = Vec::new();
+        for name in ["workspace-archives", "image-archives"] {
+            let source = scratch.join(name);
+            fs::create_dir(&source).unwrap();
+            let owner = ownership::Owner::observed(&source).unwrap();
+            lowers.push(Lower { source, owner });
+        }
+        let cache = Cache {
+            name: "archives",
+            lowers,
+            target: PathBuf::from("/motor-cargo-home/registry/cache"),
+        };
+        let mounts = cache.mounts(999, 999);
+        assert_eq!(mounts.len(), 3);
+        for (index, mount) in mounts[..2].iter().enumerate() {
+            assert!(mount.contains(&"--read-only".to_owned()));
+            assert!(mount[5].starts_with("X-mount.idmap="));
+            assert_eq!(
+                mount[6],
+                format!("/motor-cargo-overlay/archives/lower-{index}")
+            );
+            assert_eq!(
+                mount[7],
+                format!("/motor-cargo-overlay/archives/mapped-lower-{index}")
+            );
+        }
+        assert_eq!(mounts[2][5], "lowerdir=/motor-cargo-overlay/archives/mapped-lower-0:/motor-cargo-overlay/archives/mapped-lower-1,upperdir=/motor-cargo-overlay/archives/upper,workdir=/motor-cargo-overlay/archives/work,index=off,nosuid,nodev,metacopy=off,redirect_dir=nofollow");
+    }
 
     #[test]
     fn lower_idmap_presents_backing_owner_as_job_identity() {

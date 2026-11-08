@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 mod cargo_fetch;
 pub(crate) mod cargo_overlay;
+pub(crate) mod cargo_sources;
 mod host_inputs;
 mod hosts;
 mod javascript_tools;
@@ -273,6 +274,35 @@ pub(crate) fn retire_writer_cache(fleet: &Path, retired: &Path) -> io::Result<()
 /// without rescanning the shared trees before each launch.
 pub(crate) fn prepare_shared_read_access(javascript: &JavascriptTools) -> io::Result<()> {
     prepare_shared_read_access_as(USER, javascript)
+}
+
+/// Image access control lists (ACLs) need `u:motor-job:rX,m::rX` on entries and
+/// `d:u:motor-job:r-x,d:m::r-x` on directories. Masks may grant more, but must allow effective
+/// read/search. Without an extended access ACL, group/other rX also suffices.
+/// Source entries must not be owned by motor-job. Missing image ACLs are refused,
+/// never rewritten through the overlay, which would copy all source files up.
+pub(crate) fn prepare_job_vm_read_access(javascript: &JavascriptTools) -> io::Result<()> {
+    let home = PathBuf::from(
+        std::env::var_os("CARGO_HOME").ok_or_else(|| io::Error::other("CARGO_HOME unset"))?,
+    );
+    let uid = account_uid(USER)?.ok_or_else(|| io::Error::other("motor-job account missing"))?;
+    for layer in cargo_sources::layers(&home, Path::new(cargo_sources::IMAGE_CARGO)) {
+        // Image publication must provision its ACLs. Recursively granting them
+        // through the merged mount would copy every crate onto each workspace.
+        if !readable::already_readable(&layer.lower, uid, true) {
+            return Err(io::Error::other(format!(
+                "immutable Cargo source ACL check failed: {}; require u:motor-job:rX,m::rX (or group/other rX without an extended access ACL), and directory d:u:motor-job:r-x,d:m::r-x; masks must allow effective read/search and entries must not be owned by motor-job",
+                layer.lower.display()
+            )));
+        }
+        grant_read_only_tree_as(&layer.upper, true, USER)?;
+    }
+    let rustup = PathBuf::from(
+        std::env::var_os("RUSTUP_HOME").ok_or_else(|| io::Error::other("RUSTUP_HOME unset"))?,
+    );
+    grant_read_only_tree_as(&rustup, false, USER)?;
+    grant_read_only_tree_as(&home.join("bin"), false, USER)?;
+    grant_read_only_tree_as(javascript.bun_dir(), false, USER)
 }
 
 pub(crate) fn prepare_writer_shared_read_access(javascript: &JavascriptTools) -> io::Result<()> {
@@ -2264,6 +2294,7 @@ pub(crate) struct Sandbox {
     network: bool,
     tenant_vm: bool,
     private_pids: bool,
+    cargo_image: Option<PathBuf>,
     boat_profile: bool,
     boat_memory_max: Option<u64>,
     /// Set for Boat jobs: the identity the PID namespace
@@ -3557,6 +3588,7 @@ impl Sandbox {
             network: false,
             tenant_vm: false,
             private_pids: true,
+            cargo_image: None,
             boat_profile: false,
             boat_memory_max: None,
             pid_init: None,
@@ -3596,6 +3628,10 @@ impl Sandbox {
     }
     pub(crate) fn in_tenant_vm(mut self, enabled: bool) -> Self {
         self.tenant_vm = enabled;
+        self
+    }
+    pub(crate) fn with_cargo_image(mut self, image: Option<PathBuf>) -> Self {
+        self.cargo_image = image;
         self
     }
     pub(crate) fn with_boat_profile(
@@ -3671,6 +3707,7 @@ impl Sandbox {
                 &mut self.read_only,
                 &mut self.read_write,
                 &self.locked_git_commits,
+                self.cargo_image.as_deref(),
             )?);
         }
         let resolver = self.runtime.0.join("resolv.conf");

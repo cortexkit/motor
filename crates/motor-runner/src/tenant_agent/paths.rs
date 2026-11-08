@@ -166,6 +166,57 @@ pub(super) struct DiskLayout {
     pub(super) roots: Vec<Directory>,
 }
 
+impl DiskLayout {
+    pub(super) fn initialize_job_history(&self, boot_marker: &Path) -> io::Result<()> {
+        match fs::symlink_metadata(boot_marker) {
+            Ok(metadata) => {
+                if !metadata.is_file()
+                    || metadata.uid() != self.runner.owner
+                    || metadata.mode() & 0o022 != 0
+                {
+                    return Err(unsafe_path(boot_marker, "expected an owned boot marker"));
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.clear_execution_history()?;
+        // The marker lives on /run, not the workspace disk. It is created before
+        // starting a runner, so a restart in this boot cannot erase a live job.
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(boot_marker)?
+            .sync_all()
+    }
+
+    // Execution pages and returned-file collections are both below jobs/.
+    // Keep the catalog, mirror refs and retirement records beside them intact.
+    fn execution_history(&self) -> [PathBuf; 2] {
+        ["jobs", "tenant-events.json"].map(|name| self.runner.fd_path().join(name))
+    }
+
+    pub(super) fn clear_execution_history(&self) -> io::Result<()> {
+        for path in self.execution_history() {
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if metadata.is_dir() {
+                fs::remove_dir_all(path)?;
+            } else {
+                // Unlink a symlink itself, never the object it names.
+                fs::remove_file(path)?;
+            }
+        }
+        self.runner.file.sync_all()
+    }
+}
+
 pub(super) fn prepare_disk_layout(tenant: &Path, owner: u32) -> io::Result<DiskLayout> {
     let tenant = Directory::open(tenant, owner)?;
     let state = tenant.create("state", 0o755)?;
@@ -314,5 +365,130 @@ mod cargo_layout_tests {
             assert_eq!(metadata.uid(), owner);
             assert_eq!(metadata.mode() & 0o777, 0o755);
         }
+    }
+}
+#[cfg(test)]
+mod job_layout_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn uid() -> u32 {
+        unsafe { libc::geteuid() }
+    }
+    fn tenant_root(name: &str) -> (cortexkit_test_support::ScratchDir, PathBuf) {
+        let scratch = cortexkit_test_support::ScratchDir::new(name);
+        let root = scratch.join("tenant");
+        fs::create_dir(&root).unwrap();
+        (scratch, root)
+    }
+
+    #[test]
+    fn job_vm_cleanup_pins_only_execution_history_and_preserves_warm_state() {
+        let (_scratch, root) = tenant_root("motor-job-history");
+        let layout = prepare_disk_layout(&root, uid()).unwrap();
+        let relative: Vec<_> = layout
+            .execution_history()
+            .iter()
+            .map(|p| p.strip_prefix(layout.runner.fd_path()).unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            relative,
+            [PathBuf::from("jobs"), PathBuf::from("tenant-events.json")]
+        );
+        let state = root.join("state/main");
+        let job = state.join("jobs/old-job");
+        fs::create_dir_all(job.join("returned-collection")).unwrap();
+        fs::write(job.join("record.json"), b"old job").unwrap();
+        fs::write(job.join("0.chunk"), b"output page").unwrap();
+        fs::write(job.join("returned-collection/0"), b"returned page").unwrap();
+        fs::write(state.join("tenant-events.json"), b"old events").unwrap();
+        let preserved = [
+            "state/main/mirrors/repo/refs/motor/snapshots/pin",
+            "roots/home/workspace/target/object",
+            "cargo-home/registry/source",
+        ];
+        for name in preserved {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, name.as_bytes()).unwrap();
+        }
+        let mut catalog = crate::storage::Catalog::default();
+        catalog.workspaces.insert(
+            "/home/workspace".into(),
+            crate::storage::Workspace {
+                repository: "/home/repo".into(),
+                snapshot: "snapshot-pin".into(),
+                ..Default::default()
+            },
+        );
+        catalog.mirror_used_ms.insert("repo".into(), 42);
+        catalog.legacy_checkouts.insert(
+            "/home/retiring-checkout".into(),
+            crate::storage::LegacyCheckout {
+                repository: "/home/repo".into(),
+                tip: Some("retiring-tip".into()),
+            },
+        );
+        let catalog_bytes = serde_json::to_vec(&catalog).unwrap();
+        fs::write(state.join("catalog.json"), &catalog_bytes).unwrap();
+        layout.clear_execution_history().unwrap();
+        layout.clear_execution_history().unwrap();
+        assert!(!state.join("jobs").exists());
+        assert!(!state.join("tenant-events.json").exists());
+        let kept_bytes = fs::read(state.join("catalog.json")).unwrap();
+        assert_eq!(kept_bytes, catalog_bytes);
+        let kept: crate::storage::Catalog = serde_json::from_slice(&kept_bytes).unwrap();
+        assert_eq!(kept.workspaces["/home/workspace"].snapshot, "snapshot-pin");
+        assert_eq!(kept.mirror_used_ms["repo"], 42);
+        assert_eq!(
+            kept.legacy_checkouts["/home/retiring-checkout"]
+                .tip
+                .as_deref(),
+            Some("retiring-tip")
+        );
+        for name in preserved {
+            assert_eq!(fs::read(root.join(name)).unwrap(), name.as_bytes());
+        }
+    }
+
+    #[test]
+    fn job_vm_cleanup_never_follows_history_symlinks() {
+        let (scratch, root) = tenant_root("motor-job-history-symlink");
+        let layout = prepare_disk_layout(&root, uid()).unwrap();
+        let kept = scratch.join("kept");
+        fs::create_dir(&kept).unwrap();
+        fs::write(kept.join("page"), b"keep").unwrap();
+        symlink(&kept, layout.runner.path().join("jobs")).unwrap();
+        symlink(
+            kept.join("page"),
+            layout.runner.path().join("tenant-events.json"),
+        )
+        .unwrap();
+        layout.clear_execution_history().unwrap();
+        assert_eq!(fs::read(kept.join("page")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn second_initialization_in_one_boot_keeps_job_records() {
+        let (scratch, root) = tenant_root("motor-job-boot-history");
+        let layout = prepare_disk_layout(&root, uid()).unwrap();
+        let marker = scratch.join("boot-marker");
+        let jobs = layout.runner.path().join("jobs");
+        fs::create_dir(&jobs).unwrap();
+        fs::write(jobs.join("old-record"), b"previous boot").unwrap();
+        layout.initialize_job_history(&marker).unwrap();
+        assert!(!jobs.exists());
+        fs::create_dir(&jobs).unwrap();
+        let record = jobs.join("record.json");
+        fs::write(&record, b"this boot's execution").unwrap();
+        drop(layout);
+        let restarted = prepare_disk_layout(&root, uid()).unwrap();
+        restarted.initialize_job_history(&marker).unwrap();
+        assert_eq!(fs::read(&record).unwrap(), b"this boot's execution");
+        fs::remove_file(marker).unwrap();
+        restarted
+            .initialize_job_history(&scratch.join("boot-marker"))
+            .unwrap();
+        assert!(!jobs.exists());
     }
 }

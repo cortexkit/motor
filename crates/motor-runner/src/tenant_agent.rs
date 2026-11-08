@@ -17,6 +17,7 @@ mod diagnostics;
 pub(crate) mod dns;
 mod network;
 mod paths;
+mod per_job;
 mod remote_cache;
 mod resize;
 mod runner_socket;
@@ -31,6 +32,15 @@ pub(crate) use crate::tenant::DNS_MARKER;
 pub(crate) const ROOTS: [&str; 2] = ["/Users", "/home"];
 
 pub async fn serve_agent() -> io::Result<()> {
+    // Validate immutable boot inputs before accepting even the first account
+    // frame. Keep a typed refusal available to the host if validation fails.
+    let preflight = if per_job::enabled()? {
+        per_job::preflight()
+            .err()
+            .map(|error| agent_result(Err(error)))
+    } else {
+        None
+    };
     let listener = crate::vsock::Listener::bind(54)?;
     let attach = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let mut tasks = tokio::task::JoinSet::new();
@@ -42,12 +52,25 @@ pub async fn serve_agent() -> io::Result<()> {
             Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
         };
         let attach = attach.clone();
+        let preflight = preflight.clone();
         tasks.spawn(async move {
-            if let Err(error) = agent_session(socket, attach).await {
+            if let Err(error) = checked_agent_session(socket, attach, preflight).await {
                 tracing::warn!(%error, "tenant agent channel detached");
             }
         });
     }
+}
+
+async fn checked_agent_session<S: AsyncRead + AsyncWrite + Unpin>(
+    mut socket: S,
+    attach: std::sync::Arc<tokio::sync::Mutex<()>>,
+    preflight: Option<Value>,
+) -> io::Result<()> {
+    if let Some(refusal) = preflight {
+        // Do not read or deserialize account input on a failed boot.
+        return write_json(&mut socket, &refusal).await;
+    }
+    agent_session(socket, attach).await
 }
 
 async fn read_json<S: AsyncRead + Unpin>(socket: &mut S) -> io::Result<Option<Value>> {
@@ -91,6 +114,19 @@ async fn agent_session<S: AsyncRead + AsyncWrite + Unpin>(
 fn agent_result(result: io::Result<Value>) -> Value {
     match result {
         Ok(value) => value,
+        Err(error)
+            if error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<per_job::BootFailure>())
+                .is_some() =>
+        {
+            let failure = error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<per_job::BootFailure>()
+                .unwrap();
+            json!({"ok":false,"error":failure.code,"cause":"workspace_setup_failed","detail":failure.detail})
+        }
         Err(error)
             if error
                 .get_ref()
@@ -170,7 +206,11 @@ async fn dispatch(
             Ok(json!({"ok":true}))
         }
         TenantAgentRequest::ArgsStatus => {
-            let args = RunnerArgs::read(Path::new(ARGS))?;
+            let args = if per_job::enabled()? {
+                per_job::args()?
+            } else {
+                RunnerArgs::read(Path::new(ARGS))?
+            };
             let mut value = serde_json::to_value(args.status)?;
             value["ok"] = json!(true);
             Ok(value)
@@ -643,6 +683,12 @@ fn attach_tenant(request: TenantAgentRequest) -> io::Result<()> {
 }
 
 fn initialize_tenant(request: TenantAgentRequest, started: Instant) -> io::Result<()> {
+    let per_job = per_job::enabled()?;
+    let job_args = if per_job {
+        Some(per_job::args()?)
+    } else {
+        None
+    };
     let TenantAgentRequest::AttachTenant {
         generation,
         recovery_required,
@@ -691,11 +737,21 @@ fn initialize_tenant(request: TenantAgentRequest, started: Instant) -> io::Resul
         }
         recover_tenant_disk(deadline)?;
     } else if !snapshot::mounted("/tenant")? {
-        command("mount", &["-t", "xfs", "/dev/vdb", "/tenant"])?;
+        if per_job {
+            per_job::mount_workspace()?;
+        } else {
+            command("mount", &["-t", "xfs", "/dev/vdb", "/tenant"])?;
+        }
     }
     let layout = paths::prepare_disk_layout(Path::new("/tenant"), 0)?;
+    if per_job {
+        layout.initialize_job_history(Path::new("/run/motor-job-state-initialized"))?;
+    }
     layout.runner.remove_stale_socket("runner.sock")?;
-    let args = RunnerArgs::read(Path::new(ARGS))?;
+    let args = match job_args {
+        Some(args) => args,
+        None => RunnerArgs::read(Path::new(ARGS))?,
+    };
     let image_cargo = PathBuf::from(
         std::env::var_os("CARGO_HOME")
             .ok_or_else(|| io::Error::other("image CARGO_HOME is unset"))?,
@@ -706,6 +762,9 @@ fn initialize_tenant(request: TenantAgentRequest, started: Instant) -> io::Resul
         ));
     }
     let tool_bin = image_cargo.join("bin");
+    if per_job {
+        per_job::mount_sources(&image_cargo)?;
+    }
     paths::Directory::absolute(&tool_bin, 0)?.bind(&layout.cargo_bin, true)?;
     let mut bound_roots = Vec::new();
     for (source, root) in layout.roots.iter().zip(ROOTS) {
@@ -1178,6 +1237,22 @@ mod tests {
     }
 
     const TEST_ARGS: &str = "--backend host --tenant-vm --job-network veth --max-weight 2 --rustc-slots 2 --sccache-size-gib 5 --free-space-floor-bytes 2147483648 --workspace-root /Users --owned-workspace-root /Users --workspace-root /home --owned-workspace-root /home";
+
+    #[tokio::test]
+    async fn dax_boot_refusal_is_sent_without_reading_any_account_frame() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let refusal = agent_result(Err(per_job::failure("job_vm_dax_required", "missing DAX")));
+        let attach = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        // No client input is sent. Any read before the refusal would hang.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            checked_agent_session(server, attach, Some(refusal.clone())),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(read_json(&mut client).await.unwrap(), Some(refusal));
+    }
 
     #[test]
     fn fixed_path_options_round_trip_to_runner_command() {

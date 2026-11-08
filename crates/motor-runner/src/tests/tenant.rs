@@ -10,6 +10,9 @@ mod cancellation;
 #[cfg(target_os = "linux")]
 mod memory;
 
+#[path = "tenant_per_job.rs"]
+mod per_job;
+
 fn open(f: &Fixture) -> Runner {
     let mut config = f.config();
     config.manual_tick = true;
