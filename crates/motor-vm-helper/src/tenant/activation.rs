@@ -37,6 +37,8 @@ fn validate_runner_args(text: &str) -> Result<()> {
     let (mut host, mut tenant, mut network) = (false, false, false);
     let (mut weight, mut slots, mut cache, mut floor) = (None, None, None, None);
     let (mut roots, mut owned) = (Vec::new(), Vec::new());
+    let mut fixed_path_repositories = std::collections::BTreeSet::new();
+    let mut account_subject = None;
     while let Some(option) = words.next() {
         if option == "--tenant-vm" {
             tenant = true;
@@ -73,11 +75,36 @@ fn validate_runner_args(text: &str) -> Result<()> {
             }
             "--workspace-root" => roots.push(std::path::PathBuf::from(value)),
             "--owned-workspace-root" => owned.push(std::path::PathBuf::from(value)),
+            "--account-subject" => account_subject = Some(value),
+            "--fixed-path-repository" => {
+                if (value != "*" && !value.starts_with('/'))
+                    || value.chars().any(char::is_whitespace)
+                    || !fixed_path_repositories.insert(value)
+                {
+                    return Err(Error("invalid fixed-path repository".into()));
+                }
+            }
             "--state-root" if value == "/tenant/state" => {}
             // A tenant installed with remote cache files runs with the
             // runner's cache switch on; provisioning never writes `false`.
             "--remote-cache" if value == "true" => {}
             _ => return Err(Error("unsupported runner-args option".into())),
+        }
+    }
+    if !fixed_path_repositories.is_empty() {
+        if fixed_path_repositories.contains("*") && fixed_path_repositories.len() != 1 {
+            return Err(Error("fixed-path * must be used alone".into()));
+        }
+        let valid_subject = account_subject
+            .and_then(|sub| sub.strip_prefix("acct:").or_else(|| sub.strip_prefix("org:")))
+            .is_some_and(|id| {
+                id.len() == 26
+                    && id.bytes().all(|b| {
+                        matches!(b, b'0'..=b'9' | b'A'..=b'H' | b'J'..=b'K' | b'M'..=b'N' | b'P'..=b'T' | b'V'..=b'Z')
+                    })
+            });
+        if !valid_subject {
+            return Err(Error("fixed paths require a valid account subject".into()));
         }
     }
     roots.sort_unstable();
@@ -101,6 +128,62 @@ fn validate_runner_args(text: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod fixed_path_tests {
+    use super::validate_runner_args;
+
+    const LEGACY: &str = "--backend host --tenant-vm --job-network veth --max-weight 4 --rustc-slots 4 --sccache-size-gib 8 --free-space-floor-bytes 100 --workspace-root /Users --workspace-root /home --owned-workspace-root /Users --owned-workspace-root /home --state-root /tenant/state";
+    const SUBJECT: &str = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+    #[test]
+    fn fixed_path_arguments_accept_opt_in_and_preserve_legacy() {
+        assert!(validate_runner_args(LEGACY).is_ok());
+        assert!(validate_runner_args(&format!("{LEGACY} --account-subject ignored")).is_ok());
+        for subject in [SUBJECT, "org:01ARZ3NDEKTSV4RRFFQ69G5FAV"] {
+            for roots in [
+                "--fixed-path-repository *",
+                "--fixed-path-repository /repo/a --fixed-path-repository /repo/b",
+            ] {
+                assert!(validate_runner_args(&format!(
+                    "{LEGACY} {roots} --account-subject {subject}"
+                ))
+                .is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_path_arguments_reject_malformed_values() {
+        for roots in [
+            "relative",
+            "/repo a",
+            "/repo\ta",
+            "/repo\u{2003}a",
+            "/repo --fixed-path-repository /repo",
+            "* --fixed-path-repository /repo",
+            "/repo --fixed-path-repository *",
+            "* --fixed-path-repository *",
+            "",
+        ] {
+            let args =
+                format!("{LEGACY} --account-subject {SUBJECT} --fixed-path-repository {roots}");
+            assert!(validate_runner_args(&args).is_err(), "{args}");
+        }
+        assert!(validate_runner_args(&format!("{LEGACY} --fixed-path-repository /repo")).is_err());
+        for subject in [
+            "acct:short",
+            "user:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "acct:01arz3ndektsv4rrffq69g5fav",
+            "acct:01ARZ3NDEKTSV4RRFFQ69G5FAI",
+            "",
+        ] {
+            let args =
+                format!("{LEGACY} --fixed-path-repository /repo --account-subject {subject}");
+            assert!(validate_runner_args(&args).is_err(), "{args}");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -316,7 +316,7 @@ def component(value):
 def checked(config, *, allow_old_headroom=False):
     allowed = {"tenant", "sub", "vm", "image_version", "vcpu_ceiling", "guest_ram_mib", "disk_quota_bytes", "cpuset", "tap_index",
                "idle_suspend_s", "host_floor_bytes", "memory_headroom_mib", "page_cache_mib", "snapshot_memory_high_mib", "io_weight", "resolvers",
-               "capture_console", "max_weight", "remote_cache"}
+               "capture_console", "max_weight", "remote_cache", "fixed_path_repositories"}
     if set(config) - allowed:
         raise ValueError("unknown provisioning key")
     c = dict(config)
@@ -324,6 +324,14 @@ def checked(config, *, allow_old_headroom=False):
         raise ValueError("capture_console must be boolean")
     if "remote_cache" in c and type(c["remote_cache"]) is not bool:
         raise ValueError("remote_cache must be boolean")
+    if "fixed_path_repositories" in c:
+        roots = c["fixed_path_repositories"]
+        if not isinstance(roots, list) or any(
+                not isinstance(root, str) or (root != "*" and not root.startswith("/"))
+                or any(ch.isspace() for ch in root) for root in roots):
+            raise ValueError("fixed_path_repositories must be a list of absolute roots without whitespace, or * alone")
+        if len(set(roots)) != len(roots) or ("*" in roots and len(roots) != 1):
+            raise ValueError("fixed_path_repositories must contain distinct roots, or * alone")
     for name in ("tenant", "vm", "image_version"):
         component(c[name])
     if not re.fullmatch(r"(?:acct|org):[0-9A-HJKMNP-TV-Z]{26}", c["sub"]):
@@ -390,6 +398,9 @@ def runner_args(c):
     # cache switch on. A record without the key renders the same bytes it
     # always did, so resize keeps rendering what install wrote.
     cache = "--remote-cache true " if c.get("remote_cache") else ""
+    roots = c.get("fixed_path_repositories", [])
+    fixed_paths = (f"--account-subject {c['sub']} " +
+                   " ".join(f"--fixed-path-repository {root}" for root in roots) + " ") if roots else ""
     # Large returns reserve from a 2 GiB disk budget; jobs wait when it is full.
     return (f"--backend host --tenant-vm --job-network veth --state-root /tenant/state "
             f"--max-weight {weight} --rustc-slots {weight} "
@@ -398,6 +409,7 @@ def runner_args(c):
             f"--free-space-floor-bytes {c['disk_quota_bytes'] // 10} "
             f"--free-space-eviction-bytes {c['disk_quota_bytes'] * EVICTION_GOAL_PERCENT // 100} "
             f"{cache}"
+            f"{fixed_paths}"
             "--workspace-root /Users --owned-workspace-root /Users "
             "--workspace-root /home --owned-workspace-root /home\n")
 
@@ -888,9 +900,10 @@ def unclean_stop_evidence(tenant):
 # than copying from the provisioning record.
 REGISTRY_PATHS = {"disk": "disk.img", "generation": "generation", "suspend": "suspend"}
 # Provisioning fields provision() leaves out of the helper registry. The helper
-# and motor-host refuse unknown registry fields, and remote_cache matters only
-# to the runner arguments, which are rendered from the provisioning record.
-PROVISION_ONLY = {"tenant", "sub", "vm", "resolvers", "remote_cache"}
+# and motor-host refuse unknown registry fields. Remote-cache settings and
+# repository checkout-path opt-ins affect only runner arguments, which are
+# rendered from the provisioning record.
+PROVISION_ONLY = {"tenant", "sub", "vm", "resolvers", "remote_cache", "fixed_path_repositories"}
 
 
 def repair_from_registry(tenant, validate_image=None, check_trusted=None, output=print):
@@ -1687,7 +1700,7 @@ HELPER_CGROUPS = Path("/sys/fs/cgroup/system.slice/motor-vm-helper.service/tenan
 WINDOWS_CPUS = "12-15,28-31"
 RESIZE_SCHEMA = 1
 # The record fields a resize may change; every other field stays as provisioned.
-RESIZE_FIELDS = ("vcpu_ceiling", "guest_ram_mib", "cpuset", "max_weight", "idle_suspend_s", "disk_quota_bytes", "page_cache_mib")
+RESIZE_FIELDS = ("vcpu_ceiling", "guest_ram_mib", "cpuset", "max_weight", "idle_suspend_s", "disk_quota_bytes", "page_cache_mib", "fixed_path_repositories")
 # Forward phases, in order. Before "committed" the published records are the
 # old ones and resize --abort restores everything; from "committed" on the
 # resize only rolls forward.
@@ -1955,7 +1968,7 @@ def plan_resize(tenant, arguments):
     helper_new = render_helper_config(helper_old, old["cpuset"], new["cpuset"])
 
     registry_new = dict(record)
-    registry_new.update({name: new_config[name] for name in arguments})
+    registry_new.update({name: new_config[name] for name in arguments if name not in PROVISION_ONLY})
     registry_new["memory_headroom_mib"] = new["memory_headroom_mib"]
     registry_new["page_cache_mib"] = new["page_cache_mib"]
     return {
@@ -2210,6 +2223,7 @@ def main():
     for field, kind in (("vcpu_ceiling", int), ("guest_ram_mib", int), ("cpuset", str), ("max_weight", int),
                         ("idle_suspend_s", int), ("disk_quota_bytes", int), ("page_cache_mib", int)):
         resize_command.add_argument("--" + field.replace("_", "-"), dest=field, type=kind)
+    resize_command.add_argument("--fixed-path-repositories", nargs="*")
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("provisioning requires root on the dedicated VM host")

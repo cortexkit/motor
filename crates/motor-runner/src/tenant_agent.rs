@@ -389,6 +389,8 @@ impl RunnerArgs {
         let mut host = false;
         let mut network = false;
         let mut slots = None;
+        let mut fixed_path_repositories = Vec::new();
+        let mut account_subject = None;
         while let Some(option) = iter.next() {
             if option == "--tenant-vm" {
                 tenant = true;
@@ -430,6 +432,8 @@ impl RunnerArgs {
                 }
                 "--workspace-root" => roots.push(PathBuf::from(value)),
                 "--owned-workspace-root" => owned.push(PathBuf::from(value)),
+                "--fixed-path-repository" => fixed_path_repositories.push(value.clone()),
+                "--account-subject" => account_subject = Some(value.as_str()),
                 "--state-root" if value == "/tenant/state" => {}
                 // Provisioning turns the runner's remote cache switch on for a
                 // tenant installed with cache provisioning files; it never
@@ -438,6 +442,8 @@ impl RunnerArgs {
                 _ => return Err(io::Error::other("unsupported runner-args option")),
             }
         }
+        // Tenant runners always enable job isolation in the runner's defaults.
+        crate::engine::check_fixed_path_options(&fixed_path_repositories, account_subject, true)?;
         let required: Vec<PathBuf> = ROOTS.iter().map(PathBuf::from).collect();
         let mut actual_roots = roots;
         let mut actual_owned = owned.clone();
@@ -1172,6 +1178,72 @@ mod tests {
     }
 
     const TEST_ARGS: &str = "--backend host --tenant-vm --job-network veth --max-weight 2 --rustc-slots 2 --sccache-size-gib 5 --free-space-floor-bytes 2147483648 --workspace-root /Users --owned-workspace-root /Users --workspace-root /home --owned-workspace-root /home";
+
+    #[test]
+    fn fixed_path_options_round_trip_to_runner_command() {
+        assert!(RunnerArgs::parse(TEST_ARGS).is_ok());
+        assert!(RunnerArgs::parse(&format!("{TEST_ARGS} --account-subject ignored")).is_ok());
+        for subject in [
+            "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "org:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        ] {
+            for roots in [
+                "--fixed-path-repository *",
+                "--fixed-path-repository /repo/a --fixed-path-repository /repo/b",
+            ] {
+                let text = format!("{TEST_ARGS} {roots} --account-subject {subject}");
+                let parsed = RunnerArgs::parse(&text).unwrap();
+                assert_eq!(parsed.words, text.split_whitespace().collect::<Vec<_>>());
+                let command =
+                    runner_command(&parsed, Path::new("/usr/local/bin/motor-runner"), &[]);
+                let words: Vec<_> = command
+                    .get_args()
+                    .map(|word| word.to_str().unwrap())
+                    .collect();
+                assert!(words
+                    .windows(2)
+                    .any(|words| words == ["--account-subject", subject]));
+                for pair in roots
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .as_chunks::<2>()
+                    .0
+                {
+                    assert!(words.windows(2).any(|words| words == pair));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_path_options_reject_malformed_values() {
+        for roots in [
+            "relative",
+            "/repo a",
+            "/repo\ta",
+            "/repo\u{2003}a",
+            "/repo --fixed-path-repository /repo",
+            "* --fixed-path-repository /repo",
+            "/repo --fixed-path-repository *",
+            "* --fixed-path-repository *",
+            "",
+        ] {
+            let text = format!("{TEST_ARGS} --account-subject acct:01ARZ3NDEKTSV4RRFFQ69G5FAV --fixed-path-repository {roots}");
+            assert!(RunnerArgs::parse(&text).is_err(), "{text}");
+        }
+        assert!(RunnerArgs::parse(&format!("{TEST_ARGS} --fixed-path-repository /repo")).is_err());
+        for subject in [
+            "acct:short",
+            "user:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "acct:01arz3ndektsv4rrffq69g5fav",
+            "acct:01ARZ3NDEKTSV4RRFFQ69G5FAI",
+            "",
+        ] {
+            let text =
+                format!("{TEST_ARGS} --fixed-path-repository /repo --account-subject {subject}");
+            assert!(RunnerArgs::parse(&text).is_err(), "{text}");
+        }
+    }
 
     #[test]
     fn return_options_are_bounded_and_passed_to_the_runner() {

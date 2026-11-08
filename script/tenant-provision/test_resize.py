@@ -268,6 +268,37 @@ class ResizeTests(unittest.TestCase):
         self.assert_new_state()
         self.assertEqual(self.bases, [self.image / "base/4-8192"])
 
+    def test_fixed_path_only_resize_rerenders_args_without_registry_field(self):
+        roots = ["/repo/a", "/repo/b"]
+        home = self.root / "tenants/a"
+        registry_before = json.loads((p.REGISTRY / "a.json").read_text())
+        self.resize({"fixed_path_repositories": roots})
+        updated = json.loads((p.PROVISION / "a.json").read_text())
+        self.assertEqual(updated["fixed_path_repositories"], roots)
+        self.assertEqual({key: value for key, value in updated.items() if key != "fixed_path_repositories"}, self.config)
+        self.assertEqual(json.loads((p.REGISTRY / "a.json").read_text()), registry_before)
+        staged = json.loads((home / "runner-args.staged").read_text())
+        self.assertEqual(staged["runner_args"], p.runner_args(p.checked(updated)))
+        self.assertIn(f"--account-subject {SUB} --fixed-path-repository /repo/a --fixed-path-repository /repo/b ",
+                      staged["runner_args"])
+        self.assertFalse(staged["quota_grew"])
+        self.assertEqual((home / "disk.img").stat().st_size, 20 * GIB)
+        self.assertEqual(self.bases, [])
+        self.assertEqual(self.commands, [])
+
+    def test_fixed_path_resize_can_disable_and_rejects_invalid_roots(self):
+        for roots in [["relative"], ["*", "/repo"], ["/repo", "/repo"], ["/repo a"]]:
+            before = self.tree()
+            with self.subTest(roots=roots), self.assertRaisesRegex(ValueError, "fixed_path_repositories"):
+                self.resize({"fixed_path_repositories": roots})
+            self.assertEqual(self.tree(), before)
+        enabled = {**self.config, "fixed_path_repositories": ["*"]}
+        (p.PROVISION / "a.json").write_text(json.dumps(enabled, indent=2) + "\n")
+        self.resize({"fixed_path_repositories": []})
+        staged = json.loads((self.root / "tenants/a/runner-args.staged").read_text())
+        self.assertNotIn("--fixed-path-repository", staged["runner_args"])
+        self.assertNotIn("--account-subject", staged["runner_args"])
+
     def test_resize_accepts_windows_threads_without_a_windows_vm(self):
         capacity = dict(CAPACITY, windows_vm_bytes=0)
         for cpuset, vcpus in (("12-15", 4), ("28-31", 4), ("0-14,16-30", 30)):

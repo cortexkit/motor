@@ -95,6 +95,12 @@ pub struct Config {
     /// Accept host-authenticated tenant connections over vsock and limit each
     /// job unit to 4096 tasks, with no permission to open AF_VSOCK sockets.
     pub tenant_vm: bool,
+    /// Exact caller repository roots selected for job checkouts at
+    /// `/w/<account>/<repo-key>/<name>`; `*` selects all roots.
+    pub fixed_path_repositories: Vec<String>,
+    /// Account subject for the checkout path's account component, independent
+    /// of tenant-VM mode.
+    pub account_subject: Option<String>,
     /// Explicit single-tenant Boat compatibility: systemd before 257 cannot
     /// create private PID namespaces. All other job isolation remains enabled.
     pub boat_profile: bool,
@@ -444,6 +450,47 @@ fn refuse_before_start(
     }
 }
 
+pub(crate) fn check_fixed_path_options(
+    repositories: &[String],
+    account_subject: Option<&str>,
+    isolate_jobs: bool,
+) -> io::Result<()> {
+    if repositories.is_empty() {
+        return Ok(());
+    }
+    let mut seen = BTreeSet::new();
+    for root in repositories {
+        if (root != "*" && !root.starts_with('/'))
+            || root.chars().any(char::is_whitespace)
+            || !seen.insert(root)
+            || (root == "*" && repositories.len() != 1)
+        {
+            return Err(io::Error::other(
+                "--fixed-path-repository requires distinct absolute roots without whitespace, or * alone",
+            ));
+        }
+    }
+    let valid_subject = account_subject
+        .and_then(|sub| sub.strip_prefix("acct:").or_else(|| sub.strip_prefix("org:")))
+        .is_some_and(|id| {
+            id.len() == 26
+                && id.bytes().all(|b| {
+                    matches!(b, b'0'..=b'9' | b'A'..=b'H' | b'J'..=b'K' | b'M'..=b'N' | b'P'..=b'T' | b'V'..=b'Z')
+                })
+        });
+    if !valid_subject {
+        return Err(io::Error::other(
+            "--fixed-path-repository requires --account-subject with an acct: or org: Crockford base32 identity",
+        ));
+    }
+    if !isolate_jobs {
+        return Err(io::Error::other(
+            "--fixed-path-repository requires job isolation",
+        ));
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn new(state_root: impl Into<PathBuf>, instance: impl Into<String>) -> Self {
         let state_root = state_root.into();
@@ -452,6 +499,8 @@ impl Config {
             source_seals: Arc::default(),
             metrics: crate::metrics::Settings::default(),
             tenant_vm: false,
+            fixed_path_repositories: Vec::new(),
+            account_subject: None,
             boat_profile: false,
             boat_cold_materialization: false,
             #[cfg(target_os = "linux")]
@@ -612,6 +661,11 @@ impl Config {
 
     /// Validate serve options without opening the state directory or taking locks.
     pub fn check_options(&self) -> io::Result<()> {
+        check_fixed_path_options(
+            &self.fixed_path_repositories,
+            self.account_subject.as_deref(),
+            self.isolate_jobs,
+        )?;
         if let Some(max) = self.return_chunked_max_bytes {
             if !(RETURN_CHUNKED_MAX_BYTES_CAP..=RETURN_LARGE_MAX_BYTES_CAP).contains(&max)
                 || !self.supports_returns()

@@ -599,6 +599,39 @@ class ProvisionTests(unittest.TestCase):
             self.assertIn(option, args)
         self.assertIn("--workspace-root /home --owned-workspace-root /home", args)
 
+    def test_fixed_path_disabled_runner_args_golden(self):
+        expected = (
+            "--backend host --tenant-vm --job-network veth --state-root /tenant/state "
+            "--max-weight 2 --rustc-slots 2 "
+            "--return-chunked-max-bytes 134217728 --return-budget-bytes 2147483648 "
+            "--sccache-size-gib 5 --free-space-floor-bytes 2147483648 "
+            "--free-space-eviction-bytes 7516192768 "
+            "--workspace-root /Users --owned-workspace-root /Users "
+            "--workspace-root /home --owned-workspace-root /home\n")
+        self.assertEqual(p.runner_args(config()), expected)
+        self.assertEqual(p.runner_args(p.checked({**config(), "fixed_path_repositories": []})), expected)
+
+    def test_fixed_path_enabled_record_round_trips_and_renders(self):
+        for roots in [["/repo/a", "/repo/b"], ["*"]]:
+            with self.subTest(roots=roots):
+                enabled = p.checked({**config(), "fixed_path_repositories": roots})
+                restored = p.checked(json.loads(json.dumps(enabled)))
+                self.assertEqual(restored, enabled)
+                options = f"--account-subject {SUB} " + " ".join(
+                    f"--fixed-path-repository {root}" for root in roots) + " "
+                self.assertEqual(p.runner_args(restored), p.runner_args(config()).replace(
+                    "--workspace-root /Users", options + "--workspace-root /Users"))
+                self.assertIn("fixed_path_repositories", p.PROVISION_ONLY)
+                registry = {key: value for key, value in restored.items() if key not in p.PROVISION_ONLY}
+                self.assertNotIn("fixed_path_repositories", registry)
+
+    def test_fixed_path_records_refuse_malformed_roots(self):
+        for roots in ["/repo", None, 1, {}, [1], [""], ["relative"], ["/repo a"],
+                      ["/repo\ta"], ["/repo\na"], ["/repo\u2003a"],
+                      ["*", "/repo"], ["/repo", "*"], ["*", "*"], ["/repo", "/repo"]]:
+            with self.subTest(roots=roots), self.assertRaisesRegex(ValueError, "fixed_path_repositories"):
+                p.checked({**config(), "fixed_path_repositories": roots})
+
     def test_new_base_space_is_checked_before_any_mutation(self):
         c = config()
         needed = c["disk_quota_bytes"] + 2 * c["guest_ram_mib"] * 1048576 + c["host_floor_bytes"] + 512 * 1048576

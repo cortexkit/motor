@@ -484,6 +484,8 @@ fn configure_options(
             "--metrics-key-file" => config.metrics.key_file = Some(value.into()),
             "--metrics-counter-journal" => config.metrics.counter_journal = Some(value.into()),
             "--instance" => config.instance = value,
+            "--account-subject" => config.account_subject = Some(value),
+            "--fixed-path-repository" => config.fixed_path_repositories.push(value),
             "--remote-cache" => config.remote_cache = value.parse().map_err(io::Error::other)?,
             "--remote-cache-forwarder-port" => {
                 let (tool, port) = value
@@ -587,6 +589,125 @@ fn configure_options(
     config.check_options()?;
     config.metrics.check()?;
     Ok((job, drain_timeout_s, exit_after))
+}
+
+#[cfg(test)]
+mod fixed_path_options {
+    use super::*;
+
+    const SUBJECT: &str = "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+    fn parse(args: &[&str], isolate_jobs: bool) -> io::Result<Config> {
+        let mut config = Config::new("/state", "test");
+        config.isolate_jobs = isolate_jobs;
+        configure_options(&mut config, args.iter().map(|s| (*s).to_owned()))?;
+        Ok(config)
+    }
+
+    #[test]
+    fn accepts_fixed_path_roots_and_wildcard_without_tenant_mode() {
+        for subject in [SUBJECT, "org:01ARZ3NDEKTSV4RRFFQ69G5FAV"] {
+            let config = parse(
+                &[
+                    "--fixed-path-repository",
+                    "/repo/a",
+                    "--account-subject",
+                    subject,
+                    "--fixed-path-repository",
+                    "/repo/b",
+                ],
+                true,
+            )
+            .unwrap();
+            assert_eq!(config.fixed_path_repositories, ["/repo/a", "/repo/b"]);
+            assert_eq!(config.account_subject.as_deref(), Some(subject));
+            assert!(!config.tenant_vm);
+        }
+        assert_eq!(
+            parse(
+                &["--account-subject", SUBJECT, "--fixed-path-repository", "*"],
+                true
+            )
+            .unwrap()
+            .fixed_path_repositories,
+            ["*"]
+        );
+    }
+
+    #[test]
+    fn refuses_malformed_fixed_path_roots() {
+        for roots in [
+            vec!["relative"],
+            vec![""],
+            vec!["/repo a"],
+            vec!["/repo\ta"],
+            vec!["/repo\u{2003}a"],
+            vec!["/repo", "/repo"],
+            vec!["*", "/repo"],
+            vec!["/repo", "*"],
+            vec!["*", "*"],
+        ] {
+            let mut args = vec!["--account-subject", SUBJECT];
+            for root in &roots {
+                args.extend(["--fixed-path-repository", root]);
+            }
+            let err = parse(&args, true).err().expect("invalid roots accepted");
+            assert!(
+                err.to_string().contains("distinct absolute roots"),
+                "{roots:?}: {err}"
+            );
+        }
+        assert!(parse(&["--fixed-path-repository"], true).is_err());
+        assert!(parse(&["--account-subject"], true).is_err());
+    }
+
+    #[test]
+    fn fixed_paths_require_subject_and_isolation_only_when_enabled() {
+        let err = parse(&["--fixed-path-repository", "/repo"], true)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("requires --account-subject"));
+        for subject in [
+            "",
+            "user:01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "acct:short",
+            "acct:01arz3ndektsv4rrffq69g5fav",
+            "acct:01ARZ3NDEKTSV4RRFFQ69G5FAI",
+            "acct:01ARZ3NDEKTSV4RRFFQ69G5FAV0",
+        ] {
+            let err = parse(
+                &[
+                    "--fixed-path-repository",
+                    "/repo",
+                    "--account-subject",
+                    subject,
+                ],
+                true,
+            )
+            .err()
+            .expect("invalid subject accepted");
+            assert!(
+                err.to_string().contains("requires --account-subject"),
+                "{subject}: {err}"
+            );
+        }
+        let err = parse(
+            &[
+                "--fixed-path-repository",
+                "/repo",
+                "--account-subject",
+                SUBJECT,
+            ],
+            false,
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("requires job isolation"));
+        let config = parse(&[], false).unwrap();
+        assert!(config.fixed_path_repositories.is_empty());
+        assert!(config.account_subject.is_none());
+        assert!(parse(&["--account-subject", "not-a-subject"], false).is_ok());
+    }
 }
 
 #[cfg(test)]
