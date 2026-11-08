@@ -10,6 +10,8 @@ mod cancellation;
 #[cfg(target_os = "linux")]
 mod memory;
 
+#[path = "tenant_have_reports.rs"]
+mod have_reports;
 #[path = "tenant_per_job.rs"]
 mod per_job;
 
@@ -27,6 +29,7 @@ fn lease(id: Uuid, purpose: LeasePurpose) -> VerifiedLease {
         vcpus: 2,
         mem_mib: Some(16384),
         mem_burst_mib: None,
+        mirror_reports: false,
         platform: crate::tenant::host_platform()
             .unwrap_or("unsupported")
             .into(),

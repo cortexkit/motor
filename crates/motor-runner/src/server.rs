@@ -29,6 +29,8 @@ struct TenantState {
     closed: bool,
     created_record: bool,
     cause: RefusedCause,
+    terminal_written: bool,
+    terminal_stored: bool,
 }
 
 struct TenantConnection {
@@ -95,6 +97,7 @@ impl TenantConnection {
                 true
             }
             Frame::Attach(request) => request.job_id == self.lease.jti,
+            Frame::TerminalStored { jti } => self.runner.config().per_job && *jti == self.lease.jti,
             Frame::Cancel(request) => request.job_id == self.lease.jti,
             Frame::Withdraw { job_id, .. } | Frame::JobStatus { job_id } => {
                 *job_id == self.lease.jti
@@ -117,6 +120,9 @@ pub(crate) async fn tenant_channel<S: AsyncRead + AsyncWrite + Unpin + Send + 's
             Ok(Ok(Some(DecodedFrame::Frame(Frame::VerifiedLease(lease))))) => lease,
             _ => return Ok(()),
         };
+    if let Some(events) = runner.tenant_events() {
+        events.enable_reports(runner.config().per_job, lease.mirror_reports)?;
+    }
     let ctx = Arc::new(TenantConnection {
         runner: runner.clone(),
         lease,
@@ -125,6 +131,8 @@ pub(crate) async fn tenant_channel<S: AsyncRead + AsyncWrite + Unpin + Send + 's
             closed: false,
             created_record: false,
             cause: RefusedCause::Disconnect,
+            terminal_written: false,
+            terminal_stored: false,
         }),
         changed: tokio::sync::Notify::new(),
         stop_write: tokio::sync::Notify::new(),
@@ -150,7 +158,7 @@ pub async fn serve(runner: Runner, listener: UnixListener) -> io::Result<()> {
             biased;
             _ = service_stop.changed() => break,
             _ = poll.tick() => {
-                if runner.is_draining() && runner.drain_should_exit() { break; }
+                if !runner.config().per_job && runner.is_draining() && runner.drain_should_exit() { break; }
                 continue;
             },
             Some(_) = channels.join_next(), if !channels.is_empty() => continue,
@@ -273,6 +281,16 @@ async fn reader<R: AsyncRead + Unpin>(
                 trace.reason = "operation_refused";
                 break;
             }
+            if let Frame::TerminalStored { jti } = &frame {
+                let mut state = ctx.state.lock().await;
+                if !state.terminal_written || !ctx.runner.terminal_stored(*jti) {
+                    ctx.operation_refused("terminal_stored", "terminal_not_written");
+                    break;
+                }
+                state.terminal_stored = true;
+                ctx.changed.notify_one();
+                continue;
+            }
         }
         read.activity.send_modify(|p| {
             p.partial_at = None;
@@ -351,6 +369,16 @@ async fn writer<W: AsyncWrite + Unpin>(
                 }
             } else {
                 state.closed = true;
+            }
+            ctx.changed.notify_one();
+            result
+        } else if let (Some(ctx), Frame::Terminal(_)) = (&tenant, &frame) {
+            // Hold the same lock as the reader through the flush so an ack
+            // arriving immediately cannot race terminal_written publication.
+            let mut state = ctx.state.lock().await;
+            let result = write_frame_async(&mut write, &frame).await;
+            if result.is_ok() {
+                state.terminal_written = true;
             }
             ctx.changed.notify_one();
             result
@@ -516,6 +544,24 @@ async fn channel_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         },
     )
     .await;
+    if let Some(ctx) = &tenant {
+        if ctx.runner.config().per_job && result.is_ok() {
+            loop {
+                let changed = ctx.changed.notified();
+                let state = ctx.state.lock().await;
+                if state.closed || state.terminal_stored {
+                    break;
+                }
+                // Only a completed job stream drains for durable replay. A
+                // pre-admission refusal must still close promptly.
+                if !ctx.runner.terminal_ready(ctx.lease.jti) {
+                    break;
+                }
+                drop(state);
+                changed.await;
+            }
+        }
+    }
     if let Some(ctx) = &tenant {
         // The session's own end, beside the reader's and writer's
         // runner_channel_closed: "returned" covers a delivered terminal, a

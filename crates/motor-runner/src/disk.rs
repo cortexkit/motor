@@ -2098,6 +2098,10 @@ impl Runner {
             let access: io::Result<()> = authorization;
             let mut cache_cleared = false;
             let deleted = access.and_then(|()| {
+                if candidate.path.parent() == Some(self.core.trees.state.join("git-deps").as_path())
+                {
+                    self.report_retired_mirror(&candidate.path)?;
+                }
                 if crate::caller_path::trash::mapped_root(
                     &self.core.config,
                     crate::caller_path::host(&candidate.path),

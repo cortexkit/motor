@@ -118,6 +118,7 @@ fn event(
         mem_working_peak_mib: None,
         mem_over_mib_ms: None,
         remote_cache_totals: None,
+        mirror_refs: None,
     }
 }
 fn disk_host(path: &std::path::Path) -> Host {

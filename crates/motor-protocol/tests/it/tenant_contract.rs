@@ -16,6 +16,41 @@ fn verified_lease_memory_is_optional_for_older_hosts() {
 }
 
 #[test]
+fn mirror_reports_require_explicit_lease_opt_in_and_terminal_storage_ack_is_additive() {
+    let mut value = json!({"type":"verified_lease", "jti":"019e4567-89ab-7cde-8012-3456789abcde",
+        "purpose":"run", "sub":"acct:test", "vcpus":2, "platform":"linux-x64",
+        "net":false, "max_s":30, "exp":1800000000});
+    let Frame::VerifiedLease(legacy) = serde_json::from_value::<Frame>(value.clone()).unwrap()
+    else {
+        panic!()
+    };
+    assert!(!legacy.mirror_reports);
+    assert_eq!(
+        serde_json::to_value(Frame::VerifiedLease(legacy)).unwrap(),
+        value
+    );
+    value["mirror_reports"] = json!(true);
+    let Frame::VerifiedLease(opted_in) = serde_json::from_value::<Frame>(value.clone()).unwrap()
+    else {
+        panic!()
+    };
+    assert!(opted_in.mirror_reports);
+    assert_eq!(
+        serde_json::to_value(Frame::VerifiedLease(opted_in)).unwrap(),
+        value
+    );
+    for value in [
+        json!({"type":"terminal_stored", "jti":"019e4567-89ab-7cde-8012-3456789abcde"}),
+        json!({"type":"event", "event_seq":4, "event":"mirror_refs", "mirror_refs":{
+            "imported":true, "refs":[{"repository":"/repo", "reference":"refs/snapshots/abc", "commit":"abc"},
+                {"dependency":"https://example.com/dep", "reference":"refs/ck-motor/dep/def", "commit":"def"}]}}),
+    ] {
+        let frame: Frame = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(frame).unwrap(), value);
+    }
+}
+
+#[test]
 fn burst_lease_is_additive_for_old_guest_readers() {
     #[derive(serde::Deserialize, serde::Serialize)]
     struct OldLease {
@@ -150,6 +185,7 @@ fn pinned_tenant_frames_are_inline_and_integer_only() {
         mem_working_peak_mib: None,
         mem_over_mib_ms: None,
         remote_cache_totals: None,
+        mirror_refs: None,
     });
     assert_eq!(
         serde_json::to_value(event).unwrap(),
@@ -165,6 +201,7 @@ fn pinned_tenant_frames_are_inline_and_integer_only() {
         mem_working_peak_mib: None,
         mem_over_mib_ms: None,
         remote_cache_totals: None,
+        mirror_refs: None,
     });
     assert_eq!(
         serde_json::to_value(idle).unwrap(),

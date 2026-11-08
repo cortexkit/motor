@@ -7,6 +7,9 @@ use std::{
     path::{Path, PathBuf},
     sync::Mutex,
 };
+#[path = "tenant_mirror_reports.rs"]
+mod mirror_reports;
+use mirror_reports::MirrorJournal;
 
 /// Written by tenant attachment once it has placed the daemon's private
 /// resolver file. The runner that attachment starts reads it to decide whether
@@ -39,6 +42,11 @@ struct Events {
 pub(crate) struct EventLog {
     path: PathBuf,
     state: Mutex<Events>,
+    reports: std::sync::atomic::AtomicBool,
+    per_job: bool,
+    terminal_stored: std::sync::Mutex<Option<(Uuid, u64)>>,
+    mirror_path: PathBuf,
+    mirror_journal: Mutex<MirrorJournal>,
     // Samples are coalesced and ephemeral; only lifecycle events need replay.
     #[cfg(any(target_os = "linux", test))]
     samples: Mutex<BTreeMap<Uuid, MemorySample>>,
@@ -57,6 +65,7 @@ impl Events {
             mem_working_peak_mib: None,
             mem_over_mib_ms: None,
             remote_cache_totals: None,
+            mirror_refs: None,
         });
     }
 }
@@ -68,7 +77,11 @@ impl EventLog {
             s.pending.back_mut().unwrap().setup = Some(phase);
         })
     }
+    #[cfg(test)]
     pub(crate) fn open(root: &Path) -> io::Result<Self> {
+        Self::open_for_mode(root, false)
+    }
+    pub(crate) fn open_for_mode(root: &Path, per_job: bool) -> io::Result<Self> {
         let path = root.join("tenant-events.json");
         let mut state: Events = match read_json(&path) {
             Ok(state) => state,
@@ -78,9 +91,20 @@ impl EventLog {
         // A fresh runner must announce idleness even if the previous process
         // already had its idle event acknowledged.
         state.idle = false;
+        let mirror_path = root.join("mirror-reports.json");
+        let mirror_journal = if per_job {
+            MirrorJournal::open(&mirror_path)?
+        } else {
+            MirrorJournal::default()
+        };
         Ok(Self {
             path,
             state: Mutex::new(state),
+            reports: std::sync::atomic::AtomicBool::new(false),
+            per_job,
+            terminal_stored: Mutex::new(None),
+            mirror_path,
+            mirror_journal: Mutex::new(mirror_journal),
             #[cfg(any(target_os = "linux", test))]
             samples: Mutex::new(BTreeMap::new()),
         })
@@ -188,9 +212,13 @@ impl EventLog {
             return Err(io::Error::other("out-of-order tenant event ack"));
         }
         let mut state = guard.clone();
-        state.pending.pop_front();
+        let report = state.pending.pop_front().and_then(|e| e.mirror_refs);
         atomic_json_private(&self.path, &state)?;
         *guard = state;
+        drop(guard);
+        if let Some(report) = report {
+            self.ack_report(&report)?;
+        }
         Ok(())
     }
 }
@@ -247,7 +275,12 @@ pub async fn serve_tenant(runner: crate::Runner) -> io::Result<()> {
                 socket = jobs.accept() => socket?,
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
                 _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {
-                    if job_runner.drain_should_exit() { return Ok::<(), io::Error>(()); }
+                    if job_runner.job_poweroff_ready() {
+                        let status = std::process::Command::new("systemctl").arg("poweroff").status()?;
+                        if !status.success() { return Err(io::Error::other("job VM poweroff failed")); }
+                        return Ok::<(), io::Error>(());
+                    }
+                    if !job_runner.config().per_job && job_runner.drain_should_exit() { return Ok::<(), io::Error>(()); }
                     continue;
                 }
             };
@@ -271,6 +304,7 @@ pub(crate) async fn event_session<S: tokio::io::AsyncRead + tokio::io::AsyncWrit
         .tenant_events()
         .ok_or_else(|| io::Error::other("not a tenant runner"))?;
     let (mut reader, mut writer) = tokio::io::split(socket);
+    log.publish_reports()?;
     // Capture the watermark before any await; newly allocated events are live.
     // This additive control frame leaves the retained event and ack bytes alone.
     let mut boundary = serde_json::to_value(log.replay_boundary()).map_err(io::Error::other)?;
@@ -318,6 +352,96 @@ pub(crate) async fn event_session<S: tokio::io::AsyncRead + tokio::io::AsyncWrit
 mod tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
+
+    #[test]
+    fn pre_opt_in_reports_are_bounded_durable_and_count_discarded_oldest_entries() {
+        let root = ScratchDir::new("motor-deferred-mirror-reports");
+        let log = EventLog::open_for_mode(&root, true).unwrap();
+        for index in 0..mirror_reports::REPORT_LIMIT + 2 {
+            log.mirror_refs(
+                false,
+                Path::new("mirror"),
+                vec![MirrorRef {
+                    repository: None,
+                    dependency: None,
+                    reference: format!("refs/snapshots/{index}"),
+                    commit: index.to_string(),
+                }],
+            )
+            .unwrap();
+        }
+        assert!(log.first().is_none());
+        drop(log);
+        let log = EventLog::open_for_mode(&root, true).unwrap();
+        log.enable_reports(true, true).unwrap();
+        for index in 0..mirror_reports::REPORT_LIMIT {
+            let event = log.first().unwrap();
+            let report = event.mirror_refs.unwrap();
+            assert_eq!(report.dropped_reports, if index == 0 { 2 } else { 0 });
+            assert_eq!(report.refs[0].commit, (index + 2).to_string());
+            log.ack(event.event_seq).unwrap();
+        }
+        assert!(log.first().is_none());
+    }
+
+    #[test]
+    fn corrupt_mirror_journal_is_quarantined_once_and_reports_loss_without_blocking_boot() {
+        let root = ScratchDir::new("motor-corrupt-mirror-reports");
+        std::fs::write(root.join("mirror-reports.json"), b"not-json").unwrap();
+        let log = EventLog::open_for_mode(&root, true).unwrap();
+        assert_eq!(
+            std::fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("mirror-reports.invalid-"))
+                .count(),
+            1
+        );
+        log.enable_reports(true, true).unwrap();
+        let event = log.first().unwrap();
+        let report = event.mirror_refs.as_ref().unwrap();
+        assert_eq!(report.dropped_reports, 1);
+        assert!(report.refs.is_empty());
+        log.ack(event.event_seq).unwrap();
+        drop(log);
+        let log = EventLog::open_for_mode(&root, true).unwrap();
+        log.enable_reports(true, true).unwrap();
+        assert!(log.first().is_none());
+        assert_eq!(
+            std::fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("mirror-reports.invalid-"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn tenant_mode_never_creates_a_retained_mirror_journal() {
+        let root = ScratchDir::new("motor-tenant-no-mirror-journal");
+        let log = EventLog::open_for_mode(&root, false).unwrap();
+        log.enable_reports(false, true).unwrap();
+        log.mirror_refs(
+            false,
+            Path::new("mirror"),
+            vec![MirrorRef {
+                repository: None,
+                dependency: None,
+                reference: "refs/snapshots/unknown".into(),
+                commit: String::new(),
+            }],
+        )
+        .unwrap();
+        assert!(!root.join("mirror-reports.json").exists());
+        assert!(log.first().is_none());
+    }
 
     #[test]
     fn tenant_events_survive_reopen_and_ack_only_the_head() {
@@ -368,6 +492,7 @@ mod tests {
                 mem_working_peak_mib: None,
                 mem_over_mib_ms: None,
                 remote_cache_totals: None,
+                mirror_refs: None,
             }
         );
     }

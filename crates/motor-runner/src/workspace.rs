@@ -33,6 +33,60 @@ pub(crate) fn name(path: &str) -> String {
     format!("{:x}", Sha256::digest(path.as_bytes()))
 }
 
+pub(crate) fn mirror_identity(mirror: &Path) -> (Option<String>, Option<String>) {
+    let config = mirror.join("config");
+    let Some(config) = config.to_str() else {
+        return (None, None);
+    };
+    let read = |key| {
+        git(
+            mirror,
+            &["config", "--no-includes", "--file", config, "--get", key],
+        )
+        .ok()
+    };
+    let repository = read("motor.repository");
+    let dependency = read("motor.dependency-url");
+    let key_matches = |identity: &str| {
+        mirror
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.trim_end_matches(".git") == name(identity))
+    };
+    match (repository, dependency) {
+        (Some(repository), None)
+            if repository.starts_with('/')
+                && !repository.chars().any(char::is_control)
+                && key_matches(&repository) =>
+        {
+            (Some(repository), None)
+        }
+        (None, Some(dependency))
+            if dependencies::valid_url(&dependency) && key_matches(&dependency) =>
+        {
+            (None, Some(dependency))
+        }
+        _ => (None, None),
+    }
+}
+
+pub(crate) fn write_mirror_identity(mirror: &Path, key: &str, value: &str) -> io::Result<()> {
+    let config = mirror.join("config");
+    git(
+        mirror,
+        &[
+            "config",
+            "--file",
+            config
+                .to_str()
+                .ok_or_else(|| invalid("mirror config path"))?,
+            key,
+            value,
+        ],
+    )
+    .map(|_| ())
+}
+
 fn git_command(path: &Path) -> Command {
     let mut command = Command::new("git");
     command
@@ -1102,6 +1156,7 @@ impl Trees {
         if !path.exists() {
             fs::create_dir_all(&path)?;
             git(&path, &["init", "--bare"])?;
+            write_mirror_identity(&path, "motor.repository", repository)?;
         }
         Ok(path)
     }
@@ -1149,6 +1204,18 @@ impl Trees {
             // No destination ref: a later failed fetch leaves only unreachable
             // objects, not a held snapshot that have_reply would advertise.
             let spool = directory.join(b.index.to_string());
+            for prerequisite in bundle_prerequisites(&spool)? {
+                git(
+                    &mirror,
+                    &["cat-file", "-e", &format!("{prerequisite}^{{commit}}")],
+                )
+                .map_err(|_| {
+                    crate::engine::missing_history(format!(
+                        "{} prerequisite {prerequisite}",
+                        b.repository
+                    ))
+                })?;
+            }
             let spool = spool.to_str().ok_or_else(|| invalid("spool path"))?;
             let heads = git(&mirror, &["bundle", "list-heads", spool])?;
             let refs: Vec<_> = heads
@@ -1184,13 +1251,17 @@ impl Trees {
             git(
                 &self.ensure_mirror(repository)?,
                 &["cat-file", "-e", &format!("{snapshot}^{{commit}}")],
-            )?;
+            )
+            .map_err(|_| {
+                crate::engine::missing_history(format!("{repository} snapshot {snapshot}"))
+            })?;
         }
         if !tip.is_empty() {
             git(
                 &self.ensure_mirror(root)?,
                 &["cat-file", "-e", &format!("{tip}^{{commit}}")],
-            )?;
+            )
+            .map_err(|_| crate::engine::missing_history(format!("{root} tip {tip}")))?;
         }
         Ok(())
     }
@@ -1214,6 +1285,7 @@ impl Trees {
                     snapshot,
                 ],
             )?;
+            write_mirror_identity(&self.mirror(repository), "motor.repository", repository)?;
         }
         if !tip.is_empty() {
             git(

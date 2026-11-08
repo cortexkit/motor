@@ -443,6 +443,7 @@ define_frames! {
     Event(crate::TenantEvent),
     MemorySample(crate::MemorySample),
     Ack { event_seq: u64 },
+    TerminalStored { jti: Uuid },
     Hello {
         protocol_version: u32,
         /// Opt in to sequenced Started records; absence preserves the legacy output cursor.
