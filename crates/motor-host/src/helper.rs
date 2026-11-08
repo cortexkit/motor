@@ -487,7 +487,9 @@ fn check_start_reply(reply: &Value) -> Result<()> {
 /// fresh attach starts the tenant runner, so its deadline is derived from the
 /// guest's runner-readiness wait; recovery also checks the tenant disk.
 pub fn control_read_deadline(request: &Value) -> Duration {
-    if request["recovery_required"] == true {
+    if request["op"] == "job_status" {
+        Duration::from_millis(crate::billing::LOST_GUEST_CHECK_MS)
+    } else if request["recovery_required"] == true {
         motor_protocol::TENANT_ATTACH_READ_DEADLINE + motor_protocol::TENANT_RECOVERY_ALLOWANCE
     } else if request["op"] == "set_remote_cache" {
         // Stop plus restart can use the full runner readiness budget. Do not
