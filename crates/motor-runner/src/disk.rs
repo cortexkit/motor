@@ -2212,6 +2212,9 @@ impl Runner {
         if !self.periodic_disk_pressure_enabled() {
             return Ok(());
         }
+        let Ok(_cleanup) = self.core.maintenance.try_lock() else {
+            return Ok(());
+        };
         let Ok(_pressure) = self.core.disk.try_lock() else {
             return Ok(());
         };

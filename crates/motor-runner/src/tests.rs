@@ -14,6 +14,27 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::net::{UnixListener, UnixStream};
 
+fn capture_runner_logs(work: impl FnOnce()) -> String {
+    #[derive(Clone, Default)]
+    struct LogBytes(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for LogBytes {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let bytes = LogBytes::default();
+    tracing::subscriber::with_default(
+        motor_protocol::logging::LineSubscriber::new("[runner]", bytes.clone()),
+        work,
+    );
+    let captured = bytes.0.lock().unwrap().clone();
+    String::from_utf8(captured).unwrap()
+}
+
 #[path = "tests/boat_disk.rs"]
 mod boat_disk;
 #[cfg(target_os = "linux")]
