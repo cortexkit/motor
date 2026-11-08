@@ -851,8 +851,9 @@ impl WaitAnswers {
 
     fn expire(&mut self, pending: Error) -> Error {
         self.expired = true;
-        // Keep BoatHostFull's spill_attempted detail instead of replacing it
-        // with the ordinary registered-host capacity refusal.
+        // An overflow sandbox (Boat) that was full keeps its own refusal, whose
+        // detail says the job tried overflow capacity, instead of becoming the
+        // ordinary refusal for a full registered host.
         if pending == Error::BoatHostFull {
             return pending;
         }

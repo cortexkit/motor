@@ -1228,8 +1228,8 @@ async fn replay_owner(
             return;
         }
     }
-    // Keep the connection open for the follower, but do not withhold the result
-    // while waiting for that follower to disconnect.
+    // Keep the connection open, but send the result before waiting for ck-motor
+    // (the peer) to disconnect.
     if tls.flush().await.is_err() {
         return;
     }
