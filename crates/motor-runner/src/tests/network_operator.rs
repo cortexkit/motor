@@ -9,7 +9,7 @@ fn config(f: &Fixture) -> Config {
 }
 
 fn restart_config(root: &Path) -> Config {
-    let mut config = Config::new(root.join("state"), "e2e");
+    let mut config = fixture_config(root.join("state"));
     config.workspace_roots = vec![root.join("remote/worktrees")];
     config.owned_workspace_roots = vec![root.join("remote")];
     config.free_space_floor_bytes = 0;

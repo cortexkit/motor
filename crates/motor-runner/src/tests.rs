@@ -266,6 +266,20 @@ fn commit(path: &Path, content: &str) -> (String, String) {
     )
 }
 
+fn fixture_config(state_root: impl Into<PathBuf>) -> Config {
+    Config {
+        // Keep the real motor-jobs.slice memory ceiling without reading
+        // jobs_min_bytes from /etc/motor-host/capacity.json: isolation tests
+        // must not depend on the operator's host sizing. Capacity tests supply
+        // their own probe and capacity file.
+        #[cfg(target_os = "linux")]
+        slice_budget_probe: Some(Arc::new(|| {
+            Ok((crate::systemd::read_job_memory_budget()?.max, None))
+        })),
+        ..Config::new(state_root, "e2e")
+    }
+}
+
 impl Fixture {
     fn new() -> Self {
         let scratch = ScratchDir::new("motor-runner");
@@ -308,7 +322,7 @@ impl Fixture {
         }
     }
     fn config(&self) -> Config {
-        let mut c = Config::new(self.scratch.join("state"), "e2e");
+        let mut c = fixture_config(self.scratch.join("state"));
         c.free_space_floor_bytes = 0;
         let cargo_home = self.scratch.join("cargo-home");
         fs::create_dir_all(&cargo_home).unwrap();
@@ -532,6 +546,23 @@ impl Drop for Fixture {
             panic!("fixture runner did not quiesce before scratch cleanup");
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_config_ignores_the_operator_capacity_declaration() {
+    let f = Fixture::new();
+    let mut config = f.config();
+    assert!(
+        config.slice_budget_probe.is_some(),
+        "fixture configs must override the live capacity-file probe"
+    );
+    config.manual_tick = true;
+    let runner = Runner::open(config).unwrap();
+    assert_eq!(
+        runner.core.declared_jobs_min.load(Ordering::SeqCst),
+        crate::job_memory_budget::NO_JOB_MEMORY_BUDGET
+    );
 }
 
 #[test]
@@ -1397,7 +1428,7 @@ fn surviving_unit_child() {
     };
     let root = PathBuf::from(root);
     let request: Run = read_json(&root.join("request.json")).unwrap();
-    let mut config = Config::new(root.join("state"), "e2e");
+    let mut config = fixture_config(root.join("state"));
     config.owned_workspace_roots = vec![root.clone()];
     config.free_space_floor_bytes = 0;
     config.isolate_jobs = true;

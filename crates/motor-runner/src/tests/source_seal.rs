@@ -138,11 +138,6 @@ fn isolated_config(f: &Fixture) -> Config {
     let mut config = f.config();
     config.isolate_jobs = true;
     config.disable_warm_builds = true;
-    // Preserve the real unit ceiling, but do not read the jobs_min_bytes
-    // declaration in /etc/motor-host/capacity.json for a source-protection test.
-    config.slice_budget_probe = Some(Arc::new(|| {
-        Ok((crate::systemd::read_job_memory_budget()?.max, None))
-    }));
     config
 }
 

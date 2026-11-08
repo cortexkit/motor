@@ -863,7 +863,7 @@ fn writer_restart_child() {
     };
     let path = PathBuf::from(path);
     let r: Run = read_json(&path.join("request.json")).unwrap();
-    let mut config = Config::new(path.join("state"), "e2e");
+    let mut config = fixture_config(path.join("state"));
     config.free_space_floor_bytes = 0;
     config.workspace_roots = vec![path.join("remote/worktrees")];
     config.owned_workspace_roots = vec![path.clone()];
