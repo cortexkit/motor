@@ -901,15 +901,19 @@ second) before retrying the identical request, including its job ID. Capacity
 and `202 provisioning` retries share one queue-wait deadline. Exhaustion yields
 a typed retryable refusal, never local execution. The broker can grant a lease
 from a stale view of the host, which then refuses the job as full (`host_full`,
-or `capacity`). A routed job waits two seconds and asks again with the same job
-ID and lease body, within the same queue-wait deadline. The contract allows
-this: a re-request before admission returns the same reservation and placement
-with a fresh run token. These waits don't count against the three placement
-attempts. When the deadline passes, the job gets the same refusal as for
-`no_capacity` (`hosted_capacity`, runner full, retry after 2 s), and the unused
-reservation is released. That holds when the deadline cuts off the lease request
-that asks again after a `host_full` refusal: the job was waiting for the host, so
-it is refused as runner full, not unreachable. A broker that has not answered
+or `capacity`). Before Run, an unpinned registered-host job requests a replacement
+that keeps the same reservation and excludes every host it was previously placed
+on. A `replace_pending` fence waits for `Retry-After` within the same queue budget.
+Lease bodies stay unchanged: `avoid_host` is part of the lease hash, not a retry
+option. If no replacement is available, a routed job waits two seconds and asks
+again with the same job ID and lease body. These capacity waits don't count
+against the three placement attempts. If only capacity answers exhaust the
+queue budget, including a replacement fence after a capacity refusal, the job
+gets `runner_full` with cause `hosted_capacity` and `ran: none`, so it is safe to
+resubmit. The unused reservation is released. Real connection failures remain
+`unreachable`. When answers were mixed, the refusal uses the last definite
+answer and says so in its detail, which includes the final cause. A replacement
+fence is not a new definite answer. A broker that has not answered
 the job's first lease request when the deadline passes gives
 `hosted_provisioning` (unreachable). Before the durable `run_sent`
 marker, refusals identify repository-selected routing with the exact detail text

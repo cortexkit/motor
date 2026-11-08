@@ -1343,6 +1343,7 @@ impl Motor {
                                 } else {
                                     error.detail()
                                 };
+                                let detail = client.refusal_detail(error, detail);
                                 Err((error.reason(), Some(detail), error.retry_after_ms()))
                             }
                         }
