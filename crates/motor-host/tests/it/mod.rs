@@ -4,6 +4,7 @@ mod billing;
 #[cfg(target_os = "linux")]
 mod broker;
 mod capacity;
+mod claim_log;
 mod closure;
 mod drain;
 mod enroll;
@@ -80,6 +81,25 @@ fn host() -> Host {
         Snapshot::default(),
         Box::<MemoryJournal>::default(),
     )
+}
+
+fn host_settings() -> [motor_host::config::HostSettings; 2] {
+    use motor_host::config::{HostSettings, PerJobSettings};
+    [
+        HostSettings::Tenant,
+        HostSettings::PerJob(PerJobSettings {
+            host_reserve_mib: 1024,
+            boot_reserve_mib: 256,
+            per_vm_overhead_mib: 128,
+            reclaim_timeout_ms: 5000,
+            hysteresis_mib: 512,
+            workspace_disk_cap_bytes: 10737418240,
+            boot_deadline_ms: 30000,
+            recovery_timeout_ms: 120000,
+            exit_evidence_bound_ms: 10000,
+            teardown_timeout_ms: 5000,
+        }),
+    ]
 }
 fn event(
     seq: u64,

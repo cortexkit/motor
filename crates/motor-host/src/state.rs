@@ -204,6 +204,7 @@ pub(crate) struct QuotaUpdate {
 /// All callers serialize this owner. Persisting a candidate before publishing it
 /// prevents a failed fsync from authorizing a relay or a lifecycle acknowledgement.
 pub struct Host {
+    pub settings: crate::config::HostSettings,
     pub tenants: BTreeMap<String, Tenant>,
     pub snapshot: Snapshot,
     journal: Box<dyn Journal>,
@@ -232,6 +233,7 @@ impl Host {
         journal: Box<dyn Journal>,
     ) -> Self {
         Self {
+            settings: Default::default(),
             tenants,
             snapshot,
             journal,
@@ -503,24 +505,42 @@ impl Host {
         self.connections.iter().any(|c| c.id == id)
     }
     pub fn claim(&mut self, claims: Claims, now_ms: u64) -> Result<(u64, Admission), Error> {
+        let result = self.claim_inner(&claims, now_ms);
+        crate::claim_log::record(
+            self.settings.mode(),
+            &claims,
+            result
+                .as_ref()
+                .map(|(_, admission)| *admission)
+                .map_err(|error| error.cause),
+        );
+        result.map_err(|error| error.error)
+    }
+
+    fn claim_inner(
+        &mut self,
+        claims: &Claims,
+        now_ms: u64,
+    ) -> Result<(u64, Admission), crate::claim_log::ClaimError> {
+        use crate::claim_log::RefusalCause;
         self.observed_at_ms = now_ms;
         if self.snapshot.revocations.contains_key(&claims.jti) {
-            return refuse(Refusal::Auth);
+            return Err(Refusal::Auth.into());
         }
-        let tenant = self.binding(&claims)?.clone();
+        let tenant = self.binding(claims)?.clone();
         if now_ms / 1000 >= claims.exp {
-            return refuse(Refusal::Expired);
+            return Err(Refusal::Expired.into());
         }
         if self.is_suspending(&tenant.tenant) {
             // The current first-party TLS connector budgets 60 seconds for admission and
             // runner hello. A memory snapshot can outlast that entire budget;
             // retain a typed retryable refusal instead of a silent client timeout.
-            return refuse(Refusal::Capacity);
+            return Err(RefusalCause::Suspending.into());
         }
         // A runner cleaning old state can take minutes to listen. Do not
         // admit another lease that would wait behind that startup handshake.
         if self.is_waking(&tenant.tenant) {
-            return refuse(Refusal::HostFull);
+            return Err(RefusalCause::RunnerWaking.into());
         }
         let old = self.snapshot.leases.get(&claims.jti).cloned();
         // A heartbeat can revoke this host's placement while the old run token
@@ -529,7 +549,7 @@ impl Host {
             .as_ref()
             .is_some_and(|l| l.refusal == Some(Refusal::Auth))
         {
-            return refuse(Refusal::Auth);
+            return Err(Refusal::Auth.into());
         }
         if claims.purpose == Purpose::Attach {
             // A connection task drops its watch receiver before its blocking
@@ -555,26 +575,26 @@ impl Host {
         if claims.purpose == Purpose::Run && self.is_closed(&tenant.tenant) {
             // A closed account starts no new job. Attach stays open so a
             // client can still collect a result already running or finished.
-            return refuse(Refusal::Auth);
+            return Err(Refusal::Auth.into());
         }
         if claims.purpose == Purpose::Attach {
             if live || old.is_none() {
-                return refuse(Refusal::Auth);
+                return Err(Refusal::Auth.into());
             }
         } else {
             if claims.vcpus > tenant.vcpu_ceiling {
-                return refuse(Refusal::HostFull);
+                return Err(RefusalCause::Permits.into());
             }
             // Low host storage stops new work. A lease already delivered to
             // the runner may be replaced, because its job can already be in
             // the guest.
             if self.storage_refusing() && !old.as_ref().is_some_and(|l| l.delivered) {
-                return refuse(Refusal::HostFull);
+                return Err(RefusalCause::Storage.into());
             }
             // A tenant the helper refused to start gets no lease until a
             // start succeeds; motor-host retries the start on its own.
             if self.start_retry_at(&tenant.tenant).is_some() {
-                return refuse(Refusal::HostFull);
+                return Err(RefusalCause::RunnerStartRefused.into());
             }
             // Released leases still appear in heartbeats, even though they no
             // longer consume weight. Reusing a job id needs no additional entry.
@@ -587,10 +607,10 @@ impl Host {
                     .count()
                     >= crate::wire::MAX_ENTRIES
             {
-                return refuse(Refusal::HostFull);
+                return Err(RefusalCause::LeaseEntries.into());
             }
             if next.vms.get(&tenant.tenant).is_some_and(|v| v.stop_pending) {
-                return refuse(Refusal::Capacity);
+                return Err(RefusalCause::StopPending.into());
             }
             let mut replacing = false;
             let mut delivered = false;
@@ -599,15 +619,15 @@ impl Host {
                     lease.state,
                     LeaseState::Admitted | LeaseState::Started | LeaseState::Ended
                 ) {
-                    return refuse(Refusal::Auth);
+                    return Err(Refusal::Auth.into());
                 }
-                if !same_reservation(&lease.claims, &claims) {
-                    return refuse(Refusal::Auth);
+                if !same_reservation(&lease.claims, claims) {
+                    return Err(Refusal::Auth.into());
                 }
                 let reconnect =
-                    lease.state == LeaseState::Released && !live && lease.claims == claims;
+                    lease.state == LeaseState::Released && !live && lease.claims == *claims;
                 if claims.iat <= lease.claims.iat && !reconnect {
-                    return refuse(Refusal::Auth);
+                    return Err(Refusal::Auth.into());
                 }
                 delivered = lease.delivered;
                 replacing = delivered;
@@ -621,7 +641,7 @@ impl Host {
                 .and_then(|share| share.checked_sub(previous_share))
                 .and_then(|share| share.checked_add(claims.vcpus));
             if share.is_none_or(|share| share > tenant.budget()) {
-                return refuse(Refusal::HostFull);
+                return Err(RefusalCause::Permits.into());
             }
             if replacing {
                 admission = Admission::Waiting;
@@ -655,7 +675,7 @@ impl Host {
         let id = self.next_connection;
         self.connections.push(Connection {
             id,
-            job: claims.jti,
+            job: claims.jti.clone(),
             purpose: claims.purpose,
             updates: tokio::sync::watch::channel(if admission == Admission::Waiting {
                 ConnectionState::Waiting

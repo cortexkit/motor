@@ -17,6 +17,9 @@ use std::time::Duration;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
+    #[serde(default)]
+    mode: motor_host::config::HostMode,
+    per_job: Option<motor_host::config::PerJobSettings>,
     host_id: String,
     listen: String,
     certificate: PathBuf,
@@ -31,6 +34,20 @@ struct Config {
     storage: PathBuf,
     #[serde(default)]
     fake_broker_url: Option<String>,
+}
+
+impl Config {
+    fn startup_settings(&self) -> Result<motor_host::config::HostSettings> {
+        use motor_host::config::{HostMode, HostSettings};
+        let settings = HostSettings::from_config(self.mode, self.per_job.clone())?;
+        // Do not serve a per-job configuration with tenant VMs while the job
+        // VM lifecycle is not yet wired into this executable.
+        ensure!(
+            settings.mode() != HostMode::PerJob,
+            "per_job mode is not yet available"
+        );
+        Ok(settings)
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,6 +87,7 @@ async fn main() -> Result<()> {
         .nth(1)
         .context("usage: motor-host <config.json>")?;
     let config: Config = serde_json::from_reader(File::open(&path)?)?;
+    let settings = config.startup_settings()?;
     let (broker_endpoint, jwks_url) = if let Some(url) = &config.fake_broker_url {
         motor_host::broker::trusted_override_config(std::path::Path::new(&path))?;
         let endpoint = motor_host::broker::fake_broker_endpoint(url, &config.listen)?;
@@ -135,6 +153,7 @@ async fn main() -> Result<()> {
     }
     let (journal, snapshot) = SqliteJournal::open(&config.journal_dir)?;
     let mut host = Host::new(tenants, snapshot, Box::new(journal));
+    host.settings = settings;
     // Starts latched: no lease is admitted until a probe finds the capacity
     // file valid and enough host storage free.
     host.enforce_storage();
@@ -345,4 +364,117 @@ fn show_enrollment(args: Vec<String>) -> Result<()> {
 
 fn log_tick_failure(error: &anyhow::Error) {
     tracing::error!(detail = %format!("{error:#}"), "host_tick_failed");
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+    use motor_host::config::{HostMode, HostSettings};
+
+    fn config() -> serde_json::Value {
+        json!({
+            "host_id": "host", "listen": "127.0.0.1:443",
+            "certificate": "cert", "private_key": "key", "host_signing_key": "seed",
+            "journal_dir": "journal", "helper_socket": "helper.sock",
+            "registry_dir": "registry", "bindings": "bindings.json",
+            "resolvers": ["1.1.1.1"], "admin_socket": "admin.sock", "storage": "storage"
+        })
+    }
+
+    fn per_job() -> serde_json::Value {
+        json!({
+            "host_reserve_mib": 1024, "boot_reserve_mib": 256,
+            "per_vm_overhead_mib": 128, "reclaim_timeout_ms": 5000,
+            "hysteresis_mib": 512, "workspace_disk_cap_bytes": 10737418240_u64,
+            "boot_deadline_ms": 30000, "recovery_timeout_ms": 120000,
+            "exit_evidence_bound_ms": 10000, "teardown_timeout_ms": 5000
+        })
+    }
+
+    #[test]
+    fn existing_configs_and_explicit_tenant_mode_keep_tenant_settings() {
+        let mut value = config();
+        for explicit in [false, true] {
+            if explicit {
+                value["mode"] = json!("tenant");
+            }
+            let config: Config = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(config.mode, HostMode::Tenant);
+            assert_eq!(config.startup_settings().unwrap(), HostSettings::Tenant);
+        }
+    }
+
+    #[test]
+    fn per_job_mode_requires_its_settings_object() {
+        let mut value = config();
+        value["mode"] = json!("per_job");
+        for settings in [None, Some(serde_json::Value::Null)] {
+            if let Some(settings) = settings {
+                value["per_job"] = settings;
+            }
+            let config: Config = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                config.startup_settings().unwrap_err().to_string(),
+                "per_job settings are required"
+            );
+        }
+    }
+
+    #[test]
+    fn per_job_mode_refuses_each_unset_setting_without_defaults() {
+        let mut value = config();
+        value["mode"] = json!("per_job");
+        for field in per_job().as_object().unwrap().keys() {
+            for unset in [None, Some(serde_json::Value::Null)] {
+                let mut settings = per_job();
+                if let Some(unset) = unset {
+                    settings[field] = unset;
+                } else {
+                    settings.as_object_mut().unwrap().remove(field);
+                }
+                value["per_job"] = settings;
+                let error = serde_json::from_value::<Config>(value.clone())
+                    .err()
+                    .unwrap();
+                if value["per_job"].get(field).is_none() {
+                    assert!(error
+                        .to_string()
+                        .contains(&format!("missing field `{field}`")));
+                } else {
+                    assert!(error.to_string().contains("invalid type: null"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn complete_per_job_config_is_typed_but_startup_refuses_unavailable_runtime() {
+        let mut value = config();
+        value["mode"] = json!("per_job");
+        value["per_job"] = per_job();
+        let config: Config = serde_json::from_value(value).unwrap();
+        let settings = HostSettings::from_config(config.mode, config.per_job.clone()).unwrap();
+        assert_eq!(settings.mode(), HostMode::PerJob);
+        let HostSettings::PerJob(settings) = settings else {
+            panic!("per-job settings lost")
+        };
+        assert_eq!(settings.host_reserve_mib, 1024);
+        assert_eq!(settings.boot_deadline_ms, 30000);
+        assert_eq!(settings.workspace_disk_cap_bytes, 10737418240);
+        assert_eq!(
+            config.startup_settings().unwrap_err().to_string(),
+            "per_job mode is not yet available"
+        );
+    }
+
+    #[test]
+    fn mode_and_per_job_settings_reject_unknown_fields_and_values() {
+        let mut value = config();
+        value["mode"] = json!("unknown");
+        assert!(serde_json::from_value::<Config>(value.clone()).is_err());
+        value["mode"] = json!("per_job");
+        value["per_job"] = per_job();
+        value["per_job"]["typo"] = json!(1);
+        assert!(serde_json::from_value::<Config>(value).is_err());
+    }
 }

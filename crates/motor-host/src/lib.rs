@@ -3,7 +3,9 @@
 pub mod billing;
 pub mod broker;
 pub mod capacity;
+pub mod claim_log;
 pub mod closure;
+pub mod config;
 pub mod enroll;
 pub mod helper;
 pub mod ingress;
