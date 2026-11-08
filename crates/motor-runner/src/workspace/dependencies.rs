@@ -242,7 +242,25 @@ impl Trees {
                 if header.read_line(&mut line)? == 0 {
                     return Err(invalid("unterminated dependency bundle header"));
                 }
-                if line.starts_with('-') {
+                if let Some(prerequisite) = line.strip_prefix('-') {
+                    if let Some(commit) = prerequisite
+                        .split_whitespace()
+                        .next()
+                        .filter(|commit| valid_commit(commit))
+                    {
+                        let mirror = self.dependency_mirror(&d.url);
+                        if git(
+                            &mirror,
+                            &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+                        )
+                        .is_err()
+                        {
+                            return Err(crate::engine::missing_history(format!(
+                                "dependency {} prerequisite {commit}",
+                                d.url
+                            )));
+                        }
+                    }
                     return Err(invalid("dependency bundle has prerequisites"));
                 }
                 if line.trim_end().is_empty() {

@@ -234,6 +234,44 @@ async fn missing_thin_bundle_prerequisite_is_transfer_interrupted_without_start_
 }
 
 #[tokio::test]
+async fn missing_dependency_bundle_prerequisite_is_transfer_interrupted_before_import() {
+    let f = Fixture::new();
+    let runner = runner(&f, true, true);
+    let prerequisite = git(&f.main, &["rev-parse", "HEAD"]);
+    commit(&f.main, "dependency-next\n");
+    let (mut request, mut bytes) = f.run("touch marker");
+    with_dependency(&f, &mut request, &mut bytes);
+    let reference = format!("refs/ck-motor/dep/{}", request.snapshot_commit);
+    git(&f.main, &["update-ref", &reference, "HEAD"]);
+    let path = f.scratch.join("thin-dependency.bundle");
+    git(
+        &f.main,
+        &[
+            "bundle",
+            "create",
+            text(&path),
+            &reference,
+            &format!("^{prerequisite}"),
+        ],
+    );
+    git(&f.main, &["update-ref", "-d", &reference]);
+    bytes[2] = fs::read(path).unwrap();
+    let manifest = request.git_dependencies[0].bundle.as_mut().unwrap();
+    manifest.length = bytes[2].len() as u64;
+    manifest.sha256 = format!("{:x}", Sha256::digest(&bytes[2]));
+    f.submit(&runner, &request, &bytes);
+    runner.tick().unwrap();
+    assert_eq!(
+        terminal(&runner, request.job_id).await.outcome,
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::TransferInterrupted,
+        }
+    );
+    assert!(!Path::new(&f.key).join("marker").exists());
+    assert!(pending(&runner).iter().all(|e| e.mirror_refs.is_none()));
+}
+
+#[tokio::test]
 async fn next_boot_retirement_before_any_run_reports_local_identity_or_explicit_unknown() {
     for known in [true, false] {
         let f = Fixture::new();
