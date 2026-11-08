@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 // Legacy rows lack the requested timeout. Eight-hour jobs have run here;
 // 48 hours leaves ample headroom before treating an abandoned row as stale.
-const LEGACY_JOB_HORIZON_MS: u64 = 48 * 60 * 60 * 1000;
+pub(super) const LEGACY_JOB_HORIZON_MS: u64 = 48 * 60 * 60 * 1000;
 const FAILURE_HORIZON_MS: u64 = 60 * 60 * 1000;
 const STALE_PROBE_INTERVAL_MS: u64 = 15 * 60 * 1000;
 

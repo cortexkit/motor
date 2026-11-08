@@ -623,7 +623,7 @@ impl Motor {
                 }
                 return Ok(true);
             }
-            let expired = owner.now_ms() >= self.hosted_result_deadline(id);
+            let expired = owner.now_ms() >= self.hosted_result_deadline(id)?;
             let result = self.finish_hosted(id, expired, tx).await;
             owner.live(false);
             result?;
@@ -1005,7 +1005,7 @@ impl Motor {
         error: crate::hosted::Error,
         now: u64,
     ) -> io::Result<bool> {
-        let expired = now >= self.hosted_result_deadline(id);
+        let expired = now >= self.hosted_result_deadline(id)?;
         let (cause, broker_finished) = match error {
             crate::hosted::Error::Finished => ("broker reports the job finished; no result reached ck-motor", true),
             crate::hosted::Error::AttachAuth if expired => ("host refused reattach with auth past the job's deadline; no result reached ck-motor", false),
@@ -1015,12 +1015,40 @@ impl Motor {
         self.retire_idle_hosted_result(id, now, cause, broker_finished)
     }
 
-    pub(super) fn hosted_result_deadline(&self, id: Uuid) -> u64 {
-        self.hosted_state(id)
-            .and_then(|state| state.reattach_deadline_s())
-            .map(|seconds| seconds.saturating_mul(1000))
-            .or_else(|| self.storage.job(id).map(|job| health::deadline(id, &job)))
-            .unwrap_or(u64::MAX)
+    pub(super) fn hosted_result_deadline(&self, id: Uuid) -> io::Result<u64> {
+        let route = self.hosted_state(id);
+        if let Some(deadline) = route.as_ref().and_then(|state| state.reattach_deadline_s()) {
+            return Ok(deadline.saturating_mul(1000));
+        }
+        let Some(mut job) = self.storage.job(id) else {
+            return Ok(u64::MAX);
+        };
+        if route.is_none() {
+            return Ok(health::deadline(id, &job));
+        }
+        // A missing lease deadline cannot leave hosted recovery unlimited. Only
+        // here, cap an absent or unbounded health deadline at 48 hours after the
+        // job ID was created; ordinary health keeps its no-timeout semantics.
+        if job.health_deadline_ms == Some(u64::MAX) {
+            job.health_deadline_ms = None;
+        }
+        let deadline = health::deadline(id, &job);
+        if deadline != u64::MAX {
+            return Ok(deadline);
+        }
+        // Some older IDs omit their creation time. Save one recovery-age timestamp
+        // so restart cannot renew the 48-hour bound. This timestamp does not prove
+        // that the runner supplied an execution result.
+        let anchor = if let Some(anchor) = job.terminal_observed_at_ms {
+            anchor
+        } else {
+            self.storage.terminal_observed(id)?;
+            self.storage
+                .job(id)
+                .and_then(|job| job.terminal_observed_at_ms)
+                .ok_or_else(|| io::Error::other("missing legacy recovery age anchor"))?
+        };
+        Ok(anchor.saturating_add(health::LEGACY_JOB_HORIZON_MS))
     }
 }
 

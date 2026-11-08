@@ -591,6 +591,97 @@ async fn audit_13_expired_unknown_cancel_recovery_reaches_a_terminal_state() {
     motor.close().await;
 }
 
+#[tokio::test]
+async fn audit_13_legacy_max_or_missing_deadline_unknown_retires_at_mint_horizon() {
+    for explicit_max in [true, false] {
+        let (root, motor, template) = fixture();
+        let config = motor.config.clone();
+        let minted = crate::hosted::now_s().saturating_sub(49 * 60 * 60);
+        let id = Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, minted, 0));
+        motor.storage.create(id, 60, None, None, false).unwrap();
+        let mut state = motor.hosted_state(template).unwrap();
+        state.retry_iat = None;
+        state.max_runtime_s = None;
+        state.broker_url = "http://127.0.0.1:1".into();
+        state.terminal = Some(TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0));
+        motor.storage.hosted_route(id, state).unwrap();
+        if explicit_max {
+            motor.storage.health_deadline(id, None).unwrap();
+        }
+        motor.storage.cancel(id, true).unwrap();
+        motor.close().await;
+        let motor = Motor::with_connector(
+            config,
+            &root,
+            Arc::new(crate::hosted::tests::harness::NoSsh(
+                std::sync::atomic::AtomicUsize::new(0),
+            )),
+        )
+        .unwrap();
+        assert!(motor.pending(id));
+        let owner = motor.reserve_hosted_result(id, u64::MAX);
+        let (tx, _records) = mpsc::channel(32);
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            motor.recover_recorded_unknown(id, &owner, &tx)
+        )
+        .await
+        .expect("legacy cancellation recovery ignored its finite mint horizon")
+        .unwrap());
+        assert!(!motor.pending(id));
+        assert!(motor.storage.job(id).unwrap().hosted_complete());
+        assert!(!motor.storage.unsettled_hosted().contains(&id));
+        motor.hosted_results.lock().unwrap().remove(&id);
+        motor.close().await;
+    }
+}
+
+#[tokio::test]
+async fn audit_13_undated_legacy_unknown_gets_one_durable_recovery_horizon() {
+    let (root, motor, template) = fixture();
+    let config = motor.config.clone();
+    let id = Uuid::from_u128(1);
+    assert!(id.get_timestamp().is_none());
+    motor.storage.create(id, 60, None, None, false).unwrap();
+    let mut state = motor.hosted_state(template).unwrap();
+    state.retry_iat = None;
+    state.max_runtime_s = None;
+    state.terminal = Some(TerminalRecord::new(id, Outcome::OutcomeUnknown, 0, 0, 0));
+    motor.storage.hosted_route(id, state).unwrap();
+    motor.storage.health_deadline(id, None).unwrap();
+    motor.storage.cancel(id, true).unwrap();
+    let first = motor.hosted_result_deadline(id).unwrap();
+    assert_ne!(
+        first,
+        u64::MAX,
+        "a legacy ID without mint time left cancellation recovery unbounded"
+    );
+    let anchor = motor
+        .storage
+        .job(id)
+        .unwrap()
+        .terminal_observed_at_ms
+        .unwrap();
+    assert_eq!(first, anchor + 48 * 60 * 60 * 1000);
+    motor.close().await;
+    let motor = Motor::with_connector(
+        config,
+        &root,
+        Arc::new(crate::hosted::tests::harness::NoSsh(
+            std::sync::atomic::AtomicUsize::new(0),
+        )),
+    )
+    .unwrap();
+    assert!(motor.pending(id));
+    assert!(!motor.hosted_state(id).unwrap().has_real_terminal());
+    assert_eq!(
+        motor.hosted_result_deadline(id).unwrap(),
+        first,
+        "restart renewed the legacy recovery horizon"
+    );
+    motor.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audit_14a_pending_settlement_attach_preserves_requested_output_cursor() {
     let h = Harness::new(Behavior::OwnerReplay).await;

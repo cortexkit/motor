@@ -2252,9 +2252,8 @@ impl Motor {
         // Attempt cancellation first, but a network failure must not leave the
         // caller without a terminal. Retain and retry unconfirmed cancellation.
         let mut cancel_unconfirmed = false;
-        let host_expired = state
-            .reattach_deadline_s()
-            .is_some_and(|d| crate::hosted::now_s() >= d);
+        let host_expired = state.run_sent
+            && crate::hosted::now_s().saturating_mul(1000) >= self.hosted_result_deadline(id)?;
         if host_expired && matches!(terminal.outcome, Outcome::OutcomeUnknown) {
             self.storage.cancel(id, false)?;
         }
@@ -2614,7 +2613,7 @@ impl Motor {
                     if self
                         .hosted_state(id)
                         .is_some_and(|state| state.terminal.is_some())
-                        && owner.now_ms() >= self.hosted_result_deadline(id)
+                        && owner.now_ms() >= self.hosted_result_deadline(id)?
                         && (!probe_settlement || reattaches > 1)
                     {
                         return self.finish_hosted(id, true, tx).await.map(|_| false);
